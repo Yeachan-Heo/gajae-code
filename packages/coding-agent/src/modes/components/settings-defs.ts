@@ -64,7 +64,17 @@ export interface TextInputSettingDef extends BaseSettingDef {
 	type: "text";
 }
 
-export type SettingDef = BooleanSettingDef | EnumSettingDef | SubmenuSettingDef | TextInputSettingDef;
+/** Array setting rendered by a dedicated ordered-list editor (currently only `modelProviderOrder`). */
+export interface ProviderOrderSettingDef extends BaseSettingDef {
+	type: "providerOrder";
+}
+
+export type SettingDef =
+	| BooleanSettingDef
+	| EnumSettingDef
+	| SubmenuSettingDef
+	| TextInputSettingDef
+	| ProviderOrderSettingDef;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Condition Functions
@@ -129,6 +139,16 @@ function pathToSettingDef(path: SettingPath): SettingDef | null {
 			return { ...base, type: "submenu", options };
 		}
 		return { ...base, type: "text" };
+	}
+
+	if (schemaType === "array") {
+		// Arrays render through dedicated custom editors rather than the generic
+		// value list. `modelProviderOrder` is the only array with a provider-order
+		// editor today; other arrays with a `ui` block stay hidden here.
+		if (path === "modelProviderOrder") {
+			return { ...base, type: "providerOrder" };
+		}
+		return null;
 	}
 
 	return null;

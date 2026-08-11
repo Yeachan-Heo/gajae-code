@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { AcpSdkAdapter } from "../src/sdk/acp";
+import { SdkClient } from "../src/sdk/client";
 
 const waitFor = async <T>(read: () => T | undefined, label: string): Promise<T> => {
 	const deadline = Date.now() + 2_000;
@@ -71,11 +72,27 @@ test("ACP provider reconnects after a server-side heartbeat disconnect, awaits h
 	}
 });
 
+// The ACP reconnect budget deliberately outlives the host heartbeat TTL (#4012),
+// so exhausting the production budget against a dead endpoint burns tens of
+// seconds of real backoff. Inject a one-shot client so this stays an assertion
+// about the typed rejection; the budget itself is asserted from its constants in
+// acp-session-reconnect.test.ts.
 test("ACP reconnect exhaustion is observable as a typed rejection", async () => {
+	// The ACP session reconnect budget (ACP_SESSION_RECONNECT) deliberately
+	// outlives the host heartbeat TTL — 23 attempts with backoff up to 2s, ~40s
+	// total. That budget is exercised under a fake clock in
+	// acp-session-reconnect.test.ts; here, inject a bounded client so the
+	// adapter's typed-rejection propagation is still asserted without a 40s
+	// real-time wait in CI.
 	const adapter = new AcpSdkAdapter({
 		url: "ws://127.0.0.1:1",
 		token: "token",
 		providers: [{ capability: "ui", definitions: [] }],
+		client: new SdkClient("ws://127.0.0.1:1", "token", {
+			reconnectAttempts: 1,
+			reconnectBackoffMs: 1,
+			reconnectMaxBackoffMs: 1,
+		}),
 	});
 	await expect(adapter.start()).rejects.toMatchObject({ code: "reconnect_exhausted" });
 });

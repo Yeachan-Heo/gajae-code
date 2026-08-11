@@ -54,6 +54,9 @@ import {
 	createAgentSession,
 	discoverAuthStorage,
 } from "./sdk";
+import { processIncarnation } from "./sdk/broker/process-incarnation";
+import { SessionIndex } from "./sdk/broker/session-index";
+
 import type { AgentSession } from "./session/agent-session";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
@@ -258,15 +261,15 @@ export function resolveAcpStartupOptions(
 		...(parsed.providerSessionId ? ["--provider-session-id"] : []),
 		...(parsed.resume ? ["--resume"] : []),
 		...(parsed.sessionDir ? ["--session-dir"] : []),
-		...(parsed.skills?.length ? ["--skills"] : []),
+		...(parsed.skills !== undefined ? ["--skills"] : []),
 		...(parsed.slow ? ["--slow"] : []),
 		...(parsed.smol ? ["--smol"] : []),
 		...(parsed.plan ? ["--plan"] : []),
 		...(parsed.systemPrompt ? ["--system-prompt"] : []),
 		...(parsed.tmux ? ["--tmux"] : []),
-		...(parsed.tools?.length ? ["--tools"] : []),
+		...(parsed.tools !== undefined ? ["--tools"] : []),
 		...(parsed.extensions?.length ? ["--extension"] : []),
-		...(parsed.unknownFlags.size > 0 ? ["extension flags"] : []),
+		...(parsed.unknownFlags.size > 0 ? [`unknown flags: ${[...parsed.unknownFlags.keys()].join(" ")}`] : []),
 	];
 	if (unsupported.length > 0) {
 		throw new Error(
@@ -877,6 +880,7 @@ export async function createSessionManager(
 	activeSettings: Settings = settings,
 ): Promise<SessionManager | undefined> {
 	const migrationPolicy = activeSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+	const sessionMemoryMode = activeSettings.get("sessionMemory.mode");
 	const sessionDestination = () =>
 		parsed.sessionDir
 			? SessionManager.explicitDestination(parsed.sessionDir)
@@ -890,7 +894,14 @@ export async function createSessionManager(
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			return await SessionManager.forkFrom(forkSource, cwd, sessionDestination(), undefined, migrationPolicy);
+			return await SessionManager.forkFrom(
+				forkSource,
+				cwd,
+				sessionDestination(),
+				undefined,
+				migrationPolicy,
+				sessionMemoryMode,
+			);
 		}
 		const match = await resolveResumableSession(
 			forkSource,
@@ -902,7 +913,14 @@ export async function createSessionManager(
 		if (!match) {
 			throw new Error(`Session "${forkSource}" not found.`);
 		}
-		return await SessionManager.forkFrom(match.session.path, cwd, sessionDestination(), undefined, migrationPolicy);
+		return await SessionManager.forkFrom(
+			match.session.path,
+			cwd,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
 	}
 
 	if (parsed.noSession) {
@@ -914,7 +932,7 @@ export async function createSessionManager(
 			const destination = parsed.sessionDir
 				? SessionManager.explicitDestination(parsed.sessionDir)
 				: SessionManager.explicitDestination(path.dirname(sessionArg));
-			return await SessionManager.open(sessionArg, destination, undefined, migrationPolicy);
+			return await SessionManager.open(sessionArg, destination, undefined, migrationPolicy, sessionMemoryMode);
 		}
 		const match = await resolveResumableSession(
 			sessionArg,
@@ -940,13 +958,26 @@ export async function createSessionManager(
 					sessionDestination(),
 					undefined,
 					migrationPolicy,
+					sessionMemoryMode,
 				);
 			}
 		}
-		return await SessionManager.open(match.session.path, sessionDestination(), undefined, migrationPolicy);
+		return await SessionManager.open(
+			match.session.path,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, sessionDestination(), undefined, migrationPolicy);
+		return await SessionManager.continueRecent(
+			cwd,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
@@ -969,8 +1000,14 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, sessionDestination(), undefined, migrationPolicy);
-		if (manager.getEntries().length > 0) {
+		const manager = await SessionManager.continueRecent(
+			cwd,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
+		if (manager.hasHistoryEntries()) {
 			parsed.continue = true;
 		}
 		return manager;
@@ -1474,6 +1511,21 @@ export async function runRootCommand(
 			...(roleOverrides.plan ? { plan: roleOverrides.plan } : {}),
 		});
 	}
+	// Apply --clipboard-transport / --clipboard-ssh-host as ephemeral runtime
+	// overrides (CLI > persisted config > "auto" default). Not persisted —
+	// mirrors the role-override precedence above.
+	if (parsedArgs.clipboardTransport) {
+		settingsInstance.override("clipboard.transport", parsedArgs.clipboardTransport);
+	}
+	if (parsedArgs.clipboardSshHost) {
+		settingsInstance.override("clipboard.sshHost", parsedArgs.clipboardSshHost);
+	}
+	if (parsedArgs.clipboardTransport === "ssh" && !settingsInstance.get("clipboard.sshHost")) {
+		process.stderr.write(
+			`${chalk.red("Error: --clipboard-transport ssh requires --clipboard-ssh-host <alias> (or clipboard.sshHost in config)")}\n`,
+		);
+		process.exit(1);
+	}
 
 	await logger.time(
 		"initTheme:final",
@@ -1617,8 +1669,11 @@ export async function runRootCommand(
 		sessionOptions.deferMcpConfigStartup = true;
 	}
 	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
-	const deferMemoryBackendStartup =
-		hasRootStartupProfile && !(parsedArgs.authBootstrap === true && isInteractive) && mode !== "acp";
+	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
+	// session here, and the broker-launched lifecycle child defers memory startup
+	// unconditionally (createLifecycleAgentSession) so readiness never waits on
+	// the memory pipeline's LLM work.
+	const deferMemoryBackendStartup = hasRootStartupProfile && !(parsedArgs.authBootstrap === true && isInteractive);
 	sessionOptions.deferMemoryBackendStartup = deferMemoryBackendStartup;
 
 	// Research-mode (RLM) preset: augment session options before session creation.
@@ -1674,6 +1729,34 @@ export async function runRootCommand(
 		await postmortem.cleanup();
 		return;
 	}
+	// Register a resumed direct session before constructing the agent: GC holds the
+	// same index lock while deleting artifacts, so startup and deletion are fenced.
+	const directSessionId = process.env.GJC_LIFECYCLE_REQUEST_ID ? undefined : sessionManager?.getSessionId();
+	if (directSessionId) {
+		const sessionIndex = new SessionIndex(settingsInstance.getAgentDir());
+		const locator = { repo: sessionManager?.getCwd() ?? cwd, stateRoot: settingsInstance.getAgentDir() };
+		// A pid is reusable, so the broker's teardown fence needs this session's OS
+		// start incarnation recorded alongside the pid it publishes.
+		const directSessionIncarnation = processIncarnation(process.pid);
+		await sessionIndex.append({
+			type: "host_registered",
+			sessionId: directSessionId,
+			locator,
+			endpointGeneration: 0,
+			pid: process.pid,
+			...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
+		});
+		postmortem.register("direct-session-index", async () => {
+			await sessionIndex.append({
+				type: "host_unregistered",
+				sessionId: directSessionId,
+				locator,
+				endpointGeneration: 0,
+				pid: process.pid,
+			});
+		});
+	}
+
 	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
 	const createSession: CreateSessionForMain = async (options, context): Promise<CreateAgentSessionResult> => {
 		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);

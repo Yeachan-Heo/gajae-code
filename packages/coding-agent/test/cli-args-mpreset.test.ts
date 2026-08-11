@@ -168,13 +168,12 @@ describe("MCP config CLI args", () => {
 		}
 	});
 
-	test("rejects non-standalone config routes during parsing", () => {
-		const rejectedArgs = [
-			["--mcp-config", "/tmp/gjc-mcp.json", "--mode", "acp"],
+	test("defers ACP config validation to the ACP startup owner", () => {
+		expect(parseArgs(["--mcp-config", "/tmp/gjc-mcp.json", "--mode", "acp"]).mcpConfig).toBe("/tmp/gjc-mcp.json");
+		for (const args of [
 			["--mcp-config", "/tmp/gjc-mcp.json", "--export", "/tmp/session.jsonl"],
 			["--mcp-config", "/tmp/gjc-mcp.json", "--list-models"],
-		];
-		for (const args of rejectedArgs) {
+		]) {
 			expect(() => parseArgs(args)).toThrow(CliParseError);
 		}
 	});
@@ -573,6 +572,43 @@ test("root startup recovers a missing credential only for an input-free interact
 
 	expect(result.recoverableErrors).toEqual([
 		expect.stringContaining('Model profile "codex-medium" requires credentials for: openai-codex'),
+	]);
+});
+
+test("root startup recovers when a persisted bare alias loses its last credential", async () => {
+	const session = fakeSession();
+	const settings = Settings.isolated({ "modelProfile.default": "bare-default" });
+	const registry = {
+		...fakeRegistry([
+			{
+				name: "bare-default",
+				requiredProviders: [],
+				modelMapping: { default: "default" },
+				source: "user",
+			},
+		]),
+		getApiKeyForProvider: async () => undefined,
+		resolveCanonicalModel: () => undefined,
+		getCanonicalVariants: () => [],
+		getCanonicalId: () => undefined,
+	} as never;
+
+	const result = await applyStartupModelProfilesForRoot({
+		session,
+		settings,
+		modelRegistry: registry,
+		parsedArgs: {},
+		startupModel: undefined,
+		startupThinkingLevel: undefined,
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: undefined,
+	});
+
+	expect(result.recoverableErrors).toEqual([
+		expect.stringContaining('Model profile "bare-default" requires credentials for: profile-provider'),
 	]);
 });
 

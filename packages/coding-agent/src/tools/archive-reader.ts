@@ -156,10 +156,19 @@ async function readTarEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
 }
 
 async function readZipEntries(bytes: Uint8Array): Promise<ArchiveIndexEntry[]> {
-	const { unzipSync } = await loadFflate();
+	const { unzip } = await loadFflate();
+	const result = Promise.withResolvers<Record<string, Uint8Array>>();
+	unzip(bytes, (error, files) => {
+		if (error) {
+			result.reject(error);
+			return;
+		}
+		result.resolve(files);
+	});
+
 	let files: Record<string, Uint8Array>;
 	try {
-		files = unzipSync(bytes);
+		files = await result.promise;
 	} catch (error) {
 		throw new ToolError(error instanceof Error ? error.message : String(error));
 	}

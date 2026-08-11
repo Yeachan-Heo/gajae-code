@@ -636,6 +636,7 @@ describe("AgentSession retry fallback", () => {
 			modelRegistry,
 			providerSessionId: logicalSessionId,
 			providerCacheSessionId: providerAffinitySessionId,
+			credentialSessionId: providerAffinitySessionId,
 		});
 		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
@@ -698,6 +699,7 @@ describe("AgentSession retry fallback", () => {
 			modelRegistry,
 			providerSessionId: "logical-session",
 			providerCacheSessionId: poolSessionId,
+			credentialSessionId: poolSessionId,
 			extensionRunner,
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -753,6 +755,7 @@ describe("AgentSession retry fallback", () => {
 			modelRegistry,
 			providerSessionId: "logical-session",
 			providerCacheSessionId: poolSessionId,
+			credentialSessionId: poolSessionId,
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 

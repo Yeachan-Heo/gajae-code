@@ -41,6 +41,7 @@ Current retryable inputs are regex/string-classified:
 - service unavailable / server/internal error
 - provider-suggested retry wording, including OpenAI `retry your request` failures
 - network/connection/socket failures, refused/closed connections, upstream connect/reset-before-headers, socket hang up, timeout/timed out, fetch failed, terminated, retry delay wording, and unexpected socket close messages
+- canonical idle-stream watchdog stalls (`stream stalled while waiting for the next event`); in the legacy single-model path these remain retryable but use the bounded `retry.maxRetries` budget
 
 Managed fallback uses structured transport facts and typed provider error codes when available. A structured classification of `other` becomes the bounded `unknown` fallback class; error prose cannot promote it to quota or transient. Regex classification is retained only as a legacy fallback.
 
@@ -59,7 +60,7 @@ Flow (`#handleRetryableError`):
 2. If `retry.enabled === false`, stop immediately (`false`, no retry started).
 3. Increment `#retryAttempt`.
 4. Create `#retryPromise` once (first attempt in a chain).
-5. Transient errors retry without an attempt limit; unknown/no-code errors stop after `retry.maxRetries`.
+5. In the legacy single-model path, ordinary transient errors retry without an attempt limit, while canonical idle-stream watchdog stalls and unknown/no-code errors stop after `retry.maxRetries`. Managed fallback instead uses its controller's per-entry `fallback.maxAttempts` budget.
 6. Compute exponential full-jitter delay capped at `retry.maxDelayMs`; legacy parsed provider retry-after values override computed backoff and are capped at `retry.maxDelayMs`, while managed typed Retry-After values are intentionally uncapped.
 7. For usage-limit errors, call auth storage (`markUsageLimitReached(...)`); if credential switching succeeds, force delay to `0`, otherwise use the applicable backoff.
 8. Eligible ordered role-array fallback chains advance on entry-budget exhaustion. A selected fallback entry remains sticky until the head selector's rate-limit cooldown expires, when `retry.fallbackRevertPolicy: cooldown-expiry` probes it again on a new turn.
@@ -101,7 +102,7 @@ Backoff uses capped exponential full jitter. With default settings the maximum j
 - attempt 2: 4000 ms
 - attempt 3: 8000 ms
 
-`retry.maxDelayMs` caps every legacy session retry delay, including provider retry-after hints, which otherwise take precedence over computed backoff. Managed fallback intentionally does not cap typed Retry-After values because it retries within its separate per-entry budget. Legacy transient errors have unbounded attempts; unknown/no-code errors are bounded by `retry.maxRetries`.
+`retry.maxDelayMs` caps every legacy session retry delay, including provider retry-after hints, which otherwise take precedence over computed backoff. Managed fallback intentionally does not cap typed Retry-After values because it retries within its separate per-entry `fallback.maxAttempts` budget. In the legacy single-model path, transient errors have unbounded attempts except canonical idle-stream watchdog stalls, which are bounded by `retry.maxRetries`; unknown/no-code errors use the same bound.
 
 ## Abort mechanics
 

@@ -73,13 +73,13 @@ enum BatchAction {
 }
 
 impl BatchAction {
-	fn timeout_ms(&self) -> Option<u32> {
+	const fn timeout_ms(&self) -> Option<u32> {
 		match self {
 			Self::Input { timeout_ms, .. } | Self::Screenshot { timeout_ms, .. } => *timeout_ms,
 		}
 	}
 
-	fn timeout_group(&self) -> Option<u32> {
+	const fn timeout_group(&self) -> Option<u32> {
 		match self {
 			Self::Input { timeout_group, .. } | Self::Screenshot { timeout_group, .. } => {
 				*timeout_group
@@ -204,7 +204,7 @@ impl ComputerController {
 			.collect::<napi::Result<Vec<_>>>()?;
 		let cancel_token = CancelToken::new(timeout_ms, signal);
 		Ok(blocking("computer_execute_batch", cancel_token, move |cancel_token| {
-			Self::execute_batch_actions(expected_epoch, &actions, &|| cancel_token.aborted())
+			Ok(Self::execute_batch_actions(expected_epoch, &actions, &|| cancel_token.aborted()))
 		}))
 	}
 
@@ -248,7 +248,7 @@ impl ComputerController {
 		expected_epoch: Option<f64>,
 		actions: &[BatchAction],
 		cancelled: &dyn Fn() -> bool,
-	) -> napi::Result<ComputerBatchResult> {
+	) -> ComputerBatchResult {
 		let needs_input = actions.iter().any(|action| {
 			matches!(action, BatchAction::Input {
 				action: InputAction::Click { .. }
@@ -274,28 +274,28 @@ impl ComputerController {
 				let step_cancelled =
 					|| batch_cancelled() || deadline.is_some_and(|value| Instant::now() >= value);
 				if step_cancelled() {
-					return Ok(batch_failure(
+					return batch_failure(
 						results,
 						ExecError::ActionFailed { index, source: Box::new(ExecError::Cancelled) },
 						None,
-					));
+					);
 				}
 				let BatchAction::Input { name, action, .. } = action else {
 					unreachable!("all-wait batches only contain wait steps")
 				};
 				if let Err(source) = Self::run_wait(action, &step_cancelled) {
-					return Ok(batch_failure(
+					return batch_failure(
 						results,
 						ExecError::ActionFailed { index, source: Box::new(source) },
 						None,
-					));
+					);
 				}
 				if step_cancelled() {
-					return Ok(batch_failure(
+					return batch_failure(
 						results,
 						ExecError::ActionFailed { index, source: Box::new(ExecError::Cancelled) },
 						None,
-					));
+					);
 				}
 				results.push(ComputerBatchStepResult {
 					index:      index as u32,
@@ -303,7 +303,7 @@ impl ComputerController {
 					screenshot: None,
 				});
 			}
-			return Ok(batch_success(results));
+			return batch_success(results);
 		}
 
 		if !needs_input {
@@ -312,24 +312,24 @@ impl ComputerController {
 				let step_cancelled =
 					|| batch_cancelled() || deadline.is_some_and(|value| Instant::now() >= value);
 				if step_cancelled() {
-					return Ok(batch_failure(
+					return batch_failure(
 						results,
 						ExecError::ActionFailed { index, source: Box::new(ExecError::Cancelled) },
 						None,
-					));
+					);
 				}
 				match action {
 					BatchAction::Screenshot { .. } => match capture_primary_display() {
 						Ok(frame) => {
 							if step_cancelled() {
-								return Ok(batch_failure(
+								return batch_failure(
 									results,
 									ExecError::ActionFailed {
 										index,
 										source: Box::new(ExecError::Cancelled),
 									},
 									None,
-								));
+								);
 							}
 							results.push(ComputerBatchStepResult {
 								index:      index as u32,
@@ -338,30 +338,30 @@ impl ComputerController {
 							});
 						},
 						Err(err) => {
-							return Ok(batch_failure(
+							return batch_failure(
 								results,
 								ExecError::ActionFailed {
 									index,
 									source: Box::new(ExecError::ScreenshotFailed),
 								},
 								Some(format!("COMPUTER_SCREENSHOT_FAILED: {err}")),
-							));
+							);
 						},
 					},
 					BatchAction::Input { name, action, .. } => {
 						if let Err(source) = Self::run_wait(action, &step_cancelled) {
-							return Ok(batch_failure(
+							return batch_failure(
 								results,
 								ExecError::ActionFailed { index, source: Box::new(source) },
 								None,
-							));
+							);
 						}
 						if step_cancelled() {
-							return Ok(batch_failure(
+							return batch_failure(
 								results,
 								ExecError::ActionFailed { index, source: Box::new(ExecError::Cancelled) },
 								None,
-							));
+							);
 						}
 						results.push(ComputerBatchStepResult {
 							index:      index as u32,
@@ -371,25 +371,25 @@ impl ComputerController {
 					},
 				}
 			}
-			return Ok(batch_success(results));
+			return batch_success(results);
 		}
 
 		hotkey::start();
 		if batch_cancelled() {
-			return Ok(batch_failure(results, ExecError::Cancelled, None));
+			return batch_failure(results, ExecError::Cancelled, None);
 		}
 		let initial = match capture_primary_display() {
 			Ok(frame) => frame,
 			Err(err) => {
-				return Ok(batch_failure(
+				return batch_failure(
 					results,
 					ExecError::ScreenshotFailed,
 					Some(format!("COMPUTER_SCREENSHOT_FAILED: {err}")),
-				));
+				);
 			},
 		};
 		if batch_cancelled() {
-			return Ok(batch_failure(results, ExecError::Cancelled, None));
+			return batch_failure(results, ExecError::Cancelled, None);
 		}
 		let mut display = initial.display;
 		let mut expected_epoch = expected_epoch.map(epoch_from_f64);
@@ -397,18 +397,15 @@ impl ComputerController {
 			.iter()
 			.position(|action| matches!(action, BatchAction::Input { action, .. } if !matches!(action, InputAction::Wait { .. })))
 			.unwrap_or(0);
-		let mut controller = match guarded_controller() {
-			Ok(controller) => controller,
-			Err(_) => {
-				return Ok(batch_failure(
-					results,
-					ExecError::ActionFailed {
-						index:  first_input_index,
-						source: Box::new(ExecError::PermissionRequired),
-					},
-					None,
-				));
-			},
+		let Ok(mut controller) = guarded_controller() else {
+			return batch_failure(
+				results,
+				ExecError::ActionFailed {
+					index:  first_input_index,
+					source: Box::new(ExecError::PermissionRequired),
+				},
+				None,
+			);
 		};
 		let mut hooks = MacCursorHooks;
 		let transaction =
@@ -475,10 +472,10 @@ impl ComputerController {
 				}
 				Ok(())
 			});
-		Ok(match transaction {
+		match transaction {
 			Ok(()) => batch_success(results),
 			Err(err) => batch_failure(results, err, None),
-		})
+		}
 	}
 
 	fn run_wait(action: &InputAction, cancelled: &dyn Fn() -> bool) -> Result<(), ExecError> {
@@ -546,7 +543,7 @@ fn batch_action_deadline_at(
 		.or_insert(candidate);
 	Some(*deadline)
 }
-fn action_name(action: &InputAction) -> &'static str {
+const fn action_name(action: &InputAction) -> &'static str {
 	match action {
 		InputAction::Click { .. } => "click",
 		InputAction::DoubleClick { .. } => "double_click",
@@ -614,7 +611,7 @@ fn screenshot_from_frame(frame: crate::computer::capture::CapturedFrame) -> Comp
 		capture_id:    frame.capture_id,
 	}
 }
-fn batch_success(results: Vec<ComputerBatchStepResult>) -> ComputerBatchResult {
+const fn batch_success(results: Vec<ComputerBatchStepResult>) -> ComputerBatchResult {
 	ComputerBatchResult {
 		results,
 		failure_code: None,

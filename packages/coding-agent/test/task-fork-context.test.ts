@@ -91,6 +91,7 @@ function createSession(
 		settings: Settings.isolated({ "async.enabled": false, ...overrides }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		getSessionId: () => "parent-session",
 		model: { contextWindow: 1_000 } as Model,
 		buildForkContextSeed,
 		modelRegistry: {
@@ -396,13 +397,39 @@ describe("fork context policy surface", () => {
 		expect(seedBuilder).not.toHaveBeenCalled();
 		expect(getOptions()?.forkContextSeed).toBeUndefined();
 	});
+	test("does not apply profile alias intent to a manual override outside a partial profile", async () => {
+		mockAgents([createAgent("executor", "allowed")]);
+		const { getOptions } = mockCreateAgentSession();
+		const parent = createSession({
+			"task.agentModelOverrides": { executor: "shared-model" },
+		});
+		Object.assign(parent, { getActiveModelProfile: () => "planner-only" });
+		Object.assign(parent.modelRegistry!, {
+			getModelProfile: () => ({
+				name: "planner-only",
+				requiredProviders: [],
+				modelMapping: { planner: "planner-alias" },
+				source: "user" as const,
+			}),
+		});
+		const tool = await TaskTool.create(parent);
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [{ id: "ManualExecutor", description: "manual", assignment: "Keep manual override exact." }],
+		});
+
+		expect(getOptions()?.activeModelProfile).toBeUndefined();
+	});
 
 	test("passes a sanitized fork seed and cache identity without sharing provider state", async () => {
 		mockAgents([createAgent("executor", "allowed")]);
 		const seed = createSeed();
 		const seedBuilder = vi.fn(async () => seed);
 		const { getOptions } = mockCreateAgentSession();
-		const tool = await TaskTool.create(createSession({ "task.forkContext.enabled": true }, seedBuilder));
+		const parent = createSession({ "task.forkContext.enabled": true }, seedBuilder);
+		Object.assign(parent, { getCredentialSessionId: () => "credential-pool" });
+		const tool = await TaskTool.create(parent);
 
 		await executeDetached(tool, {
 			agent: "executor",
@@ -413,7 +440,11 @@ describe("fork context policy surface", () => {
 
 		expect(seedBuilder).toHaveBeenCalledWith({ maxMessages: 50, maxTokens: 8000, signal: undefined });
 		expect(getOptions()?.forkContextSeed).toBe(seed);
-		expect(getOptions()?.providerSessionId).toBeUndefined();
+		const parentSessionId = parent.getSessionId?.();
+		const forkScope = getOptions()?.providerSessionId;
+		expect(forkScope).toBeDefined();
+		expect(forkScope).not.toBe(parentSessionId);
+		expect(getOptions()?.credentialSessionId).toBe("credential-pool");
 		expect(getOptions()?.providerSessionState).toBeUndefined();
 		expect(getOptions()?.toolNames).toEqual(["read"]);
 		const systemPromptOption = getOptions()?.systemPrompt;
@@ -421,6 +452,23 @@ describe("fork context policy surface", () => {
 			typeof systemPromptOption === "function" ? systemPromptOption(["base", "tail"]) : systemPromptOption;
 		expect(renderedPrompt?.join("\n")).toContain("executor system prompt");
 		expect(renderedPrompt?.join("\n")).toContain("forked snapshot of the parent conversation");
+
+		await executeDetached(tool, {
+			agent: "executor",
+			tasks: [
+				{
+					id: "ForkSeedSibling",
+					description: "seed",
+					assignment: "Use inherited context.",
+					inheritContext: "bounded",
+				},
+			],
+		});
+
+		const siblingScope = getOptions()?.providerSessionId;
+		expect(siblingScope).toBeDefined();
+		expect(siblingScope).not.toBe(parentSessionId);
+		expect(siblingScope).not.toBe(forkScope);
 	});
 
 	test("suppresses fork-context prompt notice for zero-message seeds", async () => {

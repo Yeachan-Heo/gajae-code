@@ -231,14 +231,22 @@ describe("default GJC definitions", () => {
 		});
 	});
 
-	it("exposes default and four GJC role agents as model assignment targets", () => {
-		expect(GJC_MODEL_ASSIGNMENT_TARGET_IDS).toEqual(["default", "executor", "architect", "planner", "critic"]);
+	it("exposes default, four GJC role agents, and image as model assignment targets", () => {
+		expect(GJC_MODEL_ASSIGNMENT_TARGET_IDS).toEqual([
+			"default",
+			"executor",
+			"architect",
+			"planner",
+			"critic",
+			"image",
+		]);
 		expect(GJC_MODEL_ASSIGNMENT_TARGET_IDS.map(id => GJC_MODEL_ASSIGNMENT_TARGETS[id].tag)).toEqual([
 			"DEFAULT",
 			"EXECUTOR",
 			"ARCHITECT",
 			"PLANNER",
 			"CRITIC",
+			"IMAGE",
 		]);
 	});
 
@@ -513,8 +521,12 @@ Project executor override body.
 			"Ambiguous implementation asks with a missing target, scope, acceptance criteria, or safety boundary",
 		);
 		expect(routing).toContain("Informational questions are answer-only/read-only");
-		expect(routing).toContain("Vague requirements use `/skill:deep-interview`");
-		expect(routing).toContain("requirements-only workflow that must not mutate product code");
+		expect(routing).toContain("Explicit user intent outranks every routing heuristic");
+		expect(routing).toContain("Skills are explicit-invocation surfaces, NEVER autonomous defaults");
+		expect(routing).toContain("Do not overestimate task difficulty");
+		expect(routing).toContain("offer it through the `ask` tool with a workflow option and a proceed-directly option");
+		expect(routing).toContain("recommend `/skill:deep-interview` via `ask`");
+		expect(routing).toContain("requirements-only and must not mutate product code");
 		expect(routing).toContain("`/skill:ralplan --deliberate`");
 		expect(routing).toContain("`/skill:ultragoal`");
 		expect(routing).toContain("`/skill:team`");
@@ -526,7 +538,7 @@ Project executor override body.
 		expect(routing).toContain(
 			"reconciliation must persist its final receipt before choosing approval or an admitted handoff",
 		);
-		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(10);
+		expect(routing.split("\n").filter(line => line.startsWith("-"))).toHaveLength(14);
 		expect(decomposition).toMatch(/skip it for one-step or obvious two-step fixes/i);
 	});
 

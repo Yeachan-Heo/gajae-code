@@ -305,8 +305,12 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		return this.runtime.setThinkingVisibilityForControl(visibility, persist);
 	}
 
-	setModelTemporaryForControl(model: Model, expectedSessionId?: string): Promise<boolean> {
-		return this.runtime.setModelTemporaryForControl(model, expectedSessionId);
+	setModelTemporaryForControl(
+		model: Model,
+		expectedSessionId?: string,
+		thinkingLevel?: ThinkingLevel,
+	): Promise<boolean> {
+		return this.runtime.setModelTemporaryForControl(model, expectedSessionId, thinkingLevel);
 	}
 
 	fetchUsageReportsForControl(): Promise<UsageReport[] | null> {

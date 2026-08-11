@@ -339,7 +339,7 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 					: undefined;
 				prewarmSearchProviders({
 					authStorage,
-					sessionId: session.getSessionId?.() ?? undefined,
+					sessionId: session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 					activeModelContext,
 				});
 			} catch {
@@ -356,7 +356,7 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SearchRenderDetails>> {
 		const authStorage = this.#session.authStorage ?? (await discoverAuthStorage());
-		const sessionId = this.#session.getSessionId?.() ?? undefined;
+		const sessionId = this.#session.getCredentialSessionId?.() ?? this.#session.getSessionId?.() ?? undefined;
 		const activeModelContext = this.#session.model
 			? this.#session.modelRegistry?.getActiveSearchModelContext(this.#session.model)
 			: undefined;
@@ -379,7 +379,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRende
 		signal?: AbortSignal,
 	) {
 		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
-		const sessionId = ctx.sessionManager.getSessionId();
+		const sessionId = ctx.credentialSessionId ?? ctx.sessionManager.getSessionId();
 		return executeSearch(toolCallId, params, {
 			authStorage,
 			sessionId,

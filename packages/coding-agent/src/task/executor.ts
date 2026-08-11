@@ -40,8 +40,11 @@ import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../sessio
 import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
-import { SessionManager } from "../session/session-manager";
+import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
+import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
+// Ensure mandatory subagent result extraction is available even when a session is mocked.
+import "../tools/yield";
 import type { ContextFileEntry } from "../tools";
 import { jtdToJsonSchema, normalizeSchema } from "../tools/jtd-to-json-schema";
 import type { ReportFindingDetails } from "../tools/review";
@@ -211,7 +214,15 @@ export interface ExecutorOptions {
 	 * if the resolved subagent model has no working credentials. See #985.
 	 */
 	parentActiveModelPattern?: string;
+	/**
+	 * Whether the live parent session has an active model profile. When set,
+	 * persisted `task.agentModelOverrides` may resolve through preset-equivalent
+	 * aliases (bare profile aliases re-resolve to an equivalent provider variant).
+	 * Manual/direct parents (no active profile) keep exact resolution.
+	 */
+	parentActiveModelProfile?: string;
 	parentSessionId?: string;
+	parentCredentialSessionId?: string;
 	thinkingLevel?: ThinkingLevel;
 	outputSchema?: unknown;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
@@ -285,7 +296,7 @@ export class ManagedTaskPersistence {
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
-	async openSession(cwd: string): Promise<SessionManager> {
+	async openSession(cwd: string, sessionMemoryMode: SessionMemoryMode = "shadow"): Promise<SessionManager> {
 		const store = this.#artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
 		this.#artifacts.assertManagedBinding();
@@ -296,6 +307,7 @@ export class ManagedTaskPersistence {
 			store,
 			undefined,
 			cwd,
+			sessionMemoryMode,
 		);
 		this.#artifacts.assertManagedBinding();
 		return session;
@@ -1509,8 +1521,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					options.parentActiveModelPattern,
 					modelRegistry,
 					settings,
-					options.parentSessionId,
-					{ managedFallback: true },
+					options.parentCredentialSessionId ?? options.parentSessionId,
+					{
+						managedFallback: true,
+						...(options.parentActiveModelProfile ? { aliasIntent: "preset-equivalent" } : {}),
+					},
 					canonicalChildScope,
 				),
 			);
@@ -1555,10 +1570,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
 			const sessionManager = options.managedPersistence
-				? await awaitAbortable(options.managedPersistence.openSession(worktree ?? cwd))
+				? await awaitAbortable(
+						options.managedPersistence.openSession(worktree ?? cwd, subagentSettings.get("sessionMemory.mode")),
+					)
 				: sessionFile
 					? await awaitAbortable(
-							SessionManager.open(sessionFile, SessionManager.explicitDestination(path.dirname(sessionFile))),
+							SessionManager.open(
+								sessionFile,
+								SessionManager.explicitDestination(path.dirname(sessionFile)),
+								new FileSessionStorage(),
+								subagentSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain",
+								subagentSettings.get("sessionMemory.mode"),
+							),
 						)
 					: SessionManager.inMemory(worktree ?? cwd);
 			if (options.parentArtifactManager) {
@@ -1649,8 +1672,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					authStorage,
 					modelRegistry,
 					settings: subagentSettings,
+					providerSessionId: canonicalChildScope,
 					model,
 					thinkingLevel: effectiveThinkingLevel,
+					activeModelProfile: options.parentActiveModelProfile,
+					credentialSessionId: options.parentCredentialSessionId ?? options.parentSessionId,
 					modelSubstitution:
 						modelSubstitutionWarning?.reason === "auth_unavailable" && requestedModel
 							? { requestedModel, reason: modelSubstitutionWarning.reason }
@@ -1720,20 +1746,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			);
 
 			activeSession = session;
-			// Each subagent invocation owns a fresh controller; its configured chain
-			// is scoped to this child session and never shares parent sticky state.
-			// Auth-aware resolution can substitute the parent model only after every
-			// override entry was unavailable. Rebase the controller to that concrete
-			// parent selector so its request is never charged to override index zero.
-			session.setConfiguredModelChain(
-				"default",
-				parentFallbackSelector ? [parentFallbackSelector] : modelPatterns,
-				"subagent",
-				agent.name,
-				true,
-			);
-			if (activeIndex !== undefined && !parentFallbackSelector) {
-				session.seedDefaultFallbackResolution(activeIndex, skips);
+			const configuredChildChain = parentFallbackSelector ? [parentFallbackSelector] : modelPatterns;
+			session.setConfiguredModelChain("default", configuredChildChain, "subagent", agent.name, true);
+			if (!parentFallbackSelector) {
+				session.seedDefaultFallbackResolution(activeIndex ?? 0, skips);
 			}
 			const liveSubagentId = options.subagentId ?? id;
 			const manager = AsyncJobManager.instance();
@@ -1847,8 +1863,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						setThinkingLevelForControl: (level, persist) => session.setThinkingLevelForControl(level, persist),
 						setThinkingVisibilityForControl: (visibility, persist) =>
 							session.setThinkingVisibilityForControl(visibility, persist),
-						setModelTemporaryForControl: (model, expectedSessionId) =>
-							session.setModelTemporaryForControl(model, expectedSessionId),
+						setModelTemporaryForControl: (model, expectedSessionId, thinkingLevel) =>
+							session.setModelTemporaryForControl(model, expectedSessionId, thinkingLevel),
 						fetchUsageReportsForControl: () => session.fetchUsageReportsForControl(),
 						getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 						getSessionName: () => session.sessionManager.getSessionName(),
@@ -1858,6 +1874,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					},
 					{
 						getModel: () => session.model,
+						getCredentialSessionId: () => session.credentialSessionId,
 						isIdle: () => !session.isStreaming,
 						getActivePromptHandle: () => session.activePromptHandle,
 						abort: () => session.abort(),

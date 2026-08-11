@@ -85,7 +85,7 @@ function instrumentSettings(settings: Settings) {
 }
 
 describe("model profile activation red-team", () => {
-	test("fully unresolved non-default role selector activates and preserves the configured selector", async () => {
+	test("fully unresolved custom non-default role fails atomically", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({
 			"task.agentModelOverrides": { executor: "provider-a/original" },
@@ -103,13 +103,14 @@ describe("model profile activation red-team", () => {
 			],
 		});
 
-		await activateModelProfile({ session, modelRegistry: registry, settings, profileName: "unresolved-role" });
-		expect(session.model?.id).toBe("default");
-		expect(session.thinkingLevel).toBe(ThinkingLevel.High);
-		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-b/missing" });
+		await expect(
+			activateModelProfile({ session, modelRegistry: registry, settings, profileName: "unresolved-role" }),
+		).rejects.toThrow(/executor selectors do not match any catalog model/);
+		expect(session.model?.id).toBe("initial");
+		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "provider-a/original" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
-		expect(calls.overrideCalls).toEqual(["task.agentModelOverrides"]);
+		expect(calls.overrideCalls).toEqual([]);
 		expect(calls.flushCount).toBe(0);
 	});
 
@@ -228,7 +229,7 @@ describe("model profile activation red-team", () => {
 		});
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
 		expect(calls.setCalls).toEqual([]);
-		expect(calls.overrideCalls).toEqual(["task.agentModelOverrides"]);
+		expect(calls.overrideCalls).toEqual(["modelRoles", "task.agentModelOverrides"]);
 		expect(calls.flushCount).toBe(0);
 	});
 

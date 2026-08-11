@@ -1,8 +1,11 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { Broker } from "../src/sdk/broker/broker";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
+import { createSdkWebSocketTransport } from "../src/sdk/host/websocket-transport";
 
 const event = (
 	type: "host_registered" | "host_heartbeat" | "host_unregistered",
@@ -48,9 +51,250 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 		await busIndex.append(event("host_unregistered", "live", stateRoot));
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
-			result: { indexSeq: 4, sessions: [] },
+			result: { indexSeq: 4, sessions: [{ sessionId: "live", live: false, terminal: true }] },
 		});
 	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker session.list returns bounded stable cursor pages", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-page-"));
+	const stateRoot = path.join(agentDir, "state");
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	try {
+		const busIndex = await new SessionIndex(agentDir).open();
+		await busIndex.append(event("host_registered", "one", stateRoot));
+		await busIndex.append(event("host_registered", "two", stateRoot));
+		await busIndex.append(event("host_registered", "three", stateRoot));
+
+		const first = await broker.handleRequest("session.list", { limit: 2 });
+		expect(first.ok).toBe(true);
+		if (!first.ok) throw new Error(first.error.message);
+		const firstPage = first.result as {
+			indexSeq: number;
+			sessions: Array<{ sessionId: string }>;
+			continuationCursor?: string;
+		};
+		expect(firstPage.sessions).toMatchObject([{ sessionId: "one" }, { sessionId: "two" }]);
+		expect(firstPage.continuationCursor).toEqual(expect.any(String));
+
+		await busIndex.append(event("host_registered", "four", stateRoot));
+		await fs.appendFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), '{"version":999}\n');
+		const second = await broker.handleRequest("session.list", { cursor: firstPage.continuationCursor });
+		expect(second).toMatchObject({
+			ok: true,
+			indexSeq: firstPage.indexSeq,
+			result: { indexSeq: firstPage.indexSeq, sessions: [{ sessionId: "three" }] },
+		});
+		expect(JSON.stringify(second)).not.toContain('"four"');
+		expect(await broker.handleRequest("session.list", { limit: 101 })).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "limit must be a safe integer from 1 to 100" },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker session.list keeps cursor warnings snapshot-stable", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-warning-snapshot-"));
+	const stateRoot = path.join(agentDir, "state");
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	try {
+		const busIndex = await new SessionIndex(agentDir).open();
+		await busIndex.append(event("host_registered", "one", stateRoot));
+		await busIndex.append(event("host_registered", "two", stateRoot));
+		const first = await broker.handleRequest("session.list", { limit: 1 });
+		expect(first.ok).toBe(true);
+		if (!first.ok) throw new Error(first.error.message);
+		const firstPage = first.result as { continuationCursor?: string; warnings: string[] };
+		expect(firstPage.warnings).toEqual([]);
+		await fs.appendFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "not json\n");
+		const second = await broker.handleRequest("session.list", { cursor: firstPage.continuationCursor });
+		expect(second).toMatchObject({ ok: true, result: { sessions: [{ sessionId: "two" }], warnings: [] } });
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("broker session.list rejects a new cursor stream at capacity without evicting active cursors", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-cursor-capacity-"));
+	const stateRoot = path.join(agentDir, "state");
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	try {
+		const busIndex = await new SessionIndex(agentDir).open();
+		const sessionIds = Array.from({ length: 2 }, (_, index) => `session-${index + 1}`);
+		for (const sessionId of sessionIds) await busIndex.append(event("host_registered", sessionId, stateRoot));
+
+		const cursors: string[] = [];
+		for (let index = 0; index < 32; index += 1) {
+			const response = await broker.handleRequest("session.list", { limit: 1 });
+			expect(response.ok).toBe(true);
+			if (!response.ok) throw new Error(response.error.message);
+			const page = response.result as { continuationCursor?: string };
+			expect(page.continuationCursor).toEqual(expect.any(String));
+			cursors.push(page.continuationCursor as string);
+		}
+
+		expect(await broker.handleRequest("session.list", { limit: 1 })).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "session.list cursor capacity is exhausted" },
+		});
+
+		const continued = await broker.handleRequest("session.list", { cursor: cursors[0] });
+		expect(continued).toMatchObject({
+			ok: true,
+			result: { sessions: [{ sessionId: "session-2" }] },
+		});
+		if (!continued.ok) throw new Error(continued.error.message);
+		expect(await broker.handleRequest("session.list", { cursor: cursors[0] })).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "cursor is expired or invalid" },
+		});
+		expect(await broker.handleRequest("session.list", { limit: 1 })).toMatchObject({
+			ok: true,
+			result: { sessions: [{ sessionId: "session-1" }], continuationCursor: expect.any(String) },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only runtime registers its broker endpoint and retracts it on shutdown", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-only-broker-"));
+	const cwd = path.join(agentDir, "workspace");
+	const sessionId = "sdk-only-live";
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void | Promise<void>>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	createSdkSessionRuntimeExtension(api, {
+		agentDir,
+		createTransport: input => createSdkWebSocketTransport(input),
+	});
+	const pendingGateIds = new Set(["gate-answer", "gate-approve", "gate-drain"]);
+	let drainGateResolution: (() => void) | undefined;
+	const workflowGate = {
+		listWorkflowGateQueryRecords: () =>
+			[...pendingGateIds].map(gateId => ({ id: `pending:${gateId}`, gate_id: gateId, tag: "pending" })),
+		listPendingGates: () => [...pendingGateIds].map(gate_id => ({ gate_id })),
+		resolveGate: async (response: { gate_id: string }) => {
+			if (response.gate_id === "gate-drain")
+				return await new Promise(resolve => {
+					drainGateResolution = () => {
+						pendingGateIds.delete(response.gate_id);
+						resolve({ gate_id: response.gate_id, status: "accepted" });
+					};
+				});
+			pendingGateIds.delete(response.gate_id);
+			return { gate_id: response.gate_id, status: "accepted" };
+		},
+		recoverAcceptedGates: async () => [],
+		lookupCompletedResolution: () => ({ kind: "none" }),
+		prepareTerminalization: () => true,
+		clearPreparedTerminalization: () => {},
+		registerGateTerminalController: () => () => {},
+		quarantineGate: () => {},
+	};
+	const context = {
+		cwd,
+		sdkBindings: () => [],
+		sessionManager: { getSessionId: () => sessionId, getSessionName: () => undefined },
+		workflowGate,
+	} as unknown as ExtensionContext;
+	try {
+		const start = handlers.get("session_start");
+		if (!start) throw new Error("SDK-only session_start handler was not registered.");
+		await start({}, context);
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+			ok: true,
+			result: { sessionId, pid: process.pid, url: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:/) },
+		});
+		const endpoint = await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 });
+		if (!endpoint.ok) throw new Error(endpoint.error.message);
+		const socket = new WebSocket(
+			`${(endpoint.result as { url: string; token: string }).url}?token=${encodeURIComponent((endpoint.result as { token: string }).token)}`,
+		);
+		const frames: Array<Record<string, unknown>> = [];
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("SDK-only WebSocket failed to open.")), {
+				once: true,
+			});
+		});
+		const request = async (id: string, frame: Record<string, unknown>) => {
+			socket.send(JSON.stringify({ ...frame, id }));
+			const deadline = Date.now() + 2_000;
+			while (!frames.some(candidate => candidate.id === id)) {
+				if (Date.now() > deadline) throw new Error(`Timed out awaiting ${id}.`);
+				await Bun.sleep(10);
+			}
+			return frames.find(candidate => candidate.id === id)!;
+		};
+		expect(await request("gates", { type: "query_request", query: "Q12", input: {} })).toMatchObject({
+			type: "query_response",
+			ok: true,
+			page: { items: [{ gate_id: "gate-answer" }, { gate_id: "gate-approve" }, { gate_id: "gate-drain" }] },
+		});
+		expect(
+			await request("wrong-session", {
+				type: "control_request",
+				operation: "workflow.gate_answer",
+				input: { id: "gate-answer", response: "approve", expectedSessionId: "wrong-session" },
+			}),
+		).toMatchObject({ type: "control_response", ok: false, error: { code: "resource_gone" } });
+		expect(
+			await request("answer", {
+				type: "control_request",
+				operation: "workflow.gate_answer",
+				input: { id: "gate-answer", response: "approve", expectedSessionId: sessionId },
+			}),
+		).toMatchObject({ type: "control_response", ok: true, result: { status: "accepted" } });
+		expect(
+			await request("approve", {
+				type: "control_request",
+				operation: "workflow.plan_approve",
+				input: { id: "gate-approve", choice: "approve", expectedSessionId: sessionId },
+			}),
+		).toMatchObject({ type: "control_response", ok: true, result: { status: "accepted" } });
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "drain",
+				operation: "workflow.gate_answer",
+				input: { id: "gate-drain", response: "approve", expectedSessionId: sessionId },
+			}),
+		);
+		while (!drainGateResolution) await Bun.sleep(10);
+		const shutdown = handlers.get("session_shutdown");
+		if (!shutdown) throw new Error("SDK-only session_shutdown handler was not registered.");
+		const stopping = Promise.resolve(shutdown({}, context));
+		await Bun.sleep(10);
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+			ok: true,
+		});
+		drainGateResolution();
+		await stopping;
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+			ok: false,
+			error: { code: "endpoint_stale", message: "session endpoint is stale" },
+		});
+	} finally {
+		const shutdown = handlers.get("session_shutdown");
+		if (shutdown) await Promise.resolve(shutdown({}, context)).catch(() => undefined);
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}

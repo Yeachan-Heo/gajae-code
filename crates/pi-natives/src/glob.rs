@@ -14,7 +14,12 @@
 //! // JS: await native.glob({ pattern: "*.rs", path: "." })
 //! ```
 
-use std::path::Path;
+use std::{
+	cmp::Ordering,
+	collections::BinaryHeap,
+	path::Path,
+	time::{Duration, Instant},
+};
 
 use globset::GlobSet;
 use napi::{
@@ -26,6 +31,9 @@ use napi_derive::napi;
 // Re-export entry types so existing `glob::FileType` / `glob::GlobMatch` paths still work.
 pub use crate::fs_cache::{FileType, GlobMatch};
 use crate::{fs_cache, glob_util, task};
+
+const MAX_PROGRESS_SNAPSHOTS: usize = 32;
+const DEFAULT_PROGRESS_INTERVAL_MS: u64 = 200;
 
 /// Input options for `glob`, including traversal, filtering, and cancellation.
 #[napi(object)]
@@ -79,6 +87,79 @@ struct GlobConfig {
 	mentions_node_modules: bool,
 	sort_by_mtime:         bool,
 	use_cache:             bool,
+	progress_interval:     Duration,
+}
+
+fn compare_matches(left: &GlobMatch, right: &GlobMatch) -> Ordering {
+	right
+		.mtime
+		.unwrap_or(0.0)
+		.total_cmp(&left.mtime.unwrap_or(0.0))
+		.then_with(|| left.path.cmp(&right.path))
+}
+
+#[derive(Clone)]
+struct RankedMatch(GlobMatch);
+
+impl PartialEq for RankedMatch {
+	fn eq(&self, other: &Self) -> bool {
+		compare_matches(&self.0, &other.0) == Ordering::Equal
+	}
+}
+
+impl Eq for RankedMatch {}
+
+impl PartialOrd for RankedMatch {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for RankedMatch {
+	fn cmp(&self, other: &Self) -> Ordering {
+		compare_matches(&self.0, &other.0)
+	}
+}
+
+struct BoundedMatches {
+	limit: usize,
+	heap:  BinaryHeap<RankedMatch>,
+}
+
+impl BoundedMatches {
+	const fn new(limit: usize) -> Self {
+		Self { limit, heap: BinaryHeap::new() }
+	}
+
+	fn insert(&mut self, entry: GlobMatch) -> bool {
+		if self.limit == 0 {
+			return false;
+		}
+		if self.heap.len() < self.limit {
+			self.heap.push(RankedMatch(entry));
+			return true;
+		}
+		let Some(worst) = self.heap.peek() else {
+			return false;
+		};
+		if compare_matches(&entry, &worst.0) != Ordering::Less {
+			return false;
+		}
+		self.heap.pop();
+		self.heap.push(RankedMatch(entry));
+		true
+	}
+
+	fn sorted(&self) -> Vec<GlobMatch> {
+		let mut entries: Vec<_> = self.heap.iter().map(|entry| entry.0.clone()).collect();
+		entries.sort_by(compare_matches);
+		entries
+	}
+
+	#[cfg(test)]
+	fn len(&self) -> usize {
+		self.heap.len()
+	}
 }
 
 fn resolve_symlink_target_type(root: &Path, relative_path: &str) -> Option<FileType> {
@@ -156,6 +237,88 @@ fn filter_entries(
 	Ok(matches)
 }
 
+fn emit_snapshot(entries: &[GlobMatch], on_match: Option<&ThreadsafeFunction<GlobMatch>>) {
+	let Some(callback) = on_match else {
+		return;
+	};
+	for entry in entries {
+		callback.call(Ok(entry.clone()), ThreadsafeFunctionCallMode::NonBlocking);
+	}
+}
+
+fn collect_uncached_entries(
+	glob_set: &GlobSet,
+	config: &GlobConfig,
+	on_match: Option<&ThreadsafeFunction<GlobMatch>>,
+	ct: &task::CancelToken,
+) -> Result<Vec<GlobMatch>> {
+	let builder = fs_cache::build_walker(
+		&config.root,
+		config.include_hidden,
+		config.use_gitignore,
+		!config.mentions_node_modules,
+		false,
+	);
+	let mut unsorted = Vec::new();
+	let mut ranked = BoundedMatches::new(config.max_results);
+	let mut progress_snapshots = 0;
+	let mut progress_dirty = false;
+	let now = Instant::now();
+	let mut last_progress = now.checked_sub(config.progress_interval).unwrap_or(now);
+
+	for walked in builder.build() {
+		ct.heartbeat()?;
+		let Ok(walked) = walked else {
+			continue;
+		};
+		let relative = fs_cache::normalize_relative_path(&config.root, walked.path()).into_owned();
+		if relative.is_empty()
+			|| fs_cache::should_skip_path(Path::new(&relative), config.mentions_node_modules)
+			|| !glob_set.is_match(&relative)
+		{
+			continue;
+		}
+		let Some((file_type, mtime, size)) = fs_cache::classify_file_type(walked.path()) else {
+			continue;
+		};
+		let mut entry =
+			GlobMatch { path: relative, file_type, mtime, size: size.map(|value| value as f64) };
+		let Some(effective_file_type) = apply_file_type_filter(&entry, config) else {
+			continue;
+		};
+		entry.file_type = effective_file_type;
+
+		if !config.sort_by_mtime {
+			if let Some(callback) = on_match {
+				callback.call(Ok(entry.clone()), ThreadsafeFunctionCallMode::NonBlocking);
+			}
+			unsorted.push(entry);
+			if unsorted.len() >= config.max_results {
+				break;
+			}
+			continue;
+		}
+
+		progress_dirty |= ranked.insert(entry);
+		if progress_dirty
+			&& progress_snapshots < MAX_PROGRESS_SNAPSHOTS
+			&& last_progress.elapsed() >= config.progress_interval
+		{
+			emit_snapshot(&ranked.sorted(), on_match);
+			progress_snapshots += 1;
+			progress_dirty = false;
+			last_progress = Instant::now();
+		}
+	}
+
+	if !config.sort_by_mtime {
+		return Ok(unsorted);
+	}
+	let matches = ranked.sorted();
+	emit_snapshot(&matches, on_match);
+	Ok(matches)
+}
+
 /// Executes matching/filtering over scanned entries and optionally streams each
 /// hit.
 fn run_glob(
@@ -191,19 +354,13 @@ fn run_glob(
 		}
 		matches
 	} else {
-		let fresh = fs_cache::force_rescan(&config.root, scan_options, false, &ct)?;
-		filter_entries(&fresh, &glob_set, &config, on_match, &ct)?
+		collect_uncached_entries(&glob_set, &config, on_match, &ct)?
 	};
 
 	if config.sort_by_mtime {
-		// Sorting mode: rank by mtime descending, then apply max-results truncation.
-		matches.sort_by(|a, b| {
-			let a_mtime = a.mtime.unwrap_or(0.0);
-			let b_mtime = b.mtime.unwrap_or(0.0);
-			b_mtime
-				.partial_cmp(&a_mtime)
-				.unwrap_or(std::cmp::Ordering::Equal)
-		});
+		// Cached sorting still ranks the complete snapshot; uncached collection is
+		// already bounded.
+		matches.sort_by(compare_matches);
 		matches.truncate(config.max_results);
 	}
 	let total_matches = matches.len().min(u32::MAX as usize) as u32;
@@ -247,6 +404,10 @@ pub fn glob(
 	let pattern = if pattern.is_empty() { "*" } else { pattern };
 	let pattern = pattern.to_string();
 
+	let progress_interval_ms = timeout_ms.map_or(DEFAULT_PROGRESS_INTERVAL_MS, |value| {
+		u64::from(value).div_ceil(MAX_PROGRESS_SNAPSHOTS as u64)
+	});
+	let progress_interval = Duration::from_millis(progress_interval_ms.max(1));
 	let ct = task::CancelToken::new(timeout_ms, signal);
 
 	task::blocking("glob", ct, move |ct| {
@@ -262,10 +423,55 @@ pub fn glob(
 					.unwrap_or_else(|| pattern.contains("node_modules")),
 				sort_by_mtime: sort_by_mtime.unwrap_or(false),
 				use_cache: cache.unwrap_or(false),
+				progress_interval,
 				pattern,
 			},
 			on_match.as_ref(),
 			ct,
 		)
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn candidate(path: String, mtime: f64) -> GlobMatch {
+		GlobMatch { path, file_type: FileType::File, mtime: Some(mtime), size: Some(0.0) }
+	}
+
+	#[test]
+	fn bounded_matches_keeps_newest_entries_beyond_the_old_scan_limit() {
+		let mut matches = BoundedMatches::new(3);
+		for index in 0..250_003 {
+			matches.insert(candidate(format!("entry-{index:06}.txt"), index as f64));
+		}
+
+		assert_eq!(matches.len(), 3);
+		assert_eq!(
+			matches
+				.sorted()
+				.into_iter()
+				.map(|entry| entry.path)
+				.collect::<Vec<_>>(),
+			["entry-250002.txt", "entry-250001.txt", "entry-250000.txt"],
+		);
+	}
+
+	#[test]
+	fn bounded_matches_breaks_mtime_ties_by_path() {
+		let mut matches = BoundedMatches::new(2);
+		for path in ["z.txt", "a.txt", "m.txt"] {
+			matches.insert(candidate(path.to_string(), 42.0));
+		}
+
+		assert_eq!(
+			matches
+				.sorted()
+				.into_iter()
+				.map(|entry| entry.path)
+				.collect::<Vec<_>>(),
+			["a.txt", "m.txt"],
+		);
+	}
 }

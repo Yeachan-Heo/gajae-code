@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import type { Api, Model } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
@@ -20,6 +21,7 @@ import { formatModelSelectorValue } from "../../config/model-resolver";
 import { selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { type Settings, type SettingsAtomicReceipt, settings } from "../../config/settings";
+import type { SettingValue } from "../../config/settings-schema";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -50,6 +52,7 @@ import {
 	stopInteractiveActivityIndicator,
 	suspendInteractiveActivityIndicator,
 } from "../../modes/types";
+import { configureSttFromSettings } from "../../runtime/stt-settings-setup";
 import { ChatDaemonController } from "../../sdk/bus/chat-daemon-control";
 import {
 	getCurrentTelegramActivationMarker,
@@ -91,6 +94,7 @@ import {
 } from "../../sdk/bus/telegram-daemon";
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
+import type { DefaultFallbackRuntimeState } from "../../session/agent-session";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
 
@@ -123,11 +127,8 @@ import {
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
 import {
-	IMAGE_PROVIDER_DEFAULTS,
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
-	setConfiguredImageModel,
-	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
@@ -171,6 +172,8 @@ import {
 	type ProviderOnboardingAction,
 	ProviderOnboardingSelectorComponent,
 } from "../components/provider-onboarding-selector";
+import { ProviderOrderContext } from "../components/provider-order-context";
+import { ProviderOrderEditorComponent } from "../components/provider-order-editor";
 import { SessionObserverOverlayComponent } from "../components/session-observer-overlay";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { dashboardSessions, SessionsDashboardComponent } from "../components/sessions-dashboard";
@@ -1195,6 +1198,21 @@ export function createNotificationsEditorOperations(
 	};
 }
 
+interface DefaultAssignmentRollbackSnapshot {
+	model: Model<Api> | undefined;
+	thinkingLevel: ThinkingLevel | undefined;
+	persistedModelRoles: SettingValue<"modelRoles"> | undefined;
+	persistedAgentOverrides: SettingValue<"task.agentModelOverrides"> | undefined;
+	persistedProfile: SettingValue<"modelProfile.default"> | undefined;
+	modelRolesOverride: SettingValue<"modelRoles"> | undefined;
+	agentOverridesOverride: SettingValue<"task.agentModelOverrides"> | undefined;
+	profileOverride: SettingValue<"modelProfile.default"> | undefined;
+	chain: { entries: readonly string[]; origin: string; identity?: string; explicitHead?: boolean } | undefined;
+	activeProfile: string | undefined;
+	canonicalVariant: string | undefined;
+	resumeDefaultSelector: string | undefined;
+	fallbackRuntimeState: DefaultFallbackRuntimeState;
+}
 export class SelectorController {
 	#transcriptViewerOpen = false;
 	#transcriptViewer?: TranscriptViewerOverlay;
@@ -1213,6 +1231,113 @@ export class SelectorController {
 		this.#credentialAutoImportStateStore = credentialAutoImportStateStore;
 	}
 
+	#captureDefaultAssignmentRollback(): DefaultAssignmentRollbackSnapshot {
+		return {
+			model: this.ctx.session.model,
+			thinkingLevel: this.ctx.session.thinkingLevel,
+			persistedModelRoles: this.ctx.settings.getGlobal("modelRoles"),
+			persistedAgentOverrides: this.ctx.settings.getGlobal("task.agentModelOverrides"),
+			persistedProfile: this.ctx.settings.getGlobal("modelProfile.default"),
+			modelRolesOverride: this.ctx.settings.getOverride("modelRoles"),
+			agentOverridesOverride: this.ctx.settings.getOverride("task.agentModelOverrides"),
+			profileOverride: this.ctx.settings.getOverride("modelProfile.default"),
+			chain: this.ctx.session.getConfiguredModelChainState("default"),
+			activeProfile: this.ctx.session.getActiveModelProfile?.(),
+			canonicalVariant: this.ctx.session.modelRegistry.getSessionCanonicalVariant?.(this.ctx.session.sessionId),
+			resumeDefaultSelector: this.ctx.session.sessionManager.buildSessionContext().models.default,
+			fallbackRuntimeState: this.ctx.session.getDefaultFallbackRuntimeState(),
+		};
+	}
+
+	async #restoreDefaultAssignmentRollback(
+		snapshot: DefaultAssignmentRollbackSnapshot,
+		error: unknown,
+		restoreLiveModel: boolean = true,
+		restoreProfileState: boolean = true,
+	): Promise<never> {
+		if (!restoreLiveModel && !restoreProfileState) throw error;
+		const rollbackErrors: unknown[] = [];
+		const restore = (action: () => void): void => {
+			try {
+				action();
+			} catch (rollbackError) {
+				rollbackErrors.push(rollbackError);
+			}
+		};
+		restore(() =>
+			snapshot.persistedModelRoles === undefined
+				? this.ctx.settings.unset("modelRoles")
+				: this.ctx.settings.set("modelRoles", snapshot.persistedModelRoles),
+		);
+		restore(() =>
+			snapshot.persistedAgentOverrides === undefined
+				? this.ctx.settings.unset("task.agentModelOverrides")
+				: this.ctx.settings.set("task.agentModelOverrides", snapshot.persistedAgentOverrides),
+		);
+		restore(() =>
+			snapshot.persistedProfile === undefined
+				? this.ctx.settings.unset("modelProfile.default")
+				: this.ctx.settings.set("modelProfile.default", snapshot.persistedProfile),
+		);
+		restore(() =>
+			snapshot.modelRolesOverride === undefined
+				? this.ctx.settings.clearOverride("modelRoles")
+				: this.ctx.settings.override("modelRoles", snapshot.modelRolesOverride),
+		);
+		restore(() =>
+			snapshot.agentOverridesOverride === undefined
+				? this.ctx.settings.clearOverride("task.agentModelOverrides")
+				: this.ctx.settings.override("task.agentModelOverrides", snapshot.agentOverridesOverride),
+		);
+		restore(() =>
+			snapshot.profileOverride === undefined
+				? this.ctx.settings.clearOverride("modelProfile.default")
+				: this.ctx.settings.override("modelProfile.default", snapshot.profileOverride),
+		);
+		if (restoreProfileState) {
+			restore(() =>
+				this.ctx.session.setConfiguredModelChain(
+					"default",
+					snapshot.chain?.entries ?? [],
+					snapshot.chain?.origin ?? "rollback",
+					snapshot.chain?.identity,
+					snapshot.chain?.explicitHead ?? true,
+				),
+			);
+			restore(() => this.ctx.session.restoreDefaultFallbackRuntimeState(snapshot.fallbackRuntimeState));
+			restore(() => {
+				if (snapshot.canonicalVariant) {
+					this.ctx.session.modelRegistry.restoreSessionCanonicalVariant?.(
+						this.ctx.session.sessionId,
+						snapshot.canonicalVariant,
+					);
+				} else {
+					this.ctx.session.modelRegistry.clearCanonicalVariant?.(this.ctx.session.sessionId);
+				}
+			});
+		}
+		if (restoreLiveModel) {
+			restore(() => this.ctx.session.recordResumeDefaultModel(snapshot.resumeDefaultSelector));
+		}
+		restore(() => this.ctx.session.setActiveModelProfile?.(snapshot.activeProfile));
+		try {
+			await this.ctx.settings.flushOrThrow();
+		} catch (rollbackError) {
+			rollbackErrors.push(rollbackError);
+		}
+		if (restoreLiveModel) {
+			try {
+				await this.ctx.session.restoreModelSelectionForRollback(snapshot.model, snapshot.thinkingLevel);
+			} catch (rollbackError) {
+				rollbackErrors.push(rollbackError);
+			}
+		}
+		if (rollbackErrors.length > 0) {
+			throw new AggregateError([error, ...rollbackErrors], "Model assignment failed and rollback was incomplete");
+		}
+		throw error;
+	}
+
 	isTranscriptViewerOpen(): boolean {
 		return this.#transcriptViewerOpen;
 	}
@@ -1226,7 +1351,7 @@ export class SelectorController {
 		await Promise.all(
 			oauthProviders.map(provider =>
 				this.ctx.session.modelRegistry
-					.getApiKeyForProvider(provider.id, this.ctx.session.sessionId)
+					.getApiKeyForProvider(provider.id, this.ctx.session.credentialSessionId)
 					.catch(() => undefined),
 			),
 		);
@@ -1535,81 +1660,6 @@ export class SelectorController {
 		}
 	}
 
-	async #handleImageGenerationConfig(): Promise<void> {
-		const provider = await this.ctx.showHookInput(
-			"Image Generation provider (auto, openai, gemini, openrouter, antigravity, alibaba, custom)",
-			"auto",
-		);
-		if (provider === undefined) return;
-		const normalized = provider.trim().toLowerCase();
-		const validProviders = ["auto", "openai", "gemini", "openrouter", "antigravity", "alibaba", "custom"];
-		if (!validProviders.includes(normalized)) {
-			this.ctx.showStatus(`Invalid image provider: ${normalized}. Valid: ${validProviders.join(", ")}`);
-			return;
-		}
-		let model: string | undefined;
-		if (normalized !== "auto" && normalized !== "custom") {
-			const defaultModel = IMAGE_PROVIDER_DEFAULTS[normalized];
-			model = await this.ctx.showHookInput(`Image model for ${normalized} (default: ${defaultModel})`, defaultModel);
-			if (model === undefined) return;
-			model = model.trim() || defaultModel;
-		}
-		let customUrl: string | undefined;
-		let customKey: string | undefined;
-		if (normalized === "custom") {
-			customUrl = await this.ctx.showHookInput("Custom image endpoint base URL");
-			if (!customUrl?.trim()) {
-				this.ctx.showStatus("Custom image endpoint requires a base URL");
-				return;
-			}
-			model = await this.ctx.showHookInput("Custom image model", IMAGE_PROVIDER_DEFAULTS.openai);
-			if (model === undefined) return;
-			model = model.trim() || IMAGE_PROVIDER_DEFAULTS.openai;
-			customKey = await this.ctx.showHookInput("Custom image endpoint API key");
-		}
-		const scope = await this.ctx.showHookInput(
-			"Scope: 'session' (this session only) or 'default' (persist)",
-			"session",
-		);
-		if (scope === undefined) return;
-		const persistDefault = scope.trim().toLowerCase() === "default";
-		if (persistDefault && !this.ctx.settings.canWriteDurableConfig()) {
-			this.ctx.showError(
-				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
-			);
-			return;
-		}
-
-		const imageProvider = normalized as
-			| "auto"
-			| "openai"
-			| "gemini"
-			| "openrouter"
-			| "antigravity"
-			| "alibaba"
-			| "custom";
-		setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
-		setConfiguredImageModel({
-			provider: imageProvider,
-			model: model ?? null,
-			customUrl: customUrl?.trim(),
-			customKey: customKey?.trim(),
-		});
-
-		if (persistDefault) {
-			this.ctx.settings.set("providers.image", imageProvider);
-			if (model) this.ctx.settings.set("providers.imageModel", model);
-			if (customUrl?.trim()) this.ctx.settings.set("providers.imageCustomUrl", customUrl.trim());
-			if (customKey?.trim()) this.ctx.settings.set("providers.imageCustomKey", customKey.trim());
-		}
-
-		const displayModel =
-			model ?? (normalized !== "auto" && normalized !== "custom" ? IMAGE_PROVIDER_DEFAULTS[normalized] : undefined);
-		const label = normalized === "auto" ? "Auto" : `${normalized}${displayModel ? ` (${displayModel})` : ""}`;
-		this.ctx.showStatus(`Image Generation: ${label}${persistDefault ? " (default)" : " (session)"}`);
-		this.ctx.ui.requestRender();
-	}
-
 	showCustomProviderWizard(): void {
 		this.showSelector(done => {
 			let wizard: CustomProviderWizardComponent;
@@ -1745,6 +1795,40 @@ export class SelectorController {
 							this.ctx.ui.requestRender();
 						},
 						onRenderRequested: () => this.ctx.ui.requestRender(),
+						createProviderOrderEditor: closeEditor => {
+							// The editor owns the context lifecycle: dispose() on
+							// close or external teardown releases the subscriptions,
+							// so the controller only wires change repaints here.
+							let editor: ProviderOrderEditorComponent | undefined;
+							const context = new ProviderOrderContext(
+								this.ctx.session.modelRegistry,
+								this.ctx.settings,
+								() => {
+									editor?.refresh();
+									this.ctx.ui.requestRender();
+								},
+								this.ctx.session.credentialSessionId,
+							);
+							try {
+								editor = new ProviderOrderEditorComponent(
+									context,
+									() => {
+										closeEditor();
+										this.ctx.ui.requestRender();
+									},
+									message => this.ctx.showError(message),
+								);
+							} catch (error) {
+								// The context subscribed to settings/auth in its constructor.
+								// If editor construction fails the editor disposes it before
+								// rethrowing (initial rebuild failure); dispose again here so
+								// failures before that point (e.g. UI setup) can't leak the
+								// subscriptions this closure created.
+								context.dispose();
+								throw error;
+							}
+							return editor;
+						},
 						onCancel: () => {
 							done();
 							// Restore status line to saved settings
@@ -1965,6 +2049,18 @@ export class SelectorController {
 				this.ctx.editor.setAutocompleteMaxVisible(typeof value === "number" ? value : Number(value));
 				break;
 
+			case "stt.enabled":
+				if (value === true) {
+					void configureSttFromSettings({
+						modelName: settings.get("stt.modelName"),
+						setEnabled: enabled => settings.set("stt.enabled", enabled),
+						flush: () => settings.flushOrThrow(),
+						showStatus: message => this.ctx.showStatus(message),
+						showError: message => this.ctx.showError(message),
+					});
+				}
+				break;
+
 			// Settings with UI side effects
 			case "showImages":
 				for (const child of this.ctx.chatContainer.children) {
@@ -2101,37 +2197,6 @@ export class SelectorController {
 					setSearchHardTimeoutMs(value * 1000);
 				}
 				break;
-			case "providers.image":
-			case "providers.imageModel":
-			case "providers.imageCustomUrl":
-			case "providers.imageCustomKey":
-			case "providers.imageCustomKeyEnv": {
-				const imgProvider = this.ctx.settings.get("providers.image");
-				const imgModel = this.ctx.settings.get("providers.imageModel");
-				const imgCustomUrl = this.ctx.settings.get("providers.imageCustomUrl");
-				const imgCustomKey = this.ctx.settings.get("providers.imageCustomKey");
-				const imgCustomKeyEnv = this.ctx.settings.get("providers.imageCustomKeyEnv");
-				if (
-					imgProvider === "auto" ||
-					imgProvider === "openai" ||
-					imgProvider === "gemini" ||
-					imgProvider === "openrouter" ||
-					imgProvider === "antigravity" ||
-					imgProvider === "alibaba" ||
-					imgProvider === "custom"
-				) {
-					setPreferredImageProvider(imgProvider === "custom" ? "auto" : imgProvider);
-					setConfiguredImageModel({
-						provider: imgProvider,
-						model: imgModel ?? null,
-						customUrl: imgCustomUrl,
-						customKey: imgCustomKey,
-						customKeyEnv: imgCustomKeyEnv,
-					});
-				}
-				break;
-			}
-
 			// MCP update injection - live subscribe/unsubscribe
 			case "mcp.notifications":
 				this.ctx.mcpManager?.setNotificationsEnabled(value as boolean);
@@ -2199,11 +2264,6 @@ export class SelectorController {
 							await this.#deleteCustomModelPreset(selection.profileName, modelSelector);
 							return;
 						}
-						if (selection.kind === "imageGeneration") {
-							done();
-							await this.#handleImageGenerationConfig();
-							return;
-						}
 						if (selection.kind === "profile") {
 							await this.#applyModelProfile(selection.profileName, selection.setDefault);
 							done();
@@ -2232,11 +2292,18 @@ export class SelectorController {
 							if (includesRoleAgent) {
 								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
 									model,
-									this.ctx.session.sessionId,
+									this.ctx.session.credentialSessionId,
 								);
 								if (!apiKey) {
 									throw new Error(`No API key for ${model.provider}/${model.id}`);
 								}
+							}
+							if (includesDefault && !includesRoleAgent) {
+								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+									model,
+									this.ctx.session.credentialSessionId,
+								);
+								if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
 							}
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
@@ -2247,30 +2314,47 @@ export class SelectorController {
 									? selectedSelector.slice(0, -thinkingLevel.length - 1)
 									: selectedSelector;
 
-							if (includesDefault) {
-								await this.ctx.session.setModel(model, "default", {
-									selector: defaultSelector,
-									thinkingLevel,
-									cause: "user-selection",
-								});
-								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(thinkingLevel);
-								}
-							}
-							const materializedProfile = materializeActiveModelProfileAssignments({
-								session: this.ctx.session,
-								settings: this.ctx.settings,
-								assignments,
-							});
-							if (!materializedProfile) {
-								for (const targetRole of targetRoles) {
-									const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
-									if (target.settingsPath === "modelRoles") {
-										this.ctx.settings.setModelRole(targetRole, value);
-									} else {
-										this.ctx.settings.setAgentModelOverride(targetRole, value);
+							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
+							let defaultMutationStarted = false;
+							let assignmentMutationStarted = false;
+							let materializedProfile = false;
+							try {
+								if (includesDefault) {
+									await this.ctx.session.setModel(model, "default", {
+										selector: defaultSelector,
+										thinkingLevel,
+										cause: "user-selection",
+										onMutationStarted: () => {
+											defaultMutationStarted = true;
+										},
+									});
+									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+										this.ctx.session.setThinkingLevel(thinkingLevel);
 									}
 								}
+								assignmentMutationStarted = true;
+								materializedProfile = materializeActiveModelProfileAssignments({
+									session: this.ctx.session,
+									settings: this.ctx.settings,
+									assignments,
+								});
+								if (!materializedProfile) {
+									for (const targetRole of targetRoles) {
+										const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+										if (target.settingsPath === "modelRoles") {
+											this.ctx.settings.setModelRole(targetRole, value);
+										} else {
+											this.ctx.settings.setAgentModelOverride(targetRole, value);
+										}
+									}
+								}
+							} catch (error) {
+								await this.#restoreDefaultAssignmentRollback(
+									rollbackSnapshot,
+									error,
+									defaultMutationStarted,
+									defaultMutationStarted || assignmentMutationStarted,
+								);
 							}
 							modelSelector.refreshRoleAssignments({
 								currentModel: this.ctx.session.model,
@@ -2294,27 +2378,47 @@ export class SelectorController {
 							this.ctx.ui.requestRender();
 						} else if (role === "default") {
 							// Default: update agent state and persist as the active default model.
-							await this.ctx.session.setModel(model, role, {
-								selector: selectedSelector,
-								thinkingLevel,
-								cause: "user-selection",
-							});
+							const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+								model,
+								this.ctx.session.credentialSessionId,
+							);
+							if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
+							let defaultMutationStarted = false;
+							let assignmentMutationStarted = false;
 							const value = formatModelSelectorValue(
 								selectedSelector ?? `${model.provider}/${model.id}`,
 								thinkingLevel,
 							);
-							if (
-								!materializeActiveModelProfileAssignment({
+							try {
+								await this.ctx.session.setModel(model, role, {
+									selector: selectedSelector,
+									thinkingLevel,
+									cause: "user-selection",
+									onMutationStarted: () => {
+										defaultMutationStarted = true;
+									},
+								});
+								assignmentMutationStarted = true;
+								const materializedProfile = materializeActiveModelProfileAssignment({
 									session: this.ctx.session,
 									settings: this.ctx.settings,
 									role,
 									selector: value,
-								})
-							) {
-								this.ctx.settings.setModelRole(role, value);
-							}
-							if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-								this.ctx.session.setThinkingLevel(thinkingLevel);
+								});
+								if (!materializedProfile) {
+									this.ctx.settings.setModelRole(role, value);
+								}
+								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+									this.ctx.session.setThinkingLevel(thinkingLevel);
+								}
+							} catch (error) {
+								await this.#restoreDefaultAssignmentRollback(
+									rollbackSnapshot,
+									error,
+									defaultMutationStarted,
+									defaultMutationStarted || assignmentMutationStarted,
+								);
 							}
 							refreshRoleAssignments();
 							this.ctx.statusLine.invalidate();
@@ -2322,7 +2426,10 @@ export class SelectorController {
 							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
 							this.ctx.ui.requestRender();
 						} else {
-							const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
+							const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+								model,
+								this.ctx.session.credentialSessionId,
+							);
 							if (!apiKey) {
 								throw new Error(`No API key for ${model.provider}/${model.id}`);
 							}
@@ -2365,7 +2472,7 @@ export class SelectorController {
 				},
 				{
 					...options,
-					sessionId: this.ctx.session.sessionId,
+					sessionId: this.ctx.session.credentialSessionId,
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
 					activeModelProfile:
 						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
@@ -3234,7 +3341,7 @@ export class SelectorController {
 					validateAuth: async (selectedProviderId: string) => {
 						const apiKey = await this.ctx.session.modelRegistry.getApiKeyForProvider(
 							selectedProviderId,
-							this.ctx.session.sessionId,
+							this.ctx.session.credentialSessionId,
 						);
 						return !!apiKey;
 					},

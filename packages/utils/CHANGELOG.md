@@ -2,9 +2,22 @@
 
 ## [Unreleased]
 
+## [0.12.21] - 2026-08-09
+
+## [0.12.20] - 2026-08-09
+
+## [0.12.19] - 2026-08-08
+
+## [0.12.18] - 2026-08-08
+
+## [0.12.17] - 2026-08-08
+
+## [0.12.16] - 2026-08-08
+
 ### Changed
 
 - Process-tree and native process helpers now defer native binding access until the operation is invoked.
+- `readJsonl` now accepts an optional raw-line observer for byte-derived diagnostics while isolating observer failures from stream consumption.
 
 ## [0.12.15] - 2026-08-06
 

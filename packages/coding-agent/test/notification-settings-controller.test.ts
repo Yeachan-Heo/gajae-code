@@ -93,6 +93,7 @@ function health(): NotificationHealthReport {
 			stopped: false,
 			heartbeatAt: undefined,
 			heartbeatAgeMs: undefined,
+			attachedEndpoints: undefined,
 			generation: undefined,
 			currentGeneration: 1,
 			generationRelation: "unknown",

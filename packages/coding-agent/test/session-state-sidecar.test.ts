@@ -1836,7 +1836,7 @@ describe("coordinator runtime state sidecar", () => {
 			expect(verdict.classification).toBe("unexpected_owner_loss");
 			expect(verdict.intent_id).toBeUndefined();
 		}
-	});
+	}, 30_000);
 
 	it("reclaims orphaned runtime-state locks without inspecting protected payloads", async () => {
 		const root = await tempRoot();

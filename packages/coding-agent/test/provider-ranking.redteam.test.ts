@@ -328,6 +328,8 @@ describe("/provider preset CLI surface", () => {
 			"alibaba-token-plan",
 			"minimax",
 			"minimax-cn",
+			"litellm",
+			"openai-compatible-proxy",
 		]);
 	});
 });

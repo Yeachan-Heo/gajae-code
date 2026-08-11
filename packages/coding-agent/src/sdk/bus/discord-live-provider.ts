@@ -13,6 +13,7 @@ const GATEWAY_INTENTS = 1 + 512 + 32_768;
 const MAX_RATE_LIMIT_RETRIES = 2;
 const NONCE_PREFIX = "<!-- gjc-thread-nonce:";
 const INVALID_SESSION_RECONNECT_DELAY_MS = 1_000;
+const TERMINAL_GATEWAY_CLOSE_CODES: ReadonlySet<number> = new Set([4_004, 4_010, 4_011, 4_012, 4_013, 4_014]);
 
 const NONCE_SUFFIX = " -->";
 
@@ -329,15 +330,35 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		socket.addEventListener("message", event => {
 			void this.#handleGateway(socket, event).catch(error => this.#handleGatewayFailure(socket, error));
 		});
-		socket.addEventListener("close", () => this.#scheduleReconnect(socket));
+		socket.addEventListener("close", event => {
+			const code = typeof (event as CloseEvent).code === "number" ? (event as CloseEvent).code : 0;
+			if (TERMINAL_GATEWAY_CLOSE_CODES.has(code)) {
+				this.#gatewayError = new Error(`Discord gateway rejected the connection (close code ${code})`);
+				this.#heartbeat?.cancel();
+				this.#heartbeat = undefined;
+				this.#gatewayReady = false;
+				return;
+			}
+			this.#scheduleReconnect(socket);
+		});
 		socket.addEventListener("error", () => {
 			if (socket.readyState !== 3) socket.close();
 		});
 	}
 
 	async #handleGateway(socket: DiscordGatewaySocket, event: Event): Promise<void> {
-		const data = (event as MessageEvent).data;
-		if (typeof data !== "string") return;
+		const raw = (event as MessageEvent).data;
+		const data =
+			typeof raw === "string"
+				? raw
+				: raw instanceof ArrayBuffer
+					? Buffer.from(raw).toString("utf8")
+					: ArrayBuffer.isView(raw)
+						? Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString("utf8")
+						: raw instanceof Blob
+							? await raw.text()
+							: undefined;
+		if (data === undefined) return;
 		let frame: JsonRecord;
 		try {
 			frame = JSON.parse(data) as JsonRecord;
@@ -387,7 +408,7 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 			this.#resumeGatewayUrl = this.#string(payload, "resume_gateway_url");
 		}
 		if (frame.t === "READY" || frame.t === "RESUMED") this.#gatewayReady = true;
-		const inbound = this.#inbound(frame.t, payload);
+		const inbound = await this.#inbound(frame.t, payload);
 		if (inbound && !inbound.bot && inbound.authorId !== this.#botUserId) await this.#onEvent?.(inbound);
 	}
 	#handleGatewayFailure(socket: DiscordGatewaySocket, error: unknown): void {
@@ -526,14 +547,21 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 			this.#string(this.#record(data.channel), "parent_id")
 		);
 	}
-	#inbound(type: unknown, data: JsonRecord): DiscordInboundEvent | undefined {
+	async #inbound(type: unknown, data: JsonRecord): Promise<DiscordInboundEvent | undefined> {
 		if (type === "MESSAGE_CREATE") {
 			const id = this.#string(data, "id");
 			const guildId = this.#string(data, "guild_id");
 			const threadId = this.#string(data, "channel_id");
 			const author = this.#record(data.author);
 			const authorId = this.#string(author, "id");
-			const parentId = this.#parentId(data);
+			let parentId = this.#parentId(data);
+			if (!parentId && threadId) {
+				try {
+					parentId = this.#string(this.#record(await this.#request(`/channels/${threadId}`)), "parent_id");
+				} catch {
+					return undefined;
+				}
+			}
 			if (!id || !guildId || !threadId || !parentId || !authorId) return undefined;
 			return {
 				id,

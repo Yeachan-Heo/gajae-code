@@ -1,10 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { Api, Model } from "@gajae-code/ai";
-import { kNoAuth } from "@gajae-code/coding-agent/config/model-registry";
+import { kNoAuth, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type ModelLookupRegistry,
 	resolveModelOverrideWithAuthFallback,
 } from "@gajae-code/coding-agent/config/model-resolver";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import {
 	type ConfiguredFallbackChain,
 	FallbackChainController,
@@ -168,6 +172,25 @@ describe("issue #985: subagent dispatch auth fallback", () => {
 		);
 		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-pro");
 		expect(controller.attemptsUsed).toBe(0);
+	});
+
+	test("retains authenticated override tails for request-time fallback", async () => {
+		const fallbackModel = { ...parentModel, id: "deepseek-v4-fallback", name: "DeepSeek V4 Fallback" };
+		const patterns = ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-fallback"];
+		const registry = createMockRegistry({
+			models: [parentModel, fallbackModel],
+			authedProviders: new Set(["deepseek"]),
+		});
+		const result = await resolveModelOverrideWithAuthFallback(patterns, undefined, registry);
+		const controller = new FallbackChainController(
+			{ role: "default", entries: patterns, origin: "subagent", explicitHead: true },
+			1,
+		);
+		controller.seedResolution(result.activeIndex ?? 0, result.skips);
+
+		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-pro");
+		expect(controller.onAttemptFailure("server", "500")).toBe("advance");
+		expect(controller.currentSelector()).toBe("deepseek/deepseek-v4-fallback");
 	});
 
 	test("rebases to the parent when every override selector is unknown", async () => {
@@ -345,4 +368,118 @@ test("skips a Cursor subagent chain head when managed fallback is enabled", asyn
 	expect(result.model).toBe(parentModel);
 	expect(result.activeIndex).toBe(1);
 	expect(result.skips[0]?.reason).toContain("cannot be used in a retryable fallback chain");
+});
+
+describe("preset-equivalent alias boundaries with the real registry", () => {
+	// A slash-prefixed catalog id keeps the alias out of the exact canonical-id
+	// path, so resolution must pass through the final-segment alias stage.
+	const aliasModel: Model<Api> = {
+		id: "synthetic/flare-alias",
+		name: "Flare Alias",
+		api: "openai-completions",
+		provider: "alias-provider",
+		baseUrl: "http://127.0.0.1:9/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128000,
+		maxTokens: 8192,
+	};
+
+	async function createRealRegistry(): Promise<{ registry: ModelRegistry; cleanup: () => void }> {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-985-alias-"));
+		const authStorage = await AuthStorage.create(path.join(dir, "auth.db"));
+		authStorage.setRuntimeApiKey("alias-provider", "test-key");
+		const registry = new ModelRegistry(authStorage, path.join(dir, "models.yml"));
+		registry.registerProvider("alias-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "ALIAS_KEY",
+			api: "openai-completions",
+			models: [aliasModel],
+		});
+		return {
+			registry,
+			cleanup: () => {
+				authStorage.close();
+				fs.rmSync(dir, { recursive: true, force: true });
+			},
+		};
+	}
+
+	test("active parent profile resolves a bare persisted override through the alias stage", async () => {
+		const { registry, cleanup } = await createRealRegistry();
+		try {
+			const lookupAliasSpy = vi.spyOn(registry, "lookupAliasExists");
+			const resolveAliasSpy = vi.spyOn(registry, "resolveModelByLookupAlias");
+			const result = await resolveModelOverrideWithAuthFallback(
+				["flare-alias"],
+				undefined,
+				registry,
+				undefined,
+				"parent-session",
+				{ aliasIntent: "preset-equivalent" },
+			);
+
+			expect(result.authFallbackUsed).toBe(false);
+			expect(result.model).toMatchObject({ provider: "alias-provider", id: "synthetic/flare-alias" });
+			// Regression: the alias stage previously crashed on the real registry
+			// (unbound private-field access); it must consult the alias methods.
+			expect(lookupAliasSpy).toHaveBeenCalled();
+			expect(resolveAliasSpy).toHaveBeenCalled();
+		} finally {
+			cleanup();
+		}
+	});
+
+	test("active parent profile retries an equivalent provider when the preferred alias fails authentication", async () => {
+		const alpha = { ...aliasModel, provider: "alpha" };
+		const beta = { ...aliasModel, provider: "beta" };
+		const clearCanonicalVariant = vi.fn();
+		const registry = {
+			getAvailable: () => [alpha, beta],
+			getApiKey: async (candidate: Model) => (candidate.provider === "beta" ? "beta-key" : undefined),
+			lookupAliasExists: (alias: string) => alias === "flare-alias",
+			resolveModelByLookupAlias: (_alias: string, options?: { candidates?: readonly Model[] }) =>
+				options?.candidates?.[0],
+			resolveCanonicalModel: () => undefined,
+			clearCanonicalVariant,
+		} as unknown as ModelRegistry;
+
+		const result = await resolveModelOverrideWithAuthFallback(
+			["flare-alias"],
+			undefined,
+			registry,
+			undefined,
+			"credential-session",
+			{ aliasIntent: "preset-equivalent" },
+			"child-scope",
+		);
+
+		expect(result.model?.provider).toBe("beta");
+		expect(result.requestedModel?.provider).toBe("alpha");
+		expect(result.authFallbackUsed).toBe(true);
+		expect(clearCanonicalVariant).toHaveBeenCalledWith("child-scope");
+	});
+
+	test("no active profile keeps persisted override resolution exact without consulting aliases", async () => {
+		const { registry, cleanup } = await createRealRegistry();
+		try {
+			const lookupAliasSpy = vi.spyOn(registry, "lookupAliasExists");
+			const resolveAliasSpy = vi.spyOn(registry, "resolveModelByLookupAlias");
+			const result = await resolveModelOverrideWithAuthFallback(
+				["flare-alias"],
+				undefined,
+				registry,
+				undefined,
+				"parent-session",
+			);
+
+			expect(result.authFallbackUsed).toBe(false);
+			expect(result.model).toMatchObject({ provider: "alias-provider", id: "synthetic/flare-alias" });
+			expect(lookupAliasSpy).not.toHaveBeenCalled();
+			expect(resolveAliasSpy).not.toHaveBeenCalled();
+		} finally {
+			cleanup();
+		}
+	});
 });

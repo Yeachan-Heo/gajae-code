@@ -145,4 +145,13 @@ describe("SessionManager configured model chain persistence", () => {
 			explicitHead: true,
 		});
 	});
+
+	it("replays an explicit default-model clear without reviving legacy model identity", () => {
+		const session = SessionManager.inMemory();
+		session.appendModelChange("anthropic/claude", "default");
+		session.clearModelRole("default");
+
+		expect(session.buildSessionContext().models.default).toBeUndefined();
+		expect(session.buildSessionContext().configuredModelChains.default).toBeUndefined();
+	});
 });

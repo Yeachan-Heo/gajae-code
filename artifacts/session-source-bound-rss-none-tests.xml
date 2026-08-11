@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="bun test" tests="13" assertions="67" failures="2" skipped="0" time="79.177054">
+  <testsuite name="packages/coding-agent/test/session/session-memory-rss.test.ts" file="packages/coding-agent/test/session/session-memory-rss.test.ts" tests="13" assertions="67" failures="2" skipped="0" time="0" hostname="MacBook-Pro.local">
+    <testsuite name="session memory RSS plateau" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="38" tests="13" assertions="67" failures="2" skipped="0" time="79.143" hostname="MacBook-Pro.local">
+      <testcase name="materializes a 24 MiB public provider context within the 64 MiB RSS budget" classname="session memory RSS plateau" time="0.220102" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="39" assertions="3" />
+      <testcase name="keeps post-compaction RSS growth bounded across a 120k-record session" classname="session memory RSS plateau" time="43.960259" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="55" assertions="6" />
+      <testcase name="streams a 120k-record HTML export within the 64 MiB RSS budget" classname="session memory RSS plateau" time="2.383905" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="77" assertions="5" />
+      <testcase name="activates a retired compacted branch within the 64 MiB process budget" classname="session memory RSS plateau" time="17.264863" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="97" assertions="5" />
+      <testcase name="reopens the authenticated 120k-record sidecar within the 64 MiB RSS budget" classname="session memory RSS plateau" time="2.341673" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="119" assertions="5" />
+      <testcase name="builds a first 60k-record enabled sidecar within the 64 MiB RSS budget" classname="session memory RSS plateau" time="0.494957" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="155" assertions="5">
+        <failure type="AssertionError" />
+      </testcase>
+      <testcase name="stages and promotes a cold 120k-record model selection within the bounded allocator envelope" classname="session memory RSS plateau" time="1.638378" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="175" assertions="5" />
+      <testcase name="forks an enabled 120k-record cold transcript within the 64 MiB RSS budget" classname="session memory RSS plateau" time="1.507377" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="198" assertions="5" />
+      <testcase name="forks a captured 120k-record cold transcript within the 64 MiB RSS budget" classname="session memory RSS plateau" time="1.455731" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="221" assertions="5" />
+      <testcase name="builds and reopens one million records within the bounded allocator envelope" classname="session memory RSS plateau" time="0.664625" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="244" assertions="3">
+        <failure type="AssertionError" />
+      </testcase>
+      <testcase name="forks a one-GiB compacted transcript within the latency and allocator budgets" classname="session memory RSS plateau" time="2.690887" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="300" assertions="7" />
+      <testcase name="forks a captured one-GiB transcript within the latency and allocator budgets" classname="session memory RSS plateau" time="4.244417" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="318" assertions="7" />
+      <testcase name="keeps RSS flat across many distinct parent lookups served from the persistent artifact" classname="session memory RSS plateau" time="0.283729" file="packages/coding-agent/test/session/session-memory-rss.test.ts" line="336" assertions="6" />
+    </testsuite>
+  </testsuite>
+</testsuites>

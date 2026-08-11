@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -18,10 +18,19 @@ import { isEnoent, pathIsWithin, peekFile, toError } from "@gajae-code/utils";
 import {
 	assertManagedDirectoryRoot,
 	type ManagedDirectoryRoot,
+	renameFlagsUnsupported,
+	shouldFsyncManagedDirectory,
 	validateNativeSecurityResult,
 } from "./internal/managed-session-storage";
+import {
+	classifyNativePublishOutcome,
+	mayCleanCurrentStaging,
+	type NativePublishOutcome,
+} from "./internal/native-publish-outcome";
+import { isDerivedSessionMemoryFile } from "./internal/session-memory-sidecar";
 
 const utf8Decoder = new TextDecoder("utf-8");
+const newlineBuffer = Buffer.from("\n", "utf8");
 function canonicalPathSync(value: string): string {
 	try {
 		return fs.realpathSync.native(value);
@@ -47,6 +56,44 @@ export interface SessionStorageStat {
 export interface SessionStorageSnapshot {
 	bytes: Uint8Array;
 	stat: SessionStorageStat;
+}
+
+export interface SessionStorageExactReplacementExpectation {
+	readonly stat: SessionStorageStat;
+	readonly sha256: string;
+}
+/** Upper bound for one descriptor-validated recorded range read. */
+export const SESSION_RANGE_READ_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * One bounded recorded-length read validated against a single opened descriptor.
+ * `bytes` is exactly `length` bytes from `[start, start + length)` of the same
+ * regular-file object; `stat` is the fresh post-read descriptor snapshot so the
+ * caller can compare dev/ino/nlink against the pathname before committing an index.
+ */
+export interface SessionStorageRangeSnapshot {
+	stat: SessionStorageStat;
+	bytes: Uint8Array;
+}
+
+function validateRangeReadBounds(start: number, length: number): void {
+	if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(length) || length < 0)
+		throw new RangeError("Invalid session range read bounds");
+	if (start > Number.MAX_SAFE_INTEGER - length) throw new RangeError("Session range read start overflows");
+	if (length > SESSION_RANGE_READ_MAX_BYTES) throw new RangeError("Session range read exceeds the bounded maximum");
+}
+
+function normalizeBufferedWriterCapacity(value: number | undefined): number {
+	const capacity = value ?? SESSION_STORAGE_BUFFERED_WRITER_DEFAULT_BYTES;
+	if (
+		!Number.isSafeInteger(capacity) ||
+		capacity < SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES ||
+		capacity > SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES
+	)
+		throw new RangeError(
+			`Buffered writer capacity must be between ${SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES} and ${SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES} bytes`,
+		);
+	return capacity;
 }
 
 function statFromNode(stats: fs.BigIntStats): SessionStorageStat {
@@ -101,6 +148,23 @@ export class SessionStorageWriterRetryableCloseError extends Error {
 export interface SessionStorageWriterCloseAdapter {
 	close(fd: number): void;
 }
+/** Bounded buffered-writer capacity limits. */
+export const SESSION_STORAGE_BUFFERED_WRITER_MIN_BYTES = 64 * 1024;
+export const SESSION_STORAGE_BUFFERED_WRITER_MAX_BYTES = 512 * 1024;
+export const SESSION_STORAGE_BUFFERED_WRITER_DEFAULT_BYTES = 256 * 1024;
+
+/**
+ * Counters for a synchronous buffered sidecar writer. `bytesWritten` and
+ * `writeCalls` count operations against the backend, not calls accepted into
+ * the in-process buffer.
+ */
+export interface SessionStorageBufferedWriterInstrumentation {
+	readonly bytesSubmitted: number;
+	readonly bytesWritten: number;
+	readonly writeCalls: number;
+	readonly flushCalls: number;
+	readonly bufferedBytes: number;
+}
 
 /** Options for opening a {@link SessionStorageWriter}. */
 export interface SessionStorageWriterOpenOptions {
@@ -110,6 +174,8 @@ export interface SessionStorageWriterOpenOptions {
 	closeAdapter?: SessionStorageWriterCloseAdapter;
 	/** Opaque authority for default-computed managed destinations only. */
 	securityContext?: SessionStorageSecurityContext;
+	/** Enable bounded synchronous buffering for disposable sidecar writes. */
+	bufferSize?: number;
 }
 
 /**
@@ -163,6 +229,10 @@ export interface SessionStorageWriter {
 	writeLineSync(line: string): void;
 	flush(): Promise<void>;
 	fsync(): Promise<void>;
+	/** Synchronously fsync all prior writes when the backend supports durable sidecar publication. */
+	fsyncSync?(): void;
+	/** Descriptor-bound identity captured from the still-open writer after fsync. */
+	statSync?(): SessionStorageStat;
 	close(): Promise<void>;
 	/**
 	 * Synchronously close the underlying descriptor. The certainty-aware close
@@ -176,6 +246,69 @@ export interface SessionStorageWriter {
 	getCloseState(): SessionStorageWriterCloseState;
 	/** Stored error for non-success close states (`close_failed_retryable`/`close_unknown`). */
 	getCloseError(): Error | undefined;
+}
+
+/** Synchronous byte-oriented writer with bounded buffering for disposable sidecars. */
+export interface SessionStorageBufferedWriter extends SessionStorageWriter {
+	/** Append already-serialized bytes; the caller's view may be reused on return. */
+	writeBytesSync(bytes: Uint8Array): void;
+	/** Flush pending bytes to the backend without synchronizing them to stable storage. */
+	flushSync(): void;
+	/** Flush pending bytes, then synchronize the backend. */
+	fsyncSync(): void;
+	/** Flush pending bytes, then close the backend descriptor. */
+	closeSync(): void;
+	/** Snapshot backend-write counters and current pending capacity. */
+	getInstrumentation(): SessionStorageBufferedWriterInstrumentation;
+}
+// =============================================================================
+// Staged streaming writer contract (two-pass fork publication, immutable destinations)
+// =============================================================================
+
+/** Upper bound for one staged line (excluding the trailing newline). */
+export const STAGED_WRITER_LINE_MAX_BYTES = 64 * 1024 * 1024;
+/** Upper bound for aggregated different-length patches buffered for the publish-time overlay pass. */
+export const STAGED_WRITER_PATCH_LIMIT_BYTES = 8 * 1024 * 1024;
+export const STAGED_WRITER_PATCH_MAX_COUNT = 65_536;
+export const STAGED_MEMORY_WRITER_MAX_BYTES = 20 * 1024 * 1024;
+export const STAGED_MEMORY_WRITER_MAX_LINES = STAGED_WRITER_PATCH_MAX_COUNT + 1;
+const STAGED_WRITER_COPY_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Bounded staged streaming writer for one immutable one-shot destination (fork /
+ * capture). Lines are streamed to a sibling staging file; {@link publishNoReplace}
+ * atomically publishes the staged file only while the destination is still absent,
+ * so publication never materializes the whole file in memory. Different-length
+ * {@link patchLine} replacements are buffered (bounded) and applied by a second
+ * bounded streaming pass at publish time.
+ *
+ * `publishNoReplace` is reserved for immutable one-shot destinations and must never
+ * be used for the mutable `.spill.commit` marker (checked create/replace helpers
+ * exist for that path).
+ */
+export interface StagedStreamingWriter {
+	/** Append one complete line; the writer adds the trailing newline. */
+	writeLine(bytes: Uint8Array): void;
+	/** Move the line cursor to `ordinal` (0-based) so a later patchLine targets it. */
+	seekToLine(ordinal: number): void;
+	/**
+	 * Replace the line at `ordinal` with `bytes`. Same-length replacements are
+	 * applied in place; different-length replacements are buffered (bounded) and
+	 * applied by the publish-time overlay pass.
+	 */
+	patchLine(ordinal: number, bytes: Uint8Array): void;
+	/** Hand buffered writes to the kernel (the staged descriptor is unbuffered). */
+	flush(): void;
+	/** Synchronize the staged file. */
+	fsync(): void;
+	/** Close the staged descriptor; required before {@link publishNoReplace}. */
+	closeSync(): void;
+	/** Atomically publish the staged file at the destination only while it is absent. */
+	publishNoReplace(): void;
+}
+
+export interface SessionStorageExclusiveLock {
+	releaseSync(): void;
 }
 
 export interface SessionStorage {
@@ -203,6 +336,12 @@ export interface SessionStorage {
 	writeText(path: string, content: string): Promise<void>;
 	rename(path: string, nextPath: string): Promise<void>;
 	renameSync(path: string, nextPath: string): void;
+	/** Replace only while the destination still has the expected exact identity and bytes. */
+	replaceExactSync?(
+		sourcePath: string,
+		destinationPath: string,
+		expected: SessionStorageExactReplacementExpectation,
+	): boolean;
 	unlink(path: string): Promise<void>;
 	unlinkSync(path: string): void;
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
@@ -214,6 +353,19 @@ export interface SessionStorage {
 	 */
 	deleteSessionVerified?(target: VerifiedSessionDeleteTarget): Promise<VerifiedSessionDeleteResult>;
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter;
+	/** Open a bounded synchronous byte-oriented writer for disposable sidecars. */
+	openBufferedWriter?(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter;
+	/** Bounded recorded-length read with descriptor identity validation (additive). */
+	readRangeSync?(path: string, start: number, length: number): SessionStorageRangeSnapshot;
+	/** Async bounded recorded-length read with descriptor identity validation (additive). */
+	readRange?(path: string, start: number, length: number): Promise<SessionStorageRangeSnapshot>;
+	/** Open a staged streaming writer for one immutable one-shot destination (additive). */
+	openStagedWriter?(path: string, options?: SessionStorageWriterOpenOptions): StagedStreamingWriter;
+	/** Acquire an owner-bound exclusive lock; returns undefined while another owner holds it. */
+	acquireExclusiveLockSync?(
+		path: string,
+		options?: { securityContext?: SessionStorageSecurityContext },
+	): SessionStorageExclusiveLock | undefined;
 }
 
 // =============================================================================
@@ -513,6 +665,29 @@ function secureOwnerOnlyFileDescriptor(
 ): void {
 	if (securityContext && !isValidManagedSecurityContext(securityContext))
 		throw new Error("Invalid managed session security context");
+	if (securityContext) {
+		const root = fs.lstatSync(securityContext.rootAuthority.canonicalPath, { bigint: true });
+		if (
+			!root.isDirectory() ||
+			root.isSymbolicLink() ||
+			root.dev !== securityContext.rootAuthority.dev ||
+			root.ino !== securityContext.rootAuthority.ino
+		)
+			throw new Error("Managed writer root authority changed");
+		if (securityContext.retainedAuthority) {
+			const relative = path.relative(securityContext.sessionDir, pathname).split(path.sep).join("/");
+			const retained = securityContext.retainedAuthority.stat(relative);
+			const opened = fs.fstatSync(fd, { bigint: true });
+			if (
+				!retained.ok ||
+				!retained.identity ||
+				retained.identity.dev !== opened.dev.toString() ||
+				retained.identity.ino !== opened.ino.toString() ||
+				retained.identity.nlink !== opened.nlink.toString()
+			)
+				throw new Error("Managed writer descriptor escaped retained authority");
+		}
+	}
 	if (process.platform !== "linux" || !securityContext) {
 		if (operation === "apply") {
 			const applied = validateNativeSecurityResult(
@@ -557,6 +732,279 @@ function assertNoReparsePath(pathname: string): void {
 		}
 	}
 }
+// =============================================================================
+// Commit-marker checked create/replace (mutable `.spill.commit` publication)
+// =============================================================================
+
+function fsyncDirectorySync(pathname: string): void {
+	if (!shouldFsyncManagedDirectory()) return;
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+	try {
+		fs.fsyncSync(fd);
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+/** Best-effort identity-checked removal of one of our own staged temp names. */
+function unlinkOwnedStagedSync(stagingPath: string, expected: { dev: bigint; ino: bigint }): void {
+	try {
+		const named = fs.lstatSync(stagingPath, { bigint: true });
+		if (!named.isFile() || named.isSymbolicLink() || named.dev !== expected.dev || named.ino !== expected.ino) return;
+		const sha256 = createHash("sha256").update(fs.readFileSync(stagingPath)).digest("hex");
+		exactRemoveSessionStorageLockPath(stagingPath, named, sha256, named.nlink > 1n);
+	} catch {
+		// ENOENT means the name was already consumed or removed; cleanup is best-effort.
+		return;
+	}
+}
+
+function sameDescriptorIdentity(left: SessionStorageStat, right: SessionStorageStat): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+/** Physically observed commit-marker state; corrupt JSON is still `present`. */
+export type SessionCommitMarkerState =
+	| { kind: "missing" }
+	| { kind: "present"; rawBytesSha256: string; stat: SessionStorageStat };
+
+/** Exact `present` expectation for one checked commit-marker replacement. */
+export interface SessionCommitMarkerPresentExpectation {
+	/** SHA-256 of the exact raw marker bytes physically on disk (corrupt JSON included). */
+	rawBytesSha256: string;
+	/** Descriptor snapshot of the marker object expected to be replaced. */
+	descriptorIdentity: SessionStorageStat;
+}
+
+/** Snapshot one commit marker's physical state without granting write authority. */
+export function readSessionCommitMarkerSync(storage: SessionStorage, markerPath: string): SessionCommitMarkerState {
+	if (!storage.existsSync(markerPath)) return { kind: "missing" };
+	if (!storage.readBytesSync) throw new Error("Commit marker reads require exact-bytes storage");
+	const bytes = storage.readBytesSync(markerPath);
+	const stat = storage.statSync(markerPath);
+	return { kind: "present", rawBytesSha256: createHash("sha256").update(bytes).digest("hex"), stat };
+}
+
+/**
+ * Checked commit-marker create: publishes only while the marker is still `missing`.
+ * Temp + fsync + atomic create-if-absent + directory fsync (file backend); the
+ * in-memory backend mirrors the same missing-expectation abort. Leftover temps are
+ * removed on any failure. Runs inside the caller's persistence fence.
+ */
+export function createSessionCommitMarkerCheckedSync(
+	storage: SessionStorage,
+	markerPath: string,
+	bytes: Uint8Array,
+	options?: { securityContext?: SessionStorageSecurityContext },
+): void {
+	if (storage instanceof FileSessionStorage) {
+		createFileCommitMarkerCheckedSync(storage, markerPath, bytes, options?.securityContext);
+		return;
+	}
+	if (storage instanceof MemorySessionStorage) {
+		if (storage.existsSync(markerPath)) throw new Error("commit_marker_expected_missing");
+		storage.writeTextSync(markerPath, Buffer.from(bytes).toString("utf8"));
+		return;
+	}
+	throw new Error("Commit marker checked publication requires a file or memory storage backend");
+}
+
+/**
+ * Checked commit-marker replace: replaces only on an exact `present` raw/hash +
+ * descriptor identity match (corrupt-present included). Temp + fsync + checked
+ * atomic rename + directory fsync (file backend); any mismatch aborts with the
+ * current marker untouched. The in-memory backend mirrors the same aborts. Runs
+ * inside the caller's persistence fence.
+ */
+export function replaceSessionCommitMarkerCheckedSync(
+	storage: SessionStorage,
+	markerPath: string,
+	bytes: Uint8Array,
+	expected: SessionCommitMarkerPresentExpectation,
+	options?: { securityContext?: SessionStorageSecurityContext },
+): void {
+	if (storage instanceof FileSessionStorage) {
+		replaceFileCommitMarkerCheckedSync(storage, markerPath, bytes, expected, options?.securityContext);
+		return;
+	}
+	if (storage instanceof MemorySessionStorage) {
+		replaceMemoryCommitMarkerCheckedSync(storage, markerPath, bytes, expected);
+		return;
+	}
+	throw new Error("Commit marker checked publication requires a file or memory storage backend");
+}
+
+function createFileCommitMarkerCheckedSync(
+	_storage: FileSessionStorage,
+	markerPath: string,
+	bytes: Uint8Array,
+	securityContext: SessionStorageSecurityContext,
+): void {
+	const dir = path.dirname(markerPath);
+	assertNoReparsePath(dir);
+	if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	assertNoReparsePath(markerPath);
+	const tempPath = path.join(dir, `.${path.basename(markerPath)}.${randomUUID()}.tmp`);
+	let fd: number | undefined;
+	let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
+	let failure: unknown;
+	let outcome: NativePublishOutcome | undefined;
+	let linkPublished = false;
+	try {
+		fd = fs.openSync(
+			tempPath,
+			fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+			0o600,
+		);
+		secureOwnerOnlyFileDescriptor(tempPath, fd, "apply", securityContext);
+		const opened = fs.fstatSync(fd, { bigint: true });
+		stagedIdentity = { dev: opened.dev, ino: opened.ino };
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+			if (written === 0) throw new Error("Short write");
+			offset += written;
+		}
+		fs.fsyncSync(fd);
+		secureOwnerOnlyFileDescriptor(tempPath, fd, "verify", securityContext);
+		const staged = fs.fstatSync(fd, { bigint: true });
+		stagedIdentity = { dev: staged.dev, ino: staged.ino };
+		fs.closeSync(fd);
+		fd = undefined;
+
+		outcome = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(tempPath, markerPath));
+		if (renameFlagsUnsupported(outcome)) {
+			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(tempPath, markerPath));
+			linkPublished = outcome.ok;
+		}
+		if (!outcome.ok) {
+			if (outcome.reason === "destination_exists") throw new Error("commit_marker_expected_missing");
+			throw new Error(`commit_marker_create_rejected:${outcome.reason}`);
+		}
+		const named = fs.lstatSync(markerPath, { bigint: true });
+		if (
+			!named.isFile() ||
+			named.isSymbolicLink() ||
+			named.dev !== stagedIdentity.dev ||
+			named.ino !== stagedIdentity.ino
+		)
+			throw new Error("destination_identity_changed");
+		fsyncDirectorySync(dir);
+	} catch (error) {
+		failure = error;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+		if (stagedIdentity && (outcome === undefined || linkPublished || mayCleanCurrentStaging(outcome))) {
+			unlinkOwnedStagedSync(tempPath, stagedIdentity);
+		}
+	}
+	if (failure !== undefined) throw failure;
+}
+
+function replaceFileCommitMarkerCheckedSync(
+	storage: FileSessionStorage,
+	markerPath: string,
+	bytes: Uint8Array,
+	expected: SessionCommitMarkerPresentExpectation,
+	securityContext: SessionStorageSecurityContext,
+): void {
+	// Expected-state check runs before any mutation (inside the caller's fence).
+	const current = readSessionCommitMarkerSync(storage, markerPath);
+	if (current.kind !== "present") throw new Error("commit_marker_expected_present");
+	if (current.rawBytesSha256 !== expected.rawBytesSha256) throw new Error("commit_marker_raw_hash_mismatch");
+	if (!sameDescriptorIdentity(current.stat, expected.descriptorIdentity))
+		throw new Error("commit_marker_identity_mismatch");
+
+	const dir = path.dirname(markerPath);
+	const parentIdentity = fs.statSync(dir, { bigint: true });
+	const tempPath = path.join(dir, `.${path.basename(markerPath)}.${randomUUID()}.tmp`);
+	let fd: number | undefined;
+	let staged: fs.BigIntStats | undefined;
+	let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
+	const stagedSha256 = createHash("sha256").update(bytes).digest("hex");
+	let failure: unknown;
+	try {
+		fd = fs.openSync(
+			tempPath,
+			fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+			0o600,
+		);
+		secureOwnerOnlyFileDescriptor(tempPath, fd, "apply", securityContext);
+		const opened = fs.fstatSync(fd, { bigint: true });
+		stagedIdentity = { dev: opened.dev, ino: opened.ino };
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+			if (written === 0) throw new Error("Short write");
+			offset += written;
+		}
+		fs.fsyncSync(fd);
+		secureOwnerOnlyFileDescriptor(tempPath, fd, "verify", securityContext);
+		staged = fs.fstatSync(fd, { bigint: true });
+		fs.closeSync(fd);
+		fd = undefined;
+
+		// Checked atomic rename: replaces the destination only while it is still the
+		// expected marker object (exact dev/ino/nlink/size/mtimeNs + raw sha256).
+		const replaced = nativeSessionStorage().exactReplacePath(
+			tempPath,
+			markerPath,
+			{
+				dev: staged.dev,
+				ino: staged.ino,
+				nlink: staged.nlink,
+				parentDev: parentIdentity.dev,
+				parentIno: parentIdentity.ino,
+				size: BigInt(bytes.byteLength),
+				mtimeNs: staged.mtimeNs,
+				sha256: stagedSha256,
+			},
+			{
+				dev: expected.descriptorIdentity.dev,
+				ino: expected.descriptorIdentity.ino,
+				nlink: expected.descriptorIdentity.nlink,
+				parentDev: parentIdentity.dev,
+				parentIno: parentIdentity.ino,
+				size: BigInt(expected.descriptorIdentity.size),
+				mtimeNs: expected.descriptorIdentity.mtimeNs,
+				sha256: expected.rawBytesSha256,
+			},
+		);
+		if (!replaced.ok) throw new Error(`commit_marker_replace_rejected:${replaced.code ?? "unknown"}`);
+		const named = fs.lstatSync(markerPath, { bigint: true });
+		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino)
+			throw new Error("destination_identity_changed");
+		fsyncDirectorySync(dir);
+	} catch (error) {
+		failure = error;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+		if (staged) unlinkOwnedStagedSync(tempPath, { dev: staged.dev, ino: staged.ino });
+		else if (stagedIdentity) unlinkOwnedStagedSync(tempPath, stagedIdentity);
+	}
+	if (failure !== undefined) throw failure;
+}
+
+function replaceMemoryCommitMarkerCheckedSync(
+	storage: MemorySessionStorage,
+	markerPath: string,
+	bytes: Uint8Array,
+	expected: SessionCommitMarkerPresentExpectation,
+): void {
+	const current = readSessionCommitMarkerSync(storage, markerPath);
+	if (current.kind !== "present") throw new Error("commit_marker_expected_present");
+	if (current.rawBytesSha256 !== expected.rawBytesSha256) throw new Error("commit_marker_raw_hash_mismatch");
+	if (!sameDescriptorIdentity(current.stat, expected.descriptorIdentity))
+		throw new Error("commit_marker_identity_mismatch");
+	storage.writeTextSync(markerPath, Buffer.from(bytes).toString("utf8"));
+}
 
 // FinalizationRegistry to clean up leaked file descriptors
 const writerRegistry = new FinalizationRegistry<number>(fd => {
@@ -567,7 +1015,7 @@ const writerRegistry = new FinalizationRegistry<number>(fd => {
 	}
 });
 
-class FileSessionStorageWriter implements SessionStorageWriter {
+class FileSessionStorageWriter implements SessionStorageBufferedWriter {
 	#fd: number;
 	#path: string;
 
@@ -578,10 +1026,21 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	#closeAdapter: SessionStorageWriterCloseAdapter;
 	#securityContext: SessionStorageSecurityContext;
 
+	#bufferSize: number | undefined;
+	#buffer: Buffer | undefined;
+	#bufferedBytes = 0;
+	#bytesSubmitted = 0;
+	#bytesWritten = 0;
+	#writeCalls = 0;
+	#flushCalls = 0;
+
 	constructor(fpath: string, options?: SessionStorageWriterOpenOptions) {
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter ?? defaultCloseAdapter;
 		this.#securityContext = options?.securityContext;
+		this.#bufferSize =
+			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
+		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
 		const flags = options?.flags ?? "a";
 		const dir = path.dirname(fpath);
 		assertNoReparsePath(dir);
@@ -628,43 +1087,102 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		}
 	}
 
-	writeLineSync(line: string): void {
+	#assertOpen(): void {
 		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
 		if (this.#error) throw this.#error;
+	}
+
+	#asBuffer(bytes: Uint8Array): Buffer {
+		if (Buffer.isBuffer(bytes)) return bytes;
+		return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	}
+
+	#writeToKernel(bytes: Uint8Array): void {
+		const buffer = this.#asBuffer(bytes);
+		let offset = 0;
+		while (offset < buffer.byteLength) {
+			this.#writeCalls++;
+			const written = fs.writeSync(this.#fd, buffer, offset, buffer.byteLength - offset);
+			if (written === 0) throw new Error("Short write");
+			offset += written;
+			this.#bytesWritten += written;
+		}
+	}
+
+	#flushPending(): void {
+		this.#flushCalls++;
+		if (!this.#buffer || this.#bufferedBytes === 0) return;
+		this.#writeToKernel(this.#buffer.subarray(0, this.#bufferedBytes));
+		this.#bufferedBytes = 0;
+	}
+
+	#appendBytes(bytes: Uint8Array): void {
+		if (bytes.byteLength === 0) return;
+		if (!this.#buffer || !this.#bufferSize) {
+			this.#writeToKernel(bytes);
+			return;
+		}
+		const source = this.#asBuffer(bytes);
+		if (source.byteLength >= this.#bufferSize) {
+			this.#flushPending();
+			this.#writeToKernel(source);
+			return;
+		}
+		if (this.#bufferedBytes + source.byteLength > this.#bufferSize) this.#flushPending();
+		source.copy(this.#buffer, this.#bufferedBytes);
+		this.#bufferedBytes += source.byteLength;
+		if (this.#bufferedBytes === this.#bufferSize) this.#flushPending();
+	}
+
+	writeBytesSync(bytes: Uint8Array): void {
+		this.#assertOpen();
 		try {
-			const buf = Buffer.from(line, "utf-8");
-			let offset = 0;
-			while (offset < buf.length) {
-				const written = fs.writeSync(this.#fd, buf, offset, buf.length - offset);
-				if (written === 0) {
-					throw new Error("Short write");
-				}
-				offset += written;
-			}
+			this.#appendBytes(bytes);
+			this.#bytesSubmitted += bytes.byteLength;
 		} catch (err) {
 			throw this.#recordError(err);
 		}
+	}
+
+	writeLineSync(line: string): void {
+		this.writeBytesSync(Buffer.from(line, "utf-8"));
 	}
 
 	async writeLine(line: string): Promise<void> {
 		this.writeLineSync(line);
 	}
 
-	async flush(): Promise<void> {
-		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
-		if (this.#error) throw this.#error;
-		// OS buffers are flushed on fsync, nothing to do here
+	flushSync(): void {
+		this.#assertOpen();
+		try {
+			this.#flushPending();
+		} catch (err) {
+			throw this.#recordError(err);
+		}
 	}
 
-	async fsync(): Promise<void> {
-		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
-		if (this.#error) throw this.#error;
+	async flush(): Promise<void> {
+		this.flushSync();
+	}
+
+	fsyncSync(): void {
+		this.#assertOpen();
 		try {
+			this.#flushPending();
 			fs.fsyncSync(this.#fd);
 			secureOwnerOnlyFileDescriptor(this.#path, this.#fd, "verify", this.#securityContext);
 		} catch (err) {
 			throw this.#recordError(err);
 		}
+	}
+
+	statSync(): SessionStorageStat {
+		this.#assertOpen();
+		return statFromNode(fs.fstatSync(this.#fd, { bigint: true }));
+	}
+
+	async fsync(): Promise<void> {
+		this.fsyncSync();
 	}
 
 	closeSync(): void {
@@ -673,6 +1191,15 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		// Dispatched close already threw: outcome is uncertain. Never dispatch OS close
 		// for this numeric fd again; surface the stored non-quiescent error.
 		if (this.#closeState === "close_unknown") throw this.#closeError!;
+
+		let flushError: Error | undefined;
+		if (!this.#error) {
+			try {
+				this.#flushPending();
+			} catch (err) {
+				flushError = this.#recordError(err);
+			}
+		}
 		// State is "open" or "close_failed_retryable": a close may be dispatched.
 		try {
 			secureOwnerOnlyFileDescriptor(this.#path, this.#fd, "verify", this.#securityContext);
@@ -704,7 +1231,9 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 		// Successful underlying close confirms closed.
 		this.#closeState = "closed";
 		this.#closeError = undefined;
+		this.#bufferedBytes = 0;
 		writerRegistry.unregister(this);
+		if (flushError) throw flushError;
 	}
 
 	async close(): Promise<void> {
@@ -724,9 +1253,648 @@ class FileSessionStorageWriter implements SessionStorageWriter {
 	getCloseError(): Error | undefined {
 		return this.#closeError;
 	}
+
+	getInstrumentation(): SessionStorageBufferedWriterInstrumentation {
+		return {
+			bytesSubmitted: this.#bytesSubmitted,
+			bytesWritten: this.#bytesWritten,
+			writeCalls: this.#writeCalls,
+			flushCalls: this.#flushCalls,
+			bufferedBytes: this.#bufferedBytes,
+		};
+	}
+}
+/**
+ * File-backend staged streaming writer: streams lines to a sibling staging file and
+ * publishes no-replace to the immutable destination. Different-length patchLine
+ * replacements are applied by a bounded publish-time second pass (64 KiB chunks),
+ * so publication never materializes the whole file in memory.
+ */
+class FileStagedStreamingWriter implements StagedStreamingWriter {
+	#fd: number;
+	#stagingPath: string;
+	#destinationPath: string;
+	#securityContext: SessionStorageSecurityContext;
+	#lineCount = 0;
+	#pendingPatches = new Map<number, Uint8Array>();
+	#pendingPatchBytes = 0;
+	#closed = false;
+	#published = false;
+	#error: Error | undefined;
+
+	constructor(destinationPath: string, options?: SessionStorageWriterOpenOptions) {
+		this.#securityContext = options?.securityContext;
+		const dir = path.dirname(destinationPath);
+		assertNoReparsePath(dir);
+		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		assertNoReparsePath(dir);
+		this.#destinationPath = destinationPath;
+		this.#stagingPath = path.join(dir, `.${path.basename(destinationPath)}.${randomUUID()}.staged`);
+		const fd = fs.openSync(
+			this.#stagingPath,
+			fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+			0o600,
+		);
+		try {
+			secureOwnerOnlyFileDescriptor(this.#stagingPath, fd, "apply", this.#securityContext);
+		} catch (error) {
+			fs.closeSync(fd);
+			throw error;
+		}
+		this.#fd = fd;
+		writerRegistry.register(this, this.#fd, this);
+	}
+
+	#recordError(err: unknown): Error {
+		const error = toError(err);
+		if (!this.#error) this.#error = error;
+		return error;
+	}
+
+	#assertOpen(): void {
+		if (this.#closed) throw new Error("Staged writer is closed");
+		if (this.#error) throw this.#error;
+	}
+
+	writeLine(bytes: Uint8Array): void {
+		this.#assertOpen();
+		if (bytes.byteLength > STAGED_WRITER_LINE_MAX_BYTES)
+			throw new RangeError("Staged line exceeds the bounded maximum");
+		try {
+			for (const chunk of [bytes, newlineBuffer]) {
+				let written = 0;
+				while (written < chunk.byteLength) {
+					const count = fs.writeSync(this.#fd, chunk, written, chunk.byteLength - written);
+					if (count === 0) throw new Error("Short write");
+					written += count;
+				}
+			}
+			this.#lineCount++;
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
+
+	seekToLine(ordinal: number): void {
+		this.#assertOpen();
+		this.#findLine(ordinal);
+	}
+
+	patchLine(ordinal: number, bytes: Uint8Array): void {
+		this.#assertOpen();
+		const existing = this.#findLine(ordinal);
+		const lineLength = bytes.byteLength + 1;
+		const prior = this.#pendingPatches.get(ordinal);
+		if (prior) {
+			const nextPatchBytes = this.#pendingPatchBytes - prior.byteLength + bytes.byteLength;
+			if (nextPatchBytes > STAGED_WRITER_PATCH_LIMIT_BYTES) {
+				this.#error = new Error("staged_overlay_capacity_exceeded");
+				throw this.#error;
+			}
+			this.#pendingPatches.set(ordinal, Buffer.from(bytes));
+			this.#pendingPatchBytes = nextPatchBytes;
+			return;
+		}
+		if (lineLength === existing.length) {
+			try {
+				fs.writeSync(this.#fd, Buffer.from(bytes), 0, bytes.byteLength, existing.offset);
+			} catch (err) {
+				throw this.#recordError(err);
+			}
+			return;
+		}
+		if (
+			this.#pendingPatches.size >= STAGED_WRITER_PATCH_MAX_COUNT ||
+			this.#pendingPatchBytes + bytes.byteLength > STAGED_WRITER_PATCH_LIMIT_BYTES
+		) {
+			this.#error = new Error("staged_overlay_capacity_exceeded");
+			throw this.#error;
+		}
+		this.#pendingPatches.set(ordinal, Buffer.from(bytes));
+		this.#pendingPatchBytes += bytes.byteLength;
+	}
+
+	#findLine(ordinal: number): { offset: number; length: number } {
+		if (ordinal < 0 || ordinal >= this.#lineCount) throw new RangeError("Line ordinal is not staged");
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(this.#stagingPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+			const writerIdentity = fs.fstatSync(this.#fd, { bigint: true });
+			const readerIdentity = fs.fstatSync(fd, { bigint: true });
+			if (writerIdentity.dev !== readerIdentity.dev || writerIdentity.ino !== readerIdentity.ino)
+				throw new Error("staged_source_identity_changed");
+			const chunk = Buffer.alloc(STAGED_WRITER_COPY_CHUNK_BYTES);
+			let offset = 0;
+			let lineStart = 0;
+			let current = 0;
+			for (;;) {
+				const count = fs.readSync(fd, chunk, 0, chunk.byteLength, offset);
+				if (count === 0) break;
+				for (let index = 0; index < count; index++) {
+					if (chunk[index] !== 0x0a) continue;
+					const lineEnd = offset + index + 1;
+					if (current === ordinal) return { offset: lineStart, length: lineEnd - lineStart };
+					current++;
+					lineStart = lineEnd;
+				}
+				offset += count;
+			}
+			throw new RangeError("Line ordinal is not staged");
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
+
+	flush(): void {
+		this.#assertOpen();
+		// writeSync already handed the bytes to the kernel; nothing is buffered here.
+	}
+
+	fsync(): void {
+		this.#assertOpen();
+		try {
+			fs.fsyncSync(this.#fd);
+			secureOwnerOnlyFileDescriptor(this.#stagingPath, this.#fd, "verify", this.#securityContext);
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
+
+	closeSync(): void {
+		if (this.#closed) return;
+		if (this.#error) throw this.#error;
+		try {
+			secureOwnerOnlyFileDescriptor(this.#stagingPath, this.#fd, "verify", this.#securityContext);
+			fs.closeSync(this.#fd);
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+		this.#closed = true;
+		writerRegistry.unregister(this);
+	}
+
+	publishNoReplace(): void {
+		if (this.#published) throw new Error("Staged writer already published");
+		if (!this.#closed) throw new Error("Staged writer must be closed before publication");
+		if (this.#error) throw this.#error;
+		const dir = path.dirname(this.#destinationPath);
+		const originalStaging = fs.lstatSync(this.#stagingPath, { bigint: true });
+		const originalStagingIdentity = { dev: originalStaging.dev, ino: originalStaging.ino };
+		let publishSource = this.#stagingPath;
+		let materialized: string | undefined;
+		let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
+		let outcome: NativePublishOutcome | undefined;
+		let linkPublished = false;
+		let failure: unknown;
+		try {
+			if (this.#pendingPatches.size > 0) {
+				materialized = this.#materializePatchedCopy();
+				publishSource = materialized;
+			}
+			const staged = fs.lstatSync(publishSource, { bigint: true });
+			stagedIdentity = { dev: staged.dev, ino: staged.ino };
+			outcome = classifyNativePublishOutcome(
+				nativeSessionStorage().renameNoReplacePath(publishSource, this.#destinationPath),
+			);
+			if (renameFlagsUnsupported(outcome)) {
+				outcome = classifyNativePublishOutcome(
+					nativeSessionStorage().linkNoReplacePath(publishSource, this.#destinationPath),
+				);
+				linkPublished = outcome.ok;
+			}
+			if (!outcome.ok) throw new Error(`staged_publish_rejected:${outcome.reason}`);
+			const named = fs.lstatSync(this.#destinationPath, { bigint: true });
+			if (
+				!named.isFile() ||
+				named.isSymbolicLink() ||
+				named.dev !== stagedIdentity.dev ||
+				named.ino !== stagedIdentity.ino
+			)
+				throw new Error("destination_identity_changed");
+			fsyncDirectorySync(dir);
+			this.#published = true;
+		} catch (error) {
+			failure = error;
+		} finally {
+			// Only a validated pre-mutation outcome authorizes removing our own staged
+			// name: a committed outcome may have made publishSource the destination.
+			if (materialized) {
+				if (stagedIdentity && (linkPublished || (outcome && mayCleanCurrentStaging(outcome))))
+					unlinkOwnedStagedSync(materialized, stagedIdentity);
+				unlinkOwnedStagedSync(this.#stagingPath, originalStagingIdentity);
+			} else if (stagedIdentity && (linkPublished || (outcome && mayCleanCurrentStaging(outcome)))) {
+				unlinkOwnedStagedSync(this.#stagingPath, stagedIdentity);
+			}
+		}
+		if (failure !== undefined) throw failure;
+	}
+
+	/** Second bounded streaming pass: materialize staged lines with pending patches applied. */
+	#materializePatchedCopy(): string {
+		const dir = path.dirname(this.#stagingPath);
+		const copyPath = path.join(dir, `.${path.basename(this.#destinationPath)}.${randomUUID()}.staged-final`);
+		let copyFd: number | undefined;
+		let sourceFd: number | undefined;
+		let copyIdentity: { dev: bigint; ino: bigint } | undefined;
+		try {
+			copyFd = fs.openSync(
+				copyPath,
+				fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+				0o600,
+			);
+			secureOwnerOnlyFileDescriptor(copyPath, copyFd, "apply", this.#securityContext);
+			const created = fs.fstatSync(copyFd, { bigint: true });
+			copyIdentity = { dev: created.dev, ino: created.ino };
+			sourceFd = fs.openSync(this.#stagingPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			let ordinal = 0;
+			let carry = Buffer.alloc(0);
+			const chunk = Buffer.alloc(STAGED_WRITER_COPY_CHUNK_BYTES);
+			for (;;) {
+				const count = fs.readSync(sourceFd, chunk, 0, chunk.byteLength, null);
+				if (count === 0) break;
+				const combined =
+					carry.byteLength === 0 ? chunk.subarray(0, count) : Buffer.concat([carry, chunk.subarray(0, count)]);
+				let lineStart = 0;
+				for (;;) {
+					const newline = combined.indexOf(0x0a, lineStart);
+					if (newline === -1) break;
+					const line = this.#pendingPatches.get(ordinal) ?? combined.subarray(lineStart, newline);
+					this.#writeCopyLine(copyFd, line);
+					ordinal++;
+					lineStart = newline + 1;
+				}
+				carry = Buffer.from(combined.subarray(lineStart));
+			}
+			if (carry.byteLength > 0) throw new Error("staged_file_malformed_tail");
+			fs.fsyncSync(copyFd);
+			return copyPath;
+		} catch (error) {
+			if (copyIdentity) unlinkOwnedStagedSync(copyPath, copyIdentity);
+			throw this.#recordError(error);
+		} finally {
+			if (sourceFd !== undefined) fs.closeSync(sourceFd);
+			if (copyFd !== undefined) fs.closeSync(copyFd);
+		}
+	}
+
+	#writeCopyLine(fd: number, line: Uint8Array): void {
+		let written = 0;
+		while (written < line.byteLength) {
+			const count = fs.writeSync(fd, line, written, line.byteLength - written);
+			if (count === 0) throw new Error("Short write");
+			written += count;
+		}
+		let nlWritten = 0;
+		while (nlWritten < newlineBuffer.byteLength) {
+			const count = fs.writeSync(fd, newlineBuffer, nlWritten, newlineBuffer.byteLength - nlWritten);
+			if (count === 0) throw new Error("Short write");
+			nlWritten += count;
+		}
+	}
+}
+
+type SessionStorageLockOwner = {
+	pid: number;
+	incarnation?: string;
+	token: string;
+};
+
+type SessionStorageLockOwnerProbe =
+	| { kind: "absent" }
+	| { kind: "live"; incarnation?: string }
+	| { kind: "unverifiable" };
+
+function probeSessionStorageLockOwner(pid: number): SessionStorageLockOwnerProbe {
+	try {
+		const owner = nativeSessionStorage().Process.fromPid(pid) as { incarnation?: unknown } | null;
+		if (!owner) return { kind: "absent" };
+		return {
+			kind: "live",
+			...(typeof owner.incarnation === "string" && owner.incarnation.length > 0
+				? { incarnation: owner.incarnation }
+				: {}),
+		};
+	} catch {
+		return { kind: "unverifiable" };
+	}
+}
+
+function parseSessionStorageLockOwner(bytes: Buffer): SessionStorageLockOwner | undefined {
+	const text = bytes.toString("utf8").trim();
+	try {
+		const value = JSON.parse(text) as Partial<SessionStorageLockOwner>;
+		if (
+			!Number.isSafeInteger(value.pid) ||
+			(value.pid ?? 0) <= 0 ||
+			typeof value.token !== "string" ||
+			value.token.length === 0 ||
+			(value.incarnation !== undefined && (typeof value.incarnation !== "string" || value.incarnation.length === 0))
+		)
+			return undefined;
+		return value as SessionStorageLockOwner;
+	} catch {
+		const legacy = /^(\d+):(.+)$/.exec(text);
+		if (!legacy) return undefined;
+		const pid = Number.parseInt(legacy[1]!, 10);
+		if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+		return { pid, token: legacy[2]! };
+	}
+}
+
+function exactRemoveSessionStorageLockPath(
+	lockPath: string,
+	expected: fs.BigIntStats,
+	sha256: string,
+	allowHardLink = false,
+): boolean {
+	try {
+		const parent = fs.lstatSync(path.dirname(lockPath), { bigint: true });
+		if (!parent.isDirectory() || parent.isSymbolicLink()) return false;
+		const result = nativeSessionStorage().exactUnlink(lockPath, {
+			dev: expected.dev,
+			ino: expected.ino,
+			nlink: expected.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: expected.size,
+			mtimeNs: expected.mtimeNs,
+			sha256,
+			quarantineName: `${path.basename(lockPath)}.reap-${randomUUID()}`,
+			allowHardLink,
+		});
+		return result.ok || (result.code === "cleanup_pending" && typeof result.detachedPath === "string");
+	} catch {
+		return false;
+	}
+}
+
+function exactRemoveOwnedSessionStorageLockPath(
+	lockPath: string,
+	expected: Pick<fs.BigIntStats, "dev" | "ino">,
+): boolean {
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+		const current = fs.fstatSync(fd, { bigint: true });
+		if (
+			!current.isFile() ||
+			current.dev !== expected.dev ||
+			current.ino !== expected.ino ||
+			current.nlink < 1n ||
+			current.nlink > 2n ||
+			current.size > 4096n
+		)
+			return false;
+		const bytes = Buffer.allocUnsafe(Number(current.size));
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const read = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
+			if (read === 0) return false;
+			offset += read;
+		}
+		const sha256 = createHash("sha256").update(bytes).digest("hex");
+		fs.closeSync(fd);
+		fd = undefined;
+		return exactRemoveSessionStorageLockPath(lockPath, current, sha256);
+	} catch {
+		return false;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+}
+
+function reclaimStaleSessionStorageLockSync(lockPath: string): boolean {
+	let fd: number | undefined;
+	let expected: fs.BigIntStats | undefined;
+	let owner: SessionStorageLockOwner | undefined;
+	let sha256: string | undefined;
+	try {
+		fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+		expected = fs.fstatSync(fd, { bigint: true });
+		if (
+			!expected.isFile() ||
+			expected.nlink < 1n ||
+			expected.nlink > 2n ||
+			expected.size <= 0n ||
+			expected.size > 4096n
+		)
+			return false;
+		const bytes = Buffer.allocUnsafe(Number(expected.size));
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const read = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
+			if (read === 0) return false;
+			offset += read;
+		}
+		owner = parseSessionStorageLockOwner(bytes);
+		sha256 = createHash("sha256").update(bytes).digest("hex");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+		return false;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+	if (!owner || !expected || !sha256) return false;
+	const probe = probeSessionStorageLockOwner(owner.pid);
+	const stale =
+		probe.kind === "absent" ||
+		(probe.kind === "live" &&
+			owner.incarnation !== undefined &&
+			probe.incarnation !== undefined &&
+			probe.incarnation !== owner.incarnation);
+	if (!stale) return false;
+	let lockExpected = expected;
+	const stagedPath = expected.nlink === 2n ? `${lockPath}.${owner.token}.owner.tmp` : undefined;
+	if (stagedPath) {
+		try {
+			const staged = fs.lstatSync(stagedPath, { bigint: true });
+			if (staged.dev !== expected.dev || staged.ino !== expected.ino || staged.isSymbolicLink()) return false;
+			unlinkOwnedStagedSync(stagedPath, expected);
+			if (fs.existsSync(stagedPath)) return false;
+			lockExpected = fs.lstatSync(lockPath, { bigint: true });
+			if (
+				lockExpected.dev !== expected.dev ||
+				lockExpected.ino !== expected.ino ||
+				lockExpected.nlink !== 1n ||
+				lockExpected.size !== expected.size ||
+				lockExpected.mtimeNs !== expected.mtimeNs ||
+				lockExpected.isSymbolicLink()
+			)
+				return false;
+		} catch {
+			return false;
+		}
+	}
+	return exactRemoveSessionStorageLockPath(lockPath, lockExpected, sha256);
 }
 
 export class FileSessionStorage implements SessionStorage {
+	acquireExclusiveLockSync(
+		lockPath: string,
+		options?: { securityContext?: SessionStorageSecurityContext },
+	): SessionStorageExclusiveLock | undefined {
+		const dir = path.dirname(lockPath);
+		this.ensureDirSync(dir);
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const token = randomUUID();
+			const stagedPath = `${lockPath}.${token}.owner.tmp`;
+			let fd: number | undefined;
+			let stagedIdentity: fs.BigIntStats | undefined;
+			let ownerDigest: string | undefined;
+			let published = false;
+			try {
+				fd = fs.openSync(
+					stagedPath,
+					fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0),
+					0o600,
+				);
+				secureOwnerOnlyFileDescriptor(stagedPath, fd, "apply", options?.securityContext);
+				stagedIdentity = fs.fstatSync(fd, { bigint: true });
+				const probe = probeSessionStorageLockOwner(process.pid);
+				const owner: SessionStorageLockOwner = {
+					pid: process.pid,
+					...(probe.kind === "live" && probe.incarnation ? { incarnation: probe.incarnation } : {}),
+					token,
+				};
+				const bytes = Buffer.from(`${JSON.stringify(owner)}\n`, "utf8");
+				ownerDigest = createHash("sha256").update(bytes).digest("hex");
+				let offset = 0;
+				while (offset < bytes.byteLength) {
+					const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
+					if (written === 0) throw new Error("Short write");
+					offset += written;
+				}
+				fs.fsyncSync(fd);
+				secureOwnerOnlyFileDescriptor(stagedPath, fd, "verify", options?.securityContext);
+				stagedIdentity = fs.fstatSync(fd, { bigint: true });
+				let outcome = classifyNativePublishOutcome(
+					nativeSessionStorage().renameNoReplacePath(stagedPath, lockPath),
+				);
+				let linkPublished = false;
+				if (renameFlagsUnsupported(outcome)) {
+					outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(stagedPath, lockPath));
+					linkPublished = outcome.ok;
+				}
+				if (!outcome.ok) {
+					fs.closeSync(fd);
+					fd = undefined;
+					exactRemoveSessionStorageLockPath(stagedPath, stagedIdentity, ownerDigest);
+					if (outcome.reason === "destination_exists") {
+						if (attempt === 0 && reclaimStaleSessionStorageLockSync(lockPath)) continue;
+						return undefined;
+					}
+					throw new Error(`exclusive_lock_publish_rejected:${outcome.reason}`);
+				}
+				published = true;
+				fs.closeSync(fd);
+				fd = undefined;
+				if (linkPublished) {
+					const stagedNamed = fs.lstatSync(stagedPath, { bigint: true });
+					if (
+						stagedNamed.dev !== stagedIdentity.dev ||
+						stagedNamed.ino !== stagedIdentity.ino ||
+						stagedNamed.isSymbolicLink()
+					)
+						throw new Error("exclusive_lock_staging_identity_changed");
+					unlinkOwnedStagedSync(stagedPath, stagedIdentity);
+					if (fs.existsSync(stagedPath)) throw new Error("exclusive_lock_staging_cleanup_failed");
+				}
+				const publishedFd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+				let expected: fs.BigIntStats;
+				try {
+					secureOwnerOnlyFileDescriptor(lockPath, publishedFd, "verify", options?.securityContext);
+					expected = fs.fstatSync(publishedFd, { bigint: true });
+					if (
+						!expected.isFile() ||
+						expected.isSymbolicLink() ||
+						expected.dev !== stagedIdentity.dev ||
+						expected.ino !== stagedIdentity.ino ||
+						expected.nlink !== 1n ||
+						expected.size !== BigInt(bytes.byteLength)
+					)
+						throw new Error("exclusive_lock_identity_changed");
+					const installed = Buffer.allocUnsafe(bytes.byteLength);
+					let readOffset = 0;
+					while (readOffset < installed.byteLength) {
+						const read = fs.readSync(
+							publishedFd,
+							installed,
+							readOffset,
+							installed.byteLength - readOffset,
+							readOffset,
+						);
+						if (read === 0) throw new Error("exclusive_lock_short_read");
+						readOffset += read;
+					}
+					if (createHash("sha256").update(installed).digest("hex") !== ownerDigest)
+						throw new Error("exclusive_lock_content_changed");
+				} finally {
+					fs.closeSync(publishedFd);
+				}
+				fsyncDirectorySync(dir);
+				let released = false;
+				return {
+					releaseSync: () => {
+						if (released) return;
+						if (!exactRemoveSessionStorageLockPath(lockPath, expected, ownerDigest!)) {
+							try {
+								const current = fs.lstatSync(lockPath, { bigint: true });
+								if (current.dev === expected.dev && current.ino === expected.ino) {
+									// The inode matches, but exactRemove refused — either the
+									// content changed (replacement reused the inode) or cleanup
+									// genuinely failed on the original. Re-verify the content
+									// digest to distinguish: a replacement whose sha256 no longer
+									// matches is not ours and must not be unlinked.
+									let fd: number | undefined;
+									try {
+										fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+										const bytes = Buffer.allocUnsafe(Number(current.size));
+										let offset = 0;
+										while (offset < bytes.byteLength) {
+											const read = fs.readSync(fd, bytes, offset, bytes.byteLength - offset, offset);
+											if (read === 0) break;
+											offset += read;
+										}
+										const currentDigest = createHash("sha256")
+											.update(bytes.subarray(0, offset))
+											.digest("hex");
+										if (currentDigest === ownerDigest!) throw new Error("exclusive_lock_release_failed");
+									} finally {
+										if (fd !== undefined) fs.closeSync(fd);
+									}
+								}
+							} catch (error) {
+								if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+							}
+						}
+						released = true;
+					},
+				};
+			} catch (error) {
+				if (fd !== undefined) fs.closeSync(fd);
+				if (published && stagedIdentity && ownerDigest) {
+					try {
+						const named = fs.lstatSync(lockPath, { bigint: true });
+						if (named.dev === stagedIdentity.dev && named.ino === stagedIdentity.ino)
+							exactRemoveSessionStorageLockPath(lockPath, named, ownerDigest);
+					} catch {
+						// The published name is absent or belongs to another owner.
+					}
+				}
+				if (stagedIdentity && ownerDigest) {
+					try {
+						const named = fs.lstatSync(stagedPath, { bigint: true });
+						if (named.dev === stagedIdentity.dev && named.ino === stagedIdentity.ino)
+							exactRemoveOwnedSessionStorageLockPath(stagedPath, stagedIdentity);
+					} catch {
+						// The staged name was consumed or removed.
+					}
+				}
+				throw error;
+			}
+		}
+		return undefined;
+	}
 	ensureDirSync(dir: string): void {
 		if (!fs.existsSync(dir)) {
 			fs.mkdirSync(dir, { recursive: true });
@@ -762,6 +1930,65 @@ export class FileSessionStorage implements SessionStorage {
 			fs.closeSync(fd);
 		}
 	}
+	/**
+	 * Bounded recorded-length read with descriptor identity validation: opens one
+	 * no-follow descriptor, verifies the requested range is fully present, reads
+	 * exactly `length` bytes, and revalidates dev/ino/nlink on the same descriptor
+	 * plus the pathname (append-only size growth is tolerated; an object swap is
+	 * rejected). No path-based Bun Blob reads for managed authority.
+	 */
+	readRangeSync(fpath: string, start: number, length: number): SessionStorageRangeSnapshot {
+		validateRangeReadBounds(start, length);
+		const flags = fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0);
+		const fd = fs.openSync(fpath, flags);
+		try {
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
+			if (Number(before.size) < start + length) throw new Error("range_not_present");
+			const bytes = Buffer.alloc(length);
+			let offset = 0;
+			while (offset < length) {
+				const count = fs.readSync(fd, bytes, offset, length - offset, start + offset);
+				if (count === 0) throw new Error("range_not_present");
+				offset += count;
+			}
+			const after = fs.fstatSync(fd, { bigint: true });
+			if (after.dev !== before.dev || after.ino !== before.ino || after.nlink !== before.nlink)
+				throw new Error("source_changed");
+			const named = fs.lstatSync(fpath, { bigint: true });
+			if (!named.isFile() || named.isSymbolicLink() || named.dev !== before.dev || named.ino !== before.ino)
+				throw new Error("source_changed");
+			return { bytes, stat: statFromNode(after) };
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+
+	async readRange(fpath: string, start: number, length: number): Promise<SessionStorageRangeSnapshot> {
+		validateRangeReadBounds(start, length);
+		const handle = await fs.promises.open(fpath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+		try {
+			const before = await handle.stat({ bigint: true });
+			if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
+			if (Number(before.size) < start + length) throw new Error("range_not_present");
+			const bytes = Buffer.alloc(length);
+			let offset = 0;
+			while (offset < length) {
+				const { bytesRead } = await handle.read(bytes, offset, length - offset, start + offset);
+				if (bytesRead === 0) throw new Error("range_not_present");
+				offset += bytesRead;
+			}
+			const after = await handle.stat({ bigint: true });
+			if (after.dev !== before.dev || after.ino !== before.ino || after.nlink !== before.nlink)
+				throw new Error("source_changed");
+			const named = fs.lstatSync(fpath, { bigint: true });
+			if (!named.isFile() || named.isSymbolicLink() || named.dev !== before.dev || named.ino !== before.ino)
+				throw new Error("source_changed");
+			return { bytes, stat: statFromNode(after) };
+		} finally {
+			await handle.close();
+		}
+	}
 
 	statSync(path: string): SessionStorageStat {
 		return statFromNode(fs.statSync(path, { bigint: true }));
@@ -769,7 +1996,9 @@ export class FileSessionStorage implements SessionStorage {
 
 	listFilesSync(dir: string, pattern: string): string[] {
 		try {
-			return Array.from(new Bun.Glob(pattern).scanSync(dir)).map(name => path.join(dir, name));
+			return Array.from(new Bun.Glob(pattern).scanSync({ cwd: dir, dot: pattern.startsWith(".") })).map(name =>
+				path.join(dir, name),
+			);
 		} catch {
 			return [];
 		}
@@ -835,6 +2064,68 @@ export class FileSessionStorage implements SessionStorage {
 		}
 	}
 
+	replaceExactSync(
+		sourcePath: string,
+		destinationPath: string,
+		expected: SessionStorageExactReplacementExpectation,
+	): boolean {
+		const dir = path.dirname(destinationPath);
+		const parent = fs.statSync(dir, { bigint: true });
+		let fd: number | undefined;
+		try {
+			fd = fs.openSync(sourcePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+			const before = fs.fstatSync(fd, { bigint: true });
+			if (!before.isFile()) return false;
+			const hash = createHash("sha256");
+			const chunk = Buffer.alloc(STAGED_WRITER_COPY_CHUNK_BYTES);
+			for (;;) {
+				const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+				if (count === 0) break;
+				hash.update(chunk.subarray(0, count));
+			}
+			const after = fs.fstatSync(fd, { bigint: true });
+			if (
+				before.dev !== after.dev ||
+				before.ino !== after.ino ||
+				before.nlink !== after.nlink ||
+				before.size !== after.size ||
+				before.mtimeNs !== after.mtimeNs
+			)
+				return false;
+			fs.closeSync(fd);
+			fd = undefined;
+			const outcome = nativeSessionStorage().exactReplacePath(
+				sourcePath,
+				destinationPath,
+				{
+					dev: before.dev,
+					ino: before.ino,
+					nlink: before.nlink,
+					parentDev: parent.dev,
+					parentIno: parent.ino,
+					size: before.size,
+					mtimeNs: before.mtimeNs,
+					sha256: hash.digest("hex"),
+				},
+				{
+					dev: expected.stat.dev,
+					ino: expected.stat.ino,
+					nlink: expected.stat.nlink ?? 1n,
+					parentDev: parent.dev,
+					parentIno: parent.ino,
+					size: BigInt(expected.stat.size),
+					mtimeNs: expected.stat.mtimeNs,
+					sha256: expected.sha256,
+				},
+			);
+			if (!outcome.ok) return false;
+			fsyncDirectorySync(dir);
+			return true;
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
+
 	unlink(path: string): Promise<void> {
 		return fs.promises.unlink(path);
 	}
@@ -846,6 +2137,16 @@ export class FileSessionStorage implements SessionStorage {
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
 		return new FileSessionStorageWriter(path, options);
 	}
+	openBufferedWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter {
+		return new FileSessionStorageWriter(path, {
+			...options,
+			bufferSize: options?.bufferSize ?? SESSION_STORAGE_BUFFERED_WRITER_DEFAULT_BYTES,
+		}) as SessionStorageBufferedWriter;
+	}
+
+	openStagedWriter(path: string, options?: SessionStorageWriterOpenOptions): StagedStreamingWriter {
+		return new FileStagedStreamingWriter(path, options);
+	}
 
 	/**
 	 * Delete a session and sibling artifacts in an operator-selected explicit directory.
@@ -856,6 +2157,15 @@ export class FileSessionStorage implements SessionStorage {
 			await this.unlink(sessionPath);
 		} catch (error) {
 			if (!isEnoent(error)) throw error;
+		}
+		for (const candidate of this.listFilesSync(path.dirname(sessionPath), `${path.basename(sessionPath)}.spill.*`)) {
+			if (candidate.startsWith(`${sessionPath}.spill.`) && isDerivedSessionMemoryFile(candidate)) {
+				try {
+					await this.unlink(candidate);
+				} catch (error) {
+					if (!isEnoent(error)) throw error;
+				}
+			}
 		}
 		const artifactsDir = sessionPath.slice(0, -6);
 		try {
@@ -1524,13 +2834,127 @@ function parseFirstJsonlLine(bytes: Uint8Array): Record<string, unknown> | undef
 
 function matchesPattern(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
+	if (pattern === ".*") return name.startsWith(".");
 	if (pattern.startsWith("*.")) {
 		return name.endsWith(pattern.slice(1));
 	}
 	return name === pattern;
 }
+/**
+ * In-memory staged streaming writer: mirrors the file-backend contract exactly
+ * (line streaming, in-place same-length patchLine, bounded buffered overlay for
+ * different-length patches, missing-only no-replace publication) against the
+ * backing MemorySessionStorage so parity tests can exercise the full surface
+ * without touching the filesystem.
+ */
+class MemoryStagedStreamingWriter implements StagedStreamingWriter {
+	#storage: MemorySessionStorage;
+	#path: string;
+	#lines: Buffer[] = [];
+	#pendingPatches = new Map<number, Uint8Array>();
+	#pendingPatchBytes = 0;
+	#retainedLineBytes = 0;
+	#closed = false;
+	#published = false;
+	#error: Error | undefined;
 
-class MemorySessionStorageWriter implements SessionStorageWriter {
+	constructor(storage: MemorySessionStorage, path: string) {
+		this.#storage = storage;
+		this.#path = path;
+	}
+
+	#assertOpen(): void {
+		if (this.#closed) throw new Error("Staged writer is closed");
+		if (this.#error) throw this.#error;
+	}
+
+	writeLine(bytes: Uint8Array): void {
+		this.#assertOpen();
+		if (bytes.byteLength > STAGED_WRITER_LINE_MAX_BYTES)
+			throw new RangeError("Staged line exceeds the bounded maximum");
+		if (
+			this.#lines.length >= STAGED_MEMORY_WRITER_MAX_LINES ||
+			this.#retainedLineBytes + bytes.byteLength + 1 > STAGED_MEMORY_WRITER_MAX_BYTES
+		)
+			throw new Error("staged_memory_capacity_exceeded");
+		this.#lines.push(Buffer.from(bytes));
+		this.#retainedLineBytes += bytes.byteLength + 1;
+	}
+
+	seekToLine(ordinal: number): void {
+		this.#assertOpen();
+		if (ordinal < 0 || ordinal >= this.#lines.length) throw new RangeError("Line ordinal is not staged");
+	}
+
+	patchLine(ordinal: number, bytes: Uint8Array): void {
+		this.#assertOpen();
+		if (ordinal < 0 || ordinal >= this.#lines.length) throw new RangeError("Line ordinal is not staged");
+		const existing = this.#lines[ordinal];
+		if (!existing) throw new RangeError("Line ordinal is not staged");
+		if (bytes.byteLength === existing.byteLength) {
+			this.#lines[ordinal] = Buffer.from(bytes);
+			return;
+		}
+		const prior = this.#pendingPatches.get(ordinal);
+		if (prior) {
+			const nextPatchBytes = this.#pendingPatchBytes - prior.byteLength + bytes.byteLength;
+			if (nextPatchBytes > STAGED_WRITER_PATCH_LIMIT_BYTES) {
+				this.#error = new Error("staged_overlay_capacity_exceeded");
+				throw this.#error;
+			}
+			this.#pendingPatches.set(ordinal, Buffer.from(bytes));
+			this.#pendingPatchBytes = nextPatchBytes;
+			return;
+		}
+		if (
+			this.#pendingPatches.size >= STAGED_WRITER_PATCH_MAX_COUNT ||
+			this.#pendingPatchBytes + bytes.byteLength > STAGED_WRITER_PATCH_LIMIT_BYTES
+		) {
+			this.#error = new Error("staged_overlay_capacity_exceeded");
+			throw this.#error;
+		}
+		this.#pendingPatches.set(ordinal, Buffer.from(bytes));
+		this.#pendingPatchBytes += bytes.byteLength;
+	}
+
+	flush(): void {
+		this.#assertOpen();
+	}
+
+	fsync(): void {
+		this.#assertOpen();
+	}
+
+	closeSync(): void {
+		if (this.#closed) return;
+		if (this.#error) throw this.#error;
+		this.#closed = true;
+	}
+
+	publishNoReplace(): void {
+		if (this.#published) throw new Error("Staged writer already published");
+		if (!this.#closed) throw new Error("Staged writer must be closed before publication");
+		if (this.#error) throw this.#error;
+		if (this.#storage.existsSync(this.#path)) throw new Error("destination_conflict");
+		const selectedLines = this.#lines.map((line, index) => this.#pendingPatches.get(index) ?? line);
+		const totalBytes = selectedLines.reduce((total, line) => total + line.byteLength + 1, 0);
+		if (totalBytes > STAGED_MEMORY_WRITER_MAX_BYTES + STAGED_WRITER_PATCH_LIMIT_BYTES)
+			throw new Error("staged_memory_capacity_exceeded");
+		const content = Buffer.allocUnsafe(totalBytes);
+		let offset = 0;
+		for (const line of selectedLines) {
+			Buffer.from(line).copy(content, offset);
+			offset += line.byteLength;
+			content[offset++] = 0x0a;
+		}
+		this.#lines.length = 0;
+		this.#pendingPatches.clear();
+		this.#storage.writeBytesOwnedSync(this.#path, content);
+		this.#published = true;
+	}
+}
+
+class MemorySessionStorageWriter implements SessionStorageBufferedWriter {
 	#storage: MemorySessionStorage;
 	#path: string;
 	#closeState: SessionStorageWriterCloseState = "open";
@@ -1539,15 +2963,32 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 	#onError: ((err: Error) => void) | undefined;
 
 	#closeAdapter: SessionStorageWriterCloseAdapter | undefined;
+	#bytes: Buffer;
+	#length = 0;
+	#bufferSize: number | undefined;
+	#buffer: Buffer | undefined;
+	#bufferedBytes = 0;
+	#bytesSubmitted = 0;
+	#bytesWritten = 0;
+	#writeCalls = 0;
+	#flushCalls = 0;
 
 	constructor(storage: MemorySessionStorage, path: string, options?: SessionStorageWriterOpenOptions) {
 		this.#storage = storage;
 		this.#path = path;
 		this.#onError = options?.onError;
 		this.#closeAdapter = options?.closeAdapter;
-		if ((options?.flags ?? "a") === "w") {
-			this.#storage.writeTextSync(path, "");
-		}
+		this.#bufferSize =
+			options?.bufferSize === undefined ? undefined : normalizeBufferedWriterCapacity(options.bufferSize);
+		this.#buffer = this.#bufferSize === undefined ? undefined : Buffer.allocUnsafe(this.#bufferSize);
+		const existing =
+			options?.flags === "w" || !storage.existsSync(path)
+				? Buffer.alloc(0)
+				: Buffer.from(storage.readBytesSync(path));
+		this.#length = existing.byteLength;
+		this.#bytes = Buffer.allocUnsafe(Math.max(existing.byteLength, 4096));
+		existing.copy(this.#bytes);
+		if (options?.flags === "w") this.#storage.writeBytesOwnedSync(path, this.#bytes.subarray(0, 0));
 	}
 
 	#recordError(err: unknown): Error {
@@ -1557,30 +2998,132 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		return error;
 	}
 
-	writeLineSync(line: string): void {
-		if (this.#closeState !== "open") throw new Error("Writer closed");
+	#nonOpenWriteError(): Error {
+		switch (this.#closeState) {
+			case "closed":
+				return new Error("Writer closed");
+			case "close_unknown":
+				return this.#closeError ?? new Error("Writer close outcome is unknown; descriptor quarantined");
+			case "close_failed_retryable":
+				return this.#closeError ?? new Error("Writer close failed before dispatch (retryable); writes rejected");
+			default:
+				return new Error("Writer closed");
+		}
+	}
+
+	#assertOpen(): void {
+		if (this.#closeState !== "open") throw this.#nonOpenWriteError();
 		if (this.#error) throw this.#error;
+	}
+
+	#asBuffer(bytes: Uint8Array): Buffer {
+		if (Buffer.isBuffer(bytes)) return bytes;
+		return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	}
+
+	#appendToBytes(bytes: Uint8Array): void {
+		const source = this.#asBuffer(bytes);
+		const nextLength = this.#length + source.byteLength;
+		if (nextLength > this.#bytes.byteLength) {
+			const expanded = Buffer.allocUnsafe(Math.max(nextLength, this.#bytes.byteLength * 2));
+			this.#bytes.copy(expanded, 0, 0, this.#length);
+			this.#bytes = expanded;
+		}
+		source.copy(this.#bytes, this.#length);
+		this.#length = nextLength;
+	}
+
+	#writeCurrent(bytesWritten: number): void {
+		this.#writeCalls++;
+		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(this.#bytes.subarray(0, this.#length)));
+		this.#bytesWritten += bytesWritten;
+	}
+
+	#flushPending(): void {
+		this.#flushCalls++;
+		if (!this.#buffer || this.#bufferedBytes === 0) return;
+		const pendingBytes = this.#bufferedBytes;
+		const nextLength = this.#length + pendingBytes;
+		if (nextLength > this.#bytes.byteLength) {
+			const expanded = Buffer.allocUnsafe(Math.max(nextLength, this.#bytes.byteLength * 2));
+			this.#bytes.copy(expanded, 0, 0, this.#length);
+			this.#bytes = expanded;
+		}
+		this.#buffer.copy(this.#bytes, this.#length, 0, pendingBytes);
+		this.#writeCalls++;
+		this.#storage.writeBytesOwnedSync(this.#path, Buffer.from(this.#bytes.subarray(0, nextLength)));
+		this.#length = nextLength;
+		this.#bufferedBytes = 0;
+		this.#bytesWritten += pendingBytes;
+	}
+
+	#appendBytes(bytes: Uint8Array): void {
+		if (bytes.byteLength === 0) return;
+		if (!this.#buffer || !this.#bufferSize) {
+			this.#appendToBytes(bytes);
+			this.#writeCurrent(bytes.byteLength);
+			return;
+		}
+		const source = this.#asBuffer(bytes);
+		if (source.byteLength >= this.#bufferSize) {
+			this.#flushPending();
+			this.#appendToBytes(source);
+			this.#writeCurrent(source.byteLength);
+			return;
+		}
+		if (this.#bufferedBytes + source.byteLength > this.#bufferSize) this.#flushPending();
+		source.copy(this.#buffer, this.#bufferedBytes);
+		this.#bufferedBytes += source.byteLength;
+		if (this.#bufferedBytes === this.#bufferSize) this.#flushPending();
+	}
+
+	writeBytesSync(bytes: Uint8Array): void {
+		this.#assertOpen();
 		try {
-			const existing = this.#storage.existsSync(this.#path) ? this.#storage.readTextSync(this.#path) : "";
-			this.#storage.writeTextSync(this.#path, `${existing}${line}`);
+			this.#appendBytes(bytes);
+			this.#bytesSubmitted += bytes.byteLength;
 		} catch (err) {
 			throw this.#recordError(err);
 		}
+	}
+
+	writeLineSync(line: string): void {
+		this.writeBytesSync(Buffer.from(line, "utf8"));
 	}
 
 	async writeLine(line: string): Promise<void> {
 		this.writeLineSync(line);
 	}
 
+	flushSync(): void {
+		this.#assertOpen();
+		try {
+			this.#flushPending();
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
+
 	async flush(): Promise<void> {
-		if (this.#closeState !== "open") throw new Error("Writer closed");
-		if (this.#error) throw this.#error;
+		this.flushSync();
+	}
+
+	fsyncSync(): void {
+		this.#assertOpen();
+		try {
+			this.#flushPending();
+		} catch (err) {
+			throw this.#recordError(err);
+		}
+	}
+
+	statSync(): SessionStorageStat {
+		this.#assertOpen();
+		return this.#storage.statSync(this.#path);
 	}
 
 	async fsync(): Promise<void> {
-		// No-op for in-memory storage
-		if (this.#closeState !== "open") throw new Error("Writer closed");
-		if (this.#error) throw this.#error;
+		this.fsyncSync();
 	}
 
 	closeSync(): void {
@@ -1590,6 +3133,15 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		// succeeds. The sentinel fd (-1) signals "no real descriptor".
 		if (this.#closeState === "closed") return;
 		if (this.#closeState === "close_unknown") throw this.#closeError!;
+
+		let flushError: Error | undefined;
+		if (!this.#error) {
+			try {
+				this.#flushPending();
+			} catch (err) {
+				flushError = this.#recordError(err);
+			}
+		}
 		if (this.#closeAdapter) {
 			try {
 				this.#closeAdapter.close(-1);
@@ -1606,6 +3158,8 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		}
 		this.#closeState = "closed";
 		this.#closeError = undefined;
+		this.#bufferedBytes = 0;
+		if (flushError) throw flushError;
 	}
 
 	async close(): Promise<void> {
@@ -1623,11 +3177,41 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 	getCloseError(): Error | undefined {
 		return this.#closeError;
 	}
+
+	getInstrumentation(): SessionStorageBufferedWriterInstrumentation {
+		return {
+			bytesSubmitted: this.#bytesSubmitted,
+			bytesWritten: this.#bytesWritten,
+			writeCalls: this.#writeCalls,
+			flushCalls: this.#flushCalls,
+			bufferedBytes: this.#bufferedBytes,
+		};
+	}
 }
 
 export class MemorySessionStorage implements SessionStorage {
 	#files = new Map<string, { content: Buffer; mtimeMs: number; ino: bigint }>();
 	#nextInode = 1n;
+	acquireExclusiveLockSync(
+		lockPath: string,
+		_options?: { securityContext?: SessionStorageSecurityContext },
+	): SessionStorageExclusiveLock | undefined {
+		if (this.#files.has(lockPath)) return undefined;
+		const ino = this.#nextInode++;
+		this.#files.set(lockPath, {
+			content: Buffer.from(`${process.pid}:${randomUUID()}\n`, "utf8"),
+			mtimeMs: Date.now(),
+			ino,
+		});
+		let released = false;
+		return {
+			releaseSync: () => {
+				if (released) return;
+				released = true;
+				if (this.#files.get(lockPath)?.ino === ino) this.#files.delete(lockPath);
+			},
+		};
+	}
 
 	#statFor(entry: { content: Buffer; mtimeMs: number; ino: bigint }): SessionStorageStat {
 		return {
@@ -1649,6 +3233,15 @@ export class MemorySessionStorage implements SessionStorage {
 
 	existsSync(path: string): boolean {
 		return this.#files.has(path);
+	}
+
+	writeBytesOwnedSync(path: string, content: Buffer): void {
+		const existing = this.#files.get(path);
+		this.#files.set(path, {
+			content,
+			mtimeMs: Date.now(),
+			ino: existing?.ino ?? this.#nextInode++,
+		});
 	}
 
 	writeTextSync(path: string, content: string): void {
@@ -1674,6 +3267,22 @@ export class MemorySessionStorage implements SessionStorage {
 		const entry = this.#files.get(path);
 		if (!entry) throw new Error(`File not found: ${path}`);
 		return { bytes: Buffer.from(entry.content), stat: this.#statFor(entry) };
+	}
+	/**
+	 * Bounded recorded-length read with descriptor identity validation: mirrors the
+	 * file backend's contract (dev/ino/nlink identity, exact `length` bytes present)
+	 * against the in-memory file model so parity tests can compare backends.
+	 */
+	readRangeSync(path: string, start: number, length: number): SessionStorageRangeSnapshot {
+		validateRangeReadBounds(start, length);
+		const entry = this.#files.get(path);
+		if (!entry) throw new Error(`File not found: ${path}`);
+		if (entry.content.byteLength < start + length) throw new Error("range_not_present");
+		return { bytes: Buffer.from(entry.content.subarray(start, start + length)), stat: this.#statFor(entry) };
+	}
+
+	async readRange(path: string, start: number, length: number): Promise<SessionStorageRangeSnapshot> {
+		return this.readRangeSync(path, start, length);
 	}
 
 	statSync(path: string): SessionStorageStat {
@@ -1741,6 +3350,21 @@ export class MemorySessionStorage implements SessionStorage {
 		this.#files.delete(path);
 	}
 
+	replaceExactSync(
+		sourcePath: string,
+		destinationPath: string,
+		expected: SessionStorageExactReplacementExpectation,
+	): boolean {
+		const source = this.#files.get(sourcePath);
+		const destination = this.#files.get(destinationPath);
+		if (!source || !destination) return false;
+		if (!sameDescriptorIdentity(this.#statFor(destination), expected.stat)) return false;
+		if (createHash("sha256").update(destination.content).digest("hex") !== expected.sha256) return false;
+		this.#files.set(destinationPath, source);
+		this.#files.delete(sourcePath);
+		return true;
+	}
+
 	unlink(path: string): Promise<void> {
 		this.#files.delete(path);
 		return Promise.resolve();
@@ -1752,6 +3376,14 @@ export class MemorySessionStorage implements SessionStorage {
 
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
 		this.#files.delete(sessionPath);
+		const artifactPrefix = sessionPath.endsWith(".jsonl") ? `${sessionPath.slice(0, -6)}/` : `${sessionPath}/`;
+		for (const candidate of [...this.#files.keys()]) {
+			if (
+				(candidate.startsWith(`${sessionPath}.spill.`) || candidate.startsWith(artifactPrefix)) &&
+				isDerivedSessionMemoryFile(candidate)
+			)
+				this.#files.delete(candidate);
+		}
 		return Promise.resolve();
 	}
 
@@ -1810,11 +3442,169 @@ export class MemorySessionStorage implements SessionStorage {
 				new SessionDeleteVerificationError("artifacts", "Artifact path exists but is not a directory"),
 			);
 		}
+		for (const candidate of [...this.#files.keys()]) {
+			if (candidate.startsWith(`${transcriptPath}.spill.`) && isDerivedSessionMemoryFile(candidate))
+				this.#files.delete(candidate);
+		}
 		this.#files.delete(transcriptPath);
 		return Promise.resolve({ kind: "deleted" });
 	}
 
 	openWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageWriter {
 		return new MemorySessionStorageWriter(this, path, options);
+	}
+	openBufferedWriter(path: string, options?: SessionStorageWriterOpenOptions): SessionStorageBufferedWriter {
+		return new MemorySessionStorageWriter(this, path, {
+			...options,
+			bufferSize: options?.bufferSize ?? SESSION_STORAGE_BUFFERED_WRITER_DEFAULT_BYTES,
+		}) as SessionStorageBufferedWriter;
+	}
+
+	openStagedWriter(path: string): StagedStreamingWriter {
+		return new MemoryStagedStreamingWriter(this, path);
+	}
+}
+
+/**
+ * Outcome of a disk-retention retirement attempt.
+ *
+ * `kept` means the transcript survived and nothing of the session was
+ * destroyed, with the exact reason so `gjc gc --disk` can report it.
+ * `cleanup_pending` means the delete authority already detached or removed the
+ * session's artifact tree (or quarantined the transcript) before it stopped:
+ * the record survives, the session does not, and a caller must NOT report that
+ * as an ordinary keep.
+ */
+export type SessionRetirementOutcome =
+	| { kind: "retired" }
+	| { kind: "kept"; reason: string }
+	| { kind: "cleanup_pending"; reason: string };
+
+/** A retirement that cleared every precondition the retention pass itself owns. */
+type SessionRetirementPlan =
+	| { kind: "retirable"; target: VerifiedSessionDeleteTarget; artifactsPresent: boolean }
+	| { kind: "kept"; reason: string };
+
+/**
+ * Evaluate the preconditions retirement owns — the transcript must be readable
+ * and carry a usable session header — and bind the delete target to the exact
+ * bytes just read. Nothing here mutates the store.
+ */
+function planSessionRetirement(
+	storage: FileSessionStorage,
+	sessionsRoot: string,
+	transcriptPath: string,
+): SessionRetirementPlan {
+	let snapshot: SessionStorageSnapshot;
+	try {
+		snapshot = storage.readSnapshotSync(transcriptPath);
+	} catch (err) {
+		return { kind: "kept", reason: `transcript_unreadable: ${toError(err).message}` };
+	}
+
+	const header = parseFirstJsonlLine(snapshot.bytes);
+	if (header?.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string") {
+		return { kind: "kept", reason: "transcript_header_unusable" };
+	}
+
+	// The verified delete authority only unlinks a single-link transcript, so a
+	// hard-linked one can never be retired. Refusing here keeps the dry run from
+	// promising bytes prune cannot release, and — because this runs before the
+	// artifact phase — keeps a doomed retirement from destroying the artifact
+	// tree of a session whose transcript will survive anyway.
+	if (snapshot.stat.nlink === undefined || snapshot.stat.nlink !== 1n) {
+		return { kind: "kept", reason: "transcript_not_single_link" };
+	}
+
+	const directory = path.dirname(transcriptPath);
+	return {
+		kind: "retirable",
+		artifactsPresent: storage.existsSync(transcriptPath.slice(0, -".jsonl".length)),
+		target: {
+			sessionsRoot,
+			transcriptPath,
+			sessionId: header.id,
+			cwd: header.cwd,
+			transcriptIdentity: {
+				dev: snapshot.stat.dev,
+				ino: snapshot.stat.ino,
+				nlink: snapshot.stat.nlink,
+				size: snapshot.stat.size,
+				mtimeNs: snapshot.stat.mtimeNs,
+				sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+			},
+			plannedArtifactsPath: path.join(directory, `.gjc-delete-gc-${randomUUID()}-artifacts`),
+			plannedTranscriptPath: path.join(directory, `.gjc-delete-gc-${randomUUID()}-transcript`),
+		},
+	};
+}
+
+/**
+ * Non-mutating projection of {@link retireSessionTranscript}: would the
+ * retention pass's own preconditions let this transcript be retired at all?
+ *
+ * `gjc gc --disk` runs it so a dry run reports the verdict a prune would reach
+ * instead of promising bytes the delete authority will refuse to release. The
+ * authority's verdict (containment, identity, artifact tree) is deliberately
+ * not predicted here — it is re-derived against live state at delete time.
+ */
+export function probeSessionRetirement(
+	storage: FileSessionStorage,
+	sessionsRoot: string,
+	transcriptPath: string,
+): { kind: "retirable" } | { kind: "kept"; reason: string } {
+	const plan = planSessionRetirement(storage, sessionsRoot, transcriptPath);
+	return plan.kind === "retirable" ? { kind: "retirable" } : plan;
+}
+
+/**
+ * A transcript that survives after its artifacts are already gone is not a
+ * benign keep: the session is half-destroyed and the caller has to surface it.
+ */
+function retirementIncomplete(artifactsRemoved: boolean, reason: string): SessionRetirementOutcome {
+	return artifactsRemoved ? { kind: "cleanup_pending", reason } : { kind: "kept", reason };
+}
+
+/**
+ * Retire one managed session transcript through the verified hard-delete
+ * authority.
+ *
+ * This is the only supported way for a retention pass to remove a transcript:
+ * identity, containment, header id/cwd, artifact tree and parent directory are
+ * all re-verified inside {@link FileSessionStorage.deleteSessionVerified}, and
+ * anything ambiguous fails closed as `kept` rather than deleting bytes. The
+ * caller owns the retention policy; this function owns nothing but the delete
+ * authority.
+ */
+export async function retireSessionTranscript(
+	storage: FileSessionStorage,
+	sessionsRoot: string,
+	transcriptPath: string,
+): Promise<SessionRetirementOutcome> {
+	const plan = planSessionRetirement(storage, sessionsRoot, transcriptPath);
+	if (plan.kind === "kept") return plan;
+
+	let artifactsRemoved = false;
+	try {
+		// Phase 1 removes the sibling artifact directory (or proves it absent);
+		// phase 2 unlinks the transcript only against the same bound identity.
+		const artifacts = await storage.deleteSessionVerified(plan.target);
+		if (artifacts.kind === "deleted") return { kind: "retired" };
+		if (artifacts.kind === "cleanup_pending") {
+			return { kind: "cleanup_pending", reason: `cleanup_pending_${artifacts.phase}: ${artifacts.error.message}` };
+		}
+		// Phase 1 is durable: whatever artifact tree the session had is gone, so
+		// every later refusal leaves a record without its artifacts.
+		artifactsRemoved = plan.artifactsPresent;
+		const deletion = await storage.deleteSessionVerified({ ...plan.target, artifactsRemoved: true });
+		if (deletion.kind === "deleted") return { kind: "retired" };
+		if (deletion.kind === "cleanup_pending") {
+			return { kind: "cleanup_pending", reason: `cleanup_pending_${deletion.phase}: ${deletion.error.message}` };
+		}
+		return retirementIncomplete(artifactsRemoved, "transcript_not_deleted");
+	} catch (err) {
+		const error = toError(err);
+		const kind = err instanceof SessionDeleteVerificationError ? err.kind : "error";
+		return retirementIncomplete(artifactsRemoved, `verified_delete_rejected(${kind}): ${error.message}`);
 	}
 }

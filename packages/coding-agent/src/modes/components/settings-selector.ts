@@ -34,6 +34,7 @@ import {
 } from "./notifications-settings-editor";
 import { createPetSelectItems, getPetUnavailableWarning, isPetAvailable } from "./pet-capability";
 import { handleInputOrEscape, PluginSettingsComponent } from "./plugin-settings";
+import { normalizeProviderOrder } from "./provider-order-context";
 import { getSettingsForTab, type SettingDef } from "./settings-defs";
 import { getPreset } from "./status-line/presets";
 import { ALL_SEGMENT_IDS } from "./status-line/segments";
@@ -724,6 +725,8 @@ export interface SettingsCallbacks {
 	onPluginsChanged?: () => void;
 	/** Called when asynchronously rebuilt settings content needs a repaint. */
 	onRenderRequested?: () => void;
+	/** Create the ordered provider-priority editor for `modelProviderOrder`. */
+	createProviderOrderEditor?: (done: () => void) => Container;
 	/** Called when an interactive setting cannot be committed. */
 	onError?: (message: string) => void;
 	/** Called when settings panel is closed */
@@ -762,6 +765,7 @@ export class SettingsSelectorComponent extends Container {
 	#statusPreviewText: Text | null = null;
 	#currentTabId: SettingTab | "plugins" | "gjc-bundles" = "appearance";
 	#textInputActive = false;
+	#activeProviderOrderEditor: Container | null = null;
 
 	constructor(
 		private readonly context: SettingsRuntimeContext,
@@ -795,6 +799,11 @@ export class SettingsSelectorComponent extends Container {
 		if (this.#currentTabId === "notifications" && tabId !== "notifications" && !this.#disposeNotificationsEditor()) {
 			return;
 		}
+		// Release an open provider-order editor (and its context subscriptions)
+		// before switching tabs; the submenu's done() never runs on tab change,
+		// so without this the abandoned editor's listeners would survive.
+		this.#activeProviderOrderEditor?.dispose();
+		this.#activeProviderOrderEditor = null;
 		this.#currentTabId = tabId;
 
 		// Remove current content
@@ -883,6 +892,29 @@ export class SettingsSelectorComponent extends Container {
 					currentValue: this.#getSubmenuCurrentValue(def.path, currentValue),
 					submenu: (cv, done) => this.#createSubmenu(def, cv, done),
 				};
+
+			case "providerOrder": {
+				const createEditor = this.callbacks.createProviderOrderEditor;
+				if (!createEditor) return null;
+				return {
+					id: def.path,
+					label: def.label,
+					description: def.description,
+					currentValue: `${normalizeProviderOrder(settings.getGlobal("modelProviderOrder") ?? []).length} configured`,
+					submenu: (_currentValue, done) => {
+						const editor = createEditor(() => {
+							this.#activeProviderOrderEditor = null;
+							// Rebuild the parent list from current settings so the
+							// `${count} configured` summary reflects the editor's
+							// persistence before the submenu closes.
+							this.#refreshCurrentTabItems();
+							done();
+						});
+						this.#activeProviderOrderEditor = editor;
+						return editor;
+					},
+				};
+			}
 
 			case "text":
 				return {
@@ -1035,6 +1067,11 @@ export class SettingsSelectorComponent extends Container {
 			options,
 			currentValue,
 			value => {
+				if (def.path === "modelProfile.default") {
+					this.callbacks.onChange(def.path, value);
+					done(value);
+					return;
+				}
 				if (def.path === "pet.mode") {
 					// The shared pet commit policy rechecks capability immediately
 					// before mutation and persists only on acceptance; the settings
@@ -1264,9 +1301,11 @@ export class SettingsSelectorComponent extends Container {
 	}
 
 	/** Re-evaluate condition gates against the current settings and refresh the active list. */
-	#refreshCurrentTabItems(defs: SettingDef[]): void {
+	#refreshCurrentTabItems(defs?: SettingDef[]): void {
 		if (this.#currentTabId === "plugins" || this.#currentTabId === "gjc-bundles" || !this.#currentList) return;
-		this.#currentList.setItems(this.#buildItemsForTab(defs, this.#currentTabId));
+		this.#currentList.setItems(
+			this.#buildItemsForTab(defs ?? getSettingsForTab(this.#currentTabId), this.#currentTabId),
+		);
 	}
 
 	/**
@@ -1335,6 +1374,10 @@ export class SettingsSelectorComponent extends Container {
 
 	override dispose(): void {
 		if (this.#notificationsEditor?.navigationLocked) return;
+		// Release an open provider-order editor (and its context subscriptions)
+		// when the whole selector is torn down without a normal close.
+		this.#activeProviderOrderEditor?.dispose();
+		this.#activeProviderOrderEditor = null;
 		this.#notificationsEditor?.dispose();
 		this.#notificationsEditor = null;
 		this.#gjcBundleComponent?.dispose();

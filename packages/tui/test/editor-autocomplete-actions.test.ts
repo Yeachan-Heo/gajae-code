@@ -217,7 +217,7 @@ class InlineSkillProvider implements AutocompleteProvider {
 	syncCallCount = 0;
 }
 describe("Editor Enter handler sync slash completion", () => {
-	it("auto-triggers slash command autocomplete from an inline slash after prompt text", async () => {
+	it("does not auto-trigger slash command autocomplete after prompt text", async () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider(
 			new CombinedAutocompleteProvider([{ name: "model", description: "Switch model", value: "model" }], "/tmp"),
@@ -226,10 +226,10 @@ describe("Editor Enter handler sync slash completion", () => {
 		editor.handleInput("explain this/");
 		await Bun.sleep(0);
 
-		expect(editor.isShowingAutocomplete()).toBe(true);
+		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 
-	it("auto-triggers slash command autocomplete from an adjacent slash after prompt text", async () => {
+	it("does not auto-trigger slash command autocomplete from an adjacent slash", async () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider(
 			new CombinedAutocompleteProvider([{ name: "help", description: "Learn commands", value: "help" }], "/tmp"),
@@ -238,7 +238,7 @@ describe("Editor Enter handler sync slash completion", () => {
 		editor.handleInput("explain this/");
 		await Bun.sleep(0);
 
-		expect(editor.isShowingAutocomplete()).toBe(true);
+		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 	it("opens path-only autocomplete inside inline code", async () => {
 		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "editor-backtick-path-"));
@@ -349,7 +349,7 @@ describe("Editor Enter handler sync slash completion", () => {
 		expect(editor.getText()).toBe("please read `src/");
 	});
 
-	it("restores command autocomplete after a closed inline-code span", async () => {
+	it("keeps command autocomplete closed after a closed inline-code span", async () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider(
 			new CombinedAutocompleteProvider([{ name: "model", description: "Switch model", value: "model" }], "/tmp"),
@@ -359,10 +359,10 @@ describe("Editor Enter handler sync slash completion", () => {
 		editor.handleInput("o");
 		await Bun.sleep(20);
 
-		expect(editor.isShowingAutocomplete()).toBe(true);
+		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 
-	it("auto-triggers inline slash skill autocomplete after prompt text", async () => {
+	it("does not auto-trigger inline slash skill autocomplete after prompt text", async () => {
 		const provider = new InlineSkillProvider();
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider(provider);
@@ -370,11 +370,11 @@ describe("Editor Enter handler sync slash completion", () => {
 		editor.handleInput("explain with /skill-te");
 		await Bun.sleep(0);
 
-		expect(provider.suggestionCalls).toBeGreaterThan(0);
-		expect(editor.isShowingAutocomplete()).toBe(true);
+		expect(provider.suggestionCalls).toBe(0);
+		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 
-	it("applies inline slash skill completion before submitting", async () => {
+	it("submits inline slash skill text without completion", async () => {
 		const provider = new InlineSkillProvider();
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider(provider);
@@ -387,7 +387,34 @@ describe("Editor Enter handler sync slash completion", () => {
 		await Bun.sleep(0);
 		editor.handleInput("\r");
 
-		expect(submitted).toBe("explain with /skill:team");
+		expect(submitted).toBe("explain with /skill-te");
+	});
+	it("does not synchronously rewrite a slash skill token on a later prompt line", () => {
+		const provider = new InlineSkillProvider();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(provider);
+		let submitted = "";
+		editor.onSubmit = text => {
+			submitted = text;
+		};
+
+		editor.setText("explain this\n/skill-te");
+		editor.handleInput("\r");
+
+		expect(submitted).toBe("explain this\n/skill-te");
+		expect(provider.syncCallCount).toBe(0);
+	});
+	it.each(["\n/m", "  /m"])("shows command completion for prompt-start whitespace: %s", async initialText => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider([{ name: "model", description: "Switch model", value: "model" }], "/tmp"),
+		);
+		editor.setText(initialText);
+
+		editor.handleInput("o");
+		await Bun.sleep(20);
+
+		expect(editor.isShowingAutocomplete()).toBe(true);
 	});
 	it("submits an inline-code skill token without synchronous Enter completion", () => {
 		const provider = new InlineSkillProvider();

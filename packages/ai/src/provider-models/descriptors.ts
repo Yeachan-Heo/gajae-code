@@ -51,6 +51,7 @@ import {
 import {
 	cursorModelManagerOptions,
 	glmZcodeModelManagerOptions,
+	jetbrainsJunieModelManagerOptions,
 	openCodexModelManagerOptions,
 	zaiModelManagerOptions,
 } from "./special";
@@ -346,6 +347,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => glmZcodeModelManagerOptions(config),
 		catalog("GLM ZCode (unofficial)", ["GLM_ZCODE_API_KEY"], { oauthProvider: "glm-zcode" }),
 	),
+	descriptor("jetbrains-junie", "claude-sonnet-4-6", config => jetbrainsJunieModelManagerOptions(config)),
 	descriptor("github-copilot", "gpt-4o", config => githubCopilotModelManagerOptions(config)),
 	descriptor("google", "gemini-2.5-pro", config => googleModelManagerOptions(config)),
 	catalogDescriptor(

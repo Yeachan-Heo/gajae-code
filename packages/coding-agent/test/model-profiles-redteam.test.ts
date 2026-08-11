@@ -22,20 +22,17 @@ function profileConfig(modelSelector: string) {
 }
 
 describe("model profile red-team schema and catalog cases", () => {
-	test("required_providers rejects empty arrays", () => {
+	test("required_providers accepts an empty array for provider-agnostic profiles", () => {
 		const result = ModelsConfigSchema.safeParse({
 			profiles: {
-				bad: {
+				agnostic: {
 					required_providers: [],
-					model_mapping: { default: "provider/model" },
+					model_mapping: { default: "glm-5.2:high" },
 				},
 			},
 		});
 
-		expect(result.success).toBe(false);
-		if (!result.success) {
-			expect(issuePaths(result.error)).toContain("profiles.bad.required_providers");
-		}
+		expect(result.success).toBe(true);
 	});
 
 	test("model_mapping accepts a partial one-role mapping", () => {
@@ -68,20 +65,23 @@ describe("model profile red-team schema and catalog cases", () => {
 	});
 
 	test.each([
-		["missing slash", "providermodel"],
 		["empty provider", "/model"],
 		["empty model", "provider/"],
 		["trailing colon", "provider/model:"],
-		["bogus effort", "provider/model:ultra"],
-		["double effort", "provider/model:high:low"],
 	])("selector rejects %s", (_label, selector) => {
 		const result = ModelsConfigSchema.safeParse(profileConfig(selector));
 
 		expect(result.success).toBe(false);
 		if (!result.success) {
 			expect(issuePaths(result.error)).toContain("profiles.bad.model_mapping.default");
-			expect(result.error.issues[0]?.message).toBe("Expected provider/modelId with optional :effort suffix");
+			expect(result.error.issues[0]?.message).toBe(
+				"Expected modelId or provider/modelId with optional :effort suffix",
+			);
 		}
+	});
+
+	test.each(["provider/model:ultra", "provider/model:high:low"])("selector accepts colon route %s", selector => {
+		expect(ModelsConfigSchema.safeParse(profileConfig(selector)).success).toBe(true);
 	});
 
 	test("profile definitions strictly reject extra fields", () => {

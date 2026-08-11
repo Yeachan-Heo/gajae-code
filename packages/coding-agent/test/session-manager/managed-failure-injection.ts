@@ -34,6 +34,10 @@ export type ManagedInjectionHandle = {
 	assertHit: () => void;
 };
 
+type ManagedAppendOutcomeInjectionHandle = ManagedInjectionHandle & {
+	realAppendCalls: () => number;
+};
+
 function handle(hits: { n: number }, restore: () => void): ManagedInjectionHandle {
 	return {
 		restore,
@@ -171,38 +175,6 @@ export function injectManagedFileRename(
 	impl: (source: string, destination: string) => ReturnType<typeof publishFailure> | "passthrough",
 ): ManagedInjectionHandle {
 	const hits = { n: 0 };
-	if (process.platform === "linux") {
-		const real = native.RecoveryFsRoot.prototype.renameManagedFileNoReplace;
-		const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "renameManagedFileNoReplace").mockImplementation(function (
-			this: native.RecoveryFsRoot,
-			sourceRelativePath,
-			destinationRelativePath,
-			expectedDev,
-			expectedIno,
-			expectedSize,
-			expectedMtimeNs,
-			expectedCtimeNs,
-			expectedSha256,
-		) {
-			const result = impl(String(sourceRelativePath), String(destinationRelativePath));
-			if (result === "passthrough") {
-				return real.call(
-					this,
-					sourceRelativePath,
-					destinationRelativePath,
-					expectedDev,
-					expectedIno,
-					expectedSize,
-					expectedMtimeNs,
-					expectedCtimeNs,
-					expectedSha256,
-				);
-			}
-			hits.n += 1;
-			return result;
-		});
-		return handle(hits, () => spy.mockRestore());
-	}
 	const real = native.renameNoReplacePath;
 	const spy = vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
 		const result = impl(String(source), String(destination));
@@ -213,8 +185,8 @@ export function injectManagedFileRename(
 	return handle(hits, () => spy.mockRestore());
 }
 
-/** Inject managed append failures (moveTo cwd header_patch). */
-export function injectManagedAppend(
+/** Inject a failure before a managed append starts (moveTo cwd header_patch). */
+export function injectManagedAppendPreCommit(
 	impl: (relativePath: string, data: Uint8Array) => { ok: false; code: string } | "passthrough",
 ): ManagedInjectionHandle {
 	const hits = { n: 0 };
@@ -247,7 +219,7 @@ export function injectManagedAppend(
 				);
 			}
 			hits.n += 1;
-			return result;
+			throw new Error(result.code);
 		});
 		return handle(hits, () => spy.mockRestore());
 	}
@@ -270,4 +242,44 @@ export function injectManagedAppend(
 		return realWrite(...args);
 	} as typeof fs.writeSync);
 	return handle(hits, () => spy.mockRestore());
+}
+
+/** Commit a Linux managed append, then report an ambiguous failed outcome. */
+export function injectManagedAppendOutcomeUncertain(
+	impl: (relativePath: string, data: Uint8Array) => { ok: false; code: string } | "passthrough",
+): ManagedAppendOutcomeInjectionHandle {
+	if (process.platform !== "linux") throw new Error("managed_append_post_commit_injection_unsupported");
+	const hits = { n: 0 };
+	const realAppendCalls = { n: 0 };
+	const real = native.RecoveryFsRoot.prototype.appendManaged;
+	const spy = vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
+		this: native.RecoveryFsRoot,
+		relativePath,
+		data,
+		expectedDev,
+		expectedIno,
+		expectedSize,
+		expectedMtimeNs,
+		expectedCtimeNs,
+		expectedSha256,
+	) {
+		const bytes = data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBuffer);
+		const result = impl(String(relativePath), bytes);
+		realAppendCalls.n += 1;
+		const committed = real.call(
+			this,
+			relativePath,
+			data,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		);
+		if (result === "passthrough" || !committed.ok) return committed;
+		hits.n += 1;
+		return result;
+	});
+	return { ...handle(hits, () => spy.mockRestore()), realAppendCalls: () => realAppendCalls.n };
 }

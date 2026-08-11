@@ -4,7 +4,7 @@ import { Agent } from "@gajae-code/agent-core";
 import type { AssistantMessage, Model, ProviderSessionState } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
@@ -201,6 +201,42 @@ describe("AgentSession context promotion", () => {
 		// exactly once.
 		await session.setModel(codexModel, "default", { cause: "user-selection" });
 		expect(closeSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps an untyped zero-token proxy empty stop on the promotion path", async () => {
+		const sparkModel = modelRegistry.find("openai-codex", "gpt-5.3-codex-spark");
+		const codexModel = modelRegistry.find("openai-codex", "gpt-5.5");
+		if (!sparkModel || !codexModel) throw new Error("Expected codex spark and codex models to exist");
+
+		const agent = new Agent({
+			initialState: { model: sparkModel, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"contextPromotion.enabled": true,
+				"retry.maxRetries": 3,
+			}),
+			modelRegistry,
+		});
+		const retryStarts: AgentSessionEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStarts.push(event);
+		});
+
+		const proxyOverflow: AssistantMessage = {
+			...createOverflowMessage(sparkModel),
+			content: [],
+			stopReason: "stop",
+			errorMessage: undefined,
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: proxyOverflow });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [proxyOverflow] });
+
+		await waitFor(() => session.model?.id === codexModel.id);
+		expect(retryStarts).toHaveLength(0);
 	});
 
 	it("does not promote or continue typed provider safety stops", async () => {

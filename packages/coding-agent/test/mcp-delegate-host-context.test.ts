@@ -276,7 +276,7 @@ describe("MCP delegate-flow host context", () => {
 			dispatchGjcNativeSkillHook(
 				{
 					hookEventName: "UserPromptSubmit",
-					userPrompt: "ultragoal continue this objective",
+					userPrompt: "$ultragoal continue objective",
 					cwd: root,
 					sessionId: "skill-after-persist-failure",
 				},
@@ -294,7 +294,7 @@ describe("MCP delegate-flow host context", () => {
 		await dispatchGjcNativeSkillHook(
 			{
 				hookEventName: "UserPromptSubmit",
-				userPrompt: "ultragoal continue this objective",
+				userPrompt: "$ultragoal continue this objective",
 				cwd: root,
 				sessionId,
 			},
@@ -304,7 +304,7 @@ describe("MCP delegate-flow host context", () => {
 		expect(await readVisibleSkillActiveState(root, sessionId)).toMatchObject({
 			active: true,
 			skill: "ultragoal",
-			keyword: "ultragoal",
+			keyword: "$ultragoal",
 		});
 	});
 });

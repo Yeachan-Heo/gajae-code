@@ -1,0 +1,247 @@
+/**
+ * Versioned DTO rows for `gjc sdk session` semantic verbs (row DTO v1, DR-12).
+ *
+ * Every semantic verb renders its output through these rows so machine
+ * consumers get one deterministic, versioned envelope per verb. Credentials
+ * are never part of the row schema: broker `session.list` rows carry no
+ * credentials, offline inspect rows are projected from endpoint discovery
+ * records with secret-shaped fields stripped before they can reach a row, and
+ * pass-through host payloads are redacted recursively before rendering.
+ */
+
+export const SESSION_ROWS_VERSION = 1;
+
+export type SdkSessionActivityState = "active" | "idle";
+
+export interface SdkSessionActivityV1 {
+	state: SdkSessionActivityState;
+	at: number;
+}
+
+export interface SdkSessionRowV1 {
+	sessionId: string;
+	locator: { repo: string; stateRoot: string };
+	endpointGeneration: number;
+	/** Process-bound incarnation of the hosting process (C1); absent for legacy-provenance rows. */
+	hostIncarnation?: string;
+	pid: number;
+	live: boolean;
+	/** Tombstone flag (C4): deleted sessions are excluded from list/endpoint/resumable surfaces. */
+	deleted: boolean;
+	indexSeq: number;
+	terminalUncertain?: boolean;
+	lifecycleRequestId?: string;
+	endpointMtimeMs?: number;
+	/** Coalesced broker-owned heartbeat checkpoint (C2). */
+	activity?: SdkSessionActivityV1;
+	/** Wall-clock timestamp of the latest admitted heartbeat, when one exists. */
+	lastHeartbeatAt?: number;
+	/** "legacy" for v1/v2-era rows that predate process-incarnation identity. */
+	identityProvenance?: "composite" | "legacy";
+	/** True when the same sessionId maps to more than one stateRoot (cross-repo duplicate). */
+	ambiguous?: boolean;
+}
+
+export interface SdkCheckpointRecordV1 {
+	revision: number;
+	generation: number;
+	seq: number;
+}
+
+export interface SdkRetentionGapV1 {
+	code: "retention_gap";
+	missing?: { from: number; to: number };
+	resync?: SdkCheckpointRecordV1;
+}
+
+/** One tail item: a retained transcript entry or a live event-ring event. */
+export interface SdkTailItemV1 {
+	/** "transcript" for retained transcript entries, otherwise the event-ring kind. */
+	kind: string;
+	id?: string;
+	generation?: number;
+	seq?: number;
+	payload: unknown;
+}
+
+export interface SdkTailEnvelopeV1 {
+	version: typeof SESSION_ROWS_VERSION;
+	source: "session" | "offline";
+	session: SdkSessionRowV1;
+	checkpoint?: SdkCheckpointRecordV1;
+	gap?: SdkRetentionGapV1;
+	items: SdkTailItemV1[];
+}
+
+const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
+
+/** Recursively removes secret-shaped fields (defense in depth for DTO output). */
+export function stripSecretFields(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(stripSecretFields);
+	if (!value || typeof value !== "object") return value;
+	const out: Record<string, unknown> = {};
+	for (const [key, nested] of Object.entries(value)) {
+		if (SECRET_FIELD.test(key)) continue;
+		out[key] = stripSecretFields(nested);
+	}
+	return out;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function optionalFiniteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function locatorOf(row: Record<string, unknown>): { repo: string; stateRoot: string } {
+	const locator = isRecord(row.locator) ? row.locator : {};
+	return {
+		repo: optionalString(locator.repo) ?? "unknown",
+		stateRoot: optionalString(locator.stateRoot) ?? "unknown",
+	};
+}
+
+function activityOf(row: Record<string, unknown>): SdkSessionActivityV1 | undefined {
+	if (!isRecord(row.activity)) return undefined;
+	const state = row.activity.state;
+	const at = row.activity.at;
+	if ((state !== "active" && state !== "idle") || typeof at !== "number" || !Number.isFinite(at)) return undefined;
+	return { state, at };
+}
+
+/**
+ * Projects one broker `session.list` row into the credential-free v1 row DTO.
+ * The row is a superset-tolerant projection: identity fields introduced by
+ * later index versions (hostIncarnation, activity, deleted) pass through when
+ * present and are omitted otherwise, so the same mapper serves both v2 and v3
+ * index shapes.
+ */
+export function toSessionRowV1(value: unknown): SdkSessionRowV1 {
+	if (!isRecord(value)) throw new Error("session row is not a record");
+	const sessionId = optionalString(value.sessionId);
+	if (!sessionId) throw new Error("session row is missing sessionId");
+	const pid = typeof value.pid === "number" && Number.isSafeInteger(value.pid) ? value.pid : 0;
+	const endpointGeneration =
+		typeof value.endpointGeneration === "number" && Number.isSafeInteger(value.endpointGeneration)
+			? value.endpointGeneration
+			: 0;
+	const indexSeq = typeof value.indexSeq === "number" && Number.isSafeInteger(value.indexSeq) ? value.indexSeq : 0;
+	const row: SdkSessionRowV1 = {
+		sessionId,
+		locator: locatorOf(value),
+		endpointGeneration,
+		pid,
+		live: value.live === true,
+		deleted: value.deleted === true,
+		indexSeq,
+	};
+	const hostIncarnation = optionalString(value.hostIncarnation);
+	if (hostIncarnation !== undefined) row.hostIncarnation = hostIncarnation;
+	if (value.terminalUncertain === true) row.terminalUncertain = true;
+	const lifecycleRequestId = optionalString(value.lifecycleRequestId);
+	if (lifecycleRequestId !== undefined) row.lifecycleRequestId = lifecycleRequestId;
+	const endpointMtimeMs = optionalFiniteNumber(value.endpointMtimeMs);
+	if (endpointMtimeMs !== undefined) row.endpointMtimeMs = endpointMtimeMs;
+	const activity = activityOf(value);
+	if (activity !== undefined) row.activity = activity;
+	const lastHeartbeatAt = optionalFiniteNumber(value.lastHeartbeatAt);
+	if (lastHeartbeatAt !== undefined) row.lastHeartbeatAt = lastHeartbeatAt;
+	if (value.identityProvenance === "composite" || value.identityProvenance === "legacy")
+		row.identityProvenance = value.identityProvenance;
+	if (value.ambiguous === true) row.ambiguous = true;
+	return row;
+}
+
+/**
+ * Offline inspect row projected from a local SDK endpoint discovery record.
+ * The discovery record carries the endpoint credential (`url`/`token`); neither
+ * is ever projected into the row. `path` is the endpoint file
+ * `<stateRoot>/sdk/<sessionId>.json`, so the state root is recovered from the
+ * path when the layout matches.
+ */
+export function toOfflineSessionRowV1(value: unknown): SdkSessionRowV1 {
+	if (!isRecord(value)) throw new Error("endpoint discovery record is not a record");
+	const sessionId = optionalString(value.sessionId);
+	if (!sessionId) throw new Error("endpoint discovery record is missing sessionId");
+	const pid = typeof value.pid === "number" && Number.isSafeInteger(value.pid) ? value.pid : 0;
+	const stale = value.stale === true;
+	const rawPath = optionalString(value.path);
+	const stateRoot =
+		rawPath !== undefined && /[\\/]sdk[\\/][^\\/]+\.json$/.test(rawPath)
+			? rawPath.replace(/[\\/]sdk[\\/][^\\/]+\.json$/, "")
+			: rawPath !== undefined
+				? rawPath.replace(/[\\/][^\\/]+\.json$/, "")
+				: "unknown";
+	const row: SdkSessionRowV1 = {
+		sessionId,
+		locator: { repo: "unknown", stateRoot },
+		endpointGeneration: 0,
+		pid,
+		live: !stale,
+		deleted: false,
+		indexSeq: 0,
+	};
+	return row;
+}
+
+export function toCheckpointRecordV1(value: unknown): SdkCheckpointRecordV1 | undefined {
+	if (!isRecord(value)) return undefined;
+	const revision = value.revision;
+	const generation = value.generation;
+	const seq = value.seq;
+	if (
+		typeof revision !== "number" ||
+		!Number.isSafeInteger(revision) ||
+		revision < 0 ||
+		typeof generation !== "number" ||
+		!Number.isSafeInteger(generation) ||
+		generation < 0 ||
+		typeof seq !== "number" ||
+		!Number.isSafeInteger(seq) ||
+		seq < 0
+	)
+		return undefined;
+	return { revision, generation, seq };
+}
+
+export function toRetentionGapV1(value: unknown): SdkRetentionGapV1 | undefined {
+	if (!isRecord(value) || value.code !== "retention_gap") return undefined;
+	const gap: SdkRetentionGapV1 = { code: "retention_gap" };
+	if (isRecord(value.missing)) {
+		const from = value.missing.from;
+		const to = value.missing.to;
+		if (typeof from === "number" && Number.isSafeInteger(from) && typeof to === "number" && Number.isSafeInteger(to))
+			gap.missing = { from, to };
+	}
+	const resync = toCheckpointRecordV1(value.resync);
+	if (resync !== undefined) gap.resync = resync;
+	return gap;
+}
+
+/** Projects a transcript entry or ring event into a tail item with dedupe keys. */
+export function toTailItemV1(
+	value: unknown,
+	fallback: { kind: string; generation?: number; seq?: number },
+): SdkTailItemV1 {
+	if (!isRecord(value)) return { kind: fallback.kind, payload: stripSecretFields(value) };
+	const kind = optionalString(value.kind) ?? fallback.kind;
+	const id = optionalString(value.id);
+	const payload = isRecord(value.payload) ? (value.payload as Record<string, unknown>) : value;
+	const payloadId = optionalString(payload.id);
+	const item: SdkTailItemV1 = {
+		kind,
+		...(payloadId !== undefined ? { id: payloadId } : id !== undefined ? { id } : {}),
+		...(typeof value.generation === "number" ? { generation: value.generation } : {}),
+		...(typeof value.seq === "number" ? { seq: value.seq } : {}),
+		payload: stripSecretFields(payload),
+	};
+	if (fallback.generation !== undefined && item.generation === undefined) item.generation = fallback.generation;
+	if (fallback.seq !== undefined && item.seq === undefined) item.seq = fallback.seq;
+	return item;
+}

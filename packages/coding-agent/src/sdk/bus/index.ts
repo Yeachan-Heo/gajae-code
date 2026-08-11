@@ -24,6 +24,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -48,7 +49,7 @@ function sdkBusNatives(): NativeSdkBusBindings {
 type NotificationServer = NativeNotificationServer;
 
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
-import { Settings } from "../../config/settings";
+import { Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
 import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
@@ -80,11 +81,22 @@ import {
 } from "../../tools/ask-answer-registry";
 import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
+import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
+import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
+import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
-import { type ControlSurface, dispatchControl } from "../host/control";
+import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
+import {
+	parseSyntheticModelId,
+	resolveSyntheticModelSelection,
+	SYNTHETIC_PROVIDER_ID,
+	syntheticModelInputError,
+	syntheticNamespaceCollision,
+} from "../model-profile-model";
+import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
@@ -120,7 +132,7 @@ import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMess
 import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
-import { createPromptReconciliation, sanitizePromptFailure } from "./prompt-reconciliation";
+import { createPromptReconciliation } from "./prompt-reconciliation";
 import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import type { SlackConversation } from "./slack-conversation";
@@ -146,6 +158,40 @@ export {
 
 const PROMPT_SETTLEMENT_DIAGNOSTIC_ENTRY_LIMIT = 8;
 const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
+/**
+ * Upper bound on the failure reason copied into the local operator log. Mirrors
+ * the 512-char bound documented for reconciliation failure messages so a runaway
+ * provider error cannot flood the log file.
+ */
+const PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX = 512;
+type PromptTerminalDiagnostic = {
+	reason?: unknown;
+	loopStopReason?: string;
+	assistantStopReason?: string;
+	errorKind?: string;
+	intentionalCancellation?: boolean;
+};
+
+type PromptTerminalExtra = {
+	finalText?: string;
+	error?: { code: string; message: string };
+	diagnostic?: PromptTerminalDiagnostic;
+	diagnosticAlreadyLogged?: boolean;
+};
+
+function formatPromptTerminalFailureReason(reason: unknown): string {
+	let rawReason: string;
+	if (reason instanceof Error) rawReason = reason.message;
+	else if (typeof reason === "string") rawReason = reason;
+	else if (reason === undefined || reason === null) return "unreported";
+	else
+		try {
+			rawReason = String(reason);
+		} catch {
+			return "unreported";
+		}
+	return rawReason ? rawReason.slice(0, PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX) : "unreported";
+}
 
 export function formatPromptSettlementDiagnostic(
 	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
@@ -1163,6 +1209,8 @@ interface SessionRuntime {
 	/** Terminal cleanup proof retained across retries; each owner is released at most once after proof. */
 	hostStopped: boolean;
 	serverStopped: boolean;
+	/** This runtime's own host-liveness publication; only its teardown may retract it. */
+	evidencePublication?: SessionHostRuntimePublication;
 	brokerRegistrationReleased: boolean;
 	/** Managed Telegram root registration released during terminal teardown. */
 	notificationRootRegistration?: { settings: Settings; cwd: string; registrationToken: string };
@@ -1185,11 +1233,8 @@ interface SessionRuntime {
 	terminalizePrompt: (
 		correlation: { commandId: string; turnId: string },
 		outcome: SdkPromptTerminalOutcome,
-		extra?: { finalText?: string },
+		extra?: PromptTerminalExtra,
 	) => Promise<void>;
-	/** Records a correlated prompt terminal boundary after agent unwind. */
-	/** Atomically claims a correlated prompt terminal boundary after agent unwind. */
-	recordPromptTerminal: (correlation: { commandId: string; turnId: string } | undefined) => boolean;
 	/** Transitions the authoritative reconciliation record at lifecycle ingress; terminal outcomes settle once. */
 	notePromptReconciliation: (
 		correlation: { commandId: string; turnId: string } | undefined,
@@ -2243,6 +2288,7 @@ function sdkQuerySurface(
 		followupQueueDepth: 0,
 	}),
 	configOverrides: ReadonlyMap<string, unknown> = new Map(),
+	settings: Settings | undefined = undefined,
 	promptStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
 		status: "unknown",
 	}),
@@ -2257,6 +2303,7 @@ function sdkQuerySurface(
 		getInstalledDefinitions,
 		getLiveState,
 		configOverrides,
+		settings,
 		promptStatusLookup,
 		skillStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
@@ -2272,6 +2319,49 @@ function containsSecretConfigKey(value: unknown, seen = new Set<object>()): bool
 		([key, nested]) =>
 			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
 			containsSecretConfigKey(nested, seen),
+	);
+}
+
+function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
+	const before = new Map<string, unknown>();
+	for (const key of configOverrides.keys()) {
+		try {
+			before.set(key, settings.get(key as never));
+		} catch {
+			before.set(key, undefined);
+		}
+	}
+	return before;
+}
+
+function reconcileConfigOverridesShadow(
+	settings: Settings,
+	configOverrides: Map<string, unknown>,
+	before: ReadonlyMap<string, unknown>,
+): void {
+	for (const [key, prior] of before) {
+		let current: unknown;
+		try {
+			current = settings.get(key as never);
+		} catch {
+			current = undefined;
+		}
+		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
+	}
+}
+
+function deepStructuralEqual(left: unknown, right: unknown): boolean {
+	if (Object.is(left, right)) return true;
+	if (Array.isArray(left) && Array.isArray(right))
+		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
+	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
+	const leftRecord = left as Record<string, unknown>;
+	const rightRecord = right as Record<string, unknown>;
+	const leftKeys = Object.keys(leftRecord);
+	const rightKeys = Object.keys(rightRecord);
+	return (
+		leftKeys.length === rightKeys.length &&
+		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
 	);
 }
 
@@ -2297,6 +2387,7 @@ function sdkControlSurface(
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
+	elevationAuthorityToken?: string,
 	abortOwnedPrompt: (
 		connectionId: string | undefined,
 	) => Promise<{ aborted: true; disposition: "cancelled" | "already_terminal" | "idle" }> = async () => ({
@@ -2374,6 +2465,55 @@ function sdkControlSurface(
 				: ctx.modelRegistry.getAll().find(candidate => candidate.id === id);
 		if (!model) throw Object.assign(new Error(`Model ${id} was not found.`), { code: "invalid_input" });
 		return model;
+	};
+	/**
+	 * `config.patch` records patched values in `configOverrides` so query
+	 * readback shows them, but a serialized activation that rewrites the same
+	 * setting (e.g. `modelRoles` cleared by persist-default activation) does not
+	 * touch the shadow — leaving `config.list/get` reporting a stale patch as
+	 * authoritative. After the admitted mutation completes, drop any shadowed
+	 * key whose live settings value changed so the durable value wins.
+	 */
+
+	/**
+	 * Route a synthetic `gajae-code/<profile>` model selection into the
+	 * session-scoped activation transaction. ACP model selection never writes a
+	 * global profile default; persistence remains an explicit TUI choice. Only
+	 * an absent or `off` thinking level is forwarded (synthetic rows advertise
+	 * `validLevels: ["off"]`); any other level is rejected before admission.
+	 * A user-defined provider under the reserved namespace fails closed rather
+	 * than being shadowed. With a thinking level, the typed host surface returns
+	 * the pinned `DefaultModelSelectionResult`-shaped result.
+	 */
+	const setSyntheticModel = async (id: string, requestedThinkingLevel: unknown) => {
+		const hasLevel = requestedThinkingLevel !== undefined;
+		const thinkingLevel =
+			typeof requestedThinkingLevel === "string" ? parseThinkingLevel(requestedThinkingLevel) : undefined;
+		if (
+			hasLevel &&
+			(!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit || thinkingLevel !== ThinkingLevel.Off)
+		)
+			throw syntheticModelInputError('model.set thinkingLevel for a synthetic profile must be "off".');
+		const profiles = ctx.modelRegistry.getModelProfiles();
+		const resolved = resolveSyntheticModelSelection(id, profiles, ctx.modelRegistry.getError?.());
+		if (syntheticNamespaceCollision(ctx.modelRegistry.getAll(), ctx.modelRegistry.getConfiguredProviderIds?.() ?? []))
+			throw syntheticModelInputError(
+				`The ${SYNTHETIC_PROVIDER_ID} namespace is reserved; synthetic preset selection is disabled while a provider of the same name is configured.`,
+			);
+		const setDefaultModelProfile = ctx.setDefaultModelProfile;
+		if (!bindings.has("setDefaultModelProfile") || !setDefaultModelProfile)
+			return unavailable("model.set", "no default model-profile seam is installed")();
+		await setDefaultModelProfile(resolved.canonicalName, {
+			persistDefault: false,
+			...(hasLevel ? { thinkingLevelOverride: ThinkingLevel.Off } : {}),
+		});
+		return hasLevel
+			? {
+					provider: SYNTHETIC_PROVIDER_ID,
+					modelId: resolved.canonicalName,
+					thinkingLevel: ThinkingLevel.Off,
+				}
+			: { changed: true };
 	};
 	const unavailablePerSession = (operation: string) =>
 		unavailable(operation, "the registry classifies it outside the per-session extension host");
@@ -2547,6 +2687,9 @@ function sdkControlSurface(
 		cancelPendingPreflights(): void;
 		cancelPendingPreflightsForConnection(connectionId: string): void;
 	} = {
+		authorizeElevationClaim: (sdkId, input, capability) =>
+			elevationAuthorityToken !== undefined &&
+			verifyElevationCapability(elevationAuthorityToken, capability, sdkId, input),
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
 		steer: text => sendSteer(text),
@@ -2581,7 +2724,7 @@ function sdkControlSurface(
 			pending.completeDirect();
 			return { resolved: true };
 		},
-		answerGate: async (id, response, expectedSessionId, idempotencyKey) => {
+		answerGate: async (id, response, expectedSessionId, idempotencyKey, _elevationRequestId) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.gate_answer");
@@ -2656,7 +2799,7 @@ function sdkControlSurface(
 				code: "terminal_uncertain",
 			});
 		},
-		approvePlan: async (id, choice, expectedSessionId) => {
+		approvePlan: async (id, choice, expectedSessionId, _elevationRequestId) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.plan_approve");
@@ -2835,8 +2978,22 @@ function sdkControlSurface(
 		},
 		replaceTodo: items => typed("todo.replace", { items }),
 		setModel: async (id, requestedThinkingLevel) => {
+			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, requestedThinkingLevel);
 			const model = resolveModel(id);
-			if (requestedThinkingLevel === undefined) return { changed: await api.setModel(model) };
+			if (requestedThinkingLevel === undefined) {
+				// The extension seam is not admission-bound, so serialize it (and the
+				// Q13 shadow capture/reconcile) against config.patch through the
+				// session admission boundary.
+				const run = async () => {
+					const shadowBefore = settings ? captureConfigOverridesShadow(settings, configOverrides) : undefined;
+					const changed = await api.setModel(model);
+					if (settings && shadowBefore) reconcileConfigOverridesShadow(settings, configOverrides, shadowBefore);
+					return { changed };
+				};
+				return typeof (ctx as Partial<ExtensionContext>).withSdkControlMutation === "function"
+					? ctx.withSdkControlMutation!(run)
+					: run();
+			}
 			const thinkingLevel =
 				typeof requestedThinkingLevel === "string" ? parseThinkingLevel(requestedThinkingLevel) : undefined;
 			if (!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit)
@@ -2844,7 +3001,21 @@ function sdkControlSurface(
 					new Error("model.set thinkingLevel must be off, minimal, low, medium, high, xhigh, or max."),
 					{ code: "invalid_input" },
 				);
-			return typed("model.set", { id: `${model.provider}/${model.id}`, thinkingLevel });
+			// The typed concrete selection already admits internally; run the Q13
+			// shadow capture/reconcile inside that same admission via internal
+			// hooks so a concurrent config.patch cannot race the snapshot.
+			let shadowBefore: Map<string, unknown> | undefined;
+			const capture = () =>
+				(shadowBefore = settings ? captureConfigOverridesShadow(settings, configOverrides) : undefined);
+			const reconcile = () => {
+				if (settings && shadowBefore) reconcileConfigOverridesShadow(settings, configOverrides, shadowBefore);
+			};
+			const result = await typed("model.set", {
+				id: `${model.provider}/${model.id}`,
+				thinkingLevel,
+				...(settings ? { onBeforeMutation: capture, onAfterMutation: reconcile } : {}),
+			});
+			return result;
 		},
 		setModelProfile: async id => {
 			if (!bindings.has("setModelProfile") || !ctx.setModelProfile)
@@ -2908,12 +3079,28 @@ function sdkControlSurface(
 				throw Object.assign(new Error("config.patch rejects secret fields at the SDK host."), {
 					code: "invalid_input",
 				});
+			const patchIssues = validateSettingPatch(patch as Record<string, unknown>);
+			if (patchIssues.length > 0) {
+				const detail = patchIssues.map(issue => `${issue.path} (${issue.detail})`).join("; ");
+				throw Object.assign(new Error(`config.patch rejects invalid settings: ${detail}`), {
+					code: "invalid_input",
+				});
+			}
 			if (!settings) return unavailable("config.patch", "configuration settings are unavailable for this session")();
-			const entries = Object.entries(patch as Record<string, unknown>);
-			for (const [key, value] of entries) settings.set(key as never, value as never);
-			for (const [key, value] of entries) configOverrides.set(key, value);
-			configRevision.current += 1;
-			return { patched: entries.map(([key]) => key), revision: String(configRevision.current) };
+			const applyPatch = async () => {
+				const entries = Object.entries(patch as Record<string, unknown>);
+				for (const [key, value] of entries) settings.set(key as never, value as never);
+				for (const [key, value] of entries) configOverrides.set(key, value);
+				configRevision.current += 1;
+				return { patched: entries.map(([key]) => key), revision: String(configRevision.current) };
+			};
+			// Serialize config mutations against synthetic profile activation and
+			// default-model selection so an interleaved patch can never be lost or
+			// clobbered by an activation rollback (plan criterion 8).
+			if (typeof (ctx as Partial<ExtensionContext>).withSdkControlMutation === "function") {
+				return ctx.withSdkControlMutation!(applyPatch);
+			}
+			return applyPatch();
 		},
 
 		reloadRuntime: components => typed("runtime.reload", { components }),
@@ -3604,6 +3791,13 @@ export function createNotificationsExtension(
 				await rt.server.stopAndWait();
 				serverStopped = true;
 				rt.serverStopped = true;
+				// This runtime no longer serves an SDK endpoint, so it withdraws its
+				// own evidence — and only its own. A predecessor's deferred teardown
+				// runs while an identity successor is already serving, and clearing
+				// that live runtime's reader would manufacture "no evidence" for a
+				// host whose clients are still attached.
+				rt.evidencePublication?.retract();
+				rt.evidencePublication = undefined;
 			} catch (e) {
 				ownerReleaseFailures.push(e);
 				logger.warn(`notifications: stop failed: ${String(e)}`);
@@ -3730,6 +3924,11 @@ export function createNotificationsExtension(
 		// build information and required capability while lifecycle startup can settle
 		// a structured failure instead of leaving the lifecycle caller pending.
 		const token = resolveToken();
+		const elevationAuthorityToken = crypto.randomBytes(32).toString("base64url");
+		const elevationAuthorityFile = elevationAuthorityPath(endpointStateRoot, id);
+		await fsPromises.mkdir(path.dirname(elevationAuthorityFile), { recursive: true, mode: 0o700 });
+		await Bun.write(elevationAuthorityFile, `${JSON.stringify({ version: 1, token: elevationAuthorityToken })}\n`);
+		await fsPromises.chmod(elevationAuthorityFile, 0o600);
 		let server: NotificationServer;
 		try {
 			const { NotificationServer, nativeBuildInfo } = sdkBusNatives();
@@ -3902,7 +4101,6 @@ export function createNotificationsExtension(
 			connectionId: string;
 			abandoned: boolean;
 			failed: boolean;
-			error: unknown;
 			terminal: boolean;
 			retainCorrelation: boolean;
 			/** Fatal/uncertain closure: transport-level only, never a semantic terminal. */
@@ -4101,7 +4299,6 @@ export function createNotificationsExtension(
 				connectionId: requesterConnectionId,
 				abandoned: false,
 				failed: false,
-				error: undefined,
 				terminal: false,
 				retainCorrelation: trackReconciliation,
 				createdAt: Date.now(),
@@ -4123,6 +4320,7 @@ export function createNotificationsExtension(
 						provenance: "deadline",
 					},
 					{ fence: true },
+					{ diagnostic: { reason: "Prompt deadline exceeded." } },
 				);
 			}, submission.deadlineMs);
 		};
@@ -4209,7 +4407,7 @@ export function createNotificationsExtension(
 			// run and prove settlement. A natural `agent_end`/`agent_failed` already unwound,
 			// so aborting there would cancel the next turn instead of fencing this one.
 			options: { fence?: boolean } = {},
-			extra?: { finalText?: string; error?: { code: string; message: string } },
+			extra?: PromptTerminalExtra,
 		) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
@@ -4281,6 +4479,24 @@ export function createNotificationsExtension(
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			if (!recordPromptTerminal(correlation) || !runtime) return;
+			if (
+				winner.kind === "failed" &&
+				extra?.diagnostic?.intentionalCancellation !== true &&
+				extra?.diagnosticAlreadyLogged !== true
+			) {
+				const diagnostic = extra?.diagnostic;
+				logger.error("sdk_prompt_terminal_failed", {
+					sessionId: id,
+					commandId: correlation.commandId,
+					turnId: correlation.turnId,
+					code: winner.code,
+					provenance: winner.provenance,
+					...(diagnostic?.loopStopReason ? { loopStopReason: diagnostic.loopStopReason } : {}),
+					...(diagnostic?.assistantStopReason ? { assistantStopReason: diagnostic.assistantStopReason } : {}),
+					...(diagnostic?.errorKind ? { errorKind: diagnostic.errorKind } : {}),
+					reason: formatPromptTerminalFailureReason(diagnostic?.reason),
+				});
+			}
 			if (winner.kind === "failed") {
 				emitPromptLifecycle(correlation, {
 					type: "agent_failed",
@@ -4300,26 +4516,41 @@ export function createNotificationsExtension(
 			}
 		};
 		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
+			logger.error("SDK prompt submission failed", {
+				commandId: correlation.commandId,
+				turnId: correlation.turnId,
+				error: formatPromptFailureForLocalLog(error),
+			});
 			const sanitized = sanitizePromptFailure(error);
+			const outcome: SdkPromptTerminalOutcome = {
+				kind: "failed",
+				code: "prompt_failed",
+				message: sanitized.message,
+				provenance: "agent_failed",
+			};
+			// This rejection bypasses `agent_end`, so record its local-only reason at
+			// the accepted submission failure boundary before terminalization begins.
+			logger.error("sdk_prompt_terminal_failed", {
+				sessionId: id,
+				commandId: correlation.commandId,
+				turnId: correlation.turnId,
+				code: outcome.code,
+				provenance: outcome.provenance,
+				reason: formatPromptTerminalFailureReason(error),
+			});
 			void terminalizePrompt(
 				correlation,
-				{
-					kind: "failed",
-					code: "prompt_failed",
-					message: sanitized.message,
-					provenance: "agent_failed",
-				},
+				outcome,
 				{},
-				// The normalized outcome is the ACP contract; the wire error keeps the
-				// existing sanitized discriminator so SDK clients keep branching on it.
-				{ error: sanitized },
+				// The normalized outcome and wire error retain the fixed safe token.
+				// Mark the diagnostic as recorded so terminalization does not duplicate it.
+				{ error: sanitized, diagnostic: { reason: error }, diagnosticAlreadyLogged: true },
 			);
 		};
 		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission) return;
 			submission.failed = true;
-			submission.error = error;
 			removePendingPromptCorrelation(correlation);
 			if (
 				runtime?.activePromptCorrelation?.commandId === correlation.commandId &&
@@ -4355,6 +4586,7 @@ export function createNotificationsExtension(
 					};
 				},
 				configOverrides,
+				settings,
 				lookupPromptStatus,
 				selector => kindReconciliation.lookup("skill", selector),
 			),
@@ -4379,6 +4611,7 @@ export function createNotificationsExtension(
 			settings,
 			configOverrides,
 			configRevision,
+			elevationAuthorityToken,
 			async connectionId => {
 				const active = [...promptSubmissions.entries()].find(
 					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
@@ -4528,6 +4761,8 @@ export function createNotificationsExtension(
 			},
 			...(preparesExistingThread ? { readiness: "deferred" as const } : {}),
 			...(activationGate ? { activationGate } : {}),
+			...(settings ? { settings } : {}),
+			...(configOverrides ? { configOverrides } : {}),
 			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
@@ -4660,15 +4895,7 @@ export function createNotificationsExtension(
 					dispatchControl(
 						controlSurface,
 						OPERATIONS.find(row => row.kind === "control" && row.sdkId === operation),
-						{
-							id: requestId,
-							operation,
-							input: request.input,
-							expectedRevision:
-								typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
-							idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
-							confirm: request.confirm === true,
-						},
+						controlRequestFromFrame(request as Record<string, unknown>),
 					),
 				);
 
@@ -4680,6 +4907,16 @@ export function createNotificationsExtension(
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as { id?: unknown; query?: unknown; input?: unknown; cursor?: unknown };
+				// D1: a non-string top-level cursor is rejected, never silently
+				// dropped into a fresh-snapshot query (parity with the loopback
+				// session-runtime adapter).
+				if (request.cursor !== undefined && typeof request.cursor !== "string")
+					return {
+						type: "query_response",
+						id: typeof request.id === "string" ? request.id : undefined,
+						ok: false,
+						error: { code: "invalid_input", message: "cursor must be a non-empty string" },
+					};
 				const response = await queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -4746,7 +4983,6 @@ export function createNotificationsExtension(
 			bindPromptExecutionHandle,
 			peekPromptPendingOutcome: correlation => kindReconciliation.peekPendingOutcome(correlation),
 			terminalizePrompt: (correlation, outcome, extra) => terminalizePrompt(correlation, outcome, {}, extra),
-			recordPromptTerminal,
 			notePromptReconciliation: (correlation, frame) => {
 				void kindReconciliation.noteTransition("prompt", correlation, frame);
 			},
@@ -5355,6 +5591,14 @@ export function createNotificationsExtension(
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			const endpoint = await sdkRuntime.startTransport();
+			// The native server owns the only authoritative view of this host's live
+			// SDK client sockets; publish it so a detached session host can bound its
+			// own lifetime without probing the OS (#4010). The handle is this
+			// runtime's alone, so only this runtime's teardown can retract it.
+			initializedRuntime.evidencePublication = publishSessionHostRuntimeEvidence({
+				attachedClients: () => server.clientCount(),
+				workInFlight: () => initializedRuntime.busy || initializedRuntime.pendingPromptCorrelations.length > 0,
+			});
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
 				endpointDigest: endpointAuthorityDigest(endpoint.url, token),
@@ -5379,6 +5623,7 @@ export function createNotificationsExtension(
 					throwIfLifecycleStopped();
 					const locator = { repo: path.resolve(ctx.cwd), stateRoot: endpointStateRoot };
 					const endpointMtimeMs = fs.statSync(path.join(endpointStateRoot, "sdk", `${id}.json`)).mtimeMs;
+					const hostProcessIncarnation = processIncarnation(process.pid);
 					await host.registerWithBroker({
 						// The endpoint is written before registration. Its exact mtime
 						// binds this index generation to that discovery record.
@@ -5388,6 +5633,11 @@ export function createNotificationsExtension(
 								...input,
 								locator,
 								pid: process.pid,
+								// A pid alone cannot survive its own reuse, and the marker that
+								// binds it lives in the workspace state root this host can outlive.
+								// Publishing the incarnation into broker-owned storage is what keeps
+								// teardown identity provable after that workspace is gone.
+								...(hostProcessIncarnation ? { processIncarnation: hostProcessIncarnation } : {}),
 								endpointMtimeMs,
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
@@ -5581,7 +5831,7 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
-			let suppressExtensionError = false;
+			let suppressExtensionError = result.failure?.message === "Lifecycle SDK startup was cancelled.";
 			let stopped = false;
 			try {
 				stopped = await stopSession(id, "session", runtime);
@@ -6135,7 +6385,7 @@ export function createNotificationsExtension(
 				message =>
 					(message as { stopReason?: unknown }).stopReason === "error" ||
 					(message as { stopReason?: unknown }).stopReason === "aborted",
-			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown } | undefined;
+			) as { stopReason?: "error" | "aborted"; errorMessage?: unknown; errorKind?: unknown } | undefined;
 			const legacyCode =
 				event.stopReason === "cancelled"
 					? "cancelled"
@@ -6144,8 +6394,25 @@ export function createNotificationsExtension(
 						: terminalAssistant?.stopReason === "aborted"
 							? "aborted"
 							: undefined;
+			// The SDK wire outcome and ACP error envelope use a fixed safe token by
+			// contract (see `sanitizePromptFailure`). Assistant failure messages may
+			// still remain in the local session transcript; terminalization copies only
+			// a bounded reason into the local operator log.
 			void rt.terminalizePrompt(correlation, outcome, {
 				...(finalText ? { finalText } : {}),
+				...(outcome.kind === "failed"
+					? {
+							diagnostic: {
+								reason: terminalAssistant?.errorMessage,
+								loopStopReason: event.stopReason ?? "none",
+								assistantStopReason: terminalAssistant?.stopReason ?? "none",
+								...(event.stopReason === "cancelled" ? { intentionalCancellation: true } : {}),
+								...(typeof terminalAssistant?.errorKind === "string"
+									? { errorKind: terminalAssistant.errorKind }
+									: {}),
+							},
+						}
+					: {}),
 				...(outcome.kind === "failed" && legacyCode
 					? {
 							// Only the legacy discriminator is preserved; provider text is never

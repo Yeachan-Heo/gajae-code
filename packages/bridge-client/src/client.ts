@@ -28,12 +28,19 @@ export interface SdkClientOptions {
 
 	reconnectAttempts?: number;
 	reconnectBackoffMs?: number;
+	/**
+	 * Per-attempt ceiling for the exponential reconnect backoff. A long reconnect
+	 * budget must keep probing frequently instead of sleeping for tens of seconds
+	 * on its last attempts. Defaults to 2s.
+	 */
+	reconnectMaxBackoffMs?: number;
 }
 
 export interface SdkRequestOptions {
 	timeoutMs?: number;
 	idempotencyKey?: string;
 	confirm?: boolean;
+	elevationRequestId?: string;
 }
 
 export type SdkFrame = Record<string, unknown>;
@@ -72,7 +79,17 @@ type Pending = {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
+	sent: boolean;
 };
+
+/**
+ * Transport facts attached to an SdkClientError with code "timeout" for a request.
+ * `requestSent` proves only that WebSocket.send() returned; it never proves server acceptance.
+ */
+export interface SdkRequestTimeoutDetails {
+	requestId: string;
+	requestSent: boolean;
+}
 
 function errorFrom(frame: Frame): SdkClientError {
 	const error = frame.error;
@@ -104,6 +121,7 @@ export class SdkClient {
 	readonly #timeoutMs: number;
 	readonly #reconnectAttempts: number;
 	readonly #reconnectBackoffMs: number;
+	readonly #reconnectMaxBackoffMs: number;
 	/**
 	 * Bounded grace for best-effort transport close, independent of the request
 	 * deadline. Close teardown must never be gated by an already-elapsed operation
@@ -134,6 +152,7 @@ export class SdkClient {
 
 		this.#reconnectAttempts = options.reconnectAttempts ?? 3;
 		this.#reconnectBackoffMs = options.reconnectBackoffMs ?? 25;
+		this.#reconnectMaxBackoffMs = Math.max(this.#reconnectBackoffMs, options.reconnectMaxBackoffMs ?? 2_000);
 	}
 
 	static async connect(url: string, token: string, options: SdkClientOptions = {}): Promise<SdkClient> {
@@ -227,6 +246,7 @@ export class SdkClient {
 				operation,
 				input,
 				...(options.confirm === undefined ? {} : { confirm: options.confirm }),
+				...(options.elevationRequestId === undefined ? {} : { elevationRequestId: options.elevationRequestId }),
 			},
 			options,
 		);
@@ -249,7 +269,15 @@ export class SdkClient {
 		input: Record<string, unknown> = {},
 		options: SdkRequestOptions = {},
 	): Promise<unknown> {
-		return await this.#request({ type: "broker_request", operation, input }, options);
+		return await this.#request(
+			{
+				type: "broker_request",
+				operation,
+				input,
+				...(options.elevationRequestId === undefined ? {} : { elevationRequestId: options.elevationRequestId }),
+			},
+			options,
+		);
 	}
 
 	async #request(frame: Frame, options: SdkRequestOptions): Promise<unknown> {
@@ -264,12 +292,16 @@ export class SdkClient {
 				incarnation,
 				resolve,
 				reject,
+				sent: false,
 				timer: setTimeout(
 					() =>
 						this.#settlePending(
 							id,
 							pending,
-							new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`),
+							new SdkClientError("timeout", `SDK request timed out after ${timeoutMs}ms`, {
+								requestId: id,
+								requestSent: pending.sent,
+							} satisfies SdkRequestTimeoutDetails),
 						),
 					timeoutMs,
 				),
@@ -287,6 +319,7 @@ export class SdkClient {
 						...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
 					}),
 				);
+				pending.sent = true;
 			} catch (error) {
 				this.#settlePending(
 					id,
@@ -356,7 +389,9 @@ export class SdkClient {
 						true,
 					);
 				if (attempt < this.#reconnectAttempts) {
-					const backoffMs = this.#remainingTimeout(this.#reconnectBackoffMs * 2 ** attempt);
+					const backoffMs = this.#remainingTimeout(
+						Math.min(this.#reconnectBackoffMs * 2 ** attempt, this.#reconnectMaxBackoffMs),
+					);
 					if (backoffMs <= 0) break;
 					cycle.phase = "backoff";
 					await new Promise<void>((resolve, reject) => {

@@ -52,6 +52,7 @@ function health(overall: "ok" | "warn" | "error" = "warn"): NotificationHealthRe
 			stopped: false,
 			heartbeatAt: 1_700_000_000_000,
 			heartbeatAgeMs: 42_000,
+			attachedEndpoints: 2,
 			generation: 4,
 			currentGeneration: 4,
 			generationRelation: "current",

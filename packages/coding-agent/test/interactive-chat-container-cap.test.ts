@@ -127,4 +127,42 @@ describe("interactive chat container cap", () => {
 		expect(placeholder).toBeInstanceOf(CollapsedChatHistoryComponent);
 		expect((placeholder as CollapsedChatHistoryComponent).count).toBeGreaterThan(0);
 	});
+
+	test("soak: placeholder residual stays constant under sustained message growth (AC12)", () => {
+		const ctx = createCtx();
+
+		// Simulate a long-running interactive session: 10 batches of 1,000 completed
+		// chat children each. The approved cap is 400 children; the render-cache
+		// residual is the number of retained collapsed placeholder components.
+		const residuals: number[] = [];
+		const placeholderCounts: number[] = [];
+		for (let batch = 0; batch < 10; batch++) {
+			for (let i = 0; i < 1000; i++) {
+				addAt(
+					ctx,
+					component(`batch ${batch} message ${i}`),
+					`2026-07-06T${String(batch).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}:00`,
+				);
+			}
+			residuals.push(ctx.chatContainer.children.length);
+			placeholderCounts.push(
+				ctx.chatContainer.children.filter(child => child instanceof CollapsedChatHistoryComponent).length,
+			);
+		}
+
+		// The cap holds at every checkpoint: never more than CHAT_CHILD_CAP + the
+		// single merged placeholder window.
+		for (const residual of residuals) {
+			expect(residual).toBeLessThanOrEqual(401);
+		}
+		// Exactly one merged placeholder is retained — residual is constant, not
+		// linear in the number of messages, so the render cache cannot grow.
+		expect(placeholderCounts.every(count => count === 1)).toBe(true);
+		expect(placeholderCounts).toHaveLength(10);
+		// The placeholder accumulates the full collapsed count (10 batches × ~400
+		// collapsed each), proving retention is aggregated, not accumulated.
+		const placeholder = ctx.chatContainer.children[0] as CollapsedChatHistoryComponent;
+		expect(placeholder.count).toBeGreaterThan(3000);
+		expect(residuals.at(-1)).toBe(residuals[0]);
+	});
 });

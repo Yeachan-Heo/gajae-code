@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
 	getOpenAIStreamIdleTimeoutMs,
 	getProviderFirstEventTimeoutFallbackMs,
+	getProviderStreamIdleTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
 	resolveOpenAISdkRequestTimeoutMs,
@@ -43,6 +44,15 @@ afterEach(() => {
 	}
 });
 
+describe("getProviderStreamIdleTimeoutFallbackMs(provider)", () => {
+	it("gives Anthropic a 300-second idle window for long reasoning gaps", () => {
+		expect(getProviderStreamIdleTimeoutFallbackMs("anthropic")).toBe(300_000);
+	});
+
+	it("does not widen unrelated providers", () => {
+		expect(getProviderStreamIdleTimeoutFallbackMs("kimi-code")).toBeUndefined();
+	});
+});
 describe("getProviderFirstEventTimeoutFallbackMs(provider)", () => {
 	it("gives Alibaba Token Plan one continuous 600-second first-event window", () => {
 		expect(getProviderFirstEventTimeoutFallbackMs("alibaba-token-plan")).toBe(600_000);

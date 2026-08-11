@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "kind": "black-box-cli-receipt",
+  "description": "Read-only check that the workspace has no raw/ directory to modify.",
+  "commands": [
+    "find raw wiki README.md index.md log.md"
+  ],
+  "observed": {
+    "rawDirectory": "absent",
+    "rawFilesModified": false,
+    "workspaceStatus": "raw/ was not present before or after setup"
+  }
+}

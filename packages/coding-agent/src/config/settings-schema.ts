@@ -522,6 +522,39 @@ export const SETTINGS_SCHEMA = {
 			options: "runtime",
 		},
 	},
+	"modelProfile.proxyProvider": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "model",
+			label: "Proxy Provider",
+			description:
+				"Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints.",
+		},
+	},
+	"modelProfile.proxyMode": {
+		type: "enum",
+		values: ["fallback", "always"] as const,
+		default: "fallback",
+		ui: {
+			tab: "model",
+			label: "Proxy Routing Mode",
+			description:
+				"fallback routes only selectors whose direct provider lacks credentials; always routes every proxy-routable built-in preset selector through the configured proxy.",
+			options: [
+				{
+					value: "fallback",
+					label: "Fallback",
+					description: "Use the proxy only when direct provider credentials are unavailable",
+				},
+				{
+					value: "always",
+					label: "Always",
+					description: "Route proxy-routable built-in preset selectors through the proxy",
+				},
+			],
+		},
+	},
 	"session.resumeModelBehavior": {
 		type: "enum",
 		values: ["keepSessionModel", "useCurrentDefault", "ask"] as const,
@@ -541,7 +574,16 @@ export const SETTINGS_SCHEMA = {
 
 	modelTags: { type: "record", default: EMPTY_MODEL_TAGS_RECORD },
 
-	modelProviderOrder: { type: "array", default: EMPTY_STRING_ARRAY },
+	modelProviderOrder: {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "providers",
+			label: "Provider Priority Order",
+			description:
+				"Ordered provider priority for automatic model resolution. Providers listed earlier win ties; omitted providers fall back to curated ranking. Unavailable saved entries are retained and skipped at runtime.",
+		},
+	},
 
 	cycleOrder: { type: "array", default: DEFAULT_CYCLE_ORDER },
 
@@ -2079,6 +2121,19 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Bounded-memory cold-session offloading. Budgets are fixed implementation
+	// constants in the sidecar primitives, not user-tunable fields. Auto keeps
+	// ordinary sessions on the eager path and routes transcripts above the eager
+	// admission limit through bounded cold-session state.
+	"sessionMemory.mode": {
+		type: "enum",
+		values: ["off", "shadow", "enabled", "auto"] as const,
+		default: "auto",
+	},
+	// Independent runtime switch for AgentSession's async compact-once overflow
+	// recovery. The synchronous bounded context preflight stays always on.
+	"sessionMemory.contextOverflowRecovery": { type: "boolean", default: true },
+
 	// ────────────────────────────────────────────────────────────────────────
 	// Editing
 	// ────────────────────────────────────────────────────────────────────────
@@ -2662,6 +2717,28 @@ export const SETTINGS_SCHEMA = {
 				"Past soft TTL but within hard TTL, the tool returns the cached row and refreshes it in the background. Past hard TTL, the row is dropped. Default 7 days.",
 		},
 	},
+	"clipboard.transport": {
+		type: "enum",
+		values: ["auto", "native", "osc52", "ssh"] as const,
+		default: "auto",
+		ui: {
+			tab: "tools",
+			label: "Clipboard Transport",
+			description:
+				"auto keeps current OSC52+native best-effort behavior. native/osc52 restrict copy to one mechanism. ssh routes text copy/paste through `ssh <clipboard.sshHost> pbcopy/pbpaste` via argv spawn and never silently falls back to native/OSC52 on failure.",
+		},
+	},
+	"clipboard.sshHost": {
+		type: "string",
+		default: "",
+		validate: (value: string) => value === "" || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value),
+		ui: {
+			tab: "tools",
+			label: "Clipboard SSH Host",
+			description:
+				"SSH host alias (from ~/.ssh/config) used when clipboard.transport is ssh. Required in that mode.",
+		},
+	},
 
 	"web_search.enabled": {
 		type: "boolean",
@@ -2787,6 +2864,29 @@ export const SETTINGS_SCHEMA = {
 			label: "Browser Tab GC RSS Limit (MB)",
 			description: "Parent-process RSS (MB) above which idle tabs are opportunistically evicted LRU.",
 		},
+	},
+	// `gjc gc --disk` retention policy. Report-only unless `--prune` is also passed;
+	// these knobs never run implicitly and never affect the PID-liveness axis.
+	"gc.sessions.maxAgeDays": {
+		type: "number",
+		default: 60,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	// 0 disables the size axis; only the age axis retires transcripts then.
+	"gc.sessions.maxTotalBytes": {
+		type: "number",
+		default: 0,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
+	},
+	"gc.natives.keepVersions": {
+		type: "number",
+		default: 2,
+		validate: (value: number) => Number.isInteger(value) && value >= 0,
+	},
+	"gc.backups.maxAgeDays": {
+		type: "number",
+		default: 30,
+		validate: (value: number) => Number.isFinite(value) && value >= 0,
 	},
 	"resourceGc.sweepIntervalMs": {
 		type: "number",
@@ -3498,74 +3598,6 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-	"providers.image": {
-		type: "enum",
-		values: ["auto", "openai", "gemini", "openrouter", "antigravity", "alibaba", "custom"] as const,
-		default: "auto",
-		ui: {
-			tab: "providers",
-			label: "Image Generation",
-			description: "Provider and model for image generation tool",
-			options: [
-				{
-					value: "auto",
-					label: "Auto",
-					description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini > Alibaba",
-				},
-				{ value: "openai", label: "OpenAI", description: "Uses gpt-image-2 via OpenAI Responses/Codex" },
-				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
-				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
-				{ value: "antigravity", label: "Antigravity", description: "Requires login with google-antigravity" },
-				{
-					value: "alibaba",
-					label: "Alibaba Bailian",
-					description: "Requires ALIBABA_TOKEN_PLAN_API_KEY (wan2.7-image via Token Plan)",
-				},
-				{
-					value: "custom",
-					label: "Custom",
-					description: "OpenAI-compatible endpoint (set providers.imageCustomUrl)",
-				},
-			],
-		},
-	},
-	"providers.imageModel": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Model",
-			description: "Override the default image generation model for the selected provider",
-		},
-	},
-	"providers.imageCustomUrl": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom URL",
-			description: "Base URL for custom OpenAI-compatible image endpoint",
-		},
-	},
-	"providers.imageCustomKey": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom API Key",
-			description: "API key for custom OpenAI-compatible image endpoint",
-		},
-	},
-	"providers.imageCustomKeyEnv": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom API Key Env",
-			description: "Environment variable name holding the API key for custom image endpoint",
-		},
-	},
-
 	"providers.kimiApiFormat": {
 		type: "enum",
 		values: ["openai", "anthropic"] as const,
@@ -3842,6 +3874,67 @@ function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], va
 	);
 }
 
+/**
+ * Validate an external (SDK `config.patch`) path/value set against the
+ * settings schema before any durable write. Dotted sub-paths of record
+ * settings (e.g. `modelRoles.default`) are validated against the record's
+ * value schema. Returns the offending entries so the caller can reject the
+ * whole patch without durable side effects.
+ */
+export function validateSettingPatch(patch: Record<string, unknown>): Array<{ path: string; detail: string }> {
+	const issues: Array<{ path: string; detail: string }> = [];
+	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
+	for (const [path, value] of Object.entries(patch)) {
+		const definition = SETTINGS_SCHEMA[path as SettingPath];
+		if (!definition) {
+			const recordParent = [...knownPaths].find(known => known !== path && path.startsWith(`${known}.`));
+			if (!recordParent) {
+				issues.push({ path, detail: "Setting is not recognized by this version." });
+				continue;
+			}
+			const parentDef = SETTINGS_SCHEMA[recordParent as SettingPath];
+			if (parentDef.type !== "record" || !("valueSchema" in parentDef) || !parentDef.valueSchema) {
+				issues.push({ path, detail: "Setting is not a valid record sub-path." });
+				continue;
+			}
+			if (
+				parentDef.valueSchema.type === "model-selector-value" &&
+				!(typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string")))
+			) {
+				issues.push({ path, detail: "Expected model-selector-value." });
+			}
+			continue;
+		}
+		if (!validSettingValue(definition, value)) {
+			// `Expected array.` is wrong for a real array carrying bad elements, and an
+			// SDK client reaching this through `config.patch` cannot act on it. Name the
+			// element constraint that actually failed.
+			const arrayItemEnum =
+				definition.type === "array" && Array.isArray(value) && "items" in definition
+					? definition.items?.enum
+					: undefined;
+			const detail = arrayItemEnum
+				? `Expected array items to be one of: ${arrayItemEnum.join(", ")}.`
+				: definition.type === "array" && Array.isArray(value)
+					? "Expected array items to be strings."
+					: `Expected ${definition.type}.`;
+			issues.push({ path, detail });
+			continue;
+		}
+		if (definition.type === "record" && "valueSchema" in definition && definition.valueSchema) {
+			for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+				if (
+					definition.valueSchema.type === "model-selector-value" &&
+					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
+				) {
+					issues.push({ path: `${path}.${key}`, detail: "Expected model-selector-value." });
+				}
+			}
+		}
+	}
+	return issues;
+}
+
 /** Coerce supported scalar legacy values and report unknown or invalid settings without dropping them. */
 export function reconcileSettingsSchema(raw: Record<string, unknown>): {
 	settings: Record<string, unknown>;
@@ -4053,6 +4146,11 @@ export interface ShellMinimizerSettings {
 	maxCaptureBytes: number;
 }
 
+export interface SessionMemorySettings {
+	mode: "off" | "shadow" | "enabled" | "auto";
+	contextOverflowRecovery: boolean;
+}
+
 export interface MemoryGuardSettings {
 	enabled: boolean;
 	checkIntervalMs: number;
@@ -4128,6 +4226,7 @@ export interface GroupTypeMap {
 	thinkingBudgets: ThinkingBudgetsSettings;
 	stt: SttSettings;
 	memoryGuard: MemoryGuardSettings;
+	sessionMemory: SessionMemorySettings;
 	modelRoles: Record<string, ModelSelectorValue>;
 	modelTags: ModelTagsSettings;
 	cycleOrder: string[];

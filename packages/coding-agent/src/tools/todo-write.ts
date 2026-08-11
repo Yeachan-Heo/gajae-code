@@ -11,7 +11,7 @@ import type { ToolSession } from "../sdk";
 import type { SessionEntry } from "../session/session-manager";
 import { renderStatusLine, renderTreeList } from "../tui";
 import { PREVIEW_LIMITS } from "./render-utils";
-import { isDoneAlias, validateRawTodoArguments } from "./todo-contract";
+import { isDoneAlias, TODO_OPS, validateRawTodoArguments } from "./todo-contract";
 
 // =============================================================================
 // Types
@@ -47,10 +47,7 @@ export interface TodoWriteToolDetails {
 // =============================================================================
 
 const TodoOp = z
-	.preprocess(
-		value => (typeof value === "string" && isDoneAlias(value) ? "done" : value),
-		z.enum(["init", "start", "done", "rm", "drop", "append", "note"] as const),
-	)
+	.preprocess(value => (typeof value === "string" && isDoneAlias(value) ? "done" : value), z.enum(TODO_OPS))
 	.describe('operation to apply; use "done" to complete a task');
 
 const InitListEntry = z.object({

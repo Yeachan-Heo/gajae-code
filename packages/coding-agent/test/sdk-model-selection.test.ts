@@ -418,4 +418,121 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await session.dispose();
 		}
 	});
+	test("resumes a bare profile alias through preset-equivalent resolution when a startup profile is configured", async () => {
+		// Slash-prefixed catalog id keeps the alias out of the exact canonical-id
+		// path, so resolution must pass through the final-segment alias stage.
+		modelRegistry.registerProvider("alias-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "ALIAS_KEY",
+			api: "openai-completions",
+			models: [
+				{
+					id: "synthetic/flare-alias",
+					name: "Flare Alias",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey("alias-provider", "test-key");
+		const profileName = modelRegistry.getAvailableModelProfileNames()[0];
+		if (!profileName) throw new Error("Expected at least one registered model profile");
+
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		sessionManager.appendConfiguredModelChain({
+			role: "default",
+			entries: ["flare-alias"],
+			origin: "profile-activation",
+			identity: profileName,
+			explicitHead: true,
+		});
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await sessionManager.close();
+
+		const lookupAliasSpy = vi.spyOn(modelRegistry, "lookupAliasExists");
+		const resolveAliasSpy = vi.spyOn(modelRegistry, "resolveModelByLookupAlias");
+		const resumedManager = await SessionManager.open(sessionFile, tempDir);
+		const { session } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			settings: Settings.isolated({ "modelProfile.default": profileName }),
+			sessionManager: resumedManager,
+			providerSessionId: "provider-affinity",
+		});
+
+		try {
+			expect(session.model).toMatchObject({ provider: "alias-provider", id: "synthetic/flare-alias" });
+			// The persisted bare alias must be resolved through the preset-equivalent
+			// alias stage (real registry), not left to exact/fuzzy matching.
+			expect(lookupAliasSpy).toHaveBeenCalled();
+			expect(resolveAliasSpy).toHaveBeenCalled();
+			expect(session.getActiveModelProfile()).toBe(profileName);
+			expect(modelRegistry.getSessionCanonicalVariant("provider-affinity")).toBe(
+				"alias-provider/synthetic/flare-alias",
+			);
+			expect(modelRegistry.getSessionCanonicalVariant(resumedManager.getSessionId())).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("keeps resume exact when no startup profile is configured", async () => {
+		modelRegistry.registerProvider("alias-provider", {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "ALIAS_KEY",
+			api: "openai-completions",
+			models: [
+				{
+					id: "synthetic/flare-alias",
+					name: "Flare Alias",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+				},
+			],
+		});
+		authStorage.setRuntimeApiKey("alias-provider", "test-key");
+
+		const sessionManager = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+		sessionManager.appendConfiguredModelChain({
+			role: "default",
+			entries: ["flare-alias"],
+			origin: "profile-activation",
+			identity: "stale-profile",
+			explicitHead: true,
+		});
+		await sessionManager.ensureOnDisk();
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await sessionManager.close();
+
+		const lookupAliasSpy = vi.spyOn(modelRegistry, "lookupAliasExists");
+		const resolveAliasSpy = vi.spyOn(modelRegistry, "resolveModelByLookupAlias");
+		const resumedManager = await SessionManager.open(sessionFile, tempDir);
+		// Direct/manual startup: no profile default, so the alias stage must not
+		// be consulted and the persisted alias falls back to the exact path.
+		const { session } = await createAgentSession({
+			...buildSessionOptions(""),
+			modelPattern: undefined,
+			sessionManager: resumedManager,
+		});
+
+		try {
+			expect(session.model).toMatchObject({ provider: "alias-provider", id: "synthetic/flare-alias" });
+			expect(lookupAliasSpy).not.toHaveBeenCalled();
+			expect(resolveAliasSpy).not.toHaveBeenCalled();
+			expect(session.getActiveModelProfile()).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
 });

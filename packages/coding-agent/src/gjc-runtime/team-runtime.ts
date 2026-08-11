@@ -2892,13 +2892,16 @@ type TeamTmuxMutation =
 	| { type: "profile-option"; target: string; name: string; value: string }
 	| { type: "profile-window-option"; target: string; name: string; value: string };
 
+const TMUX_ENCODED_LAYOUT_PATTERN = /^[0-9a-f]{4},/i;
+
 function readTeamTmuxValue(
 	config: GjcTeamConfig,
 	command: "show-options" | "show-window-options",
 	target: string,
 	name: string,
 ): string | undefined {
-	const result = Bun.spawnSync(teamTmuxArgs(config, command, ["-qv", "-t", target, name]), {
+	const flags = command === "show-options" ? "-qv" : "-v";
+	const result = Bun.spawnSync(teamTmuxArgs(config, command, [flags, "-t", target, name]), {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -2942,6 +2945,55 @@ function assertTeamTmuxMutationPreproof(config: GjcTeamConfig, operation: TeamTm
 	// Delivery is proven asynchronously by the generation-bound worker startup ACK
 	// or continuation outcome named in the closed operation variant. Exit status
 	// alone is never treated as delivery proof.
+}
+
+function hasMainVerticalPaneTopology(config: GjcTeamConfig, target: string): boolean {
+	const result = Bun.spawnSync(
+		teamTmuxArgs(config, "list-panes", ["-t", target, "-F", "#{pane_left} #{pane_top} #{pane_width} #{pane_height}"]),
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	if (result.exitCode !== 0) return false;
+	const lines = result.stdout.toString().trim().split("\n");
+	const tokens = lines.map(line => line.trim().split(/\s+/));
+	if (
+		tokens.length < 2 ||
+		tokens.some(values => values.length !== 4 || values.some(value => !/^(?:0|[1-9]\d*)$/.test(value)))
+	)
+		return false;
+	const geometry = tokens.map(values => values.map(value => Number.parseInt(value, 10))) as [
+		number,
+		number,
+		number,
+		number,
+	][];
+	if (geometry.some(values => values.some(value => !Number.isSafeInteger(value) || value < 0))) return false;
+	if (geometry.some(([, , width, height]) => width === 0 || height === 0)) return false;
+	const right = Math.max(...geometry.map(([left, , width]) => left + width));
+	const bottom = Math.max(...geometry.map(([, top, , height]) => top + height));
+	const main = geometry.filter(
+		([left, top, width, height]) => left === 0 && top === 0 && height === bottom && width < right,
+	);
+	if (main.length !== 1) return false;
+	const mainRight = main[0]![0] + main[0]![2];
+	const stack = geometry.filter(pane => pane !== main[0]);
+	const stackLeft = stack[0]![0];
+	if (
+		stack.some(([left, , width]) => left !== stackLeft || left + width !== right) ||
+		stackLeft - mainRight < 0 ||
+		stackLeft - mainRight > 1
+	)
+		return false;
+	const ordered = [...stack].sort((a, b) => a[1] - b[1]);
+	return (
+		ordered[0]![1] === 0 &&
+		ordered.every((pane, index) => {
+			if (index === 0) return true;
+			const previous = ordered[index - 1]!;
+			const rowGap = pane[1] - (previous[1] + previous[3]);
+			return rowGap >= 0 && rowGap <= 1;
+		}) &&
+		ordered.at(-1)![1] + ordered.at(-1)![3] === bottom
+	);
 }
 
 function executeTeamTmuxMutation(
@@ -2995,7 +3047,12 @@ function executeTeamTmuxMutation(
 			teamTmuxArgs(config, "display-message", ["-p", "-t", operation.target, "#{window_layout}"]),
 			{ stdout: "pipe", stderr: "pipe" },
 		);
-		if (layout.exitCode !== 0 || layout.stdout.toString().trim() !== operation.layout)
+		const observedLayout = layout.stdout.toString().trim();
+		if (
+			layout.exitCode !== 0 ||
+			!TMUX_ENCODED_LAYOUT_PATTERN.test(observedLayout) ||
+			!hasMainVerticalPaneTopology(config, operation.target)
+		)
 			throw new Error("tmux_layout_postproof_failed");
 	} else if (operation.type === "set-window-option" || operation.type === "profile-window-option") {
 		if (readTeamTmuxValue(config, "show-window-options", operation.target, operation.name) !== operation.value)

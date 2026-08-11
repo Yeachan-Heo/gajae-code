@@ -1774,6 +1774,67 @@ describe("agentLoopContinue with AgentMessage", () => {
 });
 
 describe("agentLoop - empty response overflow detection", () => {
+	it("promotes a zero-token empty stop to a typed provider error", async () => {
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: [],
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [],
+					stopReason: "stop",
+					usage: { input: 0, output: 0 },
+					transportFailure: { kind: "transport", providerCode: "empty_response" },
+				},
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const events: AgentEvent[] = [];
+
+		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const messages = await stream.result();
+		const assistantMessage = messages.find(m => m.role === "assistant") as AssistantMessage | undefined;
+		expect(assistantMessage).toMatchObject({
+			stopReason: "error",
+			errorMessage: "Provider returned an empty response with zero token usage",
+			transportFailure: { kind: "transport", providerCode: "empty_response" },
+		});
+		const messageEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(messageEnd?.message).toMatchObject({
+			stopReason: "error",
+			errorMessage: "Provider returned an empty response with zero token usage",
+		});
+	});
+
+	it("does not promote a zero-token stop that contains a content block", async () => {
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: [],
+		};
+		const mock = createMockModel({
+			responses: [{ content: [""], stopReason: "stop", usage: { input: 0, output: 0 } }],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream);
+		for await (const _ of stream) {
+			// drain
+		}
+
+		const messages = await stream.result();
+		const assistantMessage = messages.find(m => m.role === "assistant") as AssistantMessage | undefined;
+		expect(assistantMessage?.stopReason).toBe("stop");
+	});
 	it("promotes empty stop response with low usage to error stopReason", async () => {
 		const context: AgentContext = {
 			systemPrompt: ["You are helpful."],

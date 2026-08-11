@@ -13,7 +13,7 @@ Use the smallest surface that fits your bot:
 | Coordinator MCP | Any external controller that can discover SDK-backed sessions, send turns, answer questions, and read artifacts. | `gjc mcp-serve coordinator` | Preferred orchestration surface. `gjc mcp-serve hermes` is a compatibility alias, not a separate contract. |
 | Setup adapter | Rendering a portable MCP config and operator instructions for a controller profile. | `gjc setup hermes --root /path/to/repo` | Compatibility-oriented config renderer; does not call an LLM or validate provider credentials. |
 | SDK WebSocket | A controller that drives one live session directly: state queries, events, actions, and workflow-gate replies. | Connect to the session's loopback SDK endpoint (see [`docs/sdk.md`](./sdk.md)) | The canonical machine interface. `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. |
-| Daemon session CLI | Scripted control/queries against a live session with JSON output. | `gjc daemon session list\|control\|query\|global` | A pure SDK client; honors the same protocol and dispositions. |
+| SDK session CLI | Broker-bound semantic session operations and explicit raw SDK dispatch with JSON output. | `gjc sdk session list|inspect|send|status|tail|elevate` or `gjc sdk session raw control|query|global` | Resolves authority through the broker and never renders endpoint credentials by default. |
 
 ## Recommended architecture
 
@@ -324,7 +324,7 @@ Use the SDK when your bot owns a single live session rather than an MCP coordina
 Key SDK workflow-gate facts:
 - The discovery file carries the endpoint URL and per-session token; a wrong
   token is rejected at the WebSocket handshake. `server_hello` marks a
-  connection ready, and `gjc daemon session control|query|global` uses the same
+  connection ready, and `gjc sdk session raw control|query|global` uses the same
   protocol for shell scripts.
 
 - `action_needed.id` is an opaque, transient presentation ID. It is the only

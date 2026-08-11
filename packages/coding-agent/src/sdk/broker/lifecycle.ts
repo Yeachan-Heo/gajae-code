@@ -13,7 +13,7 @@ function nativeLifecycle(): typeof import("@gajae-code/natives") {
 	return nativeLifecycleBindings;
 }
 
-import { $credentialEnv, resolveEquivalentPath } from "@gajae-code/utils";
+import { $credentialEnv, logger, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
 	isModelProfileError,
@@ -51,7 +51,11 @@ import {
 	type ManagedSessionScope,
 	resolveManagedSessionScope,
 } from "../session-directory";
-import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
+import {
+	normalizeSdkStartupFailure,
+	type SdkStartupFailure,
+	type SdkStartupRollbackResult,
+} from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
@@ -68,6 +72,13 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
+import {
+	cancellableSleep,
+	DEFAULT_READINESS_TIMEOUT_MS,
+	isValidReadinessTimeoutMs,
+	READINESS_TIMEOUT_INVALID_MESSAGE,
+	startupQueueWaitMs,
+} from "./startup-budget";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -76,9 +87,6 @@ export {
 	processIncarnation,
 };
 
-const READY_TIMEOUT_MS = 10_000;
-const MIN_READY_TIMEOUT_MS = 4_000;
-const MAX_READY_TIMEOUT_MS = 60_000;
 const POLL_MS = 50;
 const CLOSE_TIMEOUT_MS = 2_000;
 const MAX_RECEIVED_AT_SKEW_MS = 5_000;
@@ -95,12 +103,7 @@ export interface LifecycleDeadlines {
 }
 
 export function deriveLifecycleDeadlines(receivedAt: number, requestedReadinessTimeoutMs: number): LifecycleDeadlines {
-	if (
-		!Number.isSafeInteger(receivedAt) ||
-		!Number.isSafeInteger(requestedReadinessTimeoutMs) ||
-		requestedReadinessTimeoutMs < MIN_READY_TIMEOUT_MS ||
-		requestedReadinessTimeoutMs > MAX_READY_TIMEOUT_MS
-	)
+	if (!Number.isSafeInteger(receivedAt) || !isValidReadinessTimeoutMs(requestedReadinessTimeoutMs))
 		throw new Error("Lifecycle timing values must be safe integers in the approved readiness range.");
 	const phaseWindowMs = Math.min(1_000, Math.max(500, Math.floor(requestedReadinessTimeoutMs / 4)));
 	const lifecycleCleanupDeadlineAt = receivedAt + requestedReadinessTimeoutMs;
@@ -124,18 +127,17 @@ export function deriveLifecycleDeadlines(receivedAt: number, requestedReadinessT
 
 export interface LifecycleTiming {
 	now(): number;
-	sleep(ms: number): Promise<void>;
+	sleep(ms: number, signal?: AbortSignal): Promise<void>;
 }
 
-const defaultLifecycleTiming: LifecycleTiming = {
-	now: Date.now,
-	sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-};
+const defaultLifecycleTiming: LifecycleTiming = { now: Date.now, sleep: cancellableSleep };
 const lifecycleTimingsForTest = new WeakMap<Broker, LifecycleTiming>();
 type LifecycleCommand = SdkInternalSpawnCommand | { file: string; args: string[] };
 type LifecycleCommandResolver = () => LifecycleCommand;
 const lifecycleCommandResolversForTest = new WeakMap<Broker, LifecycleCommandResolver>();
 const lifecycleCleanupHooksForTest = new WeakMap<Broker, () => void>();
+const startupAdmittedInputs = new WeakSet<Input>();
+const startupLaunchInputs = new WeakMap<Input, SessionLaunch>();
 
 /** Test-only hook for simulating a crash immediately after one exact lifecycle detach. */
 export function setLifecycleCleanupHookForTest(broker: Broker, hook: (() => void) | undefined): void {
@@ -486,17 +488,8 @@ export function validateBrokerModelPresetForTest(agentDir: string, requestedProf
 
 function readinessTimeout(input: Input): number | BrokerResponse {
 	const value = input.readinessTimeoutMs;
-	if (value === undefined) return READY_TIMEOUT_MS;
-	if (
-		typeof value !== "number" ||
-		!Number.isSafeInteger(value) ||
-		value < MIN_READY_TIMEOUT_MS ||
-		value > MAX_READY_TIMEOUT_MS
-	)
-		return fail(
-			"invalid_input",
-			`readinessTimeoutMs must be an integer between ${MIN_READY_TIMEOUT_MS} and ${MAX_READY_TIMEOUT_MS}.`,
-		);
+	if (value === undefined) return DEFAULT_READINESS_TIMEOUT_MS;
+	if (!isValidReadinessTimeoutMs(value)) return fail("invalid_input", READINESS_TIMEOUT_INVALID_MESSAGE);
 	return value;
 }
 
@@ -748,6 +741,10 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 		locator: { ...record.locator, repo: scope },
 		endpointGeneration: record.endpointGeneration,
 		pid: record.pid,
+		// Reconciliation only re-scopes the locator, so every identity fact the host
+		// published about its own process has to survive it: dropping the incarnation
+		// here would silently disarm the teardown fence for every lifecycle session.
+		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
 		endpointMtimeMs: record.endpointMtimeMs,
 	});
 }
@@ -976,6 +973,7 @@ function isSdkStartupFailure(value: unknown): value is SdkStartupFailure {
 			failure.reason !== "ineligible" &&
 			failure.reason !== "factory_absent" &&
 			failure.reason !== "runner_absent" &&
+			failure.reason !== "admission_timeout" &&
 			failure.reason !== "pending" &&
 			failure.reason !== "failed") ||
 		typeof failure.message !== "string" ||
@@ -1953,15 +1951,35 @@ export async function readSessionLifecycleFailureForTest(
 		: undefined;
 }
 
-async function hasDurableProcessIdentity(
-	root: string,
-	id: string,
-	pid: number,
-	expected?: EffectMarker,
-): Promise<boolean> {
-	const marker = await readEffectMarker(lifecycleMarkerPath(root, id));
-	if (!marker || marker.pid !== pid || (expected && !sameEffectMarker(marker, expected))) return false;
-	return marker.incarnation === processIncarnation(pid);
+/** Everything a signal target must prove about itself before it can be signalled. */
+type SignalTarget = {
+	locator: { stateRoot: string };
+	pid: number;
+	lifecycleRequestId?: string;
+	processIncarnation?: string;
+};
+
+/**
+ * The spawn-time marker is the strongest evidence — the broker itself wrote it for
+ * exactly this pid — but it lives in the session's own workspace state root. A
+ * workspace deleted while its host keeps running takes that evidence with it, and
+ * the host then survives every later `session.close` as an orphan still serving the
+ * source it started with. The registration its host published into the broker-owned
+ * index carries the same pid-to-incarnation binding, outlives the workspace, and is
+ * therefore consulted when the marker is absent. A marker naming a different process
+ * is contradiction rather than absence and still refuses the signal, and either
+ * source is only accepted while the pid's current OS incarnation still matches it.
+ */
+async function hasDurableProcessIdentity(target: SignalTarget, id: string, expected?: EffectMarker): Promise<boolean> {
+	const marker = await readEffectMarker(lifecycleMarkerPath(target.locator.stateRoot, id));
+	if (marker)
+		return (
+			marker.pid === target.pid &&
+			(!expected || sameEffectMarker(marker, expected)) &&
+			marker.incarnation === processIncarnation(target.pid)
+		);
+	if (expected && (expected.pid !== target.pid || target.lifecycleRequestId !== expected.effectMarker)) return false;
+	return target.processIncarnation !== undefined && target.processIncarnation === processIncarnation(target.pid);
 }
 
 async function hasOwnedReadinessEvidence(
@@ -2235,14 +2253,14 @@ async function terminateSpawnedChild(
 }
 
 async function signalVerifiedSession(
-	record: { locator: { stateRoot: string }; pid: number },
+	record: SignalTarget,
 	id: string,
 	signal: NodeJS.Signals,
 	expected?: EffectMarker,
 ): Promise<boolean> {
-	if (!(await hasDurableProcessIdentity(record.locator.stateRoot, id, record.pid, expected))) return false;
+	if (!(await hasDurableProcessIdentity(record, id, expected))) return false;
 	try {
-		if (!(await hasDurableProcessIdentity(record.locator.stateRoot, id, record.pid, expected))) return false;
+		if (!(await hasDurableProcessIdentity(record, id, expected))) return false;
 		process.kill(record.pid, signal);
 		return true;
 	} catch {
@@ -2282,6 +2300,24 @@ async function waitForClose(
 			hasObservedProcessExit(record.pid)
 		)
 			return true;
+		// A host that dies before it can withdraw its own registration — killed
+		// mid-teardown, or unable to finish one because its workspace is gone —
+		// leaves the index advertising a session whose process is provably absent.
+		// That is exactly the evidence the dead-registration sweep retires records
+		// on, so retire it here too instead of escalating signals at a pid that no
+		// longer exists and then reporting the teardown as unfinished.
+		if (registration && hasObservedProcessExit(record.pid)) {
+			await broker.index.append({
+				type: "host_unregistered",
+				sessionId: id,
+				locator: registration.locator,
+				endpointGeneration: registration.endpointGeneration,
+				pid: registration.pid,
+				...(registration.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registration.endpointMtimeMs }),
+				...(registration.lifecycleRequestId ? { lifecycleRequestId: registration.lifecycleRequestId } : {}),
+			});
+			return true;
+		}
 		await timing.sleep(POLL_MS);
 	}
 	return false;
@@ -3002,27 +3038,22 @@ function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & 
 	);
 }
 
-function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
-	return (
-		current.live &&
-		current.endpointGeneration === expected.endpointGeneration &&
-		current.pid === expected.pid &&
-		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
-		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
-	);
-}
-
 async function revalidateCloseGeneration(
 	broker: Broker,
 	id: string,
 	expected: CloseRecord,
 	authority: CloseAuthority | undefined,
+	allowUnreachable = false,
 ): Promise<BrokerResponse | undefined> {
 	await broker.index.refresh();
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	return current &&
-		sameCloseGeneration(expected, current) &&
+		(allowUnreachable || current.live) &&
+		current.endpointGeneration === expected.endpointGeneration &&
+		current.pid === expected.pid &&
+		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot) &&
 		(!authority || sameCloseAuthority(authority, current, id))
 		? undefined
 		: fail("endpoint_stale", "session endpoint is stale");
@@ -3109,15 +3140,57 @@ async function executeLifecycleResponse(
 			}
 		}
 		const timing = lifecycleTiming(broker);
+		const admissionGranted = startupAdmittedInputs.has(input);
+		if (!admissionGranted) {
+			const suppliedDeadlineFields = [
+				input.receivedAt,
+				input.requestedReadinessTimeoutMs,
+				input.semanticReadyDeadlineAt,
+				input.terminationStartDeadlineAt,
+				input.lifecycleCleanupDeadlineAt,
+			];
+			let requestedReadinessTimeoutMs: number;
+			if (suppliedDeadlineFields.some(value => value !== undefined)) {
+				const supplied = lifecycleDeadlines(input, timing.now());
+				if ("ok" in supplied) return supplied;
+				requestedReadinessTimeoutMs = supplied.requestedReadinessTimeoutMs;
+			} else {
+				const timeout = readinessTimeout(input);
+				if (typeof timeout !== "number") return timeout;
+				requestedReadinessTimeoutMs = timeout;
+			}
+			const queueWaitMs = startupQueueWaitMs(requestedReadinessTimeoutMs);
+			const launch = await launchInput(broker, operation, input);
+			if ("ok" in launch) return launch;
+			const admitted = await broker.runStartup(queueWaitMs, timing, async admittedAt => {
+				const admittedInput = { ...input, ...deriveLifecycleDeadlines(admittedAt, requestedReadinessTimeoutMs) };
+				startupAdmittedInputs.add(admittedInput);
+				startupLaunchInputs.set(admittedInput, launch);
+				try {
+					return await executeLifecycleResponse(broker, operation, admittedInput, identity, cleanup);
+				} finally {
+					startupLaunchInputs.delete(admittedInput);
+					startupAdmittedInputs.delete(admittedInput);
+				}
+			});
+			if (admitted.status === "completed") return admitted.value;
+			if (admitted.status === "admission_refused")
+				return fail(
+					"startup_admission_refused",
+					"SDK host startup was refused because the broker no longer owns the session root.",
+				);
+			const failure = normalizeSdkStartupFailure("startup", admitted.reason);
+			return fail("startup_admission_timeout", failure.message);
+		}
 
-		const deadlines = lifecycleDeadlines(input, timing.now());
+		const deadlines = lifecycleDeadlines(input, input.receivedAt as number);
 
 		if ("ok" in deadlines) return deadlines;
 		const lifecycleDeadline = deadlines.lifecycleCleanupDeadlineAt;
 		const readinessDeadline = deadlines.semanticReadyDeadlineAt;
 		const terminationStartDeadline = deadlines.terminationStartDeadlineAt;
 
-		const launch = await launchInput(broker, operation, input);
+		const launch = startupLaunchInputs.get(input) ?? (await launchInput(broker, operation, input));
 		if ("ok" in launch) return launch;
 		if (!hasProcessIncarnationAuthority())
 			return fail(
@@ -3207,41 +3280,49 @@ async function executeLifecycleResponse(
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
 		try {
-			const cmd = command(broker);
-			const spawned = spawn(cmd.file, cmd.args, {
-				cwd: launch.cwd,
-				detached: true,
-				stdio: "ignore",
-				env: {
-					...("kind" in cmd ? cmd.env : process.env),
-					GJC_AGENT_DIR: broker.settings.agentDir,
-					GJC_CODING_AGENT_DIR: broker.settings.agentDir,
-					GJC_SESSION_ID: launch.id,
-					GJC_STATE_ROOT: launch.root,
-					GJC_LIFECYCLE_REQUEST_ID: effectMarker,
-					GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
-					// Coordinator-correlation env scoped to this designated launch only (#2549).
-					// The runtime sidecar reads these to write terminal state to the
-					// coordinator-shared file instead of an unread session-local fallback.
-					// The broker computes the file path from coordinatorStateDir + launch.id
-					// because the session ID is generated at spawn time.
-					...(launch.coordinatorStateDir
-						? {
-								[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: path.join(
-									launch.coordinatorStateDir,
-									"session-states",
-									`${launch.id}.json`,
-								),
-							}
-						: {}),
-					...(launch.coordinatorSessionId
-						? { [GJC_COORDINATOR_SESSION_ID_ENV]: launch.coordinatorSessionId }
-						: {}),
-					...(launch.coordinatorSessionBranch
-						? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
-						: {}),
-				},
+			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
+				const cmd = command(broker);
+				return spawn(cmd.file, cmd.args, {
+					cwd: launch.cwd,
+					detached: true,
+					stdio: "ignore",
+					env: {
+						...("kind" in cmd ? cmd.env : process.env),
+						GJC_AGENT_DIR: broker.settings.agentDir,
+						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
+						GJC_SESSION_ID: launch.id,
+						GJC_STATE_ROOT: launch.root,
+						GJC_LIFECYCLE_REQUEST_ID: effectMarker,
+						GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+						// Coordinator-correlation env scoped to this designated launch only (#2549).
+						// The runtime sidecar reads these to write terminal state to the
+						// coordinator-shared file instead of an unread session-local fallback.
+						// The broker computes the file path from coordinatorStateDir + launch.id
+						// because the session ID is generated at spawn time.
+						...(launch.coordinatorStateDir
+							? {
+									[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: path.join(
+										launch.coordinatorStateDir,
+										"session-states",
+										`${launch.id}.json`,
+									),
+								}
+							: {}),
+						...(launch.coordinatorSessionId
+							? { [GJC_COORDINATOR_SESSION_ID_ENV]: launch.coordinatorSessionId }
+							: {}),
+						...(launch.coordinatorSessionBranch
+							? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
+							: {}),
+					},
+				});
 			});
+			if (!authorizedSpawn.authorized)
+				return fail(
+					"startup_admission_refused",
+					"SDK host startup was refused because the broker no longer owns the session root.",
+				);
+			const spawned = authorizedSpawn.value;
 			child = spawned;
 			const pid = spawned.pid;
 			if (!pid) throw new Error("spawned session has no pid");
@@ -3383,9 +3464,13 @@ async function executeLifecycleResponse(
 			}
 		}
 		if (!endpointResult.ok) {
-			if (endpointResult.error.code === "endpoint_stale") return endpointResult;
-			if (endpointResult.error.code !== "resource_gone") return endpointResult;
-			usedSignalFallback = true;
+			if (endpointResult.error.code === "endpoint_stale") {
+				if (requestedAuthority.authority) return endpointResult;
+				usedSignalFallback = true;
+			} else {
+				if (endpointResult.error.code !== "resource_gone") return endpointResult;
+				usedSignalFallback = true;
+			}
 		} else {
 			const endpoint = closeEndpoint(endpointResult.result);
 			if (!endpoint) return fail("close_refused", "Session endpoint is malformed.");
@@ -3426,7 +3511,7 @@ async function executeLifecycleResponse(
 		}
 
 		if (usedSignalFallback) {
-			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
+			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority, true);
 			if (stale) return stale;
 			if (!(await signalVerifiedSession(record, id, "SIGTERM")))
 				return fail(
@@ -4359,7 +4444,7 @@ export async function executeLifecycle(
 									}
 								: {
 										code: "spawn_failed",
-										message: "No ready SDK endpoint remains available.",
+										message: startupFailure.message,
 										endpoint: "unavailable" as const,
 									},
 							...(durableEffects ? { durableEffects } : {}),
@@ -4381,4 +4466,175 @@ export async function executeLifecycle(
 		...(durableEffects ? { durableEffects } : {}),
 		...(startupFailure ? { startupFailure } : {}),
 	};
+}
+
+/**
+ * The live client/socket subscription count of the SDK session endpoint this
+ * process serves, or `undefined` while this process serves no endpoint.
+ *
+ * Only the SDK session runtime owns the real socket table, so it publishes a
+ * reader here instead of every consumer re-deriving attachment from the OS.
+ * Consumers must treat `undefined` as "no evidence" and never as "detached".
+ */
+export type SessionHostAttachmentReader = () => number;
+
+/** What one serving runtime reports about itself while its transport is up. */
+export interface SessionHostRuntimeEvidence {
+	/** This runtime's own live SDK client/socket subscription count. */
+	attachedClients: SessionHostAttachmentReader;
+	/** Whether this runtime currently has agent work in flight. */
+	workInFlight: () => boolean;
+}
+
+/** One runtime's live publication, retractable only by its owner. */
+export interface SessionHostRuntimePublication {
+	/**
+	 * Withdraws the evidence this handle published. Idempotent, and never able
+	 * to touch a sibling runtime's evidence.
+	 */
+	retract(): void;
+}
+
+/**
+ * Every runtime in this process that currently serves an SDK endpoint.
+ *
+ * A process can serve more than one at a time: an identity-rotating control op
+ * starts the successor before the predecessor's deferred stop runs. A single
+ * global slot let that predecessor's teardown retract the live successor's
+ * reader and manufacture "no evidence" for a host with clients attached, so
+ * publications are held per runtime and retracted only through their own handle.
+ */
+const sessionHostRuntimes = new Set<SessionHostRuntimeEvidence>();
+
+/**
+ * Publishes this runtime's own liveness evidence for the lifetime of its
+ * transport. Retraction goes through the returned handle, so a runtime can only
+ * ever withdraw evidence it owns.
+ */
+export function publishSessionHostRuntimeEvidence(evidence: SessionHostRuntimeEvidence): SessionHostRuntimePublication {
+	const published: SessionHostRuntimeEvidence = { ...evidence };
+	sessionHostRuntimes.add(published);
+	return {
+		retract(): void {
+			sessionHostRuntimes.delete(published);
+		},
+	};
+}
+
+/**
+ * This process's currently attached SDK client count, summed across every
+ * serving runtime, or `undefined` when no runtime publishes a readable count
+ * (before startup, after teardown, or when every reader itself fails). Never
+ * guesses: absence of a reader is absence of evidence.
+ */
+export function sessionHostAttachedClients(): number | undefined {
+	let total: number | undefined;
+	for (const { attachedClients } of sessionHostRuntimes) {
+		let count: number;
+		try {
+			count = attachedClients();
+		} catch {
+			continue;
+		}
+		if (!Number.isSafeInteger(count) || count < 0) continue;
+		total = (total ?? 0) + count;
+	}
+	return total;
+}
+
+/**
+ * Whether any runtime in this process has agent work in flight right now.
+ *
+ * Positive evidence only: a runtime that publishes nothing, or whose reader
+ * fails, reports no work, so this can never keep an abandoned host alive.
+ */
+export function sessionHostWorkInFlight(): boolean {
+	for (const { workInFlight } of sessionHostRuntimes) {
+		try {
+			if (workInFlight()) return true;
+		} catch {}
+	}
+	return false;
+}
+
+/**
+ * How often a live broker re-checks its own session registrations against OS
+ * process liveness.
+ *
+ * This sweep can never disturb healthy work: a registration is only dropped
+ * when `process.kill(pid, 0)` proves the exact published pid is gone, and a
+ * working host answers that probe for its entire life no matter how long a turn
+ * runs. One minute keeps `gjc_sessions`/`session.get_endpoint` from advertising
+ * a corpse for longer than a single poll while costing one index refresh per
+ * minute on an otherwise idle broker.
+ */
+export const BROKER_DEAD_REGISTRATION_SWEEP_MS = 60_000;
+
+/** One reaped registration, as recorded by {@link reapDeadSessionRegistrations}. */
+export interface ReapedSessionRegistration {
+	sessionId: string;
+	pid: number;
+	endpointGeneration: number;
+}
+
+/**
+ * Drops every indexed session registration whose host process is provably gone.
+ *
+ * Liveness is the session index's own `alive(pid)` probe (`listSessions().live`),
+ * which reports live for both a running pid and an EPERM pid, so an alien or
+ * unreadable process is never mistaken for a dead one. Registrations already
+ * marked `terminalUncertain` are left alone: their disposition belongs to the
+ * terminal-uncertainty reconciliation path, and silently dropping them would
+ * turn a fail-closed `session.close`/`session.delete` refusal into `not_found`.
+ */
+export async function reapDeadSessionRegistrations(
+	broker: Pick<Broker, "index">,
+): Promise<ReapedSessionRegistration[]> {
+	await broker.index.refresh();
+	const dead = broker.index.listSessions().sessions.filter(session => !session.live && !session.terminalUncertain);
+	const reaped: ReapedSessionRegistration[] = [];
+	for (const session of dead) {
+		await broker.index.append({
+			type: "host_unregistered",
+			sessionId: session.sessionId,
+			locator: session.locator,
+			endpointGeneration: session.endpointGeneration,
+			pid: session.pid,
+			...(session.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: session.endpointMtimeMs }),
+			...(session.lifecycleRequestId ? { lifecycleRequestId: session.lifecycleRequestId } : {}),
+		});
+		const record = {
+			sessionId: session.sessionId,
+			pid: session.pid,
+			endpointGeneration: session.endpointGeneration,
+		};
+		reaped.push(record);
+		logger.warn("sdk broker reaped a session registration whose host process is gone", record);
+	}
+	return reaped;
+}
+
+/**
+ * Runs {@link reapDeadSessionRegistrations} on {@link BROKER_DEAD_REGISTRATION_SWEEP_MS}.
+ * The timer is unref'd, so it never keeps an otherwise idle broker process alive.
+ * Returns a disposer.
+ */
+export function startBrokerDeadRegistrationSweep(
+	broker: Pick<Broker, "index">,
+	intervalMs = BROKER_DEAD_REGISTRATION_SWEEP_MS,
+): () => void {
+	let running = false;
+	const timer = setInterval(() => {
+		if (running) return;
+		running = true;
+		void reapDeadSessionRegistrations(broker)
+			.catch(error => {
+				logger.warn("sdk broker dead-registration sweep failed", { error: String(error) });
+			})
+			.finally(() => {
+				running = false;
+			});
+	}, intervalMs);
+	timer.unref();
+	return () => clearInterval(timer);
 }

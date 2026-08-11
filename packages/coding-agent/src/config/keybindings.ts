@@ -35,6 +35,7 @@ interface AppKeybindings {
 	"app.message.queue": true;
 	"app.message.dequeue": true;
 	"app.clipboard.pasteImage": true;
+	"app.clipboard.pasteText": true;
 	"app.clipboard.copyLine": true;
 	"app.clipboard.copyPrompt": true;
 	"app.session.new": true;
@@ -154,6 +155,11 @@ export const KEYBINDINGS = {
 	"app.clipboard.pasteImage": {
 		defaultKeys: defaultClipboardPasteImageKeysForPlatform(),
 		description: "Paste image from clipboard",
+	},
+	"app.clipboard.pasteText": {
+		defaultKeys: [],
+		description:
+			"Paste text from configured clipboard transport (command palette only; no default key to avoid colliding with image paste)",
 	},
 	"app.clipboard.copyLine": {
 		defaultKeys: "alt+shift+l",
@@ -289,6 +295,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	queue: "app.message.queue",
 	dequeue: "app.message.dequeue",
 	pasteImage: "app.clipboard.pasteImage",
+	pasteText: "app.clipboard.pasteText",
 	copyLine: "app.clipboard.copyLine",
 	copyPrompt: "app.clipboard.copyPrompt",
 	newSession: "app.session.new",

@@ -37,6 +37,7 @@ import {
 	copyManagedFileNoReplace,
 	ensureManagedDirectory,
 	fsyncManagedArtifactTree,
+	inspectManagedFileNoFollow,
 	MANAGED_ARTIFACT_COPY_BATCH_SIZE,
 	MANAGED_ARTIFACT_MAX_FILES,
 	MANAGED_ARTIFACT_MAX_TOTAL_BYTES,
@@ -50,6 +51,7 @@ import {
 	prepareManagedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedTombstone,
+	reapScrubbedProtocolRemnantsSync,
 	retainManagedDirectoryAuthority,
 	validateManagedArtifactTree,
 	validateNativeSecurityResult,
@@ -192,8 +194,27 @@ export type ManagedScopeResolution =
 			cause?: { readonly classification: string; readonly diagnostic?: string };
 	  };
 
+/**
+ * Classify a failure for the operator-visible `cause`.
+ *
+ * Must agree with {@link managedScopeErrorCode}: the reported `code` and the
+ * `cause.classification` printed in the startup error are produced by separate
+ * helpers, so a message recognized by one and not the other still surfaces to
+ * the operator as `binding_invalid`.
+ */
 function managedScopeFailureCause(error: unknown): { readonly classification: string } {
-	return { classification: managedSecurityFailureClassification(error) ?? "binding_invalid" };
+	const security = managedSecurityFailureClassification(error);
+	if (security) return { classification: security };
+	return { classification: managedScopeErrorCode(error instanceof Error ? error.message : "") };
+}
+
+/**
+ * A scope whose directory outgrew a scan budget. The binding is untouched and
+ * canonical; only the surrounding entry count is over budget, so this must not
+ * be reported as binding corruption.
+ */
+function isManagedScopeCapacityMessage(message: string): boolean {
+	return message === "artifact_capacity_exceeded" || message === "managed_replace_cleanup_receipt_limit_exceeded";
 }
 
 const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
@@ -213,7 +234,7 @@ const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
  * corrupt binding, which sends operators to delete a healthy binding file.
  */
 function managedScopeErrorCode(message: string): ManagedScopeErrorCode {
-	if (message === "content_too_large") return "capacity_exceeded";
+	if (message === "content_too_large" || isManagedScopeCapacityMessage(message)) return "capacity_exceeded";
 	return managedScopeFailureCodes.has(message as ManagedScopeErrorCode)
 		? (message as ManagedScopeErrorCode)
 		: "binding_invalid";
@@ -223,7 +244,7 @@ function managedScopeFailureMessage(error: unknown, fallback: string): string {
 	const classification = managedSecurityFailureClassification(error);
 	if (classification) return classification;
 	if (!(error instanceof Error)) return fallback;
-	if (error.message === "content_too_large") return error.message;
+	if (error.message === "content_too_large" || isManagedScopeCapacityMessage(error.message)) return error.message;
 	return managedScopeFailureCodes.has(error.message as ManagedScopeErrorCode) ? error.message : fallback;
 }
 
@@ -784,7 +805,7 @@ function matchesPreflightIdentity(candidate: ManagedCandidate, preflight: Candid
 
 function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): ManagedCandidate | { code: string } {
 	try {
-		const snapshot = captureManagedFileNoFollow(filePath);
+		const snapshot = inspectManagedFileNoFollow(filePath, HEADER_MAX_BYTES);
 		const lineEnd = snapshot.bytes.subarray(0, HEADER_MAX_BYTES).indexOf(0x0a);
 		if (lineEnd < 0) return { code: "invalid_header" };
 		const value: unknown = JSON.parse(snapshot.bytes.subarray(0, lineEnd).toString("utf8"));
@@ -816,7 +837,7 @@ function inspectCandidate(filePath: string, provenance: "v2" | "legacy"): Manage
 				...snapshot.identity,
 				nlink: snapshot.identity.nlink,
 				mtimeMs: Number(named.mtimeMs),
-				sha256: createHash("sha256").update(snapshot.bytes).digest("hex"),
+				sha256: snapshot.identity.sha256,
 			},
 		};
 	} catch (error) {
@@ -1132,6 +1153,7 @@ export function prepareManagedSessionScopeForWriteSync(
 		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
 		stage = "tombstones_directory";
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
+		reapScrubbedProtocolRemnantsSync(scope.directoryPath);
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
@@ -3376,32 +3398,37 @@ function receiptPair(scope: ManagedScope, candidate: ManagedCandidate): ManagedC
 	const directory = path.join(managedInternalDirectory(scope), MANAGED_RECEIPTS_DIRECTORY);
 	try {
 		for (const name of fs.readdirSync(directory)) {
-			const pathname = path.join(directory, name);
-			const value: unknown = JSON.parse(captureManagedFileNoFollow(pathname).bytes.toString("utf8"));
-			if (!value || typeof value !== "object") continue;
-			const record = value as { source?: { path?: unknown }; destination?: { path?: unknown } };
-			const otherPath =
-				record.source?.path === candidate.path
-					? record.destination?.path
-					: record.destination?.path === candidate.path
-						? record.source?.path
-						: undefined;
-			if (typeof otherPath !== "string") continue;
-			const other = inspectCandidate(otherPath, candidate.provenance === "v2" ? "legacy" : "v2");
-			if (
-				"code" in other ||
-				!receiptMatches(
-					pathname,
-					candidate.provenance === "legacy" ? candidate : other,
-					candidate.provenance === "v2" ? candidate : other,
-					scope,
+			try {
+				const pathname = path.join(directory, name);
+				const value: unknown = JSON.parse(captureManagedFileNoFollow(pathname).bytes.toString("utf8"));
+				if (!value || typeof value !== "object") continue;
+				const record = value as { source?: { path?: unknown }; destination?: { path?: unknown } };
+				const otherPath =
+					record.source?.path === candidate.path
+						? record.destination?.path
+						: record.destination?.path === candidate.path
+							? record.source?.path
+							: undefined;
+				if (typeof otherPath !== "string") continue;
+				const other = inspectCandidate(otherPath, candidate.provenance === "v2" ? "legacy" : "v2");
+				if (
+					"code" in other ||
+					!receiptMatches(
+						pathname,
+						candidate.provenance === "legacy" ? candidate : other,
+						candidate.provenance === "v2" ? candidate : other,
+						scope,
+					)
 				)
-			)
-				continue;
-			return other;
+					continue;
+				return other;
+			} catch {
+				// Native cleanup residues, symlinks, and malformed files grant no authority;
+				// continue to the deterministic committed receipt instead of aborting the scan.
+			}
 		}
 	} catch {
-		/* no committed pair grants no shadow authority */
+		/* a missing receipts directory grants no shadow authority */
 	}
 	return undefined;
 }
@@ -3707,6 +3734,7 @@ export async function prepareManagedSessionScopeForWrite(
 		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
 		await reconcileManagedTombstones(scope, expectedCandidate);
+		reapScrubbedProtocolRemnantsSync(scope.directoryPath);
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
@@ -3857,8 +3885,12 @@ async function openManagedCandidateForWriteInternal(
 				assertPublicationConsent,
 				scopeRoot(scope),
 			);
+			assertPublicationConsent();
 		} catch (error) {
-			if ((error as Error).message !== "destination_conflict") throw error;
+			if ((error as Error).message !== "destination_conflict") {
+				await removeStagedReceipts(scope, afterLock);
+				throw error;
+			}
 		}
 
 		revalidatePickerConsent(scope, afterLock, expectedIdentity);

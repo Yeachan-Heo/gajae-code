@@ -20,12 +20,16 @@ import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/ag
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { getUserMessageViewportAnchorIds } from "../../session/session-manager";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
-import { copyToClipboard, readImageFromClipboard } from "../../utils/clipboard";
+import { copyToClipboard, pasteFromClipboard, readImageFromClipboard } from "../../utils/clipboard";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
 import { loadPastedImageBatch, PastedImageBatchError } from "../../utils/pasted-image-loading";
-import { formatPastedImageReference, parsePastedImagePaths } from "../../utils/pasted-image-path";
+import {
+	formatPastedImageReference,
+	locatePastedImageReferenceAroundCursor,
+	parsePastedImagePaths,
+} from "../../utils/pasted-image-path";
 import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { ActionRegistry, APP_ACTION_METADATA } from "../action-registry";
 import { CommandPalette, type CommandPaletteAction, type CommandPaletteEntry } from "../components/command-palette";
@@ -64,6 +68,11 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	#imagePlaceholderDeletionUndo?: {
+		beforeText: string;
+		afterText: string;
+		pendingImages: InteractiveModeContext["pendingImages"];
+	};
 
 	constructor(
 		private ctx: InteractiveModeContext,
@@ -100,6 +109,9 @@ export class InputController {
 			"app.message.dequeue": () => this.handleDequeue(),
 			"app.clipboard.pasteImage": async () => {
 				await this.handleImagePaste();
+			},
+			"app.clipboard.pasteText": async () => {
+				await this.handlePasteText();
 			},
 			"app.clipboard.copyLine": () => this.handleCopyCurrentLine(),
 			"app.clipboard.copyPrompt": () => this.handleCopyPrompt(),
@@ -605,6 +617,10 @@ export class InputController {
 		);
 		this.ctx.editor.onPasteImage = () => this.actionRegistry.execute("app.clipboard.pasteImage");
 		this.#registerCommandPaletteAction("app.clipboard.pasteImage", pasteImageFromPalette);
+		const pasteTextFromPalette = async () => {
+			await this.handlePasteText();
+		};
+		this.#registerCommandPaletteAction("app.clipboard.pasteText", pasteTextFromPalette);
 		const copyPrompt = () => this.handleCopyPrompt();
 		this.ctx.editor.setActionKeys(
 			"app.clipboard.copyPrompt",
@@ -638,6 +654,12 @@ export class InputController {
 		};
 
 		this.ctx.editor.clearCustomKeyHandlers();
+		for (const key of new Set([
+			...this.ctx.keybindings.getKeys("tui.editor.deleteCharBackward"),
+			"shift+backspace" as const,
+		])) {
+			this.ctx.editor.setCustomKeyHandler(key, () => this.#deleteImagePlaceholderBeforeCursor());
+		}
 		// Wire up extension shortcuts
 		this.registerExtensionShortcuts();
 
@@ -744,6 +766,7 @@ export class InputController {
 		// Tab on an empty composer accepts the pending ghost-text prompt suggestion.
 		this.ctx.editor.onTab = (text: string) => this.ctx.promptSuggestion?.tryAcceptOnTab(text) === true;
 
+		this.ctx.editor.onUndo = text => this.#restorePendingImagesAfterPlaceholderUndo(text);
 		this.ctx.editor.onChange = (text: string) => {
 			this.#resetEscapeGestures();
 			this.ctx.promptSuggestion?.notifyEditorChanged(text);
@@ -770,7 +793,10 @@ export class InputController {
 	}
 
 	async submitText(text: string, composer: ComposerSubmissionOptions): Promise<void> {
+		this.#imagePlaceholderDeletionUndo = undefined;
 		text = text.trim();
+		const submittedBashMode = this.ctx.isBashMode;
+		const submittedBashNoContext = this.ctx.isBashNoContext;
 		if ((!isSettingsInitialized() || settings.get("emojiAutocomplete")) && text) text = expandEmoticons(text);
 		if (this.ctx.hasActiveBtw()) {
 			if (!text) return;
@@ -873,19 +899,32 @@ export class InputController {
 		}
 
 		// Handle bash command (! for normal, !! for excluded from context)
-		if (text.startsWith("!")) {
-			const isExcluded = text.startsWith("!!");
-			const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
+		const hasExplicitShellPrefix = text.startsWith("!");
+		const hasExplicitNoContextPrefix = text.startsWith("!!");
+		const shellMode = submittedBashMode || hasExplicitShellPrefix;
+		if (shellMode) {
+			const isExcluded = hasExplicitNoContextPrefix || (!hasExplicitShellPrefix && submittedBashNoContext);
+			const command = hasExplicitNoContextPrefix
+				? text.slice(2).trim()
+				: hasExplicitShellPrefix
+					? text.slice(1).trim()
+					: text.trim();
+			const historyText = hasExplicitShellPrefix ? text : `${isExcluded ? "!!" : "!"}${text}`;
 			if (command) {
 				if (this.ctx.session.isBashRunning) {
 					this.ctx.showWarning("A bash command is already running. Press Esc to cancel it first.");
 					if (this.#canModifyComposer(composer)) {
+						const isBashMode = hasExplicitShellPrefix || submittedBashMode;
+						const isBashNoContext = hasExplicitShellPrefix ? hasExplicitNoContextPrefix : submittedBashNoContext;
 						this.ctx.editor.setText(text);
+						this.ctx.isBashMode = isBashMode;
+						this.ctx.isBashNoContext = isBashNoContext;
+						this.ctx.updateEditorBorderColor();
 					}
 					return;
 				}
 				if (this.#canModifyComposer(composer)) {
-					this.ctx.editor.addToHistory(text);
+					this.ctx.editor.addToHistory(historyText);
 				}
 				await this.ctx.handleBashCommand(command, isExcluded);
 				this.ctx.isBashMode = false;
@@ -967,7 +1006,7 @@ export class InputController {
 				text,
 				registry,
 				this.ctx.settings,
-				this.ctx.session.sessionId,
+				this.ctx.session.credentialSessionId,
 				this.ctx.session.model,
 				provider => this.ctx.session.agent.metadataForProvider(provider),
 			)
@@ -1458,6 +1497,21 @@ export class InputController {
 			return;
 		}
 
+		// Foreground bash/eval owns the process fence. Queue all prompt text,
+		// including slash skill input, until the process settles instead of
+		// expanding a skill and starting a competing model turn.
+		if (this.ctx.session.isBashRunning || this.ctx.session.isEvalRunning) {
+			this.ctx.editor.addToHistory(text);
+			this.ctx.editor.setText("");
+			await this.ctx.withLocalSubmission(text, () =>
+				this.ctx.session.followUp(text, undefined, {
+					followUpQueuePolicy: "sequential",
+				}),
+			);
+			this.ctx.updatePendingMessagesDisplay();
+			this.ctx.ui.requestRender();
+			return;
+		}
 		// Skill commands invoke through the custom-message path regardless of
 		// which keybinding submitted them. Enter routes them as `steer`;
 		// explicit queue shortcuts route them as `followUp`.
@@ -1714,6 +1768,45 @@ export class InputController {
 		}
 	}
 
+	#deleteImagePlaceholderBeforeCursor(): boolean {
+		if (this.ctx.pendingImages.length === 0) return false;
+
+		const { line, col } = this.ctx.editor.getCursor();
+		const currentLine = this.ctx.editor.getLines()[line] ?? "";
+		const range = locatePastedImageReferenceAroundCursor(currentLine, col);
+		if (!range) return false;
+		const placeholderNumberText = String(range.imageIndex);
+
+		const imageIndex = Number.parseInt(placeholderNumberText, 10) - 1;
+		if (imageIndex < 0 || imageIndex >= this.ctx.pendingImages.length) return false;
+
+		const beforeText = this.ctx.editor.getText();
+		const pendingImages = this.ctx.pendingImages;
+		const deleted = this.ctx.editor.deleteTextRangeAroundCursor(range.startCol, range.endCol);
+		if (deleted) {
+			this.#imagePlaceholderDeletionUndo = {
+				beforeText,
+				afterText: this.ctx.editor.getText(),
+				pendingImages,
+			};
+		}
+		return deleted;
+	}
+
+	#restorePendingImagesAfterPlaceholderUndo(text: string): void {
+		const deletion = this.#imagePlaceholderDeletionUndo;
+		if (!deletion) return;
+
+		if (text === deletion.beforeText) {
+			if (this.ctx.pendingImages.length === 0) {
+				this.ctx.pendingImages = deletion.pendingImages;
+			}
+			this.#imagePlaceholderDeletionUndo = undefined;
+		} else if (text !== deletion.afterText) {
+			this.#imagePlaceholderDeletionUndo = undefined;
+		}
+	}
+
 	#nextImagePlaceholder(): string {
 		return `[image ${this.ctx.pendingImages.length}]`;
 	}
@@ -1759,9 +1852,8 @@ export class InputController {
 		if (this.ctx.pendingImages.length === 0 || IMAGE_PLACEHOLDER_PRESENT_PATTERN.test(text)) {
 			return;
 		}
-		// Editor submit resets the composer and emits onChange("") before onSubmit(result).
-		// Defer the empty-buffer clear so the submit handler can still resolve image
-		// placeholders against pendingImages, while manual clears still drop stale images.
+		// Editor clears its internal buffer before invoking onSubmit and emits
+		// onChange("") afterward; defer the empty-buffer clear for that callback.
 		if (text.length === 0) {
 			const pendingImages = this.ctx.pendingImages;
 			const pendingImageCount = pendingImages.length;
@@ -1827,6 +1919,33 @@ export class InputController {
 			return false;
 		}
 	}
+	/**
+	 * Explicit "Paste text from configured clipboard" action (P3-b v1). Only
+	 * meaningful when `clipboard.transport` is `ssh` — reads via `pbpaste` on
+	 * the configured host and inserts the result at the cursor. No default
+	 * key (command palette only), so it never collides with the platform
+	 * image-paste binding. Explicit ssh failures are surfaced verbatim and
+	 * never fall back to native/OSC52 or leave stale text inserted.
+	 */
+	async handlePasteText(): Promise<boolean> {
+		try {
+			const text = await pasteFromClipboard();
+			if (text === null) {
+				this.ctx.showStatus(
+					"Paste text from clipboard requires --clipboard-transport ssh (or clipboard.transport: ssh in config).",
+				);
+				return false;
+			}
+			this.ctx.editor.insertText(text);
+			this.ctx.ui.requestRender();
+			return true;
+		} catch (error) {
+			this.ctx.showError(
+				`Failed to paste from clipboard: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return false;
+		}
+	}
 
 	createAutocompleteProvider(commands: SlashCommand[], basePath: string): AutocompleteProvider {
 		this.#slashCommands = commands;
@@ -1837,6 +1956,7 @@ export class InputController {
 			copyCurrentLine: () => this.handleCopyCurrentLine(),
 			copyPrompt: () => this.handleCopyPrompt(),
 			pasteImage: () => void this.handleImagePaste(),
+			pasteText: () => void this.handlePasteText(),
 			newSession: () => void this.ctx.handleClearCommand(),
 			showHelp: () => this.ctx.handleHelpCommand(),
 			scrollTmuxToPreviousUserInput: () => this.scrollTmuxToPreviousUserInput(),
@@ -1857,14 +1977,14 @@ export class InputController {
 			this.ctx.showStatus("Nothing to copy");
 			return;
 		}
-		try {
-			copyToClipboard(text);
-			const sanitized = sanitizeText(text);
-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
-			this.ctx.showStatus(`Copied line: ${preview}`);
-		} catch {
-			this.ctx.showWarning("Failed to copy to clipboard");
-		}
+		copyToClipboard(text).then(
+			() => {
+				const sanitized = sanitizeText(text);
+				const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+				this.ctx.showStatus(`Copied line: ${preview}`);
+			},
+			() => this.ctx.showWarning("Failed to copy to clipboard"),
+		);
 	}
 
 	/** Copy current prompt text to system clipboard. */
@@ -1874,14 +1994,14 @@ export class InputController {
 			this.ctx.showStatus("Nothing to copy");
 			return;
 		}
-		try {
-			copyToClipboard(text);
-			const sanitized = sanitizeText(text);
-			const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
-			this.ctx.showStatus(`Copied: ${preview}`);
-		} catch {
-			this.ctx.showWarning("Failed to copy to clipboard");
-		}
+		copyToClipboard(text).then(
+			() => {
+				const sanitized = sanitizeText(text);
+				const preview = sanitized.length > 30 ? `${sanitized.slice(0, 30)}...` : sanitized;
+				this.ctx.showStatus(`Copied: ${preview}`);
+			},
+			() => this.ctx.showWarning("Failed to copy to clipboard"),
+		);
 	}
 
 	async #dispatchPaletteSlashCommand(name: string, restoreComposer: () => void): Promise<void> {

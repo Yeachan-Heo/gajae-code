@@ -68,6 +68,8 @@ function makeFakeSession() {
 	const session = {
 		isStreaming: true,
 		isCompacting: false,
+		isBashRunning: false,
+		isEvalRunning: false,
 		extensionRunner: undefined,
 		customCommands: [] as Array<{ command: { name: string } }>,
 		getQueuedMessages: () => ({ steering, followUp }),
@@ -132,6 +134,25 @@ function makeCtx(initialQueue: CompactionQueuedMessage[]) {
 }
 
 describe("issue #825: steer preview stuck after compaction", () => {
+	test("defers compaction queue transfer while foreground bash is active", async () => {
+		const queued: CompactionQueuedMessage[] = [{ text: "after bash", mode: "followUp" }];
+		const { ctx, fake } = makeCtx(queued);
+		fake.session.isBashRunning = true;
+
+		const helpers = new UiHelpers(ctx);
+		await helpers.flushCompactionQueue({ willRetry: false });
+
+		expect(ctx.compactionQueuedMessages).toEqual(queued);
+		expect(fake.promptCalls).toEqual([]);
+		expect(fake.followUpCalls).toEqual([]);
+
+		fake.session.isBashRunning = false;
+		await Bun.sleep(150);
+		expect(ctx.compactionQueuedMessages).toEqual([]);
+		expect(fake.promptCalls).toEqual([
+			{ text: "after bash", opts: { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" } },
+		]);
+	});
 	test("AgentBusyError on flush leaves the steer message in the session queue (submittable on next turn)", async () => {
 		const queued: CompactionQueuedMessage[] = [{ text: "address review feedback", mode: "steer" }];
 		const { ctx, fake } = makeCtx(queued);

@@ -262,9 +262,10 @@ describe("G004 streamed tool args QA", () => {
 			pending.push({ resolve: deferred.resolve });
 			return deferred.promise;
 		};
+		const args = makeArgs("edit", 1, true);
 		const component = new ToolExecutionComponent(
 			"edit",
-			makeArgs("edit", 1, true),
+			args,
 			{},
 			{ name: "edit", label: "Edit", mode: "hashline" } as any,
 			ui,
@@ -277,15 +278,46 @@ describe("G004 streamed tool args QA", () => {
 			throw new Error(`Preview did not render ${expected}`);
 		};
 		try {
+			component.setExpanded(true);
 			expect(pending).toHaveLength(1);
 			pending[0].resolve([{ path: "preview-one.txt", diff: "+preview-one" }]);
 			await settleRenderedPreview("preview-one");
 
-			component.updateArgs(makeArgs("edit", 2, true));
+			const changedArgs = makeArgs("edit", 2, true);
+			expect(originalJsonStringify(changedArgs)).toHaveLength(originalJsonStringify(args).length);
+			Object.assign(args, changedArgs);
+			component.updateArgs(args);
 			expect(pending).toHaveLength(2);
 			pending[1].resolve([{ path: "preview-two.txt", diff: "+preview-two" }]);
 			await settleRenderedPreview("preview-two");
 			expect(rendered(component)).not.toContain("preview-one");
+		} finally {
+			strategy.computeDiffPreview = originalCompute;
+			component.dispose();
+		}
+	});
+
+	it("COALESCE-SKIP retains a preview for an unchanged streamed payload", async () => {
+		const editModule = await import("../src/edit/index");
+		const strategy = (editModule.EDIT_MODE_STRATEGIES as any).hashline;
+		const originalCompute = strategy.computeDiffPreview;
+		const pending: Array<{ resolve: (value: unknown) => void }> = [];
+		strategy.computeDiffPreview = () => {
+			const deferred = Promise.withResolvers<unknown>();
+			pending.push({ resolve: deferred.resolve });
+			return deferred.promise;
+		};
+		const args = makeArgs("edit", 1, true);
+		const component = new ToolExecutionComponent(
+			"edit",
+			args,
+			{},
+			{ name: "edit", label: "Edit", mode: "hashline" } as any,
+			ui,
+		);
+		try {
+			component.updateArgs({ ...args });
+			expect(pending).toHaveLength(1);
 		} finally {
 			strategy.computeDiffPreview = originalCompute;
 			component.dispose();

@@ -45,6 +45,7 @@ export interface LocalProtocolOptions {
 	getArtifactsDir?: () => string | null;
 	isManagedDestination?: () => boolean;
 	getManagedLegacyLocalMigrationSource?: () => ManagedLegacyLocalMigrationSource | null;
+	getCredentialSessionId?: () => string | null;
 	getSessionId?: () => string | null;
 }
 
@@ -508,6 +509,7 @@ async function migrateLegacyLocal(
 }
 
 const initializedLocalRoots = new Set<string>();
+const initializingLocalRoots = new Map<string, Promise<string>>();
 
 /**
  * Completes the mandatory legacy migration gate for a local root.
@@ -541,6 +543,18 @@ export async function initializeLocalRoot(options: LocalProtocolOptions): Promis
 	const explicitRoot = explicitLocalRoot(options);
 	if (explicitRoot) return await initializeExplicitLocalRoot(explicitRoot);
 	const localRoot = path.resolve(resolveLocalRoot(options));
+	const existing = initializingLocalRoots.get(localRoot);
+	if (existing) return await existing;
+	const initializing = initializeManagedLocalRoot(options, localRoot);
+	initializingLocalRoots.set(localRoot, initializing);
+	try {
+		return await initializing;
+	} finally {
+		if (initializingLocalRoots.get(localRoot) === initializing) initializingLocalRoots.delete(localRoot);
+	}
+}
+
+async function initializeManagedLocalRoot(options: LocalProtocolOptions, localRoot: string): Promise<string> {
 	const scratchParent = path.dirname(localRoot);
 
 	await fs.mkdir(scratchParent, { recursive: true, mode: 0o700 });
@@ -682,6 +696,7 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		LocalProtocolHandler.#override = undefined;
 		LocalProtocolHandler.#ownedOverrides = [];
 		initializedLocalRoots.clear();
+		initializingLocalRoots.clear();
 	}
 
 	/**

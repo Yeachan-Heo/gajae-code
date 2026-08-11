@@ -2409,7 +2409,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (countTextLines(code) > MAX_SUMMARY_LINES) return null;
 
 			const summarizeCode = (await nativeRead()).summarizeCode;
-			return summarizeCode({
+			return await summarizeCode({
 				code,
 				path: absolutePath,
 				minBodyLines: this.session.settings.get("read.summarize.minBodyLines"),

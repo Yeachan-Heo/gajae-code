@@ -7,6 +7,7 @@ import { Snowflake } from "@gajae-code/utils/snowflake";
 import type { HTMLElement } from "linkedom";
 import type {
 	Browser,
+	CDPSession,
 	Dialog,
 	ElementHandle,
 	HTTPResponse,
@@ -27,6 +28,11 @@ import {
 	loadPuppeteerInWorker,
 } from "./launch";
 import { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./readable";
+import {
+	BrowserRuntimeDiagnosticsMailbox,
+	instrumentBrowserRuntimeDiagnostics,
+	serializeRuntimeDiagnostics,
+} from "./runtime-diagnostics";
 import { formatScreenshot } from "./screenshot-format";
 import type {
 	Observation,
@@ -74,6 +80,16 @@ const INTERACTIVE_AX_ROLES = new Set([
 ]);
 
 const LEGACY_SELECTOR_PREFIXES = ["p-aria/", "p-text/", "p-xpath/", "p-pierce/"] as const;
+
+/**
+ * Test seam: override the worker's puppeteer loader so WorkerCore-level tests can
+ * inject a fake browser/page without a live Chromium. Mirrors the supervisor's
+ * `__setAcquireTabWorkerDepsForTest` pattern.
+ */
+let loadPuppeteerInWorkerForTest: typeof loadPuppeteerInWorker | undefined;
+export function __setLoadPuppeteerInWorkerForTest(loader: typeof loadPuppeteerInWorker | undefined): void {
+	loadPuppeteerInWorkerForTest = loader;
+}
 
 type DialogPolicy = "accept" | "dismiss";
 type DragTarget = string | { readonly x: number; readonly y: number };
@@ -398,6 +414,8 @@ export class WorkerCore {
 	#transport: Transport;
 	#browser?: Browser;
 	#page?: Page;
+	#runtimeDiagnostics = new BrowserRuntimeDiagnosticsMailbox();
+	#runtimeDiagnosticsSession?: CDPSession;
 	#targetId?: string;
 	#elementCache = new Map<number, ElementHandle>();
 	#elementCounter = 0;
@@ -447,7 +465,7 @@ export class WorkerCore {
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
 			this.#mode = payload.mode;
-			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
+			const puppeteer = await (loadPuppeteerInWorkerForTest ?? loadPuppeteerInWorker)(payload.safeDir);
 			this.#browser = await puppeteer.connect({
 				browserWSEndpoint: payload.browserWSEndpoint,
 				defaultViewport: null,
@@ -457,6 +475,7 @@ export class WorkerCore {
 				this.#page = await this.#browser.newPage();
 				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null }, payload.geo);
 				await applyViewport(this.#page, payload.viewport);
+				if (payload.runtimeDiagnostics) await this.#instrumentRuntimeDiagnostics(this.#page);
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 				if (payload.url) {
 					await this.#page.goto(payload.url, {
@@ -467,6 +486,7 @@ export class WorkerCore {
 				}
 			} else {
 				this.#page = await this.#findAttachedPage(payload.targetId);
+				if (payload.runtimeDiagnostics) await this.#instrumentRuntimeDiagnostics(this.#page);
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 			}
 			this.#targetId = await targetIdForPage(this.#page);
@@ -515,6 +535,16 @@ export class WorkerCore {
 		page.on("dialog", handler);
 		this.#dialogPolicy = policy;
 		this.#dialogHandler = handler;
+	}
+
+	async #instrumentRuntimeDiagnostics(page: Page): Promise<void> {
+		try {
+			this.#runtimeDiagnosticsSession = await instrumentBrowserRuntimeDiagnostics(page, this.#runtimeDiagnostics);
+		} catch (error) {
+			this.#log("debug", "Failed to instrument browser runtime diagnostics", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	async #postReadyInfo(): Promise<void> {
@@ -581,6 +611,10 @@ export class WorkerCore {
 					cancelRejection,
 				]);
 				await this.#postReadyInfo();
+				const drained = this.#runtimeDiagnostics.drain();
+				if (drained.runtimeDiagnostics.length || drained.runtimeDiagnosticsDropped) {
+					displays.push({ type: "text", text: serializeRuntimeDiagnostics(drained) });
+				}
 				this.#transport.send({
 					type: "result",
 					id: msg.id,
@@ -1034,6 +1068,7 @@ export class WorkerCore {
 		this.#clearElementCache();
 		const page = this.#page;
 		if (this.#dialogHandler && page && !page.isClosed()) page.off("dialog", this.#dialogHandler);
+		await this.#runtimeDiagnosticsSession?.detach().catch(() => undefined);
 		if (this.#mode === "headless" && page && !page.isClosed()) await page.close().catch(() => undefined);
 		if (this.#browser?.connected) this.#browser.disconnect();
 		this.#transport.send({ type: "closed" });

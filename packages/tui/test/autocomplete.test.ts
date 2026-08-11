@@ -178,53 +178,19 @@ describe("CombinedAutocompleteProvider", () => {
 	});
 });
 
-describe("inline backtick slash classification", () => {
-	it.each([
-		["open span", "please use `/mo", null],
-		["closed span", "please use `/mo` then /he", "/he"],
-		["multiple spans", "`/mo` and `/he", null],
-		["odd escaped delimiter", "please use \\`/mo", "/mo"],
-		["even escaped delimiter", "please use \\\\`/mo", null],
-		["double-backtick run", "please use ``/mo", "/mo"],
-		["triple-backtick run", "please use ```/mo", "/mo"],
-	])("handles %s", (_name, text, expected) => {
-		expect(extractSlashCommandTokenPrefix(text)).toBe(expected);
-	});
-
-	it("resets literal state at line boundaries", () => {
-		expect(extractSlashCommandTokenPrefix("/mo")).toBe("/mo");
-	});
-
+describe("slash command token classification", () => {
 	it.each([
 		["top-level command", "/he", "/he"],
-		["inline command token", "please use /he", "/he"],
+		["inline command token", "please use /he", null],
+		["adjacent inline token", "please/hel", null],
 		["nested absolute path", "/chromium/src", null],
 		["multi-segment relative path", "chromium/lib/src", null],
 		["URL path", "https://example.com/he", null],
-	])("classifies %s with nested slash boundaries", (_name, text, expected) => {
+	])("classifies %s", (_name, text, expected) => {
 		expect(extractSlashCommandTokenPrefix(text)).toBe(expected);
 	});
 
-	it("preserves path suggestions inside an open inline-code span", async () => {
-		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-backtick-test-"));
-		try {
-			fs.mkdirSync(path.join(baseDir, "src", "foo"), { recursive: true });
-			fs.writeFileSync(path.join(baseDir, "src", "foo", "bar.ts"), "export {};\n");
-			const provider = new CombinedAutocompleteProvider(
-				[{ name: "model", description: "Switch AI model", value: "model" }],
-				baseDir,
-			);
-			const line = "please read `src/foo/";
-			const result = await provider.getSuggestions([line], 0, line.length);
-
-			expect(result?.prefix).toBe("src/foo/");
-			expect(result?.items.map(item => item.value)).toContain("src/foo/bar.ts");
-			expect(result?.items.map(item => item.value)).not.toContain("model");
-		} finally {
-			fs.rmSync(baseDir, { recursive: true, force: true });
-		}
-	});
-	it("preserves submitted command argument completion inside backticks", async () => {
+	it("preserves submitted command argument completion", async () => {
 		const provider = new CombinedAutocompleteProvider(
 			[
 				{
@@ -236,15 +202,15 @@ describe("inline backtick slash classification", () => {
 			],
 			"/tmp",
 		);
-		const line = "/read `src/foo/";
+		const line = "/read src/foo/";
 		const result = await provider.getSuggestions([line], 0, line.length);
 
-		expect(result?.prefix).toBe("`src/foo/");
-		expect(result?.items).toEqual([{ value: "`src/foo/", label: "existing argument completion" }]);
+		expect(result?.prefix).toBe("src/foo/");
+		expect(result?.items).toEqual([{ value: "src/foo/", label: "existing argument completion" }]);
 	});
 });
 
-describe("inline slash command suggestions", () => {
+describe("slash command suggestion position", () => {
 	it("marks start-of-input command-name suggestions as slash commands", async () => {
 		const provider = new CombinedAutocompleteProvider(
 			[{ name: "model", description: "Switch AI model", value: "model" }],
@@ -253,100 +219,62 @@ describe("inline slash command suggestions", () => {
 		const result = await provider.getSuggestions(["/mo"], 0, 3);
 
 		expect(result?.kind).toBe("slash-command");
+		expect(result?.items.map(item => item.value)).toContain("model");
 	});
 
-	it("suggests command names for slash tokens after existing prompt text", async () => {
+	it.each([
+		"explain this /mo",
+		"explain this/hel",
+	])("does not open automatic slash-command suggestions after prompt text: %s", async line => {
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{ name: "model", description: "Switch AI model", value: "model" },
+				{ name: "help", description: "Learn commands", value: "help" },
+			],
+			"/tmp",
+		);
+
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
+	});
+
+	it("preserves inline file-path suggestions after prompt text", async () => {
+		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-inline-path-test-"));
+		try {
+			fs.mkdirSync(path.join(baseDir, "src", "foo"), { recursive: true });
+			fs.writeFileSync(path.join(baseDir, "src", "foo", "bar.ts"), "export {};\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "read src/foo/";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe("src/foo/");
+			expect(result?.items.map(item => item.value)).toContain("src/foo/bar.ts");
+		} finally {
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		[["", "/mo"], 1, 3],
+		[["  /mo"], 0, 5],
+	])("offers command suggestions after only leading whitespace", async (lines, cursorLine, cursorCol) => {
 		const provider = new CombinedAutocompleteProvider(
 			[{ name: "model", description: "Switch AI model", value: "model" }],
 			"/tmp",
 		);
-		const line = "explain this /mo";
-		const result = await provider.getSuggestions([line], 0, line.length);
+		const result = await provider.getSuggestions(lines, cursorLine, cursorCol);
 
-		expect(result).not.toBeNull();
-		expect(result!.prefix).toBe("/mo");
-		expect(result!.kind).toBe("slash-command");
-		expect(result!.items.map(item => item.value)).toEqual(["model"]);
+		expect(result?.kind).toBe("slash-command");
+		expect(result?.prefix).toBe("/mo");
+		expect(result?.items.map(item => item.value)).toContain("model");
 	});
 
-	it("suggests command names for slash tokens adjacent to prompt text", async () => {
-		const provider = new CombinedAutocompleteProvider(
-			[{ name: "help", description: "Learn commands", value: "help" }],
-			"/tmp",
-		);
-		const line = "explain this/hel";
-		const result = await provider.getSuggestions([line], 0, line.length);
-
-		expect(result).not.toBeNull();
-		expect(result!.prefix).toBe("/hel");
-		expect(result!.items.map(item => item.value)).toEqual(["help"]);
-	});
-
-	it("lets absolute paths use file suggestions when the inline slash token is not a command prefix", async () => {
-		const line = "open /tmp";
-		const pathOnlyProvider = new CombinedAutocompleteProvider([], "/tmp");
-		const pathOnlyResult = await pathOnlyProvider.getSuggestions([line], 0, line.length);
-		const provider = new CombinedAutocompleteProvider(
-			[{ name: "template", description: "Temporary prompt template", value: "template" }],
-			"/tmp",
-		);
-		const result = await provider.getSuggestions([line], 0, line.length);
-
-		expect(result).toEqual(pathOnlyResult);
-		expect(result?.kind).toBe("default");
-		expect(result?.items.map(item => item.value) ?? []).not.toContain("template");
-	});
-
-	it("lets bare absolute root paths use file suggestions before slash commands", async () => {
-		const line = "open /";
-		const provider = new CombinedAutocompleteProvider(
-			[{ name: "model", description: "Switch model", value: "model" }],
-			"/tmp",
-		);
-		const result = await provider.getSuggestions([line], 0, line.length);
-
-		expect(result).not.toBeNull();
-		expect(result!.prefix).toBe("/");
-		expect(result!.kind).toBe("default");
-		expect(result!.items.some(item => item.value.startsWith("/"))).toBe(true);
-		expect(result!.items.map(item => item.value)).not.toContain("model");
-	});
-
-	it("matches normalized inline slash command prefixes", async () => {
-		const provider = new CombinedAutocompleteProvider(
-			[{ name: "skill:team", description: "Run team workflow", value: "skill:team" }],
-			"/tmp",
-		);
-		const line = "explain this /skill-te";
-		const result = await provider.getSuggestions([line], 0, line.length);
-
-		expect(result).not.toBeNull();
-		expect(result!.prefix).toBe("/skill-te");
-		expect(result!.items.map(item => item.value)).toEqual(["skill:team"]);
-	});
-
-	it("applies inline slash command completion without replacing prior text", () => {
+	it("does not offer slash commands at the start of a later prompt line", async () => {
 		const provider = new CombinedAutocompleteProvider(
 			[{ name: "model", description: "Switch AI model", value: "model" }],
 			"/tmp",
 		);
-		const line = "explain this /mo";
-		const result = provider.applyCompletion([line], 0, line.length, { value: "model", label: "model" }, "/mo");
 
-		expect(result.lines[0]).toBe("explain this /model ");
-		expect(result.cursorCol).toBe("explain this /model ".length);
-	});
-
-	it("applies adjacent inline slash command completion without replacing prior text", () => {
-		const provider = new CombinedAutocompleteProvider(
-			[{ name: "help", description: "Learn commands", value: "help" }],
-			"/tmp",
-		);
-		const line = "explain this/hel";
-		const result = provider.applyCompletion([line], 0, line.length, { value: "help", label: "help" }, "/hel");
-
-		expect(result.lines[0]).toBe("explain this/help ");
-		expect(result.cursorCol).toBe("explain this/help ".length);
+		expect(await provider.getSuggestions(["explain this", "/mo"], 1, 3)).toBeNull();
 	});
 });
 describe("trySyncSlashCompletion", () => {
@@ -602,10 +530,10 @@ describe("Editor autocomplete layout", () => {
 			"  한글명령                        Unicode workflow description",
 		]);
 	});
-	it("uses the compact slash-command layout for inline command-name suggestions", async () => {
+	it("does not render slash-command suggestions after existing prompt text", async () => {
 		const lines = await renderEditorAutocomplete("/g", slashItems, 120, "slash-command", "explain this ");
 
-		expect(lines).toEqual(["> go          Run immediately", "  한글명령    Unicode workflow description"]);
+		expect(lines).toEqual([]);
 	});
 
 	it("keeps absolute-path file autocomplete byte-identical to the default layout", async () => {

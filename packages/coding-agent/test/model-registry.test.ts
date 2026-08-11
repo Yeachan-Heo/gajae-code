@@ -20,6 +20,10 @@ import {
 	resolveModelOverride,
 	resolveModelOverrideWithAuthFallback,
 } from "@gajae-code/coding-agent/config/model-resolver";
+import {
+	buildProviderSelectionCatalog,
+	createProviderSelectionPolicy,
+} from "@gajae-code/coding-agent/config/provider-selection-policy";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
@@ -293,6 +297,115 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("user contextWindow override survives the Codex GPT-5.6 cap; invalid values are ignored", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"gpt-5.6-sol": { contextWindow: 373_000 },
+						"gpt-5.6-terra": { contextWindow: -5 },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const codexModels = getModelsForProvider(registry, "openai-codex");
+			const sol = codexModels.find(model => model.id === "gpt-5.6-sol");
+			const terra = codexModels.find(model => model.id === "gpt-5.6-terra");
+
+			expect(sol?.contextWindow).toBe(373_000);
+			expect(terra?.contextWindow).toBe(372_000);
+		});
+		test("registerProvider reapplies an openai-codex contextWindow override before the final cap", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"gpt-5.6-sol": { contextWindow: 373_000 },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("openai-codex", {
+				baseUrl: "https://chatgpt.com/backend-api",
+				api: "openai-codex-responses",
+				apiKey: "TEST_KEY",
+				models: [
+					{
+						id: "gpt-5.6-sol",
+						name: "Runtime GPT-5.6 Sol",
+						reasoning: true,
+						input: ["text", "image"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 1_000_000,
+						maxTokens: 128_000,
+					},
+				],
+			});
+
+			expect(registry.find("openai-codex", "gpt-5.6-sol")?.contextWindow).toBe(373_000);
+		});
+		test("openai-codex contextWindow override does not exempt same-id models on other Codex-transport providers", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"gpt-5.6-sol": { contextWindow: 373_000 },
+					},
+				},
+				"codex-extension": {
+					baseUrl: "https://codex-extension.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-codex-responses",
+					models: [{ id: "gpt-5.6-sol", contextWindow: 1_000_000 }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const codexModels = getModelsForProvider(registry, "openai-codex");
+			const openaiCodexSol = codexModels.find(model => model.id === "gpt-5.6-sol");
+			const extensionSol = getModelsForProvider(registry, "codex-extension").find(
+				model => model.id === "gpt-5.6-sol",
+			);
+
+			expect(openaiCodexSol?.contextWindow).toBe(373_000);
+			expect(extensionSol?.contextWindow).toBe(372_000);
+		});
+		test("non-Codex contextWindow overrides that are not positive finite numbers are ignored without corrupting the bundled model", () => {
+			writeRawModelsJson({
+				openai: {
+					modelOverrides: {
+						"gpt-4o": { contextWindow: -5 },
+						"gpt-4.1": { contextWindow: Number.NaN },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const models = getModelsForProvider(registry, "openai");
+			for (const id of ["gpt-4o", "gpt-4.1"]) {
+				const model = models.find(candidate => candidate.id === id);
+				expect(model?.contextWindow).toBeTypeOf("number");
+				expect(Number.isFinite(model!.contextWindow!)).toBe(true);
+				expect(model!.contextWindow!).toBeGreaterThan(0);
+			}
+		});
+
+		test("mixed-case modelOverrides keys match the bundled lowercase models and the Codex cap exemption", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"GPT-5.6-SOL": { contextWindow: 380_000 },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const codexModels = getModelsForProvider(registry, "openai-codex");
+			const sol = codexModels.find(model => model.id === "gpt-5.6-sol");
+
+			// The mixed-case key is normalized to gpt-5.6-sol, so the value is
+			// merged AND the cap exemption matches the same normalized key.
+			expect(sol?.contextWindow).toBe(380_000);
+		});
 		test("keeps models config baseUrl ahead of provider base URL env vars", () => {
 			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-env.example.com/v1");
 			try {
@@ -671,12 +784,8 @@ describe("ModelRegistry", () => {
 		});
 
 		test("resolves canonical models using configured provider order", async () => {
-			await Settings.init({
-				inMemory: true,
-				overrides: {
-					modelProviderOrder: ["demo", "anthropic"],
-				},
-			});
+			await Settings.init({ inMemory: true });
+			settings.set("modelProviderOrder", ["demo", "anthropic"]);
 			// Both variants are vision-capable, so provider order is the deciding factor.
 			writeRawModelsJson({
 				demo: {
@@ -766,11 +875,17 @@ describe("ModelRegistry", () => {
 			});
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			const candidates = () => fixtureCandidates(registry);
-			const initial = registry.resolveCanonicalModel("claude-sonnet-4-5", {
-				availableOnly: true,
-				candidates: candidates(),
-				sessionId: "session-0",
-			});
+			const alphaModel = registry.find("alpha", "anthropic/claude-sonnet-4.5")!;
+			const betaModel = registry.find("beta", "anthropic/claude-sonnet-4.5")!;
+			// Seed a non-catalog winner so eviction observably releases the session.
+			expect(registry.seedCanonicalVariant("session-0", betaModel)).toBe(true);
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: candidates(),
+					sessionId: "session-0",
+				}),
+			).toBe(betaModel);
 			for (let index = 1; index < 65; index += 1) {
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: true,
@@ -778,6 +893,8 @@ describe("ModelRegistry", () => {
 					sessionId: `session-${index}`,
 				});
 			}
+			// The 64-entry cap evicted session-0; it re-resolves to the catalog winner
+			// even when the caller reorders candidates.
 			const reversedCandidates = [...candidates()].reverse();
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
@@ -785,19 +902,14 @@ describe("ModelRegistry", () => {
 					candidates: reversedCandidates,
 					sessionId: "session-0",
 				}),
-			).not.toBe(initial);
+			).toBe(alphaModel);
 		});
 
-		test("prefers vision-capable variant over configured provider order", async () => {
-			await Settings.init({
-				inMemory: true,
-				overrides: {
-					modelProviderOrder: ["demo", "anthropic"],
-				},
-			});
-			// demo's variant is text-only and ranked first by provider order, but the
-			// vision-capable bundled variant must win so an ambiguous id never resolves
-			// to a text-only namesake when a vision-capable variant is available.
+		test("prefers configured provider order before vision capability", async () => {
+			await Settings.init({ inMemory: true });
+			settings.set("modelProviderOrder", ["demo", "anthropic"]);
+			// Explicit provider order is the first automatic-resolution axis, so the
+			// listed text-only provider wins before the later vision capability axis.
 			writeRawModelsJson({
 				demo: providerConfig("https://demo.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
 			});
@@ -808,14 +920,12 @@ describe("ModelRegistry", () => {
 				candidates: registry.getAll(),
 			});
 
-			expect(resolved?.input.includes("image")).toBe(true);
-			expect(resolved?.provider).toBe("anthropic");
+			expect(resolved?.input.includes("image")).toBe(false);
+			expect(resolved?.provider).toBe("demo");
 		});
 		test("ranks bare aliases and canonical ids identically across provider order conflicts", async () => {
-			await Settings.init({
-				inMemory: true,
-				overrides: { modelProviderOrder: ["beta", "alpha"] },
-			});
+			await Settings.init({ inMemory: true });
+			settings.set("modelProviderOrder", ["beta", "alpha"]);
 			writeRawModelsJson({
 				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "claude-sonnet-4.5" }]),
 				beta: providerConfig("https://beta.example.com/v1", [{ id: "claude-sonnet-4.5" }]),
@@ -953,7 +1063,7 @@ describe("ModelRegistry", () => {
 
 				await expect(authStorage.peekApiKey("xai")).resolves.toBeUndefined();
 				const available = registry.getAvailable();
-				expect(available).not.toBe(afterFirst);
+				expect(available).toBe(afterFirst);
 				expect(available.some(model => model.provider === "xai")).toBe(true);
 				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(false);
 			} finally {
@@ -980,9 +1090,9 @@ describe("ModelRegistry", () => {
 
 				const registry = new ModelRegistry(authStorage, modelsJsonPath);
 				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
-				await expect(authStorage.peekApiKey("xai")).resolves.toBeUndefined();
+				await expect(authStorage.peekApiKey("xai")).resolves.toBe("selected-access");
 				expect(registry.getAvailable().some(model => model.provider === "xai")).toBe(true);
-				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(false);
+				expect(registry.getActiveProviders().some(provider => provider.provider === "xai")).toBe(true);
 
 				authStorage.setRuntimeCredentialSelector("xai", {
 					kind: "email",
@@ -1106,6 +1216,32 @@ describe("ModelRegistry", () => {
 			});
 			expect(resolved).toBe(initial);
 		});
+		test("normalizes sticky session IDs when recording canonical variants", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const resolved = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: false,
+				candidates: registry.getAll(),
+				sessionId: "  sticky-session  ",
+			});
+
+			expect(resolved).toBeDefined();
+			expect(registry.getSessionCanonicalVariant("sticky-session")).toBe(`${resolved!.provider}/${resolved!.id}`);
+			expect(registry.clearCanonicalVariant("sticky-session")).toBe(true);
+		});
+		test("restores case-variant sticky selectors using canonical catalog spelling", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const variant = registry.getCanonicalVariants("claude-sonnet-4-5")[0]!;
+
+			expect(registry.restoreSessionCanonicalVariant("sticky-session", variant.selector.toUpperCase())).toBe(true);
+			expect(registry.getSessionCanonicalVariant("sticky-session")).toBe(variant.selector);
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: false,
+					candidates: registry.getAll(),
+					sessionId: "sticky-session",
+				}),
+			).toBe(variant.model);
+		});
 		test("seeds isolated child canonical scopes from a concrete parent model", async () => {
 			const alpha = providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
 			const beta = providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
@@ -1141,14 +1277,15 @@ describe("ModelRegistry", () => {
 				childA,
 			);
 			expect(resumed.model).toBe(alphaModel);
-			// The child-first canonical lookup must not populate the parent scope.
+			// The child-first canonical lookup must not populate the parent scope;
+			// with no sticky parent entry, deterministic catalog order picks alpha.
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: true,
 					candidates: [...fixtureModels()].reverse(),
 					sessionId: "parent-session",
 				}),
-			).toBe(betaModel);
+			).toBe(alphaModel);
 			expect(registry.seedCanonicalVariant(childB, betaModel)).toBe(true);
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
@@ -1182,6 +1319,894 @@ describe("ModelRegistry", () => {
 		});
 	});
 
+	describe("provider selection policy and alias resolution", () => {
+		test("dedupes explicit provider order and assigns disjoint rank bands", () => {
+			const policy = createProviderSelectionPolicy({
+				explicitProviderOrder: ["Alpha", "alpha", " beta ", ""],
+				effectiveAuth: new Map([
+					["beta", "oauth"],
+					["gamma", "oauth"],
+					["delta", "key"],
+					["epsilon", "keyless"],
+				]),
+				catalogProviders: ["alpha", "beta", "gamma", "delta", "epsilon"],
+				catalogModels: [],
+			});
+
+			expect(policy.explicitProviders()).toEqual(["alpha", "beta"]);
+			expect(policy.rank("alpha")).toBe(0);
+			expect(policy.rank("beta")).toBe(1);
+			// Omitted effective-OAuth providers share rank n.
+			expect(policy.rank("gamma")).toBe(2);
+			// Omitted non-OAuth/unknown/keyless providers share rank n+1.
+			expect(policy.rank("delta")).toBe(3);
+			expect(policy.rank("epsilon")).toBe(3);
+			expect(policy.rank("unknown-provider")).toBe(3);
+			expect(policy.isExplicit("ALPHA")).toBe(true);
+			expect(policy.isExplicit("gamma")).toBe(false);
+		});
+
+		test("ordered providers follow explicit order then catalog order", () => {
+			const policy = createProviderSelectionPolicy({
+				explicitProviderOrder: ["beta"],
+				effectiveAuth: new Map(),
+				catalogProviders: ["alpha", "beta", "gamma"],
+				catalogModels: [],
+			});
+
+			expect(policy.orderedProviders()).toEqual(["beta", "alpha", "gamma"]);
+			expect(policy.providerCatalogIndex("alpha")).toBe(0);
+			expect(policy.providerCatalogIndex("gamma")).toBe(2);
+			expect(policy.providerCatalogIndex("zeta")).toBe(Number.MAX_SAFE_INTEGER);
+		});
+
+		test("builds stable catalog tie data from registry model order", () => {
+			const makeCatalogModel = (provider: string, id: string): Model<Api> =>
+				({
+					id,
+					name: id,
+					api: "anthropic-messages",
+					provider,
+					baseUrl: `https://${provider}.example.com/v1`,
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 8192,
+				}) as Model<Api>;
+
+			const { catalogProviders, catalogModels } = buildProviderSelectionCatalog([
+				makeCatalogModel("alpha", "m1"),
+				makeCatalogModel("beta", "m2"),
+				makeCatalogModel("alpha", "m3"),
+			]);
+
+			expect(catalogProviders).toEqual(["alpha", "beta"]);
+			expect(catalogModels).toEqual(["alpha/m1", "beta/m2", "alpha/m3"]);
+		});
+
+		test("resolves final-slash-segment aliases through canonical records", () => {
+			writeRawModelsJson({
+				demo: providerConfig("https://demo.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const resolved = registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+				availableOnly: false,
+				candidates: registry.getAll(),
+			});
+
+			expect(resolved?.provider).toBe("demo");
+			expect(resolved?.id).toBe("anthropic/claude-sonnet-4.5");
+			expect(registry.lookupAliasExists("claude-sonnet-4.5")).toBe(true);
+			// A concrete model whose final segment equals the canonical id may also
+			// expose that spelling as an alias; exact canonical lookup still wins first.
+			expect(registry.lookupAliasExists("claude-sonnet-4-5")).toBe(true);
+			expect(registry.lookupAliasExists("unknown-alias")).toBe(false);
+			// Exact canonical resolution stays exact-first and alias-unaware.
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: false,
+					candidates: registry.getAll(),
+				}),
+			).toMatchObject({ id: "claude-sonnet-4-5" });
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4.5", {
+					availableOnly: false,
+					candidates: registry.getAll(),
+				}),
+			).toBeUndefined();
+		});
+
+		test("resolves aliases at arbitrary slash depth", () => {
+			writeRawModelsJson({
+				demo: providerConfig("https://demo.example.com/v1", [{ id: "org/team/project/deep-model" }]),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.resolveModelByLookupAlias("deep-model", {
+				availableOnly: false,
+				candidates: registry.getAll(),
+			});
+
+			expect(model?.provider).toBe("demo");
+			expect(model?.id).toBe("org/team/project/deep-model");
+		});
+
+		test("includes runtime custom providers in provider-agnostic alias selection", async () => {
+			await Settings.init({ inMemory: true });
+			settings.set("modelProviderOrder", ["custom-open-model", "catalog-provider"]);
+			writeRawModelsJson({
+				"catalog-provider": providerConfig("https://catalog.example.com/v1", [{ id: "zai-org/GLM-5.2" }]),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("custom-open-model", {
+				baseUrl: "https://custom.example.com/v1",
+				apiKey: "CUSTOM_OPEN_MODEL_KEY",
+				api: "openai-completions",
+				models: [
+					{
+						id: "hosted/glm-5.2",
+						name: "Custom GLM-5.2",
+						reasoning: true,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128000,
+						maxTokens: 8192,
+					},
+				],
+			});
+			authStorage.setRuntimeApiKey("custom-open-model", "custom-key");
+
+			const resolved = registry.resolveModelByLookupAlias("glm-5.2", {
+				availableOnly: true,
+				candidates: registry.getAvailable(),
+			});
+			expect(resolved).toMatchObject({ provider: "custom-open-model", id: "hosted/glm-5.2" });
+		});
+
+		test("preserves full model and wire ids when resolving via alias", () => {
+			writeRawModelsJson({
+				demo: {
+					baseUrl: "https://demo.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "anthropic-messages",
+					models: [
+						{
+							id: "anthropic/claude-sonnet-4.5",
+							name: "Sonnet via demo",
+							wireModelId: "wire-sonnet-4.5",
+							reasoning: true,
+							input: ["text", "image"],
+							cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0 },
+							contextWindow: 200000,
+							maxTokens: 16000,
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const resolved = registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+				availableOnly: false,
+				candidates: registry.getAll(),
+			});
+
+			expect(resolved?.provider).toBe("demo");
+			expect(resolved?.id).toBe("anthropic/claude-sonnet-4.5");
+			expect(resolved?.wireModelId).toBe("wire-sonnet-4.5");
+			expect(resolved?.name).toBe("Sonnet via demo");
+		});
+
+		test("fails closed for known aliases with no eligible variants", async () => {
+			writeRawModelsJson({
+				demo: {
+					baseUrl: "https://demo.example.com/v1",
+					api: "anthropic-messages",
+					apiKeyEnv: "GJC_TEST_MISSING_ALIAS_AUTH_KEY",
+					models: [{ id: "anthropic/claude-sonnet-4.5" }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.lookupAliasExists("claude-sonnet-4.5")).toBe(true);
+			// Canonical-id access stays alias-unaware.
+			expect(registry.getCanonicalVariants("claude-sonnet-4.5")).toEqual([]);
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: registry.getAll(),
+				}),
+			).toBeUndefined();
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: false,
+					candidates: registry.getAll(),
+				}),
+			).toBeUndefined();
+		});
+
+		test("intersects alias variants with filtered supplied candidates", () => {
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+				beta: {
+					baseUrl: "https://beta.example.com/v1",
+					api: "anthropic-messages",
+					apiKeyEnv: "GJC_TEST_MISSING_ALIAS_BETA_KEY",
+					models: [{ id: "anthropic/claude-sonnet-4.5" }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const alphaModel = registry.find("alpha", "anthropic/claude-sonnet-4.5")!;
+			const betaModel = registry.find("beta", "anthropic/claude-sonnet-4.5")!;
+
+			// Both candidates supplied, but beta is not available → alpha wins.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: false,
+					candidates: [betaModel, alphaModel],
+				}),
+			).toBe(alphaModel);
+			// Supplied candidates that only reference the unavailable variant fail closed.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: false,
+					candidates: [betaModel],
+				}),
+			).toBeUndefined();
+		});
+
+		test("ranks explicit, omitted-OAuth, and omitted non-OAuth providers disjointly", async () => {
+			await Settings.init({ inMemory: true });
+			settings.set("modelProviderOrder", ["alpha"]);
+			writeRawModelsJson({
+				gamma: providerConfig("https://gamma.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+				beta: {
+					baseUrl: "https://beta.example.com/v1",
+					api: "anthropic-messages",
+					apiKeyEnv: "GJC_TEST_MISSING_ALIAS_BETA_KEY",
+					models: [{ id: "anthropic/claude-sonnet-4.5" }],
+				},
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+			await authStorage.set("beta", [
+				{
+					type: "oauth",
+					access: "beta-oauth-access",
+					refresh: "beta-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "beta@example.com",
+				},
+			]);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const gammaModel = registry.find("gamma", "anthropic/claude-sonnet-4.5")!;
+			const betaModel = registry.find("beta", "anthropic/claude-sonnet-4.5")!;
+			const alphaModel = registry.find("alpha", "anthropic/claude-sonnet-4.5")!;
+
+			expect(registry.getEffectiveProviderAuth("alpha")).toBe("key");
+			expect(registry.getEffectiveProviderAuth("beta")).toBe("oauth");
+			expect(registry.getEffectiveProviderAuth("gamma")).toBe("key");
+
+			// Catalog order is gamma, beta, alpha — the explicit provider still wins.
+			expect(
+				registry.resolveCanonicalModel("claude-sonnet-4-5", {
+					availableOnly: true,
+					candidates: [gammaModel, betaModel, alphaModel],
+				})?.provider,
+			).toBe("alpha");
+			// Omitted effective-OAuth (beta) beats omitted non-OAuth (gamma).
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [gammaModel, betaModel],
+				})?.provider,
+			).toBe("beta");
+			// Explicit providers stay ahead of both omitted bands.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [betaModel, alphaModel],
+				})?.provider,
+			).toBe("alpha");
+
+			vi.spyOn(authStorage, "getSessionCredentialType").mockReturnValue("oauth");
+			expect(registry.getEffectiveProviderAuth("beta", "session-with-oauth")).toBe("oauth");
+			authStorage.setRuntimeApiKey("beta", "runtime-beta-key");
+			expect(registry.getEffectiveProviderAuth("beta", "session-with-oauth")).toBe("key");
+			authStorage.removeRuntimeApiKey("beta");
+			authStorage.setConfigApiKey("beta", "config-beta-key");
+			expect(registry.getEffectiveProviderAuth("beta", "session-with-oauth")).toBe("key");
+		});
+
+		test("ranks colliding alias targets by provider order, not catalog first-wins", async () => {
+			await Settings.init({ inMemory: true });
+			settings.set("modelProviderOrder", ["beta", "alpha"]);
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "org/conflict-model" }]),
+				beta: providerConfig("https://beta.example.com/v1", [{ id: "team/conflict-model" }]),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const alphaModel = registry.find("alpha", "org/conflict-model")!;
+			const betaModel = registry.find("beta", "team/conflict-model")!;
+
+			expect(registry.lookupAliasExists("conflict-model")).toBe(true);
+			// Catalog order is alpha-first, but the explicit provider order wins.
+			expect(
+				registry.resolveModelByLookupAlias("conflict-model", {
+					availableOnly: true,
+					candidates: [alphaModel, betaModel],
+				}),
+			).toBe(betaModel);
+		});
+
+		test("ranks colliding alias targets by OAuth provenance over non-OAuth", async () => {
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "org/conflict-model" }]),
+				beta: {
+					baseUrl: "https://beta.example.com/v1",
+					api: "anthropic-messages",
+					apiKeyEnv: "GJC_TEST_MISSING_ALIAS_BETA_KEY",
+					models: [{ id: "team/conflict-model" }],
+				},
+			});
+			await authStorage.set("beta", [
+				{
+					type: "oauth",
+					access: "beta-oauth-access",
+					refresh: "beta-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "beta@example.com",
+				},
+			]);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const alphaModel = registry.find("alpha", "org/conflict-model")!;
+			const betaModel = registry.find("beta", "team/conflict-model")!;
+
+			expect(registry.getEffectiveProviderAuth("alpha")).toBe("key");
+			expect(registry.getEffectiveProviderAuth("beta")).toBe("oauth");
+			// Catalog order is alpha-first; the omitted-OAuth band still outranks
+			// the omitted non-OAuth band for the colliding alias.
+			expect(
+				registry.resolveModelByLookupAlias("conflict-model", {
+					availableOnly: true,
+					candidates: [alphaModel, betaModel],
+				}),
+			).toBe(betaModel);
+		});
+
+		test("session-selected OAuth and API-key provenance change a mixed provider's alias rank", async () => {
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "org/conflict-model" }]),
+				beta: {
+					baseUrl: "https://beta.example.com/v1",
+					api: "anthropic-messages",
+					apiKeyEnv: "GJC_TEST_MISSING_ALIAS_BETA_KEY",
+					models: [{ id: "team/conflict-model" }],
+				},
+			});
+			await authStorage.set("beta", [
+				{ type: "api_key", key: "stored-beta-key" },
+				{
+					type: "oauth",
+					access: "beta-oauth-access",
+					refresh: "beta-oauth-refresh",
+					expires: Date.now() + 120_000,
+					email: "beta@example.com",
+				},
+			]);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const alphaModel = registry.find("alpha", "org/conflict-model")!;
+			const betaModel = registry.find("beta", "team/conflict-model")!;
+
+			// Surface-derived: beta has a stored manual key alongside OAuth, so
+			// the API-key surface wins — beta's omitted non-OAuth band collides
+			// with alpha's and catalog order (alpha first) decides.
+			expect(registry.getEffectiveProviderAuth("beta")).toBe("key");
+			expect(
+				registry.resolveModelByLookupAlias("conflict-model", {
+					availableOnly: true,
+					candidates: [alphaModel, betaModel],
+				}),
+			).toBe(alphaModel);
+
+			// A session that explicitly selected beta's OAuth credential moves
+			// beta into the OAuth band ahead of alpha.
+			await registry.getApiKey(betaModel, "oauth-session", {
+				credentialSelector: { kind: "email", value: "beta@example.com" },
+			});
+			expect(authStorage.getSessionCredentialType("beta", "oauth-session")).toBe("oauth");
+			expect(registry.getEffectiveProviderAuth("beta", "oauth-session")).toBe("oauth");
+			expect(
+				registry.resolveModelByLookupAlias("conflict-model", {
+					availableOnly: true,
+					candidates: [alphaModel, betaModel],
+					sessionId: "oauth-session",
+				}),
+			).toBe(betaModel);
+
+			expect(
+				registry.resolveModelByLookupAlias("conflict-model", {
+					availableOnly: true,
+					candidates: [alphaModel, betaModel],
+					sessionId: "logical-session",
+					credentialSessionId: "oauth-session",
+				}),
+			).toBe(betaModel);
+			// A session that authenticated with beta's manual key keeps beta in
+			// the non-OAuth band; both collide at n+1 and catalog order (alpha
+			// first) decides — session provenance changed the rank.
+			await registry.getApiKey(betaModel, "key-session");
+			expect(authStorage.getSessionCredentialType("beta", "key-session")).toBe("api_key");
+			expect(registry.getEffectiveProviderAuth("beta", "key-session")).toBe("key");
+			expect(
+				registry.resolveModelByLookupAlias("conflict-model", {
+					availableOnly: true,
+					candidates: [alphaModel, betaModel],
+					sessionId: "key-session",
+				}),
+			).toBe(alphaModel);
+		});
+
+		test("ranks a provider by OAuth after its stored command key resolves unusable", async () => {
+			const restoreAnthropicKey = unsetEnvForTest("ANTHROPIC_API_KEY");
+			try {
+				authStorage.close();
+				authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
+					configValueResolver: async () => undefined,
+				});
+				writeRawModelsJson({
+					alpha: providerConfig("https://alpha.example.com/v1", [{ id: "org/conflict-model" }]),
+					anthropic: {
+						baseUrl: "https://api.anthropic.com",
+						api: "anthropic-messages",
+						apiKeyEnv: "ANTHROPIC_API_KEY",
+						models: [{ id: "team/conflict-model" }],
+					},
+				});
+				await authStorage.set("anthropic", [
+					{ type: "api_key", key: "!missing-anthropic-key" },
+					{
+						type: "oauth",
+						access: "anthropic-oauth-access",
+						refresh: "anthropic-oauth-refresh",
+						expires: Date.now() + 60 * 60_000,
+					},
+				]);
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const alphaModel = registry.find("alpha", "org/conflict-model")!;
+				const anthropicModel = registry.find("anthropic", "team/conflict-model")!;
+
+				await expect(registry.getApiKeyForProvider("anthropic")).resolves.toBe("anthropic-oauth-access");
+				expect(registry.getEffectiveProviderAuth("anthropic")).toBe("oauth");
+				expect(
+					registry.resolveModelByLookupAlias("conflict-model", {
+						availableOnly: true,
+						candidates: [alphaModel, anthropicModel],
+					}),
+				).toBe(anthropicModel);
+			} finally {
+				restoreAnthropicKey();
+			}
+		});
+
+		test("ranks expired OAuth ahead of an environment key because requests refresh OAuth first", async () => {
+			const restoreAnthropicKey = setEnvForTest("ANTHROPIC_API_KEY", "environment-anthropic-key");
+			try {
+				await authStorage.set("anthropic", [
+					{
+						type: "oauth",
+						access: "expired-oauth-access",
+						refresh: "expired-oauth-refresh",
+						expires: Date.now() - 1,
+					},
+				]);
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await expect(authStorage.peekApiKey("anthropic")).resolves.toBe("environment-anthropic-key");
+				expect(registry.getEffectiveProviderAuth("anthropic")).toBe("oauth");
+			} finally {
+				restoreAnthropicKey();
+			}
+		});
+		test("ranks a mixed manual+OAuth provider in the non-OAuth band by default", async () => {
+			writeRawModelsJson({
+				manualOnly: providerConfig("https://manual.example.com/v1", [{ id: "org/conflict-model" }]),
+				mixed: providerConfig("https://mixed.example.com/v1", [{ id: "team/conflict-model" }]),
+				oauthOnly: {
+					baseUrl: "https://oauth.example.com/v1",
+					api: "anthropic-messages",
+					apiKeyEnv: "GJC_TEST_MISSING_ALIAS_OAUTH_KEY",
+					models: [{ id: "other/conflict-model" }],
+				},
+			});
+			await authStorage.set("mixed", [
+				{ type: "api_key", key: "stored-mixed-key" },
+				{
+					type: "oauth",
+					access: "mixed-oauth-access",
+					refresh: "mixed-oauth-refresh",
+					expires: Date.now() + 60_000,
+					email: "mixed@example.com",
+				},
+			]);
+			await authStorage.set("oauthOnly", [
+				{
+					type: "oauth",
+					access: "oauth-only-access",
+					refresh: "oauth-only-refresh",
+					expires: Date.now() + 60_000,
+					email: "oauth@example.com",
+				},
+			]);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const manualModel = registry.find("manualOnly", "org/conflict-model")!;
+			const mixedModel = registry.find("mixed", "team/conflict-model")!;
+			const oauthModel = registry.find("oauthOnly", "other/conflict-model")!;
+
+			// The mixed provider has a manual key (models.yml apiKey) AND stored
+			// OAuth — the API-key surface wins by default.
+			expect(registry.getEffectiveProviderAuth("manualOnly")).toBe("key");
+			expect(registry.getEffectiveProviderAuth("mixed")).toBe("key");
+			expect(registry.getEffectiveProviderAuth("oauthOnly")).toBe("oauth");
+
+			// The OAuth-only provider still outranks both key providers, and the
+			// mixed provider does NOT jump into the OAuth band.
+			expect(
+				registry.resolveModelByLookupAlias("conflict-model", {
+					availableOnly: true,
+					candidates: [manualModel, mixedModel, oauthModel],
+				}),
+			).toBe(oauthModel);
+
+			// Without the OAuth-only candidate the manual and mixed providers
+			// collide in the non-OAuth band; catalog order (manualOnly first)
+			// decides the tie.
+			expect(
+				registry.resolveModelByLookupAlias("conflict-model", {
+					availableOnly: true,
+					candidates: [mixedModel, manualModel],
+				}),
+			).toBe(manualModel);
+		});
+
+		test("keeps key-shaped OAuth access tokens OAuth for glm-zcode/kimi-code presets versus manual keys", async () => {
+			writeRawModelsJson({
+				manualGlm: providerConfig("https://manual.example.com/v1", [{ id: "glm-zcode" }]),
+				manualKimi: providerConfig("https://manual-kimi.example.com/v1", [{ id: "kimi-code" }]),
+				zhipu: {
+					baseUrl: "https://zhipu.example.com/v1",
+					api: "anthropic-messages",
+					apiKeyEnv: "GJC_TEST_MISSING_GLM_ZCODE_KEY",
+					models: [{ id: "zai/glm-zcode" }],
+				},
+				moonshot: {
+					baseUrl: "https://moonshot.example.com/v1",
+					api: "anthropic-messages",
+					apiKeyEnv: "GJC_TEST_MISSING_KIMI_CODE_KEY",
+					models: [{ id: "moonshot/kimi-code" }],
+				},
+			});
+			await authStorage.set("zhipu", [
+				{
+					type: "oauth",
+					access: "glm-zcode",
+					refresh: "zhipu-oauth-refresh",
+					expires: Date.now() + 120_000,
+					email: "zhipu@example.com",
+				},
+			]);
+			await authStorage.set("moonshot", [
+				{
+					type: "oauth",
+					access: "kimi-code",
+					refresh: "moonshot-oauth-refresh",
+					expires: Date.now() + 120_000,
+					email: "moonshot@example.com",
+				},
+			]);
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const manualGlm = registry.find("manualGlm", "glm-zcode")!;
+			const zhipuGlm = registry.find("zhipu", "zai/glm-zcode")!;
+			const manualKimi = registry.find("manualKimi", "kimi-code")!;
+			const moonshotKimi = registry.find("moonshot", "moonshot/kimi-code")!;
+
+			// OAuth access strings that look like bare model ids stay OAuth —
+			// provenance comes from the credential type, never token shape.
+			expect(registry.getEffectiveProviderAuth("zhipu")).toBe("oauth");
+			expect(registry.getEffectiveProviderAuth("moonshot")).toBe("oauth");
+			expect(registry.getEffectiveProviderAuth("manualGlm")).toBe("key");
+			expect(registry.getEffectiveProviderAuth("manualKimi")).toBe("key");
+
+			// The OAuth provider outranks the manual-key provider for the shared
+			// glm-zcode alias even though its model id is slash-prefixed.
+			expect(
+				registry.resolveModelByLookupAlias("glm-zcode", {
+					availableOnly: true,
+					candidates: [manualGlm, zhipuGlm],
+				}),
+			).toBe(zhipuGlm);
+
+			// kimi-code likewise resolves from the OAuth-backed provider over the
+			// manual-key provider.
+			expect(
+				registry.resolveModelByLookupAlias("kimi-code", {
+					availableOnly: true,
+					candidates: [manualKimi, moonshotKimi],
+				}),
+			).toBe(moonshotKimi);
+		});
+
+		test("resolves exact-id alias targets before slash-prefixed ids on ties", () => {
+			writeRawModelsJson({
+				prefixed: providerConfig("https://prefixed.example.com/v1", [{ id: "team/zebra-model" }]),
+				exact: providerConfig("https://exact.example.com/v1", [{ id: "zebra-model" }]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const prefixedModel = registry.find("prefixed", "team/zebra-model")!;
+			const exactModel = registry.find("exact", "zebra-model")!;
+
+			// The prefixed and exact ids land in different canonical records, so
+			// the shared-canonical-id exactness axis is inactive for this alias.
+			expect(registry.getCanonicalId(prefixedModel)).toBe("team/zebra-model");
+			expect(registry.getCanonicalId(exactModel)).toBe("zebra-model");
+
+			// Same provider band (both manual keys), same source (override), same
+			// cost — catalog order (prefixed first) would win without the alias
+			// exactness axis, but `model.id === alias` beats the slash-prefixed id.
+			expect(
+				registry.resolveModelByLookupAlias("zebra-model", {
+					availableOnly: true,
+					candidates: [prefixedModel, exactModel],
+				}),
+			).toBe(exactModel);
+		});
+		test("resolves mixed-case exact-id alias targets case-insensitively", () => {
+			writeRawModelsJson({
+				shared: providerConfig("https://shared.example.com/v1", [
+					{ id: "team/zebra-model" },
+					{ id: "Zebra-Model" },
+				]),
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const prefixedModel = registry.find("shared", "team/zebra-model")!;
+			const exactModel = registry.find("shared", "Zebra-Model")!;
+
+			// The alias key is normalized to lowercase ("zebra-model"), while the
+			// exact model id carries mixed case ("Zebra-Model"). Alias exactness
+			// must compare normalized ids case-insensitively so the mixed-case id
+			// still beats the slash-prefixed id instead of tying on catalog order.
+			expect(registry.lookupAliasExists("zebra-model")).toBe(true);
+			expect(
+				registry.resolveModelByLookupAlias("zebra-model", {
+					availableOnly: true,
+					candidates: [prefixedModel, exactModel],
+				}),
+			).toBe(exactModel);
+		});
+
+		test("keeps alias winners sticky across priority edits and reranks when the winner is unavailable", async () => {
+			await Settings.init({ inMemory: true });
+			const alpha = providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			const beta = providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]);
+			writeRawModelsJson({ alpha, beta });
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const alphaModel = registry.find("alpha", "anthropic/claude-sonnet-4.5")!;
+			const betaModel = registry.find("beta", "anthropic/claude-sonnet-4.5")!;
+
+			// Default resolution: catalog order picks alpha first.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [alphaModel, betaModel],
+					sessionId: "editor-session",
+				}),
+			).toBe(alphaModel);
+
+			// The provider priority editor flips the order to beta-first.
+			settings.set("modelProviderOrder", ["beta", "alpha"]);
+
+			// The session's remembered winner stays sticky despite the priority
+			// edit re-ranking beta first.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [betaModel, alphaModel],
+					sessionId: "editor-session",
+				}),
+			).toBe(alphaModel);
+
+			// A fresh session honors the new priority.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [betaModel, alphaModel],
+					sessionId: "fresh-session",
+				}),
+			).toBe(betaModel);
+
+			// The sticky winner becomes unavailable; the session re-ranks to the
+			// new priority instead of staying pinned to an ineligible variant.
+			settings.set("disabledProviders", ["alpha"]);
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [betaModel],
+					sessionId: "editor-session",
+				}),
+			).toBe(betaModel);
+		});
+
+		test("alias A cannot select a sibling variant that only has alias B in the same record", () => {
+			writeRawModelsJson({
+				demo: providerConfig("https://demo.example.com/v1", [
+					{ id: "anthropic/claude-sonnet-4.5" },
+					{ id: "claude-sonnet-45" },
+				]),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const dotVariant = registry.find("demo", "anthropic/claude-sonnet-4.5")!;
+			const compactVariant = registry.find("demo", "claude-sonnet-45")!;
+
+			// Both variants live in the same canonical record with different
+			// final segments.
+			expect(
+				registry.getCanonicalVariants("claude-sonnet-4-5", { candidates: [dotVariant, compactVariant] }),
+			).toHaveLength(2);
+			expect(registry.lookupAliasExists("claude-sonnet-4.5")).toBe(true);
+			expect(registry.lookupAliasExists("claude-sonnet-45")).toBe(true);
+
+			// Alias `claude-sonnet-4.5` resolves only the dotted variant.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: registry.getAll(),
+				}),
+			).toBe(dotVariant);
+			// Alias `claude-sonnet-45` resolves only the compact variant.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-45", {
+					availableOnly: true,
+					candidates: registry.getAll(),
+				}),
+			).toBe(compactVariant);
+			// Supplying only the compact variant cannot satisfy the dotted alias.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [compactVariant],
+				}),
+			).toBeUndefined();
+		});
+
+		test("derives effective credential provenance from session and credential surfaces", async () => {
+			const restoreAnthropicToken = unsetEnvForTest("ANTHROPIC_OAUTH_TOKEN");
+			const restoreAnthropicKey = unsetEnvForTest("ANTHROPIC_API_KEY");
+			try {
+				await authStorage.set("anthropic", [
+					{ type: "api_key", key: "stored-anthropic-key" },
+					{
+						type: "oauth",
+						access: "stored-anthropic-oauth",
+						refresh: "stored-anthropic-refresh",
+						expires: Date.now() + 60_000,
+						email: "anthropic@example.com",
+					},
+				]);
+				await authStorage.set("github-copilot", [
+					{
+						type: "oauth",
+						access: "ghu_key_like_access",
+						refresh: "ghu_key_like_refresh",
+						expires: Date.now() + 60_000,
+					},
+				]);
+				writeRawModelsJson({
+					manual: providerConfig("https://manual.example.com/v1", [{ id: "manual-model" }]),
+					keyless: {
+						baseUrl: "http://127.0.0.1:1234/v1",
+						api: "openai-completions",
+						auth: "none",
+						models: [{ id: "keyless-model" }],
+					},
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				expect(registry.getEffectiveProviderAuth("manual")).toBe("key");
+				expect(registry.getEffectiveProviderAuth("keyless")).toBe("keyless");
+				expect(registry.getEffectiveProviderAuth("no-such-provider")).toBe("unknown");
+				// OAuth-provisioned key-like tokens stay OAuth — no token-shape sniffing.
+				expect(registry.getEffectiveProviderAuth("github-copilot")).toBe("oauth");
+				// A stored manual key wins over OAuth presence: a provider with
+				// both an API key and OAuth is "key" unless a session selected OAuth.
+				expect(registry.getEffectiveProviderAuth("anthropic")).toBe("key");
+
+				const model = registry.find("anthropic", "claude-sonnet-4-5");
+				expect(model).toBeDefined();
+				await registry.getApiKey(model!, "session-a");
+				expect(authStorage.getSessionCredentialType("anthropic", "session-a")).toBe("api_key");
+				// Session-specific provenance agrees with the surface-derived
+				// answer for a mixed provider: both are key.
+				expect(registry.getEffectiveProviderAuth("anthropic", "session-a")).toBe("key");
+				expect(registry.getEffectiveProviderAuth("anthropic")).toBe("key");
+			} finally {
+				restoreAnthropicKey();
+				restoreAnthropicToken();
+			}
+		});
+
+		test("resolves deterministically from registry catalog order regardless of candidate order", () => {
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+				beta: providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = () =>
+				["alpha", "beta"]
+					.map(provider => registry.find(provider, "anthropic/claude-sonnet-4.5"))
+					.filter((model): model is Model<Api> => model !== undefined);
+			const forward = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: true,
+				candidates: candidates(),
+			});
+			const reversed = registry.resolveCanonicalModel("claude-sonnet-4-5", {
+				availableOnly: true,
+				candidates: [...candidates()].reverse(),
+			});
+
+			expect(forward?.provider).toBe("alpha");
+			expect(reversed).toBe(forward);
+		});
+
+		test("keeps alias winners sticky per session and clears on explicit reselection", () => {
+			writeRawModelsJson({
+				alpha: providerConfig("https://alpha.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+				beta: providerConfig("https://beta.example.com/v1", [{ id: "anthropic/claude-sonnet-4.5" }]),
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const alphaModel = registry.find("alpha", "anthropic/claude-sonnet-4.5")!;
+			const betaModel = registry.find("beta", "anthropic/claude-sonnet-4.5")!;
+			// Seed a non-catalog winner so stickiness is observable.
+			expect(registry.seedCanonicalVariant("alias-session", betaModel)).toBe(true);
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [alphaModel, betaModel],
+					sessionId: "alias-session",
+				}),
+			).toBe(betaModel);
+			// Reordered candidates keep the remembered winner.
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [betaModel, alphaModel],
+					sessionId: "alias-session",
+				}),
+			).toBe(betaModel);
+			// Explicit reselection clears the sticky winner.
+			expect(registry.clearCanonicalVariant("alias-session")).toBe(true);
+			expect(
+				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
+					availableOnly: true,
+					candidates: [betaModel, alphaModel],
+					sessionId: "alias-session",
+				}),
+			).toBe(alphaModel);
+			expect(registry.clearCanonicalVariant("alias-session")).toBe(true);
+		});
+	});
 	describe("OpenRouter routed suffix fallback", () => {
 		test("find synthesizes a routed model id from the base OpenRouter metadata", () => {
 			writeRawModelsJson({
@@ -1855,6 +2880,16 @@ describe("ModelRegistry", () => {
 			expect(model?.name).toBe("Proxy GPT-5.4");
 			expect(model?.contextWindow).toBe(256000);
 			expect(model?.baseUrl).toBe("https://my-proxy.example.com/v1");
+		});
+
+		test("bundled jetbrains-junie gpt-5.4 keeps its probed 922K window", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			// The generic gpt-5.4 policy raises the window to 1M for everyone except
+			// gateway-fronted providers. JetBrains AI enforces 922K, so the measured
+			// bundled value must survive; raising it would delay compaction past the
+			// point the gateway accepts.
+			expect(registry.find("jetbrains-junie", "gpt-5.4")?.contextWindow).toBe(922_000);
+			expect(registry.find("openai-codex", "gpt-5.4")?.contextWindow).toBe(1_000_000);
 		});
 
 		test("discoverable custom-only gpt-5.4 survives refresh", async () => {
@@ -4443,6 +5478,57 @@ describe("ModelRegistry", () => {
 				requestTransform: { extraBody: { proxy: true } },
 			}),
 		).toThrow('"requestTransform" is only supported with openai-completions or openai-responses APIs');
+	});
+
+	test("restores resolved runtime provider keys ahead of stored OAuth after a static reload", async () => {
+		const envName = "GJC_TEST_RUNTIME_PROVIDER_RELOAD_KEY";
+		const restoreKey = setEnvForTest(envName, "resolved-runtime-provider-key");
+		try {
+			await authStorage.set("runtime-proxy", [
+				{
+					type: "oauth",
+					access: "stored-oauth-access",
+					refresh: "stored-oauth-refresh",
+					expires: Date.now() + 60_000,
+				},
+			]);
+			writeRawModelsJson({
+				"runtime-proxy": {
+					...providerConfig("https://static-proxy.example/v1", [{ id: "static-model" }], "openai-completions"),
+					apiKey: "static-provider-key-before",
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("runtime-proxy", {
+				baseUrl: "https://runtime-proxy.example/v1",
+				apiKey: envName,
+				api: "openai-completions",
+				models: [
+					{
+						id: "runtime-model",
+						name: "Runtime Model",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 100_000,
+						maxTokens: 8_000,
+					},
+				],
+			});
+
+			await expect(registry.getApiKeyForProvider("runtime-proxy")).resolves.toBe("resolved-runtime-provider-key");
+			writeRawModelsJson({
+				"runtime-proxy": {
+					...providerConfig("https://static-proxy.example/v1", [{ id: "static-model" }], "openai-completions"),
+					apiKey: "static-provider-key-after",
+				},
+			});
+			await registry.refresh("offline");
+			await expect(registry.getApiKeyForProvider("runtime-proxy")).resolves.toBe("resolved-runtime-provider-key");
+			expect(registry.getEffectiveProviderAuth("runtime-proxy")).toBe("key");
+		} finally {
+			restoreKey();
+		}
 	});
 
 	test("rejects model override request shaping on non-OpenAI-compatible models", () => {

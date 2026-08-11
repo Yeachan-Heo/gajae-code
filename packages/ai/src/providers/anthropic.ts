@@ -68,6 +68,7 @@ import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } fr
 import {
 	FirstEventTimeoutError,
 	getProviderFirstEventTimeoutFallbackMs,
+	getProviderStreamIdleTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
@@ -316,10 +317,33 @@ let warnedStopSequencesTrim = false;
 
 const ANTHROPIC_PROVIDER_SESSION_STATE_KEY = "anthropic-messages";
 
+/**
+ * Scope of a classified replayed-thinking repair currently applied to this
+ * session: `latest` drops native thinking from the newest assistant turn, `all`
+ * stops replaying native thinking entirely. Persisted across stream
+ * re-invocations so a repair that keeps being rejected is not re-attempted from
+ * scratch on every turn (issue #4011), and released again by the first stream
+ * that completes. Unclassifiable masked `api_error` repairs remain local to the
+ * current stream invocation because a transient masked failure must not degrade
+ * later turns.
+ */
+type AnthropicThinkingReplayRepairScope = "none" | "latest" | "all";
+
+/**
+ * Repairs are bounded independently of `PROVIDER_MAX_RETRIES` because they do
+ * not consume the provider retry budget: without their own ceiling an
+ * unacceptable request shape retries forever (issue #4011). The ceiling spans
+ * the session rather than a single stream, and only a completed stream re-arms
+ * it — an unacceptable shape never completes, so it can never buy more repairs.
+ */
+const ANTHROPIC_MAX_THINKING_REPAIRS = 2;
+
 type AnthropicProviderSessionState = ProviderSessionState & {
 	strictToolsDisabled: boolean;
 	fastModeDisabled: boolean;
 	generatedCacheBudget: GeneratedCacheBudget;
+	thinkingReplayRepairScope: AnthropicThinkingReplayRepairScope;
+	thinkingReplayRepairAttempts: number;
 };
 
 function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
@@ -327,10 +351,14 @@ function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 		strictToolsDisabled: false,
 		fastModeDisabled: false,
 		generatedCacheBudget: 2,
+		thinkingReplayRepairScope: "none",
+		thinkingReplayRepairAttempts: 0,
 		close: () => {
 			state.strictToolsDisabled = false;
 			state.fastModeDisabled = false;
 			state.generatedCacheBudget = 2;
+			state.thinkingReplayRepairScope = "none";
+			state.thinkingReplayRepairAttempts = 0;
 		},
 	};
 	return state;
@@ -1449,8 +1477,13 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let strictFallbackErrorMessage: string | undefined;
 			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
 			let droppedForcedToolChoice = false;
-			let repairLatestAssistantThinking = false;
-			let repairAllAssistantThinking = false;
+			let thinkingReplayRepairScope: AnthropicThinkingReplayRepairScope =
+				providerSessionState?.thinkingReplayRepairScope ?? "none";
+			let thinkingReplayRepairAttempts = providerSessionState?.thinkingReplayRepairAttempts ?? 0;
+			// A scope inherited from an earlier turn can only have come from the
+			// deterministic branch below — the speculative masked-`api_error` probe is
+			// never persisted — so a completed stream must not release it.
+			let thinkingReplayRepairPersistent = thinkingReplayRepairScope !== "none";
 			let generatedCacheBudget: GeneratedCacheBudget = providerSessionState?.generatedCacheBudget ?? 2;
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
 				// Degradation state is cumulative: every fallback rebuild must merge all
@@ -1465,7 +1498,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					isOAuthToken,
 					options,
 					disableStrictTools,
-					{ repairLatestAssistantThinking, repairAllAssistantThinking },
+					{
+						repairLatestAssistantThinking: thinkingReplayRepairScope === "latest",
+						repairAllAssistantThinking: thinkingReplayRepairScope === "all",
+					},
 					generatedCacheBudget,
 				);
 				if (droppedForcedToolChoice) {
@@ -1548,7 +1584,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				truncatedToolCalls.clear();
 				sawTerminalStopReason = false;
 			};
-			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+			const idleTimeoutMs =
+				options?.streamIdleTimeoutMs ??
+				getStreamIdleTimeoutMs(getProviderStreamIdleTimeoutFallbackMs(model.provider));
 			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
@@ -1878,6 +1916,26 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					if (output.stopReason === "aborted" || output.stopReason === "error") {
 						throw new Error(output.errorMessage ?? "An unknown error occurred");
 					}
+					// The first stream that completes is the only evidence available that this
+					// session is not the #4011 loop, which never produced one. Release the
+					// repair escalation and the budget it consumed: the masked `api_error`
+					// branch above fires on an error nobody can classify, so keeping its
+					// guess would silently strip native thinking replay from every later
+					// turn of the session over what may have been one transient blip.
+					//
+					// A deterministic rejection ("cannot be modified" / invalid signature) is
+					// the opposite case: it cites blocks that stay in this session's history,
+					// so releasing the repair here makes the next turn replay the same blocks
+					// and spend another rejected round trip on every turn that follows. That
+					// repair has to outlive the stream it fixed.
+					if (
+						providerSessionState &&
+						!thinkingReplayRepairPersistent &&
+						(thinkingReplayRepairScope !== "none" || thinkingReplayRepairAttempts > 0)
+					) {
+						providerSessionState.thinkingReplayRepairScope = "none";
+						providerSessionState.thinkingReplayRepairAttempts = 0;
+					}
 					break;
 				} catch (streamError) {
 					const localAbortReason = activeAbortTracker.getLocalAbortReason();
@@ -1932,31 +1990,50 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						continue;
 					}
 					const thinkingSignatureInvalid = isAnthropicThinkingSignatureInvalidError(streamFailure);
+					const thinkingBlocksImmutable = isAnthropicThinkingBlockMutationError(streamFailure);
+					const maskedProxyRejection = isAnthropicMaskedProxyRejection(streamFailure);
 					if (
 						!options?.fallbackManaged &&
-						!repairAllAssistantThinking &&
+						thinkingReplayRepairScope !== "all" &&
+						thinkingReplayRepairAttempts < ANTHROPIC_MAX_THINKING_REPAIRS &&
 						firstTokenTime === undefined &&
 						(thinkingSignatureInvalid ||
-							isAnthropicThinkingBlockMutationError(streamFailure) ||
+							thinkingBlocksImmutable ||
 							// Masked proxy rejection: unclassifiable on its own, so the replayed
 							// request shape is the evidence. Without signed thinking blocks in
 							// flight there is nothing to repair and the error must surface.
-							(isAnthropicMaskedProxyRejection(streamFailure) && hasNativeThinkingBlocks(params.messages)))
+							(maskedProxyRejection && hasNativeThinkingBlocks(params.messages)))
 					) {
-						// The mutation 400 blames the "latest assistant message", but its cited
-						// `messages.N.content.M` path can point at an EARLIER replayed turn, so the
-						// latest-only repair gets rejected identically. Escalate to the full-history
-						// repair instead of burning the single retry on one scope.
-						const escalateToAll: boolean = thinkingSignatureInvalid || repairLatestAssistantThinking;
+						// "cannot be modified" means the cited blocks must be replayed byte for
+						// byte, so editing that turn again can never converge — the only recovery
+						// is to stop replaying native thinking at all. The invalid-signature 400
+						// cites blocks anywhere in history and needs the same full-history scope.
+						// Only the unclassifiable masked rejection is worth probing latest-first.
+						const nextScope: AnthropicThinkingReplayRepairScope =
+							thinkingSignatureInvalid || thinkingBlocksImmutable || thinkingReplayRepairScope === "latest"
+								? "all"
+								: "latest";
+						thinkingReplayRepairAttempts++;
 						logger.debug("anthropic: repairing assistant thinking replay after provider rejection", {
 							model: model.id,
-							scope: escalateToAll ? "all" : "latest",
+							scope: nextScope,
+							attempt: thinkingReplayRepairAttempts,
 							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
 						});
-						repairLatestAssistantThinking = !escalateToAll;
-						repairAllAssistantThinking = escalateToAll;
+						thinkingReplayRepairScope = nextScope;
+						// Anything but the masked probe is caused by blocks that remain in
+						// history, so this repair must survive the stream it is about to fix.
+						if (!maskedProxyRejection) thinkingReplayRepairPersistent = true;
+						if (providerSessionState) {
+							providerSessionState.thinkingReplayRepairAttempts = thinkingReplayRepairAttempts;
+							if (!maskedProxyRejection) {
+								providerSessionState.thinkingReplayRepairScope = nextScope;
+							}
+						}
 						params = await prepareParams();
-						providerRetryAttempt = 0;
+						// The provider retry budget is deliberately NOT reset here: a repair that
+						// keeps being rejected must run out instead of renewing the budget it is
+						// supposed to consume (issue #4011).
 						resetOutputForRetry();
 						continue;
 					}
@@ -2225,6 +2302,25 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
 			fetch: debugFetch,
+		};
+	}
+
+	// JetBrains AI (Ingrazzio) authenticates with a plain `Authorization: Bearer`
+	// token and rejects requests that also carry `X-Api-Key`. `buildAnthropicHeaders`
+	// already emits the bearer for non-Anthropic hosts, so keep the SDK from adding
+	// its own API-key header on top of it.
+	if (model.provider === "jetbrains-junie") {
+		return {
+			isOAuthToken: false,
+			apiKey: null,
+			authToken: null,
+			baseURL: baseUrl,
+			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
+			dangerouslyAllowBrowser: true,
+			defaultHeaders,
+			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
+			fetch: debugFetch,
+			...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
 		};
 	}
 

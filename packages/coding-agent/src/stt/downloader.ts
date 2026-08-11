@@ -1,5 +1,6 @@
 import { $which, logger } from "@gajae-code/utils";
 import { $ } from "bun";
+import { getRecorderInstallHint } from "./setup";
 import { resolvePython } from "./transcriber";
 
 export interface DownloadProgress {
@@ -32,9 +33,7 @@ async function ensureRecordingTool(options?: EnsureOptions): Promise<void> {
 		return;
 	}
 
-	throw new Error(
-		"No audio recording tool found. Install SoX: sudo apt install sox, or FFmpeg: sudo apt install ffmpeg",
-	);
+	throw new Error(`No audio recording tool found. ${getRecorderInstallHint()}`);
 }
 
 // ── Python whisper ─────────────────────────────────────────────────

@@ -1,7 +1,34 @@
 import { detectRecordingTools } from "./recorder";
 import { resolvePython } from "./transcriber";
 
-const isWindows = process.platform === "win32";
+export function getRecorderInstallHint(platform: NodeJS.Platform = process.platform): string {
+	if (platform === "win32") return "PowerShell fallback available. For better quality: install SoX or FFmpeg.";
+	if (platform === "darwin") return "Install a recorder with Homebrew: brew install sox (or brew install ffmpeg)";
+	return "Install a recorder: sudo apt install sox (or sudo apt install ffmpeg)";
+}
+
+export function formatSTTUsage(
+	platform: NodeJS.Platform = process.platform,
+	terminalProgram: string | undefined = Bun.env.TERM_PROGRAM,
+): string {
+	const lines = [
+		"Enable STT: gjc config set stt.enabled true",
+		"You can also enable it in /settings > Interaction > Speech-to-Text.",
+		"In the composer, press Alt+H to start recording, then press Alt+H again to stop and transcribe.",
+		"The transcription is inserted into the composer for review before you send it.",
+		"Shortcut fallback: press Ctrl+P and select Toggle speech-to-text; repeat to stop and transcribe.",
+	];
+	if (platform === "darwin") {
+		lines.push("On macOS, Alt+H is Option+H. Your terminal must forward Option as Meta/Esc.");
+		if (terminalProgram?.toLowerCase().includes("ghostty")) {
+			lines.push(
+				"Ghostty: set macos-option-as-alt = true in its config, then reload the config or restart Ghostty.",
+			);
+		}
+	}
+	lines.push("Run /hotkeys inside GJC to confirm the active shortcut.");
+	return lines.join("\n");
+}
 
 export interface STTDependencyStatus {
 	recorder: { available: boolean; tool: string | null; installHint: string };
@@ -11,9 +38,7 @@ export interface STTDependencyStatus {
 
 export async function checkDependencies(): Promise<STTDependencyStatus> {
 	const recorderTools = detectRecordingTools();
-	const recorderHint = isWindows
-		? "PowerShell fallback available. For better quality: install SoX or FFmpeg."
-		: "Install SoX: sudo apt install sox, or FFmpeg: sudo apt install ffmpeg";
+	const recorderHint = getRecorderInstallHint();
 
 	const pythonCmd = resolvePython();
 	const pythonHint = "Install Python 3.8+ from https://python.org";

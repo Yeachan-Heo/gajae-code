@@ -240,7 +240,10 @@ describe("GJC native skill-state hooks", () => {
 			"team",
 		]);
 		expect(detectSkillKeywords("$autopilot deep interview")).toEqual([]);
-		expect(detectSkillKeywords("please run a consensus plan")[0]?.skill).toBe("ralplan");
+		expect(detectSkillKeywords("please run a consensus plan")).toEqual([]);
+		expect(detectSkillKeywords("don't assume, interview me about the coordinated team setup")).toEqual([]);
+		expect(detectSkillKeywords("run a deep interview about ultragoal tracking")).toEqual([]);
+		expect(detectSkillKeywords("$ralplan this refactor")[0]?.skill).toBe("ralplan");
 	});
 
 	it("UserPromptSubmit adds advisory answer-only context for question-only prompts", async () => {

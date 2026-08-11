@@ -183,10 +183,21 @@ class ReplaceDuringFinalAuthorityInspectionStorage extends FileSessionStorage {
 		super();
 	}
 
-	override async rename(filePath: string, nextPath: string): Promise<void> {
-		await super.rename(filePath, nextPath);
-		if (path.resolve(nextPath) !== path.resolve(this.sourcePath) && nextPath.endsWith(".jsonl"))
-			fs.renameSync(this.replacementPath, this.sourcePath);
+	override openStagedWriter(filePath: string) {
+		const writer = super.openStagedWriter(filePath);
+		return {
+			writeLine: writer.writeLine.bind(writer),
+			seekToLine: writer.seekToLine.bind(writer),
+			patchLine: writer.patchLine.bind(writer),
+			flush: writer.flush.bind(writer),
+			fsync: writer.fsync.bind(writer),
+			closeSync: writer.closeSync.bind(writer),
+			publishNoReplace: () => {
+				writer.publishNoReplace();
+				if (path.resolve(filePath) !== path.resolve(this.sourcePath) && filePath.endsWith(".jsonl"))
+					fs.renameSync(this.replacementPath, this.sourcePath);
+			},
+		};
 	}
 }
 class ForeignDestinationAfterAbsenceStorage extends ReplaceDuringFinalAuthorityInspectionStorage {
@@ -533,7 +544,11 @@ describe("SessionManager read-only resume", () => {
 		const renameNoReplacePath = native.renameNoReplacePath;
 		const rename = vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
 			const result = renameNoReplacePath(source, destination);
-			if (result.ok && String(source).includes(".fork-staging-")) {
+			if (
+				result.ok &&
+				path.dirname(String(source)) === root &&
+				path.basename(String(source)).includes(".fork-staging-")
+			) {
 				fs.renameSync(String(destination), publishedEvidenceDir);
 				fs.mkdirSync(String(destination));
 				fs.writeFileSync(path.join(String(destination), "foreign.txt"), "foreign");
@@ -1197,27 +1212,27 @@ describe("active managed picker root", () => {
 			receipts: fs.readdirSync(path.join(protocolRoot, "receipts")),
 			tombstones: fs.readdirSync(path.join(protocolRoot, "tombstones")),
 		};
-		const assertBound = ManagedSessionDescendantStore.prototype.assertBound;
+		const renameNoReplacePath = native.renameNoReplacePath;
 		let publicationGuards = 0;
-		vi.spyOn(ManagedSessionDescendantStore.prototype, "assertBound").mockImplementation(function (
-			this: ManagedSessionDescendantStore,
-		) {
-			assertBound.call(this);
-			const stack = new Error().stack ?? "";
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destinationPath) => {
+			const result = renameNoReplacePath(source, destinationPath);
 			if (
-				stack.includes("publishManagedFileNoReplace") &&
-				stack.includes("assertPublicationConsent") &&
-				++publicationGuards === 2
+				result.ok &&
+				String(destinationPath).includes(`${path.sep}receipts${path.sep}`) &&
+				++publicationGuards === 1
 			)
 				fs.renameSync(replacementPath, legacyPath);
+			return result;
 		});
 
 		expectStrictFailure(
 			await SessionManager.openExistingStrict(inspection.identity, destination),
 			"identity-mismatch",
 		);
-		expect(publicationGuards).toBe(2);
-		expect(fs.readdirSync(path.join(protocolRoot, "receipts"))).toEqual(before.receipts);
+		expect(publicationGuards).toBe(1);
+		expect(fs.readdirSync(path.join(protocolRoot, "receipts")).filter(name => name.endsWith(".json"))).toEqual(
+			before.receipts,
+		);
 		expect(fs.readdirSync(path.join(protocolRoot, "tombstones"))).toEqual(before.tombstones);
 		expect(fs.existsSync(path.join(destination.directory, path.basename(legacyPath)))).toBe(false);
 		expect(fs.existsSync(path.join(destination.directory, path.basename(legacyPath).slice(0, -6)))).toBe(false);
@@ -1284,7 +1299,7 @@ describe("active managed picker root", () => {
 
 		await expect(
 			SessionManager.prepareManagedCandidateForWrite(legacyPath, "copy-retain", destination),
-		).rejects.toThrow("Managed descendant root binding changed");
+		).rejects.toThrow(/Managed (?:descendant root binding|root authority) changed/);
 
 		expect(assertions).toBe(5);
 		expect(fs.readFileSync(legacyPath)).toEqual(candidateBefore);

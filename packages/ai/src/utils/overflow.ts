@@ -145,6 +145,7 @@ const NON_OVERFLOW_PROVIDER_CODES = new Set([
 	"rate_limit_error",
 	"rate_limit_exceeded",
 	"too_many_requests",
+	"empty_response",
 ]);
 
 function transportCodes(transportFailure: TransportFailureFacts | undefined): string[] {

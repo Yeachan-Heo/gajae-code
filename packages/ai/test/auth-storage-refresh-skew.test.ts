@@ -246,6 +246,7 @@ describe("AuthStorage OAuth refresh skew", () => {
 
 		await expect(authStorage.getApiKey("unit-oauth-transient")).resolves.toBeUndefined();
 		expect(authStorage.hasUsableAuth("unit-oauth-transient")).toBeFalse();
+		expect(authStorage.getEffectiveCredentialType("unit-oauth-transient")).toBe("oauth");
 	});
 	test("does not fall through a blocked API-key selection to OAuth", async () => {
 		if (!authStorage) throw new Error("test setup failed");
@@ -286,5 +287,166 @@ describe("AuthStorage OAuth refresh skew", () => {
 		await expect(commandStorage.getApiKey("xai")).resolves.toBe("working-api-key");
 		expect(commandCalls).toBe(0);
 		expect(commandStorage.hasUsableAuth("xai")).toBeTrue();
+	});
+
+	test("keeps a session-selected OAuth credential ahead of stored API keys", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		registerOAuthProvider({
+			id: "unit-session-oauth",
+			name: "Unit Session OAuth",
+			sourceId: "auth-storage-refresh-skew-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			async refreshToken(credentials) {
+				return credentials;
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+		await authStorage.set("unit-session-oauth", [
+			{ type: "api_key", key: "stored-api-key" },
+			{
+				type: "oauth",
+				access: "session-oauth-access",
+				refresh: "session-oauth-refresh",
+				expires: Date.now() + 60 * 60_000,
+				email: "session@example.com",
+			},
+		]);
+		authStorage.setRuntimeCredentialSelector("unit-session-oauth", {
+			kind: "email",
+			value: "session@example.com",
+		});
+		await expect(authStorage.getApiKey("unit-session-oauth", "sticky-session")).resolves.toBe("session-oauth-access");
+		authStorage.removeRuntimeCredentialSelector("unit-session-oauth");
+
+		expect(authStorage.getEffectiveCredentialType("unit-session-oauth", "sticky-session")).toBe("oauth");
+		await expect(authStorage.getApiKey("unit-session-oauth", "sticky-session")).resolves.toBe("session-oauth-access");
+	});
+
+	test("fails effective provenance closed for a dangling selector even with an override", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.set("unit-dangling-selector", [
+			{
+				type: "oauth",
+				access: "selected-access",
+				refresh: "selected-refresh",
+				expires: Date.now() + 60 * 60_000,
+				email: "selected@example.com",
+			},
+		]);
+		authStorage.setRuntimeCredentialSelector("unit-dangling-selector", {
+			kind: "email",
+			value: "selected@example.com",
+		});
+		await authStorage.set("unit-dangling-selector", []);
+		authStorage.setRuntimeApiKey("unit-dangling-selector", "runtime-override");
+
+		expect(authStorage.getEffectiveCredentialType("unit-dangling-selector")).toBeUndefined();
+		await expect(authStorage.getApiKey("unit-dangling-selector")).rejects.toThrow("cannot be used");
+	});
+
+	test("keeps blocked selected OAuth provenance aligned with its request fallback", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		registerOAuthProvider({
+			id: "unit-blocked-selected-oauth",
+			name: "Unit Blocked Selected OAuth",
+			sourceId: "auth-storage-refresh-skew-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			async refreshToken(credentials) {
+				return credentials;
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+		await authStorage.set("unit-blocked-selected-oauth", [
+			{
+				type: "oauth",
+				access: "blocked-selected-access",
+				refresh: "blocked-selected-refresh",
+				expires: Date.now() + 60 * 60_000,
+				email: "blocked@example.com",
+			},
+		]);
+		authStorage.setRuntimeCredentialSelector("unit-blocked-selected-oauth", {
+			kind: "email",
+			value: "blocked@example.com",
+		});
+		await expect(authStorage.getApiKey("unit-blocked-selected-oauth", "blocked-session")).resolves.toBe(
+			"blocked-selected-access",
+		);
+		await authStorage.markUsageLimitReached("unit-blocked-selected-oauth", "blocked-session");
+
+		expect(authStorage.getEffectiveCredentialType("unit-blocked-selected-oauth", "blocked-session")).toBe("oauth");
+		await expect(authStorage.getApiKey("unit-blocked-selected-oauth", "blocked-session")).resolves.toBe(
+			"blocked-selected-access",
+		);
+	});
+
+	test("ranks refreshable expired OAuth ahead of a fallback key", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		registerOAuthProvider({
+			id: "unit-expired-oauth",
+			name: "Unit Expired OAuth",
+			sourceId: "auth-storage-refresh-skew-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			async refreshToken(credentials) {
+				return {
+					...credentials,
+					access: "refreshed-oauth-access",
+					expires: Date.now() + 60 * 60_000,
+				};
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+		authStorage.setFallbackResolver(() => "fallback-key");
+		await authStorage.set("unit-expired-oauth", [
+			{
+				type: "oauth",
+				access: "expired-access",
+				refresh: "expired-refresh",
+				expires: Date.now() - 1,
+			},
+		]);
+
+		expect(authStorage.getEffectiveCredentialType("unit-expired-oauth")).toBe("oauth");
+		await expect(authStorage.getApiKey("unit-expired-oauth")).resolves.toBe("refreshed-oauth-access");
+	});
+
+	test("normalizes device aliases across overrides and effective provenance", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+		authStorage.setRuntimeApiKey("openai-codex-device", "device-runtime-key");
+
+		expect(authStorage.hasRuntimeApiKey("openai-codex")).toBeTrue();
+		expect(authStorage.getEffectiveCredentialType("openai-codex-device")).toBe("api_key");
+		await expect(authStorage.getApiKey("openai-codex-device")).resolves.toBe("device-runtime-key");
+		await authStorage.set("openai-codex", [
+			{
+				type: "oauth",
+				access: "device-oauth-access",
+				refresh: "device-oauth-refresh",
+				expires: Date.now() + 60 * 60_000,
+				accountId: "device-account",
+			},
+		]);
+		await expect(authStorage.getOAuthAccess("openai-codex-device")).resolves.toBeUndefined();
+		expect(authStorage.getOAuthAccountId("openai-codex-device")).toBeUndefined();
+		authStorage.removeRuntimeApiKey("openai-codex");
+		expect(authStorage.hasRuntimeApiKey("openai-codex-device")).toBeFalse();
+		await authStorage.set("openai-codex", [{ type: "api_key", key: "stored-device-key" }]);
+		await expect(authStorage.getApiKey("openai-codex-device", "device-session")).resolves.toBe("stored-device-key");
+		expect(authStorage.getSessionCredentialType("openai-codex-device", "device-session")).toBe("api_key");
+		expect(authStorage.getSessionCredentialRowId("openai-codex-device", "device-session")).toBeDefined();
+		await expect(authStorage.markUsageLimitReached("openai-codex-device", "device-session")).resolves.toBeFalse();
+		expect(authStorage.getEffectiveCredentialType("openai-codex-device", "device-session")).toBe("api_key");
 	});
 });

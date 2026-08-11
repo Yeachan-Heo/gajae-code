@@ -6,13 +6,16 @@ import {
 	type AuthCredentialSelector,
 	applyFinalCodexGpt56ContextCap,
 	type CacheRetention,
+	CODEX_GPT_5_6_CONTEXT_CAP,
 	type Context,
+	codexContextOverrideKey,
 	createModelManager,
 	enrichModelThinking,
 	getBundledModels,
 	getBundledProviders,
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
+	isCodexGpt56Tier,
 	isKnownProvider,
 	type Model,
 	type ModelManagerOptions,
@@ -47,7 +50,7 @@ import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
 import { type ConfigError, ConfigFile } from "./config-file";
 import { isAuthenticated, kNoAuth } from "./model-auth";
-import { ModelBindingsApplier } from "./model-bindings-applier";
+import { type ConfiguredModelBindings, ModelBindingsApplier } from "./model-bindings-applier";
 import { ModelDiscoveryManager, type ProviderDiscoveryState } from "./model-discovery-manager";
 
 export type { ProviderDiscoveryState, ProviderDiscoveryStatus } from "./model-discovery-manager";
@@ -76,8 +79,15 @@ import {
 	type ProviderAuthMode,
 	type ProviderDiscovery,
 } from "./models-config-schema";
+import {
+	buildProviderSelectionCatalog,
+	createProviderSelectionPolicy,
+	type EffectiveProviderAuth,
+	type ProviderSelectionPolicy,
+} from "./provider-selection-policy";
 import { type Settings, settings } from "./settings";
 
+export type { EffectiveProviderAuth, ProviderSelectionPolicy } from "./provider-selection-policy";
 export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, ModelEquivalenceConfig };
 
 export { isAuthenticated, kNoAuth };
@@ -158,6 +168,7 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 		settingsPath: "task.agentModelOverrides",
 	},
 	critic: { id: "critic", tag: "CRITIC", name: "Critic", color: "error", settingsPath: "task.agentModelOverrides" },
+	image: { id: "image", tag: "IMAGE", name: "Image", color: "accent", settingsPath: "modelRoles" },
 };
 
 /** Alias for ModelRoleInfo - used for both built-in and custom roles */
@@ -651,6 +662,8 @@ export interface CanonicalModelQueryOptions {
 	candidates?: readonly Model<Api>[];
 	/** Stable session identity used to keep a canonical variant sticky within a session. */
 	sessionId?: string;
+	/** Credential-selection session used to classify effective provider auth. Defaults to sessionId. */
+	credentialSessionId?: string;
 }
 
 /** Result of loading custom models from models.json */
@@ -851,7 +864,18 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.output !== undefined) result.output = override.output as ("text" | "image")[];
 	if (override.cacheRetention !== undefined) result.cacheRetention = override.cacheRetention;
-	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
+	const contextWindowOverride = toPositiveNumberOrUndefined(override.contextWindow);
+	if (contextWindowOverride !== undefined) {
+		result.contextWindow = contextWindowOverride;
+	} else if (override.contextWindow !== undefined && !isCodexGpt56Tier({ id: model.id })) {
+		// Codex-tier invalid overrides are diagnosed in #collectCodexContextWindowOverrides;
+		// every other provider is diagnosed here so an ignored override is never silent.
+		logger.warn("model context-window override ignored: value must be a positive finite number", {
+			model: model.id,
+			provider: model.provider,
+			override: override.contextWindow,
+		});
+	}
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
 	if (override.contextPromotionTarget !== undefined) result.contextPromotionTarget = override.contextPromotionTarget;
 	if (override.wireModelId !== undefined) result.wireModelId = override.wireModelId;
@@ -870,6 +894,26 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	}
 	result.compat = mergeCompat(model.compat, override.compat);
 	return enrichModelThinking(result);
+}
+/**
+ * Normalizes `modelOverrides` keys to lowercase so override matching is
+ * case-insensitive everywhere (the Codex cap exemption is keyed by
+ * `codexContextOverrideKey`, which lowercases both sides). Without this,
+ * a mixed-case config key is exempted from the cap without its value ever
+ * being merged into the model.
+ */
+function normalizeModelOverrideKeys(
+	modelOverrides: Map<string, Map<string, ModelOverride>>,
+): Map<string, Map<string, ModelOverride>> {
+	const normalized = new Map<string, Map<string, ModelOverride>>();
+	for (const [provider, perModel] of modelOverrides) {
+		const perProvider = new Map<string, ModelOverride>();
+		for (const [modelId, override] of perModel) {
+			perProvider.set(modelId.toLowerCase(), override);
+		}
+		normalized.set(provider.toLowerCase(), perProvider);
+	}
+	return normalized;
 }
 
 interface CustomModelDefinitionLike {
@@ -1149,7 +1193,8 @@ function getDisabledProviderIdsFromSettings(): Set<string> {
 
 function getConfiguredProviderOrderFromSettings(): string[] {
 	try {
-		return settings.get("modelProviderOrder");
+		const configured = settings.getGlobal("modelProviderOrder");
+		return Array.isArray(configured) ? configured.filter((value): value is string => typeof value === "string") : [];
 	} catch {
 		return [];
 	}
@@ -1178,7 +1223,12 @@ interface ModelManagerDiscoveryOptions {
  */
 export class ModelRegistry {
 	#models: Model<Api>[] = [];
-	#canonicalIndex: CanonicalModelIndex = { records: [], byId: new Map(), bySelector: new Map() };
+	#canonicalIndex: CanonicalModelIndex = {
+		records: [],
+		byId: new Map(),
+		bySelector: new Map(),
+		aliases: new Map(),
+	};
 	#availableModelsCache: Model<Api>[] | undefined;
 	#availableModelsDisabledProviders: string | undefined;
 	#availableModelsEnvFingerprint: string | undefined;
@@ -1205,6 +1255,7 @@ export class ModelRegistry {
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
+	#codexContextWindowOverrides: Map<string, number> = new Map();
 	#equivalenceConfig: ModelEquivalenceConfig | undefined;
 	#modelBindingsApplier = new ModelBindingsApplier();
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
@@ -1345,17 +1396,20 @@ export class ModelRegistry {
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
 		this.authStorage.clearConfigApiKeys();
-		// Restore runtime API keys before #loadModels — survives because
-		// #loadModels only calls .set() on #customProviderApiKeys, never reassigns it.
-		for (const [k, v] of this.#runtimeProviderApiKeys) {
-			this.#customProviderApiKeys.set(k, v);
-		}
+		// Runtime provider keys are reapplied after #loadModels so they retain
+		// registration-time precedence over colliding static provider keys.
 		this.#providerOverrides.clear();
 		this.#modelOverrides.clear();
 		this.#equivalenceConfig = undefined;
 		this.#modelBindingsApplier.setBindings(undefined);
 		this.#configError = undefined;
 		this.#loadModels();
+		for (const [provider, apiKeyConfig] of this.#runtimeProviderApiKeys) {
+			const resolved = resolveApiKeyConfig(apiKeyConfig);
+			if (!resolved) continue;
+			this.#customProviderApiKeys.set(provider, resolved);
+			this.authStorage.setConfigApiKey(provider, resolved);
+		}
 		this.#lastDisabledProviderKey = disabledProviderKey;
 	}
 
@@ -1387,7 +1441,8 @@ export class ModelRegistry {
 		this.#configuredDiscoveryProviderIds = new Set(discoverableProviders.map(provider => provider.provider));
 		this.#customModelOverlays = customModels;
 		this.#providerOverrides = overrides;
-		this.#modelOverrides = modelOverrides;
+		this.#modelOverrides = normalizeModelOverrideKeys(modelOverrides);
+		this.#codexContextWindowOverrides = this.#collectCodexContextWindowOverrides();
 		this.#equivalenceConfig = equivalence;
 		this.#modelBindingsApplier.setBindings(modelBindings);
 		this.#modelProfiles = mergeModelProfiles(profiles);
@@ -1404,7 +1459,11 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive refresh() cycles
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#models = applyFinalCodexGpt56ContextCap(
+			this.#applyRuntimeProviderOverrides(withModelOverrides),
+			undefined,
+			this.#codexContextWindowOverrides,
+		);
 		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
@@ -1979,6 +2038,20 @@ export class ModelRegistry {
 		this.#modelBindingsApplier.applyTo(targetSettings);
 	}
 
+	/**
+	 * Re-assert configured modelBindings into the target override slots after a
+	 * session-scoped profile reset removed profile-installed keys. Bypasses the
+	 * user-edit heuristic so the startup role/agent routing is restored.
+	 */
+	reapplyConfiguredModelBindings(targetSettings: Settings): void {
+		this.#modelBindingsApplier.forceApplyTo(targetSettings);
+	}
+
+	/** The currently configured modelBindings, for pre-profile baseline lookup. */
+	getConfiguredModelBindings(): ConfiguredModelBindings | undefined {
+		return this.#modelBindingsApplier.getBindings();
+	}
+
 	async #refreshRuntimeDiscoveries(
 		strategy: ModelRefreshStrategy,
 		providerFilter?: ReadonlySet<string>,
@@ -2147,7 +2220,11 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive online discovery completion
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#models = applyFinalCodexGpt56ContextCap(
+			this.#applyRuntimeProviderOverrides(withModelOverrides),
+			undefined,
+			this.#codexContextWindowOverrides,
+		);
 		this.#rebuildCanonicalIndex();
 	}
 
@@ -2993,10 +3070,10 @@ export class ModelRegistry {
 	}
 
 	#applyProviderModelOverrides(provider: string, models: Model<Api>[]): Model<Api>[] {
-		const overrides = this.#modelOverrides.get(provider);
+		const overrides = this.#modelOverrides.get(provider.toLowerCase());
 		if (!overrides || overrides.size === 0) return models;
 		return models.map(model => {
-			const override = overrides.get(model.id);
+			const override = overrides.get(model.id.toLowerCase());
 			if (!override) return model;
 			return applyModelOverride(model, override);
 		});
@@ -3084,7 +3161,7 @@ export class ModelRegistry {
 	}
 	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
 		const withTransportOverride = this.#applyProviderTransportOverride(model, override);
-		const modelCompat = this.#modelOverrides.get(model.provider)?.get(model.id)?.compat;
+		const modelCompat = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase())?.compat;
 		return modelCompat
 			? { ...withTransportOverride, compat: mergeCompat(withTransportOverride.compat, modelCompat) }
 			: withTransportOverride;
@@ -3097,22 +3174,65 @@ export class ModelRegistry {
 			return this.#applyRuntimeProviderOverride(model, override);
 		});
 	}
+	/**
+	 * Collects explicit user `contextWindow` overrides keyed by provider + model
+	 * id (`codexContextOverrideKey`), and surfaces diagnostics when one applies
+	 * to a Codex GPT-5.6 tier
+	 * model. The map is computed once per config load and feeds the final
+	 * context cap so an explicit override is never silently re-clamped.
+	 */
+	#collectCodexContextWindowOverrides(): Map<string, number> {
+		const result = new Map<string, number>();
+		for (const [provider, providerOverrides] of this.#modelOverrides) {
+			for (const [modelId, override] of providerOverrides) {
+				if (override.contextWindow === undefined) {
+					continue;
+				}
+				const normalizedId = modelId.toLowerCase();
+				const value = toPositiveNumberOrUndefined(override.contextWindow);
+				if (value === undefined) {
+					if (isCodexGpt56Tier({ id: normalizedId })) {
+						logger.warn("codex gpt-5.6 context-window override ignored: value must be a positive finite number", {
+							model: modelId,
+							provider,
+							override: override.contextWindow,
+						});
+					}
+					continue;
+				}
+				result.set(codexContextOverrideKey(provider, modelId), value);
+				if (!isCodexGpt56Tier({ id: normalizedId })) {
+					continue;
+				}
+				logger.warn("codex gpt-5.6 context-window override active; verify it against the live product limit", {
+					model: modelId,
+					provider,
+					override: override.contextWindow,
+					enforced: CODEX_GPT_5_6_CONTEXT_CAP.enforced,
+				});
+			}
+		}
+		return result;
+	}
 	#applyModelOverrides(models: Model<Api>[], overrides: Map<string, Map<string, ModelOverride>>): Model<Api>[] {
 		if (overrides.size === 0) return models;
 		return models.map(model => {
-			const providerOverrides = overrides.get(model.provider);
+			const providerOverrides = overrides.get(model.provider.toLowerCase());
 			if (!providerOverrides) return model;
-			const override = providerOverrides.get(model.id);
+			const override = providerOverrides.get(model.id.toLowerCase());
 			if (!override) return model;
 			return applyModelOverride(model, override);
 		});
 	}
 	#applyHardcodedModelPolicies(models: Model<Api>[]): Model<Api>[] {
 		return models.map(model => {
-			if (model.id !== "gpt-5.4" || model.provider === "github-copilot") {
+			// `github-copilot` and `jetbrains-junie` both serve GPT-5.4 through their own
+			// gateway, which enforces a smaller prompt budget than the first-party 1M
+			// figure (Junie's is a probed 922K). Their bundled values are measured.
+			if (model.id !== "gpt-5.4" || model.provider === "github-copilot" || model.provider === "jetbrains-junie") {
 				return model;
 			}
-			const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
+			const overrides = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase());
 			if (!overrides) {
 				return applyModelOverride(model, { contextWindow: 1_000_000 });
 			}
@@ -3201,6 +3321,11 @@ export class ModelRegistry {
 		return this.#models;
 	}
 
+	/** Provider ids declared in models.yml, including override-only providers. */
+	getConfiguredProviderIds(): readonly string[] {
+		return [...this.#configuredProviderIds];
+	}
+
 	#isModelAvailable(model: Model<Api>, disabledProviders = getDisabledProviderIdsFromSettings()): boolean {
 		return (
 			!disabledProviders.has(model.provider) &&
@@ -3223,54 +3348,113 @@ export class ModelRegistry {
 		});
 	}
 
-	#providerRank(models: readonly Model<Api>[]): Map<string, number> {
-		const configuredProviders = getConfiguredProviderOrderFromSettings();
-		const result = new Map<string, number>();
-		let nextRank = 0;
-		for (const provider of configuredProviders) {
-			const normalized = provider.trim().toLowerCase();
-			if (!normalized || result.has(normalized)) {
+	/**
+	 * Effective credential provenance for a provider, derived from existing
+	 * AuthStorage/session credential surfaces — never from token shape.
+	 *
+	 * Precedence mirrors actual credential selection (`getApiKey`):
+	 * 1. Runtime/config API-key overrides (the actual credential resolver's
+	 *    highest-priority surfaces)
+	 * 2. Session-recorded stored credential type
+	 * 3. Stored/custom API-key surfaces
+	 * 4. OAuth, only when it is the effective remaining stored credential
+	 * 5. Keyless providers
+	 * 6. Unknown (no credential surface)
+	 */
+	#effectiveProviderAuth(provider: string, sessionId?: string): EffectiveProviderAuth {
+		const credentialType = this.authStorage.getEffectiveCredentialType(provider, sessionId);
+		if (credentialType === "api_key") return "key";
+		if (credentialType === "oauth") return "oauth";
+		if (this.#keylessProviders.has(provider)) return "keyless";
+		return "unknown";
+	}
+
+	/**
+	 * Build the pure provider selection policy from the registry catalog order,
+	 * configured `modelProviderOrder`, and effective credential provenance for
+	 * the given session. Caller candidate order never influences the resulting
+	 * ranks or tie data; session provenance can (a session that authenticated
+	 * with an API key moves a mixed-credential provider out of the OAuth band).
+	 */
+	#buildProviderSelectionPolicy(sessionId?: string): ProviderSelectionPolicy {
+		const { catalogProviders, catalogModels } = buildProviderSelectionCatalog(this.#models);
+		const effectiveAuth = new Map<string, EffectiveProviderAuth>();
+		for (const model of this.#models) {
+			const providerKey = model.provider.trim().toLowerCase();
+			if (!providerKey || effectiveAuth.has(providerKey)) {
 				continue;
 			}
-			result.set(normalized, nextRank);
-			nextRank += 1;
+			effectiveAuth.set(providerKey, this.#effectiveProviderAuth(model.provider, sessionId));
 		}
-		for (const model of models) {
-			const normalized = model.provider.toLowerCase();
-			if (result.has(normalized)) {
-				continue;
+		return createProviderSelectionPolicy({
+			explicitProviderOrder: getConfiguredProviderOrderFromSettings(),
+			effectiveAuth,
+			catalogProviders,
+			catalogModels,
+		});
+	}
+
+	#providerRankMap(policy: ProviderSelectionPolicy): Map<string, number> {
+		const providerRank = new Map<string, number>();
+		for (const provider of policy.orderedProviders()) {
+			if (!providerRank.has(provider)) {
+				providerRank.set(provider, policy.rank(provider));
 			}
-			result.set(normalized, nextRank);
-			nextRank += 1;
 		}
-		return result;
+		return providerRank;
+	}
+
+	/** Stable model order from the registry catalog (never caller candidate order). */
+	#catalogModelOrder(): Map<string, number> {
+		const modelOrder = new Map<string, number>();
+		for (let index = 0; index < this.#models.length; index += 1) {
+			const selector = formatCanonicalVariantSelector(this.#models[index]!);
+			if (!modelOrder.has(selector)) {
+				modelOrder.set(selector, index);
+			}
+		}
+		return modelOrder;
 	}
 
 	#rememberCanonicalVariant(sessionId: string, selector: string): void {
-		this.#sessionCanonicalVariants.delete(sessionId);
-		this.#sessionCanonicalVariants.set(sessionId, selector);
+		const normalizedSessionId = sessionId.trim();
+		if (!normalizedSessionId) return;
+		this.#sessionCanonicalVariants.delete(normalizedSessionId);
+		this.#sessionCanonicalVariants.set(normalizedSessionId, selector);
 		if (this.#sessionCanonicalVariants.size > MAX_SESSION_CANONICAL_VARIANTS) {
 			this.#sessionCanonicalVariants.delete(this.#sessionCanonicalVariants.keys().next().value!);
 		}
 	}
+
+	/**
+	 * Resolve the winning variant among equivalent candidates. Session stickiness
+	 * wins when the remembered selector is still eligible; otherwise the variant
+	 * is ranked with provider-rank-first axis order when `providerRankFirst` is
+	 * set (alias resolution), or the legacy vision-first order by default
+	 * (canonical resolution). `exactnessKey` (the alias lookup key) replaces the
+	 * canonical-id exactness axis so `model.id === alias` beats slash-prefixed
+	 * ids before source/cost/catalog ties. Provider/model tie data always comes
+	 * from the registry catalog.
+	 */
 	#resolveCanonicalVariant(
 		variants: readonly CanonicalModelVariant[],
-		allCandidates: readonly Model<Api>[],
 		sessionId?: string,
+		options: { providerRankFirst?: boolean; exactnessKey?: string; credentialSessionId?: string } = {},
 	): CanonicalModelVariant | undefined {
 		if (variants.length === 0) return undefined;
-		const stickySelector = sessionId ? this.#sessionCanonicalVariants.get(sessionId) : undefined;
-		const stickyVariant = stickySelector ? variants.find(variant => variant.selector === stickySelector) : undefined;
+		const normalizedSessionId = sessionId?.trim();
+		const stickySelector = normalizedSessionId ? this.#sessionCanonicalVariants.get(normalizedSessionId) : undefined;
+		const stickyVariant = stickySelector
+			? variants.find(variant => variant.selector.toLowerCase() === stickySelector.toLowerCase())
+			: undefined;
 		if (stickyVariant) {
-			this.#rememberCanonicalVariant(sessionId!, stickyVariant.selector);
+			this.#rememberCanonicalVariant(normalizedSessionId!, stickyVariant.selector);
 			return stickyVariant;
 		}
-		if (sessionId && stickySelector) this.#sessionCanonicalVariants.delete(sessionId);
-		const providerRank = this.#providerRank(allCandidates);
-		const modelOrder = new Map<string, number>();
-		for (let index = 0; index < allCandidates.length; index += 1) {
-			modelOrder.set(formatCanonicalVariantSelector(allCandidates[index]!), index);
-		}
+		if (normalizedSessionId && stickySelector) this.#sessionCanonicalVariants.delete(normalizedSessionId);
+		const policy = this.#buildProviderSelectionPolicy(options.credentialSessionId ?? normalizedSessionId);
+		const providerRank = this.#providerRankMap(policy);
+		const modelOrder = this.#catalogModelOrder();
 		const sourceRank: Record<CanonicalModelVariant["source"], number> = {
 			override: 1,
 			bundled: 1,
@@ -3279,8 +3463,10 @@ export class ModelRegistry {
 		};
 		return [...variants].sort((left, right) =>
 			compareEquivalentModelVariants(left.model, right.model, {
+				providerRankFirst: options.providerRankFirst,
 				providerRank,
-				canonicalId: left.canonicalId === right.canonicalId ? left.canonicalId : undefined,
+				canonicalId:
+					options.exactnessKey ?? (left.canonicalId === right.canonicalId ? left.canonicalId : undefined),
 				leftSourceRank: sourceRank[left.source],
 				rightSourceRank: sourceRank[right.source],
 				includeCost: true,
@@ -3313,13 +3499,140 @@ export class ModelRegistry {
 		return this.#filterCanonicalVariants(record, options);
 	}
 
+	/**
+	 * Resolve an exact canonical id to a concrete model.
+	 *
+	 * Canonical ids remain exact lookup keys, but their provider variant uses the
+	 * same provider-rank-first policy as preset aliases. Availability filtering
+	 * remains opt-in through `availableOnly`; final-segment aliases never fall
+	 * back implicitly — use {@link resolveModelByLookupAlias} for alias intent.
+	 */
 	resolveCanonicalModel(canonicalId: string, options?: CanonicalModelQueryOptions): Model<Api> | undefined {
 		const variants = this.getCanonicalVariants(canonicalId, options);
 		if (variants.length === 0) return undefined;
-		const candidates = options?.candidates ?? (options?.availableOnly ? this.getAvailable() : this.getAll());
-		const resolved = this.#resolveCanonicalVariant(variants, candidates, options?.sessionId);
+		const resolved = this.#resolveCanonicalVariant(variants, options?.sessionId, {
+			providerRankFirst: true,
+			credentialSessionId: options?.credentialSessionId,
+		});
 		if (resolved && options?.sessionId) this.#rememberCanonicalVariant(options.sessionId, resolved.selector);
 		return resolved?.model;
+	}
+
+	/**
+	 * Resolve a final-slash-segment alias to a concrete model, explicitly.
+	 *
+	 * The alias gathers every matching variant selector from the variant-level
+	 * alias index — never sibling variants in the same canonical record that end
+	 * in a different segment — then ranks all eligible variants together by the
+	 * centralized provider policy (provider-rank-first axis order), with the
+	 * canonical/exactness axis preserved relative to the alias lookup key
+	 * (`model.id === alias` beats slash-prefixed ids before source/cost/catalog
+	 * ties). Fails closed: availability/disabled filtering applies even to
+	 * supplied candidate arrays, alias variants are intersected with the
+	 * filtered candidate selectors before ranking, and zero eligible candidates
+	 * returns an authoritative `undefined` without rewriting the variant's
+	 * model/wire ids. Winners stay sticky per session.
+	 */
+	resolveModelByLookupAlias(alias: string, options?: CanonicalModelQueryOptions): Model<Api> | undefined {
+		const normalizedAlias = alias.trim().toLowerCase();
+		const aliasSelectors = this.#canonicalIndex.aliases.get(normalizedAlias);
+		if (!aliasSelectors || aliasSelectors.length === 0) return undefined;
+
+		const candidateKeys = options?.candidates
+			? new Set(
+					options.candidates
+						.filter(candidate => this.#isModelAvailable(candidate))
+						.map(candidate => formatCanonicalVariantSelector(candidate)),
+				)
+			: undefined;
+		const eligible: CanonicalModelVariant[] = [];
+		for (const aliasSelector of aliasSelectors) {
+			const canonicalId = this.#canonicalIndex.bySelector.get(aliasSelector);
+			if (canonicalId === undefined) continue;
+			const record = this.#canonicalIndex.byId.get(canonicalId.trim().toLowerCase());
+			if (!record) continue;
+			const variant = record.variants.find(entry => entry.selector.toLowerCase() === aliasSelector);
+			if (!variant) continue;
+			if (candidateKeys && !candidateKeys.has(variant.selector)) continue;
+			if (!this.#isModelAvailable(variant.model)) continue;
+			eligible.push(variant);
+		}
+		if (eligible.length === 0) return undefined;
+
+		const resolved = this.#resolveCanonicalVariant(eligible, options?.sessionId, {
+			providerRankFirst: true,
+			exactnessKey: normalizedAlias,
+			credentialSessionId: options?.credentialSessionId,
+		});
+		if (resolved && options?.sessionId) this.#rememberCanonicalVariant(options.sessionId, resolved.selector);
+		return resolved?.model;
+	}
+
+	/**
+	 * Whether a final-slash-segment alias is known in the current canonical
+	 * index. Knownness is decided from the full multi-target alias index and is
+	 * independent of availability: a known-but-unavailable alias still reports
+	 * `true` while {@link resolveModelByLookupAlias} returns an authoritative
+	 * `undefined`.
+	 */
+	lookupAliasExists(alias: string): boolean {
+		const normalized = alias.trim().toLowerCase();
+		return this.#canonicalIndex.aliases.has(normalized);
+	}
+
+	/**
+	 * Effective credential provenance for a provider, derived from existing
+	 * AuthStorage/session credential surfaces (never from token shape).
+	 * Session-specific provenance wins; API-key surfaces (runtime, config,
+	 * custom/manual, stored api_key) beat OAuth presence; OAuth remains the
+	 * provenance when it is the effective remaining stored credential;
+	 * unknown/keyless providers fall back to non-OAuth.
+	 */
+	getEffectiveProviderAuth(provider: string, sessionId?: string): EffectiveProviderAuth {
+		return this.#effectiveProviderAuth(provider, sessionId);
+	}
+
+	/**
+	 * Forget a session's remembered canonical variant so the next resolution
+	 * for that session re-ranks from scratch (explicit reselection
+	 * integration). Returns whether an entry was actually removed.
+	 */
+	clearCanonicalVariant(sessionId: string): boolean {
+		const scope = sessionId.trim();
+		if (!scope) return false;
+		return this.#sessionCanonicalVariants.delete(scope);
+	}
+	/**
+	 * Snapshot a session's remembered sticky canonical variant selector — the exact
+	 * concrete "provider/id" selector, captured verbatim rather than re-derived
+	 * from any live model. Returns undefined when the session has no remembered
+	 * variant. The caller owns restoring it later via
+	 * {@link restoreSessionCanonicalVariant}.
+	 */
+	getSessionCanonicalVariant(sessionId: string): string | undefined {
+		const scope = sessionId.trim();
+		if (!scope) return undefined;
+		return this.#sessionCanonicalVariants.get(scope);
+	}
+
+	/**
+	 * Restore a session's sticky canonical variant selector exactly, preserving the
+	 * concrete provider/model previously remembered (never re-derived from a live
+	 * model). The selector must still be present in the canonical index, otherwise
+	 * the stale variant is left untouched and `false` is returned.
+	 */
+	restoreSessionCanonicalVariant(sessionId: string, selector: string): boolean {
+		const scope = sessionId.trim();
+		if (!scope) return false;
+		const normalized = selector.trim();
+		if (!normalized) return false;
+		const canonicalId = this.#canonicalIndex.bySelector.get(normalized.toLowerCase());
+		if (!canonicalId) return false;
+		const record = this.#canonicalIndex.byId.get(canonicalId.trim().toLowerCase());
+		const variant = record?.variants.find(candidate => candidate.selector.toLowerCase() === normalized.toLowerCase());
+		if (!variant) return false;
+		this.#rememberCanonicalVariant(scope, variant.selector);
+		return true;
 	}
 
 	getCanonicalId(model: Model<Api>): string | undefined {
@@ -3475,6 +3788,10 @@ export class ModelRegistry {
 	 */
 	hasConfiguredProviderAuth(provider: string): boolean {
 		return this.#keylessProviders.has(provider) || this.authStorage.hasAuth(provider);
+	}
+
+	isCredentiallessProvider(provider: string): boolean {
+		return this.#isCredentiallessProvider(provider);
 	}
 
 	getDiscoverableProviders(): string[] {
@@ -3774,12 +4091,15 @@ export class ModelRegistry {
 						return this.#applyRuntimeProviderOverride(model, runtimeTransportOverride);
 					})
 				: nextModels;
+			const withModelOverrides = this.#applyProviderModelOverrides(providerName, withRuntimeTransportOverride);
 
 			if (config.oauth?.modifyModels) {
 				const credential = this.authStorage.getOAuthCredential(providerName);
 				if (credential) {
 					this.#models = applyFinalCodexGpt56ContextCap(
-						config.oauth.modifyModels(withRuntimeTransportOverride, credential),
+						config.oauth.modifyModels(withModelOverrides, credential),
+						undefined,
+						this.#codexContextWindowOverrides,
 					);
 					this.#rebuildCanonicalIndex();
 					this.#rebuildProviderActivity();
@@ -3787,7 +4107,11 @@ export class ModelRegistry {
 				}
 			}
 
-			this.#models = applyFinalCodexGpt56ContextCap(withRuntimeTransportOverride);
+			this.#models = applyFinalCodexGpt56ContextCap(
+				withModelOverrides,
+				undefined,
+				this.#codexContextWindowOverrides,
+			);
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();
 			return;

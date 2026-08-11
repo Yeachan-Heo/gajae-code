@@ -34,6 +34,9 @@ import { SdkClient } from "@gajae-code/bridge-client";
 ```
 
 `@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
+For terminal-side session operation, see [the SDK session CLI guide](./sdk-session-cli.md):
+`gjc sdk session list|inspect|send|status|tail` plus the explicit raw
+`control|query|global` hatch, all broker-bound and credential-free.
 
 ## Migration from the removed RPC mode
 
@@ -73,6 +76,33 @@ python -m pip install ./python/gjc-sdk
 Import `SdkClient` with `from gjc_sdk import SdkClient`, then use
 `SdkClient.connect_ws`, `SdkClient.connect_socket`, or `SdkClient.connect_stdio`.
 The client supplies `reply.token` for replies.
+
+## External-agent SDK skills
+
+The generated `sdk-skills/` bundle provides host-neutral guidance for external agents that operate local GJC sessions directly through SDK v3. It is intentionally separate from GJC's four internal workflow skills, the coordinator MCP plugin, and the SDK MCP adapter.
+
+The bundle owns exactly six files:
+
+- `manifest.json`
+- `gjc-sdk-discover/SKILL.md`
+- `gjc-sdk-operate/SKILL.md`
+- `gjc-sdk-author/SKILL.md`
+- `gjc-sdk-author/templates/direct-sdk.ts`
+- `gjc-sdk-author/templates/direct-sdk.py`
+
+Regenerate with `bun run generate-sdk-skills`; CI checks byte-for-byte content and rejects unexpected files with `bun run check:sdk-skills`.
+
+### Bundle format version
+
+`manifest.json` is the versioned root of the on-disk bundle contract. It declares `formatVersion` (currently `1`) and the exact relative file closure the bundle owns. Consumers must treat any bundle whose manifest is missing, malformed, or declares an unsupported `formatVersion` as unreadable and fail closed — never guess at an unknown layout. The skill prompts are authored as static Markdown sources under `scripts/gjc-sdk-skills/prompts/`; the generator copies them verbatim and `check:sdk-skills` proves the committed bundle matches the generated artifacts byte-for-byte, so prompt text is reviewed and diffed as content, not as generator strings.
+
+The compatibility contract is additive: `formatVersion` only bumps when the layout becomes incompatible, and regeneration upgrades an installed bundle in place. A legacy unversioned bundle (the original five-file layout) is unsupported and must be rejected with a regeneration hint rather than read ambiguously.
+
+### Trust boundary
+
+Authentication for a direct SDK connection checks only possession of the endpoint token carried by the discovery record; there is no further per-request capability check at the transport. Once authenticated, requests reach the SDK operation registry dispatcher, which can serve managed bash, configuration, permissions, tools, extensions, and destructive session operations. The `sdk-skills/` templates and their allowlists are a procedural safety policy for reviewed local scripts — they are **not** a security boundary. A modified local script that has read the endpoint token can call more of the SDK than the templates permit, with that token's authority.
+
+The skills use a trusted-local procedural model. They require exact live-session selection, never log or persist endpoint credentials, compose a provenance-labeled inspection view from existing queries, and require single-use human approval before allowlisted lifecycle operations. They do not claim capability isolation: a modified local script that can read an endpoint token has the authority of that token.
 
 Phase 2 still does **not** provide unattended negotiation, a cross-process
 reattach/registry, or a renderer-grade full event stream. No event-plane parity
@@ -283,6 +313,65 @@ as a `model.set` input.
 Malformed reasoning descriptors are not client-recoverable catalog data. The
 query returns the SDK's safe `internal` error rather than exposing a partially
 formed row or descriptor details.
+### Model profiles as synthetic models (`gajae-code/<profile>`)
+
+The Q10 catalog also exposes model profiles as logical synthetic models under
+the reserved provider namespace `gajae-code`, e.g. `gajae-code/codex-eco`.
+These rows let clients (such as ACP model pickers) offer presets like ordinary
+models without provider-specific metadata:
+
+```json
+{
+  "provider": "gajae-code",
+  "id": "codex-eco",
+  "name": "Codex Eco",
+  "contextWindow": 222222,
+  "maxTokens": 8888,
+  "reasoning": false,
+  "thinking": { "validLevels": ["off"] },
+  "current": false
+}
+```
+
+- `gajae-code/<profile>` is a **logical namespace, not a callable provider**. No
+  API transport, credentials, or streaming route is registered for it; send the
+  value back through the generic `model.set` control (or the ACP `Model`
+  select) to activate the profile.
+- Synthetic rows are **availability-filtered**: only profiles whose required and
+  alternative providers have usable stored credentials are listed. The profile
+  id suffix is parsed losslessly after the first namespace slash, so profile ids
+  containing additional slashes or punctuation round-trip exactly.
+- `contextWindow`/`maxTokens` mirror the profile's resolvable default model when
+  available and otherwise fall back to the shared unknown-model constants
+  (222222 / 8888); the profile's real default model remains authoritative.
+- Synthetic rows are non-reasoning with `validLevels: ["off"]`: a `model.set`
+  on a synthetic id with any thinking level other than `off` is rejected with
+  `invalid_input`, and only an absent or `off` level is forwarded as a session
+  override.
+- **Current-state semantics:** while a profile is active for the session, exactly
+  the synthetic row carries `current: true` with `currentThinkingLevel:
+  "inherit"`, and the underlying concrete row is not marked current. A persisted
+  `modelProfile.default` alone (without an in-session active marker) never
+  creates a synthetic current row. Selecting a concrete `provider/model` clears
+  the active marker and restores concrete current semantics.
+- **Selecting a synthetic profile is session-scoped.** `model.set` with
+  `gajae-code/<profile>` activates the full profile in the live session without
+  writing `modelProfile.default`, `modelRoles`, or
+  `task.agentModelOverrides`. Persisting a profile remains an explicit TUI
+  choice (`/model` → default), mirroring `gjc --mpreset <profile> --default`.
+  Unknown or ambiguous synthetic ids fail with `invalid_input`; missing profile
+  credentials fail with the existing authentication-required error.
+- `gajae-code` is **reserved**: a user-defined `models.yml` provider of the same
+  name disables the synthetic facade (rows are omitted and synthetic selection
+  is rejected) rather than being silently shadowed. Q27 (`models.profiles.list`)
+  remains the full profile catalog with explicit `available` status; Q10 is the
+  availability-aware facade for client selection.
+`config.patch` mutations are serialized through the same session admission
+boundary as profile activation and default-model selection, so a patch racing
+a synthetic `gajae-code/*` selection (or another patch) is applied in a
+deterministic order and is never lost or clobbered by an activation rollback.
+The cost is the same as `model.set`: an external `config.patch` queues behind
+any in-flight prompt admission rather than applying mid-turn.
 
 ## Prompt acceptance, termination, and reconciliation (Q26)
 

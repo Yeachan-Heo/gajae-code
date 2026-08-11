@@ -496,7 +496,7 @@ async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Pr
 }
 
 async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
-	const { checkDependencies, formatDependencyStatus } = await import("../stt/setup");
+	const { checkDependencies, formatDependencyStatus, formatSTTUsage } = await import("../stt/setup");
 	const status = await checkDependencies();
 
 	if (flags.json) {
@@ -509,6 +509,7 @@ async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promi
 
 	if (status.recorder.available && status.python.available && status.whisper.available) {
 		console.log(chalk.green(`\n${theme.status.success} Speech-to-text is ready`));
+		console.log(`\n${formatSTTUsage()}`);
 		return;
 	}
 
@@ -542,6 +543,7 @@ async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promi
 	const recheck = await checkDependencies();
 	if (recheck.recorder.available && recheck.python.available && recheck.whisper.available) {
 		console.log(chalk.green(`\n${theme.status.success} Speech-to-text is ready`));
+		console.log(`\n${formatSTTUsage()}`);
 	} else {
 		console.error(chalk.red(`\n${theme.status.error} Setup incomplete`));
 		console.log(formatDependencyStatus(recheck));
@@ -733,6 +735,8 @@ ${chalk.bold("Provider example:")}
   ${APP_NAME} setup provider --preset glm
   ${APP_NAME} setup provider --preset cline-pass
   ${APP_NAME} setup provider --preset commandcode-goat
+  ${APP_NAME} setup provider --preset litellm --base-url https://litellm.example.com/v1
+  ${APP_NAME} setup provider --preset openai-compatible-proxy --base-url https://gateway.example.com/v1
   MY_PROVIDER_KEY=sk-... ${APP_NAME} setup provider --compat openai --provider my-oai --base-url https://api.example.com/v1 --api-key-env MY_PROVIDER_KEY --model gpt-example
 
 ${chalk.bold("Hermes example:")}
@@ -748,7 +752,7 @@ ${chalk.bold("Options:")}
   --preset          Provider preset id (run setup provider --help to list available presets)
   --compat          Provider compatibility: openai or anthropic
   --provider        Provider id to add to models.yml
-  --base-url        Provider API base URL
+  --base-url        Provider API base URL (required for proxy presets: litellm, openai-compatible-proxy)
   --api-key-env     Read provider API key from this environment variable
   --model, --models Model id to add (repeat or comma-separate)
   --models-path     Override models config path

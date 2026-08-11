@@ -279,7 +279,8 @@ describe("system Handlebars prompt templates", () => {
 		expect(countOccurrences(rendered, "Informational questions are answer-only/read-only")).toBe(1);
 		expect(rendered).toContain("unless the user explicitly requests a change, command, or execution");
 		expect(rendered).toContain("Clear, low-risk implementation requests use direct tools");
-		expect(rendered).toContain("Vague requirements use `/skill:deep-interview`");
+		expect(rendered).toContain("recommend `/skill:deep-interview` via `ask`");
+		expect(rendered).toContain("Explicit user intent outranks every routing heuristic");
 	});
 	test("system-prompt routes explicit worktree requests through isolated delegation", async () => {
 		const templatePath = path.join(systemPromptsDir, "system-prompt.md");

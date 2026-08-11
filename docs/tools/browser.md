@@ -76,8 +76,9 @@ The tool returns one result per call; no streaming partial output is emitted fro
 - `close`: text content with either `Closed ...` or `No tab named ...`. `details` includes `action`, `name`, and `details.result`.
 - `run`: ordered `content` array built as:
   1. every `display(value)` call in execution order,
-  2. final return value, JSON-stringified unless already a string,
-  3. or `Ran code on tab "..."` if nothing else was produced.
+  2. a runtime-diagnostics JSON block when the tab observed page exceptions or `console.error` events,
+  3. final return value, JSON-stringified unless already a string,
+  4. or `Ran code on tab "..."` if nothing else was produced.
 - `act`: the same ordered `content` shape, with per-step results as the final JSON return value, or `Ran <n> action(s) on tab "..."` if no step produced content.
 - `display(value)` coercion in `packages/coding-agent/src/tools/browser/tab-worker.ts`:
   - `{ type: "image", data: string, mimeType: string }` becomes image content,
@@ -85,6 +86,7 @@ The tool returns one result per call; no streaming partial output is emitted fro
   - other values become pretty JSON text when serializable, else `String(value)`.
 - `tab.screenshot()` also appends text plus an image content item unless `silent: true`; `details.screenshots` records persisted screenshot metadata `{ dest, mimeType, bytes, width, height }`.
 - `run` and `act` `details` include `action`, `name`, current `browser`/`url` when the tab exists, optional `screenshots`, and `details.result` containing only concatenated text outputs.
+- Runtime diagnostics are opt-in: `open(..., { diagnostics: true })` subscribes the tab to CDP `Runtime.exceptionThrown` and `console.error` events (an extra CDP session plus `Runtime.enable` per tab — the added per-event traffic is the reason it is not on by default). Each tab keeps the newest 20 events in memory. The next successful `run` or `act` drains them as `{ runtimeDiagnostics, runtimeDiagnosticsDropped }`; failed actions leave the mailbox for the next successful response. Each entry contains only kind, timestamp, origin-only URL, line/column, and an error class from a fixed allowlist of built-in error classes when available; path segments, query strings, messages, console arguments, values, and stacks are never retained. Serialization is bounded: the `url` field is capped with a visible `…` marker and the whole block is capped at 4 KiB, shedding the oldest entries first and marking the block with `runtimeDiagnosticsTruncated: true` when that cap is hit — truncation is never silent.
 
 ## Flow
 1. `BrowserTool.execute()` (`packages/coding-agent/src/tools/browser.ts`) abort-checks, clamps `timeout` via `clampTimeout("browser", ...)`, defaults `name` to `"main"`, and dispatches `open`, `close`, `act`, or `run`.
@@ -266,3 +268,4 @@ Security and lifecycle rules:
 - `close(all: true, kill: false)` disconnects from spawned/connected browsers when the last tab closes but leaves spawned app processes running.
 - Headless orphan cleanup is best-effort: if a worker dies before closing its page, the supervisor searches browser targets by `targetId` and closes that page.
 - Console methods inside `run` do not appear in tool output; they are forwarded as debug/warn/error logs through the worker transport.
+- Runtime diagnostics are not written to a separate browser state or log. Once surfaced, their bounded metadata follows the ordinary tool-result transcript lifecycle. Opening a tab without `diagnostics: true` creates no CDP `Runtime` subscription and no per-event work.

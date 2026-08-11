@@ -58,6 +58,18 @@ function legacyDirectory(sessionsRoot: string, cwd: string): string {
 	);
 }
 
+async function committedReceiptNames(directory: string): Promise<string[]> {
+	const names = await fs.readdir(directory);
+	return names.filter(name => {
+		if (!/^[a-f0-9]{64}\.json$/.test(name)) return false;
+		try {
+			return JSON.parse(syncFs.readFileSync(path.join(directory, name), "utf8")).state === "committed";
+		} catch {
+			return false;
+		}
+	});
+}
+
 function encoded(value: string): string {
 	return value.replace(/[/\\:]/g, "-");
 }
@@ -584,7 +596,7 @@ describe("managed session write protocol", () => {
 		for (const receipt of await fs.readdir(receipts)) await fs.unlink(path.join(receipts, receipt));
 		const interruptedReplay = await openManagedCandidateForWrite(scope, legacyCandidate);
 		expect(interruptedReplay).toMatchObject({ kind: "opened", path: first.path, migrated: true });
-		expect(await fs.readdir(receipts)).toHaveLength(1);
+		expect(await committedReceiptNames(receipts)).toHaveLength(1);
 	});
 	it("publishes a committed managed inode with exactly one link", async () => {
 		const { scope } = await fixture();
@@ -632,9 +644,7 @@ describe("managed session write protocol", () => {
 		expect((await fs.readdir(opened.path.slice(0, -6))).filter(name => name.endsWith(".bin"))).toHaveLength(count);
 		expect((await fs.readdir(artifacts)).filter(name => name.endsWith(".bin"))).toHaveLength(count);
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
-		const committed = (await fs.readdir(receipts))
-			.filter(name => !name.startsWith(".") && name.endsWith(".json"))
-			.find(name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed");
+		const [committed] = await committedReceiptNames(receipts);
 		if (!committed) throw new Error("Missing committed migration receipt");
 		const receipt = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
 			artifactManifest?: unknown[];
@@ -855,9 +865,7 @@ describe("managed session write protocol", () => {
 		await expect(openManagedCandidateForWrite(scope, listed.owned[0])).resolves.toMatchObject({ kind: "opened" });
 
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
-		const committed = (await fs.readdir(receipts)).find(
-			name => JSON.parse(syncFs.readFileSync(path.join(receipts, name), "utf8")).state === "committed",
-		);
+		const [committed] = await committedReceiptNames(receipts);
 		if (!committed) throw new Error("Missing committed receipt");
 		const record = JSON.parse(await fs.readFile(path.join(receipts, committed), "utf8")) as {
 			sourceArtifactCleanup?: { retainedPath?: unknown };
@@ -1454,7 +1462,7 @@ describe("managed session write protocol", () => {
 		const opened = await openManagedCandidateForWrite(scope, initial.owned[0]);
 		if (opened.kind !== "opened") throw new Error(opened.message);
 		const receipts = path.join(scope.directoryPath, ".gjc-managed-session-internal", "receipts");
-		const [receipt] = await fs.readdir(receipts);
+		const receipt = (await fs.readdir(receipts)).find(name => /^[a-f0-9]{64}\.json$/.test(name));
 		if (!receipt) throw new Error("Missing committed receipt");
 		const receiptPath = path.join(receipts, receipt);
 		const externalReceipt = path.join(path.dirname(scope.directoryPath), "external-receipt.json");
@@ -2774,7 +2782,10 @@ describe("managed session write protocol", () => {
 				await expect(prepareManagedSessionScopeForWrite(restarted.scope)).resolves.toMatchObject({
 					kind: "error",
 					code: "durability_failed",
-					cause: { classification: "binding_invalid" },
+					// Since #4185 the operator-visible classification mirrors the
+					// recognized error code instead of falling back to a false
+					// `binding_invalid` corruption report (#4184).
+					cause: { classification: "durability_failed" },
 				});
 			} finally {
 				FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
@@ -2943,5 +2954,63 @@ describe("managed session write protocol", () => {
 			remove.mockRestore();
 			unlink.mockRestore();
 		}
+	});
+});
+
+describe("scrubbed write-protocol remnant reaping", () => {
+	const remnantNames = [
+		".gjc-exact-unlink-placeholder-100000d-cad4835",
+		".gjc-exact-replace-destination-100000d-9f00001",
+		".gjc-receipt-remove-100000d-c023948-100000d-c023947",
+		".gjc-receipt-placeholder-remove-1-2-3-4-5-6",
+		".gjc-replace-retry-100000d-c024971",
+	];
+	const aged = new Date(Date.now() - 60 * 60 * 1000);
+
+	it("reaps only aged zero-length remnants and preserves evidence", async () => {
+		const { scope } = await fixture();
+		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+		for (const name of remnantNames) {
+			const pathname = path.join(scope.directoryPath, name);
+			await fs.writeFile(pathname, "", { mode: 0o600 });
+			await fs.utimes(pathname, aged, aged);
+		}
+		const fresh = path.join(scope.directoryPath, ".gjc-exact-unlink-placeholder-fresh");
+		await fs.writeFile(fresh, "", { mode: 0o600 });
+		const evidence = path.join(scope.directoryPath, ".gjc-receipt-remove-retained-evidence");
+		await fs.writeFile(evidence, "retained receipt payload", { mode: 0o600 });
+		await fs.utimes(evidence, aged, aged);
+		const transcriptFile = path.join(scope.directoryPath, "unrelated.jsonl");
+		await fs.writeFile(transcriptFile, "", { mode: 0o600 });
+		await fs.utimes(transcriptFile, aged, aged);
+
+		expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toBe(remnantNames.length);
+
+		const remaining = await fs.readdir(scope.directoryPath);
+		expect(remaining.sort()).toEqual(
+			[path.basename(fresh), path.basename(evidence), path.basename(transcriptFile)].sort(),
+		);
+	});
+
+	it("removes aged remnants during managed scope preparation", async () => {
+		const { scope } = await fixture();
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		for (const name of remnantNames) {
+			const pathname = path.join(scope.directoryPath, name);
+			await fs.writeFile(pathname, "", { mode: 0o600 });
+			await fs.utimes(pathname, aged, aged);
+		}
+
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+
+		const remaining = await fs.readdir(scope.directoryPath);
+		for (const name of remnantNames) expect(remaining).not.toContain(name);
+		expect(remaining).toContain(MANAGED_SESSION_BINDING_FILE);
+	});
+
+	it("tolerates a missing scope directory", () => {
+		expect(
+			managedSessionStorage.reapScrubbedProtocolRemnantsSync(path.join(os.tmpdir(), "gjc-reap-missing-none")),
+		).toBe(0);
 	});
 });

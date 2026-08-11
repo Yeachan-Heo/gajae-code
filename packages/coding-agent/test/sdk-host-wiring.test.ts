@@ -953,10 +953,10 @@ test("SDK broker registration records an absolute lifecycle scope", async () => 
 		getAgentDir: () => agentDir,
 	} as unknown as Settings);
 	try {
-		await waitFor(
-			() => fs.existsSync(path.join(agentDir, "sdk", "sessions", "index.jsonl")),
-			"SDK broker registration",
-		);
+		await waitFor(() => {
+			const indexPath = path.join(agentDir, "sdk", "sessions", "index.jsonl");
+			return fs.existsSync(indexPath) && fs.readFileSync(indexPath, "utf8").includes(sessionId);
+		}, "SDK broker registration");
 		const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
 		expect(sessions).toContainEqual(
 			expect.objectContaining({ sessionId, locator: expect.objectContaining({ repo: path.resolve(cwd) }) }),
@@ -1045,6 +1045,57 @@ test("interactive extension context advertises typed SDK controls and forwards p
 	).rejects.toMatchObject({ code: "invalid_input" });
 });
 
+test("interactive SDK control routes synthetic gajae-code selections to session-scoped activation", async () => {
+	let contextActions: ExtensionContextActions | undefined;
+	let activated: { name: string; options: unknown } | undefined;
+	let thinkingLevel: string | undefined;
+	const runner = {
+		initialize(
+			_actions: ExtensionActions,
+			actions: ExtensionContextActions,
+			_commands: unknown,
+			_ui: ExtensionUIContext,
+		): void {
+			contextActions = actions;
+		},
+	};
+	const controller = new ExtensionUiController({
+		session: {
+			extensionRunner: runner,
+			modelRegistry: {
+				find: () => undefined,
+				getModelProfiles: () =>
+					new Map([["codex-eco", { name: "codex-eco", requiredProviders: [], modelMapping: {} }]]),
+				getError: () => undefined,
+			},
+			setDefaultModelProfileForControl: async (name: string, options?: unknown) => {
+				activated = { name, options };
+				thinkingLevel = "off";
+				return { changed: true, id: name };
+			},
+			getActiveModelProfile: () => undefined,
+			get thinkingLevel() {
+				return thinkingLevel;
+			},
+		},
+	} as unknown as InteractiveModeContext);
+	controller.initializeHookRunner({} as ExtensionUIContext, false);
+
+	expect(
+		await contextActions?.sdkControl?.("model.set", {
+			id: "gajae-code/codex-eco",
+			thinkingLevel: "off",
+		}),
+	).toEqual({ provider: "gajae-code", modelId: "codex-eco", thinkingLevel: "off" });
+	expect(activated).toEqual({
+		name: "codex-eco",
+		options: { persistDefault: false, thinkingLevelOverride: "off" },
+	});
+
+	await expect(
+		contextActions?.sdkControl?.("model.set", { id: "gajae-code/codex-eco", thinkingLevel: "high" }),
+	).rejects.toMatchObject({ code: "invalid_input" });
+});
 test("interactive session.handoff SDK control threads focus instructions to session.handoff", async () => {
 	let contextActions: ExtensionContextActions | undefined;
 	const handoffCalls: (string | undefined)[] = [];
@@ -1145,7 +1196,7 @@ test("startup records identity before an early lifecycle event and publishes it 
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 });
 
-test("concurrent /notify on waits for startup before activating notification answers", async () => {
+test("serializes concurrent /notify on across cancelled and replacement startups", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-startup-"));
 	dirs.push(cwd);
 	const sessionId = `notify-startup-${Date.now()}`;
@@ -1180,7 +1231,7 @@ test("concurrent /notify on waits for startup before activating notification ans
 
 		expect(getAskAnswerSource(sessionId)).toBeDefined();
 		expect(messages).toEqual([
-			{ message: "Notifications enabled for this session.", level: "info" },
+			{ message: "Notifications failed to start for this session.", level: "error" },
 			{ message: "Notifications enabled for this session.", level: "info" },
 		]);
 	} finally {
@@ -1266,14 +1317,19 @@ test("/notify on fences teardown and permits a later same-ID replacement runtime
 		).toBe(true);
 		allowStart.resolve();
 		await enabling;
-		expect(messages).toEqual([
+		expect(messages).toHaveLength(1);
+		expect([
+			{ message: "Notifications failed to start for this session.", level: "error" },
 			{
-				message: "Notifications failed to start for this session.",
-				level: "error",
+				message: "Notifications were not enabled because daemon ownership could not be proved.",
+				level: "warning",
 			},
-		]);
+		]).toContainEqual(messages[0]);
 		expect(getAskAnswerSource(sessionId)).toBeUndefined();
-		await commands.get("notify")!.handler("on", sessionContext);
+		for (let attempt = 0; attempt < 3 && getAskAnswerSource(sessionId) === undefined; attempt++) {
+			await commands.get("notify")!.handler("on", sessionContext);
+			if (getAskAnswerSource(sessionId) === undefined) await Bun.sleep(20);
+		}
 		expect(messages.at(-1)).toEqual({ message: "Notifications enabled for this session.", level: "info" });
 		expect(getAskAnswerSource(sessionId)).toBeDefined();
 		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
@@ -3772,6 +3828,41 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 		ok: false,
 		error: { code: "invalid_input", message: "config.patch rejects secret fields at the SDK host." },
 	});
+	// Invalid values must be rejected before any durable write: a numeric
+	// cycleOrder would later break getRoleModelCycleCandidateCount()'s for...of.
+	expect(
+		await request("invalid-type-error", {
+			type: "control_request",
+			id: "invalid-type-error",
+			operation: "config.patch",
+			input: { patch: { cycleOrder: 1 } },
+		}),
+	).toEqual({
+		type: "control_response",
+		id: "invalid-type-error",
+		ok: false,
+		error: {
+			code: "invalid_input",
+			message: "config.patch rejects invalid settings: cycleOrder (Expected array.)",
+		},
+	});
+	// Unknown paths are rejected the same way, with no durable side effects.
+	expect(
+		await request("unknown-path-error", {
+			type: "control_request",
+			id: "unknown-path-error",
+			operation: "config.patch",
+			input: { patch: { noSuchSetting: true } },
+		}),
+	).toEqual({
+		type: "control_response",
+		id: "unknown-path-error",
+		ok: false,
+		error: {
+			code: "invalid_input",
+			message: "config.patch rejects invalid settings: noSuchSetting (Setting is not recognized by this version.)",
+		},
+	});
 	expect(configWrites).toEqual([]);
 });
 
@@ -5384,7 +5475,7 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 		compact: async () => {
 			compactions++;
 		},
-		getConfigItems: () => ({ "ui.theme": "light" }),
+		getConfigItems: () => ({ "theme.dark": "light" }),
 	};
 	process.env.GJC_NOTIFICATIONS = "1";
 	start(ctx, settings);
@@ -5492,7 +5583,7 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 			type: "control_request",
 			id: "config-patch",
 			operation: "config.patch",
-			input: { patch: { "ui.theme": "dark" } },
+			input: { patch: { "theme.dark": "dark" } },
 			expectedRevision: "0",
 			idempotencyKey: "successful-verbs-config-patch",
 		}),
@@ -5500,9 +5591,27 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 		type: "control_response",
 		id: "config-patch",
 		ok: true,
-		result: { patched: ["ui.theme"], revision: "1" },
+		result: { patched: ["theme.dark"], revision: "1" },
 	});
-	expect(configWrites).toEqual([["ui.theme", "dark"]]);
+	expect(
+		await request("config-patch-repeat", {
+			type: "control_request",
+			id: "config-patch-repeat",
+			operation: "config.patch",
+			input: { patch: { "theme.dark": "light" } },
+			expectedRevision: "1",
+			idempotencyKey: "successful-verbs-config-patch-repeat",
+		}),
+	).toEqual({
+		type: "control_response",
+		id: "config-patch-repeat",
+		ok: true,
+		result: { patched: ["theme.dark"], revision: "2" },
+	});
+	expect(configWrites).toEqual([
+		["theme.dark", "dark"],
+		["theme.dark", "light"],
+	]);
 	expect(
 		await request("config-readback", {
 			type: "query_request",
@@ -5513,7 +5622,7 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 		type: "query_response",
 		id: "config-readback",
 		ok: true,
-		page: { items: [{ "ui.theme": "dark" }] },
+		page: { items: [{ "theme.dark": "light" }] },
 	});
 });
 

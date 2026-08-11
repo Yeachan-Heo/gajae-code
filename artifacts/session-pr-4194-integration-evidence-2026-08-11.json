@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "kind": "pr-integration-evidence",
+  "prNumber": 4194,
+  "prTitle": "perf(session): complete bounded stress optimization",
+  "originalHead": "04154feffbc58369e04220b3fef26a4840cba53a",
+  "originalBase": "3e902206b3961144980411839b4797b2cf48eb74",
+  "currentDevBase": "e40129516965d5c081319898deba3c695f0dc29b",
+  "integratedHead": "f665582ede72afc2a9f4370516869094073bd417",
+  "branch": "research/stress-test",
+  "conflictsResolved": {
+    "session-manager.ts": 15,
+    "CHANGELOG.md": 1
+  },
+  "verification": {
+    "typecheck": "passed",
+    "schemas": "passed",
+    "biomeLint": "passed",
+    "computerRedTeam": "passed (1 test, 10 assertions)",
+    "focusedTests": {
+      "session-memory-integration": "93 pass, 0 fail",
+      "session-memory-rss": "11 pass, 3 fail (latency budget only, RSS within bounds)",
+      "session-memory-latency": "39 pass (with 15 skip), 0 fail",
+      "session-memory-storage-contracts": "passed",
+      "session-manager-resume-oversized": "passed",
+      "session-storage": "passed",
+      "settings-session-memory": "passed",
+      "session-resident-cache+lifecycle+transition+root": "48 pass, 0 fail",
+      "session-memory-sidecar+crash+rollout": "78 pass, 0 fail",
+      "computer-enforcement": "1 pass, 0 fail"
+    },
+    "totalFocusPassed": 312,
+    "totalFocusFailed": 3,
+    "failuresAreLatencyOnly": true
+  },
+  "mergeable": true,
+  "devAncestorCheck": "e40129516965 is an ancestor of f665582ede — fast-forward mergeable",
+  "footer": "gaebal-gajae"
+}

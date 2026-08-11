@@ -91,3 +91,39 @@ describe.skipIf(process.platform !== "linux")("managed scope capacity classifica
 		expect(result.code).toBe("migration_busy");
 	});
 });
+
+describe("managed scope receipt-scan capacity classification", () => {
+	// Same trap, different budget: `#reconcileReplacementCleanupReceipts`
+	// (managed-session-storage.ts:1249) throws once the scope directory holds
+	// more entries than the receipt scan limit. The binding is canonical — only
+	// the surrounding entry count is over budget — so `binding_invalid` sends an
+	// operator to delete a healthy binding instead of pruning receipts.
+	//
+	// This drives the real path: the reconcile scan walks the scope with
+	// `fs.opendirSync`, so the failure is injected there rather than at the
+	// native layer, which does not raise this error at all.
+	it("reports an over-budget receipt scan as capacity_exceeded, not binding_invalid", () => {
+		const input = fixture();
+
+		const prepared = prepareManagedSessionScopeForWriteSync(scopeFor(input));
+		expect(prepared.kind).toBe("resolved");
+		if (prepared.kind !== "resolved") return;
+
+		const realOpendir = fs.opendirSync;
+		vi.spyOn(fs, "opendirSync").mockImplementation((target, options) => {
+			if (path.resolve(String(target)) === path.resolve(prepared.scope.directoryPath))
+				throw new Error("managed_replace_cleanup_receipt_limit_exceeded");
+			return realOpendir(target, options);
+		});
+
+		const result = prepareManagedSessionScopeForWriteSync(scopeFor(input));
+		expect(result.kind).toBe("error");
+		if (result.kind !== "error") return;
+		expect(result.code).toBe("capacity_exceeded");
+		expect(result.message).toBe("managed_replace_cleanup_receipt_limit_exceeded");
+		// The startup error prints `cause.classification`, produced by a different
+		// helper than `code`; both must agree or the operator still sees binding
+		// corruption even when the code is right.
+		expect(result.cause?.classification).toBe("capacity_exceeded");
+	});
+});

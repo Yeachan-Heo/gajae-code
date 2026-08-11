@@ -373,6 +373,64 @@ describe("TopicRegistry", () => {
 		await expect(reg.getOrCreateTopic("s1", async () => "2")).rejects.toThrow("topic authority is archive-fenced");
 		expect(reg.get("s1")?.topicId).toBe("1");
 	});
+	test("clears disconnect grace before persisting an archive fence", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "1");
+		expect(reg.markOrphaned("s1", 1_000)).toBe(true);
+
+		reg.beginArchive("s1", undefined, 2_000);
+		const snapshot = reg.serialize();
+
+		expect(snapshot.topics.s1).toMatchObject({ authorityState: "archive_pending", orphanedAt: 1_000 });
+		expect(snapshot.topics.s1.disconnectGraceExpiresAt).toBeUndefined();
+		expect(parseTopicRegistryState(snapshot)).toBeDefined();
+	});
+	test("drops disconnect grace metadata when a durable fence promotes the record to archive pending", () => {
+		const reg = new TopicRegistry({
+			version: 2,
+			registryGeneration: 1,
+			fences: { s1: 2 },
+			topics: {
+				s1: {
+					topicId: "1",
+					topicOrigin: "daemon_created",
+					identitySent: false,
+					createdAt: 1,
+					authorityEpoch: 1,
+					authorityState: "disconnect_grace",
+					orphanedAt: 1_000,
+					disconnectGraceExpiresAt: 31_000,
+					chatId: "42",
+					endpointKey: "ws://s1",
+					endpointDigest: "digest-s1",
+					endpointGeneration: 1,
+				},
+			},
+		});
+
+		const snapshot = reg.serialize();
+		expect(snapshot.topics.s1.authorityState).toBe("archive_pending");
+		expect(snapshot.topics.s1.disconnectGraceExpiresAt).toBeUndefined();
+		expect(parseTopicRegistryState(snapshot)).toBeDefined();
+	});
+
+	test("restores the exact disconnect grace deadline after archive publication fails", async () => {
+		const reg = new TopicRegistry();
+		await reg.getOrCreateTopic("s1", async () => "1");
+		expect(reg.markOrphaned("s1", 1_000)).toBe(true);
+		const authority = reg.captureArchiveAuthority("s1");
+
+		reg.beginArchive("s1", undefined, 2_000);
+		expect(reg.restoreArchiveAuthority(authority)).toBe(true);
+		const snapshot = reg.serialize();
+
+		expect(snapshot.topics.s1).toMatchObject({
+			authorityState: "disconnect_grace",
+			orphanedAt: 1_000,
+			disconnectGraceExpiresAt: 31_000,
+		});
+		expect(parseTopicRegistryState(snapshot)).toBeDefined();
+	});
 	test.each([
 		["empty", ""],
 		["non-decimal", "1e2"],
@@ -562,10 +620,13 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes generation 56 at serving epoch 5", () => {
+test("publishes generation 59 at serving epoch 5", () => {
 	// Generation 55: shared-topic-authority outage hardening (#3974).
 	// Generation 56: lazy native authority for startup-cost cut (#3846).
-	expect(DAEMON_GENERATION).toBe(56);
+	// Generation 57: parser-valid archive transitions after disconnect grace.
+	// Generation 58: parser-valid durable-fence promotion and rollback.
+	// Generation 59: attached OPEN-socket count in the heartbeat sidecar (#4128).
+	expect(DAEMON_GENERATION).toBe(59);
 	expect(SERVING_EPOCH).toBe(5);
 });
 test("archives pending topics into retained inactive records", async () => {

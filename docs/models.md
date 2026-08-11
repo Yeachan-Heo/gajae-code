@@ -206,7 +206,7 @@ profiles:
       critic: openai/o3:high
 ```
 
-`model_mapping` keys are role names (`default`, `executor`, `architect`, `planner`, `critic`). Every role accepts either one `provider/modelId[:effort]` selector or a non-empty ordered array of selectors; the first entry is primary and later entries are fallback candidates. `required_providers` is the aggregate set of providers required across the profile's mapped roles.
+`model_mapping` keys are role names (`default`, `executor`, `architect`, `planner`, `critic`). Every role accepts either one selector or a non-empty ordered array of selectors; the first entry is primary and later entries are fallback candidates. A selector may be a provider-agnostic bare alias such as `glm-5.2[:effort]` or an explicit `provider/modelId[:effort]` pin, including nested model IDs such as `openrouter/anthropic/claude-sonnet-5`. `required_providers` lists explicit provider prerequisites and may be empty when availability is resolved from bare aliases.
 
 ### Fallback chains
 
@@ -235,6 +235,7 @@ Built-in profiles are grouped by provider mix and tier:
 
 - `codex-{eco,medium,pro}` — GPT-5.6 Sol/Terra/Luna role mixes tuned by tier and reasoning effort; `lunamaxxing` — OpenAI Codex Luna-only profile with maximum reasoning on delegated roles
 - `opencodego` — single OpenCode Go preset (Kimi K3 default and planner, DeepSeek executor/architect, MiMo critic)
+- Provider-agnostic open-model profiles are named by the model families they require. Single-family choices are `open-weights-{glm,deepseek,kimi,luna}`; two-family choices are `open-weights-glm-deepseek`, `open-weights-kimi-deepseek`, and `open-weights-kimi-glm`; `open-weights-kimi-glm-deepseek` uses all three open-weight families; `open-weights-all` adds GPT-5.6 Luna. Choose the smallest combination covered by the models available through your configured providers. Every selector is a bare final-segment alias with `required_providers: []`, so each family may come from any authenticated bundled or custom provider under Provider Priority. GPT-5.6 Luna is proprietary despite its inclusion in this group.
 - `claude-opus` — Anthropic OAuth preset centered on `claude-opus-5`
 - Single-provider tiers: `glm-{eco,medium,pro}`, `kimi-coding-plan-{eco,medium,pro}`, `mimo-{eco,medium,pro}`, `grok-{eco,medium,pro}`, `cursor-{eco,medium,pro}`, `minimax-{eco,medium,pro}`
 - Alibaba Token Plan: `alibaba-token-plan-balanced` preserves the established Qwen/DeepSeek V4 Pro/GLM mix; `alibaba-token-plan-pro` raises execution and independent criticism with DeepSeek V4 Flash 0731 max and GLM xhigh; `alibaba-token-plan-qwenmaxxing` stays Qwen-only; `alibaba-token-plan-qwen-deepseek` keeps Qwen 3.8 Max (`qwen3.8-max`) on the expensive default (high)/architect (xhigh)/critic (xhigh) roles and spends DeepSeek V4 Flash 0731 on the cheap planner (max) and executor (high) roles; `alibaba-token-plan-glm-deepseek` does the same with GLM 5.2 (`glm-5.2`) as the expensive model
@@ -250,7 +251,27 @@ gjc --mpreset codex-medium
 gjc --mpreset opencodego --default
 ```
 
-The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful provider login, the matching preset is recommended automatically.
+### Routing built-in presets through a proxy (`modelProfile.proxyProvider`)
+
+Built-in preset selectors pin a direct provider endpoint (`xai/grok-4.3`, `xiaomi/mimo-v2.5-pro`, …). To serve those models through your own OpenAI-compatible gateway (LiteLLM, OpenRouter, or a custom proxy) instead of each vendor's endpoint, configure the proxy provider id and routing mode in `config.yml`:
+
+```yaml
+modelProfile:
+  proxyProvider: litellm
+  proxyMode: always # use fallback to keep directly authenticated providers direct
+```
+
+The proxy provider is a normal `providers:` entry. Add it with `gjc setup provider --preset litellm --base-url <url>` or the generic `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (both presets require `--base-url` and use live model discovery). The configured proxy must be authenticated and expose every routed model. Activation rewrites each selected built-in preset selector from `<direct-provider>/<model>` to `<proxy>/<direct-provider>/<model>` (for example `xai/grok-4.3` → `litellm/xai/grok-4.3`), matching the proxy's catalog entry for the model. The rules:
+
+- Routing applies to **built-in presets only**. User-defined `profiles:` entries always keep their exact selectors — set them explicitly if you want them proxied.
+- `proxyMode: fallback` (the default) routes only selectors whose direct provider is unauthenticated. `proxyMode: always` routes every proxy-routable built-in selector through the configured proxy, including selectors with direct credentials.
+- The proxy id must name a configured provider. `proxyMode: always` requires `proxyProvider` and a usable proxy credential; activation fails closed when a required proxy is unset or unauthenticated. `auth: none` proxies count as authenticated.
+- Only providers the bundled preset catalog treats as routable are rewritten; providers outside that set (for example a custom `acme-private`) keep the direct credential error.
+- A routed selector must have exactly one matching proxy catalog model. Exact `<direct-provider>/<model>` proxy ids win over suffix matches; missing or ambiguous matches fail activation before any role can run.
+
+The `/model` command opens to a preset landing view: presets are grouped by provider with live auth marks (✓/✗), highlighting a group expands its tiers, and selecting a tier shows the full role→model preview before applying for the session or as default. Typing jumps straight to model search, and `Browse all models` opens the classic tabbed model selector. In `/login`, `Add custom provider` is the first option for configuring credentials needed by custom or profile-required providers; after a successful provider login, the matching preset is recommended automatically. Custom providers participate in provider-agnostic alias resolution but require manual preset selection.
+
+External SDK/ACP clients (e.g. the Paseo TUI) can select profiles like ordinary models: the SDK `models.list/current` (Q10) catalog exposes every usable profile as a synthetic `gajae-code/<profile>` entry (e.g. `gajae-code/codex-eco`), and selecting one through `model.set` (or the ACP Model picker) activates the profile for the live session only. Persisting a profile remains an explicit TUI choice, mirroring `gjc --mpreset <name> --default`. See [SDK model profiles](./sdk.md#model-profiles-as-synthetic-models-gajae-codeprofile).
 
 MiniMax's OpenAI-compatible endpoint rejects multiple system messages and emits thinking in `reasoning_content`, so pin the public-safe compatibility fields when hand-authoring a custom provider:
 
@@ -283,6 +304,35 @@ providers:
     models:
       - id: glm-4.6
 ```
+
+### JetBrains AI (Junie)
+
+`jetbrains-junie` is a first-class provider serving JetBrains-hosted models through the documented
+Ingrazzio gateway (`https://ingrazzio-cloud-prod.labs.jb.gg`).
+
+Authenticate with an access token generated at [junie.jetbrains.com/cli](https://junie.jetbrains.com/cli):
+
+```sh
+export JUNIE_API_KEY=...
+```
+
+The token is sent as `Authorization: Bearer` — JetBrains AI rejects requests that also carry `x-api-key`, so
+this provider never lets the Anthropic SDK attach one. Usage is billed against your JetBrains AI
+subscription, so bundled per-token costs are zero. There is no OAuth login flow; the environment variable is
+the only supported credential source.
+
+The gateway multiplexes transports by model family:
+
+| Family | Models | Transport | Prompt limit |
+| --- | --- | --- | --- |
+| Claude | `claude-sonnet-4-6` (default), `claude-sonnet-5`, `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `claude-opus-5`, `claude-fable-5` | `anthropic-messages` | 1M |
+| GPT | `gpt-5-2025-08-07`, `gpt-5.2-2025-12-11`, `gpt-5.4`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` | `openai-completions` | 922K |
+| GPT (Responses-only) | `gpt-5.3-codex` | `openai-responses` | 272K |
+
+All models cap output at 128K. Junie also exposes Gemini and Grok, but those ride a proprietary Grazie
+translation protocol that GJC does not implement, so they are deliberately not bundled. The bare
+`opus`/`sonnet`/`gpt`/`grok` aliases are Junie CLI shorthands the gateway itself rejects.
+
 ### Allowed auth/discovery values
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
@@ -293,6 +343,7 @@ providers:
 ## OpenAI-compatible proxy configuration
 
 OpenAI-compatible proxy providers should use schema-supported provider keys first:
+The first-class way to add a proxy provider is `gjc setup provider --preset litellm --base-url <url>` (LiteLLM) or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` (any OpenAI-compatible gateway); both presets require `--base-url` and configure live model discovery. Proxy providers can also be used to route built-in model-preset selectors — see [Routing built-in presets through a proxy](#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider). The YAML below shows the equivalent hand-written provider config:
 
 ```yaml
 providers:
@@ -498,18 +549,21 @@ Current heuristics are intentionally narrow:
 - dotted and dashed version variants can normalize only when they map to an existing official id, for example `4.6 -> 4-6`
 - ambiguous families or versions are not merged without a bundled match or explicit override
 
-### Canonical resolution behavior
+### Canonical and preset-equivalent resolution behavior
 
-When multiple concrete variants share a canonical id, resolution uses:
+When multiple concrete variants are eligible for automatic resolution, the global provider policy uses this order:
 
-1. availability and auth
-2. `config.yml` `modelProviderOrder`
-3. the lowest combined `cost.input + cost.cacheRead`
-4. existing registry/provider order if the earlier ranks tie
+1. explicit `config.yml` `modelProviderOrder` entries, in their saved order
+2. omitted providers whose effective credential came from OAuth
+3. omitted providers using a manual API key, unknown credential provenance, or keyless access
+4. vision capability, exact canonical identity, canonical source quality, lowest `cost.input + cost.cacheRead`, stable registry model order, then concrete selector order
 
-Disabled or unauthenticated providers are skipped. A session that resolves a canonical selector keeps its concrete variant across discovery refreshes; it changes only after an explicit concrete selection or when that variant is no longer available.
+The explicit provider list may be partial. A listed API-key provider beats every omitted OAuth provider. Resetting Provider Priority clears the explicit list and restores OAuth-first plus deterministic fallback. Saved providers that are not currently available remain visible and persisted, but runtime resolution skips them.
 
-Session state and transcripts continue to record the concrete provider/model that actually executed the turn.
+Model-profile and preset assignments support a lookup-only alias when the assignment does not explicitly name a provider. For example, a bare preset assignment `gpt-5` can select any available concrete variant whose final model-id segment is `gpt-5`, ranked by the same global policy. An assignment such as `openai/gpt-5` is an explicit provider pin: if that exact model is unavailable, activation reports it unavailable instead of switching providers. Alias lookup never rewrites the selected model's concrete provider, full model id, or `wireModelId`; a known bare alias with no eligible variant is unavailable and does not fall through to a different fuzzy match. Direct model selection remains unchanged.
+Runtime custom providers participate in the same lookup automatically. A custom provider model such as `hosted/glm-5.2` contributes the alias `glm-5.2` when the provider is registered, authenticated, and available; Provider Priority can rank that custom provider ahead of bundled providers without changing the preset. Custom IDs whose final segment differs (for example `glm-5.2-special`) do not join the alias.
+
+A session that resolves a canonical or alias selector keeps its concrete variant across provider-priority edits and discovery refreshes. Updated priority applies to new or unpinned resolutions. The session re-ranks only after explicit reselection or when the sticky variant becomes unavailable. Session state and transcripts continue to record the concrete provider/model that executed the turn.
 
 Provider defaults vs per-model overrides:
 
@@ -643,6 +697,8 @@ Resolution precedence for exact selectors:
 
 Thinking suffixes are split once from the final `:` only after the complete selector does not resolve. This preserves concrete OpenRouter route IDs such as `openrouter/z-ai/glm-4.7:nitro`; `:high` can follow that route suffix. Multiple suffixes are not recursively consumed. A complete `provider/modelId` selector is exact-only: it never falls back to fuzzy, substring, glob, or another provider when that concrete selector is absent. Exact-case provider/model entries resolve deterministically for custom replacement semantics; a case-insensitive selector that remains ambiguous does not guess.
 
+Preset/profile activation may use an unqualified assignment as a final-segment lookup alias after exact resolution fails. Provider-qualified assignments remain exact pins, and this opt-in does not apply to CLI or direct concrete model selection.
+
 ### Initial model selection priority
 
 `findInitialModel(...)` uses this order:
@@ -667,7 +723,7 @@ Related settings:
 
 - `modelRoles` (record)
 - `enabledModels` (scoped pattern list)
-- `modelProviderOrder` (global canonical-provider precedence)
+- `modelProviderOrder` (global automatic provider precedence; editable under Settings → Providers with add/remove, move up/down, unavailable-entry retention, and Reset)
 - `providers.kimiApiFormat` (`openai` or `anthropic` request format)
 - `providers.openaiWebsockets` (`auto|off|on` websocket preference for OpenAI code provider transport)
 

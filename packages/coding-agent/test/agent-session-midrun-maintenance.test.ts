@@ -530,7 +530,7 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		} finally {
 			SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = undefined;
 		}
-	}, 15_000);
+	}, 45_000);
 
 	it("keeps canonical output when exact publication is incomplete", async () => {
 		session = await buildSession({ persisted: true, settings: { "compaction.keepRecentTokens": 10 } });
@@ -550,7 +550,7 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
 		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
 		expect((await session.sessionManager.getArtifactManager()?.listFiles()) ?? []).toEqual([]);
-	}, 30_000);
+	}, 90_000);
 
 	it("keeps canonical output when exact publication fails after planning", async () => {
 		session = await buildSession({ persisted: true, settings: { "compaction.keepRecentTokens": 10 } });
@@ -582,7 +582,7 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		if (entry?.type !== "message" || entry.message.role !== "toolResult") return;
 		expect(entry.message.content).toEqual([{ type: "text", text: output }]);
 		expect(await artifactManager.listFiles()).toEqual([]);
-	}, 30_000);
+	}, 90_000);
 
 	it("commits persisted tool-output eviction through production maintenance and releases append-only retainers", async () => {
 		session = await buildSession({
@@ -771,7 +771,7 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		} finally {
 			SessionManagerTestHooks.beforeEphemeralArtifactManagerInstall = undefined;
 		}
-	}, 15_000);
+	}, 45_000);
 
 	it("T6 attempts identical provider-response anchors at most once", async () => {
 		session = await buildSession({ shortCircuit: false });

@@ -23,8 +23,15 @@ export async function runExtensionCompact(
 }
 
 interface SetModelCapableSession {
-	modelRegistry: { getApiKey(model: Model): Promise<string | undefined> };
+	credentialSessionId?: string;
+	modelRegistry: { getApiKey(model: Model, sessionId?: string): Promise<string | undefined> };
 	setModel(model: Model, role?: string, options?: { cause?: string }): Promise<unknown>;
+	/** Persist effective profile roles and clear its marker for a concrete default selection. */
+	materializeActiveDefaultModelProfileAssignment?(model: Model): boolean;
+	/** Drop a session-only profile marker and its runtime role overrides. */
+	clearSessionOnlyModelProfileState?(): void;
+	/** Fallback marker clear for legacy session adapters. */
+	setActiveModelProfile?(name: string | undefined): void;
 }
 
 /**
@@ -33,8 +40,16 @@ interface SetModelCapableSession {
  * Returns false when no API key is available for the requested model.
  */
 export async function runExtensionSetModel(session: SetModelCapableSession, model: Model): Promise<boolean> {
-	const key = await session.modelRegistry.getApiKey(model);
+	const key = await session.modelRegistry.getApiKey(model, session.credentialSessionId);
 	if (!key) return false;
 	await session.setModel(model, "default", { cause: "user-selection" });
+	// A durable profile is replaced by materializing its effective assignments
+	// (otherwise a restart reapplies modelProfile.default and restores the
+	// profile the caller just replaced); a session-only marker is dropped
+	// together with its runtime role overrides.
+	if (!session.materializeActiveDefaultModelProfileAssignment?.(model)) {
+		if (session.clearSessionOnlyModelProfileState) session.clearSessionOnlyModelProfileState();
+		else session.setActiveModelProfile?.(undefined);
+	}
 	return true;
 }

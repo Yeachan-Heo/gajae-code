@@ -80,8 +80,10 @@ describe("platform-aware key hint formatting", () => {
 		expect(formatKeyHints(["alt+up", "ctrl++"], { platform: "linux" })).toBe("Alt+Up/Ctrl++");
 	});
 
-	it("uses a fixed safe fallback for invalid input", () => {
-		expect(formatKeyHint("command+p", { platform: "darwin" })).toBe("Invalid keybinding");
+	it("formats aliases and uses a fixed safe fallback for invalid input", () => {
+		expect(formatKeyHint("command+p", { platform: "darwin" })).toBe("⌘P");
+		expect(formatKeyHint("option+q", { platform: "darwin" })).toBe("⌥Q");
+		expect(formatKeyHint("control+p", { platform: "linux" })).toBe("Invalid keybinding");
 		expect(formatKeyHint("ctrl+\u001b[31m", { platform: "linux" })).toBe("Invalid keybinding");
 	});
 });

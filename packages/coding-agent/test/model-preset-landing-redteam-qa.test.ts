@@ -117,6 +117,7 @@ function createRegistry(
 			anthropicModel,
 			minimaxModel,
 			noSuffixModel,
+			{ ...noSuffixModel, provider: "provider-b" },
 			...builtinCodexModels,
 			...builtinComboModels,
 		],
@@ -125,6 +126,7 @@ function createRegistry(
 			anthropicModel,
 			minimaxModel,
 			noSuffixModel,
+			{ ...noSuffixModel, provider: "provider-b" },
 			...builtinCodexModels,
 			...builtinComboModels,
 		],
@@ -302,6 +304,64 @@ describe("preset landing adversarial QA", () => {
 		const text = await rendered(selector);
 		expect(text).toContain("✓ COMBOS");
 		expect(text).not.toContain("✗ COMBOS");
+	});
+
+	test("alternative provider groups allow a preset through with one authenticated member", async () => {
+		const alternativeProfile: ModelProfileDefinition = {
+			name: "alternative-profile",
+			displayName: "Alternative Profile",
+			requiredProviders: ["provider-a", "provider-b"],
+			alternativeProviderGroups: [["provider-a", "provider-b"]],
+			modelMapping: { default: "provider-a/default" },
+			source: "builtin",
+		};
+		const selector = createSelector({ authenticatedProviders: ["provider-b"], profiles: [alternativeProfile] });
+		await rendered(selector);
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("Preset preview: Alternative Profile");
+		expect(text).not.toContain("Run /login");
+	});
+
+	test("a valid bare-alias fallback tail keeps the preset usable", async () => {
+		const fallbackProfile: ModelProfileDefinition = {
+			name: "alias-fallback-profile",
+			displayName: "Alias Fallback Profile",
+			requiredProviders: [],
+			modelMapping: { default: ["missing-alias", "gpt-5.5"] },
+			source: "builtin",
+		};
+		const selector = createSelector({ authenticatedProviders: ["openai-codex"], profiles: [fallbackProfile] });
+		await rendered(selector);
+		selector.handleInput("\n");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("Preset preview: Alias Fallback Profile");
+		expect(text).not.toContain("No available model matches this preset");
+	});
+	test("provider-qualified selectors require an available catalog model", async () => {
+		const unavailablePinnedProfile: ModelProfileDefinition = {
+			name: "unavailable-pinned-profile",
+			displayName: "Unavailable Pinned Profile",
+			requiredProviders: ["provider-a"],
+			modelMapping: { default: "provider-a/missing" },
+			source: "builtin",
+		};
+		const selector = createSelector({
+			authenticatedProviders: ["provider-a"],
+			profiles: [unavailablePinnedProfile],
+		});
+		await rendered(selector);
+		selector.handleInput("\n");
+
+		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		expect(text).toContain("No available model matches this preset");
+		expect(text).not.toContain("Preset preview: Unavailable Pinned Profile");
 	});
 
 	test("preview clamps codex eco executor to low and omits suffix for suffixless selector", async () => {

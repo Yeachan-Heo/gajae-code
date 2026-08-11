@@ -232,18 +232,15 @@ Notes: ...
 - URL truncation keeps the `URL:`/`Content-Type:`/`Method:` (and `Notes:`) preamble intact. `head` retains the historical whole-output byte accounting; explicit `last`/`both` apply the 300-line / 50 KiB cap to the body only and then reattach the preamble.
 - URL truncation metadata (`totalLines` / `totalBytes` and shown counts) describes the body window, not the preamble. The preamble offset is recorded when the output is built; artifact rehydration stores a separate wrapped-coordinate offset so delimiter text is never rediscovered from content.
 
-- `method` records the winning path (`json`, `feed`, `text`, `alternate-markdown`, `md-suffix`, `content-negotiation`, `image`, `markit`, `llms.txt`, `raw`, `raw-html`, `insane`, etc.).
+- `method` records the winning path (`json`, `feed`, `text`, `alternate-markdown`, `md-suffix`, `content-negotiation`, `image`, `markit`, `llms.txt`, `raw`, `raw-html`, etc.).
 - URL reads may return an inline image block when the fetched resource is a supported image and survives resizing.
 
-### Insane Search fallback (opt-in)
+### Insane Search fallback compatibility setting (disabled)
 
-- Setting: `web.insaneFallback` (default **off**). When enabled, blocked or degraded public URL reads escalate through the vendored [`fivetaku/insane-search`](https://github.com/fivetaku/insane-search) engine (`packages/coding-agent/vendor/insane-search`) before `read` gives up.
-- It runs at three points in `renderUrl()`: the hard fetch failure (`!response.ok`, e.g. 403/WAF), the renderer-failure raw-HTML branch, and the low-quality/JS-gated branch — the latter only after the existing document-extraction and `llms.txt` fallbacks fail. A successful escalation is tagged `Method: insane`.
-- **Public content only.** A pre-spawn guard (`src/web/insane/url-guard.ts`) rejects non-HTTP(S) schemes, URL credentials, `localhost`/`.local`/`.internal` hosts, loopback/private/link-local/reserved IPs (IPv4, IPv6, and IPv4-mapped IPv6), and DNS names that resolve to any private/reserved address — **before** any dependency probe or subprocess runs.
-- **Raw mode is never escalated.** `read <url>:raw` performs no guard DNS, no dependency probe, and no subprocess.
-- **Dependencies are required, never auto-installed.** Phase 0–2 need `python3` + `curl_cffi`; the browser phase needs `node` + `playwright`/`playwright-extra`/`puppeteer-extra-plugin-stealth` under `vendor/insane-search/engine/templates`. Missing dependencies surface a stable `insane fallback unavailable: …` note and `read` continues with its normal degraded result.
-- **Login/paywall is not bypassed.** An `authentication required` verdict maps to a note (`insane fallback stopped: authentication required`) and normal degraded output.
-- **Residual risk:** the engine performs its own network requests and may follow redirects that this guard never re-validates. This is accepted, documented risk, mitigated by validating the input target and keeping the feature opt-in/off by default. Enabling it changes network posture by allowing TLS/browser impersonation for public pages.
+- `web.insaneFallback` is retained as a compatibility setting and defaults to **off**. The production `read` path does not invoke the guard, dependency probes, Python bridge, vendored engine, or browser phase even when the setting is enabled; it appends a disabled-security note and preserves the normal `read` result.
+- The vendored [`fivetaku/insane-search`](https://github.com/fivetaku/insane-search) engine remains packaged but is not a current `read` winning path, so `Method: insane` is not emitted.
+- The fallback was disabled because a subprocess or browser handoff cannot preserve GJC's validated per-hop network route. The vendored curl transport classifies each redirect target, but it does not bind the validated DNS address to the subsequent connection; the Playwright phase also cannot constrain redirects and subresources to that boundary.
+- Any future reactivation must remain public-content-only, must never auto-install Python/browser dependencies, and must continue to reject authentication, login, paywall, and CAPTCHA bypasses. Raw mode must remain ineligible for escalation.
 
 ## Side Effects
 - Filesystem

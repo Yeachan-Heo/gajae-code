@@ -59,20 +59,10 @@ function residentCacheRoot(): string {
 	return getResidentCacheRootDir(getAgentDir());
 }
 
-function residentCacheDirs(): string[] {
-	const root = residentCacheRoot();
-	return fs.existsSync(root)
-		? fs
-				.readdirSync(root)
-				.map(name => path.join(root, name))
-				.filter(dir => path.basename(dir).startsWith("i-") && fs.statSync(dir).isDirectory())
-		: [];
-}
-
-function activeResidentCacheDir(): string {
-	const dirs = residentCacheDirs();
-	if (dirs.length !== 1) throw new Error(`Expected one active resident cache dir, got ${dirs.length}`);
-	return dirs[0]!;
+function residentTextCacheDir(sm: SessionManager): string {
+	const dir = sm.residentTextCacheDirForTests();
+	if (!dir) throw new Error("Expected a directory-backed resident text cache");
+	return dir;
 }
 
 async function createPersistedLargeTextSession(
@@ -86,7 +76,7 @@ async function createPersistedLargeTextSession(
 	const sessionFile = sm.getSessionFile();
 	const artifactsDir = sm.getArtifactsDir();
 	if (!sessionFile || !artifactsDir) throw new Error("Expected persisted session paths");
-	const cacheDir = activeResidentCacheDir();
+	const cacheDir = residentTextCacheDir(sm);
 	expect(fs.existsSync(cacheDir)).toBe(true);
 
 	return { sm, sessionFile, artifactsDir, cacheDir, entryId };
@@ -124,7 +114,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		expect(fs.existsSync(cacheDir)).toBe(false);
 
 		const reopened = await SessionManager.open(sessionFile);
-		const reopenedCacheDir = activeResidentCacheDir();
+		const reopenedCacheDir = residentTextCacheDir(reopened);
 		await fs.promises.rm(reopenedCacheDir, { recursive: true, force: true });
 
 		vi.spyOn(EphemeralBlobStore.prototype, "getSync").mockImplementation(function (
@@ -168,7 +158,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 	it("exports and rewrites a public-safe placeholder after disk cache deletion", async () => {
 		const sentinel = `corrupt resident text ${"z".repeat(2048)}`;
 		const { sm, sessionFile } = await createPersistedLargeTextSession(sentinel);
-		const liveCacheDir = activeResidentCacheDir();
+		const liveCacheDir = residentTextCacheDir(sm);
 		await fs.promises.rm(liveCacheDir, { recursive: true, force: true });
 		vi.spyOn(EphemeralBlobStore.prototype, "getSync").mockImplementation(function (
 			this: EphemeralBlobStore,
@@ -183,7 +173,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		await sm.close();
 
 		const standalone = await SessionManager.open(sessionFile);
-		const standaloneCacheDir = activeResidentCacheDir();
+		const standaloneCacheDir = residentTextCacheDir(standalone);
 		await fs.promises.rm(standaloneCacheDir, { recursive: true, force: true });
 		const standaloneHtml = path.join(makeTempDir(), "standalone-corrupt.html");
 		await exportSessionToHtml(standalone, undefined, {
@@ -193,7 +183,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		await standalone.close();
 		const fromFileHtml = path.join(makeTempDir(), "from-file-corrupt.html");
 		const exportManager = await SessionManager.open(sessionFile);
-		const exportCacheDir = activeResidentCacheDir();
+		const exportCacheDir = residentTextCacheDir(exportManager);
 		await fs.promises.rm(exportCacheDir, { recursive: true, force: true });
 		await exportSessionToHtml(exportManager, undefined, {
 			outputPath: fromFileHtml,
@@ -202,7 +192,7 @@ describe("resident text cache missing-blob and reference hygiene", () => {
 		await expectFileContainsResidentPlaceholder(fromFileHtml);
 
 		const rewrite = await SessionManager.open(sessionFile);
-		const rewriteCacheDir = activeResidentCacheDir();
+		const rewriteCacheDir = residentTextCacheDir(rewrite);
 		await fs.promises.rm(rewriteCacheDir, { recursive: true, force: true });
 		await rewrite.rewriteEntries();
 		await rewrite.close().catch(() => {});

@@ -115,41 +115,81 @@ if (rows.length > 0) {
 if (checkOnly) process.exit(0);
 
 const startedAt = performance.now();
-let commandReceipts = 0;
-let rowReceipts = 0;
 const perAdapter = new Map<string, number>();
 
-async function executeReceipt(argv: string[]): Promise<void> {
+/**
+ * A receipt is already an isolated `bun test` process, so a manifest whose
+ * receipts are independent can run them through a bounded worker pool instead of
+ * one at a time — which is what made this gate the dominant cost of `check:ts`,
+ * a few hundred process startups serialized behind each other. Independence is
+ * not free, though: receipts that each spawn a detached SDK broker and load
+ * Node-API addons fail when they race, so concurrency is never assumed. It stays
+ * sequential unless the caller opts a specific manifest in through
+ * `GJC_MANIFEST_RECEIPT_CONCURRENCY`, and every receipt keeps its own process,
+ * its own argv, and its own receipt line either way.
+ */
+const receiptConcurrency = (() => {
+	const configured = Number(process.env.GJC_MANIFEST_RECEIPT_CONCURRENCY);
+	return Number.isSafeInteger(configured) && configured >= 1 ? configured : 1;
+})();
+
+type ReceiptOutcome = { stdout: string; stderr: string; exitCode: number; tests: number | undefined };
+
+function satisfiesReceipt(outcome: ReceiptOutcome): boolean {
+	return outcome.exitCode === 0 && outcome.tests !== undefined && outcome.tests >= 1;
+}
+
+async function runReceipt(argv: string[]): Promise<ReceiptOutcome> {
 	const child = Bun.spawn(argv, { cwd: repoRoot, stdout: "pipe", stderr: "pipe" });
 	const [stdout, stderr, exitCode] = await Promise.all([
 		new Response(child.stdout).text(),
 		new Response(child.stderr).text(),
 		child.exited,
 	]);
-	process.stdout.write(stdout);
-	process.stderr.write(stderr);
-	const tests = testCount(`${stdout}\n${stderr}`);
-	process.stdout.write(`receipt: ${argv.join(" ")} exit=${exitCode} tests=${tests ?? "unknown"}\n`);
-	if (exitCode === 0 && tests !== undefined && tests >= 1) return;
-	const reason = exitCode !== 0 ? `exit ${exitCode}` : "did not report at least one test";
-	process.stderr.write(`Manifest receipt failed: ${argv.join(" ")} (${reason})\n`);
-	process.exit(1);
+	return { stdout, stderr, exitCode, tests: testCount(`${stdout}\n${stderr}`) };
 }
 
-for (const command of manifest.commands) {
-	await executeReceipt(command.argv);
-	commandReceipts++;
+/**
+ * Runs one phase to completion and then reports it in manifest order. A failing
+ * receipt stops the pool from claiming further work and exits non-zero, so the
+ * gate still fails closed; receipts already in flight are drained rather than
+ * abandoned, and receipts that were never claimed are never reported as evidence.
+ */
+async function executePhase(argvs: string[][]): Promise<void> {
+	const outcomes = new Array<ReceiptOutcome | undefined>(argvs.length);
+	let claimed = 0;
+	let stopped = false;
+	const drain = async (): Promise<void> => {
+		for (;;) {
+			const index = claimed++;
+			if (stopped || index >= argvs.length) return;
+			const outcome = await runReceipt(argvs[index]!);
+			outcomes[index] = outcome;
+			if (!satisfiesReceipt(outcome)) stopped = true;
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(receiptConcurrency, argvs.length) }, drain));
+	for (const [index, argv] of argvs.entries()) {
+		const outcome = outcomes[index];
+		if (!outcome) continue;
+		process.stdout.write(outcome.stdout);
+		process.stderr.write(outcome.stderr);
+		process.stdout.write(`receipt: ${argv.join(" ")} exit=${outcome.exitCode} tests=${outcome.tests ?? "unknown"}\n`);
+		if (satisfiesReceipt(outcome)) continue;
+		const reason = outcome.exitCode !== 0 ? `exit ${outcome.exitCode}` : "did not report at least one test";
+		process.stderr.write(`Manifest receipt failed: ${argv.join(" ")} (${reason})\n`);
+		process.exit(1);
+	}
 }
-process.stdout.write(`manifest command receipts complete: ${commandReceipts}\n`);
 
-for (const row of rows) {
-	await executeReceipt(row.argv);
-	rowReceipts++;
-	perAdapter.set(row.adapter, (perAdapter.get(row.adapter) ?? 0) + 1);
-}
+await executePhase(manifest.commands.map(command => command.argv));
+process.stdout.write(`manifest command receipts complete: ${manifest.commands.length}\n`);
+
+await executePhase(rows.map(row => row.argv));
+for (const row of rows) perAdapter.set(row.adapter, (perAdapter.get(row.adapter) ?? 0) + 1);
 if (rows.length > 0) {
 	process.stdout.write(
-		`manifest row receipts complete: ${rowReceipts} (${[...perAdapter].map(([adapter, count]) => `${adapter}=${count}`).join(", ")})\n`,
+		`manifest row receipts complete: ${rows.length} (${[...perAdapter].map(([adapter, count]) => `${adapter}=${count}`).join(", ")})\n`,
 	);
 }
 process.stdout.write(`manifest receipts runtime=${Math.round(performance.now() - startedAt)}ms\n`);

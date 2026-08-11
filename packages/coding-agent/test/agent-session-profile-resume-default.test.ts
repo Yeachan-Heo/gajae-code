@@ -18,10 +18,10 @@ import { TempDir } from "@gajae-code/utils";
 // model used to record the main model with role="temporary". On resume the
 // session restored `models.default` (the stale pre-profile base model, e.g.
 // openai-codex/gpt-5.5), flipping the main provider away from the profile's
-// intended main model. Profile activation now records its main model as the
-// session default via `persistAsSessionDefault`, while transient switches
-// (retry/fallback/context-promotion/plan mode) stay role="temporary".
-describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
+// intended main model. Profile activation records its concrete main model as
+// the session default only after the activation transaction succeeds, while
+// transient switches (retry/fallback/context-promotion/plan mode) stay role="temporary".
+describe("AgentSession profile resume defaults", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
 	let modelRegistry: ModelRegistry;
@@ -101,6 +101,25 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		expect(session.sessionManager.buildSessionContext().models.default).toBe("openai-codex/gpt-5.5");
 	});
 
+	it("restores an in-memory runtime fallback chain without persisting it", () => {
+		const { base } = resolveModels();
+		session = makeSession(base);
+		session.setDefaultFallbackRuntimeModel("anthropic/claude-opus-5:high");
+		const snapshot = session.getDefaultFallbackRuntimeState();
+		expect(snapshot.chain).toEqual({
+			role: "default",
+			entries: ["anthropic/claude-opus-5:high"],
+			origin: "runtime",
+			explicitHead: true,
+		});
+
+		session.setConfiguredModelChain("default", ["openai-codex/gpt-5.5"], "model_profile", "profile-a");
+		session.restoreDefaultFallbackRuntimeState(snapshot);
+
+		expect(session.getDefaultFallbackRuntimeState().chain).toEqual(snapshot.chain);
+		expect(session.getConfiguredModelChain("default")).toEqual(["openai-codex/gpt-5.5"]);
+	});
+
 	it("rollback of a failed activation restores the pre-activation resume default, not the transient live model", async () => {
 		// A = persisted resume default, B = transient live model (e.g. retry/
 		// fallback/plan switch), profileMain = the profile's main model the failed
@@ -133,8 +152,8 @@ describe("AgentSession setModelTemporary persistAsSessionDefault", () => {
 		expect(prepared.previousSessionDefaultModel).toBe("openai-codex/gpt-5.5");
 		expect(prepared.defaultModel?.id).toBe("claude-opus-5");
 
-		// Force the activation to fail AFTER the profile main model is recorded as
-		// the session default: the agent-model-override step throws.
+		// Force the activation to fail after the live model changes but before the
+		// profile main model is committed as the session resume default.
 		prepared.settings = new Proxy(session.settings, {
 			get(target, prop, receiver) {
 				if (prop === "override") {

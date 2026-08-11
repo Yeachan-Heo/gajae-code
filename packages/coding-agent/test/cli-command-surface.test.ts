@@ -152,6 +152,8 @@ process.exitCode = await child.exited;`;
 			"state",
 			"setup",
 			"acp",
+			"auth-broker",
+			"auth-gateway",
 			"skills",
 			"session",
 			"harness",
@@ -178,6 +180,7 @@ process.exitCode = await child.exited;`;
 			"plugin",
 			"completion",
 			"launch",
+			"quick-lane",
 		]);
 	});
 
@@ -333,6 +336,54 @@ process.exitCode = await child.exited;`;
 		}
 	}, 30_000);
 
+	it("routes compact worktree selectors before root help and version fast paths", () => {
+		for (const args of [
+			["-winvalid..branch", "--help"],
+			["-w=invalid..branch", "--help"],
+		]) {
+			const result = Bun.spawnSync(["bun", cliEntry, ...args], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+
+			expect(result.exitCode, output).toBe(0);
+			expect(result.stdout.toString()).toContain("$ gjc launch");
+		}
+
+		for (const args of [
+			["-winvalid..branch", "--version"],
+			["-w=invalid..branch", "--version"],
+		]) {
+			const result = Bun.spawnSync(["bun", cliEntry, ...args], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+
+			expect(result.exitCode, result.stderr.toString()).toBe(0);
+			expect(result.stdout.toString()).toBe(`${packageJson.version}\n`);
+		}
+
+		const delimiter = Bun.spawnSync(["bun", cliEntry, "-winvalid..branch", "--", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const delimiterOutput = `${delimiter.stdout.toString()}\n${delimiter.stderr.toString()}`;
+		expect(delimiter.exitCode, delimiterOutput).not.toBe(0);
+		expect(delimiterOutput).toContain("invalid..branch");
+
+		const unrelated = Bun.spawnSync(["bun", cliEntry, "-xnot-worktree", "--version"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(unrelated.exitCode, unrelated.stderr.toString()).toBe(0);
+		expect(unrelated.stdout.toString()).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
+	}, 30_000);
+
 	it("does not capture absolute-path prompts as startup slash commands", () => {
 		const parsed = parseArgs(["/tmp/request.md", "--model", "opus", "summarize"]);
 
@@ -406,6 +457,59 @@ process.exitCode = await child.exited;`;
 			await fs.rm(home, { recursive: true, force: true });
 		}
 	}, 15_000);
+
+	it("routes sdk session verbs and rejects the removed daemon session route", async () => {
+		const help = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const helpOutput = `${help.stdout.toString()}\n${help.stderr.toString()}`;
+		expect(help.exitCode, helpOutput).toBe(0);
+		for (const token of [
+			"list",
+			"inspect",
+			"send",
+			"status",
+			"tail",
+			"raw",
+			"--until-idle",
+			"--strict",
+			"--all-events",
+		])
+			expect(help.stdout.toString()).toContain(token);
+
+		const missingVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const missingOutput = `${missingVerb.stdout.toString()}\n${missingVerb.stderr.toString()}`;
+		expect(missingVerb.exitCode, missingOutput).toBe(2);
+		expect(JSON.parse(missingVerb.stdout.toString())).toMatchObject({
+			ok: false,
+			error: { code: "usage" },
+		});
+
+		const unknownVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "bogus"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const unknownOutput = `${unknownVerb.stdout.toString()}\n${unknownVerb.stderr.toString()}`;
+		expect(unknownVerb.exitCode, unknownOutput).toBe(2);
+		expect(unknownVerb.stderr.toString()).toContain("Expected verb to be one of");
+
+		// `gjc daemon session` is deleted without an alias (DR-13).
+		const daemonSession = Bun.spawnSync(["bun", cliEntry, "daemon", "session", "list"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const daemonOutput = `${daemonSession.stdout.toString()}\n${daemonSession.stderr.toString()}`;
+		expect(daemonSession.exitCode, daemonOutput).toBe(2);
+		expect(daemonSession.stderr.toString()).toContain("Expected action to be one of");
+	}, 30_000);
 });
 
 describe("startup login parsing", () => {

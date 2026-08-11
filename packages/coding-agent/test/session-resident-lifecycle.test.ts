@@ -142,10 +142,10 @@ function residentCacheDirs(): string[] {
 		: [];
 }
 
-function activeResidentCacheDir(): string {
-	const dirs = residentCacheDirs();
-	if (dirs.length !== 1) throw new Error(`Expected one active resident cache dir, got ${dirs.length}`);
-	return dirs[0]!;
+function residentTextCacheDir(sm: SessionManager): string {
+	const dir = sm.residentTextCacheDirForTests();
+	if (!dir) throw new Error("Expected a directory-backed resident text cache");
+	return dir;
 }
 
 async function makeLargeSession(
@@ -160,7 +160,7 @@ async function makeLargeSession(
 	const sessionFile = sm.getSessionFile();
 	const artifactsDir = sm.getArtifactsDir();
 	if (!sessionFile || !artifactsDir) throw new Error("Expected persisted paths");
-	return { sm, root, sessionFile, artifactsDir, cacheDir: activeResidentCacheDir() };
+	return { sm, root, sessionFile, artifactsDir, cacheDir: residentTextCacheDir(sm) };
 }
 
 describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", () => {
@@ -193,7 +193,7 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		await sm.setSessionFile(second.sessionFile);
 		expect(fs.existsSync(switchCacheDir)).toBe(false);
 		expect(JSON.stringify(sm.getEntries())).toContain("cleanup two");
-		const activeCacheDir = activeResidentCacheDir();
+		const activeCacheDir = residentTextCacheDir(sm);
 		expect(fs.existsSync(activeCacheDir)).toBe(true);
 		await sm.close();
 		expect(fs.existsSync(activeCacheDir)).toBe(false);
@@ -238,7 +238,7 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		if (!forked) throw new Error("Expected fork result");
 		expect(forked.oldSessionFile).toBe(oldSessionFile);
 		expect(forked.newSessionFile).not.toBe(oldSessionFile);
-		const forkCacheDir = activeResidentCacheDir();
+		const forkCacheDir = residentTextCacheDir(sm);
 		expect(forkCacheDir).not.toBe(oldCacheDir);
 		expect(JSON.stringify(sm.getEntries())).toContain(sentinel);
 		expect(JSON.stringify(sm.buildSessionContext())).toContain(sentinel);
@@ -246,9 +246,10 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		const oldManager = await SessionManager.open(oldSessionFile);
 		expect(JSON.stringify(oldManager.getEntries())).toContain(sentinel);
 		const cacheDirs = residentCacheDirs();
-		expect(cacheDirs).toHaveLength(2);
+		const oldManagerCacheDir = residentTextCacheDir(oldManager);
+		expect(oldManagerCacheDir).not.toBe(forkCacheDir);
 		expect(cacheDirs).toContain(forkCacheDir);
-		expect(cacheDirs.filter(dir => dir !== forkCacheDir)).toHaveLength(1);
+		expect(cacheDirs).toContain(oldManagerCacheDir);
 		await oldManager.close();
 		await sm.close();
 	});
@@ -266,9 +267,13 @@ describe("resident cache prune retention, lifecycle cleanup, and JSONL parity", 
 		expect(await readPersistedJsonl(movedFile)).toContain(sentinel.slice(0, 100));
 		expect(await readPersistedJsonl(movedFile)).not.toContain("__gjcResidentBlob");
 		expect(await readPersistedJsonl(movedFile)).not.toContain("blob:sha256:");
-		const movedCacheDir = activeResidentCacheDir();
+		const movedCacheDir = residentTextCacheDir(sm);
 		expect(movedCacheDir).not.toBe(cacheDir);
+		// The superseded text store must not survive the move, even though the
+		// managed sidecar cache keeps its own instance dir under the same root.
+		expect(residentCacheDirs()).not.toContain(cacheDir);
 		await sm.close();
+		expect(residentCacheDirs()).toEqual([]);
 	});
 
 	it("restoreState re-owns resident text before resetting the resident store", async () => {

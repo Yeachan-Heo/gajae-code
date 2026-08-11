@@ -37,6 +37,54 @@ async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 2_000)
 	]);
 }
 
+type SessionListResponse = Record<string, unknown>;
+
+async function createSessionListBroker(
+	responder: (input: Record<string, unknown>) => SessionListResponse,
+): Promise<{ directory: string; agentDir: string; requests: Array<Record<string, unknown>> }> {
+	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-session-list-"));
+	directories.push(directory);
+	const agentDir = path.join(directory, ".gjc", "agent");
+	const token = "acp-session-list-token";
+	const requests: Array<Record<string, unknown>> = [];
+	let server!: TestServer;
+	server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			if (new URL(request.url).searchParams.get("token") !== token)
+				return new Response("Unauthorized", { status: 401 });
+			if (!server.upgrade(request)) return new Response("Upgrade failed", { status: 400 });
+		},
+		websocket: {
+			open(socket) {
+				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+			},
+			message(socket, raw) {
+				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+				requests.push(frame);
+				const input = (frame.input ?? {}) as Record<string, unknown>;
+				socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ...responder(input) }));
+			},
+		},
+	});
+	servers.push(server);
+	await writeBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test",
+		ownerId: "test-owner",
+		pid: process.pid,
+		host: "127.0.0.1",
+		port: server.port!,
+		url: `ws://127.0.0.1:${server.port!}`,
+		token,
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	});
+	return { directory, agentDir, requests };
+}
+
 test("production ACP routes zero-session SDK globals through the broker adapter", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-production-"));
 	directories.push(directory);
@@ -98,6 +146,48 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 	abort.abort();
 });
 
+test("production ACP drains session.list continuation pages before returning sessions", async () => {
+	const pageOne = { sessionId: "page-one", locator: { repo: "/workspace" }, live: true };
+	const pageTwo = { sessionId: "page-two", locator: { repo: "/workspace" }, live: false };
+	const fixture = await createSessionListBroker(input =>
+		input.cursor === undefined
+			? { ok: true, result: { sessions: [pageOne], continuationCursor: "page-2" } }
+			: { ok: true, result: { sessions: [pageTwo] } },
+	);
+	const abort = new AbortController();
+	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
+		agentDir: fixture.agentDir,
+	});
+	try {
+		const listed = await agent.listSessions({});
+		expect(listed.sessions.map(session => session.sessionId)).toEqual(["page-one", "page-two"]);
+		expect(fixture.requests.map(request => request.input)).toEqual([{}, { cursor: "page-2" }]);
+	} finally {
+		abort.abort();
+	}
+});
+
+test("production ACP rejects an ok:false session.list continuation instead of returning page one", async () => {
+	const pageOne = { sessionId: "page-one", locator: { repo: "/workspace" }, live: true };
+	const fixture = await createSessionListBroker(input =>
+		input.cursor === undefined
+			? { ok: true, result: { sessions: [pageOne], continuationCursor: "page-2" } }
+			: { ok: false, error: { code: "continuation_failed", message: "page two failed" } },
+	);
+	const abort = new AbortController();
+	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
+		agentDir: fixture.agentDir,
+	});
+	try {
+		await expect(agent.listSessions({})).rejects.toMatchObject({
+			code: "continuation_failed",
+			message: "page two failed",
+		});
+		expect(fixture.requests.map(request => request.input)).toEqual([{}, { cursor: "page-2" }]);
+	} finally {
+		abort.abort();
+	}
+});
 test("production ACP preserves lifecycle, turn, replay, and connection ownership contracts over SDK WebSockets", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-contract-"));
 	directories.push(directory);

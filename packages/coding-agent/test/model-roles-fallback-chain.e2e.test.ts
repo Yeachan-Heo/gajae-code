@@ -73,7 +73,7 @@ describe("modelRoles fallback chain e2e", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("loads a direct role array, keeps its fallback across turns, and exposes the active selection", async () => {
+	it("loads a direct role array, restarts its fallback budget across turns, and exposes the active selection", async () => {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
 		if (!primary || !fallback) throw new Error("Expected bundled test models");
@@ -109,11 +109,19 @@ describe("modelRoles fallback chain e2e", () => {
 		expect(session.resolveRoleModelWithThinking("default").model?.id).toBe(primary.id);
 		await session.prompt("switch from direct role chain");
 		await session.waitForIdle();
-		await session.prompt("sticky second turn");
+		await session.prompt("second fallback turn");
 		await session.waitForIdle();
 
-		expect(calls).toEqual([selector(primary), selector(fallback), selector(fallback)]);
+		expect(calls).toEqual([selector(primary), selector(fallback), selector(primary), selector(fallback)]);
 		expect(switches).toEqual([
+			expect.objectContaining({
+				from: selector(primary),
+				to: selector(fallback),
+				role: "default",
+				scope: "session",
+				activeIndex: 1,
+				chainLength: 2,
+			}),
 			expect.objectContaining({
 				from: selector(primary),
 				to: selector(fallback),

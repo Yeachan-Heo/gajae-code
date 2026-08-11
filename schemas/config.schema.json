@@ -408,6 +408,19 @@
 				"default": {
 					"type": "string",
 					"description": "Model profile applied automatically at startup"
+				},
+				"proxyProvider": {
+					"type": "string",
+					"description": "Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints."
+				},
+				"proxyMode": {
+					"type": "string",
+					"enum": [
+						"fallback",
+						"always"
+					],
+					"description": "fallback routes only selectors whose direct provider lacks credentials; always routes every proxy-routable built-in preset selector through the configured proxy.",
+					"default": "fallback"
 				}
 			},
 			"additionalProperties": false
@@ -420,6 +433,7 @@
 		"modelProviderOrder": {
 			"type": "array",
 			"items": true,
+			"description": "Ordered provider priority for automatic model resolution. Providers listed earlier win ties; omitted providers fall back to curated ranking. Unavailable saved entries are retained and skipped at runtime.",
 			"default": []
 		},
 		"cycleOrder": {
@@ -1599,6 +1613,26 @@
 			},
 			"additionalProperties": false
 		},
+		"sessionMemory": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"type": "string",
+					"enum": [
+						"off",
+						"shadow",
+						"enabled",
+						"auto"
+					],
+					"default": "auto"
+				},
+				"contextOverflowRecovery": {
+					"type": "boolean",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
 		"edit": {
 			"type": "object",
 			"properties": {
@@ -2105,6 +2139,28 @@
 			},
 			"additionalProperties": false
 		},
+		"clipboard": {
+			"type": "object",
+			"properties": {
+				"transport": {
+					"type": "string",
+					"enum": [
+						"auto",
+						"native",
+						"osc52",
+						"ssh"
+					],
+					"description": "auto keeps current OSC52+native best-effort behavior. native/osc52 restrict copy to one mechanism. ssh routes text copy/paste through `ssh <clipboard.sshHost> pbcopy/pbpaste` via argv spawn and never silently falls back to native/OSC52 on failure.",
+					"default": "auto"
+				},
+				"sshHost": {
+					"type": "string",
+					"description": "SSH host alias (from ~/.ssh/config) used when clipboard.transport is ssh. Required in that mode.",
+					"default": ""
+				}
+			},
+			"additionalProperties": false
+		},
 		"web_search": {
 			"type": "object",
 			"properties": {
@@ -2225,6 +2281,46 @@
 							"type": "number",
 							"description": "Parent-process RSS (MB) above which idle tabs are opportunistically evicted LRU.",
 							"default": 1536
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"gc": {
+			"type": "object",
+			"properties": {
+				"sessions": {
+					"type": "object",
+					"properties": {
+						"maxAgeDays": {
+							"type": "number",
+							"default": 60
+						},
+						"maxTotalBytes": {
+							"type": "number",
+							"default": 0
+						}
+					},
+					"additionalProperties": false
+				},
+				"natives": {
+					"type": "object",
+					"properties": {
+						"keepVersions": {
+							"type": "number",
+							"default": 2
+						}
+					},
+					"additionalProperties": false
+				},
+				"backups": {
+					"type": "object",
+					"properties": {
+						"maxAgeDays": {
+							"type": "number",
+							"default": 30
 						}
 					},
 					"additionalProperties": false
@@ -2570,36 +2666,6 @@
 					],
 					"description": "Provider for web search tool",
 					"default": "auto"
-				},
-				"image": {
-					"type": "string",
-					"enum": [
-						"auto",
-						"openai",
-						"gemini",
-						"openrouter",
-						"antigravity",
-						"alibaba",
-						"custom"
-					],
-					"description": "Provider and model for image generation tool",
-					"default": "auto"
-				},
-				"imageModel": {
-					"type": "string",
-					"description": "Override the default image generation model for the selected provider"
-				},
-				"imageCustomUrl": {
-					"type": "string",
-					"description": "Base URL for custom OpenAI-compatible image endpoint"
-				},
-				"imageCustomKey": {
-					"type": "string",
-					"description": "API key for custom OpenAI-compatible image endpoint"
-				},
-				"imageCustomKeyEnv": {
-					"type": "string",
-					"description": "Environment variable name holding the API key for custom image endpoint"
 				},
 				"kimiApiFormat": {
 					"type": "string",

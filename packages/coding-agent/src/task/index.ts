@@ -21,6 +21,7 @@ import type { Model, Usage } from "@gajae-code/ai/core";
 import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
 import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner, type SubagentRunOutcome } from "../async";
+import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
@@ -1642,6 +1643,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const agentModelOverrides = this.session.settings.get("task.agentModelOverrides");
 		const settingsModelOverride = agentModelOverrides[agentName];
 		const parentActiveModelPattern = this.session.getActiveModelString?.();
+		// A live active model profile claims persisted agent overrides: bare
+		// profile aliases may re-resolve to an equivalent provider variant at
+		// dispatch. Manual/direct sessions (no active profile) stay exact.
+		const parentActiveModelProfile = (
+			this.session as { getActiveModelProfile?: () => string | undefined }
+		).getActiveModelProfile?.();
+		const parentProfileDefinition = parentActiveModelProfile
+			? this.session.modelRegistry?.getModelProfile?.(parentActiveModelProfile)
+			: undefined;
+		const parentOwnedModelProfile =
+			parentProfileDefinition &&
+			Object.hasOwn(resolveProfileBindings(parentProfileDefinition).agentModelOverrides, agentName)
+				? parentActiveModelProfile
+				: undefined;
 		const modelOverride = resolveAgentModelPatterns({
 			settingsOverride: settingsModelOverride,
 			agentModel: effectiveAgent.model,
@@ -1985,7 +2000,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
+						parentActiveModelProfile: parentOwnedModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
+						parentCredentialSessionId:
+							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
@@ -2060,7 +2078,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
+						parentActiveModelProfile: parentOwnedModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
+						parentCredentialSessionId:
+							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
 						thinkingLevel: thinkingLevelOverride,
 						outputSchema: effectiveOutputSchema,
 						sessionFile: taskSessionFile,
@@ -2117,7 +2138,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 												diff,
 												this.session.modelRegistry!,
 												this.session.settings,
-												this.session.getSessionId?.() ?? undefined,
+												this.session.getCredentialSessionId?.() ??
+													this.session.getSessionId?.() ??
+													undefined,
 											);
 										}
 									: undefined;

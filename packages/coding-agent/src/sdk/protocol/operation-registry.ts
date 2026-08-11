@@ -165,6 +165,7 @@ const queries = [
 		"Read the authoritative reconciliation status of a skill.invoke by command/turn IDs or clientRef.",
 	],
 	["providers.list/active", "List active providers."],
+	["session.checkpoint", "Resolve a durable transcript checkpoint into a connection-owned replay cursor."],
 ] as const;
 
 const reverse = [
@@ -237,14 +238,14 @@ function revision(id: string): string | undefined {
 }
 function queryContinuityClass(id: string): QueryContinuityClass {
 	if (["Q01", "Q02"].includes(id)) return "stable_prefix";
-	if (["Q04", "Q05", "Q06", "Q07", "Q08", "Q11", "Q12", "Q13", "Q20", "Q21", "Q22", "Q23", "Q27"].includes(id))
+	if (["Q04", "Q05", "Q06", "Q07", "Q08", "Q11", "Q12", "Q13", "Q20", "Q21", "Q22", "Q23", "Q27", "Q30"].includes(id))
 		return "retained_revision";
 	if (id === "Q24") return "content_addressed";
 	return "scalar_snapshot";
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q28", "Q29"].includes(id))
+	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q28", "Q29", "Q30"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }

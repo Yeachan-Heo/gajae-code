@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
@@ -13,6 +13,7 @@ describe("AgentSession role model thinking behavior", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
 	let sessionSettings: Settings;
+	let modelRegistry: ModelRegistry;
 	const authStorages: AuthStorage[] = [];
 
 	beforeEach(() => {
@@ -53,7 +54,7 @@ describe("AgentSession role model thinking behavior", () => {
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 
 		sessionSettings = Settings.isolated();
 		for (const [role, modelRoleValue] of Object.entries(options.modelRoles)) {
@@ -66,6 +67,94 @@ describe("AgentSession role model thinking behavior", () => {
 			modelRegistry,
 		});
 	}
+
+	it("counts provider-agnostic cycle roles without changing canonical affinity", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: {
+				default: "claude-sonnet-4-5",
+				slow: "claude-sonnet-4-6",
+			},
+		});
+		session.setActiveModelProfile("provider-agnostic-profile");
+		modelRegistry.seedCanonicalVariant(session.sessionId, defaultModel);
+		const before = modelRegistry.getSessionCanonicalVariant(session.sessionId);
+
+		expect(session.getRoleModelCycleCandidateCount(["default", "slow"])).toBe(2);
+		expect(modelRegistry.getSessionCanonicalVariant(session.sessionId)).toBe(before);
+	});
+
+	it("resolves a profile-owned role without changing canonical affinity", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const executorModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: {},
+		});
+		sessionSettings.set("task.agentModelOverrides", { executor: "profile-alias" });
+		vi.spyOn(modelRegistry, "getModelProfile").mockReturnValue({
+			name: "executor-profile",
+			requiredProviders: [],
+			modelMapping: { executor: "profile-alias" },
+			source: "user",
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([executorModel]);
+		vi.spyOn(modelRegistry, "lookupAliasExists").mockReturnValue(true);
+		const aliasLookup = vi.spyOn(modelRegistry, "resolveModelByLookupAlias").mockReturnValue(executorModel);
+		session.setActiveModelProfile("executor-profile");
+		modelRegistry.seedCanonicalVariant(session.sessionId, defaultModel);
+		const before = modelRegistry.getSessionCanonicalVariant(session.sessionId);
+
+		expect(session.resolveRoleModelWithThinking("executor").model?.id).toBe(executorModel.id);
+		expect(aliasLookup).toHaveBeenCalled();
+		expect(modelRegistry.getSessionCanonicalVariant(session.sessionId)).toBe(before);
+	});
+
+	it("keeps manual role aliases exact when a partial profile does not own the role", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { executor: "claude-sonnet-4-6" },
+		});
+		sessionSettings.set("task.agentModelOverrides", { executor: "claude-sonnet-4-6" });
+		vi.spyOn(modelRegistry, "getModelProfile").mockReturnValue({
+			name: "planner-only",
+			requiredProviders: [],
+			modelMapping: { planner: "claude-sonnet-4-5" },
+			source: "user",
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([getAnthropicModelOrThrow("claude-sonnet-4-6")]);
+		const aliasLookup = vi.spyOn(modelRegistry, "resolveModelByLookupAlias");
+		session.setActiveModelProfile("planner-only");
+
+		expect(session.resolveRoleModelWithThinking("executor").model?.id).toBe("claude-sonnet-4-6");
+		expect(aliasLookup).not.toHaveBeenCalled();
+	});
+
+	it("keeps a manual default exact when a partial profile does not own default", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: defaultModel.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: { default: "claude-sonnet-4-5" },
+		});
+		vi.spyOn(modelRegistry, "getModelProfile").mockReturnValue({
+			name: "planner-only",
+			requiredProviders: [],
+			modelMapping: { planner: "claude-sonnet-4-6" },
+			source: "user",
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([defaultModel]);
+		const aliasLookup = vi.spyOn(modelRegistry, "resolveModelByLookupAlias");
+		session.setActiveModelProfile("planner-only");
+
+		expect(session.resolveConfiguredDefaultModel()?.id).toBe(defaultModel.id);
+		expect(aliasLookup).not.toHaveBeenCalled();
+	});
 
 	it("re-applies explicit role thinking each time that role is selected", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");

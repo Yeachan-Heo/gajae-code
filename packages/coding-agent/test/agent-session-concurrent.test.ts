@@ -270,7 +270,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		let firstStream: AssistantMessageEventStream | undefined;
+		const firstTurn = Promise.withResolvers<void>();
 		const callMessages: Message[][] = [];
 
 		const agent = new Agent({
@@ -283,15 +283,19 @@ describe("AgentSession concurrent prompt guard", () => {
 			convertToLlm,
 			streamFn: (_model, context) => {
 				callMessages.push([...context.messages]);
+				const callIndex = callMessages.length;
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
-					stream.push({ type: "start", partial: createAssistantMessage("") });
-					if (callMessages.length > 1) {
-						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Resumed") });
-						return;
-					}
+					void (async () => {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						if (callIndex === 1) await firstTurn.promise;
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: createAssistantMessage(callIndex === 1 ? "Done" : "Resumed"),
+						});
+					})();
 				});
-				firstStream = stream;
 				return stream;
 			},
 		});
@@ -311,9 +315,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 
 		const firstPrompt = session.prompt("First message");
-		await waitFor(() => session.isStreaming && firstStream !== undefined && callMessages.length === 1);
+		await waitFor(() => session.isStreaming && callMessages.length === 1);
 
-		await session.sendCustomMessage(
+		const hiddenTurn = session.sendCustomMessage(
 			{
 				customType: "autoresearch-resume",
 				content: "Hidden stop reaction",
@@ -326,7 +330,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.queuedMessageCount).toBe(0);
 		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 
-		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+		firstTurn.resolve();
+		await hiddenTurn;
 		await firstPrompt;
 		await session.waitForIdle();
 

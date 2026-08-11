@@ -171,4 +171,58 @@ describe("SDK prompt terminal arbiter", () => {
 		});
 		expect(settled[2]).toMatchObject({ status: "failed", error: { code: "process_restart" } });
 	});
+	test("surfaces a late agent_failed reason on a terminal_ok record through the production lookup and persists it", async () => {
+		const { reconciliation, store } = await accepted();
+		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
+		await reconciliation.finalizePromptOutcome(correlation);
+
+		const settled = reconciliation.lookup("prompt", correlation);
+		expect(settled).toMatchObject({ status: "terminal_ok" });
+		expect(settled).not.toHaveProperty("error");
+
+		// The reason arrives from a different path than the one that claimed the terminal.
+		await reconciliation.noteTransition("prompt", correlation, {
+			type: "agent_failed",
+			error: Object.assign(new Error("socket closed"), { code: "transport_reset" }),
+		});
+
+		const enriched = reconciliation.lookup("prompt", correlation);
+		expect(enriched).toMatchObject({
+			status: "terminal_ok",
+			error: { code: "transport_reset", message: "Prompt submission failed." },
+		});
+		// Enrichment only: status/terminalAt unchanged, no new active slot.
+		expect((enriched as { terminalAt: number }).terminalAt).toBe((settled as { terminalAt: number }).terminalAt);
+		expect(reconciliation.activeCount("prompt")).toBe(0);
+		// The reason is durable: it survives store reload reconciliation.
+		expect(store.snapshot()[0]?.error).toEqual({ code: "transport_reset", message: "Prompt submission failed." });
+	});
+
+	test("keeps the first late reason when later agent_failed frames disagree", async () => {
+		const { reconciliation } = await accepted();
+		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
+		await reconciliation.finalizePromptOutcome(correlation);
+		await reconciliation.noteTransition("prompt", correlation, {
+			type: "agent_failed",
+			error: Object.assign(new Error("first"), { code: "transport_reset" }),
+		});
+		await reconciliation.noteTransition("prompt", correlation, {
+			type: "agent_failed",
+			error: Object.assign(new Error("second"), { code: "generic_late" }),
+		});
+		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
+			status: "terminal_ok",
+			error: { code: "transport_reset" },
+		});
+	});
+
+	test("does not enrich a terminal record with a late agent_start or agent_end", async () => {
+		const { reconciliation } = await accepted();
+		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
+		await reconciliation.finalizePromptOutcome(correlation);
+		const before = reconciliation.lookup("prompt", correlation);
+		await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });
+		await reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+		expect(reconciliation.lookup("prompt", correlation)).toEqual(before);
+	});
 });

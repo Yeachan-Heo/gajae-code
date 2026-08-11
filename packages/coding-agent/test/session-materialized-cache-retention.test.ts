@@ -26,9 +26,9 @@ async function settleAndCollect(): Promise<void> {
 }
 
 describe("SessionManager materialized cache retention", () => {
-	it("keeps below-cap materialized entries and context strongly cached", async () => {
+	it("rematerializes resident-backed contexts instead of strongly caching them", async () => {
 		SessionManagerTestHooks.materializedCacheMaxBytesOverride = 1024 * 1024;
-		const text = `below-cap ${"a".repeat(32 * 1024)}`;
+		const text = `below-cap ${"a".repeat(1024)}`;
 		const manager = createSession(text);
 		try {
 			readPair(manager, text);
@@ -44,7 +44,7 @@ describe("SessionManager materialized cache retention", () => {
 
 			expect(manager.getObservabilityStatsForTests()).toMatchObject({
 				materializedEntriesCachePopulateCount: warmed.materializedEntriesCachePopulateCount,
-				pathOnlyContextBuildCount: warmed.pathOnlyContextBuildCount,
+				pathOnlyContextBuildCount: warmed.pathOnlyContextBuildCount + 5,
 			});
 		} finally {
 			await manager.close();

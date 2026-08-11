@@ -57,6 +57,7 @@ export const FAMOUS_PROVIDER_ORDER: readonly string[] = [
 	"bizrouter",
 	"mara",
 	"github-copilot",
+	"jetbrains-junie",
 	"cursor",
 ];
 

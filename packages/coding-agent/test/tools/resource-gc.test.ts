@@ -17,6 +17,7 @@ import {
 	__setResourceGcSchedulerNowForTest,
 	type ResourceGcDeps,
 	registerResourceGcSession,
+	requestMemoryPressureGc,
 	resolveBrowserGcPolicy,
 	resolveComputerGcPolicy,
 	resolveSweepIntervalMs,
@@ -319,6 +320,14 @@ describe("resource GC controller", () => {
 		__resetResourceGcForTest();
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+	});
+
+	it("requests memory-pressure GC without forcing a synchronous collection", () => {
+		const gc = vi.spyOn(Bun, "gc").mockImplementation(() => undefined);
+
+		requestMemoryPressureGc();
+
+		expect(gc).toHaveBeenCalledWith(false);
 	});
 
 	it("applies enabled memory policy to GC and sustained restart advisory telemetry", async () => {

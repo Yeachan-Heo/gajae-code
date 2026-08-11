@@ -26,6 +26,39 @@ async function renderSessionInfo(costBreakdown?: Usage["cost"], model?: Model): 
 				premiumRequests: 0,
 				cost: 0.67,
 				costBreakdown,
+				sessionMemory: {
+					sidecarEnabled: true,
+					coldRetirementActive: true,
+					sidecarIneligible: false,
+					hotRegionBytes: 1024,
+					metaDescriptorBytes: 2048,
+					totalAccountedBytes: 4096,
+					reservedBudgetBytes: 4096,
+					allocatedCacheBytes: 512,
+					hotResidentBytes: 1024,
+					metadataResidentBytes: 2048,
+					sidecarFileBytes: 8192,
+					lastReopenTransition: undefined,
+					currentCommitTransition: { kind: "exact", reason: "descriptor_and_proof_match" },
+					lazyReopenAttempted: true,
+					lazyReopenSucceeded: true,
+					lazyReopenFallbackReason: undefined,
+					retirementFallbackReason: undefined,
+					autoDisabledReason: undefined,
+					coldIndexBytes: 0,
+					coldIndexBlockCacheBytes: 0,
+					coldEntryCacheBytes: 0,
+					coldEntriesRetired: 0,
+					coldEntriesReloaded: 0,
+					rangeReadCount: 0,
+					rangeReadGenerationMismatchCount: 0,
+					sidecarRebuildCount: 0,
+					coldMutationPromotions: 0,
+					hotOverflowTransitions: 0,
+					labelDiskFallbackCount: 0,
+					transcriptGeneration: 0,
+					consecutiveBuildFailures: 0,
+				},
 			}),
 			model,
 			modelRegistry: {
@@ -74,6 +107,18 @@ describe("/session command", () => {
 		expect(output).not.toContain("Estimated Miss Premium");
 		expect(output.indexOf("Tokens")).toBeLessThan(output.indexOf("Cost\nTotal: 0.6700"));
 		expect(output.indexOf("Cost\nTotal: 0.6700")).toBeLessThan(output.indexOf("Cache Miss Cost"));
+	});
+
+	it("renders live cold-session memory health", async () => {
+		const output = await renderSessionInfo();
+		expect(output).toContain("Session Memory\nCold Retirement: active");
+		expect(output).toContain("Hot Resident: 1.0KB");
+		expect(output).toContain("Metadata Resident: 2.0KB");
+		expect(output).toContain("Allocated Caches: 512B");
+		expect(output).toContain("Reserved Budget: 4.0KB");
+		expect(output).toContain("Sidecar Files: 8.0KB");
+		expect(output).toContain("Budget Accounted: 4.0KB");
+		expect(output).toContain("Lazy Reopen: exact");
 	});
 
 	it("is invariant to the selected model's prices", async () => {

@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [0.12.21] - 2026-08-09
+
+## [0.12.20] - 2026-08-09
+### Fixed
+
+- `SdkClient` request-timeout errors now expose `SdkRequestTimeoutDetails`, including whether `WebSocket.send()` returned. A sent request remains execution-uncertain; ordered prompt and skill callers must reconcile through their existing `clientRef` rather than retry.
+
+## [0.12.19] - 2026-08-08
+
+## [0.12.18] - 2026-08-08
+
+## [0.12.17] - 2026-08-08
+
+## [0.12.16] - 2026-08-08
+
+### Added
+
+- `SdkClientOptions.reconnectMaxBackoffMs` caps each exponential reconnect sleep (default 2s). A client configured with a long reconnect budget now keeps probing every couple of seconds instead of sleeping for tens of seconds on its final attempts. The `reconnectAttempts`/`reconnectBackoffMs` defaults (3 attempts, 25ms base, 100ms maximum sleep) are unchanged and stay below the new cap, so no existing caller changes behavior.
+
 ## [0.12.15] - 2026-08-06
 
 ## [0.12.14] - 2026-08-06

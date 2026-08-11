@@ -7,6 +7,8 @@ export function getExtraHelpText(): string {
   ${APP_NAME} setup                - Install GJC defaults or optional dependencies
   ${APP_NAME} session              - List, inspect, create, remove, or attach sessions
   ${APP_NAME} state                - Inspect or manage persisted GJC state
+  ${APP_NAME} auth-broker         - Manage the auth-broker (credential vault)
+  ${APP_NAME} auth-gateway        - Run an auth-gateway forward proxy
   ${APP_NAME} harness              - Run harness control-plane commands
   ${APP_NAME} coordinator          - Manage coordinator/runtime coordination helpers
   ${APP_NAME} team                 - Run tmux-backed coordinated execution
@@ -28,6 +30,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} web-search           - Search the web from the CLI (alias: q)
   ${APP_NAME} codex-native-hook    - Run Codex native hook integration
   ${APP_NAME} gc                   - Run garbage-collection/cleanup helpers
+  ${APP_NAME} quick-lane         - Classify a task into quick lane or deep path
   ${APP_NAME} <command> --help     - Show command-specific help
 
 Environment Variables:
@@ -54,6 +57,7 @@ Environment Variables:
   KILO_API_KEY               - Kilo Gateway models
   MISTRAL_API_KEY            - Mistral models
   ZAI_API_KEY                - z.ai models (ZhipuAI/GLM)
+  JUNIE_API_KEY              - JetBrains AI models (Junie; Claude via JetBrains AI)
   MINIMAX_API_KEY            - MiniMax models
   OPENCODE_API_KEY           - OpenCode Zen/OpenCode Go models
   CURSOR_ACCESS_TOKEN        - Cursor AI models

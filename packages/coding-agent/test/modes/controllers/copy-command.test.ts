@@ -24,26 +24,29 @@ describe("/copy command", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("copies the latest assistant text", () => {
+	it("copies the latest assistant text", async () => {
 		const copySpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => undefined);
 		const { controller, showStatus, showError } = createController({
 			assistantText: "latest **markdown** response",
 		});
 
 		controller.handleCopyCommand();
+		await Promise.resolve();
+		await Promise.resolve();
 
 		expect(copySpy).toHaveBeenCalledWith("latest **markdown** response");
 		expect(showStatus).toHaveBeenCalledWith("Copied last agent message to clipboard");
 		expect(showError).not.toHaveBeenCalled();
 	});
-
-	it("falls back to the fresh handoff context when no assistant message exists", () => {
+	it("falls back to the fresh handoff context when no assistant message exists", async () => {
 		const copySpy = vi.spyOn(native, "copyToClipboard").mockImplementation(() => undefined);
 		const { controller, showStatus, showError } = createController({
 			handoffText: "<handoff-context>\n## Goal\nContinue\n</handoff-context>",
 		});
 
 		controller.handleCopyCommand();
+		await Promise.resolve();
+		await Promise.resolve();
 
 		expect(copySpy).toHaveBeenCalledWith("<handoff-context>\n## Goal\nContinue\n</handoff-context>");
 		expect(showStatus).toHaveBeenCalledWith("Copied handoff context to clipboard");

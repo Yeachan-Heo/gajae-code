@@ -9,7 +9,7 @@ import {
 	recommendModelProfileForProvider,
 	resolveProfileBindings,
 } from "@gajae-code/coding-agent/config/model-profiles";
-import { parseModelString } from "@gajae-code/coding-agent/config/model-resolver";
+import { parseModelString, splitSelectorThinkingSuffix } from "@gajae-code/coding-agent/config/model-resolver";
 import { ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import modelsJson from "../../ai/src/models.json";
 import { normalizeModelSelectorValue, selectorHead } from "../src/config/model-selector-value";
@@ -72,6 +72,105 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 			planner: "opencode-go/kimi-k3",
 			critic: "opencode-go/mimo-v2.5-pro",
 			architect: "opencode-go/deepseek-v4-pro",
+		},
+	},
+	{
+		name: "open-weights-glm",
+		requiredProviders: [],
+		mapping: {
+			default: "glm-5.2:medium",
+			executor: "glm-5.2:low",
+			planner: "glm-5.2:high",
+			critic: "glm-5.2:high",
+			architect: "glm-5.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "deepseek-v4-flash:high",
+			executor: "deepseek-v4-flash:medium",
+			planner: "deepseek-v4-flash:high",
+			critic: "deepseek-v4-flash:xhigh",
+			architect: "deepseek-v4-flash:xhigh",
+		},
+	},
+	{
+		name: "open-weights-kimi",
+		requiredProviders: [],
+		mapping: {
+			default: "kimi-k3:high",
+			executor: "kimi-k3:high",
+			planner: "kimi-k3:xhigh",
+			critic: "kimi-k3:high",
+			architect: "kimi-k3:xhigh",
+		},
+	},
+	{
+		name: "open-weights-luna",
+		requiredProviders: [],
+		mapping: {
+			default: "gpt-5.6-luna:high",
+			executor: "gpt-5.6-luna:high",
+			planner: "gpt-5.6-luna:xhigh",
+			critic: "gpt-5.6-luna:xhigh",
+			architect: "gpt-5.6-luna:xhigh",
+		},
+	},
+	{
+		name: "open-weights-glm-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "glm-5.2:medium",
+			executor: "deepseek-v4-flash:high",
+			planner: "glm-5.2:high",
+			critic: "deepseek-v4-flash:xhigh",
+			architect: "glm-5.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-kimi-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "kimi-k3:high",
+			executor: "deepseek-v4-flash:high",
+			planner: "kimi-k3:xhigh",
+			critic: "deepseek-v4-flash:xhigh",
+			architect: "kimi-k3:xhigh",
+		},
+	},
+	{
+		name: "open-weights-kimi-glm",
+		requiredProviders: [],
+		mapping: {
+			default: "glm-5.2:high",
+			executor: "glm-5.2:high",
+			planner: "kimi-k3:high",
+			critic: "glm-5.2:xhigh",
+			architect: "kimi-k3:xhigh",
+		},
+	},
+	{
+		name: "open-weights-kimi-glm-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "glm-5.2:medium",
+			executor: "deepseek-v4-flash:high",
+			planner: "kimi-k3:high",
+			critic: "glm-5.2:high",
+			architect: "kimi-k3:xhigh",
+		},
+	},
+	{
+		name: "open-weights-all",
+		requiredProviders: [],
+		mapping: {
+			default: "gpt-5.6-luna:high",
+			executor: "deepseek-v4-flash:high",
+			planner: "kimi-k3:high",
+			critic: "glm-5.2:high",
+			architect: "gpt-5.6-luna:xhigh",
 		},
 	},
 	{
@@ -444,6 +543,13 @@ const oldNames = [
 ];
 
 function selectorExists(selector: string): boolean {
+	const selectorWithoutThinking = splitSelectorThinkingSuffix(selector).selector;
+	if (!selectorWithoutThinking.includes("/")) {
+		const alias = selectorWithoutThinking.trim().toLowerCase();
+		return Object.values(modelsJson as Record<string, Record<string, unknown>>).some(models =>
+			Object.keys(models).some(modelId => modelId.split("/").at(-1)?.toLowerCase() === alias),
+		);
+	}
 	const parsed = parseModelString(selector);
 	if (!parsed) return false;
 	if (parsed.provider === "grok-build") return ["grok-composer-2.5-fast", "grok-build"].includes(parsed.id);
@@ -483,7 +589,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 37-profile matrix cell-for-cell", () => {
+	test("contains exact 46-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -491,6 +597,29 @@ describe("built-in model profile catalog", () => {
 			const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === expected.name);
 			expect(profile?.requiredProviders).toEqual(expected.requiredProviders);
 			expect(profile?.modelMapping).toEqual(expected.mapping);
+		}
+	});
+
+	test("open-weight profiles use only provider-agnostic aliases", () => {
+		const profiles = BUILTIN_MODEL_PROFILES.filter(profile => profile.name.startsWith("open-weights-"));
+		expect(profiles.map(profile => profile.name)).toEqual([
+			"open-weights-glm",
+			"open-weights-deepseek",
+			"open-weights-kimi",
+			"open-weights-luna",
+			"open-weights-glm-deepseek",
+			"open-weights-kimi-deepseek",
+			"open-weights-kimi-glm",
+			"open-weights-kimi-glm-deepseek",
+			"open-weights-all",
+		]);
+		for (const profile of profiles) {
+			expect(profile.requiredProviders).toEqual([]);
+			for (const selectorValue of Object.values(profile.modelMapping)) {
+				for (const selector of normalizeModelSelectorValue(selectorValue)) {
+					expect(splitSelectorThinkingSuffix(selector).selector).not.toContain("/");
+				}
+			}
 		}
 	});
 	test("Grok 4.5 profiles resolve every role at the expected effort", () => {
@@ -594,9 +723,9 @@ describe("built-in model profile catalog", () => {
 				const selector = profile.modelMapping[role];
 				expect(selector).toBeDefined();
 				expect(ProfileModelSelectorSchema.safeParse(selector).success).toBe(true);
-				expect(parseModelString(selectorHead(selector) ?? "")).toBeDefined();
-				if (selector && !selectorExists(selectorHead(selector) ?? ""))
-					missing.push(`${profile.name}.${role}=${selector}`);
+				const head = selectorHead(selector) ?? "";
+				if (head.includes("/")) expect(parseModelString(head)).toBeDefined();
+				if (!selectorExists(head)) missing.push(`${profile.name}.${role}=${selector}`);
 			}
 		}
 		expect(missing).toEqual([]);
@@ -623,6 +752,10 @@ describe("built-in model profile catalog", () => {
 			displayName: "Kimi Coding Plan Medium",
 			providerGroup: "KIMI CODING PLAN",
 		});
+		expect(getModelProfilePresentation("open-weights-glm-deepseek")).toEqual({
+			displayName: "GLM + DeepSeek",
+			providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+		});
 		for (const [name, displayName] of Object.entries({
 			"grok-45-eco": "Grok 4.5 Eco",
 			"grok-45-medium": "Grok 4.5 Medium",
@@ -633,6 +766,7 @@ describe("built-in model profile catalog", () => {
 		expect([...groupModelProfilesForPresetLanding(profiles).keys()]).toEqual([
 			"CODEX",
 			"OPENCODEGO",
+			"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 			"CLAUDE",
 			"GLM",
 			"KIMI CODING PLAN",
@@ -642,6 +776,21 @@ describe("built-in model profile catalog", () => {
 			"MINIMAX",
 			"ALIBABA TOKEN PLAN",
 			"COMBOS",
+		]);
+		expect(
+			groupModelProfilesForPresetLanding(profiles)
+				.get("OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)")
+				?.map(profile => profile.name),
+		).toEqual([
+			"open-weights-glm",
+			"open-weights-deepseek",
+			"open-weights-kimi",
+			"open-weights-luna",
+			"open-weights-glm-deepseek",
+			"open-weights-kimi-deepseek",
+			"open-weights-kimi-glm",
+			"open-weights-kimi-glm-deepseek",
+			"open-weights-all",
 		]);
 		expect(recommendModelProfileForProvider("openai-codex", profiles)?.name).toBe("codex-medium");
 		expect(recommendModelProfileForProvider("anthropic", profiles)?.name).toBe("claude-opus");

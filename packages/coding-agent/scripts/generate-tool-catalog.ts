@@ -491,6 +491,7 @@ export interface ToolCatalogEntry {
 	readonly platformExclusions?: readonly { platform: string; arch?: string }[];
 }
 
+// biome-ignore format: generated JSON preserves deterministic serialization
 export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = ${JSON.stringify(catalog, null, "\t")};
 `;
 }

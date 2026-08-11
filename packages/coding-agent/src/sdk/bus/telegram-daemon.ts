@@ -1217,7 +1217,18 @@ type OwnerHeartbeatSidecar = {
 	ownerId: string;
 	acquisitionId: string;
 	heartbeatAt: number;
+	/**
+	 * Session endpoints this owner had an OPEN WebSocket to when the heartbeat was
+	 * published. Optional: a sidecar written by an older daemon omits it and must
+	 * read back as unknown, never as zero.
+	 */
+	attachedEndpoints?: number;
 };
+
+/** Attachment counts are advisory observations, so only safe non-negative integers are published or trusted. */
+function validAttachedEndpointCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
 
 function ownerTagFromState(
 	state: DaemonState | undefined,
@@ -1250,6 +1261,7 @@ function sidecarMatchesOwnerTag(
 			typeof sidecar.ownerId === "string" &&
 			typeof sidecar.acquisitionId === "string" &&
 			Number.isSafeInteger(sidecar.heartbeatAt) &&
+			(sidecar.attachedEndpoints === undefined || validAttachedEndpointCount(sidecar.attachedEndpoints)) &&
 			sidecar.pid === tag.pid &&
 			sidecar.incarnation === tag.incarnation &&
 			sidecar.ownerId === tag.ownerId &&
@@ -1277,6 +1289,12 @@ export interface OwnerFreshnessSnapshot {
 	ownerTag: Pick<OwnerHeartbeatSidecar, "pid" | "incarnation" | "ownerId" | "acquisitionId"> | null;
 	effectiveHeartbeatAt: number | undefined;
 	legacyEmbedded: boolean;
+	/**
+	 * Session endpoints the current owner reported as attached in its latest matching
+	 * heartbeat sidecar. `undefined` means the owner never published the field (older
+	 * daemon, no stable owner tag, or no matching sidecar) — that is unknown, not zero.
+	 */
+	attachedEndpoints: number | undefined;
 	state: DaemonState | undefined;
 }
 
@@ -1293,7 +1311,14 @@ export async function readOwnerFreshnessSnapshot(input: {
 	const tag = ownerTagFromState(state);
 	const lock = await readOwnershipLock(fsImpl, paths.lock);
 	const ownerTag = tag && ownershipLockMatchesState(lock, state) ? tag : null;
-	if (legacyEmbedded) return { ownerTag, effectiveHeartbeatAt: state?.heartbeatAt, legacyEmbedded, state };
+	if (legacyEmbedded)
+		return {
+			ownerTag,
+			effectiveHeartbeatAt: state?.heartbeatAt,
+			legacyEmbedded,
+			attachedEndpoints: undefined,
+			state,
+		};
 	const sidecar = await readSidecarLenient(fsImpl, paths.heartbeat);
 	const rereadState = await readJson<DaemonState>(fsImpl, paths.state);
 	const rereadLock = await readOwnershipLock(fsImpl, paths.lock);
@@ -1301,15 +1326,20 @@ export async function readOwnerFreshnessSnapshot(input: {
 	const stableTag = rereadTag && ownershipLockMatchesState(rereadLock, rereadState) ? rereadTag : null;
 	const stable =
 		ownerTag && stableTag && sidecarMatchesOwnerTag({ ...ownerTag, heartbeatAt: 0 }, stableTag) ? stableTag : null;
+	const matchingSidecar = stable && sidecarMatchesOwnerTag(sidecar, stable) ? sidecar : undefined;
 	const effectiveHeartbeatAt = stable
-		? sidecarMatchesOwnerTag(sidecar, stable)
-			? Math.max(rereadState?.heartbeatAt ?? 0, sidecar.heartbeatAt)
+		? matchingSidecar
+			? Math.max(rereadState?.heartbeatAt ?? 0, matchingSidecar.heartbeatAt)
 			: rereadState?.heartbeatAt
+		: undefined;
+	const attachedEndpoints = validAttachedEndpointCount(matchingSidecar?.attachedEndpoints)
+		? matchingSidecar.attachedEndpoints
 		: undefined;
 	return {
 		ownerTag: stable,
 		effectiveHeartbeatAt,
 		legacyEmbedded: false,
+		attachedEndpoints,
 		state: rereadState,
 	};
 }
@@ -1323,6 +1353,12 @@ export async function renewOwnerHeartbeatSidecar(input: {
 	now?: () => number;
 	pid?: number;
 	pidIncarnation?: (pid: number) => string | undefined;
+	/**
+	 * Session endpoints the caller currently holds an OPEN WebSocket to. Omitted by
+	 * non-daemon callers (bootstrap/proof paths) so their sidecar reports unknown
+	 * rather than falsely claiming zero attachments.
+	 */
+	attachedEndpoints?: number;
 }): Promise<boolean> {
 	const fsImpl = input.fs ?? nodeFs;
 	const paths = daemonPaths(input.settings.getAgentDir());
@@ -1347,6 +1383,7 @@ export async function renewOwnerHeartbeatSidecar(input: {
 		ownerId: input.ownerId,
 		acquisitionId,
 		heartbeatAt: (input.now ?? Date.now)(),
+		...(validAttachedEndpointCount(input.attachedEndpoints) ? { attachedEndpoints: input.attachedEndpoints } : {}),
 	};
 	const tmp = `${paths.heartbeat}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
 	await fsImpl.writeFile(tmp, `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o600 });
@@ -9665,6 +9702,18 @@ export class TelegramNotificationDaemon {
 	private stopFlushTimer(): void {
 		this.runtime.stopInterval("telegram-flush");
 	}
+	/**
+	 * Sessions this owner can actually deliver to right now. Only `WebSocket.OPEN`
+	 * counts: a CONNECTING socket is constructed but cannot carry a frame, and
+	 * CLOSING/CLOSED ones are gone. Every delivery path in this daemon refuses to
+	 * send unless `readyState === WebSocket.OPEN`, so OPEN is exactly the state
+	 * that means a notification can leave this process for that session.
+	 */
+	private attachedEndpointCount(): number {
+		let attached = 0;
+		for (const session of this.sessions.values()) if (session.ws.readyState === WebSocket.OPEN) attached += 1;
+		return attached;
+	}
 	private async renewOwnershipHeartbeat(): Promise<boolean> {
 		return renewOwnerHeartbeatSidecar({
 			settings: this.opts.settings,
@@ -9674,6 +9723,7 @@ export class TelegramNotificationDaemon {
 			now: this.opts.now,
 			pid: this.opts.pid ?? process.pid,
 			pidIncarnation: this.opts.pidIncarnation,
+			attachedEndpoints: this.attachedEndpointCount(),
 		});
 	}
 
@@ -12347,6 +12397,7 @@ export class TelegramNotificationDaemon {
 						now: this.opts.now,
 						pid: this.opts.pid ?? process.pid,
 						pidIncarnation: this.opts.pidIncarnation,
+						attachedEndpoints: this.attachedEndpointCount(),
 					}))
 				)
 					break;

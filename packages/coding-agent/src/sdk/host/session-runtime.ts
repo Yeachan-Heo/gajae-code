@@ -3,15 +3,33 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { ThinkingLevel } from "@gajae-code/agent-core";
+import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
-import { isAuthenticated, kNoAuth } from "../../config/model-registry";
+import { type ModelProfileDefinition, resolveProfileBindings } from "../../config/model-profiles";
+import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../config/model-resolver";
+import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../config/model-selector-value";
+import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { parseThinkingLevel } from "../../thinking";
+import { ensureBroker } from "../broker/ensure";
+import { SessionIndex } from "../broker/session-index";
+import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
+import {
+	collectAuthenticatedProfileProviders,
+	parseSyntheticModelId,
+	resolveSyntheticModelSelection,
+	SYNTHETIC_PROVIDER_ID,
+	syntheticModelInputError,
+	syntheticNamespaceCollision,
+} from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
+import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { OPERATIONS } from "../protocol/operation-registry";
-import { type ControlSurface, dispatchControl } from "./control";
+import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "./control";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
-import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
+import { CursorRegistry, QueryHandlers, RevisionStore, type SdkCheckpointRecord, type SessionSurface } from "./query";
 import {
 	createSdkCapabilities,
 	createSdkSurfacePolicyForContext,
@@ -52,6 +70,10 @@ export interface SessionSdkTransport {
 export interface SessionSdkRuntimeOptions
 	extends Omit<SessionSdkHostOptions, "sessionId" | "stateRoot" | "token" | "sendFrame" | "onFrame"> {
 	transport: SessionSdkTransport;
+	/** Session settings; enables `config.patch` application on this runtime. */
+	settings?: Settings;
+	/** Mutable shadow of patched config values merged into query readback. */
+	configOverrides?: Map<string, unknown>;
 }
 
 /**
@@ -198,12 +220,20 @@ export class SessionSdkSessionRuntime {
 
 /** Narrow extension-facing factory for the SDK-only session path. */
 export interface CreateSdkSessionRuntimeOptions {
+	/** Authoritative broker state root for this session's endpoint lifecycle. */
+	agentDir: string;
+	/** Lifecycle-owned sessions require broker publication before they become usable. */
+	brokerRegistrationRequired?: boolean;
 	createTransport(input: {
 		sessionId: string;
 		stateRoot: string;
 		token: string;
 	}): SessionSdkTransport | Promise<SessionSdkTransport>;
 	onSdkRequest?: SessionSdkHostOptions["onRequest"];
+	/** Session settings; enables `config.patch` application on this runtime. */
+	settings?: Settings;
+	/** Mutable shadow of patched config values merged into query readback. */
+	configOverrides?: Map<string, unknown>;
 }
 
 function unavailable(operation: string): () => never {
@@ -243,7 +273,7 @@ export interface InvocationReconciliation {
 	hydrate(): Promise<void>;
 }
 
-function createInvocationReconciliation(
+export function createInvocationReconciliation(
 	options: { stateRoot?: string; sessionId?: string } = {},
 ): InvocationReconciliation {
 	const ACTIVE_CAPACITY = 256;
@@ -339,6 +369,7 @@ function createInvocationReconciliation(
 					record.terminalAt = Date.now();
 					record.error = { code: "process_restart", message: "Reconciliation incomplete after process restart." };
 				}
+				if (record.status === "failed") record.error = sanitizePromptFailure(record.error);
 				records.set(key(record.kind, record), { ...record });
 			}
 		}
@@ -387,14 +418,39 @@ function createInvocationReconciliation(
 		async noteTransition(kind, correlation, frame) {
 			if (!correlation) return;
 			const record = records.get(key(kind, correlation));
-			if (!record || record.terminalAt !== undefined) return;
+			if (!record) return;
+			if (record.terminalAt !== undefined) {
+				// Same late agent_failed enrichment as the kind-aware bus reconciler: a
+				// failure reason may arrive on a different delivery path than the one that
+				// claimed the terminal. Enrich the settled record instead of dropping it;
+				// never resurrect (status/terminalAt untouched), and first reason wins.
+				if (frame.type === "agent_failed" && record.error === undefined) {
+					logger.error("SDK invocation failed (late)", {
+						kind,
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+						error: formatPromptFailureForLocalLog(frame.error),
+					});
+					record.error = sanitizePromptFailure(frame.error);
+					await persist();
+				}
+				return;
+			}
 			if (frame.type === "agent_start") {
 				record.status = "in_flight";
 				record.startedAt = Date.now();
 			} else {
 				record.status = frame.type === "agent_failed" ? "failed" : "terminal_ok";
 				record.terminalAt = Date.now();
-				if (frame.type === "agent_failed") record.error = { code: "prompt_failed", message: "Invocation failed." };
+				if (frame.type === "agent_failed") {
+					logger.error("SDK invocation failed", {
+						kind,
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+						error: formatPromptFailureForLocalLog(frame.error),
+					});
+					record.error = sanitizePromptFailure(frame.error);
+				}
 			}
 			await persist();
 		},
@@ -429,9 +485,13 @@ export interface SdkSurfaceFactoryOptions {
 	getInstalledDefinitions?: (capability: string) => unknown | undefined;
 	getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
 	configOverrides?: ReadonlyMap<string, unknown>;
+	/** Session settings; used for model-usage preferences in profile-limit resolution. */
+	settings?: Settings;
 	promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
+	/** Q30 event-ring watermark source (the live session event stream); synchronous. */
+	getEventWatermark?: () => { generation: number; seq: number };
 }
 
 /** Shared policy, capability, and query-surface factory for every SDK transport. */
@@ -451,9 +511,13 @@ function createQuerySurface(
 		getInstalledDefinitions?: (capability: string) => unknown | undefined;
 		getLiveState?: () => { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
 		configOverrides?: ReadonlyMap<string, unknown>;
+		/** Session settings; used for model-usage preferences in profile-limit resolution. */
+		settings?: Settings;
 		promptStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		skillStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
+		/** Q30 event-ring watermark source (the live session event stream); synchronous. */
+		getEventWatermark?: () => { generation: number; seq: number };
 	} = {},
 ): SessionSurface {
 	const policy =
@@ -491,6 +555,63 @@ function createQuerySurface(
 					.join("");
 		}
 		return undefined;
+	};
+	const getProfileCredentialSessionId = () => ctx.credentialSessionId ?? id;
+	const resolveProfileAvailability = async (
+		profile: ModelProfileDefinition,
+		authenticatedProviders: ReadonlySet<string>,
+	): Promise<{ available: boolean; defaultModel?: Model<Api> }> => {
+		const rewriteSelectorProvider = (selector: string): string => {
+			const slash = selector.indexOf("/");
+			if (slash < 0) return selector;
+			const provider = selector.slice(0, slash);
+			if (authenticatedProviders.has(provider)) return selector;
+			const group = (profile.alternativeProviderGroups ?? []).find(candidates => candidates.includes(provider));
+			if (!group) return selector;
+			const replacement = group.find(candidate => authenticatedProviders.has(candidate));
+			return replacement ? replacement + selector.slice(slash) : selector;
+		};
+		try {
+			const bindings = resolveProfileBindings(profile);
+			const assignments: Array<{ value: ModelSelectorValue; isDefault: boolean }> = [];
+			if (bindings.defaultSelector !== undefined) {
+				assignments.push({ value: bindings.defaultSelector, isDefault: true });
+			}
+			for (const value of Object.values(bindings.modelRoles)) assignments.push({ value, isDefault: false });
+			for (const value of Object.values(bindings.agentModelOverrides)) assignments.push({ value, isDefault: false });
+			let defaultModel: Model<Api> | undefined;
+			for (const assignment of assignments) {
+				const selectors = normalizeModelSelectorValue(assignment.value).map(rewriteSelectorProvider);
+				const hasBareSelector = selectors.some(selector => {
+					const suffix = splitSelectorThinkingSuffix(selector);
+					const identity = suffix.thinkingLevel ? suffix.selector : selector;
+					return !identity.includes("/");
+				});
+				if (!assignment.isDefault && !hasBareSelector) continue;
+				const resolution = await resolveModelChainWithAuth(
+					selectors,
+					{
+						...ctx.modelRegistry,
+						getAvailable: () => ctx.modelRegistry.getAvailable(),
+						getApiKey: (model: Model<Api>, sessionId?: string) =>
+							ctx.modelRegistry.getApiKeyForProvider(model.provider, sessionId, model.baseUrl),
+					},
+					options.settings,
+					getProfileCredentialSessionId(),
+					{
+						managedFallback: true,
+						aliasIntent: "preset-equivalent",
+						canonicalSessionId: null,
+						credentialSessionId: getProfileCredentialSessionId(),
+					},
+				);
+				if (!resolution.model) return { available: false };
+				if (assignment.isDefault) defaultModel = resolution.model;
+			}
+			return { available: true, defaultModel };
+		} catch {
+			return { available: false };
+		}
 	};
 	const getDiff = async () => {
 		try {
@@ -530,12 +651,101 @@ function createQuerySurface(
 			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
 		getDiff,
 		getUsage: () => ctx.sessionManager.getUsageStatistics(),
-		getModels: () =>
-			projectQ10Models({
-				models: ctx.modelRegistry.getAll(),
-				currentModel: ctx.model,
-				currentThinkingLevel: api.getThinkingLevel(),
-			}),
+		getModels: async () => {
+			const models = ctx.modelRegistry.getAll();
+			const currentModel = ctx.model;
+			const currentThinkingLevel = api.getThinkingLevel();
+			const activeProfile =
+				typeof ctx.getActiveModelProfile === "function" ? ctx.getActiveModelProfile() : undefined;
+			// A user-defined provider under the reserved logical namespace makes
+			// `gajae-code/*` ids ambiguous: selection is rejected, so Q10 must
+			// NOT advertise any rows from that namespace (neither the colliding
+			// provider's concrete models nor synthetic profiles). The collided
+			// provider's rows are filtered out of every degraded projection too,
+			// making the documented fail-closed behavior effective.
+			const collision = syntheticNamespaceCollision(models, ctx.modelRegistry.getConfiguredProviderIds?.() ?? []);
+			const concreteRows = collision ? models.filter(model => model.provider !== SYNTHETIC_PROVIDER_ID) : models;
+			// Degraded projection: concrete rows always (minus a collided
+			// gajae-code provider), plus a bounded synthetic current readback
+			// when a profile marker is active — unless the namespace is collided,
+			// in which case no synthetic row (including the active fallback) may
+			// appear because selection is rejected.
+			const degraded = () =>
+				projectQ10Models(
+					activeProfile !== undefined && !collision
+						? {
+								models: concreteRows,
+								currentModel,
+								currentThinkingLevel,
+								profiles: new Map<string, ModelProfileDefinition>(),
+								activeProfile,
+							}
+						: { models: concreteRows, currentModel, currentThinkingLevel },
+				);
+			let profiles: ReadonlyMap<string, ModelProfileDefinition>;
+			try {
+				const registryWithProfiles = ctx.modelRegistry as {
+					getModelProfiles?: () => ReadonlyMap<string, ModelProfileDefinition>;
+				};
+				profiles =
+					typeof registryWithProfiles.getModelProfiles === "function"
+						? registryWithProfiles.getModelProfiles()
+						: new Map<string, ModelProfileDefinition>();
+			} catch {
+				// The profile registry is unreadable: keep the concrete catalog
+				// and the active marker readback; never fail the whole Q10 query.
+				return degraded();
+			}
+			if (profiles.size === 0) return degraded();
+			// An invalid models configuration must not advertise synthetic rows:
+			// the same registry error rejects selection, so Q10 fails closed to
+			// the concrete catalog (plus the active-marker readback).
+			if (ctx.modelRegistry.getError?.() !== undefined) return degraded();
+			if (collision) return degraded();
+			let authenticatedProviders: ReadonlySet<string>;
+			try {
+				authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
+					ctx.modelRegistry.getApiKeyForProvider(provider, getProfileCredentialSessionId()),
+				);
+			} catch {
+				// Availability join failed: degrade only the synthetic facade,
+				// retain concrete rows and the active marker readback.
+				return degraded();
+			}
+			const resolvedDefaultModels = new Map<string, Model<Api>>();
+			const fullyResolvedProfiles = new Set<string>();
+			await Promise.all(
+				[...profiles.entries()].map(async ([name, profile]) => {
+					const result = await resolveProfileAvailability(profile, authenticatedProviders);
+					if (!result.available) return;
+					fullyResolvedProfiles.add(name);
+					if (result.defaultModel) resolvedDefaultModels.set(name, result.defaultModel);
+				}),
+			);
+			const availableProfileIds = new Set<string>();
+			for (const [name, profile] of profiles) {
+				if (!isModelProfileProviderAvailable(profile, authenticatedProviders)) continue;
+				if (!fullyResolvedProfiles.has(name)) continue;
+				// A profile with a default mapping is selectable only when its
+				// default chain actually resolves to an authenticated model:
+				// activation rejects unresolvable defaults even when the
+				// required providers are authenticated. Role-only profiles
+				// (no default) remain selectable.
+				if (profile.modelMapping.default !== undefined && !resolvedDefaultModels.has(name)) continue;
+				availableProfileIds.add(name);
+			}
+			const resolveProfileDefaultModel = (profile: ModelProfileDefinition) =>
+				resolvedDefaultModels.get(profile.name);
+			return projectQ10Models({
+				models,
+				currentModel,
+				currentThinkingLevel,
+				profiles,
+				availableProfileIds,
+				activeProfile,
+				resolveProfileDefaultModel,
+			});
+		},
 		getSkillState: () => ctx.getSkillState(),
 		getGates: () => {
 			const workflowGate = ctx.workflowGate;
@@ -575,23 +785,38 @@ function createQuerySurface(
 			(options.promptStatusLookup ?? (value => reconciliation.lookup("prompt", value)))(selector),
 		getSkillInvokeStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
 			(options.skillStatusLookup ?? (value => reconciliation.lookup("skill", value)))(selector),
-		getModelProfiles: () => {
+		getModelProfiles: async () => {
 			const profiles = ctx.modelRegistry.getModelProfiles();
-			const providers = new Set([...profiles.values()].flatMap(profile => profile.requiredProviders));
-			const authenticatedProviders = new Set<string>();
-			return Promise.all(
-				[...providers].map(async provider => {
-					try {
-						const credential = await ctx.modelRegistry.getApiKeyForProvider(provider, id);
-						if (credential === kNoAuth || isAuthenticated(credential)) authenticatedProviders.add(provider);
-					} catch {}
-				}),
-			).then(() => {
-				return projectModelProfileCatalog(profiles, ctx.modelRegistry.getError()).map(item => ({
+			const authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
+				ctx.modelRegistry.getApiKeyForProvider(provider, getProfileCredentialSessionId()),
+			);
+			return (await Promise.all(
+				projectModelProfileCatalog(profiles, ctx.modelRegistry.getError()).map(async item => ({
 					...item,
-					available: isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders),
-				})) as unknown[];
-			});
+					available:
+						isModelProfileProviderAvailable(profiles.get(item.id)!, authenticatedProviders) &&
+						(
+							await resolveProfileAvailability(profiles.get(item.id)!, authenticatedProviders)
+						).available,
+				})),
+			)) as unknown[];
+		},
+		getCheckpointSnapshot: (): { entries: unknown[]; watermark: SdkCheckpointRecord } => {
+			// Q30 atomic checkpoint capture (C9): the transcript entries and the
+			// event-ring watermark are read in one synchronous call from the host
+			// event stream, so the snapshot revision and the subscribe position
+			// can never straddle a concurrent append.
+			const entries =
+				typeof (ctx as Partial<ExtensionContext>).getTranscript === "function" ? ctx.getTranscript() : [];
+			const watermark = options.getEventWatermark?.() ?? { generation: 0, seq: 0 };
+			return {
+				entries,
+				watermark: {
+					revision: Array.isArray(entries) ? entries.length : 0,
+					generation: watermark.generation,
+					seq: watermark.seq,
+				},
+			};
 		},
 		installedQueries: policy.installedQueries,
 	};
@@ -619,9 +844,11 @@ export function createSdkSurfaceFactory(
 		getInstalledDefinitions: options.getInstalledDefinitions,
 		getLiveState: options.getLiveState,
 		configOverrides: options.configOverrides,
+		settings: options.settings,
 		promptStatusLookup: options.promptStatusLookup,
 		skillStatusLookup: options.skillStatusLookup,
 		hostTools: options.hostTools,
+		getEventWatermark: options.getEventWatermark,
 	});
 	return {
 		policy,
@@ -630,12 +857,119 @@ export function createSdkSurfaceFactory(
 	};
 }
 
+function captureConfigOverridesShadow(settings: Settings, configOverrides: Map<string, unknown>): Map<string, unknown> {
+	const before = new Map<string, unknown>();
+	for (const key of configOverrides.keys()) {
+		try {
+			before.set(key, settings.get(key as never));
+		} catch {
+			before.set(key, undefined);
+		}
+	}
+	return before;
+}
+
+function reconcileConfigOverridesShadow(
+	settings: Settings,
+	configOverrides: Map<string, unknown>,
+	before: ReadonlyMap<string, unknown>,
+): void {
+	for (const [key, prior] of before) {
+		let current: unknown;
+		try {
+			current = settings.get(key as never);
+		} catch {
+			current = undefined;
+		}
+		if (!deepStructuralEqual(current, prior)) configOverrides.delete(key);
+	}
+}
+
+function deepStructuralEqual(left: unknown, right: unknown): boolean {
+	if (Object.is(left, right)) return true;
+	if (Array.isArray(left) && Array.isArray(right))
+		return left.length === right.length && left.every((value, index) => deepStructuralEqual(value, right[index]));
+	if (left === null || right === null || typeof left !== "object" || typeof right !== "object") return false;
+	const leftRecord = left as Record<string, unknown>;
+	const rightRecord = right as Record<string, unknown>;
+	const leftKeys = Object.keys(leftRecord);
+	const rightKeys = Object.keys(rightRecord);
+	return (
+		leftKeys.length === rightKeys.length &&
+		leftKeys.every(key => deepStructuralEqual(leftRecord[key], rightRecord[key]))
+	);
+}
+
+/** True when a patch contains any secret-shaped key, recursively. */
+function containsSecretConfigKey(value: unknown, seen = new Set<object>()): boolean {
+	if (!value || typeof value !== "object") return false;
+	if (seen.has(value)) return false;
+	seen.add(value);
+	if (Array.isArray(value)) return value.some(item => containsSecretConfigKey(item, seen));
+	return Object.entries(value as Record<string, unknown>).some(
+		([key, nested]) =>
+			/(?:token|secret|password|api[_-]?key|credential|authorization)/i.test(key) ||
+			containsSecretConfigKey(nested, seen),
+	);
+}
+async function resolveSdkWorkflowGate(
+	ctx: ExtensionContext,
+	operation: "workflow.gate_answer" | "workflow.plan_approve",
+	id: string,
+	answer: unknown,
+	expectedSessionId: string | undefined,
+	idempotencyKey: string,
+	canResolve: () => boolean,
+): Promise<unknown> {
+	if (!canResolve())
+		throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
+	if (expectedSessionId !== undefined && expectedSessionId !== ctx.sessionManager.getSessionId())
+		throw Object.assign(new Error("Workflow gate session does not match this endpoint."), { code: "resource_gone" });
+	if (expectedSessionId === undefined) logger.warn("workflow_control_missing_expected_session_id", { operation });
+	const workflowGate = ctx.workflowGate;
+	if (
+		typeof workflowGate?.resolveGate !== "function" ||
+		typeof workflowGate.recoverAcceptedGates !== "function" ||
+		typeof workflowGate.lookupCompletedResolution !== "function" ||
+		typeof workflowGate.prepareTerminalization !== "function" ||
+		typeof workflowGate.clearPreparedTerminalization !== "function"
+	)
+		throw Object.assign(new Error("Workflow gates are unavailable for this session."), { code: "resource_gone" });
+	const response = { gate_id: id, answer, idempotency_key: idempotencyKey };
+	const completed = workflowGate.lookupCompletedResolution(response);
+	if (completed.kind === "completed") return completed.resolution;
+	if (completed.kind === "accepted_incomplete") {
+		await workflowGate.recoverAcceptedGates();
+		const recovered = workflowGate.lookupCompletedResolution(response);
+		if (recovered.kind === "completed") return recovered.resolution;
+		throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), { code: "terminal_uncertain" });
+	}
+	if (!workflowGate.prepareTerminalization(id, "not_published"))
+		throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
+	try {
+		const resolution = await workflowGate.resolveGate(response);
+		if ((resolution as { status?: unknown }).status === "rejected") workflowGate.clearPreparedTerminalization(id);
+		return resolution;
+	} catch (error) {
+		const stillPending = workflowGate.listPendingGates?.().some(gate => gate.gate_id === id) === true;
+		if (stillPending) workflowGate.clearPreparedTerminalization(id);
+		else workflowGate.quarantineGate?.(id);
+		throw error;
+	}
+}
+
 function createControlSurface(
 	ctx: ExtensionContext,
 	api: ExtensionAPI,
 	reconciliation: InvocationReconciliation,
 	onAccepted: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
 	policy?: SdkSurfacePolicy,
+	settings?: Settings,
+	configOverrides?: Map<string, unknown>,
+	configRevision: { current: number } = { current: 0 },
+	elevationAuthorityToken?: string,
+	canResolveGate: () => boolean = () => true,
+	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 ): ControlSurface {
 	const surfacePolicy =
 		policy ?? createSdkSurfacePolicyForContext(ctx, hasSdkWorkflowGateCapability(ctx.workflowGate));
@@ -649,6 +983,45 @@ function createControlSurface(
 				: ctx.modelRegistry.getAll().find(candidate => candidate.id === id);
 		if (!model) throw Object.assign(new Error(`Model ${id} was not found.`), { code: "invalid_input" });
 		return model;
+	};
+	/**
+	 * Route a synthetic `gajae-code/<profile>` model selection into the
+	 * session-scoped activation transaction. ACP model selection never writes a
+	 * global profile default; persistence remains an explicit TUI choice. Only
+	 * an absent or `off` thinking level is forwarded (synthetic rows advertise
+	 * `validLevels: ["off"]`); any other level is rejected before admission.
+	 * A user-defined provider under the reserved namespace fails closed rather
+	 * than being shadowed. With a thinking level the typed host surface returns
+	 * the pinned `DefaultModelSelectionResult`-shaped result.
+	 */
+	const setSyntheticModel = async (id: string, requestedThinkingLevel: unknown) => {
+		const hasLevel = requestedThinkingLevel !== undefined;
+		const thinkingLevel =
+			typeof requestedThinkingLevel === "string" ? parseThinkingLevel(requestedThinkingLevel) : undefined;
+		if (
+			hasLevel &&
+			(!thinkingLevel || thinkingLevel === ThinkingLevel.Inherit || thinkingLevel !== ThinkingLevel.Off)
+		)
+			throw syntheticModelInputError('model.set thinkingLevel for a synthetic profile must be "off".');
+		const profiles = ctx.modelRegistry.getModelProfiles();
+		const resolved = resolveSyntheticModelSelection(id, profiles, ctx.modelRegistry.getError?.());
+		if (syntheticNamespaceCollision(ctx.modelRegistry.getAll(), ctx.modelRegistry.getConfiguredProviderIds?.() ?? []))
+			throw syntheticModelInputError(
+				`The ${SYNTHETIC_PROVIDER_ID} namespace is reserved; synthetic preset selection is disabled while a provider of the same name is configured.`,
+			);
+		const setDefaultModelProfile = ctx.setDefaultModelProfile;
+		if (!setDefaultModelProfile) return unavailable("model.set")();
+		await setDefaultModelProfile(resolved.canonicalName, {
+			persistDefault: false,
+			...(hasLevel ? { thinkingLevelOverride: ThinkingLevel.Off } : {}),
+		});
+		return hasLevel
+			? {
+					provider: SYNTHETIC_PROVIDER_ID,
+					modelId: resolved.canonicalName,
+					thinkingLevel: ThinkingLevel.Off,
+				}
+			: { changed: true };
 	};
 	const newCorrelation = () => ({ commandId: crypto.randomUUID(), turnId: crypto.randomUUID() });
 	const normalizeClientRef = (clientRef: string | undefined): string | undefined => {
@@ -693,7 +1066,7 @@ function createControlSurface(
 		try {
 			const submission = Promise.resolve(
 				run({
-					onPreflightAccepted: () => void accept().catch(() => undefined),
+					onPreflightAccepted: () => void accept().catch(error => preflight.reject(error)),
 					onPreflightAcceptCommit: accept,
 				}),
 			);
@@ -704,7 +1077,7 @@ function createControlSurface(
 						return;
 					}
 					if (allowCompletionFallback) {
-						void accept().catch(() => undefined);
+						void accept().catch(error => preflight.reject(error));
 						return;
 					}
 					settled = true;
@@ -716,8 +1089,11 @@ function createControlSurface(
 				},
 				error => {
 					if (settled) {
-						if (kind === "skill")
-							void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
+						// The submission promise rejects after preflight acceptance only when the
+						// work itself is over (provider stream interrupt, abort, queue failure).
+						// Every kind must terminalize here or the record stays non-terminal
+						// forever; `noteTransition` ignores an already-terminal record.
+						void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
 						return;
 					}
 					settled = true;
@@ -737,6 +1113,9 @@ function createControlSurface(
 		}
 	};
 	return {
+		authorizeElevationClaim: (sdkId, input, capability) =>
+			elevationAuthorityToken !== undefined &&
+			verifyElevationCapability(elevationAuthorityToken, capability, sdkId, input),
 		prompt: async (text, images, clientRef) =>
 			submit("prompt", clientRef, options =>
 				api.sendUserMessage(
@@ -759,8 +1138,22 @@ function createControlSurface(
 			return await submit("prompt", undefined, options => api.sendUserMessage(text, options));
 		},
 		answerAsk: unavailable("ask.answer"),
-		answerGate: unavailable("workflow.gate_answer"),
-		approvePlan: unavailable("workflow.plan_approve"),
+		answerGate: async (id, response, expectedSessionId, idempotencyKey) =>
+			await trackGateResolution(
+				resolveSdkWorkflowGate(
+					ctx,
+					"workflow.gate_answer",
+					id,
+					response,
+					expectedSessionId,
+					idempotencyKey ?? id,
+					canResolveGate,
+				),
+			),
+		approvePlan: async (id, choice, expectedSessionId) =>
+			await trackGateResolution(
+				resolveSdkWorkflowGate(ctx, "workflow.plan_approve", id, choice, expectedSessionId, id, canResolveGate),
+			),
 		invokeSkill: async (name, args, clientRef) => {
 			if (!ctx.invokeSkill) return unavailable("skill.invoke")();
 			if (args !== undefined && typeof args !== "string")
@@ -790,10 +1183,27 @@ function createControlSurface(
 			ctx.operateGoal ? ctx.operateGoal(op as never, objective) : unavailable("mode.goal.operate")(),
 		replaceTodo: items => typed("todo.replace", { items }),
 		setModel: async (id, thinkingLevel) => {
-			const changed = await api.setModelTemporaryForControl(resolveModel(id));
-			if (!changed) throw Object.assign(new Error("Model unavailable for this session."), { code: "unavailable" });
-			if (thinkingLevel !== undefined) api.setThinkingLevel(thinkingLevel as never);
-			return { changed: true };
+			if (parseSyntheticModelId(id) !== undefined) return setSyntheticModel(id, thinkingLevel);
+			// Serialize the concrete selection (and the Q13 shadow capture/reconcile)
+			// against config.patch through the session admission boundary so a
+			// concurrent patch cannot race the snapshot.
+			const run = async () => {
+				const shadowBefore =
+					settings && configOverrides ? captureConfigOverridesShadow(settings, configOverrides) : undefined;
+				const changed = await api.setModelTemporaryForControl(
+					resolveModel(id),
+					undefined,
+					thinkingLevel as ThinkingLevel | undefined,
+				);
+				if (!changed)
+					throw Object.assign(new Error("Model unavailable for this session."), { code: "unavailable" });
+				if (settings && configOverrides && shadowBefore)
+					reconcileConfigOverridesShadow(settings, configOverrides, shadowBefore);
+				return { changed: true };
+			};
+			return typeof (ctx as Partial<ExtensionContext>).withSdkControlMutation === "function"
+				? ctx.withSdkControlMutation!(run)
+				: run();
 		},
 		setModelProfile: id => (ctx.setModelProfile ? ctx.setModelProfile(id) : unavailable("model.profile.set")()),
 		cycleModel: () => (ctx.cycleModel ? ctx.cycleModel() : unavailable("model.cycle")()),
@@ -824,7 +1234,38 @@ function createControlSurface(
 		renameSession: name => typed("session.rename", { name }),
 		handoffSession: target => typed("session.handoff", { target }),
 		exportHtml: () => typed("session.export_html"),
-		patchConfig: patch => typed("config.patch", { patch }),
+		patchConfig: patch => {
+			if (!patch || typeof patch !== "object" || Array.isArray(patch))
+				throw Object.assign(new Error("config.patch requires an object."), { code: "invalid_input" });
+			if (containsSecretConfigKey(patch))
+				throw Object.assign(new Error("config.patch rejects secret fields at the SDK host."), {
+					code: "invalid_input",
+				});
+			const patchIssues = validateSettingPatch(patch as Record<string, unknown>);
+			if (patchIssues.length > 0) {
+				const detail = patchIssues.map(issue => `${issue.path} (${issue.detail})`).join("; ");
+				throw Object.assign(new Error(`config.patch rejects invalid settings: ${detail}`), {
+					code: "invalid_input",
+				});
+			}
+			if (!settings) return unavailable("config.patch")();
+			const applyPatch = async () => {
+				const entries = Object.entries(patch as Record<string, unknown>);
+				for (const [key, value] of entries) settings.set(key as never, value as never);
+				if (configOverrides) for (const [key, value] of entries) configOverrides.set(key, value);
+				configRevision.current += 1;
+				return { patched: entries.map(([key]) => key), revision: String(configRevision.current) };
+			};
+			// Serialize config mutations against synthetic profile activation and
+			// default-model selection so an interleaved patch can never be lost or
+			// clobbered by an activation rollback. The patch itself authoritatively
+			// updates the shadow, so it must NOT be wrapped in the shadow refresh
+			// (that would delete the entry it just wrote on the second patch).
+			if (typeof (ctx as Partial<ExtensionContext>).withSdkControlMutation === "function") {
+				return ctx.withSdkControlMutation!(applyPatch);
+			}
+			return applyPatch();
+		},
 		reloadRuntime: components => typed("runtime.reload", { components }),
 		login: provider => typed("auth.login", { provider }),
 		registerHostTools: defs => typed("host_tools.register", { defs }),
@@ -855,6 +1296,7 @@ function createControlSurface(
 		retryNow: () => typed("retry.now"),
 		backgroundBash: () => typed("bash.background"),
 		installedOperations: surfacePolicy.installedControls,
+		revisionProvider: resource => (resource === "config" ? String(configRevision.current) : undefined),
 	};
 }
 
@@ -893,6 +1335,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				cursors: CursorRegistry;
 				reconciliation: InvocationReconciliation;
 				pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
+				registerBroker: () => Promise<void>;
+				fenceGateResolutions: () => void;
+				waitForGateResolutionQuiescence: () => Promise<void>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
 				disposeGate?: () => void;
 		  }
@@ -911,9 +1356,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
 	api.on("agent_end", async (_event, ctx) => await emitLifecycle("agent_end", ctx));
-	api.on("turn_start", (_event, ctx) =>
-		active?.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() }),
-	);
+	api.on("turn_start", async (_event, ctx) => {
+		const current = active;
+		if (!current) return;
+		await current.registerBroker();
+		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
+	});
 	api.on("turn_end", (_event, ctx) =>
 		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
 	);
@@ -929,12 +1377,37 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const sessionId = ctx.sessionManager.getSessionId();
 		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
 		const token = crypto.randomBytes(24).toString("base64url");
+		const elevationAuthorityToken = crypto.randomBytes(32).toString("base64url");
+		const elevationAuthorityFile = elevationAuthorityPath(stateRoot, sessionId);
+		await fs.mkdir(path.dirname(elevationAuthorityFile), { recursive: true, mode: 0o700 });
+		await Bun.write(elevationAuthorityFile, `${JSON.stringify({ version: 1, token: elevationAuthorityToken })}\n`);
+		await fs.chmod(elevationAuthorityFile, 0o600);
 		const transport = await options.createTransport({ sessionId, stateRoot, token });
 		const revisions = new RevisionStore(sessionId, Date.now, { storageDir: stateRoot });
 		const cursors = new CursorRegistry(token, revisions);
 		const reconciliation = createInvocationReconciliation({ stateRoot, sessionId });
 		await reconciliation.hydrate();
 		const pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
+		const configRevision = { current: 0 };
+		// The event-ring watermark lives on the runtime host, which is constructed
+		// after the surface factory; the lazy source indirection lets the surface
+		// read the live generation/seq once the runtime exists (Q30 atomic
+		// capture, C9).
+		let eventWatermarkSource: () => { generation: number; seq: number } = () => ({ generation: 0, seq: 0 });
+		let acceptingGateResolutions = true;
+		const inFlightGateResolutions = new Set<Promise<unknown>>();
+		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
+			const tracked = resolution.finally(() => inFlightGateResolutions.delete(tracked));
+			inFlightGateResolutions.add(tracked);
+			return tracked;
+		};
+		const waitForGateResolutionQuiescence = async (): Promise<void> => {
+			const settled = Promise.allSettled(inFlightGateResolutions);
+			const timeout = Bun.sleep(5_000).then(() => {
+				throw new Error("Timed out waiting for SDK workflow gate resolutions to settle.");
+			});
+			await Promise.race([settled, timeout]);
+		};
 		const surfaceFactory = createSdkSurfaceFactory({
 			ctx,
 			id: sessionId,
@@ -942,6 +1415,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			reconciliation,
 			promptStatusLookup: selector => reconciliation.lookup("prompt", selector),
 			skillStatusLookup: selector => reconciliation.lookup("skill", selector),
+			configOverrides: options.configOverrides,
+			settings: options.settings,
+			getEventWatermark: () => eventWatermarkSource(),
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		const controlSurface = createControlSurface(
@@ -952,6 +1428,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				pending.push({ kind, correlation });
 			},
 			surfaceFactory.policy,
+			options.settings,
+			options.configOverrides,
+			configRevision,
+			elevationAuthorityToken,
+			() => acceptingGateResolutions,
+			trackGateResolution,
 		);
 		let runtime: SessionSdkSessionRuntime;
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
@@ -1021,22 +1503,23 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		runtime = new SessionSdkSessionRuntime({
 			transport,
 			control: async (_connectionId, frame) => {
-				const request = frame as Record<string, unknown>;
+				const request = controlRequestFromFrame(frame as Record<string, unknown>);
 				return dispatchControl(
 					controlSurface,
 					OPERATIONS.find(operation => operation.kind === "control" && operation.sdkId === request.operation),
-					{
-						id: typeof request.id === "string" ? request.id : "",
-						operation: typeof request.operation === "string" ? request.operation : "",
-						input: request.input,
-						expectedRevision: typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
-						idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
-						confirm: request.confirm === true,
-					},
+					request,
 				);
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as Record<string, unknown>;
+				// D1: a non-string top-level cursor is rejected, never silently
+				// dropped into a fresh-snapshot query.
+				if (request.cursor !== undefined && typeof request.cursor !== "string")
+					return {
+						id: typeof request.id === "string" ? request.id : undefined,
+						ok: false,
+						error: { code: "invalid_input", message: "cursor must be a non-empty string" },
+					};
 				return queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -1055,12 +1538,54 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},
 		});
+		// The runtime host now owns the live event stream; point the surface's
+		// checkpoint watermark at the real generation/seq (C9).
+		eventWatermarkSource = () => ({
+			generation: runtime.host.events.generation,
+			seq: runtime.host.events.sequence,
+		});
 		const disposeGate = ctx.workflowGate?.onGateEmitted?.(gate =>
 			runtime.emitEvent({ kind: "workflow_gate", payload: gate }),
 		);
-		active = { runtime, revisions, cursors, reconciliation, pending, disposeGate };
+		let brokerRegistered = false;
+		const registerBroker = async (): Promise<void> => {
+			if (brokerRegistered) return;
+			try {
+				await ensureBroker({ agentDir: options.agentDir });
+				const index = await new SessionIndex(options.agentDir).open();
+				const locator = { repo: path.resolve(ctx.cwd), stateRoot };
+				await runtime.registerWithBroker({
+					register: async input => {
+						const endpointMtimeMs = (await fs.stat(path.join(input.stateRoot, "sdk", `${input.sessionId}.json`)))
+							.mtimeMs;
+						await index.append({ type: "host_registered", ...input, locator, pid: process.pid, endpointMtimeMs });
+					},
+					unregister: async input => {
+						await index.append({ type: "host_unregistered", ...input, locator, pid: process.pid });
+					},
+				});
+				brokerRegistered = true;
+			} catch (error) {
+				if (options.brokerRegistrationRequired) throw error;
+				logger.warn(`sdk broker registration unavailable: ${String(error)}`);
+			}
+		};
+		active = {
+			runtime,
+			revisions,
+			cursors,
+			reconciliation,
+			pending,
+			registerBroker,
+			fenceGateResolutions: () => {
+				acceptingGateResolutions = false;
+			},
+			waitForGateResolutionQuiescence,
+			disposeGate,
+		};
 		try {
 			await runtime.start();
+			await registerBroker();
 		} catch (error) {
 			active = undefined;
 			disposeGate?.();
@@ -1071,7 +1596,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					code: errorCode(cleanupError),
 					error: String(cleanupError),
 				});
-				active = { runtime, revisions, cursors, reconciliation, pending, disposeGate };
+				active = {
+					runtime,
+					revisions,
+					cursors,
+					reconciliation,
+					pending,
+					registerBroker,
+					fenceGateResolutions: () => {
+						acceptingGateResolutions = false;
+					},
+					waitForGateResolutionQuiescence,
+					disposeGate,
+				};
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}
 			cursors.close();
@@ -1081,10 +1618,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	const stopActive = async (): Promise<void> => {
 		const current = active;
-		active = undefined;
 		if (!current) return;
-		current.disposeGate?.();
+		current.fenceGateResolutions();
 		try {
+			await current.waitForGateResolutionQuiescence();
+			active = undefined;
+			current.disposeGate?.();
 			await current.runtime.stop();
 		} catch (error) {
 			logger.error("sdk runtime stop failed", { code: errorCode(error), error: String(error) });

@@ -262,6 +262,7 @@ export async function runRlmCommand(argv: string[]): Promise<void> {
 	const cwd = getProjectDir();
 	ensureRlmGjcSessionId();
 	const { dataPath, resumeSessionId, minSuccessfulRuns, rest } = extractRlmFlags(argv);
+	const parsed = parseArgs(rest, "local");
 	const dataContext = await loadRlmDataContext(cwd, dataPath);
 
 	const sessionId = resumeSessionId ?? generateRlmSessionId();
@@ -297,7 +298,6 @@ export async function runRlmCommand(argv: string[]): Promise<void> {
 		},
 	});
 
-	const parsed = parseArgs(rest);
 	parsed.sessionDir = paths.agentSessionDir;
 	if (resumeSessionId) {
 		parsed.continue = true;

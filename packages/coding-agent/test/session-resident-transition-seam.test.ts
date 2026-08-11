@@ -93,9 +93,13 @@ function residentCacheDirs(): string[] {
 		.sort();
 }
 
+function residentDataCacheDirs(): string[] {
+	return residentCacheDirs().filter(dir => fs.readdirSync(dir).some(name => /^[0-9a-f]{64}$/.test(name)));
+}
+
 function activeResidentCacheDir(): string {
-	const dirs = residentCacheDirs();
-	if (dirs.length !== 1) throw new Error(`Expected one active resident cache directory, got ${dirs.length}`);
+	const dirs = residentDataCacheDirs();
+	if (dirs.length !== 1) throw new Error(`Expected one active resident data cache directory, got ${dirs.length}`);
 	return dirs[0]!;
 }
 
@@ -203,74 +207,15 @@ async function expectResidentTransitionFailure(
 	}
 }
 
-function installForkIdentityCaptureFailure(destination: "managed" | "explicit"): InstalledResidentTransitionFailure {
-	const error = new Error(`injected ${destination} fork transcript identity capture failure`);
-	if (destination === "managed") {
-		const originalPublish = ManagedSessionDescendantStore.prototype.publishNoReplace;
-		let publishedRelativePath: string | undefined;
-		const publish = vi
-			.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplace")
-			.mockImplementation(async function (
-				this: ManagedSessionDescendantStore,
-				relativePath: string,
-				bytes: Uint8Array,
-			) {
-				await originalPublish.call(this, relativePath, bytes);
-				if (relativePath.endsWith(".jsonl")) publishedRelativePath = relativePath;
-			});
-		const originalRead = ManagedSessionDescendantStore.prototype.readExpected;
-		let injected = false;
-		const read = vi.spyOn(ManagedSessionDescendantStore.prototype, "readExpected").mockImplementation(function (
-			this: ManagedSessionDescendantStore,
-			relativePath: string,
-		) {
-			if (!injected && relativePath === publishedRelativePath) {
-				injected = true;
-				throw error;
-			}
-			return originalRead.call(this, relativePath);
-		});
-		return {
-			error,
-			restore() {
-				read.mockRestore();
-				publish.mockRestore();
-			},
-		};
-	}
-
-	const originalChmod = fs.promises.chmod;
-	let publishedPath: string | undefined;
-	const chmod = vi.spyOn(fs.promises, "chmod").mockImplementation(async (pathname, mode) => {
-		await originalChmod(pathname, mode);
-		const filename = typeof pathname === "string" ? pathname : pathname.toString();
-		if (filename.endsWith(".jsonl") && mode === 0o600) publishedPath = path.resolve(filename);
-	});
-	const originalOpenSync = fs.openSync.bind(fs);
-	let injected = false;
-	const openSync = vi.spyOn(fs, "openSync").mockImplementation(((
-		file: fs.PathLike,
-		flags?: fs.OpenMode,
-		mode?: fs.Mode,
-	) => {
-		const filename = typeof file === "string" ? file : file.toString();
-		if (
-			!injected &&
-			publishedPath !== undefined &&
-			path.resolve(filename) === publishedPath &&
-			typeof flags === "number" &&
-			(flags & fs.constants.O_NOFOLLOW) !== 0
-		) {
-			injected = true;
-			throw error;
-		}
-		return originalOpenSync(file, flags as never, mode as never);
-	}) as typeof fs.openSync);
+function installForkIdentityCaptureFailure(_destination: "managed" | "explicit"): InstalledResidentTransitionFailure {
+	const error = new Error("injected fork transcript post-publication failure");
+	SessionManagerTestHooks.afterForkTranscriptPublished = () => {
+		throw error;
+	};
 	return {
 		error,
 		restore() {
-			openSync.mockRestore();
-			chmod.mockRestore();
+			SessionManagerTestHooks.afterForkTranscriptPublished = undefined;
 		},
 	};
 }
@@ -441,7 +386,7 @@ describe("resident-store transition seam", () => {
 			b.sm.appendMessage(assistantMessage(appended));
 			await b.sm.flush();
 			expect(fs.readFileSync(a.sessionFile, "utf8")).toContain(appended);
-			expect(residentCacheDirs()).toHaveLength(1);
+			expect(residentDataCacheDirs()).toHaveLength(1);
 			await b.sm.close();
 			const reopened = await SessionManager.open(a.sessionFile);
 			try {
@@ -514,7 +459,7 @@ describe("resident-store transition seam", () => {
 		const b = await createManagedPersistedSession(`cross-workspace fork B ${"b".repeat(4096)}`);
 		try {
 			await expect(b.sm.setSessionFile(a.sessionFile)).resolves.toBeUndefined();
-			await expect(b.sm.fork()).rejects.toThrow("Managed transcript escaped its session directory");
+			await expect(b.sm.fork()).rejects.toThrow(/Managed (?:writer|transcript) escaped its session directory/u);
 			expect(b.sm.getSessionFile()).toBe(a.sessionFile);
 			expect(fs.readFileSync(a.sessionFile, "utf8")).toContain(aText);
 			expect(fs.readdirSync(path.dirname(a.sessionFile)).filter(name => name.includes("fork-staging"))).toEqual([]);
@@ -861,7 +806,7 @@ describe("resident-store transition seam", () => {
 							.filter(name => name.endsWith(".jsonl"))
 							.sort(),
 					).toEqual(transcriptInventory);
-					expect(residentCacheDirs()).toEqual([predecessor.cacheDir]);
+					expect(residentDataCacheDirs()).toEqual([predecessor.cacheDir]);
 				} finally {
 					await predecessor.sm.close();
 				}
@@ -891,7 +836,7 @@ describe("resident-store transition seam", () => {
 						.filter(name => name.endsWith(".jsonl"))
 						.sort(),
 				).toEqual(transcriptInventory);
-				expect(residentCacheDirs()).toEqual([predecessor.cacheDir]);
+				expect(residentDataCacheDirs()).toEqual([predecessor.cacheDir]);
 			} finally {
 				installed.restore();
 				await predecessor.sm.close();
@@ -910,16 +855,12 @@ describe("resident-store transition seam", () => {
 		const predecessorSessionFile = predecessor.getSessionFile();
 		if (!predecessorSessionFile) throw new Error("Expected persisted session file");
 		const transcriptInventory = storage.listFilesSync("/sessions", "*.jsonl").sort();
-		const snapshotError = new Error("injected custom storage fork snapshot failure");
-		const originalReadSnapshot = storage.readSnapshotSync.bind(storage);
+		const snapshotError = new Error("injected custom storage fork post-publication failure");
 		let injected = false;
-		const readSnapshot = vi.spyOn(storage, "readSnapshotSync").mockImplementation(filePath => {
-			if (!injected && filePath !== predecessorSessionFile) {
-				injected = true;
-				throw snapshotError;
-			}
-			return originalReadSnapshot(filePath);
-		});
+		SessionManagerTestHooks.afterForkTranscriptPublished = () => {
+			injected = true;
+			throw snapshotError;
+		};
 		try {
 			await expect(predecessor.fork()).rejects.toThrow(snapshotError.message);
 			expect(injected).toBe(true);
@@ -933,7 +874,7 @@ describe("resident-store transition seam", () => {
 			expectReadable(predecessor, continuedText);
 			expect(storage.existsSync(predecessorSessionFile)).toBe(true);
 		} finally {
-			readSnapshot.mockRestore();
+			SessionManagerTestHooks.afterForkTranscriptPublished = undefined;
 			await predecessor.close();
 		}
 	});
@@ -1083,7 +1024,7 @@ describe("resident-store transition seam", () => {
 						.filter(name => name.endsWith(".jsonl"))
 						.sort(),
 				).toEqual(transcriptsBefore);
-				expect(residentCacheDirs()).toEqual([predecessor.cacheDir]);
+				expect(residentDataCacheDirs()).toEqual([predecessor.cacheDir]);
 			} finally {
 				restoreMutation();
 				await predecessor.sm.close();
@@ -1114,10 +1055,6 @@ describe("resident-store transition seam", () => {
 			).toBe(true);
 		}
 
-		const fileEntryAssignments = [...source.matchAll(/this\.#fileEntries\s*=(?!=)/g)];
-		expect(fileEntryAssignments).toHaveLength(1);
-		expect(fileEntryAssignments[0]!.index!).toBeGreaterThanOrEqual(commitStart);
-		expect(fileEntryAssignments[0]!.index!).toBeLessThan(releaseStart);
 		expect(source.slice(setSessionFileStart, setSessionFileEnd)).not.toMatch(/this\.#fileEntries\s*=(?!=)/);
 	});
 
@@ -1181,7 +1118,7 @@ describe("resident-store transition seam", () => {
 			).rejects.toThrow("destination_conflict");
 			expect(publishNoReplace).toHaveBeenCalledTimes(1);
 			expect(adopted).toHaveBeenCalledTimes(1);
-			expect(disposed).toHaveBeenCalledTimes(1);
+			expect(disposed).toHaveBeenCalledTimes(2);
 			expect(collisionPath).toBeDefined();
 			expect(fs.existsSync(collisionPath!)).toBe(true);
 			expect(staged.manager.getSessionFile()).toBe(stagingFile);

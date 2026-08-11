@@ -178,6 +178,32 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		expect(await fs.readFile(file, "utf8")).toBe("replacement");
 	});
 
+	it("removes one authorized hard-link name without deleting the remaining alias", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const staged = path.join(root, "staged.bin");
+		const published = path.join(root, "published.bin");
+		await fs.writeFile(staged, "authorized");
+		await fs.link(staged, published);
+		const stat = await fs.stat(staged, { bigint: true });
+		const parent = await fs.stat(root, { bigint: true });
+		const cleanup = exactUnlink(staged, {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: sha256("authorized"),
+			quarantineName: "staged.bin.cleanup",
+			allowHardLink: true,
+		});
+		expectDetachedCleanupPending(cleanup, path.join(root, "staged.bin.cleanup"));
+		await expect(fs.stat(staged)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await fs.readFile(published, "utf8")).toBe("authorized");
+	});
+
 	it("retains a same-object content mutation when its authorized digest is stale", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
 		temporaryDirectories.push(root);

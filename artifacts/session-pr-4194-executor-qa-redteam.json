@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "kind": "test-report",
+  "description": "Executor QA/red-team matrix for PR #4194 boundary",
+  "tests": "207 pass, 0 fail (93 integration + 39 storage-contracts + 63 sidecar + 11 crash + 1 computer-enforcement)",
+  "adversarialCases": "8 pass (buffered-writer splits/parity/bounds, exclusive-lock idempotency/replacement, cold-ID saturation@cap1, concurrent first-open, digest checkpoint)",
+  "blockers": []
+}

@@ -534,6 +534,20 @@ export class Container implements ViewportAnchorProvider {
 		}
 	}
 
+	/**
+	 * Non-disposing parentage query: is `component` still a live direct child?
+	 *
+	 * Callers that park a component here and later move it elsewhere must ask
+	 * this instead of consulting their own bookkeeping — `clear()`/`dispose()`
+	 * tear children down without notifying anyone. Disposal is terminal: a
+	 * disposed child, or a child of a disposed container, is never live.
+	 */
+	hasLiveChild(component: Component): boolean {
+		if (this.#disposed) return false;
+		if (component instanceof Container && component.#disposed) return false;
+		return this.children.includes(component);
+	}
+
 	clear(): void {
 		for (const child of this.children) child.dispose?.();
 		this.children = [];

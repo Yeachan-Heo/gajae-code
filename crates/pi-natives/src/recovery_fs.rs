@@ -1965,7 +1965,7 @@ fn open_existing(root: &File, relative_path: &str, writable: bool) -> Result<Fil
 		| if writable {
 			libc::O_RDWR
 		} else {
-			libc::O_RDONLY
+			libc::O_RDONLY | libc::O_NONBLOCK
 		};
 	// SAFETY: `parent` owns a valid fd and `name` is a live NUL-terminated path for
 	// the duration of the call.
@@ -2901,7 +2901,11 @@ fn snapshot_tree_fd(
 				// SAFETY: child is opened once under the retained parent without following
 				// links.
 				let child_fd = unsafe {
-					libc::openat(fd, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+					libc::openat(
+						fd,
+						name.as_ptr(),
+						libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+					)
 				};
 				if child_fd < 0 {
 					return Err("reparse_point");

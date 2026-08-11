@@ -4,6 +4,6 @@
 		"noEmit": true,
 		"emitDeclarationOnly": false
 	},
-	"include": ["scripts"],
+	"include": ["scripts", "sdk-skills/gjc-sdk-author/templates/direct-sdk.ts"],
 	"exclude": ["node_modules"]
 }

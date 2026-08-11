@@ -6,6 +6,7 @@ import {
 	decodePastedPathCandidate,
 	decodePastedPathCandidates,
 	formatPastedImageReference,
+	locatePastedImageReferenceAroundCursor,
 	MAX_PASTED_IMAGE_COUNT,
 	MAX_PASTED_IMAGE_PATH_CHARACTERS,
 	parsePastedImagePaths,
@@ -190,5 +191,75 @@ describe("formatPastedImageReference", () => {
 		expect(formatPastedImageReference("[image 2]", String.raw`C:\Users\me\shot "final".png`)).toBe(
 			String.raw`[image 2] source="C:\\Users\\me\\shot \"final\".png"`,
 		);
+	});
+});
+describe("locatePastedImageReferenceAroundCursor", () => {
+	it("locates a formatted reference at either supported cursor boundary", () => {
+		const reference = formatPastedImageReference("[image 2]", String.raw`C:\Users\me\shot "final".png`);
+		const line = `before ${reference} after`;
+		const startCol = "before ".length;
+		const placeholderEnd = startCol + "[image 2]".length;
+		const referenceEnd = startCol + reference.length;
+
+		expect(locatePastedImageReferenceAroundCursor(line, placeholderEnd)).toEqual({
+			imageIndex: 2,
+			startCol,
+			endCol: referenceEnd,
+		});
+		expect(locatePastedImageReferenceAroundCursor(line, referenceEnd)).toEqual({
+			imageIndex: 2,
+			startCol,
+			endCol: referenceEnd,
+		});
+	});
+
+	it("keeps bare placeholders supported without accepting malformed source suffixes", () => {
+		expect(locatePastedImageReferenceAroundCursor("[image 3]", "[image 3]".length)).toEqual({
+			imageIndex: 3,
+			startCol: 0,
+			endCol: "[image 3]".length,
+		});
+		expect(locatePastedImageReferenceAroundCursor('[image 3] source="unterminated', "[image 3]".length)).toBeNull();
+		expect(locatePastedImageReferenceAroundCursor('[image 3] source="/tmp/a.png"', 1)).toBeNull();
+		expect(
+			locatePastedImageReferenceAroundCursor(
+				'[image 3] source="/tmp/[image 1].png"',
+				'[image 3] source="/tmp/[image 1]'.length,
+			),
+		).toBeNull();
+		expect(
+			locatePastedImageReferenceAroundCursor(
+				'[image 3] source="/tmp/[image 1].png',
+				'[image 3] source="/tmp/[image 1]'.length,
+			),
+		).toBeNull();
+	});
+
+	it("never deletes a placeholder-looking token inside a validated source path", () => {
+		const orphaned = ' source="/tmp/[image 1].png"';
+		expect(locatePastedImageReferenceAroundCursor(orphaned, orphaned.indexOf("].png") + 1)).toBeNull();
+		expect(locatePastedImageReferenceAroundCursor(orphaned, orphaned.length)).toBeNull();
+
+		const trailing = 'note source="/tmp/[image 2].png" tail';
+		expect(locatePastedImageReferenceAroundCursor(trailing, trailing.indexOf("].png") + 1)).toBeNull();
+	});
+
+	it("resolves each reference independently when an earlier path embeds a later placeholder", () => {
+		const first = formatPastedImageReference("[image 1]", "/tmp/[image 2].png");
+		const second = formatPastedImageReference("[image 2]", "/tmp/b.png");
+		const line = `${first} ${second}`;
+		const secondStart = first.length + 1;
+
+		expect(locatePastedImageReferenceAroundCursor(line, first.length)).toEqual({
+			imageIndex: 1,
+			startCol: 0,
+			endCol: first.length,
+		});
+		expect(locatePastedImageReferenceAroundCursor(line, line.length)).toEqual({
+			imageIndex: 2,
+			startCol: secondStart,
+			endCol: line.length,
+		});
+		expect(locatePastedImageReferenceAroundCursor(line, first.indexOf("].png") + 1)).toBeNull();
 	});
 });

@@ -197,6 +197,7 @@ export class ExtensionRunner {
 	#attemptRecordStore: AttemptRecordStore | undefined;
 
 	#getModel: () => Model | undefined = () => undefined;
+	#getCredentialSessionId: () => string = () => "";
 	#isIdleFn: () => boolean = () => true;
 	#getActivePromptHandleFn: () => string | undefined = () => undefined;
 	#waitForIdleFn: () => Promise<void> = async () => {};
@@ -225,6 +226,9 @@ export class ExtensionRunner {
 	#getResolveToolFn: ExtensionContext["resolveTool"] = () => undefined;
 	#cycleModelFn: ExtensionContextActions["cycleModel"] = undefined;
 	#setModelProfileFn: ExtensionContextActions["setModelProfile"] = undefined;
+	#setDefaultModelProfileFn: ExtensionContextActions["setDefaultModelProfile"] = undefined;
+	#getActiveModelProfileFn: ExtensionContextActions["getActiveModelProfile"] = undefined;
+	#withSdkControlMutationFn: ExtensionContextActions["withSdkControlMutation"] = undefined;
 	#cycleThinkingLevelFn: ExtensionContextActions["cycleThinkingLevel"] = undefined;
 	#setQueueModeFn: ExtensionContextActions["setQueueMode"] = undefined;
 	#getSkillStateFn: ExtensionContextActions["getSkillState"] = undefined;
@@ -320,6 +324,7 @@ export class ExtensionRunner {
 
 		// Context actions (required)
 		this.#getModel = contextActions.getModel;
+		this.#getCredentialSessionId = contextActions.getCredentialSessionId ?? (() => "");
 		this.#isIdleFn = contextActions.isIdle;
 		this.#getActivePromptHandleFn = contextActions.getActivePromptHandle ?? (() => undefined);
 		this.#abortFn = contextActions.abort;
@@ -345,6 +350,9 @@ export class ExtensionRunner {
 		this.#getResolveToolFn = contextActions.resolveTool ?? (() => undefined);
 		this.#cycleModelFn = contextActions.cycleModel;
 		this.#setModelProfileFn = contextActions.setModelProfile;
+		this.#setDefaultModelProfileFn = contextActions.setDefaultModelProfile;
+		this.#getActiveModelProfileFn = contextActions.getActiveModelProfile;
+		this.#withSdkControlMutationFn = contextActions.withSdkControlMutation;
 		this.#cycleThinkingLevelFn = contextActions.cycleThinkingLevel;
 		this.#setQueueModeFn = contextActions.setQueueMode;
 		this.#getSkillStateFn = contextActions.getSkillState;
@@ -591,6 +599,7 @@ export class ExtensionRunner {
 
 	createContext(): ExtensionContext {
 		const getModel = this.#getModel;
+		const getCredentialSessionId = this.#getCredentialSessionId;
 		return {
 			ui: this.#uiContext,
 			getContextUsage: () => this.#getContextUsageFn(),
@@ -600,6 +609,9 @@ export class ExtensionRunner {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
+			get credentialSessionId() {
+				return getCredentialSessionId();
+			},
 			get model() {
 				return getModel();
 			},
@@ -619,6 +631,10 @@ export class ExtensionRunner {
 			resolveTool: name => this.#getResolveToolFn(name),
 			cycleModel: async () => await this.#cycleModelFn?.(),
 			setModelProfile: async name => (await this.#setModelProfileFn?.(name)) ?? false,
+			setDefaultModelProfile: async (name, options) =>
+				(await this.#setDefaultModelProfileFn?.(name, options)) ?? { changed: false, id: name },
+			getActiveModelProfile: () => this.#getActiveModelProfileFn?.(),
+			withSdkControlMutation: body => this.#withSdkControlMutationFn?.(body) ?? body(),
 			cycleThinkingLevel: () => this.#cycleThinkingLevelFn?.(),
 			setQueueMode: (kind, mode) => this.#setQueueModeFn?.(kind, mode) ?? false,
 			invokeSkill: async (name, args) => await this.#invokeSkillFn?.(name, args),
@@ -640,6 +656,9 @@ export class ExtensionRunner {
 			sdkBindings: () => [
 				...(this.#cycleModelFn ? ["cycleModel"] : []),
 				...(this.#setModelProfileFn ? ["setModelProfile"] : []),
+				...(this.#setDefaultModelProfileFn ? ["setDefaultModelProfile"] : []),
+				...(this.#getActiveModelProfileFn ? ["getActiveModelProfile"] : []),
+				...(this.#withSdkControlMutationFn ? ["withSdkControlMutation"] : []),
 				...(this.#cycleThinkingLevelFn ? ["cycleThinkingLevel"] : []),
 				...(this.#setQueueModeFn ? ["setQueueMode"] : []),
 				...(this.#getSkillStateFn ? ["getSkillState"] : []),

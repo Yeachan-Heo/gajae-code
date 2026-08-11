@@ -1249,7 +1249,6 @@
 				"type": "object",
 				"properties": {
 					"required_providers": {
-						"minItems": 1,
 						"type": "array",
 						"items": {
 							"type": "string",
@@ -1269,7 +1268,8 @@
 								"executor",
 								"architect",
 								"planner",
-								"critic"
+								"critic",
+								"image"
 							]
 						},
 						"additionalProperties": {
@@ -1277,7 +1277,7 @@
 								{
 									"type": "string",
 									"minLength": 1,
-									"pattern": "^[^,/]+\\/[^,:]+(?::(?:minimal|low|medium|high|xhigh|max))?$"
+									"pattern": "^(?:[^,/]+\\/[^,]*[^,:]|[^/,]*[^/,:])$"
 								},
 								{
 									"minItems": 1,
@@ -1285,7 +1285,7 @@
 									"items": {
 										"type": "string",
 										"minLength": 1,
-										"pattern": "^[^,/]+\\/[^,:]+(?::(?:minimal|low|medium|high|xhigh|max))?$"
+										"pattern": "^(?:[^,/]+\\/[^,]*[^,:]|[^/,]*[^/,:])$"
 									}
 								}
 							]

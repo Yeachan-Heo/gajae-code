@@ -13,11 +13,22 @@ export type CreateLifecycleAgentSessionResult =
 			session: AgentSession;
 			capability: SdkStartupCapability;
 			rollback: SdkStartupRollbackTracker;
+			/**
+			 * Starts the memory backend that construction deliberately skipped. The
+			 * caller MUST run it only after readiness is published.
+			 */
+			startDeferredMemoryBackend: () => Promise<void>;
 	  }
 	| { capability: SdkStartupCapability; rollback: SdkStartupRollbackTracker; failure: SdkStartupFailure };
 
-/** Options accepted by lifecycle-only session construction. */
-export type CreateLifecycleAgentSessionOptions = CreateAgentSessionOptions & {
+/**
+ * Options accepted by lifecycle-only session construction.
+ *
+ * `deferMemoryBackendStartup` is not accepted: lifecycle sessions are launched
+ * by the broker under a fixed readiness deadline, and memory startup runs
+ * unbounded LLM work, so deferral is an invariant rather than a caller choice.
+ */
+export type CreateLifecycleAgentSessionOptions = Omit<CreateAgentSessionOptions, "deferMemoryBackendStartup"> & {
 	/**
 	 * Startup budget for ACP lifecycle MCP launches, in milliseconds. Set only
 	 * when the lifecycle request supplies `mcpServers`; ordinary consumers keep
@@ -42,6 +53,11 @@ export async function createLifecycleAgentSession(
 		const { mcpStartupTimeoutMs, readiness: _readiness, ...sessionOptions } = options;
 		const internalOptions = {
 			...sessionOptions,
+			// Memory startup (rollout summarisation) issues one LLM request per
+			// claimed rollout, so its duration scales with the backlog. Keeping it
+			// inside the broker's readiness window is what kills the child at the
+			// cutoff; the host resumes it once readiness is published.
+			deferMemoryBackendStartup: true,
 			[lifecycleStartupCapabilityOption]: capability,
 			...(mcpStartupTimeoutMs !== undefined ? { [lifecycleMcpStartupTimeoutOption]: mcpStartupTimeoutMs } : {}),
 		} as CreateAgentSessionOptions & {
@@ -51,7 +67,14 @@ export async function createLifecycleAgentSession(
 		const result = await createAgentSession(internalOptions);
 		if (!result.session.extensionRunner)
 			capability.settleFailure(capability.normalizeFailure("registration", "runner_absent"));
-		return { session: result.session, capability, rollback };
+		if (!result.startDeferredMemoryBackend)
+			throw new Error("Lifecycle session construction did not return a deferred memory backend starter.");
+		return {
+			session: result.session,
+			capability,
+			rollback,
+			startDeferredMemoryBackend: result.startDeferredMemoryBackend,
+		};
 	} catch (error) {
 		const settled = capability.settleFailure(capability.normalizeFailure("registration", "failed", error));
 		const failure =

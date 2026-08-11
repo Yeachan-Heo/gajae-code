@@ -21,7 +21,9 @@ import {
 	sendNotificationTest,
 	writeNotificationDiagnostic,
 } from "../src/sdk/bus/notification-service";
-import { DAEMON_GENERATION } from "../src/sdk/bus/telegram-daemon-contract";
+import type { DaemonState } from "../src/sdk/bus/telegram-daemon";
+import { isCurrentCompatibleOwner, isFreshLiveOwner } from "../src/sdk/bus/telegram-daemon";
+import { DAEMON_GENERATION, SERVING_EPOCH } from "../src/sdk/bus/telegram-daemon-contract";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
@@ -343,6 +345,149 @@ describe("notification-service health", () => {
 				"No local notification endpoint for this working directory. In this GJC terminal run /notify on; if it does not report notifications enabled, start a new local GJC session. Do not re-pair Telegram.",
 		});
 		expect(report.checks.indexOf(hint!)).toBe(report.checks.findIndex(check => check.name === "endpoints") + 1);
+	});
+
+	const heartbeatPath = daemonPaths(settings.getAgentDir()).heartbeat;
+	// Matches the owner tag daemonStateJson() writes, so the sidecar is accepted as this owner's own.
+	const ownerSidecarTag = { pid: 1000, incarnation: "linux:100", ownerId: "owner-a", acquisitionId: "owner-a" };
+	const attachStateRoot = "/tmp/gjc-attachment";
+	const attachEndpoint = JSON.stringify({
+		sessionId: "session-a",
+		url: "ws://127.0.0.1:3000",
+		token: "endpoint-token",
+		pid: 1000,
+	});
+
+	test("warns when endpoint files are registered but a live daemon reports zero attachments", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			[heartbeatPath]: JSON.stringify({ ...ownerSidecarTag, heartbeatAt: 1_490, attachedEndpoints: 0 }),
+			[path.join(attachStateRoot, "sdk", "session-a.json")]: attachEndpoint,
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: attachStateRoot,
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.attachedEndpoints).toBe(0);
+		expect(report.endpoints.total).toBe(1);
+		expect(report.checks.find(check => check.name === "endpoint_attachment")).toEqual({
+			name: "endpoint_attachment",
+			level: "warn",
+			detail:
+				"1 endpoint file(s) registered but daemon pid 1000 reports 0 attached session(s); the daemon cannot deliver to any registered endpoint",
+		});
+		expect(report.overall).toBe("warn");
+	});
+
+	test("stays clean when the live daemon reports at least one attached endpoint", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, generation: DAEMON_GENERATION }),
+			[heartbeatPath]: JSON.stringify({ ...ownerSidecarTag, heartbeatAt: 1_490, attachedEndpoints: 1 }),
+			[path.join(attachStateRoot, "sdk", "session-a.json")]: attachEndpoint,
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: attachStateRoot,
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.attachedEndpoints).toBe(1);
+		expect(report.checks.some(check => check.name === "endpoint_attachment")).toBe(false);
+		expect(report.overall).toBe("ok");
+	});
+
+	test("treats a sidecar without an attachment count as unknown rather than zero", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490, generation: DAEMON_GENERATION }),
+			[heartbeatPath]: JSON.stringify({ ...ownerSidecarTag, heartbeatAt: 1_490 }),
+			[path.join(attachStateRoot, "sdk", "session-a.json")]: attachEndpoint,
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: attachStateRoot,
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.daemon.attachedEndpoints).toBeUndefined();
+		expect(report.checks.some(check => check.name === "endpoint_attachment")).toBe(false);
+		expect(report.overall).toBe("ok");
+	});
+
+	test("flags a live daemon whose generation this build refuses to attach a transport to", async () => {
+		const servedGeneration = DAEMON_GENERATION - 1;
+		const stateJson = daemonStateJson({
+			pid: 1000,
+			heartbeatAt: 1_490,
+			generation: servedGeneration,
+			ownershipPhase: "ready",
+			servingEpoch: SERVING_EPOCH,
+		});
+		const attachInput = {
+			state: JSON.parse(stateJson) as DaemonState,
+			now: 1_500,
+			tokenFingerprint: tokenFingerprint(TOKEN),
+			chatId: "12345",
+			pidAlive: (pid: number) => pid === 1000,
+			pidIncarnation: () => "linux:100",
+		};
+		// The runtime's own predicates are what make this owner undeliverable: it is a
+		// fresh live owner, so nothing replaces it, but it is not a current compatible
+		// owner, so `acquireDaemonOwnership` answers `provisional` and no session ever
+		// binds a transport. The generation is the sole discriminator between the two.
+		expect(isFreshLiveOwner(attachInput)).toBe(true);
+		expect(isCurrentCompatibleOwner(attachInput)).toBe(false);
+		expect(
+			isCurrentCompatibleOwner({
+				...attachInput,
+				state: { ...attachInput.state, generation: DAEMON_GENERATION },
+			}),
+		).toBe(true);
+
+		const { fs } = mockFs({
+			[statePath]: stateJson,
+			[heartbeatPath]: JSON.stringify({ ...ownerSidecarTag, heartbeatAt: 1_490 }),
+			[path.join(attachStateRoot, "sdk", "session-a.json")]: attachEndpoint,
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: attachStateRoot,
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		// Every other signal is green: the process is alive, the heartbeat is fresh, the
+		// identity matches, a live endpoint file is registered, and an owner older than
+		// generation 59 publishes no attachment count, so #4128's detector stays silent.
+		expect(report.daemon.alive).toBe(true);
+		expect(report.daemon.heartbeatFresh).toBe(true);
+		expect(report.daemon.identityMatches).toBe(true);
+		expect(report.endpoints.live).toBe(1);
+		expect(report.daemon.attachedEndpoints).toBeUndefined();
+		expect(report.checks.some(check => check.name === "endpoint_attachment")).toBe(false);
+		expect(report.checks.find(check => check.name === "daemon")).toEqual({
+			name: "daemon",
+			level: "warn",
+			detail: `daemon pid 1000 serves generation ${servedGeneration} but this build attaches only to generation ${DAEMON_GENERATION}; it cannot attach a session transport — run \`gjc daemon reload\``,
+		});
+		expect(report.overall).toBe("warn");
+	});
+
+	test("keeps the no-endpoint-file hint and skips the attachment warn when nothing is registered", async () => {
+		const { fs } = mockFs({
+			[statePath]: daemonStateJson({ pid: 1000, heartbeatAt: 1_490 }),
+			[heartbeatPath]: JSON.stringify({ ...ownerSidecarTag, heartbeatAt: 1_490, attachedEndpoints: 0 }),
+		});
+		const report = await checkNotificationHealth({
+			settings,
+			stateRoot: "/tmp/gjc-none",
+			deps: { fs, now: () => 1_500, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.endpoints.total).toBe(0);
+		expect(report.checks.find(check => check.name === "local_endpoint")).toEqual({
+			name: "local_endpoint",
+			level: "warn",
+			detail:
+				"No local notification endpoint for this working directory. In this GJC terminal run /notify on; if it does not report notifications enabled, start a new local GJC session. Do not re-pair Telegram.",
+		});
+		expect(report.checks.some(check => check.name === "endpoint_attachment")).toBe(false);
+		expect(report.overall).toBe("warn");
 	});
 	test("ignores shared lifecycle, ready, and broker records when discovering endpoints", async () => {
 		const stateRoot = "/tmp/gjc-shared-sdk-state";

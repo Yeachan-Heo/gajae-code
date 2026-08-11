@@ -45,19 +45,21 @@ function ensureOwnerOnlyDirectory(directory: string): void {
 
 function installVerifiedNativeCleanup(): void {
 	vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
-		if (
-			identity.parentDev === undefined ||
-			identity.parentIno === undefined ||
-			parent.dev !== identity.parentDev ||
-			parent.ino !== identity.parentIno
-		)
-			throw new Error("resident cleanup parent authority mismatch");
+		if (identity.parentDev !== undefined || identity.parentIno !== undefined) {
+			const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+			if (
+				identity.parentDev === undefined ||
+				identity.parentIno === undefined ||
+				parent.dev !== identity.parentDev ||
+				parent.ino !== identity.parentIno
+			)
+				throw new Error("resident cleanup parent authority mismatch");
+		}
 		const stat = fs.lstatSync(pathname, { bigint: true });
 		if (
 			stat.dev !== identity.dev ||
 			stat.ino !== identity.ino ||
-			stat.nlink !== identity.nlink ||
+			(identity.nlink !== undefined && stat.nlink !== identity.nlink) ||
 			stat.size !== identity.size ||
 			stat.mtimeNs !== identity.mtimeNs
 		)
@@ -75,10 +77,11 @@ function installVerifiedNativeCleanup(): void {
 		return { ok: true };
 	});
 	vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation((pathname, snapshot, parentIdentity) => {
-		const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
-		if (!parentIdentity) throw new Error("resident tree cleanup parent authority missing");
-		if (parent.dev !== parentIdentity.dev || parent.ino !== parentIdentity.ino)
-			throw new Error("resident tree cleanup parent authority mismatch");
+		if (parentIdentity) {
+			const parent = fs.lstatSync(path.dirname(pathname), { bigint: true });
+			if (parent.dev !== parentIdentity.dev || parent.ino !== parentIdentity.ino)
+				throw new Error("resident tree cleanup parent authority mismatch");
+		}
 		const current = native.snapshotDirectoryTree(pathname);
 		if (!current.ok || !current.snapshot || current.snapshot.entries.length !== snapshot.entries.length)
 			throw new Error("resident tree cleanup snapshot mismatch");
@@ -138,6 +141,12 @@ function residentInstanceDirs(root = residentCacheRoot()): string[] {
 	} catch {
 		return [];
 	}
+}
+
+function residentTextCacheDir(manager: SessionManager): string {
+	const directory = manager.residentTextCacheDirForTests();
+	if (!directory) throw new Error("Expected a directory-backed resident text cache");
+	return directory;
 }
 
 function residentBlobFiles(instanceDir: string): string[] {
@@ -221,9 +230,9 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 				const atId = appendUserText(manager, at);
 				const aboveId = appendUserText(manager, above);
 				const sessionFile = await persist(manager);
-				const instances = residentInstanceDirs();
-				expect(instances).toHaveLength(1);
-				expect(residentBlobFiles(instances[0]!)).toHaveLength(2);
+				const activeInstance = residentTextCacheDir(manager);
+				expect(residentInstanceDirs()).toContain(activeInstance);
+				expect(residentBlobFiles(activeInstance)).toHaveLength(2);
 				expect(messageText(manager, belowId)).toBe(below);
 				expect(messageText(manager, atId)).toBe(at);
 				expect(messageText(manager, aboveId)).toBe(above);
@@ -521,8 +530,8 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 		const seed = `C7-seed-${"s".repeat(4096)}`;
 		appendUserText(manager, seed);
 		await persist(manager);
-		const active = residentInstanceDirs(root);
-		expect(active).toHaveLength(1);
+		const activeInstance = residentTextCacheDir(manager);
+		expect(residentInstanceDirs(root)).toContain(activeInstance);
 		const stale = path.join(root, "i-redteam-dead");
 		ensureOwnerOnlyDirectory(stale);
 		fs.writeFileSync(
@@ -538,7 +547,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 				}
 			})();
 			await Promise.all([sweepResidentCacheRoot(root, { maxDirectories: 64, maxDurationMs: 250 }), appendRace]);
-			expect(fs.existsSync(active[0]!)).toBe(true);
+			expect(fs.existsSync(activeInstance)).toBe(true);
 			expect(fs.existsSync(stale)).toBe(false);
 			expectReadable(manager, seed);
 			expectReadable(manager, "C7-race-3-");
@@ -548,7 +557,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 		expect(residentInstanceDirs(root)).toEqual([]);
 	});
 
-	it("C8 keeps below-cap snapshots strong and rebuilds above-cap snapshots without content loss", async () => {
+	it("C8 rematerializes resident-backed contexts and rebuilds above-cap snapshots without content loss", async () => {
 		const belowCap = SessionManager.inMemory();
 		try {
 			SessionManagerTestHooks.materializedCacheMaxBytesOverride = MiB;
@@ -562,7 +571,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 			}
 			expect(belowCap.getObservabilityStatsForTests()).toMatchObject({
 				materializedEntriesCachePopulateCount: warmed.materializedEntriesCachePopulateCount,
-				pathOnlyContextBuildCount: warmed.pathOnlyContextBuildCount,
+				pathOnlyContextBuildCount: warmed.pathOnlyContextBuildCount + 3,
 			});
 		} finally {
 			await belowCap.close();

@@ -114,6 +114,14 @@ function isCompleteSequence(data: string): "complete" | "incomplete" | "not-esca
 	}
 
 	const afterEsc = data.slice(1);
+	// macOS Terminal.app with "Use Option as Meta key" applies to both
+	// physical Option keys and wraps an escape sequence with a second ESC
+	// (for example Option+Up: ESC ESC [ A).
+	// Delegate completeness to the inner sequence so the pair is emitted
+	// atomically instead of being split into ESC ESC and the CSI suffix.
+	if (afterEsc.startsWith(ESC)) {
+		return isCompleteSequence(afterEsc);
+	}
 
 	// CSI sequences: ESC [
 	if (afterEsc.startsWith("[")) {

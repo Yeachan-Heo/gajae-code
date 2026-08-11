@@ -115,6 +115,8 @@ describe("CustomEditor queue keybinding", () => {
 	it("parses and dispatches macOS Option queue and dequeue sequences", () => {
 		const inputs = [
 			{ data: "\x1bq", key: "alt+q" },
+			{ data: "\x1b\x1b[A", key: "alt+up" },
+			{ data: "\x1b\x1b[B", key: "alt+down" },
 			{ data: "\x1b[1;3A", key: "alt+up" },
 			{ data: "\x1b[1;3B", key: "alt+down" },
 		] as const;
@@ -131,7 +133,7 @@ describe("CustomEditor queue keybinding", () => {
 		for (const { data } of inputs) editor.handleInput(data);
 
 		expect(onQueue).toHaveBeenCalledTimes(1);
-		expect(onDequeue).toHaveBeenCalledTimes(2);
+		expect(onDequeue).toHaveBeenCalledTimes(4);
 		expect(editor.getText()).toBe("");
 	});
 

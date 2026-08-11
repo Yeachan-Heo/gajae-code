@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 /**
  * Long-lived macOS appearance observer.
  *
@@ -523,7 +522,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_12_15(): void
+export declare function __piNativesV0_12_21(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -1786,6 +1785,11 @@ export interface NativeExactFileIdentity {
    * verified from the detached object before unlinking it.
    */
   sha256?: string
+  /**
+   * Permit removing exactly this authorized pathname when the inode has other
+   * hard links. Remaining links are retained after exact quarantine cleanup.
+   */
+  allowHardLink?: boolean
 }
 
 /** Typed result of an identity-bound regular-file deletion or directory detach. */
@@ -2291,7 +2295,7 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
  */
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
 
-export declare function summarizeCode(options: SummaryOptions): SummaryResult
+export declare function summarizeCode(options: SummaryOptions): Promise<SummaryResult>
 
 export interface SummaryOptions {
   /** Source code to summarize. */

@@ -1,5 +1,12 @@
 import { expect, test } from "bun:test";
-import { AcpSdkAdapter, type AcpSdkAdapterError } from "../src/sdk/acp";
+import * as fs from "node:fs/promises";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { AcpAgent } from "../src/modes/acp/acp-agent";
+import { AcpSdkAdapter, type AcpSdkAdapterError, acpMcpLaunchFailure } from "../src/sdk/acp";
+import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { SdkClientError } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 
 class FakeSdkClient {
@@ -130,6 +137,7 @@ test("ACP SDK adapter exposes SDK event frames while rejecting raw lifecycle glo
 		operation: "session.create",
 		input: { cwd: "/workspace" },
 		idempotencyKey: "lifecycle-key",
+		timeoutMs: 21_000,
 	});
 	expect(received).toContainEqual({ type: "event", payload: { type: "turn_end" } });
 	unsubscribe();
@@ -175,6 +183,7 @@ test("ACP lifecycle aliases forward caller idempotency keys outside operation in
 			operation: alias.operation,
 			input: alias.input,
 			idempotencyKey: `alias-${index}`,
+			...(alias.operation === "session.close" ? {} : { timeoutMs: 21_000 }),
 		})),
 	);
 	await adapter.close();
@@ -428,5 +437,104 @@ test("ACP reverse cancellation and stale failures suppress responses over the re
 	} finally {
 		await adapter.close();
 		server.stop(true);
+	}
+});
+
+test("the ACP MCP launch wrapper reports broker refusal and re-attributes spawn failures", () => {
+	const mcpServers = [
+		{ name: "docs", command: "docs-mcp", args: [] },
+		{ name: "search", command: "search-mcp", args: [] },
+	];
+
+	const refused = new SdkClientError(
+		"startup_admission_refused",
+		"SDK host startup was refused because the broker no longer owns the session root.",
+	);
+	expect(acpMcpLaunchFailure(refused, mcpServers)).toBe(refused);
+
+	const masked = acpMcpLaunchFailure(new SdkClientError("spawn_failed", "child exited"), mcpServers) as {
+		code: string;
+		message: string;
+	};
+	expect(masked).toMatchObject({
+		code: "unavailable",
+		message: "MCP server request failed to start (docs, search).",
+	});
+
+	const bare = new SdkClientError("spawn_failed", "child exited");
+	expect(acpMcpLaunchFailure(bare, [])).toBe(bare);
+});
+test("the production ACP MCP launch path preserves broker admission timeout failures", async () => {
+	const root = await fs.mkdtemp(path.join(tmpdir(), "gjc-acp-mcp-admission-timeout-"));
+	const agentDir = path.join(root, "agent");
+	const cwd = path.join(root, "workspace");
+	const token = "acp-admission-timeout-token";
+	const controller = new AbortController();
+	let server!: ReturnType<typeof Bun.serve>;
+	try {
+		await fs.mkdir(cwd, { recursive: true });
+		server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				if (new URL(request.url).searchParams.get("token") !== token)
+					return new Response("Unauthorized", { status: 401 });
+				if (!server.upgrade(request, { data: undefined })) return new Response("Upgrade failed", { status: 400 });
+			},
+			websocket: {
+				open(socket) {
+					socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+				},
+				message(socket, raw) {
+					const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+					socket.send(
+						JSON.stringify({
+							type: "broker_response",
+							id: frame.id,
+							ok: false,
+							error: {
+								code: "startup_admission_timeout",
+								message: "SDK host startup was not admitted before the queue wait cutoff.",
+							},
+						}),
+					);
+				},
+			},
+		});
+		await writeBrokerDiscovery(agentDir, {
+			version: 1,
+			protocolVersion: 3,
+			packageGeneration: "test",
+			ownerId: "acp-admission-timeout-owner",
+			pid: process.pid,
+			host: "127.0.0.1",
+			port: server.port!,
+			url: `ws://127.0.0.1:${server.port}`,
+			token,
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		});
+		const agent = new AcpAgent(
+			{
+				signal: controller.signal,
+				closed: Promise.withResolvers<void>().promise,
+			} as unknown as AgentSideConnection,
+			{ agentDir },
+		);
+		await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+		await expect(
+			agent.newSession({
+				cwd,
+				additionalDirectories: [],
+				mcpServers: [{ name: "docs", command: process.execPath, args: [], env: [] }],
+			}),
+		).rejects.toMatchObject({
+			code: "startup_admission_timeout",
+			message: "SDK host startup was not admitted before the queue wait cutoff.",
+		});
+	} finally {
+		controller.abort();
+		server?.stop(true);
+		await fs.rm(root, { recursive: true, force: true });
 	}
 });

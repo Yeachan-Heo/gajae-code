@@ -21,8 +21,10 @@ function createRuntime() {
 				selector: string,
 				options?: { candidates?: Array<{ provider: string; id: string }> },
 			) => (selector === "claude-sonnet" ? options?.candidates?.[0] : undefined),
+			getAvailable: () => [availableModel],
 		},
 		getAvailableModels: () => [availableModel],
+		setConfiguredModelChain: () => {},
 		async setModel(model: { provider: string; id: string }, _role: "default", _options?: unknown) {
 			this.model = model;
 		},
@@ -71,7 +73,7 @@ function createRuntime() {
 }
 
 describe("/model batch assignments", () => {
-	test("roles and assignments print the five-row summary without mutating settings", async () => {
+	test("roles and assignments print the six-row summary without mutating settings", async () => {
 		const { output, runtime, settings } = createRuntime();
 		settings.setModelRole("default", "anthropic/default-model:medium");
 		settings.set("task.agentModelOverrides", { executor: "anthropic/executor-model:low" });
@@ -86,6 +88,7 @@ describe("/model batch assignments", () => {
 			"  ARCHITECT (Architect): (unset)",
 			"  PLANNER (Planner): (unset)",
 			"  CRITIC (Critic): (unset)",
+			"  IMAGE (Image): (unset)",
 		].join("\n");
 		expect(output).toEqual([expected, expected]);
 		expect(settings.get("task.agentModelOverrides")).toEqual({ executor: "anthropic/executor-model:low" });
@@ -124,16 +127,16 @@ describe("/model batch assignments", () => {
 
 		expect(setActiveSpy).toHaveBeenCalledTimes(1);
 		expect(setActiveSpy).toHaveBeenCalledWith(undefined);
-		expect(settings.getModelRole("default")).toBe("claude-sonnet:low");
+		expect(settings.getModelRole("default")).toBe("anthropic/claude-3-5-sonnet:low");
 		expect(settings.get("task.agentModelOverrides")).toEqual({
-			executor: "claude-sonnet:low",
-			architect: "claude-sonnet:low",
-			planner: "claude-sonnet:low",
-			critic: "claude-sonnet:low",
+			executor: "anthropic/claude-3-5-sonnet:low",
+			architect: "anthropic/claude-3-5-sonnet:low",
+			planner: "anthropic/claude-3-5-sonnet:low",
+			critic: "anthropic/claude-3-5-sonnet:low",
 		});
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(output).toEqual([
-			"All model targets set to claude-sonnet:low for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
+			"All model targets set to claude-sonnet:low for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC, IMAGE.",
 		]);
 	});
 

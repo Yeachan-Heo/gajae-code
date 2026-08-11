@@ -39,6 +39,7 @@ function createSelector(
 		getProviderDiscoveryState: () => undefined,
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,
+		getModelProfile: () => undefined,
 	} as unknown as ModelRegistry;
 	const ui = { requestRender: vi.fn(registryOptions.requestRender ?? (() => {})) } as unknown as TUI;
 

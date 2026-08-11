@@ -4,15 +4,15 @@
     "name": "Gajae Code"
   },
   "metadata": {
-    "description": "GJC delegation plugin",
-    "version": "0.12.15"
+    "description": "GJC delegation plugin with advisory SDK skills",
+    "version": "0.12.21"
   },
   "plugins": [
     {
       "name": "gajae-code",
       "source": "./gajae-code",
-      "description": "Delegate GJC planning/execution/team workflows via coordinator MCP.",
-      "version": "0.12.15",
+      "description": "Delegate GJC planning/execution/team workflows via coordinator MCP, plus advisory SDK session CLI and guide skills.",
+      "version": "0.12.21",
       "author": {
         "name": "Gajae Code"
       },
@@ -21,7 +21,8 @@
         "delegation",
         "mcp",
         "planning",
-        "agents"
+        "agents",
+        "sdk"
       ]
     }
   ]

@@ -41,6 +41,8 @@ import {
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
 import { loadCapability } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
+import { resolveModelProfileName } from "../config/model-profile-contract";
+import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -115,6 +117,7 @@ import {
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
+import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
@@ -325,6 +328,8 @@ export interface CreateAgentSessionOptions {
 	/** Raw model pattern string (e.g. from --model CLI flag) to resolve after extensions load.
 	 * Used when model lookup is deferred because extension-provided models aren't registered yet. */
 	modelPattern?: string;
+	/** Active profile inherited by a nested SDK/subagent session. */
+	activeModelProfile?: string;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ThinkingLevel;
 	/** Runtime substitution metadata for the initial model_change session event. */
@@ -337,6 +342,8 @@ export interface CreateAgentSessionOptions {
 	/** Optional provider-facing session identifier for prompt caches and sticky auth selection.
 	 * Keeps persisted session files isolated while reusing provider-side caches. */
 	providerSessionId?: string;
+	/** Optional credential-selection session identity, distinct from provider transport/cache identity. */
+	credentialSessionId?: string;
 	/** Runtime credential selector for multi-account auth pools. */
 	credentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
 
@@ -951,8 +958,22 @@ function withEmbeddedDefaultGjcSkills(skills: Skill[]): Skill[] {
 	return [...byName.values()];
 }
 
-export function resolveIntentTracingEnabled(intentTracingSetting: boolean | undefined, hasUI: boolean): boolean {
-	return (!!intentTracingSetting || $flag("PI_INTENT_TRACING")) && hasUI;
+/**
+ * Intent tracing (`_i`) is a model-facing reasoning aid, not a UI feature: it
+ * makes the model state a tool call's purpose before the call executes, and the
+ * loop turns that string into `tool_execution_start.intent` for every consumer
+ * (TUI transcript, ACP `tool_call.title`, telemetry, session dumps).
+ *
+ * The per-call token cost is only worth forcing on the operator-facing session,
+ * so canonical sub-sessions (role agents spawned through `task`) stay omitted.
+ * Surface shape must not decide this — an ACP or print-mode top-level session is
+ * the same conversation the operator would have run in the TUI.
+ */
+export function resolveIntentTracingEnabled(
+	intentTracingSetting: boolean | undefined,
+	options: { subSession: boolean },
+): boolean {
+	return (!!intentTracingSetting || $flag("PI_INTENT_TRACING")) && !options.subSession;
 }
 
 const MCP_CONFIG_PATH_AND_MANAGER_ERROR = "mcpConfigPath and mcpManager are mutually exclusive";
@@ -1273,31 +1294,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		applyConfiguredSearchTimeout(settings);
 
-		const imageProvider = settings.get("providers.image");
-		const imageModel = settings.get("providers.imageModel");
-		const imageCustomUrl = settings.get("providers.imageCustomUrl");
-		const imageCustomKey = settings.get("providers.imageCustomKey");
-		const imageCustomKeyEnv = settings.get("providers.imageCustomKeyEnv");
-		if (
-			imageProvider === "auto" ||
-			imageProvider === "openai" ||
-			imageProvider === "gemini" ||
-			imageProvider === "openrouter" ||
-			imageProvider === "antigravity" ||
-			imageProvider === "alibaba" ||
-			imageProvider === "custom"
-		) {
-			const { setConfiguredImageModel, setPreferredImageProvider } = await import("../tools/image-gen");
-			setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
-			setConfiguredImageModel({
-				provider: imageProvider,
-				model: imageModel ?? null,
-				customUrl: imageCustomUrl,
-				customKey: imageCustomKey,
-				customKeyEnv: imageCustomKeyEnv,
-			});
-		}
-
 		const sessionManager =
 			options.sessionManager ??
 			(await logger.time("sessionManager", async () => {
@@ -1309,6 +1305,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session_id upstream, where session-owning transports reject the extra
 		// downstreams (owner_busy) and degrade those turns to uncached HTTP.
 		const providerSessionId = options.providerSessionId ?? logicalSessionId;
+		const credentialSessionId = options.credentialSessionId ?? providerSessionId;
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
 			`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
@@ -1331,7 +1328,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return false;
 			}
 			const key = await modelRegistry
-				.getApiKey(candidate, providerSessionId, { credentialSelector })
+				.getApiKey(candidate, credentialSessionId, { credentialSelector })
 				.catch(error => {
 					if (credentialSelector) {
 						logger.debug("Credential selector did not match model availability candidate", {
@@ -1381,6 +1378,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const modelMatchPreferences = {
 			usageOrder: settings.getStorage()?.getModelUsageOrder(),
 		};
+		const persistedProfiles = modelRegistry.getModelProfiles();
+		const resolvedInheritedProfileName = options.activeModelProfile
+			? resolveModelProfileName(options.activeModelProfile, persistedProfiles)
+			: undefined;
+		const acceptedInheritedProfileName =
+			resolvedInheritedProfileName && persistedProfiles.has(resolvedInheritedProfileName)
+				? resolvedInheritedProfileName
+				: undefined;
+		const inheritedProfileOwnsDefault = acceptedInheritedProfileName
+			? resolveProfileBindings(persistedProfiles.get(acceptedInheritedProfileName)!).defaultSelector !== undefined
+			: false;
+		const settingsProfileAliasIntent: { aliasIntent: "preset-equivalent" } | undefined = inheritedProfileOwnsDefault
+			? { aliasIntent: "preset-equivalent" }
+			: undefined;
 		const allowedModels = await logger.time("resolveAllowedModels", () =>
 			resolveAllowedModels(modelRegistry, settings, modelMatchPreferences),
 		);
@@ -1389,20 +1400,41 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				settings,
 				matchPreferences: modelMatchPreferences,
 				modelRegistry,
+				...(settingsProfileAliasIntent ?? {}),
+				sessionId: providerSessionId,
+				credentialSessionId,
 			}),
 		);
 		let model = options.model;
 		let modelFallbackMessage: string | undefined;
 		const resumeModelBehavior = settings.get("session.resumeModelBehavior");
-		const persistedDefaultChain = existingSession.configuredModelChains.default?.entries;
+		const persistedDefaultChain = existingSession.configuredModelChains.default;
 		const defaultModelEntries =
 			resumeModelBehavior === "useCurrentDefault"
 				? []
-				: persistedDefaultChain && persistedDefaultChain.length > 0
-					? persistedDefaultChain
+				: persistedDefaultChain?.entries && persistedDefaultChain.entries.length > 0
+					? persistedDefaultChain.entries
 					: existingSession.models.default
 						? [existingSession.models.default]
 						: [];
+		const persistedProfileName =
+			persistedDefaultChain?.origin === "profile-activation" ? persistedDefaultChain.identity : undefined;
+		const resolvedPersistedProfileName = persistedProfileName
+			? resolveModelProfileName(persistedProfileName, persistedProfiles)
+			: undefined;
+		const acceptedPersistedProfileName =
+			resolvedPersistedProfileName &&
+			persistedProfiles.has(resolvedPersistedProfileName) &&
+			(!acceptedInheritedProfileName || acceptedInheritedProfileName === resolvedPersistedProfileName) &&
+			resumeModelBehavior !== "useCurrentDefault"
+				? resolvedPersistedProfileName
+				: undefined;
+		const persistedProfileOwnsDefault = acceptedPersistedProfileName
+			? resolveProfileBindings(persistedProfiles.get(acceptedPersistedProfileName)!).defaultSelector !== undefined
+			: false;
+		const startupActiveModelProfile =
+			acceptedInheritedProfileName ??
+			(!hasExplicitModel && acceptedPersistedProfileName ? acceptedPersistedProfileName : undefined);
 		// If session has data, restore its configured default chain rather than the
 		// scalar runtime model, which may be a stale fallback from the prior run.
 		if (!hasExplicitModel && !model && hasExistingSession && defaultModelEntries.length > 0) {
@@ -1411,8 +1443,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					defaultModelEntries,
 					modelRegistry,
 					settings,
-					providerSessionId,
-					{ managedFallback: defaultModelEntries.length > 1 },
+					credentialSessionId,
+					{
+						managedFallback: defaultModelEntries.length > 1,
+						canonicalSessionId: providerSessionId,
+						...(persistedProfileOwnsDefault ? { aliasIntent: "preset-equivalent" as const } : {}),
+					},
 				);
 				model = restoredDefaultResolution.model;
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
@@ -1657,6 +1693,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
+			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
 			getActiveSkillState: () => session?.getActiveSkillState(),
@@ -1757,6 +1794,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			isManagedDestination: () => sessionManager.isManagedDestination(),
 			getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
 			getSessionId: () => sessionManager.getSessionId(),
+			getCredentialSessionId: () => credentialSessionId,
 		};
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
@@ -1768,6 +1806,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			disposeLocalProtocolOverride = LocalProtocolHandler.installOverride(options.localProtocolOptions);
 		}
 		toolSession.getArtifactsDir = getArtifactsDir;
+		// Live parent profile accessor for task/subagent dispatch: profile-owned
+		// persisted model overrides may resolve through preset-equivalent aliases
+		// only while an active profile claims them (see task/executor.ts).
+		(toolSession as ToolSession & { getActiveModelProfile?: () => string | undefined }).getActiveModelProfile = () =>
+			session?.getActiveModelProfile();
 		toolSession.getAuthorizedArtifactsDirs = () => {
 			const manager = sessionManager.getArtifactManager();
 			return manager ? [manager.dir] : [];
@@ -1792,9 +1835,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const pluginMcpToolNames: string[] = [];
 		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
 
-		// Add image tools when the active model or configured image providers can generate images.
+		// Add image tools when an image role model is configured.
 		const { getImageGenTools } = await import("../tools/image-gen");
-		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
+		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, settings));
 		if (imageGenTools.length > 0) {
 			customTools.push(...(imageGenTools as unknown as CustomTool[]));
 		}
@@ -2107,9 +2150,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						});
 					} else if (sdkHostEligible) {
 						registerSdkOnlyNotificationCommand(api);
-						const { createSdkWebSocketTransport } = await import("../sdk/host/websocket-transport");
 						createSdkSessionRuntimeExtension(api, {
+							agentDir,
+							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
 							createTransport: input => createSdkWebSocketTransport(input),
+							settings,
+							configOverrides: new Map(),
 						});
 					}
 				} catch (error) {
@@ -2180,6 +2226,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			};
 			const { model: resolved } = parseModelPattern(options.modelPattern, availableModels, matchPreferences, {
 				modelRegistry,
+				sessionId: logicalSessionId,
+				credentialSessionId,
 			});
 			if (resolved) {
 				model = resolved;
@@ -2267,6 +2315,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const getSessionContext = () => ({
 			sessionManager: createReadonlySessionManager(sessionManager),
 			modelRegistry,
+			get credentialSessionId() {
+				return session.credentialSessionId;
+			},
 			model: agent.state.model,
 			isIdle: () => !session.isStreaming,
 			hasQueuedMessages: () => session.queuedMessageCount > 0,
@@ -2296,6 +2347,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const customToolContext = (): CustomToolContext => ({
 				sessionManager: createReadonlySessionManager(sessionManager),
 				modelRegistry,
+				get credentialSessionId() {
+					return session?.credentialSessionId ?? credentialSessionId;
+				},
 				model: agent?.state.model,
 				isIdle: () => !session?.isStreaming,
 				hasQueuedMessages: () => (session?.queuedMessageCount ?? 0) > 0,
@@ -2390,10 +2444,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
 		const eagerTasks = settings.get("task.eager");
-		const intentTracingEnabled = resolveIntentTracingEnabled(
-			settings.get("tools.intentTracing"),
-			options.hasUI ?? false,
-		);
+		const intentTracingEnabled = resolveIntentTracingEnabled(settings.get("tools.intentTracing"), {
+			subSession: isCanonicalSubSession,
+		});
 		const emittedContextFileWarnings = new Set(discoveredContextFileWarnings);
 		const contextFileWarnings = [...discoveredContextFileWarnings];
 		for (const warning of discoveredContextFileWarnings) {
@@ -2828,14 +2881,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getApiKey: async provider => {
 				// Read agent.sessionId at call time so credential selection stays aligned
 				// with metadataResolver after /new, fork, resume, or branch switches.
-				const key = await modelRegistry.getApiKeyForProvider(provider, agent.providerSessionId ?? agent.sessionId);
+				const key = await modelRegistry.getApiKeyForProvider(
+					provider,
+					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
+				);
 				if (!key) {
 					throw new Error(`No API key found for provider "${provider}"`);
 				}
 				return key;
 			},
 			getAuthCredentialType: provider =>
-				modelRegistry.getSessionCredentialType(provider, agent.providerSessionId ?? agent.sessionId),
+				modelRegistry.getSessionCredentialType(
+					provider,
+					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
+				),
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
@@ -2843,15 +2902,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
 						onAuthError: async (provider, oldKey, error) => {
+							const credentialSessionId =
+								options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId;
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 								signal: streamOptions?.signal,
-								sessionId: agent.sessionId,
+								sessionId: credentialSessionId,
 							});
 							logger.debug("Retrying provider request after credential invalidation", {
 								provider,
 								error: error instanceof Error ? error.message : String(error),
 							});
-							return modelRegistry.getApiKeyForProvider(provider, agent.sessionId);
+							return modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
 						},
 					});
 				} catch (error) {
@@ -3013,10 +3074,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agentId: resolvedAgentId,
 			agentRegistry,
 			providerSessionId: options.providerSessionId,
+			credentialSessionId: options.credentialSessionId,
 			providerCacheSessionId: providerSessionId,
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
+		session.setActiveModelProfile(startupActiveModelProfile);
 		session.configWarnings.push(...contextFileWarnings);
 		hasSession = true;
 		if (asyncJobManager) {
@@ -3066,7 +3129,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (codexTransport.websocketPreferred) {
 				void (async () => {
 					try {
-						const codexPrewarmApiKey = await modelRegistry.getApiKey(codexModel, providerSessionId);
+						const codexPrewarmApiKey = await modelRegistry.getApiKey(codexModel, credentialSessionId);
 						if (!codexPrewarmApiKey) return;
 						await logger.time("prewarmOpenAICodexResponses", prewarmOpenAICodexResponses, codexModel, {
 							apiKey: codexPrewarmApiKey,

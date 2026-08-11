@@ -30,6 +30,8 @@ function installTestTheme(): void {
 
 const defaultModel = model("provider-a", "default");
 const alternateModel = model("provider-a", "alternate");
+const aliasModel = model("provider-b", "org/flare-alias");
+const providerBDefault = model("provider-b", "default");
 const profile: ModelProfileDefinition = {
 	name: "profile-a",
 	displayName: "Profile Alpha",
@@ -52,12 +54,23 @@ function createRegistry(options: { missingCredentials?: boolean } = {}) {
 	return {
 		refresh: vi.fn(async () => {}),
 		getError: () => undefined,
-		getAvailable: () => [defaultModel, alternateModel],
-		getAll: () => [defaultModel, alternateModel],
+		getAvailable: () => [defaultModel, alternateModel, aliasModel, providerBDefault],
+		getAll: () => [defaultModel, alternateModel, aliasModel, providerBDefault],
 		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,
+		lookupAliasExists: (alias: string) => alias === "flare-alias",
+		resolveModelByLookupAlias: vi.fn(
+			(
+				_alias: string,
+				lookupOptions?: {
+					candidates?: readonly Model[];
+					sessionId?: string;
+					credentialSessionId?: string;
+				},
+			) => lookupOptions?.candidates?.find(candidate => candidate === aliasModel),
+		),
 		getModelProfiles: () => new Map(profiles),
 		getModelProfile: (name: string) => profiles.get(name),
 		getAvailableModelProfileNames: () => [...profiles.keys()],
@@ -76,6 +89,8 @@ function createSelector(
 		currentThinkingLevel?: ThinkingLevel;
 		activeModelProfile?: string;
 		configuredDefaultChain?: readonly string[];
+		registry?: ReturnType<typeof createRegistry>;
+		sessionId?: string;
 	} = {},
 ) {
 	const ui = { requestRender: vi.fn() } as unknown as TUI;
@@ -83,11 +98,11 @@ function createSelector(
 		ui,
 		options.currentModel,
 		options.settings ?? Settings.isolated(),
-		createRegistry() as never,
+		(options.registry ?? createRegistry()) as never,
 		[],
 		onSelect,
 		() => {},
-		options,
+		{ ...options, sessionId: options.sessionId },
 	);
 }
 
@@ -97,7 +112,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		"modelProfile.default": "old-profile",
 	});
 	const flush = vi.fn(async () => {});
-	settings.flush = flush as typeof settings.flush;
+	settings.flushOrThrow = flush as typeof settings.flushOrThrow;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
@@ -234,6 +249,29 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("DEFAULT: provider-a/default (high)");
 		expect(rendered).toContain("EXECUTOR: provider-a/alternate");
 		expect(rendered).toContain("(current)");
+	});
+
+	test("active profile role badges resolve bare aliases without mutating canonical session affinity", async () => {
+		installTestTheme();
+		const registry = createRegistry();
+		const selector = createSelector(() => {}, {
+			currentModel: defaultModel,
+			activeModelProfile: "profile-a",
+			settings: Settings.isolated({
+				"task.agentModelOverrides": { executor: "flare-alias" },
+			}),
+			registry,
+			sessionId: "profile-session",
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("EXECUTOR: provider-b/org/flare-alias");
+		const aliasCalls = registry.resolveModelByLookupAlias.mock.calls.filter(([alias]) => alias === "flare-alias");
+		expect(aliasCalls.length).toBeGreaterThan(0);
+		expect(aliasCalls.every(([, options]) => options?.sessionId === undefined)).toBe(true);
+		expect(aliasCalls.some(([, options]) => options?.credentialSessionId === "profile-session")).toBe(true);
 	});
 
 	test("landing header reflects the active fallback model snapshot", async () => {

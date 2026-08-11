@@ -592,6 +592,7 @@ function fixedHealth(
 			stopped: stateId === "foreign-blocked" || stateId === "blocked-restore-retain",
 			heartbeatAt: configured ? heartbeatAt : undefined,
 			heartbeatAgeMs: configured ? clock.now() - heartbeatAt : undefined,
+			attachedEndpoints: configured ? 2 : undefined,
 			generation: configured ? 7 : undefined,
 			currentGeneration: 7,
 			generationRelation: configured ? "current" : "unknown",

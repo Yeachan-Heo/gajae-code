@@ -463,6 +463,82 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(JSON.stringify(tail)).not.toContain("prompt is too long: 1000001 tokens > 1000000 maximum");
 	});
 
+	it("drains a queued follow-up through continueQueuedMessages after an overflow no-op would replay", async () => {
+		await session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+		// A tiny history inside the keep-recent window leaves nothing to summarize,
+		// so prepareCompaction returns undefined and overflow recovery takes the
+		// terminal overflow-no-op branch with a resumable non-assistant tail.
+		await createSession({ "compaction.keepRecentTokens": 100_000 });
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueQueuedMessagesSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
+		const events: Array<Extract<AgentSessionEvent, { type: "auto_compaction_end" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") events.push(event);
+		});
+
+		sessionManager.appendMessage({ role: "user", content: "resumable boundary", timestamp: Date.now() - 1 });
+		session.agent.appendMessage({ role: "user", content: "resumable boundary", timestamp: Date.now() - 1 });
+		session.agent.followUp({
+			role: "custom",
+			customType: "test",
+			content: [{ type: "text", text: "Queued follow-up" }],
+			display: false,
+			timestamp: Date.now(),
+		});
+		const overflow = assistantMessage({
+			stopReason: "error",
+			errorMessage: "prompt is too long: 1000001 tokens > 1000000 maximum",
+			timestamp: Date.now() + 1,
+		});
+		await driveCompaction(overflow);
+		await advancePostPrompt(200);
+		await session.waitForIdle();
+
+		// The explicit queued_continue drain must consume the queued message
+		// instead of replaying the oversized non-assistant tail.
+		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(events).toEqual([
+			expect.objectContaining({
+				type: "auto_compaction_end",
+				action: "context-full",
+				skipped: true,
+				errorMessage: expect.stringContaining("nothing eligible to compact"),
+			}),
+		]);
+	});
+
+	it("drains a queued steer through continueQueuedMessages after an overflow no-op would replay", async () => {
+		await session.dispose();
+		authStorage.close();
+		tempDir.removeSync();
+		await createSession({ "compaction.keepRecentTokens": 100_000 });
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueQueuedMessagesSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
+
+		sessionManager.appendMessage({ role: "user", content: "resumable boundary", timestamp: Date.now() - 1 });
+		session.agent.appendMessage({ role: "user", content: "resumable boundary", timestamp: Date.now() - 1 });
+		session.agent.steer({
+			role: "user",
+			content: [{ type: "text", text: "Queued steer" }],
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+		const overflow = assistantMessage({
+			stopReason: "error",
+			errorMessage: "prompt is too long: 1000001 tokens > 1000000 maximum",
+			timestamp: Date.now() + 1,
+		});
+		await driveCompaction(overflow);
+		await advancePostPrompt(200);
+		await session.waitForIdle();
+
+		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
 	it("starts synthetic continuation when no generation supersedes it", async () => {
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		await driveCompaction();
@@ -515,9 +591,12 @@ describe("AgentSession auto-compaction continuation", () => {
 		});
 		const warnSpy = vi.spyOn(logger, "warn");
 		const resetAttemptBudgetSpy = vi.spyOn(FallbackChainController.prototype, "resetAttemptBudget");
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async options => {
-			options?.onRunAccepted?.();
-		});
+		const continueSpy = vi.spyOn(session.agent, "continue");
+		const continueQueuedMessagesSpy = vi
+			.spyOn(session.agent, "continueQueuedMessages")
+			.mockImplementation(async options => {
+				options?.onRunAccepted?.();
+			});
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		const events: string[] = [];
 		session.subscribe(event => events.push(event.type));
@@ -525,7 +604,8 @@ describe("AgentSession auto-compaction continuation", () => {
 		await driveCompaction();
 		await advancePostPrompt(200);
 		await session.waitForIdle();
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(1);
 		expect(resetAttemptBudgetSpy).toHaveBeenCalledTimes(1);
 		expect(promptSpy).not.toHaveBeenCalled();
 		expect(events.filter(type => type === "agent_end")).toHaveLength(0);
@@ -634,10 +714,13 @@ describe("AgentSession auto-compaction continuation", () => {
 		const warnSpy = vi.spyOn(logger, "warn");
 		const debugSpy = vi.spyOn(logger, "debug");
 		const resetAttemptBudgetSpy = vi.spyOn(FallbackChainController.prototype, "resetAttemptBudget");
-		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementationOnce(async () => {
-			throw new AgentBusyError();
-		});
-		continueSpy.mockImplementationOnce(async options => {
+		const continueSpy = vi.spyOn(session.agent, "continue");
+		const continueQueuedMessagesSpy = vi
+			.spyOn(session.agent, "continueQueuedMessages")
+			.mockImplementationOnce(async () => {
+				throw new AgentBusyError();
+			});
+		continueQueuedMessagesSpy.mockImplementationOnce(async options => {
 			options?.onRunAccepted?.();
 		});
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
@@ -648,7 +731,8 @@ describe("AgentSession auto-compaction continuation", () => {
 		await advancePostPrompt(300);
 		await session.waitForIdle();
 
-		expect(continueSpy).toHaveBeenCalledTimes(2);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(2);
 		expect(resetAttemptBudgetSpy).toHaveBeenCalledTimes(1);
 		expect(promptSpy).not.toHaveBeenCalled();
 		expect(events.filter(type => type === "agent_end")).toHaveLength(0);
@@ -671,7 +755,10 @@ describe("AgentSession auto-compaction continuation", () => {
 		// Instant waits: without a cap the reschedule loop never terminates, so this
 		// test hangs instead of passing against the unpatched fixed-100ms spin.
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
-		const continueSpy = vi.spyOn(session.agent, "continue").mockRejectedValue(new AgentBusyError());
+		const continueSpy = vi.spyOn(session.agent, "continue");
+		const continueQueuedMessagesSpy = vi
+			.spyOn(session.agent, "continueQueuedMessages")
+			.mockRejectedValue(new AgentBusyError());
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 
 		await driveCompaction();
@@ -679,10 +766,12 @@ describe("AgentSession auto-compaction continuation", () => {
 		await session.waitForIdle();
 
 		// 1 initial attempt + 50 bounded reschedules, then the loop stops for good.
-		expect(continueSpy).toHaveBeenCalledTimes(51);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(51);
 		await advancePostPrompt(300);
 		await session.waitForIdle();
-		expect(continueSpy).toHaveBeenCalledTimes(51);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(51);
 
 		const busyDebugs = debugSpy.mock.calls.filter(
 			call => call[0] === "agent.continue busy after scheduling; rescheduling",

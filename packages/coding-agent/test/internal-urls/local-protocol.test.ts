@@ -94,6 +94,36 @@ it("migrates opaque managed legacy topology, retires exactly once, and verifies 
 	});
 });
 
+it("coalesces concurrent managed migration for the same local root", async () => {
+	const sessionId = `managed-concurrent-${crypto.randomUUID()}`;
+	let captures = 0;
+	let retired = 0;
+	await withLocalRoot(sessionId, async localRoot => {
+		const captureStarted = Promise.withResolvers<void>();
+		const releaseCapture = Promise.withResolvers<void>();
+		const options = {
+			getSessionId: () => sessionId,
+			getManagedLegacyLocalMigrationSource: () => ({
+				capture: async () => {
+					captures++;
+					captureStarted.resolve();
+					await releaseCapture.promise;
+					return null;
+				},
+				retire: () => retired++,
+			}),
+		};
+		const first = initializeLocalRoot(options);
+		await captureStarted.promise;
+		const second = initializeLocalRoot(options);
+		expect(captures).toBe(1);
+		releaseCapture.resolve();
+		await expect(Promise.all([first, second])).resolves.toEqual([localRoot, localRoot]);
+		expect(await fs.readFile(path.join(localRoot, ".gjc-local-legacy-migrated-v1"), "utf8")).toBe("absent\n");
+		expect({ captures, retired }).toEqual({ captures: 1, retired: 0 });
+	});
+});
+
 it("rolls back a sorted managed partial install and retries the same identity", async () => {
 	const sessionId = `managed-collision-${crypto.randomUUID()}`;
 	const snapshot = { rootDev: "1", rootIno: "2", entries: [] } as never;

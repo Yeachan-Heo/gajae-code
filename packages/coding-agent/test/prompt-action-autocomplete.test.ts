@@ -14,6 +14,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -42,6 +43,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -61,6 +63,7 @@ describe("prompt action autocomplete", () => {
 			"Copy current line",
 			"Copy whole prompt",
 			"Paste image from clipboard",
+			"Paste text from configured clipboard",
 			"Scroll to previous user input",
 			"Undo",
 			"Move cursor to end of message",
@@ -76,6 +79,9 @@ describe("prompt action autocomplete", () => {
 		);
 		expect(suggestions?.items.find(item => item.label === "Paste image from clipboard")?.description).toBe(
 			keybindings.getDisplayString("app.clipboard.pasteImage"),
+		);
+		expect(suggestions?.items.find(item => item.label === "Paste text from configured clipboard")?.description).toBe(
+			"requires --clipboard-transport ssh",
 		);
 		expect(suggestions?.items.find(item => item.label === "Move cursor to beginning of line")?.description).toBe(
 			keybindings.getDisplayString("tui.editor.cursorLineStart"),
@@ -106,6 +112,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -135,6 +142,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -179,35 +187,16 @@ describe("prompt action autocomplete", () => {
 		);
 	});
 
-	it("offers slash command names from inline prompt text", async () => {
+	it.each([
+		"please /he",
+		"please/hel",
+	])("does not offer slash-command suggestions after prompt text: %s", async line => {
 		const provider = createNoopProvider([{ name: "help", description: "Learn commands and beginner workflows" }]);
-		const line = "please /he";
-		const suggestions = await provider.getSuggestions([line], 0, line.length);
 
-		expect(suggestions?.prefix).toBe("/he");
-		expect(suggestions?.items.map(item => item.value)).toContain("help");
+		expect(await provider.getSuggestions([line], 0, line.length)).toBeNull();
 	});
 
-	it("offers slash command names from adjacent inline prompt text", async () => {
-		const provider = createNoopProvider([{ name: "help", description: "Learn commands and beginner workflows" }]);
-		const line = "please/hel";
-		const suggestions = await provider.getSuggestions([line], 0, line.length);
-
-		expect(suggestions?.prefix).toBe("/hel");
-		expect(suggestions?.items.map(item => item.value)).toContain("help");
-	});
-
-	it("preserves root path suggestions for bare absolute inline slash", async () => {
-		const provider = createNoopProvider([{ name: "model", description: "Switch model" }]);
-		const line = "open /";
-		const suggestions = await provider.getSuggestions([line], 0, line.length);
-
-		expect(suggestions?.prefix).toBe("/");
-		expect(suggestions?.items.some(item => item.value.startsWith("/"))).toBe(true);
-		expect(suggestions?.items.map(item => item.value)).not.toContain("model");
-	});
-
-	it("opens the composer autocomplete list from an adjacent inline slash", async () => {
+	it("keeps the composer autocomplete closed for an inline slash", async () => {
 		const editor = new Editor(defaultEditorTheme);
 		editor.setAutocompleteProvider(
 			createNoopProvider([{ name: "help", description: "Learn commands and beginner workflows" }]),
@@ -216,22 +205,7 @@ describe("prompt action autocomplete", () => {
 		editor.handleInput("please/");
 		await Bun.sleep(0);
 
-		expect(editor.isShowingAutocomplete()).toBe(true);
-	});
-
-	it("applies adjacent inline slash command completion without replacing prompt text", async () => {
-		const provider = createNoopProvider([{ name: "help", description: "Learn commands and beginner workflows" }]);
-		const line = "please/hel";
-		const suggestions = await provider.getSuggestions([line], 0, line.length);
-		const item = suggestions?.items.find(entry => entry.value === "help");
-		expect(item).toBeDefined();
-		if (!item || !suggestions) {
-			throw new Error("expected help suggestion");
-		}
-
-		const applied = provider.applyCompletion([line], 0, line.length, item, suggestions.prefix);
-		expect(applied.lines[0]).toBe("please/help ");
-		expect(applied.cursorCol).toBe("please/help ".length);
+		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 
 	it("passes the typed trigger to undo and leaves text removal to the editor", async () => {
@@ -244,6 +218,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -286,6 +261,7 @@ describe("prompt action autocomplete", () => {
 			pasteImage: () => {
 				pasteCalls += 1;
 			},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -320,6 +296,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {
 				newSessionCalls += 1;
 			},
@@ -354,6 +331,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {
@@ -389,6 +367,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -411,6 +390,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},
@@ -434,6 +414,7 @@ describe("prompt action autocomplete", () => {
 			copyCurrentLine: () => {},
 			copyPrompt: () => {},
 			pasteImage: () => {},
+			pasteText: () => {},
 			newSession: () => {},
 			showHelp: () => {},
 			scrollTmuxToPreviousUserInput: () => {},

@@ -209,6 +209,30 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual(["\x1b[104u", "\x1b[104;1:3u", "\x1b[105u", "\x1b[105;1:3u"]);
 		});
 	});
+	describe("macOS Terminal.app Meta-wrapped shortcuts", () => {
+		it("keeps Option arrow sequences together and parses them as Alt arrows", () => {
+			setKittyProtocolActive(false);
+			processInput("\x1b\x1b[A\x1b\x1b[B");
+			expect(emittedSequences).toEqual(["\x1b\x1b[A", "\x1b\x1b[B"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["alt+up", "alt+down"]);
+		});
+
+		it("buffers a Meta-wrapped arrow split across chunks", () => {
+			processInput("\x1b");
+			processInput("\x1b");
+			expect(emittedSequences).toEqual([]);
+
+			processInput("[A");
+			expect(emittedSequences).toEqual(["\x1b\x1b[A"]);
+			expect(parseKey(emittedSequences[0]!)).toBe("alt+up");
+		});
+		it("keeps Option paging, function, delete, and shifted-arrow sequences atomic", () => {
+			setKittyProtocolActive(false);
+			processInput("\x1b\x1b[5~\x1b\x1bOP\x1b\x1b[3~\x1b\x1b[1;2A");
+			expect(emittedSequences).toEqual(["\x1b\x1b[5~", "\x1b\x1bOP", "\x1b\x1b[3~", "\x1b\x1b[1;2A"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["alt+pageUp", "alt+f1", "alt+delete", "alt+shift+up"]);
+		});
+	});
 	describe.each([
 		{ chunks: ["\x1bi"], expected: ["\x1bi"], parsed: ["alt+i"] },
 		{ chunks: ["\x1b", "i"], expected: ["\x1bi"], parsed: ["alt+i"] },

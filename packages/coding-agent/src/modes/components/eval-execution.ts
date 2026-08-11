@@ -30,6 +30,7 @@ export class EvalExecutionComponent extends Container {
 	#expanded = false;
 	#contentContainer: Container;
 	#headerText: Text;
+	#resultPersisted = false;
 
 	#highlightLang(): "python" | "javascript" {
 		return this.language === "js" ? "javascript" : "python";
@@ -164,5 +165,18 @@ export class EvalExecutionComponent extends Container {
 
 	getCode(): string {
 		return this.code;
+	}
+
+	/**
+	 * Record that this execution's message reached session state, so a transcript
+	 * rebuild renders it from the session instead of keeping this live block parked.
+	 */
+	markResultPersisted(): void {
+		this.#resultPersisted = true;
+	}
+
+	/** Whether the session already holds this execution's message. */
+	hasPersistedResult(): boolean {
+		return this.#resultPersisted;
 	}
 }

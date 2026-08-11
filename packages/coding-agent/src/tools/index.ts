@@ -219,6 +219,8 @@ export interface ToolSession {
 	requestForegroundBashBackground?: () => boolean;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Get credential-selection session identity. */
+	getCredentialSessionId?: () => string | null;
 	/** Scope-held MCP facade for mcp:// resolution. */
 	getMcpManager?: () => import("../runtime-mcp/manager").MCPManager | undefined;
 	/** Whether local:// must use external managed scratch instead of artifacts/local. */
