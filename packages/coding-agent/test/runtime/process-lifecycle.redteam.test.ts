@@ -218,6 +218,7 @@ time.sleep(100)
 		expect(groupLeaderIdentityMatches("100", { kind: "live", startTime: "101", ttyDevice: "0" })).toBe(false);
 		expect(groupLeaderIdentityMatches("100", { kind: "live", startTime: "100", ttyDevice: "0" })).toBe(true);
 		expect(groupLeaderIdentityMatches("100", { kind: "absent" })).toBe(true);
+		expect(groupLeaderIdentityMatches(undefined, { kind: "absent" })).toBe(true);
 		expect(groupLeaderIdentityMatches("100", { kind: "unverifiable", reason: "permission_denied" })).toBe(false);
 	});
 

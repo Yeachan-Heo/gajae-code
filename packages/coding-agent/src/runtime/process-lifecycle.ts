@@ -82,10 +82,11 @@ export function groupLeaderIdentityMatches(
 	expectedStartTime: string | undefined,
 	leader: LinuxProcPidProbeResult,
 ): boolean {
-	return (
-		expectedStartTime !== undefined &&
-		(leader.kind === "absent" || (leader.kind === "live" && leader.startTime === expectedStartTime))
-	);
+	// An absent leader cannot be a recycled leader. Its group may still contain
+	// descendants that we own, including when the root exits before we can read
+	// its start time immediately after spawn.
+	if (leader.kind === "absent") return true;
+	return expectedStartTime !== undefined && leader.kind === "live" && leader.startTime === expectedStartTime;
 }
 
 /**
