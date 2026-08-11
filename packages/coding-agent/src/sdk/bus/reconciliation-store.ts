@@ -60,7 +60,7 @@ const nodeFs: ReconciliationStoreFs = {
 	mkdir: fs.mkdir,
 	readFile: fs.readFile,
 	writeFile: fs.writeFile,
-	rename: (from, to) => fs.rename(from, to),
+	rename: fs.rename,
 	unlink: fs.unlink,
 	open: fs.open as ReconciliationStoreFs["open"],
 };

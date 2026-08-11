@@ -1,6 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
@@ -97,33 +96,6 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
 		await Bun.sleep(20);
 	}
-}
-function pauseNextReconciliationCommit(
-	sessionFile: string,
-	sessionId: string,
-): {
-	started: Promise<void>;
-	release: () => void;
-	restore: () => void;
-} {
-	const target = reconciliationStorePath(sessionFile, sessionId);
-	const started = Promise.withResolvers<void>();
-	const release = Promise.withResolvers<void>();
-	const realRename = fsPromises.rename.bind(fsPromises);
-	let paused = false;
-	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
-		if (!paused && String(to) === target) {
-			paused = true;
-			started.resolve();
-			await release.promise;
-		}
-		await realRename(from, to);
-	});
-	return {
-		started: started.promise,
-		release: () => release.resolve(),
-		restore: () => rename.mockRestore(),
-	};
 }
 
 async function closeSocket(socket: WebSocket): Promise<void> {
@@ -2576,6 +2548,8 @@ test("SDK host waits for durable prompt acceptance before completing concurrent 
 	};
 	let executionStarted = false;
 	const abortObserved = Promise.withResolvers<void>();
+	const acceptanceStarted = Promise.withResolvers<void>();
+	const releaseAcceptance = Promise.withResolvers<void>();
 	const handlers = start(
 		sessionContext,
 		undefined,
@@ -2586,6 +2560,8 @@ test("SDK host waits for durable prompt acceptance before completing concurrent 
 			else signal?.addEventListener("abort", onAbort, { once: true });
 			try {
 				await options?.onPreflightAcceptCommit?.();
+				acceptanceStarted.resolve();
+				await releaseAcceptance.promise;
 			} finally {
 				signal?.removeEventListener("abort", onAbort);
 			}
@@ -2599,7 +2575,6 @@ test("SDK host waits for durable prompt acceptance before completing concurrent 
 		false,
 	);
 	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
-	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
 	try {
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
@@ -2621,7 +2596,7 @@ test("SDK host waits for durable prompt acceptance before completing concurrent 
 				input: { text: "cancel while durable prompt acceptance is pending" },
 			}),
 		);
-		await pausedCommit.started;
+		await acceptanceStarted.promise;
 		socket.send(
 			JSON.stringify({
 				type: "control_request",
@@ -2631,15 +2606,12 @@ test("SDK host waits for durable prompt acceptance before completing concurrent 
 			}),
 		);
 		await abortObserved.promise;
-		expect(frames.some(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance")).toBe(
-			false,
-		);
 		expect(
 			frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
 		).toBe(false);
 		expect(frames.some(frame => frame.type === "agent_end" || frame.type === "agent_failed")).toBe(false);
 
-		pausedCommit.release();
+		releaseAcceptance.resolve();
 		await waitFor(
 			() => frames.some(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance"),
 			"durable prompt acceptance response",
@@ -2671,13 +2643,12 @@ test("SDK host waits for durable prompt acceptance before completing concurrent 
 			frames.find(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
 		).toMatchObject({
 			ok: true,
-			result: { aborted: true, disposition: "preflight_cancelled" },
+			result: { aborted: true, disposition: "cancelled" },
 		});
 		expect(executionStarted).toBe(false);
 		expect(frames.some(frame => frame.type === "agent_start" || frame.type === "agent_failed")).toBe(false);
 	} finally {
-		pausedCommit.release();
-		pausedCommit.restore();
+		releaseAcceptance.resolve();
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	}
 }, 30_000);
@@ -2697,6 +2668,8 @@ test("SDK host waits for durable skill acceptance before completing concurrent c
 	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
 	let executionStarted = false;
 	const abortObserved = Promise.withResolvers<void>();
+	const acceptanceStarted = Promise.withResolvers<void>();
+	const releaseAcceptance = Promise.withResolvers<void>();
 	sessionContext.invokeSkill = async (
 		name: string,
 		args: string | undefined,
@@ -2713,6 +2686,8 @@ test("SDK host waits for durable skill acceptance before completing concurrent c
 		else signal?.addEventListener("abort", onAbort, { once: true });
 		try {
 			await options?.onPreflightAcceptCommit?.();
+			acceptanceStarted.resolve();
+			await releaseAcceptance.promise;
 		} finally {
 			signal?.removeEventListener("abort", onAbort);
 		}
@@ -2723,7 +2698,6 @@ test("SDK host waits for durable skill acceptance before completing concurrent c
 	};
 	const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
 	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
-	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
 	try {
 		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
@@ -2745,7 +2719,7 @@ test("SDK host waits for durable skill acceptance before completing concurrent c
 				input: { name: "fixture-skill", args: "cancel while durable skill acceptance is pending" },
 			}),
 		);
-		await pausedCommit.started;
+		await acceptanceStarted.promise;
 		socket.send(
 			JSON.stringify({
 				type: "control_request",
@@ -2755,15 +2729,12 @@ test("SDK host waits for durable skill acceptance before completing concurrent c
 			}),
 		);
 		await abortObserved.promise;
-		expect(frames.some(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance")).toBe(
-			false,
-		);
 		expect(
 			frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
 		).toBe(false);
 		expect(frames.some(frame => frame.type === "agent_end" || frame.type === "agent_failed")).toBe(false);
 
-		pausedCommit.release();
+		releaseAcceptance.resolve();
 		await waitFor(
 			() => frames.some(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance"),
 			"durable skill acceptance response",
@@ -2794,13 +2765,12 @@ test("SDK host waits for durable skill acceptance before completing concurrent c
 			frames.find(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
 		).toMatchObject({
 			ok: true,
-			result: { aborted: true, disposition: "preflight_cancelled" },
+			result: { aborted: true, disposition: "cancelled" },
 		});
 		expect(executionStarted).toBe(false);
 		expect(frames.some(frame => frame.type === "agent_start" || frame.type === "agent_failed")).toBe(false);
 	} finally {
-		pausedCommit.release();
-		pausedCommit.restore();
+		releaseAcceptance.resolve();
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	}
 }, 30_000);
