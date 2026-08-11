@@ -31,6 +31,7 @@ import {
 import { normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import { areJsonValuesEqual } from "../utils/schema";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
 const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES = new Set([
@@ -405,6 +406,13 @@ export async function processResponsesStream<TApi extends Api>(
 		summaryBuffer: string;
 		rawBuffer: string;
 		summaryStarted: boolean;
+		/**
+		 * Raw `arguments` carried by the item's `response.output_item.added` snapshot.
+		 * Kept out of the streaming buffer (a relay may put a `{}` placeholder here)
+		 * but retained as the lowest-precedence source for relays that supply the
+		 * real payload only in that snapshot.
+		 */
+		addedArguments: string;
 	}
 	// Per-item argument buffer keyed on stable item identity. Multiple tool-call
 	// items can stream interleaved argument deltas in one response, so a single
@@ -412,6 +420,7 @@ export async function processResponsesStream<TApi extends Api>(
 	const items = new Map<string, ItemEntry>();
 	let lastKey: string | null = null;
 	const idKey = (id: string) => `id:${id}`;
+	const callKey = (id: string) => `call:${id}`;
 	const idxKey = (n: number) => `idx:${n}`;
 	const hasIndex = (n: number | undefined): n is number => typeof n === "number" && Number.isFinite(n);
 	const resolveEntry = (
@@ -429,6 +438,8 @@ export async function processResponsesStream<TApi extends Api>(
 		if (itemId) {
 			const byId = items.get(idKey(itemId));
 			if (byId) return byId;
+			const byCallId = items.get(callKey(itemId));
+			if (byCallId) return byCallId;
 		}
 		if (hasIndex(outputIndex)) {
 			const byIdx = items.get(idxKey(outputIndex));
@@ -448,6 +459,7 @@ export async function processResponsesStream<TApi extends Api>(
 			summaryBuffer: "",
 			rawBuffer: "",
 			summaryStarted: false,
+			addedArguments: item.type === "function_call" ? (item.arguments ?? "") : "",
 		};
 		// Primary key prefers the stable item id; if the wire omits it, fall back to
 		// the positional index. A synthetic key keeps the entry addressable as lastKey
@@ -455,16 +467,23 @@ export async function processResponsesStream<TApi extends Api>(
 		const key = item.id ? idKey(item.id) : hasIndex(outputIndex) ? idxKey(outputIndex) : `seq:${items.size}`;
 		items.set(key, entry);
 		if (item.id && hasIndex(outputIndex)) items.set(idxKey(outputIndex), entry);
+		if ((item.type === "function_call" || item.type === "custom_tool_call") && item.call_id) {
+			items.set(callKey(item.call_id), entry);
+		}
 		lastKey = key;
 		return entry;
 	};
-	const dropEntry = (itemId: string | undefined, outputIndex: number | undefined): void => {
-		const key = itemId ? idKey(itemId) : hasIndex(outputIndex) ? idxKey(outputIndex) : null;
-		if (key) {
+	const dropEntry = (itemId: string | undefined, outputIndex: number | undefined, callId?: string): void => {
+		const entry =
+			(itemId ? (items.get(idKey(itemId)) ?? items.get(callKey(itemId))) : undefined) ??
+			(callId ? items.get(callKey(callId)) : undefined) ??
+			(hasIndex(outputIndex) ? items.get(idxKey(outputIndex)) : undefined);
+		if (!entry) return;
+		for (const [key, candidate] of items) {
+			if (candidate !== entry) continue;
 			items.delete(key);
 			if (lastKey === key) lastKey = null;
 		}
-		if (itemId && hasIndex(outputIndex)) items.delete(idxKey(outputIndex));
 	};
 	let sawFirstToken = false;
 
@@ -492,7 +511,7 @@ export async function processResponsesStream<TApi extends Api>(
 					id: encodeResponsesToolCallId(item.call_id, item.id),
 					name: item.name,
 					arguments: {},
-					partialJson: item.arguments || "",
+					partialJson: "",
 				};
 				const entry = registerEntry(item, block, outputIndex);
 				stream.push({ type: "toolcall_start", contentIndex: entry.blockContentIndex, partial: output });
@@ -649,7 +668,13 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.output_item.done") {
 			const item = structuredCloneJSON(event.item);
 			options?.onOutputItemDone?.(item);
-			const entry = resolveEntry(item.id, event.output_index, "never");
+			// A tool item may be registered under its call id alone (relays that omit
+			// item ids in `added`) and then introduce an item id in the terminal event,
+			// so both identities are tried before the positional fallback.
+			const isToolItem = item.type === "function_call" || item.type === "custom_tool_call";
+			const entry =
+				resolveEntry(item.id, event.output_index, "never") ??
+				(isToolItem && item.call_id ? resolveEntry(item.call_id, event.output_index, "never") : undefined);
 			if (item.type === "reasoning") {
 				// Prefer the streamed summary buffer only when it carries real text. When it
 				// holds only synthetic separators (e.g. a part.done arrived before/without any
@@ -732,26 +757,55 @@ export async function processResponsesStream<TApi extends Api>(
 				});
 				dropEntry(item.id, event.output_index);
 			} else if (item.type === "function_call") {
-				// Finalize onto the same block object stored in output.content, reading
-				// the matching entry's buffered partialJson first and only then the done
-				// item's arguments — never an adjacent item's buffer.
-				const args =
-					entry?.block.type === "toolCall" && entry.block.partialJson
-						? parseStreamingJson(entry.block.partialJson)
-						: parseStreamingJson(item.arguments || "{}");
+				// The terminal item is canonical. Some compatible Responses relays put an
+				// empty placeholder in output_item.added and only provide real arguments
+				// here. When streamed arguments also exist, require agreement rather than
+				// silently choosing one source — but compare the decoded payloads, since a
+				// relay that re-serializes the terminal item (different key spacing or
+				// escaping) is not a disagreement about what the model asked for.
+				const streamedArguments = entry?.block.type === "toolCall" ? entry.block.partialJson : "";
+				const finalArguments = item.arguments ?? "";
+				const hasStreamedArguments = streamedArguments.length > 0;
+				const hasFinalArguments = finalArguments.length > 0;
+				const conflictingArgumentSources =
+					hasStreamedArguments &&
+					hasFinalArguments &&
+					streamedArguments !== finalArguments &&
+					!isEquivalentJsonPayload(streamedArguments, finalArguments);
+				// Source precedence: terminal, then streamed deltas, then the `added`
+				// snapshot. The last one only matters for relays that never emit deltas
+				// and leave the terminal `arguments` empty; without it their real payload
+				// would silently degrade to `{}`.
+				const rawArguments = hasFinalArguments
+					? finalArguments
+					: hasStreamedArguments
+						? streamedArguments
+						: (entry?.addedArguments ?? "");
+				const decodedArguments =
+					conflictingArgumentSources || !isCompleteJson(rawArguments)
+						? undefined
+						: parseStreamingJson(rawArguments);
+				// Function-call arguments must decode to a JSON object; `null`, arrays and
+				// scalars cannot be dispatched against a tool schema, so they fail closed
+				// instead of reaching validation as a non-record value.
+				const incompleteArguments = !isJsonRecord(decodedArguments);
+				const args = incompleteArguments ? {} : (decodedArguments as Record<string, unknown>);
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
 					name: item.name,
 					arguments: args,
+					...(incompleteArguments ? { incompleteArguments: true } : {}),
 				};
 				if (entry?.block.type === "toolCall") {
 					entry.block.id = toolCall.id;
 					entry.block.name = toolCall.name;
 					entry.block.arguments = args;
+					if (incompleteArguments) entry.block.incompleteArguments = true;
+					else delete entry.block.incompleteArguments;
 				}
 				const contentIndex = entry?.blockContentIndex ?? output.content.length - 1;
-				dropEntry(item.id, event.output_index);
+				dropEntry(item.id, event.output_index, item.call_id);
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			} else if (item.type === "custom_tool_call") {
 				const rawInput =
@@ -771,7 +825,7 @@ export async function processResponsesStream<TApi extends Api>(
 					entry.block.arguments = { input: rawInput };
 				}
 				const contentIndex = entry?.blockContentIndex ?? output.content.length - 1;
-				dropEntry(item.id, event.output_index);
+				dropEntry(item.id, event.output_index, item.call_id);
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			}
 		} else if (event.type === "response.completed") {
@@ -817,6 +871,26 @@ export async function processResponsesStream<TApi extends Api>(
 					: "Unknown error (no error details in response)";
 			throw new Error(message);
 		}
+	}
+}
+
+/**
+ * Whether two raw JSON argument strings decode to the same value. Used to tell a
+ * relay's re-serialization of the same tool arguments apart from a genuine
+ * disagreement between the streamed and terminal payloads; anything that does
+ * not decode cleanly on both sides is treated as a disagreement (fail closed).
+ */
+/** Whether a decoded JSON value is a plain object usable as tool-call arguments. */
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isEquivalentJsonPayload(left: string, right: string): boolean {
+	if (!isCompleteJson(left) || !isCompleteJson(right)) return false;
+	try {
+		return areJsonValuesEqual(JSON.parse(left), JSON.parse(right));
+	} catch {
+		return false;
 	}
 }
 
