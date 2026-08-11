@@ -519,3 +519,50 @@ test("SdkClient clamps reconnect backoff to the configured per-attempt ceiling",
 		await client.close();
 	});
 });
+
+test("SdkClient treats explicit server unavailable as terminal, not uncertain_after_send", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		// Send a request that gets an explicit server rejection.
+		const rejected = client.control("rejected");
+		await flush();
+		expect(socket.sent).toHaveLength(1);
+		const frame = sent(socket);
+		// Simulate the server sending back an unavailable rejection.
+		socket.message({
+			type: "control_response",
+			id: frame.id as string,
+			ok: false,
+			error: { code: "unavailable", message: "broker publication unavailable" },
+		});
+		await flush();
+		// The outcome is known: the server rejected it. It must stay "unavailable",
+		// not become "uncertain_after_send".
+		await expect(rejected).rejects.toMatchObject({ code: "unavailable" });
+		await client.close();
+	});
+});
+
+test("SdkClient still converts timeout and connection_closed after send to uncertain_after_send", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0, timeoutMs: 50 });
+		const socket = await connect(client);
+		// timeout after send -> uncertain_after_send
+		const timedOut = client.control("timeout-test");
+		await flush();
+		expect(socket.sent).toHaveLength(1);
+		clock.advanceBy(60);
+		await expect(timedOut).rejects.toMatchObject({ code: "uncertain_after_send" });
+
+		// connection_closed after send -> uncertain_after_send
+		const lost = client.control("lost-test");
+		await flush();
+		expect(socket.sent).toHaveLength(2);
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		await expect(lost).rejects.toMatchObject({ code: "uncertain_after_send" });
+
+		await client.close();
+	});
+});

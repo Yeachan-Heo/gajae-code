@@ -704,7 +704,7 @@ export class SdkClient {
 			if (
 				pending.sent &&
 				result instanceof SdkClientError &&
-				(result.code === "timeout" || result.code === "connection_closed" || result.code === "unavailable")
+				(result.code === "timeout" || result.code === "connection_closed")
 			)
 				pending.reject(
 					new SdkClientError(
