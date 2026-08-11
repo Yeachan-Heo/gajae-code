@@ -53,7 +53,7 @@ import {
 	type ScopedModelSelection,
 } from "../config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "../config/prompt-templates";
-import { Settings, type SkillsSettings } from "../config/settings";
+import { type SettingPath, Settings, type SkillsSettings } from "../config/settings";
 import { CursorExecHandlers } from "../cursor";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import "../discovery";
@@ -1294,29 +1294,36 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		applyConfiguredSearchTimeout(settings);
 
-		const imageProvider = settings.get("providers.image");
-		const imageModel = settings.get("providers.imageModel");
-		const imageCustomUrl = settings.get("providers.imageCustomUrl");
-		const imageCustomKey = settings.get("providers.imageCustomKey");
-		const imageCustomKeyEnv = settings.get("providers.imageCustomKeyEnv");
-		if (
-			imageProvider === "auto" ||
-			imageProvider === "openai" ||
-			imageProvider === "gemini" ||
-			imageProvider === "openrouter" ||
-			imageProvider === "antigravity" ||
-			imageProvider === "alibaba" ||
-			imageProvider === "custom"
-		) {
-			const { setConfiguredImageModel, setPreferredImageProvider } = await import("../tools/image-gen");
-			setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
-			setConfiguredImageModel({
-				provider: imageProvider,
-				model: imageModel ?? null,
-				customUrl: imageCustomUrl,
-				customKey: imageCustomKey,
-				customKeyEnv: imageCustomKeyEnv,
-			});
+		// Migrate legacy custom image endpoint: register as a first-class provider
+		// if the migration stashed pending provider details in the raw config.
+		const pendingImageProvider = settings.getGlobal("migrations.imageCustomProvider" as SettingPath) as
+			| { providerId: string; baseUrl: string; apiKey?: string; modelId: string }
+			| undefined;
+		if (pendingImageProvider) {
+			try {
+				const { addApiCompatibleProvider } = await import("../setup/provider-onboarding");
+				await addApiCompatibleProvider({
+					providerId: pendingImageProvider.providerId,
+					baseUrl: pendingImageProvider.baseUrl,
+					apiKey: pendingImageProvider.apiKey,
+					models: [pendingImageProvider.modelId],
+					force: true,
+				});
+				// Clear the migration marker from the raw config.
+				await settings.commitAtomicBatchWithCurrent(current => {
+					const mutable = current as Record<string, unknown>;
+					const migrations = (mutable.migrations ?? {}) as Record<string, unknown>;
+					delete migrations.imageCustomProvider;
+					if (Object.keys(migrations).length === 0) {
+						delete mutable.migrations;
+					} else {
+						mutable.migrations = migrations;
+					}
+					return [];
+				});
+			} catch {
+				// Provider registration may fail if models.yml is read-only.
+			}
 		}
 
 		const sessionManager =
@@ -1860,9 +1867,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const pluginMcpToolNames: string[] = [];
 		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
 
-		// Add image tools when the active model or configured image providers can generate images.
+		// Add image tools when an image role model is configured.
 		const { getImageGenTools } = await import("../tools/image-gen");
-		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
+		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, settings));
 		if (imageGenTools.length > 0) {
 			customTools.push(...(imageGenTools as unknown as CustomTool[]));
 		}

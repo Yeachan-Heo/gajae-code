@@ -57,7 +57,14 @@ export const ModelCompatSchema = z.object({
 export const OpenAICompatSchema = ModelCompatSchema;
 
 export const GJC_MODEL_EFFORT_IDS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
-export const GJC_MODEL_ASSIGNMENT_TARGET_IDS = ["default", "executor", "architect", "planner", "critic"] as const;
+export const GJC_MODEL_ASSIGNMENT_TARGET_IDS = [
+	"default",
+	"executor",
+	"architect",
+	"planner",
+	"critic",
+	"image",
+] as const;
 export const EffortSchema = z.enum(GJC_MODEL_EFFORT_IDS);
 const CacheRetentionSchema = z.enum(["none", "short", "long"]);
 

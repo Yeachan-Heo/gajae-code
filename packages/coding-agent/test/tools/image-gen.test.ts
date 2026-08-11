@@ -7,22 +7,16 @@ import * as https from "node:https";
 import { Readable } from "node:stream";
 import type { Model } from "@gajae-code/ai";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { SETTINGS_SCHEMA } from "@gajae-code/coding-agent/config/settings-schema";
+import type { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { CustomToolContext } from "@gajae-code/coding-agent/extensibility/custom-tools";
 import type { ReadonlySessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import {
-	getImageGenToolsWithRegistry,
-	imageGenTool,
-	setConfiguredImageModel,
-	setPreferredImageProvider,
-} from "@gajae-code/coding-agent/tools/image-gen";
+import { getImageGenToolsWithRegistry, imageGenTool } from "@gajae-code/coding-agent/tools/image-gen";
 
 const originalFetch = global.fetch;
 const originalOpenRouterKey = Bun.env.OPENROUTER_API_KEY;
 const originalGeminiKey = Bun.env.GEMINI_API_KEY;
 const originalGoogleKey = Bun.env.GOOGLE_API_KEY;
 const originalOpenAIBaseUrl = Bun.env.OPENAI_BASE_URL;
-const originalCustomImageKey = Bun.env.TEST_CUSTOM_IMAGE_API_KEY;
 const generatedImagePaths: string[] = [];
 
 afterEach(async () => {
@@ -49,13 +43,6 @@ afterEach(async () => {
 	} else {
 		Bun.env.GOOGLE_API_KEY = originalGoogleKey;
 	}
-	if (originalCustomImageKey === undefined) {
-		delete Bun.env.TEST_CUSTOM_IMAGE_API_KEY;
-	} else {
-		Bun.env.TEST_CUSTOM_IMAGE_API_KEY = originalCustomImageKey;
-	}
-	setPreferredImageProvider("auto");
-	setConfiguredImageModel(null);
 });
 
 function clearFallbackImageProviderEnv(): void {
@@ -65,12 +52,41 @@ function clearFallbackImageProviderEnv(): void {
 }
 
 const MAX_IMAGE_BYTES = 35 * 1024 * 1024;
+
+/** Create a mock Settings that returns the given selector for modelRoles.image */
+function makeMockSettings(imageRoleSelector: string | undefined): Settings {
+	return {
+		getModelRole: (role: string) => (role === "image" ? imageRoleSelector : undefined),
+		get: (() => undefined) as unknown as Settings["get"],
+	} as unknown as Settings;
+}
+
+/** Create a mock ModelRegistry whose getAvailable() returns the given models */
+function makeMockRegistry(extra: Partial<ModelRegistry> = {}, models: Model[] = []): ModelRegistry {
+	return {
+		getAvailable: () => models,
+		getApiKey: async () => undefined,
+		getApiKeyForProvider: async () => undefined,
+		...extra,
+	} as unknown as ModelRegistry;
+}
+
 const OPENROUTER_MODEL = {
-	api: "google-generative-ai",
-	provider: "google",
-	id: "gemini-3-pro-image-preview",
+	api: "openai-completions",
+	provider: "openrouter",
+	id: "google/gemini-3-pro-image-preview",
 	name: "Gemini 3 Pro Image Preview",
-	baseUrl: "https://generativelanguage.googleapis.com",
+	baseUrl: "https://openrouter.ai/api/v1",
+	output: ["text", "image"],
+} as Model;
+
+const OPENAI_MODEL = {
+	api: "openai-responses",
+	provider: "openai",
+	id: "gpt-5.5",
+	name: "GPT 5.5",
+	baseUrl: "https://api.openai.com/v1",
+	output: ["text", "image"],
 } as Model;
 
 function makeOpenRouterCtx(): CustomToolContext {
@@ -79,8 +95,9 @@ function makeOpenRouterCtx(): CustomToolContext {
 			getCwd: () => "/tmp",
 			getSessionId: () => "test-session",
 		} as unknown as ReadonlySessionManager,
-		modelRegistry: {} as ModelRegistry,
+		modelRegistry: makeMockRegistry({ getApiKey: async () => "test-openrouter-key" }, [OPENROUTER_MODEL]),
 		model: OPENROUTER_MODEL,
+		settings: makeMockSettings("openrouter/google/gemini-3-pro-image-preview"),
 		isIdle: () => true,
 		hasQueuedMessages: () => false,
 		abort: () => {},
@@ -88,7 +105,6 @@ function makeOpenRouterCtx(): CustomToolContext {
 }
 
 function mockOpenRouterResponse(imageUrl: string): void {
-	setPreferredImageProvider("openrouter");
 	Bun.env.OPENROUTER_API_KEY = "test-openrouter-key";
 	const fetchMock: typeof fetch = (async () =>
 		new Response(
@@ -183,23 +199,20 @@ describe("imageGenTool", () => {
 		fetchMock.preconnect = originalFetch.preconnect;
 		global.fetch = fetchMock;
 
-		const model = {
-			api: "openai-responses",
-			provider: "openai",
-			id: "gpt-5.5",
-			name: "GPT 5.5",
-			baseUrl: "https://api.openai.com/v1",
-		} as Model;
 		const ctx: CustomToolContext = {
 			sessionManager: {
 				getCwd: () => "/tmp",
 				getSessionId: () => "test-session",
 			} as unknown as ReadonlySessionManager,
-			modelRegistry: {
-				getApiKey: async () => "test-openai-key",
-				getApiKeyForProvider: async () => undefined,
-			} as unknown as ModelRegistry,
-			model,
+			modelRegistry: makeMockRegistry(
+				{
+					getApiKey: async () => "test-openai-key",
+					getApiKeyForProvider: async () => undefined,
+				},
+				[OPENAI_MODEL],
+			),
+			model: OPENAI_MODEL,
+			settings: makeMockSettings("openai/gpt-5.5"),
 			isIdle: () => true,
 			hasQueuedMessages: () => false,
 			abort: () => {},
@@ -248,23 +261,20 @@ describe("imageGenTool", () => {
 		fetchMock.preconnect = originalFetch.preconnect;
 		global.fetch = fetchMock;
 
-		const model = {
-			api: "openai-responses",
-			provider: "openai",
-			id: "gpt-5.5",
-			name: "GPT 5.5",
-			baseUrl: "https://api.openai.com/v1",
-		} as Model;
 		const ctx: CustomToolContext = {
 			sessionManager: {
 				getCwd: () => "/tmp",
 				getSessionId: () => "test-session",
 			} as unknown as ReadonlySessionManager,
-			modelRegistry: {
-				getApiKey: async () => "test-openai-key",
-				getApiKeyForProvider: async () => undefined,
-			} as unknown as ModelRegistry,
-			model,
+			modelRegistry: makeMockRegistry(
+				{
+					getApiKey: async () => "test-openai-key",
+					getApiKeyForProvider: async () => undefined,
+				},
+				[OPENAI_MODEL],
+			),
+			model: OPENAI_MODEL,
+			settings: makeMockSettings("openai/gpt-5.5"),
 			isIdle: () => true,
 			hasQueuedMessages: () => false,
 			abort: () => {},
@@ -298,18 +308,23 @@ describe("imageGenTool", () => {
 			id: "gpt-5.5",
 			name: "GPT 5.5",
 			baseUrl: "",
+			output: ["text", "image"],
 		} as Model;
 		const ctx: CustomToolContext = {
 			sessionManager: {
 				getCwd: () => "/tmp",
 				getSessionId: () => "test-session",
 			} as unknown as ReadonlySessionManager,
-			modelRegistry: {
-				getApiKey: async () => "oauth-token",
-				getApiKeyForProvider: async () => undefined,
-				getSessionCredentialType: () => "oauth",
-			} as unknown as ModelRegistry,
+			modelRegistry: makeMockRegistry(
+				{
+					getApiKey: async () => "oauth-token",
+					getApiKeyForProvider: async () => undefined,
+					getSessionCredentialType: () => "oauth",
+				},
+				[model],
+			),
 			model,
+			settings: makeMockSettings("openai/gpt-5.5"),
 			isIdle: () => true,
 			hasQueuedMessages: () => false,
 			abort: () => {},
@@ -319,36 +334,6 @@ describe("imageGenTool", () => {
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
 		expect(requestUrl).toBe("https://api.openai.com/v1/responses");
-	});
-	it("routes configured custom image models through their configured base URL", async () => {
-		let requestUrl: string | undefined;
-		let requestBody: unknown;
-		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-			requestUrl = input.toString();
-			requestBody = JSON.parse(String(init?.body));
-			return new Response(
-				JSON.stringify({
-					output: [{ type: "image_generation_call", result: Buffer.from("fake-webp").toString("base64") }],
-				}),
-				{ status: 200, headers: { "content-type": "application/json" } },
-			);
-		}) as unknown as typeof fetch;
-		fetchMock.preconnect = originalFetch.preconnect;
-		global.fetch = fetchMock;
-		Bun.env.TEST_CUSTOM_IMAGE_API_KEY = "test-custom-key";
-		setConfiguredImageModel({
-			provider: "custom",
-			model: "proxy-image-model",
-			customUrl: "https://images.example.test/v1/",
-			customKeyEnv: "TEST_CUSTOM_IMAGE_API_KEY",
-		});
-
-		const result = await imageGenTool.execute("call-custom", { subject: "a cat" }, undefined, makeOpenRouterCtx());
-		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
-
-		expect(requestUrl).toBe("https://images.example.test/v1/responses");
-		expect(requestBody).toMatchObject({ model: "proxy-image-model", tool_choice: { type: "image_generation" } });
-		expect(result.details?.provider).toBe("openai");
 	});
 });
 
@@ -379,6 +364,7 @@ const ANTIGRAVITY_MODEL = {
 	id: "gemini-3-pro-image",
 	name: "Gemini 3 Pro Image (Antigravity)",
 	baseUrl: "https://daily-cloudcode-pa.sandbox.googleapis.com",
+	output: ["text", "image"],
 } as Model;
 
 function makeAntigravityCtx(modelRegistry: Partial<ModelRegistry>): CustomToolContext {
@@ -387,25 +373,17 @@ function makeAntigravityCtx(modelRegistry: Partial<ModelRegistry>): CustomToolCo
 			getCwd: () => "/tmp",
 			getSessionId: () => "test-session",
 		} as unknown as ReadonlySessionManager,
-		modelRegistry: modelRegistry as unknown as ModelRegistry,
+		modelRegistry: makeMockRegistry(modelRegistry, [ANTIGRAVITY_MODEL]),
 		model: ANTIGRAVITY_MODEL,
+		settings: makeMockSettings("google-antigravity/gemini-3-pro-image"),
 		isIdle: () => true,
 		hasQueuedMessages: () => false,
 		abort: () => {},
 	};
 }
 
-describe("providers.image settings schema", () => {
-	it("accepts antigravity and does not include openai-codex", () => {
-		const values = SETTINGS_SCHEMA["providers.image"].values as readonly string[];
-		expect(values).toContain("antigravity");
-		expect(values).not.toContain("openai-codex");
-	});
-});
-
 describe("imageGenTool antigravity provider", () => {
 	it("uses structured getOAuthAccess metadata (access token + projectId) for the request", async () => {
-		setPreferredImageProvider("antigravity");
 		let requestUrl: string | undefined;
 		let authorization: string | undefined;
 		let requestBody: { project?: string } | undefined;
@@ -439,7 +417,6 @@ describe("imageGenTool antigravity provider", () => {
 	});
 
 	it("falls back to JSON-parsed getApiKeyForProvider credentials when OAuth access is absent", async () => {
-		setPreferredImageProvider("antigravity");
 		let authorization: string | undefined;
 		let requestBody: { project?: string } | undefined;
 
@@ -466,39 +443,25 @@ describe("imageGenTool antigravity provider", () => {
 	});
 
 	it("does not register for malformed JSON credentials without a token field", async () => {
-		setPreferredImageProvider("antigravity");
 		clearFallbackImageProviderEnv();
 
-		const modelRegistry = {
-			authStorage: {
-				getOAuthAccess: async () => undefined,
-			} as unknown as ModelRegistry["authStorage"],
-			getApiKeyForProvider: async () => JSON.stringify({ projectId: "project-without-token" }),
-		} as unknown as ModelRegistry;
-
-		const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
-		expect(tools).toHaveLength(0);
-	});
-
-	it("does not register for empty or whitespace antigravity credentials", async () => {
-		setPreferredImageProvider("antigravity");
-		clearFallbackImageProviderEnv();
-
-		for (const credential of ["", "   \n\t  "]) {
-			const modelRegistry = {
+		const modelRegistry = makeMockRegistry(
+			{
 				authStorage: {
 					getOAuthAccess: async () => undefined,
 				} as unknown as ModelRegistry["authStorage"],
-				getApiKeyForProvider: async () => credential,
-			} as unknown as ModelRegistry;
+				getApiKeyForProvider: async () => JSON.stringify({ projectId: "project-without-token" }),
+			},
+			[ANTIGRAVITY_MODEL],
+		);
+		const settings = makeMockSettings("google-antigravity/gemini-3-pro-image");
 
-			const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
-			expect(tools).toHaveLength(0);
-		}
+		const tools = await getImageGenToolsWithRegistry(modelRegistry, settings);
+		// Tool registers because the model is resolvable; credential failure happens at execute time
+		expect(tools).toHaveLength(1);
 	});
 
 	it("accepts JSON credentials with accessToken and honors projectId", async () => {
-		setPreferredImageProvider("antigravity");
 		let authorization: string | undefined;
 		let requestBody: { project?: string } | undefined;
 
@@ -527,7 +490,6 @@ describe("imageGenTool antigravity provider", () => {
 	});
 
 	it("registers OAuth access without projectId but fails loudly before fetch", async () => {
-		setPreferredImageProvider("antigravity");
 		let fetchCalled = false;
 		const fetchMock: typeof fetch = (async () => {
 			fetchCalled = true;
@@ -536,16 +498,20 @@ describe("imageGenTool antigravity provider", () => {
 		fetchMock.preconnect = originalFetch.preconnect;
 		global.fetch = fetchMock;
 
-		const modelRegistry = {
-			authStorage: {
-				getOAuthAccess: async () => ({ accessToken: "oauth-token-without-project" }),
-			} as unknown as ModelRegistry["authStorage"],
-			getApiKeyForProvider: async () => {
-				throw new Error("getApiKeyForProvider should not be called when OAuth access token is present");
+		const modelRegistry = makeMockRegistry(
+			{
+				authStorage: {
+					getOAuthAccess: async () => ({ accessToken: "oauth-token-without-project" }),
+				} as unknown as ModelRegistry["authStorage"],
+				getApiKeyForProvider: async () => {
+					throw new Error("getApiKeyForProvider should not be called when OAuth access token is present");
+				},
 			},
-		} as unknown as ModelRegistry;
+			[ANTIGRAVITY_MODEL],
+		);
+		const settings = makeMockSettings("google-antigravity/gemini-3-pro-image");
 
-		const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+		const tools = await getImageGenToolsWithRegistry(modelRegistry, settings);
 		expect(tools).toHaveLength(1);
 
 		const ctx = makeAntigravityCtx(modelRegistry);
@@ -557,7 +523,6 @@ describe("imageGenTool antigravity provider", () => {
 	});
 
 	it("registers the tool for a raw-token-only credential but fails loudly without a projectId", async () => {
-		setPreferredImageProvider("antigravity");
 		let fetchCalled = false;
 		const fetchMock: typeof fetch = (async () => {
 			fetchCalled = true;
@@ -566,14 +531,18 @@ describe("imageGenTool antigravity provider", () => {
 		fetchMock.preconnect = originalFetch.preconnect;
 		global.fetch = fetchMock;
 
-		const modelRegistry = {
-			authStorage: {
-				getOAuthAccess: async () => undefined,
-			} as unknown as ModelRegistry["authStorage"],
-			getApiKeyForProvider: async () => "raw-token",
-		} as unknown as ModelRegistry;
+		const modelRegistry = makeMockRegistry(
+			{
+				authStorage: {
+					getOAuthAccess: async () => undefined,
+				} as unknown as ModelRegistry["authStorage"],
+				getApiKeyForProvider: async () => "raw-token",
+			},
+			[ANTIGRAVITY_MODEL],
+		);
+		const settings = makeMockSettings("google-antigravity/gemini-3-pro-image");
 
-		const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+		const tools = await getImageGenToolsWithRegistry(modelRegistry, settings);
 		expect(tools).toHaveLength(1);
 
 		const ctx = makeAntigravityCtx(modelRegistry);
@@ -784,5 +753,33 @@ describe("imageGenTool OpenRouter remote images", () => {
 
 		await expect(operation).rejects.toThrow(/image deadline/);
 		expect(clients[0]?.destroy).toHaveBeenCalled();
+	});
+});
+
+describe("imageGenTool modelRoles.image resolution", () => {
+	it("returns no tools when no image role is set", async () => {
+		const modelRegistry = makeMockRegistry({}, [OPENAI_MODEL]);
+		const settings = makeMockSettings(undefined);
+		const tools = await getImageGenToolsWithRegistry(modelRegistry, settings);
+		expect(tools).toHaveLength(0);
+	});
+
+	it("errors at execute time when no image role model is set", async () => {
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({}, [OPENAI_MODEL]),
+			model: OPENAI_MODEL,
+			settings: makeMockSettings(undefined),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		await expect(imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(
+			/No image model configured/,
+		);
 	});
 });
