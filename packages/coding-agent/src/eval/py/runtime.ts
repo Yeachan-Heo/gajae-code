@@ -25,6 +25,7 @@ export interface PythonRuntimeLifecycleOptions {
 }
 
 const RUNTIME_CANCEL_GRACE_MS = 1_000;
+const RUNTIME_PROCESS_TREE_EXIT_TIMEOUT_MS = 5_000;
 
 const DEFAULT_ENV_ALLOWLIST = new Set([
 	"PATH",
@@ -287,19 +288,21 @@ async function runRuntimeCommand(
 			() => undefined,
 		);
 	};
-	const waitForProcessTreeExit = async (): Promise<void> => {
+	const waitForProcessTreeExit = async (): Promise<boolean> => {
 		if (process.platform === "win32") {
 			await windowsTermination;
-			return;
+			return true;
 		}
-		while (true) {
+		const deadline = Date.now() + RUNTIME_PROCESS_TREE_EXIT_TIMEOUT_MS;
+		while (Date.now() < deadline) {
 			try {
 				process.kill(-proc.pid, 0);
 				await Bun.sleep(10);
 			} catch {
-				return;
+				return true;
 			}
 		}
+		return false;
 	};
 	const cancel = (timedOut: boolean): void => {
 		if (cancellation) return;
@@ -340,8 +343,13 @@ async function runRuntimeCommand(
 	void proc.exited.then(async code => {
 		const cancelled = cancellation;
 		if (cancelled) {
-			await waitForProcessTreeExit();
-			finish(() => reject(createRuntimeCancellationError(cancelled.timedOut)));
+			const processTreeExited = await waitForProcessTreeExit();
+			finish(() => {
+				const error = createRuntimeCancellationError(cancelled.timedOut);
+				if (!processTreeExited)
+					error.message += "; Python provisioner process tree did not exit after cancellation";
+				reject(error);
+			});
 			return;
 		}
 		finish(() => resolve(code));
