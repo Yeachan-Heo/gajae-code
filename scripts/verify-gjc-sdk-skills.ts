@@ -29,8 +29,8 @@ const typeScriptPath = path.join("gjc-sdk-author", "templates", "direct-sdk.ts")
 const pythonPath = path.join("gjc-sdk-author", "templates", "direct-sdk.py");
 const expectedPaths = [discoverPath, operatePath, authorPath, typeScriptPath, pythonPath, BUNDLE_MANIFEST_NAME].sort();
 const actualPaths = [...files.keys()].sort();
-const unexpectedFiles = findUnexpectedSdkSkillFiles(files);
-const manifestProblem = validateInstalledBundle();
+const unexpectedFiles = await findUnexpectedSdkSkillFiles(files);
+const manifestProblem = await validateInstalledBundle();
 
 gate("exact six-file versioned bundle", JSON.stringify(actualPaths) === JSON.stringify(expectedPaths), actualPaths.join(", "));
 gate("no unexpected generated files", unexpectedFiles.length === 0, unexpectedFiles.join(", ") || "none");

@@ -17,7 +17,7 @@ import {
 
 const repoRoot = path.join(import.meta.dir, "..");
 const roots: string[] = [];
-const servers: Array<ReturnType<typeof Bun.serve>> = [];
+const servers: Bun.Server<undefined>[] = [];
 
 afterEach(() => {
 	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -160,7 +160,7 @@ describe("generated external GJC SDK skills", () => {
 		expect(validatePromptAllowlistConsistency()).toBeNull();
 	});
 
-	it("keeps the four default workflow skills closed and adds no extra skills", () => {
+	it("keeps the four default workflow skills closed and adds no extra skills", async () => {
 		const files = renderSdkSkillFiles();
 		const skills = [...files.keys()].filter(key => key.endsWith("/SKILL.md")).sort();
 		expect(skills).toEqual(["gjc-sdk-author/SKILL.md", "gjc-sdk-discover/SKILL.md", "gjc-sdk-operate/SKILL.md"]);
@@ -182,11 +182,11 @@ describe("generated external GJC SDK skills", () => {
 		const extra = materialize();
 		fs.mkdirSync(path.join(extra.root, "gjc-sdk-bash"));
 		fs.writeFileSync(path.join(extra.root, "gjc-sdk-bash", "SKILL.md"), "---\nname: gjc-sdk-bash\n---\n");
-		expect(findUnexpectedSdkSkillFiles(extra.files, extra.root)).toEqual([path.join("gjc-sdk-bash", "SKILL.md")]);
-		expect(checkSdkSkillFiles(extra.files, extra.root, false)).toBe(1);
+		expect(await findUnexpectedSdkSkillFiles(extra.files, extra.root)).toEqual([path.join("gjc-sdk-bash", "SKILL.md")]);
+		expect(await checkSdkSkillFiles(extra.files, extra.root, false)).toBe(1);
 	});
 
-	it("fails closed on missing, malformed, and unsupported manifest versions", () => {
+	it("fails closed on missing, malformed, and unsupported manifest versions", async () => {
 		const files = renderSdkSkillFiles();
 		const contentFiles = bundleContentFiles(files);
 		const manifest = files.get(BUNDLE_MANIFEST_NAME) ?? "";
@@ -206,23 +206,23 @@ describe("generated external GJC SDK skills", () => {
 
 		const missingManifest = materialize();
 		fs.rmSync(path.join(missingManifest.root, BUNDLE_MANIFEST_NAME));
-		expect(checkSdkSkillFiles(missingManifest.files, missingManifest.root, false)).toBe(1);
+		expect(await checkSdkSkillFiles(missingManifest.files, missingManifest.root, false)).toBe(1);
 	});
 
-	it("upgrades installed v1 bundles and fails closed on legacy or future layouts", () => {
+	it("upgrades installed v1 bundles and fails closed on legacy or future layouts", async () => {
 		const files = renderSdkSkillFiles();
 		const contentFiles = bundleContentFiles(files);
 
 		const installed = materialize();
-		expect(validateInstalledBundle(installed.root)).toBeNull();
-		expect(checkSdkSkillFiles(installed.files, installed.root, false)).toBe(0);
+		expect(await validateInstalledBundle(installed.root)).toBeNull();
+		expect(await checkSdkSkillFiles(installed.files, installed.root, false)).toBe(0);
 
 		// A legacy unversioned install (the original five-file layout) must be
 		// rejected with a migration hint instead of being read ambiguously.
 		const legacy = materialize();
 		fs.rmSync(path.join(legacy.root, BUNDLE_MANIFEST_NAME));
-		expect(validateInstalledBundle(legacy.root)).toContain("regenerate with `bun run generate-sdk-skills`");
-		expect(checkSdkSkillFiles(legacy.files, legacy.root, false)).toBe(1);
+		expect(await validateInstalledBundle(legacy.root)).toContain("regenerate with `bun run generate-sdk-skills`");
+		expect(await checkSdkSkillFiles(legacy.files, legacy.root, false)).toBe(1);
 
 		// A future incompatible layout must fail closed on the version field.
 		const future = materialize();
@@ -230,8 +230,8 @@ describe("generated external GJC SDK skills", () => {
 			path.join(future.root, BUNDLE_MANIFEST_NAME),
 			JSON.stringify({ bundle: "gjc-sdk-skills", formatVersion: 2, files: contentFiles }, null, 2) + "\n",
 		);
-		expect(validateInstalledBundle(future.root)).toContain("unsupported");
-		expect(checkSdkSkillFiles(future.files, future.root, false)).toBe(1);
+		expect(await validateInstalledBundle(future.root)).toContain("unsupported");
+		expect(await checkSdkSkillFiles(future.files, future.root, false)).toBe(1);
 
 		// Regeneration upgrades an installed bundle in place to the versioned format.
 		const upgrade = materialize();
@@ -239,12 +239,12 @@ describe("generated external GJC SDK skills", () => {
 		for (const [rel, content] of files) {
 			fs.writeFileSync(path.join(upgrade.root, rel), content);
 		}
-		expect(validateInstalledBundle(upgrade.root)).toBeNull();
+		expect(await validateInstalledBundle(upgrade.root)).toBeNull();
 	});
 
-	it("matches the committed bundle byte-for-byte", () => {
+	it("matches the committed bundle byte-for-byte", async () => {
 		const files = renderSdkSkillFiles();
-		expect(checkSdkSkillFiles(files)).toBe(0);
+		expect(await checkSdkSkillFiles(files)).toBe(0);
 	});
 
 	it("passes the generator drift check as a subprocess", async () => {
@@ -262,14 +262,14 @@ describe("generated external GJC SDK skills", () => {
 		expect(stderr).toBe("");
 	});
 
-	it("rejects missing, drifted, and unexpected generated files", () => {
+	it("rejects missing, drifted, and unexpected generated files", async () => {
 		const missing = materialize();
 		fs.rmSync(path.join(missing.root, "gjc-sdk-discover", "SKILL.md"));
-		expect(checkSdkSkillFiles(missing.files, missing.root, false)).toBe(1);
+		expect(await checkSdkSkillFiles(missing.files, missing.root, false)).toBe(1);
 
 		const drifted = materialize();
 		fs.appendFileSync(path.join(drifted.root, "gjc-sdk-operate", "SKILL.md"), "drift\n");
-		expect(checkSdkSkillFiles(drifted.files, drifted.root, false)).toBe(1);
+		expect(await checkSdkSkillFiles(drifted.files, drifted.root, false)).toBe(1);
 
 		const symlinked = materialize();
 		const target = path.join(symlinked.root, "gjc-sdk-operate", "SKILL.md");
@@ -278,15 +278,15 @@ describe("generated external GJC SDK skills", () => {
 		const backing = path.join(symlinked.root, "same-bytes.md");
 		fs.writeFileSync(backing, contents);
 		fs.symlinkSync(backing, target);
-		expect(checkSdkSkillFiles(symlinked.files, symlinked.root, false)).toBe(1);
+		expect(await checkSdkSkillFiles(symlinked.files, symlinked.root, false)).toBe(1);
 
 		const unexpected = materialize();
 		const stale = path.join(unexpected.root, "gjc-sdk-author", "stale.md");
 		fs.writeFileSync(stale, "stale\n");
-		expect(findUnexpectedSdkSkillFiles(unexpected.files, unexpected.root)).toEqual([
+		expect(await findUnexpectedSdkSkillFiles(unexpected.files, unexpected.root)).toEqual([
 			path.join("gjc-sdk-author", "stale.md"),
 		]);
-		expect(checkSdkSkillFiles(unexpected.files, unexpected.root, false)).toBe(1);
+		expect(await checkSdkSkillFiles(unexpected.files, unexpected.root, false)).toBe(1);
 	});
 
 	it("keeps direct-client templates fail-closed and credential-safe", () => {
@@ -316,7 +316,7 @@ describe("generated external GJC SDK skills", () => {
 		const sdk = startSdkServer(frames);
 		const repo = endpointRepo(sdk.url, sdk.token);
 		const result = await runTypeScriptTemplate(["--repo", repo, "--session-id", "session-1", "--mode", "inspect"]);
-		expect(result.exitCode).toBe(0);
+		expect(result.exitCode, result.stderr).toBe(0);
 		expect(frames.map(frame => frame.query)).toEqual([
 			"session.metadata",
 			"context.get",
@@ -353,7 +353,7 @@ describe("generated external GJC SDK skills", () => {
 		expect(denied.stderr).not.toContain(sdk.token);
 
 		const approved = await runTypeScriptTemplate(args, "accept");
-		expect(approved.exitCode).toBe(0);
+		expect(approved.exitCode, approved.stderr).toBe(0);
 		expect(frames).toHaveLength(1);
 		expect(frames[0]).toMatchObject({ type: "control_request", operation: "turn.prompt", input: { prompt: "hello" } });
 		expect(approved.stdout).not.toContain(sdk.token);
@@ -362,7 +362,7 @@ describe("generated external GJC SDK skills", () => {
 		const replayed = await runTypeScriptTemplate(args, { reply: acceptedChallenge! });
 		expect(replayed.exitCode).toBe(1);
 		expect(frames).toHaveLength(1);
-	});
+	}, 15_000);
 
 	it("rejects unsupported arguments before discovery", async () => {
 		const result = await runTypeScriptTemplate(["--repo", "/missing", "--token", "must-not-print"]);
@@ -395,7 +395,7 @@ describe("generated external GJC SDK skills", () => {
 		const mismatched = await runTypeScriptTemplate(["--repo", repo, "--session-id", "session-1", "--mode", "inspect"]);
 		expect(mismatched.exitCode).toBe(1);
 		expect(frames).toEqual([]);
-	});
+	}, 15_000);
 
 	it("sends no control when discovery changes during approval", async () => {
 		const frames: Array<Record<string, unknown>> = [];

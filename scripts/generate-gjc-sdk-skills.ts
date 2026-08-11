@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -89,20 +89,20 @@ export function validateBundleManifest(manifestContent: string | null, expectedF
 	return null;
 }
 
-export function readBundleManifest(root = bundleDir): string | null {
+export async function readBundleManifest(root = bundleDir): Promise<string | null> {
 	const target = path.join(root, BUNDLE_MANIFEST_NAME);
 	try {
-		const stat = fs.lstatSync(target);
+		const stat = await fs.lstat(target);
 		if (stat.isSymbolicLink() || !stat.isFile()) return null;
-		return fs.readFileSync(target, "utf8");
+		return await Bun.file(target).text();
 	} catch {
 		return null;
 	}
 }
 
-export function validateInstalledBundle(root = bundleDir): string | null {
+export async function validateInstalledBundle(root = bundleDir): Promise<string | null> {
 	const files = renderSdkSkillFiles();
-	return validateBundleManifest(readBundleManifest(root), bundleContentFiles(files));
+	return validateBundleManifest(await readBundleManifest(root), bundleContentFiles(files));
 }
 
 /**
@@ -475,29 +475,34 @@ export function renderSdkSkillFiles(): Map<string, string> {
 	return files;
 }
 
-function listFiles(dir: string, rel = ""): string[] {
-	if (!fs.existsSync(dir)) return [];
-	const files: string[] = [];
-	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-		const entryRel = path.join(rel, entry.name);
-		const entryPath = path.join(dir, entry.name);
-		if (entry.isDirectory()) files.push(...listFiles(entryPath, entryRel));
-		else files.push(entryRel);
+async function listFiles(dir: string, rel = ""): Promise<string[]> {
+	try {
+		const entries = await fs.readdir(dir, { withFileTypes: true });
+		const files: string[] = [];
+		for (const entry of entries) {
+			const entryRel = path.join(rel, entry.name);
+			const entryPath = path.join(dir, entry.name);
+			if (entry.isDirectory()) files.push(...(await listFiles(entryPath, entryRel)));
+			else files.push(entryRel);
+		}
+		return files;
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+		throw error;
 	}
-	return files;
 }
 
-export function findUnexpectedSdkSkillFiles(files: ReadonlyMap<string, string>, root = bundleDir): string[] {
+export async function findUnexpectedSdkSkillFiles(files: ReadonlyMap<string, string>, root = bundleDir): Promise<string[]> {
 	const expected = new Set(files.keys());
-	return listFiles(root).filter(rel => !expected.has(rel)).sort();
+	return (await listFiles(root)).filter(rel => !expected.has(rel)).sort();
 }
 
-export function checkSdkSkillFiles(files: ReadonlyMap<string, string>, root = bundleDir, report = true): number {
+export async function checkSdkSkillFiles(files: ReadonlyMap<string, string>, root = bundleDir, report = true): Promise<number> {
 	const problems: string[] = [];
 	// Fail closed on the versioned contract first: an unsupported or missing
 	// format version means the layout is unknown, so content-level drift checks
 	// must not run against it.
-	const manifestProblem = validateBundleManifest(readBundleManifest(root), bundleContentFiles(files));
+	const manifestProblem = validateBundleManifest(await readBundleManifest(root), bundleContentFiles(files));
 	if (manifestProblem !== null) problems.push(manifestProblem);
 	const allowlistProblem = validatePromptAllowlistConsistency();
 	if (allowlistProblem !== null) problems.push(allowlistProblem);
@@ -506,19 +511,19 @@ export function checkSdkSkillFiles(files: ReadonlyMap<string, string>, root = bu
 			const target = path.join(root, rel);
 			let actual: string | null = null;
 			try {
-				const stat = fs.lstatSync(target);
+				const stat = await fs.lstat(target);
 				if (stat.isSymbolicLink() || !stat.isFile()) {
 					problems.push(`invalid: sdk-skills/${rel}`);
 					continue;
 				}
-				actual = fs.readFileSync(target, "utf8");
+				actual = await Bun.file(target).text();
 			} catch {
 				actual = null;
 			}
 			if (actual === null) problems.push(`missing: sdk-skills/${rel}`);
 			else if (actual !== content) problems.push(`drift: sdk-skills/${rel}`);
 		}
-		for (const rel of findUnexpectedSdkSkillFiles(files, root)) problems.push(`unexpected: sdk-skills/${rel}`);
+		for (const rel of await findUnexpectedSdkSkillFiles(files, root)) problems.push(`unexpected: sdk-skills/${rel}`);
 	}
 	if (problems.length > 0) {
 		if (report) {
@@ -531,38 +536,38 @@ export function checkSdkSkillFiles(files: ReadonlyMap<string, string>, root = bu
 	return 0;
 }
 
-function writeFiles(files: ReadonlyMap<string, string>): void {
-	fs.rmSync(bundleDir, { recursive: true, force: true });
+async function writeFiles(files: ReadonlyMap<string, string>): Promise<void> {
+	await fs.rm(bundleDir, { recursive: true, force: true });
 	for (const [rel, content] of files) {
 		const target = path.join(bundleDir, rel);
-		fs.mkdirSync(path.dirname(target), { recursive: true });
-		fs.writeFileSync(target, content);
+		await fs.mkdir(path.dirname(target), { recursive: true });
+		await Bun.write(target, content);
 	}
 	process.stdout.write(`Generated ${files.size} SDK skill file(s) under sdk-skills/\n`);
 }
 
-function runSelfTest(): void {
+async function runSelfTest(): Promise<void> {
 	const files = renderSdkSkillFiles();
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skills-self-test-"));
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-skills-self-test-"));
 	try {
 		for (const [rel, content] of files) {
 			const target = path.join(root, rel);
-			fs.mkdirSync(path.dirname(target), { recursive: true });
-			fs.writeFileSync(target, content);
+			await fs.mkdir(path.dirname(target), { recursive: true });
+			await Bun.write(target, content);
 		}
 		const stale = path.join(root, "gjc-sdk-author", "stale.md");
-		fs.writeFileSync(stale, "stale\n");
-		if (checkSdkSkillFiles(files, root, false) !== 1 || !findUnexpectedSdkSkillFiles(files, root).includes(path.join("gjc-sdk-author", "stale.md")))
+		await Bun.write(stale, "stale\n");
+		if ((await checkSdkSkillFiles(files, root, false)) !== 1 || !(await findUnexpectedSdkSkillFiles(files, root)).includes(path.join("gjc-sdk-author", "stale.md")))
 			throw new Error("SDK skill file-set check did not reject an unexpected file");
 		process.stdout.write("SDK skill file-set self-test passed.\n");
 	} finally {
-		fs.rmSync(root, { recursive: true, force: true });
+		await fs.rm(root, { recursive: true, force: true });
 	}
 }
 
 if (import.meta.main) {
 	const files = renderSdkSkillFiles();
-	if (process.argv.includes("--self-test")) runSelfTest();
-	else if (process.argv.includes("--check")) process.exitCode = checkSdkSkillFiles(files);
-	else writeFiles(files);
+	if (process.argv.includes("--self-test")) await runSelfTest();
+	else if (process.argv.includes("--check")) process.exitCode = await checkSdkSkillFiles(files);
+	else await writeFiles(files);
 }
