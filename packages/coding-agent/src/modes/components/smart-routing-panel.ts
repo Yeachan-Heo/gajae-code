@@ -47,7 +47,7 @@ export interface SmartRoutingPanelOptions {
 	stale: boolean;
 	preview: SmartRoutingPreview;
 	generatePreview: (draft: AutoroutingSetup) => SmartRoutingPreview;
-	onSelect: (intent: SmartRoutingIntent) => void | Promise<SmartRoutingPreview | void>;
+	onSelect: (intent: SmartRoutingIntent) => undefined | Promise<SmartRoutingPreview | undefined>;
 	onCancel: () => void;
 }
 

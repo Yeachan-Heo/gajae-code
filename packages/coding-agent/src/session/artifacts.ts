@@ -316,33 +316,18 @@ export class ArtifactManager {
 		if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) return false;
 		try {
 			if (this.#store) {
-				const before = this.#store.captureTree("");
+				const beforePaths = new Set(await fs.readdir(this.#store.dir));
 				const staged = this.#store.readExpected(filename);
 				if (staged) this.#store.removeExpected(filename, staged);
-				const after = this.#store.captureTree("");
-				const beforePaths = new Set(before.entries.map(entry => entry.relativePath));
-				// Clean only residue that APPEARED as a result of this removal (the before/after diff)
-				// and that matches the native residue shapes. Two shapes exist: quarantine named after
-				// the artifact (`<filename>.removing`) and native placeholders whose names do NOT carry
-				// the filename (`.gjc-remove-*`, `.gjc-exact-unlink-placeholder-*`). A filename match is
-				// therefore required to be a whole-name boundary rather than a substring, so
-				// `1.tool.log` can never claim `11.tool.log.removing`.
-				// Sibling subagents share this parent store; a concurrent attempt interleaving between
-				// the two snapshots is out of scope per the accepted no-concurrent-attempt limitation.
-				for (const entry of after.entries) {
-					const basename = path.posix.basename(entry.relativePath);
+				// Capture only root names outside retained authority so foreign sibling
+				// placeholders cannot make rollback fail before exact removal runs.
+				for (const basename of await fs.readdir(this.#store.dir)) {
 					const nativeResidue = /^\.gjc-/u.test(basename);
 					const ownQuarantine = basename === `${filename}.removing` || basename.startsWith(`${filename}.`);
-					if (
-						entry.relativePath.length === 0 ||
-						beforePaths.has(entry.relativePath) ||
-						(!nativeResidue && !ownQuarantine)
-					)
-						continue;
-					await fs.rm(path.join(this.#store.dir, entry.relativePath), {
-						recursive: entry.kind === "directory",
-						force: true,
-					});
+					if (beforePaths.has(basename) || (!nativeResidue && !ownQuarantine)) continue;
+					const residuePath = path.join(this.#store.dir, basename);
+					const stat = await fs.lstat(residuePath);
+					await fs.rm(residuePath, { recursive: stat.isDirectory(), force: true });
 				}
 			} else {
 				await fs.unlink(path.join(this.#dir, filename));

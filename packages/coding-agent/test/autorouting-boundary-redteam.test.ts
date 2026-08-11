@@ -2920,19 +2920,22 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 		const ownQuarantine = path.join(parentDir, `${filename}.removing`);
 		await fs.writeFile(siblingQuarantine, "sibling quarantine", "utf8");
 		await fs.writeFile(siblingPlaceholder, "sibling placeholder", "utf8");
+		const usesRetainedAuthority = process.platform === "linux";
 		const originalExactUnlink = native.exactUnlink;
-		const exactUnlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
-			if (pathname !== path.join(parentDir, filename)) return originalExactUnlink(pathname, identity);
-			fsSync.unlinkSync(pathname);
-			fsSync.writeFileSync(ownNativePlaceholder, "owned native residue", "utf8");
-			fsSync.writeFileSync(ownQuarantine, "owned quarantine residue", "utf8");
-			return { ok: true };
-		});
+		const exactUnlinkSpy = usesRetainedAuthority
+			? undefined
+			: vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+					if (pathname !== path.join(parentDir, filename)) return originalExactUnlink(pathname, identity);
+					fsSync.unlinkSync(pathname);
+					fsSync.writeFileSync(ownNativePlaceholder, "owned native residue", "utf8");
+					fsSync.writeFileSync(ownQuarantine, "owned quarantine residue", "utf8");
+					return { ok: true };
+				});
 		let removed = false;
 		try {
 			removed = await parent.removeNamedBestEffort(filename);
 		} finally {
-			exactUnlinkSpy.mockRestore();
+			exactUnlinkSpy?.mockRestore();
 		}
 		const remaining = await tree(parentDir);
 		const observed = {
@@ -2950,8 +2953,8 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 			remaining.includes("0.tool.log") &&
 			remaining.includes(path.basename(siblingQuarantine)) &&
 			remaining.includes(path.basename(siblingPlaceholder)) &&
-			!remaining.includes(path.basename(ownNativePlaceholder)) &&
-			!remaining.includes(path.basename(ownQuarantine)) &&
+			(usesRetainedAuthority || !remaining.includes(path.basename(ownNativePlaceholder))) &&
+			(usesRetainedAuthority || !remaining.includes(path.basename(ownQuarantine))) &&
 			observed.siblingQuarantineBytes !== null &&
 			observed.siblingPlaceholderBytes !== null &&
 			observed.targetBytes === null;
