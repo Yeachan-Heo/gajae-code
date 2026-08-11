@@ -401,11 +401,17 @@ describe("Telegram provider supervisor ownership", () => {
 			if (!scheduledCleanup) throw new Error("Expected rejected topic cleanup to be scheduled.");
 			now += 60_001;
 			scheduledCleanup();
-			await Bun.sleep(25);
+			// The grace archival settles asynchronously; poll bounded instead of a
+			// fixed sleep so heavy parallel suite load cannot flake this assertion.
+			const deadline = Date.now() + 5_000;
+			let archived: { topics: { ordinary: { authorityState: string } } };
+			do {
+				await Bun.sleep(25);
+				archived = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+					topics: { ordinary: { authorityState: string } };
+				};
+			} while (archived.topics.ordinary.authorityState !== "inactive" && Date.now() < deadline);
 			expect(calls).toContain("closeForumTopic");
-			const archived = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
-				topics: { ordinary: { authorityState: string } };
-			};
 			expect(archived.topics.ordinary.authorityState).toBe("inactive");
 		} finally {
 			daemon.requestStop();

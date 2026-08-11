@@ -120,6 +120,17 @@ function isInput(value: unknown): value is ControlInput {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function controlRequestFromFrame(frame: Record<string, unknown>): ControlRequest {
+	return {
+		id: typeof frame.id === "string" ? frame.id : "",
+		operation: typeof frame.operation === "string" ? frame.operation : "",
+		input: frame.input,
+		expectedRevision: typeof frame.expectedRevision === "string" ? frame.expectedRevision : undefined,
+		idempotencyKey: typeof frame.idempotencyKey === "string" ? frame.idempotencyKey : undefined,
+		confirm: frame.confirm === true,
+	};
+}
+
 function canonicalize(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(canonicalize);
 	if (value && typeof value === "object") {

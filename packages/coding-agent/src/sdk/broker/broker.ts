@@ -183,11 +183,6 @@ function pendingCleanupSessionId(response: BrokerResponse): string | undefined {
 	return typeof response.error.cleanup?.sessionId === "string" ? response.error.cleanup.sessionId : undefined;
 }
 
-function lifecycleResponseState(response: BrokerResponse): LifecycleState {
-	if (response.ok) return "terminal_ok";
-	if (isCleanupPending(response)) return "effect_started";
-	return response.error.code === "terminal_uncertain" ? "terminal_uncertain" : "terminal_error";
-}
 
 const LIFECYCLE_OPERATIONS = new Set([
 	"session.create",
