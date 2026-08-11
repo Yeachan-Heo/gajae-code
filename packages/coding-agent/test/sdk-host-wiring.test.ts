@@ -1,5 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
@@ -96,6 +97,33 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
 		await Bun.sleep(20);
 	}
+}
+function pauseNextReconciliationCommit(
+	sessionFile: string,
+	sessionId: string,
+): {
+	started: Promise<void>;
+	release: () => void;
+	restore: () => void;
+} {
+	const target = reconciliationStorePath(sessionFile, sessionId);
+	const started = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const realRename = fsPromises.rename.bind(fsPromises);
+	let paused = false;
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+		if (!paused && String(to) === target) {
+			paused = true;
+			started.resolve();
+			await release.promise;
+		}
+		await realRename(from, to);
+	});
+	return {
+		started: started.promise,
+		release: () => release.resolve(),
+		restore: () => rename.mockRestore(),
+	};
 }
 
 async function closeSocket(socket: WebSocket): Promise<void> {
@@ -2521,6 +2549,247 @@ test("SDK host waits for accepted handleless skill settlement before publishing 
 	expect(executionStarted).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
+test("SDK host waits for durable prompt acceptance before completing concurrent cancellation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-durable-accept-cancel-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-prompt-durable-accept-cancel-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	let executionStarted = false;
+	const abortObserved = Promise.withResolvers<void>();
+	const handlers = start(
+		sessionContext,
+		undefined,
+		async (_content, options) => {
+			const signal = options?.preflightSignal;
+			const onAbort = () => abortObserved.resolve();
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				await options?.onPreflightAcceptCommit?.();
+			} finally {
+				signal?.removeEventListener("abort", onAbort);
+			}
+			if (signal?.aborted)
+				throw Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
+			executionStarted = true;
+		},
+		true,
+		new Map(),
+		undefined,
+		false,
+	);
+	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "durable-prompt-acceptance",
+				operation: "turn.prompt",
+				input: { text: "cancel while durable prompt acceptance is pending" },
+			}),
+		);
+		await pausedCommit.started;
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "abort-durable-prompt-acceptance",
+				operation: "turn.abort",
+				input: {},
+			}),
+		);
+		await abortObserved.promise;
+		expect(frames.some(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance")).toBe(
+			false,
+		);
+		expect(
+			frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
+		).toBe(false);
+		expect(frames.some(frame => frame.type === "agent_end" || frame.type === "agent_failed")).toBe(false);
+
+		pausedCommit.release();
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance"),
+			"durable prompt acceptance response",
+		);
+		await waitFor(
+			() =>
+				frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
+			"durable prompt abort response",
+		);
+		await waitFor(
+			() =>
+				frames.some(
+					frame =>
+						frame.type === "agent_end" &&
+						typeof frame.commandId === "string" &&
+						typeof frame.turnId === "string" &&
+						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.kind === "stopped" &&
+						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.reason === "cancelled",
+				),
+			"durable prompt cancellation terminal",
+		);
+		expect(
+			frames.find(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance"),
+		).toMatchObject({
+			ok: true,
+			result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+		});
+		expect(
+			frames.find(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
+		).toMatchObject({
+			ok: true,
+			result: { aborted: true, disposition: "preflight_cancelled" },
+		});
+		expect(executionStarted).toBe(false);
+		expect(frames.some(frame => frame.type === "agent_start" || frame.type === "agent_failed")).toBe(false);
+	} finally {
+		pausedCommit.release();
+		pausedCommit.restore();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+}, 30_000);
+
+test("SDK host waits for durable skill acceptance before completing concurrent cancellation", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-durable-accept-cancel-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-durable-accept-cancel-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	let executionStarted = false;
+	const abortObserved = Promise.withResolvers<void>();
+	sessionContext.invokeSkill = async (
+		name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+			preflightSignal?: AbortSignal;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md", cleanedArgs: args });
+		const signal = options?.preflightSignal;
+		const onAbort = () => abortObserved.resolve();
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			await options?.onPreflightAcceptCommit?.();
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+		if (signal?.aborted)
+			throw Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" });
+		executionStarted = true;
+		return { name, path: "/fixture/SKILL.md", args };
+	};
+	const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
+	try {
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "durable-skill-acceptance",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "cancel while durable skill acceptance is pending" },
+			}),
+		);
+		await pausedCommit.started;
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "abort-durable-skill-acceptance",
+				operation: "turn.abort",
+				input: {},
+			}),
+		);
+		await abortObserved.promise;
+		expect(frames.some(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance")).toBe(
+			false,
+		);
+		expect(
+			frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
+		).toBe(false);
+		expect(frames.some(frame => frame.type === "agent_end" || frame.type === "agent_failed")).toBe(false);
+
+		pausedCommit.release();
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance"),
+			"durable skill acceptance response",
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
+			"durable skill abort response",
+		);
+		await waitFor(
+			() =>
+				frames.some(
+					frame =>
+						frame.type === "agent_end" &&
+						typeof frame.commandId === "string" &&
+						typeof frame.turnId === "string" &&
+						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.kind === "stopped" &&
+						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.reason === "cancelled",
+				),
+			"durable skill cancellation terminal",
+		);
+		expect(
+			frames.find(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance"),
+		).toMatchObject({
+			ok: true,
+			result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
+		});
+		expect(
+			frames.find(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
+		).toMatchObject({
+			ok: true,
+			result: { aborted: true, disposition: "preflight_cancelled" },
+		});
+		expect(executionStarted).toBe(false);
+		expect(frames.some(frame => frame.type === "agent_start" || frame.type === "agent_failed")).toBe(false);
+	} finally {
+		pausedCommit.release();
+		pausedCommit.restore();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+}, 30_000);
 
 test("SDK host rolls back canonical skill ownership when durable acceptance fails", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-acceptance-failed-"));
