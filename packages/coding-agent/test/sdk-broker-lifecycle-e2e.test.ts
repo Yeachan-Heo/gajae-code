@@ -2918,6 +2918,71 @@ test("broker fences ambiguous state roots from checkpoint, endpoint, and resume 
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+test("broker promotes the lower-generation root after the higher-generation root terminates", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ambiguous-reverse-"));
+	const agentDir = path.join(root, "agent");
+	const currentStateRoot = path.join(root, ".gjc", "state");
+	const alternateRepo = path.join(root, "alternate-worktree");
+	const alternateStateRoot = path.join(alternateRepo, ".gjc", "state");
+	const broker = new Broker({ agentDir });
+	const sessionId = "reverse-root";
+	const endpointPath = path.join(alternateStateRoot, "sdk", `${sessionId}.json`);
+	try {
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "alternate-token" }),
+		);
+		const alternateEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		await broker.start();
+		const alternate = await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: alternateRepo, stateRoot: alternateStateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: alternateEndpointMtimeMs,
+		});
+		const current = await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: root, stateRoot: currentStateRoot },
+			endpointGeneration: 2,
+			pid: process.pid,
+			endpointMtimeMs: 1,
+		});
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId, endpointGeneration: current.endpointGeneration, ambiguous: true }),
+		]);
+
+		await broker.index.append({
+			type: "host_unregistered",
+			sessionId,
+			locator: current.locator,
+			endpointGeneration: current.endpointGeneration,
+			pid: current.pid,
+			...(current.processIncarnation === undefined ? {} : { processIncarnation: current.processIncarnation }),
+			...(current.hostIncarnation === undefined ? {} : { hostIncarnation: current.hostIncarnation }),
+		});
+		expect(await broker.heartbeatSessions()).toBe(1);
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({
+				sessionId,
+				locator: alternate.locator,
+				endpointGeneration: alternate.endpointGeneration,
+				ambiguous: false,
+				live: true,
+			}),
+		]);
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId })).toMatchObject({
+			ok: true,
+			result: { sessionId, pid: process.pid, token: "alternate-token" },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
 test("broker refuses a stale registered PID when no durable effect marker proves ownership", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-stale-"));
 	const stateRoot = path.join(agentDir, "state");
@@ -3564,6 +3629,157 @@ test("dead-registration sweeps retain terminal rows without appending duplicate 
 		expect(broker.index.indexSeq).toBe(terminalSeq);
 		expect(await reapDeadSessionRegistrations({ index: broker.index })).toEqual([]);
 		expect(broker.index.indexSeq).toBe(terminalSeq);
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+test("dead-registration sweep retains stale and uncertain live registrations", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-sweep-proof-"));
+	const stateRoot = path.join(agentDir, "state");
+	const broker = new Broker({ agentDir });
+	const originalKill = process.kill;
+	const epermPid = 4_194_303;
+	try {
+		const hostIncarnation = await incarnation(process.pid);
+		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "sweep-stale-heartbeat",
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
+			ts: 0,
+		});
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId: "sweep-stale-heartbeat", live: false, terminal: false }),
+		]);
+		expect(await reapDeadSessionRegistrations(broker)).toEqual([]);
+
+		process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+			if (pid === epermPid && (signal === 0 || signal === undefined)) {
+				const error = new Error("permission denied") as NodeJS.ErrnoException;
+				error.code = "EPERM";
+				throw error;
+			}
+			return originalKill(pid, signal);
+		}) as typeof process.kill;
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "sweep-eperm",
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: 2,
+			pid: epermPid,
+			processIncarnation: "unreadable-eperm",
+			hostIncarnation: "unreadable-eperm",
+			ts: 0,
+		});
+		expect(await reapDeadSessionRegistrations(broker)).toEqual([]);
+
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "sweep-unreadable-incarnation",
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: 3,
+			pid: process.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
+			ts: 0,
+		});
+		setProcessIncarnationForTest(broker, pid => (pid === process.pid ? undefined : processIncarnation(pid)));
+		expect(await reapDeadSessionRegistrations(broker)).toEqual([]);
+		expect(
+			broker.index
+				.listSessionIdentities()
+				.filter(session => session.sessionId.startsWith("sweep-"))
+				.every(session => !session.terminal),
+		).toBe(true);
+	} finally {
+		setProcessIncarnationForTest(broker, undefined);
+		process.kill = originalKill;
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+test("dead-registration sweep retires a reused identity without signaling its replacement", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-sweep-reused-"));
+	const stateRoot = path.join(agentDir, "state");
+	const broker = new Broker({ agentDir });
+	const replacement = spawnDisposableHost();
+	try {
+		const replacementIncarnation = await incarnation(replacement.pid);
+		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "sweep-reused-pid",
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: 1,
+			pid: replacement.pid,
+			processIncarnation: "retired-incarnation",
+			hostIncarnation: "retired-incarnation",
+			ts: 0,
+		});
+		setProcessIncarnationForTest(broker, pid =>
+			pid === replacement.pid ? replacementIncarnation : processIncarnation(pid),
+		);
+		expect(await reapDeadSessionRegistrations(broker)).toEqual([
+			{ sessionId: "sweep-reused-pid", pid: replacement.pid, endpointGeneration: 1 },
+		]);
+		expect(replacement.exitCode).toBeNull();
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId: "sweep-reused-pid", terminal: true, live: false }),
+		]);
+	} finally {
+		setProcessIncarnationForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+test("dead-registration sweep retires a dead losing root and preserves the live authority", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-sweep-losing-root-"));
+	const liveStateRoot = path.join(agentDir, "live-state");
+	const deadStateRoot = path.join(agentDir, "dead-state");
+	const broker = new Broker({ agentDir });
+	const deadPid = 4_194_304;
+	try {
+		expect(() => process.kill(deadPid, 0)).toThrow();
+		const hostIncarnation = await incarnation(process.pid);
+		await broker.start();
+		const live = await broker.index.append({
+			type: "host_registered",
+			sessionId: "sweep-losing-root",
+			locator: { repo: agentDir, stateRoot: liveStateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
+		});
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "sweep-losing-root",
+			locator: { repo: agentDir, stateRoot: deadStateRoot },
+			endpointGeneration: 2,
+			pid: deadPid,
+			processIncarnation: "dead-incarnation",
+		});
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId: "sweep-losing-root", endpointGeneration: 2, ambiguous: true }),
+		]);
+		expect(await reapDeadSessionRegistrations(broker)).toEqual([
+			{ sessionId: "sweep-losing-root", pid: deadPid, endpointGeneration: 2 },
+		]);
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({
+				sessionId: "sweep-losing-root",
+				locator: live.locator,
+				endpointGeneration: live.endpointGeneration,
+				ambiguous: false,
+				live: true,
+			}),
+		]);
+		expect(await broker.heartbeatSessions()).toBe(1);
 	} finally {
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });

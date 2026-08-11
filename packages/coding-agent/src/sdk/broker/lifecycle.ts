@@ -799,7 +799,8 @@ type ReadinessResult =
 	| { kind: "startup_failed"; failure: SdkStartupFailure }
 	| { kind: "child_exited" }
 	| { kind: "timeout" };
-const processIncarnationReadersForTest = new WeakMap<Broker, (pid: number) => string | undefined>();
+type BrokerIndex = Pick<Broker, "index">;
+const processIncarnationReadersForTest = new WeakMap<BrokerIndex, (pid: number) => string | undefined>();
 
 export function setProcessIncarnationForTest(
 	broker: Broker,
@@ -809,7 +810,7 @@ export function setProcessIncarnationForTest(
 	else processIncarnationReadersForTest.delete(broker);
 }
 
-function processIncarnationForBroker(broker: Broker, pid: number): string | undefined {
+function processIncarnationForBroker(broker: BrokerIndex, pid: number): string | undefined {
 	const reader = processIncarnationReadersForTest.get(broker);
 	return reader ? reader(pid) : processIncarnation(pid);
 }
@@ -4933,12 +4934,12 @@ export function sessionHostWorkInFlight(): boolean {
  * How often a live broker re-checks its own session registrations against OS
  * process liveness.
  *
- * This sweep can never disturb healthy work: a registration is only dropped
- * when `process.kill(pid, 0)` proves the exact published pid is gone, and a
- * working host answers that probe for its entire life no matter how long a turn
- * runs. One minute keeps `gjc_sessions`/`session.get_endpoint` from advertising
- * a corpse for longer than a single poll while costing one index refresh per
- * minute on an otherwise idle broker.
+ * This sweep can never disturb healthy work: a registration is dropped only when
+ * `observeProcess` proves its exact published process identity exited. A live
+ * replacement at the same pid retires the stale registration without being
+ * signaled. One minute keeps `gjc_sessions`/`session.get_endpoint` from
+ * advertising a corpse for longer than a single poll while costing one index
+ * refresh per minute on an otherwise idle broker.
  */
 export const BROKER_DEAD_REGISTRATION_SWEEP_MS = 60_000;
 
@@ -4952,24 +4953,25 @@ export interface ReapedSessionRegistration {
 /**
  * Drops every indexed session registration whose host process is provably gone.
  *
- * Liveness is the session index's own `alive(pid)` probe (`listSessions().live`),
- * which reports live for both a running pid and an EPERM pid, so an alien or
- * unreadable process is never mistaken for a dead one. Registrations already
- * marked `terminalUncertain`, retained terminal rows, and ambiguous identities are left
- * alone: their disposition belongs to their exact lifecycle authority path, and silently
- * dropping them would turn a fail-closed `session.close`/`session.delete` refusal into
- * `not_found`.
+ * Proof of death is positive, never inferred from a missing liveness proof:
+ * `observeProcess` reports "exited" only on ESRCH or on a readable OS process
+ * incarnation that differs from the recorded one (a reused pid). A stale or
+ * missing heartbeat merely makes a session read as not-live — the host may
+ * still be running ahead of the next heartbeat checkpoint pass, so it is never
+ * grounds for a reap. EPERM and unreadable incarnations stay "uncertain", so an
+ * alien or unreadable process is never mistaken for a dead one. Terminal and
+ * terminal-uncertain identities are retained. Identity-level rows let the sweep
+ * retire a dead losing root without disturbing the surviving authority.
  */
-export async function reapDeadSessionRegistrations(
-	broker: Pick<Broker, "index">,
-): Promise<ReapedSessionRegistration[]> {
+export async function reapDeadSessionRegistrations(broker: BrokerIndex): Promise<ReapedSessionRegistration[]> {
 	await broker.index.refresh();
-	const dead = broker.index
-		.listSessions()
-		.sessions.filter(
-			session =>
-				!session.live && !session.terminal && !session.terminalUncertain && isSessionAuthorityEligible(session),
+	const dead = broker.index.listSessionIdentities().filter(session => {
+		if (session.terminal || session.terminalUncertain) return false;
+		const recordedIncarnation = session.hostIncarnation ?? session.processIncarnation;
+		return (
+			observeProcess(session.pid, recordedIncarnation, pid => processIncarnationForBroker(broker, pid)) === "exited"
 		);
+	});
 	const reaped: ReapedSessionRegistration[] = [];
 	for (const session of dead) {
 		if (!(await broker.index.unregisterIfCurrent(session))) continue;
