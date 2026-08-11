@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { $env, $which, getPythonEnvDir, WhichCachePolicy } from "@gajae-code/utils";
+import { withFileLock } from "../../config/file-lock";
 
 export const RLM_MANAGED_PYTHON_PACKAGES: readonly string[] = ["numpy", "pandas", "matplotlib", "polars"];
 
@@ -321,8 +322,6 @@ async function runRuntimeCommand(
 	}
 }
 
-const managedVenvProvisioning = new Map<string, Promise<void>>();
-
 async function ensureWorkspaceManagedVenv(
 	cwd: string,
 	baseEnv: Record<string, string | undefined>,
@@ -330,15 +329,11 @@ async function ensureWorkspaceManagedVenv(
 	lifecycle?: PythonRuntimeLifecycleOptions,
 ): Promise<void> {
 	const venvPath = resolveWorkspaceManagedPythonCandidate(cwd).venvPath;
-	const existing = managedVenvProvisioning.get(venvPath);
-	if (existing) return await existing;
-	const provisioning = ensureWorkspaceManagedVenvInner(cwd, baseEnv, seedPackages, lifecycle);
-	managedVenvProvisioning.set(venvPath, provisioning);
-	try {
-		await provisioning;
-	} finally {
-		if (managedVenvProvisioning.get(venvPath) === provisioning) managedVenvProvisioning.delete(venvPath);
-	}
+	return await withFileLock(
+		venvPath,
+		async () => await ensureWorkspaceManagedVenvInner(cwd, baseEnv, seedPackages, lifecycle),
+		{ retries: 600 },
+	);
 }
 
 async function ensureWorkspaceManagedVenvInner(
