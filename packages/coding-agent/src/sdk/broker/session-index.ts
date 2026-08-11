@@ -1158,7 +1158,16 @@ export class SessionIndex {
 	async checkpointLiveHeartbeats(now = Date.now()): Promise<number> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
-			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			// An absent index holds no registration to checkpoint, so this pass must read
+			// it as "nothing to do" instead of creating one. Recreating the directory
+			// resurrects a state root its owner already retired: the broker's 5s
+			// publication watch would rebuild a removed agent dir after shutdown.
+			try {
+				await fs.stat(dirFor(this.#agentDir));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+				throw error;
+			}
 			return await withFileLock(logFor(this.#agentDir), async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) return 0;

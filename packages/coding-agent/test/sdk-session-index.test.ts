@@ -794,6 +794,20 @@ describe("SDK session index", () => {
 		}
 		expect(replacementChecks).toBe(2);
 	});
+	it("does not recreate a retired index directory when a heartbeat pass runs", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-retired-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("heartbeat-owner"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		expect(await fs.exists(sessionsDir)).toBe(true);
+
+		// The owner retires the whole state root; the broker's periodic checkpoint must
+		// observe "nothing to check point" rather than rebuilding the tree underneath it.
+		await fs.rm(path.join(dir, "sdk"), { recursive: true, force: true });
+		expect(await index.checkpointLiveHeartbeats()).toBe(0);
+		expect(await fs.exists(sessionsDir)).toBe(false);
+		expect(await fs.exists(path.join(dir, "sdk"))).toBe(false);
+	});
 	it("repairs a long history into a retention-bounded snapshot other clients can lock promptly", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-repair-bound-"));
 		const maxRows = 50;
