@@ -212,6 +212,7 @@ function createRuntimeCancellationError(timedOut: boolean): Error {
 async function waitForRuntimeLifecycle<T>(
 	value: Promise<T>,
 	lifecycle: PythonRuntimeLifecycleOptions | undefined,
+	settleAfterCancellation?: () => boolean,
 ): Promise<T> {
 	const { promise, resolve, reject } = Promise.withResolvers<T>();
 	const cleanups: Array<() => void> = [];
@@ -219,18 +220,22 @@ async function waitForRuntimeLifecycle<T>(
 		while (cleanups.length > 0) cleanups.pop()?.();
 		callback();
 	};
-	if (lifecycle?.signal?.aborted) throw lifecycle.signal.reason ?? createRuntimeCancellationError(false);
-	if (lifecycle?.signal) {
-		const onAbort = (): void =>
-			finish(() => reject(lifecycle.signal?.reason ?? createRuntimeCancellationError(false)));
+	const cancel = (timedOut: boolean): void => {
+		if (settleAfterCancellation?.()) return;
+		finish(() => reject(createRuntimeCancellationError(timedOut)));
+	};
+	if (lifecycle?.signal?.aborted) {
+		if (!settleAfterCancellation?.()) throw lifecycle.signal.reason ?? createRuntimeCancellationError(false);
+	} else if (lifecycle?.signal) {
+		const onAbort = (): void => cancel(false);
 		lifecycle.signal.addEventListener("abort", onAbort, { once: true });
 		cleanups.push(() => lifecycle.signal?.removeEventListener("abort", onAbort));
 	}
 	const remainingMs = lifecycle?.deadlineMs === undefined ? undefined : lifecycle.deadlineMs - Date.now();
 	if (remainingMs !== undefined) {
-		if (remainingMs <= 0) finish(() => reject(createRuntimeCancellationError(true)));
+		if (remainingMs <= 0) cancel(true);
 		else {
-			const timer = setTimeout(() => finish(() => reject(createRuntimeCancellationError(true))), remainingMs);
+			const timer = setTimeout(() => cancel(true), remainingMs);
 			timer.unref();
 			cleanups.push(() => clearTimeout(timer));
 		}
@@ -368,6 +373,7 @@ async function ensureWorkspaceManagedVenv(
 			: lifecycle.signal
 				? AbortSignal.any([lifecycle.signal, AbortSignal.timeout(Math.max(0, lifecycle.deadlineMs - Date.now()))])
 				: AbortSignal.timeout(Math.max(0, lifecycle.deadlineMs - Date.now()));
+	let lockAcquired = false;
 	const provisioning = withFileLock(
 		venvPath,
 		async () => {
@@ -376,9 +382,9 @@ async function ensureWorkspaceManagedVenv(
 				throw createRuntimeCancellationError(true);
 			await ensureWorkspaceManagedVenvInner(cwd, baseEnv, seedPackages, lifecycle);
 		},
-		{ retries: Number.POSITIVE_INFINITY, signal: lockSignal },
+		{ retries: Number.POSITIVE_INFINITY, signal: lockSignal, onAcquired: () => (lockAcquired = true) },
 	);
-	return await waitForRuntimeLifecycle(provisioning, lifecycle);
+	return await waitForRuntimeLifecycle(provisioning, lifecycle, () => lockAcquired);
 }
 
 async function ensureWorkspaceManagedVenvInner(

@@ -9,11 +9,12 @@ export interface FileLockOptions {
 	retries?: number;
 	retryDelayMs?: number;
 	signal?: AbortSignal;
+	onAcquired?: () => void;
 	/** Stable host identity required to safely reclaim locks on a shared volume. */
 	ownerHostId?: string;
 }
 
-const DEFAULT_OPTIONS: Required<Omit<FileLockOptions, "ownerHostId" | "signal">> = {
+const DEFAULT_OPTIONS: Required<Omit<FileLockOptions, "ownerHostId" | "signal" | "onAcquired">> = {
 	staleMs: 10_000,
 	retries: 50,
 	retryDelayMs: 100,
@@ -343,6 +344,7 @@ export async function withFileLock<T>(
 	options: FileLockOptions = {},
 ): Promise<T> {
 	const release = await acquireLock(filePath, options);
+	options.onAcquired?.();
 	let result: T;
 	try {
 		result = await fn();

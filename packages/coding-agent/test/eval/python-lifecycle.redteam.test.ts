@@ -147,8 +147,9 @@ describe("python eval lifecycle red-team", () => {
 		const controller = new AbortController();
 		const originalPath = process.env.PATH;
 		process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+		let provisioning: Promise<unknown> | undefined;
 		try {
-			const provisioning = ensurePythonRuntime(
+			provisioning = ensurePythonRuntime(
 				tempDir.path(),
 				{ PATH: process.env.PATH },
 				{ managedWorkspaceVenv: true, seedPackages: [] },
@@ -157,9 +158,11 @@ describe("python eval lifecycle red-team", () => {
 			void provisioning.catch(() => undefined);
 			const childPid = await waitForOwnedProcess(childPidPath);
 			controller.abort();
-			await expect(provisioning).rejects.toMatchObject({ name: "AbortError" });
+			await expect(provisioning!).rejects.toMatchObject({ name: "AbortError" });
 			expect(await waitForProcessGone(childPid)).toBe(true);
 		} finally {
+			controller.abort();
+			await provisioning?.catch(() => undefined);
 			process.env.PATH = originalPath;
 		}
 	});
