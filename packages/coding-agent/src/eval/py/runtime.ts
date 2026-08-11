@@ -7,7 +7,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { $env, $which, getPythonEnvDir } from "@gajae-code/utils";
+import { $env, $which, getPythonEnvDir, WhichCachePolicy } from "@gajae-code/utils";
 
 export const RLM_MANAGED_PYTHON_PACKAGES: readonly string[] = ["numpy", "pandas", "matplotlib", "polars"];
 
@@ -225,6 +225,7 @@ async function runRuntimeCommand(
 		stdout: "pipe",
 		stderr: "pipe",
 		windowsHide: true,
+		detached: process.platform !== "win32",
 	});
 	const output = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
 	const { promise, resolve, reject } = Promise.withResolvers<number>();
@@ -237,18 +238,19 @@ async function runRuntimeCommand(
 	const cancel = (timedOut: boolean): void => {
 		if (cancellation) return;
 		cancellation = { timedOut };
-		try {
-			proc.kill("SIGTERM");
-		} catch {
-			// The process may have exited between the cancellation check and signal.
-		}
-		const escalation = setTimeout(() => {
+		const signalProcessTree = (signal: NodeJS.Signals): void => {
 			try {
-				proc.kill("SIGKILL");
+				if (process.platform === "win32") {
+					proc.kill(signal);
+				} else {
+					process.kill(-proc.pid, signal);
+				}
 			} catch {
-				// The process may have exited during the graceful cancellation window.
+				// The process may have exited between the cancellation check and signal.
 			}
-		}, RUNTIME_CANCEL_GRACE_MS);
+		};
+		signalProcessTree("SIGTERM");
+		const escalation = setTimeout(() => signalProcessTree("SIGKILL"), RUNTIME_CANCEL_GRACE_MS);
 		escalation.unref();
 		cleanups.push(() => clearTimeout(escalation));
 	};
@@ -299,7 +301,9 @@ async function ensureWorkspaceManagedVenv(
 ): Promise<void> {
 	const managed = resolveWorkspaceManagedPythonCandidate(cwd);
 	if (!fs.existsSync(managed.pythonPath)) {
-		const basePython = $which("python3") ?? $which("python");
+		const basePython =
+			$which("python3", { PATH: baseEnv.PATH, cache: WhichCachePolicy.Bypass }) ??
+			$which("python", { PATH: baseEnv.PATH, cache: WhichCachePolicy.Bypass });
 		if (!basePython) throw new Error("Python executable not found on PATH");
 		await fs.promises.mkdir(path.dirname(managed.venvPath), { recursive: true });
 		await runRuntimeCommand(

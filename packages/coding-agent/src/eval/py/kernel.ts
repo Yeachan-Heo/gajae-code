@@ -16,7 +16,12 @@ import { type KernelDisplayOutput, renderKernelDisplay } from "./display";
 import { resolvePythonIpcTrace, resolvePythonSkipCheck } from "./env";
 import { PYTHON_PRELUDE } from "./prelude";
 import { ensureRunnerScript } from "./runner-artifact";
-import { ensurePythonRuntime, filterEnv, type PythonRuntimeOptions } from "./runtime";
+import {
+	ensurePythonRuntime,
+	filterEnv,
+	type PythonRuntimeLifecycleOptions,
+	type PythonRuntimeOptions,
+} from "./runtime";
 
 export type { KernelDisplayOutput, PythonStatusEvent } from "./display";
 export { renderKernelDisplay } from "./display";
@@ -106,15 +111,20 @@ function throwIfAborted(signal: AbortSignal | undefined, fallbackReason: string)
 export async function checkPythonKernelAvailability(
 	cwd: string,
 	runtimeOptions?: PythonRuntimeOptions,
+	lifecycle?: PythonRuntimeLifecycleOptions,
 ): Promise<PythonKernelAvailability> {
 	if (isBunTestRuntime() || resolvePythonSkipCheck($env)) {
 		return { ok: true };
+	}
+	throwIfAborted(lifecycle?.signal, "Python kernel availability check aborted");
+	if (lifecycle?.deadlineMs !== undefined && lifecycle.deadlineMs <= Date.now()) {
+		throw createAbortError("TimeoutError", "Python kernel availability check timed out");
 	}
 	try {
 		const settings = await Settings.init();
 		const { env } = settings.getShellConfig();
 		const baseEnv = filterEnv(env);
-		const runtime = await ensurePythonRuntime(cwd, baseEnv, runtimeOptions);
+		const runtime = await ensurePythonRuntime(cwd, baseEnv, runtimeOptions, lifecycle);
 		const probe = await $`${runtime.pythonPath} -c "import sys;sys.exit(0)"`
 			.quiet()
 			.nothrow()
@@ -129,6 +139,10 @@ export async function checkPythonKernelAvailability(
 			reason: `Python interpreter at ${runtime.pythonPath} returned exit code ${probe.exitCode}`,
 		};
 	} catch (err) {
+		throwIfAborted(lifecycle?.signal, "Python kernel availability check aborted");
+		if (lifecycle?.deadlineMs !== undefined && lifecycle.deadlineMs <= Date.now()) {
+			throw createAbortError("TimeoutError", "Python kernel availability check timed out");
+		}
 		return { ok: false, reason: err instanceof Error ? err.message : String(err) };
 	}
 }
@@ -186,6 +200,7 @@ export class PythonKernel {
 			checkPythonKernelAvailability,
 			options.cwd,
 			options.runtimeOptions,
+			{ signal: options.signal, deadlineMs: options.deadlineMs },
 		);
 		if (!availability.ok) {
 			throw new Error(availability.reason ?? "Python kernel unavailable");

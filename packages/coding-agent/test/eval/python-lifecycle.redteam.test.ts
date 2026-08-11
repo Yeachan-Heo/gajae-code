@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { disposeAllKernelSessions, executePython, type PythonResult } from "@gajae-code/coding-agent/eval/py/executor";
 import type {
 	KernelExecuteOptions,
@@ -6,6 +8,7 @@ import type {
 	KernelShutdownResult,
 } from "@gajae-code/coding-agent/eval/py/kernel";
 import { PythonKernel } from "@gajae-code/coding-agent/eval/py/kernel";
+import { ensurePythonRuntime } from "@gajae-code/coding-agent/eval/py/runtime";
 import { TempDir } from "@gajae-code/utils";
 
 const originalStart = PythonKernel.start;
@@ -129,6 +132,35 @@ function countAbortListeners(signal: AbortSignal): { readonly count: () => numbe
 }
 
 describe("python eval lifecycle red-team", () => {
+	it("terminates the complete managed-runtime provisioning process group on cancellation", async () => {
+		if (process.platform === "win32") return;
+		using tempDir = TempDir.createSync("@gjc-python-lifecycle-redteam-");
+		const binDir = path.join(tempDir.path(), "bin");
+		const pythonPath = path.join(binDir, "python3");
+		const childPidPath = path.join(tempDir.path(), "provision-child.pid");
+		await fs.mkdir(binDir);
+		await Bun.write(pythonPath, '#!/bin/sh\n(sleep 30) &\nprintf \'%s\' "$!" > "$PWD/provision-child.pid"\nwait\n');
+		await fs.chmod(pythonPath, 0o755);
+		const controller = new AbortController();
+		const originalPath = process.env.PATH;
+		process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+		try {
+			const provisioning = ensurePythonRuntime(
+				tempDir.path(),
+				{ PATH: process.env.PATH },
+				{ managedWorkspaceVenv: true, seedPackages: [] },
+				{ signal: controller.signal },
+			);
+			void provisioning.catch(() => undefined);
+			const childPid = await waitForOwnedProcess(childPidPath);
+			controller.abort();
+			await expect(provisioning).rejects.toMatchObject({ name: "AbortError" });
+			expect(await waitForProcessGone(childPid)).toBe(true);
+		} finally {
+			process.env.PATH = originalPath;
+		}
+	});
+
 	afterEach(async () => {
 		PythonKernel.start = originalStart;
 		delete Bun.env.PI_PYTHON_SKIP_CHECK;

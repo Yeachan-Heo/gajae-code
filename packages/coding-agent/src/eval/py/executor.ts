@@ -657,10 +657,10 @@ async function executeWithKernel(
 }
 
 async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions): Promise<void> {
-	const availability = await waitForPromiseWithCancellation(
-		checkPythonKernelAvailability(cwd, options.runtimeOptions),
-		options,
-	);
+	const availability = await checkPythonKernelAvailability(cwd, options.runtimeOptions, {
+		signal: options.signal,
+		deadlineMs: options.deadlineMs,
+	});
 	if (!availability.ok) {
 		throw new Error(availability.reason ?? "Python kernel unavailable");
 	}
