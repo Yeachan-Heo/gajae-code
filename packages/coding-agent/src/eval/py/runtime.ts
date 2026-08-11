@@ -235,6 +235,17 @@ async function runRuntimeCommand(
 		callback();
 	};
 	let cancellation: { timedOut: boolean } | undefined;
+	const waitForProcessTreeExit = async (): Promise<void> => {
+		if (process.platform === "win32") return;
+		while (true) {
+			try {
+				process.kill(-proc.pid, 0);
+				await Bun.sleep(10);
+			} catch {
+				return;
+			}
+		}
+	};
 	const cancel = (timedOut: boolean): void => {
 		if (cancellation) return;
 		cancellation = { timedOut };
@@ -271,9 +282,10 @@ async function runRuntimeCommand(
 			cleanups.push(() => clearTimeout(timer));
 		}
 	}
-	proc.exited.then(code => {
+	void proc.exited.then(async code => {
 		const cancelled = cancellation;
 		if (cancelled) {
+			await waitForProcessTreeExit();
 			finish(() => reject(createRuntimeCancellationError(cancelled.timedOut)));
 			return;
 		}

@@ -10,7 +10,6 @@
  */
 import { $env, isBunTestRuntime, logger, Snowflake } from "@gajae-code/utils";
 import type { Subprocess } from "bun";
-import { $ } from "bun";
 import { Settings } from "../../config/settings";
 import { type KernelDisplayOutput, renderKernelDisplay } from "./display";
 import { resolvePythonIpcTrace, resolvePythonSkipCheck } from "./env";
@@ -108,6 +107,46 @@ function throwIfAborted(signal: AbortSignal | undefined, fallbackReason: string)
 	throw createAbortError("AbortError", typeof reason === "string" ? reason : fallbackReason);
 }
 
+async function waitForLifecycle<T>(
+	value: Promise<T>,
+	lifecycle: PythonRuntimeLifecycleOptions | undefined,
+	message: string,
+): Promise<T> {
+	const { promise, resolve, reject } = Promise.withResolvers<T>();
+	const cleanups: Array<() => void> = [];
+	const finish = (callback: () => void): void => {
+		while (cleanups.length > 0) cleanups.pop()?.();
+		callback();
+	};
+	if (lifecycle?.signal?.aborted) {
+		return Promise.reject(lifecycle.signal.reason ?? createAbortError("AbortError", message));
+	}
+	if (lifecycle?.signal) {
+		const onAbort = (): void =>
+			finish(() => reject(lifecycle.signal?.reason ?? createAbortError("AbortError", message)));
+		lifecycle.signal.addEventListener("abort", onAbort, { once: true });
+		cleanups.push(() => lifecycle.signal?.removeEventListener("abort", onAbort));
+	}
+	const remainingMs = getRemainingTimeMs(lifecycle?.deadlineMs);
+	if (remainingMs !== undefined) {
+		if (remainingMs <= 0) {
+			finish(() => reject(createAbortError("TimeoutError", `${message} timed out`)));
+		} else {
+			const timer = setTimeout(
+				() => finish(() => reject(createAbortError("TimeoutError", `${message} timed out`))),
+				remainingMs,
+			);
+			timer.unref();
+			cleanups.push(() => clearTimeout(timer));
+		}
+	}
+	void value.then(
+		result => finish(() => resolve(result)),
+		error => finish(() => reject(error)),
+	);
+	return await promise;
+}
+
 export async function checkPythonKernelAvailability(
 	cwd: string,
 	runtimeOptions?: PythonRuntimeOptions,
@@ -121,22 +160,39 @@ export async function checkPythonKernelAvailability(
 		throw createAbortError("TimeoutError", "Python kernel availability check timed out");
 	}
 	try {
-		const settings = await Settings.init();
+		const settings = await waitForLifecycle(Settings.init(), lifecycle, "Python kernel settings initialization");
 		const { env } = settings.getShellConfig();
 		const baseEnv = filterEnv(env);
 		const runtime = await ensurePythonRuntime(cwd, baseEnv, runtimeOptions, lifecycle);
-		const probe = await $`${runtime.pythonPath} -c "import sys;sys.exit(0)"`
-			.quiet()
-			.nothrow()
-			.cwd(cwd)
-			.env(runtime.env);
-		if (probe.exitCode === 0) {
+		const probeEnv: Record<string, string> = {};
+		for (const [key, value] of Object.entries(runtime.env)) {
+			if (typeof value === "string") probeEnv[key] = value;
+		}
+		const remainingMs = getRemainingTimeMs(lifecycle?.deadlineMs);
+		if (remainingMs !== undefined && remainingMs <= 0) {
+			throw createAbortError("TimeoutError", "Python kernel availability check timed out");
+		}
+		const probe = Bun.spawn([runtime.pythonPath, "-c", "import sys;sys.exit(0)"], {
+			cwd,
+			env: probeEnv,
+			stdout: "ignore",
+			stderr: "ignore",
+			windowsHide: true,
+			signal: lifecycle?.signal,
+			timeout: remainingMs,
+		});
+		const exitCode = await probe.exited;
+		throwIfAborted(lifecycle?.signal, "Python kernel availability check aborted");
+		if (lifecycle?.deadlineMs !== undefined && lifecycle.deadlineMs <= Date.now()) {
+			throw createAbortError("TimeoutError", "Python kernel availability check timed out");
+		}
+		if (exitCode === 0) {
 			return { ok: true, pythonPath: runtime.pythonPath };
 		}
 		return {
 			ok: false,
 			pythonPath: runtime.pythonPath,
-			reason: `Python interpreter at ${runtime.pythonPath} returned exit code ${probe.exitCode}`,
+			reason: `Python interpreter at ${runtime.pythonPath} returned exit code ${exitCode}`,
 		};
 	} catch (err) {
 		throwIfAborted(lifecycle?.signal, "Python kernel availability check aborted");

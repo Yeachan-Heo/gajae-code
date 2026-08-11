@@ -139,7 +139,10 @@ describe("python eval lifecycle red-team", () => {
 		const pythonPath = path.join(binDir, "python3");
 		const childPidPath = path.join(tempDir.path(), "provision-child.pid");
 		await fs.mkdir(binDir);
-		await Bun.write(pythonPath, '#!/bin/sh\n(sleep 30) &\nprintf \'%s\' "$!" > "$PWD/provision-child.pid"\nwait\n');
+		await Bun.write(
+			pythonPath,
+			'#!/bin/sh\n(trap "" TERM; while :; do sleep 1; done) &\nprintf \'%s\' "$!" > "$PWD/provision-child.pid"\nwait\n',
+		);
 		await fs.chmod(pythonPath, 0o755);
 		const controller = new AbortController();
 		const originalPath = process.env.PATH;
