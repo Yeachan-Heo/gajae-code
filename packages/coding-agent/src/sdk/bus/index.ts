@@ -3659,6 +3659,22 @@ export function createNotificationsExtension(
 		await ensureConfiguredProviderDaemons(settings, cfg, options.ensureProviderDaemon);
 		return "ready";
 	}
+
+	function retainNotificationRootRegistration(
+		runtime: SessionRuntime,
+		settings: Settings,
+		cwd: string,
+		id: string,
+		registrationToken: string,
+	): void {
+		if (runtimes.get(id) === runtime && !runtime.stopping) {
+			runtime.notificationRootRegistration = { settings, cwd, registrationToken };
+			return;
+		}
+		void unregisterNotificationRoot({ settings, cwd, sessionId: id, registrationToken }).catch(error =>
+			logger.warn(`notifications: late Telegram root unregister failed: ${String(error)}`),
+		);
+	}
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -5571,10 +5587,9 @@ export function createNotificationsExtension(
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				initializedRuntime.notificationOwnerState = "retry";
-				let registrationToken: string | undefined;
 				try {
 					const ownership = await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id, token => {
-						registrationToken = token;
+						retainNotificationRootRegistration(initializedRuntime, settings, ctx.cwd, id, token);
 					});
 					initializedRuntime.notificationOwnerState =
 						ownership === "ready" || (ownership === "blocked_identity_with_sibling" && isolateChatEndpoint)
@@ -5593,9 +5608,6 @@ export function createNotificationsExtension(
 					logger.warn(
 						`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
 					);
-				} finally {
-					if (registrationToken !== undefined)
-						initializedRuntime.notificationRootRegistration = { settings, cwd: ctx.cwd, registrationToken };
 				}
 			}
 
@@ -5876,7 +5888,6 @@ export function createNotificationsExtension(
 				if (runtime.notificationOwnerState === "retry") {
 					const { cfg, settings, settingsAvailable } = resolveSettings(options.settings);
 					if (!settingsAvailable || !settings) return "failed";
-					let registrationToken: string | undefined;
 					try {
 						const ownership = await ensureConfiguredDaemonOwners(
 							settings,
@@ -5884,7 +5895,7 @@ export function createNotificationsExtension(
 							binding.cwd,
 							binding.sessionId,
 							token => {
-								registrationToken = token;
+								retainNotificationRootRegistration(runtime, settings, binding.cwd, binding.sessionId, token);
 							},
 						);
 						runtime.notificationOwnerState =
@@ -5894,9 +5905,6 @@ export function createNotificationsExtension(
 								: "blocked";
 					} catch {
 						return "failed";
-					} finally {
-						if (registrationToken !== undefined)
-							runtime.notificationRootRegistration = { settings, cwd: binding.cwd, registrationToken };
 					}
 				}
 				return "started";
