@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { watchSessionHostClientAttachment } from "../src/commands/sdk";
 import {
+	BROKER_DEAD_REGISTRATION_SWEEP_LIMIT,
 	publishSessionHostRuntimeEvidence,
 	reapDeadSessionRegistrations,
 	sessionHostAttachedClients,
@@ -355,6 +356,47 @@ test("the broker drops registrations whose host process is gone, keeps live ones
 				.sessions.map(session => session.sessionId)
 				.sort(),
 		).toEqual(["leaked", "live", "uncertain"]);
+	} finally {
+		warn.mockRestore();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("a dead-registration sweep stays bounded so another client can still take the index lock", async () => {
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-reap-bound-"));
+	const deadPid = 4_194_304;
+	expect(() => process.kill(deadPid, 0)).toThrow();
+	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const index = await new SessionIndex(agentDir).open();
+		const locator = { repo: agentDir, stateRoot: agentDir };
+		const dead = BROKER_DEAD_REGISTRATION_SWEEP_LIMIT * 3;
+		for (let i = 0; i < dead; i++) {
+			await index.append({
+				type: "host_registered",
+				sessionId: `leaked-${i}`,
+				locator,
+				endpointGeneration: i + 1,
+				pid: deadPid,
+			});
+		}
+
+		// Every reap is its own locked transaction, so an uncapped sweep over a
+		// long-lived index owns the shared lock continuously and unrelated launches
+		// exhaust their retry budget instead of registering.
+		const contender = await new SessionIndex(agentDir).open();
+		const sweeping = reapDeadSessionRegistrations({ index });
+		const started = Date.now();
+		await contender.withLocked(async () => undefined);
+		const waited = Date.now() - started;
+		const reaped = await sweeping;
+
+		expect(reaped).toHaveLength(BROKER_DEAD_REGISTRATION_SWEEP_LIMIT);
+		expect(waited).toBeLessThan(10_000);
+		// The surplus is left for later sweeps rather than extending this one.
+		expect(index.listSessions().sessions.filter(session => !session.terminal)).toHaveLength(
+			dead - BROKER_DEAD_REGISTRATION_SWEEP_LIMIT,
+		);
 	} finally {
 		warn.mockRestore();
 		await fs.rm(agentDir, { recursive: true, force: true });
