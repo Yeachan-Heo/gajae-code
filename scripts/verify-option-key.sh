@@ -53,9 +53,18 @@ def check_iterm(prefs, emit):
         return False
     profiles = prefs.get("New Bookmarks", [])
     required = {"Default", "tmux"}
-    by_name = {profile.get("Name"): profile for profile in profiles}
+    by_name = {}
+    duplicate_names = []
+    for profile in profiles:
+        name = profile.get("Name")
+        if name in required:
+            if name in by_name:
+                duplicate_names.append(name)
+            else:
+                by_name[name] = profile
     missing = sorted(required - by_name.keys())
     problems = [f"required iTerm2 profiles are missing: {', '.join(missing)}"] if missing else []
+    problems.extend(f"duplicate iTerm2 profile name: {name}" for name in sorted(set(duplicate_names)))
 
     # iTerm2 key maps may encode letter keys as physical macOS keycodes (Q=12, I=34)
     # or as character codes (q=0x71, i=0x69). Option is 0x80000.
@@ -68,8 +77,8 @@ def check_iterm(prefs, emit):
             right = profile.get("Right Option Key Sends")
             if emit:
                 print(f"iTerm2 profile {name}: left={left}, right={right}")
-            if left != 1 or right != 1:
-                problems.append(f"{name}: Option keys are not +Esc")
+            if left != 2 or right != 2:
+                problems.append(f"{name}: Option keys are not +Esc (expected 2)")
             keyboard_map = profile.get("Keyboard Map", {}) or {}
             for map_key, mapping in keyboard_map.items():
                 mapping = mapping if isinstance(mapping, dict) else {}
@@ -90,7 +99,7 @@ def check_iterm(prefs, emit):
         if problems:
             print("FAIL: " + "; ".join(problems))
         else:
-            print("PASS: iTerm2 Default and tmux send both Option keys as +Esc with no Option+Q/I overrides")
+            print("PASS: iTerm2 Default and tmux send both Option keys as +Esc (value 2) with no Option+Q/I overrides")
     return not problems
 
 
