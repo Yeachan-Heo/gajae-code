@@ -260,13 +260,18 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 	}
 }
 
-async function tryAcquireLock(lockPath: string, ownerHostId?: string): Promise<LockInfo | null> {
+async function tryAcquireLock(
+	lockPath: string,
+	ownerHostId?: string,
+	onAcquired?: () => void,
+): Promise<LockInfo | null> {
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
 	if (ownerHostId === undefined) {
 		try {
 			await fs.mkdir(lockPath);
+			onAcquired?.();
 			return await writeLockInfo(lockPath, lockInfo());
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
@@ -281,6 +286,7 @@ async function tryAcquireLock(lockPath: string, ownerHostId?: string): Promise<L
 		await writeLockInfo(pendingPath, owner);
 		try {
 			await fs.rename(pendingPath, lockPath);
+			onAcquired?.();
 			return owner;
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
@@ -311,11 +317,8 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
-		const owner = await tryAcquireLock(lockPath, opts.ownerHostId);
-		if (owner) {
-			opts.onAcquired?.();
-			return () => releaseLock(lockPath, owner);
-		}
+		const owner = await tryAcquireLock(lockPath, opts.ownerHostId, opts.onAcquired);
+		if (owner) return () => releaseLock(lockPath, owner);
 		const stale = await staleLockSnapshot(lockPath, opts.staleMs, opts.ownerHostId, contentionStartTimes);
 		if (await removeStaleLockForAcquire(lockPath, stale)) continue;
 		if (!opts.signal) {
