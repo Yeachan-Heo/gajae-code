@@ -47,10 +47,15 @@ export interface SessionLifecycleTranscriptIdentity {
 	readonly sha256: string;
 }
 
+export interface SessionLifecycleSavedSessionIdentity extends SessionLifecycleTranscriptIdentity {
+	readonly nlink: string;
+	readonly ctimeNs: string;
+}
+
 export interface SessionLifecycleSavedSession {
 	readonly id: string;
 	readonly path: string;
-	readonly identity: SessionLifecycleTranscriptIdentity;
+	readonly identity: SessionLifecycleSavedSessionIdentity;
 }
 
 export interface SessionLifecycleCoordinatorTarget {
@@ -422,14 +427,16 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 	return result;
 }
 
-function transcriptIdentity(value: unknown): SessionLifecycleTranscriptIdentity | undefined {
+function savedSessionTranscriptIdentity(value: unknown): SessionLifecycleSavedSessionIdentity | undefined {
 	if (!isRecord(value)) return undefined;
-	const { dev, ino, size, mtimeMs, mtimeNs, sha256 } = value;
+	const { dev, ino, nlink, size, mtimeMs, mtimeNs, ctimeNs, sha256 } = value;
 	if (
 		typeof dev !== "string" ||
 		!/^\d+$/.test(dev) ||
 		typeof ino !== "string" ||
 		!/^\d+$/.test(ino) ||
+		typeof nlink !== "string" ||
+		!/^\d+$/.test(nlink) ||
 		typeof size !== "number" ||
 		!Number.isSafeInteger(size) ||
 		size < 0 ||
@@ -438,16 +445,18 @@ function transcriptIdentity(value: unknown): SessionLifecycleTranscriptIdentity 
 		mtimeMs < 0 ||
 		typeof mtimeNs !== "string" ||
 		!/^\d+$/.test(mtimeNs) ||
+		typeof ctimeNs !== "string" ||
+		!/^\d+$/.test(ctimeNs) ||
 		typeof sha256 !== "string" ||
 		!/^[a-f0-9]{64}$/.test(sha256)
 	)
 		return undefined;
-	return { dev, ino, size, mtimeMs, mtimeNs, sha256 };
+	return { dev, ino, nlink, size, mtimeMs, mtimeNs, ctimeNs, sha256 };
 }
 
 function savedSessionFromResult(value: unknown): SessionLifecycleSavedSession | undefined {
 	if (!isRecord(value)) return undefined;
-	const identity = transcriptIdentity(value.identity);
+	const identity = savedSessionTranscriptIdentity(value.identity);
 	if (typeof value.id !== "string" || typeof value.path !== "string" || value.path.length === 0 || !identity)
 		return undefined;
 	return { id: value.id, path: value.path, identity };
@@ -484,7 +493,9 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 		if (typeof warning !== "string") return undefined;
 		warnings.push(warning);
 	}
-	const savedSession = savedSessionFromResult(value.savedSession);
+	const savedSessionPresent = Object.hasOwn(value, "savedSession");
+	const savedSession = savedSessionPresent ? savedSessionFromResult(value.savedSession) : undefined;
+	if (savedSessionPresent && !savedSession) return undefined;
 	return { indexSeq, sessions, warnings, ...(savedSession ? { savedSession } : {}) };
 }
 type LifecycleListPage = {

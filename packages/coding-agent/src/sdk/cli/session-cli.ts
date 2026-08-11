@@ -10,7 +10,7 @@ import type {
 	SessionLifecycleMutationRequest,
 	SessionLifecycleOperation,
 	SessionLifecycleSavedSession,
-	SessionLifecycleTranscriptIdentity,
+	SessionLifecycleSavedSessionIdentity,
 } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
@@ -645,7 +645,7 @@ function retainedTranscriptIdentityMismatch(): RetainedTranscriptTailError {
 }
 
 function matchesRetainedTranscriptIdentity(
-	identity: SessionLifecycleTranscriptIdentity,
+	identity: SessionLifecycleSavedSessionIdentity,
 	descriptor: fsSync.BigIntStats,
 ): boolean {
 	try {
@@ -653,9 +653,11 @@ function matchesRetainedTranscriptIdentity(
 			descriptor.isFile() &&
 			descriptor.dev === BigInt(identity.dev) &&
 			descriptor.ino === BigInt(identity.ino) &&
+			descriptor.nlink === BigInt(identity.nlink) &&
 			descriptor.size === BigInt(identity.size) &&
 			descriptor.mtimeMs === BigInt(identity.mtimeMs) &&
-			descriptor.mtimeNs === BigInt(identity.mtimeNs)
+			descriptor.mtimeNs === BigInt(identity.mtimeNs) &&
+			descriptor.ctimeNs === BigInt(identity.ctimeNs)
 		);
 	} catch {
 		return false;

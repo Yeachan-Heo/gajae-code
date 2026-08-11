@@ -230,8 +230,10 @@ describe("SDK session CLI", () => {
 
 	async function tailAfterBrokerSelectsOfflineSession(
 		mutate: (session: OfflineSession) => Promise<void>,
+		prepare?: (session: OfflineSession) => Promise<void>,
 	): Promise<{ result: CliResult; selections: number }> {
 		const session = await createStoppedSavedSession();
+		if (prepare) await prepare(session);
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		let selections = 0;
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
@@ -398,6 +400,37 @@ describe("SDK session CLI", () => {
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			ok: true,
 			result: { source: "offline", session: { sessionId: session.id }, terminal: true },
+		});
+	}, 60_000);
+	it("fails closed when the Broker-selected offline transcript is rewritten in place with restored metadata", async () => {
+		const retainedTimestamp = 1_700_000_000;
+		const { result, selections } = await tailAfterBrokerSelectsOfflineSession(
+			async session => {
+				const before = await fs.stat(session.path, { bigint: true });
+				const original = await Bun.file(session.path).text();
+				const rewrittenId = `${session.id.slice(0, -1)}${session.id.endsWith("x") ? "y" : "x"}`;
+				const rewritten = original.replace(session.id, rewrittenId);
+				expect(rewritten).not.toBe(original);
+				await fs.writeFile(session.path, rewritten);
+				await fs.utimes(session.path, retainedTimestamp, retainedTimestamp);
+				const after = await fs.stat(session.path, { bigint: true });
+				expect(after.dev).toBe(before.dev);
+				expect(after.ino).toBe(before.ino);
+				expect(after.nlink).toBe(before.nlink);
+				expect(after.size).toBe(before.size);
+				expect(after.mtimeMs).toBe(before.mtimeMs);
+				expect(after.mtimeNs).toBe(before.mtimeNs);
+				expect(after.ctimeNs).not.toBe(before.ctimeNs);
+			},
+			async session => {
+				await fs.utimes(session.path, retainedTimestamp, retainedTimestamp);
+			},
+		);
+		expect(selections).toBe(1);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+		expect(JSON.parse(result.stdout)).toMatchObject({
+			ok: false,
+			error: { code: "retention_gap", details: { code: "retention_gap", reason: "changed" } },
 		});
 	}, 60_000);
 

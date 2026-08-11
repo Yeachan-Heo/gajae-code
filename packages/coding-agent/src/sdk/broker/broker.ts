@@ -1392,25 +1392,31 @@ export class Broker {
 						? listed.owned.filter(candidate => candidate.sessionId === resolveSessionId)
 						: [];
 				const match = matches.length === 1 ? matches[0] : undefined;
+				const savedSession =
+					match &&
+					match.sessionId === resolveSessionId &&
+					match.identity.nlink !== undefined &&
+					match.identity.ctimeNs !== undefined
+						? {
+								id: match.sessionId,
+								path: match.path,
+								identity: {
+									dev: match.identity.dev.toString(),
+									ino: match.identity.ino.toString(),
+									nlink: match.identity.nlink.toString(),
+									size: match.identity.size,
+									mtimeMs: match.identity.mtimeMs,
+									mtimeNs: match.identity.mtimeNs.toString(),
+									ctimeNs: match.identity.ctimeNs.toString(),
+									sha256: match.identity.sha256,
+								},
+							}
+						: undefined;
 				return {
 					...page,
 					result: {
 						...pageResult,
-						savedSession:
-							match && match.sessionId === resolveSessionId
-								? {
-										id: match.sessionId,
-										path: match.path,
-										identity: {
-											dev: match.identity.dev.toString(),
-											ino: match.identity.ino.toString(),
-											size: match.identity.size,
-											mtimeMs: match.identity.mtimeMs,
-											mtimeNs: match.identity.mtimeNs.toString(),
-											sha256: match.identity.sha256,
-										},
-									}
-								: undefined,
+						...(savedSession === undefined ? {} : { savedSession }),
 					},
 				};
 			}

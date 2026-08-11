@@ -44,9 +44,11 @@ const target = { cwd: "/repo" } as const;
 const savedTranscriptIdentity = {
 	dev: "1",
 	ino: "2",
+	nlink: "1",
 	size: 3,
 	mtimeMs: 4,
 	mtimeNs: "4000000",
+	ctimeNs: "5000000",
 	sha256: "a".repeat(64),
 } as const;
 
@@ -243,6 +245,39 @@ describe("SessionLifecycleService", () => {
 			{ indexSeq: 7, sessions: [], warnings: ["valid", 1] },
 		]) {
 			const { service } = serviceWith({ ok: true, result });
+			expect(await service.list({ actor, capability: "session.list" })).toMatchObject({
+				ok: false,
+				certainty: "uncertain",
+				error: { code: "malformed_response" },
+			});
+		}
+	});
+	it("accepts session.list responses with genuinely absent savedSession", async () => {
+		const { service } = serviceWith({ ok: true, result: { indexSeq: 7, sessions: [], warnings: [] } });
+		expect(await service.list({ actor, capability: "session.list" })).toEqual({
+			ok: true,
+			operation: "session.list",
+			result: { indexSeq: 7, sessions: [], warnings: [] },
+		});
+	});
+	it("rejects present malformed session.list savedSession identities", async () => {
+		for (const savedSession of [
+			undefined,
+			{
+				id: "saved",
+				path: "/saved.jsonl",
+				identity: { ...savedTranscriptIdentity, nlink: "invalid" },
+			},
+			{
+				id: "saved",
+				path: "/saved.jsonl",
+				identity: { ...savedTranscriptIdentity, ctimeNs: "invalid" },
+			},
+		]) {
+			const { service } = serviceWith({
+				ok: true,
+				result: { indexSeq: 7, sessions: [], warnings: [], savedSession },
+			});
 			expect(await service.list({ actor, capability: "session.list" })).toMatchObject({
 				ok: false,
 				certainty: "uncertain",
