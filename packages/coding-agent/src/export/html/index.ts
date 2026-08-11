@@ -163,35 +163,47 @@ async function assertExportDoesNotAliasSource(sourcePath: string, outputPath: st
 		throw new Error("HTML export output must not overwrite the source transcript");
 }
 
+const HTML_EXPORT_SOURCE_OPEN_FLAGS =
+	syncFs.constants.O_RDONLY |
+	syncFs.constants.O_NONBLOCK |
+	(process.platform === "win32" ? 0 : (syncFs.constants.O_NOFOLLOW ?? 0));
+
 const HTML_EXPORT_DESTINATION_OPEN_FLAGS =
 	syncFs.constants.O_WRONLY |
 	syncFs.constants.O_CREAT |
 	(process.platform === "win32" ? 0 : (syncFs.constants.O_NOFOLLOW ?? 0));
 
-function sourceIdentityForExport(sourcePath: string): syncFs.BigIntStats | undefined {
-	try {
-		return syncFs.statSync(sourcePath, { bigint: true });
-	} catch (error) {
-		if (isEnoent(error)) return undefined;
-		throw error;
-	}
-}
-
 function sameFileIdentity(left: syncFs.BigIntStats, right: syncFs.BigIntStats): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
 }
 
-function openHtmlExportDestination(sourcePath: string | undefined, outputPath: string): number {
-	const descriptor = syncFs.openSync(outputPath, HTML_EXPORT_DESTINATION_OPEN_FLAGS, 0o666);
+async function openHtmlExportDescriptors(
+	sourcePath: string | undefined,
+	outputPath: string,
+): Promise<{ source: number | undefined; destination: number }> {
+	let source: number | undefined;
+	let destination: number | undefined;
 	try {
-		const openedIdentity = syncFs.fstatSync(descriptor, { bigint: true });
-		const sourceIdentity = sourcePath ? sourceIdentityForExport(sourcePath) : undefined;
-		if (sourceIdentity && sameFileIdentity(sourceIdentity, openedIdentity))
-			throw new Error("HTML export output must not overwrite the source transcript");
-		syncFs.ftruncateSync(descriptor, 0);
-		return descriptor;
+		if (sourcePath) {
+			try {
+				source = syncFs.openSync(sourcePath, HTML_EXPORT_SOURCE_OPEN_FLAGS);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+			await assertExportDoesNotAliasSource(sourcePath, outputPath);
+		}
+		destination = syncFs.openSync(outputPath, HTML_EXPORT_DESTINATION_OPEN_FLAGS, 0o666);
+		if (source !== undefined) {
+			const sourceIdentity = syncFs.fstatSync(source, { bigint: true });
+			const destinationIdentity = syncFs.fstatSync(destination, { bigint: true });
+			if (sameFileIdentity(sourceIdentity, destinationIdentity))
+				throw new Error("HTML export output must not overwrite the source transcript");
+		}
+		syncFs.ftruncateSync(destination, 0);
+		return { source, destination };
 	} catch (error) {
-		syncFs.closeSync(descriptor);
+		if (destination !== undefined) syncFs.closeSync(destination);
+		if (source !== undefined) syncFs.closeSync(source);
 		throw error;
 	}
 }
@@ -208,9 +220,8 @@ async function writeSessionHtml(
 	const markerOffset = themedTemplate.indexOf(marker);
 	if (markerOffset < 0) throw new Error("HTML export template is missing the session-data marker");
 	const sourcePath = sm.getSessionFile();
-	if (sourcePath) await assertExportDoesNotAliasSource(sourcePath, outputPath);
-	const descriptor = openHtmlExportDestination(sourcePath, outputPath);
-	const sink = Bun.file(descriptor).writer();
+	const descriptors = await openHtmlExportDescriptors(sourcePath, outputPath);
+	const sink = Bun.file(descriptors.destination).writer();
 	const encoder = new Base64StreamEncoder();
 	const writeEncoded = (value: string): void => {
 		const encoded = encoder.write(value);
@@ -240,7 +251,8 @@ async function writeSessionHtml(
 		await sink.end();
 		throw error;
 	} finally {
-		syncFs.closeSync(descriptor);
+		if (descriptors.source !== undefined) syncFs.closeSync(descriptors.source);
+		syncFs.closeSync(descriptors.destination);
 	}
 }
 
