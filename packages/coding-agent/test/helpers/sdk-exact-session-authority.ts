@@ -55,6 +55,12 @@ export async function publishExactSessionAuthority(
 	const stateRoot = path.join(options.cwd, ".gjc", "state");
 	const indexDirectory = path.join(options.agentDir, "sdk", "sessions");
 	await fs.mkdir(indexDirectory, { recursive: true });
+	// SessionIndex.append() stamps the OS incarnation on every host registration it
+	// writes, and liveness requires that incarnation to still match (the pid-reuse
+	// fence). A fixture that writes the log directly must stamp it too; a legacy
+	// row without one can never read live, so the Router would refuse to attach a
+	// session this fixture is meant to present as live.
+	const hostIncarnation = processIncarnation(authority.pid);
 	const unsigned = {
 		type: "host_registered" as const,
 		sessionId: authority.sessionId,
@@ -67,6 +73,7 @@ export async function publishExactSessionAuthority(
 		// incarnation to mirror a genuine host.
 		processIncarnation: processIncarnation(process.pid),
 		endpointMtimeMs: authority.endpointMtimeMs,
+		...(hostIncarnation === undefined ? {} : { hostIncarnation }),
 		version: SDK_STATE_VERSION,
 		indexSeq: 1,
 		ts: Date.now(),
