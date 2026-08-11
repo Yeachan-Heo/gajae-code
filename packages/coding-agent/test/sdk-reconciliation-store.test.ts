@@ -460,8 +460,13 @@ describe("reconciliation-store", () => {
 		// Review thread P2: an abandoned no_effect_reserved row (the process
 		// exited before finalization) settles to plain no_effect, but its
 		// only deliverable is the metadata-bearing no_active_turn replay — the
-		// settled row must store the replay-shaped hash (replacing the input
-		// placeholder) or a written replay can never advance it.
+		// settled row must store the replay-shaped hash or a written replay can
+		// never advance it. The responsePayloadHash stays the ORIGINAL
+		// placeholder: the delivered replay envelope embeds it, so the replay
+		// hash computed from that envelope is the hash the delivery observer
+		// actually compares — replacing the field with the replay hash would
+		// embed a different value and keep the row durably pending (review
+		// thread P2).
 		const now = 5_000;
 		const reserved: DurableTerminalScopeRecord = {
 			selection: "turn",
@@ -496,7 +501,7 @@ describe("reconciliation-store", () => {
 			},
 		};
 		const replayPayloadHash = hash(JSON.stringify(replayResult));
-		expect(settled.responsePayloadHash).toBe(replayPayloadHash);
+		expect(settled.responsePayloadHash).toBe(hash("input-placeholder"));
 		expect(settled.replayPayloadHash).toBe(replayPayloadHash);
 	});
 
@@ -541,10 +546,13 @@ describe("reconciliation-store", () => {
 		};
 		const replayPayloadHash = hash(JSON.stringify(replayResult));
 		expect(settled.turnDisposition).toBe("uncertain");
-		expect(settled.responsePayloadHash).toBe(replayPayloadHash);
+		expect(settled.responsePayloadHash).toBe(hash("original-input-placeholder"));
 		expect(settled.replayPayloadHash).toBe(replayPayloadHash);
 		// The delivery observer's advance condition accepts the written replay:
-		// the written response's hash matches the stored replay-shaped hash.
+		// the written response's hash matches the stored replay-shaped hash
+		// (the responsePayloadHash stays the original placeholder the replay
+		// envelope embeds, so replayPayloadHash is what the observer compares).
+		expect(settled.replayPayloadHash).toBe(replayPayloadHash);
 		expect(
 			settled.responseState === "pending" &&
 				(settled.responsePayloadHash === replayPayloadHash || settled.replayPayloadHash === replayPayloadHash),

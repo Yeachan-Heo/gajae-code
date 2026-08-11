@@ -472,8 +472,13 @@ export function settleTerminalScopeRestart(
 		if (scope.turnDisposition === "no_effect_reserved") {
 			// The reservation's only deliverable after restart is the
 			// metadata-bearing no_active_turn replay; store the replay-shaped
-			// payload hash (and replace the input placeholder) so a written
-			// replay can advance the row instead of staying durably pending
+			// payload hash so a written replay can advance the row instead of
+			// staying durably pending (review thread P2). The stored
+			// responsePayloadHash stays the ORIGINAL placeholder: the delivered
+			// replay envelope embeds it, so the replay hash computed from that
+			// envelope is the hash the delivery observer will actually compare —
+			// replacing the field with the replay hash would make the delivered
+			// envelope embed a DIFFERENT value and never advance the row
 			// (review thread P2).
 			const replayResult = {
 				ok: true,
@@ -490,7 +495,6 @@ export function settleTerminalScopeRestart(
 			return {
 				...scope,
 				turnDisposition: "no_effect" as const,
-				responsePayloadHash: replayPayloadHash,
 				replayPayloadHash,
 				terminalAt: scope.terminalAt ?? now,
 			};
@@ -521,8 +525,13 @@ export function settleTerminalScopeRestart(
 			...scope,
 			turnDisposition: "uncertain",
 			ownedWorkDisposition: scope.ownedWorkDisposition === "not_requested" ? "not_requested" : "uncertain",
-			responsePayloadHash: replayPayloadHash,
-			replayPayloadHash: replayPayloadHash,
+			// responsePayloadHash stays the ORIGINAL hash: the delivered replay
+			// envelope embeds it, so replayPayloadHash (computed from that
+			// envelope) is the hash the delivery observer compares — replacing
+			// the field with the replay hash would embed a different value and
+			// keep the row durably pending (review thread P2).
+			responsePayloadHash: scope.responsePayloadHash,
+			replayPayloadHash,
 			terminalAt: now,
 		};
 	});
