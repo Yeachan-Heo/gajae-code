@@ -176,7 +176,7 @@ describe("SelectorController model batch assignments", () => {
 		});
 		const selector = await openReadySelector(ctx);
 
-		selectMenuAction(selector, 5);
+		selectMenuAction(selector, 6);
 		await settleSelectorInput();
 
 		expect(setModelCalls).toEqual([]);
@@ -205,7 +205,7 @@ describe("SelectorController model batch assignments", () => {
 		const { ctx, settings, setModelCalls } = createControllerContext();
 		const selector = await openReadySelector(ctx);
 
-		selectMenuAction(selector, 6);
+		selectMenuAction(selector, 7);
 		await settleSelectorInput();
 
 		expect(setModelCalls).toEqual([
@@ -228,7 +228,7 @@ describe("SelectorController model batch assignments", () => {
 			critic: "provider-a/selected",
 		});
 		expect(ctx.showStatus).toHaveBeenCalledWith(
-			"All model targets set to provider-a/selected for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.",
+			"All model targets set to provider-a/selected for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC, IMAGE.",
 		);
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
@@ -243,7 +243,7 @@ describe("SelectorController model batch assignments", () => {
 		});
 		const selector = await openReadySelector(ctx);
 
-		selectMenuAction(selector, 6);
+		selectMenuAction(selector, 7);
 		await settleSelectorInput();
 
 		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("role write failed"));
@@ -262,7 +262,7 @@ describe("SelectorController model batch assignments", () => {
 		});
 		const selector = await openReadySelector(ctx);
 
-		selectMenuAction(selector, 6);
+		selectMenuAction(selector, 7);
 		await settleSelectorInput();
 
 		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("role write failed"));
@@ -277,7 +277,7 @@ describe("SelectorController model batch assignments", () => {
 		});
 		const selector = await openReadySelector(ctx);
 
-		selectMenuAction(selector, 5);
+		selectMenuAction(selector, 6);
 		await settleSelectorInput();
 
 		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("role write failed"));

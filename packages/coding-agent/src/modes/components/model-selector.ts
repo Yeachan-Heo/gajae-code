@@ -43,7 +43,6 @@ import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
 import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
-import { getConfiguredImageModel } from "../../tools/image-gen";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 
@@ -147,9 +146,6 @@ export type ModelSelectorSelection =
 	| {
 			kind: "deleteProfile";
 			profileName: string;
-	  }
-	| {
-			kind: "imageGeneration";
 	  };
 
 interface PendingThinkingChoice {
@@ -215,8 +211,8 @@ interface PresetBrowseRow {
 	kind: "browse";
 }
 
-interface PresetImageGenerationRow {
-	kind: "imageGeneration";
+interface PresetImageRoleRow {
+	kind: "imageRole";
 }
 
 type PresetLandingRow =
@@ -226,7 +222,7 @@ type PresetLandingRow =
 	| PresetCreateUnavailableRow
 	| PresetAlreadySavedRow
 	| PresetBrowseRow
-	| PresetImageGenerationRow;
+	| PresetImageRoleRow;
 
 // Stable logical identity for a preset landing row, independent of its current
 // list position. Used to relocate the cursor after the expanded group changes so
@@ -245,8 +241,8 @@ function presetRowIdentity(row: PresetLandingRow): string {
 			return "createUnavailable";
 		case "alreadySaved":
 			return `alreadySaved:${row.profile.name}`;
-		case "imageGeneration":
-			return "imageGeneration";
+		case "imageRole":
+			return "imageRole";
 	}
 }
 
@@ -391,6 +387,7 @@ export class ModelSelectorComponent extends Container {
 	#providerAuthPending: boolean = false;
 	#presetLoginHint?: string;
 	#authSessionId?: string;
+	#imageRoleFilter: boolean = false;
 
 	// Tab state
 	#providers: ProviderTabState[] = STATIC_PROVIDER_TABS;
@@ -1031,8 +1028,11 @@ export class ModelSelectorComponent extends Container {
 		// Start with all models or filter by provider/canonical view
 		let baseModels = this.#allModels;
 		const baseCanonicalModels = this.#canonicalModels;
+		if (this.#imageRoleFilter) {
+			baseModels = baseModels.filter(m => m.model.output?.includes("image") ?? false);
+		}
 		if (activeProviderId) {
-			baseModels = this.#allModels.filter(m => m.provider === activeProviderId);
+			baseModels = baseModels.filter(m => m.provider === activeProviderId);
 		}
 
 		// Apply fuzzy filter if query is present
@@ -1208,7 +1208,7 @@ export class ModelSelectorComponent extends Container {
 		} else {
 			rows.push({ kind: "createUnavailable", label: "Select a model before creating a custom preset" });
 		}
-		rows.push({ kind: "imageGeneration" });
+		rows.push({ kind: "imageRole" });
 		rows.push({ kind: "browse" });
 		return rows;
 	}
@@ -1415,7 +1415,7 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
 			selected.kind === "alreadySaved" ||
-			selected.kind === "imageGeneration"
+			selected.kind === "imageRole"
 		)
 			return;
 		if (this.#expandedPresetProviderId === selected.groupId) return;
@@ -1432,7 +1432,7 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
 			selected.kind === "alreadySaved" ||
-			selected.kind === "imageGeneration"
+			selected.kind === "imageRole"
 		)
 			return;
 		if (this.#expandedPresetProviderId !== selected.groupId) return;
@@ -1445,7 +1445,7 @@ export class ModelSelectorComponent extends Container {
 		this.#searchInput.setValue(value);
 	}
 
-	#switchToModelMode(seed?: string): void {
+	#switchToModelMode(seed?: string, options?: { imageRoleFilter?: boolean }): void {
 		this.#viewMode = "models";
 		this.#expandedPresetProviderId = undefined;
 		this.#previewProfileName = undefined;
@@ -1454,6 +1454,7 @@ export class ModelSelectorComponent extends Container {
 		this.#presetLoginHint = undefined;
 		this.#activeTabIndex = 0;
 		this.#selectedIndex = 0;
+		this.#imageRoleFilter = options?.imageRoleFilter ?? false;
 		this.#setSearchInputValue(seed ?? this.#searchInput.getValue());
 		this.#updateTabBar();
 		this.#filterModels(this.#searchInput.getValue());
@@ -1532,13 +1533,14 @@ export class ModelSelectorComponent extends Container {
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}
-			if (row.kind === "imageGeneration") {
-				const config = getConfiguredImageModel();
-				const current =
-					config && config.provider !== "auto"
-						? `${config.provider}${config.model ? ` (${config.model})` : ""}`
-						: "Auto";
-				const label = `Image Generation: ${current}`;
+			if (row.kind === "imageRole") {
+				const imageRoleValue = this.#settings.getModelRole("image");
+				const current = imageRoleValue
+					? Array.isArray(imageRoleValue)
+						? imageRoleValue[0]
+						: imageRoleValue
+					: "No image model set";
+				const label = `Image Role: ${current}`;
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}
@@ -2094,8 +2096,8 @@ export class ModelSelectorComponent extends Container {
 			this.#switchToModelMode();
 			return;
 		}
-		if (row.kind === "imageGeneration") {
-			this.#onSelectCallback({ kind: "imageGeneration" });
+		if (row.kind === "imageRole") {
+			this.#switchToModelMode(undefined, { imageRoleFilter: true });
 			return;
 		}
 		if (row.kind === "group") {

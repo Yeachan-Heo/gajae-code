@@ -1294,31 +1294,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		applyConfiguredSearchTimeout(settings);
 
-		const imageProvider = settings.get("providers.image");
-		const imageModel = settings.get("providers.imageModel");
-		const imageCustomUrl = settings.get("providers.imageCustomUrl");
-		const imageCustomKey = settings.get("providers.imageCustomKey");
-		const imageCustomKeyEnv = settings.get("providers.imageCustomKeyEnv");
-		if (
-			imageProvider === "auto" ||
-			imageProvider === "openai" ||
-			imageProvider === "gemini" ||
-			imageProvider === "openrouter" ||
-			imageProvider === "antigravity" ||
-			imageProvider === "alibaba" ||
-			imageProvider === "custom"
-		) {
-			const { setConfiguredImageModel, setPreferredImageProvider } = await import("../tools/image-gen");
-			setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
-			setConfiguredImageModel({
-				provider: imageProvider,
-				model: imageModel ?? null,
-				customUrl: imageCustomUrl,
-				customKey: imageCustomKey,
-				customKeyEnv: imageCustomKeyEnv,
-			});
-		}
-
 		const sessionManager =
 			options.sessionManager ??
 			(await logger.time("sessionManager", async () => {
@@ -1860,9 +1835,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const pluginMcpToolNames: string[] = [];
 		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
 
-		// Add image tools when the active model or configured image providers can generate images.
+		// Add image tools when an image role model is configured.
 		const { getImageGenTools } = await import("../tools/image-gen");
-		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
+		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, settings));
 		if (imageGenTools.length > 0) {
 			customTools.push(...(imageGenTools as unknown as CustomTool[]));
 		}

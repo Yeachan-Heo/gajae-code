@@ -1627,6 +1627,40 @@ export class Settings implements NotificationSettingsReader {
 			}
 		}
 
+		// Migrate legacy providers.image* settings into modelRoles.image.
+		// The image-generation model is now selected via the model-role system
+		// (/model image <selector>) instead of a separate provider config dialog.
+		const providersObj = raw.providers as Record<string, unknown> | undefined;
+		if (providersObj && typeof providersObj.image === "string") {
+			const imageProvider = providersObj.image as string;
+			const imageModel = typeof providersObj.imageModel === "string" ? providersObj.imageModel : undefined;
+			const imageCustomUrl =
+				typeof providersObj.imageCustomUrl === "string" ? providersObj.imageCustomUrl : undefined;
+
+			if (imageProvider !== "auto") {
+				const roles = rawSettingsRecord(raw.modelRoles) ?? {};
+				if (!roles.image) {
+					if (imageProvider === "custom" && imageCustomUrl) {
+						// Custom providers are registered as first-class OpenAI-compatible providers;
+						// the migration produces a provider/model selector.
+						const customProviderId = "image-custom";
+						roles.image = `${customProviderId}/${imageModel ?? "gpt-image-2"}`;
+					} else if (imageModel) {
+						roles.image = `${imageProvider}/${imageModel}`;
+					} else {
+						roles.image = imageProvider;
+					}
+					raw.modelRoles = roles;
+				}
+			}
+
+			delete providersObj.image;
+			delete providersObj.imageModel;
+			delete providersObj.imageCustomUrl;
+			delete providersObj.imageCustomKey;
+			delete providersObj.imageCustomKeyEnv;
+		}
+
 		raw.configSchemaVersion = CONFIG_SCHEMA_VERSION;
 
 		return raw;

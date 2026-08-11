@@ -2666,36 +2666,6 @@
 					"description": "Provider for web search tool",
 					"default": "auto"
 				},
-				"image": {
-					"type": "string",
-					"enum": [
-						"auto",
-						"openai",
-						"gemini",
-						"openrouter",
-						"antigravity",
-						"alibaba",
-						"custom"
-					],
-					"description": "Provider and model for image generation tool",
-					"default": "auto"
-				},
-				"imageModel": {
-					"type": "string",
-					"description": "Override the default image generation model for the selected provider"
-				},
-				"imageCustomUrl": {
-					"type": "string",
-					"description": "Base URL for custom OpenAI-compatible image endpoint"
-				},
-				"imageCustomKey": {
-					"type": "string",
-					"description": "API key for custom OpenAI-compatible image endpoint"
-				},
-				"imageCustomKeyEnv": {
-					"type": "string",
-					"description": "Environment variable name holding the API key for custom image endpoint"
-				},
 				"kimiApiFormat": {
 					"type": "string",
 					"enum": [

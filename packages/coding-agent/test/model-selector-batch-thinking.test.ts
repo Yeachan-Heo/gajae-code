@@ -126,10 +126,10 @@ function selectActionRow(selector: ModelSelectorComponent, rowIndex: number): vo
 	selector.handleInput("\n");
 }
 
-// Action menu rows: 0..4 = default/executor/architect/planner/critic,
-// 5 = "Set for all role agents", 6 = "Set for all targets".
-const ALL_ROLE_AGENTS_ROW = 5;
-const ALL_TARGETS_ROW = 6;
+// Action menu rows: 0..5 = default/executor/architect/planner/critic/image,
+// 6 = "Set for all role agents", 7 = "Set for all targets".
+const ALL_ROLE_AGENTS_ROW = 6;
+const ALL_TARGETS_ROW = 7;
 
 describe("ModelSelector batch assignment thinking menu", () => {
 	beforeAll(async () => {
@@ -193,7 +193,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected batch selection after picking a thinking level");
 		expect(selectedAfterEnter.role).toBe("default");
-		expect(selectedAfterEnter.roles).toEqual(["default", "executor", "architect", "planner", "critic"]);
+		expect(selectedAfterEnter.roles).toEqual(["default", "executor", "architect", "planner", "critic", "image"]);
 		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(selectedAfterEnter.selector).toBe("openai-codex/gpt-5.5:high");
 	});

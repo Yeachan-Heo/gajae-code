@@ -24,6 +24,8 @@ import {
 import * as z from "zod/v4";
 import packageJson from "../../package.json" with { type: "json" };
 import { isAuthenticated, type ModelRegistry } from "../config/model-registry";
+import { resolveModelRoleValue } from "../config/model-resolver";
+import type { Settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/url-guard";
@@ -46,7 +48,7 @@ const ALIBABA_IMAGE_GENERATION_URL = `${ALIBABA_TOKEN_PLAN_HOST}/api/v1/services
 const IMAGE_SYSTEM_INSTRUCTION =
 	"You are an AI image generator. Generate images based on user descriptions. Focus on creating high-quality, visually appealing images that match the user's request.";
 
-type ImageProvider = "alibaba" | "antigravity" | "gemini" | "openai" | "openai-codex" | "openrouter";
+type ImageProvider = "alibaba" | "antigravity" | "gemini" | "openai" | "openai-codex" | "openrouter" | (string & {});
 interface ImageApiKey {
 	provider: ImageProvider;
 	apiKey: string;
@@ -651,15 +653,7 @@ function extractOpenRouterImageUrls(message: OpenRouterMessage | undefined): str
 	return urls;
 }
 
-/** Preferred provider set via settings (default: auto) */
-let preferredImageProvider: ImageProvider | "auto" = "auto";
-
-/** Set the preferred image provider from settings */
-export function setPreferredImageProvider(provider: ImageProvider | "auto"): void {
-	preferredImageProvider = provider;
-}
-
-/** Provider → default image model mapping for auto-binding */
+/** Provider → default image model mapping for fallbacks */
 export const IMAGE_PROVIDER_DEFAULTS: Record<string, string> = {
 	openai: "gpt-image-2",
 	alibaba: "wan2.7-image",
@@ -669,32 +663,26 @@ export const IMAGE_PROVIDER_DEFAULTS: Record<string, string> = {
 	openrouter: "google/gemini-3-pro-image-preview",
 };
 
-/** Resolved image generation configuration from settings */
-export interface ImageProviderConfig {
-	provider: ImageProvider | "auto" | "custom";
-	model: string | null;
-	customUrl?: string;
-	customKey?: string;
-	customKeyEnv?: string;
-}
-
-/** Module-level configured image model state (set from settings at session init) */
-let configuredImageConfig: ImageProviderConfig | null = null;
-
-/** Set the configured image provider + model from settings */
-export function setConfiguredImageModel(config: ImageProviderConfig | null): void {
-	configuredImageConfig = config;
-	// Keep preferredImageProvider in sync for backward compat
-	if (config && config.provider !== "auto" && config.provider !== "custom") {
-		preferredImageProvider = config.provider;
-	} else if (!config || config.provider === "auto") {
-		preferredImageProvider = "auto";
-	}
-}
-
-/** Get the current configured image model (for UI display) */
-export function getConfiguredImageModel(): ImageProviderConfig | null {
-	return configuredImageConfig;
+/**
+ * Resolve the image-generation model from the `modelRoles.image` settings entry.
+ * Returns the resolved Model (with provider identity) or undefined when no
+ * image role is configured / no matching model is available.
+ */
+export function resolveImageRoleModel(
+	settings: Settings,
+	modelRegistry: ModelRegistry,
+	options?: { sessionId?: string; credentialSessionId?: string },
+): Model | undefined {
+	const roleValue = settings.getModelRole("image");
+	if (!roleValue) return undefined;
+	const availableModels = modelRegistry.getAvailable();
+	const resolved = resolveModelRoleValue(roleValue, availableModels, {
+		settings,
+		modelRegistry,
+		sessionId: options?.sessionId,
+		credentialSessionId: options?.credentialSessionId,
+	});
+	return resolved.model;
 }
 
 /** Resolve the effective image model for a configured provider */
@@ -724,22 +712,6 @@ function parseAntigravityCredentials(raw: string): ParsedAntigravityCredentials 
 	return rawToken.length > 0 ? { accessToken: rawToken } : null;
 }
 
-function createCustomImageModel(baseUrl: string, id: string): Model<"openai-responses"> {
-	return {
-		id,
-		name: id,
-		api: "openai-responses",
-		provider: "openai",
-		baseUrl: baseUrl.replace(/\/+$/, ""),
-		reasoning: false,
-		input: ["text"],
-		output: ["text", "image"],
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128_000,
-		maxTokens: 16_384,
-	};
-}
-
 async function findAntigravityCredentials(
 	modelRegistry: ModelRegistry,
 	sessionId?: string,
@@ -763,22 +735,6 @@ async function findAntigravityCredentials(
 		provider: "antigravity",
 		apiKey: parsed.accessToken,
 		projectId: parsed.projectId,
-	};
-}
-
-async function findOpenAIHostedImageCredentials(
-	modelRegistry: ModelRegistry | undefined,
-	activeModel: Model | undefined,
-	sessionId?: string,
-): Promise<ImageApiKey | null> {
-	if (!modelRegistry || !isOpenAIHostedImageModel(activeModel)) return null;
-	const apiKey = await modelRegistry.getApiKey(activeModel, sessionId);
-	if (!isAuthenticated(apiKey)) return null;
-	return {
-		provider: getOpenAIHostedImageProvider(activeModel),
-		apiKey,
-		model: activeModel,
-		authCredentialType: modelRegistry.getSessionCredentialType?.(activeModel.provider, sessionId),
 	};
 }
 
@@ -811,93 +767,77 @@ export function googleImageApiKeyFromEnvForTest(): string | undefined {
 	return googleImageApiKeyFromEnv();
 }
 
+/**
+ * Resolve image API credentials from the `modelRoles.image` model.
+ *
+ * The resolved model's provider identity determines which credential path
+ * is used. Returns null when no image role model is configured or the
+ * corresponding credentials are unavailable.
+ */
 async function findImageApiKey(
-	modelRegistry?: ModelRegistry,
-	activeModel?: Model,
+	modelRegistry: ModelRegistry,
+	settings: Settings,
+	sessionId?: string,
+	credentialSessionId?: string,
+): Promise<ImageApiKey | null> {
+	const imageModel = resolveImageRoleModel(settings, modelRegistry, { sessionId, credentialSessionId });
+	if (!imageModel) return null;
+	return resolveCredentialsForImageModel(imageModel, modelRegistry, sessionId);
+}
+
+/**
+ * Map a resolved image model to its provider credentials. Each provider
+ * branch mirrors the original credential-resolution path.
+ */
+async function resolveCredentialsForImageModel(
+	model: Model,
+	modelRegistry: ModelRegistry,
 	sessionId?: string,
 ): Promise<ImageApiKey | null> {
-	// Config-driven routing: if an explicit provider+model is configured, use it.
-	if (configuredImageConfig && configuredImageConfig.provider !== "auto") {
-		const config = configuredImageConfig;
-		if (config.provider === "custom") {
-			const baseUrl = config.customUrl?.trim();
-			const apiKey = config.customKey ?? (config.customKeyEnv ? Bun.env[config.customKeyEnv] : undefined);
-			if (baseUrl && apiKey) {
-				return {
-					provider: "openai",
-					apiKey,
-					model: createCustomImageModel(baseUrl, config.model ?? IMAGE_PROVIDER_DEFAULTS.openai),
-				};
-			}
-			return null;
-		}
-		// For configured providers, resolve credentials through the existing paths.
-		if (config.provider === "openai" || config.provider === "openai-codex") {
-			const openAI = await findOpenAIHostedImageCredentials(modelRegistry, activeModel, sessionId);
-			if (openAI) return openAI;
-			return null;
-		}
-		if (config.provider === "antigravity") {
-			if (!modelRegistry) return null;
-			return await findAntigravityCredentials(modelRegistry, sessionId);
-		}
-		if (config.provider === "gemini") {
-			const geminiKey = getEnvApiKey("google");
-			if (geminiKey) return { provider: "gemini", apiKey: geminiKey };
-			const googleKey = googleImageApiKeyFromEnv();
-			return googleKey ? { provider: "gemini", apiKey: googleKey } : null;
-		}
-		if (config.provider === "openrouter") {
-			const openRouterKey = getEnvApiKey("openrouter");
-			return openRouterKey ? { provider: "openrouter", apiKey: openRouterKey } : null;
-		}
-		if (config.provider === "alibaba") {
-			return await findAlibabaImageCredentials(modelRegistry, sessionId);
-		}
+	const provider: string = model.provider;
+
+	// OpenAI-hosted image generation (gpt-image via Responses API, including
+	// OpenAI-compatible proxies whose models declare output:image).
+	if (isOpenAIHostedImageModel(model)) {
+		const apiKey = await modelRegistry.getApiKey(model, sessionId);
+		if (!isAuthenticated(apiKey)) return null;
+		return {
+			provider: getOpenAIHostedImageProvider(model),
+			apiKey,
+			model,
+			authCredentialType: modelRegistry.getSessionCredentialType?.(model.provider, sessionId),
+		};
 	}
 
-	// If a specific provider is preferred (legacy path), try it first.
-	if (preferredImageProvider === "openai") {
-		const openAI = await findOpenAIHostedImageCredentials(modelRegistry, activeModel, sessionId);
-		if (openAI) return openAI;
-		// Fall through to auto-detect if preferred provider key not found.
-	} else if (preferredImageProvider === "antigravity") {
-		if (!modelRegistry) return null;
+	if (provider === "antigravity" || provider === "google-antigravity") {
 		return await findAntigravityCredentials(modelRegistry, sessionId);
-	} else if (preferredImageProvider === "gemini") {
-		const geminiKey = getEnvApiKey("google");
-		if (geminiKey) return { provider: "gemini", apiKey: geminiKey };
-		const googleKey = googleImageApiKeyFromEnv();
-		return googleKey ? { provider: "gemini", apiKey: googleKey } : null;
-	} else if (preferredImageProvider === "openrouter") {
-		const openRouterKey = getEnvApiKey("openrouter");
-		return openRouterKey ? { provider: "openrouter", apiKey: openRouterKey } : null;
-	} else if (preferredImageProvider === "alibaba") {
+	}
+	if (provider === "alibaba" || provider === "alibaba-token-plan") {
 		return await findAlibabaImageCredentials(modelRegistry, sessionId);
 	}
-
-	// Auto-detect: GPT hosted image generation, then Antigravity, OpenRouter, Gemini, Alibaba.
-	const openAI = await findOpenAIHostedImageCredentials(modelRegistry, activeModel, sessionId);
-	if (openAI) return openAI;
-
-	if (modelRegistry) {
-		const antigravity = await findAntigravityCredentials(modelRegistry, sessionId);
-		if (antigravity) return antigravity;
+	if (provider === "openrouter") {
+		const openRouterKey = await modelRegistry.getApiKey(model, sessionId);
+		if (isAuthenticated(openRouterKey)) return { provider: "openrouter", apiKey: openRouterKey };
+		const envKey = getEnvApiKey("openrouter");
+		return envKey ? { provider: "openrouter", apiKey: envKey } : null;
+	}
+	if (provider === "gemini" || provider === "google") {
+		const googleKey = await modelRegistry.getApiKey(model, sessionId);
+		if (isAuthenticated(googleKey)) return { provider: "gemini", apiKey: googleKey };
+		const envKey = getEnvApiKey("google");
+		if (envKey) return { provider: "gemini", apiKey: envKey };
+		const fallbackKey = googleImageApiKeyFromEnv();
+		return fallbackKey ? { provider: "gemini", apiKey: fallbackKey } : null;
 	}
 
-	const openRouterKey = getEnvApiKey("openrouter");
-	if (openRouterKey) return { provider: "openrouter", apiKey: openRouterKey };
-
-	const geminiKey = getEnvApiKey("google");
-	if (geminiKey) return { provider: "gemini", apiKey: geminiKey };
-
-	const googleKey = googleImageApiKeyFromEnv();
-	if (googleKey) return { provider: "gemini", apiKey: googleKey };
-
-	const alibaba = await findAlibabaImageCredentials(modelRegistry, sessionId);
-	if (alibaba) return alibaba;
-
-	return null;
+	// Fallback: try the model's own API key via the registry.
+	const apiKey = await modelRegistry.getApiKey(model, sessionId);
+	if (!isAuthenticated(apiKey)) return null;
+	return {
+		provider: provider as ImageProvider,
+		apiKey,
+		model,
+	};
 }
 
 async function loadImageFromPath(imagePath: string, cwd: string): Promise<InlineImageData> {
@@ -1337,26 +1277,28 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 	async execute(_toolCallId, params, _onUpdate, ctx, signal) {
 		return untilAborted(signal, async () => {
 			const sessionId = ctx.credentialSessionId ?? ctx.sessionManager.getSessionId();
-			const apiKey = await findImageApiKey(ctx.modelRegistry, ctx.model, sessionId);
+			const settings = ctx.settings;
+			if (!settings) {
+				throw new Error("Image generation requires session settings to resolve the image model role.");
+			}
+			const apiKey = await findImageApiKey(ctx.modelRegistry, settings, sessionId, ctx.credentialSessionId);
 			if (!apiKey) {
 				throw new Error(
-					"No image API credentials found. Use a GPT Responses/Codex model with OpenAI credentials, login with google-antigravity, or set OPENROUTER_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or ALIBABA_TOKEN_PLAN_API_KEY.",
+					"No image model configured. Set an image-capable model via /model (image role) to enable image generation.",
 				);
 			}
 
 			const provider = apiKey.provider;
-			const model =
-				configuredImageConfig && configuredImageConfig.provider !== "auto" && configuredImageConfig.model
-					? configuredImageConfig.model
-					: provider === "openai" || provider === "openai-codex"
-						? (apiKey.model?.id ?? resolveImageModel(provider, null))
-						: provider === "antigravity"
-							? resolveImageModel("antigravity", null)
-							: provider === "alibaba"
-								? resolveImageModel("alibaba", null)
-								: provider === "openrouter"
-									? resolveImageModel("openrouter", null)
-									: resolveImageModel("gemini", null);
+			const imageModel = apiKey.model;
+			const model = imageModel
+				? imageModel.id
+				: provider === "antigravity"
+					? resolveImageModel("antigravity", null)
+					: provider === "alibaba"
+						? resolveImageModel("alibaba", null)
+						: provider === "openrouter"
+							? resolveImageModel("openrouter", null)
+							: resolveImageModel("gemini", null);
 			const resolvedModel = provider === "openrouter" ? resolveOpenRouterModel(model) : model;
 			const cwd = ctx.sessionManager.getCwd();
 
@@ -1743,18 +1685,20 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 export async function getImageGenTools(
 	modelRegistry?: ModelRegistry,
-	activeModel?: Model,
+	settings?: Settings,
 ): Promise<Array<CustomTool<typeof imageGenSchema, ImageGenToolDetails>>> {
-	const apiKey = await findImageApiKey(modelRegistry, activeModel);
-	if (!apiKey) return [];
+	// The tool is available when an image role model is configured and resolvable.
+	if (!modelRegistry || !settings) return [];
+	const imageModel = resolveImageRoleModel(settings, modelRegistry);
+	if (!imageModel) return [];
 	return [imageGenTool];
 }
 
 export async function getImageGenToolsWithRegistry(
 	modelRegistry: ModelRegistry,
-	activeModel?: Model,
+	settings: Settings,
 ): Promise<Array<CustomTool<typeof imageGenSchema, ImageGenToolDetails>>> {
-	const apiKey = await findImageApiKey(modelRegistry, activeModel);
-	if (!apiKey) return [];
+	const imageModel = resolveImageRoleModel(settings, modelRegistry);
+	if (!imageModel) return [];
 	return [imageGenTool];
 }
