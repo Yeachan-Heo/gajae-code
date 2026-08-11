@@ -48,6 +48,7 @@ const MAX_PUBLIC_ERROR_MESSAGE_LENGTH = 2000;
 const HEARTBEAT_MS = 1000;
 const MAX_PUBLIC_ACTIVE_TOOLS = 8;
 const MAX_ACTIVE_TOOL_CALLS = 64;
+const MAX_ACTIVE_TOOL_CALLS_OVERFLOW_DIGESTS = MAX_ACTIVE_TOOL_CALLS;
 const SAFE_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const ACTIVE_TOOL_CALL_KEY = /^[a-f0-9]{64}$/;
 
@@ -442,13 +443,52 @@ function validActiveToolCallsOverflowCount(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function validActiveToolCallsOverflowDigests(value: unknown): value is string[] {
+	return (
+		Array.isArray(value) &&
+		value.length <= MAX_ACTIVE_TOOL_CALLS_OVERFLOW_DIGESTS &&
+		new Set(value).size === value.length &&
+		value.every(digest => typeof digest === "string" && ACTIVE_TOOL_CALL_KEY.test(digest))
+	);
+}
+
 function activeToolCallsOverflowCount(previous: Record<string, unknown>): number {
 	return validActiveToolCallsOverflowCount(previous.active_tool_calls_overflow_count)
 		? previous.active_tool_calls_overflow_count
 		: 0;
 }
 
-function evictOldestActiveToolCall(activeToolCalls: ActiveToolCalls): boolean {
+function activeToolCallsOverflowDigests(previous: Record<string, unknown>): string[] {
+	return validActiveToolCallsOverflowDigests(previous.active_tool_calls_overflow_digests)
+		? [...previous.active_tool_calls_overflow_digests]
+		: [];
+}
+
+function activeToolCallsOverflowCountIsLowerBound(previous: Record<string, unknown>): boolean {
+	return previous.active_tool_calls_overflow_count_is_lower_bound === true;
+}
+
+function validActiveToolCallsOverflowState(payload: Record<string, unknown>): boolean {
+	const hasOverflowCount = Object.hasOwn(payload, "active_tool_calls_overflow_count");
+	const hasOverflowDigests = Object.hasOwn(payload, "active_tool_calls_overflow_digests");
+	const hasLowerBound = Object.hasOwn(payload, "active_tool_calls_overflow_count_is_lower_bound");
+	if (
+		(hasOverflowCount && !validActiveToolCallsOverflowCount(payload.active_tool_calls_overflow_count)) ||
+		(hasOverflowDigests && !validActiveToolCallsOverflowDigests(payload.active_tool_calls_overflow_digests)) ||
+		(hasLowerBound && typeof payload.active_tool_calls_overflow_count_is_lower_bound !== "boolean") ||
+		(hasOverflowDigests && !hasOverflowCount) ||
+		(hasLowerBound && (!hasOverflowCount || !hasOverflowDigests))
+	)
+		return false;
+	const overflowDigests = activeToolCallsOverflowDigests(payload);
+	if (activeToolCallsOverflowCount(payload) !== overflowDigests.length) return false;
+	const activeToolCalls = payload.active_tool_calls;
+	return (
+		!validActiveToolCalls(activeToolCalls) || !overflowDigests.some(digest => Object.hasOwn(activeToolCalls, digest))
+	);
+}
+
+function evictOldestActiveToolCall(activeToolCalls: ActiveToolCalls): string | null {
 	let oldestKey: string | undefined;
 	let oldestStartedAt = Number.POSITIVE_INFINITY;
 	for (const [key, entry] of Object.entries(activeToolCalls)) {
@@ -458,9 +498,9 @@ function evictOldestActiveToolCall(activeToolCalls: ActiveToolCalls): boolean {
 			oldestStartedAt = startedAt;
 		}
 	}
-	if (!oldestKey) return false;
+	if (!oldestKey) return null;
 	delete activeToolCalls[oldestKey];
-	return true;
+	return oldestKey;
 }
 
 function activityFieldsForEvent(
@@ -472,19 +512,26 @@ function activityFieldsForEvent(
 	const activeToolCalls: ActiveToolCalls = validActiveToolCalls(previous.active_tool_calls)
 		? { ...previous.active_tool_calls }
 		: {};
-	let overflowCount = activeToolCallsOverflowCount(previous);
+	const overflowDigests = activeToolCallsOverflowDigests(previous);
+	let overflowCountIsLowerBound = activeToolCallsOverflowCountIsLowerBound(previous);
 	const prior = activeToolCalls[activityEvent.toolCallKey];
+	const overflowDigestIndex = overflowDigests.indexOf(activityEvent.toolCallKey);
 	if (activityEvent.phase === "started") {
-		if (
-			!prior &&
-			Object.keys(activeToolCalls).length >= MAX_ACTIVE_TOOL_CALLS &&
-			evictOldestActiveToolCall(activeToolCalls)
-		)
-			overflowCount = Math.min(Number.MAX_SAFE_INTEGER, overflowCount + 1);
-		activeToolCalls[activityEvent.toolCallKey] = { tool_name: activityEvent.toolName, started_at: now };
+		if (!prior && overflowDigestIndex === -1) {
+			const evictedToolCallKey =
+				Object.keys(activeToolCalls).length >= MAX_ACTIVE_TOOL_CALLS
+					? evictOldestActiveToolCall(activeToolCalls)
+					: null;
+			if (evictedToolCallKey) {
+				if (overflowDigests.length < MAX_ACTIVE_TOOL_CALLS_OVERFLOW_DIGESTS)
+					overflowDigests.push(evictedToolCallKey);
+				else overflowCountIsLowerBound = true;
+			}
+			activeToolCalls[activityEvent.toolCallKey] = { tool_name: activityEvent.toolName, started_at: now };
+		}
 	} else {
-		delete activeToolCalls[activityEvent.toolCallKey];
-		if (!prior && overflowCount > 0) overflowCount--;
+		if (prior) delete activeToolCalls[activityEvent.toolCallKey];
+		else if (overflowDigestIndex !== -1) overflowDigests.splice(overflowDigestIndex, 1);
 	}
 	const previousActivity =
 		previous.activity && typeof previous.activity === "object" && !Array.isArray(previous.activity)
@@ -513,11 +560,17 @@ function activityFieldsForEvent(
 			...(startedAt ? { started_at: startedAt } : {}),
 			...(elapsedMs === undefined ? {} : { elapsed_ms: elapsedMs }),
 			...(activityEvent.phase === "finished" ? { outcome: activityEvent.outcome } : {}),
-			active_tool_count: Math.min(Number.MAX_SAFE_INTEGER, Object.keys(activeToolCalls).length + overflowCount),
+			active_tool_count: Math.min(
+				Number.MAX_SAFE_INTEGER,
+				Object.keys(activeToolCalls).length + overflowDigests.length,
+			),
+			...(overflowCountIsLowerBound ? { active_tool_count_is_lower_bound: true } : {}),
 		},
 		active_tools: activeTools,
 		active_tool_calls: activeToolCalls,
-		active_tool_calls_overflow_count: overflowCount,
+		active_tool_calls_overflow_count: overflowDigests.length,
+		active_tool_calls_overflow_digests: overflowDigests,
+		...(overflowCountIsLowerBound ? { active_tool_calls_overflow_count_is_lower_bound: true } : {}),
 	};
 }
 
@@ -577,8 +630,7 @@ function validPreviousRuntimeStatePayload(value: unknown): value is Record<strin
 		return false;
 	if (
 		(Object.hasOwn(payload, "active_tool_calls") && !validActiveToolCalls(payload.active_tool_calls)) ||
-		(Object.hasOwn(payload, "active_tool_calls_overflow_count") &&
-			!validActiveToolCallsOverflowCount(payload.active_tool_calls_overflow_count))
+		!validActiveToolCallsOverflowState(payload)
 	)
 		return false;
 	if (payload.ready_for_input !== undefined) {
@@ -751,6 +803,12 @@ function basePayload(input: {
 			: {}),
 		...(validActiveToolCallsOverflowCount(input.previous.active_tool_calls_overflow_count)
 			? { active_tool_calls_overflow_count: input.previous.active_tool_calls_overflow_count }
+			: {}),
+		...(validActiveToolCallsOverflowDigests(input.previous.active_tool_calls_overflow_digests)
+			? { active_tool_calls_overflow_digests: input.previous.active_tool_calls_overflow_digests }
+			: {}),
+		...(input.previous.active_tool_calls_overflow_count_is_lower_bound === true
+			? { active_tool_calls_overflow_count_is_lower_bound: true }
 			: {}),
 		...(input.context.ownerTerminal ? { owner_generation: input.context.ownerTerminal.generation } : {}),
 	};
