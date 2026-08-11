@@ -143,6 +143,52 @@ describe("SessionSdkHost", () => {
 		expect(unregisterAttempts).toBe(2);
 	});
 
+	test("continues expiring client leases after a retryable broker-unregister failure", async () => {
+		let receive!: (connectionId: string, frame: Record<string, unknown>) => void;
+		let now = 0;
+		let tick!: () => void;
+		let empty = 0;
+		let unregisterAttempts = 0;
+		const host = new SessionSdkHost({
+			sessionId: "retry-liveness",
+			stateRoot: "/tmp/retry-liveness",
+			token: "t",
+			sendFrame: () => {},
+			onFrame: handler => {
+				receive = handler;
+				return () => {};
+			},
+			onClientLivenessEmpty: () => {
+				empty++;
+			},
+			clientLiveness: {
+				now: () => now,
+				setInterval: (callback: Parameters<typeof setInterval>[0], ..._args: unknown[]) => {
+					tick = () => (callback as () => void)();
+					void _args;
+					return 0 as unknown as NodeJS.Timeout;
+				},
+				clearInterval: () => {},
+			},
+		});
+		await host.registerWithBroker({
+			register: () => {},
+			unregister: () => {
+				unregisterAttempts++;
+				if (unregisterAttempts === 1) throw new Error("unregister failed once");
+			},
+		});
+		await host.start();
+		receive("client", { type: "client_heartbeat", connectionId: "client" });
+		await Bun.sleep(0);
+
+		await expect(host.stop()).rejects.toThrow("unregister failed once");
+		now = 15_000;
+		tick();
+		expect(empty).toBe(1);
+		expect(await host.stop()).toBe("stopped");
+	});
+
 	test("shares one broker unregister across concurrent stop callers", async () => {
 		let unsubscribeAttempts = 0;
 		let unregisterAttempts = 0;

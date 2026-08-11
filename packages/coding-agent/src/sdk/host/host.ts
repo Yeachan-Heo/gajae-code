@@ -369,12 +369,17 @@ export class SessionSdkHost {
 		this.#stopping = true;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
-		if (this.#registration?.writer.unregister)
-			await this.#registration.writer.unregister({
-				sessionId: this.#options.sessionId,
-				stateRoot: this.#options.stateRoot,
-				endpointGeneration: this.events.generation,
-			});
+		try {
+			if (this.#registration?.writer.unregister)
+				await this.#registration.writer.unregister({
+					sessionId: this.#options.sessionId,
+					stateRoot: this.#options.stateRoot,
+					endpointGeneration: this.events.generation,
+				});
+		} catch (error) {
+			this.#stopping = false;
+			throw error;
+		}
 		// Clear liveness only after teardown succeeded: a rejected unregister
 		// rolls back with the timer still armed while the host stays active.
 		const clear = this.#options.clientLiveness?.clearInterval ?? clearInterval;

@@ -545,3 +545,12 @@ test("SdkClient with clientHeartbeatMs sends client_heartbeat frames and stops a
 		await client.close();
 	});
 });
+
+test("SdkClient rejects heartbeat cadences that cannot satisfy the host lease", () => {
+	expect(() => new SdkClient("ws://sdk.test", "token", { clientHeartbeatMs: 10_001 })).toThrow(
+		"clientHeartbeatMs must be a finite value between 1 and 10000.",
+	);
+	expect(() => new SdkClient("ws://sdk.test", "token", { clientHeartbeatMs: Number.POSITIVE_INFINITY })).toThrow(
+		"clientHeartbeatMs must be a finite value between 1 and 10000.",
+	);
+});

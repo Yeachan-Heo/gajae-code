@@ -21,6 +21,9 @@ export class SdkClientError extends Error {
 	}
 }
 
+/** The host expires client liveness leases after 15 seconds; leave one sweep interval of margin. */
+const MAX_CLIENT_HEARTBEAT_MS = 10_000;
+
 export interface SdkClientOptions {
 	timeoutMs?: number;
 	/** Absolute wall-clock deadline shared by connect, hello, retry, and request work. */
@@ -34,7 +37,11 @@ export interface SdkClientOptions {
 	 * on its last attempts. Defaults to 2s.
 	 */
 	reconnectMaxBackoffMs?: number;
-	/** Application heartbeat cadence for persistent session-host connections. */
+	/**
+	 * Application heartbeat cadence for persistent session-host connections.
+	 * Must be a finite positive value no greater than 10 seconds, leaving margin
+	 * before the host's 15-second client-liveness lease expires.
+	 */
 	clientHeartbeatMs?: number;
 }
 
@@ -150,6 +157,13 @@ export class SdkClient {
 		this.#token = token;
 		this.#timeoutMs = options.timeoutMs ?? 10_000;
 		this.#closeGraceMs = Math.max(1, Math.min(this.#timeoutMs, 1_000));
+		if (
+			options.clientHeartbeatMs !== undefined &&
+			(!Number.isFinite(options.clientHeartbeatMs) ||
+				options.clientHeartbeatMs <= 0 ||
+				options.clientHeartbeatMs > MAX_CLIENT_HEARTBEAT_MS)
+		)
+			throw new TypeError(`clientHeartbeatMs must be a finite value between 1 and ${MAX_CLIENT_HEARTBEAT_MS}.`);
 		this.#clientHeartbeatMs = options.clientHeartbeatMs;
 		this.#deadline =
 			typeof options.deadline === "number" && Number.isFinite(options.deadline) ? options.deadline : undefined;
