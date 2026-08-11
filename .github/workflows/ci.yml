@@ -2,7 +2,7 @@ name: CI
 
 on:
    push:
-      branches: [main]
+      branches: [main, nightly]
       tags: ["v*"]
    pull_request:
       branches: [main]
@@ -51,6 +51,7 @@ jobs:
               EVENT_NAME: ${{ github.event_name }}
               SOURCE_SHA: ${{ github.sha }}
               RUN_ID: ${{ github.run_id }}
+              BUMP_KIND: ${{ github.ref == 'refs/heads/nightly' && 'minor' || 'patch' }}
            run: |
               set -euo pipefail
               if [ "$IS_NIGHTLY" = 1 ]; then
@@ -58,12 +59,15 @@ jobs:
                  if [ "$EVENT_NAME" = schedule ]; then
                     expected_ref=refs/heads/main
                  fi
+                 if [ "$GITHUB_REF" = refs/heads/nightly ]; then
+                    expected_ref=refs/heads/nightly
+                 fi
                  if [ "$GITHUB_REF" != "$expected_ref" ]; then
                     echo "Nightly release for $EVENT_NAME must run from $expected_ref, not $GITHUB_REF" >&2
                     exit 1
                  fi
                  timestamp="$(git show -s --format=%cI "$SOURCE_SHA")"
-                 version="$(bun scripts/nightly-release.ts version --timestamp "$timestamp" --run-id "$RUN_ID" --source-sha "$SOURCE_SHA")"
+                 version="$(bun scripts/nightly-release.ts version --timestamp "$timestamp" --run-id "$RUN_ID" --source-sha "$SOURCE_SHA" --bump-kind "$BUMP_KIND")"
                  {
                     echo "channel=nightly"
                     echo "version=$version"

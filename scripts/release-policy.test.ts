@@ -161,6 +161,11 @@ describe("stable release policy", () => {
 		expect(metadata).toContain("expected_ref=refs/heads/dev");
 		expect(metadata).toContain('if [ "$EVENT_NAME" = schedule ]');
 		expect(metadata).toContain("expected_ref=refs/heads/main");
+		expect(metadata).toContain('if [ "$GITHUB_REF" = refs/heads/nightly ]');
+		expect(metadata).toContain("expected_ref=refs/heads/nightly");
+		expect(metadata).toContain("BUMP_KIND");
+		expect(metadata).toContain('--bump-kind "$BUMP_KIND"');
+		expect(ci).toContain("branches: [main, nightly]");
 		expect(metadata).toContain("git show -s --format=%cI");
 		expect(metadata).toContain("Stable release tag must be exact vX.Y.Z");
 		expect(metadata).toContain("does not match package version");
