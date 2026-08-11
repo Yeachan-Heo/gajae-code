@@ -2,8 +2,12 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import type { IndexedSession, SessionIndex } from "../broker/session-index";
-import { SessionIndex as DefaultSessionIndex } from "../broker/session-index";
+import {
+	SessionIndex as DefaultSessionIndex,
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	type SessionIndex,
+} from "../broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
@@ -218,6 +222,7 @@ function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession)
 	return (
 		current.sessionId === expected.sessionId &&
 		current.live &&
+		isSessionAuthorityEligible(current) &&
 		!current.terminalUncertain &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
@@ -469,7 +474,7 @@ export class SessionRouter {
 		} catch {
 			return undefined;
 		}
-		if (!indexed?.live || indexed.terminalUncertain) return undefined;
+		if (!indexed?.live || !isSessionAuthorityEligible(indexed) || indexed.terminalUncertain) return undefined;
 		if (
 			!Number.isSafeInteger(indexed.endpointGeneration) ||
 			indexed.endpointGeneration <= 0 ||
@@ -506,6 +511,7 @@ export class SessionRouter {
 		}
 		if (
 			!indexed?.live ||
+			!isSessionAuthorityEligible(indexed) ||
 			indexed.terminalUncertain ||
 			!Number.isSafeInteger(indexed.endpointGeneration) ||
 			indexed.endpointGeneration <= 0 ||
@@ -616,7 +622,9 @@ export class SessionRouter {
 		const indexed = this.#index.listSessions();
 		const live =
 			indexed.warnings.length === 0
-				? indexed.sessions.filter(session => session.live && !session.terminalUncertain)
+				? indexed.sessions.filter(
+						session => session.live && isSessionAuthorityEligible(session) && !session.terminalUncertain,
+					)
 				: [];
 		const liveIds = new Set(live.map(session => session.sessionId));
 		const attachedIds = new Set<string>();
@@ -630,6 +638,7 @@ export class SessionRouter {
 				}
 				const exactIndex =
 					indexedSession?.live === true &&
+					isSessionAuthorityEligible(indexedSession) &&
 					!indexedSession.terminalUncertain &&
 					indexedSession.endpointGeneration === adopted.generation &&
 					indexedSession.pid === adopted.pid &&
@@ -696,6 +705,7 @@ export class SessionRouter {
 	}
 
 	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
+		if (!isSessionAuthorityEligible(indexed)) return null;
 		const repo = path.resolve(indexed.locator.repo);
 		const defaultStateRoot = path.join(repo, ".gjc", "state");
 		const indexedStateRoot = path.resolve(indexed.locator.stateRoot);

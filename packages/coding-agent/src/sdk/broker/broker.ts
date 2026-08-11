@@ -35,7 +35,7 @@ import {
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
-import { type IndexedSession, SessionIndex, type SessionList } from "./session-index";
+import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -395,6 +395,7 @@ function matchesEndpointAuthority(record: IndexedSession, authority: EndpointAut
 function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): boolean {
 	return (
 		current.live &&
+		isSessionAuthorityEligible(current) &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
@@ -1202,12 +1203,19 @@ export class Broker {
 		if ("ok" in authority) return authority;
 		await this.index.refresh();
 		let record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
-		if (record && !record.live && !record.terminal && !record.terminalUncertain) {
+		if (
+			record &&
+			!record.live &&
+			!record.terminal &&
+			!record.terminalUncertain &&
+			isSessionAuthorityEligible(record)
+		) {
 			await this.heartbeatSessions();
 			await this.index.refresh();
 			record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
 		}
 		if (!record) return error("resource_gone", "session is not indexed");
+		if (!isSessionAuthorityEligible(record)) return error("resource_gone", "session endpoint record is gone");
 		if (!matchesEndpointAuthority(record, authority)) return error("endpoint_stale", "session endpoint is stale");
 		if (!record.live) return error("resource_gone", "session endpoint record is gone");
 		return this.#readEndpoint(record, authority);
@@ -1215,10 +1223,12 @@ export class Broker {
 	async #readLifecycleReplayEndpoint(sessionId: string): Promise<LifecycleReplayEndpoint | BrokerResponse> {
 		await this.index.refresh();
 		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
-		if (!record?.live) return error("resource_gone", "session endpoint record is gone");
-		const endpointMtimeMs = record.endpointMtimeMs;
+		if (!record) return error("resource_gone", "session endpoint record is gone");
 		if (record.terminalUncertain)
 			return error("terminal_uncertain", "Session ownership is uncertain and cannot be replayed safely");
+		if (!isSessionAuthorityEligible(record) || !record.live)
+			return error("resource_gone", "session endpoint record is gone");
+		const endpointMtimeMs = record.endpointMtimeMs;
 		if (
 			!Number.isSafeInteger(record.endpointGeneration) ||
 			record.endpointGeneration <= 0 ||

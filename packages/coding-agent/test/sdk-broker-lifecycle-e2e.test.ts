@@ -23,6 +23,7 @@ import {
 	reapDeadSessionRegistrations,
 	setLifecycleCleanupHookForTest,
 	setLifecycleCommandResolverForTest,
+	setLifecycleTimingForTest,
 	setProcessIncarnationForTest,
 	writeSessionLifecycleFailure,
 } from "../src/sdk/broker/lifecycle";
@@ -1279,6 +1280,17 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				await broker.handleRequest("session.delete", forkDeleteInput, "canonical-cold-fork-delete"),
 			),
 		).toMatchObject({ ok: true, result: { sessionId: forkId } });
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({
+			ok: true,
+			result: { sessions: expect.not.arrayContaining([expect.objectContaining({ sessionId: forkId })]) },
+		});
+		expect(
+			(await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as { sessionId?: string; type?: string })
+				.findLast(event => event.sessionId === forkId),
+		).toMatchObject({ type: "session_deleted", sessionId: forkId });
 		expect(
 			await fs.access(forkCandidate.path).then(
 				() => true,
@@ -2772,6 +2784,140 @@ setInterval(()=>{},1000);
 	}
 });
 
+test("broker fences ambiguous state roots from checkpoint, endpoint, and resume authority until one resolves", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-ambiguous-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const alternateStateRoot = path.join(root, ".gjc", "alternate-state");
+	const broker = new Broker({ agentDir });
+	const source = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
+	await source.ensureOnDisk();
+	const sessionId = source.getSessionId();
+	const sessionPath = source.getSessionFile();
+	if (!sessionPath) throw new Error("Expected a saved session path.");
+	const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	let launchAttempts = 0;
+	try {
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "current-token" }),
+		);
+		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		await broker.start();
+		setLifecycleCommandResolverForTest(broker, () => {
+			launchAttempts += 1;
+			return { file: "/bin/false", args: [] };
+		});
+		const alternate = await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: root, stateRoot: alternateStateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: 1,
+		});
+		const current = await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 2,
+			pid: process.pid,
+			endpointMtimeMs,
+		});
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({
+				sessionId,
+				endpointGeneration: current.endpointGeneration,
+				ambiguous: true,
+				live: false,
+			}),
+		]);
+		const ambiguousSeq = broker.index.indexSeq;
+		expect(await broker.heartbeatSessions()).toBe(0);
+		expect(broker.index.indexSeq).toBe(ambiguousSeq);
+		expect(await reapDeadSessionRegistrations({ index: broker.index })).toEqual([]);
+		expect(broker.index.indexSeq).toBe(ambiguousSeq);
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId })).toEqual({
+			ok: false,
+			error: { code: "resource_gone", message: "session endpoint record is gone" },
+		});
+		expect(
+			await broker.handleRequest(
+				"session.resume",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				"ambiguous-resume",
+			),
+		).toEqual({
+			ok: false,
+			error: { code: "endpoint_stale", message: "Session authority is ambiguous and cannot be resumed safely." },
+		});
+		expect(launchAttempts).toBe(0);
+
+		await broker.index.append({
+			type: "host_unregistered",
+			sessionId,
+			locator: alternate.locator,
+			endpointGeneration: alternate.endpointGeneration,
+			pid: alternate.pid,
+			...(alternate.processIncarnation === undefined ? {} : { processIncarnation: alternate.processIncarnation }),
+			...(alternate.hostIncarnation === undefined ? {} : { hostIncarnation: alternate.hostIncarnation }),
+		});
+		expect(await broker.heartbeatSessions()).toBe(1);
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId })).toMatchObject({
+			ok: true,
+			result: { sessionId, pid: process.pid, token: "current-token" },
+		});
+		expect(
+			await broker.handleRequest(
+				"session.resume",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				"resolved-resume",
+			),
+		).toMatchObject({
+			ok: true,
+			result: {
+				sessionId,
+				endpointGeneration: current.endpointGeneration,
+				reused: true,
+				endpoint: { token: "current-token" },
+			},
+		});
+		const replayAlternate = await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: root, stateRoot: alternateStateRoot },
+			endpointGeneration: alternate.endpointGeneration,
+			pid: process.pid,
+			endpointMtimeMs: 1,
+		});
+		expect(
+			await broker.handleRequest(
+				"session.resume",
+				{ cwd: root, stateRoot, sessionId, sessionPath },
+				"resolved-resume",
+			),
+		).toEqual({
+			ok: false,
+			error: { code: "resource_gone", message: "session endpoint record is gone" },
+		});
+		await broker.index.append({
+			type: "host_unregistered",
+			sessionId,
+			locator: replayAlternate.locator,
+			endpointGeneration: replayAlternate.endpointGeneration,
+			pid: replayAlternate.pid,
+			...(replayAlternate.processIncarnation === undefined
+				? {}
+				: { processIncarnation: replayAlternate.processIncarnation }),
+			...(replayAlternate.hostIncarnation === undefined ? {} : { hostIncarnation: replayAlternate.hostIncarnation }),
+		});
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
 test("broker refuses a stale registered PID when no durable effect marker proves ownership", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-stale-"));
 	const stateRoot = path.join(agentDir, "state");
@@ -3097,6 +3243,7 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 			endpointPath,
 			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "live-owner-token" }),
 		);
+		const hostIncarnation = await incarnation(host.pid);
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
@@ -3104,6 +3251,8 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 			endpointGeneration: 17,
 			pid: host.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
 		});
 		await broker.index.append({
 			type: "host_heartbeat",
@@ -3111,6 +3260,8 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 			locator: { repo: root, stateRoot },
 			endpointGeneration: 17,
 			pid: host.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
 		});
 
 		const [first, second] = await Promise.all([
@@ -3176,6 +3327,108 @@ test("broker never signals a PID reused after its lifecycle marker was written",
 		expect(await fs.readFile(marker, "utf8")).toContain("reused-process-incarnation");
 		expect(host.exitCode).toBeNull();
 	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+test("broker binds close-escalation terminal uncertainty to the indexed reused-pid incarnation", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-reused-terminal-"));
+	const stateRoot = path.join(agentDir, "state");
+	const sessionId = "reused-terminal";
+	const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	const markerPath = path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`);
+	const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	const endpointServer = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request, server) {
+			if (server.upgrade(request)) return;
+			return new Response("WebSocket required", { status: 426 });
+		},
+		websocket: {
+			open(socket) {
+				socket.send(JSON.stringify({ type: "hello", connectionId: "reused-terminal" }));
+			},
+			message(socket, message) {
+				const frame = JSON.parse(String(message)) as { id?: string; type?: string };
+				if (frame.type === "control_request" && frame.id) socket.send(JSON.stringify({ id: frame.id, ok: true }));
+			},
+		},
+	});
+	const broker = new Broker({ agentDir });
+	const originalHandleRequest = broker.handleRequest.bind(broker);
+	const indexedIncarnation = "reused-indexed-incarnation";
+	let now = 0;
+	try {
+		if (!child.pid) throw new Error("fixture child has no pid");
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		const endpoint = {
+			sessionId,
+			pid: child.pid,
+			url: `ws://127.0.0.1:${endpointServer.port}`,
+			token: "reused-terminal-token",
+		};
+		await fs.writeFile(endpointPath, JSON.stringify(endpoint));
+		await fs.writeFile(
+			markerPath,
+			JSON.stringify({ pid: child.pid, effectMarker: "reused-terminal-effect", incarnation: indexedIncarnation }),
+		);
+		await broker.start();
+		setLifecycleTimingForTest(broker, {
+			now: () => now,
+			sleep: async milliseconds => {
+				now += milliseconds;
+			},
+		});
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: 1,
+			pid: child.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			lifecycleRequestId: "reused-terminal-effect",
+			processIncarnation: indexedIncarnation,
+			hostIncarnation: indexedIncarnation,
+		});
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			if (operation === "session.get_endpoint" && input.sessionId === sessionId)
+				return { ok: true, result: endpoint };
+			return await originalHandleRequest(operation, input, idempotencyKey);
+		};
+
+		expect(await broker.handleRequest("session.close", { sessionId }, "reused-terminal-close")).toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		const terminal = (await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as Record<string, unknown>)
+			.findLast(event => event.type === "lifecycle_terminal");
+		expect(terminal).toMatchObject({
+			type: "lifecycle_terminal",
+			sessionId,
+			processIncarnation: indexedIncarnation,
+			hostIncarnation: indexedIncarnation,
+			terminalUncertain: true,
+		});
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId, terminalUncertain: true }),
+		]);
+		expect(await broker.handleRequest("session.delete", { sessionId }, "reused-terminal-delete")).toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+	} finally {
+		broker.handleRequest = originalHandleRequest;
+		setLifecycleTimingForTest(broker, undefined);
+		endpointServer.stop(true);
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await child.exited;
 		await broker.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
@@ -3285,6 +3538,37 @@ if (process.platform === "darwin") {
 	}, 10_000);
 }
 
+test("dead-registration sweeps retain terminal rows without appending duplicate retirements", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-sweep-terminal-"));
+	const stateRoot = path.join(agentDir, "state");
+	const broker = new Broker({ agentDir });
+	const deadPid = 4_194_304;
+	try {
+		expect(() => process.kill(deadPid, 0)).toThrow();
+		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "sweep-terminal",
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: 1,
+			pid: deadPid,
+		});
+		const registration = broker.index.listSessions().sessions[0];
+		if (!registration) throw new Error("Expected a dead registration.");
+		expect(await broker.index.unregisterIfCurrent(registration)).toBe(true);
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId: "sweep-terminal", terminal: true, live: false }),
+		]);
+		const terminalSeq = broker.index.indexSeq;
+		expect(await reapDeadSessionRegistrations({ index: broker.index })).toEqual([]);
+		expect(broker.index.indexSeq).toBe(terminalSeq);
+		expect(await reapDeadSessionRegistrations({ index: broker.index })).toEqual([]);
+		expect(broker.index.indexSeq).toBe(terminalSeq);
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
 test("dead-registration sweep retains terminal uncertainty appended after its snapshot", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-sweep-race-"));
 	const stateRoot = path.join(agentDir, "state");
@@ -3337,12 +3621,15 @@ test("conditional unregister accepts a reconciled equivalent repository locator"
 		await fs.mkdir(repo, { recursive: true });
 		await fs.symlink(repo, repoAlias, "dir");
 		const index = await new SessionIndex(agentDir).open();
+		const hostIncarnation = await incarnation(host.pid);
 		await index.append({
 			type: "host_registered",
 			sessionId: "reconciled-repo",
 			locator: { repo: repoAlias, stateRoot },
 			endpointGeneration: 1,
 			pid: host.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
 		});
 		const expected = index.listSessions().sessions[0];
 		if (!expected) throw new Error("Expected indexed registration.");
@@ -3352,6 +3639,8 @@ test("conditional unregister accepts a reconciled equivalent repository locator"
 			locator: { repo, stateRoot },
 			endpointGeneration: expected.endpointGeneration,
 			pid: expected.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
 		});
 		expect(await index.unregisterIfCurrent(expected)).toBe(true);
 		expect(index.listSessions().sessions).toEqual([
@@ -3596,6 +3885,7 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "successor-token" }),
 		);
 		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const hostIncarnation = await incarnation(host.pid);
 		initial = new Broker({ agentDir });
 		await initial.start();
 		await initial.index.append({
@@ -3605,6 +3895,8 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 			endpointGeneration: 2,
 			pid: host.pid,
 			endpointMtimeMs,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
 		});
 		await initial.index.append({
 			type: "host_heartbeat",
@@ -3612,6 +3904,8 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 			locator: { repo: root, stateRoot },
 			endpointGeneration: 2,
 			pid: host.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
 		});
 		const key = "replay-authority";
 		const targetHash = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");

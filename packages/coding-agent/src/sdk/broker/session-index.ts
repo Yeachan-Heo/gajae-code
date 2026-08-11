@@ -84,10 +84,15 @@ export interface IndexedSession {
 	activity?: SessionActivity;
 	/** Wall-clock timestamp of the latest admitted heartbeat, when one exists. */
 	lastHeartbeatAt?: number;
-	/** True when the same sessionId maps to more than one stateRoot (cross-repo duplicate). */
+	/** True when more than one unresolved current state-root identity claims this session id. */
 	ambiguous: boolean;
 	/** True when the identity's latest event is host_unregistered or session_closed (DR-1: stopped rows are retained). */
 	terminal: boolean;
+}
+
+/** A session can grant endpoint or lifecycle authority only when one current state root claims its id. */
+export function isSessionAuthorityEligible(session: Pick<IndexedSession, "ambiguous">): boolean {
+	return session.ambiguous !== true;
 }
 export interface SessionList {
 	indexSeq: number;
@@ -298,14 +303,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 		if (previous === undefined || event.indexSeq > previous.indexSeq) latestByIdentity.set(key, event);
 	}
 	const winner = new Map<string, { gen: number; seq: number; identity: string }>();
-	const roots = new Map<string, Set<string>>();
 	for (const event of admitted) {
-		let group = roots.get(event.sessionId);
-		if (group === undefined) {
-			group = new Set();
-			roots.set(event.sessionId, group);
-		}
-		group.add(event.locator.stateRoot);
 		if (event.type === "host_heartbeat") continue;
 		const current = winner.get(event.sessionId);
 		if (
@@ -320,6 +318,21 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 			});
 		}
 	}
+	const unresolvedRoots = new Map<string, Set<string>>();
+	for (const current of latestByIdentity.values()) {
+		if (
+			current.type === "host_unregistered" ||
+			current.type === "session_closed" ||
+			current.type === "session_deleted"
+		)
+			continue;
+		let roots = unresolvedRoots.get(current.sessionId);
+		if (roots === undefined) {
+			roots = new Set();
+			unresolvedRoots.set(current.sessionId, roots);
+		}
+		roots.add(current.locator.stateRoot);
+	}
 	const sessions: IndexedSession[] = [];
 	for (const [sessionId, chosen] of winner) {
 		const latest = latestByIdentity.get(chosen.identity);
@@ -327,6 +340,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 		const terminal = latest.type === "host_unregistered" || latest.type === "session_closed";
 		if (latest.type === "session_deleted") continue;
 		const terminalUncertain = latest.type === "lifecycle_terminal" || latest.terminalUncertain === true;
+		const ambiguous = (unresolvedRoots.get(sessionId)?.size ?? 0) > 1;
 		const heartbeat = latestHeartbeatByIdentity.get(chosen.identity);
 		const pidAlive = alive(latest.pid);
 		// Liveness evidence is host-written: a checkpointed heartbeat, or the
@@ -355,9 +369,15 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 			identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
 			activity: heartbeat?.activity,
 			lastHeartbeatAt: heartbeat?.ts,
-			ambiguous: (roots.get(sessionId)?.size ?? 0) > 1,
+			ambiguous,
 			terminal,
-			live: !terminal && !terminalUncertain && pidAlive && heartbeatFresh && incarnationMatches,
+			live:
+				isSessionAuthorityEligible({ ambiguous }) &&
+				!terminal &&
+				!terminalUncertain &&
+				pidAlive &&
+				heartbeatFresh &&
+				incarnationMatches,
 		});
 	}
 	return sessions;
@@ -900,9 +920,14 @@ export class SessionIndex {
 					indexSeq: this.indexSeq + 1,
 					ts: input.ts ?? Date.now(),
 				};
-				// Use the registration's durable process identity when supplied; otherwise
-				// derive one from the OS. Legacy records remain explicitly unbound.
-				if (unsigned.hostIncarnation === undefined && Number.isSafeInteger(unsigned.pid) && unsigned.pid > 0) {
+				// A host may derive its own OS identity; broker-authored events for another
+				// process must carry the registration's persisted binding instead.
+				if (
+					unsigned.hostIncarnation === undefined &&
+					unsigned.pid === process.pid &&
+					Number.isSafeInteger(unsigned.pid) &&
+					unsigned.pid > 0
+				) {
 					unsigned.hostIncarnation = unsigned.processIncarnation ?? processIncarnation(unsigned.pid);
 				}
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
@@ -1053,8 +1078,8 @@ export class SessionIndex {
 	 * `host_heartbeat` per session at most once per {@link SESSION_HEARTBEAT_INTERVAL_MS}.
 	 * The pass observes liveness the same way the projection does — the host process
 	 * must be alive and, for composite identities, still carry the recorded OS process
-	 * incarnation (a reused PID is never checkpointed). Stopped/terminal rows and rows
-	 * whose heartbeat is still fresh are skipped. After a broker restart, sessions whose
+	 * incarnation (a reused PID is never checkpointed). Stopped, terminal, and ambiguous rows
+	 * and rows whose heartbeat is still fresh are skipped. After a broker restart, sessions whose
 	 * host survived are re-observed as live on the first pass; sessions whose host died
 	 * while the broker was down keep their stale or missing heartbeat and read as
 	 * unknown/not-live (never fresh forever). Returns the number of checkpoints written.
@@ -1069,7 +1094,7 @@ export class SessionIndex {
 				const events: SessionIndexEvent[] = [];
 				const rows = reduceEvents(this.#events, now);
 				for (const row of rows) {
-					if (row.terminal || row.terminalUncertain) continue;
+					if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
 					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
 						continue;
 					if (!alive(row.pid)) continue;

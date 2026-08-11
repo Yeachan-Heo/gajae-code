@@ -73,6 +73,7 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
+import { isSessionAuthorityEligible } from "./session-index";
 import {
 	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
@@ -556,6 +557,7 @@ type LiveResumeRecord = {
 	pid: number;
 	endpointMtimeMs?: number;
 	live: boolean;
+	ambiguous: boolean;
 };
 type ResumeScope = {
 	cwd: string;
@@ -590,6 +592,7 @@ function sameResumeSessionIdentity(left: ResumeScope, right: ResumeScope): boole
 function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRecord): boolean {
 	return (
 		current.live &&
+		isSessionAuthorityEligible(current) &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
@@ -746,6 +749,7 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 		// published about its own process has to survive it: dropping the incarnation
 		// here would silently disarm the teardown fence for every lifecycle session.
 		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
+		...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
 		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 		endpointMtimeMs: record.endpointMtimeMs,
 	});
@@ -2182,6 +2186,8 @@ async function recordTerminalUncertain(broker: Broker, id: string, root: string,
 			locator: registered.locator,
 			endpointGeneration: registered.endpointGeneration,
 			pid: registered.pid,
+			...(registered.processIncarnation === undefined ? {} : { processIncarnation: registered.processIncarnation }),
+			...(registered.hostIncarnation === undefined ? {} : { hostIncarnation: registered.hostIncarnation }),
 			terminalUncertain: true,
 		});
 	else
@@ -3395,6 +3401,8 @@ async function executeLifecycleResponse(
 			const existing = requestedSessionId
 				? broker.index.listSessions().sessions.find(session => session.sessionId === requestedSessionId)
 				: undefined;
+			if (existing && !isSessionAuthorityEligible(existing))
+				return fail("endpoint_stale", "Session authority is ambiguous and cannot be resumed safely.");
 			if (existing?.live) {
 				const initialScope = await validateLiveResumeScope(broker, input, requestedSessionId!, existing);
 				if ("ok" in initialScope) return initialScope;
@@ -3739,14 +3747,20 @@ async function executeLifecycleResponse(
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
 		if (!record) return fail("not_found", "session is not indexed");
-		if (!record.live && !record.terminal && !record.terminalUncertain) {
+		if (record.terminalUncertain)
+			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
+		if (!isSessionAuthorityEligible(record))
+			return fail("endpoint_stale", "Session authority is ambiguous and cannot be closed safely.");
+		if (!record.live && !record.terminal) {
 			await broker.heartbeatSessions();
 			await broker.index.refresh();
 			record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 			if (!record) return fail("not_found", "session is not indexed");
+			if (record.terminalUncertain)
+				return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
+			if (!isSessionAuthorityEligible(record))
+				return fail("endpoint_stale", "Session authority is ambiguous and cannot be closed safely.");
 		}
-		if (record.terminalUncertain)
-			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
 		const requestedAuthority = requestedCloseAuthority(input);
 		if ("error" in requestedAuthority) return requestedAuthority.error;
 		if (requestedAuthority.authority && !sameCloseAuthority(requestedAuthority.authority, record, id))
@@ -3919,6 +3933,8 @@ async function executeLifecycleResponse(
 	if (operation === "session.delete") {
 		if (record?.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be deleted safely.");
+		if (record && !isSessionAuthorityEligible(record))
+			return fail("endpoint_stale", "Session authority is ambiguous and cannot be deleted safely.");
 		if (record?.live) return fail("live_session", "Refusing to delete a live session; close it first.");
 		if (cleanup === undefined) {
 			const requestedTranscriptPath = text(input.sessionPath);
@@ -4533,7 +4549,7 @@ async function executeLifecycleResponse(
 		}
 		if (record)
 			await broker.index.append({
-				type: "session_closed",
+				type: "session_deleted",
 				sessionId: id,
 				locator: record.locator,
 				endpointGeneration: record.endpointGeneration,
@@ -4939,15 +4955,21 @@ export interface ReapedSessionRegistration {
  * Liveness is the session index's own `alive(pid)` probe (`listSessions().live`),
  * which reports live for both a running pid and an EPERM pid, so an alien or
  * unreadable process is never mistaken for a dead one. Registrations already
- * marked `terminalUncertain` are left alone: their disposition belongs to the
- * terminal-uncertainty reconciliation path, and silently dropping them would
- * turn a fail-closed `session.close`/`session.delete` refusal into `not_found`.
+ * marked `terminalUncertain`, retained terminal rows, and ambiguous identities are left
+ * alone: their disposition belongs to their exact lifecycle authority path, and silently
+ * dropping them would turn a fail-closed `session.close`/`session.delete` refusal into
+ * `not_found`.
  */
 export async function reapDeadSessionRegistrations(
 	broker: Pick<Broker, "index">,
 ): Promise<ReapedSessionRegistration[]> {
 	await broker.index.refresh();
-	const dead = broker.index.listSessions().sessions.filter(session => !session.live && !session.terminalUncertain);
+	const dead = broker.index
+		.listSessions()
+		.sessions.filter(
+			session =>
+				!session.live && !session.terminal && !session.terminalUncertain && isSessionAuthorityEligible(session),
+		);
 	const reaped: ReapedSessionRegistration[] = [];
 	for (const session of dead) {
 		if (!(await broker.index.unregisterIfCurrent(session))) continue;
