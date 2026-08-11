@@ -13,12 +13,39 @@ export type SdkErrorCode =
 export class SdkClientError extends Error {
 	readonly code: SdkErrorCode;
 	readonly details: unknown;
-	constructor(code: SdkErrorCode, message: string, details?: unknown) {
+	/**
+	 * Reconnect-cycle diagnostics, separate from `details` because `details` is an
+	 * established contract: callers read the terminating transport error straight off
+	 * it (`session-cli.ts` matches `details.code` against `ENOENT`/`ECONNREFUSED`, and
+	 * lifecycle callers cast it to a sent record). Wrapping that value would silently
+	 * break every such reader, so the new attribution rides alongside it instead.
+	 */
+	readonly reconnect?: SdkReconnectExhaustedDetails;
+	constructor(code: SdkErrorCode, message: string, details?: unknown, reconnect?: SdkReconnectExhaustedDetails) {
 		super(message);
 		this.name = "SdkClientError";
 		this.code = code;
 		this.details = details;
+		if (reconnect) this.reconnect = reconnect;
 	}
+}
+
+export type SdkReconnectTerminationReason = "attempts_exhausted" | "deadline" | "cancelled";
+
+/**
+ * Reconnect-cycle termination diagnostics. `attemptsConsumed` counts retry slots,
+ * not socket opens: the initial open is free, so the loop can open one more socket
+ * than `attemptBudget`. Both values are therefore directly comparable.
+ *
+ * `reason` is authoritative. `attemptsConsumed < attemptBudget` is corroborating
+ * evidence of truncation, not a classifier: a zero-attempt client that trips its
+ * deadline immediately reports `0 === 0` and is still deadline-terminated.
+ */
+export interface SdkReconnectExhaustedDetails {
+	readonly attemptsConsumed: number;
+	readonly attemptBudget: number;
+	readonly elapsedMs: number;
+	readonly reason: SdkReconnectTerminationReason;
 }
 
 export interface SdkClientOptions {
@@ -322,8 +349,8 @@ export class SdkClient {
 		return await deferred.promise;
 	}
 
-	#deadlineError(): SdkClientError {
-		return new SdkClientError("timeout", "SDK client deadline elapsed.");
+	#deadlineError(reconnect?: SdkReconnectExhaustedDetails): SdkClientError {
+		return new SdkClientError("timeout", "SDK client deadline elapsed.", undefined, reconnect);
 	}
 
 	#remainingTimeout(limit = this.#timeoutMs): number {
@@ -351,14 +378,32 @@ export class SdkClient {
 	}
 
 	async #openWithRetry(cycle: Cycle): Promise<Incarnation> {
+		const startedAt = Date.now();
+		let attemptsConsumed = 0;
 		let lastError: unknown;
+		const diagnostics = (reason: SdkReconnectTerminationReason): SdkReconnectExhaustedDetails => ({
+			attemptsConsumed,
+			attemptBudget: this.#reconnectAttempts,
+			elapsedMs: Date.now() - startedAt,
+			reason,
+		});
+		const cancelled = (): SdkClientError =>
+			new SdkClientError("connection_closed", "SDK client closed", lastError, diagnostics("cancelled"));
+		/**
+		 * A deadline and retry budget measure different failure axes. One-shot clients
+		 * need the deadline to fast-fail their operation, while long-lived ACP sessions
+		 * express their recovery window as retry slots. Honor both, but retain the
+		 * terminating axis so a deadline-truncated session budget is not misdiagnosed
+		 * as a host that consumed every retry.
+		 */
 		for (let attempt = 0; attempt <= this.#reconnectAttempts; attempt++) {
 			if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
-				const error = this.#deadlineError();
+				const error = this.#deadlineError(diagnostics("deadline"));
 				this.#completeCycle(cycle, error);
 				throw error;
 			}
-			if (!this.#isOpening(cycle)) throw new SdkClientError("connection_closed", "SDK client closed");
+			if (!this.#isOpening(cycle)) throw cancelled();
+			if (attempt > 0) attemptsConsumed++;
 			try {
 				const incarnation = await this.#open(cycle);
 				if (!this.#isActive(incarnation) && (!this.#isOpening(cycle) || cycle.candidate !== incarnation))
@@ -368,7 +413,7 @@ export class SdkClient {
 				throw new SdkClientError("connection_closed", "SDK WebSocket is not connected");
 			} catch (error) {
 				lastError = error;
-				if (!this.#isOpening(cycle)) throw error;
+				if (!this.#isOpening(cycle)) throw cancelled();
 				const candidate = cycle.candidate;
 				if (candidate && candidate.phase !== "active")
 					this.#retire(
@@ -384,26 +429,40 @@ export class SdkClient {
 					);
 					if (backoffMs <= 0) break;
 					cycle.phase = "backoff";
+					// A close during the sleep rejects this promise. Left uncaught it escapes as
+					// the bare teardown error, so the one cancellation that is hardest to observe
+					// would be the only one carrying no attribution.
 					const deferred = Promise.withResolvers<void>();
 					cycle.rejectBackoff = deferred.reject;
 					cycle.backoffTimer = setTimeout(() => deferred.resolve(), backoffMs);
-					await deferred.promise;
-					cycle.rejectBackoff = undefined;
-					cycle.backoffTimer = undefined;
-					if (!this.#isOpening(cycle)) throw new SdkClientError("connection_closed", "SDK client closed");
+					try {
+						await deferred.promise;
+					} catch (backoffRejection) {
+						lastError = backoffRejection;
+						throw cancelled();
+					} finally {
+						cycle.rejectBackoff = undefined;
+						cycle.backoffTimer = undefined;
+					}
+					if (!this.#isOpening(cycle)) throw cancelled();
 					cycle.phase = "opening";
 				}
 			}
 		}
-		if (!this.#isOpening(cycle)) throw new SdkClientError("connection_closed", "SDK client closed");
+		if (!this.#isOpening(cycle)) throw cancelled();
 		if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
-			const error = this.#deadlineError();
+			const error = this.#deadlineError(diagnostics("deadline"));
 			this.#completeCycle(cycle, error);
 			throw error;
 		}
 		cycle.phase = "complete";
 		if (this.#opening === cycle) this.#opening = null;
-		const error = new SdkClientError("reconnect_exhausted", "SDK WebSocket reconnect attempts exhausted", lastError);
+		const error = new SdkClientError(
+			"reconnect_exhausted",
+			"SDK WebSocket reconnect attempts exhausted",
+			lastError,
+			diagnostics("attempts_exhausted"),
+		);
 		this.#notifyReconnectFailedHandlers(error);
 		throw error;
 	}

@@ -421,7 +421,71 @@ test("SdkClient terminal close rejects opening, hello, and retry waiters", async
 		FakeWebSocket.instances[2].emit("error");
 		for (let index = 0; index < 4; index++) await flush();
 		await retryClient.close();
-		await expect(retry).rejects.toMatchObject({ code: "connection_closed" });
+		let cancelled: SdkClientError | undefined;
+		try {
+			await retry;
+		} catch (error) {
+			cancelled = error as SdkClientError;
+		}
+		expect(cancelled).toMatchObject({ code: "connection_closed" });
+		// Closing mid-backoff is the cancellation least likely to be noticed, so it has to
+		// carry the same attribution as the rest and keep the transport error that led here.
+		expect(cancelled?.reconnect).toMatchObject({ reason: "cancelled", attemptBudget: 1 });
+		expect(cancelled?.details).toBeDefined();
+	});
+});
+
+test("SdkClient attributes a deadline-truncated reconnect budget", async () => {
+	await withFakeTransport(async clock => {
+		// A budget sized in attempts, terminated by wall-clock: the exact shape an ACP
+		// session hits, where 23 slots exist but a deadline ends the cycle early.
+		const reconnectAttempts = 5;
+		const client = new SdkClient("ws://sdk.test", "token", {
+			reconnectAttempts,
+			reconnectBackoffMs: 10,
+			deadline: Date.now() + 15,
+		});
+		const connecting = client.connect();
+		let failure: SdkClientError | undefined;
+		const settled = connecting.catch((error: unknown) => {
+			failure = error as SdkClientError;
+		});
+		for (let index = 0; index < 4; index++) await flush();
+		FakeWebSocket.instances[0].emit("error");
+		for (let index = 0; index < 4; index++) await flush();
+		clock.advanceBy(15);
+		for (let index = 0; index < 4; index++) await flush();
+
+		await settled;
+		expect(failure).toMatchObject({ code: "timeout" });
+		expect(failure?.reconnect).toMatchObject({ reason: "deadline" });
+		// Slots left unused is the evidence that the budget was cut short rather than spent.
+		expect(failure?.reconnect?.attemptsConsumed).toBeLessThan(reconnectAttempts);
+		await client.close();
+	});
+});
+
+test("SdkClient keeps a default one-shot client deadline-dominant", async () => {
+	await withFakeTransport(async clock => {
+		// Defaults, not a zero-retry client: the fast-fail path an ordinary request
+		// client gets without configuring anything must stay deadline-dominant.
+		const client = new SdkClient("ws://sdk.test", "token", { deadline: Date.now() + 30, timeoutMs: 50 });
+		const connecting = client.connect();
+		let failure: SdkClientError | undefined;
+		const settled = connecting.catch((error: unknown) => {
+			failure = error as SdkClientError;
+		});
+		for (let index = 0; index < 4; index++) await flush();
+		FakeWebSocket.instances[0].emit("error");
+		for (let index = 0; index < 4; index++) await flush();
+		clock.advanceBy(30);
+		for (let index = 0; index < 4; index++) await flush();
+
+		await settled;
+		expect(failure).toMatchObject({ code: "timeout" });
+		expect(failure?.reconnect).toMatchObject({ reason: "deadline" });
+		expect(failure?.reconnect?.attemptsConsumed).toBeLessThan(failure!.reconnect!.attemptBudget);
+		await client.close();
 	});
 });
 
@@ -513,7 +577,21 @@ test("SdkClient clamps reconnect backoff to the configured per-attempt ceiling",
 			for (let index = 0; index < 4; index++) await flush();
 		}
 
-		await expect(connecting).rejects.toMatchObject({ code: "reconnect_exhausted" });
+		let exhausted: SdkClientError | undefined;
+		try {
+			await connecting;
+		} catch (error) {
+			exhausted = error as SdkClientError;
+		}
+		expect(exhausted).toMatchObject({ code: "reconnect_exhausted" });
+		expect(exhausted?.reconnect).toMatchObject({
+			reason: "attempts_exhausted",
+			attemptsConsumed: reconnectAttempts,
+			attemptBudget: reconnectAttempts,
+		});
+		// `details` stays the terminating transport error: consumers read it directly
+		// (`session-cli` matches ENOENT/ECONNREFUSED there), so diagnostics must not displace it.
+		expect(exhausted?.details).toBeInstanceOf(SdkClientError);
 		expect(FakeWebSocket.instances).toHaveLength(reconnectAttempts + 1);
 		expect(observed).toEqual(expected);
 		expect(Math.max(...observed)).toBe(reconnectMaxBackoffMs);
