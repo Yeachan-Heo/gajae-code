@@ -3,7 +3,7 @@
 ## [Unreleased]
 ### Changed
 
-- Renamed the create-connect-submit API contract to durable client-side orchestration. The create key and submission reference remain durable in their existing authorities, and recovery reconciles their composite outcome after restart; the SDK does not promise a single-authority transactional atomic outcome across process failure. Recovery identities now retain only canonical create fields needed for reconciliation and exclude credentials and secrets.
+- Renamed the create-connect-submit API contract to durable client-side orchestration. The create key and submission reference remain durable in their existing authorities, and recovery reconciles their composite outcome after restart; the SDK does not promise a single-authority transactional atomic outcome across process failure. `SdkDurableLookupIdentity` carries no create replay material — no `create` or `createRedacted` field — so no potentially secret-bearing MCP server definition (HTTP/SSE URL userinfo/query tokens, stdio args, env, headers) can leak into the public recovery identity. The full create is supplied separately by the caller via `SdkDurableReconcileOptions.create` when replay is needed during reconciliation.
 
 ### Added
 

@@ -75,20 +75,24 @@ export interface SdkDurableCreateConnectSubmitInput {
 	replaySinceSeq?: number;
 }
 
-/** Safe, canonical recovery identity without endpoint or create credentials. */
+/** Safe, canonical recovery identity without create credentials or MCP replay material. */
 export interface SdkDurableLookupIdentity {
 	version: 1;
 	operation: "session.create";
 	createIdempotencyKey: string;
-	create: Record<string, unknown>;
-	/** The create request contained credential fields which cannot be replayed from this public identity. */
-	createRedacted?: true;
 	sessionId?: string;
 	endpointGeneration?: number;
 	endpointIncarnation?: string;
 	submission: { kind: SdkDurableSubmission["kind"]; clientRef: string };
 	commandId?: string;
 	turnId?: string;
+}
+
+/** Options for reconciling a prior durable orchestration. The create input is
+ *  supplied separately by the caller and is only used when the identity has no
+ *  sessionId; it is never stored on or serialized through the identity. */
+export interface SdkDurableReconcileOptions extends SdkRequestOptions {
+	create?: Record<string, unknown>;
 }
 
 /** Durable client-side orchestration outcome, including reconciliation-required uncertainty. */
@@ -260,30 +264,6 @@ function canonicalCreate(create: Record<string, unknown>): Record<string, unknow
 	return canonicalize(create, new Set()) as Record<string, unknown>;
 }
 
-function recoverySafeCreate(create: Record<string, unknown>): { create: Record<string, unknown>; redacted: boolean } {
-	let redacted = false;
-	const redactMcpCredentials = (value: unknown): unknown => {
-		if (Array.isArray(value)) return value.map(redactMcpCredentials);
-		if (!isRecord(value)) return value;
-		const result: Record<string, unknown> = {};
-		for (const [key, nested] of Object.entries(value)) {
-			if (key === "env" || key === "headers") {
-				redacted = true;
-				continue;
-			}
-			result[key] = redactMcpCredentials(nested);
-		}
-		return result;
-	};
-	return {
-		create: {
-			...create,
-			...(create.mcpServers === undefined ? {} : { mcpServers: redactMcpCredentials(create.mcpServers) }),
-		},
-		redacted,
-	};
-}
-
 function validTimeout(value: unknown): boolean {
 	return value === undefined || (typeof value === "number" && Number.isFinite(value) && value > 0);
 }
@@ -312,18 +292,17 @@ function durableIdentity(input: SdkDurableCreateConnectSubmitInput): SdkDurableL
 	} else {
 		throw new SdkClientError("invalid_input", "Submission is invalid.");
 	}
-	const canonical = canonicalCreate(input.create);
-	const safe = recoverySafeCreate(canonical);
+	// Validate create input shape without retaining it on the identity. The full
+	// create payload is sent to the broker on session.create; it is not stored on
+	// the public identity, which carries only non-secret lookup fields.
+	canonicalCreate(input.create);
 	return {
 		version: 1,
 		operation: "session.create",
 		createIdempotencyKey: input.createIdempotencyKey,
-		create: safe.create,
-		...(safe.redacted ? { createRedacted: true } : {}),
 		submission: { kind: submission.kind, clientRef: submission.clientRef },
 	};
 }
-
 function validDurableIdentity(identity: unknown): identity is SdkDurableLookupIdentity {
 	if (!isRecord(identity) || !isRecord(identity.submission)) return false;
 	return (
@@ -331,9 +310,7 @@ function validDurableIdentity(identity: unknown): identity is SdkDurableLookupId
 		identity.operation === "session.create" &&
 		validClientRef(identity.createIdempotencyKey) &&
 		validClientRef(identity.submission.clientRef) &&
-		(identity.submission.kind === "prompt" || identity.submission.kind === "skill") &&
-		isRecord(identity.create) &&
-		(identity.createRedacted === undefined || identity.createRedacted === true)
+		(identity.submission.kind === "prompt" || identity.submission.kind === "skill")
 	);
 }
 
@@ -658,16 +635,20 @@ export class SdkClient {
 	/** Reconcile a prior durable client-side orchestration outcome without resubmitting ordered work. */
 	async reconcileCreateConnectSubmit(
 		identity: SdkDurableLookupIdentity,
-		options: SdkRequestOptions = {},
+		options: SdkDurableReconcileOptions = {},
 	): Promise<SdkDurableResult> {
 		if (!validDurableIdentity(identity))
 			return durableFailure(new SdkClientError("invalid_input", "Invalid durable lookup identity."));
 		let recovered = identity;
 		if (!recovered.sessionId) {
-			if (recovered.createRedacted) return uncertain("create_uncertain", recovered);
+			// The identity intentionally carries no create replay material. The
+			// caller must supply the original create separately so the broker's
+			// idempotency key can resolve the prior create; without it, recovery
+			// cannot safely replay and must report uncertainty.
+			if (!options.create) return uncertain("create_uncertain", recovered);
 			try {
 				const created = responseResult(
-					await this.global("session.create", recovered.create, {
+					await this.global("session.create", canonicalCreate(options.create), {
 						idempotencyKey: recovered.createIdempotencyKey,
 						timeoutMs: options.timeoutMs,
 					}),
