@@ -130,6 +130,8 @@ Inside a session:
 gjc ultragoal create-goals --brief-file <approved-plan>
 ```
 
+The default dark TUI identity is the GJC red-claw theme, while light-appearance terminals default to the bundled blue-crab theme. Pick more from Settings or `/theme`.
+
 ## Let OpenClaw / Hermes drive GJC
 
 GJC ships a native Coordinator MCP bridge, so an external controller like OpenClaw or Hermes orchestrates real GJC sessions through durable turns — never terminal scraping.
@@ -174,6 +176,7 @@ The session command selector accepts only "gjc" or "gjc --worktree [name]".
 For a controller that drives one live session directly, every session also exposes a loopback **SDK WebSocket** endpoint, the `gjc sdk session` CLI (`list|inspect|send|status|tail`), and the bundled `sdk-skills/` (`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`) — reviewed, approval-gated procedures any controller-hosted agent can follow.
 
 - [External controller integration guide](docs/bot-integration.md) · [Coordinator MCP bridge](docs/hermes-mcp-bridge.md)
+- [External controller / bot](docs/bot-integration.md) — provider-independent smokes; [`docs/aside-integration.md`](docs/aside-integration.md) covers the opt-in search/context sidecar
 - [SDK & wire protocol](docs/sdk.md) · [SDK session CLI](docs/sdk-session-cli.md) · [External-control readiness](docs/external-control-readiness.md)
 
 ## Documentation

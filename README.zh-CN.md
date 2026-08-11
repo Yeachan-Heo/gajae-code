@@ -132,6 +132,8 @@ gjc @screenshot.png "我该改什么？"    # 图片输入
 gjc ultragoal create-goals --brief-file <已批准的计划>
 ```
 
+默认暗色 TUI 身份是 GJC red-claw 主题，亮色外观终端默认使用捆绑的 blue-crab 主题。更多主题从 Settings 或 `/theme` 选择。
+
 ## 让 OpenClaw / Hermes 驱动 GJC
 
 GJC 内置原生 Coordinator MCP 桥，让 OpenClaw、Hermes 之类的外部控制器通过持久 turn 编排真实的 GJC 会话 —— 绝不抓取终端。
@@ -176,6 +178,7 @@ The session command selector accepts only "gjc" or "gjc --worktree [name]".
 对于直接驱动单个实时会话的控制器，每个会话还暴露回环 **SDK WebSocket** 端点、`gjc sdk session` CLI（`list|inspect|send|status|tail`），以及内置的 `sdk-skills/`（`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`）—— 经过评审、带审批门控的流程，任何控制器上的代理都可以遵循。
 
 - [外部控制器集成指南](docs/bot-integration.md) · [Coordinator MCP 桥](docs/hermes-mcp-bridge.md)
+- [外部控制器 / 机器人](docs/bot-integration.md) — 提供商无关冒烟测试；[`docs/aside-integration.md`](docs/aside-integration.md) 涵盖可选的搜索/上下文边车
 - [SDK & 线协议](docs/sdk.md) · [SDK 会话 CLI](docs/sdk-session-cli.md) · [外部控制就绪度](docs/external-control-readiness.md)
 
 ## 文档

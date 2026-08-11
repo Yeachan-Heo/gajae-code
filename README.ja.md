@@ -132,6 +132,8 @@ gjc @screenshot.png "何を変えるべき？"   # 画像入力
 gjc ultragoal create-goals --brief-file <承認済み計画>
 ```
 
+デフォルトのダーク TUI アイデンティティは GJC red-claw テーマで、ライト外観ターミナルは同梱の blue-crab テーマがデフォルトです。他のテーマは Settings または `/theme` から選択してください。
+
 ## OpenClaw / Hermes に GJC を使わせる
 
 GJC はネイティブの Coordinator MCP ブリッジを同梱しており、OpenClaw や Hermes のような外部コントローラが永続 turn を通じて実際の GJC セッションをオーケストレーションします — ターミナルスクレイピングは一切不要です。
@@ -176,6 +178,7 @@ The session command selector accepts only "gjc" or "gjc --worktree [name]".
 ライブセッションを直接操作するコントローラのために、各セッションはループバック **SDK WebSocket** エンドポイント、`gjc sdk session` CLI（`list|inspect|send|status|tail`）、同梱の `sdk-skills/`（`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`）も公開しています — レビュー済みで承認ゲート付きの手順であり、コントローラ上のどんなエージェントでも従えます。
 
 - [外部コントローラ統合ガイド](docs/bot-integration.md) · [Coordinator MCP ブリッジ](docs/hermes-mcp-bridge.md)
+- [外部コントローラ / ボット](docs/bot-integration.md) — プロバイダ非依存スモーク；[`docs/aside-integration.md`](docs/aside-integration.md) はオプトインの検索/コンテキストサイドカーを扱います
 - [SDK & ワイヤプロトコル](docs/sdk.md) · [SDK セッション CLI](docs/sdk-session-cli.md) · [外部制御レディネス](docs/external-control-readiness.md)
 
 ## ドキュメント

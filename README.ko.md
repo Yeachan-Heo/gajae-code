@@ -132,6 +132,8 @@ gjc @screenshot.png "뭘 바꿔야 할까?"   # 이미지 입력
 gjc ultragoal create-goals --brief-file <승인된-계획>
 ```
 
+기본 다크 TUI 정체성은 GJC red-claw 테마이며, 라이트 외형 터미널은 번들 blue-crab 테마가 기본입니다. 더 많은 테마는 Settings 또는 `/theme`에서 선택하세요.
+
 ## OpenClaw / Hermes가 GJC를 부리게 하기
 
 GJC는 네이티브 Coordinator MCP 브리지를 내장하고 있어 OpenClaw나 Hermes 같은 외부 컨트롤러가 터미널 스크래핑 없이 durable turn으로 실제 GJC 세션을 오케스트레이션합니다.
@@ -176,6 +178,7 @@ The session command selector accepts only "gjc" or "gjc --worktree [name]".
 라이브 세션 하나를 직접 다루는 컨트롤러를 위해 모든 세션은 루프백 **SDK WebSocket** 엔드포인트, `gjc sdk session` CLI(`list|inspect|send|status|tail`), 번들 `sdk-skills/`(`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`)를 함께 노출합니다 — 컨트롤러에 올라탄 에이전트가 따라갈 수 있는, 검토되고 승인 게이트가 있는 절차입니다.
 
 - [외부 컨트롤러 통합 가이드](docs/bot-integration.md) · [Coordinator MCP 브리지](docs/hermes-mcp-bridge.md)
+- [외부 컨트롤러 / 봇](docs/bot-integration.md) — 프로바이더 독립 스모크; [`docs/aside-integration.md`](docs/aside-integration.md)는 옵트인 검색/컨텍스트 사이드카를 다룹니다
 - [SDK & 와이어 프로토콜](docs/sdk.md) · [SDK 세션 CLI](docs/sdk-session-cli.md) · [외부 제어 준비도](docs/external-control-readiness.md)
 
 ## 문서
