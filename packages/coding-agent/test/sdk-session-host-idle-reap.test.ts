@@ -370,7 +370,11 @@ test("a dead-registration sweep stays bounded so another client can still take t
 	try {
 		const index = await new SessionIndex(agentDir).open();
 		const locator = { repo: agentDir, stateRoot: agentDir };
-		const dead = BROKER_DEAD_REGISTRATION_SWEEP_LIMIT * 3;
+		// The cap itself is the contract, not its production value: seed a small
+		// surplus over an injected limit so the bound is proven without paying for
+		// 192 fsynced index transactions on a shared CI runner.
+		const limit = 4;
+		const dead = limit * 3;
 		for (let i = 0; i < dead; i++) {
 			await index.append({
 				type: "host_registered",
@@ -385,18 +389,18 @@ test("a dead-registration sweep stays bounded so another client can still take t
 		// long-lived index owns the shared lock continuously and unrelated launches
 		// exhaust their retry budget instead of registering.
 		const contender = await new SessionIndex(agentDir).open();
-		const sweeping = reapDeadSessionRegistrations({ index });
+		const sweeping = reapDeadSessionRegistrations({ index }, limit);
 		const started = Date.now();
 		await contender.withLocked(async () => undefined);
 		const waited = Date.now() - started;
 		const reaped = await sweeping;
 
-		expect(reaped).toHaveLength(BROKER_DEAD_REGISTRATION_SWEEP_LIMIT);
+		expect(reaped).toHaveLength(limit);
 		expect(waited).toBeLessThan(10_000);
 		// The surplus is left for later sweeps rather than extending this one.
-		expect(index.listSessions().sessions.filter(session => !session.terminal)).toHaveLength(
-			dead - BROKER_DEAD_REGISTRATION_SWEEP_LIMIT,
-		);
+		expect(index.listSessions().sessions.filter(session => !session.terminal)).toHaveLength(dead - limit);
+		// The production default stays the shipped bound the sweep runs with.
+		expect(BROKER_DEAD_REGISTRATION_SWEEP_LIMIT).toBe(64);
 	} finally {
 		warn.mockRestore();
 		await fs.rm(agentDir, { recursive: true, force: true });
