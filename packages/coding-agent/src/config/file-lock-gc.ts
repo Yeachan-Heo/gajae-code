@@ -35,6 +35,8 @@ interface WalkState {
 export interface FileLocksGcCollectOptions {
 	/** Override per-root entry budget (tests). Defaults to {@link FILE_LOCK_GC_MAX_WALK_ENTRIES}. */
 	maxWalkEntries?: number;
+	/** Override global lock roots for isolated collection tests. */
+	roots?: readonly string[];
 }
 
 // Global, env-aware GJC lock roots. Per the approved scope this covers the
@@ -169,7 +171,8 @@ export async function collectFileLocksForGc(
 	const warnings: GcWarning[] = [];
 	const lockDirs = new Set<string>();
 
-	for (const root of knownFileLockRoots(ctx)) {
+	const roots = options.roots ?? knownFileLockRoots(ctx);
+	for (const root of Array.from(new Set(roots.map(root => path.resolve(root))))) {
 		// Fresh budget per root so a huge agent dir cannot starve config/spool.
 		const state: WalkState = { entries: 0, truncated: false };
 		await walkForLockDirs(root, 0, state, lockDirs, errors, maxWalkEntries);
