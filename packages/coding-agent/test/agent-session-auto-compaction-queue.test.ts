@@ -182,6 +182,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueQueuedMessagesSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 
 		// Wait for auto_compaction_end event to know when the async handler is done
 		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
@@ -227,7 +228,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(idleResolved).toBe(false);
 		await withTimeout(idlePromise, 1000, "Queued continuation did not become idle");
 
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(1);
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals).toContain("compaction:start:threshold");
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
@@ -272,7 +274,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 			display: false,
 			timestamp: Date.now(),
 		});
-		const continueQueuedSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueQueuedMessagesSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 		const { promise: firstCompactionDone, resolve: onFirstCompactionDone } = Promise.withResolvers<void>();
 		const { promise: secondCompactionDone, resolve: onSecondCompactionDone } = Promise.withResolvers<void>();
 		let compactionEndCount = 0;
@@ -317,7 +320,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await withTimeout(secondCompactionDone, 1000, "Pre-continue compaction timed out");
 		await session.waitForIdle();
 
-		expect(continueQueuedSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(1);
 		expect(getRuntimeSignals().filter(signal => signal === "compaction:start:threshold")).toHaveLength(2);
 	});
 

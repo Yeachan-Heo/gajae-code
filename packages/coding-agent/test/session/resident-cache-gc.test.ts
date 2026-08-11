@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	EphemeralBlobStore,
 	openVerifiedResidentCacheInstanceDir,
+	openVerifiedSidecarCacheInstanceDir,
 	sweepResidentCacheRoot,
 } from "@gajae-code/coding-agent/session/blob-store";
 
@@ -82,6 +83,27 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 		} finally {
 			store.dispose();
 		}
+	});
+
+	it("uses a deterministic sidecar lease and reaps an abandoned sidecar instance", async () => {
+		const cacheRoot = path.join(makeTempDir(), "sidecar-cache");
+		const sessionHash = "a".repeat(32);
+		const instanceDir = openVerifiedSidecarCacheInstanceDir(cacheRoot, sessionHash);
+		const store = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+		try {
+			expect(path.basename(instanceDir)).toBe(`s-${sessionHash}`);
+			expect(() => openVerifiedSidecarCacheInstanceDir(cacheRoot, sessionHash)).toThrow("instance_create_failed");
+		} finally {
+			store.dispose();
+		}
+
+		const stale = createInstance(cacheRoot, `s-${"b".repeat(32)}`, {
+			pid: DEAD_PID,
+			startTimeMs: 0,
+			nonce: "dead-sidecar",
+		});
+		await sweepResidentCacheRoot(cacheRoot);
+		expect(fs.existsSync(stale)).toBe(false);
 	});
 
 	it("collects an instance whose owner PID is dead", async () => {

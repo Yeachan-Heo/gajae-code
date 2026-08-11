@@ -4882,6 +4882,11 @@ export class AgentSession {
 		onError?: (error: unknown) => void;
 		resourceRunId?: string;
 		maintenanceContinuation?: boolean;
+		// Queue-consuming continuations (follow-up/steer drained after execution
+		// tails settle) must run continueQueuedMessages() so they deliver the
+		// queued turn without replaying the non-assistant tail. Every other
+		// scheduled continuation keeps continue() semantics.
+		continueQueuedOnly?: boolean;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
 			? this.#reserveDeferredAgentEndForContinuation()
@@ -4969,11 +4974,12 @@ export class AgentSession {
 							this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
 						};
 						const hasQueuedMessages = this.agent.hasQueuedMessages();
-						const startsQueuedSuccessor = hasQueuedMessages;
-						const continueQueued =
-							this.agent.state.messages.at(-1)?.role === "assistant" || !hasQueuedMessages
-								? this.agent.continue.bind(this.agent)
-								: this.agent.continueQueuedMessages.bind(this.agent);
+						const startsQueuedSuccessor =
+							hasQueuedMessages &&
+							(options?.continueQueuedOnly === true || this.agent.state.messages.at(-1)?.role === "assistant");
+						const continueQueued = options?.continueQueuedOnly
+							? this.agent.continueQueuedMessages.bind(this.agent)
+							: this.agent.continue.bind(this.agent);
 						try {
 							await continueQueued({
 								...this.#managedFallbackPromptOptions(),
@@ -9469,6 +9475,7 @@ export class AgentSession {
 		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForSteer()) {
 			this.#scheduleAgentContinue({
 				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
+				continueQueuedOnly: true,
 			});
 		}
 	}
@@ -9521,6 +9528,7 @@ export class AgentSession {
 		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) {
 			this.#scheduleAgentContinue({
 				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+				continueQueuedOnly: true,
 			});
 		}
 	}
@@ -10316,6 +10324,7 @@ export class AgentSession {
 					delayMs: 1,
 					generation: this.#promptGeneration,
 					shouldContinue: () => this.agent.hasQueuedSteering(),
+					continueQueuedOnly: true,
 				});
 			}
 			return outcome;
@@ -14921,6 +14930,7 @@ export class AgentSession {
 							generation,
 							shouldContinue: () => this.agent.hasQueuedMessages(),
 							rescheduleOnBusy: true,
+							continueQueuedOnly: true,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
 							resourceRunId: options?.resourceRunId,
@@ -14942,6 +14952,7 @@ export class AgentSession {
 
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 						rescheduleOnBusy: true,
+						continueQueuedOnly: true,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 						resourceRunId: options?.resourceRunId,
@@ -15201,6 +15212,7 @@ export class AgentSession {
 					suppressPredecessorAgentEnd: true,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
 					rescheduleOnBusy: true,
+					continueQueuedOnly: true,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					resourceRunId: options?.resourceRunId,
@@ -16716,6 +16728,7 @@ export class AgentSession {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
 					rescheduleOnBusy: true,
+					continueQueuedOnly: true,
 				});
 			}
 			options?.onPersisted?.();

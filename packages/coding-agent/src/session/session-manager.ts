@@ -28,6 +28,7 @@ import {
 	getProjectDir,
 	getResidentCacheRootDir,
 	getSessionsDir,
+	getSidecarCacheRootDir,
 	getTerminalSessionsDir,
 	hasFsCode,
 	isEnoent,
@@ -57,12 +58,14 @@ import {
 	isImageDataUrl,
 	MemoryBlobStore,
 	openVerifiedResidentCacheInstanceDir,
+	openVerifiedSidecarCacheInstanceDir,
 	parseBlobRef,
 	ResidentBlobMissingError,
 	ResidentCacheTrustError,
 	resolveResidentImageDataSync,
 	resolveResidentImageDataUrlSync,
 	resolveTextBlobSync,
+	sweepResidentCacheRoot,
 } from "./blob-store";
 import {
 	canonicalizeTrustedPath,
@@ -9962,8 +9965,13 @@ export class SessionManager {
 		if (this.#managedSidecarCacheStore && this.#managedSidecarCacheSessionFile === sessionFile)
 			return this.#managedSidecarCacheStore.dir;
 		this.#releaseManagedSidecarCache();
-		const instanceDir = openVerifiedResidentCacheInstanceDir(
-			getResidentCacheRootDir(this.#residentCacheProfileAgentDir()),
+		// Sweep abandoned pre-namespace sidecars from the resident root. The sweep
+		// only reaps stale owner leases, so the canonical resident store is untouched.
+		void sweepResidentCacheRoot(getResidentCacheRootDir(this.#residentCacheProfileAgentDir()));
+		const sessionHash = crypto.createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
+		const instanceDir = openVerifiedSidecarCacheInstanceDir(
+			getSidecarCacheRootDir(this.#residentCacheProfileAgentDir()),
+			sessionHash,
 		);
 		const cacheParent = path.dirname(instanceDir);
 		let retainedAuthority: native.RecoveryFsRoot | undefined;

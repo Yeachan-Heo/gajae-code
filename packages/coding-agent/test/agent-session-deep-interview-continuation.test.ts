@@ -372,6 +372,7 @@ describe("AgentSession deep-interview continuation", () => {
 	it("supersedes an old stop when a genuine queued user input arrives before agent_end", async () => {
 		await activateWorkflow("deep-interview");
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueQueuedSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 		const assistantMessage = { ...createAssistantMessage("Round recorded."), timestamp: 100 };
 
 		session.agent.emitExternalEvent({ type: "turn_start" });
@@ -381,7 +382,8 @@ describe("AgentSession deep-interview continuation", () => {
 		await session.waitForIdle();
 
 		// The user-owned queue continuation is permitted; the stale deep-interview continuation is not.
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(continueQueuedSpy).toHaveBeenCalledTimes(1);
 		expect(developerReminders()).toHaveLength(0);
 	});
 
@@ -409,6 +411,7 @@ describe("AgentSession deep-interview continuation", () => {
 	it("keeps a superseded assistant stop terminal after a newer user turn starts", async () => {
 		await activateWorkflow("deep-interview");
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueQueuedSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 		const assistantMessage = { ...createAssistantMessage("Round recorded."), timestamp: 100 };
 
 		session.agent.emitExternalEvent({ type: "turn_start" });
@@ -418,6 +421,7 @@ describe("AgentSession deep-interview continuation", () => {
 		await Bun.sleep(50);
 		await session.waitForIdle();
 		const continuationCalls = continueSpy.mock.calls.length;
+		const queuedContinuationCalls = continueQueuedSpy.mock.calls.length;
 
 		const [queued] = session.agent.snapshotSteering();
 		if (queued?.role !== "user") throw new Error("Expected queued user message");
@@ -428,6 +432,7 @@ describe("AgentSession deep-interview continuation", () => {
 		await session.waitForIdle();
 
 		expect(continueSpy).toHaveBeenCalledTimes(continuationCalls);
+		expect(continueQueuedSpy).toHaveBeenCalledTimes(queuedContinuationCalls);
 		expect(developerReminders()).toHaveLength(0);
 	});
 
@@ -593,8 +598,8 @@ describe("AgentSession deep-interview continuation", () => {
 
 	it("claims genuine ingress exactly once while synthetic and agent-attributed streaming inputs cannot supersede", async () => {
 		await activateWorkflow("deep-interview");
-		vi.spyOn(session.agent, "continue").mockResolvedValue();
-		vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const continueQueuedSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		let isStreaming = false;
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => isStreaming });
@@ -646,6 +651,8 @@ describe("AgentSession deep-interview continuation", () => {
 			expect(developerReminders().length - remindersBefore, name).toBe(genuine ? 0 : 1);
 		}
 		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).toHaveBeenCalledTimes(2);
+		expect(continueQueuedSpy).toHaveBeenCalledTimes(5);
 		expect(session.getQueuedMessages().steering).toEqual([
 			"synthetic",
 			"stream-steer",
