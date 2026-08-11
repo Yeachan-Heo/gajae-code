@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getResidentCacheRootDir, logger, TempDir } from "@gajae-code/utils";
+import { getSidecarCacheRootDir, logger, TempDir } from "@gajae-code/utils";
 import { EphemeralBlobStore, ResidentCacheTrustError } from "../../src/session/blob-store";
 import { SessionManager } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
@@ -15,8 +15,8 @@ interface ManagedSidecarFixture {
 }
 
 /**
- * A managed session keeps its cold-history sidecar in a resident-cache instance
- * directory rather than under managed authority, so `close()` disposes that
+ * A managed session keeps its cold-history sidecar in a verified instance
+ * directory under the dedicated sidecar-cache root, so `close()` disposes that
  * directory during teardown.
  */
 function createManagedSidecarSession(prefix: string): ManagedSidecarFixture {
@@ -57,12 +57,11 @@ function createManagedSidecarSession(prefix: string): ManagedSidecarFixture {
 	expect(manager.getSessionMemoryStats()).toMatchObject({ coldRetirementActive: true, sidecarIneligible: false });
 
 	if (destination.kind !== "managed") throw new Error("Expected a managed destination");
-	const cacheRoot = getResidentCacheRootDir(destination.securityContext.profileAgentDir);
-	const residentTextCacheDir = manager.residentTextCacheDirForTests();
+	const cacheRoot = getSidecarCacheRootDir(destination.securityContext.profileAgentDir);
 	const sidecarCacheDirs = fs
 		.readdirSync(cacheRoot)
 		.map(name => path.join(cacheRoot, name))
-		.filter(candidate => path.basename(candidate).startsWith("i-") && candidate !== residentTextCacheDir);
+		.filter(candidate => path.basename(candidate).startsWith("s-"));
 
 	return { manager, sidecarCacheDirs, cleanup: () => tempDir.removeSync() };
 }
