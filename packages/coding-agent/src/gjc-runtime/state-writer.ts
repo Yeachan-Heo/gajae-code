@@ -117,6 +117,8 @@ export interface StateWriterOptions {
 	receipt?: StateWriterReceiptContext;
 	audit?: StateWriterAuditContext;
 	sourceRevision?: number;
+	/** Advance a cache source revision under the target lock when the value carries none. */
+	advanceSourceRevision?: boolean;
 	/**
 	 * Cross-process lock tuning for read-modify-write paths that route through
 	 * `withWorkflowStateLock` / `updateJsonAtomic`. Omit for the hardened
@@ -547,8 +549,10 @@ async function writeGuardedResolvedJsonAtomic(
 				return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 			}
 
+			const valueSourceRevision = isPlainObject(value) ? persistedSourceRevision(value) : 0;
 			const incomingSourceRevision =
-				options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
+				options.sourceRevision ??
+				(valueSourceRevision || (options.advanceSourceRevision ? persistedSourceRevision(current) + 1 : 0));
 			if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
 				return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
 			}
@@ -1017,7 +1021,7 @@ export async function writeActiveEntry(
 		{
 			...options,
 			policy: "cache",
-			sourceRevision: persistedSourceRevision(entry) || 1,
+			advanceSourceRevision: true,
 		},
 	);
 	invalidateActiveStateCacheForScope(cwd, sessionScope);
