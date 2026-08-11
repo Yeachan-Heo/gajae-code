@@ -7,6 +7,37 @@ import { InsaneProvider, routeInsanePublicUrl, searchInsane } from "../../src/we
 const REDDIT_FEED = `<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
 <entry><title>Reddit Post</title><author><name>/u/alice</name></author><link href="https://www.reddit.com/r/test/comments/abc/post/"/><updated>2026-06-23T00:00:00Z</updated><content>Post body</content></entry>
 </feed>`;
+const PUBLIC_ROUTE_RESPONSE_LIMIT = 1024 * 1024;
+
+function redditFeedOfSize(totalBytes: number): string {
+	const prefix =
+		'<?xml version="1.0"?><feed><entry><title>Large Feed</title><link href="https://www.reddit.com/r/test/comments/large"/><content>';
+	const suffix = "</content></entry></feed>";
+	const fixedBytes = new TextEncoder().encode(prefix + suffix).byteLength;
+	if (totalBytes < fixedBytes) throw new Error("fixture size is too small");
+	return prefix + "x".repeat(totalBytes - fixedBytes) + suffix;
+}
+
+function chunkedResponse(chunks: string[], onCancel: () => void): Response {
+	const encoder = new TextEncoder();
+	let index = 0;
+	return new Response(
+		new ReadableStream<Uint8Array>({
+			pull(controller) {
+				const chunk = chunks[index++];
+				if (chunk === undefined) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(encoder.encode(chunk));
+			},
+			cancel() {
+				onCancel();
+			},
+		}),
+		{ status: 200 },
+	);
+}
 
 function fakeAuth(): AuthStorage {
 	return { hasAuth: () => false, hasOAuth: () => false, getApiKey: () => undefined } as unknown as AuthStorage;
@@ -35,6 +66,88 @@ describe("Insane public-route provider", () => {
 		if (!result || !("sources" in result)) throw new Error("expected route success");
 		expect(result.sources[0]).toMatchObject({ title: "Reddit Post", author: "/u/alice" });
 		expect(result.attempts).toEqual([expect.objectContaining({ platform: "reddit", route: "rss", ok: true })]);
+	});
+
+	it("accepts a public-route response exactly at the 1 MiB limit", async () => {
+		const feed = redditFeedOfSize(PUBLIC_ROUTE_RESPONSE_LIMIT);
+		using _hook = hookFetch(() => new Response(feed, { status: 200 }));
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("sources" in result)) throw new Error("expected route success");
+
+		expect(result.attempts[0]?.bytes).toBe(PUBLIC_ROUTE_RESPONSE_LIMIT);
+		expect(result.sources[0]?.title).toBe("Large Feed");
+	});
+
+	it("rejects a declared oversized response and cancels its body", async () => {
+		let cancelCount = 0;
+		using _hook = hookFetch(
+			() =>
+				new Response(
+					new ReadableStream<Uint8Array>({
+						pull() {},
+						cancel() {
+							cancelCount++;
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Length": String(PUBLIC_ROUTE_RESPONSE_LIMIT + 1) },
+					},
+				),
+		);
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("attempts" in result) || "sources" in result) throw new Error("expected route failure");
+
+		expect(result.attempts).toHaveLength(2);
+		expect(result.attempts.every(item => item.note === "response_too_large")).toBe(true);
+		expect(cancelCount).toBe(2);
+	});
+
+	it("rejects an oversized chunked response without returning partial content", async () => {
+		let cancelCount = 0;
+		using _hook = hookFetch(() =>
+			chunkedResponse(["x".repeat(700_000), "y".repeat(400_000), "unread"], () => {
+				cancelCount++;
+			}),
+		);
+
+		const result = await routeInsanePublicUrl("https://www.reddit.com/r/test");
+		if (!result || !("attempts" in result) || "sources" in result) throw new Error("expected route failure");
+
+		expect(result.attempts).toHaveLength(2);
+		expect(result.attempts.every(item => item.note === "response_too_large")).toBe(true);
+		expect(cancelCount).toBe(2);
+	});
+
+	it("continues discovery after an oversized candidate", async () => {
+		using _hook = hookFetch(input => {
+			const url = input.toString();
+			if (url.startsWith("https://html.duckduckgo.com")) {
+				return new Response(
+					[
+						`<a class="result__a" href="//duckduckgo.com/l/?uddg=${encodeURIComponent("https://www.reddit.com/r/oversized")}">Oversized</a>`,
+						'<a class="result__snippet">too large</a>',
+						`<a class="result__a" href="//duckduckgo.com/l/?uddg=${encodeURIComponent("https://www.reddit.com/r/good")}">Good</a>`,
+						'<a class="result__snippet">good result</a>',
+					].join(""),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/oversized")) {
+				return chunkedResponse(["x".repeat(700_000), "y".repeat(400_000), "unread"], () => {});
+			}
+			if (url === "https://www.reddit.com/r/good/.rss") {
+				return new Response(REDDIT_FEED, { status: 200 });
+			}
+			return new Response("", { status: 404 });
+		});
+
+		const result = await searchInsane({ query: "reddit bounded discovery" });
+
+		expect(result.sources[0]?.title).toBe("Reddit Post");
+		expect(result.sources.some(source => source.snippet?.includes("x".repeat(100)))).toBe(false);
 	});
 
 	it("routes X status URLs through public tweet-result metadata", async () => {

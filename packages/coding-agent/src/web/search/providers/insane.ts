@@ -25,6 +25,7 @@ const DEFAULT_NUM_RESULTS = 10;
 const MAX_NUM_RESULTS = 20;
 const PUBLIC_ROUTE_TIMEOUT_MS = 15_000;
 const DISCOVERY_LIMIT = 8;
+const MAX_PUBLIC_ROUTE_RESPONSE_BYTES = 1024 * 1024;
 
 const USER_AGENT = "Gajae-Code insane-search safe-public-routes/1.0 (+https://github.com/Yeachan-Heo/gajae-code)";
 
@@ -146,6 +147,59 @@ function attempt(
 	return { platform, route, ok, status, bytes: new TextEncoder().encode(body).byteLength, note };
 }
 
+class ResponseTooLargeError extends Error {
+	override readonly name = "response_too_large";
+}
+
+async function cancelBody(body: ReadableStream<Uint8Array> | null): Promise<void> {
+	if (!body) return;
+	try {
+		await body.cancel();
+	} catch {
+		// Best-effort teardown; preserve the stable size-limit diagnostic.
+	}
+}
+
+async function readResponseText(response: Response): Promise<string> {
+	const contentLength = response.headers.get("content-length");
+	if (contentLength !== null) {
+		const declaredBytes = Number.parseInt(contentLength, 10);
+		if (Number.isFinite(declaredBytes) && declaredBytes > MAX_PUBLIC_ROUTE_RESPONSE_BYTES) {
+			await cancelBody(response.body);
+			throw new ResponseTooLargeError();
+		}
+	}
+
+	const reader = response.body?.getReader();
+	if (!reader) return "";
+
+	const decoder = new TextDecoder();
+	let totalBytes = 0;
+	let text = "";
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value || value.byteLength === 0) continue;
+
+			totalBytes += value.byteLength;
+			if (totalBytes > MAX_PUBLIC_ROUTE_RESPONSE_BYTES) {
+				try {
+					await reader.cancel();
+				} catch {
+					// Best-effort teardown; preserve the stable size-limit diagnostic.
+				}
+				throw new ResponseTooLargeError();
+			}
+			text += decoder.decode(value, { stream: true });
+		}
+		text += decoder.decode();
+		return text;
+	} finally {
+		reader.releaseLock();
+	}
+}
+
 async function fetchText(
 	url: string,
 	signal?: AbortSignal,
@@ -158,7 +212,7 @@ async function fetchText(
 		redirect: "follow",
 		signal: withHardTimeout(signal, PUBLIC_ROUTE_TIMEOUT_MS),
 	});
-	const text = await response.text();
+	const text = await readResponseText(response);
 	return { status: response.status, text, contentType: response.headers.get("content-type") ?? "" };
 }
 

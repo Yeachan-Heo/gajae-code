@@ -206,6 +206,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 ## Limits & Caps
 - Provider registry size: 16 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`), including the keyless `duckduckgo` default/fallback and selectable `insane` safe-public-route provider. `SEARCH_PROVIDER_ORDER` no longer drives auto selection — see "Active-model-gated auto" above.
 - Insane result count: default `10`, max `20` (`packages/coding-agent/src/web/search/providers/insane.ts`).
+- Insane public-route response bodies are limited to 1 MiB after transfer/content decoding; oversized declared or streamed bodies are cancelled and that route fails closed (`packages/coding-agent/src/web/search/providers/insane.ts`).
 - `formatForLLM()` truncates source snippets and citation text to 240 chars (`packages/coding-agent/src/web/search/index.ts`).
 - `formatForLLM()` emits at most 3 search queries, each truncated to 120 chars (`packages/coding-agent/src/web/search/index.ts`).
 - Brave result count: default `10`, max `20` (`DEFAULT_NUM_RESULTS`, `MAX_NUM_RESULTS` in `packages/coding-agent/src/web/search/providers/brave.ts`).
