@@ -1301,7 +1301,7 @@ export class AcpAgent implements Agent {
 		}
 		this.#beginTeardown(params.sessionId);
 		try {
-			await this.#teardownSession(params.sessionId, "deleted", true);
+			await this.#teardownSession(params.sessionId, "deleted", true, true);
 			let saved = pendingLocator?.cwd === cwd ? pendingLocator.path : undefined;
 			if (!saved) {
 				try {
@@ -1928,7 +1928,12 @@ export class AcpAgent implements Agent {
 	 * waiting prompt before any awaited socket or broker work. A failed close is
 	 * terminally uncertain, not a reason to leave a usable-looking ACP record.
 	 */
-	async #teardownSession(id: string, reason: string, closeRemote: boolean): Promise<void> {
+	async #teardownSession(
+		id: string,
+		reason: string,
+		closeRemote: boolean,
+		allowBrokerCloseRefusal = false,
+	): Promise<void> {
 		const record = this.#sessions.get(id);
 		const ownershipBound = record !== undefined || this.#knownSessionCwds.has(id);
 		this.#beginTeardown(id);
@@ -1968,8 +1973,12 @@ export class AcpAgent implements Agent {
 				try {
 					await (await this.#brokerAdapter()).global("session.close", { sessionId: id }, closeIdempotencyKey);
 				} catch (error) {
-					if (this.#isDefinitiveBrokerResponse(error)) this.#pendingCloseIdempotencyKeys.delete(id);
-					if (!(ownershipBound && this.#isAlreadyGone(error))) failures.push(error);
+					if (allowBrokerCloseRefusal && error instanceof SdkClientError && error.code === "close_refused") {
+						this.#pendingCloseIdempotencyKeys.delete(id);
+					} else {
+						if (this.#isDefinitiveBrokerResponse(error)) this.#pendingCloseIdempotencyKeys.delete(id);
+						if (!(ownershipBound && this.#isAlreadyGone(error))) failures.push(error);
+					}
 				}
 			}
 			if (failures.length > 0) {

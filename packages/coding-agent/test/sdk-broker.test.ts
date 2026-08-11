@@ -693,7 +693,7 @@ describe("SDK broker identity and discovery", () => {
 		let heartbeatAttempts = 0;
 		const realSetInterval = globalThis.setInterval;
 		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
-			watchdog = callback;
+			watchdog ??= callback;
 			return realSetInterval(() => {}, 2 ** 31 - 1);
 		}) as typeof setInterval);
 		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
@@ -727,7 +727,7 @@ describe("SDK broker identity and discovery", () => {
 		let heartbeatAttempts = 0;
 		const realSetInterval = globalThis.setInterval;
 		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
-			watchdog = callback;
+			watchdog ??= callback;
 			return realSetInterval(() => {}, 2 ** 31 - 1);
 		}) as typeof setInterval);
 		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
@@ -838,7 +838,7 @@ describe("SDK broker identity and discovery", () => {
 		let watchdog: (() => void) | undefined;
 		const realSetInterval = globalThis.setInterval;
 		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
-			watchdog = callback;
+			watchdog ??= callback;
 			return realSetInterval(() => {}, 2 ** 31 - 1);
 		}) as typeof setInterval);
 		const broker = new Broker({ agentDir: dir });
@@ -873,7 +873,7 @@ describe("SDK broker identity and discovery", () => {
 		let watchdog: (() => void) | undefined;
 		const realSetInterval = globalThis.setInterval;
 		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
-			watchdog = callback;
+			watchdog ??= callback;
 			return realSetInterval(() => {}, 2 ** 31 - 1);
 		}) as typeof setInterval);
 		const broker = new Broker({ agentDir: dir });
@@ -1217,6 +1217,15 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			});
+			await broker.index.append({
+				type: "host_heartbeat",
+				sessionId,
+				locator: { repo: liveCwd, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				activity: { state: "active", at: Date.now() },
 			});
 			const result = await broker.handleRequest(
 				"session.resume",

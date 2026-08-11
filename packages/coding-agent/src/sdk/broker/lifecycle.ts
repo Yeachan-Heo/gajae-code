@@ -1959,6 +1959,7 @@ type SignalTarget = {
 	pid: number;
 	lifecycleRequestId?: string;
 	processIncarnation?: string;
+	hostIncarnation?: string;
 };
 
 /**
@@ -1981,7 +1982,8 @@ async function hasDurableProcessIdentity(target: SignalTarget, id: string, expec
 			marker.incarnation === processIncarnation(target.pid)
 		);
 	if (expected && (expected.pid !== target.pid || target.lifecycleRequestId !== expected.effectMarker)) return false;
-	return target.processIncarnation !== undefined && target.processIncarnation === processIncarnation(target.pid);
+	const recordedIncarnation = target.processIncarnation ?? target.hostIncarnation;
+	return recordedIncarnation !== undefined && recordedIncarnation === processIncarnation(target.pid);
 }
 
 async function hasOwnedReadinessEvidence(
@@ -4179,7 +4181,7 @@ async function executeLifecycleResponse(
 		}
 		if (record)
 			await broker.index.append({
-				type: "session_closed",
+				type: operation === "session.delete" ? "session_deleted" : "session_closed",
 				sessionId: id,
 				locator: record.locator,
 				endpointGeneration: record.endpointGeneration,
