@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { deriveNightlyVersion, NIGHTLY_VERSION_PATTERN, stageNightlyVersion } from "./nightly-release";
+import { deriveNightlyVersion, NIGHTLY_VERSION_PATTERN, stageNightlyVersion, stageStableVersion } from "./nightly-release";
 import { PUBLIC_PACKAGE_DEFINITIONS } from "./release-evidence";
 
 const temporaryRoots: string[] = [];
@@ -97,5 +97,101 @@ describe("nightly release versioning", () => {
 		const before = await Bun.file(path.join(root, "packages/ai/package.json")).text();
 		await expect(stageNightlyVersion(root, nightlyVersion, "0".repeat(40))).rejects.toThrow("source suffix");
 		expect(await Bun.file(path.join(root, "packages/ai/package.json")).text()).toBe(before);
+	});
+	test("derives the next minor (patch reset to 0) with bumpKind=minor", () => {
+		const version = deriveNightlyVersion(
+			["0.12.21"],
+			new Date("2026-08-05T03:21:09.999Z"),
+			"123456",
+			sourceSha,
+			"minor",
+		);
+
+		expect(version).toBe("0.13.0-nightly.20260805032109.123456.gabcdef012345");
+		expect(NIGHTLY_VERSION_PATTERN.test(version)).toBe(true);
+	});
+
+	test("minor derive ignores the highest patch (patch resets to 0 across mixed patches)", () => {
+		const version = deriveNightlyVersion(
+			["1.2.3", "1.2.8"],
+			new Date("2026-08-05T03:21:09.999Z"),
+			"123456",
+			sourceSha,
+			"minor",
+		);
+
+		expect(version).toBe("1.3.0-nightly.20260805032109.123456.gabcdef012345");
+	});
+
+	test("omitting bumpKind equals explicit patch (back-compat default)", () => {
+		const explicitPatch = deriveNightlyVersion(["1.2.3"], new Date("2026-08-05T03:21:09.999Z"), "123456", sourceSha, "patch");
+		const defaultBump = deriveNightlyVersion(["1.2.3"], new Date("2026-08-05T03:21:09.999Z"), "123456", sourceSha);
+
+		expect(defaultBump).toBe(explicitPatch);
+		expect(defaultBump).toBe("1.2.4-nightly.20260805032109.123456.gabcdef012345");
+	});
+
+	test("rejects invalid bumpKind values", () => {
+		expect(() => deriveNightlyVersion(["1.2.3"], new Date(), "1", sourceSha, "major" as never)).toThrow("bump kind");
+		expect(() => deriveNightlyVersion(["1.2.3"], new Date(), "1", sourceSha, "preview" as never)).toThrow("bump kind");
+	});
+
+	test("stageStableVersion stages every public package, catalog edge, Cargo version, lock entry, and native sentinel", async () => {
+		const root = await fixture();
+		const stableVersion = "1.3.0";
+		const changed = await stageStableVersion(root, stableVersion, sourceSha);
+
+		expect(changed).toContain("package.json");
+		expect(changed).toContain("Cargo.toml");
+		expect(changed).toContain("Cargo.lock");
+		expect(changed).toContain("crates/pi-natives/src/lib.rs");
+		for (const definition of PUBLIC_PACKAGE_DEFINITIONS) {
+			const manifest = await Bun.file(path.join(root, definition.dir, "package.json")).json() as { version: string };
+			expect(manifest.version).toBe(stableVersion);
+		}
+		const rootManifest = await Bun.file(path.join(root, "package.json")).json() as { workspaces: { catalog: Record<string, string> } };
+		for (const definition of PUBLIC_PACKAGE_DEFINITIONS.filter(candidate => candidate.name.startsWith("@gajae-code/"))) {
+			expect(rootManifest.workspaces.catalog[definition.name]).toBe(stableVersion);
+		}
+		expect(await Bun.file(path.join(root, "Cargo.toml")).text()).toContain(`version = "${stableVersion}"`);
+		expect((await Bun.file(path.join(root, "Cargo.lock")).text()).match(new RegExp(stableVersion.replaceAll(".", "\\."), "gu"))).toHaveLength(5);
+		const sentinel = "__piNativesV1_3_0";
+		for (const relativePath of ["crates/pi-natives/src/lib.rs", "packages/natives/native/index.d.ts", "packages/natives/native/index.js"]) {
+			expect(await Bun.file(path.join(root, relativePath)).text()).toContain(sentinel);
+		}
+	});
+
+	test("stageStableVersion rejects a non-monotonic (downgrade or same) target before mutating files", async () => {
+		const root = await fixture();
+		const before = await Bun.file(path.join(root, "packages/ai/package.json")).text();
+		await expect(stageStableVersion(root, "1.2.3", sourceSha)).rejects.toThrow("not strictly before");
+		await expect(stageStableVersion(root, "1.0.0", sourceSha)).rejects.toThrow("not strictly before");
+		expect(await Bun.file(path.join(root, "packages/ai/package.json")).text()).toBe(before);
+	});
+
+	test("stageStableVersion rejects nightly-suffixed targets (validates stableVersionPattern, not the nightly suffix assert)", async () => {
+		const root = await fixture();
+		const nightlySuffixed = "1.3.0-nightly.20260805032109.123456.gabcdef012345";
+		await expect(stageStableVersion(root, nightlySuffixed, sourceSha)).rejects.toThrow("Invalid stable version");
+	});
+
+	test("stage-stable CLI mode rejects --bump-kind (mode-boundary isolation)", async () => {
+		const { exitCode, stderr } = Bun.spawnSync(["bun", "scripts/nightly-release.ts", "stage-stable", "--version", "1.3.0", "--source-sha", sourceSha, "--bump-kind", "minor"], {
+			cwd: path.join(import.meta.dir, ".."),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(exitCode).toBe(1);
+		expect(stderr.toString()).toContain("Expected exactly");
+	});
+
+	test("stage CLI mode rejects --bump-kind (mode-boundary isolation)", async () => {
+		const { exitCode, stderr } = Bun.spawnSync(["bun", "scripts/nightly-release.ts", "stage", "--version", nightlyVersion, "--source-sha", sourceSha, "--bump-kind", "minor"], {
+			cwd: path.join(import.meta.dir, ".."),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(exitCode).toBe(1);
+		expect(stderr.toString()).toContain("Expected exactly");
 	});
 });

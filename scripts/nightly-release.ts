@@ -2,12 +2,13 @@
 
 import * as path from "node:path";
 import { $, Glob } from "bun";
-import { PUBLIC_PACKAGE_DEFINITIONS, nightlyVersionPattern, stableVersionPattern } from "./release-evidence";
+import { PUBLIC_PACKAGE_DEFINITIONS, compareStableVersions, nightlyVersionPattern, stableVersionPattern } from "./release-evidence";
 
 export const NIGHTLY_VERSION_PATTERN = nightlyVersionPattern;
 const sourceShaPattern = /^[0-9a-f]{40}$/u;
 const positiveIntegerPattern = /^[1-9]\d*$/u;
 const cargoManifestGlob = new Glob("crates/*/Cargo.toml");
+export type NightlyBumpKind = "patch" | "minor";
 
 interface PackageManifest {
 	name?: unknown;
@@ -62,15 +63,21 @@ export function deriveNightlyVersion(
 	timestamp: Date,
 	runId: string,
 	sourceSha: string,
+	bumpKind: NightlyBumpKind = "patch",
 ): string {
 	if (stableVersions.length === 0) throw new Error("Cannot derive a nightly version without public package versions");
 	assertPositiveInteger(runId, "Run id");
 	assertSourceSha(sourceSha);
+	if (bumpKind !== "patch" && bumpKind !== "minor") throw new Error(`Invalid nightly bump kind ${bumpKind}; expected "patch" or "minor"`);
 
 	const parsed = stableVersions.map(parseStableVersion);
 	const [major, minor] = parsed[0]!;
 	if (parsed.some(([candidateMajor, candidateMinor]) => candidateMajor !== major || candidateMinor !== minor)) {
 		throw new Error("All public packages must share one stable major/minor line before a nightly release");
+	}
+	if (bumpKind === "minor") {
+		const nextMinor = (BigInt(minor) + 1n).toString();
+		return `${major}.${nextMinor}.0-nightly.${utcIdentifier(timestamp)}.${runId}.g${sourceSha.slice(0, 12)}`;
 	}
 	const highestPatch = parsed.map(([, , patch]) => patch).reduce((highest, candidate) =>
 		compareNumericIdentifier(candidate, highest) > 0 ? candidate : highest,
@@ -123,8 +130,9 @@ export async function deriveNightlyVersionFromRepo(
 	timestamp: Date,
 	runId: string,
 	sourceSha: string,
+	bumpKind: NightlyBumpKind = "patch",
 ): Promise<string> {
-	return deriveNightlyVersion(await publicPackageVersions(repoRoot), timestamp, runId, sourceSha);
+	return deriveNightlyVersion(await publicPackageVersions(repoRoot), timestamp, runId, sourceSha, bumpKind);
 }
 
 async function workspaceVersionedCrates(repoRoot: string): Promise<string[]> {
@@ -209,17 +217,102 @@ export async function stageNightlyVersion(repoRoot: string, version: string, sou
 	for (const write of writes) await Bun.write(write.path, write.content);
 	return writes.map(write => path.relative(repoRoot, write.path).replaceAll(path.sep, "/"));
 }
+export async function stageStableVersion(repoRoot: string, version: string, sourceSha: string): Promise<string[]> {
+	if (!stableVersionPattern.test(version)) throw new Error(`Invalid stable version ${version}`);
+	assertSourceSha(sourceSha);
 
-function namedArguments(argv: readonly string[], expected: readonly string[]): Record<string, string> {
-	if (argv.length !== expected.length * 2) throw new Error(`Expected exactly ${expected.join(", ")}`);
+	const writes: PendingWrite[] = [];
+	for (const definition of PUBLIC_PACKAGE_DEFINITIONS) {
+		const manifestPath = path.join(repoRoot, definition.dir, "package.json");
+		const content = await Bun.file(manifestPath).text();
+		const manifest = JSON.parse(content) as PackageManifest;
+		if (manifest.name !== definition.name || manifest.private === true) {
+			throw new Error(`${definition.dir}/package.json does not match public package ${definition.name}`);
+		}
+		if (typeof manifest.version === "string" && stableVersionPattern.test(manifest.version)) {
+			if (compareStableVersions(version, manifest.version) <= 0) {
+				throw new Error(`${definition.dir}/package.json version ${manifest.version} is not strictly before target ${version}`);
+			}
+		} else {
+			assertCurrentVersion(manifest.version, version, `${definition.dir}/package.json`);
+		}
+		writes.push({
+			path: manifestPath,
+			content: replaceSingle(content, /^(\s*"version"\s*:\s*)"[^"]+"/gmu, `$1"${version}"`, `${definition.dir}/package.json version`),
+		});
+	}
+
+	const rootManifestPath = path.join(repoRoot, "package.json");
+	let rootContent = await Bun.file(rootManifestPath).text();
+	const rootManifest = JSON.parse(rootContent) as RootManifest;
+	const catalog = rootManifest.workspaces?.catalog;
+	if (catalog === undefined) throw new Error("Root package.json has no workspace catalog");
+	for (const definition of PUBLIC_PACKAGE_DEFINITIONS.filter(candidate => candidate.name.startsWith("@gajae-code/"))) {
+		assertCurrentVersion(catalog[definition.name], version, `root catalog ${definition.name}`);
+		const pattern = new RegExp(`^(\\s*"${escapeRegExp(definition.name)}"\\s*:\\s*)"[^"]+"`, "gmu");
+		rootContent = replaceSingle(rootContent, pattern, `$1"${version}"`, `root catalog ${definition.name}`);
+	}
+	writes.push({ path: rootManifestPath, content: rootContent });
+
+	const cargoTomlPath = path.join(repoRoot, "Cargo.toml");
+	const cargoToml = await Bun.file(cargoTomlPath).text();
+	const workspaceVersion = cargoToml.match(/^\[workspace\.package\][\s\S]*?^version\s*=\s*"([^"]+)"/mu)?.[1];
+	assertCurrentVersion(workspaceVersion, version, "Cargo workspace");
+	writes.push({
+		path: cargoTomlPath,
+		content: replaceSingle(
+			cargoToml,
+			/^(\[workspace\.package\][\s\S]*?^version\s*=\s*)"[^"]+"/gmu,
+			`$1"${version}"`,
+			"Cargo workspace version",
+		),
+	});
+
+	let cargoLock = await Bun.file(path.join(repoRoot, "Cargo.lock")).text();
+	for (const crateName of await workspaceVersionedCrates(repoRoot)) {
+		const pattern = new RegExp(`(\\[\\[package\\]\\]\\nname = "${escapeRegExp(crateName)}"\\nversion = ")[^"]+(")`, "gu");
+		cargoLock = replaceSingle(cargoLock, pattern, `$1${version}$2`, `Cargo.lock ${crateName}`);
+	}
+	writes.push({ path: path.join(repoRoot, "Cargo.lock"), content: cargoLock });
+
+	const sentinel = `__piNativesV${version.replace(/[^A-Za-z0-9]/gu, "_")}`;
+	for (const relativePath of [
+		"crates/pi-natives/src/lib.rs",
+		"packages/natives/native/index.d.ts",
+		"packages/natives/native/index.js",
+	]) {
+		const filePath = path.join(repoRoot, relativePath);
+		const content = await Bun.file(filePath).text();
+		writes.push({
+			path: filePath,
+			content: replaceVersionSentinel(content, sentinel, `${relativePath} version sentinel`),
+		});
+	}
+
+	for (const write of writes) await Bun.write(write.path, write.content);
+	return writes.map(write => path.relative(repoRoot, write.path).replaceAll(path.sep, "/"));
+}
+
+function namedArguments(argv: readonly string[], expected: readonly string[], optional: readonly string[] = []): Record<string, string> {
+	const minimumLength = expected.length * 2;
+	const maximumLength = (expected.length + optional.length) * 2;
+	if (argv.length < minimumLength || argv.length > maximumLength || argv.length % 2 !== 0) {
+		throw new Error(`Expected exactly ${expected.join(", ")}${optional.length > 0 ? ` (optionally ${optional.join(", ")})` : ""}`);
+	}
 	const values: Record<string, string> = {};
 	for (let index = 0; index < argv.length; index += 2) {
 		const key = argv[index];
 		const value = argv[index + 1];
-		if (key === undefined || value === undefined || !expected.includes(key) || values[key] !== undefined || value.startsWith("--")) {
-			throw new Error(`Expected exactly ${expected.join(", ")}`);
+		if (key === undefined || value === undefined || values[key] !== undefined || value.startsWith("--")) {
+			throw new Error(`Expected exactly ${expected.join(", ")}${optional.length > 0 ? ` (optionally ${optional.join(", ")})` : ""}`);
+		}
+		if (!expected.includes(key) && !optional.includes(key)) {
+			throw new Error(`Unexpected argument ${key}; expected ${expected.join(", ")}${optional.length > 0 ? ` (optionally ${optional.join(", ")})` : ""}`);
 		}
 		values[key] = value;
+	}
+	for (const key of expected) {
+		if (values[key] === undefined) throw new Error(`Missing required argument ${key}`);
 	}
 	return values;
 }
@@ -228,13 +321,18 @@ async function main(): Promise<void> {
 	const [mode, ...argv] = process.argv.slice(2);
 	const repoRoot = path.join(import.meta.dir, "..");
 	if (mode === "version") {
-		const values = namedArguments(argv, ["--timestamp", "--run-id", "--source-sha"]);
+		const values = namedArguments(argv, ["--timestamp", "--run-id", "--source-sha"], ["--bump-kind"]);
 		await assertCheckedOutSourceSha(repoRoot, values["--source-sha"]!);
+		const bumpKind = values["--bump-kind"] === undefined ? "patch" : (values["--bump-kind"] as NightlyBumpKind);
+		if (bumpKind !== "patch" && bumpKind !== "minor") {
+			throw new Error(`Invalid --bump-kind ${values["--bump-kind"]}; expected "patch" or "minor"`);
+		}
 		const version = await deriveNightlyVersionFromRepo(
 			repoRoot,
 			new Date(values["--timestamp"]!),
 			values["--run-id"]!,
 			values["--source-sha"]!,
+			bumpKind,
 		);
 		process.stdout.write(`${version}\n`);
 		return;
@@ -246,7 +344,14 @@ async function main(): Promise<void> {
 		console.log(JSON.stringify({ ok: true, version: values["--version"], changedPaths }));
 		return;
 	}
-	throw new Error("Use version --timestamp <iso> --run-id <id> --source-sha <sha>, or stage --version <version> --source-sha <sha>");
+	if (mode === "stage-stable") {
+		const values = namedArguments(argv, ["--version", "--source-sha"]);
+		await assertCheckedOutSourceSha(repoRoot, values["--source-sha"]!);
+		const changedPaths = await stageStableVersion(repoRoot, values["--version"]!, values["--source-sha"]!);
+		console.log(JSON.stringify({ ok: true, version: values["--version"], changedPaths }));
+		return;
+	}
+	throw new Error("Use version --timestamp <iso> --run-id <id> --source-sha <sha>, stage --version <version> --source-sha <sha>, or stage-stable --version <version> --source-sha <sha>");
 }
 
 if (import.meta.main) {
