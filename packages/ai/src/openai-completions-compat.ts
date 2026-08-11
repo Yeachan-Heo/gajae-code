@@ -12,6 +12,7 @@ export type ResolvedOpenAICompat = Required<
 		| "toolStrictMode"
 		| "toolChoiceSupport"
 		| "supportsResponsesSessionAffinity"
+		| "supportsServiceTier"
 		| "reservedToolNames"
 	>
 > & {
@@ -20,6 +21,7 @@ export type ResolvedOpenAICompat = Required<
 	extraBody?: OpenAICompat["extraBody"];
 	toolStrictMode: ResolvedToolStrictMode;
 	supportsResponsesSessionAffinity?: OpenAICompat["supportsResponsesSessionAffinity"];
+	supportsServiceTier?: OpenAICompat["supportsServiceTier"];
 	/** Optional explicit capability override; resolved via deriveToolChoiceSupport. */
 	toolChoiceSupport?: OpenAICompat["toolChoiceSupport"];
 };
@@ -282,6 +284,7 @@ export function resolveOpenAICompat(
 			("supportsResponsesSessionAffinity" in model.compat
 				? model.compat.supportsResponsesSessionAffinity
 				: undefined) ?? detected.supportsResponsesSessionAffinity,
+		supportsServiceTier: model.compat.supportsServiceTier ?? detected.supportsServiceTier,
 		supportsMultipleSystemMessages:
 			model.compat.supportsMultipleSystemMessages ?? detected.supportsMultipleSystemMessages,
 		supportsReasoningEffort: model.compat.supportsReasoningEffort ?? detected.supportsReasoningEffort,

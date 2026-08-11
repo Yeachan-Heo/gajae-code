@@ -920,6 +920,7 @@ export function applyCommonResponsesSamplingParams<P extends CommonResponsesPara
 	params: P,
 	options: CommonSamplingOptions | undefined,
 	provider: string,
+	supportsServiceTier = false,
 ): void {
 	if (options?.maxTokens) params.max_output_tokens = options.maxTokens;
 	if (options?.temperature !== undefined) params.temperature = options.temperature;
@@ -928,7 +929,7 @@ export function applyCommonResponsesSamplingParams<P extends CommonResponsesPara
 	if (options?.minP !== undefined) params.min_p = options.minP;
 	if (options?.presencePenalty !== undefined) params.presence_penalty = options.presencePenalty;
 	if (options?.repetitionPenalty !== undefined) params.repetition_penalty = options.repetitionPenalty;
-	if (shouldSendServiceTier(options?.serviceTier, provider)) {
+	if (shouldSendServiceTier(options?.serviceTier, provider, supportsServiceTier)) {
 		const resolved = resolveServiceTier(options?.serviceTier, provider);
 		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
 			params.service_tier = resolved;

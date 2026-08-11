@@ -257,17 +257,38 @@ export function resolveServiceTier(
 
 /**
  * True when the (possibly scoped) tier should be sent as an OpenAI-compatible
- * `service_tier` request field for providers that support it. Unsupported tiers
- * (`"auto"`, `"default"`) and scope mismatches all return false.
+ * `service_tier` request field. Custom providers must explicitly opt in through
+ * `compat.supportsServiceTier`; unknown providers remain fail-closed.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
+	supportsServiceTier = false,
 ): boolean {
 	const resolved = resolveServiceTier(serviceTier, provider);
 	if (provider === "deepinfra") return resolved === "priority";
-	if (provider !== "openai" && provider !== "openai-codex") return false;
+	if (provider !== "openai" && provider !== "openai-codex" && !supportsServiceTier) return false;
 	return resolved === "flex" || resolved === "scale" || resolved === "priority";
+}
+
+/**
+ * True when a priority tier is realized as a fast-mode request on the provider's
+ * wire protocol. Custom OpenAI-compatible proxies opt in explicitly rather than
+ * inheriting support merely because their API shape resembles OpenAI.
+ */
+export function isFastModeEffectiveForProvider(
+	serviceTier: ServiceTier | null | undefined,
+	provider: Provider | undefined,
+	supportsServiceTier = false,
+): boolean {
+	if (resolveServiceTier(serviceTier, provider) !== "priority") return false;
+	return (
+		provider === "openai" ||
+		provider === "openai-codex" ||
+		provider === "anthropic" ||
+		provider === "deepinfra" ||
+		supportsServiceTier
+	);
 }
 
 /**
@@ -282,12 +303,7 @@ export function getPriorityPremiumRequests(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
 ): number {
-	if (resolveServiceTier(serviceTier, provider) !== "priority") return 0;
-	// Only providers that realize `priority` on the wire bill the user.
-	// Everywhere else, the field is silently dropped and nothing is charged.
-	return provider === "openai" || provider === "openai-codex" || provider === "anthropic" || provider === "deepinfra"
-		? 1
-		: 0;
+	return isFastModeEffectiveForProvider(serviceTier, provider) ? 1 : 0;
 }
 
 export interface ProviderSessionState {
@@ -888,6 +904,12 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 */
 	supportsResponsesSessionAffinity?: boolean;
 	/**
+	 * Whether an OpenAI-compatible endpoint accepts the `service_tier` request
+	 * field. Disabled by default for custom providers; opt in only when the proxy
+	 * preserves or intentionally realizes OpenAI priority processing.
+	 */
+	supportsServiceTier?: boolean;
+	/**
 	 * Tool names the provider reserves for its own built-ins and refuses to
 	 * accept as custom function declarations. A colliding tool is **dropped**
 	 * from the declared tools array rather than renamed: a renamed function
@@ -1147,4 +1169,9 @@ export interface Model<TApi extends Api = any> {
 	 * `options.isOAuth = true` for the underlying provider call.
 	 */
 	isOAuth?: boolean;
+}
+
+/** True when a model explicitly opts into OpenAI-compatible `service_tier` forwarding. */
+export function modelSupportsServiceTier(model: Pick<Model, "compat"> | undefined): boolean {
+	return Boolean(model?.compat && "supportsServiceTier" in model.compat && model.compat.supportsServiceTier === true);
 }

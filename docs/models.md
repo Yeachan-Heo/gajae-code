@@ -150,6 +150,31 @@ providers:
       - id: deepseek-ai/DeepSeek-V3.2
 ```
 
+#### `/fast` provider support
+
+`/fast on` only shows `⚡` when GJC will put a fast/priority field on the selected provider's wire request:
+
+| Provider ID | Wire request | Notes |
+|---|---|---|
+| `openai` | `service_tier: "priority"` | OpenAI renamed Priority processing to [Fast mode](https://developers.openai.com/api/docs/guides/fast-mode); `priority` remains an accepted alias. For API-key requests, the response `service_tier` reports the tier actually used and may be `default` after a ramp-rate downgrade. |
+| `openai-codex` | `service_tier: "priority"` | ChatGPT-authenticated Codex handles Fast through server-side routing. A final response value of `service_tier: "default"` does not show that Fast was ignored or downgraded. |
+| `anthropic` | `speed: "fast"` plus `fast-mode-2026-02-01` beta | Direct Claude API only. Anthropic's [Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) is model- and account-gated; unsupported or unavailable requests can fall back after a provider rejection. Bedrock, Vertex, and Microsoft Foundry do not support it. |
+| `deepinfra` | `service_tier: "priority"` | Sent only for the first-class `deepinfra` provider ID and only with the `priority` tier. |
+| `opencodex` | `service_tier: "priority"` | First-class OpenCodex discovery opts in automatically; OpenCodex Fast Mode must remain `Auto` for client passthrough. When OpenCodex uses ChatGPT authentication, a final `service_tier: "default"` is not downgrade evidence. |
+
+Custom OpenAI-compatible providers remain fail-closed unless their provider or model configuration explicitly sets `compat.supportsServiceTier: true`. Use that opt-in only when the proxy preserves or intentionally realizes OpenAI's `service_tier` contract:
+
+```yaml
+providers:
+  my-openai-proxy:
+    baseUrl: http://proxy.example/v1
+    api: openai-responses
+    compat:
+      supportsServiceTier: true
+```
+
+Without that capability, `/fast status` shows `off` even when the session retains an unscoped `priority` intent. The `⚡` indicator means that GJC sends the provider's fast request field. API-key providers may report a downgrade in their response; ChatGPT-authenticated Codex and OpenCodex route Fast server-side and cannot be verified from the final `service_tier` value.
+
 Amazon Bedrock uses the native `bedrock-converse-stream` transport and AWS credential chain auth. Do not put AWS access keys in `models.yml`; configure `AWS_REGION` / `AWS_PROFILE` or standard static AWS credential environment variables instead:
 
 ```yaml

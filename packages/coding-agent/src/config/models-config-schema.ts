@@ -25,6 +25,7 @@ export const ModelCompatSchema = z.object({
 	supportsDeveloperRole: z.boolean().optional(),
 	sendSessionHeaders: z.boolean().optional(),
 	supportsResponsesSessionAffinity: z.boolean().optional(),
+	supportsServiceTier: z.boolean().optional(),
 	supportsMultipleSystemMessages: z.boolean().optional(),
 	supportsReasoningEffort: z.boolean().optional(),
 	reasoningEffortMap: ReasoningEffortMapSchema.optional(),

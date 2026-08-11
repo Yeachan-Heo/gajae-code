@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { getPriorityPremiumRequests, resolveServiceTier, shouldSendServiceTier } from "../src/types";
+import {
+	getPriorityPremiumRequests,
+	isFastModeEffectiveForProvider,
+	resolveServiceTier,
+	shouldSendServiceTier,
+} from "../src/types";
 
 describe("getPriorityPremiumRequests", () => {
 	it("counts priority tier as one premium request on OpenAI", () => {
@@ -96,11 +101,44 @@ describe("resolveServiceTier", () => {
 	});
 });
 
+describe("isFastModeEffectiveForProvider", () => {
+	it("matches providers that realize priority on the wire", () => {
+		expect(isFastModeEffectiveForProvider("priority", "openai")).toBe(true);
+		expect(isFastModeEffectiveForProvider("priority", "openai-codex")).toBe(true);
+		expect(isFastModeEffectiveForProvider("priority", "anthropic")).toBe(true);
+		expect(isFastModeEffectiveForProvider("priority", "deepinfra")).toBe(true);
+	});
+
+	it("rejects providers that silently drop unscoped priority intent", () => {
+		expect(isFastModeEffectiveForProvider("priority", "openrouter")).toBe(false);
+		expect(isFastModeEffectiveForProvider("priority", "google")).toBe(false);
+		expect(isFastModeEffectiveForProvider("priority", "amazon-bedrock")).toBe(false);
+		expect(isFastModeEffectiveForProvider("priority", undefined)).toBe(false);
+	});
+
+	it("supports explicit custom-provider opt-in", () => {
+		expect(isFastModeEffectiveForProvider("priority", "custom-proxy")).toBe(false);
+		expect(isFastModeEffectiveForProvider("priority", "custom-proxy", true)).toBe(true);
+	});
+
+	it("honors scoped priority tiers", () => {
+		expect(isFastModeEffectiveForProvider("openai-only", "openai")).toBe(true);
+		expect(isFastModeEffectiveForProvider("openai-only", "anthropic")).toBe(false);
+		expect(isFastModeEffectiveForProvider("claude-only", "anthropic")).toBe(true);
+		expect(isFastModeEffectiveForProvider("claude-only", "openai")).toBe(false);
+	});
+});
+
 describe("shouldSendServiceTier", () => {
 	it("returns false for providers that do not accept service_tier", () => {
 		expect(shouldSendServiceTier("priority", "fireworks")).toBe(false);
 		expect(shouldSendServiceTier("flex", "azure-openai-responses")).toBe(false);
 		expect(shouldSendServiceTier("scale", "firepass")).toBe(false);
+	});
+
+	it("supports explicit custom-provider opt-in", () => {
+		expect(shouldSendServiceTier("priority", "custom-proxy")).toBe(false);
+		expect(shouldSendServiceTier("priority", "custom-proxy", true)).toBe(true);
 	});
 
 	it("returns true for openai with priority/flex/scale tiers", () => {

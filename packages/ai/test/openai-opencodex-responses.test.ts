@@ -48,6 +48,7 @@ describe("OpenCodex discovery", () => {
 			wireModelId: "provider/model",
 			baseUrl: "http://127.0.0.1:10201/v1",
 			provider: "opencodex",
+			compat: { supportsServiceTier: true },
 		});
 	});
 	test("ignores runtime endpoints on foreign hosts", async () => {

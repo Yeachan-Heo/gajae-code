@@ -1335,7 +1335,7 @@ function buildParams(
 	if (options?.frequencyPenalty !== undefined) {
 		params.frequency_penalty = options.frequencyPenalty;
 	}
-	if (shouldSendServiceTier(options?.serviceTier, model.provider)) {
+	if (shouldSendServiceTier(options?.serviceTier, model.provider, compat.supportsServiceTier === true)) {
 		const resolved = resolveServiceTier(options?.serviceTier, model.provider);
 		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
 			params.service_tier = resolved;

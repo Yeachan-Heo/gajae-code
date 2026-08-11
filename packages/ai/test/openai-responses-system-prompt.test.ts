@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { getBundledModel } from "../src/models";
 import { streamOpenAIResponses } from "../src/providers/openai-responses";
-import type { Context, Model } from "../src/types";
+import type { Context, Model, ServiceTier } from "../src/types";
 
 const originalFetch = global.fetch;
 
@@ -43,6 +43,7 @@ function createSseResponse(): Response {
 async function captureRequestBody(
 	model: Model<"openai-responses">,
 	context: Context,
+	serviceTier?: ServiceTier,
 ): Promise<Record<string, unknown>> {
 	let captured: Record<string, unknown> = {};
 	const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -51,7 +52,7 @@ async function captureRequestBody(
 	});
 	global.fetch = Object.assign(fetchMock, { preconnect: originalFetch.preconnect }) as typeof fetch;
 
-	const stream = streamOpenAIResponses(model, context, { apiKey: "test-key" });
+	const stream = streamOpenAIResponses(model, context, { apiKey: "test-key", serviceTier });
 	for await (const event of stream) {
 		if (event.type === "done" || event.type === "error") break;
 	}
@@ -113,6 +114,23 @@ describe("openai-responses system prompt routing", () => {
 			expect(body.instructions).toBe("You are a proxy assistant.");
 			const input = body.input as Array<{ role: string }>;
 			expect(input.every(m => m.role !== "system")).toBe(true);
+		});
+
+		it("forwards priority for an explicitly capable custom proxy", async () => {
+			const proxyModel: Model<"openai-responses"> = {
+				...gpt4oMiniModel,
+				provider: "custom-proxy",
+				baseUrl: "https://proxy.example.com/v1",
+				compat: { ...gpt4oMiniModel.compat, supportsServiceTier: true },
+			};
+			const context: Context = {
+				systemPrompt: ["You are a proxy assistant."],
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			};
+
+			const body = await captureRequestBody(proxyModel, context, "priority");
+
+			expect(body.service_tier).toBe("priority");
 		});
 	});
 

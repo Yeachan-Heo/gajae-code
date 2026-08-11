@@ -73,6 +73,7 @@ describe("openai-completions compatibility", () => {
 			supportsDeveloperRole: true,
 			sendSessionHeaders: false,
 			supportsResponsesSessionAffinity: false,
+			supportsServiceTier: false,
 			reservedToolNames: [],
 			supportsMultipleSystemMessages: true,
 			supportsReasoningEffort: true,
