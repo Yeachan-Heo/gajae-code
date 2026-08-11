@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -45,6 +45,8 @@ export type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | 
 type FinalResponseSource = "agent_end" | "launch_error";
 const MAX_PUBLIC_ERROR_MESSAGE_LENGTH = 2000;
 const HEARTBEAT_MS = 1000;
+const MAX_PUBLIC_ACTIVE_TOOLS = 8;
+const SAFE_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 
 type LastPayloadCacheEntry = { mtimeMs: number; size: number; payload: Record<string, unknown> };
 const lastPayloadByStateFile = new Map<string, LastPayloadCacheEntry>();
@@ -61,6 +63,9 @@ export const __sessionStateSidecarPerfCounters = {
 interface RuntimeStateEvent {
 	type: string;
 	messages?: unknown[];
+	toolCallId?: unknown;
+	toolName?: unknown;
+	isError?: unknown;
 }
 
 export interface OwnerTerminalContext {
@@ -369,7 +374,95 @@ export function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 }
 
 export function eventAffectsCoordinatorRuntimeState(event: RuntimeStateEvent): boolean {
-	return stateForEvent(event) !== null;
+	return stateForEvent(event) !== null || toolActivityForEvent(event) !== null;
+}
+
+function safeToolName(value: unknown): string {
+	return typeof value === "string" && SAFE_TOOL_NAME.test(value) ? value : "custom";
+}
+
+function toolActivityForEvent(
+	event: RuntimeStateEvent,
+):
+	| { phase: "started"; toolCallKey: string; toolName: string }
+	| { phase: "finished"; toolCallKey: string; toolName: string; outcome: "succeeded" | "failed" }
+	| null {
+	if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return null;
+	if (typeof event.toolCallId !== "string") return null;
+	const toolCallKey = createHash("sha256").update(event.toolCallId).digest("hex");
+	if (event.type === "tool_execution_start")
+		return { phase: "started", toolCallKey, toolName: safeToolName(event.toolName) };
+	return {
+		phase: "finished",
+		toolCallKey,
+		toolName: safeToolName(event.toolName),
+		outcome: event.isError === true ? "failed" : "succeeded",
+	};
+}
+
+function runtimeStateFromPrevious(value: unknown): RuntimeState {
+	return value === "ready_for_input" ||
+		value === "running" ||
+		value === "needs_user_input" ||
+		value === "completed" ||
+		value === "errored"
+		? value
+		: "running";
+}
+
+function activityFieldsForEvent(
+	previous: Record<string, unknown>,
+	activityEvent: NonNullable<ReturnType<typeof toolActivityForEvent>>,
+	now: string,
+	nowMs: number,
+): Record<string, unknown> {
+	const activeToolCalls: Record<string, { tool_name: string; started_at: string }> = {};
+	const existing = previous.active_tool_calls;
+	if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+		for (const [key, value] of Object.entries(existing)) {
+			if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+			const entry = value as Record<string, unknown>;
+			if (typeof entry.tool_name !== "string" || typeof entry.started_at !== "string") continue;
+			if (!Number.isFinite(Date.parse(entry.started_at))) continue;
+			activeToolCalls[key] = { tool_name: safeToolName(entry.tool_name), started_at: entry.started_at };
+		}
+	}
+	const prior = activeToolCalls[activityEvent.toolCallKey];
+	if (activityEvent.phase === "started")
+		activeToolCalls[activityEvent.toolCallKey] = { tool_name: activityEvent.toolName, started_at: now };
+	else delete activeToolCalls[activityEvent.toolCallKey];
+	const previousActivity =
+		previous.activity && typeof previous.activity === "object" && !Array.isArray(previous.activity)
+			? (previous.activity as Record<string, unknown>)
+			: null;
+	const sequence =
+		previousActivity &&
+		typeof previousActivity.sequence === "number" &&
+		Number.isSafeInteger(previousActivity.sequence) &&
+		previousActivity.sequence >= 0
+			? Math.min(Number.MAX_SAFE_INTEGER, previousActivity.sequence + 1)
+			: 1;
+	const activeTools = Object.values(activeToolCalls)
+		.sort((left, right) => left.started_at.localeCompare(right.started_at))
+		.slice(0, MAX_PUBLIC_ACTIVE_TOOLS);
+	const startedAt = activityEvent.phase === "started" ? now : prior?.started_at;
+	const elapsedMs = startedAt ? Math.max(0, nowMs - Date.parse(startedAt)) : undefined;
+	return {
+		last_activity_at: now,
+		activity: {
+			sequence,
+			kind: "tool_execution",
+			phase: activityEvent.phase,
+			tool_name: activityEvent.toolName,
+			observed_at: now,
+			...(startedAt ? { started_at: startedAt } : {}),
+			...(elapsedMs === undefined ? {} : { elapsed_ms: elapsedMs }),
+			...(activityEvent.phase === "finished" ? { outcome: activityEvent.outcome } : {}),
+			active_tool_count: Object.keys(activeToolCalls).length,
+		},
+		active_tools: activeTools,
+		active_tool_calls: activeToolCalls,
+	};
 }
 
 class PreviousRuntimeStateReadError extends Error {
@@ -584,6 +677,16 @@ function basePayload(input: {
 		workdir: identity.workdir,
 		branch: branchForContext(input.context),
 		session_file: identity.sessionFile,
+		...(typeof input.previous.last_activity_at === "string"
+			? { last_activity_at: input.previous.last_activity_at }
+			: {}),
+		...(input.previous.activity && typeof input.previous.activity === "object"
+			? { activity: input.previous.activity }
+			: {}),
+		...(Array.isArray(input.previous.active_tools) ? { active_tools: input.previous.active_tools } : {}),
+		...(input.previous.active_tool_calls && typeof input.previous.active_tool_calls === "object"
+			? { active_tool_calls: input.previous.active_tool_calls }
+			: {}),
 		...(input.context.ownerTerminal ? { owner_generation: input.context.ownerTerminal.generation } : {}),
 	};
 }
@@ -784,8 +887,9 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 ): Promise<void> {
 	__sessionStateSidecarPerfCounters.persistFromEventCalls += 1;
 	const stateFile = runtimeStateFileForContext(context);
-	const state = stateForEvent(event);
-	if (!stateFile || !state) return;
+	const eventState = stateForEvent(event);
+	const activityEvent = toolActivityForEvent(event);
+	if (!stateFile || (!eventState && !activityEvent)) return;
 	context = contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	await serializeStateFileWrite(
@@ -799,6 +903,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity);
+						const state = eventState ?? runtimeStateFromPrevious(previous.state);
 						const payload = {
 							...basePayload({
 								context,
@@ -815,6 +920,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 							...(state === "errored"
 								? { error: { code: "agent_error", message: "GJC agent reported an error", recoverable: true } }
 								: {}),
+							...(activityEvent ? activityFieldsForEvent(previous, activityEvent, now, nowMs) : {}),
 						};
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 						await writeStateFile(stateFile, payload);

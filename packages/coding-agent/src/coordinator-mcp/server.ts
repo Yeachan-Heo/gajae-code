@@ -5,13 +5,13 @@ import * as path from "node:path";
 import { getAgentDir, isKnownSinkPeerClosedError } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
 
+import { withFileLock } from "../config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
-import { readLinuxProcStartTimeSync } from "../gjc-runtime/linux-proc";
 import { listMcpDelegateHostContexts } from "../hooks/mcp-delegate-host-context";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
@@ -280,6 +280,10 @@ interface CoordinatorSessionState {
 	source: "coordinator" | "agent_session_event";
 	live: boolean | null;
 	reason: string | null;
+	last_activity_at?: string;
+	activity?: unknown;
+	active_tools?: unknown;
+	active_tool_calls?: unknown;
 }
 
 type CoordinatorEventKind =
@@ -1237,7 +1241,7 @@ function publicLifecycleReceipt(result: Record<string, unknown>, sessionId: stri
 
 function publicCoordinatorSessionState(state: CoordinatorSessionState | null): Record<string, unknown> | null {
 	if (!state) return null;
-	return {
+	const result: Record<string, unknown> = {
 		session_id: state.session_id,
 		state: state.state,
 		ready_for_input: state.ready_for_input,
@@ -1246,6 +1250,55 @@ function publicCoordinatorSessionState(state: CoordinatorSessionState | null): R
 		updated_at: state.updated_at,
 		...(typeof state.live === "boolean" ? { live: state.live } : {}),
 	};
+	const activity = asRecord(state.activity);
+	if (
+		typeof state.last_activity_at === "string" &&
+		Number.isFinite(Date.parse(state.last_activity_at)) &&
+		activity &&
+		typeof activity.sequence === "number" &&
+		Number.isSafeInteger(activity.sequence) &&
+		activity.sequence > 0 &&
+		activity.kind === "tool_execution" &&
+		(activity.phase === "started" || activity.phase === "finished") &&
+		typeof activity.tool_name === "string" &&
+		/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(activity.tool_name) &&
+		typeof activity.observed_at === "string" &&
+		Number.isFinite(Date.parse(activity.observed_at)) &&
+		typeof activity.active_tool_count === "number" &&
+		Number.isSafeInteger(activity.active_tool_count) &&
+		activity.active_tool_count >= 0
+	) {
+		result.last_activity_at = state.last_activity_at;
+		result.activity = {
+			sequence: activity.sequence,
+			kind: activity.kind,
+			phase: activity.phase,
+			tool_name: activity.tool_name,
+			observed_at: activity.observed_at,
+			...(typeof activity.started_at === "string" && Number.isFinite(Date.parse(activity.started_at))
+				? { started_at: activity.started_at }
+				: {}),
+			...(typeof activity.elapsed_ms === "number" &&
+			Number.isSafeInteger(activity.elapsed_ms) &&
+			activity.elapsed_ms >= 0
+				? { elapsed_ms: activity.elapsed_ms }
+				: {}),
+			...(activity.outcome === "succeeded" || activity.outcome === "failed" ? { outcome: activity.outcome } : {}),
+			active_tool_count: activity.active_tool_count,
+		};
+		if (Array.isArray(state.active_tools))
+			result.active_tools = state.active_tools.slice(0, 8).flatMap(value => {
+				const tool = asRecord(value);
+				return tool &&
+					typeof tool.tool_name === "string" &&
+					/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(tool.tool_name) &&
+					typeof tool.started_at === "string" &&
+					Number.isFinite(Date.parse(tool.started_at))
+					? [{ tool_name: tool.tool_name, started_at: tool.started_at }]
+					: [];
+			});
+	}
+	return result;
 }
 
 function eventTimestamp(record: Record<string, unknown>): string | null {
@@ -1838,7 +1891,8 @@ async function writeSessionStateUnlocked(
 		overwrite?: boolean;
 	} = {},
 ): Promise<CoordinatorSessionState> {
-	const previous = options.overwrite ? null : await readSessionState(namespaceDir, sessionId);
+	const existing = await readSessionState(namespaceDir, sessionId);
+	const previous = options.overwrite ? null : existing;
 	const hasCurrentTurn = Object.hasOwn(options, "currentTurnId");
 	const hasLastTurn = Object.hasOwn(options, "lastTurnId");
 	const hasLive = Object.hasOwn(options, "live");
@@ -1857,6 +1911,12 @@ async function writeSessionStateUnlocked(
 		source: options.source ?? "coordinator",
 		live: hasLive ? (options.live ?? null) : (previous?.live ?? null),
 		reason: options.reason ?? null,
+		...(typeof existing?.last_activity_at === "string" ? { last_activity_at: existing.last_activity_at } : {}),
+		...(existing?.activity && typeof existing.activity === "object" ? { activity: existing.activity } : {}),
+		...(Array.isArray(existing?.active_tools) ? { active_tools: existing.active_tools } : {}),
+		...(existing?.active_tool_calls && typeof existing.active_tool_calls === "object"
+			? { active_tool_calls: existing.active_tool_calls }
+			: {}),
 	};
 	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);
 	if (
@@ -1884,108 +1944,8 @@ async function writeSessionStateUnlocked(
 	return payload;
 }
 
-interface SessionStateLockOwner {
-	pid: number;
-	start_time: string;
-	token: string;
-}
-
-function processStartTime(pid: number): string | null {
-	return readLinuxProcStartTimeSync(pid);
-}
-
-function validLockOwner(value: unknown): value is SessionStateLockOwner {
-	if (!value || typeof value !== "object") return false;
-	const owner = value as Partial<SessionStateLockOwner>;
-	return (
-		typeof owner.pid === "number" &&
-		Number.isSafeInteger(owner.pid) &&
-		owner.pid > 0 &&
-		typeof owner.start_time === "string" &&
-		typeof owner.token === "string" &&
-		owner.token.length > 0
-	);
-}
-
-function lockOwnerIsAlive(value: unknown): boolean {
-	if (!validLockOwner(value)) return false;
-	const owner = value;
-	try {
-		process.kill(owner.pid, 0);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-		return true;
-	}
-	const currentStartTime = processStartTime(owner.pid);
-	return currentStartTime === null || currentStartTime === owner.start_time;
-}
-
-async function reclaimStaleSessionStateLock(lockFile: string): Promise<void> {
-	let raw: string;
-	try {
-		raw = await fs.readFile(lockFile, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-		throw error;
-	}
-	let owner: unknown;
-	try {
-		owner = JSON.parse(raw);
-	} catch {
-		owner = null;
-	}
-	if (!validLockOwner(owner)) {
-		const stat = await fs.stat(lockFile);
-		if (Date.now() - stat.mtimeMs < 30_000) return;
-	} else if (lockOwnerIsAlive(owner)) return;
-	try {
-		if ((await fs.readFile(lockFile, "utf8")) === raw) await fs.rm(lockFile);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-	}
-}
-
 async function withSessionStateLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
-	const lockFile = `${stateFile}.lock`;
-	const owner: SessionStateLockOwner = {
-		pid: process.pid,
-		start_time: processStartTime(process.pid) ?? "unknown",
-		token: randomUUID(),
-	};
-	await ensureDir(path.dirname(stateFile));
-	for (let attempt = 0; attempt < 12_000; attempt++) {
-		let handle: fs.FileHandle | undefined;
-		try {
-			handle = await fs.open(lockFile, "wx");
-			try {
-				await handle.writeFile(JSON.stringify(owner));
-			} catch (error) {
-				await handle.close().catch(() => undefined);
-				handle = undefined;
-				await fs.rm(lockFile, { force: true }).catch(() => undefined);
-				throw error;
-			}
-			const outcome = await operation().then(
-				value => ({ ok: true as const, value }),
-				error => ({ ok: false as const, error }),
-			);
-			await handle.close();
-			try {
-				if ((await fs.readFile(lockFile, "utf8")) === JSON.stringify(owner)) await fs.rm(lockFile);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
-			if (!outcome.ok) throw outcome.error;
-			return outcome.value;
-		} catch (error) {
-			if (handle) throw error;
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("coordinator_state_unreadable");
-
-			await reclaimStaleSessionStateLock(lockFile);
-			await Bun.sleep(5);
-		}
-	}
-	throw new Error("coordinator_state_unreadable");
+	return await withFileLock(stateFile, operation, { staleMs: 30_000, retries: 12_000, retryDelayMs: 5 });
 }
 
 async function writeSessionState(

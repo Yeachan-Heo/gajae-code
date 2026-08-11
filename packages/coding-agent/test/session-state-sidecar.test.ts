@@ -153,14 +153,102 @@ describe("coordinator runtime state sidecar", () => {
 			{ event: { type: "message_update", message: {}, assistantMessageEvent: {} }, affects: false },
 			{ event: { type: "notice", level: "info", message: "background notice" }, affects: false },
 			{ event: { type: "turn_start" }, affects: true },
+			{ event: { type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash" }, affects: true },
+			{ event: { type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash" }, affects: true },
 			{ event: { type: "agent_start" }, affects: true },
 			{ event: { type: "agent_end", messages: [] }, affects: true },
 		] as const;
 
 		for (const { event, affects } of events) {
 			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(affects);
-			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(stateForEvent(event as never) !== null);
 		}
+		expect(stateForEvent({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash" })).toBeNull();
+	});
+
+	it("persists bounded public-safe tool activity while preserving lifecycle state", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "activity-session";
+		try {
+			setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			setSystemTime(new Date("2026-01-01T00:00:01.000Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_start", toolCallId: "private-tool-call-id", toolName: "bash" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			setSystemTime(new Date("2026-01-01T00:00:03.500Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_end", toolCallId: "private-tool-call-id", toolName: "bad\nlabel", isError: true },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+			const payload = await readJson(stateFile);
+			expect(payload).toMatchObject({
+				state: "running",
+				last_activity_at: "2026-01-01T00:00:03.500Z",
+				activity: {
+					sequence: 2,
+					kind: "tool_execution",
+					phase: "finished",
+					tool_name: "custom",
+					started_at: "2026-01-01T00:00:01.000Z",
+					elapsed_ms: 2500,
+					outcome: "failed",
+					active_tool_count: 0,
+				},
+				active_tools: [],
+			});
+			expect(JSON.stringify(payload.active_tools)).not.toContain("private-tool-call-id");
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("keeps the active-tool count truthful when the public list is bounded", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "bounded-activity-session";
+		for (let index = 0; index < 9; index++)
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+		const payload = await readJson(stateFile);
+		expect(payload.activity).toMatchObject({ sequence: 9, active_tool_count: 9 });
+		expect(payload.active_tools).toHaveLength(8);
+	});
+
+	it("saturates an exhausted activity sequence without wrapping", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "saturated-activity-session";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "saturated-activity-session",
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				activity: { sequence: Number.MAX_SAFE_INTEGER },
+			}),
+		);
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "tool_execution_start", toolCallId: "tool-1", toolName: "read" },
+			{ sessionId: "fallback", cwd: root, sessionFile: null },
+		);
+
+		expect((await readJson(stateFile)).activity).toMatchObject({ sequence: Number.MAX_SAFE_INTEGER });
 	});
 
 	it("skips duplicate same-state running writes within the heartbeat", async () => {

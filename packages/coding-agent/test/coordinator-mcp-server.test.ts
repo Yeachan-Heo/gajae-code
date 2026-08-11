@@ -410,6 +410,20 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				source: "coordinator",
 				live: true,
 				reason: "Bearer session-state-secret",
+				last_activity_at: "2026-08-11T00:00:00.000Z",
+				activity: {
+					sequence: 4,
+					kind: "tool_execution",
+					phase: "started",
+					tool_name: "bash",
+					observed_at: "2026-08-11T00:00:00.000Z",
+					active_tool_count: 9,
+					private_args: "do not expose",
+				},
+				active_tools: [
+					{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z", tool_call_id: "private-tool-id" },
+				],
+				active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
 			}),
 		);
 		const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
@@ -417,6 +431,11 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			ok: true,
 			session: { session_id: "visible-session" },
 			status: { authority: "sdk_broker", live: true },
+			session_state: {
+				last_activity_at: "2026-08-11T00:00:00.000Z",
+				activity: { sequence: 4, tool_name: "bash", active_tool_count: 9 },
+				active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
+			},
 		});
 		const publicResult = JSON.stringify(status);
 		expect(publicResult).not.toContain("broker-endpoint-secret");
@@ -424,6 +443,8 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(publicResult).not.toContain("session-endpoint-secret");
 		expect(publicResult).not.toContain("session-record-secret");
 		expect(publicResult).not.toContain("session-state-secret");
+		expect(publicResult).not.toContain("private-tool-id");
+		expect(publicResult).not.toContain("do not expose");
 		expect(publicResult).not.toContain(root);
 		expect(controls).toEqual([
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
@@ -438,6 +459,59 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			},
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
 		]);
+		await expect(
+			server.callTool("gjc_coordinator_register_session", {
+				session_id: "visible-session",
+				cwd: root,
+				tmux_session: "visible-session",
+				tmux_target: "visible-session:0.0",
+				idempotency_key: "preserve-activity-registration",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true });
+		const lifecyclePayload = JSON.parse(
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(lifecyclePayload).toMatchObject({
+			last_activity_at: "2026-08-11T00:00:00.000Z",
+			activity: { sequence: 4, active_tool_count: 9 },
+			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
+			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
+		});
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "complete and repair projections",
+			idempotency_key: "repair-activity-turn",
+			allow_mutation: true,
+		});
+		const turnId = (sent as { turn_id?: unknown }).turn_id;
+		if (typeof turnId !== "string") throw new Error("expected turn id");
+		await expect(
+			server.callTool("gjc_coordinator_report_status", {
+				session_id: "visible-session",
+				turn_id: turnId,
+				status: "completed",
+				summary: "repaired terminal projection",
+				idempotency_key: "repair-activity-terminal",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true });
+		const repairedPayload = JSON.parse(
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(repairedPayload).toMatchObject({
+			state: "completed",
+			last_activity_at: "2026-08-11T00:00:00.000Z",
+			activity: { sequence: 4, active_tool_count: 9 },
+			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
+			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
+		});
 	});
 	it("marks lifecycle-created sessions ready after successful SDK lifecycle binding", async () => {
 		const root = await tempRoot();
