@@ -1122,7 +1122,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			return usage("Usage: /routing [on|off|status]", runtime);
 		},
-		handleTui: (command, runtime) => {
+		handleTui: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			runtime.ctx.editor.setText("");
 			if (arg === "") {
@@ -1130,12 +1130,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			if (arg === "on" || arg === "off") {
-				try {
-					runtime.ctx.settings.set("task.autorouting.enabled", arg === "on");
-				} catch (err) {
-					runtime.ctx.showError(`Failed to change autorouting: ${errorMessage(err)}`);
-					return;
-				}
+				// Route through the controller so the toggle honors the same
+				// scoped-session and durable-config guards as the panel.
+				await runtime.ctx.setAutoroutingEnabled(arg === "on");
 			} else if (arg !== "status") {
 				runtime.ctx.showStatus("Usage: /routing [on|off|status]");
 				return;

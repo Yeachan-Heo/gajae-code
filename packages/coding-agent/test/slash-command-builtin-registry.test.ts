@@ -445,18 +445,30 @@ describe("builtin /routing slash command", () => {
 		const showError = vi.fn();
 		const setText = vi.fn();
 		const settings = Settings.isolated(settingsValues as never);
+		// Mirrors SelectorController.setAutoroutingEnabled: the only writer the
+		// command is allowed to use, so scoped/read-only guards stay in one place.
+		const setAutoroutingEnabled = vi.fn(async (enabled: boolean) => {
+			settings.set("task.autorouting.enabled", enabled);
+		});
 		const chatContainer = { addChild: vi.fn() };
 		const ctx = {
 			showModelSelector,
 			showStatus,
 			showError,
 			settings,
+			setAutoroutingEnabled,
 			chatContainer,
 			ui: { requestRender: vi.fn() },
 			editor: { setText },
 		} as unknown as InteractiveModeContext;
 
-		return { runtime: { ctx, handleBackgroundCommand: () => undefined }, showModelSelector, settings, setText };
+		return {
+			runtime: { ctx, handleBackgroundCommand: () => undefined },
+			showModelSelector,
+			setAutoroutingEnabled,
+			settings,
+			setText,
+		};
 	}
 
 	it("opens the smart-routing panel directly when invoked without arguments", async () => {
@@ -468,13 +480,15 @@ describe("builtin /routing slash command", () => {
 		expect(setText).toHaveBeenCalledWith("");
 	});
 
-	it("toggles task.autorouting.enabled without opening a selector", async () => {
-		const { runtime, showModelSelector, settings } = createRoutingTuiRuntime();
+	it("routes the toggle through the guarded controller entry point", async () => {
+		const { runtime, showModelSelector, setAutoroutingEnabled, settings } = createRoutingTuiRuntime();
 
 		expect(await executeBuiltinSlashCommand("/routing on", runtime)).toBe(true);
+		expect(setAutoroutingEnabled).toHaveBeenLastCalledWith(true);
 		expect(settings.get("task.autorouting.enabled")).toBe(true);
 
 		expect(await executeBuiltinSlashCommand("/routing off", runtime)).toBe(true);
+		expect(setAutoroutingEnabled).toHaveBeenLastCalledWith(false);
 		expect(settings.get("task.autorouting.enabled")).toBe(false);
 		expect(showModelSelector).not.toHaveBeenCalled();
 	});
@@ -490,5 +504,35 @@ describe("builtin /routing slash command", () => {
 		).toContain("Autorouting: on (preset anthropic)");
 
 		expect(buildAutoroutingStatusReport(Settings.isolated().getEffectiveAutorouting())).toContain("Autorouting: off");
+	});
+
+	it("strips terminal control sequences from hand-edited selectors", () => {
+		// The selector grammar rejects whitespace but not ESC/BEL, so a hand-edited
+		// tier can still smuggle control bytes into the rendered status.
+		const settings = Settings.isolated({ "task.autorouting.enabled": true } as never);
+		settings.set("task.autorouting.tiers", {
+			balanced: ["anthropic/\x1b]0;pwned\x07evil-model"],
+		} as never);
+
+		const report = buildAutoroutingStatusReport(settings.getEffectiveAutorouting());
+
+		expect(report).toContain("Autorouting: on");
+		expect(report).not.toContain("\x1b");
+		expect(report).not.toContain("\x07");
+		expect(report).toContain("evil-model");
+	});
+
+	it("bounds a pathologically long chain", () => {
+		const settings = Settings.isolated({ "task.autorouting.enabled": true } as never);
+		settings.set("task.autorouting.tiers", {
+			fast: Array.from({ length: 40 }, (_, index) => `anthropic/model-${index}`),
+		} as never);
+
+		const fastLine = buildAutoroutingStatusReport(settings.getEffectiveAutorouting())
+			.split("\n")
+			.find(line => line.trimStart().startsWith("fast:"));
+
+		expect(fastLine).toBeDefined();
+		expect(fastLine?.length).toBeLessThanOrEqual(220);
 	});
 }

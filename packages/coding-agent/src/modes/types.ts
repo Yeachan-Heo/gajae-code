@@ -404,6 +404,7 @@ export interface InteractiveModeContext {
 	showExtensionsDashboard(): void;
 	showAgentsDashboard(): void;
 	showModelSelector(options?: { temporaryOnly?: boolean; smartRoutingOnly?: boolean }): void;
+	setAutoroutingEnabled(enabled: boolean): Promise<void>;
 	showEffortSelector(): void;
 	showProviderOnboarding(): void;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
