@@ -1479,6 +1479,10 @@ it("matches eager replay-metadata sanitation on bounded first open and exact reo
 		"enabled",
 	);
 	expect(enabled.getSessionMemoryStats().coldRetirementActive).toBe(true);
+	const coldExportEntries: unknown[] = [];
+	enabled.visitEntriesForExport(entry => coldExportEntries.push(entry));
+	expect(JSON.stringify(coldExportEntries)).not.toContain("stale-signature");
+	expect(JSON.stringify(coldExportEntries)).not.toContain("openaiResponsesHistory");
 	expect(enabled.buildSessionContext()).toEqual(expected);
 	expect(JSON.stringify(enabled.buildSessionContext())).not.toContain("stale-signature");
 	expect(JSON.stringify(enabled.buildSessionContext())).not.toContain("openaiResponsesHistory");
