@@ -90,12 +90,35 @@ export function validateBundleManifest(manifestContent: string | null, expectedF
 	return null;
 }
 
+type RegularFileIdentity = {
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+};
+
+function regularFileIdentity(stat: fsConstants.Stats): RegularFileIdentity | null {
+	if (stat.isSymbolicLink() || !stat.isFile()) return null;
+	return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
+function isSameRegularFileIdentity(first: RegularFileIdentity, second: RegularFileIdentity): boolean {
+	return first.dev === second.dev && first.ino === second.ino && first.size === second.size && first.mtimeMs === second.mtimeMs;
+}
+
 async function readRegularFile(target: string): Promise<string | null> {
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(target, fsConstants.constants.O_RDONLY | fsConstants.constants.O_NOFOLLOW);
-		if (!(await handle.stat()).isFile()) return null;
-		return await handle.readFile({ encoding: "utf8" });
+		const expected = process.platform === "win32" ? regularFileIdentity(await fs.lstat(target)) : undefined;
+		if (process.platform === "win32" && !expected) return null;
+		handle = await fs.open(target, fsConstants.constants.O_RDONLY | (process.platform === "win32" ? 0 : fsConstants.constants.O_NOFOLLOW));
+		const opened = regularFileIdentity(await handle.stat());
+		if (!opened || (expected && !isSameRegularFileIdentity(expected, opened))) return null;
+		const contents = await handle.readFile({ encoding: "utf8" });
+		if (!expected) return contents;
+		const current = regularFileIdentity(await fs.lstat(target));
+		const reread = regularFileIdentity(await handle.stat());
+		return current && reread && isSameRegularFileIdentity(expected, current) && isSameRegularFileIdentity(expected, reread) ? contents : null;
 	} catch {
 		return null;
 	} finally {
