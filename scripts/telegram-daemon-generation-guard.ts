@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 46;
+export const GUARD_CONTRACT_VERSION = 47;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -21,6 +21,7 @@ const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
 const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
 const sessionRouter = "packages/coding-agent/src/sdk/router/session-router.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
+const busIndex = "packages/coding-agent/src/sdk/bus/index.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
 const nativeAuthorityDeclarations = {
@@ -69,7 +70,7 @@ type GuardManifest = {
  * protected because old owners must be replaced when that admission path changes.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "33829373c15a54fe665b888adf28d10a383098ab7ce041263d4bee32db3fa65e";
+const PROTECTED_INVENTORY_SHA256 = "228f081a2d02781eb548f218bd83dca8e82badc9d7879310ed6ebbc6293c7c63";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -191,6 +192,17 @@ export const TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS = {
 		"processTelegramUpdate",
 	],
 } as const;
+
+/** Topic admission must preserve orchestration provenance from identity production through registry load. */
+export const TELEGRAM_TOPIC_ADMISSION_PROTECTED_DECLARATIONS = {
+	[config]: ["isTelegramOrchestrationSession"],
+	[busIndex]: ["buildIdentity", "createNotificationsExtension"],
+	[telegramDaemon]: [
+		"TelegramNotificationDaemon.#topicAdmissionAllows",
+		"TelegramNotificationDaemon.#rejectTopicAdmission",
+		"loadTopics",
+	],
+} as const;
 /** Callback recovery receipt and routing primitives must remain generation-fenced. */
 export const TELEGRAM_CALLBACK_RECOVERY_PROTECTED_DECLARATIONS = {
 	[telegramDaemon]: [
@@ -285,6 +297,16 @@ function validateTelegramToolActivityInventory(inventory: Inventory): void {
 	}
 }
 
+function validateTelegramTopicAdmissionInventory(inventory: Inventory): void {
+	for (const [file, required] of Object.entries(TELEGRAM_TOPIC_ADMISSION_PROTECTED_DECLARATIONS)) {
+		const symbols = inventory.telegram[file];
+		if (!symbols || required.some(symbol => !symbols.includes(symbol)))
+			throw new Error(
+				"telegram-daemon-generation-guard: Telegram topic-admission provenance, identity, and registry authorities must be protected by the Telegram generation contract",
+			);
+	}
+}
+
 function validateTelegramOwnerLockInventory(inventory: Inventory): void {
 	const symbols = inventory.telegram[telegramDaemon];
 	if (!symbols || TELEGRAM_OWNER_LOCK_PROTECTED_DECLARATIONS.some(symbol => !symbols.includes(symbol)))
@@ -346,6 +368,7 @@ export function validateInventory(inventory: Inventory = protectedInventory): vo
 	validateChatConfigInventory(inventory);
 	validateChatEndpointDiscoveryInventory(inventory);
 	validateTelegramToolActivityInventory(inventory);
+	validateTelegramTopicAdmissionInventory(inventory);
 	validateTelegramCallbackRecoveryInventory(inventory);
 	validateTelegramShutdownDrainInventory(inventory);
 }
