@@ -86,24 +86,39 @@ describe("managed sidecar resident-cache release", () => {
 	);
 
 	itPosix(
-		"closes the session when the sidecar cache refuses disposal",
+		"retries failed sidecar disposal without disclosing its cache path",
 		async () => {
 			const fixture = createManagedSidecarSession("@pi-managed-sidecar-untrusted-");
+			const originalDispose = EphemeralBlobStore.prototype.dispose;
 			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			let rejectDisposal = true;
 			const dispose = vi.spyOn(EphemeralBlobStore.prototype, "dispose").mockImplementation(function (
 				this: EphemeralBlobStore,
 			) {
-				throw new ResidentCacheTrustError("directory_untrusted", this.dir);
+				if (rejectDisposal) throw new ResidentCacheTrustError("directory_untrusted", this.dir);
+				return originalDispose.call(this);
 			});
 			try {
 				expect(fixture.sidecarCacheDirs).not.toHaveLength(0);
 
 				await fixture.manager.close();
 
-				expect(dispose.mock.calls.length).toBeGreaterThan(0);
-				expect(
-					warn.mock.calls.some(([message]) => String(message).includes("managed sidecar resident cache")),
-				).toBe(true);
+				const firstCloseAttempts = dispose.mock.calls.length;
+				expect(firstCloseAttempts).toBeGreaterThan(0);
+				const warnings = warn.mock.calls.filter(([message]) =>
+					String(message).includes("managed sidecar resident cache"),
+				);
+				expect(warnings.length).toBeGreaterThan(0);
+				for (const warning of warnings) expect(warning[1]).toEqual({ reason: "directory_untrusted" });
+				const warningPayload = JSON.stringify(warnings);
+				for (const directory of fixture.sidecarCacheDirs) expect(warningPayload).not.toContain(directory);
+				for (const directory of fixture.sidecarCacheDirs) expect(fs.existsSync(directory)).toBe(true);
+
+				rejectDisposal = false;
+				await fixture.manager.close();
+
+				expect(dispose.mock.calls.length).toBeGreaterThan(firstCloseAttempts);
+				for (const directory of fixture.sidecarCacheDirs) expect(fs.existsSync(directory)).toBe(false);
 			} finally {
 				dispose.mockRestore();
 				warn.mockRestore();

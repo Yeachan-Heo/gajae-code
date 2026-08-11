@@ -6828,6 +6828,7 @@ export class SessionManager {
 	#managedTranscriptStoreCache: { directory: string; store: ManagedSessionDescendantStore } | null = null;
 	#ownedManagedAuthority: ManagedSessionDescendantStore | undefined;
 	#managedSidecarCacheStore: EphemeralBlobStore | undefined;
+	readonly #managedSidecarCleanupStores = new Set<EphemeralBlobStore>();
 	#managedSidecarAuthorityStore: ManagedSessionDescendantStore | undefined;
 	#managedSidecarSecurityContext: ManagedSessionSecurityContext | undefined;
 	#managedSidecarCacheSessionFile: string | undefined;
@@ -10773,16 +10774,16 @@ export class SessionManager {
 		this.#managedSidecarCacheStore = undefined;
 		this.#managedSidecarCacheSessionFile = undefined;
 		this.#managedRangeExpectedDescriptor = undefined;
-		// Release state before disposal so a rejected cache directory can never
-		// strand a half-released sidecar, and never escape teardown (close()) as
-		// an unhandled rejection.
-		if (!store) return;
-		try {
-			store.dispose();
-		} catch (error) {
-			logger.warn("Failed to dispose the managed sidecar resident cache", {
-				error: toError(error).message,
-			});
+		if (store) this.#managedSidecarCleanupStores.add(store);
+		for (const pending of this.#managedSidecarCleanupStores) {
+			try {
+				pending.dispose();
+				this.#managedSidecarCleanupStores.delete(pending);
+			} catch (error) {
+				const candidate = error instanceof ResidentCacheTrustError ? error.reason : "";
+				const reason = /^[a-z0-9_]{1,64}$/.test(candidate) ? candidate : "cleanup_failed";
+				logger.warn("Failed to dispose the managed sidecar resident cache; retained for retry", { reason });
+			}
 		}
 	}
 
