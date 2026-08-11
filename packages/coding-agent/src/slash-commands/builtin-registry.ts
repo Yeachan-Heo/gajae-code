@@ -87,7 +87,12 @@ const PET_COMMAND_DEPRECATED_INPUTS: Readonly<Record<string, PetMode>> = {
 type GjcModelBatchAssignmentTargetId = "all-role-agents" | "all-targets";
 type ParsedModelCommandArgs =
 	| { kind: "summary" }
-	| { kind: "assign"; targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId; selector: string };
+	| {
+			kind: "assign";
+			targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId;
+			selector: string;
+			hasExplicitTarget: boolean;
+	  };
 
 const GJC_MODEL_ROLE_AGENT_TARGET_IDS: GjcModelAssignmentTargetId[] = ["executor", "architect", "planner", "critic"];
 
@@ -230,19 +235,19 @@ function parseModelCommandArgs(args: string): ParsedModelCommandArgs {
 
 	if (first === "assign") {
 		const targetId = parseTarget(tokens[1]);
-		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" ") };
-		return { kind: "assign", targetId: "default", selector: tokens.slice(1).join(" ") };
+		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" "), hasExplicitTarget: true };
+		return { kind: "assign", targetId: "default", selector: tokens.slice(1).join(" "), hasExplicitTarget: false };
 	}
 
 	const explicitTarget = parseTarget(first);
 	if (explicitTarget) {
-		return { kind: "assign", targetId: explicitTarget, selector: tokens.slice(1).join(" ") };
+		return { kind: "assign", targetId: explicitTarget, selector: tokens.slice(1).join(" "), hasExplicitTarget: true };
 	}
 	if (first === "set") {
 		const targetId = parseTarget(tokens[1]);
-		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" ") };
+		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" "), hasExplicitTarget: true };
 	}
-	return { kind: "assign", targetId: "default", selector: args.trim() };
+	return { kind: "assign", targetId: "default", selector: args.trim(), hasExplicitTarget: false };
 }
 /**
  * Optional namespace prefix accepted on `/model <preset>` selectors so users
@@ -798,11 +803,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					);
 				}
 				// Preset shortcut: when the selector names a known model profile
-				// (optionally `gajae-code/`-prefixed) and no explicit role target
-				// was given, activate the profile immediately instead of treating
-				// the preset name as a model id and failing with "Unknown model".
-				// `/model <role> <preset>` keeps assigning to the named role.
-				if (parsedArgs.targetId === "default") {
+				// (optionally `gajae-code/`-prefixed) and the target is implicit,
+				// activate the profile immediately instead of treating the preset name
+				// as a model id and failing with "Unknown model". Explicit targets,
+				// including `/model default <preset>`, remain ordinary assignments.
+				if (parsedArgs.targetId === "default" && !parsedArgs.hasExplicitTarget) {
 					const presetName = resolvePresetSelector(modelId, runtime.session.modelRegistry);
 					if (presetName) {
 						try {

@@ -1,3 +1,4 @@
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
@@ -162,6 +163,39 @@ async function assertExportDoesNotAliasSource(sourcePath: string, outputPath: st
 		throw new Error("HTML export output must not overwrite the source transcript");
 }
 
+const HTML_EXPORT_DESTINATION_OPEN_FLAGS =
+	syncFs.constants.O_WRONLY |
+	syncFs.constants.O_CREAT |
+	(process.platform === "win32" ? 0 : (syncFs.constants.O_NOFOLLOW ?? 0));
+
+function sourceIdentityForExport(sourcePath: string): syncFs.BigIntStats | undefined {
+	try {
+		return syncFs.statSync(sourcePath, { bigint: true });
+	} catch (error) {
+		if (isEnoent(error)) return undefined;
+		throw error;
+	}
+}
+
+function sameFileIdentity(left: syncFs.BigIntStats, right: syncFs.BigIntStats): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function openHtmlExportDestination(sourcePath: string | undefined, outputPath: string): number {
+	const descriptor = syncFs.openSync(outputPath, HTML_EXPORT_DESTINATION_OPEN_FLAGS, 0o666);
+	try {
+		const openedIdentity = syncFs.fstatSync(descriptor, { bigint: true });
+		const sourceIdentity = sourcePath ? sourceIdentityForExport(sourcePath) : undefined;
+		if (sourceIdentity && sameFileIdentity(sourceIdentity, openedIdentity))
+			throw new Error("HTML export output must not overwrite the source transcript");
+		syncFs.ftruncateSync(descriptor, 0);
+		return descriptor;
+	} catch (error) {
+		syncFs.closeSync(descriptor);
+		throw error;
+	}
+}
+
 async function writeSessionHtml(
 	sm: SessionManager,
 	state: AgentState | undefined,
@@ -175,7 +209,8 @@ async function writeSessionHtml(
 	if (markerOffset < 0) throw new Error("HTML export template is missing the session-data marker");
 	const sourcePath = sm.getSessionFile();
 	if (sourcePath) await assertExportDoesNotAliasSource(sourcePath, outputPath);
-	const sink = Bun.file(outputPath).writer();
+	const descriptor = openHtmlExportDestination(sourcePath, outputPath);
+	const sink = Bun.file(descriptor).writer();
 	const encoder = new Base64StreamEncoder();
 	const writeEncoded = (value: string): void => {
 		const encoded = encoder.write(value);
@@ -204,6 +239,8 @@ async function writeSessionHtml(
 	} catch (error) {
 		await sink.end();
 		throw error;
+	} finally {
+		syncFs.closeSync(descriptor);
 	}
 }
 
