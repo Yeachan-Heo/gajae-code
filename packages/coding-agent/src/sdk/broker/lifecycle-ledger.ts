@@ -685,7 +685,13 @@ export class LifecycleLedger {
 			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);
 			const entry = this.#byIdentity.get(from);
 			if (!entry) return undefined;
-			return await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
+			const migrated = await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
+			// Retire the legacy row so hasLegacyIdentity() returns false and future
+			// unrelated lifecycle requests are not globally blocked. The legacy
+			// identity gets a metadata-bearing replacement row in the append-only
+			// log, superseding the original metadata-free entry in #byIdentity.
+			if (entry.operationKey === undefined) await this.#append({ ...entry, ...metadata, ts: Date.now() });
+			return migrated;
 		});
 	}
 	get warnings(): readonly string[] {

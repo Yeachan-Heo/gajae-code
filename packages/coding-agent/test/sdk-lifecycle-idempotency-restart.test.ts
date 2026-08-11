@@ -478,3 +478,51 @@ describe("SDK lifecycle reconciliation lookup (broker.lookup_lifecycle)", () => 
 		expect(entry?.response).toBeUndefined();
 	});
 });
+
+describe("SDK lifecycle legacy identity retirement", () => {
+	it("retires a legacy identity after migration so unrelated requests are not globally blocked", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-legacy-retire-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		// Simulate a pre-index legacy row (no operationKey/fingerprint metadata).
+		await ledger.begin("legacy-target-a", "request-a");
+		expect(ledger.hasLegacyIdentity()).toBe(true);
+
+		// Migrate the legacy identity to the new operation/key-based identity.
+		const migrated = await ledger.migrateIdentity("legacy-target-a", "new-identity-a", {
+			operationKey: "session.create\0caller-key-a",
+			fingerprint: '{"operation":"session.create","input":{}}',
+		});
+		expect(migrated).toBeDefined();
+		expect(migrated?.identity).toBe("new-identity-a");
+		expect(migrated?.operationKey).toBe("session.create\0caller-key-a");
+
+		// The legacy identity is now retired: hasLegacyIdentity() must be false.
+		expect(ledger.hasLegacyIdentity()).toBe(false);
+
+		// A fresh unrelated lifecycle request (different operation, different key)
+		// must succeed without hitting idempotency_conflict from the legacy row.
+		const fresh = await ledger.begin("new-identity-b", "request-b", {
+			operationKey: "session.close\0caller-key-b",
+			fingerprint: '{"operation":"session.close","input":{}}',
+		});
+		expect(fresh.kind).toBe("new");
+	});
+
+	it("is idempotent: repeated migration of the same legacy identity is a no-op", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-legacy-idempotent-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		await ledger.begin("legacy-target-c", "request-c");
+
+		const metadata = {
+			operationKey: "session.create\0caller-key-c",
+			fingerprint: '{"operation":"session.create","input":{}}',
+		};
+		const first = await ledger.migrateIdentity("legacy-target-c", "new-identity-c", metadata);
+		expect(first).toBeDefined();
+
+		// Second migration: the new identity already exists, so it returns early.
+		const second = await ledger.migrateIdentity("legacy-target-c", "new-identity-c", metadata);
+		expect(second?.identity).toBe("new-identity-c");
+		expect(ledger.hasLegacyIdentity()).toBe(false);
+	});
+});
