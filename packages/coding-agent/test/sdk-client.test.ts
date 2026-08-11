@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { SdkClient, SdkClientError } from "../src/sdk/client/client";
 
 type FakeListener = ((event: Event) => void) | { handleEvent(event: Event): void };
@@ -331,23 +332,44 @@ test("SdkClient distinguishes pre-send closure from a sent lifecycle request and
 		expect(socket.sent).toHaveLength(0);
 
 		socket.throwOnSend = undefined;
-		const afterSend = client.global("session.create", { cwd: "/repo" }, { idempotencyKey: "after-send" });
+		const secret = "mcp-credential-not-for-sent-record";
+		const lifecycleInput = {
+			cwd: "/repo",
+			mcp: {
+				headers: { authorization: `Bearer ${secret}` },
+				env: { MCP_TOKEN: secret },
+			},
+		};
+		const expectedFingerprint = createHash("sha256")
+			.update(JSON.stringify({ operation: "session.create", input: lifecycleInput }))
+			.digest("hex");
+		const afterSend = client.global("session.create", lifecycleInput, { idempotencyKey: "after-send" });
 		await flush();
 		const sentFrame = sent(socket);
 		if (typeof sentFrame.id !== "string") throw new Error("lifecycle request id missing");
 		socket.readyState = FakeWebSocket.CLOSED;
 		socket.emit("close");
-		await expect(afterSend).rejects.toMatchObject({
+		let uncertain: unknown;
+		try {
+			await afterSend;
+		} catch (error) {
+			uncertain = error;
+		}
+		if (!(uncertain instanceof SdkClientError)) throw new Error("sent lifecycle request was not uncertain");
+		expect(uncertain).toMatchObject({
 			code: "uncertain_after_send",
 			details: {
 				id: sentFrame.id,
 				operation: "session.create",
 				idempotencyKey: "after-send",
-				fingerprint: '{"operation":"session.create","input":{"cwd":"/repo"}}',
+				fingerprint: expectedFingerprint,
 			},
 		});
+		expect(JSON.stringify(uncertain.details)).not.toContain(secret);
 		const record = client.getSentRecord(sentFrame.id);
 		if (!record) throw new Error("sent lifecycle record missing");
+		expect(record.fingerprint).toBe(expectedFingerprint);
+		expect(JSON.stringify(record)).not.toContain(secret);
 
 		const reconciliation = client.lookupLifecycle(record);
 		for (let index = 0; index < 4; index++) await flush();

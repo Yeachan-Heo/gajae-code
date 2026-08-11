@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
@@ -45,7 +46,7 @@ async function connect(url: string): Promise<WebSocket> {
 }
 
 function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
-	return JSON.stringify({ operation, input: JSON.parse(JSON.stringify(input)) });
+	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
 }
 
 type TerminalLifecycleState = "terminal_ok" | "terminal_error" | "terminal_uncertain";
@@ -228,7 +229,7 @@ describe("SDK broker WebSocket transport", () => {
 						id: "lookup-conflict",
 						operation: "session.create",
 						idempotencyKey: "lookup-ok",
-						fingerprint: "different-request",
+						fingerprint: "f".repeat(64),
 					}),
 				).toEqual({
 					type: "broker_response",
@@ -278,6 +279,60 @@ describe("SDK broker WebSocket transport", () => {
 				await client.close();
 			}
 		} finally {
+			await broker.stop();
+		}
+	});
+	it("hashes lifecycle wire fingerprints before retaining secret-bearing large inputs", async () => {
+		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-digest-"));
+		const broker = new Broker({ agentDir, packageGeneration: "test" });
+		const discovery = await broker.start();
+		const secret = "mcp-credential-not-for-ledger";
+		const input = {
+			sessionId: "secret-lifecycle-input",
+			mcp: {
+				headers: { authorization: `Bearer ${secret}` },
+				env: { MCP_TOKEN: secret },
+			},
+			padding: "x".repeat(2 * 1024 * 1024),
+		};
+		const expectedFingerprint = createHash("sha256")
+			.update(JSON.stringify({ operation: "session.close", input }))
+			.digest("hex");
+		const request = JSON.stringify({
+			type: "broker_request",
+			id: "large-secret-lifecycle",
+			operation: "session.close",
+			input,
+			idempotencyKey: "large-secret-lifecycle",
+		});
+		expect(Buffer.byteLength(request)).toBeGreaterThan(2 * 1024 * 1024);
+		expect(Buffer.byteLength(request)).toBeLessThan(4 * 1024 * 1024);
+		const ws = await connect(`${discovery.url}/?token=${discovery.token}`);
+		try {
+			expect(await nextFrame(ws)).toEqual({ type: "broker_hello", protocolVersion: 3 });
+			const response = nextFrame(ws);
+			ws.send(request);
+			expect(await response).toEqual({
+				type: "broker_response",
+				id: "large-secret-lifecycle",
+				ok: false,
+				error: { code: "not_found", message: "session is not indexed" },
+			});
+			const ledger = await fs.readFile(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"), "utf8");
+			expect(ledger).not.toContain(secret);
+			expect(ledger).not.toContain(input.padding.slice(0, 128));
+			expect(Buffer.byteLength(ledger)).toBeLessThan(4 * 1024);
+			const rows = ledger
+				.trimEnd()
+				.split("\n")
+				.map(line => JSON.parse(line) as { fingerprint?: unknown });
+			expect(rows).toHaveLength(2);
+			for (const row of rows) {
+				expect(row.fingerprint).toBe(expectedFingerprint);
+				expect(row.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+			}
+		} finally {
+			ws.close();
 			await broker.stop();
 		}
 	});

@@ -197,6 +197,16 @@ const LIFECYCLE_OPERATIONS = new Set([
 	"session.delete",
 ]);
 
+function lifecycleFingerprint(operation: string, input: unknown): string {
+	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
+}
+
+function lifecycleResponseState(response: BrokerResponse): LifecycleState {
+	if (response.ok) return "terminal_ok";
+	if (isCleanupPending(response)) return "effect_started";
+	return response.error.code === "terminal_uncertain" ? "terminal_uncertain" : "terminal_error";
+}
+
 type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
 type SessionListCursor = {
@@ -1362,8 +1372,7 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
-		const fingerprint = JSON.stringify({ operation, input: JSON.parse(JSON.stringify(input)) });
-
+		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
@@ -1389,7 +1398,18 @@ export class Broker {
 						...pageResult,
 						savedSession:
 							match && match.sessionId === resolveSessionId
-								? { id: match.sessionId, path: match.path }
+								? {
+										id: match.sessionId,
+										path: match.path,
+										identity: {
+											dev: match.identity.dev.toString(),
+											ino: match.identity.ino.toString(),
+											size: match.identity.size,
+											mtimeMs: match.identity.mtimeMs,
+											mtimeNs: match.identity.mtimeNs.toString(),
+											sha256: match.identity.sha256,
+										},
+									}
 								: undefined,
 					},
 				};

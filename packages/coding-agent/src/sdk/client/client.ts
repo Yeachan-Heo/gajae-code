@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export type SdkErrorCode =
 	| "invalid_input"
@@ -153,19 +153,12 @@ function parseFrame(value: unknown): Frame {
 	throw new SdkClientError("protocol_error", "SDK server sent a malformed frame.");
 }
 
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.filter(key => record[key] !== undefined)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
+function lifecycleFingerprint(operation: string, input: unknown): string {
+	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
 }
 
-function lifecycleFingerprint(operation: string, input: unknown): string {
-	return JSON.stringify({ operation, input: JSON.parse(JSON.stringify(input)) });
+function inputFingerprint(input: unknown): string {
+	return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
 /** A transport-only v3 SDK WebSocket client with no host or session authority. */
@@ -408,7 +401,7 @@ export class SdkClient {
 				fingerprint:
 					typeof serializedFrame.operation === "string"
 						? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
-						: canonicalJson(serializedFrame.input ?? {}),
+						: inputFingerprint(serializedFrame.input ?? {}),
 			});
 		} catch (error) {
 			this.#settlePending(
