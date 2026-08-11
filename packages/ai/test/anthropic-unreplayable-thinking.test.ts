@@ -205,6 +205,25 @@ describe("Anthropic unreplayable latest-assistant thinking", () => {
 		expect(nativeThinkingCount(payload)).toBe(1);
 	});
 
+	it("drops signed-empty historical thinking recorded under a different model id (#4262)", async () => {
+		// The same turn recorded under the dated snapshot while the request runs the
+		// alias (or vice versa) is not `isSameModel`, so it takes the cross-identity
+		// branch instead of the #4247 drop. It must still never reach the wire: this
+		// is the shape #4262 reported as replaying from earlier assistant messages.
+		const snapshotModel: Model<"anthropic-messages"> = { ...model, id: `${model.id}-20260101` };
+		const payload = await capturePayload([
+			user,
+			assistantTurn([SIGNED_EMPTY], "toolu_a", snapshotModel),
+			toolResult("toolu_a"),
+			{ ...user, content: "again", timestamp: Date.now() + 1 },
+			assistantTurn([SIGNED_LATE], "toolu_b"),
+			toolResult("toolu_b"),
+		]);
+
+		expect(JSON.stringify(payload.messages)).not.toContain("sig_empty");
+		expect(nativeThinkingCount(payload)).toBe(1);
+	});
+
 	it("does not degrade a non-signing endpoint whose latest turn has signed-empty thinking", async () => {
 		const payload = await capturePayload(
 			[
