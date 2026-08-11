@@ -1194,6 +1194,9 @@ async function markGcDiskBlobReferences(transcriptPath: string, into: Set<string
 interface GcDiskMarkedTranscript {
 	size: number;
 	mtimeMs: number;
+	ctimeMs: number;
+	dev: number;
+	ino: number;
 }
 
 /**
@@ -1233,14 +1236,26 @@ async function markGcDiskTranscript(
 		errors.push({ surface: "blobs", scope: transcriptPath, message: gcDiskErrorText(error) });
 		return;
 	}
-	if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+	if (
+		before.size !== after.size ||
+		before.mtimeMs !== after.mtimeMs ||
+		before.ctimeMs !== after.ctimeMs ||
+		before.dev !== after.dev ||
+		before.ino !== after.ino
+	) {
 		// The transcript changed while its references were being read: the
 		// reference set is not bound to a stable snapshot, so it cannot vouch
 		// for any blob. Same posture as the drift rounds exhausting below.
 		markGcDiskEvidenceIncomplete(evidence, "sessions_changed_during_mark");
 		return;
 	}
-	marked.set(transcriptPath, { size: after.size, mtimeMs: after.mtimeMs });
+	marked.set(transcriptPath, {
+		size: after.size,
+		mtimeMs: after.mtimeMs,
+		ctimeMs: after.ctimeMs,
+		dev: after.dev,
+		ino: after.ino,
+	});
 }
 
 /**
@@ -1269,7 +1284,14 @@ async function findGcDiskMarkDrift(input: {
 		visit: (transcriptPath, _directory, stat) => {
 			const mark = input.marked.get(transcriptPath);
 			if (mark) {
-				if (mark.size !== stat.size || mark.mtimeMs !== stat.mtimeMs) drifted.push(transcriptPath);
+				if (
+					mark.size !== stat.size ||
+					mark.mtimeMs !== stat.mtimeMs ||
+					mark.ctimeMs !== stat.ctimeMs ||
+					mark.dev !== stat.dev ||
+					mark.ino !== stat.ino
+				)
+					drifted.push(transcriptPath);
 				return;
 			}
 			if (!input.accounted.has(transcriptPath)) drifted.push(transcriptPath);

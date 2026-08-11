@@ -520,6 +520,44 @@ describe("gjc gc --disk --prune (blob mark and sweep)", () => {
 		}
 	});
 
+	test("withholds the sweep when a transcript is replaced with preserved size and mtime during marking", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const precious = await writeBlob(fixture, "payload referenced after transcript replacement", 10);
+			const replaced = await writeBlob(fixture, "payload replaced in the transcript reference", 10);
+			const transcript = await writeSession(fixture, "repo-a", "replaced-mid-mark-session", {
+				ageDays: 0,
+				blobRefs: [replaced],
+			});
+			const original = await fsp.lstat(transcript);
+			const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: false }) => Promise<Stats>;
+			let transcriptStats = 0;
+			const spy = spyOn(fsp, "lstat");
+			spy.mockImplementation((async (target: PathLike, options?: { bigint?: false }) => {
+				if (path.resolve(String(target)) === transcript && ++transcriptStats === 3) {
+					const replacement = `${transcript}.replacement`;
+					const content = (await Bun.file(transcript).text()).replace(replaced, precious);
+					await Bun.write(replacement, content);
+					await fsp.utimes(replacement, original.atime, original.mtime);
+					await fsp.rename(replacement, transcript);
+				}
+				return await realLstat(target, options);
+			}) as unknown as typeof fsp.lstat);
+			try {
+				const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+				expect(reasonById(disk, "blobs").get(precious)).toBe(
+					"keep:withheld_evidence_incomplete: sessions_changed_during_mark",
+				);
+				expect(disk.surfaces.blobs.reclaimed).toBe(0);
+				expect(await Bun.file(path.join(fixture.blobsDir, precious)).exists()).toBe(true);
+			} finally {
+				spy.mockRestore();
+			}
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
 	test("withholds the sweep when a transcript is appended to during the sweep", async () => {
 		const fixture = await makeTestRoot();
 		try {
