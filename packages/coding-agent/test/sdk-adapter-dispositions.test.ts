@@ -140,6 +140,8 @@ function inputFor(operation: Operation, secret = false): Record<string, unknown>
 		case "turn.follow_up":
 		case "turn.abort_and_prompt":
 			return { text: "adapter disposition probe" };
+		case "turn.steer_status":
+			return { clientRef: "adapter-disposition-probe" };
 		case "ask.answer":
 			return { id: "missing-ask", answer: "answer" };
 		case "workflow.gate_answer":

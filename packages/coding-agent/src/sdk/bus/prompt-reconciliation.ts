@@ -22,9 +22,9 @@
  */
 
 import { PROMPT_FAILURE_CODE_MAX, sanitizePromptFailure } from "../prompt-failure";
+import type { ReceiptState } from "../receipt-state";
 
 export { PROMPT_FAILURE_CODE_MAX, sanitizePromptFailure };
-
 export const PROMPT_RECONCILIATION_ACTIVE_CAPACITY = 128;
 export const PROMPT_RECONCILIATION_TERMINAL_CAPACITY = 256;
 export const PROMPT_RECONCILIATION_TERMINAL_TTL_MS = 15 * 60_000;
@@ -43,11 +43,13 @@ export interface PromptReconciliationRecord extends PromptCorrelation {
 	acceptedAt: number;
 	startedAt?: number;
 	terminalAt?: number;
+	receiptState?: Exclude<ReceiptState, "absent">;
 }
 
 export type TurnPromptReconciliation =
 	| {
 			status: "accepted";
+			receiptState: "absent";
 			commandId: string;
 			turnId: string;
 			clientRef?: string;
@@ -55,6 +57,7 @@ export type TurnPromptReconciliation =
 	  }
 	| {
 			status: "in_flight";
+			receiptState: "absent";
 			commandId: string;
 			turnId: string;
 			clientRef?: string;
@@ -63,6 +66,7 @@ export type TurnPromptReconciliation =
 	  }
 	| {
 			status: "terminal_ok";
+			receiptState: Exclude<ReceiptState, "absent">;
 			commandId: string;
 			turnId: string;
 			clientRef?: string;
@@ -74,6 +78,7 @@ export type TurnPromptReconciliation =
 	  }
 	| {
 			status: "failed";
+			receiptState: Exclude<ReceiptState, "absent">;
 			commandId: string;
 			turnId: string;
 			clientRef?: string;
@@ -82,7 +87,7 @@ export type TurnPromptReconciliation =
 			terminalAt: number;
 			error: { code: string; message: string };
 	  }
-	| { status: "unknown" };
+	| { status: "unknown"; receiptState: "unknown" };
 
 export interface PromptReconciliation {
 	/** Fail-closed admission BEFORE any execution; holds an identity-bound reservation. */
@@ -94,7 +99,10 @@ export interface PromptReconciliation {
 	/** Lifecycle transition; terminal outcomes settle exactly once. */
 	noteTransition(
 		correlation: PromptCorrelation | undefined,
-		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+		frame:
+			| { type: "agent_start" }
+			| { type: "agent_end"; finalText?: string }
+			| { type: "agent_failed"; error: unknown; finalText?: string },
 	): void;
 	lookup(selector: { commandId?: string; turnId?: string; clientRef?: string }): TurnPromptReconciliation;
 	cleanup(): void;
@@ -184,7 +192,10 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 
 	const noteTransition = (
 		correlation: PromptCorrelation | undefined,
-		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+		frame:
+			| { type: "agent_start" }
+			| { type: "agent_end"; finalText?: string }
+			| { type: "agent_failed"; error: unknown; finalText?: string },
 	) => {
 		if (!correlation) return;
 		const record = records.get(keyOf(correlation));
@@ -207,6 +218,7 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 			return;
 		}
 		record.terminalAt = now();
+		record.receiptState = frame.finalText?.trim() ? "present" : "missing";
 		if (frame.type === "agent_failed") {
 			record.status = "failed";
 			record.error = sanitizePromptFailure(frame.error);
@@ -226,20 +238,21 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 					? keyOf({ commandId: selector.commandId, turnId: selector.turnId })
 					: undefined;
 		const record = key === undefined ? undefined : records.get(key);
-		if (!record) return { status: "unknown" };
+		if (!record) return { status: "unknown", receiptState: "unknown" };
 		const identity = {
 			commandId: record.commandId,
 			turnId: record.turnId,
 			...(record.clientRef !== undefined ? { clientRef: record.clientRef } : {}),
 			acceptedAt: record.acceptedAt,
 		};
-		if (record.status === "accepted") return { status: "accepted", ...identity };
+		if (record.status === "accepted") return { status: "accepted", receiptState: "absent", ...identity };
 		if (record.status === "in_flight")
-			return { status: "in_flight", ...identity, startedAt: record.startedAt as number };
+			return { status: "in_flight", receiptState: "absent", ...identity, startedAt: record.startedAt as number };
 		const terminal = {
 			...identity,
 			...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
 			terminalAt: record.terminalAt as number,
+			receiptState: record.receiptState ?? "unknown",
 		};
 		if (record.status === "terminal_ok")
 			return {

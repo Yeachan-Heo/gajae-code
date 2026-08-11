@@ -15,14 +15,13 @@ import {
 } from "./fixture-broker-cleanup";
 import { isolatedNotificationSettings } from "./notification-settings";
 
-export async function startProductionSdkHost(
-	cwd: string,
-	options: { acceptPromptPreflightWithoutExecution?: boolean } = {},
-): Promise<{
+export interface ProductionSdkHost {
 	endpoint: { url: string; token: string; pid: number };
 	sessionId: string;
+	session: Awaited<ReturnType<typeof createAgentSession>>["session"];
 	endpointMtimeMs: number;
 	observed: Array<{ kind: "control" | "query"; operation: string }>;
+	dispatches: Array<{ deliverAs?: string }>;
 	triggerAsk: (
 		question: string,
 		options: string[],
@@ -35,8 +34,13 @@ export async function startProductionSdkHost(
 		>[0],
 	) => { registered: true; result: Promise<unknown> } | { registered: false; reason: "authority_unavailable" };
 	stop: () => Promise<void>;
-}> {
+}
+export async function startProductionSdkHost(
+	cwd: string,
+	options: { acceptPromptPreflightWithoutExecution?: boolean } = {},
+): Promise<ProductionSdkHost> {
 	const observed: Array<{ kind: "control" | "query"; operation: string }> = [];
+	const dispatches: Array<{ deliverAs?: string }> = [];
 	const agentDir = path.join(cwd, ".gjc", "agent");
 	const fixtureEnv = createFixtureBrokerEnvironment(agentDir, agentDir);
 	return withFixtureBrokerEnvironment(async () => {
@@ -90,6 +94,11 @@ export async function startProductionSdkHost(
 				},
 				dispose: () => session.dispose(),
 			});
+			const originalSendUserMessage = session.sendUserMessage.bind(session);
+			session.sendUserMessage = async (content, options) => {
+				dispatches.push({ deliverAs: options?.deliverAs });
+				return await originalSendUserMessage(content, options);
+			};
 			if (options.acceptPromptPreflightWithoutExecution) {
 				session.sendUserMessage = async (_content, promptOptions) => {
 					if (promptOptions?.onPreflightAcceptCommit) await promptOptions.onPreflightAcceptCommit();
@@ -133,7 +142,9 @@ export async function startProductionSdkHost(
 				endpoint,
 				endpointMtimeMs,
 				sessionId: session.sessionId,
+				session,
 				observed,
+				dispatches,
 				triggerAsk,
 				triggerGate,
 				stop: () => cleanupFixtureRoot(cleanup),

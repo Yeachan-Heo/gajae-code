@@ -89,6 +89,7 @@ import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime,
 import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
+import { createKindAwareReconciliation, type KindAwareReconciliation } from "../kind-aware-reconciliation";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -99,6 +100,7 @@ import {
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { PROMPT_CLIENT_REF_MAX_LENGTH, type SdkPromptTerminalOutcome } from "../prompt-status";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { createReconciliationStore, resolveReconciliationSessionFile } from "../reconciliation-store";
 import {
 	lifecycleStartupCapabilityForApi,
 	normalizeSdkStartupFailure,
@@ -129,11 +131,9 @@ import {
 	isExistingThreadBindingRequested,
 } from "./existing-thread-readiness";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
-import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation } from "./prompt-reconciliation";
-import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import type { SlackConversation } from "./slack-conversation";
 import {
@@ -2299,6 +2299,9 @@ function sdkQuerySurface(
 		turnId?: string;
 		clientRef?: string;
 	}) => unknown = () => ({ status: "unknown" }),
+	steerStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
+		status: "unknown",
+	}),
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2309,6 +2312,7 @@ function sdkQuerySurface(
 		configOverrides,
 		settings,
 		turnResultLookup,
+		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 	}).query;
 }
@@ -2407,9 +2411,14 @@ function sdkControlSurface(
 		) => Promise<void>;
 		noteTransition: (
 			correlation: { commandId: string; turnId: string } | undefined,
-			frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
+			frame:
+				| { type: "agent_start" }
+				| { type: "agent_end"; finalText?: string }
+				| { type: "agent_failed"; error: unknown; finalText?: string },
 		) => Promise<void>;
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
+		reserveSteer?: KindAwareReconciliation["reserveSteer"];
+		settleSteer?: KindAwareReconciliation["settleSteer"];
 	},
 ): ControlSurface & {
 	cancelPendingPreflights(): void;
@@ -2424,6 +2433,22 @@ function sdkControlSurface(
 		id: ctx.sessionManager.getSessionId(),
 		api,
 	}).policy;
+	const lastAssistantText = () => {
+		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const content = entry.message.content;
+			if (typeof content === "string") return content;
+			if (Array.isArray(content))
+				return content
+					.filter(
+						(block): block is { type: "text"; text: string } =>
+							block.type === "text" && typeof block.text === "string",
+					)
+					.map(block => block.text)
+					.join("");
+		}
+		return undefined;
+	};
 	const missingExpectedSessionAudits = new Set<"workflow.gate_answer" | "workflow.plan_approve">();
 	const auditMissingExpectedSessionId = (operation: "workflow.gate_answer" | "workflow.plan_approve") => {
 		if (missingExpectedSessionAudits.has(operation)) return;
@@ -2454,11 +2479,29 @@ function sdkControlSurface(
 		}
 		return "unknown";
 	};
-	const sendSteer = async (text: string) => {
-		// Await admission so a rejection (e.g. handoff in progress) surfaces as a
-		// control error instead of a false `accepted: true`.
-		await api.sendUserMessage(text, { deliverAs: "steer" });
-		return { commandId: crypto.randomUUID(), accepted: true };
+	const sendSteer = async (text: string, clientRef?: string) => {
+		if (clientRef === undefined) {
+			const correlation = { commandId: crypto.randomUUID(), turnId: crypto.randomUUID() };
+			await api.sendUserMessage(text, { deliverAs: "steer" });
+			return { ...correlation, accepted: true };
+		}
+		const normalizedClientRef = clientRef.trim();
+		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer)
+			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
+		const reservation = await skillRecon.reserveSteer(normalizedClientRef, text);
+		if (reservation.replay) return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
+		try {
+			await api.sendUserMessage(text, { deliverAs: "steer" });
+			return {
+				sessionId: ctx.sessionManager.getSessionId(),
+				...(await skillRecon.settleSteer(normalizedClientRef, "accepted")),
+			};
+		} catch (error) {
+			return {
+				sessionId: ctx.sessionManager.getSessionId(),
+				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
+			};
+		}
 	};
 	const resolveModel = (id: string) => {
 		const [provider, ...modelId] = id.split("/");
@@ -2695,7 +2738,7 @@ function sdkControlSurface(
 			verifyElevationCapability(elevationAuthorityToken, capability, sdkId, input),
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
-		steer: text => sendSteer(text),
+		steer: (text, clientRef) => sendSteer(text, clientRef),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
 			const requesterConnectionId = controlRequesterContext.getStore();
@@ -2958,7 +3001,11 @@ function sdkControlSurface(
 						if (skillRecon) skillRecon.release(trimmedClientRef);
 						settleReject(error);
 					} else if (skillRecon) {
-						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
+						void skillRecon.noteTransition(correlation, {
+							type: "agent_failed",
+							error,
+							finalText: lastAssistantText(),
+						});
 					}
 					throw error;
 				},
@@ -4149,10 +4196,13 @@ export function createNotificationsExtension(
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
 		// Active records never age into terminal; documented TTL/capacity
 		// eviction is the only removal, after which lookups report `unknown`.
-		const sessionFile =
+		const persistedSessionFile =
 			typeof ctx.sessionManager?.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : null;
 		const reconciliationSessionId =
 			typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : "";
+		const sessionFile = reconciliationSessionId
+			? resolveReconciliationSessionFile(persistedSessionFile, stateRoot, String(reconciliationSessionId))
+			: null;
 		const durableStore =
 			sessionFile && reconciliationSessionId
 				? createReconciliationStore({ sessionFile, sessionId: String(reconciliationSessionId) })
@@ -4433,12 +4483,13 @@ export function createNotificationsExtension(
 			options: { fence?: boolean } = {},
 			extra?: PromptTerminalExtra,
 		) => {
+			const receiptState = extra?.finalText?.trim() ? "present" : "missing";
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
 			submission.phase = "outcome_claimed";
 			let winner: SdkPromptTerminalOutcome;
 			try {
-				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome);
+				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome, receiptState);
 			} catch (error) {
 				// The claim is the durability boundary: without it nothing may be published
 				// and the endpoint must fail closed so the client rejects exactly once. The
@@ -4612,6 +4663,7 @@ export function createNotificationsExtension(
 				configOverrides,
 				settings,
 				selector => kindReconciliation.lookupResult(selector.kind, selector),
+				selector => kindReconciliation.lookupSteer(selector),
 			),
 			id,
 			revisions,
@@ -4656,6 +4708,8 @@ export function createNotificationsExtension(
 					kindReconciliation.noteAccepted("skill", correlation, clientRef, extra),
 				noteTransition: (correlation, frame) => kindReconciliation.noteTransition("skill", correlation, frame),
 				lookup: selector => kindReconciliation.lookup("skill", selector),
+				reserveSteer: kindReconciliation.reserveSteer,
+				settleSteer: kindReconciliation.settleSteer,
 			},
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;

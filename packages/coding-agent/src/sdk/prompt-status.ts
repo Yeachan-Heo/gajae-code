@@ -51,6 +51,8 @@ export interface TurnPromptInput {
  * prompt that is active at process restart is finalized from its durable pending
  * outcome (or `prompt_failed` when it has none), so it never reports as unknown.
  */
+import type { ReceiptState } from "./receipt-state";
+
 export type PromptReconciliationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
 export type SdkPromptStopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
 export type SdkPromptFailureCode = "prompt_failed" | "prompt_deadline_exceeded";
@@ -71,16 +73,19 @@ interface TurnPromptReconciliationIdentity {
 
 export interface TurnPromptReconciliationAccepted extends TurnPromptReconciliationIdentity {
 	status: "accepted";
+	receiptState: Extract<ReceiptState, "absent">;
 }
 
 export interface TurnPromptReconciliationInFlight extends TurnPromptReconciliationIdentity {
 	status: "in_flight";
+	receiptState: Extract<ReceiptState, "absent">;
 	/** Epoch milliseconds of the agent_start transition. */
 	startedAt: number;
 }
 
 export interface TurnPromptReconciliationTerminalOk extends TurnPromptReconciliationIdentity {
 	status: "terminal_ok";
+	receiptState: Exclude<ReceiptState, "absent">;
 	startedAt?: number;
 	/** Epoch milliseconds of the terminal transition. */
 	terminalAt: number;
@@ -91,6 +96,7 @@ export interface TurnPromptReconciliationTerminalOk extends TurnPromptReconcilia
 
 export interface TurnPromptReconciliationFailed extends TurnPromptReconciliationIdentity {
 	status: "failed";
+	receiptState: Exclude<ReceiptState, "absent">;
 	startedAt?: number;
 	terminalAt: number;
 	/** Bounded, sanitized failure detail (code safe-token ≤64, message ≤512). */
@@ -100,6 +106,7 @@ export interface TurnPromptReconciliationFailed extends TurnPromptReconciliation
 
 export interface TurnPromptReconciliationUnknown {
 	status: "unknown";
+	receiptState: Extract<ReceiptState, "unknown">;
 }
 
 export type TurnPromptReconciliation =

@@ -27,6 +27,8 @@ import {
 import { projectQ10Models } from "../models.js";
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { createKindAwareReconciliation, type KindAwareReconciliation } from "../bus/kind-aware-reconciliation";
+import { createReconciliationStore, resolveReconciliationSessionFile } from "../bus/reconciliation-store";
 import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "./control";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SdkCheckpointRecord, type SessionSurface } from "./query";
@@ -249,7 +251,7 @@ export interface InvocationCorrelation {
 	turnId: string;
 }
 
-export type InvocationKind = "prompt" | "skill";
+export type InvocationKind = "prompt" | "skill" | "steer";
 type InvocationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
 interface InvocationRecord extends InvocationCorrelation {
 	kind: InvocationKind;
@@ -285,6 +287,7 @@ export function createInvocationReconciliation(
 	const reservationCounts = new Map<InvocationKind, number>([
 		["prompt", 0],
 		["skill", 0],
+		["steer", 0],
 	]);
 	const key = (kind: InvocationKind, correlation: InvocationCorrelation) =>
 		`${kind}:${correlation.commandId}:${correlation.turnId}`;
@@ -498,6 +501,7 @@ export interface SdkSurfaceFactoryOptions {
 		turnId?: string;
 		clientRef?: string;
 	}) => unknown;
+	steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 	hostTools?: boolean | (() => boolean);
 	/** Q30 event-ring watermark source (the live session event stream); synchronous. */
 	getEventWatermark?: () => { generation: number; seq: number };
@@ -528,6 +532,7 @@ function createQuerySurface(
 			turnId?: string;
 			clientRef?: string;
 		}) => unknown;
+		steerStatusLookup?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
 		hostTools?: boolean | (() => boolean);
 		/** Q30 event-ring watermark source (the live session event stream); synchronous. */
 		getEventWatermark?: () => { generation: number; seq: number };
@@ -804,6 +809,8 @@ function createQuerySurface(
 			turnId?: string;
 			clientRef?: string;
 		}) => (options.turnResultLookup ?? (value => reconciliation.lookupResult(value.kind, value)))(selector),
+		getSteerStatus: (selector: { commandId?: string; turnId?: string; clientRef?: string }) =>
+			(options.steerStatusLookup ?? (value => reconciliation.lookup("steer", value)))(selector),
 		getModelProfiles: async () => {
 			const profiles = ctx.modelRegistry.getModelProfiles();
 			const authenticatedProviders = await collectAuthenticatedProfileProviders(profiles, provider =>
@@ -865,6 +872,7 @@ export function createSdkSurfaceFactory(
 		configOverrides: options.configOverrides,
 		settings: options.settings,
 		turnResultLookup: options.turnResultLookup,
+		steerStatusLookup: options.steerStatusLookup,
 		hostTools: options.hostTools,
 		getEventWatermark: options.getEventWatermark,
 	});
@@ -981,6 +989,7 @@ function createControlSurface(
 	api: ExtensionAPI,
 	reconciliation: InvocationReconciliation,
 	onAccepted: (kind: InvocationKind, correlation: InvocationCorrelation) => void,
+	steerReconciliation: KindAwareReconciliation,
 	policy?: SdkSurfacePolicy,
 	settings?: Settings,
 	configOverrides?: Map<string, unknown>,
@@ -1091,7 +1100,7 @@ function createControlSurface(
 			void submission.then(
 				result => {
 					if (settled) {
-						if (kind === "skill")
+						if (kind === "skill" || kind === "steer")
 							void reconciliation.noteTransition(kind, correlation, {
 								type: "agent_end",
 								...(typeof result === "string"
@@ -1147,9 +1156,22 @@ function createControlSurface(
 					options,
 				),
 			),
-		steer: async text => {
-			await api.sendUserMessage(text, { deliverAs: "steer" });
-			return { commandId: crypto.randomUUID(), accepted: true };
+		steer: async (text, clientRef) => {
+			const retainedClientRef = normalizeClientRef(clientRef);
+			if (retainedClientRef === undefined) {
+				const correlation = newCorrelation();
+				await api.sendUserMessage(text, { deliverAs: "steer" });
+				return { accepted: true, ...correlation };
+			}
+			const durable = steerReconciliation;
+			const reservation = await durable.reserveSteer(retainedClientRef, text);
+			if (reservation.replay) return { accepted: reservation.result.status === "accepted", ...reservation.result };
+			try {
+				await api.sendUserMessage(text, { deliverAs: "steer" });
+				return { accepted: true, ...(await durable.settleSteer(retainedClientRef, "accepted")) };
+			} catch (error) {
+				return { accepted: false, ...(await durable.settleSteer(retainedClientRef, "rejected", error)) };
+			}
 		},
 		followUp: async text =>
 			submit("prompt", undefined, options => api.sendUserMessage(text, { ...options, deliverAs: "followUp" })),
@@ -1358,6 +1380,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				revisions: RevisionStore;
 				cursors: CursorRegistry;
 				reconciliation: InvocationReconciliation;
+				steerReconciliation: KindAwareReconciliation;
 				pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 				registerBroker: () => Promise<void>;
 				fenceGateResolutions: () => void;
@@ -1411,6 +1434,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const cursors = new CursorRegistry(token, revisions);
 		const reconciliation = createInvocationReconciliation({ stateRoot, sessionId });
 		await reconciliation.hydrate();
+		const sessionFile =
+			(typeof ctx.sessionManager.getSessionFile === "function"
+				? ctx.sessionManager.getSessionFile()
+				: undefined) ?? resolveReconciliationSessionFile(undefined, stateRoot, sessionId);
+		const steerReconciliation = createKindAwareReconciliation({
+			store: createReconciliationStore({ sessionFile, sessionId }),
+		});
+		await steerReconciliation.hydrateFromStore();
 		const pending: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		const configRevision = { current: 0 };
 		// The event-ring watermark lives on the runtime host, which is constructed
@@ -1438,6 +1469,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			api,
 			reconciliation,
 			turnResultLookup: selector => reconciliation.lookupResult(selector.kind, selector),
+			steerStatusLookup: selector => steerReconciliation.lookupSteer(selector),
 			configOverrides: options.configOverrides,
 			settings: options.settings,
 			getEventWatermark: () => eventWatermarkSource(),
@@ -1450,6 +1482,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			(kind, correlation) => {
 				pending.push({ kind, correlation });
 			},
+			steerReconciliation,
 			surfaceFactory.policy,
 			options.settings,
 			options.configOverrides,
@@ -1598,6 +1631,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			revisions,
 			cursors,
 			reconciliation,
+			steerReconciliation,
 			pending,
 			registerBroker,
 			fenceGateResolutions: () => {
@@ -1624,6 +1658,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					revisions,
 					cursors,
 					reconciliation,
+					steerReconciliation,
 					pending,
 					registerBroker,
 					fenceGateResolutions: () => {
