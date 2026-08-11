@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
 import {
 	disposeAllResourceOwners,
+	groupLeaderIdentityMatches,
 	liveOwnedProcessCount,
+	procEntryMayStillBeRunning,
 	registerResourceOwner,
 	resourceOwnerCount,
 	spawnOwnedProcess,
@@ -67,6 +70,15 @@ function processGroupGone(pgid: number): boolean {
 	}
 }
 
+function processState(pid: number): string | undefined {
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+		return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+	} catch {
+		return undefined;
+	}
+}
+
 describe("process-lifecycle adversarial owned-process invariants", () => {
 	test("dispose immediately after spawn wins the startup race and returns to baseline", async () => {
 		const before = liveOwnedProcessCount();
@@ -75,7 +87,7 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 			gracefulMs: 10,
 		});
 
-		await expect(owner.dispose()).resolves.toBeUndefined();
+		await expect(owner.dispose()).resolves.toEqual({ status: "terminated" });
 		expect(owner.disposed).toBe(true);
 		const exit = await owner.awaitExit({ timeoutMs: 2_000 });
 		expect(exit.exited).toBe(true);
@@ -88,8 +100,8 @@ describe("process-lifecycle adversarial owned-process invariants", () => {
 		const exit = await owner.awaitExit({ timeoutMs: 2_000 });
 		expect(exit).toEqual({ exited: true, code: 7 });
 
-		await expect(owner.dispose()).resolves.toBeUndefined();
-		await expect(owner.dispose()).resolves.toBeUndefined();
+		await expect(owner.dispose()).resolves.toEqual({ status: "terminated" });
+		await expect(owner.dispose()).resolves.toEqual({ status: "terminated" });
 		expect(owner.disposed).toBe(true);
 		await waitFor(
 			() => liveOwnedProcessCount() === before,
@@ -154,6 +166,7 @@ time.sleep(100)
 				// parent (the helper) never reaps it, so the zombie persists.
 				process.kill(grandchildPid, "SIGKILL");
 				await Bun.sleep(50);
+				await waitFor(() => processState(grandchildPid) === "Z", 2_000, "grandchild zombie state");
 				// Root exits on its own; the only owned member left is the zombie.
 				process.kill(pgid, "SIGKILL");
 
@@ -161,7 +174,8 @@ time.sleep(100)
 				// zombie-blind liveness probe the whole SIGTERM+SIGKILL escalation is
 				// burned waiting for an external reaper (>= gracefulMs).
 				const start = Date.now();
-				await owner.dispose();
+				const teardown = await owner.dispose();
+				expect(teardown).toEqual({ status: "terminated" });
 				const elapsed = Date.now() - start;
 				expect(elapsed).toBeLessThan(800);
 
@@ -191,6 +205,22 @@ time.sleep(100)
 		},
 	);
 
+	test("treats unreadable proc entries as possibly running except for vanished processes", () => {
+		const permissionDenied = new Error("permission denied") as NodeJS.ErrnoException;
+		permissionDenied.code = "EACCES";
+		const vanished = new Error("gone") as NodeJS.ErrnoException;
+		vanished.code = "ENOENT";
+		expect(procEntryMayStillBeRunning(permissionDenied)).toBe(true);
+		expect(procEntryMayStillBeRunning(vanished)).toBe(false);
+	});
+
+	test("refuses a recycled process-group leader", () => {
+		expect(groupLeaderIdentityMatches("100", { kind: "live", startTime: "101", ttyDevice: "0" })).toBe(false);
+		expect(groupLeaderIdentityMatches("100", { kind: "live", startTime: "100", ttyDevice: "0" })).toBe(true);
+		expect(groupLeaderIdentityMatches("100", { kind: "absent" })).toBe(true);
+		expect(groupLeaderIdentityMatches("100", { kind: "unverifiable", reason: "permission_denied" })).toBe(false);
+	});
+
 	test("double and concurrent dispose share one settled result and issue one terminating signal", async () => {
 		const before = liveOwnedProcessCount();
 		const tmp = `/tmp/gjc-process-lifecycle-${process.pid}-${Date.now()}`;
@@ -206,9 +236,9 @@ time.sleep(100)
 			const second = owner.dispose();
 			expect(second).toBe(first);
 			await expect(Promise.all([first, second, owner.dispose()])).resolves.toEqual([
-				undefined,
-				undefined,
-				undefined,
+				{ status: "terminated" },
+				{ status: "terminated" },
+				{ status: "terminated" },
 			]);
 			const exit = await owner.awaitExit({ timeoutMs: 2_000 });
 			expect(exit.exited).toBe(true);
@@ -328,8 +358,8 @@ time.sleep(100)
 			}) as typeof process.kill;
 
 			try {
-				await expect(owner.dispose()).resolves.toBeUndefined();
-				await expect(owner.dispose()).resolves.toBeUndefined();
+				await expect(owner.dispose()).resolves.toEqual({ status: "terminated" });
+				await expect(owner.dispose()).resolves.toEqual({ status: "terminated" });
 				expect(terminatingSignals).toEqual([]);
 				expect(owner.disposed).toBe(true);
 				expect(liveOwnedProcessCount()).toBe(before);

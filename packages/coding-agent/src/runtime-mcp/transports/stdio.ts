@@ -89,10 +89,10 @@ export class StdioTransport implements MCPTransport {
 	 * Start the subprocess and begin reading.
 	 */
 	async connect(): Promise<void> {
-		if (this.#closePromise) {
-			throw new MCPExpectedFailure();
-		}
 		if (this.#connected) return;
+		if (this.#closePromise || this.#process) {
+			throw new MCPExpectedFailure(new Error("MCP stdio child teardown is incomplete"));
+		}
 
 		const args = this.config.args ?? [];
 		const env = this.config.noInheritEnv
@@ -244,7 +244,9 @@ export class StdioTransport implements MCPTransport {
 	}
 
 	#handleClose(failure?: MCPExpectedFailure): void {
-		void this.#closeInternal(true, failure);
+		void this.#closeInternal(true, failure).catch(error => {
+			this.onError?.(error instanceof Error ? error : new Error(String(error)));
+		});
 	}
 
 	async request<T = unknown>(
@@ -374,11 +376,14 @@ export class StdioTransport implements MCPTransport {
 
 		const stdin = this.#getStdin();
 		const process = this.#process;
-		this.#process = null;
 		if (process) {
 			stdin?.end();
-			await process.dispose().catch(() => {});
+			const teardown = await process.dispose();
 			await process.awaitExit({ timeoutMs: CLOSE_WAIT_MS }).catch(() => ({ exited: false, code: null }));
+			if (teardown.status !== "terminated") {
+				throw new MCPExpectedFailure(new Error(`stdio child teardown ${teardown.status}`));
+			}
+			this.#process = null;
 		}
 
 		if (!fromReadLoop && this.#readLoop) {
