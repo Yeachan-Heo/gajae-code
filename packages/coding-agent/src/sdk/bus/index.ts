@@ -3671,7 +3671,9 @@ export function createNotificationsExtension(
 			runtime.notificationRootRegistration = { settings, cwd, registrationToken };
 			return;
 		}
-		void unregisterNotificationRoot({ settings, cwd, sessionId: id, registrationToken }).catch(error =>
+		runtime.notificationRootRegistration = { settings, cwd, registrationToken };
+		cleanupRetries.set(id, runtime);
+		void stopSession(id, "session", runtime).catch(error =>
 			logger.warn(`notifications: late Telegram root unregister failed: ${String(error)}`),
 		);
 	}
