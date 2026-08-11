@@ -388,10 +388,41 @@ function removeResidentCacheTreeNoFollow(pathname: string): void {
 	fs.unlinkSync(pathname);
 }
 
+/**
+ * Disposal-time parent authority is an *identity* contract: the retained descriptor
+ * must still name the same owned directory, so a substituted parent (rename, symlink,
+ * or a foreign directory moved into place) fails closed and keeps disposal retryable.
+ *
+ * It deliberately does not re-assert the parent's owner-only mode. Adoption and every
+ * read/write path already refuse an untrusted (group/other-accessible) cache root, and
+ * the instance directory itself stays fully verified here — owner, mode, `O_NOFOLLOW`
+ * open, and post-rename `dev`/`ino` identity. Requiring owner-only mode on the parent
+ * *at disposal time* would instead turn a widened root into permanent retention of the
+ * predecessor's resident session bytes, which is the leak disposal exists to prevent.
+ */
+function assertResidentCacheDisposalParentIdentity(pathname: string, descriptor: number, uid: number): void {
+	let current: fs.Stats;
+	try {
+		current = fs.lstatSync(pathname);
+	} catch (error) {
+		throw residentCacheTrustError("directory_unverifiable", pathname, error);
+	}
+	if (!current.isDirectory() || current.isSymbolicLink() || current.uid !== uid)
+		throw new ResidentCacheTrustError("directory_untrusted", pathname);
+	let opened: fs.Stats;
+	try {
+		opened = fs.fstatSync(descriptor);
+	} catch (error) {
+		throw residentCacheTrustError("directory_descriptor_unverifiable", pathname, error);
+	}
+	if (!opened.isDirectory() || opened.uid !== uid || !hasSameFilesystemIdentity(current, opened))
+		throw new ResidentCacheTrustError("directory_identity_changed", pathname);
+}
+
 function assertResidentCacheDisposalParent(instanceDir: string, parentDescriptor: number): void {
 	const parentDir = path.dirname(instanceDir);
 	try {
-		assertResidentCacheDirectoryPathMatchesDescriptor(parentDir, parentDescriptor, residentCacheOwnerUid(parentDir));
+		assertResidentCacheDisposalParentIdentity(parentDir, parentDescriptor, residentCacheOwnerUid(parentDir));
 	} catch (error) {
 		throw residentCacheTrustError("parent_authority_changed", instanceDir, error);
 	}
