@@ -413,6 +413,20 @@ export async function processResponsesStream<TApi extends Api>(
 		 * real payload only in that snapshot.
 		 */
 		addedArguments: string;
+		/**
+		 * Set when this entry's tool identity is ambiguous (a duplicate `call_id`,
+		 * an `id`/`call_id` namespace collision, or any other shape where a delta
+		 * cannot be unambiguously attributed). The entry is finalized as
+		 * `incompleteArguments` so the agent loop rejects it instead of executing
+		 * possibly-misattributed arguments.
+		 */
+		ambiguousIdentity: boolean;
+		/**
+		 * Whether this entry has already been finalized by a terminal
+		 * `response.output_item.done`. A duplicate terminal event for the same item
+		 * must not emit a second `toolcall_end`/`text_end`/`thinking_end`.
+		 */
+		finalized: boolean;
 	}
 	// Per-item argument buffer keyed on stable item identity. Multiple tool-call
 	// items can stream interleaved argument deltas in one response, so a single
@@ -437,8 +451,17 @@ export async function processResponsesStream<TApi extends Api>(
 	): ItemEntry | undefined => {
 		if (itemId) {
 			const byId = items.get(idKey(itemId));
-			if (byId) return byId;
 			const byCallId = items.get(callKey(itemId));
+			// Ambiguous identity: `item_id` matches one entry as its canonical id and
+			// a *different* entry as its `call_id` (an id/call_id namespace collision).
+			// Picking either silently mis-attributes the payload, so mark both
+			// ambiguous and drop the delta instead of resolving.
+			if (byId && byCallId && byId !== byCallId) {
+				byId.ambiguousIdentity = true;
+				byCallId.ambiguousIdentity = true;
+				return undefined;
+			}
+			if (byId) return byId;
 			if (byCallId) return byCallId;
 		}
 		if (hasIndex(outputIndex)) {
@@ -460,15 +483,45 @@ export async function processResponsesStream<TApi extends Api>(
 			rawBuffer: "",
 			summaryStarted: false,
 			addedArguments: item.type === "function_call" ? (item.arguments ?? "") : "",
+			ambiguousIdentity: false,
+			finalized: false,
 		};
 		// Primary key prefers the stable item id; if the wire omits it, fall back to
 		// the positional index. A synthetic key keeps the entry addressable as lastKey
 		// for continuation-style non-tool events even when neither is present.
 		const key = item.id ? idKey(item.id) : hasIndex(outputIndex) ? idxKey(outputIndex) : `seq:${items.size}`;
 		items.set(key, entry);
-		if (item.id && hasIndex(outputIndex)) items.set(idxKey(outputIndex), entry);
+		// Index alias: only claim it when no other entry already holds it. Two items
+		// sharing one `output_index` (a relay defect) must not have the second steal
+		// the alias and drop the first's index-routed deltas; each stays addressable
+		// by its own stable id/call_id, and the index keeps resolving to the first
+		// occupant rather than silently reassigning.
+		if (hasIndex(outputIndex)) {
+			const idxK = idxKey(outputIndex);
+			if (!items.has(idxK)) items.set(idxK, entry);
+		}
 		if ((item.type === "function_call" || item.type === "custom_tool_call") && item.call_id) {
-			items.set(callKey(item.call_id), entry);
+			const callK = callKey(item.call_id);
+			const existing = items.get(callK);
+			// Duplicate `call_id` in one response: two distinct items claim the same
+			// alias. Fail closed for both — neither's arguments can be trusted to
+			// belong to the right call once their deltas and terminals are aliased.
+			if (existing && existing !== entry) {
+				existing.ambiguousIdentity = true;
+				entry.ambiguousIdentity = true;
+			} else if (!existing) {
+				items.set(callK, entry);
+			}
+		}
+		// Detect an id/call_id collision at registration too: a new item whose id
+		// equals another item's call_id (or vice versa) makes id-based resolution
+		// ambiguous for any delta keyed on that shared string.
+		if (item.id) {
+			const callAliasOfOther = items.get(callKey(item.id));
+			if (callAliasOfOther && callAliasOfOther !== entry) {
+				callAliasOfOther.ambiguousIdentity = true;
+				entry.ambiguousIdentity = true;
+			}
 		}
 		lastKey = key;
 		return entry;
@@ -479,6 +532,7 @@ export async function processResponsesStream<TApi extends Api>(
 			(callId ? items.get(callKey(callId)) : undefined) ??
 			(hasIndex(outputIndex) ? items.get(idxKey(outputIndex)) : undefined);
 		if (!entry) return;
+		entry.finalized = true;
 		for (const [key, candidate] of items) {
 			if (candidate !== entry) continue;
 			items.delete(key);
@@ -675,6 +729,14 @@ export async function processResponsesStream<TApi extends Api>(
 			const entry =
 				resolveEntry(item.id, event.output_index, "never") ??
 				(isToolItem && item.call_id ? resolveEntry(item.call_id, event.output_index, "never") : undefined);
+			// A duplicate terminal event for an item already finalized (dropped) must
+			// not emit a second end event. After finalization the entry is gone from
+			// the map, so a second `output_item.done` for the same tool item resolves
+			// to no live entry — skip it rather than re-emitting.
+			// An orphan terminal event (no preceding `output_item.added`, so no live
+			// entry) for a tool item must not synthesize a phantom block at a stale
+			// content index. Only finalize tool items that resolved to a live entry.
+			if (isToolItem && !entry) continue;
 			if (item.type === "reasoning") {
 				// Prefer the streamed summary buffer only when it carries real text. When it
 				// holds only synthetic separators (e.g. a part.done arrived before/without any
@@ -787,22 +849,40 @@ export async function processResponsesStream<TApi extends Api>(
 						: parseStreamingJson(rawArguments);
 				// Function-call arguments must decode to a JSON object; `null`, arrays and
 				// scalars cannot be dispatched against a tool schema, so they fail closed
-				// instead of reaching validation as a non-record value.
-				const incompleteArguments = !isJsonRecord(decodedArguments);
+				// instead of reaching validation as a non-record value. An ambiguous
+				// tool-call identity (duplicate call_id, id/call_id collision) also fails
+				// closed: attribution of the streamed/terminal payload is unsafe.
+				const ambiguousIdentity = entry?.ambiguousIdentity ?? false;
+				const incompleteArguments = ambiguousIdentity || !isJsonRecord(decodedArguments);
 				const args = incompleteArguments ? {} : (decodedArguments as Record<string, unknown>);
+				// Typed reason lets the agent loop give accurate recovery guidance instead
+				// of always suggesting "split the work" (truncation-only) for a malformed
+				// or conflicting terminal payload, or an ambiguous identity.
+				const incompleteArgumentsReason: "malformed" | "conflicting" | "ambiguous" | undefined = incompleteArguments
+					? ambiguousIdentity
+						? "ambiguous"
+						: conflictingArgumentSources
+							? "conflicting"
+							: "malformed"
+					: undefined;
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
 					name: item.name,
 					arguments: args,
-					...(incompleteArguments ? { incompleteArguments: true } : {}),
+					...(incompleteArguments ? { incompleteArguments: true, incompleteArgumentsReason } : {}),
 				};
 				if (entry?.block.type === "toolCall") {
 					entry.block.id = toolCall.id;
 					entry.block.name = toolCall.name;
 					entry.block.arguments = args;
-					if (incompleteArguments) entry.block.incompleteArguments = true;
-					else delete entry.block.incompleteArguments;
+					if (incompleteArguments) {
+						entry.block.incompleteArguments = true;
+						entry.block.incompleteArgumentsReason = incompleteArgumentsReason;
+					} else {
+						delete entry.block.incompleteArguments;
+						delete entry.block.incompleteArgumentsReason;
+					}
 				}
 				const contentIndex = entry?.blockContentIndex ?? output.content.length - 1;
 				dropEntry(item.id, event.output_index, item.call_id);
@@ -918,13 +998,17 @@ export function flagTruncatedToolCalls(
 		if (block.type !== "toolCall") continue;
 		if (!isFinalized(block)) {
 			block.incompleteArguments = true;
+			block.incompleteArgumentsReason = "truncated";
 			continue;
 		}
 		// Finalized: custom tools carry raw (non-JSON) input and are complete once
 		// finalized; only JSON function calls get the parse double-check.
 		if (!block.customWireName) {
 			const partial = (block as { partialJson?: string }).partialJson;
-			if (partial !== undefined && !isCompleteJson(partial)) block.incompleteArguments = true;
+			if (partial !== undefined && !isCompleteJson(partial)) {
+				block.incompleteArguments = true;
+				block.incompleteArgumentsReason = "truncated";
+			}
 		}
 	}
 }

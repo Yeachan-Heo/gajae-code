@@ -591,7 +591,10 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 						for (const block of output.content) {
 							if (block.type !== "toolCall") continue;
 							const partialJson = (block as InternalToolCallBlock).partialJson;
-							if (partialJson !== undefined && !isCompleteJson(partialJson)) block.incompleteArguments = true;
+							if (partialJson !== undefined && !isCompleteJson(partialJson)) {
+								block.incompleteArguments = true;
+								block.incompleteArgumentsReason = "truncated";
+							}
 						}
 					}
 					for (const index of activeToolIndices) {

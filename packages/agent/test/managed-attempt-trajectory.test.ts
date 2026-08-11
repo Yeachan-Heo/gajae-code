@@ -65,6 +65,7 @@ describe("managed attempt trajectory", () => {
 			name: "write_file",
 			arguments: { path: "a.ts" },
 			incompleteArguments: true,
+			incompleteArgumentsReason: "truncated",
 		});
 		expect(executed).toHaveLength(0);
 		expect(toolResults).toHaveLength(1);

@@ -1020,6 +1020,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				const partial = (currentBlock as { partialArgs?: string }).partialArgs;
 				if (partial !== undefined && !isCompleteJson(partial)) {
 					currentBlock.incompleteArguments = true;
+					currentBlock.incompleteArgumentsReason = "truncated";
 				}
 			}
 

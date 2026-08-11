@@ -1560,6 +1560,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					if (orphaned.type === "toolCall") {
 						if (!isCompleteJson(orphaned.partialJson)) {
 							orphaned.incompleteArguments = true;
+							orphaned.incompleteArgumentsReason = "truncated";
 							truncatedToolCalls.add(orphaned);
 						}
 						if (orphaned.partialJson.trim()) {
@@ -2149,6 +2150,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				for (const block of output.content) {
 					if (block.type === "toolCall" && truncatedToolCalls.has(block)) {
 						block.incompleteArguments = true;
+						block.incompleteArgumentsReason = "truncated";
 					}
 				}
 			}
