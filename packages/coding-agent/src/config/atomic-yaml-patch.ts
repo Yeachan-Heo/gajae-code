@@ -776,7 +776,16 @@ async function writeAtomicYaml(
 							`.${path.basename(configPath)}.${process.pid}.${nodeCrypto.randomUUID()}.restore.tmp`,
 						);
 						try {
-							await fs.writeFile(restoreTemp, expectedState.raw, { mode: 0o600 });
+							// Create the restore staging file with PRIVATE permissions from
+							// the outset (same wx + 0o600 pattern as the main temp path):
+							// a directory watcher must never observe the previous
+							// configuration at mode 0644 before a post-write chmod.
+							const restoreHandle = await fs.open(restoreTemp, "wx", 0o600);
+							try {
+								await restoreHandle.writeFile(expectedState.raw, "utf8");
+							} finally {
+								await restoreHandle.close();
+							}
 							const restoreIdentity = await captureExactFileIdentity(restoreTemp);
 							if (restoreIdentity === null) {
 								throw new Error("staged restore disappeared");
