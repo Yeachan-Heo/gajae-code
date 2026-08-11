@@ -15,7 +15,14 @@ import type {
 } from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
 import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage, Message, Model, ServiceTier } from "@gajae-code/ai/core";
+import {
+	type AssistantMessage,
+	isFastModeEffectiveForProvider,
+	type Message,
+	type Model,
+	modelSupportsServiceTier,
+	type ServiceTier,
+} from "@gajae-code/ai/core";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
@@ -248,14 +255,11 @@ export interface ExecutorOptions {
 	/** Parent session's registry; shared by child sessions for IRC routing and roster visibility. */
 	agentRegistry?: AgentRegistry;
 	/**
-	 * Live service-tier intent of the parent session (`AgentSession.serviceTier`),
-	 * used as the inherited tier when `task.serviceTier === "inherit"`. Passing the
-	 * live value (not the stale settings snapshot) lets a runtime `/fast on` reach
-	 * subagents, and a main-model fast-mode auto-disable does not clobber it.
+	 * Parent service-tier intent captured when the child is spawned. Used when
+	 * `task.serviceTier === "inherit"` so request serialization and reporting use
+	 * the same immutable child settings snapshot.
 	 */
 	inheritedServiceTier?: ServiceTier;
-	/** Resolve whether the effective subagent tier grants fast mode for the selected provider. */
-	isFastForSubagentProvider?: (provider?: string) => boolean;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -865,6 +869,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const settings = options.settings ?? Settings.isolated();
 	const subagentSettings = createSubagentSettings(settings, options.inheritedServiceTier);
+	const configuredSubagentServiceTier = subagentSettings.get("serviceTier");
+	const subagentServiceTier = configuredSubagentServiceTier === "none" ? undefined : configuredSubagentServiceTier;
+	const isFastForModel = (candidate: Model | undefined): boolean =>
+		candidate !== undefined &&
+		isFastModeEffectiveForProvider(subagentServiceTier, candidate.provider, modelSupportsServiceTier(candidate));
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	const maxRuntimeMs = Math.max(0, Math.trunc(Number(settings.get("task.maxRuntimeMs") ?? 0) || 0));
 	const parentDepth = options.taskDepth ?? 0;
@@ -1533,7 +1542,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				resolvedModelString = formatModelString(model);
 				activeProviderModelString = resolvedModelString;
 			}
-			progress.fastMode = model ? (options.isFastForSubagentProvider?.(model.provider) ?? false) : false;
+			progress.fastMode = isFastForModel(model);
 			if (authFallbackUsed && model && requestedModel) {
 				modelSubstitutionWarning = {
 					requested: formatModelString(requestedModel),
@@ -1954,6 +1963,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 				if (event.type === "model_fallback_switched") {
 					activeProviderModelString = event.to;
+					progress.fastMode = isFastForModel(session.model);
+					AsyncJobManager.instance()?.updateSubagentModel?.(options.subagentId ?? id, {
+						requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
+						effectiveModel: event.to,
+						modelFellBack: true,
+						fastMode: progress.fastMode,
+					});
+					scheduleProgress(true);
 					forwardSubagentEvent(event);
 					return;
 				}

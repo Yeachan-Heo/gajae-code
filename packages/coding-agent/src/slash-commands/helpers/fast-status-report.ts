@@ -1,4 +1,4 @@
-import type { Model } from "@gajae-code/ai/core";
+import { type Model, modelSupportsServiceTier, modelsAreEqual } from "@gajae-code/ai/core";
 
 /**
  * A single line in the `/fast status` report: a labelled model and whether fast
@@ -55,7 +55,7 @@ export function formatFastStatusReport(args: FormatFastStatusReportArgs): string
 export interface FastStatusSessionLike {
 	readonly model?: Model;
 	/** Fast predicate against the main session tier (current model + `modelRoles`). */
-	isFastForProvider(provider?: string): boolean;
+	isFastForProvider(provider?: string, supportsServiceTier?: boolean): boolean;
 	/**
 	 * Current-model EFFECTIVE fast state (intent minus any provider auto-disable).
 	 * Used for the current-model row so it matches what the next request does.
@@ -63,8 +63,13 @@ export interface FastStatusSessionLike {
 	 */
 	isFastModeActive?(): boolean;
 	/** Fast predicate against the effective subagent tier (`task.agentModelOverrides` roles). */
-	isFastForSubagentProvider(provider?: string): boolean;
+	isFastForSubagentProvider(provider?: string, supportsServiceTier?: boolean): boolean;
 	resolveRoleModelWithThinking(role: string): { model?: Model };
+	/** Runtime fallback position for the configured DEFAULT chain. */
+	getDefaultFallbackRuntimeState?(): {
+		chain: { entries: readonly string[] };
+		controller: { activeIndex: number };
+	};
 }
 
 /** A role to enumerate in the report, with the tier source its subagent runs under. */
@@ -106,15 +111,26 @@ export function buildFastStatusReport(args: BuildFastStatusReportArgs): string {
 	// on pure intent. Fall back to intent when a fake omits `isFastModeActive`.
 	const currentFast = session.isFastModeActive
 		? session.isFastModeActive()
-		: session.isFastForProvider(session.model?.provider);
+		: session.isFastForProvider(session.model?.provider, modelSupportsServiceTier(session.model));
 	const rows: FastStatusRow[] = [{ label: "현재 모델", model: session.model, fast: currentFast }];
 	for (const target of roleTargets) {
 		const resolved = session.resolveRoleModelWithThinking(target.id);
-		if (resolved.model) {
+		const fallbackState = target.id === "default" ? session.getDefaultFallbackRuntimeState?.() : undefined;
+		const activeDefaultFallback =
+			fallbackState !== undefined &&
+			fallbackState.chain.entries.length > 1 &&
+			fallbackState.controller.activeIndex > 0 &&
+			fallbackState.controller.activeIndex < fallbackState.chain.entries.length;
+		const rowModel = activeDefaultFallback && session.model ? session.model : resolved.model;
+		if (rowModel) {
+			const supportsServiceTier = modelSupportsServiceTier(rowModel);
+			const isCurrentModel = session.model !== undefined && modelsAreEqual(session.model, rowModel);
 			const fast = target.isSubagentRole
-				? session.isFastForSubagentProvider(resolved.model.provider)
-				: session.isFastForProvider(resolved.model.provider);
-			rows.push({ label: target.label, model: resolved.model, fast });
+				? session.isFastForSubagentProvider(rowModel.provider, supportsServiceTier)
+				: isCurrentModel
+					? currentFast
+					: session.isFastForProvider(rowModel.provider, supportsServiceTier);
+			rows.push({ label: target.label, model: rowModel, fast });
 		}
 	}
 	return formatFastStatusReport({ rows, iconFast, formatInactive });

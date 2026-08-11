@@ -2590,8 +2590,10 @@ export class SelectorController {
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
 					activeModelProfile:
 						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-					isFastForProvider: provider => this.ctx.session.isFastForProvider(provider),
-					isFastForSubagentProvider: provider => this.ctx.session.isFastForSubagentProvider(provider),
+					isFastForProvider: (provider, supportsServiceTier) =>
+						this.ctx.session.isFastForProvider(provider, supportsServiceTier),
+					isFastForSubagentProvider: (provider, supportsServiceTier) =>
+						this.ctx.session.isFastForSubagentProvider(provider, supportsServiceTier),
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
 				},
 			);

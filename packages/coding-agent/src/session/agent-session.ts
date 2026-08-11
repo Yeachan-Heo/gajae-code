@@ -107,9 +107,10 @@ import {
 	classifyContextOverflow,
 	getSupportedEfforts,
 	isContextOverflow,
+	isFastModeEffectiveForProvider,
 	isUsageLimitError,
+	modelSupportsServiceTier,
 	modelsAreEqual,
-	resolveServiceTier,
 	streamSimple,
 } from "@gajae-code/ai/core";
 import {
@@ -12198,17 +12199,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * True when the configured `serviceTier` resolves to `"priority"` for the
-	 * given model `provider`. Returns false for scoped tiers that don't match
-	 * (e.g. `"openai-only"` on an anthropic provider) and when `provider` is
-	 * undefined. This is the canonical provider-aware fast-mode predicate.
+	 * True when the configured tier is realized as a fast-mode field on the
+	 * provider's wire protocol. Providers that silently drop unscoped priority
+	 * intent return false so UI indicators match the request that is sent.
 	 */
-	isFastForProvider(provider?: string): boolean {
-		// Fast mode applies to a concrete model's provider. With no provider
-		// (no model selected) it cannot apply, even under an unscoped `priority`
-		// tier that `resolveServiceTier` would otherwise pass through.
-		if (provider === undefined) return false;
-		return resolveServiceTier(this.serviceTier, provider) === "priority";
+	isFastForProvider(provider?: string, supportsServiceTier = false): boolean {
+		return isFastModeEffectiveForProvider(this.serviceTier, provider, supportsServiceTier);
 	}
 
 	/**
@@ -12225,14 +12221,11 @@ export class AgentSession {
 	}
 
 	/**
-	 * Provider-aware fast-mode predicate for task-tool subagent roles, evaluated
-	 * against the effective subagent tier (`task.serviceTier`) rather than the
-	 * main session tier. Use this for `task.agentModelOverrides` role rows so the
-	 * ⚡ glyph reflects the tier the subagent actually runs under.
+	 * Wire-effective fast-mode predicate for task-tool subagent roles, evaluated
+	 * against `task.serviceTier` rather than the main session tier.
 	 */
-	isFastForSubagentProvider(provider?: string): boolean {
-		if (provider === undefined) return false;
-		return resolveServiceTier(this.#subagentServiceTier(), provider) === "priority";
+	isFastForSubagentProvider(provider?: string, supportsServiceTier = false): boolean {
+		return isFastModeEffectiveForProvider(this.#subagentServiceTier(), provider, supportsServiceTier);
 	}
 
 	/**
@@ -12288,7 +12281,10 @@ export class AgentSession {
 	 */
 	isFastModeActive(): boolean {
 		const provider = this.model?.provider;
-		return this.isFastForProvider(provider) && !this.#isFastModeAutoDisabledForProvider(provider);
+		const supportsServiceTier = modelSupportsServiceTier(this.model);
+		return (
+			this.isFastForProvider(provider, supportsServiceTier) && !this.#isFastModeAutoDisabledForProvider(provider)
+		);
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {

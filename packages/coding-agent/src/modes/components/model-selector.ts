@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { getSupportedEfforts, type Model, modelsAreEqual } from "@gajae-code/ai/core";
+import { getSupportedEfforts, type Model, modelSupportsServiceTier, modelsAreEqual } from "@gajae-code/ai/core";
 import {
 	Container,
 	fuzzyFilter,
@@ -369,8 +369,8 @@ export class ModelSelectorComponent extends Container {
 	#currentThinkingLevel?: ThinkingLevel;
 	#activeModelProfile?: string;
 	#configuredDefaultChain?: readonly string[];
-	#isFastForProvider: (provider?: string) => boolean = () => false;
-	#isFastForSubagentProvider: (provider?: string) => boolean = () => false;
+	#isFastForProvider: (provider?: string, supportsServiceTier?: boolean) => boolean = () => false;
+	#isFastForSubagentProvider: (provider?: string, supportsServiceTier?: boolean) => boolean = () => false;
 	#isCurrentModelFastModeActive: () => boolean = () => false;
 	#pendingActionItem?: ModelItem | CanonicalModelItem;
 	#selectedActionIndex: number = 0;
@@ -408,8 +408,8 @@ export class ModelSelectorComponent extends Container {
 			temporaryOnly?: boolean;
 			initialSearchInput?: string;
 			sessionId?: string;
-			isFastForProvider?: (provider?: string) => boolean;
-			isFastForSubagentProvider?: (provider?: string) => boolean;
+			isFastForProvider?: (provider?: string, supportsServiceTier?: boolean) => boolean;
+			isFastForSubagentProvider?: (provider?: string, supportsServiceTier?: boolean) => boolean;
 			isCurrentModelFastModeActive?: () => boolean;
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
@@ -437,7 +437,10 @@ export class ModelSelectorComponent extends Container {
 		// session's effective predicate so an auto-disabled provider shows no glyph.
 		this.#isCurrentModelFastModeActive =
 			options?.isCurrentModelFastModeActive ??
-			(() => (this.#currentModel ? this.#isFastForProvider(this.#currentModel.provider) : false));
+			(() =>
+				this.#currentModel
+					? this.#isFastForProvider(this.#currentModel.provider, modelSupportsServiceTier(this.#currentModel))
+					: false);
 		const initialSearchInput = options?.initialSearchInput;
 		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
 
@@ -1703,11 +1706,12 @@ export class ModelSelectorComponent extends Container {
 					// other modelRoles rows show pure intent.
 					const isSubagentRole = roleInfo.settingsPath === "task.agentModelOverrides";
 					const isCurrentRow = this.#currentModel !== undefined && modelsAreEqual(this.#currentModel, item.model);
+					const supportsServiceTier = modelSupportsServiceTier(assigned.model);
 					const roleFast = isSubagentRole
-						? this.#isFastForSubagentProvider(assigned.model.provider)
+						? this.#isFastForSubagentProvider(assigned.model.provider, supportsServiceTier)
 						: isCurrentRow
 							? this.#isCurrentModelFastModeActive()
-							: this.#isFastForProvider(assigned.model.provider);
+							: this.#isFastForProvider(assigned.model.provider, supportsServiceTier);
 					if (roleFast && isCurrentRow && !isSubagentRole) {
 						currentModelEffectiveGlyphRendered = true;
 					}

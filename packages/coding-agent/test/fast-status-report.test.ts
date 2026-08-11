@@ -118,6 +118,7 @@ describe("buildFastStatusReport", () => {
 		subagentFastProviders?: string[];
 		/** When set, drives `isFastModeActive()` (current-model EFFECTIVE state). */
 		currentEffectiveFast?: boolean;
+		activeDefaultFallback?: boolean;
 	}): FastStatusSessionLike {
 		const subagentFastProviders = args.subagentFastProviders ?? args.fastProviders;
 		return {
@@ -127,6 +128,12 @@ describe("buildFastStatusReport", () => {
 			isFastModeActive:
 				args.currentEffectiveFast === undefined ? undefined : () => args.currentEffectiveFast === true,
 			resolveRoleModelWithThinking: role => ({ model: args.roles[role] }),
+			getDefaultFallbackRuntimeState: args.activeDefaultFallback
+				? () => ({
+						chain: { entries: ["openai/gpt-5", "anthropic/claude-sonnet-4-5"] },
+						controller: { activeIndex: 1 },
+					})
+				: undefined,
 		};
 	}
 
@@ -149,6 +156,43 @@ describe("buildFastStatusReport", () => {
 		expect(report).toContain(`EXECUTOR: openai/gpt-5 ${FAST_STATUS_OFF}`);
 		// ARCHITECT is unassigned -> skipped entirely.
 		expect(report).not.toContain("ARCHITECT");
+	});
+
+	test("uses current effective state for a default role resolved to the current model", () => {
+		const currentModel = model("anthropic", "claude-sonnet-4-5");
+		const report = buildFastStatusReport({
+			session: fakeSession({
+				model: currentModel,
+				roles: { default: currentModel },
+				fastProviders: ["anthropic"],
+				currentEffectiveFast: false,
+			}),
+			roleTargets: [{ id: "default", label: "DEFAULT", isSubagentRole: false }],
+			iconFast: ICON,
+		});
+
+		expect(report).toContain(`현재 모델: anthropic/claude-sonnet-4-5 ${FAST_STATUS_OFF}`);
+		expect(report).toContain(`DEFAULT: anthropic/claude-sonnet-4-5 ${FAST_STATUS_OFF}`);
+		expect(report).not.toContain(ICON);
+	});
+
+	test("renders the active fallback model as the default row", () => {
+		const currentModel = model("anthropic", "claude-sonnet-4-5");
+		const report = buildFastStatusReport({
+			session: fakeSession({
+				model: currentModel,
+				roles: { default: model("openai", "gpt-5") },
+				fastProviders: ["anthropic"],
+				currentEffectiveFast: true,
+				activeDefaultFallback: true,
+			}),
+			roleTargets: [{ id: "default", label: "DEFAULT", isSubagentRole: false }],
+			iconFast: ICON,
+		});
+
+		expect(report).toContain(`현재 모델: anthropic/claude-sonnet-4-5 ${ICON}`);
+		expect(report).toContain(`DEFAULT: anthropic/claude-sonnet-4-5 ${ICON}`);
+		expect(report).not.toContain("DEFAULT: openai/gpt-5");
 	});
 
 	test("renders the active row off when no model is selected", () => {

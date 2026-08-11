@@ -228,6 +228,64 @@ describe("runSubprocess yield reminders", () => {
 		]);
 	});
 
+	it("refreshes Fast state when the active fallback model changes", async () => {
+		const primaryModel = {
+			...model,
+			provider: "custom-proxy",
+			id: "gpt-5.6-sol",
+			compat: { supportsServiceTier: true },
+		} as Model;
+		const fallbackModel = {
+			...model,
+			provider: "openrouter",
+			id: "openai/gpt-5.6-sol",
+		} as Model;
+		const session = createMockSession(
+			({ emit }) => {
+				(session as unknown as { model: Model }).model = fallbackModel;
+				emit({
+					type: "model_fallback_switched",
+					eventId: "fallback-fast-state",
+					from: "custom-proxy/gpt-5.6-sol",
+					to: "openrouter/openai/gpt-5.6-sol",
+					reason: "rate_limit",
+					role: "executor",
+					scope: "subagent",
+					activeIndex: 1,
+					chainLength: 2,
+					attemptsUsed: 1,
+				});
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-fallback-fast-state",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { ok: true } },
+					},
+					isError: false,
+				});
+			},
+			{ model: primaryModel },
+		);
+		mockCreateAgentSession(session);
+		const fallbackRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [primaryModel, fallbackModel],
+			getApiKey: async () => "sk-test",
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-fast-state",
+			modelOverride: "custom-proxy/gpt-5.6-sol",
+			modelRegistry: fallbackRegistry,
+			inheritedServiceTier: "priority",
+		});
+
+		expect(result.fastMode).toBe(false);
+	});
+
 	it("publishes the persisted session file for observer lifecycle and progress events", async () => {
 		const sessionFile = "/tmp/subagent-observer.jsonl";
 		const lifecycleEvents: SubagentLifecyclePayload[] = [];
@@ -1221,7 +1279,6 @@ describe("runSubprocess yield reminders", () => {
 			],
 			getApiKey: async (model: { id: string }) => (model.id === "gpt-5.5" ? "sk-test" : undefined),
 		} as unknown as import("../../src/config/model-registry").ModelRegistry;
-		const isFastForSubagentProvider = vi.fn((provider?: string) => provider === "openai-codex");
 
 		const result = await runSubprocess({
 			...baseOptions,
@@ -1229,7 +1286,7 @@ describe("runSubprocess yield reminders", () => {
 			modelOverride: "openai-codex/gpt-5.3-codex:high",
 			parentActiveModelPattern: "openai-codex/gpt-5.5",
 			modelRegistry,
-			isFastForSubagentProvider,
+			inheritedServiceTier: "priority",
 		});
 
 		expect(result.modelSubstitutionWarning).toEqual({
@@ -1237,7 +1294,6 @@ describe("runSubprocess yield reminders", () => {
 			effective: "openai-codex/gpt-5.5",
 			reason: "auth_unavailable",
 		});
-		expect(isFastForSubagentProvider).toHaveBeenCalledWith("openai-codex");
 		expect(result.fastMode).toBe(true);
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.model?.id).toBe("gpt-5.5");
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.modelSubstitution).toMatchObject({
@@ -1245,6 +1301,51 @@ describe("runSubprocess yield reminders", () => {
 			requestedModel: { provider: "openai-codex", id: "gpt-5.3-codex" },
 		});
 		expect(sessionModelChanges).toEqual([]);
+	});
+
+	it("reports Fast for an opted-in custom provider using the child tier snapshot", async () => {
+		vi.clearAllMocks();
+		const customModel = {
+			provider: "custom-proxy",
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-responses",
+			baseUrl: "https://proxy.example/v1",
+			contextWindow: 400_000,
+			maxTokens: 32_000,
+			compat: { supportsServiceTier: true },
+		} as Model;
+		const session = createMockSession(
+			({ emit }) => {
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-custom-fast",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { ok: true } },
+					},
+					isError: false,
+				});
+			},
+			{ model: customModel },
+		);
+		mockCreateAgentSession(session);
+		const customRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [customModel],
+			getApiKey: async () => "sk-test",
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-custom-fast",
+			modelOverride: "custom-proxy/gpt-5.6-sol",
+			modelRegistry: customRegistry,
+			inheritedServiceTier: "priority",
+		});
+
+		expect(result.fastMode).toBe(true);
 	});
 
 	it("surfaces server-side assistant model substitution evidence", async () => {

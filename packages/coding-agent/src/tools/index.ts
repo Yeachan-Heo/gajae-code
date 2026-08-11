@@ -282,7 +282,7 @@ export interface ToolSession {
 	/** Live service-tier intent of the parent session, inherited by `inherit` subagents. */
 	serviceTier?: ServiceTier;
 	/** Whether the effective subagent tier grants fast mode for a resolved provider. */
-	isFastForSubagentProvider?: (provider?: string) => boolean;
+	isFastForSubagentProvider?: (provider?: string, supportsServiceTier?: boolean) => boolean;
 	/** Plan mode state (if active) */
 	getPlanModeState?: () => PlanModeState | undefined;
 	/** Goal mode state (if active or paused) */

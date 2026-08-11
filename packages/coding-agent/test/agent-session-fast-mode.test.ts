@@ -52,12 +52,15 @@ describe("AgentSession fast-mode predicate", () => {
 		tempDir.removeSync();
 	});
 
-	it("returns false for an undefined provider even under an unscoped priority tier", () => {
+	it("shows fast only for providers that realize priority on the wire", () => {
 		session.setServiceTier("priority");
-		// Unscoped priority applies to a concrete provider...
 		expect(session.isFastForProvider("anthropic")).toBe(true);
 		expect(session.isFastForProvider("openai")).toBe(true);
-		// ...but never when there is no provider (no model selected).
+		expect(session.isFastForProvider("deepinfra")).toBe(true);
+		expect(session.isFastForProvider("openrouter")).toBe(false);
+		expect(session.isFastForProvider("google")).toBe(false);
+		expect(session.isFastForProvider("custom-proxy")).toBe(false);
+		expect(session.isFastForProvider("custom-proxy", true)).toBe(true);
 		expect(session.isFastForProvider(undefined)).toBe(false);
 	});
 
