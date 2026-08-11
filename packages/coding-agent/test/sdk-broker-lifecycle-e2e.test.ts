@@ -2850,11 +2850,16 @@ test("broker closes a live host whose workspace state root is gone using its reg
 		const closed = await broker.handleRequest("session.close", { sessionId: "orphan" }, "orphan-close");
 		expect(closed).toMatchObject({ ok: true, result: { sessionId: "orphan" } });
 		expect(await child.exited).toBe(143);
-		// The killed host never withdrew its own registration, so the broker owes the
-		// index that retirement; leaving it open would keep advertising a dead session.
+		// The killed host never withdrew its registration, so the broker records terminal
+		// retirement while retaining the credential-free row for stopped-session inspection.
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
-			result: { sessions: [expect.objectContaining({ sessionId: "wrong-incarnation" })] },
+			result: {
+				sessions: expect.arrayContaining([
+					expect.objectContaining({ sessionId: "wrong-incarnation" }),
+					expect.objectContaining({ sessionId: "orphan", live: false, terminal: true }),
+				]),
+			},
 		});
 	} finally {
 		if (child.exitCode === null) child.kill("SIGKILL");

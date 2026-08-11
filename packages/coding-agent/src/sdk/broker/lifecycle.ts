@@ -3038,27 +3038,22 @@ function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & 
 	);
 }
 
-function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
-	return (
-		current.live &&
-		current.endpointGeneration === expected.endpointGeneration &&
-		current.pid === expected.pid &&
-		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
-		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
-	);
-}
-
 async function revalidateCloseGeneration(
 	broker: Broker,
 	id: string,
 	expected: CloseRecord,
 	authority: CloseAuthority | undefined,
+	allowUnreachable = false,
 ): Promise<BrokerResponse | undefined> {
 	await broker.index.refresh();
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	return current &&
-		sameCloseGeneration(expected, current) &&
+		(allowUnreachable || current.live) &&
+		current.endpointGeneration === expected.endpointGeneration &&
+		current.pid === expected.pid &&
+		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot) &&
 		(!authority || sameCloseAuthority(authority, current, id))
 		? undefined
 		: fail("endpoint_stale", "session endpoint is stale");
@@ -3469,9 +3464,13 @@ async function executeLifecycleResponse(
 			}
 		}
 		if (!endpointResult.ok) {
-			if (endpointResult.error.code === "endpoint_stale") return endpointResult;
-			if (endpointResult.error.code !== "resource_gone") return endpointResult;
-			usedSignalFallback = true;
+			if (endpointResult.error.code === "endpoint_stale") {
+				if (requestedAuthority.authority) return endpointResult;
+				usedSignalFallback = true;
+			} else {
+				if (endpointResult.error.code !== "resource_gone") return endpointResult;
+				usedSignalFallback = true;
+			}
 		} else {
 			const endpoint = closeEndpoint(endpointResult.result);
 			if (!endpoint) return fail("close_refused", "Session endpoint is malformed.");
@@ -3512,7 +3511,7 @@ async function executeLifecycleResponse(
 		}
 
 		if (usedSignalFallback) {
-			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
+			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority, true);
 			if (stale) return stale;
 			if (!(await signalVerifiedSession(record, id, "SIGTERM")))
 				return fail(

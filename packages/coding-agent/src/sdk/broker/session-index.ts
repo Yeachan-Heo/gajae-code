@@ -148,8 +148,9 @@ export const DEFAULT_SESSION_RETENTION_MAX_ROWS = 25_000;
 /** Identity tuple: (sessionId, generation, stateRoot). Registration authority is per tuple. */
 const tupleKey = (event: SessionIndexEvent) =>
 	`${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.locator.stateRoot}`;
-/** Composite identity (C1): (sessionId, generation, hostIncarnation, stateRoot). */
-const identityKey = (event: SessionIndexEvent) => `${tupleKey(event)}\u0000${event.hostIncarnation ?? ""}`;
+/** Composite identity (C1): (sessionId, generation, process incarnation, stateRoot). */
+const effectiveIncarnation = (event: SessionIndexEvent) => event.hostIncarnation ?? event.processIncarnation;
+const identityKey = (event: SessionIndexEvent) => `${tupleKey(event)}\u0000${effectiveIncarnation(event) ?? ""}`;
 
 interface ResolvedRetentionPolicy {
 	clock: () => number;
@@ -325,22 +326,21 @@ function reduceEvents(events: SessionIndexEvent[], now: number): IndexedSession[
 		const heartbeat = latestHeartbeatByIdentity.get(chosen.identity);
 		const pidAlive = alive(latest.pid);
 		const heartbeatFresh = heartbeat !== undefined && now - heartbeat.ts < 2 * SESSION_HEARTBEAT_INTERVAL_MS;
-		const currentIncarnation = latest.hostIncarnation === undefined ? undefined : processIncarnation(latest.pid);
-		const incarnationMatches =
-			latest.hostIncarnation !== undefined &&
-			currentIncarnation !== undefined &&
-			currentIncarnation === latest.hostIncarnation;
+		const recordedIncarnation = effectiveIncarnation(latest);
+		const currentIncarnation = recordedIncarnation === undefined ? undefined : processIncarnation(latest.pid);
+		const incarnationMatches = currentIncarnation !== undefined && currentIncarnation === recordedIncarnation;
 		sessions.push({
 			sessionId,
 			locator: latest.locator,
 			endpointGeneration: latest.endpointGeneration,
 			pid: latest.pid,
+			processIncarnation: latest.processIncarnation,
 			endpointMtimeMs: latest.endpointMtimeMs,
 			lifecycleRequestId: latest.lifecycleRequestId,
 			terminalUncertain: latest.type === "lifecycle_terminal" || latest.terminalUncertain === true,
 			indexSeq: latest.indexSeq,
 			hostIncarnation: latest.hostIncarnation,
-			identityProvenance: latest.hostIncarnation === undefined ? "legacy" : "composite",
+			identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
 			activity: heartbeat?.activity,
 			lastHeartbeatAt: heartbeat?.ts,
 			ambiguous: (roots.get(sessionId)?.size ?? 0) > 1,
@@ -881,11 +881,10 @@ export class SessionIndex {
 					indexSeq: this.indexSeq + 1,
 					ts: input.ts ?? Date.now(),
 				};
-				// Derive the composite identity incarnation from the OS when the caller did
-				// not supply one (C1); unreadable platforms persist legacy events untouched.
+				// Use the registration's durable process identity when supplied; otherwise
+				// derive one from the OS. Legacy records remain explicitly unbound.
 				if (unsigned.hostIncarnation === undefined && Number.isSafeInteger(unsigned.pid) && unsigned.pid > 0) {
-					const incarnation = processIncarnation(unsigned.pid);
-					if (incarnation !== undefined) unsigned.hostIncarnation = incarnation;
+					unsigned.hostIncarnation = unsigned.processIncarnation ?? processIncarnation(unsigned.pid);
 				}
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
@@ -1006,9 +1005,10 @@ export class SessionIndex {
 					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
 						continue;
 					if (!alive(row.pid)) continue;
-					if (row.hostIncarnation === undefined) continue;
+					const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
+					if (recordedIncarnation === undefined) continue;
 					const current = processIncarnation(row.pid);
-					if (current === undefined || current !== row.hostIncarnation) continue;
+					if (current === undefined || current !== recordedIncarnation) continue;
 					const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 						version: SDK_STATE_VERSION,
 						indexSeq: this.indexSeq + events.length + 1,
@@ -1017,6 +1017,7 @@ export class SessionIndex {
 						locator: row.locator,
 						endpointGeneration: row.endpointGeneration,
 						pid: row.pid,
+						...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
 						...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
 						activity: { state: "active", at: now },
 						ts: now,
