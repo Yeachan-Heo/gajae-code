@@ -248,6 +248,35 @@ describe("custom model preset creation", () => {
 
 		expect(await Bun.file(modelsPath).text()).toBe(original);
 	});
+	it("saves a new preset when an existing mapping uses a colon-tagged concrete model id", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		await Bun.write(
+			modelsPath,
+			[
+				"profiles:",
+				"  repro:",
+				"    required_providers: [ollama-cloud]",
+				"    model_mapping:",
+				"      default: ollama-cloud/deepseek-v4-flash:0731",
+				"",
+			].join("\n"),
+		);
+		const registry = new ModelRegistry(authStorage, modelsPath);
+
+		await expect(
+			registry.saveCustomModelProfile("my-fast", {
+				display_name: "my-fast",
+				required_providers: ["my-oai"],
+				model_mapping: { default: "my-oai/gpt-custom:low" },
+			}),
+		).resolves.toBeDefined();
+
+		const parsed = YAML.parse(await Bun.file(modelsPath).text()) as {
+			profiles: Record<string, { model_mapping: Record<string, string> }>;
+		};
+		expect(parsed.profiles.repro.model_mapping.default).toBe("ollama-cloud/deepseek-v4-flash:0731");
+		expect(parsed.profiles["my-fast"].model_mapping.default).toBe("my-oai/gpt-custom:low");
+	});
 
 	it("rejects duplicate custom preset ids without overwriting existing profiles or providers", async () => {
 		const modelsPath = path.join(tempDir, "models.yml");

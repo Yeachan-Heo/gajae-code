@@ -3,12 +3,7 @@ import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient, SdkClientError } from "../client/client";
-import {
-	listSdkSessionEndpoints,
-	readSdkBrokerDiscovery,
-	readSdkSessionEndpoint,
-	SdkDiscoveryError,
-} from "../client/discovery";
+import { readSdkBrokerDiscovery, SdkDiscoveryError } from "../client/discovery";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation } from "../protocol/operation-registry";
 
@@ -30,6 +25,7 @@ export interface SdkMcpServerOptions {
 	agentDir?: string;
 	connect?: (url: string, token: string) => Promise<SdkClient>;
 }
+const MAX_SESSION_LIST_PAGES = 10_000;
 
 export const SDK_MCP_TOOL_NAMES = [
 	"gjc_session_control",
@@ -169,34 +165,111 @@ function textResult(
 	return { content: [{ type: "text", text: JSON.stringify(payload) }], isError };
 }
 
-/** Creates the model-facing MCP adapter using only SDK discovery records and v3 WebSockets. */
+/** Creates the model-facing MCP adapter; session targeting is broker-bound (C10). */
 export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
-	const repo = options.repo ?? process.cwd();
 	const agentDir = options.agentDir ?? getAgentDir();
 	const connect = options.connect ?? ((url, token) => SdkClient.connect(url, token));
 
+	/**
+	 * Connects to the agent broker, starting one when absent (mirrors the
+	 * lifecycle bootstrap path). The broker is the sole session authority; the
+	 * MCP server never reads endpoint discovery files itself.
+	 */
+	async function brokerClient(): Promise<SdkClient> {
+		await ensureBroker({ agentDir });
+		const broker = await readSdkBrokerDiscovery(agentDir);
+		if (!broker) throw new SdkClientError("not_found", "SDK broker not found");
+		return await connect(broker.url, broker.token);
+	}
+
+	/** Extracts a broker `result` envelope, converting an explicit error frame into a typed throw. */
+	function brokerResult(value: unknown): Record<string, unknown> {
+		if (isObject(value) && value.ok === false) {
+			const error = isObject(value.error) ? value.error : {};
+			const code = typeof error.code === "string" ? error.code : "unavailable";
+			const message = typeof error.message === "string" ? error.message : "SDK broker request failed";
+			throw new SdkClientError(code, message, value.error);
+		}
+		return isObject(value) && isObject(value.result) ? value.result : {};
+	}
+
+	function arrayOf(value: unknown): unknown[] {
+		return Array.isArray(value) ? value : [];
+	}
+	/**
+	 * Exhausts broker `session.list` cursor pagination (default page limit 100)
+	 * to one full snapshot. The broker remains the sole session authority; this
+	 * only aggregates its indexed truth across pages.
+	 */
+	async function paginatedBrokerSessionList(
+		client: SdkClient,
+	): Promise<{ sessions: Record<string, unknown>[]; warnings: unknown[] }> {
+		const sessions: Record<string, unknown>[] = [];
+		let warnings: unknown[] = [];
+		let cursor: string | undefined;
+		for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
+			const listed = brokerResult(await client.global("session.list", cursor === undefined ? {} : { cursor }));
+			sessions.push(...arrayOf(listed.sessions).filter(isObject));
+			if (Array.isArray(listed.warnings)) warnings = listed.warnings;
+			const nextCursor =
+				typeof listed.continuationCursor === "string" && listed.continuationCursor.length > 0
+					? listed.continuationCursor
+					: undefined;
+			if (!nextCursor) return { sessions, warnings };
+			cursor = nextCursor;
+		}
+		throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
+	}
+
+	/**
+	 * Resolves one session through broker `session.list` + `session.get_endpoint`
+	 * (C10): the broker's liveness and ambiguity truth decides reachability, and
+	 * only the broker mints the endpoint credential.
+	 */
 	async function withSession(sessionId: string, action: (client: SdkClient) => Promise<unknown>): Promise<unknown> {
+		let broker: SdkClient | undefined;
 		let client: SdkClient | undefined;
 		try {
-			const endpoint = await readSdkSessionEndpoint(repo, sessionId);
-			if (!endpoint)
-				return { ok: false, error: { code: "not_found", message: `SDK session not found: ${sessionId}` } };
-			client = await connect(endpoint.url, endpoint.token);
+			broker = await brokerClient();
+			const { sessions } = await paginatedBrokerSessionList(broker);
+			const row = sessions.find(item => item.sessionId === sessionId) as Record<string, unknown> | undefined;
+			if (!row) return { ok: false, error: { code: "not_found", message: `SDK session not found: ${sessionId}` } };
+			if (row.ambiguous === true)
+				return {
+					ok: false,
+					error: { code: "ambiguous_session", message: "session id maps to more than one state root" },
+				};
+			if (row.live !== true)
+				return { ok: false, error: { code: "endpoint_stale", message: "session endpoint is not live" } };
+			const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
+			const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
+			const token = typeof endpoint.token === "string" ? endpoint.token : "";
+			if (!url)
+				return { ok: false, error: { code: "unavailable", message: "SDK broker returned an invalid endpoint" } };
+			client = await connect(url, token);
 			return await action(client);
 		} catch (error) {
 			return resultError(error);
 		} finally {
 			await client?.close();
+			await broker?.close();
 		}
 	}
 
 	async function callTool(name: string, args: Arguments = {}): Promise<unknown> {
 		if (name === "gjc_session_list") {
+			let broker: SdkClient | undefined;
 			try {
-				const { endpoints, warnings } = await listSdkSessionEndpoints(repo);
-				return { ok: true, sessions: endpoints.map(({ sessionId }) => ({ sessionId })), warnings };
+				broker = await brokerClient();
+				const { sessions, warnings } = await paginatedBrokerSessionList(broker);
+				const listed = sessions.flatMap(item =>
+					typeof item.sessionId === "string" && item.sessionId ? [{ sessionId: item.sessionId }] : [],
+				);
+				return { ok: true, sessions: listed, warnings };
 			} catch (error) {
 				return resultError(error);
+			} finally {
+				await broker?.close();
 			}
 		}
 		if (name === "gjc_session_control") {
@@ -301,7 +374,7 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 /**
  * Runs the SDK MCP server over stdio (newline-delimited JSON-RPC), the shipped
  * `gjc mcp-serve sdk` entrypoint. Pure SDK client: session control/query flows
- * through discovery records and v3 WebSockets only.
+ * through the broker and v3 WebSockets only.
  */
 export async function runSdkMcpStdio(options: SdkMcpServerOptions = {}): Promise<void> {
 	const server = createSdkMcpServer(options);

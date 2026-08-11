@@ -112,6 +112,31 @@ describe("model profile schema", () => {
 		expect(badEffort.success).toBe(true);
 		expect(colonRoute.success).toBe(true);
 	});
+	test("colon-tagged concrete model IDs parse whole with optional effort suffix", () => {
+		const exactTag = ModelsConfigSchema.safeParse({
+			profiles: {
+				repro: {
+					required_providers: ["ollama-cloud"],
+					model_mapping: { default: "ollama-cloud/deepseek-v4-flash:0731" },
+				},
+			},
+		});
+		const tagPlusEffort = ModelsConfigSchema.safeParse({
+			profiles: {
+				repro: {
+					required_providers: ["ollama-cloud"],
+					model_mapping: { default: "ollama-cloud/deepseek-v4-flash:0731:xhigh" },
+				},
+			},
+		});
+		const bareTag = ModelsConfigSchema.safeParse({
+			profiles: { repro: { required_providers: [], model_mapping: { default: "deepseek-v4-flash:0731" } } },
+		});
+
+		expect(exactTag.success).toBe(true);
+		expect(tagPlusEffort.success).toBe(true);
+		expect(bareTag.success).toBe(true);
+	});
 
 	test("comma-chain selectors are rejected with model_mapping path", () => {
 		const commaChain = ModelsConfigSchema.safeParse({

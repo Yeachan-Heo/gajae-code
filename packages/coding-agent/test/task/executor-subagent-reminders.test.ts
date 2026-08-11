@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, Effort, type Model } from "@gajae-code/ai";
+import type { RecoveryFsRoot } from "@gajae-code/natives";
 import { kNoAuth } from "../../src/config/model-registry";
 
 import { Settings } from "../../src/config/settings";
@@ -9,8 +13,13 @@ import { AgentRegistry } from "../../src/registry/agent-registry";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed, PromptOptions } from "../../src/session/agent-session";
+import { ArtifactManager } from "../../src/session/artifacts";
 import type { AuthStorage } from "../../src/session/auth-storage";
-import { runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
+import {
+	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
+} from "../../src/session/internal/managed-session-storage";
+import { createManagedTaskPersistence, runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
 
 import {
 	type AgentDefinition,
@@ -747,6 +756,81 @@ describe("runSubprocess yield reminders", () => {
 		);
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.credentialSessionId).toBe("credential-pool");
 		expect(authSessionIds).toEqual(["credential-pool"]);
+	});
+	it("keeps managed fork siblings on distinct canonical provider scopes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-fork-"));
+		const retainedAuthorities: RecoveryFsRoot[] = [];
+		const retainedAuthorityCloseCounts = new Map<RecoveryFsRoot, number>();
+		const childRuns: Promise<unknown>[] = [];
+		let store: ManagedSessionDescendantStore | undefined;
+
+		try {
+			const artifactsDir = path.join(root, "artifacts");
+			store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifactsDir);
+			const manager = new ArtifactManager(store);
+			const retainAuthority = store.retainAuthority.bind(store);
+			vi.spyOn(store, "retainAuthority").mockImplementation(() => {
+				const authority = retainAuthority();
+				if (!authority) return undefined;
+				retainedAuthorities.push(authority);
+				const close = authority.close.bind(authority);
+				vi.spyOn(authority, "close").mockImplementation(() => {
+					retainedAuthorityCloseCounts.set(authority, (retainedAuthorityCloseCounts.get(authority) ?? 0) + 1);
+					return close();
+				});
+				return authority;
+			});
+			const createAgentSessionSpy = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+				const session = createMockSession(({ emit }) => {
+					emit({
+						type: "tool_execution_end",
+						toolCallId: "tool-managed-fork",
+						toolName: "yield",
+						result: {
+							content: [{ type: "text", text: "Result submitted." }],
+							details: { status: "success", data: { ok: true } },
+						},
+						isError: false,
+					});
+				});
+				session.dispose = async () => {
+					await options?.sessionManager?.close();
+				};
+				return createSessionResult(session);
+			});
+			const childIds = ["4-ManagedFork", "5-ManagedFork"];
+
+			childRuns.push(
+				...childIds.map((id, index) =>
+					runSubprocess({
+						...baseOptions,
+						cwd: root,
+						index,
+						id,
+						subagentId: id,
+						parentSessionId: "parent-session",
+						forkContextSeed: createForkContextSeed(),
+						artifactsDir,
+						managedPersistence: createManagedTaskPersistence(manager, id),
+					}),
+				),
+			);
+			await Promise.all(childRuns);
+
+			// Managed siblings share a lifecycle parent but must retain distinct child provider scopes.
+			const expectedScopes = childIds.map(id => JSON.stringify(["subagent-canonical", "parent-session", id]));
+			const providerScopes = createAgentSessionSpy.mock.calls.map(([options]) => options?.providerSessionId);
+			expect(providerScopes.sort()).toEqual(expectedScopes.sort());
+			expect(retainedAuthorities).toHaveLength(childIds.length);
+			await Promise.all(childIds.map(id => fs.stat(path.join(artifactsDir, `${id}.md.selector.json`))));
+		} finally {
+			await Promise.allSettled(childRuns);
+			for (const authority of retainedAuthorities) authority.close();
+			expect(retainedAuthorityCloseCounts).toHaveLength(retainedAuthorities.length);
+			expect([...retainedAuthorityCloseCounts.values()]).toEqual(retainedAuthorities.map(() => 1));
+			store?.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	it("renders shared task context in subagent system prompt before now", async () => {

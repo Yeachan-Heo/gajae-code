@@ -4,6 +4,7 @@ export {
 	type ControlErrorCode,
 	type ControlRequest,
 	type ControlResponse,
+	controlRequestFromFrame,
 	dispatchControl,
 	TypedControlError,
 } from "./dispatch";

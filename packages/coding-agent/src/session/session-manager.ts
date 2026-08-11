@@ -28,6 +28,7 @@ import {
 	getProjectDir,
 	getResidentCacheRootDir,
 	getSessionsDir,
+	getSidecarCacheRootDir,
 	getTerminalSessionsDir,
 	hasFsCode,
 	isEnoent,
@@ -57,12 +58,14 @@ import {
 	isImageDataUrl,
 	MemoryBlobStore,
 	openVerifiedResidentCacheInstanceDir,
+	openVerifiedSidecarCacheInstanceDir,
 	parseBlobRef,
 	ResidentBlobMissingError,
 	ResidentCacheTrustError,
 	resolveResidentImageDataSync,
 	resolveResidentImageDataUrlSync,
 	resolveTextBlobSync,
+	sweepResidentCacheRoot,
 } from "./blob-store";
 import {
 	canonicalizeTrustedPath,
@@ -9962,8 +9965,13 @@ export class SessionManager {
 		if (this.#managedSidecarCacheStore && this.#managedSidecarCacheSessionFile === sessionFile)
 			return this.#managedSidecarCacheStore.dir;
 		this.#releaseManagedSidecarCache();
-		const instanceDir = openVerifiedResidentCacheInstanceDir(
-			getResidentCacheRootDir(this.#residentCacheProfileAgentDir()),
+		// Sweep abandoned pre-namespace sidecars from the resident root. The sweep
+		// only reaps stale owner leases, so the canonical resident store is untouched.
+		void sweepResidentCacheRoot(getResidentCacheRootDir(this.#residentCacheProfileAgentDir()));
+		const sessionHash = crypto.createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
+		const instanceDir = openVerifiedSidecarCacheInstanceDir(
+			getSidecarCacheRootDir(this.#residentCacheProfileAgentDir()),
+			sessionHash,
 		);
 		const cacheParent = path.dirname(instanceDir);
 		let retainedAuthority: native.RecoveryFsRoot | undefined;
@@ -12620,7 +12628,10 @@ export class SessionManager {
 		}
 		if (!hasStrictSessionSchema(entries)) throw new Error("cold_transcript_schema_invalid");
 		const migrationApplied = migrateToCurrentVersion(entries);
-		for (const entry of entries) residentizePersistedBlobRefs(entry);
+		for (const entry of entries) {
+			if (entry.type !== "session") sanitizeLoadedSessionEntryReplayMetadata(entry);
+			residentizePersistedBlobRefs(entry);
+		}
 		const transition = this.#prepareResidentTextStoreTransition(
 			{
 				target: { sessionId: header.id, sessionFile: this.#sessionFile },
@@ -12680,7 +12691,7 @@ export class SessionManager {
 					("parentId" in record && entry.parentId !== record.parentId)
 				)
 					throw new Error("cold_index_identity_mismatch");
-				residentizePersistedBlobRefs(entry);
+				residentizePersistedBlobRefs(sanitizeLoadedSessionEntryReplayMetadata(entry));
 				rebuilt.push(entry);
 			}
 			const transition = this.#prepareResidentTextStoreTransition(
@@ -15601,6 +15612,16 @@ export class SessionManager {
 		};
 	}
 
+	/**
+	 * Directory backing the resident *text* blob store, or undefined when the
+	 * store is in-memory. The resident-cache root also holds the managed sidecar
+	 * cache instance, so callers must not infer the text store from directory
+	 * counts.
+	 */
+	residentTextCacheDirForTests(): string | undefined {
+		return this.#residentTextBlobStore instanceof EphemeralBlobStore ? this.#residentTextBlobStore.dir : undefined;
+	}
+
 	setSidecarHotSuffixBudgetForTests(bytes: number): void {
 		if (!Number.isSafeInteger(bytes) || bytes < 0) throw new RangeError("invalid_sidecar_hot_suffix_budget");
 		this.#sidecarHotSuffixBudgetBytes = bytes;
@@ -15703,10 +15724,13 @@ export class SessionManager {
 						if (record.type === "session") return;
 						if (record.type === "header_patch" || record.type === "entry_patch") return false;
 						if (typeof record.id !== "string") return false;
+						const coldEntry = sanitizeLoadedSessionEntryReplayMetadata(record);
+						residentizePersistedBlobRefs(coldEntry);
+						const entry = materializeResidentEntryForReadSync(coldEntry, this.#residentBlobStores(), new Map());
 						visitor(
 							cloneSessionEntry(
 								rehydrateColdSpillEntry(
-									materializeResidentEntryForReadSync(record, this.#residentBlobStores(), new Map()),
+									entry,
 									this.#coldSpillReadStore(),
 									this.#residentBlobStoresForColdRehydrate(),
 								),

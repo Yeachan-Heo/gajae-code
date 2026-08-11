@@ -28,7 +28,7 @@ const parityRows = (
 		rows: ParityRow[];
 	}
 ).rows;
-expect(parityRows).toHaveLength(576);
+expect(parityRows).toHaveLength(582);
 const parityPrefix: Record<Adapter, string> = {
 	telegram: "T",
 	discord: "D",
@@ -241,6 +241,15 @@ async function fixture(): Promise<AdapterFixture> {
 		pid: process.pid,
 		endpointMtimeMs,
 	});
+	await broker.index.append({
+		type: "host_heartbeat",
+		sessionId,
+		locator: { repo, stateRoot },
+		endpointGeneration: 1,
+		pid: process.pid,
+		endpointMtimeMs,
+		activity: { state: "active", at: Date.now() },
+	});
 	return {
 		repo,
 		agentDir,
@@ -249,7 +258,6 @@ async function fixture(): Promise<AdapterFixture> {
 		brokerEndpoint,
 		observed,
 		stop: async () => {
-			await brokerOwnerForTest(agentDir)?.stop();
 			await productionHost.stop();
 			await broker.stop();
 			fs.rmSync(repo, { recursive: true, force: true });
@@ -320,9 +328,11 @@ async function assertMcpRow(operation: Operation, secret: boolean): Promise<void
 		const mcp = createSdkMcpServer({
 			repo: host.repo,
 			agentDir: host.agentDir,
-			...(operation.kind === "global"
-				? {}
-				: { connect: () => SdkClient.connect(host.endpoint.url, host.endpoint.token) }),
+			connect: target =>
+				SdkClient.connect(
+					target,
+					target === host.brokerEndpoint.url ? host.brokerEndpoint.token : host.endpoint.token,
+				),
 		});
 		const tool =
 			operation.kind === "global"
@@ -371,22 +381,23 @@ async function assertDaemonCliRow(operation: Operation, secret: boolean): Promis
 		const before = host.observed.length;
 		const input =
 			operation.sdkId === "session.get_endpoint" ? { sessionId: host.sessionId } : inputFor(operation, secret);
-		const action = operation.kind === "global" ? "global" : operation.kind === "query" ? "query" : "control";
+		const rawAction = operation.kind === "global" ? "global" : operation.kind === "query" ? "query" : "control";
 		const args = {
-			action,
+			action: "raw",
+			rawAction,
 			repo: host.repo,
 			agentDir: host.agentDir,
 			idempotencyKey: operation.kind === "global" ? `parity-${operation.id}` : undefined,
-			...(action === "query"
+			...(rawAction === "query"
 				? { sessionId: host.sessionId, query: operation.sdkId }
 				: { operation: operation.sdkId }),
-			...(action === "control" ? { sessionId: host.sessionId, confirm: true } : {}),
+			...(rawAction === "control" ? { sessionId: host.sessionId, confirm: true } : {}),
 			...(operation.sdkId === "session.get_endpoint" ? { showEndpointCredential: true, yes: true } : {}),
 			jsonInput: JSON.stringify(input),
 		};
 		const result = await runDaemonCli(args);
 		if (expected === "forwarded") {
-			if (action === "global") expectGlobalSemanticResult(operation, result.output);
+			if (rawAction === "global") expectGlobalSemanticResult(operation, result.output);
 			else expectSemanticResult(operation, result.output);
 		} else expect(result.output).toMatchObject({ ok: false, error: expect.any(Object) });
 		expectObservation(host, before, operation, expected);

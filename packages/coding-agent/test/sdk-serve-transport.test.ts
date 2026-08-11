@@ -7,10 +7,17 @@ import { PassThrough, Writable } from "node:stream";
 import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
 import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
+import { Broker } from "../src/sdk/broker/broker";
+import { runTail } from "../src/sdk/cli/session-cli.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
 import { type RelayWebSocket, startRelayPair, type TransportError } from "../src/sdk/transport/relay.js";
-import { resolveServePendingCeiling, runSdkServe } from "../src/sdk/transport/serve-cli.js";
+import {
+	listBrokerSessions,
+	resolveServePendingCeiling,
+	runSdkServe,
+	selectBrokerSession,
+} from "../src/sdk/transport/serve-cli.js";
 import { startSocketServe } from "../src/sdk/transport/socket.js";
 
 const token = "test-token";
@@ -154,7 +161,7 @@ async function withStalledWebSocket<T>(run: () => Promise<T>): Promise<T> {
 	}
 }
 
-async function relayFixture(pendingCeilingBytes = 256 * 1024) {
+async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstreamFrame?: (frame: string) => boolean) {
 	const fake = upstream();
 	const input = new PassThrough();
 	const output = new PassThrough();
@@ -168,6 +175,7 @@ async function relayFixture(pendingCeilingBytes = 256 * 1024) {
 		downstream: input,
 		downstreamSink: output,
 		onTransportError: error => errors.push(error),
+		validateDownstreamFrame,
 	});
 	await waitFor(() => fake.connections[0], "upstream connection");
 	return { fake, input, output, received, errors, pair };
@@ -186,6 +194,24 @@ describe("SDK serve raw relay", () => {
 			expect((await waitFor(() => fixture.received[0], "websocket downstream frame")).toString()).toBe(
 				`${response}\n`,
 			);
+		} finally {
+			await fixture.pair.close();
+			fixture.fake.stop();
+		}
+	});
+
+	test("rejects downstream elevation claim forgery before endpoint relay", async () => {
+		const fixture = await relayFixture(256 * 1024, source => {
+			const frame = JSON.parse(source) as { elevationRequestId?: unknown };
+			return frame.elevationRequestId === undefined;
+		});
+		try {
+			fixture.input.write(`${JSON.stringify({ type: "control_request", elevationRequestId: "forged" })}\n`);
+			expect(await waitFor(() => fixture.errors[0], "forged claim rejection")).toMatchObject({
+				code: "protocol_error",
+				direction: "downstream->ws",
+			});
+			expect(fixture.fake.connections[0]?.messages).toEqual([]);
 		} finally {
 			await fixture.pair.close();
 			fixture.fake.stop();
@@ -526,4 +552,209 @@ describe("SDK serve CLI and discovery", () => {
 			fixture.fake.stop();
 		}
 	});
+	test("serve targets a live session beyond the first 100-session page", async () => {
+		// The broker's session.list page limit is 100; the live target is the
+		// 150th row, so only an exhausted paginated snapshot can select it.
+		const sessions = Array.from({ length: 150 }, (_, index) => ({
+			sessionId: `sess-${index + 1}`,
+			live: index === 149,
+			ambiguous: false,
+		}));
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>) => {
+				if (operation !== "session.list") return { ok: false, error: { code: "unknown_operation" } };
+				if (input.cursor === "page-2")
+					return { ok: true, result: { indexSeq: 1, sessions: sessions.slice(100), warnings: [] } };
+				return {
+					ok: true,
+					result: {
+						indexSeq: 1,
+						sessions: sessions.slice(0, 100),
+						warnings: [],
+						continuationCursor: "page-2",
+					},
+				};
+			},
+			close: async () => {},
+		} as never;
+		const rows = await listBrokerSessions(broker);
+		expect(rows).toHaveLength(150);
+		// Explicit targeting resolves the row only the second page carries.
+		expect(selectBrokerSession(rows, "sess-150")).toBe("sess-150");
+		// Auto-selection also observes beyond-page liveness.
+		expect(selectBrokerSession(rows, undefined)).toBe("sess-150");
+		// First-page rows are still governed by the same broker truth.
+		expect(() => selectBrokerSession(rows, "sess-1")).toThrow(/endpoint_stale/);
+	});
+
+	test("tail --until-idle resumes after a terminal checkpoint instead of completing on it", async () => {
+		// The checkpoint pins a terminal turn_end at seq 4 and the only later
+		// activity is a fresh turn (seq 5-6) that arrives after the replay. A
+		// replay that re-emits the checkpoint event would satisfy --until-idle
+		// before that new turn exists.
+		const root = await tempDir();
+		const agentDir = path.join(root, "agent");
+		const stateRoot = path.join(root, ".gjc", "state");
+		const token = "session-token";
+		const replayRequests: Array<{ sinceGeneration?: unknown; sinceSeq?: unknown }> = [];
+		const terminalCheckpoint = { revision: 2, generation: 1, seq: 4 };
+		const endpoint = Bun.serve<unknown>({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request, server) {
+				if (new URL(request.url).searchParams.get("token") !== token)
+					return new Response("Unauthorized", { status: 401 });
+				if (server.upgrade(request, { data: {} })) return;
+				return new Response("Upgrade failed", { status: 400 });
+			},
+			websocket: {
+				open(socket) {
+					queueMicrotask(() => {
+						try {
+							socket.send(
+								JSON.stringify({ type: "server_hello", protocolVersion: 3, connectionId: "tail-test-conn" }),
+							);
+						} catch {
+							// connection already closed
+						}
+					});
+				},
+				message(socket, raw) {
+					const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+					if (frame.type === "query_request") {
+						if (frame.query === "session.checkpoint") {
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									result: {
+										checkpointToken: "checkpoint:terminal:4",
+										checkpoint: terminalCheckpoint,
+										cursor: "cursor:checkpoint:2",
+										revision: 2,
+									},
+								}),
+							);
+							return;
+						}
+						if (frame.query === "transcript.list") {
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									page: { items: [], complete: true },
+								}),
+							);
+							return;
+						}
+						socket.send(
+							JSON.stringify({
+								type: "query_response",
+								id: frame.id,
+								ok: false,
+								error: { code: "unknown_operation", message: "unknown operation" },
+							}),
+						);
+						return;
+					}
+					if (frame.type === "event_replay") {
+						replayRequests.push({ sinceGeneration: frame.sinceGeneration, sinceSeq: frame.sinceSeq });
+						const sinceSeq = typeof frame.sinceSeq === "number" ? frame.sinceSeq : 0;
+						// Host semantics: replay answers events strictly after the
+						// requested sequence (frame.seq > sinceSeq).
+						const checkpointEvent = [
+							{
+								type: "event",
+								generation: 1,
+								seq: 4,
+								kind: "turn_end",
+								payload: { type: "turn_end", sessionId: "live" },
+							},
+						];
+						socket.send(
+							JSON.stringify({
+								type: "event_replay_result",
+								id: frame.id,
+								ok: true,
+								events: checkpointEvent.filter(event => event.seq > sinceSeq),
+								generation: 1,
+								lastSeq: 4,
+							}),
+						);
+						// A brand-new turn starts and completes just after the replay.
+						setTimeout(() => {
+							try {
+								socket.send(
+									JSON.stringify({
+										type: "event",
+										generation: 1,
+										seq: 5,
+										kind: "turn_start",
+										payload: { type: "turn_start", sessionId: "live" },
+									}),
+								);
+								socket.send(
+									JSON.stringify({
+										type: "event",
+										generation: 1,
+										seq: 6,
+										kind: "turn_end",
+										payload: { type: "turn_end", sessionId: "live" },
+									}),
+								);
+							} catch {
+								// connection already closed
+							}
+						}, 50);
+						return;
+					}
+					socket.send(
+						JSON.stringify({
+							type: "event_replay_result",
+							id: frame.id,
+							ok: false,
+							error: { code: "unknown_operation", message: "unknown operation" },
+						}),
+					);
+				},
+			},
+		});
+		const broker = new Broker({ agentDir, packageGeneration: "test" });
+		await broker.start();
+		const endpointPath = path.join(stateRoot, "sdk", "live.json");
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(
+			endpointPath,
+			JSON.stringify({ sessionId: "live", pid: process.pid, url: `ws://127.0.0.1:${endpoint.port}`, token }),
+		);
+		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		await broker.index.append({
+			type: "host_registered",
+			sessionId: "live",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs,
+		});
+		try {
+			const output = (await runTail(root, agentDir, "live", { untilIdle: true, timeoutMs: 10_000 })) as {
+				ok: boolean;
+				result?: { items?: Array<{ kind?: string; seq?: number }>; terminal?: boolean };
+			};
+			expect(output.ok).toBe(true);
+			expect(output.result?.terminal).toBe(true);
+			const items = output.result?.items ?? [];
+			// The checkpoint's own terminal event is never replayed...
+			expect(items.some(item => item.seq === 4 && item.kind === "turn_end")).toBe(false);
+			// ...and the tail only completes on the genuinely new turn.
+			expect(items.some(item => item.seq === 5 && item.kind === "turn_start")).toBe(true);
+			expect(items.some(item => item.seq === 6 && item.kind === "turn_end")).toBe(true);
+			expect(replayRequests[0]).toEqual({ sinceGeneration: 1, sinceSeq: 4 });
+		} finally {
+			await broker.stop();
+			await endpoint.stop(true);
+		}
+	}, 15_000);
 });

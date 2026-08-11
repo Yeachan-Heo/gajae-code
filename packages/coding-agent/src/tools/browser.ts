@@ -87,6 +87,12 @@ const browserSchema = z.object({
 		.enum(["accept", "dismiss"] as const)
 		.describe("auto-handle dialogs")
 		.optional(),
+	diagnostics: z
+		.boolean()
+		.describe(
+			"opt-in: capture bounded page runtime diagnostics (page exceptions and console.error metadata) in the next successful run/act response",
+		)
+		.optional(),
 	code: z.string().describe("js body to run in tab").optional(),
 	actions: z.array(actionStepSchema).describe("structured action steps for action 'act'").optional(),
 	timeout: z.number().default(30).describe("timeout in seconds (default 30, max 300)").optional(),
@@ -258,6 +264,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 				target: params.app?.target,
 				timeoutMs,
 				dialogs: params.dialogs,
+				runtimeDiagnostics: params.diagnostics === true,
 				signal,
 			}),
 		);

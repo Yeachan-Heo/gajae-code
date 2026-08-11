@@ -1,8 +1,9 @@
+import { getAgentDir } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
-import type { SdkSessionEndpoint } from "../client/discovery";
-import { listSdkSessionEndpoints } from "../client/discovery";
-import { type SdkEndpointSelectionError, selectLiveEndpoint } from "../client/liveness";
+import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
 import { DEFAULT_PENDING_CEILING_BYTES, MIN_PENDING_CEILING_BYTES, startSocketServe, startStdioServe } from "./index";
+
+const MAX_SESSION_LIST_PAGES = 10_000;
 
 type ServeMode = { kind: "stdio" } | { kind: "socket"; socketPath: string };
 
@@ -67,11 +68,72 @@ export function resolveServePendingCeiling(flagValue: string | undefined, envVal
 	return ceiling;
 }
 
-function isSelectionError(value: SdkSessionEndpoint | SdkEndpointSelectionError): value is SdkEndpointSelectionError {
-	return "code" in value;
+type BrokerSessionRow = { sessionId: string; live: boolean; ambiguous: boolean };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Attaches a stdio or Unix-socket relay to one live SDK session endpoint. */
+/** Extracts the broker `result` envelope, converting an explicit error frame into a typed throw. */
+function brokerResult(value: unknown): Record<string, unknown> {
+	if (isRecord(value) && value.ok === false) {
+		const error = isRecord(value.error) ? value.error : {};
+		const code = typeof error.code === "string" ? error.code : "unavailable";
+		const message = typeof error.message === "string" ? error.message : "SDK broker request failed";
+		throw new SdkClientError(code, message, value.error);
+	}
+	return isRecord(value) && isRecord(value.result) ? value.result : {};
+}
+
+function brokerSessionRows(value: Record<string, unknown>): BrokerSessionRow[] {
+	if (!Array.isArray(value.sessions)) return [];
+	return value.sessions.flatMap(item => {
+		if (!isRecord(item) || typeof item.sessionId !== "string" || !item.sessionId) return [];
+		return [{ sessionId: item.sessionId, live: item.live === true, ambiguous: item.ambiguous === true }];
+	});
+}
+
+/**
+ * Exhausts broker `session.list` cursor pagination (default page limit 100) to
+ * one full snapshot; exported for tests.
+ */
+export async function listBrokerSessions(broker: SdkClient): Promise<BrokerSessionRow[]> {
+	const rows: BrokerSessionRow[] = [];
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
+		const listed = brokerResult(await broker.global("session.list", cursor === undefined ? {} : { cursor }));
+		rows.push(...brokerSessionRows(listed));
+		const nextCursor =
+			typeof listed.continuationCursor === "string" && listed.continuationCursor.length > 0
+				? listed.continuationCursor
+				: undefined;
+		if (!nextCursor) return rows;
+		cursor = nextCursor;
+	}
+	throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
+}
+
+/** Selects the session to serve through broker `session.list` truth (C10); exported for tests. */
+export function selectBrokerSession(sessions: BrokerSessionRow[], explicitSessionId: string | undefined): string {
+	if (explicitSessionId !== undefined) {
+		const row = sessions.find(session => session.sessionId === explicitSessionId);
+		if (!row) throw new Error(`not_found: session ${explicitSessionId} is not indexed by the broker`);
+		if (row.ambiguous) throw new Error("ambiguous_session: session id maps to more than one state root");
+		if (!row.live) throw new Error(`endpoint_stale: session ${explicitSessionId} endpoint is not live`);
+		return row.sessionId;
+	}
+	const live = sessions.filter(session => session.live && !session.ambiguous);
+	if (live.length === 0) throw new Error("no_live_endpoint: no live session endpoint");
+	if (live.length > 1) throw new Error("multiple_live_endpoints: more than one live session; specify --session <id>");
+	return live[0]!.sessionId;
+}
+
+/**
+ * Attaches a stdio or Unix-socket relay to one live SDK session endpoint.
+ * Session targeting is broker-bound (C10): `session.list` resolves the session
+ * and `session.get_endpoint` mints the exact credential — never a direct
+ * endpoint-file read. A missing or unreachable broker fails closed.
+ */
 export async function runSdkServe(argv: string[]): Promise<void> {
 	const parsed = parseServeArguments(argv);
 	if (parsed.mode.kind === "socket" && process.platform === "win32")
@@ -80,26 +142,51 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 		parsed.pendingCeiling,
 		process.env.GJC_SDK_SERVE_PENDING_CEILING_BYTES,
 	);
-	const discovered = await listSdkSessionEndpoints(process.cwd());
-	const selected = selectLiveEndpoint(discovered.endpoints, parsed.sessionId);
-	if (isSelectionError(selected)) {
-		const sessionHint = parsed.sessionId ? ` for session ${parsed.sessionId}` : "; specify --session <id>";
-		throw new Error(`${selected.code}${sessionHint}`);
-	}
-	const options = { url: selected.url, token: selected.token, pendingCeilingBytes };
-	const handle =
-		parsed.mode.kind === "stdio"
-			? await startStdioServe(options)
-			: await startSocketServe({ ...options, socketPath: parsed.mode.socketPath });
-	const stop = () => {
-		void handle.close();
-	};
-	process.once("SIGINT", stop);
-	process.once("SIGTERM", stop);
+	const discovery = await readSdkBrokerDiscovery(getAgentDir());
+	if (!discovery) throw new Error("broker_unavailable: SDK broker is not running");
+	let broker: SdkClient;
 	try {
-		await handle.done;
+		broker = await SdkClient.connect(discovery.url, discovery.token);
+	} catch {
+		throw new Error("broker_unavailable: SDK broker is not reachable");
+	}
+	try {
+		const sessionId = selectBrokerSession(await listBrokerSessions(broker), parsed.sessionId);
+		const endpoint = brokerResult(await broker.global("session.get_endpoint", { sessionId }));
+		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
+		const token = typeof endpoint.token === "string" ? endpoint.token : "";
+		if (!url) throw new Error("unavailable: broker returned an invalid endpoint record");
+		const options = {
+			url,
+			token,
+			pendingCeilingBytes,
+			validateDownstreamFrame: (source: string): boolean => {
+				try {
+					const frame = JSON.parse(source) as { type?: unknown; elevationRequestId?: unknown };
+					return frame.type !== "control_request" || frame.elevationRequestId === undefined;
+				} catch {
+					return true;
+				}
+			},
+		};
+		const handle =
+			parsed.mode.kind === "stdio"
+				? await startStdioServe(options)
+				: await startSocketServe({ ...options, socketPath: parsed.mode.socketPath });
+		const stop = () => {
+			void handle.close();
+		};
+		process.once("SIGINT", stop);
+		process.once("SIGTERM", stop);
+		try {
+			await handle.done;
+		} finally {
+			process.removeListener("SIGINT", stop);
+			process.removeListener("SIGTERM", stop);
+		}
+	} catch (error) {
+		throw error instanceof SdkClientError ? new Error(`${error.code}: ${error.message}`) : error;
 	} finally {
-		process.removeListener("SIGINT", stop);
-		process.removeListener("SIGTERM", stop);
+		await broker.close();
 	}
 }

@@ -482,3 +482,131 @@ describe("SecretObfuscator authenticated placeholders", () => {
 		expect(crossKey.deobfuscate(obfuscated)).toBe(obfuscated);
 	});
 });
+const REPLACEMENT_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+describe("SecretObfuscator keyed deterministic replacement", () => {
+	const otherKey = Uint8Array.from({ length: 32 }, (_, index) => 255 - index);
+
+	function replaceOutput(key: Uint8Array, secret: string, text = `db pw = ${secret}`): string {
+		return new SecretObfuscator([{ type: "plain", content: secret, mode: "replace" }], key).obfuscate(text);
+	}
+
+	function derivedReplacement(key: Uint8Array, secret: string): string {
+		const output = replaceOutput(key, secret, secret);
+		expect(output.length).toBe(secret.length);
+		return output;
+	}
+
+	it("derives replace-mode replacements from the key (key A/B divergence)", () => {
+		const secret = "acme-staging-2024";
+		expect(replaceOutput(TEST_KEY, secret)).not.toBe(replaceOutput(otherKey, secret));
+	});
+
+	it("is mutation-sensitive to the key: flipping one key byte changes the replacement", () => {
+		const secret = "acme-staging-2024";
+		const flipped = Uint8Array.from(TEST_KEY);
+		flipped[0]! ^= 1;
+		expect(replaceOutput(TEST_KEY, secret)).not.toBe(replaceOutput(flipped, secret));
+	});
+
+	it("is mutation-sensitive to the secret: changing one character changes the replacement", () => {
+		expect(replaceOutput(TEST_KEY, "acme-staging-2024")).not.toBe(replaceOutput(TEST_KEY, "acme-staging-2025"));
+	});
+
+	it("prevents offline confirmation without the key", () => {
+		const secret = "acme-staging-2024";
+		const observed = replaceOutput(TEST_KEY, secret).split("db pw = ")[1]!;
+		const candidates = ["prod-db-pass-1", "staging-2024", "dev-password-1", "acme-prod-2024", "acme-staging-2024"];
+		// Attacker guesses with an attacker-chosen key: no candidate reproduces the observation.
+		for (const candidate of candidates) {
+			expect(replaceOutput(otherKey, candidate).split("db pw = ")[1]).not.toBe(observed);
+		}
+		// Positive control: with the true key, exactly the true secret matches.
+		expect(replaceOutput(TEST_KEY, secret).split("db pw = ")[1]).toBe(observed);
+		expect(replaceOutput(TEST_KEY, "prod-db-pass-1").split("db pw = ")[1]).not.toBe(observed);
+	});
+
+	it("keeps deterministic same-process output regardless of entry order", () => {
+		const secret = "acme-staging-2024";
+		const first = new SecretObfuscator([{ type: "plain", content: secret, mode: "replace" }], TEST_KEY);
+		const second = new SecretObfuscator(
+			[
+				{ type: "plain", content: "other-secret" },
+				{ type: "plain", content: secret, mode: "replace" },
+			],
+			TEST_KEY,
+		);
+		expect(second.obfuscate(`db pw = ${secret}`)).toBe(first.obfuscate(`db pw = ${secret}`));
+	});
+
+	it("preserves same-length alphanumeric output for ASCII, Unicode, and very long secrets", () => {
+		const secrets = ["a", "acme-staging-2024", "héllo🔑secret", "x".repeat(5000)];
+		for (const secret of secrets) {
+			const output = derivedReplacement(TEST_KEY, secret);
+			expect(output).toMatch(/^[A-Za-z0-9]*$/);
+		}
+	});
+
+	it("never exposes the secret in replace-mode output", () => {
+		const secrets = ["acme-staging-2024", "super-secret-token-abc", "x".repeat(64)];
+		for (const secret of secrets) {
+			const output = new SecretObfuscator([{ type: "plain", content: secret, mode: "replace" }], TEST_KEY).obfuscate(
+				`db pw = ${secret} and again ${secret}`,
+			);
+			expect(output).not.toContain(secret);
+			expect(output).toMatch(/^db pw = [A-Za-z0-9]+ and again [A-Za-z0-9]+$/);
+		}
+	});
+
+	it("leaves explicit replacement values byte-identical", () => {
+		const secret = "acme-staging-2024";
+		const obfuscator = new SecretObfuscator(
+			[{ type: "plain", content: secret, mode: "replace", replacement: "FIXED-VALUE" }],
+			TEST_KEY,
+		);
+		expect(obfuscator.obfuscate(`db pw = ${secret}`)).toBe("db pw = FIXED-VALUE");
+		expect(obfuscator.obfuscate(secret)).toBe("FIXED-VALUE");
+	});
+
+	it("keys regex-discovered replace-mode substitutions too", () => {
+		const matchText = "token-ab12";
+		const keyed = new SecretObfuscator([{ type: "regex", content: "token-[a-z0-9]+", mode: "replace" }], TEST_KEY);
+		const other = new SecretObfuscator([{ type: "regex", content: "token-[a-z0-9]+", mode: "replace" }], otherKey);
+		const keyedOut = keyed.obfuscate(`value=${matchText}`);
+		expect(keyedOut).not.toContain(matchText);
+		expect(keyedOut).toMatch(/^value=[A-Za-z0-9]+$/);
+		expect(keyedOut).not.toBe(other.obfuscate(`value=${matchText}`));
+		expect(keyedOut.length).toBe(other.obfuscate(`value=${matchText}`).length);
+	});
+
+	it("treats an empty derived secret as a no-op replacement", () => {
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: "", mode: "replace" }], TEST_KEY);
+		expect(obfuscator.obfuscate("unchanged text")).toBe("unchanged text");
+	});
+
+	it("spreads derived characters across the alphabet without modulo bias", () => {
+		let seed = 0x4166_2024;
+		const random = (): number => {
+			seed = (seed * 1664525 + 1013904223) >>> 0;
+			return seed / 0x100000000;
+		};
+		const counts = new Map<string, number>();
+		let total = 0;
+		for (let round = 0; round < 200; round++) {
+			let secret = "";
+			for (let i = 0; i < 32; i++) secret += REPLACEMENT_ALPHABET[Math.floor(random() * 62)]!;
+			const output = derivedReplacement(TEST_KEY, secret);
+			for (const char of output) {
+				counts.set(char, (counts.get(char) ?? 0) + 1);
+				total++;
+			}
+		}
+		expect(total).toBe(200 * 32);
+		const expected = total / 62;
+		for (const char of REPLACEMENT_ALPHABET) {
+			const count = counts.get(char) ?? 0;
+			expect(count).toBeGreaterThan(expected * 0.5);
+			expect(count).toBeLessThan(expected * 1.5);
+		}
+	});
+});

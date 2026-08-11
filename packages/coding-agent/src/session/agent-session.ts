@@ -116,6 +116,7 @@ import {
 	type AuthDisposition,
 	beginAttempt,
 	classifyFallbackTrigger,
+	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
 	type FallbackTriggerClass,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
@@ -938,6 +939,7 @@ type RetryErrorClassification =
 	| "terminal"
 	| "usage_limit"
 	| "first_event_timeout"
+	| "empty_response"
 	| "transient"
 	| "local_unavailable"
 	| "unknown";
@@ -4882,6 +4884,11 @@ export class AgentSession {
 		onError?: (error: unknown) => void;
 		resourceRunId?: string;
 		maintenanceContinuation?: boolean;
+		// Queue-consuming continuations (follow-up/steer drained after execution
+		// tails settle) must run continueQueuedMessages() so they deliver the
+		// queued turn without replaying the non-assistant tail. Every other
+		// scheduled continuation keeps continue() semantics.
+		continueQueuedOnly?: boolean;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
 			? this.#reserveDeferredAgentEndForContinuation()
@@ -4969,11 +4976,12 @@ export class AgentSession {
 							this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
 						};
 						const hasQueuedMessages = this.agent.hasQueuedMessages();
-						const startsQueuedSuccessor = hasQueuedMessages;
-						const continueQueued =
-							this.agent.state.messages.at(-1)?.role === "assistant" || !hasQueuedMessages
-								? this.agent.continue.bind(this.agent)
-								: this.agent.continueQueuedMessages.bind(this.agent);
+						const startsQueuedSuccessor =
+							hasQueuedMessages &&
+							(options?.continueQueuedOnly === true || this.agent.state.messages.at(-1)?.role === "assistant");
+						const continueQueued = options?.continueQueuedOnly
+							? this.agent.continueQueuedMessages.bind(this.agent)
+							: this.agent.continue.bind(this.agent);
 						try {
 							await continueQueued({
 								...this.#managedFallbackPromptOptions(),
@@ -9469,6 +9477,7 @@ export class AgentSession {
 		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForSteer()) {
 			this.#scheduleAgentContinue({
 				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
+				continueQueuedOnly: true,
 			});
 		}
 	}
@@ -9521,6 +9530,7 @@ export class AgentSession {
 		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) {
 			this.#scheduleAgentContinue({
 				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+				continueQueuedOnly: true,
 			});
 		}
 	}
@@ -10316,6 +10326,7 @@ export class AgentSession {
 					delayMs: 1,
 					generation: this.#promptGeneration,
 					shouldContinue: () => this.agent.hasQueuedSteering(),
+					continueQueuedOnly: true,
 				});
 			}
 			return outcome;
@@ -14921,6 +14932,7 @@ export class AgentSession {
 							generation,
 							shouldContinue: () => this.agent.hasQueuedMessages(),
 							rescheduleOnBusy: true,
+							continueQueuedOnly: true,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
 							resourceRunId: options?.resourceRunId,
@@ -14942,6 +14954,7 @@ export class AgentSession {
 
 						shouldContinue: () => this.agent.hasQueuedMessages(),
 						rescheduleOnBusy: true,
+						continueQueuedOnly: true,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
 						resourceRunId: options?.resourceRunId,
@@ -15201,6 +15214,7 @@ export class AgentSession {
 					suppressPredecessorAgentEnd: true,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
 					rescheduleOnBusy: true,
+					continueQueuedOnly: true,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
 					resourceRunId: options?.resourceRunId,
@@ -15321,6 +15335,10 @@ export class AgentSession {
 		return message.transportFailure?.providerCode?.toLowerCase() === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;
 	}
 
+	#isTypedEmptyResponse(message: AssistantMessage): boolean {
+		return message.transportFailure?.providerCode?.toLowerCase() === EMPTY_RESPONSE_PROVIDER_CODE;
+	}
+
 	#isTerminalProviderFirstEventTimeout(message: AssistantMessage): boolean {
 		return this.#isKimiCodeFirstEventTimeout(message) || this.#isAlibabaTokenPlanFirstEventTimeout(message);
 	}
@@ -15345,7 +15363,8 @@ export class AgentSession {
 				classification === "usage_limit" ||
 				classification === "transient" ||
 				classification === "unknown" ||
-				classification === "first_event_timeout"
+				classification === "first_event_timeout" ||
+				classification === "empty_response"
 			);
 		}
 		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
@@ -15456,6 +15475,7 @@ export class AgentSession {
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
+		if (this.#isTypedEmptyResponse(message)) return "empty_response";
 		if (!message.errorMessage) return "none";
 		const err = message.errorMessage;
 		// Provider safety refusals (e.g. Anthropic stop_reason "refusal" /
@@ -15952,6 +15972,7 @@ export class AgentSession {
 		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = this.#classifyErrorForRetry(message);
 		const firstEventTimeout = classification === "first_event_timeout";
+		const emptyResponse = classification === "empty_response";
 		// Content-free message-only watchdog prose (wrapped canonical or bare
 		// per-provider variants) is admitted like the typed path: it is
 		// replay-safe, so a bare-default retry may re-issue the request even
@@ -15959,6 +15980,14 @@ export class AgentSession {
 		const messageOnlyWatchdogTimeout = isBareDefaultMessageOnlyFirstEventTimeout(message);
 		if (!managedFallback && firstEventTimeout && this.#retryAttempt === 0) {
 			this.#firstEventTimeoutRetryStartedAt = Date.now();
+		}
+		if (emptyResponse && (assistantMessageHasVisibleOrToolContent(message) || !scope || !scopeWasClean)) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
 		}
 		const requiresScopedFirstEventTimeout = managedFallback || !legacyRetryConfigured;
 		if (
@@ -16009,7 +16038,8 @@ export class AgentSession {
 		// Bare defaults retain their narrow watchdog and Codex admissions. A
 		// first-event timeout adds the typed, content-free, current-clean-scope
 		// requirement above; other transient watchdogs preserve legacy behavior.
-		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
+		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
+		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
@@ -16716,6 +16746,7 @@ export class AgentSession {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
 					rescheduleOnBusy: true,
+					continueQueuedOnly: true,
 				});
 			}
 			options?.onPersisted?.();

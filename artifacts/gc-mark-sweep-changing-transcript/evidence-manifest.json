@@ -1,0 +1,95 @@
+{
+	"schemaVersion": 1,
+	"kind": "gc-mark-sweep-evidence",
+	"title": "gjc gc --disk --prune blob mark/sweep reclaims a blob while a transcript keeps changing under the mark",
+	"summary": "The blob mark/sweep drift fence is racy: when a session transcript keeps changing while the mark runs, `gjc gc --disk --prune` can converge on stale evidence and reclaim a blob as `unreferenced_by_any_surviving_session` instead of withholding the sweep with `keep:withheld_evidence_incomplete: sessions_changed_during_mark`. A reference appended after the last drift check (or during the mark's own read) is invisible to the sweep, so reclamation can destroy evidence a live transcript still points at.",
+	"surfacedBy": {
+		"workflowRunId": 31360117739,
+		"event": "workflow_dispatch",
+		"workflowJob": "test-shard / test:@gajae-code/coding-agent:shard-1-of-16",
+		"workflowJobId": 93368651727,
+		"headBranch": "fix/issue-4146-sdk-discovery-control",
+		"headSha": "5dafea1cc2a17a4b0dd74963a2d3a0c91a579637",
+		"pr": 4149,
+		"failingTest": "gjc gc --disk --prune (blob mark and sweep) > withholds the sweep when a transcript keeps changing under the mark",
+		"expected": "keep:withheld_evidence_incomplete: sessions_changed_during_mark",
+		"received": "reclaimed:unreferenced_by_any_surviving_session",
+		"failureLog": "ci-shard1-failure.txt"
+	},
+	"localReproduction": [
+		{
+			"commit": "06bf6d2055f94a77b3e7f5af1920733d48483799",
+			"label": "origin/dev head",
+			"command": "bun test packages/coding-agent/test/gc-disk-retention.test.ts",
+			"runs": 15,
+			"failures": 2,
+			"failureRate": 0.13,
+			"log": "repro-dev-head-06bf6d2055-fail.log"
+		},
+		{
+			"commit": "06bf6d2055f94a77b3e7f5af1920733d48483799",
+			"label": "origin/dev head (single-test filter)",
+			"command": "bun test packages/coding-agent/test/gc-disk-retention.test.ts -t \"withholds the sweep when a transcript keeps changing\"",
+			"runs": 40,
+			"failures": 4,
+			"failureRate": 0.1
+		},
+		{
+			"commit": "d73bc90ae46b884cadfd1eab83374b88ca7f19ed",
+			"label": "exact dev",
+			"command": "bun test packages/coding-agent/test/gc-disk-retention.test.ts -t \"withholds the sweep when a transcript keeps changing\"",
+			"runs": 25,
+			"failures": 2,
+			"failureRate": 0.08,
+			"log": "repro-exact-dev-d73bc90ae4-fail.log"
+		},
+		{
+			"commit": "e5ff1c1ba2a894eb8e977a77961012256d832f8f",
+			"label": "#4149 base",
+			"command": "bun test packages/coding-agent/test/gc-disk-retention.test.ts -t \"withholds the sweep when a transcript keeps changing\"",
+			"runs": 25,
+			"failures": 1,
+			"failureRate": 0.04,
+			"log": "repro-4149base-e5ff1c1-fail.log"
+		}
+	],
+	"attribution": {
+		"conclusion": "pre-existing race in dev's GC mark/sweep; PR #4149 did not introduce it",
+		"evidence": [
+			"packages/coding-agent/src/gjc-runtime/gc-runtime.ts is byte-identical between e5ff1c1 and dev HEAD",
+			"packages/coding-agent/test/gc-disk-retention.test.ts is byte-identical between e5ff1c1 and dev HEAD",
+			"the #4149 branch diff (e5ff1c1..5dafea1c) touches zero GC files",
+			"the test fails on exact dev d73bc90ae4, #4149 base e5ff1c1, and dev HEAD alike",
+			"the mark/sweep drift fence shipped in feat(gc): add an opt-in disk-retention pass (#4037), hardened by #4084 and #4110; the drift window survived all three"
+		]
+	},
+	"rootCauseHypothesis": {
+		"theDriftCheckIsAStatAfterTheRead": "markGcDiskTranscript reads the transcript first and lstats it after; a change landing between the end of the read and the lstat records a stat NEWER than the bytes read, so the drift comparison sees no change even though the reference set is stale.",
+		"theSweepIsNotFencedAgainstTheLastDriftCheck": "once findGcDiskMarkDrift returns empty, the loop breaks and the sweep runs; any append that lands after that final walk (or during the walk itself, after the file was visited) is never compared, so the sweep can reclaim a blob whose only reference appeared in the changed tail.",
+		"result": "a transcript that keeps changing under the mark can converge to clean evidence and have its blobs reclaimed as unreferenced_by_any_surviving_session."
+	},
+	"safetyRequirement": "A blob whose only live reference could be held by a transcript that changed at any point while the mark or sweep was measuring the store must never be reclaimed: partial or stale evidence withholds the sweep, exactly as the `sessions_changed_during_mark` path intends.",
+	"files": [
+		"ci-shard1-failure.txt",
+		"repro-dev-head-06bf6d2055-fail.log",
+		"repro-exact-dev-d73bc90ae4-fail.log",
+		"repro-4149base-e5ff1c1-fail.log",
+		"evidence-manifest.json",
+		"GPG-PUBLIC-KEY.asc",
+		"SHA256SUMS",
+		"SHA256SUMS.asc"
+	],
+	"signing": {
+		"scheme": "gpg-detached-signature",
+		"keyId": "6A8D48D0B4C7ACA36463DF217CCCF17C606579E8",
+		"keyUser": "gjc-gc-mark-sweep-evidence <gjc-gc-mark-sweep-evidence@users.noreply.github.com>",
+		"publicKeyFile": "GPG-PUBLIC-KEY.asc",
+		"signatureFile": "SHA256SUMS.asc",
+		"note": "SHA256SUMS carries the sha256 of every other file in this bundle; SHA256SUMS.asc is the detached EDDSA signature over SHA256SUMS. Verify the signature with the committed public key, then confirm every checksum."
+	},
+	"verification": [
+		"gpg --import GPG-PUBLIC-KEY.asc",
+		"gpg --verify SHA256SUMS.asc SHA256SUMS",
+		"sha256sum -c SHA256SUMS"
+	]
+}

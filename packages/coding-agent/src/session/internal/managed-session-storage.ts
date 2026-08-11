@@ -102,7 +102,7 @@ export class ManagedCommittedMutationError extends Error {
 
 function managedAppendFailure(code: string | undefined): Error {
 	const error = new Error(code ?? "managed_append_failed");
-	return code === "identity_mismatch" || code === "not_found" || code === "content_too_large"
+	return code === "content_too_large" || code === "too_large" || code === "header_patch_write_failed"
 		? error
 		: new ManagedCommittedMutationError("append", error);
 }
@@ -474,6 +474,65 @@ function replacementReceiptPlaceholderRetirementName(
 	receipt: { dev: bigint; ino: bigint },
 ): string {
 	return `.gjc-receipt-placeholder-remove-${placeholder.dev.toString(16)}-${placeholder.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}`;
+}
+
+/**
+ * Terminal write-protocol remnant names. The POSIX exact-unlink fallback cannot
+ * descriptor-unlink, so it detaches, scrubs, and retains zero-length quarantine
+ * entries and exchange placeholders instead of removing them (`cleanup_pending`
+ * with a durable payload). Linux completes deletion through the retained
+ * directory authority, but macOS has no retained authority, so every managed
+ * replacement leaks its scrubbed remnants and scope directories grow without
+ * bound (tens of thousands of dirents per workspace), degrading every
+ * per-mutation receipt scan and widening quarantine-collision windows.
+ */
+const SCRUBBED_REMNANT_PREFIXES = [
+	".gjc-exact-unlink-placeholder-",
+	".gjc-exact-replace-destination-",
+	".gjc-receipt-remove-",
+	".gjc-receipt-placeholder-remove-",
+	".gjc-replace-retry-",
+] as const;
+
+/** In-flight protocol steps complete in milliseconds; anything older is abandoned. */
+const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
+
+/**
+ * Best-effort removal of scrubbed write-protocol remnants from one managed
+ * directory. Only zero-length, single-link, non-symlink regular files whose
+ * names carry a terminal remnant prefix and whose timestamps are older than
+ * the age gate are removed: a zero-length single-link entry is exactly what
+ * the scrub proof leaves behind, and non-zero entries (displaced predecessors
+ * or detached receipts retained as evidence) are never touched. Failures are
+ * swallowed — a concurrent same-owner writer may legitimately own or already
+ * have reconciled any candidate.
+ */
+export function reapScrubbedProtocolRemnantsSync(
+	directory: string,
+	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
+): number {
+	let names: string[];
+	try {
+		names = fs.readdirSync(directory);
+	} catch {
+		return 0;
+	}
+	const cutoff = Date.now() - minAgeMs;
+	let reaped = 0;
+	for (const name of names) {
+		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+		const pathname = path.join(directory, name);
+		try {
+			const named = fs.lstatSync(pathname);
+			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+			if (named.mtimeMs > cutoff) continue;
+			fs.unlinkSync(pathname);
+			reaped += 1;
+		} catch {
+			// Best effort: concurrently reconciled or removed remnants are not errors.
+		}
+	}
+	return reaped;
 }
 
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
@@ -1501,6 +1560,25 @@ export class ManagedSessionDescendantStore {
 			throw new Error("managed_nested_path_unsupported");
 	}
 
+	/**
+	 * Without retained root authority a nested read resolves through intermediate
+	 * directories that `O_NOFOLLOW` does not cover, so each component between the
+	 * bound base directory and the target is verified as a real same-device
+	 * directory before the capture opens the leaf.
+	 */
+	#assertPathBackedDirectoryChain(resolved: string): void {
+		if (this.#authority) return;
+		const relative = path.relative(this.#baseDir, resolved);
+		const components = relative.split(path.sep);
+		let current = this.#baseDir;
+		for (const component of components.slice(0, -1)) {
+			current = path.join(current, component);
+			const stat = fs.lstatSync(current, { bigint: true });
+			if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== this.#subtreeRoot.dev)
+				throw new Error("Managed descendant path escapes retained store");
+		}
+	}
+
 	#relative(resolved: string): string {
 		return path.relative(this.#authorityBaseDir, resolved).split(path.sep).join("/");
 	}
@@ -1789,12 +1867,13 @@ export class ManagedSessionDescendantStore {
 	}
 	/** Read an exact managed file without exposing its pathname as authority. */
 	readExpected(relativePath: string): ManagedFileSnapshot | null {
-		this.#assertPathBackedReadRelative(relativePath);
 		this.#assertBound();
-		const relative = this.#relative(this.#resolve(relativePath));
+		const resolved = this.#resolve(relativePath);
+		const relative = this.#relative(resolved);
 		if (!this.#authority) {
 			try {
-				const captured = captureManagedFileNoFollow(this.#resolve(relativePath));
+				this.#assertPathBackedDirectoryChain(resolved);
+				const captured = captureManagedFileNoFollow(resolved);
 				this.#assertBound();
 				return captured;
 			} catch (error) {

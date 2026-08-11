@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { convertTools, resolveReservedToolNames } from "../src/providers/openai-responses";
-import type { Model, Tool } from "../src/types";
+import {
+	convertTools,
+	isOpenCodeGoEmptyCompletedResponse,
+	resolveReservedToolNames,
+} from "../src/providers/openai-responses";
+import type { AssistantMessage, Model, Tool } from "../src/types";
 
 /**
  * OpenCode Zen/Go reserve `web_search` for their own built-in and reject it as a
@@ -32,6 +36,58 @@ function tool(name: string): Tool {
 }
 
 const TOOLS = [tool("read"), tool("web_search"), tool("bash")];
+
+describe("OpenCode Go empty completion evidence", () => {
+	const opencodeModel = model("opencode-go");
+	const completed: AssistantMessage = {
+		role: "assistant",
+		content: [],
+		api: "openai-responses",
+		provider: "opencode-go",
+		model: "grok-4.5",
+		responseId: "resp_test",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+
+	it("accepts only a completed empty OpenCode Go response with no output items", () => {
+		expect(isOpenCodeGoEmptyCompletedResponse(opencodeModel, completed, 0)).toBe(true);
+		expect(isOpenCodeGoEmptyCompletedResponse(opencodeModel, { ...completed, responseId: undefined }, 0)).toBe(false);
+		expect(isOpenCodeGoEmptyCompletedResponse(opencodeModel, completed, 1)).toBe(false);
+	});
+
+	it("rejects unrelated providers and responses with content or usage", () => {
+		expect(isOpenCodeGoEmptyCompletedResponse(model("openai"), completed, 0)).toBe(false);
+		expect(
+			isOpenCodeGoEmptyCompletedResponse(
+				opencodeModel,
+				{
+					...completed,
+					content: [{ type: "text", text: "refusal" }],
+				},
+				0,
+			),
+		).toBe(false);
+		expect(
+			isOpenCodeGoEmptyCompletedResponse(
+				opencodeModel,
+				{
+					...completed,
+					usage: { ...completed.usage, input: 1, totalTokens: 1 },
+				},
+				0,
+			),
+		).toBe(false);
+	});
+});
 
 describe("resolveReservedToolNames", () => {
 	it("reserves web_search on opencode-go", () => {

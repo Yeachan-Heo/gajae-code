@@ -6,6 +6,25 @@ import path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
+import { SdkClient, SdkClientError } from "../client";
+import { elevationAuthorityPath, signElevationCapability } from "../elevation/capability";
+import { type ElevationOperation, elevationRequestDigest, isElevatableOperation } from "../elevation/digest";
+import {
+	type ElevationAnswerAuthority,
+	type ElevationClaimIdentity,
+	type ElevationDispatchOutcome,
+	isElevationRequestId,
+} from "../elevation/dispatch-receipt";
+import {
+	type ElevationAnswerValue,
+	type ElevationGrantRecord,
+	ElevationLedger,
+	type ElevationRequester,
+	type ElevationResult,
+	type ElevationSessionIdentity,
+} from "../elevation/grant-ledger";
+import { type BrokerOwnerPrincipal, readBrokerOwnerPrincipal } from "../elevation/owner";
+import { findOperation } from "../protocol/operation-registry";
 import {
 	type DirectoryMigrationPolicy,
 	listManagedSessionCandidates,
@@ -28,13 +47,13 @@ import {
 } from "./discovery";
 import { deriveIdempotencyIdentity } from "./identity";
 import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
-
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
+import { OperationReceiptLedger, operationReceiptDigest, operationReceiptKey } from "./operation-receipt-ledger";
 import { type IndexedSession, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
@@ -71,6 +90,7 @@ export type BrokerErrorCode =
 	| "not_found"
 	| "live_session"
 	| "cleanup_pending"
+	| "ambiguous_session"
 	| (string & {});
 
 export type BrokerCleanupIdentity = {
@@ -170,6 +190,35 @@ export type BrokerResponse =
 	  };
 const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({ ok: false, error: { code, message } });
 
+function elevationResultToBroker<T>(result: ElevationResult<T>): BrokerResponse {
+	if (result.ok) return { ok: true, result: result.value };
+	return error(result.error.code as BrokerErrorCode, result.error.message);
+}
+
+function elevationAnswerToBroker(result: ElevationResult<ElevationAnswerValue>): BrokerResponse {
+	if (!result.ok) return elevationResultToBroker(result);
+	const { outcome, grant } = result.value;
+	if (outcome === "granted")
+		return { ok: true, result: { elevationRequestId: grant.elevationRequestId, state: grant.state, outcome, grant } };
+	return error(outcome as BrokerErrorCode, `elevation ${outcome}: ${grant.elevationRequestId}`);
+}
+
+/**
+ * Result of resolving the session behind an elevation grant/request. An
+ * ambiguous session (C6) can never bind an exact endpoint identity.
+ */
+type ElevationSessionResolution =
+	| { kind: "identity"; identity: ElevationSessionIdentity }
+	| { kind: "ambiguous" }
+	| { kind: "unavailable" };
+function sameElevationSessionIdentity(left: ElevationSessionIdentity, right: ElevationSessionIdentity): boolean {
+	return (
+		left.sessionId === right.sessionId &&
+		path.resolve(left.endpointStateRoot) === path.resolve(right.endpointStateRoot) &&
+		left.endpointGeneration === right.endpointGeneration &&
+		left.endpointIncarnation === right.endpointIncarnation
+	);
+}
 function isCleanupPending(response: BrokerResponse): boolean {
 	return !response.ok && response.error.code === "cleanup_pending" && response.error.cleanup !== undefined;
 }
@@ -415,6 +464,7 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 }
 
 const BROKER_LOCK_RECORD = "owner.json";
+const BROKER_INDEX_COMPACT_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const BROKER_LOCK_STARTUP_WAIT_MS = 1_000;
 const BROKER_LOCK_RETRY_MS = 10;
 
@@ -722,11 +772,28 @@ const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
 const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
+function elevationLedgerEnabledForBroker(): boolean {
+	const raw = (process.env.GJC_SDK_ELEVATION_ENABLED ?? "").trim().toLowerCase();
+	return raw === "1" || raw === "true";
+}
+
+/** Recursive reserved-key rejection: the claim selector never travels inside approved input. */
+function containsReservedKey(value: unknown, key: string, seen = new Set<object>()): boolean {
+	if (!value || typeof value !== "object" || seen.has(value)) return false;
+	seen.add(value);
+	if (Array.isArray(value)) return value.some(item => containsReservedKey(item, key, seen));
+	return (
+		Object.hasOwn(value, key) ||
+		Object.values(value as Record<string, unknown>).some(nested => containsReservedKey(nested, key, seen))
+	);
+}
 
 export class Broker {
 	readonly settings: ResolvedBrokerSettings;
 	readonly index: SessionIndex;
 	readonly ledger: LifecycleLedger;
+	readonly elevation: ElevationLedger;
+	readonly operationReceipts: OperationReceiptLedger;
 	discovery: BrokerDiscovery | null = null;
 	#lock: string;
 	#owner = randomBytes(12).toString("hex");
@@ -745,6 +812,12 @@ export class Broker {
 	#completion!: Promise<void>;
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
+	/** Broker tenure counter: increments per start so a restart is a new epoch. */
+	#epoch = 0;
+	#incarnation: string | null = null;
+	#elevationEnforced: boolean;
+	#compactTimer: NodeJS.Timeout | null = null;
+	#operatorTimer: NodeJS.Timeout | null = null;
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
@@ -755,7 +828,10 @@ export class Broker {
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
+		this.elevation = new ElevationLedger(settings.agentDir);
+		this.operationReceipts = new OperationReceiptLedger(settings.agentDir);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
+		this.#elevationEnforced = elevationLedgerEnabledForBroker();
 		const completion = Promise.withResolvers<void>();
 		this.#completion = completion.promise;
 		this.#resolveCompletion = completion.resolve;
@@ -908,10 +984,15 @@ export class Broker {
 			this.#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 		}
 		this.#stopping = false;
+		this.#epoch += 1;
 		this.#publicationState = "healthy-owned";
 		this.#lossAt = null;
 		this.#ambiguousAt = null;
-		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
+		await Promise.all([
+			this.ledger.assertSupportedStateVersions(),
+			this.elevation.assertSupportedStateVersions(),
+			readBrokerDiscovery(this.settings.agentDir),
+		]);
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
 		for (;;) {
 			try {
@@ -958,9 +1039,20 @@ export class Broker {
 		try {
 			await this.index.open();
 			await this.ledger.open();
+			await this.elevation.open();
+			await this.operationReceipts.open();
+			if (this.#elevationEnforced)
+				await fs.mkdir(path.join(this.settings.agentDir, "sdk", "elevation", "operator"), {
+					recursive: true,
+					mode: 0o700,
+				});
+			// Broker-scheduled compaction (C3): apply the retention policy once at
+			// startup and again every six hours, independently of log rotation.
+			await this.#compactSessionIndex();
 			const now = Date.now();
 			const incarnation = brokerProcessIncarnation(process.pid);
 			if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
+			this.#incarnation = incarnation;
 			const token = newBrokerToken();
 			this.#transport = new BrokerTransport(this, token, this.settings.port);
 			const port = await this.#transport.start();
@@ -985,6 +1077,8 @@ export class Broker {
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
 			);
 			this.#heartbeatTimer = setInterval(() => void this.#watchPublication(), cadenceMs);
+			this.#compactTimer = setInterval(() => void this.#compactSessionIndex(), BROKER_INDEX_COMPACT_INTERVAL_MS);
+			if (this.#elevationEnforced) this.#operatorTimer = setInterval(() => void this.#pollOperatorDirectives(), 250);
 			return this.discovery;
 		} catch (error) {
 			await this.#transport?.stop();
@@ -1051,6 +1145,7 @@ export class Broker {
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
 			if (writeHeartbeat) await this.#writeHeartbeat();
+			await this.#checkpointSessionHeartbeats();
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
@@ -1077,6 +1172,33 @@ export class Broker {
 		if (this.#publicationState !== "healthy-owned") return;
 		await this.#writeHeartbeat();
 	}
+
+	/**
+	 * Production coalesced heartbeat checkpoint seam (C2): delegates to the session
+	 * index writer, which appends at most one `host_heartbeat` per session per
+	 * {@link SESSION_HEARTBEAT_INTERVAL_MS} for hosts that are alive and, when recorded,
+	 * still carry the same OS process incarnation. Returns the number of checkpoints
+	 * written. Used by the periodic publication watch, by session reads so a fresh
+	 * registration is observed as live, and by tests.
+	 */
+	async heartbeatSessions(now = Date.now()): Promise<number> {
+		return await this.index.checkpointLiveHeartbeats(now);
+	}
+
+	async #checkpointSessionHeartbeats(): Promise<void> {
+		try {
+			await this.heartbeatSessions();
+		} catch {
+			// Best-effort observation; a failed checkpoint never fences the broker.
+		}
+	}
+	async #compactSessionIndex(): Promise<void> {
+		try {
+			await this.index.compact();
+		} catch {
+			// Compaction is best-effort maintenance; the next scheduled pass retries.
+		}
+	}
 	async #complete(mode: BrokerStopMode): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
 		this.#stopping = true;
@@ -1090,6 +1212,10 @@ export class Broker {
 		if (mode === "lost-root") this.#startupAdmissions.close();
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
+		if (this.#compactTimer) clearInterval(this.#compactTimer);
+		this.#compactTimer = null;
+		if (this.#operatorTimer) clearInterval(this.#operatorTimer);
+		this.#operatorTimer = null;
 		this.#completionTask = (async () => {
 			await this.#transport?.stop();
 			this.#transport = null;
@@ -1169,8 +1295,12 @@ export class Broker {
 		const authority = expectedEndpointAuthority(input);
 		if ("ok" in authority) return authority;
 		await this.index.refresh();
+		await this.heartbeatSessions();
 		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
 		if (!record) return error("resource_gone", "session is not indexed");
+		// C6: a cross-repo duplicate cannot resolve an endpoint credential; require
+		// disambiguation before any credential is minted.
+		if (record.ambiguous) return error("ambiguous_session", "session id maps to more than one state root");
 		if (!record.live || !matchesEndpointAuthority(record, authority))
 			return error("endpoint_stale", "session endpoint is stale");
 		return this.#readEndpoint(record, authority);
@@ -1258,13 +1388,18 @@ export class Broker {
 			indexSeq: snapshot.indexSeq,
 		};
 	}
-	handleRequest(operation: string, input: Record<string, unknown>, idempotencyKey?: string): Promise<BrokerResponse> {
+	handleRequest(
+		operation: string,
+		input: Record<string, unknown>,
+		idempotencyKey?: string,
+		elevationRequestId?: string,
+	): Promise<BrokerResponse> {
 		if (this.#stopping || (this.#publication !== null && this.#publicationState !== "healthy-owned"))
 			return Promise.resolve(error("unavailable", "broker publication is unavailable"));
 		let release!: () => void;
 		const admission = new Promise<void>(resolve => (release = resolve));
 		this.#admitted.add(admission);
-		return this.#handleRequest(operation, input, idempotencyKey).finally(() => {
+		return this.#handleRequest(operation, input, idempotencyKey, elevationRequestId).finally(() => {
 			release();
 			this.#admitted.delete(admission);
 		});
@@ -1273,13 +1408,21 @@ export class Broker {
 		operation: string,
 		input: Record<string, unknown>,
 		idempotencyKey?: string,
+		elevationRequestId?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
+		const approvedInput = input;
 		input = normalization.input;
 		if (operation === "session.list") {
-			if (input.cursor === undefined) await this.index.refresh();
+			if (input.cursor === undefined) {
+				await this.index.refresh();
+				// Self-healing heartbeat checkpoint (C2): a host registered since the
+				// broker's last pass is observed as live on this read, so a fresh
+				// registration never reads as unknown (while a restart still does).
+				await this.heartbeatSessions();
+			}
 			const page = this.#sessionListPage(input, this.index.listSessions());
 			if (!page.ok) return page;
 			const pageResult = page.result as Record<string, unknown>;
@@ -1308,7 +1451,56 @@ export class Broker {
 			return page;
 		}
 		if (operation === "session.get_endpoint") return this.#endpoint(input);
+		if (operation === "elevation.issue") return this.#elevationIssueRequest(input);
+		if (operation === "elevation.status") return this.#elevationStatusRequest(input);
+		if (operation === "session.control") return this.#sessionControlRequest(input);
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
+		// Elevation gate (F1.3): allowlisted raw operations execute only behind a
+		// broker-owned single-use grant. Validation is fail-closed and happens
+		// before any lifecycle ledger write; the claim itself is consumed right
+		// before dispatch and the truthful outcome is recorded after it.
+		const elevationGateKind = this.#elevationGateFor(operation);
+		let elevationRequestIdForDispatch: string | undefined;
+		if (elevationGateKind !== undefined) {
+			if (elevationRequestId === undefined)
+				return error("elevation_required", "an elevation grant claim is required for this operation");
+			if (!isElevationRequestId(elevationRequestId))
+				return error("invalid_input", "elevationRequestId must be an RFC4122 lowercase UUID v4");
+			const resolved = await this.elevation.get(elevationRequestId);
+			if (!resolved.ok) {
+				if (resolved.error.code === "not_found")
+					return error(
+						"elevation_required",
+						"elevation grant was not found; a grant is required for this operation",
+					);
+				return elevationResultToBroker(resolved);
+			}
+			const grant = resolved.value.grant;
+			if (grant.operation.kind !== elevationGateKind || grant.operation.sdkId !== operation)
+				return error("elevation_digest_mismatch", "elevation grant was issued for a different operation");
+			const digest = elevationRequestDigest({ kind: elevationGateKind, sdkId: operation, input: approvedInput });
+			if (!digest.ok || digest.digest !== grant.requestDigest)
+				return error("elevation_digest_mismatch", "elevation grant digest does not match the dispatched input");
+			// Bind the grant to the actual lifecycle target before any claim: the
+			// approved input must resolve to the exact session identity the grant
+			// was issued against (C10). session.delete may target a retained
+			// stopped session; everything else requires a live endpoint.
+			const targetSessionId = typeof input.sessionId === "string" ? input.sessionId : undefined;
+			if (targetSessionId !== undefined) {
+				const target = await this.#elevationSessionResolution(targetSessionId, {
+					allowStopped: operation === "session.delete",
+				});
+				if (target.kind === "ambiguous")
+					return error("ambiguous_session", "session id maps to more than one state root");
+				if (target.kind !== "identity")
+					return error("target_unavailable", "session endpoint is unreachable or its identity is not provable");
+				if (grant.sessionIdentity.sessionId !== target.identity.sessionId)
+					return error("elevation_digest_mismatch", "elevation grant was issued for a different session target");
+				if (!sameElevationSessionIdentity(grant.sessionIdentity, target.identity))
+					return error("endpoint_stale", "session endpoint identity no longer matches the elevation grant");
+			}
+			elevationRequestIdForDispatch = elevationRequestId;
+		}
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
@@ -1412,8 +1604,46 @@ export class Broker {
 				return response;
 			}
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
-			const outcome = await executeLifecycle(this, operation, input, identity);
+			// Single-use grant claim (F1.3): consume the grant before any dispatch.
+			// A claimed grant that crashes before outcome recording is replayed
+			// truthfully as consumed/uncertain; retry requires a new grant.
+			if (elevationRequestIdForDispatch !== undefined) {
+				const claimed = await this.elevationClaim({ elevationRequestId: elevationRequestIdForDispatch });
+				if (!claimed.ok) return claimed;
+			}
+			let outcome: Awaited<ReturnType<typeof executeLifecycle>>;
+			try {
+				outcome = await executeLifecycle(this, operation, input, identity);
+			} catch (cause) {
+				if (elevationRequestIdForDispatch !== undefined)
+					await this.elevationDispatch({
+						elevationRequestId: elevationRequestIdForDispatch,
+						outcome: {
+							status: "failed",
+							code: "unavailable",
+							message: cause instanceof Error ? cause.message : String(cause),
+							dispatchedAt: Date.now(),
+						},
+					});
+				throw cause;
+			}
 			const response = outcome.response;
+			// Record the truthful dispatch outcome for the claimed grant.
+			if (elevationRequestIdForDispatch !== undefined) {
+				const dispatchedAt = Date.now();
+				const recorded = await this.elevationDispatch({
+					elevationRequestId: elevationRequestIdForDispatch,
+					outcome: response.ok
+						? { status: "ok", dispatchedAt }
+						: {
+								status: "failed",
+								code: response.error.code,
+								message: response.error.message,
+								dispatchedAt,
+							},
+				});
+				if (!recorded.ok) return recorded;
+			}
 			await this.ledger.transition(identity, lifecycleResponseState(response), {
 				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 				resultSessionId:
@@ -1452,6 +1682,460 @@ export class Broker {
 			release();
 			if (this.#chains.get(target) === current) this.#chains.delete(target);
 		}
+	}
+
+	#elevationGateFor(operation: string): "global" | undefined {
+		return this.#elevationEnforced && isElevatableOperation("global", operation) ? "global" : undefined;
+	}
+
+	async #elevationIssueRequest(input: Record<string, unknown>): Promise<BrokerResponse> {
+		const sessionId = input.sessionId;
+		if (typeof sessionId !== "string" || !isCanonicalSessionId(sessionId))
+			return error("invalid_input", "sessionId must be a canonical safe identifier");
+		const rawOperation = input.operation;
+		if (typeof rawOperation !== "object" || rawOperation === null || Array.isArray(rawOperation))
+			return error("invalid_input", "operation must be an object with kind and sdkId");
+		const { kind, sdkId } = rawOperation as { kind?: unknown; sdkId?: unknown };
+		if (
+			typeof kind !== "string" ||
+			(kind !== "control" && kind !== "query" && kind !== "global") ||
+			typeof sdkId !== "string" ||
+			!findOperation(kind, sdkId)
+		)
+			return error("invalid_request", `unknown elevation operation: ${String(kind)}:${String(sdkId)}`);
+		if (!isElevatableOperation(kind, sdkId))
+			return error("elevation_not_allowlisted", `${sdkId} does not require elevation`);
+		const approved = input.input;
+		if (typeof approved !== "object" || approved === null || Array.isArray(approved))
+			return error("invalid_input", "input must be the approved operation arguments");
+		if (containsReservedKey(approved, "elevationRequestId"))
+			return error(
+				"invalid_input",
+				"elevationRequestId is reserved and cannot appear inside the approved operation input",
+			);
+		if (input.idempotencyKey !== undefined)
+			return error(
+				"invalid_input",
+				"idempotencyKey is broker-frame metadata and cannot appear inside elevation.issue input",
+			);
+		const elevationRequestId = input.elevationRequestId;
+		if (elevationRequestId !== undefined && !isElevationRequestId(elevationRequestId))
+			return error("invalid_input", "elevationRequestId must be an RFC4122 lowercase UUID v4");
+		const expiresInMs = input.expiresInMs;
+		if (
+			expiresInMs !== undefined &&
+			(typeof expiresInMs !== "number" || !Number.isSafeInteger(expiresInMs) || expiresInMs <= 0)
+		)
+			return error("invalid_input", "expiresInMs must be a positive safe integer");
+		let requester: ElevationRequester;
+		if (input.requester === undefined) {
+			requester = { source: "broker_connection", connectionId: `broker:${this.#owner}` };
+		} else {
+			const candidate = input.requester as { source?: unknown; connectionId?: unknown };
+			if (
+				candidate?.source !== "broker_connection" ||
+				typeof candidate.connectionId !== "string" ||
+				candidate.connectionId.length === 0
+			)
+				return error("invalid_input", "requester must be a broker_connection audit identity");
+			requester = { source: "broker_connection", connectionId: candidate.connectionId };
+		}
+		return await this.elevationIssue({
+			sessionId,
+			operation: { kind, sdkId },
+			input: approved as Record<string, unknown>,
+			requester,
+			...(elevationRequestId === undefined ? {} : { elevationRequestId }),
+			...(expiresInMs === undefined ? {} : { expiresInMs }),
+		});
+	}
+
+	async #elevationStatusRequest(input: Record<string, unknown>): Promise<BrokerResponse> {
+		const elevationRequestId = input.elevationRequestId;
+		if (typeof elevationRequestId !== "string" || !isElevationRequestId(elevationRequestId))
+			return error("invalid_input", "elevationRequestId must be an RFC4122 lowercase UUID v4");
+		return await this.elevationResolve(elevationRequestId);
+	}
+
+	#elevationClaimIdentity(): ElevationClaimIdentity {
+		const incarnation = this.#incarnation;
+		if (incarnation === null) throw new Error("Broker process incarnation is unavailable.");
+		return { ownerId: this.#owner, epoch: this.#epoch, pid: process.pid, incarnation };
+	}
+	async #elevationPrincipal(): Promise<BrokerOwnerPrincipal> {
+		const incarnation = this.#incarnation;
+		if (incarnation === null) throw new Error("Broker process incarnation is unavailable.");
+		return readBrokerOwnerPrincipal(this.settings.agentDir, process.pid, incarnation);
+	}
+	/**
+	 * Resolves the exact elevation session identity (C6/C10). A cross-repo
+	 * duplicate (`ambiguous`) is rejected before any endpoint credential or
+	 * elevation grant can bind; an unreachable or unprovable session is
+	 * `unavailable`. The heartbeat checkpoint pass runs first so a fresh
+	 * registration is observable as live.
+	 *
+	 * `allowStopped` is the session.delete-only exemption: a retained stopped
+	 * session keeps its exact endpoint identity tuple (generation/pid/mtime)
+	 * in the index row, so a delete grant can still be bound and dispatched
+	 * against it. Everything else fails closed unless the endpoint is live.
+	 */
+	async #elevationSessionResolution(
+		sessionId: string,
+		options?: { allowStopped?: boolean },
+	): Promise<ElevationSessionResolution> {
+		if (!isCanonicalSessionId(sessionId)) return { kind: "unavailable" };
+		await this.index.refresh();
+		await this.heartbeatSessions();
+		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		if (!record) return { kind: "unavailable" };
+		if (record.ambiguous) return { kind: "ambiguous" };
+		if (!record.live && options?.allowStopped !== true) return { kind: "unavailable" };
+		const incarnation = endpointIncarnation(record, sessionId);
+		if (incarnation === undefined) return { kind: "unavailable" };
+		return {
+			kind: "identity",
+			identity: {
+				sessionId: record.sessionId,
+				endpointStateRoot: record.locator.stateRoot,
+				endpointGeneration: record.endpointGeneration,
+				endpointIncarnation: incarnation,
+			},
+		};
+	}
+
+	async #pollOperatorDirectives(): Promise<void> {
+		const directory = path.join(this.settings.agentDir, "sdk", "elevation", "operator");
+		let names: string[];
+		try {
+			names = await fs.readdir(directory);
+		} catch {
+			return;
+		}
+		for (const name of names) {
+			if (!name.endsWith(".json")) continue;
+			const file = path.join(directory, name);
+			try {
+				const stat = await fs.stat(file);
+				if ((stat.mode & 0o077) !== 0) throw new Error("operator directive is not private");
+				const raw: unknown = JSON.parse(await fs.readFile(file, "utf8"));
+				if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("malformed operator directive");
+				const directive = raw as Record<string, unknown>;
+				if (
+					typeof directive.elevationRequestId !== "string" ||
+					(directive.answer !== "approve" && directive.answer !== "deny") ||
+					typeof directive.presentedDigest !== "string"
+				)
+					throw new Error("malformed operator directive");
+				const response = await this.elevationAnswer({
+					elevationRequestId: directive.elevationRequestId,
+					answer: directive.answer,
+					presentedDigest: directive.presentedDigest,
+					answerer: { source: "local_operator", attestedBy: "gjc-sdk-session-cli" },
+				});
+				if (!response.ok) throw new Error(response.error.message);
+				await fs.rm(file, { force: true });
+			} catch {
+				await fs.rename(file, `${file}.rejected`).catch(() => undefined);
+			}
+		}
+	}
+
+	async #sessionControlRequest(input: Record<string, unknown>): Promise<BrokerResponse> {
+		const sessionId = typeof input.sessionId === "string" ? input.sessionId : undefined;
+		const operation = typeof input.operation === "string" ? input.operation : undefined;
+		const rawInput = input.input;
+		const controlInput =
+			rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)
+				? (rawInput as Record<string, unknown>)
+				: undefined;
+		if (!sessionId || !operation || !controlInput || !findOperation("control", operation))
+			return error(
+				"invalid_input",
+				"session.control requires a valid sessionId, control operation, and object input",
+			);
+		const elevationRequestId = typeof input.elevationRequestId === "string" ? input.elevationRequestId : undefined;
+		const elevatable = this.#elevationEnforced && isElevatableOperation("control", operation);
+		// Elevation preflight (F1.3) runs before any clientRef reservation so a
+		// no-grant attempt can never poison a later granted retry with a stale
+		// pending receipt.
+		let grant: ElevationGrantRecord | undefined;
+		if (elevatable) {
+			if (!elevationRequestId) return error("elevation_required", "an elevation grant is required for this control");
+			const resolved = await this.elevation.get(elevationRequestId);
+			if (!resolved.ok) return elevationResultToBroker(resolved);
+			grant = resolved.value.grant;
+			const digest = elevationRequestDigest({ kind: "control", sdkId: operation, input: controlInput });
+			if (
+				grant.operation.kind !== "control" ||
+				grant.operation.sdkId !== operation ||
+				!digest.ok ||
+				digest.digest !== grant.requestDigest
+			)
+				return error("elevation_digest_mismatch", "elevation grant does not match the requested control");
+		}
+		await this.index.refresh();
+		const matches = this.index.listSessions().sessions.filter(session => session.sessionId === sessionId);
+		if (matches.some(session => session.ambiguous) || matches.length > 1)
+			return error("ambiguous_session", "session id maps to more than one state root");
+		const record = matches[0];
+		if (!record?.live) return error("target_unavailable", "session endpoint is unavailable");
+		const incarnation = endpointIncarnation(record, sessionId);
+		if (!incarnation) return error("endpoint_stale", "session endpoint incarnation is unavailable");
+		// Bind the grant to the actual approved target session identity before
+		// claim/capability minting: a grant issued for a different session can
+		// never authorize this control, even with byte-identical input.
+		if (grant !== undefined) {
+			if (grant.sessionIdentity.sessionId !== record.sessionId)
+				return error("elevation_digest_mismatch", "elevation grant was issued for a different session target");
+			const targetIdentity: ElevationSessionIdentity = {
+				sessionId: record.sessionId,
+				endpointStateRoot: record.locator.stateRoot,
+				endpointGeneration: record.endpointGeneration,
+				endpointIncarnation: incarnation,
+			};
+			if (!sameElevationSessionIdentity(grant.sessionIdentity, targetIdentity))
+				return error("endpoint_stale", "session endpoint identity no longer matches the elevation grant");
+		}
+		const clientRef =
+			typeof controlInput.clientRef === "string" && controlInput.clientRef.length > 0
+				? controlInput.clientRef
+				: undefined;
+		// clientRef idempotency is target-session scoped: identical refs and
+		// input on different sessions never collide, conflict, or replay.
+		const receiptKey = clientRef === undefined ? undefined : operationReceiptKey(sessionId, clientRef);
+		const receiptDigest =
+			clientRef === undefined ? undefined : operationReceiptDigest(operation, controlInput, sessionId);
+		if (receiptKey !== undefined && receiptDigest !== undefined) {
+			const reservation = await this.operationReceipts.reserve(receiptKey, receiptDigest);
+			if (reservation.status === "replay") return reservation.response;
+			if (reservation.status === "in_progress")
+				return error("operation_in_progress", "operation receipt is pending");
+			if (reservation.status === "conflict")
+				return error("idempotency_conflict", "clientRef was reused with different operation input");
+		}
+		const settle = async (response: BrokerResponse): Promise<BrokerResponse> => {
+			if (receiptKey !== undefined && receiptDigest !== undefined)
+				await this.operationReceipts.complete(receiptKey, receiptDigest, response);
+			return response;
+		};
+		const endpointResponse = await this.#endpoint({
+			sessionId,
+			endpointGeneration: record.endpointGeneration,
+			endpointIncarnation: incarnation,
+		});
+		if (!endpointResponse.ok) return settle(endpointResponse);
+		const endpoint = endpointResponse.result as { url?: unknown; token?: unknown };
+		if (typeof endpoint.url !== "string" || typeof endpoint.token !== "string")
+			return settle(error("unavailable", "session endpoint is malformed"));
+		let elevationCapability: string | undefined;
+		if (elevatable && elevationRequestId) {
+			let authorityToken: string | undefined;
+			try {
+				const authority = JSON.parse(
+					await fs.readFile(elevationAuthorityPath(record.locator.stateRoot, sessionId), "utf8"),
+				) as { token?: unknown };
+				authorityToken = typeof authority.token === "string" ? authority.token : undefined;
+			} catch {
+				return settle(error("unavailable", "session elevation authority is unavailable"));
+			}
+			if (!authorityToken) return settle(error("unavailable", "session elevation authority is malformed"));
+			const claimed = await this.elevationClaim({ elevationRequestId });
+			if (!claimed.ok) return settle(claimed);
+			elevationCapability = signElevationCapability(authorityToken, elevationRequestId, operation, controlInput);
+		}
+		let client: SdkClient | undefined;
+		try {
+			client = await SdkClient.connect(endpoint.url, endpoint.token);
+			const response = await client.control(operation, controlInput, {
+				confirm: input.confirm === true,
+				...(elevationCapability === undefined ? {} : { elevationRequestId: elevationCapability }),
+			});
+			const ok = (response as { ok?: unknown }).ok === true;
+			if (elevatable && elevationRequestId) {
+				await this.elevationDispatch({
+					elevationRequestId,
+					outcome: ok
+						? { status: "ok", dispatchedAt: Date.now() }
+						: {
+								status: "failed",
+								code: String((response as { error?: { code?: unknown } }).error?.code ?? "control_failed"),
+								message: String(
+									(response as { error?: { message?: unknown } }).error?.message ?? "control failed",
+								),
+								dispatchedAt: Date.now(),
+							},
+				});
+			}
+			const brokerResponse = ok
+				? { ok: true as const, result: (response as { result?: unknown }).result }
+				: error(
+						String((response as { error?: { code?: unknown } }).error?.code ?? "unavailable"),
+						String((response as { error?: { message?: unknown } }).error?.message ?? "control failed"),
+					);
+			return settle(brokerResponse);
+		} catch (cause) {
+			if (elevatable && elevationRequestId)
+				await this.elevationDispatch({
+					elevationRequestId,
+					outcome: {
+						status: "failed",
+						code: "unavailable",
+						message: cause instanceof Error ? cause.message : String(cause),
+						dispatchedAt: Date.now(),
+					},
+				});
+			return settle(
+				cause instanceof SdkClientError
+					? error(cause.code, cause.message)
+					: error("unavailable", cause instanceof Error ? cause.message : String(cause)),
+			);
+		} finally {
+			await client?.close();
+		}
+	}
+	/**
+	 * Elevation issuance (internal). Binds the exact endpoint identity
+	 * (endpointStateRoot/generation/incarnation) from the live index record;
+	 * the request digest is broker-computed from the full `{kind,sdkId,input}`
+	 * triple with the top-level `elevationRequestId` excluded.
+	 */
+	async elevationIssue(params: {
+		sessionId: string;
+		operation: ElevationOperation;
+		input: Record<string, unknown>;
+		requester: ElevationRequester;
+		elevationRequestId?: string;
+		expiresInMs?: number;
+	}): Promise<BrokerResponse> {
+		if (!isCanonicalSessionId(params.sessionId))
+			return error("invalid_input", "sessionId must be a canonical safe identifier");
+		// Retained stopped sessions may only back an elevation request for the
+		// exact global lifecycle operation that needs them (session.delete); all
+		// other operations still require a live endpoint (fail closed otherwise).
+		const allowStopped = params.operation.kind === "global" && params.operation.sdkId === "session.delete";
+		const resolution = await this.#elevationSessionResolution(params.sessionId, { allowStopped });
+		if (resolution.kind === "ambiguous")
+			return error("ambiguous_session", "session id maps to more than one state root");
+		if (resolution.kind === "unavailable")
+			return error("target_unavailable", "session endpoint is unreachable or its identity is not provable");
+		// Bind the grant to the actual approved target session: the approved
+		// input for a global lifecycle operation must name the elevation session
+		// itself, never a different session (C10).
+		if (params.operation.kind === "global") {
+			const approvedTarget = typeof params.input.sessionId === "string" ? params.input.sessionId : undefined;
+			if (approvedTarget !== undefined && approvedTarget !== params.sessionId)
+				return error("invalid_input", "approved input targets a different session than the elevation session");
+		}
+		const { identity: sessionIdentity } = resolution;
+		let principal: BrokerOwnerPrincipal;
+		try {
+			principal = await this.#elevationPrincipal();
+		} catch {
+			return error("unavailable", "broker owner principal is unavailable");
+		}
+		const result = await this.elevation.issue({ ...params, sessionIdentity, principal });
+		return elevationResultToBroker(result);
+	}
+
+	/**
+	 * Elevation answer (internal, operator-only). There is no public
+	 * `elevation.answer` operation: this entry point is reserved for the local
+	 * operator approval surface and the separately authorized gate-answer
+	 * source, and the ledger enforces the distinct-answer-source boundary.
+	 */
+	async elevationAnswer(params: {
+		elevationRequestId: string;
+		answer: "approve" | "deny";
+		presentedDigest: string;
+		answerer: ElevationAnswerAuthority;
+	}): Promise<BrokerResponse> {
+		const resolved = await this.elevation.get(params.elevationRequestId);
+		if (!resolved.ok) return elevationResultToBroker(resolved);
+		const sessionId = resolved.value.grant.sessionIdentity.sessionId;
+		const grantOperation = resolved.value.grant.operation;
+		const resolution = await this.#elevationSessionResolution(sessionId, {
+			allowStopped: grantOperation.kind === "global" && grantOperation.sdkId === "session.delete",
+		});
+		if (resolution.kind === "ambiguous")
+			return error("ambiguous_session", "session id maps to more than one state root");
+		const currentSessionIdentity = resolution.kind === "identity" ? resolution.identity : undefined;
+		let principal: BrokerOwnerPrincipal;
+		try {
+			principal = await this.#elevationPrincipal();
+		} catch {
+			return error("unavailable", "broker owner principal is unavailable");
+		}
+		const result = await this.elevation.answer({ ...params, principal, currentSessionIdentity });
+		return elevationAnswerToBroker(result);
+	}
+
+	/** Single-use grant claim (internal): consumes the grant before dispatch. */
+	async elevationClaim(params: { elevationRequestId: string }): Promise<BrokerResponse> {
+		const resolved = await this.elevation.get(params.elevationRequestId);
+		if (!resolved.ok) return elevationResultToBroker(resolved);
+		const sessionId = resolved.value.grant.sessionIdentity.sessionId;
+		const grantOperation = resolved.value.grant.operation;
+		const resolution = await this.#elevationSessionResolution(sessionId, {
+			allowStopped: grantOperation.kind === "global" && grantOperation.sdkId === "session.delete",
+		});
+		if (resolution.kind === "ambiguous")
+			return error("ambiguous_session", "session id maps to more than one state root");
+		const currentSessionIdentity = resolution.kind === "identity" ? resolution.identity : undefined;
+		let claimIdentity: ElevationClaimIdentity;
+		try {
+			claimIdentity = this.#elevationClaimIdentity();
+		} catch {
+			return error("unavailable", "broker process incarnation is unavailable");
+		}
+		const result = await this.elevation.claim({
+			elevationRequestId: params.elevationRequestId,
+			claimIdentity,
+			currentSessionIdentity,
+		});
+		return elevationResultToBroker(result);
+	}
+
+	/** Records the dispatch outcome for a claimed grant (internal). */
+	async elevationDispatch(params: {
+		elevationRequestId: string;
+		outcome: ElevationDispatchOutcome;
+	}): Promise<BrokerResponse> {
+		let dispatchIdentity: ElevationClaimIdentity;
+		try {
+			dispatchIdentity = this.#elevationClaimIdentity();
+		} catch {
+			return error("unavailable", "broker process incarnation is unavailable");
+		}
+		const result = await this.elevation.dispatch({
+			elevationRequestId: params.elevationRequestId,
+			dispatchIdentity,
+			outcome: params.outcome,
+		});
+		return elevationResultToBroker(result);
+	}
+
+	/** Truthful elevation status read (internal; reconciles expiry and crash state). */
+	async elevationResolve(elevationRequestId: string): Promise<BrokerResponse> {
+		let claimIdentity: ElevationClaimIdentity;
+		try {
+			claimIdentity = this.#elevationClaimIdentity();
+		} catch {
+			return error("unavailable", "broker process incarnation is unavailable");
+		}
+		const result = await this.elevation.resolve(elevationRequestId, claimIdentity);
+		return elevationResultToBroker(result);
+	}
+
+	/** Truthful elevation listing (internal). */
+	async elevationList(): Promise<BrokerResponse> {
+		let claimIdentity: ElevationClaimIdentity;
+		try {
+			claimIdentity = this.#elevationClaimIdentity();
+		} catch {
+			return error("unavailable", "broker process incarnation is unavailable");
+		}
+		const result = await this.elevation.list(claimIdentity);
+		return elevationResultToBroker(result);
 	}
 }
 

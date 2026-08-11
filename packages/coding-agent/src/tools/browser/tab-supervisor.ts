@@ -81,6 +81,8 @@ export interface AcquireTabOptions {
 	dialogs?: DialogPolicy;
 	/** Owning session id so dispose can release only this session's tabs (F13). */
 	ownerId?: string;
+	/** Opt-in bounded page runtime diagnostics (extra CDP session + Runtime events per tab). */
+	runtimeDiagnostics?: boolean;
 	/** Internal recovery-only target id; makes a headless replacement attach, not open a page. */
 	recoveryTargetId?: string;
 	/** Recovery fence: replacement must not overwrite a tab installed after dead teardown. */
@@ -666,6 +668,7 @@ async function buildInitPayload(browser: BrowserHandle, opts: AcquireTabOptions)
 			safeDir,
 			targetId: opts.recoveryTargetId,
 			dialogs: opts.dialogs,
+			...(opts.runtimeDiagnostics ? { runtimeDiagnostics: true } : {}),
 		};
 	}
 	if (browser.kind.kind === "headless") {
@@ -679,6 +682,7 @@ async function buildInitPayload(browser: BrowserHandle, opts: AcquireTabOptions)
 			url: opts.url,
 			waitUntil: opts.waitUntil,
 			timeoutMs: opts.timeoutMs,
+			...(opts.runtimeDiagnostics ? { runtimeDiagnostics: true } : {}),
 		};
 	}
 	const page = await pickElectronTarget(browser.browser, opts.target);
@@ -689,6 +693,7 @@ async function buildInitPayload(browser: BrowserHandle, opts: AcquireTabOptions)
 		safeDir,
 		targetId,
 		dialogs: opts.dialogs,
+		...(opts.runtimeDiagnostics ? { runtimeDiagnostics: true } : {}),
 	};
 }
 export async function buildInitPayloadForTest(

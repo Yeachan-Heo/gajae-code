@@ -1283,6 +1283,78 @@ describe("AgentSession resilient retry", () => {
 			session = undefined;
 		}
 	}, 30_000);
+	it("retries a typed empty response once on a clean bare-default scope", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			bareDefault: true,
+			errorMessage: "Provider returned an empty response with zero token usage",
+			transportFailure: { kind: "transport", providerCode: "empty_response" },
+			recoveredContent: "recovered",
+			requestedModels,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("typed empty response");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]?.unbounded).toBe(false);
+		expect(lastAssistant(session).stopReason).toBe("stop");
+	});
+
+	it("bounds repeated typed empty responses by retry.maxRetries", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			bareDefault: true,
+			errorMessage: "Provider returned an empty response with zero token usage",
+			transportFailure: { kind: "transport", providerCode: "empty_response" },
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 2 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("repeated typed empty response");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(3);
+		expect(retryStartEvents).toHaveLength(2);
+		expect(retryStartEvents.every(event => event.unbounded === false)).toBe(true);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+
+	it("does not retry a typed empty response after visible progress or when retry is disabled", async () => {
+		const progressModels: string[] = [];
+		session = buildStatusErrorSession({
+			bareDefault: true,
+			errorMessage: "Provider returned an empty response with zero token usage",
+			transportFailure: { kind: "transport", providerCode: "empty_response" },
+			partialContent: "already streamed",
+			requestedModels: progressModels,
+		});
+
+		await session.prompt("typed empty response after progress");
+		await session.waitForIdle();
+
+		expect(progressModels).toHaveLength(1);
+		await session.dispose();
+		session = undefined;
+
+		const disabledModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "Provider returned an empty response with zero token usage",
+			transportFailure: { kind: "transport", providerCode: "empty_response" },
+			requestedModels: disabledModels,
+			settingsOverrides: { "retry.enabled": false },
+		});
+
+		await session.prompt("typed empty response retry disabled");
+		await session.waitForIdle();
+
+		expect(disabledModels).toHaveLength(1);
+	});
 	it("replays typed first-event timeouts only up to retry.maxRetries + 1 total attempts", async () => {
 		const requestedModels: string[] = [];
 		session = buildStatusErrorSession({
@@ -1644,6 +1716,51 @@ describe("AgentSession resilient retry", () => {
 		const { retryStartEvents } = track(session);
 
 		await session.prompt("bare-config auto-retry lifecycle watchdog");
+		await session.waitForIdle();
+
+		expect(hookCalls).toBe(1);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(streamCalls).toBe(2);
+		expect(lastAssistant(session).stopReason).toBe("error");
+	});
+	it("does not replay a second bare-default empty response after auto_retry_start handlers participate", async () => {
+		let hookCalls = 0;
+		let streamCalls = 0;
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		session = buildBareStreamingSession({
+			streamFn: () => {
+				streamCalls++;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure = assistantMessage(
+						model,
+						[],
+						"error",
+						"Provider returned an empty response with zero token usage",
+					);
+					failure.transportFailure = { kind: "transport", providerCode: "empty_response" };
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+			extensionRunner: createExtensionRunner(
+				new Map([
+					[
+						"auto_retry_start",
+						[
+							async () => {
+								hookCalls++;
+							},
+						],
+					],
+				]),
+			),
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("bare-default auto-retry lifecycle empty response");
 		await session.waitForIdle();
 
 		expect(hookCalls).toBe(1);

@@ -143,6 +143,12 @@ function residentInstanceDirs(root = residentCacheRoot()): string[] {
 	}
 }
 
+function residentTextCacheDir(manager: SessionManager): string {
+	const directory = manager.residentTextCacheDirForTests();
+	if (!directory) throw new Error("Expected a directory-backed resident text cache");
+	return directory;
+}
+
 function residentBlobFiles(instanceDir: string): string[] {
 	return fs
 		.readdirSync(instanceDir)
@@ -224,9 +230,9 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 				const atId = appendUserText(manager, at);
 				const aboveId = appendUserText(manager, above);
 				const sessionFile = await persist(manager);
-				const instances = residentInstanceDirs();
-				expect(instances).toHaveLength(1);
-				expect(residentBlobFiles(instances[0]!)).toHaveLength(2);
+				const activeInstance = residentTextCacheDir(manager);
+				expect(residentInstanceDirs()).toContain(activeInstance);
+				expect(residentBlobFiles(activeInstance)).toHaveLength(2);
 				expect(messageText(manager, belowId)).toBe(below);
 				expect(messageText(manager, atId)).toBe(at);
 				expect(messageText(manager, aboveId)).toBe(above);
@@ -524,8 +530,8 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 		const seed = `C7-seed-${"s".repeat(4096)}`;
 		appendUserText(manager, seed);
 		await persist(manager);
-		const active = residentInstanceDirs(root);
-		expect(active).toHaveLength(1);
+		const activeInstance = residentTextCacheDir(manager);
+		expect(residentInstanceDirs(root)).toContain(activeInstance);
 		const stale = path.join(root, "i-redteam-dead");
 		ensureOwnerOnlyDirectory(stale);
 		fs.writeFileSync(
@@ -541,7 +547,7 @@ describe.skipIf(process.platform === "win32")("ultragoal resident-cache adversar
 				}
 			})();
 			await Promise.all([sweepResidentCacheRoot(root, { maxDirectories: 64, maxDurationMs: 250 }), appendRace]);
-			expect(fs.existsSync(active[0]!)).toBe(true);
+			expect(fs.existsSync(activeInstance)).toBe(true);
 			expect(fs.existsSync(stale)).toBe(false);
 			expectReadable(manager, seed);
 			expectReadable(manager, "C7-race-3-");

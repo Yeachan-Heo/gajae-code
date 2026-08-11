@@ -444,7 +444,7 @@ function removePartialResidentCacheInstanceDir(instanceDir: string): void {
 }
 
 function isResidentCacheInstanceDirName(name: string): boolean {
-	return /^i-[A-Za-z0-9_-]+$/.test(name);
+	return /^(?:i-[A-Za-z0-9_-]+|s-[a-f0-9]{32})$/.test(name);
 }
 
 function residentCacheSweepLimit(value: number | undefined, ceiling: number): number {
@@ -591,7 +591,7 @@ function scheduleResidentCacheRootSweep(root: string): void {
  * directories; callers must use {@link EphemeralBlobStore.adoptVerifiedDir}
  * rather than the destructive EphemeralBlobStore constructor.
  */
-export function openVerifiedResidentCacheInstanceDir(root: string): string {
+function openVerifiedCacheInstanceDir(root: string, instanceName?: string): string {
 	const uid = residentCacheOwnerUid(root);
 	let rootDescriptor: number | null = null;
 	let instanceDir: string | null = null;
@@ -601,14 +601,32 @@ export function openVerifiedResidentCacheInstanceDir(root: string): string {
 		} catch (error) {
 			throw residentCacheTrustError("root_create_failed", root, error);
 		}
-
 		rootDescriptor = openVerifiedResidentCacheDirectory(root, uid);
 		try {
-			instanceDir = fs.mkdtempSync(path.join(root, "i-"));
+			if (instanceName === undefined) instanceDir = fs.mkdtempSync(path.join(root, "i-"));
+			else {
+				if (!/^s-[a-f0-9]{32}$/.test(instanceName))
+					throw new ResidentCacheTrustError("instance_name_invalid", instanceName);
+				const candidate = path.join(root, instanceName);
+				try {
+					fs.mkdirSync(candidate, { mode: BLOB_DIR_MODE });
+				} catch (error) {
+					if (errorCode(error) !== "EEXIST") throw error;
+					const staleInstance = readResidentCacheOwnerSnapshot(candidate, uid);
+					if (
+						staleInstance === null ||
+						!residentCacheOwnerIsStale(staleInstance.owner, new Map<number, number | null>()) ||
+						!reapResidentCacheInstanceDir(root, rootDescriptor, candidate, staleInstance, uid)
+					) {
+						throw error;
+					}
+					fs.mkdirSync(candidate, { mode: BLOB_DIR_MODE });
+				}
+				instanceDir = candidate;
+			}
 		} catch (error) {
 			throw residentCacheTrustError("instance_create_failed", root, error);
 		}
-
 		// Keep the root descriptor open while creating the nonce directory, then
 		// re-check the path against that descriptor before trusting the child.
 		assertResidentCacheDirectoryPathMatchesDescriptor(root, rootDescriptor, uid);
@@ -635,6 +653,15 @@ export function openVerifiedResidentCacheInstanceDir(root: string): string {
 			}
 		}
 	}
+}
+
+export function openVerifiedResidentCacheInstanceDir(root: string): string {
+	return openVerifiedCacheInstanceDir(root);
+}
+
+/** Open the deterministic per-session managed-sidecar instance in its separate cache root. */
+export function openVerifiedSidecarCacheInstanceDir(root: string, sessionHash: string): string {
+	return openVerifiedCacheInstanceDir(root, `s-${sessionHash}`);
 }
 
 function sha256Hex(data: Buffer): string {
@@ -1539,6 +1566,8 @@ export interface CanonicalBlobEntry {
 	readonly path: string;
 	readonly bytes: number;
 	readonly mtimeMs: number;
+	readonly dev: number;
+	readonly ino: number;
 }
 
 const CANONICAL_BLOB_NAME = /^[0-9a-f]{64}$/;
@@ -1577,7 +1606,14 @@ export async function listCanonicalBlobs(dir: string): Promise<CanonicalBlobEntr
 			continue;
 		}
 		if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) continue;
-		entries.push({ hash: name, path: blobPath, bytes: stat.size, mtimeMs: stat.mtimeMs });
+		entries.push({
+			hash: name,
+			path: blobPath,
+			bytes: stat.size,
+			mtimeMs: stat.mtimeMs,
+			dev: stat.dev,
+			ino: stat.ino,
+		});
 	}
 	return entries;
 }
@@ -1587,11 +1623,17 @@ export async function listCanonicalBlobs(dir: string): Promise<CanonicalBlobEntr
  * at scan time must still describe the file at unlink time (same inode, size and
  * mtime, still a single-link regular file), otherwise the blob is left in place.
  *
+ * `beforeUnlink` runs after this function has verified the blob and immediately
+ * before it calls unlink. Callers use it to bind external liveness evidence to
+ * the verified blob identity, so a live reference that appears while the blob is
+ * being revalidated prevents the destructive syscall.
+ *
  * `failed` distinguishes an actual IO failure (which a caller should surface as
  * a failed reclaim) from a revalidation refusal (which is an ordinary KEEP).
  */
 export async function removeCanonicalBlob(
 	entry: CanonicalBlobEntry,
+	options: { beforeUnlink?: () => Promise<boolean> } = {},
 ): Promise<{ removed: true } | { removed: false; reason: string; failed?: true }> {
 	let stat: fs.Stats;
 	try {
@@ -1603,7 +1645,17 @@ export async function removeCanonicalBlob(
 	if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
 		return { removed: false, reason: "blob_not_plain_file" };
 	}
-	if (stat.size !== entry.bytes || stat.mtimeMs !== entry.mtimeMs) return { removed: false, reason: "blob_changed" };
+	if (
+		stat.dev !== entry.dev ||
+		stat.ino !== entry.ino ||
+		stat.size !== entry.bytes ||
+		stat.mtimeMs !== entry.mtimeMs
+	) {
+		return { removed: false, reason: "blob_changed" };
+	}
+	if (options.beforeUnlink && !(await options.beforeUnlink())) {
+		return { removed: false, reason: "blob_reference_evidence_changed" };
+	}
 	try {
 		await fsp.unlink(entry.path);
 		return { removed: true };

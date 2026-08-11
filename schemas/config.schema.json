@@ -408,6 +408,19 @@
 				"default": {
 					"type": "string",
 					"description": "Model profile applied automatically at startup"
+				},
+				"proxyProvider": {
+					"type": "string",
+					"description": "Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints."
+				},
+				"proxyMode": {
+					"type": "string",
+					"enum": [
+						"fallback",
+						"always"
+					],
+					"description": "fallback routes only selectors whose direct provider lacks credentials; always routes every proxy-routable built-in preset selector through the configured proxy.",
+					"default": "fallback"
 				}
 			},
 			"additionalProperties": false

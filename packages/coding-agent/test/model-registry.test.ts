@@ -297,6 +297,115 @@ describe("ModelRegistry", () => {
 			}
 		});
 
+		test("user contextWindow override survives the Codex GPT-5.6 cap; invalid values are ignored", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"gpt-5.6-sol": { contextWindow: 373_000 },
+						"gpt-5.6-terra": { contextWindow: -5 },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const codexModels = getModelsForProvider(registry, "openai-codex");
+			const sol = codexModels.find(model => model.id === "gpt-5.6-sol");
+			const terra = codexModels.find(model => model.id === "gpt-5.6-terra");
+
+			expect(sol?.contextWindow).toBe(373_000);
+			expect(terra?.contextWindow).toBe(372_000);
+		});
+		test("registerProvider reapplies an openai-codex contextWindow override before the final cap", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"gpt-5.6-sol": { contextWindow: 373_000 },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("openai-codex", {
+				baseUrl: "https://chatgpt.com/backend-api",
+				api: "openai-codex-responses",
+				apiKey: "TEST_KEY",
+				models: [
+					{
+						id: "gpt-5.6-sol",
+						name: "Runtime GPT-5.6 Sol",
+						reasoning: true,
+						input: ["text", "image"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 1_000_000,
+						maxTokens: 128_000,
+					},
+				],
+			});
+
+			expect(registry.find("openai-codex", "gpt-5.6-sol")?.contextWindow).toBe(373_000);
+		});
+		test("openai-codex contextWindow override does not exempt same-id models on other Codex-transport providers", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"gpt-5.6-sol": { contextWindow: 373_000 },
+					},
+				},
+				"codex-extension": {
+					baseUrl: "https://codex-extension.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-codex-responses",
+					models: [{ id: "gpt-5.6-sol", contextWindow: 1_000_000 }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const codexModels = getModelsForProvider(registry, "openai-codex");
+			const openaiCodexSol = codexModels.find(model => model.id === "gpt-5.6-sol");
+			const extensionSol = getModelsForProvider(registry, "codex-extension").find(
+				model => model.id === "gpt-5.6-sol",
+			);
+
+			expect(openaiCodexSol?.contextWindow).toBe(373_000);
+			expect(extensionSol?.contextWindow).toBe(372_000);
+		});
+		test("non-Codex contextWindow overrides that are not positive finite numbers are ignored without corrupting the bundled model", () => {
+			writeRawModelsJson({
+				openai: {
+					modelOverrides: {
+						"gpt-4o": { contextWindow: -5 },
+						"gpt-4.1": { contextWindow: Number.NaN },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const models = getModelsForProvider(registry, "openai");
+			for (const id of ["gpt-4o", "gpt-4.1"]) {
+				const model = models.find(candidate => candidate.id === id);
+				expect(model?.contextWindow).toBeTypeOf("number");
+				expect(Number.isFinite(model!.contextWindow!)).toBe(true);
+				expect(model!.contextWindow!).toBeGreaterThan(0);
+			}
+		});
+
+		test("mixed-case modelOverrides keys match the bundled lowercase models and the Codex cap exemption", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					modelOverrides: {
+						"GPT-5.6-SOL": { contextWindow: 380_000 },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const codexModels = getModelsForProvider(registry, "openai-codex");
+			const sol = codexModels.find(model => model.id === "gpt-5.6-sol");
+
+			// The mixed-case key is normalized to gpt-5.6-sol, so the value is
+			// merged AND the cap exemption matches the same normalized key.
+			expect(sol?.contextWindow).toBe(380_000);
+		});
 		test("keeps models config baseUrl ahead of provider base URL env vars", () => {
 			const restore = setEnvForTest("OPENAI_BASE_URL", "https://openai-env.example.com/v1");
 			try {

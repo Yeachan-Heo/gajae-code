@@ -53,6 +53,26 @@ function coldSpillRefs(entry: SessionMessageEntry): ColdSpillRef[] {
 	return Object.values(entry.evictedContent?.payloads ?? {});
 }
 
+function staleReplayTranscript(): string {
+	return `${JSON.stringify({ type: "session", version: 5, id: "stale-replay", timestamp: "0", cwd: "/cwd" })}\n${JSON.stringify(
+		{
+			type: "message",
+			id: "assistant",
+			parentId: null,
+			timestamp: "0",
+			message: {
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" }],
+				provider: "openai",
+				model: "test",
+				timestamp: 0,
+				providerPayload: { type: "openaiResponsesHistory", provider: "openai", items: [] },
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+			},
+		},
+	)}\n`;
+}
+
 describe("session HTML export fidelity", () => {
 	it("exports rehydrated pre-compaction content instead of tombstone notices", async () => {
 		const tempDir = path.join(os.tmpdir(), `gjc-html-export-fidelity-${Snowflake.next()}`);
@@ -101,6 +121,139 @@ describe("session HTML export fidelity", () => {
 				"must not overwrite the source transcript",
 			);
 			expect(fs.readFileSync(sessionFile)).toEqual(before);
+			await session.close();
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("rejects standalone source-path output before session loading mutates the transcript", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-html-export-standalone-alias-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		try {
+			const sessionFile = path.join(tempDir, "session.jsonl");
+			fs.writeFileSync(sessionFile, staleReplayTranscript());
+			const before = fs.readFileSync(sessionFile);
+			await expect(exportFromFile(sessionFile, { outputPath: sessionFile })).rejects.toThrow(
+				"must not overwrite the source transcript",
+			);
+			expect(fs.readFileSync(sessionFile)).toEqual(before);
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	it.skipIf(process.platform === "win32")(
+		"rejects standalone hard-link output before session loading mutates the transcript",
+		async () => {
+			const tempDir = path.join(os.tmpdir(), `gjc-html-export-standalone-hardlink-${Snowflake.next()}`);
+			fs.mkdirSync(tempDir, { recursive: true });
+			try {
+				const sessionFile = path.join(tempDir, "session.jsonl");
+				const outputPath = path.join(tempDir, "session.html");
+				fs.writeFileSync(sessionFile, staleReplayTranscript());
+				fs.linkSync(sessionFile, outputPath);
+				const before = fs.readFileSync(sessionFile);
+				await expect(exportFromFile(sessionFile, { outputPath })).rejects.toThrow(
+					"must not overwrite the source transcript",
+				);
+				expect(fs.readFileSync(sessionFile)).toEqual(before);
+			} finally {
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
+	it.skipIf(process.platform === "win32")("rejects hard-link output without modifying the transcript", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-html-export-hardlink-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		try {
+			const session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({ role: "user", content: "authoritative", timestamp: 1 });
+			await session.ensureOnDisk();
+			await session.flush();
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted session");
+			const outputPath = path.join(tempDir, "transcript-hardlink.html");
+			fs.linkSync(sessionFile, outputPath);
+			const before = fs.readFileSync(sessionFile);
+			await expect(exportSessionToHtml(session, undefined, { outputPath })).rejects.toThrow(
+				"must not overwrite the source transcript",
+			);
+			expect(fs.readFileSync(sessionFile)).toEqual(before);
+			await session.close();
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("exports an in-memory session whose transcript file does not exist yet", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-html-export-prepersist-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		try {
+			const session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({ role: "user", content: "before persist", timestamp: 1 });
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a preallocated session file");
+			expect(fs.existsSync(sessionFile)).toBe(false);
+			const outputPath = path.join(tempDir, "export-prepersist.html");
+			await exportSessionToHtml(session, undefined, { outputPath });
+			expect(fs.existsSync(outputPath)).toBe(true);
+			const data = decodeExportSessionData(fs.readFileSync(outputPath, "utf8"));
+			expect(exportedMessageText(data.entries[0])).toBe("before persist");
+			await session.close();
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	it("rejects a pre-persist source-path output without creating the transcript", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-html-export-prepersist-alias-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		try {
+			const session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({ role: "user", content: "authoritative", timestamp: 1 });
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a preallocated session file");
+			expect(fs.existsSync(sessionFile)).toBe(false);
+			await expect(exportSessionToHtml(session, undefined, { outputPath: sessionFile })).rejects.toThrow(
+				"must not overwrite the source transcript",
+			);
+			expect(fs.existsSync(sessionFile)).toBe(false);
+			await session.close();
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	it.skipIf(process.platform === "win32")("rejects a pre-persist output through a symlinked ancestor", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-html-export-prepersist-symlink-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		try {
+			const session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({ role: "user", content: "authoritative", timestamp: 1 });
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a preallocated session file");
+			const aliasDir = path.join(tempDir, "alias");
+			fs.symlinkSync(tempDir, aliasDir, "dir");
+			const outputPath = path.join(aliasDir, "sessions", path.basename(sessionFile));
+			await expect(exportSessionToHtml(session, undefined, { outputPath })).rejects.toThrow(
+				"must not overwrite the source transcript",
+			);
+			expect(fs.existsSync(sessionFile)).toBe(false);
+			await session.close();
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	it.skipIf(process.platform === "win32")("rejects a pre-persist dangling output symlink", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-html-export-prepersist-dangling-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		try {
+			const session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({ role: "user", content: "authoritative", timestamp: 1 });
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a preallocated session file");
+			const outputPath = path.join(tempDir, "output.html");
+			fs.symlinkSync(sessionFile, outputPath);
+			await expect(exportSessionToHtml(session, undefined, { outputPath })).rejects.toThrow(
+				"must not overwrite the source transcript",
+			);
+			expect(fs.existsSync(sessionFile)).toBe(false);
 			await session.close();
 		} finally {
 			fs.rmSync(tempDir, { recursive: true, force: true });

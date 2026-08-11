@@ -44,6 +44,7 @@ export type RelayOptions = {
 	onTransportError: (error: TransportError) => void;
 	webSocketFactory?: (url: string) => RelayWebSocket;
 	signal?: AbortSignal;
+	validateDownstreamFrame?: (frame: string) => boolean;
 };
 
 type QueuedFrame = { bytes: Buffer; accounted: boolean };
@@ -193,6 +194,8 @@ export async function startRelayPair(options: RelayOptions): Promise<RelayPair> 
 				return fail({ type: "transport_error", code: "protocol_error", direction: "downstream->ws" });
 			if (line.length > REQUEST_FRAME_BYTES)
 				return fail({ type: "transport_error", code: "frame_oversize", direction: "downstream->ws" });
+			if (options.validateDownstreamFrame && !options.validateDownstreamFrame(line.toString("utf8")))
+				return fail({ type: "transport_error", code: "protocol_error", direction: "downstream->ws" });
 			enqueue(toWs, "downstream->ws", line);
 			if (closed) return;
 			newline = downstreamBuffer.indexOf(0x0a);

@@ -51,6 +51,8 @@ export type WorkerInitPayload =
 			url?: string;
 			waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 			timeoutMs: number;
+			/** Opt-in bounded page runtime diagnostics (extra CDP session + Runtime events). */
+			runtimeDiagnostics?: boolean;
 	  }
 	| {
 			mode: "attach";
@@ -58,6 +60,8 @@ export type WorkerInitPayload =
 			safeDir: string;
 			targetId: string;
 			dialogs?: "accept" | "dismiss";
+			/** Opt-in bounded page runtime diagnostics (extra CDP session + Runtime events). */
+			runtimeDiagnostics?: boolean;
 	  };
 
 export type ToolReply = { ok: true; value: unknown } | { ok: false; error: RunErrorPayload };

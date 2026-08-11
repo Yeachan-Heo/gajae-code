@@ -193,8 +193,27 @@ export type ManagedScopeResolution =
 			cause?: { readonly classification: string; readonly diagnostic?: string };
 	  };
 
+/**
+ * Classify a failure for the operator-visible `cause`.
+ *
+ * Must agree with {@link managedScopeErrorCode}: the reported `code` and the
+ * `cause.classification` printed in the startup error are produced by separate
+ * helpers, so a message recognized by one and not the other still surfaces to
+ * the operator as `binding_invalid`.
+ */
 function managedScopeFailureCause(error: unknown): { readonly classification: string } {
-	return { classification: managedSecurityFailureClassification(error) ?? "binding_invalid" };
+	const security = managedSecurityFailureClassification(error);
+	if (security) return { classification: security };
+	return { classification: managedScopeErrorCode(error instanceof Error ? error.message : "") };
+}
+
+/**
+ * A scope whose directory outgrew a scan budget. The binding is untouched and
+ * canonical; only the surrounding entry count is over budget, so this must not
+ * be reported as binding corruption.
+ */
+function isManagedScopeCapacityMessage(message: string): boolean {
+	return message === "artifact_capacity_exceeded" || message === "managed_replace_cleanup_receipt_limit_exceeded";
 }
 
 const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
@@ -214,7 +233,7 @@ const managedScopeFailureCodes = new Set<ManagedScopeErrorCode>([
  * corrupt binding, which sends operators to delete a healthy binding file.
  */
 function managedScopeErrorCode(message: string): ManagedScopeErrorCode {
-	if (message === "content_too_large") return "capacity_exceeded";
+	if (message === "content_too_large" || isManagedScopeCapacityMessage(message)) return "capacity_exceeded";
 	return managedScopeFailureCodes.has(message as ManagedScopeErrorCode)
 		? (message as ManagedScopeErrorCode)
 		: "binding_invalid";
@@ -224,7 +243,7 @@ function managedScopeFailureMessage(error: unknown, fallback: string): string {
 	const classification = managedSecurityFailureClassification(error);
 	if (classification) return classification;
 	if (!(error instanceof Error)) return fallback;
-	if (error.message === "content_too_large") return error.message;
+	if (error.message === "content_too_large" || isManagedScopeCapacityMessage(error.message)) return error.message;
 	return managedScopeFailureCodes.has(error.message as ManagedScopeErrorCode) ? error.message : fallback;
 }
 

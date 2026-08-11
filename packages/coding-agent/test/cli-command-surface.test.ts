@@ -457,6 +457,59 @@ process.exitCode = await child.exited;`;
 			await fs.rm(home, { recursive: true, force: true });
 		}
 	}, 15_000);
+
+	it("routes sdk session verbs and rejects the removed daemon session route", async () => {
+		const help = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const helpOutput = `${help.stdout.toString()}\n${help.stderr.toString()}`;
+		expect(help.exitCode, helpOutput).toBe(0);
+		for (const token of [
+			"list",
+			"inspect",
+			"send",
+			"status",
+			"tail",
+			"raw",
+			"--until-idle",
+			"--strict",
+			"--all-events",
+		])
+			expect(help.stdout.toString()).toContain(token);
+
+		const missingVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const missingOutput = `${missingVerb.stdout.toString()}\n${missingVerb.stderr.toString()}`;
+		expect(missingVerb.exitCode, missingOutput).toBe(2);
+		expect(JSON.parse(missingVerb.stdout.toString())).toMatchObject({
+			ok: false,
+			error: { code: "usage" },
+		});
+
+		const unknownVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "bogus"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const unknownOutput = `${unknownVerb.stdout.toString()}\n${unknownVerb.stderr.toString()}`;
+		expect(unknownVerb.exitCode, unknownOutput).toBe(2);
+		expect(unknownVerb.stderr.toString()).toContain("Expected verb to be one of");
+
+		// `gjc daemon session` is deleted without an alias (DR-13).
+		const daemonSession = Bun.spawnSync(["bun", cliEntry, "daemon", "session", "list"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const daemonOutput = `${daemonSession.stdout.toString()}\n${daemonSession.stderr.toString()}`;
+		expect(daemonSession.exitCode, daemonOutput).toBe(2);
+		expect(daemonSession.stderr.toString()).toContain("Expected action to be one of");
+	}, 30_000);
 });
 
 describe("startup login parsing", () => {

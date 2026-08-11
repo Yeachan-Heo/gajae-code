@@ -624,8 +624,7 @@ export interface GcDiskFamilyUsage {
 }
 
 /**
- * Why a surface refused to reclaim anything, and how much it withheld to stay
- * fail-closed. Present only when the surface declined.
+ * Why a surface withheld reclaim candidates because its evidence was incomplete.
  */
 export interface GcDiskDeclined {
 	reason: string;
@@ -645,7 +644,7 @@ export interface GcDiskSurfaceReport {
 	kept: number;
 	kept_bytes: number;
 	failed: number;
-	/** Set when the surface declined to reclaim anything because its evidence was incomplete. */
+	/** Set when the surface withheld reclaim candidates because its evidence was incomplete. */
 	declined?: GcDiskDeclined;
 	/** Per-family counts and bytes. Only surfaces whose records are individual files set this. */
 	families?: GcDiskFamilyUsage[];
@@ -696,6 +695,17 @@ const GC_DISK_BLOB_GRACE_MS = GC_DISK_DAY_MS;
  * sweep on, so the sweep withholds instead.
  */
 const GC_DISK_MARK_REMARK_ROUNDS = 2;
+/**
+ * How long the store must be observed completely quiet before the sweep may
+ * remove anything. The mark rounds and their drift checks can each complete
+ * inside an inter-append gap of a live session, so a single clean observation
+ * is not evidence of quiescence: the sweep brackets its decision with a probe
+ * that spans this window, which is far larger than any realistic gap between
+ * two transcript appends. A store that still moves inside the window withholds
+ * the sweep with `sessions_changed_during_mark` instead of reclaiming on
+ * evidence it could not prove stable.
+ */
+const GC_DISK_MARK_QUIESCENCE_MS = 50;
 
 /** Bound every recursive size walk so a pathological tree cannot stall `gjc gc`. */
 const GC_DISK_MAX_WALK_ENTRIES = 200_000;
@@ -1188,8 +1198,12 @@ interface GcDiskMarkedTranscript {
 
 /**
  * Read one transcript's blob references and bind the result to the bytes that
- * produced it. An append landing after this lstat can introduce a reference the
- * pass never saw, which is precisely what the drift check below looks for.
+ * produced it. The read is fenced by a stat before it and a stat after it: an
+ * append landing between the two (or after the read but before the fence) can
+ * introduce a reference the pass never saw, so the mark is only recorded when
+ * both stats agree on the bytes the read had to see. Anything that moved while
+ * the read was in flight degrades `evidence` instead of silently shrinking the
+ * reference set.
  */
 async function markGcDiskTranscript(
 	transcriptPath: string,
@@ -1198,18 +1212,35 @@ async function markGcDiskTranscript(
 	evidence: GcDiskEvidence,
 	errors: GcDiskError[],
 ): Promise<void> {
+	let before: Stats;
+	try {
+		before = await fsp.lstat(transcriptPath);
+	} catch (error) {
+		markGcDiskEvidenceIncomplete(evidence, "transcript_unstattable_before_mark");
+		errors.push({ surface: "blobs", scope: transcriptPath, message: gcDiskErrorText(error) });
+		return;
+	}
 	if (!(await markGcDiskBlobReferences(transcriptPath, referenced))) {
 		markGcDiskEvidenceIncomplete(evidence, "transcript_unreadable_during_mark");
 		errors.push({ surface: "blobs", scope: transcriptPath, message: "transcript_unreadable_during_mark" });
 		return;
 	}
+	let after: Stats;
 	try {
-		const stat = await fsp.lstat(transcriptPath);
-		marked.set(transcriptPath, { size: stat.size, mtimeMs: stat.mtimeMs });
+		after = await fsp.lstat(transcriptPath);
 	} catch (error) {
 		markGcDiskEvidenceIncomplete(evidence, "transcript_unstattable_after_mark");
 		errors.push({ surface: "blobs", scope: transcriptPath, message: gcDiskErrorText(error) });
+		return;
 	}
+	if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+		// The transcript changed while its references were being read: the
+		// reference set is not bound to a stable snapshot, so it cannot vouch
+		// for any blob. Same posture as the drift rounds exhausting below.
+		markGcDiskEvidenceIncomplete(evidence, "sessions_changed_during_mark");
+		return;
+	}
+	marked.set(transcriptPath, { size: after.size, mtimeMs: after.mtimeMs });
 }
 
 /**
@@ -1246,6 +1277,53 @@ async function findGcDiskMarkDrift(input: {
 	});
 	return drifted;
 }
+/**
+ * The sweep's evidence fence: re-walk the store and confirm every transcript
+ * still matches the snapshot its references were read from. Returns false —
+ * after degrading `evidence` to `sessions_changed_during_mark` — when anything
+ * moved since the mark, so the sweep withholds rather than acting on stale
+ * evidence. Run once after the mark loop converges and again immediately
+ * before each removal, because the sweep itself is a window a live session can
+ * write into.
+ */
+async function verifyGcDiskMarkFence(input: {
+	sessionsRoot: string;
+	accounted: ReadonlySet<string>;
+	marked: Map<string, GcDiskMarkedTranscript>;
+	evidence: GcDiskEvidence;
+	errors: GcDiskError[];
+}): Promise<boolean> {
+	const drifted = await findGcDiskMarkDrift({
+		sessionsRoot: input.sessionsRoot,
+		accounted: input.accounted,
+		marked: input.marked,
+		evidence: input.evidence,
+		errors: input.errors,
+	});
+	if (drifted.length === 0) return true;
+	markGcDiskEvidenceIncomplete(input.evidence, "sessions_changed_during_mark");
+	return false;
+}
+/**
+ * Confirm the store is observably quiet before the sweep may remove anything.
+ * A single fence pass can still complete inside an inter-append gap of a live
+ * session, so this probes the store across {@link GC_DISK_MARK_QUIESCENCE_MS}
+ * and only reports quiet when every transcript stayed unchanged for the whole
+ * window. A store that keeps moving under the probe never satisfies it, which
+ * is exactly the `sessions_changed_during_mark` condition the sweep must
+ * withhold on instead of reclaiming on evidence it could not prove stable.
+ */
+async function confirmGcDiskStoreQuiet(input: {
+	sessionsRoot: string;
+	accounted: ReadonlySet<string>;
+	marked: Map<string, GcDiskMarkedTranscript>;
+	evidence: GcDiskEvidence;
+	errors: GcDiskError[];
+}): Promise<boolean> {
+	if (!(await verifyGcDiskMarkFence(input))) return false;
+	await Bun.sleep(GC_DISK_MARK_QUIESCENCE_MS);
+	return await verifyGcDiskMarkFence(input);
+}
 
 /**
  * Mark and sweep the content-addressed blob store.
@@ -1263,6 +1341,14 @@ async function findGcDiskMarkDrift(input: {
  * grew, and only sweeps once the store stops moving under it. Drift that
  * outlasts {@link GC_DISK_MARK_REMARK_ROUNDS} is incomplete evidence, not a
  * licence to delete.
+ *
+ * The drift rounds are themselves a window: they can converge on a transcript
+ * that is mid-append, and the sweep then takes time to run. So the mark is
+ * additionally fenced — each transcript's references are bound to a stable
+ * stat snapshot taken around its read, the store must be observed completely
+ * quiet across {@link GC_DISK_MARK_QUIESCENCE_MS} before the sweep acts, and
+ * the fence is re-verified immediately before every removal. Any transcript
+ * that moved at any of those points withholds the whole sweep.
  */
 async function runGcDiskBlobs(input: {
 	surface: GcDiskSurfaceReport;
@@ -1303,6 +1389,19 @@ async function runGcDiskBlobs(input: {
 		}
 	}
 
+	// Gate the sweep on observable quiescence. The rounds can converge inside
+	// an inter-append gap of a live session, and a single clean re-walk would
+	// miss that; a store that keeps moving under the probe never satisfies it.
+	// Only pay for the probe when a blob could actually be reclaimed.
+	if (evidence.complete) {
+		const couldReclaim = blobs.some(
+			blob => !referenced.has(blob.hash) && now - blob.mtimeMs >= GC_DISK_BLOB_GRACE_MS,
+		);
+		if (couldReclaim && !(await confirmGcDiskStoreQuiet({ sessionsRoot, accounted, marked, evidence, errors }))) {
+			markGcDiskEvidenceIncomplete(evidence, "sessions_changed_during_mark");
+		}
+	}
+
 	let withheld = 0;
 	let withheldBytes = 0;
 	for (const blob of blobs) {
@@ -1323,15 +1422,36 @@ async function runGcDiskBlobs(input: {
 			withheld++;
 			withheldBytes += blob.bytes;
 		} else {
-			record.action = "would_reclaim";
-			record.reason = "unreferenced_by_any_surviving_session";
+			// Fence again immediately before acting: the sweep itself is a
+			// window, and a transcript that moved since the last check
+			// invalidates the whole mark, not just this blob.
+			if (!(await verifyGcDiskMarkFence({ sessionsRoot, accounted, marked, evidence, errors }))) {
+				record.reason = `withheld_evidence_incomplete: ${evidence.notes.join(", ")}`;
+				record.withheld = true;
+				withheld++;
+				withheldBytes += blob.bytes;
+			} else {
+				record.action = "would_reclaim";
+				record.reason = "unreferenced_by_any_surviving_session";
+			}
 		}
 		surface.records.push(record);
 
 		if (!prune || record.action !== "would_reclaim") continue;
-		const removal = await removeCanonicalBlob(blob);
+		const removal = await removeCanonicalBlob(blob, {
+			// The blob identity check has its own asynchronous read window. Bind the
+			// transcript fence after that check and before unlink, so a reference
+			// appended while the blob is being revalidated withholds the sweep.
+			beforeUnlink: async () => await verifyGcDiskMarkFence({ sessionsRoot, accounted, marked, evidence, errors }),
+		});
 		if (removal.removed) {
 			record.action = "reclaimed";
+		} else if (!evidence.complete) {
+			record.action = "keep";
+			record.reason = `withheld_evidence_incomplete: ${evidence.notes.join(", ")}`;
+			record.withheld = true;
+			withheld++;
+			withheldBytes += blob.bytes;
 		} else if (removal.failed) {
 			record.action = "reclaim_failed";
 			record.reason = removal.reason;
@@ -1987,8 +2107,10 @@ export function buildGcDiskReportText(disk: GcDiskReport): string {
 				`kept=${surface.kept} (${formatGcDiskBytes(surface.kept_bytes)})`,
 		);
 		if (surface.declined) {
+			const reclaimState =
+				surface.reclaimed === 0 ? "reclaimed nothing" : `reclaimed ${surface.reclaimed} before withholding`;
 			lines.push(
-				`  declined: reclaimed nothing — ${surface.declined.reason} ` +
+				`  declined: ${reclaimState} — ${surface.declined.reason} ` +
 					`(withheld=${surface.declined.withheld} (${formatGcDiskBytes(surface.declined.withheld_bytes)}))`,
 			);
 		}

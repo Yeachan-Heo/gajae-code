@@ -6,13 +6,16 @@ import {
 	type AuthCredentialSelector,
 	applyFinalCodexGpt56ContextCap,
 	type CacheRetention,
+	CODEX_GPT_5_6_CONTEXT_CAP,
 	type Context,
+	codexContextOverrideKey,
 	createModelManager,
 	enrichModelThinking,
 	getBundledModels,
 	getBundledProviders,
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
+	isCodexGpt56Tier,
 	isKnownProvider,
 	type Model,
 	type ModelManagerOptions,
@@ -860,7 +863,18 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.output !== undefined) result.output = override.output as ("text" | "image")[];
 	if (override.cacheRetention !== undefined) result.cacheRetention = override.cacheRetention;
-	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
+	const contextWindowOverride = toPositiveNumberOrUndefined(override.contextWindow);
+	if (contextWindowOverride !== undefined) {
+		result.contextWindow = contextWindowOverride;
+	} else if (override.contextWindow !== undefined && !isCodexGpt56Tier({ id: model.id })) {
+		// Codex-tier invalid overrides are diagnosed in #collectCodexContextWindowOverrides;
+		// every other provider is diagnosed here so an ignored override is never silent.
+		logger.warn("model context-window override ignored: value must be a positive finite number", {
+			model: model.id,
+			provider: model.provider,
+			override: override.contextWindow,
+		});
+	}
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
 	if (override.contextPromotionTarget !== undefined) result.contextPromotionTarget = override.contextPromotionTarget;
 	if (override.wireModelId !== undefined) result.wireModelId = override.wireModelId;
@@ -879,6 +893,26 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	}
 	result.compat = mergeCompat(model.compat, override.compat);
 	return enrichModelThinking(result);
+}
+/**
+ * Normalizes `modelOverrides` keys to lowercase so override matching is
+ * case-insensitive everywhere (the Codex cap exemption is keyed by
+ * `codexContextOverrideKey`, which lowercases both sides). Without this,
+ * a mixed-case config key is exempted from the cap without its value ever
+ * being merged into the model.
+ */
+function normalizeModelOverrideKeys(
+	modelOverrides: Map<string, Map<string, ModelOverride>>,
+): Map<string, Map<string, ModelOverride>> {
+	const normalized = new Map<string, Map<string, ModelOverride>>();
+	for (const [provider, perModel] of modelOverrides) {
+		const perProvider = new Map<string, ModelOverride>();
+		for (const [modelId, override] of perModel) {
+			perProvider.set(modelId.toLowerCase(), override);
+		}
+		normalized.set(provider.toLowerCase(), perProvider);
+	}
+	return normalized;
 }
 
 interface CustomModelDefinitionLike {
@@ -1220,6 +1254,7 @@ export class ModelRegistry {
 	#customModelOverlays: CustomModelOverlay[] = [];
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
+	#codexContextWindowOverrides: Map<string, number> = new Map();
 	#equivalenceConfig: ModelEquivalenceConfig | undefined;
 	#modelBindingsApplier = new ModelBindingsApplier();
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
@@ -1405,7 +1440,8 @@ export class ModelRegistry {
 		this.#configuredDiscoveryProviderIds = new Set(discoverableProviders.map(provider => provider.provider));
 		this.#customModelOverlays = customModels;
 		this.#providerOverrides = overrides;
-		this.#modelOverrides = modelOverrides;
+		this.#modelOverrides = normalizeModelOverrideKeys(modelOverrides);
+		this.#codexContextWindowOverrides = this.#collectCodexContextWindowOverrides();
 		this.#equivalenceConfig = equivalence;
 		this.#modelBindingsApplier.setBindings(modelBindings);
 		this.#modelProfiles = mergeModelProfiles(profiles);
@@ -1422,7 +1458,11 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive refresh() cycles
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#models = applyFinalCodexGpt56ContextCap(
+			this.#applyRuntimeProviderOverrides(withModelOverrides),
+			undefined,
+			this.#codexContextWindowOverrides,
+		);
 		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
@@ -2179,7 +2219,11 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive online discovery completion
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(this.#applyRuntimeProviderOverrides(withModelOverrides));
+		this.#models = applyFinalCodexGpt56ContextCap(
+			this.#applyRuntimeProviderOverrides(withModelOverrides),
+			undefined,
+			this.#codexContextWindowOverrides,
+		);
 		this.#rebuildCanonicalIndex();
 	}
 
@@ -3025,10 +3069,10 @@ export class ModelRegistry {
 	}
 
 	#applyProviderModelOverrides(provider: string, models: Model<Api>[]): Model<Api>[] {
-		const overrides = this.#modelOverrides.get(provider);
+		const overrides = this.#modelOverrides.get(provider.toLowerCase());
 		if (!overrides || overrides.size === 0) return models;
 		return models.map(model => {
-			const override = overrides.get(model.id);
+			const override = overrides.get(model.id.toLowerCase());
 			if (!override) return model;
 			return applyModelOverride(model, override);
 		});
@@ -3116,7 +3160,7 @@ export class ModelRegistry {
 	}
 	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
 		const withTransportOverride = this.#applyProviderTransportOverride(model, override);
-		const modelCompat = this.#modelOverrides.get(model.provider)?.get(model.id)?.compat;
+		const modelCompat = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase())?.compat;
 		return modelCompat
 			? { ...withTransportOverride, compat: mergeCompat(withTransportOverride.compat, modelCompat) }
 			: withTransportOverride;
@@ -3129,12 +3173,52 @@ export class ModelRegistry {
 			return this.#applyRuntimeProviderOverride(model, override);
 		});
 	}
+	/**
+	 * Collects explicit user `contextWindow` overrides keyed by provider + model
+	 * id (`codexContextOverrideKey`), and surfaces diagnostics when one applies
+	 * to a Codex GPT-5.6 tier
+	 * model. The map is computed once per config load and feeds the final
+	 * context cap so an explicit override is never silently re-clamped.
+	 */
+	#collectCodexContextWindowOverrides(): Map<string, number> {
+		const result = new Map<string, number>();
+		for (const [provider, providerOverrides] of this.#modelOverrides) {
+			for (const [modelId, override] of providerOverrides) {
+				if (override.contextWindow === undefined) {
+					continue;
+				}
+				const normalizedId = modelId.toLowerCase();
+				const value = toPositiveNumberOrUndefined(override.contextWindow);
+				if (value === undefined) {
+					if (isCodexGpt56Tier({ id: normalizedId })) {
+						logger.warn("codex gpt-5.6 context-window override ignored: value must be a positive finite number", {
+							model: modelId,
+							provider,
+							override: override.contextWindow,
+						});
+					}
+					continue;
+				}
+				result.set(codexContextOverrideKey(provider, modelId), value);
+				if (!isCodexGpt56Tier({ id: normalizedId })) {
+					continue;
+				}
+				logger.warn("codex gpt-5.6 context-window override active; verify it against the live product limit", {
+					model: modelId,
+					provider,
+					override: override.contextWindow,
+					enforced: CODEX_GPT_5_6_CONTEXT_CAP.enforced,
+				});
+			}
+		}
+		return result;
+	}
 	#applyModelOverrides(models: Model<Api>[], overrides: Map<string, Map<string, ModelOverride>>): Model<Api>[] {
 		if (overrides.size === 0) return models;
 		return models.map(model => {
-			const providerOverrides = overrides.get(model.provider);
+			const providerOverrides = overrides.get(model.provider.toLowerCase());
 			if (!providerOverrides) return model;
-			const override = providerOverrides.get(model.id);
+			const override = providerOverrides.get(model.id.toLowerCase());
 			if (!override) return model;
 			return applyModelOverride(model, override);
 		});
@@ -3147,7 +3231,7 @@ export class ModelRegistry {
 			if (model.id !== "gpt-5.4" || model.provider === "github-copilot" || model.provider === "jetbrains-junie") {
 				return model;
 			}
-			const overrides = this.#modelOverrides.get(model.provider)?.get(model.id);
+			const overrides = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase());
 			if (!overrides) {
 				return applyModelOverride(model, { contextWindow: 1_000_000 });
 			}
@@ -4006,12 +4090,15 @@ export class ModelRegistry {
 						return this.#applyRuntimeProviderOverride(model, runtimeTransportOverride);
 					})
 				: nextModels;
+			const withModelOverrides = this.#applyProviderModelOverrides(providerName, withRuntimeTransportOverride);
 
 			if (config.oauth?.modifyModels) {
 				const credential = this.authStorage.getOAuthCredential(providerName);
 				if (credential) {
 					this.#models = applyFinalCodexGpt56ContextCap(
-						config.oauth.modifyModels(withRuntimeTransportOverride, credential),
+						config.oauth.modifyModels(withModelOverrides, credential),
+						undefined,
+						this.#codexContextWindowOverrides,
 					);
 					this.#rebuildCanonicalIndex();
 					this.#rebuildProviderActivity();
@@ -4019,7 +4106,11 @@ export class ModelRegistry {
 				}
 			}
 
-			this.#models = applyFinalCodexGpt56ContextCap(withRuntimeTransportOverride);
+			this.#models = applyFinalCodexGpt56ContextCap(
+				withModelOverrides,
+				undefined,
+				this.#codexContextWindowOverrides,
+			);
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();
 			return;

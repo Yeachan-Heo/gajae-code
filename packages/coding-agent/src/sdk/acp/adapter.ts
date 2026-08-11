@@ -229,10 +229,11 @@ export class AcpSdkAdapter {
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		return await this.#client.global(operation, input, {
+		const response = await this.#client.global(operation, input, {
 			idempotencyKey,
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
 		});
+		return response;
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {

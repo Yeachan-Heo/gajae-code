@@ -10,6 +10,7 @@ export type ServeOptions = {
 	url: string;
 	token: string;
 	pendingCeilingBytes: number;
+	validateDownstreamFrame?: (frame: string) => boolean;
 };
 
 export type ServeHandle = {

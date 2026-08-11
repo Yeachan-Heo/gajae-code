@@ -334,7 +334,7 @@ describe("test manifest runner", () => {
 		expect(result.exitCode, output(result)).toBe(0);
 		expect(output(result)).toContain(`manifest command receipts complete: ${manifest.commands.length}`);
 		expect(output(result)).toContain(
-			"manifest row receipts complete: 576 (telegram=96, discord=96, slack=96, mcp=96, acp=96, daemonCli=96)",
+			"manifest row receipts complete: 582 (telegram=97, discord=97, slack=97, mcp=97, acp=97, daemonCli=97)",
 		);
 		// Receipts run concurrently inside a phase, so their relative order carries
 		// no evidence; what must hold is that every declared receipt ran exactly

@@ -14,6 +14,7 @@ import { drainReconnects, expectedBackoffs, FakeWebSocket, withFakeTransport } f
 
 const SESSION_ID = "chat-reconnect-session";
 const GENERATION = 4;
+const wallClockNow = Date.now;
 /**
  * Mirrors `REPLAY_BARRIER_LIMIT`: how many live frames one attachment holds behind an
  * outstanding replay. Too low a mirror still overflows the real barrier; too high a real
@@ -386,6 +387,15 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 			pid: process.pid,
 			endpointMtimeMs,
 		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: SESSION_ID,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: GENERATION,
+			pid: process.pid,
+			endpointMtimeMs,
+			activity: { state: "active", at: Date.now() },
+		});
 
 		const provider = new FakeSlackProvider();
 		let reconcileTick: (() => void) | undefined;
@@ -428,6 +438,16 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 					pid: process.pid,
 					endpointMtimeMs,
 				});
+				await index.append({
+					type: "host_heartbeat",
+					sessionId: SESSION_ID,
+					locator: { repo: agentDir, stateRoot },
+					endpointGeneration: GENERATION + 1,
+					pid: process.pid,
+					endpointMtimeMs,
+					ts: wallClockNow(),
+					activity: { state: "active", at: Date.now() },
+				});
 			},
 		});
 	} finally {
@@ -463,6 +483,15 @@ async function withAttachedDiscordRuntime(
 			endpointGeneration: GENERATION,
 			pid: process.pid,
 			endpointMtimeMs,
+		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: SESSION_ID,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: GENERATION,
+			pid: process.pid,
+			endpointMtimeMs,
+			activity: { state: "active", at: Date.now() },
 		});
 
 		const provider = new FakeDiscordProvider();

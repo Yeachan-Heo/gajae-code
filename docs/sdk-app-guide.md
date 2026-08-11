@@ -199,7 +199,7 @@ provides its operation and JSON input, and supplies a caller-chosen idempotency
 key:
 
 ```bash
-gjc daemon session global --op session.create \
+gjc sdk session raw global --op session.create \
   --idempotency-key <unique-key> \
   --json-input '{"cwd":"/absolute/path/to/repo"}'
 ```

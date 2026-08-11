@@ -96,7 +96,9 @@ function phaseUpdates(updates: SessionNotification[], phase: string): number {
  * @param options.silentQueries Query ids the session host accepts and never answers,
  * reproducing a host that stops producing the moment it publishes its terminal frame.
  */
-async function createFixture(options: { silentQueries?: string[] } = {}): Promise<Fixture> {
+async function createFixture(
+	options: { silentQueries?: string[]; terminalBeforeAcknowledgement?: boolean; rejectFinalTextUpdate?: boolean } = {},
+): Promise<Fixture> {
 	const silent = new Set(options.silentQueries ?? []);
 	const tempDir = TempDir.createSync("@acp-prompt-settle-");
 	const agentDir = path.join(tempDir.path(), "agent");
@@ -177,6 +179,22 @@ async function createFixture(options: { silentQueries?: string[] } = {}): Promis
 				}
 				if (frame.type !== "control_request") return;
 				if (frame.operation === "turn.prompt") promptSocket = socket;
+				if (frame.operation === "turn.prompt" && options.terminalBeforeAcknowledgement)
+					socket.send(
+						JSON.stringify({
+							type: "event",
+							commandId,
+							payload: {
+								event_type: "agent_end",
+								event: {
+									type: "agent_end",
+									turnId,
+									finalText: "the complete final report",
+									outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+								},
+							},
+						}),
+					);
 				socket.send(
 					JSON.stringify({
 						type: "control_response",
@@ -214,7 +232,11 @@ async function createFixture(options: { silentQueries?: string[] } = {}): Promis
 	});
 	const agent = new AcpAgent(
 		{
-			sessionUpdate: async (update: SessionNotification) => updates.push(update),
+			sessionUpdate: async (update: SessionNotification) => {
+				if (options.rejectFinalTextUpdate && update.update.sessionUpdate === "agent_message_chunk")
+					throw new Error("client update failed");
+				updates.push(update);
+			},
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
@@ -280,6 +302,51 @@ test("a completed turn settles on its terminal frame even when end-of-turn metad
 				.filter(update => update.update.sessionUpdate === "agent_message_chunk")
 				.map(update => (update.update as { content: { text: string } }).content.text),
 		).toEqual(["the complete final report"]);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a pre-acknowledgement terminal uses correlation carried by its event payload", async () => {
+	const fixture = await createFixture({ terminalBeforeAcknowledgement: true });
+	try {
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000002",
+			prompt: [{ type: "text", text: "fast completed turn" }],
+		} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
+		expect(await bounded(pending, "pre-acknowledgement prompt completion")).toEqual({
+			stopReason: "end_turn",
+		});
+		expect(
+			fixture.updates
+				.filter(update => update.update.sessionUpdate === "agent_message_chunk")
+				.map(update => (update.update as { content: { text: string } }).content.text),
+		).toEqual(["the complete final report"]);
+		expect(fixture.clock.now()).toBe(0);
+		expect(fixture.clock.pending).toBe(0);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("a deferred terminal processing failure is contained by the frame queue", async () => {
+	const fixture = await createFixture({ terminalBeforeAcknowledgement: true, rejectFinalTextUpdate: true });
+	try {
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000003",
+			prompt: [{ type: "text", text: "terminal update failure" }],
+		} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
+		const outcome = await bounded(
+			pending.then(
+				() => undefined,
+				(error: unknown) => error as { code?: string },
+			),
+			"deferred terminal processing failure",
+		);
+		expect(outcome).toMatchObject({ code: "frame_processing_failed" });
+		expect(fixture.clock.pending).toBe(0);
 	} finally {
 		fixture.dispose();
 	}

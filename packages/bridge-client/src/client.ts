@@ -40,6 +40,7 @@ export interface SdkRequestOptions {
 	timeoutMs?: number;
 	idempotencyKey?: string;
 	confirm?: boolean;
+	elevationRequestId?: string;
 }
 
 export type SdkFrame = Record<string, unknown>;
@@ -245,6 +246,7 @@ export class SdkClient {
 				operation,
 				input,
 				...(options.confirm === undefined ? {} : { confirm: options.confirm }),
+				...(options.elevationRequestId === undefined ? {} : { elevationRequestId: options.elevationRequestId }),
 			},
 			options,
 		);
@@ -267,7 +269,15 @@ export class SdkClient {
 		input: Record<string, unknown> = {},
 		options: SdkRequestOptions = {},
 	): Promise<unknown> {
-		return await this.#request({ type: "broker_request", operation, input }, options);
+		return await this.#request(
+			{
+				type: "broker_request",
+				operation,
+				input,
+				...(options.elevationRequestId === undefined ? {} : { elevationRequestId: options.elevationRequestId }),
+			},
+			options,
+		);
 	}
 
 	async #request(frame: Frame, options: SdkRequestOptions): Promise<unknown> {

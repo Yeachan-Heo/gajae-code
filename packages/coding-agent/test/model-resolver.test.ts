@@ -13,6 +13,7 @@ import {
 	resolveModelOverride,
 	resolveModelRoleValue,
 	resolveModelScope,
+	resolveSelector,
 	restoreModelFromSession,
 } from "@gajae-code/coding-agent/config/model-resolver";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -718,6 +719,29 @@ describe("resolveModelFromString", () => {
 		const resolved = resolveModelFromString("openrouter/qwen/qwen3-coder:exacto", allModels);
 		expect(resolved?.provider).toBe("openrouter");
 		expect(resolved?.id).toBe("qwen/qwen3-coder:exacto");
+	});
+	test("resolves a concrete colon-tagged model id whole and consumes only a recognized effort suffix", () => {
+		const catalog = [
+			...allModels,
+			{ ...mockModels[0], provider: "ollama-cloud", id: "deepseek-v4-flash:0731" },
+		] as Model[];
+
+		const exact = resolveModelFromString("ollama-cloud/deepseek-v4-flash:0731", catalog);
+		expect(exact?.provider).toBe("ollama-cloud");
+		expect(exact?.id).toBe("deepseek-v4-flash:0731");
+
+		const withEffort = resolveSelector("ollama-cloud/deepseek-v4-flash:0731:xhigh", catalog);
+		expect(withEffort.model?.provider).toBe("ollama-cloud");
+		expect(withEffort.model?.id).toBe("deepseek-v4-flash:0731");
+		expect(withEffort.thinkingLevel).toBe(Effort.XHigh);
+		expect(withEffort.explicitThinkingLevel).toBe(true);
+
+		const parsed = parseModelString("ollama-cloud/deepseek-v4-flash:0731:xhigh");
+		expect(parsed).toEqual({
+			provider: "ollama-cloud",
+			id: "deepseek-v4-flash:0731",
+			thinkingLevel: Effort.XHigh,
+		});
 	});
 });
 

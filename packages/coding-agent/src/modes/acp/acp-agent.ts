@@ -109,11 +109,11 @@ interface PromptWaiter {
 	deferredFrames: JsonObject[];
 	/** Activity frames held until acknowledgement establishes exact prompt ownership. */
 	deferredActivityFrames: JsonObject[];
-	/** Clock reading of the last inbound frame for this prompt; baseline of the inactivity watchdog. */
+	/** Clock reading of the last frame proven to belong to this prompt; watchdog silence baseline. */
 	lastFrameAt: number;
-	/** Frame (or wire event) type of that last frame, reported when the watchdog expires. */
+	/** Type of that prompt-owned frame, reported when the watchdog expires. */
 	lastFrameType: string;
-	/** Cancels the armed inactivity watchdog; re-armed by every inbound frame for this prompt. */
+	/** Cancels the armed inactivity watchdog; re-armed by prompt-owned frames. */
 	cancelWatchdog?: () => void;
 	/** What the host is observably doing — a tool running, a model call unanswered — and the bound that follows from it. */
 	activity: PromptActivity;
@@ -140,6 +140,8 @@ type SessionRecord = {
 	busy: boolean;
 	/** Start/update args retained because tool_execution_end does not carry them. */
 	toolArgs: Map<string, unknown>;
+	/** Message projection state for correlationless session-scoped assistant events. */
+	sessionMessageProgress?: { textEmitted: boolean; thoughtEmitted: boolean };
 	/** Actionable model-profile authentication failure detected before prompt dispatch. */
 	connectionId?: string;
 	/** Bounded set of correlations already settled; they stay closed for publication. */
@@ -149,6 +151,11 @@ type SessionRecord = {
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
 };
+
+function promptWaiterRetired(record: SessionRecord, waiter: PromptWaiter): boolean {
+	return waiter.settled || record.activePrompt !== waiter;
+}
+
 type Endpoint = { url: string; token: string };
 
 type BrokerSession = {
@@ -318,25 +325,6 @@ export function acpAvailableCommandsFromSkills(query: unknown): AvailableCommand
 	return [...commands.values()];
 }
 
-function correlationFrom(...values: unknown[]): PromptCorrelation {
-	const correlation: PromptCorrelation = {};
-	for (const value of values) {
-		const candidate = object(value);
-		for (const record of [candidate, object(candidate?.result)]) {
-			if (!record) continue;
-			if (!correlation.commandId) {
-				const commandId = record.commandId ?? record.command_id;
-				if (typeof commandId === "string" && commandId) correlation.commandId = commandId;
-			}
-			if (!correlation.turnId) {
-				const turnId = record.turnId ?? record.turn_id;
-				if (typeof turnId === "string" && turnId) correlation.turnId = turnId;
-			}
-		}
-	}
-	return correlation;
-}
-
 function hasCorrelation(correlation: PromptCorrelation): boolean {
 	return correlation.commandId !== undefined || correlation.turnId !== undefined;
 }
@@ -414,6 +402,36 @@ function strictCorrelationFrom(...values: unknown[]): PromptCorrelation | undefi
 		}
 	}
 	return malformed ? undefined : correlation;
+}
+
+function sdkFrameCorrelation(frame: JsonObject, event?: JsonObject): PromptCorrelation | undefined {
+	return strictCorrelationFrom(frame, event);
+}
+
+/**
+ * Conflicting envelope/event identities own no prompt and therefore cannot
+ * refresh a watchdog or publish into either turn.
+ */
+function watchdogCorrelationFrom(frame: JsonObject, event?: JsonObject): PromptCorrelation {
+	return strictCorrelationFrom(frame, event) ?? {};
+}
+
+function logDroppedPromptTerminal(
+	sessionId: string,
+	event: JsonObject,
+	reason: "incomplete_correlation" | "correlation_mismatch",
+	actual: PromptCorrelation,
+	expected?: PromptCorrelation,
+): void {
+	logger.error("acp_prompt_terminal_dropped", {
+		sessionId,
+		terminalType: event.type,
+		reason,
+		...(actual.commandId ? { commandId: actual.commandId } : {}),
+		...(actual.turnId ? { turnId: actual.turnId } : {}),
+		...(expected?.commandId ? { expectedCommandId: expected.commandId } : {}),
+		...(expected?.turnId ? { expectedTurnId: expected.turnId } : {}),
+	});
 }
 
 function terminalOutcome(event: JsonObject): SdkPromptTerminalOutcome | undefined {
@@ -1406,6 +1424,10 @@ export class AcpAgent implements Agent {
 			};
 			record.activePrompt = waiter;
 		});
+		// The watchdog may reject this waiter while the SDK acknowledgement request is still
+		// pending. Retain the original promise for the caller, but mark that delayed rejection
+		// as observed until prompt() can resume and await it.
+		void response.catch(() => undefined);
 		// Silence has to be bounded from the moment the prompt owns the session: a host that
 		// dies before it ever answers is exactly the failure that leaves the client running.
 		this.#armPromptWatchdog(params.sessionId, record, waiter);
@@ -1426,7 +1448,7 @@ export class AcpAgent implements Agent {
 				record.adapter,
 			);
 		}
-		try {
+		const acknowledgementTask = (async (): Promise<PromptResponse> => {
 			const acknowledgement = await record.adapter.prompt({
 				text: payload.text,
 				...(payload.images.length ? { images: payload.images } : {}),
@@ -1441,22 +1463,80 @@ export class AcpAgent implements Agent {
 			waiter.boundary = record.inboundSequence;
 			waiter.correlation = acknowledgementCorrelation;
 			waiter.acknowledged = true;
+			if (promptWaiterRetired(record, waiter)) {
+				if (
+					!record.settledPromptCorrelations.some(settled =>
+						correlationsExactlyMatch(settled, acknowledgementCorrelation),
+					)
+				) {
+					record.settledPromptCorrelations.push(acknowledgementCorrelation);
+					while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
+						record.settledPromptCorrelations.shift();
+				}
+				return await response;
+			}
 			// Frames held while ownership was unknown belong to this prompt only when the
 			// acknowledgement proves their complete correlation matches exactly.
 			const deferredActivityFrames = waiter.deferredActivityFrames.splice(0);
+			let observedDeferredActivity = false;
 			for (const deferredFrame of deferredActivityFrames) {
 				const deferredEvent = receivedSdkEvent(deferredFrame)?.event;
-				if (correlationsExactlyMatch(waiter.correlation, correlationFrom(deferredFrame, deferredEvent)))
+				if (correlationsExactlyMatch(waiter.correlation, watchdogCorrelationFrom(deferredFrame, deferredEvent))) {
 					this.#observePromptActivity(waiter, deferredFrame);
+					observedDeferredActivity = true;
+				}
 			}
-			if (deferredActivityFrames.length > 0) this.#armPromptWatchdog(params.sessionId, record, waiter);
+			if (observedDeferredActivity) this.#armPromptWatchdog(params.sessionId, record, waiter);
 			const deferred = waiter.deferredFrames.splice(0);
-			for (const deferredFrame of deferred)
-				if (correlationsExactlyMatch(waiter.correlation, correlationFrom(deferredFrame)))
-					record.frameTail = record.frameTail.then(
-						async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
-					);
+			for (const deferredFrame of deferred) {
+				const deferredEvent = receivedSdkEvent(deferredFrame)?.event;
+				if (!deferredEvent) continue;
+				const deferredCorrelation = sdkFrameCorrelation(deferredFrame, deferredEvent) ?? {};
+				const deferredIsTerminal = deferredEvent.type === "agent_end" || deferredEvent.type === "agent_failed";
+				if (!hasCompleteCorrelation(deferredCorrelation)) {
+					if (deferredIsTerminal)
+						logDroppedPromptTerminal(
+							params.sessionId,
+							deferredEvent,
+							"incomplete_correlation",
+							deferredCorrelation,
+							waiter.correlation,
+						);
+					continue;
+				}
+				const matchesPrompt = correlationsExactlyMatch(waiter.correlation, deferredCorrelation);
+				if (
+					!matchesPrompt &&
+					record.settledPromptCorrelations.some(settled => correlationsExactlyMatch(settled, deferredCorrelation))
+				)
+					continue;
+				if (!matchesPrompt) {
+					if (deferredIsTerminal)
+						logDroppedPromptTerminal(
+							params.sessionId,
+							deferredEvent,
+							"correlation_mismatch",
+							deferredCorrelation,
+							waiter.correlation,
+						);
+					continue;
+				}
+				const task = record.frameTail.then(
+					async () => await this.#handleSdkFrame(params.sessionId, record.adapter, deferredFrame),
+				);
+				record.frameTail = task.catch(
+					async error =>
+						await this.#failSession(params.sessionId, record.adapter, this.#frameProcessingFailure(error)),
+				);
+			}
 			this.#settlePrompt(record, waiter);
+			return await response;
+		})();
+		// Settlement can win before the SDK answers `turn.prompt`; acknowledgement processing
+		// must remain alive to tombstone its eventual correlation without holding the ACP caller.
+		void acknowledgementTask.catch(() => undefined);
+		try {
+			return await Promise.race([response, acknowledgementTask]);
 		} catch (error) {
 			waiter.deferredFrames.length = 0;
 			waiter.deferredActivityFrames.length = 0;
@@ -1475,7 +1555,6 @@ export class AcpAgent implements Agent {
 			}
 			throw error;
 		}
-		return await response;
 	}
 
 	async cancel(params: { sessionId: string }): Promise<void> {
@@ -2019,38 +2098,33 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Any frame proves the producer is alive, so every one of them restarts the bound: liveness
-	 * is a property of the session host process, not of one turn, and a host still flushing an
-	 * abandoned turn's backlog is exactly a producer that has not stopped producing. Which bound
-	 * is restarted is a different question, and that one is correlation-owned; see below.
+	 * A frame only restarts this prompt's watchdog after its complete correlation proves
+	 * that it belongs to the prompt. Correlationless or foreign traffic still proves the
+	 * session host process is alive, but not that it is making progress on this turn; using
+	 * process liveness as turn liveness lets an otherwise healthy host keep a wedged prompt
+	 * open forever. Matching frames retain the per-gap behavior for hosts demonstrably
+	 * working on this turn, while pre-acknowledgement activity is replayed after ownership
+	 * becomes known.
 	 */
 	#refreshPromptWatchdog(id: string, record: SessionRecord, frame: JsonObject): void {
 		const waiter = record.activePrompt;
 		if (!waiter || waiter.settled) return;
 		const event = receivedSdkEvent(frame)?.event;
-		waiter.lastFrameAt = this.#promptWatchdogClock.now();
-		waiter.lastFrameType =
-			typeof event?.type === "string" ? event.type : typeof frame.type === "string" ? frame.type : "unknown";
-		// Which bound applies is per-turn state, so it is fenced by the same identity that gates
-		// settlement: only a frame carrying exactly the acknowledged prompt's command/turn may
-		// start, clear, or extend a bound. Without this fence an already-settled turn's flushed
-		// frames mutate the live turn — a stale `message_update` clears `awaitingModel` and
-		// narrows it off the inference bound, a stale `tool_execution_start` pins it to the tool
-		// bound with no tool running. Frames with no correlation at all (heartbeats,
-		// session-scoped events) are refresh-only for the same reason: they prove the producer
-		// lives but say nothing about what this turn is doing, so they leave the bound as is.
-		// Before acknowledgement the prompt has no identity, so correlated activity is retained
-		// and folded in only after the acknowledgement proves exact ownership.
+		const correlation = watchdogCorrelationFrom(frame, event);
 		if (!waiter.acknowledged) {
-			if (hasCorrelation(correlationFrom(frame, event))) waiter.deferredActivityFrames.push(frame);
-		} else if (correlationsExactlyMatch(waiter.correlation, correlationFrom(frame, event))) {
-			this.#observePromptActivity(waiter, frame);
+			if (hasCorrelation(correlation)) waiter.deferredActivityFrames.push(frame);
+			return;
 		}
+		if (!correlationsExactlyMatch(waiter.correlation, correlation)) return;
+		this.#observePromptActivity(waiter, frame);
 		this.#armPromptWatchdog(id, record, waiter);
 	}
 
 	#observePromptActivity(waiter: PromptWaiter, frame: JsonObject): void {
 		const event = receivedSdkEvent(frame)?.event;
+		waiter.lastFrameAt = this.#promptWatchdogClock.now();
+		waiter.lastFrameType =
+			typeof event?.type === "string" ? event.type : typeof frame.type === "string" ? frame.type : "unknown";
 		waiter.activity.observe(
 			typeof event?.type === "string" ? event.type : undefined,
 			typeof event?.toolCallId === "string" ? event.toolCallId : undefined,
@@ -2102,8 +2176,8 @@ export class AcpAgent implements Agent {
 		if (!record || record.adapter !== adapter) return;
 		// Ingress ordering is recorded before queued work begins.
 		this.#observeSessionActivity(record, frame);
-		// Any frame at all proves the producer is still alive, so it refreshes the
-		// inactivity watchdog before the queued work that may take a long time to run.
+		// Correlation is checked at ingress before a prompt-owned frame may refresh the
+		// watchdog, so queued processing cannot turn unrelated host traffic into turn liveness.
 		this.#refreshPromptWatchdog(id, record, frame);
 		++record.inboundSequence;
 		const task = record.frameTail.then(async () => await this.#handleSdkFrame(id, adapter, frame));
@@ -2143,19 +2217,33 @@ export class AcpAgent implements Agent {
 		if (!received) return;
 		const { event, wirePayload } = received;
 		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
-		const correlation = (isTerminal ? strictCorrelationFrom(frame, event) : correlationFrom(frame, event)) ?? {};
+		const derivedCorrelation = sdkFrameCorrelation(frame, event);
+		const correlation = derivedCorrelation ?? {};
 		const activePrompt = record.activePrompt;
 		const outcome = isTerminal ? terminalOutcome(event) : undefined;
+		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
+			correlationsMatch(settled, correlation),
+		);
 		if (isTerminal) {
 			// Terminal ownership requires a complete identity. Unowned, partial, and
 			// duplicate terminals are never allowed to publish or query anything.
-			if (!hasCompleteCorrelation(correlation) || !activePrompt || activePrompt.settled) return;
+			if (!activePrompt || activePrompt.settled) return;
+			if (!hasCompleteCorrelation(correlation)) {
+				logDroppedPromptTerminal(id, event, "incomplete_correlation", correlation, activePrompt.correlation);
+				return;
+			}
 			if (!activePrompt.acknowledged) {
 				// Hold the entire frame until the prompt acknowledgement proves ownership.
 				activePrompt.deferredFrames.push(frame);
 				return;
 			}
-			if (!correlationsExactlyMatch(activePrompt.correlation, correlation) || activePrompt.terminal) return;
+			const matchesPrompt = correlationsExactlyMatch(activePrompt.correlation, correlation);
+			if (settledCorrelation && !matchesPrompt) return;
+			if (!matchesPrompt) {
+				logDroppedPromptTerminal(id, event, "correlation_mismatch", correlation, activePrompt.correlation);
+				return;
+			}
+			if (activePrompt.terminal) return;
 			if (!outcome) {
 				const detail =
 					typeof (event as { error?: { message?: unknown } }).error?.message === "string"
@@ -2171,17 +2259,15 @@ export class AcpAgent implements Agent {
 			}
 			activePrompt.terminal = { outcome, correlation };
 		}
-		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-		if (
-			toolCallId &&
-			(event.type === "tool_execution_start" || event.type === "tool_execution_update") &&
-			"args" in event
-		) {
-			record.toolArgs.set(toolCallId, event.args);
+		if (!isTerminal && derivedCorrelation === undefined) return;
+		if (!isTerminal && hasCorrelation(correlation)) {
+			if (!activePrompt || activePrompt.settled) return;
+			if (!activePrompt.acknowledged) {
+				activePrompt.deferredFrames.push(frame);
+				return;
+			}
+			if (!correlationsExactlyMatch(activePrompt.correlation, correlation)) return;
 		}
-		const settledCorrelation = record.settledPromptCorrelations.some(settled =>
-			correlationsMatch(settled, correlation),
-		);
 		if (settledCorrelation) {
 			// Frames for an already-settled correlation stay closed until an active prompt
 			// acknowledges the exact same identity.
@@ -2191,25 +2277,41 @@ export class AcpAgent implements Agent {
 			}
 			if (!activePrompt || activePrompt.settled || !correlationsMatch(activePrompt.correlation, correlation)) return;
 		}
-		// After a correlated settlement with no active prompt, correlationless wire frames
-		// have no prompt to belong to and must not publish further updates.
-		if (!record.activePrompt && record.settledPromptCorrelations.length > 0 && !hasCorrelation(correlation)) return;
+		const promptOwner =
+			activePrompt &&
+			!activePrompt.settled &&
+			activePrompt.acknowledged &&
+			correlationsExactlyMatch(activePrompt.correlation, correlation)
+				? activePrompt
+				: undefined;
+		const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+		if (
+			toolCallId &&
+			(event.type === "tool_execution_start" || event.type === "tool_execution_update") &&
+			"args" in event
+		) {
+			record.toolArgs.set(toolCallId, event.args);
+		}
 		if (wirePayload) {
 			for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, {
 				cwd: record.cwd,
 				getToolArgs: id => record.toolArgs.get(id),
 				getMessageProgress: message => {
-					if (!activePrompt || !object(message)) return undefined;
-					activePrompt.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
-					return activePrompt.messageProgress;
+					if (!object(message)) return undefined;
+					if (promptOwner) {
+						promptOwner.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
+						return promptOwner.messageProgress;
+					}
+					record.sessionMessageProgress ??= { textEmitted: false, thoughtEmitted: false };
+					return record.sessionMessageProgress;
 				},
 			})) {
 				if (
-					activePrompt &&
+					promptOwner &&
 					notification.update.sessionUpdate === "agent_message_chunk" &&
 					notification.update.content.type === "text"
 				)
-					activePrompt.emittedAssistantText += notification.update.content.text;
+					promptOwner.emittedAssistantText += notification.update.content.text;
 				await this.#publishSessionUpdate(id, notification, adapter);
 			}
 		}
@@ -2228,14 +2330,16 @@ export class AcpAgent implements Agent {
 				adapter,
 			);
 		}
-		if (event.type === "message_end" && object(event.message)?.role === "assistant" && activePrompt)
-			activePrompt.messageProgress = undefined;
+		if (event.type === "message_end" && object(event.message)?.role === "assistant") {
+			if (promptOwner) promptOwner.messageProgress = undefined;
+			else record.sessionMessageProgress = undefined;
+		}
 		if (event.type === "agent_end") {
 			const finalText = typeof event.finalText === "string" ? event.finalText : "";
-			if (activePrompt && finalText) {
-				const resolution = resolveAcpFinalText(activePrompt.emittedAssistantText, finalText);
+			if (promptOwner && finalText) {
+				const resolution = resolveAcpFinalText(promptOwner.emittedAssistantText, finalText);
 				if (resolution.kind === "emit") {
-					activePrompt.emittedAssistantText += resolution.text;
+					promptOwner.emittedAssistantText += resolution.text;
 					await this.#publishSessionUpdate(
 						id,
 						{
@@ -2251,9 +2355,9 @@ export class AcpAgent implements Agent {
 				} else if (resolution.kind === "divergent") {
 					logger.warn("acp_final_text_diverged", {
 						sessionId: id,
-						...(activePrompt.correlation.commandId ? { commandId: activePrompt.correlation.commandId } : {}),
-						...(activePrompt.correlation.turnId ? { turnId: activePrompt.correlation.turnId } : {}),
-						streamedLength: activePrompt.emittedAssistantText.length,
+						...(promptOwner.correlation.commandId ? { commandId: promptOwner.correlation.commandId } : {}),
+						...(promptOwner.correlation.turnId ? { turnId: promptOwner.correlation.turnId } : {}),
+						streamedLength: promptOwner.emittedAssistantText.length,
 						finalLength: resolution.final.text.length,
 					});
 				}

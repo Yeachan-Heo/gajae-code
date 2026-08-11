@@ -76,13 +76,18 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(requiredJob(d, "affected").needs).not.toContain("notification-atomic-windows");
 	});
 
-	test("keeps the guard in the required aggregate with a fail-closed check", async () => {
+	test("keeps the guard in the required aggregate with a fail-closed scoped check", async () => {
 		const d = await workflow();
+		const guard = requiredJob(d, "telegram-daemon-generation");
+		const guardCondition = String(guard.if);
+		expect(guardCondition).toContain("telegram-daemon");
+		expect(guardCondition).toContain("chat-daemon");
+		expect(guardCondition).toContain("telegram-daemon-generation-guard.ts");
 		const affected = requiredJob(d, "affected");
 		expect(affected.needs).toContain("telegram-daemon-generation");
 		const aggregateStep = namedStep(affected, "Validate live affected aggregate");
 		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_RESULT")).toBe("${{ needs.telegram-daemon-generation.result }}");
-		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toBe("${{ needs.affected-plan.outputs.relevant }}");
+		expect(requiredEnvValue(affected, "CI_DEV_TELEGRAM_GUARD_REQUIRED")).toContain("telegram-daemon-generation-guard.ts");
 		expect(aggregateStep.run).toContain("--validate-aggregate");
 		expect(requiredEnvValue(aggregateStep, "CI_DEV_AFFECTED_PLAN")).toBe(
 			"${{ runner.temp }}/ci-dev-affected-evidence/.ci-dev-affected-plan.json",

@@ -24,6 +24,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -83,8 +84,9 @@ import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
+import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
-import { type ControlSurface, dispatchControl } from "../host/control";
+import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
 import {
@@ -2385,6 +2387,7 @@ function sdkControlSurface(
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
+	elevationAuthorityToken?: string,
 	abortOwnedPrompt: (
 		connectionId: string | undefined,
 	) => Promise<{ aborted: true; disposition: "cancelled" | "already_terminal" | "idle" }> = async () => ({
@@ -2684,6 +2687,9 @@ function sdkControlSurface(
 		cancelPendingPreflights(): void;
 		cancelPendingPreflightsForConnection(connectionId: string): void;
 	} = {
+		authorizeElevationClaim: (sdkId, input, capability) =>
+			elevationAuthorityToken !== undefined &&
+			verifyElevationCapability(elevationAuthorityToken, capability, sdkId, input),
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
 		steer: text => sendSteer(text),
@@ -2718,7 +2724,7 @@ function sdkControlSurface(
 			pending.completeDirect();
 			return { resolved: true };
 		},
-		answerGate: async (id, response, expectedSessionId, idempotencyKey) => {
+		answerGate: async (id, response, expectedSessionId, idempotencyKey, _elevationRequestId) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.gate_answer");
@@ -2793,7 +2799,7 @@ function sdkControlSurface(
 				code: "terminal_uncertain",
 			});
 		},
-		approvePlan: async (id, choice, expectedSessionId) => {
+		approvePlan: async (id, choice, expectedSessionId, _elevationRequestId) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.plan_approve");
@@ -3918,6 +3924,11 @@ export function createNotificationsExtension(
 		// build information and required capability while lifecycle startup can settle
 		// a structured failure instead of leaving the lifecycle caller pending.
 		const token = resolveToken();
+		const elevationAuthorityToken = crypto.randomBytes(32).toString("base64url");
+		const elevationAuthorityFile = elevationAuthorityPath(endpointStateRoot, id);
+		await fsPromises.mkdir(path.dirname(elevationAuthorityFile), { recursive: true, mode: 0o700 });
+		await Bun.write(elevationAuthorityFile, `${JSON.stringify({ version: 1, token: elevationAuthorityToken })}\n`);
+		await fsPromises.chmod(elevationAuthorityFile, 0o600);
 		let server: NotificationServer;
 		try {
 			const { NotificationServer, nativeBuildInfo } = sdkBusNatives();
@@ -4600,6 +4611,7 @@ export function createNotificationsExtension(
 			settings,
 			configOverrides,
 			configRevision,
+			elevationAuthorityToken,
 			async connectionId => {
 				const active = [...promptSubmissions.entries()].find(
 					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
@@ -4883,15 +4895,7 @@ export function createNotificationsExtension(
 					dispatchControl(
 						controlSurface,
 						OPERATIONS.find(row => row.kind === "control" && row.sdkId === operation),
-						{
-							id: requestId,
-							operation,
-							input: request.input,
-							expectedRevision:
-								typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
-							idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
-							confirm: request.confirm === true,
-						},
+						controlRequestFromFrame(request as Record<string, unknown>),
 					),
 				);
 
@@ -4903,6 +4907,16 @@ export function createNotificationsExtension(
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as { id?: unknown; query?: unknown; input?: unknown; cursor?: unknown };
+				// D1: a non-string top-level cursor is rejected, never silently
+				// dropped into a fresh-snapshot query (parity with the loopback
+				// session-runtime adapter).
+				if (request.cursor !== undefined && typeof request.cursor !== "string")
+					return {
+						type: "query_response",
+						id: typeof request.id === "string" ? request.id : undefined,
+						ok: false,
+						error: { code: "invalid_input", message: "cursor must be a non-empty string" },
+					};
 				const response = await queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -5817,7 +5831,7 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
-			let suppressExtensionError = false;
+			let suppressExtensionError = result.failure?.message === "Lifecycle SDK startup was cancelled.";
 			let stopped = false;
 			try {
 				stopped = await stopSession(id, "session", runtime);

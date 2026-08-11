@@ -87,6 +87,8 @@ export interface MockResponse {
 	usage?: Partial<Omit<Usage, "cost">> & { cost?: Partial<Usage["cost"]> };
 	/** Pre-set responseId. */
 	responseId?: string;
+	/** Optional typed provider failure metadata for retry/fallback tests. */
+	transportFailure?: AssistantMessage["transportFailure"];
 	/** If set, the stream emits a terminal error event instead of completing. */
 	throw?: string | Error;
 	/** Delay before any event is emitted. Honors the call's AbortSignal. */
@@ -363,6 +365,7 @@ async function runMock(
 		provider: model.provider,
 		model: model.id,
 		responseId: response.responseId,
+		transportFailure: response.transportFailure,
 		usage: emptyUsage(),
 		stopReason: "stop",
 		timestamp: startedAt,

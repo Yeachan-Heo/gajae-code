@@ -36,7 +36,7 @@ import {
 } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { transportFailureFacts } from "../utils/fallback-transport";
+import { EMPTY_RESPONSE_PROVIDER_CODE, transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import {
 	FirstEventTimeoutError,
@@ -320,6 +320,26 @@ type OpenAIResponsesSamplingParams = ResponseCreateParamsStreaming & {
 	stream_options?: { include_obfuscation?: boolean };
 };
 
+export function isOpenCodeGoEmptyCompletedResponse(
+	model: Model<"openai-responses">,
+	output: AssistantMessage,
+	nativeOutputItemCount: number,
+): boolean {
+	return (
+		model.provider === "opencode-go" &&
+		typeof output.responseId === "string" &&
+		output.responseId.length > 0 &&
+		output.stopReason === "stop" &&
+		output.content.length === 0 &&
+		nativeOutputItemCount === 0 &&
+		output.usage.input === 0 &&
+		output.usage.output === 0 &&
+		output.usage.cacheRead === 0 &&
+		output.usage.cacheWrite === 0 &&
+		output.usage.totalTokens === 0
+	);
+}
+
 /**
  * Generate function for OpenAI Responses API
  */
@@ -462,11 +482,23 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			}
 
 			output.providerPayload = createOpenAIResponsesHistoryPayload(model.provider, nativeOutputItems);
+			if (isOpenCodeGoEmptyCompletedResponse(model, output, nativeOutputItems.length)) {
+				output.stopReason = "error";
+				output.errorMessage = "Provider returned an empty response with zero token usage";
+				output.transportFailure = {
+					kind: "transport",
+					providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+				};
+			}
 			if (providerSessionState) providerSessionState.nativeHistoryReplayWarmed = true;
 
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			if (output.stopReason === "error") {
+				stream.push({ type: "error", reason: "error", error: output });
+			} else {
+				stream.push({ type: "done", reason: output.stopReason, message: output });
+			}
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) delete (block as { index?: number }).index;

@@ -1,7 +1,7 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 
@@ -388,6 +388,7 @@ test("ACP drops a mismatched pre-ack terminal without publication or queries", a
 			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 		},
 	});
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
 	try {
 		let settled = false;
 		const pending = prompt(fixture, "mismatched pre-ack").then(
@@ -399,6 +400,19 @@ test("ACP drops a mismatched pre-ack terminal without publication or queries", a
 			},
 		);
 		await bounded(fixture.promptDelivered, "prompt delivery");
+		await waitFor(
+			() => errorSpy.mock.calls.some(([event]) => event === "acp_prompt_terminal_dropped"),
+			"deferred mismatched terminal drop log",
+		);
+		expect(errorSpy).toHaveBeenCalledWith("acp_prompt_terminal_dropped", {
+			sessionId: "prompt-terminal-session",
+			terminalType: "agent_end",
+			reason: "correlation_mismatch",
+			commandId: "other-command",
+			turnId: "other-turn",
+			expectedCommandId: "prompt-terminal-command",
+			expectedTurnId: "prompt-terminal-turn",
+		});
 		const updatesBefore = fixture.updates.length;
 		const queriesBefore = fixture.queryCalls.length;
 		await Bun.sleep(30);
@@ -408,6 +422,39 @@ test("ACP drops a mismatched pre-ack terminal without publication or queries", a
 		fixture.dispose();
 		await bounded(pending, "mismatched prompt cleanup");
 	} finally {
+		errorSpy.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("ACP logs incomplete-correlation terminals dropped from an acknowledged prompt", async () => {
+	const fixture = await createFixture();
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const pending = prompt(fixture, "incomplete terminal correlation");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_end",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		});
+		await waitFor(
+			() => errorSpy.mock.calls.some(([event]) => event === "acp_prompt_terminal_dropped"),
+			"incomplete terminal drop log",
+		);
+		expect(errorSpy).toHaveBeenCalledWith("acp_prompt_terminal_dropped", {
+			sessionId: "prompt-terminal-session",
+			terminalType: "agent_end",
+			reason: "incomplete_correlation",
+			commandId: "prompt-terminal-command",
+			expectedCommandId: "prompt-terminal-command",
+			expectedTurnId: "prompt-terminal-turn",
+		});
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion after incomplete terminal")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		errorSpy.mockRestore();
 		fixture.dispose();
 	}
 });
@@ -549,6 +596,7 @@ test("ACP keeps the authoritative terminal when it arrives inside the cancel gra
 
 test("ACP suppresses partial and duplicate terminals after settlement", async () => {
 	const fixture = await createFixture();
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
 	try {
 		const pending = prompt(fixture, "late terminal suppression");
 		await bounded(fixture.promptDelivered, "prompt delivery");
@@ -582,12 +630,14 @@ test("ACP suppresses partial and duplicate terminals after settlement", async ()
 		await Bun.sleep(30);
 		expect(fixture.updates).toHaveLength(updatesAfterSettlement);
 		expect(fixture.queryCalls).toHaveLength(queriesAfterSettlement);
+		expect(errorSpy.mock.calls.some(([event]) => event === "acp_prompt_terminal_dropped")).toBe(false);
 	} finally {
+		errorSpy.mockRestore();
 		fixture.dispose();
 	}
 });
 
-test("ACP delivers assistant updates before terminal settlement and drops later updates", async () => {
+test("ACP keeps correlationless session updates publishable after terminal settlement", async () => {
 	const fixture = await createFixture();
 	try {
 		const order: string[] = [];
@@ -609,8 +659,12 @@ test("ACP delivers assistant updates before terminal settlement and drops later 
 		expect(await bounded(pending, "terminal completion")).toEqual({ stopReason: "end_turn" });
 		expect(order).toEqual(["update", "update", "resolved"]);
 		fixture.sendAssistantMessage("after terminal");
-		await Bun.sleep(30);
-		expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toHaveLength(2);
+		await waitFor(
+			() => fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").length === 3,
+			"post-terminal correlationless assistant update",
+		);
+		const lastChunk = fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").at(-1);
+		expect((lastChunk?.update as { content?: { text?: string } }).content?.text).toBe("after terminal");
 	} finally {
 		fixture.dispose();
 	}

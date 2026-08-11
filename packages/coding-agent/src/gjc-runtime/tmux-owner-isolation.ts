@@ -1496,8 +1496,27 @@ function normalizeTerminalObservation(request: ObserveTerminalRequest): ObserveT
 	};
 }
 
+/** One process must not race its own duplicate terminal observers through SQLite. */
+const liveOwnerTerminalObservations = new Map<string, Promise<OwnerVerdict>>();
+
 /** Publish exactly one terminal verdict. Existing valid verdicts always win. */
 export async function observeOwnerTerminal(request: ObserveTerminalRequest): Promise<OwnerVerdict> {
+	if (!isObserveTerminalRequest(request)) throw new Error("terminal_observation_invalid");
+	const paths = lifecyclePaths(request.state_dir, request.session_id, request.owner_generation);
+	const existing = liveOwnerTerminalObservations.get(paths.root);
+	if (existing) return existing;
+	const observation = observeOwnerTerminalExclusive(request);
+	liveOwnerTerminalObservations.set(paths.root, observation);
+	try {
+		return await observation;
+	} finally {
+		if (liveOwnerTerminalObservations.get(paths.root) === observation)
+			liveOwnerTerminalObservations.delete(paths.root);
+	}
+}
+
+/** Publish exactly one terminal verdict. Existing valid verdicts always win. */
+async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): Promise<OwnerVerdict> {
 	if (!isObserveTerminalRequest(request)) throw new Error("terminal_observation_invalid");
 	const paths = lifecyclePaths(request.state_dir, request.session_id, request.owner_generation);
 	let observation = normalizeTerminalObservation(request);

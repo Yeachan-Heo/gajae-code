@@ -3,7 +3,7 @@ import * as crypto from "node:crypto";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getBlobsDir, getResidentCacheRootDir, logger, TempDir } from "@gajae-code/utils";
+import { getBlobsDir, getResidentCacheRootDir, getSidecarCacheRootDir, logger, TempDir } from "@gajae-code/utils";
 import {
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -579,7 +579,22 @@ describe("SessionManager cold sidecar integration", () => {
 				await manager.close();
 			}
 			const cacheRoot = getResidentCacheRootDir(profileAgentDir);
-			const beforeReopen = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
+			const residentEntriesBefore = fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0;
+			const sidecarCacheRoot = getSidecarCacheRootDir(profileAgentDir);
+			const beforeReopen = fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0;
+			const sessionHash = createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
+			const staleSidecar = path.join(sidecarCacheRoot, `s-${sessionHash}`);
+			fs.mkdirSync(sidecarCacheRoot, { recursive: true, mode: 0o700 });
+			fs.chmodSync(sidecarCacheRoot, 0o700);
+			fs.mkdirSync(staleSidecar, { mode: 0o700 });
+			fs.chmodSync(staleSidecar, 0o700);
+			fs.writeFileSync(
+				path.join(staleSidecar, "owner.json"),
+				JSON.stringify({ pid: 2_147_483_647, startTimeMs: 0, nonce: "crashed-sidecar", createdAt: 0 }),
+				{ mode: 0o600 },
+			);
+			fs.chmodSync(path.join(staleSidecar, "owner.json"), 0o600);
+			fs.writeFileSync(path.join(staleSidecar, ".session-memory.spill.idx"), "crash debris", { mode: 0o600 });
 			const transcriptRead = vi.spyOn(nestedStore, "readExpected");
 			const reopened = await SessionManager.openNestedManaged(
 				sessionFile,
@@ -594,11 +609,17 @@ describe("SessionManager cold sidecar integration", () => {
 				expect(reopened.getSessionMemoryStats().coldRetirementActive).toBe(true);
 				expect(reopened.getSessionMemoryStats().totalAccountedBytes).toBeLessThanOrEqual(64 * 1024 * 1024);
 				expect(reopened.getEntry(coldId)?.id).toBe(coldId);
-				expect(fs.readdirSync(cacheRoot).length).toBeGreaterThan(beforeReopen);
+				expect(fs.readdirSync(sidecarCacheRoot).length).toBeGreaterThan(beforeReopen);
+				expect(fs.readdirSync(sidecarCacheRoot).filter(entry => /^s-[a-f0-9]{32}$/.test(entry))).toHaveLength(1);
+				expect(JSON.parse(fs.readFileSync(path.join(staleSidecar, "owner.json"), "utf8"))).toMatchObject({
+					pid: process.pid,
+				});
+				expect(fs.readdirSync(cacheRoot).filter(entry => entry.startsWith("i-")).length).toBe(1);
 			} finally {
 				await reopened.close();
 			}
-			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(beforeReopen);
+			expect(fs.existsSync(sidecarCacheRoot) ? fs.readdirSync(sidecarCacheRoot).length : 0).toBe(beforeReopen);
+			expect(fs.existsSync(cacheRoot) ? fs.readdirSync(cacheRoot).length : 0).toBe(residentEntriesBefore);
 			expect(
 				fs
 					.readdirSync(managedRoot, { recursive: true })
@@ -1422,6 +1443,8 @@ it("bounds the first enabled open with zero full-transcript reads and authentic 
 });
 
 it("matches eager replay-metadata sanitation on bounded first open and exact reopen", async () => {
+	const missingImageRef = `blob:sha256:${"a".repeat(64)}`;
+
 	const records = [
 		{ type: "session", version: 5, id: "replay-sanitize", timestamp: "0", cwd: "/cwd" },
 		{
@@ -1431,7 +1454,11 @@ it("matches eager replay-metadata sanitation on bounded first open and exact reo
 			timestamp: "0",
 			message: {
 				role: "assistant",
-				content: [{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" }],
+				content: [
+					{ type: "thinking", thinking: "reasoning", thinkingSignature: "stale-signature" },
+					{ type: "image", data: missingImageRef, mimeType: "image/png" },
+				],
+
 				provider: "openai",
 				model: "test",
 				timestamp: 0,
@@ -1479,6 +1506,13 @@ it("matches eager replay-metadata sanitation on bounded first open and exact reo
 		"enabled",
 	);
 	expect(enabled.getSessionMemoryStats().coldRetirementActive).toBe(true);
+	const coldExportEntries: unknown[] = [];
+	enabled.visitEntriesForExport(entry => coldExportEntries.push(entry));
+	expect(JSON.stringify(coldExportEntries)).not.toContain("stale-signature");
+	expect(JSON.stringify(coldExportEntries)).not.toContain("openaiResponsesHistory");
+	expect(JSON.stringify(coldExportEntries)).not.toContain(missingImageRef);
+	expect(JSON.stringify(coldExportEntries)).not.toContain("__gjcResidentBlob");
+	expect(JSON.stringify(coldExportEntries)).toContain("[Session resident imageData blob missing:");
 	expect(enabled.buildSessionContext()).toEqual(expected);
 	expect(JSON.stringify(enabled.buildSessionContext())).not.toContain("stale-signature");
 	expect(JSON.stringify(enabled.buildSessionContext())).not.toContain("openaiResponsesHistory");
@@ -1492,6 +1526,10 @@ it("matches eager replay-metadata sanitation on bounded first open and exact reo
 		"enabled",
 	);
 	expect(reopened.getSessionMemoryStats().lazyReopenSucceeded).toBe(true);
+	enabledStorage.unlinkSync(sidecarPath("/enabled/session.jsonl", "idx"));
+	const fallbackEntries = reopened.getEntriesForExport();
+	expect(JSON.stringify(fallbackEntries)).not.toContain("stale-signature");
+	expect(JSON.stringify(fallbackEntries)).not.toContain("openaiResponsesHistory");
 	expect(reopened.buildSessionContext()).toEqual(expected);
 	await reopened.close();
 });

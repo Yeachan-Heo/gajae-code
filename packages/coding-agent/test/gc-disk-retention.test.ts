@@ -19,6 +19,7 @@ import {
 	runGjcGcCommand,
 } from "../src/gjc-runtime/gc-runtime";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import { listCanonicalBlobs, removeCanonicalBlob } from "../src/session/blob-store";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -438,6 +439,206 @@ describe("gjc gc --disk --prune (blob mark and sweep)", () => {
 			expect(disk.surfaces.blobs.declined?.reason).toBe("evidence_incomplete: sessions_changed_during_mark");
 			expect(disk.surfaces.blobs.reclaimable).toBe(0);
 			expect(await Bun.file(path.join(fixture.blobsDir, orphan)).exists()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	}, 30000);
+	test("keeps every blob when a transcript changes while its references are being read", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const orphan = await writeBlob(fixture, "orphan payload under a mark that is not atomic", 10);
+			const transcript = await writeSession(fixture, "repo-a", "mid-mark-session", { ageDays: 0 });
+
+			// The mark binds its references to a stat taken before AND after the
+			// read. The transcript's lstat sequence is: discovery walk, mark
+			// pre-stat, mark post-stat, drift walk, quiescence probes, per-removal
+			// fence. Appending on the mark's post-stat call makes it disagree with
+			// the pre-stat, so the reference set cannot be bound to a stable
+			// snapshot and the sweep must withhold.
+			const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: false }) => Promise<Stats>;
+			let transcriptStats = 0;
+			const spy = spyOn(fsp, "lstat");
+			spy.mockImplementation((async (target: PathLike, options?: { bigint?: false }) => {
+				if (path.resolve(String(target)) === transcript && ++transcriptStats === 3) {
+					await fsp.appendFile(
+						transcript,
+						`${JSON.stringify({ type: "message", role: "user", content: "appended mid-mark" })}\n`,
+					);
+				}
+				return await realLstat(target, options);
+			}) as unknown as typeof fsp.lstat);
+			try {
+				const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+				expect(reasonById(disk, "blobs").get(orphan)).toBe(
+					"keep:withheld_evidence_incomplete: sessions_changed_during_mark",
+				);
+				expect(disk.surfaces.blobs.reclaimed).toBe(0);
+				expect(disk.surfaces.blobs.declined?.reason).toBe("evidence_incomplete: sessions_changed_during_mark");
+				expect(await Bun.file(path.join(fixture.blobsDir, orphan)).exists()).toBe(true);
+			} finally {
+				spy.mockRestore();
+			}
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("withholds the sweep when a transcript is appended to between the mark and the sweep", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const orphan = await writeBlob(fixture, "orphan payload under a store that wakes up", 10);
+			const transcript = await writeSession(fixture, "repo-a", "mid-sweep-session", { ageDays: 0 });
+
+			// The quiescence probe re-walks the store, waits out its window, and
+			// re-walks again; the second probe lstat is the sixth lstat of the
+			// transcript. An append landing on it proves the store moved while
+			// the probe was running, which must withhold the sweep.
+			const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: false }) => Promise<Stats>;
+			let transcriptStats = 0;
+			const spy = spyOn(fsp, "lstat");
+			spy.mockImplementation((async (target: PathLike, options?: { bigint?: false }) => {
+				if (path.resolve(String(target)) === transcript && ++transcriptStats === 6) {
+					await fsp.appendFile(
+						transcript,
+						`${JSON.stringify({ type: "message", role: "user", content: "appended during the quiescence probe" })}\n`,
+					);
+				}
+				return await realLstat(target, options);
+			}) as unknown as typeof fsp.lstat);
+			try {
+				const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+				expect(reasonById(disk, "blobs").get(orphan)).toBe(
+					"keep:withheld_evidence_incomplete: sessions_changed_during_mark",
+				);
+				expect(disk.surfaces.blobs.reclaimed).toBe(0);
+				expect(await Bun.file(path.join(fixture.blobsDir, orphan)).exists()).toBe(true);
+			} finally {
+				spy.mockRestore();
+			}
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("withholds the sweep when a transcript is appended to during the sweep", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const orphan = await writeBlob(fixture, "orphan payload under a sweep in progress", 10);
+			const transcript = await writeSession(fixture, "repo-a", "mid-removal-session", { ageDays: 0 });
+
+			// With the mark clean and the store quiet, the fence is re-verified
+			// immediately before each removal — the seventh lstat of the
+			// transcript. An append landing there invalidates the whole mark, so
+			// the removal must not happen.
+			const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: false }) => Promise<Stats>;
+			let transcriptStats = 0;
+			const spy = spyOn(fsp, "lstat");
+			spy.mockImplementation((async (target: PathLike, options?: { bigint?: false }) => {
+				if (path.resolve(String(target)) === transcript && ++transcriptStats === 7) {
+					await fsp.appendFile(
+						transcript,
+						`${JSON.stringify({ type: "message", role: "user", content: "appended mid-removal" })}\n`,
+					);
+				}
+				return await realLstat(target, options);
+			}) as unknown as typeof fsp.lstat);
+			try {
+				const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+				expect(reasonById(disk, "blobs").get(orphan)).toBe(
+					"keep:withheld_evidence_incomplete: sessions_changed_during_mark",
+				);
+				expect(disk.surfaces.blobs.reclaimed).toBe(0);
+				expect(await Bun.file(path.join(fixture.blobsDir, orphan)).exists()).toBe(true);
+			} finally {
+				spy.mockRestore();
+			}
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("withholds when a blob reference appears during the blob identity check", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const precious = await writeBlob(fixture, "payload referenced after blob revalidation", 10);
+			const transcript = await writeSession(fixture, "repo-a", "live-state-session", { ageDays: 0 });
+			const blobPath = path.join(fixture.blobsDir, precious);
+			const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: false }) => Promise<Stats>;
+			let blobStats = 0;
+			const spy = spyOn(fsp, "lstat");
+			spy.mockImplementation((async (target: PathLike, options?: { bigint?: false }) => {
+				if (path.resolve(String(target)) === blobPath && ++blobStats === 2) {
+					await fsp.appendFile(
+						transcript,
+						`${JSON.stringify({ type: "message", role: "user", content: `blob:sha256:${precious}` })}\n`,
+					);
+				}
+				return await realLstat(target, options);
+			}) as unknown as typeof fsp.lstat);
+			try {
+				const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+				expect(reasonById(disk, "blobs").get(precious)).toBe(
+					"keep:withheld_evidence_incomplete: sessions_changed_during_mark",
+				);
+				expect(disk.surfaces.blobs.reclaimed).toBe(0);
+				expect(disk.surfaces.blobs.declined?.reason).toBe("evidence_incomplete: sessions_changed_during_mark");
+				expect(await Bun.file(blobPath).exists()).toBe(true);
+				expect(await Bun.file(transcript).text()).toContain(`blob:sha256:${precious}`);
+			} finally {
+				spy.mockRestore();
+			}
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses a same-size, same-mtime canonical blob replacement", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const hash = await writeBlob(fixture, "canonical identity must be stable", 10);
+			const blobPath = path.join(fixture.blobsDir, hash);
+			const entry = (await listCanonicalBlobs(fixture.blobsDir))[0]!;
+			const original = await fsp.lstat(blobPath);
+			const replacement = `${blobPath}.replacement`;
+			await Bun.write(replacement, "canonical identity must be stable");
+			await fsp.utimes(replacement, original.atime, original.mtime);
+			await fsp.rename(replacement, blobPath);
+
+			expect(await removeCanonicalBlob(entry)).toEqual({ removed: false, reason: "blob_changed" });
+			expect(await Bun.file(blobPath).exists()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("never reclaims a blob a changing transcript can still reference", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const precious = await writeBlob(fixture, "payload referenced only by appended lines", 10);
+			const transcript = await writeSession(fixture, "repo-a", "live-appending-session", { ageDays: 0 });
+
+			let appending = true;
+			const appender = (async () => {
+				for (let index = 0; appending && index < 20000; index++) {
+					await fsp.appendFile(
+						transcript,
+						`${JSON.stringify({ type: "message", role: "user", content: `blob:sha256:${precious}` })}\n`,
+					);
+					await Bun.sleep(0);
+				}
+			})();
+			const report = await runGjcGcCommand(["--disk", "--prune", "--json"], fixture.root, fixture.env, [], policy());
+			appending = false;
+			await appender;
+
+			// The only thing that can keep this blob is the evidence fence: the
+			// reference lives in a tail the mark never saw while it was stable.
+			// Whether the report names the reference or the withheld evidence,
+			// the blob must survive and nothing may be reclaimed.
+			const disk = requireDisk(JSON.parse(report.stdout) as GcReport);
+			expect(disk.surfaces.blobs.reclaimed).toBe(0);
+			expect(await Bun.file(path.join(fixture.blobsDir, precious)).exists()).toBe(true);
+			expect(reasonById(disk, "blobs").get(precious)).toMatch(/^keep:/);
 		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });
 		}

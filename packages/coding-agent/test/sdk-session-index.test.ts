@@ -1,8 +1,15 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
-import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
+import {
+	SESSION_HEARTBEAT_INTERVAL_MS,
+	SessionIndex,
+	type SessionIndexAuditRecord,
+	type SessionIndexEvent,
+	sessionIndexChecksum,
+} from "../src/sdk/broker/session-index";
+import { SDK_STATE_VERSION, SESSION_INDEX_SNAPSHOT_VERSION } from "../src/sdk/broker/state-version";
 
 const event = (sessionId: string) => ({
 	type: "host_registered" as const,
@@ -15,6 +22,14 @@ const event = (sessionId: string) => ({
 function deferred<T = void>() {
 	return Promise.withResolvers<T>();
 }
+const readAudit = async (dir: string): Promise<SessionIndexAuditRecord[]> => {
+	const contents = await fs.readFile(path.join(dir, "sdk", "sessions", "index-audit.jsonl"), "utf8");
+	return contents
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map(line => JSON.parse(line) as SessionIndexAuditRecord);
+};
 describe("SDK session index", () => {
 	it("diagnoses a missing index without creating session directories", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-missing-"));
@@ -490,7 +505,7 @@ describe("SDK session index", () => {
 		});
 	}, 30_000);
 
-	it("compaction drops terminal+dead sessions and keeps live sessions with their original indexSeq", async () => {
+	it("compaction retains stopped/terminal sessions and keeps live sessions with their original indexSeq", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const deadPid = await (async () => {
 			const proc = Bun.spawn({ cmd: ["true"] });
@@ -504,11 +519,16 @@ describe("SDK session index", () => {
 		await index.append(event("live2"));
 		await index.snapshot();
 		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
-		expect(snapshot.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["live", "live2"]);
+		// DR-1: stopped/terminal rows are retained (only `session_deleted` hides a row).
+		expect(snapshot.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["live", "dead", "dead", "live2"]);
 		expect(snapshot.events[0].indexSeq).toBe(1);
 		expect(snapshot.indexSeq).toBe(4);
 		const replay = await new SessionIndex(dir).open();
-		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["live", "live2"]);
+		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["live", "dead", "live2"]);
+		expect(replay.listSessions().sessions.find(s => s.sessionId === "dead")).toMatchObject({
+			live: false,
+			terminal: true,
+		});
 		expect(replay.indexSeq).toBe(4);
 	});
 	it("collapses superseded heartbeats to the latest per surviving session", async () => {
@@ -599,7 +619,7 @@ describe("SDK session index", () => {
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		await fs.mkdir(sessionsDir, { recursive: true });
 		const snapshotFile = path.join(sessionsDir, "index.snapshot.json");
-		await fs.writeFile(snapshotFile, JSON.stringify({ version: 3, indexSeq: 7, events: [] }));
+		await fs.writeFile(snapshotFile, JSON.stringify({ version: 4, indexSeq: 7, events: [] }));
 		const unsupported = new SessionIndex(dir);
 		expect(await unsupported.diagnose()).toMatchObject({ status: "unsupported", validPrefixSeq: 0, snapshotSeq: 7 });
 		expect(await unsupported.repair()).toMatchObject({ status: "unsupported", repaired: false });
@@ -802,5 +822,318 @@ describe("SDK session index", () => {
 			resumeRepair.resolve();
 			mkdir.mockRestore();
 		}
+	});
+	it("supersedes a same-generation incarnation and rejects its late terminal (V-IDX-2b)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		const currentIncarnation = processIncarnation(process.pid)!;
+		await index.append({ ...event("s"), hostIncarnation: "incarnation-a" });
+		await index.append({ ...event("s"), hostIncarnation: currentIncarnation });
+		await index.append({ ...event("s"), type: "host_unregistered", hostIncarnation: "incarnation-a" });
+		// Liveness (C2) needs a heartbeat checkpoint; registration alone is unknown.
+		await index.append({ ...event("s"), type: "host_heartbeat", hostIncarnation: currentIncarnation });
+		const rows = index.listSessions().sessions;
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({
+			sessionId: "s",
+			hostIncarnation: currentIncarnation,
+			identityProvenance: "composite",
+			live: true,
+		});
+		expect(rows[0]!.terminalUncertain).toBe(false);
+		const audit = await readAudit(dir);
+		expect(audit.map(record => record.indexSeq)).toEqual([1, 3]);
+		expect(audit.every(record => record.code === "rejected_superseded_incarnation")).toBe(true);
+		expect(audit[0]).toMatchObject({ supersededByIncarnation: currentIncarnation, supersededByIndexSeq: 2 });
+	});
+	it("replays supersession identically from a snapshot without duplicating audit records", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({ ...event("s"), hostIncarnation: "incarnation-a" });
+		await index.append({ ...event("s"), hostIncarnation: "incarnation-b" });
+		await index.append({ ...event("s"), type: "host_unregistered", hostIncarnation: "incarnation-a" });
+		await index.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		expect(snapshot.version).toBe(SESSION_INDEX_SNAPSHOT_VERSION);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().sessions).toHaveLength(1);
+		expect(replay.listSessions().sessions[0]).toMatchObject({
+			hostIncarnation: "incarnation-b",
+			identityProvenance: "composite",
+		});
+		expect((await readAudit(dir)).map(record => record.indexSeq)).toEqual([1, 3]);
+	});
+	it("rejects stale old-host events after delete + recreate (V-IDX-3)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		const currentIncarnation = processIncarnation(process.pid)!;
+		await index.append({ ...event("s"), hostIncarnation: "incarnation-a" });
+		await index.append({ ...event("s"), type: "session_deleted", hostIncarnation: "incarnation-a" });
+		await index.append({ ...event("s"), endpointGeneration: 2, hostIncarnation: currentIncarnation });
+		await index.append({ ...event("s"), type: "host_heartbeat", hostIncarnation: "incarnation-a" });
+		// The recreated host checkpoints its own liveness (C2).
+		await index.append({
+			...event("s"),
+			type: "host_heartbeat",
+			endpointGeneration: 2,
+			hostIncarnation: currentIncarnation,
+		});
+		const rows = index.listSessions().sessions;
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ endpointGeneration: 2, hostIncarnation: currentIncarnation, live: true });
+		const audit = await readAudit(dir);
+		expect(audit.filter(record => record.code === "rejected_after_tombstone").map(record => record.indexSeq)).toEqual(
+			[4],
+		);
+	});
+	it("keeps a deleted session hidden until a recreation registers", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({ ...event("s"), hostIncarnation: "incarnation-a" });
+		await index.append({ ...event("s"), type: "session_deleted", hostIncarnation: "incarnation-a" });
+		expect(index.listSessions().sessions).toEqual([]);
+		await index.append({ ...event("s"), type: "host_heartbeat", hostIncarnation: "incarnation-a" });
+		expect(index.listSessions().sessions).toEqual([]);
+		await index.append({ ...event("s"), endpointGeneration: 2, hostIncarnation: "incarnation-b" });
+		expect(index.listSessions().sessions.map(session => session.sessionId)).toEqual(["s"]);
+	});
+	it("keys identity by incarnation: re-registration of the same incarnation is not superseded", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({ ...event("s"), hostIncarnation: "incarnation-a" });
+		await index.append({ ...event("s"), hostIncarnation: "incarnation-a" });
+		expect(index.listSessions().sessions[0]!.hostIncarnation).toBe("incarnation-a");
+		await index.append({ ...event("s"), hostIncarnation: "incarnation-b" });
+		expect(index.listSessions().sessions[0]!.hostIncarnation).toBe("incarnation-b");
+		expect((await readAudit(dir)).map(record => record.indexSeq)).toEqual([1, 2]);
+	});
+	it("derives hostIncarnation from the OS process incarnation when not supplied", async () => {
+		const expected = processIncarnation(process.pid);
+		if (expected === undefined) return;
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		const appended = await index.append(event("s"));
+		expect(appended.hostIncarnation).toBe(expected);
+		expect(index.listSessions().sessions[0]).toMatchObject({
+			hostIncarnation: expected,
+			identityProvenance: "composite",
+		});
+	});
+	it("reads v2 snapshots with legacy provenance (never silently upgraded)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		const legacy = { ...event("legacy"), version: 1 as const, indexSeq: 1, ts: 1 };
+		await fs.writeFile(
+			path.join(sessionsDir, "index.snapshot.json"),
+			JSON.stringify({ version: 2, indexSeq: 1, events: [{ ...legacy, checksum: sessionIndexChecksum(legacy) }] }),
+		);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().sessions[0]).toMatchObject({
+			sessionId: "legacy",
+			hostIncarnation: undefined,
+			identityProvenance: "legacy",
+			ambiguous: false,
+		});
+	});
+	it("flags cross-repo duplicates as ambiguous without merging distinct state roots", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({
+			...event("s"),
+			locator: { repo: "/repo-a", stateRoot: "/state-a" },
+			hostIncarnation: "incarnation-a",
+		});
+		await index.append({
+			...event("s"),
+			locator: { repo: "/repo-b", stateRoot: "/state-b" },
+			hostIncarnation: "incarnation-b",
+		});
+		const rows = index.listSessions().sessions;
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({
+			sessionId: "s",
+			ambiguous: true,
+			locator: { repo: "/repo-b", stateRoot: "/state-b" },
+		});
+		const single = await new SessionIndex(dir).open();
+		await single.append({ ...event("t"), hostIncarnation: "incarnation-c" });
+		await single.append({ ...event("t"), hostIncarnation: "incarnation-d" });
+		expect(single.listSessions().sessions.find(session => session.sessionId === "t")!.ambiguous).toBe(false);
+	});
+	it("derives liveness from heartbeat freshness and activity (C2)", async () => {
+		const now = 1_000_000;
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir, { clock: () => now }).open();
+		const currentIncarnation = processIncarnation(process.pid)!;
+		await index.append({ ...event("fresh"), hostIncarnation: currentIncarnation });
+		await index.append({
+			...event("fresh"),
+			type: "host_heartbeat",
+			hostIncarnation: currentIncarnation,
+			activity: { state: "active", at: now - 5_000 },
+			ts: now - 5_000,
+		});
+		await index.append({ ...event("stale"), hostIncarnation: currentIncarnation });
+		await index.append({
+			...event("stale"),
+			type: "host_heartbeat",
+			hostIncarnation: currentIncarnation,
+			activity: { state: "idle", at: now - 2 * 60_000 - 10_000 },
+			ts: now - 2 * 60_000 - 10_000,
+		});
+		const rows = index.listSessions().sessions;
+		const fresh = rows.find(session => session.sessionId === "fresh")!;
+		const stale = rows.find(session => session.sessionId === "stale")!;
+		expect(fresh.live).toBe(true);
+		expect(fresh.activity).toEqual({ state: "active", at: now - 5_000 });
+		expect(fresh.lastHeartbeatAt).toBe(now - 5_000);
+		expect(stale.live).toBe(false);
+		expect(stale.activity).toEqual({ state: "idle", at: now - 2 * 60_000 - 10_000 });
+	});
+	it("applies injected retention by age and retains tombstones by default", async () => {
+		const now = 1_000_000;
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir, { clock: () => now, maxAgeMs: 1_000 }).open();
+		await index.append({ ...event("old"), ts: now - 2_000 });
+		await index.append({ ...event("deleted"), ts: now - 2_000 });
+		await index.append({ ...event("deleted"), type: "session_deleted", ts: now - 2_000 });
+		await index.append({ ...event("fresh"), ts: now - 500 });
+		await index.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		const sessionIds = snapshot.events.map((item: SessionIndexEvent) => item.sessionId);
+		expect(sessionIds).toContain("fresh");
+		expect(sessionIds).toContain("deleted");
+		expect(sessionIds).not.toContain("old");
+		expect(snapshot.version).toBe(SESSION_INDEX_SNAPSHOT_VERSION);
+	});
+	it("expires tombstones when configured to expire", async () => {
+		const now = 1_000_000;
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir, { clock: () => now, maxAgeMs: 1_000, tombstoneRule: "expire" }).open();
+		await index.append({ ...event("deleted"), ts: now - 2_000 });
+		await index.append({ ...event("deleted"), type: "session_deleted", ts: now - 2_000 });
+		await index.append({ ...event("fresh"), ts: now - 500 });
+		await index.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		const sessionIds = snapshot.events.map((item: SessionIndexEvent) => item.sessionId);
+		expect(sessionIds).toEqual(["fresh"]);
+	});
+	it("caps retained sessions by maxRows, evicting oldest before the anchor", async () => {
+		const now = 1_000_000;
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir, { clock: () => now, maxRows: 2 }).open();
+		await index.append({ ...event("oldest"), ts: now - 30 });
+		await index.append({ ...event("middle"), ts: now - 20 });
+		await index.append({ ...event("newest"), ts: now - 10 });
+		await index.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		const sessionIds = snapshot.events.map((item: SessionIndexEvent) => item.sessionId);
+		expect(sessionIds).toEqual(["middle", "newest"]);
+	});
+	it("compacts the log on demand, applying retention independent of rotation size", async () => {
+		const now = 1_000_000;
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir, { clock: () => now, maxAgeMs: 1_000 }).open();
+		await index.append({ ...event("old"), ts: now - 2_000 });
+		await index.append({ ...event("fresh"), ts: now - 500 });
+		const logPath = path.join(dir, "sdk", "sessions", "index.jsonl");
+		expect((await fs.readFile(logPath, "utf8")).trim().split("\n")).toHaveLength(2);
+		await index.compact();
+		expect(await fs.readFile(logPath, "utf8")).toBe("");
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		expect(snapshot.events.map((item: SessionIndexEvent) => item.sessionId)).toEqual(["fresh"]);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().sessions.map(session => session.sessionId)).toEqual(["fresh"]);
+		expect(replay.indexSeq).toBe(2);
+	});
+
+	it("checkpoints coalesced heartbeats for live hosts and treats a missing heartbeat as unknown (C2)", async () => {
+		const now = 1_000_000;
+		const incarnation = processIncarnation(process.pid);
+		if (incarnation === undefined) return;
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir, { clock: () => now }).open();
+		await index.append({ ...event("s"), hostIncarnation: incarnation });
+		// A registered host with no heartbeat yet is unknown/not live, never fresh forever.
+		expect(index.listSessions().sessions[0]).toMatchObject({ sessionId: "s", live: false, terminal: false });
+		// The production writer observes the live host and checkpoints it.
+		expect(await index.checkpointLiveHeartbeats(now)).toBe(1);
+		expect(index.listSessions().sessions[0]).toMatchObject({
+			sessionId: "s",
+			live: true,
+			lastHeartbeatAt: now,
+			activity: { state: "active", at: now },
+		});
+		// Coalesced: a second pass inside the 60s interval writes nothing.
+		expect(await index.checkpointLiveHeartbeats(now + 30_000)).toBe(0);
+		// After the interval elapses, the next pass checkpoints again.
+		expect(await index.checkpointLiveHeartbeats(now + 61_000)).toBe(1);
+		expect(index.listSessions().sessions[0]).toMatchObject({ live: true, lastHeartbeatAt: now + 61_000 });
+		// A heartbeat older than 2x the interval reads as not live.
+		const later = now + 61_000 + 2 * SESSION_HEARTBEAT_INTERVAL_MS + 1;
+		const replay = await new SessionIndex(dir, { clock: () => later }).open();
+		expect(replay.listSessions().sessions[0]).toMatchObject({ live: false, lastHeartbeatAt: now + 61_000 });
+	});
+	it("never checkpoints terminal rows, dead hosts, or reused pids (C2)", async () => {
+		const now = 1_000_000;
+		const incarnation = processIncarnation(process.pid);
+		if (incarnation === undefined) return;
+		const deadPid = await (async () => {
+			const proc = Bun.spawn({ cmd: ["true"] });
+			await proc.exited;
+			return proc.pid;
+		})();
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir, { clock: () => now }).open();
+		await index.append({ ...event("stopped"), hostIncarnation: incarnation });
+		await index.append({ ...event("stopped"), type: "host_unregistered", hostIncarnation: incarnation });
+		await index.append({ ...event("dead"), pid: deadPid, hostIncarnation: "dead-incarnation" });
+		await index.append({ ...event("reused"), hostIncarnation: "foreign-incarnation" });
+		await index.append({ ...event("live"), hostIncarnation: incarnation });
+		// Terminal, dead, and incarnation-mismatched hosts are never checkpointed.
+		expect(await index.checkpointLiveHeartbeats(now)).toBe(1);
+		const rows = index.listSessions().sessions;
+		expect(rows.find(row => row.sessionId === "live")).toMatchObject({ live: true, lastHeartbeatAt: now });
+		for (const sessionId of ["stopped", "dead", "reused"]) {
+			const row = rows.find(candidate => candidate.sessionId === sessionId)!;
+			expect(row.lastHeartbeatAt).toBeUndefined();
+			expect(row.live).toBe(false);
+		}
+	});
+	it("retains stopped/terminal rows and filters only deleted sessions (DR-1)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({ ...event("stopped"), hostIncarnation: "incarnation-a" });
+		await index.append({ ...event("stopped"), type: "host_unregistered", hostIncarnation: "incarnation-a" });
+		await index.append({ ...event("closed"), hostIncarnation: "incarnation-b" });
+		await index.append({ ...event("closed"), type: "session_closed", hostIncarnation: "incarnation-b" });
+		await index.append({ ...event("deleted"), hostIncarnation: "incarnation-c" });
+		await index.append({ ...event("deleted"), type: "session_deleted", hostIncarnation: "incarnation-c" });
+		const rows = index.listSessions().sessions;
+		expect(rows.map(row => row.sessionId).sort()).toEqual(["closed", "stopped"]);
+		for (const row of rows) {
+			expect(row.live).toBe(false);
+			expect(row.terminal).toBe(true);
+		}
+		// Compaction keeps stopped rows (only deletion hides them), so inspect and
+		// offline tail keep working across a rotate.
+		await index.snapshot();
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		expect(snapshot.events.map((item: SessionIndexEvent) => item.sessionId).sort()).toEqual([
+			"closed",
+			"closed",
+			"deleted",
+			"deleted",
+			"stopped",
+			"stopped",
+		]);
+		const replay = await new SessionIndex(dir).open();
+		expect(
+			replay
+				.listSessions()
+				.sessions.map(row => row.sessionId)
+				.sort(),
+		).toEqual(["closed", "stopped"]);
 	});
 });

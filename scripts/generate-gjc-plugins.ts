@@ -53,6 +53,19 @@ const DELEGATE_META: DelegateMeta[] = [
 		summary: "Delegate parallel team execution to GJC (runs /skill:team with internal tmux workers).",
 	},
 ];
+/**
+ * Inventory of `gjc sdk session` semantic verbs plus the raw hatch kinds,
+ * mirrored from the SDK session CLI (`SdkSessionCliAction` / raw kinds in
+ * `packages/coding-agent/src/sdk/cli/session-cli.ts`). The advisory
+ * `gjc-sdk-session` skill is rendered from this inventory and
+ * `scripts/verify-gjc-skill-docs.ts` checks every skill reference against it,
+ * so a skill can never advertise a verb the CLI does not ship.
+ */
+export const SDK_SESSION_CLI_VERBS = ["list", "inspect", "send", "status", "tail", "elevate", "raw"] as const;
+export type SdkSessionCliVerb = (typeof SDK_SESSION_CLI_VERBS)[number];
+
+export const SDK_SESSION_RAW_KINDS = ["control", "query", "global"] as const;
+export type SdkSessionRawKind = (typeof SDK_SESSION_RAW_KINDS)[number];
 
 function readPackageVersion(): string {
 	const pkgPath = path.join(repoRoot, "packages", "coding-agent", "package.json");
@@ -161,6 +174,110 @@ terminal turn state. Turn state is the source of truth, not terminal scrollback.
 `;
 }
 
+function sdkSessionSkillDoc(): string {
+	const verbs = SDK_SESSION_CLI_VERBS.join("|");
+	const rawKinds = SDK_SESSION_RAW_KINDS.join("|");
+	return `---
+name: gjc-sdk-session
+description: Operate GJC SDK sessions from the CLI (\`gjc sdk session ${verbs}\` plus the explicit raw ${rawKinds} hatch). Advisory reference: broker-bound, credential-free output; mutating verbs run only when explicitly invoked.
+---
+
+# GJC SDK session CLI (advisory)
+
+Advisory reference for interacting with live GJC SDK sessions through the
+broker-bound \`gjc sdk session\` command family. This skill is informational:
+it never prints endpoint credentials or changes configuration, and it never
+references removed command routes. Mutating commands are only documented and
+run when the operator explicitly invokes them.
+
+## Broker authority
+
+\`list\`, \`inspect\`, \`send\`, \`status\`, and \`tail\` resolve sessions through the
+SDK broker. The broker validates the indexed session against its durable
+endpoint record and hands the CLI a connection credential the CLI uses and
+never prints. \`--agent-dir\` selects the broker state directory.
+
+## Semantic verbs
+
+- \`gjc sdk session list\` — broker \`session.list\` projected to the versioned,
+  credential-free row DTO (session id, locator, pid, liveness, tombstone,
+  activity, heartbeat, identity provenance, ambiguity).
+- \`gjc sdk session inspect <sessionId>\` — one indexed row; when the broker is
+  absent, falls back to a credential-free offline projection from the local
+  endpoint discovery record.
+- \`gjc sdk session send <sessionId> --text <prompt>\` — ordered \`turn.prompt\`
+  carrying a caller-chosen operation reference (ULID). \`--wait\` polls
+  \`turn.prompt_status\` until terminal or the wait window elapses; it never
+  cancels a running turn.
+- \`gjc sdk session status <sessionId> <opRef>\` — lossless \`turn.prompt_status\`
+  for a previously submitted operation reference.
+- \`gjc sdk session tail <sessionId>\` — retained transcript replay from the
+  durable checkpoint followed by live event-ring frames. \`--strict\` fails
+  closed on retention gaps, \`--until-idle\` exits at a terminal turn state,
+  \`--all-events\` widens the emitted event kinds, and \`--cursor\` resumes from a
+  saved checkpoint token that is re-minted per connection.
+- \`gjc sdk session elevate <sessionId> --kind <control|global> --op <operation> --json-input ... --confirm\` — creates an exact-digest grant request and, only on an attended TTY, submits a private 0600 operator directive consumed by the broker. The returned request id is passed to an allowlisted raw control with \`--elevation-request-id\`.
+
+## Raw hatch
+
+\`gjc sdk session raw ${rawKinds}\` dispatches one SDK operation with \`--op\`
+(control/global) or \`--query\` (query) plus a JSON input source. Lifecycle
+globals require \`--idempotency-key\`; destructive control operations accept
+\`--confirm\`. Endpoint-disclosure operations are refused by default and stay
+refused by this skill.
+
+## Lossless prompt statuses
+
+\`turn.prompt_status\` reports \`accepted\`, \`in_flight\`, \`terminal_ok\`, or
+\`failed\`; only retained-record eviction yields \`unknown\`, which means
+uncertainty, never proof of non-execution. Never reuse an operation reference
+as a retry mechanism.
+
+## Checkpoint gaps
+
+\`tail\` reports a \`retention_gap\` with the missing sequence range and a
+\`resync\` checkpoint when retained history or the event ring dropped entries;
+\`--strict\` turns any gap into exit code 1.
+
+## Elevation behavior
+
+Elevation-gated operations are dispatched only behind broker-owned single-use
+grants whose digest binds the exact operation and input. \`elevate\` is the
+attended operator surface: it writes a private directive consumed inside the
+broker; there is no public \`elevation.answer\` operation. A crash between claim
+and dispatch is recorded truthfully as \`consumed\`/\`uncertain\` and requires a
+new grant. Default SDK scope stays grant-free.
+`;
+}
+
+function sdkGuidesSkillDoc(): string {
+	return `---
+name: gjc-sdk-guides
+description: Index of trusted GJC SDK reference guides (broker, session CLI, embedding, app development). Advisory only: read these documents for background; there is no guide to execute and no workflow skill to run.
+---
+
+# GJC SDK guides (advisory)
+
+Advisory index of trusted GJC SDK reference documents. These guides are
+reading material for background understanding; nothing in this skill is
+executable and no workflow skill is invoked.
+
+- \`docs/sdk.md\` — SDK overview: endpoint discovery, protocol, query and
+  control surfaces, broker launch isolation, managed notification adapters.
+- \`docs/sdk-session-cli.md\` — the \`gjc sdk session\` command family: semantic
+  verbs, raw hatch, lossless statuses, broker authority, checkpoint gaps, and
+  elevation behavior.
+- \`docs/sdk-embedding.md\` — embedding GJC in-process.
+- \`docs/sdk-app-guide.md\` — building applications on the SDK.
+
+## Advisory boundary
+
+The references above are consulted as background, never executed. The plugin
+bundle keeps the four default workflow skills unchanged; this skill adds no
+workflow and performs no configuration or state mutation.
+`;
+}
+
 
 function readmeDoc(): string {
 	return `# gajae-code plugin (generated)
@@ -174,7 +291,9 @@ hand; run \`bun run generate-plugins\` and commit the result. CI runs
 - \`.codex-plugin/plugin.json\` — Codex manifest.
 - \`.mcp.json\` — Claude coordinator MCP wiring (\${CLAUDE_PROJECT_DIR}).
 - \`.codex.mcp.json\` — Codex coordinator MCP wiring (host-neutral; \`gjc setup codex\` rewrites concrete roots).
-- \`commands/\`, \`skills/\` — host-facing delegate command + skill docs.
+- \`commands/\`, \`skills/\` — host-facing delegate command + skill docs, including
+  the advisory \`gjc-sdk-session\` (SDK session CLI reference) and
+  \`gjc-sdk-guides\` (trusted SDK guide index) skills.
 
 Install: \`codex plugin marketplace add ./plugins\` (Codex) or \`/plugin marketplace add ./plugins\` (Claude Code), then install the \`gajae-code\` plugin.
 `;
@@ -209,15 +328,16 @@ export function renderPluginFiles(): Map<string, string> {
 		json({
 			name: PLUGIN_NAME,
 			owner: { name: "Gajae Code" },
-			metadata: { description: "GJC delegation plugin", version },
+			metadata: { description: "GJC delegation plugin with advisory SDK skills", version },
 			plugins: [
 				{
 					name: PLUGIN_NAME,
 					source: `./${dir}`,
-					description: "Delegate GJC planning/execution/team workflows via coordinator MCP.",
+					description:
+						"Delegate GJC planning/execution/team workflows via coordinator MCP, plus advisory SDK session CLI and guide skills.",
 					version,
 					author: { name: "Gajae Code" },
-					keywords: ["gjc", "delegation", "mcp", "planning", "agents"],
+					keywords: ["gjc", "delegation", "mcp", "planning", "agents", "sdk"],
 				},
 			],
 		}),
@@ -228,7 +348,8 @@ export function renderPluginFiles(): Map<string, string> {
 		path.join(dir, ".claude-plugin", "plugin.json"),
 		json({
 			name: PLUGIN_NAME,
-			description: "Delegate planning, execution, and team workflows to GJC through the coordinator MCP server.",
+			description:
+				"Delegate planning, execution, and team workflows to GJC through the coordinator MCP server, plus advisory SDK session CLI and guide skills.",
 			version,
 			commands: "./commands",
 			skills: "./skills",
@@ -243,7 +364,8 @@ export function renderPluginFiles(): Map<string, string> {
 		json({
 			name: PLUGIN_NAME,
 			version,
-			description: "Delegate Codex tasks to GJC workflows through coordinator MCP.",
+			description:
+				"Delegate Codex tasks to GJC workflows through coordinator MCP, plus advisory SDK session CLI and guide skills.",
 			skills: "./skills/",
 			mcpServers: "./.codex.mcp.json",
 		}),
@@ -257,6 +379,8 @@ export function renderPluginFiles(): Map<string, string> {
 		files.set(path.join(dir, "commands", `delegate_${meta.workflow}.md`), commandDoc(meta));
 	}
 	files.set(path.join(dir, "skills", "gjc-delegation", "SKILL.md"), skillDoc());
+	files.set(path.join(dir, "skills", "gjc-sdk-session", "SKILL.md"), sdkSessionSkillDoc());
+	files.set(path.join(dir, "skills", "gjc-sdk-guides", "SKILL.md"), sdkGuidesSkillDoc());
 	files.set(path.join(dir, "README.md"), readmeDoc());
 
 	return files;

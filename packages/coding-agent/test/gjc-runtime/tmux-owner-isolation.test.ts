@@ -1217,7 +1217,7 @@ describe("tmux owner isolation", () => {
 			};
 			const [first, second] = await Promise.all([
 				observeOwnerTerminal(observation),
-				observeOwnerTerminal(observation),
+				observeOwnerTerminal({ ...observation, observer: "raw_monitor", reason: "raw_terminal" }),
 			]);
 			expect(second).toEqual(first);
 			expect(await fs.access(lifecyclePaths(state, "session", generation).lockDatabaseFile)).toBeNull();

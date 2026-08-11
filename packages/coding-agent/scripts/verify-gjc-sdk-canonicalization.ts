@@ -1635,14 +1635,14 @@ function lineNumber(contents: string, offset: number): number {
 const machineEntrypoints = new Map<string, string>([
 	["packages/coding-agent/src/modes/acp/acp-agent.ts", "ACP"],
 	["packages/coding-agent/src/commands/mcp-serve.ts", "MCP"],
-	["packages/coding-agent/src/sdk/cli/session-cli.ts", "daemon session CLI"],
+	["packages/coding-agent/src/sdk/cli/session-cli.ts", "sdk session CLI"],
 ]);
 
 const machineWrapperEntrypoints = new Map<string, string>([
 	["packages/coding-agent/src/commands/acp.ts", "ACP command"],
 	["packages/coding-agent/src/commands/daemon.ts", "daemon command"],
 	["packages/coding-agent/src/commands/mcp-serve.ts", "MCP command"],
-	["packages/coding-agent/src/sdk/cli/session-cli.ts", "daemon session CLI"],
+	["packages/coding-agent/src/sdk/cli/session-cli.ts", "sdk session CLI"],
 ]);
 const rootAcpEntrypoint = "packages/coding-agent/src/main.ts";
 const directMachineWrapperRoutePattern =
@@ -1938,9 +1938,14 @@ async function scan(): Promise<string[]> {
 				violations.push(`${file}: shipped ACP command does not dispatch through the root ACP bootstrap`);
 			}
 		}
-		if (file === "packages/coding-agent/src/commands/daemon.ts") {
+		if (file === "packages/coding-agent/src/commands/sdk.ts") {
 			if (!/runSdkSessionCli\s*\(/.test(contents)) {
-				violations.push(`${file}: shipped daemon session command does not dispatch the SDK session CLI`);
+				violations.push(`${file}: shipped sdk session command does not dispatch the SDK session CLI`);
+			}
+		}
+		if (file === "packages/coding-agent/src/commands/daemon.ts") {
+			if (/\brawAction\s*===\s*["']session["']|\baction:\s*["']session["']\s*[,}]/.test(contents)) {
+				violations.push(`${file}: daemon command retained removed SDK session routing`);
 			}
 		}
 		if (file === "packages/coding-agent/src/modes/acp/acp-agent.ts") {

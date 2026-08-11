@@ -5,6 +5,7 @@ import {
 	assertManagedAttempt,
 	beginAttempt,
 	classifyFallbackTrigger,
+	EMPTY_RESPONSE_PROVIDER_CODE,
 	getBundledModel,
 	streamAnthropic,
 	streamOpenAICompletions,
@@ -81,6 +82,20 @@ describe("fallback transport facts", () => {
 		expect(classifyFallbackTrigger({ kind: "transport", status: 503 })).toEqual({ class: "server" });
 		expect(classifyFallbackTrigger({ kind: "transport", providerCode: "stream_first_event_timeout" })).toEqual({
 			class: "server",
+		});
+		expect(
+			classifyFallbackTrigger({
+				kind: "transport",
+				providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+			}),
+		).toEqual({ class: "server" });
+		expect(transportFailureFacts({ providerCode: EMPTY_RESPONSE_PROVIDER_CODE })).toEqual({
+			kind: "transport",
+			status: undefined,
+			providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+			anthropicErrorType: undefined,
+			openaiErrorCode: undefined,
+			headers: undefined,
 		});
 	});
 

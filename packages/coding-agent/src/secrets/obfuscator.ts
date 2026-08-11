@@ -21,17 +21,95 @@ export interface SecretEntry {
 
 const REPLACEMENT_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-/** Generate a deterministic same-length replacement string from a secret value. */
-function generateDeterministicReplacement(secret: string): string {
-	// Simple hash: use Bun.hash for speed, seed from the secret bytes
-	const hash = BigInt(Bun.hash(secret));
+/**
+ * Domain separator for replace-mode replacement derivation. Distinct from
+ * `PLACEHOLDER_DOMAIN` so a value minted under one construction can never be
+ * confused with a value minted under the other, even with the same key.
+ */
+const REPLACEMENT_DOMAIN = "gjc.secret-obfuscation.replacement.v1\0";
+
+/** One HMAC-SHA256 digest block length in bytes. */
+const REPLACEMENT_DIGEST_BYTES = 32;
+
+/** Largest accepted byte for uniform rejection sampling (256 - (256 % 62)). */
+const REPLACEMENT_REJECT_THRESHOLD = 248;
+
+/**
+ * Generate a deterministic, keyed, same-length replacement string from a
+ * secret value.
+ *
+ * COMPATIBILITY CONTRACT (required behavior, must never regress):
+ * - Deterministic within a process: the same secret under the same key always
+ *   yields the same replacement, independent of entry order or call order.
+ * - Same length: `result.length === secret.length` (UTF-16 code units, i.e.
+ *   `String.prototype.length` semantics — unchanged from the pre-fix
+ *   implementation). Astral-plane characters count as two units, exactly as
+ *   they did before.
+ * - Allowed characters: output is restricted to `[A-Za-z0-9]` (62 chars).
+ * - Explicit `replacement` values in secrets.yml are authoritative and are
+ *   never derived; this path runs only when `replacement` is undefined.
+ * - Replace mode stays one-way: the derived value is never reversed by
+ *   `deobfuscate()`.
+ *
+ * THREAT MODEL (issue #4166):
+ * - Attacker model: an observer sees one or more replacements (model context,
+ *   provider-side logs, saved/shared transcripts) and has full knowledge of
+ *   the public algorithm. Without the 32-byte obfuscation key they cannot
+ *   confirm a candidate secret offline and cannot predict or precompute the
+ *   replacement for any secret. The construction is a keyed PRF
+ *   (HMAC-SHA256), so output is unpredictable without the key, and keyed
+ *   domain separation keeps this construction distinct from the placeholder
+ *   construction.
+ * - Accepted residual disclosure: the replacement is same-length by design
+ *   (required behavior above), so the secret's exact length is still
+ *   observable. This is inherent to size-preserving substitution and is
+ *   explicitly out of scope; the fix removes the *keyless confirmation*
+ *   oracle, not the length signal.
+ * - Cross-process stability / key rotation: the process key is generated per
+ *   process (`PROCESS_SECRET_OBFUSCATION_KEY`), so derived replacements are
+ *   stable within a process and differ across processes or after a key
+ *   rotation. This is a deliberate decision, identical in scope to the
+ *   obfuscate-mode placeholder behavior. Users who need stable values across
+ *   processes or restarts must set an explicit `replacement` in secrets.yml.
+ * - Collision/bias: output is a keyed pseudorandom mapping. Two distinct
+ *   secrets can in principle collide (birthday bound over the 62^len output
+ *   space); for realistic secret lengths this is negligible. Character
+ *   distribution is uniform by construction: digest bytes are rejection-
+ *   sampled (bytes 248-255 rejected, 256 - (256 % 62) = 248 = 62 * 4), so
+ *   every character is exactly equally likely, with no modulo bias.
+ * - Empty secrets: a zero-length secret yields an empty replacement and the
+ *   obfuscator treats it as a no-op (load-time validation rejects empty
+ *   content anyway). Unicode secrets are hashed as UTF-8 bytes, so encoding
+ *   is canonical. Very long secrets expand via a counter-based HMAC stream
+ *   in O(length) blocks; generation cost is linear in the secret length.
+ * - Overlapping secrets and streaming: derivation is per-secret and does not
+ *   depend on matching semantics (longest-first overlap handling is
+ *   unchanged), and `obfuscate()` runs per complete text payload, so chunked
+ *   output (e.g. streamed LLM messages) sees the same deterministic
+ *   replacement for the same secret within a process.
+ */
+function generateDeterministicReplacement(secret: string, key: Uint8Array): string {
+	const length = secret.length;
+	if (length === 0) return "";
 	const chars: string[] = [];
-	let h = hash;
-	for (let i = 0; i < secret.length; i++) {
-		// Mix the hash for each character position
-		h = h ^ (BigInt(i + 1) * 0x9e3779b97f4a7c15n);
-		const idx = Number((h < 0n ? -h : h) % BigInt(REPLACEMENT_CHARS.length));
-		chars.push(REPLACEMENT_CHARS[idx]);
+	// CTR-style expansion: HMAC(key, DOMAIN || counter || secret) per 32-byte
+	// block. The counter is big-endian and fixed-width, so the stream is
+	// unambiguous and never repeats.
+	const counter = new Uint8Array(8);
+	const counterView = new DataView(counter.buffer);
+	let block: Uint8Array | undefined;
+	let blockOffset = REPLACEMENT_DIGEST_BYTES;
+	let blockIndex = 0;
+	while (chars.length < length) {
+		if (block === undefined || blockOffset >= REPLACEMENT_DIGEST_BYTES) {
+			counterView.setUint32(4, blockIndex, false);
+			block = createHmac("sha256", key).update(REPLACEMENT_DOMAIN).update(counter).update(secret, "utf8").digest();
+			blockOffset = 0;
+			blockIndex++;
+		}
+		const byte = block[blockOffset++]!;
+		if (byte >= REPLACEMENT_REJECT_THRESHOLD) continue;
+		chars.push(REPLACEMENT_CHARS[byte % REPLACEMENT_CHARS.length]!);
 	}
 	return chars.join("");
 }
@@ -115,7 +193,8 @@ export class SecretObfuscator {
 					index++;
 				} else {
 					// replace mode
-					const replacement = entry.replacement ?? generateDeterministicReplacement(entry.content);
+					const replacement =
+						entry.replacement ?? generateDeterministicReplacement(entry.content, this.#placeholderKey);
 					this.#replaceMappings.set(entry.content, replacement);
 				}
 			} else {
@@ -168,7 +247,8 @@ export class SecretObfuscator {
 
 			for (const matchValue of matches) {
 				if (entry.mode === "replace") {
-					const replacement = entry.replacement ?? generateDeterministicReplacement(matchValue);
+					const replacement =
+						entry.replacement ?? generateDeterministicReplacement(matchValue, this.#placeholderKey);
 					result = replaceAll(result, matchValue, replacement);
 				} else {
 					// obfuscate mode — get or create stable index

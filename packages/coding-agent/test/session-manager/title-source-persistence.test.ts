@@ -13,7 +13,7 @@ import { FileSessionStorage, type SessionStorageWriter } from "@gajae-code/codin
 import { getConfigRootDir, parseJsonlLenient, setAgentDir } from "@gajae-code/utils";
 
 import { makeAssistantMessage } from "./helpers";
-import { injectManagedAppend } from "./managed-failure-injection";
+import { injectManagedAppendOutcomeUncertain, injectManagedAppendPreCommit } from "./managed-failure-injection";
 
 function getHeader(entries: unknown[]): SessionHeader | undefined {
 	return entries.find(
@@ -305,7 +305,7 @@ describe("session title source persistence", () => {
 	});
 
 	describe("moveTo header patch persistence", () => {
-		it("rejects when the moved session cwd patch cannot be written", async () => {
+		it("retains the causal error and source authority when the cwd patch append is rejected before commit", async () => {
 			const destinationCwd = path.join(testAgentDir, "destination-cwd");
 			fs.mkdirSync(destinationCwd, { recursive: true });
 			const storage = new FileSessionStorage();
@@ -315,8 +315,9 @@ describe("session title source persistence", () => {
 			await session.flush();
 			const originalFile = session.getSessionFile();
 			expect(originalFile).toBeDefined();
+			const originalBytes = fs.readFileSync(originalFile!);
 
-			const injection = injectManagedAppend((_relativePath, data) =>
+			const injection = injectManagedAppendPreCommit((_relativePath, data) =>
 				Buffer.from(data).includes(Buffer.from('"type":"header_patch"'))
 					? { ok: false, code: "header_patch_write_failed" }
 					: "passthrough",
@@ -324,12 +325,68 @@ describe("session title source persistence", () => {
 			try {
 				await expect(session.moveTo(destinationCwd)).rejects.toThrow("header_patch_write_failed");
 				injection.assertHit();
+				expect(injection.hits()).toBe(1);
 			} finally {
 				injection.restore();
 			}
 			expect(session.getCwd()).toBe(cwd);
 			expect(session.getSessionFile()).toBe(originalFile);
+			expect(fs.readFileSync(originalFile!)).toEqual(originalBytes);
 			expect((await loadEntriesFromFile(originalFile!, storage))[0]).toMatchObject({ cwd });
 		});
+
+		for (const failureCode of ["identity_mismatch", "not_found"] as const) {
+			it.skipIf(process.platform !== "linux")(
+				`retains the uncertain ${failureCode} classification without retry after the cwd patch append commits`,
+				async () => {
+					const destinationCwd = path.join(testAgentDir, `post-commit-${failureCode}-destination-cwd`);
+					fs.mkdirSync(destinationCwd, { recursive: true });
+					const storage = new FileSessionStorage();
+					const session = SessionManager.create(cwd, undefined, storage);
+					session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+					session.appendMessage(makeAssistantMessage());
+					await session.flush();
+					const originalFile = session.getSessionFile();
+					expect(originalFile).toBeDefined();
+					const originalBytes = fs.readFileSync(originalFile!);
+					const destinationFile = path.join(
+						SessionManager.getDefaultSessionDir(destinationCwd, testAgentDir, storage),
+						path.basename(originalFile!),
+					);
+
+					const injection = injectManagedAppendOutcomeUncertain((_relativePath, data) =>
+						Buffer.from(data).includes(Buffer.from('"type":"header_patch"'))
+							? { ok: false, code: failureCode }
+							: "passthrough",
+					);
+					let failure: Error | undefined;
+					try {
+						await session.moveTo(destinationCwd);
+					} catch (error) {
+						failure = error instanceof Error ? error : new Error(String(error));
+					} finally {
+						injection.restore();
+					}
+					expect(failure?.message).toBe("managed_append_committed_outcome_uncertain");
+					expect(failure?.cause).toBeInstanceOf(Error);
+					expect((failure?.cause as Error).message).toBe(failureCode);
+					injection.assertHit();
+					expect(injection.hits()).toBe(1);
+					expect(injection.realAppendCalls()).toBe(1);
+					expect(session.getCwd()).toBe(cwd);
+					expect(session.getSessionFile()).toBe(originalFile);
+					expect(fs.readFileSync(originalFile!)).toEqual(originalBytes);
+					const persistedBytes = fs.readFileSync(destinationFile);
+					expect(persistedBytes.subarray(0, originalBytes.byteLength)).toEqual(originalBytes);
+					const patchLines = persistedBytes
+						.toString("utf8")
+						.trimEnd()
+						.split("\n")
+						.filter(line => line.includes('"type":"header_patch"'));
+					expect(patchLines).toHaveLength(1);
+					expect(JSON.parse(patchLines[0]!)).toEqual({ type: "header_patch", patch: { cwd: destinationCwd } });
+				},
+			);
+		}
 	});
 });
