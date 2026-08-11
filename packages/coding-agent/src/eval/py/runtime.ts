@@ -209,6 +209,39 @@ function createRuntimeCancellationError(timedOut: boolean): Error {
 	return error;
 }
 
+async function waitForRuntimeLifecycle<T>(
+	value: Promise<T>,
+	lifecycle: PythonRuntimeLifecycleOptions | undefined,
+): Promise<T> {
+	const { promise, resolve, reject } = Promise.withResolvers<T>();
+	const cleanups: Array<() => void> = [];
+	const finish = (callback: () => void): void => {
+		while (cleanups.length > 0) cleanups.pop()?.();
+		callback();
+	};
+	if (lifecycle?.signal?.aborted) throw lifecycle.signal.reason ?? createRuntimeCancellationError(false);
+	if (lifecycle?.signal) {
+		const onAbort = (): void =>
+			finish(() => reject(lifecycle.signal?.reason ?? createRuntimeCancellationError(false)));
+		lifecycle.signal.addEventListener("abort", onAbort, { once: true });
+		cleanups.push(() => lifecycle.signal?.removeEventListener("abort", onAbort));
+	}
+	const remainingMs = lifecycle?.deadlineMs === undefined ? undefined : lifecycle.deadlineMs - Date.now();
+	if (remainingMs !== undefined) {
+		if (remainingMs <= 0) finish(() => reject(createRuntimeCancellationError(true)));
+		else {
+			const timer = setTimeout(() => finish(() => reject(createRuntimeCancellationError(true))), remainingMs);
+			timer.unref();
+			cleanups.push(() => clearTimeout(timer));
+		}
+	}
+	void value.then(
+		result => finish(() => resolve(result)),
+		error => finish(() => reject(error)),
+	);
+	return await promise;
+}
+
 async function runRuntimeCommand(
 	cmd: string[],
 	cwd: string,
@@ -329,11 +362,17 @@ async function ensureWorkspaceManagedVenv(
 	lifecycle?: PythonRuntimeLifecycleOptions,
 ): Promise<void> {
 	const venvPath = resolveWorkspaceManagedPythonCandidate(cwd).venvPath;
-	return await withFileLock(
+	const provisioning = withFileLock(
 		venvPath,
-		async () => await ensureWorkspaceManagedVenvInner(cwd, baseEnv, seedPackages, lifecycle),
+		async () => {
+			if (lifecycle?.signal?.aborted) throw lifecycle.signal.reason ?? createRuntimeCancellationError(false);
+			if (lifecycle?.deadlineMs !== undefined && lifecycle.deadlineMs <= Date.now())
+				throw createRuntimeCancellationError(true);
+			await ensureWorkspaceManagedVenvInner(cwd, baseEnv, seedPackages, lifecycle);
+		},
 		{ retries: 600 },
 	);
+	return await waitForRuntimeLifecycle(provisioning, lifecycle);
 }
 
 async function ensureWorkspaceManagedVenvInner(
