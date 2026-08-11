@@ -111,7 +111,11 @@ async function readRegularFile(target: string): Promise<string | null> {
 	try {
 		const expected = process.platform === "win32" ? regularFileIdentity(await fs.lstat(target)) : undefined;
 		if (process.platform === "win32" && !expected) return null;
-		handle = await fs.open(target, fsConstants.constants.O_RDONLY | (process.platform === "win32" ? 0 : fsConstants.constants.O_NOFOLLOW));
+		handle = await fs.open(
+			target,
+			fsConstants.constants.O_RDONLY |
+				(process.platform === "win32" ? 0 : fsConstants.constants.O_NOFOLLOW | fsConstants.constants.O_NONBLOCK),
+		);
 		const opened = regularFileIdentity(await handle.stat());
 		if (!opened || (expected && !isSameRegularFileIdentity(expected, opened))) return null;
 		const contents = await handle.readFile({ encoding: "utf8" });
