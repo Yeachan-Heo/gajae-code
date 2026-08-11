@@ -2213,10 +2213,20 @@ describe("SessionSdkSessionRuntime", () => {
 				},
 			);
 			await handlers.get("session_shutdown")?.({}, context);
+			// DR-1 keeps the unregistered row listed, so the two refusals stay distinct:
+			// a matching generation on a terminal row is terminally gone (no endpoint will
+			// ever be issued again, and close takes its signal fallback), while a rotated
+			// generation is still merely stale and worth re-reading.
 			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject(
 				{
 					ok: false,
 					error: { code: "resource_gone", message: "session endpoint record is gone" },
+				},
+			);
+			expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 2 })).toMatchObject(
+				{
+					ok: false,
+					error: { code: "endpoint_stale", message: "session endpoint is stale" },
 				},
 			);
 		} finally {
