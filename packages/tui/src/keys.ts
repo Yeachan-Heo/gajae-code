@@ -301,9 +301,7 @@ export function parseKeyId(value: string): ParsedKeyId | undefined {
 					.map(part => part.trim());
 	const modifiers: KeyModifier[] = [];
 	for (const part of modifierParts) {
-		const modifier = Object.prototype.hasOwnProperty.call(KEY_MODIFIER_ALIASES, part)
-			? KEY_MODIFIER_ALIASES[part]
-			: undefined;
+		const modifier = Object.hasOwn(KEY_MODIFIER_ALIASES, part) ? KEY_MODIFIER_ALIASES[part] : undefined;
 		if (!modifier || modifiers.includes(modifier)) return undefined;
 		modifiers.push(modifier);
 	}
