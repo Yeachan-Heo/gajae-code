@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import * as nodeCrypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -468,7 +468,6 @@ describe("config-root workflow settings migration", () => {
 			await fs.readFile(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), "utf8"),
 		) as string[];
 		expect(marker).toContain("gjc.ralplan.maxIterations");
-
 		// Simulate `gjc config unset`: remove the key from the project config.
 		await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
 
@@ -573,6 +572,32 @@ describe("config-root workflow settings migration", () => {
 		const remaining = after.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM settings").get();
 		after.close();
 		expect(remaining?.n).toBe(2);
+	});
+
+	test("a malformed legacy database row keeps the settings.json source discoverable", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		// BOTH legacy sources exist: agentDir/settings.json (retired via the
+		// .bak rename only after the combined migration commits) and agent.db
+		// with a malformed row that aborts the load.
+		await fs.writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ "theme.dark": "red-claw" }));
+		const db = new Database(path.join(agentDir, "agent.db"));
+		db.run(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0)",
+		);
+		db.run("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)");
+		db.run("INSERT INTO schema_version (version) VALUES (5)");
+		db.run("INSERT INTO settings (key, value, updated_at) VALUES ('gjc.ralplan.maxIterations', '{broken', 0)");
+		db.close();
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		expect(result.loadFailed).toBe(true);
+		// The settings.json source was NOT retired: after the database is
+		// repaired, the next load still discovers it.
+		expect(await fs.stat(path.join(agentDir, "settings.json")).catch(() => null)).not.toBeNull();
+		expect(await fs.stat(path.join(agentDir, "settings.json.bak")).catch(() => null)).toBeNull();
 	});
 
 	test("gjc ultragoal --help renders help without running the settings migration", async () => {
@@ -774,7 +799,7 @@ describe("config-root workflow settings migration", () => {
 		const cwd = await tempDir();
 		const { source, agentDir } = await setupHome(home, ".myconfig");
 		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
-		const sourceSha256 = createHash("sha256").update(sourceRaw).digest("hex");
+		const sourceSha256 = nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex");
 		await fs.mkdir(agentDir, { recursive: true });
 		// Simulate a crash after the patch and source move but before finalization.
 		await fs.writeFile(
@@ -813,7 +838,7 @@ describe("config-root workflow settings migration", () => {
 		const cwd = await tempDir();
 		const { source, agentDir } = await setupHome(home, ".myconfig");
 		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
-		const sourceSha256 = createHash("sha256").update(sourceRaw).digest("hex");
+		const sourceSha256 = nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex");
 		await fs.mkdir(agentDir, { recursive: true });
 		await fs.writeFile(
 			path.join(agentDir, "config.yml"),
@@ -892,7 +917,7 @@ describe("config-root workflow settings migration", () => {
 		const cwd = await tempDir();
 		const { source, agentDir } = await setupHome(home, ".myconfig");
 		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
-		const sourceSha256 = createHash("sha256").update(sourceRaw).digest("hex");
+		const sourceSha256 = nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex");
 		await fs.mkdir(agentDir, { recursive: true });
 		// Target exists but the patch never applied (e.g. a user-created backup
 		// with identical content): the source must NOT be dropped.
@@ -926,7 +951,7 @@ describe("config-root workflow settings migration", () => {
 		const cwd = await tempDir();
 		const { source } = await setupHome(home, ".myconfig");
 		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
-		const sourceSha256 = createHash("sha256").update(sourceRaw).digest("hex");
+		const sourceSha256 = nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex");
 		// Stale marker pointing at a different config-root layout.
 		await fs.writeFile(source, sourceRaw);
 		await fs.writeFile(
@@ -1204,7 +1229,7 @@ describe("config-root workflow settings migration", () => {
 		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2));
 		// ...and the user edited settings.json before the next load.
 		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":9}', "utf8");
-		const oldSourceHash = createHash("sha256").update('{"gjc.ralplan.maxIterations":7}').digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update('{"gjc.ralplan.maxIterations":7}').digest("hex");
 		// The pending marker records the OLD source hash (from the crashed run).
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
@@ -1247,7 +1272,7 @@ describe("config-root workflow settings migration", () => {
 		};
 		await fs.writeFile(source, JSON.stringify({ "gjc.ralplan.maxIterations": 99 }), "utf8");
 		const backupRaw = await fs.readFile(`${source}.bak`, "utf8");
-		expect(createHash("sha256").update(backupRaw).digest("hex")).toBe(marker.sourceSha256);
+		expect(nodeCrypto.createHash("sha256").update(backupRaw).digest("hex")).toBe(marker.sourceSha256);
 	});
 	test("a removed pending source key drops its stale target value", async () => {
 		const home = await tempDir();
@@ -1259,7 +1284,7 @@ describe("config-root workflow settings migration", () => {
 		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2));
 		// ...and the user REMOVED the key from settings.json before the next load.
 		await fs.writeFile(source, "{}", "utf8");
-		const oldSourceHash = createHash("sha256").update('{"gjc.ralplan.maxIterations":7}').digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update('{"gjc.ralplan.maxIterations":7}').digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1293,7 +1318,7 @@ describe("config-root workflow settings migration", () => {
 		// crashed migration did NOT record that key; the source is then edited.
 		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 9 } } }, null, 2));
 		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":11}');
-		const oldSourceHash = createHash("sha256").update('{"gjc.ralplan.maxIterations":7}').digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update('{"gjc.ralplan.maxIterations":7}').digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1324,7 +1349,7 @@ describe("config-root workflow settings migration", () => {
 		// the source nudgeBudget to an INVALID value before the retry.
 		await fs.writeFile(target, YAML.stringify({ gjc: { ultragoal: { nudgeBudget: 7 } } }, null, 2));
 		await fs.writeFile(source, '{"gjc.ultragoal.nudgeBudget":"bad"}');
-		const oldSourceHash = createHash("sha256").update('{"gjc.ultragoal.nudgeBudget":7}').digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update('{"gjc.ultragoal.nudgeBudget":7}').digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1363,7 +1388,7 @@ describe("config-root workflow settings migration", () => {
 		// the invalid legacy source and gjc ralplan would not exit 2).
 		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2));
 		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":"bad"}');
-		const oldSourceHash = createHash("sha256").update('{"gjc.ralplan.maxIterations":7}').digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update('{"gjc.ralplan.maxIterations":7}').digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1405,7 +1430,8 @@ describe("config-root workflow settings migration", () => {
 			),
 		);
 		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":"bad"}');
-		const oldSourceHash = createHash("sha256")
+		const oldSourceHash = nodeCrypto
+			.createHash("sha256")
 			.update('{"gjc.deepInterview.ambiguityThreshold":0.9,"gjc.ralplan.maxIterations":7}')
 			.digest("hex");
 		await fs.writeFile(
@@ -1450,7 +1476,7 @@ describe("config-root workflow settings migration", () => {
 			source,
 			'{"gjc.deepInterview.ambiguityThreshold":0.8,"gjc.ralplan.autoHandoff":"off","gjc.ralplan.maxIterations":"bad"}',
 		);
-		const oldSourceHash = createHash("sha256").update('{"gjc.ralplan.autoHandoff":"team"}').digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update('{"gjc.ralplan.autoHandoff":"team"}').digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1487,7 +1513,7 @@ describe("config-root workflow settings migration", () => {
 		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2));
 		await fs.writeFile(`${source}.bak`, oldRaw); // backup matches the marker
 		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":9}'); // user edited the source
-		const oldSourceHash = createHash("sha256").update(oldRaw).digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update(oldRaw).digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1525,7 +1551,7 @@ describe("config-root workflow settings migration", () => {
 		await fs.writeFile(`${source}.bak`, oldRaw); // migration copy (old value 7)
 		// ...and the legacy source to 9.
 		await fs.writeFile(source, '{"gjc.ralplan.maxIterations":9}');
-		const oldSourceHash = createHash("sha256").update(oldRaw).digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update(oldRaw).digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1574,7 +1600,7 @@ describe("config-root workflow settings migration", () => {
 		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2));
 		await fs.writeFile(`${source}.bak`, oldRaw);
 		await fs.writeFile(source, "null"); // edited to an invalid root
-		const oldSourceHash = createHash("sha256").update(oldRaw).digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update(oldRaw).digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1608,7 +1634,7 @@ describe("config-root workflow settings migration", () => {
 		await fs.writeFile(target, YAML.stringify({ gjc: { ultragoal: { nudgeBudget: 7 } } }, null, 2));
 		await fs.writeFile(`${source}.bak`, oldRaw);
 		await fs.writeFile(source, '{"gjc.ultragoal.nudgeBudget":"bad"}'); // invalid edit
-		const oldSourceHash = createHash("sha256").update(oldRaw).digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update(oldRaw).digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1655,7 +1681,7 @@ describe("config-root workflow settings migration", () => {
 		);
 		await fs.writeFile(source, "null", "utf8");
 		await fs.writeFile(`${source}.bak`, oldRaw);
-		const oldSourceHash = createHash("sha256").update(oldRaw).digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update(oldRaw).digest("hex");
 		await fs.writeFile(
 			`${source}.migrated`,
 			JSON.stringify({
@@ -1695,7 +1721,7 @@ describe("config-root workflow settings migration", () => {
 		// deleted the source.
 		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 11 } } }, null, 2));
 		await fs.writeFile(`${source}.bak`, oldRaw);
-		const oldSourceHash = createHash("sha256").update(oldRaw).digest("hex");
+		const oldSourceHash = nodeCrypto.createHash("sha256").update(oldRaw).digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1740,7 +1766,7 @@ describe("config-root workflow settings migration", () => {
 				targetPath: target,
 				canonicalTargetDir: await fs.realpath(agentDir),
 				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
-				sourceSha256: createHash("sha256").update(sourceRaw).digest("hex"),
+				sourceSha256: nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
 			}),
@@ -1782,7 +1808,7 @@ describe("config-root workflow settings migration", () => {
 				targetPath: target,
 				canonicalTargetDir: await fs.realpath(agentDir),
 				canonicalTargetIdentity: `${agentIdentity.dev}:${agentIdentity.ino}`,
-				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
+				sourceSha256: nodeCrypto.createHash("sha256").update(oldRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
 			}),
@@ -1818,7 +1844,7 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
-				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
+				sourceSha256: nodeCrypto.createHash("sha256").update(oldRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
 			}),
@@ -1852,7 +1878,7 @@ describe("config-root workflow settings migration", () => {
 				targetPath: target,
 				canonicalTargetDir: agentDir,
 				canonicalTargetIdentity: "replaced:0",
-				sourceSha256: createHash("sha256").update(sourceRaw).digest("hex"),
+				sourceSha256: nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
 			}),
@@ -1992,7 +2018,7 @@ describe("config-root workflow settings migration", () => {
 				sourcePath: source,
 				backupPath: `${source}.bak`,
 				targetPath: target,
-				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
+				sourceSha256: nodeCrypto.createHash("sha256").update(oldRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
 				completedAt: new Date().toISOString(),
@@ -2030,7 +2056,7 @@ describe("config-root workflow settings migration", () => {
 				targetPath: target,
 				canonicalTargetDir: agentDir,
 				canonicalTargetIdentity: "replaced:0",
-				sourceSha256: createHash("sha256").update(oldRaw).digest("hex"),
+				sourceSha256: nodeCrypto.createHash("sha256").update(oldRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				startedAt: new Date().toISOString(),
 				completedAt: new Date().toISOString(),
@@ -2054,7 +2080,8 @@ describe("config-root workflow settings migration", () => {
 		const target = path.join(agentDir, "config.yml");
 		const originalRaw = '{"gjc.ralplan.maxIterations":7}';
 		const proposedRaw = '{"gjc.ralplan.maxIterations":9}';
-		const hash = (value: unknown): string => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+		const hash = (value: unknown): string =>
+			nodeCrypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 		// The process crashed after durable pending-marker publication but before
 		// it applied the repair. An editor then chose the same proposed value.
 		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { maxIterations: 9 } } }, null, 2));
@@ -2069,8 +2096,8 @@ describe("config-root workflow settings migration", () => {
 				targetPath: target,
 				canonicalTargetDir: await fs.realpath(agentDir),
 				canonicalTargetIdentity: `${(await fs.stat(agentDir)).dev}:${(await fs.stat(agentDir)).ino}`,
-				sourceSha256: createHash("sha256").update(proposedRaw).digest("hex"),
-				priorSourceSha256: createHash("sha256").update(originalRaw).digest("hex"),
+				sourceSha256: nodeCrypto.createHash("sha256").update(proposedRaw).digest("hex"),
+				priorSourceSha256: nodeCrypto.createHash("sha256").update(originalRaw).digest("hex"),
 				migratedKeys: ["gjc.ralplan.maxIterations"],
 				repairValueHashes: { "gjc.ralplan.maxIterations": hash(9) },
 				preRepairTargetHashes: { "gjc.ralplan.maxIterations": hash(7) },
@@ -2091,6 +2118,7 @@ describe("config-root workflow settings migration", () => {
 const PROJECT_PROBE = path.join(import.meta.dir, "../fixtures/project-workflow-migration-probe.ts");
 
 type ProjectProbeResult = {
+	loadFailed?: boolean;
 	sourceExists: boolean;
 	maxIterations: unknown;
 	maxReviewPassesPerLane: unknown;
@@ -2109,9 +2137,14 @@ type ProjectProbeResult = {
 
 async function runProjectProbe(
 	cwd: string,
-	options: { viaTrigger?: boolean; home?: string } = {},
+	options: { viaTrigger?: boolean; home?: string; expectLoadFailure?: boolean; env?: Record<string, string> } = {},
 ): Promise<ProjectProbeResult> {
-	const args = [process.execPath, PROJECT_PROBE, ...(options.viaTrigger ? ["--via-trigger"] : [])];
+	const args = [
+		process.execPath,
+		PROJECT_PROBE,
+		...(options.viaTrigger ? ["--via-trigger"] : []),
+		...(options.expectLoadFailure ? ["--expect-load-failure"] : []),
+	];
 	const proc = Bun.spawn(args, {
 		cwd,
 		env: {
@@ -2125,6 +2158,7 @@ async function runProjectProbe(
 			// the test asserts warning text.
 			HOME: options.home ?? process.env.HOME,
 			...(options.home ? { GJC_PROBE_LOG: "1" } : {}),
+			...(options.env ?? {}),
 		},
 		stdout: "pipe",
 		stderr: "pipe",
@@ -2410,19 +2444,15 @@ describe("project workflow settings migration", () => {
 			JSON.stringify({ "gjc.ralplan.autoHandoff": "bad", "gjc.ralplan.maxIterations": 7 }),
 		);
 
-		const result = await runProjectProbe(cwd);
-		// The strict evidence is independently valid (autoHandoff is still
-		// invalid in the retained source) and must survive the rollback so
-		// exit 2 stays observable.
-		expect(result.strictInvalidEvidenceExists).toBe(true);
-		expect(result.strictInvalidEvidenceKeys).toEqual(["gjc.ralplan.autoHandoff"]);
-		expect(result.strictInvalidEvidenceMalformed).toBe(false);
-		// The copied valid key was rolled back (markerless publication never
-		// completes); the invalid key never reached config.yml.
+		const result = await runProjectProbe(cwd, { expectLoadFailure: true });
+		// The unreadable marker ABORTS the migration: nothing is published, no
+		// evidence is written, and the retained source stays active.
+		expect(result.loadFailed).toBe(true);
+		expect(result.strictInvalidEvidenceExists).toBe(false);
 		expect(result.maxIterations).toBeNull();
 	});
 
-	test("a marker-failure rollback removes the config.yml it created so the fallback stays active", async () => {
+	test("an unreadable ownership marker leaves an absent config.yml absent so the fallback stays active", async () => {
 		const cwd = await tempDir();
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		// The migrated-key marker path is occupied by a directory, so only the
@@ -2436,18 +2466,14 @@ describe("project workflow settings migration", () => {
 			JSON.stringify({ "gjc.ralplan.maxIterations": 7, "gjc.ralplan.maxReviewPassesPerLane": 2 }),
 		);
 
-		const result = await runProjectProbe(cwd, { home: await tempDir() });
+		const result = await runProjectProbe(cwd, { home: await tempDir(), expectLoadFailure: true });
+		// The unreadable marker ABORTS the migration before any publication:
+		// the retained source stays active and no config.yml is created, so the
+		// fallback resolution keeps working on every retry.
+		expect(result.loadFailed).toBe(true);
 		expect(result.sourceExists).toBe(true); // the retained source stays active
-		// The target the migration created during publication is REMOVED by the
-		// rollback: an empty config.yml would be authoritative to the resolver
-		// and disable the fallback resolution on every retry.
-		expect(result.configYmlRootType).toBeNull();
+		expect(result.configYmlRootType).toBeNull(); // nothing was created
 		expect(result.maxIterations).toBeNull(); // nothing published into config.yml
-		expect(result.migrationLog).toContain("removed the config.yml it created during rollback");
-		// No durable ownership was recorded, so the generic settings view must
-		// keep the retained legacy values visible - it would otherwise report a
-		// lower-layer/default while the workflow runtime still uses the fallback.
-		expect(result.settingsGetMaxIterations).toBe(7);
 	});
 
 	test("clears fallback-invalid values from config.yml when the source no longer holds them", async () => {
@@ -2578,12 +2604,165 @@ describe("project workflow settings migration", () => {
 		);
 		await fs.writeFile(path.join(cwd, ".gjc", "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
 
-		const result = await runProjectProbe(cwd, { home: await tempDir() });
-		expect(result.maxIterations).toBe(9); // pre-existing valid value untouched
-		// The marker failure is surfaced instead of silently reporting completion:
-		// without durable ownership a later config removal would re-import the
-		// stale legacy value from the retained source.
-		expect(result.migrationLog).toContain("migrated-keys marker was not written");
+		const result = await runProjectProbe(cwd, { home: await tempDir(), expectLoadFailure: true });
+		// The unreadable marker (EISDIR on the occupied path) ABORTS the
+		// migration: the user's pre-existing valid value stays untouched instead
+		// of being re-imported over by a markerless publication.
+		expect(result.loadFailed).toBe(true);
+		expect(result.maxIterations).toBe(9);
+	});
+
+	test("a marker re-read failure after publication rolls the committed values back", async () => {
+		const cwd = await tempDir();
+		const home = await tempDir();
+		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		// The marker is readable for the initial read; the seam replaces it
+		// with a DIRECTORY before the post-publication re-read.
+		await fs.writeFile(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), JSON.stringify([]));
+		// The source holds an INVALID strict key, so the seeded evidence is
+		// current (not stale); an ownership-marker failure must NOT clear it.
+		await fs.writeFile(path.join(cwd, ".gjc", "settings.json"), JSON.stringify({ "gjc.ralplan.autoHandoff": "bad" }));
+		await fs.writeFile(
+			path.join(cwd, ".gjc", "state", "settings.json.strict-invalid"),
+			JSON.stringify({ version: 2, keys: [{ key: "gjc.ralplan.autoHandoff", value: "bad" }] }),
+		);
+
+		const result = await runProjectProbe(cwd, {
+			home,
+			env: { SETTINGS_MIGRATION_TEST_MARKER_MERGE_DIR: "1" },
+		});
+		// The post-publication marker re-read failed (EISDIR): the committed
+		// values were rolled back exactly like a failed marker write, so
+		// nothing survives in config.yml without durable ownership.
+		expect(result.loadFailed).toBe(false);
+		expect(result.maxIterations).toBeNull();
+		expect(result.configYmlRootType).toBeNull();
+		// The strict-invalid evidence is PRESERVED (cleared only when the
+		// SOURCE changed, not for ownership-marker failures).
+		expect(result.strictInvalidEvidenceExists).toBe(true);
+		expect(result.strictInvalidEvidenceKeys).toEqual(["gjc.ralplan.autoHandoff"]);
+	});
+
+	test("a pending retirement marker is completed by the next load after an interrupted migration", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		// The crash case: the values were published (config.yml exists) and the
+		// pending-retirement marker was persisted, but the rename never
+		// completed before the process exited.
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
+		await fs.writeFile(path.join(agentDir, "settings.json"), sourceRaw);
+		await fs.writeFile(
+			path.join(agentDir, "settings.json.pending-retirement"),
+			nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex"),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		// The retirement completed: the agent-dir source was renamed to .bak
+		// and the pending marker was consumed.
+		expect(result.loadFailed).toBe(false);
+		expect(await fs.stat(path.join(agentDir, "settings.json")).catch(() => null)).toBeNull();
+		expect(await fs.stat(path.join(agentDir, "settings.json.bak")).catch(() => null)).not.toBeNull();
+		expect(await fs.stat(path.join(agentDir, "settings.json.pending-retirement")).catch(() => null)).toBeNull();
+	});
+
+	test("a changed settings.json is never retired by a stale pending marker", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		// The pending marker records an OLDER revision (sha of different
+		// bytes); the current source holds the user's newer edit and must stay
+		// active.
+		await fs.writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 9 }));
+		await fs.writeFile(
+			path.join(agentDir, "settings.json.pending-retirement"),
+			nodeCrypto
+				.createHash("sha256")
+				.update(JSON.stringify({ "gjc.ralplan.maxIterations": 7 }))
+				.digest("hex"),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		// The retirement is SKIPPED: the user's newer settings are not stranded
+		// in the inactive .bak.
+		expect(result.loadFailed).toBe(false);
+		expect(await fs.stat(path.join(agentDir, "settings.json")).catch(() => null)).not.toBeNull();
+		expect(await fs.stat(path.join(agentDir, "settings.json.bak")).catch(() => null)).toBeNull();
+	});
+
+	test("a marker without publication proof never retires the source", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
+		// The target exists but does NOT contain the source's workflow key (the
+		// publication was skipped or conflicted after the marker was persisted):
+		// the marker alone is not proof, so the source must not be retired.
+		await fs.writeFile(path.join(agentDir, "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
+		await fs.writeFile(path.join(agentDir, "settings.json"), sourceRaw);
+		await fs.writeFile(
+			path.join(agentDir, "settings.json.pending-retirement"),
+			nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex"),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		expect(result.loadFailed).toBe(false);
+		expect(await fs.stat(path.join(agentDir, "settings.json")).catch(() => null)).not.toBeNull();
+		expect(await fs.stat(path.join(agentDir, "settings.json.bak")).catch(() => null)).toBeNull();
+	});
+
+	test("a failed retirement rename preserves the retry marker", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		const sourceRaw = JSON.stringify({ "gjc.ralplan.maxIterations": 7 });
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		await fs.writeFile(path.join(agentDir, "settings.json"), sourceRaw);
+		// The .bak destination is occupied by a DIRECTORY: the rename fails.
+		await fs.mkdir(path.join(agentDir, "settings.json.bak"), { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "settings.json.pending-retirement"),
+			nodeCrypto.createHash("sha256").update(sourceRaw).digest("hex"),
+		);
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		expect(result.loadFailed).toBe(false);
+		// The source stays and the marker is preserved for the next load's retry.
+		expect(await fs.stat(path.join(agentDir, "settings.json")).catch(() => null)).not.toBeNull();
+		expect(await fs.stat(path.join(agentDir, "settings.json.pending-retirement")).catch(() => null)).not.toBeNull();
+	});
+
+	test("a user-created settings.json beside an existing config.yml is not retired", async () => {
+		const home = await tempDir();
+		const cwd = await tempDir();
+		const { agentDir } = await setupHome(home, ".myconfig");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(agentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		await fs.writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
+
+		const result = await runProbe(cwd, { home, configDir: ".myconfig" });
+		// No pending marker: the file is the user's own and stays untouched.
+		expect(result.loadFailed).toBe(false);
+		expect(await fs.stat(path.join(agentDir, "settings.json")).catch(() => null)).not.toBeNull();
+		expect(await fs.stat(path.join(agentDir, "settings.json.bak")).catch(() => null)).toBeNull();
 	});
 
 	test("excludes retired workflow keys from project settings discovery after a config.yml removal", async () => {
@@ -2804,17 +2983,19 @@ describe("project workflow settings migration", () => {
 			JSON.stringify({ "gjc.ralplan.maxIterations": "bad" }),
 		);
 
-		const result = await runProjectProbe(cwd, { home });
-		// The failure must be surfaced, not silently ignored (no durable surface
-		// can preserve the exit-2 here).
-		expect(result.migrationLog).toContain("strict error could not be preserved");
+		const result = await runProjectProbe(cwd, { home, expectLoadFailure: true });
+		// The unreadable marker (ENOTDIR: .gjc/state is a FILE) ABORTS the
+		// migration instead of reimporting the stale value with an empty
+		// ownership set; the read-only future-schema target is left untouched.
+		expect(result.loadFailed).toBe(true);
 	});
 
-	test("a marker-failure rollback restores repaired target values instead of unsetting them", async () => {
+	test("an unreadable ownership marker aborts the project migration without touching the user's configuration", async () => {
 		const cwd = await tempDir();
+		const home = await tempDir();
 		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
 		// The migrated-key marker path is occupied by a directory, so the marker
-		// write fails and the publication is rolled back.
+		// read fails (EISDIR) and the migration aborts.
 		await fs.mkdir(path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"), { recursive: true });
 		// config.yml already contains a PRESENT-but-invalid maxIterations value
 		// (user data) and the source holds the valid legacy value that repairs it.
@@ -2824,11 +3005,15 @@ describe("project workflow settings migration", () => {
 		);
 		await fs.writeFile(path.join(cwd, ".gjc", "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
 
-		const result = await runProjectProbe(cwd);
-		// The rollback RESTORES the user's pre-existing (invalid) value instead of
-		// unsetting it: a markerless publication never completes, but the repair
-		// must not silently delete the user's configuration.
-		expect(result.maxIterations).toBe("user-mistake");
+		const result = await runProjectProbe(cwd, { home, expectLoadFailure: true });
+		// The UNREADABLE marker ABORTS the migration (fail closed) instead of
+		// proceeding with an empty ownership set that would reimport the stale
+		// value: the user's configuration is left untouched for repair.
+		expect(result.loadFailed).toBe(true);
+		const retained = YAML.parse(await fs.readFile(path.join(cwd, ".gjc", "config.yml"), "utf8")) as {
+			gjc?: { ralplan?: { maxIterations?: unknown } };
+		};
+		expect(retained.gjc?.ralplan?.maxIterations).toBe("user-mistake");
 	});
 
 	test("a scalar project config.yml root is not replaced by the migration", async () => {

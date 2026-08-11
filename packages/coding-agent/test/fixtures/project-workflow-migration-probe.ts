@@ -11,13 +11,37 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getLogPath } from "@gajae-code/utils";
 import { YAML } from "bun";
-import { ensureWorkflowSettingsMigrated, Settings } from "../../src/config/settings";
+import { ensureWorkflowSettingsMigrated, Settings, SettingsMigrationTestHooks } from "../../src/config/settings";
 
 const cwd = process.cwd();
+// Test seam: when enabled, the post-publication marker RE-READ is made to
+// fail (the readable marker file is replaced by a directory) after the
+// migrated values already committed, so the rollback path is exercised.
+if (process.env.SETTINGS_MIGRATION_TEST_MARKER_MERGE_DIR === "1") {
+	SettingsMigrationTestHooks.beforeProjectMarkerMerge = async () => {
+		const marker = path.join(cwd, ".gjc", "state", "settings.json.migrated-keys");
+		await fs.rm(marker, { force: true });
+		await fs.mkdir(marker, { recursive: true });
+	};
+}
 let loaded: Settings | null = null;
+let loadFailed = false;
+const expectLoadFailure = process.argv.includes("--expect-load-failure");
 if (process.argv.includes("--via-trigger")) {
 	await ensureWorkflowSettingsMigrated(cwd);
+} else if (expectLoadFailure) {
+	// The caller explicitly expects the load to fail (e.g. an unreadable
+	// ownership marker aborts the migration): suppress the exception and
+	// report the migration file state.
+	try {
+		loaded = await Settings.loadForScope({ cwd });
+	} catch {
+		loadFailed = true;
+	}
 } else {
+	// Unexpected load failures stay FATAL so a regression that throws after
+	// producing the inspected filesystem state cannot mask itself in tests
+	// that never assert loadFailed.
 	loaded = await Settings.loadForScope({ cwd });
 }
 
@@ -83,6 +107,7 @@ if (await exists(target)) {
 
 process.stdout.write(
 	`${JSON.stringify({
+		loadFailed,
 		sourceExists: await exists(source),
 		maxIterations,
 		maxReviewPassesPerLane,
