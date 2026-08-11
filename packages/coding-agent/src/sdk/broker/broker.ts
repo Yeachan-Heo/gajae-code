@@ -27,6 +27,7 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { deriveIdempotencyIdentity } from "./identity";
+
 import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
 
 import {
@@ -187,6 +188,14 @@ function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (isCleanupPending(response)) return "effect_started";
 	return response.error.code === "terminal_uncertain" ? "terminal_uncertain" : "terminal_error";
 }
+
+const LIFECYCLE_OPERATIONS = new Set([
+	"session.create",
+	"session.fork",
+	"session.resume",
+	"session.close",
+	"session.delete",
+]);
 
 type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;
 
@@ -1353,6 +1362,8 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		const fingerprint = JSON.stringify({ operation, input: JSON.parse(JSON.stringify(input)) });
+
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
@@ -1386,11 +1397,32 @@ export class Broker {
 			return page;
 		}
 		if (operation === "session.get_endpoint") return this.#endpoint(input);
+		if (operation === "broker.lookup_lifecycle") {
+			const requestedOperation = typeof input.operation === "string" ? input.operation : undefined;
+			const requestedFingerprint = typeof input.fingerprint === "string" ? input.fingerprint : undefined;
+			if (!idempotencyKey || !requestedOperation || !requestedFingerprint)
+				return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
+			if (!LIFECYCLE_OPERATIONS.has(requestedOperation))
+				return error("not_found", "lifecycle operation was not found");
+			const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
+			const entry = this.ledger.get(identity);
+			if (!entry) return error("not_found", "lifecycle operation was not found");
+			if (entry.fingerprint !== requestedFingerprint)
+				return error("idempotency_conflict", "lifecycle request fingerprint differs");
+			if (entry.state === "terminal_uncertain")
+				return error("terminal_uncertain", "lifecycle outcome is still uncertain");
+			return isBrokerResponse(entry.response)
+				? entry.response
+				: error("terminal_uncertain", "lifecycle outcome has no recorded response");
+		}
+
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
+		const operationKey = `${operation}\0${idempotencyKey}`;
+
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
 		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {
 			const entry = this.ledger.get(identity);
@@ -1456,7 +1488,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash);
+			const begun = await this.ledger.begin(identity, requestHash, { operationKey, fingerprint });
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;

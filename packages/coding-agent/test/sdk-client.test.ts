@@ -165,12 +165,17 @@ test("SdkClient gates requests on hello and correlates success and typed errors"
 		await flush();
 		const frame = sent(socket);
 		expect(frame).toMatchObject({ type: "control_request", operation: "turn.prompt", input: { text: "hello" } });
+		if (typeof frame.id !== "string") throw new Error("request id missing");
+
 		socket.message({ type: "control_response", id: frame.id, ok: true, result: { accepted: true } });
 		await expect(request).resolves.toMatchObject({ result: { accepted: true } });
+		expect(client.getSentRecord(frame.id)).toBeUndefined();
 
 		const failed = client.control("missing");
 		await flush();
 		const failedFrame = sent(socket, 1);
+		if (typeof failedFrame.id !== "string") throw new Error("failed request id missing");
+
 		socket.message({
 			type: "control_response",
 			id: failedFrame.id,
@@ -179,6 +184,8 @@ test("SdkClient gates requests on hello and correlates success and typed errors"
 		});
 		await expect(failed).rejects.toBeInstanceOf(SdkClientError);
 		await expect(failed).rejects.toMatchObject({ code: "unknown_operation", message: "missing" });
+		expect(client.getSentRecord(failedFrame.id)).toBeUndefined();
+
 		await client.close();
 	});
 });
@@ -295,7 +302,7 @@ test("SdkClient settles owner responses before isolated frame observers", async 
 	});
 });
 
-test("SdkClient rejects malformed frames and a lost response with typed transport errors", async () => {
+test("SdkClient rejects malformed frames and marks a lost sent response uncertain", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
 		const socket = await connect(client);
@@ -308,7 +315,63 @@ test("SdkClient rejects malformed frames and a lost response with typed transpor
 		await flush();
 		socket.readyState = FakeWebSocket.CLOSED;
 		socket.emit("close");
-		await expect(lost).rejects.toMatchObject({ code: "connection_closed" });
+		await expect(lost).rejects.toMatchObject({ code: "uncertain_after_send" });
+
+		await client.close();
+	});
+});
+
+test("SdkClient distinguishes pre-send closure from a sent lifecycle request and reconciles the durable lookup", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		socket.throwOnSend = new SdkClientError("connection_closed", "Socket closed before write");
+		const beforeSend = client.global("session.create", { cwd: "/repo" }, { idempotencyKey: "before-send" });
+		await expect(beforeSend).rejects.toMatchObject({ code: "connection_closed" });
+		expect(socket.sent).toHaveLength(0);
+
+		socket.throwOnSend = undefined;
+		const afterSend = client.global("session.create", { cwd: "/repo" }, { idempotencyKey: "after-send" });
+		await flush();
+		const sentFrame = sent(socket);
+		if (typeof sentFrame.id !== "string") throw new Error("lifecycle request id missing");
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		await expect(afterSend).rejects.toMatchObject({
+			code: "uncertain_after_send",
+			details: {
+				id: sentFrame.id,
+				operation: "session.create",
+				idempotencyKey: "after-send",
+				fingerprint: '{"operation":"session.create","input":{"cwd":"/repo"}}',
+			},
+		});
+		const record = client.getSentRecord(sentFrame.id);
+		if (!record) throw new Error("sent lifecycle record missing");
+
+		const reconciliation = client.lookupLifecycle(record);
+		for (let index = 0; index < 4; index++) await flush();
+		const replacement = FakeWebSocket.instances.at(-1);
+		if (!replacement || replacement === socket) throw new Error("lookup replacement socket missing");
+		replacement.open();
+		replacement.message({ type: "broker_hello", connectionId: "lookup" });
+		for (let index = 0; index < 4; index++) await flush();
+		const lookupFrame = sent(replacement);
+		if (typeof lookupFrame.id !== "string") throw new Error("lookup request id missing");
+		expect(lookupFrame).toMatchObject({
+			type: "broker_request",
+			operation: "broker.lookup_lifecycle",
+			input: { operation: "session.create", fingerprint: record.fingerprint },
+			idempotencyKey: "after-send",
+		});
+		replacement.message({
+			type: "broker_response",
+			id: lookupFrame.id,
+			ok: true,
+			result: { sessionId: "durably-persisted" },
+		});
+		await expect(reconciliation).resolves.toMatchObject({ result: { sessionId: "durably-persisted" } });
+		expect(client.getSentRecord(record.id)).toBeUndefined();
 		await client.close();
 	});
 });
@@ -324,10 +387,7 @@ test("SdkClient owns request timeout, reconnect backoff, and absolute deadline d
 		const timedOut = client.control("wait");
 		await flush();
 		clock.advanceBy(50);
-		await expect(timedOut).rejects.toMatchObject({
-			code: "timeout",
-			details: { requestSent: true, requestId: expect.any(String) },
-		});
+		await expect(timedOut).rejects.toMatchObject({ code: "uncertain_after_send" });
 
 		socket.readyState = FakeWebSocket.CLOSED;
 		socket.emit("close");
@@ -526,7 +586,7 @@ test("SdkClient fences stale socket callbacks and never replays sent mutations",
 		const mutationFrame = sent(second, 1);
 		second.readyState = FakeWebSocket.CLOSED;
 		second.emit("close");
-		await expect(mutation).rejects.toMatchObject({ code: "connection_closed" });
+		await expect(mutation).rejects.toMatchObject({ code: "uncertain_after_send" });
 
 		const next = client.control("after-close");
 		for (let index = 0; index < 4; index++) await flush();
