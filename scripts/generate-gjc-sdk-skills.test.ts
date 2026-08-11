@@ -290,6 +290,15 @@ describe("generated external GJC SDK skills", () => {
 		expect(await validateInstalledBundle(linkedManifest.root)).toContain("no format version");
 		expect(await checkSdkSkillFiles(linkedManifest.files, linkedManifest.root, false)).toBe(1);
 
+		if (process.platform !== "win32") {
+			const fifo = await materialize();
+			const fifoPath = path.join(fifo.root, "gjc-sdk-discover", "SKILL.md");
+			await fs.rm(fifoPath);
+			const created = Bun.spawnSync(["mkfifo", fifoPath]);
+			expect(created.exitCode).toBe(0);
+			expect(await checkSdkSkillFiles(fifo.files, fifo.root, false)).toBe(1);
+		}
+
 		const unexpected = await materialize();
 		const stale = path.join(unexpected.root, "gjc-sdk-author", "stale.md");
 		await Bun.write(stale, "stale\n");
