@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -16,7 +15,7 @@ import type {
 import { type SlackConversation, slackConversationKey } from "../src/sdk/bus/slack-conversation";
 import type { SlackProviderClient, SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
-import type { SessionRouterClient } from "../src/sdk/router";
+import { type SessionRouterClient, sessionAttachmentAuthorityId } from "../src/sdk/router";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
@@ -1372,17 +1371,17 @@ describe("chat daemon worker", () => {
 					rootTs: "root",
 					sessionId: host.sessionId,
 					endpointGeneration: 1,
-					attachmentAuthorityId: crypto
-						.createHash("sha256")
-						.update(
-							JSON.stringify({
-								sessionId: host.sessionId,
-								generation: 1,
-								pid: process.pid,
-								endpointMtimeMs: host.endpointMtimeMs,
-							}),
-						)
-						.digest("hex"),
+					// Derived through the Router's own identity function: a hand-rolled digest
+					// stops matching the live attachment as soon as the bound fields change,
+					// and the daemon then refuses every resume against this stored root.
+					attachmentAuthorityId: sessionAttachmentAuthorityId({
+						sessionId: host.sessionId,
+						generation: 1,
+						pid: process.pid,
+						endpointMtimeMs: host.endpointMtimeMs,
+						url: host.endpoint.url,
+						token: host.endpoint.token,
+					}),
 					updatedAt: Date.now(),
 					seenEventIds: [],
 					seenContextIds: [],
