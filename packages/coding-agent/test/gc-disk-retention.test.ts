@@ -649,6 +649,31 @@ describe("gjc gc --disk --prune (blob mark and sweep)", () => {
 		}
 	});
 
+	test("refuses a canonical blob replacement after the final sweep fence", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const hash = await writeBlob(fixture, "canonical identity must survive the final fence", 10);
+			const blobPath = path.join(fixture.blobsDir, hash);
+			const entry = (await listCanonicalBlobs(fixture.blobsDir))[0]!;
+			const original = await fsp.lstat(blobPath);
+			const replacement = `${blobPath}.replacement`;
+			await Bun.write(replacement, "canonical identity must survive the final fence");
+			await fsp.utimes(replacement, original.atime, original.mtime);
+
+			expect(
+				await removeCanonicalBlob(entry, {
+					beforeUnlink: async () => {
+						await fsp.rename(replacement, blobPath);
+						return true;
+					},
+				}),
+			).toEqual({ removed: false, reason: "blob_unlink_failed: identity_mismatch", failed: true });
+			expect(await Bun.file(blobPath).exists()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
 	test("never reclaims a blob a changing transcript can still reference", async () => {
 		const fixture = await makeTestRoot();
 		try {
