@@ -96,7 +96,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain(".ci-dev-affected-evidence.receipt.json");
 		expect(workflow).not.toContain("evidencePath");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}");
-		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ needs.affected-plan.outputs.relevant }}");
+		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon')");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_REQUIRED:");
 		expect(workflow).toContain("bun test ./packages/natives/test/path-identity-windows.test.ts");
