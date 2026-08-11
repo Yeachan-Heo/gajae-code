@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import * as fsConstants from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -89,15 +90,21 @@ export function validateBundleManifest(manifestContent: string | null, expectedF
 	return null;
 }
 
-export async function readBundleManifest(root = bundleDir): Promise<string | null> {
-	const target = path.join(root, BUNDLE_MANIFEST_NAME);
+async function readRegularFile(target: string): Promise<string | null> {
+	let handle: fs.FileHandle | undefined;
 	try {
-		const stat = await fs.lstat(target);
-		if (stat.isSymbolicLink() || !stat.isFile()) return null;
-		return await Bun.file(target).text();
+		handle = await fs.open(target, fsConstants.constants.O_RDONLY | fsConstants.constants.O_NOFOLLOW);
+		if (!(await handle.stat()).isFile()) return null;
+		return await handle.readFile({ encoding: "utf8" });
 	} catch {
 		return null;
+	} finally {
+		await handle?.close();
 	}
+}
+
+export async function readBundleManifest(root = bundleDir): Promise<string | null> {
+	return readRegularFile(path.join(root, BUNDLE_MANIFEST_NAME));
 }
 
 export async function validateInstalledBundle(root = bundleDir): Promise<string | null> {
@@ -509,17 +516,7 @@ export async function checkSdkSkillFiles(files: ReadonlyMap<string, string>, roo
 	if (problems.length === 0) {
 		for (const [rel, content] of files) {
 			const target = path.join(root, rel);
-			let actual: string | null = null;
-			try {
-				const stat = await fs.lstat(target);
-				if (stat.isSymbolicLink() || !stat.isFile()) {
-					problems.push(`invalid: sdk-skills/${rel}`);
-					continue;
-				}
-				actual = await Bun.file(target).text();
-			} catch {
-				actual = null;
-			}
+			const actual = await readRegularFile(target);
 			if (actual === null) problems.push(`missing: sdk-skills/${rel}`);
 			else if (actual !== content) problems.push(`drift: sdk-skills/${rel}`);
 		}
