@@ -396,6 +396,8 @@ export class ModelSelectorComponent extends Container {
 	#closeAfterAssignment = false;
 	#unsubscribeCatalogChanged: () => void = () => {};
 	#disposed = false;
+	/** Standalone smart-routing entry: cancel closes the selector instead of falling back to the preset landing. */
+	#smartRoutingOnly = false;
 
 	// Preset landing state
 	#viewMode: ModelSelectorViewMode = "presets";
@@ -436,6 +438,8 @@ export class ModelSelectorComponent extends Container {
 			activeModelProfile?: string;
 			configuredDefaultChain?: readonly string[];
 			smartRoutingPreview?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+			/** Open the smart-routing panel directly instead of the preset landing. */
+			smartRoutingOnly?: boolean;
 		},
 	) {
 		super();
@@ -465,7 +469,12 @@ export class ModelSelectorComponent extends Container {
 					? this.#isFastForProvider(this.#currentModel.provider, modelSupportsServiceTier(this.#currentModel))
 					: false);
 		const initialSearchInput = options?.initialSearchInput;
-		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
+		this.#smartRoutingOnly = options?.smartRoutingOnly === true;
+		this.#viewMode = this.#smartRoutingOnly
+			? "smart-routing"
+			: this.#temporaryOnly || initialSearchInput || scopedModels.length > 0
+				? "models"
+				: "presets";
 
 		// Load current role assignments from settings
 		this.#rebuildRoleModels();
@@ -518,6 +527,11 @@ export class ModelSelectorComponent extends Container {
 		// Load models and do initial render
 		this.#loadModels().then(() => {
 			this.#buildProviderTabs();
+			if (this.#smartRoutingOnly) {
+				this.#enterSmartRoutingMode();
+				this.#tui.requestRender();
+				return;
+			}
 			if (this.#viewMode === "presets" && (this.#modelRegistry.getModelProfiles?.().size ?? 0) === 0) {
 				this.#viewMode = "models";
 			}
@@ -1580,6 +1594,10 @@ export class ModelSelectorComponent extends Container {
 
 	#enterSmartRoutingMode(): void {
 		if (!this.#smartRoutingPreviewBuilder) {
+			if (this.#smartRoutingOnly) {
+				this.#onCancelCallback();
+				return;
+			}
 			this.#presetLoginHint = "Smart-routing setup is unavailable in this selector context.";
 			this.#renderPresetLanding();
 			return;
@@ -1603,7 +1621,7 @@ export class ModelSelectorComponent extends Container {
 				await this.#onSelectCallback({ kind: "smartRouting", intent });
 				return intent.kind === "apply" ? this.#smartRoutingPreview(intent.draft) : undefined;
 			},
-			onCancel: () => this.#switchToPresetMode(),
+			onCancel: () => (this.#smartRoutingOnly ? this.#onCancelCallback() : this.#switchToPresetMode()),
 		});
 		this.#headerContainer.clear();
 		this.#headerContainer.addChild(new Text(theme.fg("accent", "Smart routing"), 0, 0));

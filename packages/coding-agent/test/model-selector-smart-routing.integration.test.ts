@@ -47,7 +47,7 @@ function installTheme(): void {
 	setThemeInstance(themeInstance);
 }
 
-function createContext(options: { scopedModels?: unknown[]; settings?: Settings } = {}) {
+function createContext(options: { scopedModels?: unknown[]; settings?: Settings; noProfiles?: boolean } = {}) {
 	const settings = options.settings ?? Settings.isolated();
 	const ui = { setFocus: vi.fn(), requestRender: vi.fn(), terminal: { rows: 40, columns: 120 } };
 	const editorContainer = { clear: vi.fn(), addChild: vi.fn() };
@@ -59,7 +59,7 @@ function createContext(options: { scopedModels?: unknown[]; settings?: Settings 
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,
 		getDiscoverableProviders: () => [],
-		getModelProfiles: () => new Map([[smartProfile.name, smartProfile]]),
+		getModelProfiles: () => (options.noProfiles ? new Map() : new Map([[smartProfile.name, smartProfile]])),
 		getModelProfile: (name: string) => (name === smartProfile.name ? smartProfile : undefined),
 		getAvailableModelProfileNames: () => [smartProfile.name],
 		getApiKeyForProvider: vi.fn(async () => "key"),
@@ -99,7 +99,7 @@ async function settle(): Promise<void> {
 	await Promise.resolve();
 }
 
-async function openPanel(options: Parameters<typeof createContext>[0] = {}): Promise<{
+async function openPanel(options: Parameters<typeof createContext>[0] & { smartRoutingOnly?: boolean } = {}): Promise<{
 	controller: SelectorController;
 	selector: ModelSelectorComponent;
 	panel: SmartRoutingPanelComponent;
@@ -108,11 +108,13 @@ async function openPanel(options: Parameters<typeof createContext>[0] = {}): Pro
 }> {
 	const { ctx, settings, editorContainer } = createContext(options);
 	const controller = new SelectorController(ctx as never);
-	controller.showModelSelector();
+	controller.showModelSelector(options.smartRoutingOnly ? { smartRoutingOnly: true } : undefined);
 	const selector = editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
 	await settle();
 	installTheme();
-	if ((options.scopedModels?.length ?? 0) > 0) {
+	if (options.smartRoutingOnly) {
+		// Nothing to navigate: the standalone entry mounts the panel itself.
+	} else if ((options.scopedModels?.length ?? 0) > 0) {
 		selector.__testOpenSmartRoutingPanel();
 	} else {
 		for (let index = 0; index < 20 && selector.__testSelectedPresetRowIdentity() !== "smartRouting"; index++) {
@@ -256,5 +258,25 @@ describe("/model smart-routing panel integration", () => {
 		expect(renderText(scoped.panel)).toContain("Read-only");
 		await scoped.panel.__testToggle(true);
 		expect(scoped.settings.get("task.autorouting.enabled")).toBe(false);
+	});
+
+	test("standalone /routing entry reaches the panel with zero model profiles", async () => {
+		const { panel, selector } = await openPanel({ smartRoutingOnly: true, noProfiles: true });
+		expect(selector.__testViewMode()).toBe("smart-routing");
+		expect(renderText(panel)).toContain("Smart routing setup");
+	});
+
+	test("standalone panel cancel closes the selector instead of falling back to the preset landing", async () => {
+		const { panel, selector, ctx } = await openPanel({ smartRoutingOnly: true, noProfiles: true });
+		panel.handleInput("\x1b");
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
+		expect(selector.__testViewMode()).toBe("smart-routing");
+	});
+
+	test("landing-launched panel cancel still returns to the preset landing", async () => {
+		const { panel, selector, ctx } = await openPanel();
+		panel.handleInput("\x1b");
+		expect(ctx.restoreComposer).not.toHaveBeenCalled();
+		expect(selector.__testViewMode()).toBe("presets");
 	});
 });

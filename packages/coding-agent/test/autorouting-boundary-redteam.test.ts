@@ -2908,7 +2908,7 @@ describe("autorouting boundary red-team generation 6 varied delta re-attacks", (
 
 describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 	it("CLEAN ownership keeps sibling residue while removing the artifact's own native and quarantine residue", async () => {
-		const root = await mkdtemp(path.join(tmpdir(), "autorouting-gen8-cleanup-ownership-"));
+		const root = await fs.realpath(await mkdtemp(path.join(tmpdir(), "autorouting-gen8-cleanup-ownership-")));
 		const parentDir = path.join(root, "parent");
 		const parent = new ArtifactManager(new ManagedSessionDescendantStore(managedDirectoryRoot(root), parentDir));
 		await parent.save("sibling", "tool");
@@ -2971,7 +2971,7 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 	});
 
 	it("CLEAN publication rollback retires a failed reserve block and preserves the original publication error", async () => {
-		const root = await mkdtemp(path.join(tmpdir(), "autorouting-gen8-publication-retire-"));
+		const root = await fs.realpath(await mkdtemp(path.join(tmpdir(), "autorouting-gen8-publication-retire-")));
 		const parentDir = path.join(root, "parent");
 		const parent = new ArtifactManager(new ManagedSessionDescendantStore(managedDirectoryRoot(root), parentDir));
 		await parent.save("sibling", "tool");
@@ -3042,7 +3042,7 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 	});
 
 	it("CLEAN rollbackLastAttemptCommit retires failed removals while a successful rollback still rewinds the tail", async () => {
-		const root = await mkdtemp(path.join(tmpdir(), "autorouting-gen8-rollback-retire-"));
+		const root = await fs.realpath(await mkdtemp(path.join(tmpdir(), "autorouting-gen8-rollback-retire-")));
 		const parentDir = path.join(root, "parent");
 		const parent = new ArtifactManager(new ManagedSessionDescendantStore(managedDirectoryRoot(root), parentDir));
 		await parent.save("sibling", "tool");
@@ -3065,7 +3065,7 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 		}
 		const nextIds = [parent.allocateId(), parent.allocateId()];
 
-		const successRoot = await mkdtemp(path.join(tmpdir(), "autorouting-gen8-rollback-success-"));
+		const successRoot = await fs.realpath(await mkdtemp(path.join(tmpdir(), "autorouting-gen8-rollback-success-")));
 		const successDir = path.join(successRoot, "parent");
 		const successParent = new ArtifactManager(
 			new ManagedSessionDescendantStore(managedDirectoryRoot(successRoot), successDir),

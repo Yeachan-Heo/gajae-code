@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/extensibility/slash-commands";
 import { getCurrentThemeName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
@@ -8,6 +9,7 @@ import {
 	executeBuiltinSlashCommand,
 	lookupBuiltinSlashCommand,
 } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
+import { buildAutoroutingStatusReport } from "@gajae-code/coding-agent/slash-commands/helpers/autorouting-status";
 import { ImageProtocol, TERMINAL } from "@gajae-code/tui";
 
 const mutableTerminal = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
@@ -435,3 +437,58 @@ describe("builtin /theme slash command", () => {
 		expect(String(showError.mock.calls[0]?.[0])).toContain('Unknown theme "not-a-theme"');
 	});
 });
+
+describe("builtin /routing slash command", () => {
+	function createRoutingTuiRuntime(settingsValues: Record<string, unknown> = {}) {
+		const showModelSelector = vi.fn();
+		const showStatus = vi.fn();
+		const showError = vi.fn();
+		const setText = vi.fn();
+		const settings = Settings.isolated(settingsValues as never);
+		const chatContainer = { addChild: vi.fn() };
+		const ctx = {
+			showModelSelector,
+			showStatus,
+			showError,
+			settings,
+			chatContainer,
+			ui: { requestRender: vi.fn() },
+			editor: { setText },
+		} as unknown as InteractiveModeContext;
+
+		return { runtime: { ctx, handleBackgroundCommand: () => undefined }, showModelSelector, settings, setText };
+	}
+
+	it("opens the smart-routing panel directly when invoked without arguments", async () => {
+		const { runtime, showModelSelector, setText } = createRoutingTuiRuntime();
+
+		expect(await executeBuiltinSlashCommand("/routing", runtime)).toBe(true);
+
+		expect(showModelSelector).toHaveBeenCalledWith({ smartRoutingOnly: true });
+		expect(setText).toHaveBeenCalledWith("");
+	});
+
+	it("toggles task.autorouting.enabled without opening a selector", async () => {
+		const { runtime, showModelSelector, settings } = createRoutingTuiRuntime();
+
+		expect(await executeBuiltinSlashCommand("/routing on", runtime)).toBe(true);
+		expect(settings.get("task.autorouting.enabled")).toBe(true);
+
+		expect(await executeBuiltinSlashCommand("/routing off", runtime)).toBe(true);
+		expect(settings.get("task.autorouting.enabled")).toBe(false);
+		expect(showModelSelector).not.toHaveBeenCalled();
+	});
+
+	it("reports effective tiers for status", () => {
+		expect(
+			buildAutoroutingStatusReport(
+				Settings.isolated({
+					"task.autorouting.enabled": true,
+					"task.autorouting.preset": "anthropic",
+				} as never).getEffectiveAutorouting(),
+			),
+		).toContain("Autorouting: on (preset anthropic)");
+
+		expect(buildAutoroutingStatusReport(Settings.isolated().getEffectiveAutorouting())).toContain("Autorouting: off");
+	});
+}

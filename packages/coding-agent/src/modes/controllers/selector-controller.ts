@@ -2370,7 +2370,7 @@ export class SelectorController {
 		});
 	}
 
-	showModelSelector(options?: { temporaryOnly?: boolean }): void {
+	showModelSelector(options?: { temporaryOnly?: boolean; smartRoutingOnly?: boolean }): void {
 		this.showSelector(done => {
 			let modelSelector: ModelSelectorComponent;
 			const refreshRoleAssignments = () => {
@@ -2643,6 +2643,7 @@ export class SelectorController {
 						this.ctx.session.isFastForSubagentProvider(provider, supportsServiceTier),
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
 					smartRoutingPreview: draft => this.previewSmartRouting(draft),
+					smartRoutingOnly: options?.smartRoutingOnly,
 				},
 			);
 			return { component: modelSelector, focus: modelSelector };
