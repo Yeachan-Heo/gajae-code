@@ -367,6 +367,20 @@ describe("extractPrintableText", () => {
 	it("preserves Kitty CSI-u text-field decoding for supported modifiers", () => {
 		expect(extractPrintableText("\x1b[97;1;229u")).toBe("å");
 	});
+	it("rejects malformed event types, modifier overflow, and control text", () => {
+		for (const data of [
+			"\x1b[97;1:0u",
+			"\x1b[97;1:03u",
+			"\x1b[97;1:4u",
+			"\x1b[97;4294967297u",
+			"\x1b[27;4294967297;97~",
+			"\x1b[127u",
+			"\x1b[128u",
+			"\x1b[97;1;127u",
+		]) {
+			expect(extractPrintableText(data)).toBeUndefined();
+		}
+	});
 });
 describe("KeyId grammar", () => {
 	it("parses canonical keys case-insensitively", () => {

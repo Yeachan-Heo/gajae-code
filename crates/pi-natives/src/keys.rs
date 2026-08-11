@@ -439,6 +439,9 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 	let (prefix, forced_key_plus): (&str, bool) = if s == "+" {
 		("", true)
 	} else if let Some(stripped) = s.strip_suffix("++") {
+		if stripped.is_empty() || stripped.ends_with('+') {
+			return None;
+		}
 		(stripped, true)
 	} else {
 		(s, false)
@@ -446,58 +449,62 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId<'_>> {
 
 	let mut modifier = 0;
 	let mut key: Option<&str> = if forced_key_plus { Some("+") } else { None };
+	let part_count = prefix.split('+').count();
 
-	for part in prefix.split('+') {
+	for (part_index, part) in prefix.split('+').enumerate() {
 		let p = part.trim();
+		if p.is_empty() {
+			if forced_key_plus && part_index + 1 == part_count {
+				continue;
+			}
+			return None;
+		}
 		let [c0, ..] = p.as_bytes() else {
-			continue;
+			return None;
 		};
 
 		match c0 {
 			b'c' | b'C' if p.eq_ignore_ascii_case("ctrl") => {
-				if modifier & MOD_CTRL != 0 {
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_CTRL != 0 {
 					return None;
 				}
 				modifier |= MOD_CTRL;
-				continue;
 			},
 			b's' | b'S' if p.eq_ignore_ascii_case("shift") => {
-				if modifier & MOD_SHIFT != 0 {
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_SHIFT != 0 {
 					return None;
 				}
 				modifier |= MOD_SHIFT;
-				continue;
 			},
 			b'a' | b'A' | b'o' | b'O' | b'm' | b'M'
 				if p.eq_ignore_ascii_case("alt")
 					|| p.eq_ignore_ascii_case("option")
 					|| p.eq_ignore_ascii_case("meta") =>
 			{
-				if modifier & MOD_ALT != 0 {
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_ALT != 0 {
 					return None;
 				}
 				modifier |= MOD_ALT;
-				continue;
 			},
 			b'c' | b'C' if p.eq_ignore_ascii_case("command") || p.eq_ignore_ascii_case("cmd") => {
-				if modifier & MOD_SUPER != 0 {
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_SUPER != 0 {
 					return None;
 				}
 				modifier |= MOD_SUPER;
-				continue;
 			},
 			b's' | b'S' if p.eq_ignore_ascii_case("super") => {
-				if modifier & MOD_SUPER != 0 {
+				if (!forced_key_plus && key.is_some()) || modifier & MOD_SUPER != 0 {
 					return None;
 				}
 				modifier |= MOD_SUPER;
-				continue;
 			},
-			_ => {},
+			_ => {
+				if key.is_some() {
+					return None;
+				}
+				key = Some(p);
+			},
 		}
-
-		// Treat this as the key token (last non-modifier wins)
-		key = Some(p);
 	}
 
 	let mut key = key?;
@@ -1656,6 +1663,10 @@ mod tests {
 		assert!(matches_key_inner(b"\x1b\x1f", "ctrl+alt+_", false));
 		assert!(!matches_key_inner(b"\x1b\x1f", "ctrl+alt+-", false));
 		assert!(matches_key_inner(b"\x1bOP", "F1", false));
+		assert!(parse_key_id("ctrl+").is_none());
+		assert!(parse_key_id("++").is_none());
+		assert!(parse_key_id("foo+p").is_none());
+		assert!(parse_key_id("p+ctrl").is_none());
 	}
 
 	#[test]
