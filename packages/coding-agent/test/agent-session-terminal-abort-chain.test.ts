@@ -790,6 +790,29 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await promptPromise;
 	}, 30_000);
 
+	it("fires the queued steer's SDK ownership hook exactly once when its run accepts", async () => {
+		// Review thread P1: a streaming-diverted SDK turn.prompt accepted while
+		// the old turn is still streaming queues a steer without scheduling its
+		// own continuation, and the per-message onPromoted ownership callback
+		// must survive to the run that eventually accepts the steer — the run
+		// must stay associated with the requesting connection or a later
+		// terminal abort from that client is rejected as non-owner.
+		let promoted = 0;
+		scriptedResponses = [stopReply("ok"), stopReply("steer answered")];
+		await session.prompt("first turn");
+		// Queue the client steer while idle: the auto-continue promotes it into
+		// its OWN run, which fires the ownership hook exactly once.
+		await session.sendUserMessage("client steer", {
+			deliverAs: "steer",
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+		await waitFor(() => !session.agent.hasQueuedSteering(), "steer consumed by its own run");
+		await waitFor(() => promoted === 1, "steer ownership hook fired");
+		expect(promoted).toBe(1);
+	}, 30_000);
+
 	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {
 		// Delta-review P1 regression: the steering purge must NOT
 		// collateral-purge the follow-up queue. An independently requested

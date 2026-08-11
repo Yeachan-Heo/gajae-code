@@ -2027,6 +2027,10 @@ export class AgentSession {
 	// continuation of the aborted attempt that the contract requires to be
 	// blocked (review thread P1).
 	readonly #externalSteerMessages = new WeakSet<AgentMessage>();
+	/** Per-message SDK requester-ownership correlation for queued client steers:
+	 *  fired exactly once when the steer's run accepts it — via the idle
+	 *  auto-continue or the terminal-abort rearm (review thread P1). */
+	readonly #steerPromotionHooks = new WeakMap<AgentMessage, () => void>();
 	/** Monotonic steering admission sequence; the terminal abort snapshots it. */
 	#steeringAdmissionSeq = 0;
 	readonly #externalSteerAdmissionSeq = new WeakMap<AgentMessage, number>();
@@ -10087,6 +10091,7 @@ export class AgentSession {
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
 			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
+			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
 		}
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
@@ -10107,8 +10112,14 @@ export class AgentSession {
 				continueQueuedOnly: true,
 				// The queued steer will start its OWN run: fire the SDK ownership
 				// correlation hook so the submitting connection can terminal-abort
-				// that turn once it starts (review thread P2).
-				onRunAccepted: options?.onPromoted,
+				// that turn once it starts (review thread P2). The per-message
+				// hook is released here so the rearm path (which cannot know
+				// which auto-continue consumed the message) never fires it twice.
+				onRunAccepted: () => {
+					const hook = this.#steerPromotionHooks.get(message);
+					if (hook) this.#steerPromotionHooks.delete(message);
+					options?.onPromoted?.();
+				},
 			});
 		}
 	}
@@ -10175,6 +10186,10 @@ export class AgentSession {
 					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
 					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 					this.#sdkRunTokensByQueuedMessage.delete(message);
+					// A canceled follow-up is never promoted: release its
+					// promotion hook so the callback is not retained for the
+					// session lifetime (review thread P2).
+					this.#followUpPromotionHooks.delete(message);
 				}
 				return removed;
 			},
@@ -11506,6 +11521,26 @@ export class AgentSession {
 					delayMs: 1,
 					generation: this.#promptGeneration,
 					shouldContinue: () => hasPreservedFollowUp() || hasPreservedSteering(),
+					// The rearmed continuation accepts the preserved post-snapshot
+					// steers under a fresh lineage: fire their SDK requester
+					// ownership hooks so the new turn is associated with the
+					// submitting connection — without them a later terminal abort
+					// from that client is rejected as non-owner even though its
+					// accepted prompt is running (review thread P1).
+					onRunAccepted: () => {
+						for (const message of this.agent.snapshotSteering()) {
+							if (
+								this.#externalSteerMessages.has(message) &&
+								(this.#externalSteerAdmissionSeq.get(message) ?? 0) > (abortSteeringSnapshot ?? -1)
+							) {
+								const hook = this.#steerPromotionHooks.get(message);
+								if (hook) {
+									this.#steerPromotionHooks.delete(message);
+									hook();
+								}
+							}
+						}
+					},
 				});
 			}
 		}
