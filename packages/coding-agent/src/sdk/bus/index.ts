@@ -120,6 +120,7 @@ import {
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
 	isSlackComplete,
+	isTelegramOrchestrationSession,
 	type NotificationConfig,
 	type NotificationSettingsReader,
 	resolveGenericNotificationSessionEligibility,
@@ -401,19 +402,21 @@ export function readGitRepoName(cwd: string): string | undefined {
 /** Build the one-time identity header fields for a session thread. */
 function buildIdentity(
 	cwd: string,
-	sessionName?: string,
+	sessionName: string | undefined,
+	telegramTopicsEnabled: boolean,
 ): {
 	repo: string;
 	branch: string;
 	machine: string;
 	title?: string;
+	telegramTopicsEnabled: boolean;
 } {
 	const repo = readGitRepoName(cwd) ?? (path.basename(cwd) || cwd);
 	const branch = readGitBranch(cwd) ?? "(detached)";
 	// Send repo/branch and the raw session title separately; the consumer
 	// composes the topic name ("{repo}/{branch}" before the session title is
 	// auto-generated, then "{repo}/{branch} - {session title}" once it exists).
-	return { repo, branch, machine: os.hostname(), title: sessionName };
+	return { repo, branch, machine: os.hostname(), title: sessionName, telegramTopicsEnabled };
 }
 
 /** Compact cwd label for remote session identity; never emits the full host path by default. */
@@ -3899,6 +3902,8 @@ export function createNotificationsExtension(
 ): void {
 	const terminalAbortSeams = options.terminalAbortSeams;
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
+	const telegramTopicsEnabled =
+		lifecycleStartupCapability !== undefined || isTelegramOrchestrationSession(process.env);
 	const runtimes = new Map<string, SessionRuntime>();
 	const controller =
 		options.controller ??
@@ -3927,6 +3932,7 @@ export function createNotificationsExtension(
 	let extensionShuttingDown = false;
 
 	async function ensureTelegramOwner(settings: Settings): Promise<"ready" | "blocked_identity"> {
+		if (!telegramTopicsEnabled) return "blocked_identity";
 		if (options.ensureTelegramDaemon) {
 			return (await options.ensureTelegramDaemon({ settings })) === "blocked" ? "blocked_identity" : "ready";
 		}
@@ -3939,7 +3945,7 @@ export function createNotificationsExtension(
 		settings: Settings,
 		cfg: NotificationConfig,
 	): Promise<ConfiguredDaemonOwnerResult> {
-		if (isProviderEffectivelyEnabled(cfg, "telegram")) {
+		if (telegramTopicsEnabled && isProviderEffectivelyEnabled(cfg, "telegram")) {
 			const telegramMarker = getCurrentTelegramActivationMarker(cfg);
 			if (telegramMarker) {
 				if (!isProviderEffectivelyEnabled(cfg, "discord") && !isProviderEffectivelyEnabled(cfg, "slack")) {
@@ -4414,7 +4420,7 @@ export function createNotificationsExtension(
 		const fencedConnections = new Set<string>();
 		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
-		// Authoritative bounded reconciliation state for Q26 turn.prompt_status
+		// Authoritative bounded reconciliation state for canonical Q26 turn.result
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
 		// Active records never age into terminal; documented TTL/capacity
 		// eviction is the only removal, after which lookups report `unknown`.
@@ -7123,7 +7129,7 @@ export function createNotificationsExtension(
 			const identityHeader = {
 				type: "identity_header",
 				sessionId: id,
-				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled),
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			// Core SDK authority is published before optional notification adapters acquire
@@ -8019,7 +8025,7 @@ export function createNotificationsExtension(
 			pushSessionFrame(rt, {
 				type: "identity_header",
 				sessionId: id,
-				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName()),
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled),
 			});
 		} catch {}
 		try {

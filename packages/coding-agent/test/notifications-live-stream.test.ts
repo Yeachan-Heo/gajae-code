@@ -19,6 +19,7 @@ import {
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
 import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
+import { withTelegramOrchestrationProvenance } from "./helpers/telegram-topic-test";
 
 // ---------------------------------------------------------------------------
 // 1) Pure render contract: streamed turn frames become editable, and live +
@@ -186,11 +187,13 @@ async function bootSession(
 		eligible: true,
 		getConfig: () => getNotificationConfig(settings),
 	});
-	createNotificationsExtension(api, {
-		settings,
-		controller,
-		ensureTelegramDaemon: options.ensureTelegramDaemon ?? (async () => "attached"),
-	});
+	withTelegramOrchestrationProvenance(() =>
+		createNotificationsExtension(api, {
+			settings,
+			controller,
+			ensureTelegramDaemon: options.ensureTelegramDaemon ?? (async () => "attached"),
+		}),
+	);
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,

@@ -216,8 +216,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 152 contains a thrown steady heartbeat renewal in the run loop
  * (a transient EPERM/EACCES/EBUSY on the state or ownership-lock read) the
  * same way instead of terminating the daemon (#4200).
+ * Generation 153 restricts Telegram forum-topic ownership, replay, routing, callbacks,
+ * and lease renewal to identities with coordinator or lifecycle provenance.
  */
-export const DAEMON_GENERATION = 152;
+export const DAEMON_GENERATION = 153;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

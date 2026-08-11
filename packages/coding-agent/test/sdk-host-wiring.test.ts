@@ -1064,7 +1064,7 @@ test("startup records identity before an early lifecycle event and publishes it 
 		const events = replay.events as Array<Record<string, unknown>>;
 		expect(events.map(event => event.payload)).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ type: "identity_header", sessionId }),
+				expect.objectContaining({ type: "identity_header", sessionId, telegramTopicsEnabled: true }),
 				expect.objectContaining({ type: "activity", sessionId, state: "busy" }),
 			]),
 		);
