@@ -2856,6 +2856,78 @@ describe("FileSessionStorage.deleteSessionVerified artifact-first", () => {
 		expect(await fsp.readFile(path.join(artifactsDir, "replacement.txt"), "utf8")).toBe("foreign");
 		expect(await fsp.readFile(path.join(retained, "authorized.txt"), "utf8")).toBe("authorized");
 	});
+	// Regression for #4273: a POSIX exchange-placeholder transcript scrub that reports
+	// payloadDurable:true with a detachedPath and a retained exchange placeholder must
+	// terminalize as deleted. The native protocol always retains a zero-length scrubbed
+	// placeholder; payloadDurable proves the payload bytes were destroyed before the
+	// placeholder was retained, so the placeholder alone never keeps transcript bytes.
+	it("terminalizes a scrubbed transcript with a durable retained exchange placeholder", async () => {
+		const transcriptPath = await createTranscript("scrubbed-placeholder-terminal");
+		const plannedTranscriptPath = path.join(tempDir, ".gjc-delete-scrubbed-placeholder-transcript");
+		const placeholderPath = path.join(tempDir, ".gjc-exact-unlink-placeholder-scrubbed");
+		const expectedIdentity = verifiedIdentity(transcriptPath);
+		const exactUnlink = native.exactUnlink;
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (identity.directory) return exactUnlink(pathname, identity);
+			fs.renameSync(pathname, plannedTranscriptPath);
+			fs.writeFileSync(plannedTranscriptPath, "");
+			fs.writeFileSync(placeholderPath, "", { mode: 0o600 });
+			return {
+				ok: false,
+				code: "cleanup_pending",
+				payloadDurable: true,
+				detachedPath: plannedTranscriptPath,
+				retainedPlaceholderPath: placeholderPath,
+			};
+		});
+		const target: VerifiedSessionDeleteTarget = {
+			sessionsRoot: tempDir,
+			transcriptPath,
+			sessionId: "session-id",
+			cwd: tempDir,
+			transcriptIdentity: expectedIdentity,
+			plannedTranscriptPath,
+		};
+		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
+		const result = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true });
+		expect(result).toEqual({ kind: "deleted" });
+		expect(fs.existsSync(transcriptPath)).toBe(false);
+		expect(await fsp.readFile(plannedTranscriptPath, "utf8")).toBe("");
+	});
+
+	// Regression for #4273: a transcript-phase cleanup_pending with a retained successor
+	// (a genuine canonical replacement that survived cleanup) must stay cleanup_pending.
+	it("keeps cleanup_pending for a transcript with a retained successor path", async () => {
+		const transcriptPath = await createTranscript("retained-successor-pending");
+		const plannedTranscriptPath = path.join(tempDir, ".gjc-delete-retained-successor-transcript");
+		const successorPath = path.join(tempDir, ".gjc-retained-successor");
+		const expectedIdentity = verifiedIdentity(transcriptPath);
+		const exactUnlink = native.exactUnlink;
+		vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+			if (identity.directory) return exactUnlink(pathname, identity);
+			return {
+				ok: false,
+				code: "cleanup_pending",
+				payloadDurable: true,
+				detachedPath: plannedTranscriptPath,
+				retainedSuccessorPath: successorPath,
+			};
+		});
+		const target: VerifiedSessionDeleteTarget = {
+			sessionsRoot: tempDir,
+			transcriptPath,
+			sessionId: "session-id",
+			cwd: tempDir,
+			transcriptIdentity: expectedIdentity,
+			plannedTranscriptPath,
+		};
+		expect((await storage.deleteSessionVerified(target)).kind).toBe("artifacts_removed");
+		const result = await storage.deleteSessionVerified({ ...target, artifactsRemoved: true });
+		expect(result.kind).toBe("cleanup_pending");
+		if (result.kind !== "cleanup_pending" || result.phase !== "transcript") throw new Error("unreachable");
+		expect(result.retainedSuccessorPath).toBe(successorPath);
+		expect(fs.existsSync(transcriptPath)).toBe(true);
+	});
 });
 
 describe("MemorySessionStorage.deleteSessionVerified parity", () => {

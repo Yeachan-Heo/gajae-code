@@ -91,9 +91,8 @@ async function daemonGlobal(
 			process.execPath,
 			"run",
 			cliEntrypoint,
-			"sdk",
+			"daemon",
 			"session",
-			"raw",
 			"global",
 			"--op",
 			operation,
@@ -201,7 +200,7 @@ test("shipped mcp-serve sdk stdio drives authenticated G03-G07 lifecycle topolog
 	);
 }, 120_000);
 
-test("shipped sdk session raw global CLI drives authenticated G03-G07 lifecycle topology with durable effects", async () => {
+test("shipped daemon session global CLI drives authenticated G03-G07 lifecycle topology with durable effects", async () => {
 	const life = await fixture();
 	await life.invokeScenario((operation, input, idempotencyKey) =>
 		daemonGlobal(life.repo, life.agentDir, operation, input, idempotencyKey),

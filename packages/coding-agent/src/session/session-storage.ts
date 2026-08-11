@@ -641,6 +641,24 @@ function exactUnlinkFailure(result: NativeExactUnlinkResult): SessionDeleteVerif
 				: "stat";
 	return new SessionDeleteVerificationError(kind, `Exact transcript deletion rejected: ${result.code}`);
 }
+/**
+ * A transcript-phase exact unlink is terminal when no live bytes survive. The
+ * native exchange-placeholder protocol on POSIX always retains a zero-length,
+ * descriptor-scrubbed, fsync'd internal recovery entry after scrubbing the
+ * detached transcript; `payloadDurable` proves the payload was destroyed before
+ * that entry was retained, so a placeholder alone never keeps transcript bytes
+ * alive. A retained successor or unknown path is genuine uncertainty and must
+ * stay `cleanup_pending`.
+ */
+function transcriptDeletionTerminal(result: NativeExactUnlinkResult): boolean {
+	if (result.ok) return true;
+	return (
+		result.code === "cleanup_pending" &&
+		(result as typeof result & { payloadDurable?: boolean }).payloadDurable === true &&
+		result.retainedSuccessorPath === undefined &&
+		result.retainedUnknownPath === undefined
+	);
+}
 
 function isValidManagedSecurityContext(value: SessionStorageSecurityContext): value is ManagedSessionSecurityContext {
 	if (
@@ -2654,14 +2672,7 @@ export class FileSessionStorage implements SessionStorage {
 				quarantineName: path.basename(plannedTranscriptPath),
 			});
 			if (!deletion.ok) {
-				if (
-					deletion.code === "cleanup_pending" &&
-					(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
-					deletion.retainedSuccessorPath === undefined &&
-					deletion.retainedUnknownPath === undefined &&
-					deletion.retainedPlaceholderPath === undefined
-				)
-					return { kind: "deleted" };
+				if (transcriptDeletionTerminal(deletion)) return { kind: "deleted" };
 				const error = exactUnlinkFailure(deletion);
 				const retainedAuthority =
 					deletion.detachedPath ||
@@ -2730,14 +2741,7 @@ export class FileSessionStorage implements SessionStorage {
 			quarantineName: path.basename(plannedTranscriptPath),
 		});
 		if (!deletion.ok) {
-			if (
-				deletion.code === "cleanup_pending" &&
-				(deletion as typeof deletion & { payloadDurable?: boolean }).payloadDurable === true &&
-				deletion.retainedSuccessorPath === undefined &&
-				deletion.retainedUnknownPath === undefined &&
-				deletion.retainedPlaceholderPath === undefined
-			)
-				return { kind: "deleted" };
+			if (transcriptDeletionTerminal(deletion)) return { kind: "deleted" };
 			const error = exactUnlinkFailure(deletion);
 			const retainedAuthority =
 				deletion.detachedPath ||
