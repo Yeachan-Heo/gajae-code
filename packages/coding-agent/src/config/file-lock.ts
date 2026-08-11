@@ -312,7 +312,10 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const owner = await tryAcquireLock(lockPath, opts.ownerHostId);
-		if (owner) return () => releaseLock(lockPath, owner);
+		if (owner) {
+			opts.onAcquired?.();
+			return () => releaseLock(lockPath, owner);
+		}
 		const stale = await staleLockSnapshot(lockPath, opts.staleMs, opts.ownerHostId, contentionStartTimes);
 		if (await removeStaleLockForAcquire(lockPath, stale)) continue;
 		if (!opts.signal) {
@@ -344,7 +347,6 @@ export async function withFileLock<T>(
 	options: FileLockOptions = {},
 ): Promise<T> {
 	const release = await acquireLock(filePath, options);
-	options.onAcquired?.();
 	let result: T;
 	try {
 		result = await fn();
