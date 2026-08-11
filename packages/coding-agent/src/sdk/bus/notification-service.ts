@@ -883,12 +883,12 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 			// `acquireDaemonOwnership` then answers `provisional`, which `ensureTelegramDaemonRunning`
 			// reports as `blocked_identity`: no transport is ever attached and no
 			// notification is ever published, while the owner keeps heartbeating. Reporting
-			// that as OK is what makes the outage invisible; the generation is inventory
-			// metadata that never forces a reload on its own, so the operator has to.
+			// that as OK is what makes the outage invisible. Recovery is platform-dependent,
+			// so health identifies the condition without prescribing an unsupported command.
 			checks.push({
 				name: "daemon",
 				level: "warn",
-				detail: `daemon pid ${daemon.pid} serves generation ${daemon.generation ?? "unknown"} but this build attaches only to generation ${daemon.currentGeneration}; it cannot attach a session transport — run \`gjc daemon reload\``,
+				detail: `daemon pid ${daemon.pid} serves generation ${daemon.generation ?? "unknown"} but this build attaches only to generation ${daemon.currentGeneration}; it cannot attach a session transport — inspect daemon lifecycle status before attempting recovery`,
 			});
 		} else {
 			checks.push({ name: "daemon", level: "ok", detail: `daemon pid ${daemon.pid} alive with a fresh heartbeat` });

@@ -464,7 +464,7 @@ describe("notification-service health", () => {
 		expect(report.checks.find(check => check.name === "daemon")).toEqual({
 			name: "daemon",
 			level: "warn",
-			detail: `daemon pid 1000 serves generation ${servedGeneration} but this build attaches only to generation ${DAEMON_GENERATION}; it cannot attach a session transport — run \`gjc daemon reload\``,
+			detail: `daemon pid 1000 serves generation ${servedGeneration} but this build attaches only to generation ${DAEMON_GENERATION}; it cannot attach a session transport — inspect daemon lifecycle status before attempting recovery`,
 		});
 		expect(report.overall).toBe("warn");
 	});
