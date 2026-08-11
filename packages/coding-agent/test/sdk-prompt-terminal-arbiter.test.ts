@@ -70,8 +70,8 @@ describe("SDK prompt terminal arbiter", () => {
 		const { reconciliation, store } = await accepted();
 		const first = stopped("end_turn");
 
-		expect(await reconciliation.claimPendingOutcome(correlation, first)).toEqual(first);
-		expect(await reconciliation.claimPendingOutcome(correlation, stopped("cancelled"))).toEqual(first);
+		expect(await reconciliation.claimPendingOutcome(correlation, first, "missing")).toEqual(first);
+		expect(await reconciliation.claimPendingOutcome(correlation, stopped("cancelled"), "missing")).toEqual(first);
 		expect(reconciliation.peekPendingOutcome(correlation)).toEqual(first);
 		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({ status: "accepted" });
 		expect(reconciliation.lookup("prompt", correlation)).not.toHaveProperty("outcome");
@@ -85,7 +85,7 @@ describe("SDK prompt terminal arbiter", () => {
 		for (const reason of ["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"] as const) {
 			const { reconciliation } = await accepted();
 			const outcome = stopped(reason);
-			await reconciliation.claimPendingOutcome(correlation, outcome);
+			await reconciliation.claimPendingOutcome(correlation, outcome, "missing");
 			await reconciliation.finalizePromptOutcome(correlation);
 
 			expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
@@ -99,7 +99,7 @@ describe("SDK prompt terminal arbiter", () => {
 		for (const code of ["prompt_failed", "prompt_deadline_exceeded"] as const) {
 			const { reconciliation } = await accepted();
 			const outcome = failed(code);
-			await reconciliation.claimPendingOutcome(correlation, outcome);
+			await reconciliation.claimPendingOutcome(correlation, outcome, "missing");
 			await reconciliation.finalizePromptOutcome(correlation);
 			expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
 				status: "failed",
@@ -109,7 +109,7 @@ describe("SDK prompt terminal arbiter", () => {
 		}
 
 		const { reconciliation } = await accepted();
-		await reconciliation.claimPendingOutcome(correlation, failed("prompt_failed"));
+		await reconciliation.claimPendingOutcome(correlation, failed("prompt_failed"), "missing");
 		await reconciliation.finalizePromptOutcome(correlation, undefined, { code: "overridden", message: "override" });
 		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
 			status: "failed",
@@ -121,7 +121,7 @@ describe("SDK prompt terminal arbiter", () => {
 		const { reconciliation, store } = await accepted();
 		store.failNext();
 
-		await expect(reconciliation.claimPendingOutcome(correlation, stopped("end_turn"))).rejects.toThrow(
+		await expect(reconciliation.claimPendingOutcome(correlation, stopped("end_turn"), "missing")).rejects.toThrow(
 			"persist failed",
 		);
 		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({ status: "accepted" });
@@ -137,7 +137,7 @@ describe("SDK prompt terminal arbiter", () => {
 		const claimEntered = Promise.withResolvers<void>();
 		store.holdNext(held.promise, claimEntered.resolve);
 
-		const claim = reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
+		const claim = reconciliation.claimPendingOutcome(correlation, stopped("end_turn"), "missing");
 		await claimEntered.promise;
 		const skill = reconciliation.noteAccepted("skill", { commandId: "skill-command", turnId: "skill-turn" });
 		held.resolve();
@@ -173,7 +173,7 @@ describe("SDK prompt terminal arbiter", () => {
 	});
 	test("surfaces a late agent_failed reason on a terminal_ok record through the production lookup and persists it", async () => {
 		const { reconciliation, store } = await accepted();
-		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
+		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"), "missing");
 		await reconciliation.finalizePromptOutcome(correlation);
 
 		const settled = reconciliation.lookup("prompt", correlation);
@@ -200,7 +200,7 @@ describe("SDK prompt terminal arbiter", () => {
 
 	test("keeps the first late reason when later agent_failed frames disagree", async () => {
 		const { reconciliation } = await accepted();
-		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
+		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"), "missing");
 		await reconciliation.finalizePromptOutcome(correlation);
 		await reconciliation.noteTransition("prompt", correlation, {
 			type: "agent_failed",
@@ -218,7 +218,7 @@ describe("SDK prompt terminal arbiter", () => {
 
 	test("does not enrich a terminal record with a late agent_start or agent_end", async () => {
 		const { reconciliation } = await accepted();
-		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"));
+		await reconciliation.claimPendingOutcome(correlation, stopped("end_turn"), "missing");
 		await reconciliation.finalizePromptOutcome(correlation);
 		const before = reconciliation.lookup("prompt", correlation);
 		await reconciliation.noteTransition("prompt", correlation, { type: "agent_start" });

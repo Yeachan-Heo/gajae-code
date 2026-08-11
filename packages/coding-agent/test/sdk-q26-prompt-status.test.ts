@@ -28,6 +28,7 @@ describe("prompt reconciliation record", () => {
 		rec.noteAccepted(correlation(), "ref-1");
 		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
 			status: "accepted",
+			receiptState: "absent",
 			commandId: "command-1",
 			turnId: "turn-1",
 			clientRef: "ref-1",
@@ -36,6 +37,7 @@ describe("prompt reconciliation record", () => {
 		rec.noteTransition(correlation(), { type: "agent_start" });
 		expect(rec.lookup({ clientRef: "ref-1" })).toEqual({
 			status: "in_flight",
+			receiptState: "absent",
 			commandId: "command-1",
 			turnId: "turn-1",
 			clientRef: "ref-1",
@@ -45,6 +47,7 @@ describe("prompt reconciliation record", () => {
 		rec.noteTransition(correlation(), { type: "agent_end" });
 		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
 			status: "terminal_ok",
+			receiptState: "missing",
 			commandId: "command-1",
 			turnId: "turn-1",
 			clientRef: "ref-1",
@@ -101,8 +104,14 @@ describe("prompt reconciliation record", () => {
 	it("reports unknown for a wrong commandId/turnId pair even when the commandId exists", () => {
 		const rec = createPromptReconciliation();
 		rec.noteAccepted(correlation());
-		expect(rec.lookup({ commandId: "command-1", turnId: "turn-other" })).toEqual({ status: "unknown" });
-		expect(rec.lookup({ commandId: "command-other", turnId: "turn-1" })).toEqual({ status: "unknown" });
+		expect(rec.lookup({ commandId: "command-1", turnId: "turn-other" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
+		expect(rec.lookup({ commandId: "command-other", turnId: "turn-1" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
 	});
 
 	it("reports unknown after session-runtime restart", () => {
@@ -110,8 +119,8 @@ describe("prompt reconciliation record", () => {
 		beforeRestart.noteAccepted(correlation(), "restart-ref");
 		expect(beforeRestart.lookup({ clientRef: "restart-ref" })).toMatchObject({ status: "accepted" });
 		const afterRestart = createPromptReconciliation();
-		expect(afterRestart.lookup({ clientRef: "restart-ref" })).toEqual({ status: "unknown" });
-		expect(afterRestart.lookup(correlation())).toEqual({ status: "unknown" });
+		expect(afterRestart.lookup({ clientRef: "restart-ref" })).toEqual({ status: "unknown", receiptState: "unknown" });
+		expect(afterRestart.lookup(correlation())).toEqual({ status: "unknown", receiptState: "unknown" });
 	});
 
 	it("never ages an active record into terminal", () => {
@@ -134,8 +143,11 @@ describe("prompt reconciliation record", () => {
 		clock.advance(PROMPT_RECONCILIATION_TERMINAL_TTL_MS);
 		// Admission itself enforces cleanup; no preceding lookup is required.
 		expect(() => rec.admit("ref-1")).not.toThrow();
-		expect(rec.lookup({ clientRef: "ref-1" })).toEqual({ status: "unknown" });
-		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({ status: "unknown" });
+		expect(rec.lookup({ clientRef: "ref-1" })).toEqual({ status: "unknown", receiptState: "unknown" });
+		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
 	});
 
 	it("rejects a retained duplicate clientRef before execution", () => {
@@ -175,7 +187,10 @@ describe("prompt reconciliation record", () => {
 			rec.noteTransition(correlation(n), { type: "agent_end" });
 			clock.advance(1);
 		}
-		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({ status: "unknown" });
+		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
 		expect(
 			rec.lookup({
 				commandId: `command-${PROMPT_RECONCILIATION_TERMINAL_CAPACITY + 1}`,
@@ -198,7 +213,10 @@ describe("prompt reconciliation record", () => {
 		// must drop the oldest terminal record, not the newly terminal one.
 		rec.noteTransition({ commandId: "command-early", turnId: "turn-early" }, { type: "agent_end" });
 		expect(rec.lookup({ clientRef: "ref-early" })).toMatchObject({ status: "terminal_ok" });
-		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({ status: "unknown" });
+		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
 	});
 
 	it("holds admission reservations across overlapping preflights until acceptance or release", () => {
@@ -334,6 +352,7 @@ describe("prompt reconciliation record", () => {
 			acceptedAt: startedAt,
 			startedAt,
 			terminalAt,
+			receiptState: "missing",
 			error: { code: "transport_reset", message: "Prompt submission failed." },
 		});
 		expect(rec.activeCount()).toBe(0);

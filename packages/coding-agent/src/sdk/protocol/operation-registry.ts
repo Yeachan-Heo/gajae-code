@@ -161,6 +161,7 @@ const queries = [
 
 	["providers.list/active", "List active providers."],
 	["session.checkpoint", "Resolve a durable transcript checkpoint into a connection-owned replay cursor."],
+	["turn.steer_status", "Read the durable acknowledgement status of a correlated steer by clientRef."],
 ] as const;
 
 const reverse = [
@@ -207,6 +208,7 @@ function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
 function controlErrors(id: string): string[] {
 	const errors: Record<string, string[]> = {
 		C01: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
+		C02: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C09: ["client_ref_conflict", "reconciliation_capacity", "reconciliation_persist_failed"],
 		C06: ["action_claimed"],
 		C07: ["action_claimed", "terminal_uncertain"],
@@ -249,7 +251,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q28", "Q29", "Q30"].includes(id))
+	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q28", "Q29", "Q30", "Q31"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }

@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from "node:crypto";
+
 /**
  * Kind-aware invocation reconciliation (prompt | skill) with optional durable store.
  * Preserves Q26 admit/first-terminal/capacity/TTL semantics; indexes and caps are per-kind.
@@ -5,21 +7,36 @@
 
 import { sanitizePromptFailure } from "../prompt-failure";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome, TurnPromptReconciliation } from "../prompt-status";
+import type { ReceiptState } from "../receipt-state";
 import { sanitizeTurnResultContent, type TurnResultContent, type TurnResultPage } from "../turn-result";
-
 import {
 	PROMPT_RECONCILIATION_ACTIVE_CAPACITY,
 	PROMPT_RECONCILIATION_TERMINAL_CAPACITY,
 	PROMPT_RECONCILIATION_TERMINAL_TTL_MS,
 	type PromptCorrelation,
 } from "./prompt-reconciliation";
-import type { DurableReconciliationRecord, ReconciliationKind, ReconciliationStore } from "./reconciliation-store";
+import type {
+	DurableReconciliationRecord,
+	DurableSteerReconciliationRecord,
+	ReconciliationKind,
+	ReconciliationStore,
+} from "./reconciliation-store";
 
 export type { ReconciliationKind };
 
 export interface KindCorrelation extends PromptCorrelation {
 	kind: ReconciliationKind;
 	content?: TurnResultContent;
+}
+
+export interface SteerReconciliationResult {
+	commandId: string;
+	turnId: string;
+	clientRef: string;
+	status: "accepted" | "rejected" | "uncertain";
+	acceptedAt: number;
+	terminalAt?: number;
+	error?: { code: string; message: string };
 }
 
 export interface KindAwareReconciliation {
@@ -41,6 +58,7 @@ export interface KindAwareReconciliation {
 	claimPendingOutcome(
 		correlation: PromptCorrelation,
 		outcome: SdkPromptTerminalOutcome,
+		receiptState: Extract<ReceiptState, "present" | "missing">,
 	): Promise<SdkPromptTerminalOutcome>;
 	finalizePromptOutcome(
 		correlation: PromptCorrelation,
@@ -57,6 +75,15 @@ export interface KindAwareReconciliation {
 		kind: ReconciliationKind,
 		selector: { commandId?: string; turnId?: string; clientRef?: string },
 	): TurnResultPage;
+	reserveSteer(clientRef: string, text: string): Promise<{ replay: boolean; result: SteerReconciliationResult }>;
+	settleSteer(
+		clientRef: string,
+		status: "accepted" | "rejected" | "uncertain",
+		error?: unknown,
+	): Promise<SteerReconciliationResult>;
+	lookupSteer(
+		selector: string | { commandId?: string; turnId?: string; clientRef?: string },
+	): SteerReconciliationResult | { clientRef?: string; status: "unknown" };
 	cleanup(): void;
 	activeCount(kind: ReconciliationKind): number;
 	/** Hydrate from durable store (call once at session host start). */
@@ -77,26 +104,54 @@ export function createKindAwareReconciliation(
 	const keyOf = (kind: ReconciliationKind, correlation: PromptCorrelation) =>
 		`${kind}:${correlation.commandId}:${correlation.turnId}`;
 	const refKey = (kind: ReconciliationKind, clientRef: string) => `${kind}\0${clientRef}`;
+	const steerKey = (clientRef: string) => `steer:${clientRef}`;
+	const steerResult = (record: DurableSteerReconciliationRecord): SteerReconciliationResult => ({
+		commandId: record.commandId,
+		turnId: record.turnId,
+		clientRef: record.clientRef,
+		status: record.status === "dispatching" ? "uncertain" : record.status,
+		acceptedAt: record.acceptedAt,
+		...(record.status !== "dispatching" && record.status !== "accepted" ? { terminalAt: record.settledAt } : {}),
+		...(record.error
+			? { error: record.error }
+			: record.status === "dispatching"
+				? { error: { code: "delivery_uncertain", message: "Steer delivery is still dispatching or uncertain." } }
+				: {}),
+	});
 
 	const indexRecords = (source: Map<string, DurableReconciliationRecord>) => {
 		const index = new Map<string, string>();
 		for (const [key, record] of source)
-			if (record.clientRef !== undefined) index.set(refKey(record.kind, record.clientRef), key);
+			if (record.kind !== "steer" && record.clientRef !== undefined)
+				index.set(refKey(record.kind, record.clientRef), key);
 		return index;
 	};
 
 	const cleanupRecords = (source: Map<string, DurableReconciliationRecord>) => {
 		const at = now();
-		for (const [key, record] of source)
-			if (record.terminalAt !== undefined && record.terminalAt + PROMPT_RECONCILIATION_TERMINAL_TTL_MS <= at)
-				source.delete(key);
+		for (const [key, record] of source) {
+			const terminalAt = record.kind === "steer" ? record.settledAt : record.terminalAt;
+			if (terminalAt !== undefined && terminalAt + PROMPT_RECONCILIATION_TERMINAL_TTL_MS <= at) source.delete(key);
+		}
 		for (const kind of ["prompt", "skill"] as const) {
 			const terminalEntries = [...source.entries()].filter(
 				([, record]) => record.kind === kind && record.terminalAt !== undefined,
 			);
 			if (terminalEntries.length <= PROMPT_RECONCILIATION_TERMINAL_CAPACITY) continue;
-			terminalEntries.sort((a, b) => (a[1].terminalAt as number) - (b[1].terminalAt as number));
+			terminalEntries.sort(
+				(a, b) =>
+					((a[1].kind === "steer" ? a[1].settledAt : a[1].terminalAt) as number) -
+					((b[1].kind === "steer" ? b[1].settledAt : b[1].terminalAt) as number),
+			);
 			for (const [key] of terminalEntries.slice(0, terminalEntries.length - PROMPT_RECONCILIATION_TERMINAL_CAPACITY))
+				source.delete(key);
+		}
+		const settledSteers: Array<[string, DurableSteerReconciliationRecord]> = [];
+		for (const [key, record] of source)
+			if (record.kind === "steer" && record.settledAt !== undefined) settledSteers.push([key, record]);
+		if (settledSteers.length > PROMPT_RECONCILIATION_TERMINAL_CAPACITY) {
+			settledSteers.sort((a, b) => (a[1].settledAt as number) - (b[1].settledAt as number));
+			for (const [key] of settledSteers.slice(0, settledSteers.length - PROMPT_RECONCILIATION_TERMINAL_CAPACITY))
 				source.delete(key);
 		}
 	};
@@ -122,6 +177,67 @@ export function createKindAwareReconciliation(
 		return await pending;
 	};
 
+	const reserveSteer = async (clientRef: string, text: string) => {
+		const textDigest = createHash("sha256").update(text).digest("hex");
+		return await queueMutation(candidate => {
+			cleanupRecords(candidate);
+			const existing = candidate.get(steerKey(clientRef));
+			if (existing?.kind === "steer") {
+				if (existing.textDigest !== textDigest)
+					throw Object.assign(new Error("clientRef is already bound to different steer text."), {
+						code: "client_ref_conflict",
+					});
+				return { value: { replay: true, result: steerResult(existing) }, changed: false };
+			}
+			const correlation = { commandId: randomUUID(), turnId: randomUUID() };
+			const record: DurableSteerReconciliationRecord = {
+				kind: "steer",
+				...correlation,
+				clientRef,
+				textDigest,
+				createdAt: now(),
+				acceptedAt: now(),
+				status: "dispatching",
+			};
+			candidate.set(steerKey(clientRef), record);
+			return { value: { replay: false, result: steerResult(record) }, changed: true };
+		});
+	};
+
+	const settleSteer = async (clientRef: string, status: "accepted" | "rejected" | "uncertain", error?: unknown) =>
+		await queueMutation(candidate => {
+			const record = candidate.get(steerKey(clientRef));
+			if (record?.kind !== "steer")
+				throw Object.assign(new Error("Unknown steer clientRef."), { code: "unknown_client_ref" });
+			if (record.status !== "dispatching") return { value: steerResult(record), changed: false };
+			record.status = status;
+			record.settledAt = now();
+			if (status !== "accepted") record.error = sanitizePromptFailure(error);
+			cleanupRecords(candidate);
+			return { value: steerResult(record), changed: true };
+		});
+
+	const lookupSteer = (selector: string | { commandId?: string; turnId?: string; clientRef?: string }) => {
+		const record =
+			typeof selector === "string"
+				? records.get(steerKey(selector))
+				: selector.clientRef !== undefined
+					? records.get(steerKey(selector.clientRef))
+					: selector.commandId !== undefined && selector.turnId !== undefined
+						? [...records.values()].find(
+								candidate =>
+									candidate.kind === "steer" &&
+									candidate.commandId === selector.commandId &&
+									candidate.turnId === selector.turnId,
+							)
+						: undefined;
+		return record?.kind === "steer"
+			? steerResult(record)
+			: typeof selector === "string"
+				? { clientRef: selector, status: "unknown" as const }
+				: { status: "unknown" as const };
+	};
+
 	const reservedFor = (kind: ReconciliationKind) => {
 		let set = reservedClientRefs.get(kind);
 		if (!set) {
@@ -138,7 +254,8 @@ export function createKindAwareReconciliation(
 
 	const activeCount = (kind: ReconciliationKind) => {
 		let count = 0;
-		for (const record of records.values()) if (record.kind === kind && record.terminalAt === undefined) count++;
+		for (const record of records.values())
+			if (record.kind !== "steer" && record.kind === kind && record.terminalAt === undefined) count++;
 		return count;
 	};
 
@@ -207,7 +324,7 @@ export function createKindAwareReconciliation(
 		if (!correlation) return;
 		await queueMutation(candidate => {
 			const record = candidate.get(keyOf(kind, correlation));
-			if (!record) return { value: undefined, changed: false };
+			if (!record || record.kind === "steer") return { value: undefined, changed: false };
 			if (record.terminalAt !== undefined) {
 				// The terminal is claimed by one delivery path while the reason arrives on
 				// another, so ordering is not the caller's to control. A late agent_failed
@@ -227,16 +344,18 @@ export function createKindAwareReconciliation(
 				record.status = "in_flight";
 				record.startedAt = now();
 				if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
-
 				return { value: undefined, changed: true };
 			}
 			record.terminalAt = now();
 			if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
-
 			if (frame.type === "agent_failed") {
 				record.status = "failed";
 				record.error = sanitizePromptFailure(frame.error);
-			} else record.status = "terminal_ok";
+				record.receiptState = frame.content?.text?.trim() ? "present" : "missing";
+			} else {
+				record.status = "terminal_ok";
+				record.receiptState = frame.content?.text?.trim() ? "present" : "missing";
+			}
 			cleanupRecords(candidate);
 			return { value: undefined, changed: true };
 		});
@@ -245,13 +364,14 @@ export function createKindAwareReconciliation(
 	const claimPendingOutcome = async (
 		correlation: PromptCorrelation,
 		outcome: SdkPromptTerminalOutcome,
+		receiptState: Extract<ReceiptState, "present" | "missing">,
 	): Promise<SdkPromptTerminalOutcome> =>
 		await queueMutation(candidate => {
 			const record = candidate.get(keyOf("prompt", correlation));
-			if (!record || record.terminalAt !== undefined || record.kind !== "prompt")
-				return { value: outcome, changed: false };
+			if (record?.kind !== "prompt" || record.terminalAt !== undefined) return { value: outcome, changed: false };
 			if (record.pendingOutcome !== undefined) return { value: record.pendingOutcome, changed: false };
 			record.pendingOutcome = outcome;
+			record.pendingReceiptState = receiptState;
 			return { value: outcome, changed: true };
 		});
 
@@ -263,8 +383,7 @@ export function createKindAwareReconciliation(
 	) => {
 		await queueMutation(candidate => {
 			const record = candidate.get(keyOf("prompt", correlation));
-			if (!record || record.terminalAt !== undefined || record.kind !== "prompt")
-				return { value: undefined, changed: false };
+			if (record?.kind !== "prompt" || record.terminalAt !== undefined) return { value: undefined, changed: false };
 			const finalOutcome = outcome ?? record.pendingOutcome;
 			record.terminalAt = now();
 			if (finalOutcome?.kind === "failed") {
@@ -273,14 +392,18 @@ export function createKindAwareReconciliation(
 			} else record.status = "terminal_ok";
 			record.content = sanitizeTurnResultContent(content);
 			record.outcome = finalOutcome;
+			record.receiptState = record.pendingReceiptState ?? "unknown";
 			record.pendingOutcome = undefined;
+			record.pendingReceiptState = undefined;
 			cleanupRecords(candidate);
 			return { value: undefined, changed: true };
 		});
 	};
 
-	const peekPendingOutcome = (correlation: PromptCorrelation) =>
-		records.get(keyOf("prompt", correlation))?.pendingOutcome;
+	const peekPendingOutcome = (correlation: PromptCorrelation) => {
+		const record = records.get(keyOf("prompt", correlation));
+		return record?.kind === "prompt" ? record.pendingOutcome : undefined;
+	};
 
 	const lookup = (
 		kind: ReconciliationKind,
@@ -294,20 +417,22 @@ export function createKindAwareReconciliation(
 					? keyOf(kind, { commandId: selector.commandId, turnId: selector.turnId })
 					: undefined;
 		const record = key === undefined ? undefined : records.get(key);
-		if (!record) return { status: "unknown" };
+		if (!record) return { status: "unknown", receiptState: "unknown" };
+		if (record.kind === "steer") return { status: "unknown", receiptState: "unknown" };
 		const identity = {
 			commandId: record.commandId,
 			turnId: record.turnId,
 			...(record.clientRef !== undefined ? { clientRef: record.clientRef } : {}),
 			acceptedAt: record.acceptedAt,
 		};
-		if (record.status === "accepted") return { status: "accepted", ...identity };
+		if (record.status === "accepted") return { status: "accepted", receiptState: "absent", ...identity };
 		if (record.status === "in_flight")
-			return { status: "in_flight", ...identity, startedAt: record.startedAt as number };
+			return { status: "in_flight", receiptState: "absent", ...identity, startedAt: record.startedAt as number };
 		const terminal = {
 			...identity,
 			...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
 			terminalAt: record.terminalAt as number,
+			receiptState: record.receiptState ?? "unknown",
 			...(record.outcome !== undefined ? { outcome: record.outcome } : {}),
 		};
 		if (record.status === "terminal_ok")
@@ -331,7 +456,7 @@ export function createKindAwareReconciliation(
 					? keyOf(kind, { commandId: selector.commandId, turnId: selector.turnId })
 					: undefined;
 		const record = key === undefined ? undefined : records.get(key);
-		if (!record) return { status: "unknown" };
+		if (!record || record.kind === "steer") return { status: "unknown" };
 		const identity = {
 			kind: record.kind,
 			commandId: record.commandId,
@@ -347,14 +472,38 @@ export function createKindAwareReconciliation(
 			terminalAt: record.terminalAt as number,
 			...(record.content !== undefined ? { content: record.content } : {}),
 		};
-		if (record.status === "terminal_ok") return { status: "terminal_ok", ...terminal };
+		if (record.status === "terminal_ok")
+			return {
+				status: "terminal_ok",
+				...terminal,
+				...(record.error !== undefined ? { error: record.error } : {}),
+			};
 		return { status: "failed", ...terminal, error: record.error ?? sanitizePromptFailure(undefined) };
 	};
 	const hydrateFromStore = async () => {
 		if (!store) return;
 		const run = async () => {
 			const loaded = await store.load();
-			const candidate = new Map(loaded.map(record => [keyOf(record.kind, record), { ...record }] as const));
+			const candidate = new Map(
+				loaded.map(record => {
+					const hydrated =
+						record.kind === "steer" && record.status === "accepted"
+							? {
+									...record,
+									status: "uncertain" as const,
+									settledAt: now(),
+									error: {
+										code: "process_restart_uncertain",
+										message: "Steer delivery cannot be proven after process restart.",
+									},
+								}
+							: { ...record };
+					return [
+						record.kind === "steer" ? steerKey(record.clientRef) : keyOf(record.kind, record),
+						hydrated,
+					] as const;
+				}),
+			);
 			const candidateIndex = indexRecords(candidate);
 			await store.transact(() => [...candidate.values()].map(record => ({ ...record })));
 			records = candidate;
@@ -381,6 +530,9 @@ export function createKindAwareReconciliation(
 		cleanup,
 		activeCount,
 		hydrateFromStore,
+		reserveSteer,
+		settleSteer,
+		lookupSteer,
 	};
 }
 

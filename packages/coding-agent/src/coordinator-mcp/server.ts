@@ -20,6 +20,7 @@ import { lifecycleRequestTimeoutMs } from "../sdk/broker/startup-budget";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
 import { SdkClient, SdkClientError } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
+import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { type SessionAttachment, SessionRouter, type SessionRouterDeps, SessionRouterError } from "../sdk/router";
 import {
 	type ActivatedPreparedSession,
@@ -165,10 +166,11 @@ interface CoordinatorFinalResponse {
 	truncated: boolean;
 }
 
-function reportableFinalResponse(response: CoordinatorFinalResponse): boolean {
-	return (
-		(typeof response.text === "string" && response.text.trim().length > 0) ||
-		(typeof response.artifact_path === "string" && response.artifact_path.trim().length > 0)
+function reportableFinalResponse(response: CoordinatorFinalResponse | undefined): boolean {
+	return Boolean(
+		response &&
+			((typeof response.text === "string" && response.text.trim().length > 0) ||
+				(typeof response.artifact_path === "string" && response.artifact_path.trim().length > 0)),
 	);
 }
 
@@ -1985,7 +1987,12 @@ async function markTurnTerminalFromSessionState(
 	turn: TurnRecord,
 	sessionState: CoordinatorSessionState,
 ): Promise<TurnRecord> {
-	const terminalStatus: TurnStatus = sessionState.state === "errored" ? "failed" : "completed";
+	const receiptState = reduceTerminalReceiptState({
+		execution: sessionState.state === "errored" ? "failed" : "completed",
+		reportable: reportableFinalResponse((sessionState as RuntimeSessionStatePayload).final_response),
+	});
+	const terminalStatus: TurnStatus =
+		receiptState.receipt === "missing" ? "failed" : sessionState.state === "errored" ? "failed" : "completed";
 	const runtimeState = sessionState as RuntimeSessionStatePayload;
 	const finalResponse = runtimeState.final_response ?? {
 		text: null,
@@ -2004,24 +2011,21 @@ async function markTurnTerminalFromSessionState(
 			state: "acknowledged",
 		},
 		final_response: finalResponse,
-		evidence: reportableFinalResponse(finalResponse)
-			? turn.evidence
-			: [
-					...turn.evidence,
-					{
-						type: MISSING_FINAL_RESPONSE_ADVISORY,
-						message: "Runtime completed without reportable final_response text or artifact_path.",
-						created_at: timestamp,
-					},
-				],
+		evidence: turn.evidence,
 		error:
-			terminalStatus === "failed"
-				? (runtimeState.error ?? {
-						code: "runtime_errored",
-						message: sessionState.reason ?? "runtime_errored",
+			receiptState.receipt === "missing"
+				? {
+						code: "receipt_missing",
+						message: "Runtime completed without reportable final_response text or artifact_path.",
 						recoverable: true,
-					})
-				: null,
+					}
+				: terminalStatus === "failed"
+					? (runtimeState.error ?? {
+							code: "runtime_errored",
+							message: sessionState.reason ?? "runtime_errored",
+							recoverable: true,
+						})
+					: null,
 		updated_at: timestamp,
 		completed_at: timestamp,
 	};

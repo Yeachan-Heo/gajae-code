@@ -5,6 +5,8 @@
 ## [0.13.1] - 2026-08-11
 
 ### Added
+- Terminal receipt state and correlated steering are now durable. Prompt reconciliation tracks whether a terminal turn produced reportable output (`present`/`missing`/`unknown`), failing closed as `receipt_missing` when a completed turn has no final response. `turn.steer` with a `clientRef` hashes the validated text (SHA-256) and durably reserves dispatch before queueing, deduplicating replays, rejecting conflicting text, and settling to `accepted`/`rejected`/`uncertain`. The new `turn.steer_status` query (Q31) looks up durable steer status by `clientRef` or canonical `commandId`/`turnId` pair. Steer delivery is uncertain after process restart; settled records share the 15-minute/256-record retention bound.
+
 - `/model <preset>` and `/model gajae-code/<preset>` now activate a known model profile immediately instead of failing with "Unknown model". Unknown names still fall through to model resolution, and `/model <role> <preset>` keeps assigning a model to the named role.
 - Browser `act` and `run` responses can now surface an opt-in (`open(..., { diagnostics: true })`), bounded mailbox of page exceptions and `console.error` metadata. Entries carry only kind, timestamp, origin-only URL, line/column, and an allowlisted built-in error class; path segments, query strings, messages, arguments, values, and stacks are never retained. Serialization is byte-bounded with an explicit truncation marker.
 - A generated, host-neutral `sdk-skills/` bundle now provides namespaced external-agent skills for direct GJC SDK session discovery, approved trusted-local operations, and TypeScript/Python script authoring, with deterministic drift checks and credential-safe fail-closed templates. The bundle carries a versioned `manifest.json` (format version 1) so installed bundles fail closed on missing or unsupported layouts, and the skill prompts are authored as static Markdown sources under `scripts/gjc-sdk-skills/prompts/` that the generator copies and validates.
@@ -167,6 +169,9 @@
 
 ### Fixed
 - Telegram topic archival no longer corrupts the shared topic registry when an active topic first enters disconnect grace. `beginArchive` changed `authorityState` to `archive_pending` but retained `disconnectGraceExpiresAt`, a field the persisted-state parser permits only for `disconnect_grace`; one closed or stale session therefore made the entire otherwise-valid registry unreadable, after which every daemon scan reported `shared topic authority unavailable` and no new session could create a thread or replay a message. Every transition out of disconnect grace now clears the grace-only deadline before persistence. `DAEMON_GENERATION` bumped to 57.
+
+- Added dual execution/receipt terminal truth across SDK reconciliation, runtime sidecars, and coordinator turns. Empty terminal output now fails closed as `receipt_missing`, while version-1 records without additive receipt fields remain readable as `unknown`.
+- Added retry-safe correlated `turn.steer` acknowledgement and Q30 `turn.steer_status`. GJC durably reserves a SHA-256 digest before dispatch, replays retained status without duplicate steering, and preserves uncertain delivery across restart without storing steer text.
 
 - `notifications-topic-registry.test.ts` pins `DAEMON_GENERATION` at 54 after #3965 (was stale at 53; Dev CI run 31133356543).
 - `smithery-env-trust.test.ts` no longer awaits hung probe pipes past a hard per-attempt deadline: minimal child env, `stdin: "ignore"`, SIGKILL + settled race, and up to 2 timeout-only retries. Fixes the inherited-config case that hit exactly 60001ms on Dev CI run 31133356543 after kill-at-45s left `Promise.all` on stdout/stderr unresolved. Assertions unchanged.

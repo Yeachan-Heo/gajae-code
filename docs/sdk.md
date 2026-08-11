@@ -340,6 +340,8 @@ The authoritative public reconciliation query is `Q26` /
 field is exposed only after finalization. A pending claim is never represented
 or exposed as a terminal outcome.
 
+Every prompt and skill status response includes `receiptState`: active records are `absent`; terminal records are `present`, `missing`, or `unknown`; unknown lookup is `unknown`. Ordinary success requires `status: "terminal_ok"`, `receiptState: "present"`, and readable non-empty text or an artifact path. A failed execution may retain a partial `present` receipt. Legacy version-1 reconciliation records without this additive field remain readable and project `unknown` rather than optimistic success.
+
 Callers that must recover from a lost acknowledgement should assign one fresh
 `clientRef` (a trimmed, non-empty string of at most 128 characters) to each logical
 prompt. Reconnect to the same session endpoint and query with exactly one selector:
@@ -366,19 +368,7 @@ Correlated `agent_end` and `agent_failed` frames carry the same finalized
 `outcome`. Clients must correlate those frames and Q26 by the prompt identifiers,
 not infer terminality from stream activity or an earlier pending claim.
 
-Reconciliation state survives client disconnect/reconnect. With the session-private
-durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also
-survive **GJC session-process restart** for the same session identity within
-capacity/TTL, subject to crash-consistent fsync. A non-terminal prompt record at
-restart finalizes its pending outcome; if that claim is absent, it finalizes as
-`{ kind: "failed", code: "prompt_failed", ... }`. This prompt-specific recovery
-does not apply to skill records: active `skill.invoke` records retain
-`error.code = process_restart` because their reconciliation is incomplete, not
-proof of a skill failure. Eviction or absence still returns honest `unknown`; that
-means the prior outcome is unknowable, not that execution did not occur. Active
-records are capped at 128 per kind and are never aged into terminal. Terminal
-records are retained for 15 minutes, capped at 256 per kind, and evicted
-oldest-terminal first.
+Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity/TTL, subject to crash-consistent fsync. A non-terminal prompt record at restart finalizes its pending outcome and receipt state. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are retained for 15 minutes, capped at 256 per kind, and evicted oldest-terminal first. Reconciliation stores no prompt, transcript, credential, or provider-response body.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
@@ -406,6 +396,18 @@ status with `Q28` / `skill.invoke_status` using the same selectors as Q26. Kind-
 indexes mean prompt and skill `clientRef` values never collide. Skill records use the
 same capacity/TTL limits, but an active skill record at restart settles with
 `error.code = process_restart`.
+
+## Correlated steer acknowledgement (Q30)
+
+`turn.steer` accepts an optional `clientRef` (trimmed, non-empty, at most 128 characters). When present, GJC hashes the exact validated steer text with SHA-256 and durably reserves `dispatching` before queueing. The result contains `sessionId`, `clientRef`, `status: accepted | rejected | uncertain`, known `acceptedAt` or `terminalAt`, and bounded error metadata; it never echoes text.
+
+Replay the same `clientRef` with the same text to recover the retained result without dispatching again. Reuse with different text returns `client_ref_conflict`. A live `dispatching` record and a restart during dispatch both project `uncertain`; GJC never automatically redispatches an ordered control whose first effect is unknowable. Query the same session with:
+
+```json
+{ "type": "query_request", "query": "turn.steer_status", "input": { "clientRef": "steer-018f" } }
+```
+
+Q31 returns `accepted`, `rejected`, `uncertain`, or `unknown` and never dispatches work. Settled steer records share the 15-minute/256-record retention bound; live dispatching records are not terminal-evicted. Existing uncorrelated `turn.steer` calls retain their legacy non-idempotent behavior. Version-1 reconciliation remains additive, and only digest plus bounded metadata is stored—never steer text.
 
 ## Model profile discovery and validation (Q27)
 

@@ -432,6 +432,20 @@ test("preserves typed registry errors and maps unknown failures to internal", as
 		request(tools),
 	);
 	expect(internal.error).toEqual({ code: "internal", message: "Control operation failed." });
+	const steer = OPERATIONS.find(row => row.sdkId === "turn.steer")!;
+	const conflict = await dispatchControl(
+		{
+			steer: () => {
+				throw { code: "client_ref_conflict", message: "clientRef is already bound to different steer text." };
+			},
+		} as unknown as ControlSurface,
+		steer,
+		request(steer),
+	);
+	expect(conflict.error).toEqual({
+		code: "client_ref_conflict",
+		message: "clientRef is already bound to different steer text.",
+	});
 });
 
 test("preserves action_claimed workflow fences through control dispatch", async () => {

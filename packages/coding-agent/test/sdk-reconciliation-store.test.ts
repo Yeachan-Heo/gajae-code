@@ -7,6 +7,7 @@ import {
 	type DurableReconciliationRecord,
 	isSafeReconciliationSessionId,
 	reconciliationStorePath,
+	resolveReconciliationSessionFile,
 	settleProcessRestart,
 } from "../src/sdk/bus/reconciliation-store";
 
@@ -25,6 +26,32 @@ describe("reconciliation-store", () => {
 		const storePath = reconciliationStorePath(sessionFile, "abc");
 		expect(storePath).toBe("/home/u/.gjc/agent/sessions/scope/.sdk-reconciliation/abc.json");
 		expect(storePath.includes("abc/")).toBe(false); // not under artifact stem abc/
+	});
+
+	test("bus derives a durable state-root store when session file method returns undefined", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-state-root-"));
+		try {
+			const sessionId = "session-1";
+			const sessionFile = resolveReconciliationSessionFile(undefined, root, sessionId);
+			const store = createReconciliationStore({ sessionFile, sessionId });
+			await store.transact(() => [
+				{
+					kind: "steer",
+					clientRef: "state-root-ref",
+					textDigest: "a".repeat(64),
+					createdAt: 1,
+					status: "accepted",
+					settledAt: 2,
+					commandId: "command",
+					turnId: "turn",
+					acceptedAt: 1,
+				},
+			]);
+			expect(store.path).toBe(path.join(root, ".sdk-reconciliation", `${sessionId}.json`));
+			expect(await fs.readFile(store.path!, "utf8")).toContain('"textDigest"');
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("settleProcessRestart never invents terminal_ok", () => {
