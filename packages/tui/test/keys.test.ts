@@ -367,7 +367,7 @@ describe("extractPrintableText", () => {
 	it("preserves Kitty CSI-u text-field decoding for supported modifiers", () => {
 		expect(extractPrintableText("\x1b[97;1;229u")).toBe("å");
 	});
-	it("rejects malformed event types, modifier overflow, and control text", () => {
+	it("rejects malformed event types, modifier overflow, control text, and surrogate code points", () => {
 		for (const data of [
 			"\x1b[97;1:0u",
 			"\x1b[97;1:03u",
@@ -377,6 +377,9 @@ describe("extractPrintableText", () => {
 			"\x1b[127u",
 			"\x1b[128u",
 			"\x1b[97;1;127u",
+			"\x1b[55296u",
+			"\x1b[97;1;55296u",
+			"\x1b[27;1;55296~",
 		]) {
 			expect(extractPrintableText(data)).toBeUndefined();
 		}

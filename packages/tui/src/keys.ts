@@ -522,7 +522,14 @@ function isValidProtocolNumber(value: number): boolean {
 }
 
 function isPrintableCodePoint(value: number): boolean {
-	return Number.isSafeInteger(value) && value >= 32 && value !== 0x7f && !(value >= 0x80 && value <= 0x9f);
+	return (
+		Number.isSafeInteger(value) &&
+		value >= 32 &&
+		value <= 0x10ffff &&
+		value !== 0x7f &&
+		!(value >= 0x80 && value <= 0x9f) &&
+		!(value >= 0xd800 && value <= 0xdfff)
+	);
 }
 
 function decodeKittyPrintable(data: string): string | undefined {
