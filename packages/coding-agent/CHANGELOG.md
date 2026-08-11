@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- `/model <preset>` and `/model gajae-code/<preset>` now activate a known model profile immediately instead of failing with "Unknown model". Unknown names still fall through to model resolution, and `/model <role> <preset>` keeps assigning a model to the named role.
 - Browser `act` and `run` responses can now surface an opt-in (`open(..., { diagnostics: true })`), bounded mailbox of page exceptions and `console.error` metadata. Entries carry only kind, timestamp, origin-only URL, line/column, and an allowlisted built-in error class; path segments, query strings, messages, arguments, values, and stacks are never retained. Serialization is byte-bounded with an explicit truncation marker.
 
 ### Fixed

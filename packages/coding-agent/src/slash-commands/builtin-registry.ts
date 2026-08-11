@@ -6,7 +6,8 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { PET_SKINS, type PetMode, Spacer, Text } from "@gajae-code/tui";
 import { setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
-import { materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
+import { activateModelProfile, materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
+import { formatModelProfileDisplayLabel } from "../config/model-profiles";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
@@ -243,6 +244,54 @@ function parseModelCommandArgs(args: string): ParsedModelCommandArgs {
 	}
 	return { kind: "assign", targetId: "default", selector: args.trim() };
 }
+/**
+ * Optional namespace prefix accepted on `/model <preset>` selectors so users
+ * can disambiguate preset names from model ids with `gajae-code/<preset>`.
+ * The bare preset name remains the canonical form.
+ */
+const MODEL_PRESET_NAMESPACE_PREFIX = "gajae-code/";
+
+/**
+ * Resolve a `/model <selector>` argument against the merged model-profile
+ * registry. Returns the canonical profile name when `selector` is either a
+ * bare preset name (`codex-medium`) or a namespaced one
+ * (`gajae-code/codex-medium`); returns `undefined` otherwise so the caller
+ * falls through to ordinary model resolution.
+ *
+ * Only selectors that do NOT look like `provider/model` references are
+ * considered, so `/model anthropic/claude-...` is never hijacked by a preset.
+ */
+export function resolvePresetSelector(
+	selector: string,
+	modelRegistry: { getModelProfile?: (name: string) => unknown; getError?: () => unknown },
+): string | undefined {
+	const trimmed = selector.trim();
+	if (!trimmed) return undefined;
+
+	// Reject `provider/model` references outright: even if a preset happened to
+	// be named `anthropic/claude`, the slash form is a model selector, not a
+	// preset shortcut. The only accepted slash form is the `gajae-code/`
+	// namespace prefix.
+	if (trimmed.includes("/")) {
+		if (!trimmed.toLowerCase().startsWith(MODEL_PRESET_NAMESPACE_PREFIX)) return undefined;
+		const stripped = trimmed.slice(MODEL_PRESET_NAMESPACE_PREFIX.length);
+		if (!stripped || stripped.includes("/")) return undefined;
+		return matchProfileName(stripped, modelRegistry);
+	}
+
+	return matchProfileName(trimmed, modelRegistry);
+}
+
+function matchProfileName(
+	candidate: string,
+	modelRegistry: { getModelProfile?: (name: string) => unknown; getError?: () => unknown },
+): string | undefined {
+	// A registry load error means we cannot trust the profile index; fall
+	// through to model resolution rather than guessing. A registry without a
+	// getModelProfile surface (e.g. a minimal test fixture) has no presets.
+	if (modelRegistry.getError?.()) return undefined;
+	return modelRegistry.getModelProfile?.(candidate) ? candidate : undefined;
+}
 
 function splitExplicitThinkingSelector(selector: string): { baseSelector: string; thinkingLevel?: ThinkingLevel } {
 	const trimmed = selector.trim();
@@ -402,6 +451,7 @@ function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: st
 		currentModelLine,
 		formatModelAssignmentSummary(runtime),
 		"Use /model <model> for DEFAULT, or /model <target> <model[:effort]> for EXECUTOR, ARCHITECT, PLANNER, or CRITIC.",
+		"Use /model <preset> or /model gajae-code/<preset> to activate a known model profile.",
 		formatModelOnboardingGuidance(),
 	]
 		.filter((line): line is string => Boolean(line))
@@ -746,6 +796,36 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						modelSelectionUsage(runtime, `Missing model for ${parsedArgs.targetId.toUpperCase()}.`),
 						runtime,
 					);
+				}
+				// Preset shortcut: when the selector names a known model profile
+				// (optionally `gajae-code/`-prefixed) and no explicit role target
+				// was given, activate the profile immediately instead of treating
+				// the preset name as a model id and failing with "Unknown model".
+				// `/model <role> <preset>` keeps assigning to the named role.
+				if (parsedArgs.targetId === "default") {
+					const presetName = resolvePresetSelector(modelId, runtime.session.modelRegistry);
+					if (presetName) {
+						try {
+							const profileLabel = formatModelProfileDisplayLabel(
+								runtime.session.modelRegistry.getModelProfile(presetName) ?? { name: presetName },
+							);
+							await activateModelProfile(
+								{
+									session: runtime.session,
+									modelRegistry: runtime.session.modelRegistry,
+									settings: runtime.settings,
+									profileName: presetName,
+								},
+								{ persistDefault: false },
+							);
+							await runtime.output(`Model profile: ${profileLabel}`);
+							await runtime.notifyTitleChanged?.();
+							await runtime.notifyConfigChanged?.();
+							return commandConsumed();
+						} catch (err) {
+							return usage(`Failed to activate model profile: ${errorMessage(err)}`, runtime);
+						}
+					}
 				}
 				const resolution = await resolveModelCommandSelection(runtime, modelId);
 				if (!resolution.ok) {
