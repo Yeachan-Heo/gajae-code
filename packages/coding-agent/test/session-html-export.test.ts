@@ -147,6 +147,24 @@ describe("session HTML export fidelity", () => {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+	it("rejects a pre-persist source-path output without creating the transcript", async () => {
+		const tempDir = path.join(os.tmpdir(), `gjc-html-export-prepersist-alias-${Snowflake.next()}`);
+		fs.mkdirSync(tempDir, { recursive: true });
+		try {
+			const session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+			session.appendMessage({ role: "user", content: "authoritative", timestamp: 1 });
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a preallocated session file");
+			expect(fs.existsSync(sessionFile)).toBe(false);
+			await expect(exportSessionToHtml(session, undefined, { outputPath: sessionFile })).rejects.toThrow(
+				"must not overwrite the source transcript",
+			);
+			expect(fs.existsSync(sessionFile)).toBe(false);
+			await session.close();
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 	it("streams an enabled cold session without hydrating retired history", async () => {
 		const tempDir = path.join(os.tmpdir(), `gjc-html-export-cold-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
