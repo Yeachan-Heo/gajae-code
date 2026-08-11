@@ -305,11 +305,7 @@ test("createConnectSubscribeSubmit replays and writes one prompt on the validate
 		});
 		const result = await pending;
 		expect(result).toMatchObject({ kind: "accepted", sessionId: "session-1" });
-		expect(result.kind === "accepted" && result.identity.create).toEqual({
-			cwd: "/repo",
-			readiness: "immediate",
-			target: { worktree: { name: "work" } },
-		});
+		expect(result.kind === "accepted" && "create" in result.identity).toBe(false);
 		expect(endpoint.sent.filter(value => JSON.parse(value).type === "control_request")).toHaveLength(1);
 		await client.close();
 	});
@@ -436,22 +432,35 @@ test("createConnectSubscribeSubmit permits capability-gated global replay gaps o
 	});
 });
 
-test("recovery identities redact MCP secrets while retaining recovery-safe shape", async () => {
+test("durable recovery identity never carries create material or MCP credentials from any source", async () => {
 	await withFakeTransport(async () => {
+		// Secrets in every credential form the broker accepts: HTTP/SSE URL
+		// userinfo, URL query params, stdio args, env, and headers.
+		const urlUserinfoSecret = "TEST_URL_USERINFO_TOKEN";
+		const urlQuerySecret = "TEST_URL_QUERY_TOKEN";
+		const stdioArgsSecret = "TEST_STDIO_ARGS_TOKEN";
 		const envSecret = "TEST_ONLY_MCP_ENV_SECRET";
 		const headerSecret = "TEST_ONLY_MCP_AUTH_SECRET";
+		const allSecrets = [urlUserinfoSecret, urlQuerySecret, stdioArgsSecret, envSecret, headerSecret];
 		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
 		const pending = client.createConnectSubscribeSubmit({
 			create: {
 				cwd: "/repo",
-				mcpServers: {
-					private: {
+				mcpServers: [
+					{
 						type: "http",
-						url: "https://mcp.test",
-						env: { MCP_TOKEN: envSecret },
+						name: "remote-with-userinfo",
+						url: `https://user:${urlUserinfoSecret}@mcp.test?api_key=${urlQuerySecret}`,
 						headers: { Authorization: `Bearer ${headerSecret}` },
 					},
-				},
+					{
+						type: "stdio",
+						name: "stdio-with-args-secret",
+						command: "/usr/local/bin/mcp-runner",
+						args: ["--token", stdioArgsSecret],
+						env: { MCP_TOKEN: envSecret },
+					},
+				],
 			},
 			createIdempotencyKey: "create-identity",
 			submission: { kind: "prompt", text: "hello", clientRef: "prompt-work" },
@@ -461,6 +470,8 @@ test("recovery identities redact MCP secrets while retaining recovery-safe shape
 		broker.message({ type: "hello", connectionId: "broker" });
 		await flush();
 		const create = sent(broker);
+		// The broker receives the full create with secrets intact.
+		expect(create.input.mcpServers).toHaveLength(2);
 		broker.message({
 			type: "broker_response",
 			id: create.id,
@@ -472,18 +483,42 @@ test("recovery identities redact MCP secrets while retaining recovery-safe shape
 		broker.message({ type: "broker_response", id: endpointRequest.id, ok: true, result: {} });
 		const result = await pending;
 		expect(result).toMatchObject({ kind: "attachment_uncertain", identity: { sessionId: "session-1" } });
+		// No secret from any credential form appears in the serialized result.
 		const serialized = JSON.stringify(result);
-		expect(serialized).not.toContain(envSecret);
-		expect(serialized).not.toContain(headerSecret);
+		for (const secret of allSecrets) expect(serialized).not.toContain(secret);
 		if (result.kind === "failed") throw new Error("Expected recovery identity");
-		expect(result.identity.create).toEqual({
-			cwd: "/repo",
-			mcpServers: { private: { type: "http", url: "https://mcp.test" } },
+		// The identity carries no create field at all — no replay material.
+		expect("create" in result.identity).toBe(false);
+		expect("createRedacted" in result.identity).toBe(false);
+		// Recovery from an identity with a sessionId goes directly to endpoint
+		// lookup; the create option is accepted but not needed for this path.
+		const recovery = client.reconcileCreateConnectSubmit(result.identity, {
+			create: {
+				cwd: "/repo",
+				mcpServers: [
+					{
+						type: "http",
+						name: "remote-with-userinfo",
+						url: `https://user:${urlUserinfoSecret}@mcp.test?api_key=${urlQuerySecret}`,
+						headers: { Authorization: `Bearer ${headerSecret}` },
+					},
+					{
+						type: "stdio",
+						name: "stdio-with-args-secret",
+						command: "/usr/local/bin/mcp-runner",
+						args: ["--token", stdioArgsSecret],
+						env: { MCP_TOKEN: envSecret },
+					},
+				],
+			},
 		});
-		expect(result.identity.createRedacted).toBe(true);
-		const recovery = client.reconcileCreateConnectSubmit(result.identity);
 		await flush();
 		const recoveryEndpoint = sent(broker, 2);
+		expect(recoveryEndpoint).toMatchObject({
+			type: "broker_request",
+			operation: "session.get_endpoint",
+			input: { sessionId: "session-1" },
+		});
 		broker.message({
 			type: "broker_response",
 			id: recoveryEndpoint.id,
@@ -502,8 +537,86 @@ test("recovery identities redact MCP secrets while retaining recovery-safe shape
 		endpoint.message({ type: "query_response", id: status.id, ok: true, result: { status: "unknown" } });
 		const reconciled = await recovery;
 		expect(reconciled).toMatchObject({ kind: "reconciled", status: { status: "unknown" } });
-		expect(JSON.stringify(reconciled)).not.toContain(envSecret);
-		expect(JSON.stringify(reconciled)).not.toContain(headerSecret);
+		const reconciledSerialized = JSON.stringify(reconciled);
+		for (const secret of allSecrets) expect(reconciledSerialized).not.toContain(secret);
+		await client.close();
+	});
+});
+
+test("durable recovery identity rejects nested, encoded, and duplicate credential forms in serialized output", async () => {
+	await withFakeTransport(async () => {
+		// Percent-encoded userinfo, base64 token in args, duplicate credential
+		// across URL query and headers, and nested env values.
+		const encodedUserinfoSecret = "TEST_ENCODED_USERINFO_SECRET";
+		const base64ArgsSecret = "TEST_BASE64_ARGS_SECRET";
+		const duplicateQuerySecret = "TEST_DUP_QUERY_SECRET";
+		const nestedEnvSecret = "TEST_NESTED_ENV_SECRET";
+		const allSecrets = [encodedUserinfoSecret, base64ArgsSecret, duplicateQuerySecret, nestedEnvSecret];
+		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
+		const pending = client.createConnectSubscribeSubmit({
+			create: {
+				cwd: "/repo",
+				mcpServers: [
+					{
+						type: "sse",
+						name: "encoded-userinfo",
+						url: `https://user%3A${encodedUserinfoSecret}@mcp-sse.test`,
+						headers: { "X-Api-Key": duplicateQuerySecret },
+					},
+					{
+						type: "stdio",
+						name: "base64-args",
+						command: "/opt/mcp/server",
+						args: ["--auth", Buffer.from(base64ArgsSecret).toString("base64")],
+						env: { NESTED_KEY: nestedEnvSecret },
+					},
+					{
+						type: "http",
+						name: "dup-query",
+						url: `https://mcp-dup.test?key=${duplicateQuerySecret}`,
+					},
+				],
+			},
+			createIdempotencyKey: "create-encoded-identity",
+			submission: { kind: "skill", name: "review", clientRef: "skill-work" },
+		});
+		const broker = FakeWebSocket.instances[0]!;
+		broker.open();
+		broker.message({ type: "hello", connectionId: "broker" });
+		await flush();
+		const create = sent(broker);
+		broker.message({
+			type: "broker_response",
+			id: create.id,
+			ok: false,
+			error: { code: "invalid_input", message: `Rejected ${allSecrets.join(", ")}` },
+		});
+		const result = await pending;
+		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
+		const serialized = JSON.stringify(result);
+		for (const secret of allSecrets) expect(serialized).not.toContain(secret);
+		if (result.kind === "failed" && result.identity) {
+			expect("create" in result.identity).toBe(false);
+		}
+		await client.close();
+	});
+});
+
+test("reconcileCreateConnectSubmit reports create_uncertain without create replay material", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token");
+		const result = await client.reconcileCreateConnectSubmit({
+			version: 1,
+			operation: "session.create",
+			createIdempotencyKey: "create-key",
+			submission: { kind: "prompt", clientRef: "work" },
+		});
+		expect(result).toMatchObject({
+			kind: "create_uncertain",
+			nextLegalLookupAction: "reconcileCreateConnectSubmit",
+			prohibitResubmission: true,
+		});
+		expect(FakeWebSocket.instances).toHaveLength(0);
 		await client.close();
 	});
 });
@@ -515,7 +628,6 @@ test("reconcileCreateConnectSubmit rejects malformed recovery identities before 
 			version: 1,
 			operation: "session.create",
 			createIdempotencyKey: "create-key",
-			create: { cwd: "/repo" },
 			submission: { kind: "not-a-submission", clientRef: "work" },
 		} as never);
 		expect(result).toMatchObject({ kind: "failed", error: { code: "invalid_input" } });
@@ -532,14 +644,21 @@ test("durable create errors never serialize MCP credential values", async () => 
 		const pending = client.createConnectSubscribeSubmit({
 			create: {
 				cwd: "/repo",
-				mcpServers: {
-					private: {
+				mcpServers: [
+					{
 						type: "http",
+						name: "remote",
 						url: "https://mcp.test",
-						env: { MCP_TOKEN: envSecret },
 						headers: { Authorization: `Bearer ${headerSecret}` },
 					},
-				},
+					{
+						type: "stdio",
+						name: "local",
+						command: "/usr/local/bin/mcp",
+						args: [],
+						env: { MCP_TOKEN: envSecret },
+					},
+				],
 			},
 			createIdempotencyKey: "create-error-identity",
 			submission: { kind: "prompt", text: "hello", clientRef: "prompt-error-work" },
@@ -581,13 +700,15 @@ test("reconcileCreateConnectSubmit replays unknown create fields only by rejecti
 test("reconcileCreateConnectSubmit queries status despite a replay gap and never submits ordered work", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://broker.test", "broker-token", { reconnectAttempts: 0 });
-		const pending = client.reconcileCreateConnectSubmit({
-			version: 1,
-			operation: "session.create",
-			createIdempotencyKey: "create-identity",
-			create: { cwd: "/repo" },
-			submission: { kind: "skill", clientRef: "skill-work" },
-		});
+		const pending = client.reconcileCreateConnectSubmit(
+			{
+				version: 1,
+				operation: "session.create",
+				createIdempotencyKey: "create-identity",
+				submission: { kind: "skill", clientRef: "skill-work" },
+			},
+			{ create: { cwd: "/repo" } },
+		);
 		const broker = FakeWebSocket.instances[0]!;
 		broker.open();
 		broker.message({ type: "hello", connectionId: "broker" });
