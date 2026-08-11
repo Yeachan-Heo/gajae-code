@@ -174,7 +174,6 @@ const CORE_QUERIES = [
 	"session.stats",
 ] as const;
 
-const CORE_QUERIES = ["session.metadata", "context.get", "goal.list/get", "todo.list", "workflow.gates.list", "session.stats"] as const;
 const ALLOWED_CONTROLS: ReadonlySet<string> = new Set(${JSON.stringify(ALLOWED_CONTROLS)});
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 const ALLOWED_ARGUMENTS = new Set(["--repo", "--session-id", "--mode", "--operation", "--input"]);

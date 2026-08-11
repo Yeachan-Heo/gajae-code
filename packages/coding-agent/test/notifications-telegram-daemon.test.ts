@@ -700,7 +700,7 @@ describe("Telegram daemon retained owner lifecycle", () => {
 		}
 	});
 
-	test("spawn selection uses an opaque owner on Windows source launches and preserves normal compiled selection", async () => {
+	test("spawn selection uses an opaque owner for detached launches", async () => {
 		const sourceAgentDir = tempAgentDir();
 		const compiledAgentDir = tempAgentDir();
 		try {
@@ -739,7 +739,7 @@ describe("Telegram daemon retained owner lifecycle", () => {
 			expect(sourceArgs).toEqual(expect.arrayContaining(["--owner-id", "daemon-source-nonce"]));
 			expect(compiled).toMatchObject({
 				result: "owner_spawned",
-				acquisition: { ownerId: "compiled-nonce", launcherPid: 708 },
+				acquisition: { ownerId: "daemon-compiled-nonce", launcherPid: 708 },
 				runtime: { mode: "compiled", reloadPicksUpSourceEdits: false },
 			});
 		} finally {

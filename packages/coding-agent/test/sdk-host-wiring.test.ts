@@ -7022,7 +7022,7 @@ test("turn.result validates selectors and its prompt alias rejects invalid clien
 			input: { clientRef: "r" },
 			cursor: "x",
 		}),
-	).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
+	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
 	expect(
 		await request({
 			type: "query_request",

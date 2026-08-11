@@ -14,7 +14,6 @@ const CORE_QUERIES = [
 	"session.stats",
 ] as const;
 
-const CORE_QUERIES = ["session.metadata", "context.get", "goal.list/get", "todo.list", "workflow.gates.list", "session.stats"] as const;
 const ALLOWED_CONTROLS: ReadonlySet<string> = new Set(["turn.prompt","turn.steer","turn.follow_up","ask.answer","workflow.gate_answer","todo.replace","session.switch","session.rename"]);
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 const ALLOWED_ARGUMENTS = new Set(["--repo", "--session-id", "--mode", "--operation", "--input"]);

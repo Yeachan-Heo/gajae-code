@@ -3101,14 +3101,11 @@ export async function spawnTelegramDaemonOwner(
 	const agentDir = input.settings.getAgentDir();
 	const execPath = deps.execPath ?? process.execPath;
 	const runtimeInfo = resolveGjcRuntimeSpawnInfo(execPath);
-	// On Windows, a source-linked Bun/Node detached child can begin after its
-	// short-lived CLI parent has exited. Keep the owner id opaque so the
-	// daemon-internal launcher does not mistake that parent PID for its owner;
-	// the daemon rebinds state.pid and validates token/chat below.
-	const ownerId =
-		runtimeInfo.mode === "source" && (deps.platform ?? process.platform) === "win32"
-			? `daemon-${deps.randomId?.() ?? crypto.randomUUID()}`
-			: undefined;
+	// A detached child can begin after any short-lived CLI parent has exited.
+	// Keep the owner id opaque so daemon-internal does not reject a valid owner
+	// based on that transient PID; ownership is instead bound to the child PID,
+	// incarnation, token, and chat during its initial heartbeat publication.
+	const ownerId = `daemon-${deps.randomId?.() ?? crypto.randomUUID()}`;
 	const ownership = await acquireDaemonOwnership({
 		settings: input.settings,
 		tokenFingerprint: input.tokenFingerprint,
@@ -3118,7 +3115,7 @@ export async function spawnTelegramDaemonOwner(
 		pid: deps.pid,
 		pidAlive: deps.pidAlive,
 		pidIncarnation: deps.pidIncarnation,
-		randomId: ownerId ? undefined : deps.randomId,
+		randomId: undefined,
 		ownerId,
 	});
 	if (!ownership.acquired) {
