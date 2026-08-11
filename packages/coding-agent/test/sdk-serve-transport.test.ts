@@ -7,6 +7,7 @@ import { PassThrough, Writable } from "node:stream";
 import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
 import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
+import { SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
 import { type RelayWebSocket, startRelayPair, type TransportError } from "../src/sdk/transport/relay.js";
@@ -198,13 +199,13 @@ describe("SDK serve raw relay", () => {
 		}
 	});
 
-	test("rejects downstream elevation claim forgery before endpoint relay", async () => {
+	test("rejects a downstream frame refused by the injected relay validator", async () => {
 		const fixture = await relayFixture(256 * 1024, source => {
-			const frame = JSON.parse(source) as { elevationRequestId?: unknown };
-			return frame.elevationRequestId === undefined;
+			const frame = JSON.parse(source) as { forgedAuthorityField?: unknown };
+			return frame.forgedAuthorityField === undefined;
 		});
 		try {
-			fixture.input.write(`${JSON.stringify({ type: "control_request", elevationRequestId: "forged" })}\n`);
+			fixture.input.write(`${JSON.stringify({ type: "control_request", forgedAuthorityField: "forged" })}\n`);
 			expect(await waitFor(() => fixture.errors[0], "forged claim rejection")).toMatchObject({
 				code: "protocol_error",
 				direction: "downstream->ws",
@@ -470,7 +471,7 @@ describe("SDK socket serve", () => {
 });
 
 describe("SDK serve CLI and discovery", () => {
-	test("keeps the internal SDK command hidden from public help", () => {
+	test("advertises public SDK families without leaking internal actions", () => {
 		expect(parseSdkInternalArgv(["broker-internal", "--agent-dir", "/tmp/a"])).toEqual({
 			action: "broker-internal",
 			agentDir: "/tmp/a",
@@ -489,8 +490,10 @@ describe("SDK serve CLI and discovery", () => {
 			(process.stdout as unknown as { write: typeof stdout }).write = stdout;
 		}
 		const help = output.join("\n");
-		expect(help).not.toContain("serve");
-		expect(help).not.toContain("--socket");
+		expect(help).toContain("serve");
+		expect(help).toContain("--socket");
+		expect(help).toContain("session");
+		expect(help).toContain("guides");
 		expect(help).not.toContain("broker-internal");
 		expect(help).not.toContain("session-host-internal");
 		expect(help).not.toContain("--agent-dir");
@@ -583,5 +586,60 @@ describe("SDK serve CLI and discovery", () => {
 		expect(selectBrokerSession(rows, undefined)).toBe("sess-150");
 		// First-page rows are still governed by the same broker truth.
 		expect(() => selectBrokerSession(rows, "sess-1")).toThrow(/endpoint_stale/);
+	});
+
+	test("rejects malformed broker session.list pages instead of treating them as empty", async () => {
+		const broker = {
+			global: async () => ({ ok: true, result: { sessions: "not-an-array" } }),
+		} as never;
+
+		await expect(listBrokerSessions(broker)).rejects.toBeInstanceOf(SdkClientError);
+		await expect(
+			listBrokerSessions({ global: async () => ({ ok: true, result: { sessions: "not-an-array" } }) } as never),
+		).rejects.toMatchObject({ code: "protocol_error", message: "session.list returned a malformed page." });
+	});
+
+	test("rejects malformed broker session.list continuation cursors", async () => {
+		await expect(
+			listBrokerSessions({
+				global: async () => ({ ok: true, result: { sessions: [], continuationCursor: "" } }),
+			} as never),
+		).rejects.toMatchObject({ code: "protocol_error", message: "session.list returned a malformed page." });
+	});
+
+	test("rejects repeated broker session.list cursors without returning partial rows", async () => {
+		let calls = 0;
+		const broker = {
+			global: async () => {
+				calls++;
+				return { ok: true, result: { sessions: [{ sessionId: `page-${calls}` }], continuationCursor: "repeat" } };
+			},
+		} as never;
+
+		await expect(listBrokerSessions(broker)).rejects.toMatchObject({
+			code: "protocol_error",
+			message: "session.list returned a repeated continuation cursor.",
+		});
+		expect(calls).toBe(2);
+	});
+
+	test("preserves an explicit continuation error from the broker", async () => {
+		let calls = 0;
+		const broker = {
+			global: async () => {
+				calls++;
+				return calls === 1
+					? { ok: true, result: { sessions: [{ sessionId: "page-one" }], continuationCursor: "page-two" } }
+					: { ok: false, error: { code: "continuation_failed", message: "page two failed" } };
+			},
+		} as never;
+
+		await expect(listBrokerSessions(broker)).rejects.toMatchObject({
+			name: "SdkClientError",
+			code: "continuation_failed",
+			message: "page two failed",
+			details: { code: "continuation_failed", message: "page two failed" },
+		});
+		expect(calls).toBe(2);
 	});
 });

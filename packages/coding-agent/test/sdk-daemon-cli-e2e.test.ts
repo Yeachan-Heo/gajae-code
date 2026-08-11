@@ -23,6 +23,13 @@ function closeCaptureFd(fd: number): void {
 	}
 }
 
+function publicSessionArgs(args: string[]): string[] {
+	const action = args[0];
+	return action === "control" || action === "query" || action === "global"
+		? ["sdk", "session", "raw", ...args]
+		: ["sdk", "session", ...args];
+}
+
 async function runCli(repo: string, agentDir: string, args: string[]): Promise<CliResult> {
 	const captureDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-cli-capture-"));
 	const stdoutPath = path.join(captureDir, "stdout");
@@ -30,7 +37,7 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 	const stdoutFd = openSync(stdoutPath, "w");
 	const stderrFd = openSync(stderrPath, "w");
 	try {
-		const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "daemon", "session", ...args], {
+		const child = Bun.spawn([process.execPath, "run", cliEntrypoint, ...publicSessionArgs(args)], {
 			cwd: repo,
 			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
 			stdout: stdoutFd,
@@ -53,18 +60,22 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 	}
 }
 
-describe("SDK daemon session CLI", () => {
+describe("SDK session CLI", () => {
 	let root: string;
 	let agentDir: string;
 	let stateRoot: string;
-	let endpointServer: ReturnType<typeof Bun.serve>;
+	let endpointServer: Bun.Server<undefined>;
 	let broker: Broker;
 	let receivedControl: Record<string, unknown> | undefined;
 	let endpointConnections = 0;
+	let promptStatuses = new Map<string, { status: string }>();
+	let replayEvents: Record<string, unknown>[] = [];
 
 	beforeEach(async () => {
 		endpointConnections = 0;
 		receivedControl = undefined;
+		promptStatuses = new Map();
+		replayEvents = [];
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-cli-"));
 		agentDir = path.join(root, "agent");
 		stateRoot = path.join(root, ".gjc", "state");
@@ -97,15 +108,66 @@ describe("SDK daemon session CLI", () => {
 				message(socket, message) {
 					const frame = JSON.parse(String(message)) as Record<string, unknown>;
 					if (frame.type === "event_replay") {
-						socket.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
-						return;
-					}
-					if (frame.type === "control_request") receivedControl = frame;
-					if (frame.type === "query_request" && frame.query === "session.metadata") {
 						socket.send(
-							JSON.stringify({ type: "query_response", id: frame.id, ok: true, result: { sessionId: "live" } }),
+							JSON.stringify({ type: "event_replay_result", id: frame.id, ok: true, events: replayEvents }),
 						);
 						return;
+					}
+					if (frame.type === "control_request") {
+						receivedControl = frame;
+						if (frame.operation === "turn.prompt") {
+							const input = frame.input as Record<string, unknown> | undefined;
+							const clientRef = typeof input?.clientRef === "string" ? input.clientRef : undefined;
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id: frame.id,
+									ok: true,
+									result: { accepted: true, ...(clientRef === undefined ? {} : { clientRef }) },
+								}),
+							);
+							return;
+						}
+					}
+					if (frame.type === "query_request") {
+						if (frame.query === "session.metadata") {
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									result: { sessionId: "live" },
+								}),
+							);
+							return;
+						}
+						if (frame.query === "turn.prompt_status") {
+							const input = frame.input as Record<string, unknown> | undefined;
+							const clientRef = typeof input?.clientRef === "string" ? input.clientRef : undefined;
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									result:
+										clientRef === undefined
+											? { status: "unknown" }
+											: (promptStatuses.get(clientRef) ?? { status: "unknown" }),
+								}),
+							);
+							return;
+						}
+						if (frame.query === "session.checkpoint") {
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									result: { checkpoint: { revision: 1, generation: 1, seq: 0 } },
+								}),
+							);
+							return;
+						}
 					}
 					socket.send(
 						JSON.stringify({
@@ -185,7 +247,7 @@ describe("SDK daemon session CLI", () => {
 		expect(refused.exitCode).toBe(1);
 		expect(JSON.parse(refused.stdout)).toMatchObject({ error: { code: "endpoint_credential_forbidden" } });
 
-		const disclosed = await runCli(root, agentDir, [
+		const credentialFlag = await runCli(root, agentDir, [
 			"global",
 			"--op",
 			"session.get_endpoint",
@@ -193,11 +255,59 @@ describe("SDK daemon session CLI", () => {
 			'{"sessionId":"live"}',
 			"--show-endpoint-credential",
 		]);
-		expect(disclosed.exitCode).not.toBe(0);
-		expect(`${disclosed.stdout}\n${disclosed.stderr}`).not.toContain("session-token");
+		expect(credentialFlag.exitCode).toBe(2);
+		expect(`${credentialFlag.stdout}\n${credentialFlag.stderr}`).not.toContain("session-token");
 	}, 60_000);
 
-	it("drains daemon CLI session.list continuation pages before returning sessions", async () => {
+	it("routes semantic inspect, send, status, and tail through Router-owned attachments", async () => {
+		const inspect = await runCli(root, agentDir, ["inspect", "live"]);
+		expect(inspect.exitCode, inspect.stderr).toBe(0);
+		expect(JSON.parse(inspect.stdout)).toMatchObject({
+			ok: true,
+			result: { source: "broker", session: { sessionId: "live" } },
+		});
+
+		const send = await runCli(root, agentDir, ["send", "live", "--text", "hello", "--op-ref", "semantic-ref"]);
+		expect(send.exitCode, `send stdout=${send.stdout}\nstderr=${send.stderr}`).toBe(0);
+		expect(JSON.parse(send.stdout)).toMatchObject({
+			ok: true,
+			result: {
+				operationRef: "semantic-ref",
+				status: "accepted",
+				receipt: { accepted: true, clientRef: "semantic-ref" },
+			},
+		});
+		expect(receivedControl).toMatchObject({
+			operation: "turn.prompt",
+			input: { clientRef: "semantic-ref", text: "hello" },
+		});
+
+		promptStatuses.set("semantic-ref", { status: "terminal_ok" });
+		const status = await runCli(root, agentDir, ["status", "live", "semantic-ref"]);
+		expect(status.exitCode, `status stdout=${status.stdout}\nstderr=${status.stderr}`).toBe(0);
+		expect(JSON.parse(status.stdout)).toMatchObject({
+			ok: true,
+			result: { operationRef: "semantic-ref", status: { status: "terminal_ok" }, summary: { completed: true } },
+		});
+
+		replayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 1,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live" },
+			},
+		];
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		expect(JSON.parse(tail.stdout)).toMatchObject({
+			ok: true,
+			result: { source: "session", terminal: true, items: [expect.objectContaining({ kind: "turn_end", seq: 1 })] },
+		});
+	}, 60_000);
+
+	it("drains SDK session CLI session.list continuation pages before returning sessions", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		const requests: Array<Record<string, unknown>> = [];
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
@@ -219,7 +329,7 @@ describe("SDK daemon session CLI", () => {
 		expect(requests).toEqual([{}, { cursor: "page-2" }]);
 	}, 60_000);
 
-	it("rejects a failed daemon CLI session.list continuation without returning page one", async () => {
+	it("rejects a failed SDK session CLI session.list continuation without returning page one", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		const requests: Array<Record<string, unknown>> = [];
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
@@ -240,7 +350,7 @@ describe("SDK daemon session CLI", () => {
 		expect(requests).toEqual([{}, { cursor: "page-2" }]);
 	}, 60_000);
 
-	it("rejects repeated daemon CLI session.list cursors without partial output", async () => {
+	it("rejects repeated SDK session CLI session.list cursors without partial output", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		const requests: Array<Record<string, unknown>> = [];
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
@@ -266,7 +376,7 @@ describe("SDK daemon session CLI", () => {
 		expect(requests).toEqual([{}, { cursor: "repeat" }]);
 	}, 60_000);
 
-	it("rejects malformed daemon CLI session.list continuation pages without partial output", async () => {
+	it("rejects malformed SDK session CLI session.list continuation pages without partial output", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		const requests: Array<Record<string, unknown>> = [];
 		broker.handleRequest = async (operation, input, idempotencyKey) => {

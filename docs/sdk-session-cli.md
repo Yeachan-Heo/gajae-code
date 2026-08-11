@@ -2,9 +2,9 @@
 
 `gjc sdk session` is the broker-bound command family for operating live GJC SDK
 sessions from the terminal. It replaces the removed `gjc daemon session` route
-(no alias is kept). The command family has seven verbs — `list`, `inspect`,
-`send`, `status`, `tail`, and `elevate` — plus the explicit `raw` hatch
-that dispatches one SDK operation as `control`, `query`, or `global`.
+(no alias is kept). The command family has five semantic verbs — `list`, `inspect`,
+`send`, `status`, and `tail` — plus the explicit `raw` hatch that dispatches one
+SDK operation as `control`, `query`, or `global`.
 
 The session CLI is advisory tooling over the SDK: every semantic verb resolves
 sessions through the SDK broker, and output is rendered through a versioned,
@@ -13,11 +13,11 @@ credential-free DTO. Endpoint credentials are never printed.
 ## Broker authority
 
 `list`, `inspect`, `send`, `status`, and `tail` resolve sessions through the
-SDK broker. The broker validates the indexed session against its durable
-endpoint record (`session.get_endpoint`) and hands the CLI a connection
-credential that the CLI uses for its one connection and never renders. The
-broker is started on demand (`ensureBroker`) when discovery is absent, and a
-missing or unreachable broker surfaces as `broker_unavailable` (exit 1).
+SDK broker and Router. The Router validates indexed endpoint authority and keeps
+the connection credential in SDK core; the CLI receives only credential-free
+results. The broker is started on demand (`ensureBroker`) when discovery is
+absent, and an unavailable broker fails closed with a typed operational error
+(exit 1).
 
 `--agent-dir` selects the broker state directory; `--repo` selects the
 workspace directory used for saved-session resolution (default: the current
@@ -41,10 +41,9 @@ row is credential-free and carries:
 
 ### inspect
 
-`gjc sdk session inspect <sessionId>` renders one indexed row. When the broker
-is absent, it falls back to a credential-free offline projection from the local
-endpoint discovery record (`<repo>/.gjc/state/sdk/<sessionId>.json`) so a
-session can still be inspected without a broker.
+`gjc sdk session inspect <sessionId>` renders one indexed row from the broker.
+It never reads endpoint discovery records directly: a missing or unavailable
+broker fails closed rather than exposing endpoint authority outside SDK core.
 
 ### send
 
@@ -92,9 +91,6 @@ A deleted session has no tail (`session_deleted`). A stopped session replays
 its retained transcript without an endpoint (offline source), bounded to the
 most recent retained entries.
 
-### elevate
-
-`gjc sdk session elevate <sessionId> --kind <control|global> --op <operation> --json-input '{...}' --confirm` requests an exact-digest, single-use elevation grant. The command requires an attended TTY and writes a private 0600 operator directive that the broker consumes internally; no public `elevation.answer` operation exists. Use the returned request id with `raw control ... --elevation-request-id <id>`.
 ## Raw hatch
 
 `gjc sdk session raw <control|query|global>` dispatches exactly one SDK
@@ -108,11 +104,9 @@ operation and returns the broker/host response:
   (`session.create`, `session.fork`, `session.resume`, `session.close`,
   `session.delete`) require `--idempotency-key`.
 
-`session.get_endpoint` is refused by default: it requires
-`--show-endpoint-credential` and (on a TTY) an interactive confirmation, so
-credentials are never printed by accident. The raw hatch validates operation
-names and adapter dispositions up front and refuses endpoint-disclosure
-operations unless explicitly requested.
+`session.get_endpoint` is refused unconditionally: endpoint credentials remain
+an SDK-core implementation detail. The raw hatch validates operation names and
+adapter dispositions up front and never renders endpoint-disclosure results.
 
 ## Lossless prompt statuses
 
@@ -136,17 +130,6 @@ sequence range (`missing.from`/`missing.to`) and a `resync` checkpoint.
 `--strict` turns any gap into `retention_gap` with exit 1; without `--strict`,
 tail continues from the resync position and reports the gap in the envelope.
 
-## Elevation behavior
-
-Elevation-gated operations — `session.close`, `session.delete`,
-`workflow.gate_answer`, `workflow.plan_approve` — are dispatched only behind
-broker-owned single-use grants. The grant digest binds the exact
-`{kind, sdkId, input}` triple, so substituting a different operation or input
-changes the digest and the gate fails closed. A crash between claim and
-dispatch is replayed truthfully as `consumed` with outcome `unknown`
-(`uncertain`), and retry requires a new grant. There is no public
-`elevation.answer` operation; default SDK scope (list/query/send/tail) stays
-grant-free.
 
 ## Migration from the removed daemon session route
 

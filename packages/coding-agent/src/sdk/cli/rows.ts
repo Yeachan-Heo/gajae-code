@@ -4,9 +4,8 @@
  * Every semantic verb renders its output through these rows so machine
  * consumers get one deterministic, versioned envelope per verb. Credentials
  * are never part of the row schema: broker `session.list` rows carry no
- * credentials, offline inspect rows are projected from endpoint discovery
- * records with secret-shaped fields stripped before they can reach a row, and
- * pass-through host payloads are redacted recursively before rendering.
+ * credentials, and pass-through host payloads are redacted recursively before
+ * rendering.
  */
 
 export const SESSION_ROWS_VERSION = 1;
@@ -155,38 +154,6 @@ export function toSessionRowV1(value: unknown): SdkSessionRowV1 {
 	if (value.identityProvenance === "composite" || value.identityProvenance === "legacy")
 		row.identityProvenance = value.identityProvenance;
 	if (value.ambiguous === true) row.ambiguous = true;
-	return row;
-}
-
-/**
- * Offline inspect row projected from a local SDK endpoint discovery record.
- * The discovery record carries the endpoint credential (`url`/`token`); neither
- * is ever projected into the row. `path` is the endpoint file
- * `<stateRoot>/sdk/<sessionId>.json`, so the state root is recovered from the
- * path when the layout matches.
- */
-export function toOfflineSessionRowV1(value: unknown): SdkSessionRowV1 {
-	if (!isRecord(value)) throw new Error("endpoint discovery record is not a record");
-	const sessionId = optionalString(value.sessionId);
-	if (!sessionId) throw new Error("endpoint discovery record is missing sessionId");
-	const pid = typeof value.pid === "number" && Number.isSafeInteger(value.pid) ? value.pid : 0;
-	const stale = value.stale === true;
-	const rawPath = optionalString(value.path);
-	const stateRoot =
-		rawPath !== undefined && /[\\/]sdk[\\/][^\\/]+\.json$/.test(rawPath)
-			? rawPath.replace(/[\\/]sdk[\\/][^\\/]+\.json$/, "")
-			: rawPath !== undefined
-				? rawPath.replace(/[\\/][^\\/]+\.json$/, "")
-				: "unknown";
-	const row: SdkSessionRowV1 = {
-		sessionId,
-		locator: { repo: "unknown", stateRoot },
-		endpointGeneration: 0,
-		pid,
-		live: !stale,
-		deleted: false,
-		indexSeq: 0,
-	};
 	return row;
 }
 
