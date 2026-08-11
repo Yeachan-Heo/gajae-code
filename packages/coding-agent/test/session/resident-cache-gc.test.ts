@@ -268,6 +268,61 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 		expect(fs.existsSync(instanceDir)).toBe(false);
 	});
 
+	it("retains disposal authority when the cache parent pathname is substituted", () => {
+		const root = makeTempDir();
+		const cacheRoot = path.join(root, "resident-cache");
+		const parkedRoot = path.join(root, "resident-cache-parked");
+		const replacementRoot = path.join(root, "resident-cache-replacement");
+		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);
+		const store = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+		store.putSync(Buffer.from("resident payload", "utf8"));
+
+		fs.renameSync(cacheRoot, parkedRoot);
+		fs.mkdirSync(replacementRoot, { mode: 0o700 });
+		fs.symlinkSync(replacementRoot, cacheRoot, "dir");
+		try {
+			expect(() => store.dispose()).toThrow(ResidentCacheTrustError);
+			expect(fs.existsSync(path.join(parkedRoot, path.basename(instanceDir)))).toBe(true);
+		} finally {
+			fs.unlinkSync(cacheRoot);
+			fs.renameSync(parkedRoot, cacheRoot);
+		}
+
+		store.dispose();
+		expect(fs.existsSync(instanceDir)).toBe(false);
+	});
+
+	it("detects parent substitution racing the target absence check", () => {
+		const root = makeTempDir();
+		const cacheRoot = path.join(root, "resident-cache");
+		const parkedRoot = path.join(root, "resident-cache-parked");
+		const replacementRoot = path.join(root, "resident-cache-replacement");
+		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);
+		const store = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+		const lstatSync = fs.lstatSync;
+		let substituted = false;
+		const lstat = vi.spyOn(fs, "lstatSync").mockImplementation(((pathname: fs.PathLike, options?: unknown) => {
+			if (!substituted && path.resolve(String(pathname)) === path.resolve(instanceDir)) {
+				substituted = true;
+				fs.renameSync(cacheRoot, parkedRoot);
+				fs.mkdirSync(replacementRoot, { mode: 0o700 });
+				fs.symlinkSync(replacementRoot, cacheRoot, "dir");
+			}
+			return (lstatSync as (pathname: fs.PathLike, options?: unknown) => fs.Stats)(pathname, options);
+		}) as typeof fs.lstatSync);
+		try {
+			expect(() => store.dispose()).toThrow(ResidentCacheTrustError);
+			expect(substituted).toBe(true);
+			expect(fs.existsSync(path.join(parkedRoot, path.basename(instanceDir)))).toBe(true);
+		} finally {
+			lstat.mockRestore();
+			fs.unlinkSync(cacheRoot);
+			fs.renameSync(parkedRoot, cacheRoot);
+		}
+
+		store.dispose();
+		expect(fs.existsSync(instanceDir)).toBe(false);
+	});
 	it("refuses to dispose a present instance directory that lost owner-only mode", () => {
 		const cacheRoot = path.join(makeTempDir(), "resident-cache");
 		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);

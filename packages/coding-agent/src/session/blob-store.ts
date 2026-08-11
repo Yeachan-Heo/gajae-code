@@ -387,16 +387,32 @@ function removeResidentCacheTreeNoFollow(pathname: string): void {
 	fs.unlinkSync(pathname);
 }
 
-export function disposeVerifiedResidentCacheInstanceDir(instanceDir: string): void {
+function assertResidentCacheDisposalParent(instanceDir: string, parentDescriptor: number): void {
+	const parentDir = path.dirname(instanceDir);
+	try {
+		assertResidentCacheDirectoryPathMatchesDescriptor(parentDir, parentDescriptor, residentCacheOwnerUid(parentDir));
+	} catch (error) {
+		throw residentCacheTrustError("parent_authority_changed", instanceDir, error);
+	}
+}
+
+export function disposeVerifiedResidentCacheInstanceDir(instanceDir: string, parentDescriptor?: number): void {
 	const instanceKey = path.resolve(instanceDir);
 	const uid = residentCacheOwnerUid(instanceDir);
-	// An instance directory that no longer exists carries nothing left to
-	// distrust: disposal is already satisfied. Only a present-but-unreadable
-	// entry is a trust failure.
+	let parentVerified = false;
+	if (parentDescriptor !== undefined) {
+		assertResidentCacheDisposalParent(instanceDir, parentDescriptor);
+		parentVerified = true;
+	}
+	// ENOENT is authoritative only while the retained parent still names the
+	// directory or after this process has already retired its ownership record.
 	try {
 		fs.lstatSync(instanceDir);
 	} catch (error) {
 		if (errorCode(error) !== "ENOENT") throw residentCacheTrustError("directory_unverifiable", instanceDir, error);
+		if (parentDescriptor !== undefined) assertResidentCacheDisposalParent(instanceDir, parentDescriptor);
+		if (!parentVerified && ownedResidentCacheInstanceDirs.has(instanceKey))
+			throw residentCacheTrustError("directory_absence_unverified", instanceDir, error);
 		ownedResidentCacheInstanceDirs.delete(instanceKey);
 		return;
 	}
@@ -418,7 +434,9 @@ export function disposeVerifiedResidentCacheInstanceDir(instanceDir: string): vo
 		descriptor = openVerifiedResidentCacheDirectory(instanceDir, uid);
 		assertResidentCacheDirectoryPathMatchesDescriptor(instanceDir, descriptor, uid);
 		const expected = fs.fstatSync(descriptor);
+		if (parentDescriptor !== undefined) assertResidentCacheDisposalParent(instanceDir, parentDescriptor);
 		fs.renameSync(instanceDir, quarantineDir);
+		if (parentDescriptor !== undefined) assertResidentCacheDisposalParent(instanceDir, parentDescriptor);
 		const moved = fs.lstatSync(quarantineDir);
 		if (
 			!moved.isDirectory() ||
@@ -1061,6 +1079,7 @@ export class BlobStore {
 
 interface EphemeralBlobStoreOptions {
 	readonly adoptVerifiedDir?: boolean;
+	readonly disposalParentDescriptor?: number;
 }
 
 /**
@@ -1107,10 +1126,12 @@ export class EphemeralBlobStore extends BlobStore {
 	#bufferCacheBytes = 0;
 	#adoptedVerifiedDir = false;
 	#disposed = false;
+	#disposalParentDescriptor: number | null = null;
 
 	constructor(dir: string, options: EphemeralBlobStoreOptions = {}) {
 		super(dir);
 		this.#adoptedVerifiedDir = options.adoptVerifiedDir === true;
+		this.#disposalParentDescriptor = options.disposalParentDescriptor ?? null;
 		if (this.#adoptedVerifiedDir) return;
 		fs.rmSync(dir, { recursive: true, force: true });
 		fs.mkdirSync(dir, { recursive: true, mode: BLOB_DIR_MODE });
@@ -1124,10 +1145,15 @@ export class EphemeralBlobStore extends BlobStore {
 	static adoptVerifiedDir(dir: string): EphemeralBlobStore {
 		const uid = residentCacheOwnerUid(dir);
 		let descriptor: number | null = null;
+		let parentDescriptor: number | null = null;
 		let failure: unknown;
 		try {
 			descriptor = openVerifiedResidentCacheDirectory(dir, uid);
 			assertResidentCacheDirectoryPathMatchesDescriptor(dir, descriptor, uid);
+			const parentDir = path.dirname(dir);
+			const parentUid = residentCacheOwnerUid(parentDir);
+			parentDescriptor = openVerifiedResidentCacheDirectory(parentDir, parentUid);
+			assertResidentCacheDirectoryPathMatchesDescriptor(parentDir, parentDescriptor, parentUid);
 		} catch (error) {
 			failure = error;
 		}
@@ -1139,10 +1165,18 @@ export class EphemeralBlobStore extends BlobStore {
 			}
 		}
 		if (failure !== undefined) {
+			if (parentDescriptor !== null) {
+				try {
+					fs.closeSync(parentDescriptor);
+				} catch {
+					// Preserve the adoption failure.
+				}
+			}
 			removeEmptyResidentCacheInstanceDir(dir);
 			throw residentCacheTrustError("instance_adoption_failed", dir, failure);
 		}
-		return new EphemeralBlobStore(dir, { adoptVerifiedDir: true });
+		if (parentDescriptor === null) throw new ResidentCacheTrustError("parent_authority_unavailable", dir);
+		return new EphemeralBlobStore(dir, { adoptVerifiedDir: true, disposalParentDescriptor: parentDescriptor });
 	}
 
 	#cachePut(hash: string, data: Buffer): void {
@@ -1268,7 +1302,15 @@ export class EphemeralBlobStore extends BlobStore {
 		this.#bufferCache.clear();
 		this.#bufferCacheBytes = 0;
 		if (this.#adoptedVerifiedDir) {
-			disposeVerifiedResidentCacheInstanceDir(this.dir);
+			disposeVerifiedResidentCacheInstanceDir(this.dir, this.#disposalParentDescriptor ?? undefined);
+			if (this.#disposalParentDescriptor !== null) {
+				try {
+					fs.closeSync(this.#disposalParentDescriptor);
+				} catch {
+					// Disposal is already complete; descriptor cleanup cannot restore the tree.
+				}
+				this.#disposalParentDescriptor = null;
+			}
 			this.#disposed = true;
 			return;
 		}
