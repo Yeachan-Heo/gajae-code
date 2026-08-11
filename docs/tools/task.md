@@ -28,12 +28,14 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `agent` | `string` | Yes | Exact agent name for every task item. Resolved at execution time through `discoverAgents(...)`. |
-| `tasks` | `Array<{ id: string; description: string; assignment: string }>` | Yes | Batch of small, self-contained task items. `id` max length 48 in schema; duplicate ids are rejected case-insensitively at runtime. |
+| `tasks` | `Array<{ id: string; description: string; assignment: string; tier?: "fast" \| "balanced" \| "strong" }>` | Yes | Batch of small, self-contained task items. `id` max length 48 in schema; duplicate ids are rejected case-insensitively at runtime. `tier` is advisory unless autorouting is enabled. |
 | `context` | `string` | No | Shared background prepended to every subagent system prompt. Trimmed before use. |
 | `schema` | `string` | No | JSON-encoded JTD schema. Overrides agent/session output schema when this mode allows task-level schemas. |
 | `isolated` | `boolean` | No | Only present when the tool is created with isolation enabled. Requests isolated execution for the whole batch. |
 
 `tasks[].description` is UI-only. `tasks[].assignment` is the actual per-task instruction.
+
+`tasks[].tier` is inert while `task.autorouting.enabled` is `false`. When autorouting is active it selects the model chain for that item, an omitted `tier` routes as `balanced`, and the routed pin overrides the manual model chain. See [Autorouting](#autorouting).
 
 ### Schema-free mode (`task.simple = "schema-free"`)
 
@@ -150,6 +152,19 @@ Artifacts and side channels:
   - `architect` — read-only architecture and code-review assessment.
   - `planner` — read-only sequencing and acceptance criteria.
   - `critic` — read-only plan critique and actionability review.
+
+## Autorouting
+
+Off by default. When `task.autorouting.enabled` is `true`, each task item is routed by its `tier` instead of the manual model chain.
+
+- Tier map source: `task.autorouting.tiers` (explicit or generated) wins over `task.autorouting.preset` (`anthropic`, `openai-codex`, `google`, `xai`). Contract in `packages/coding-agent/src/config/autorouting-contract.ts`.
+- Selectors are exact `provider/modelId` strings with an optional `:minimal|low|medium|high|xhigh` suffix. Globs, bare model ids, and `pi/<role>` aliases are rejected by the generated config schema.
+- An omitted `tier` routes as `balanced`. A tier with no usable chain falls back to manual resolution for that item alone, with a bounded reason recorded.
+- Preflight tries at most three unique candidates and only advances on transient failures observed before the run starts; there is no mid-run failover. Failed attempts run in staged sessions and attempt-scoped artifacts, so they leave no durable residue.
+- Resolved routing evidence (skips, attempts, terminal outcome) is attached to the task result, receipt, renderer, and task-summary prompt.
+- Setup: `/routing` opens the smart-routing panel (declare providers in priority order; chains are generated deterministically from the curated tier map and the model catalog, never from credentials). `/routing on|off|status` manages the toggle and prints effective chains.
+
+With autorouting disabled, model resolution is byte-for-byte unchanged.
 
 ## Side Effects
 - Filesystem

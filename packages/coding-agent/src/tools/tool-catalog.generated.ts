@@ -2058,6 +2058,15 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 								"type": "string",
 								"description": "per-task instructions; self-contained"
 							},
+							"tier": {
+								"description": "Advisory unless autorouting is enabled; omitted routes as balanced.",
+								"type": "string",
+								"enum": [
+									"fast",
+									"balanced",
+									"strong"
+								]
+							},
 							"executionMode": {
 								"description": "typed executor mode: default keeps ordinary executor behavior; ultragoal-red-team injects the Ultragoal QA/red-team prompt fragment. Prefer this over free-form assignment text (#2698).",
 								"type": "string",
