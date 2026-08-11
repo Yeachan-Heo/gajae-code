@@ -927,7 +927,6 @@ describe("SDK session index", () => {
 				sessionId: "ambiguous",
 				endpointGeneration: current.endpointGeneration,
 				ambiguous: false,
-				live: false,
 			}),
 		]);
 		expect(await index.checkpointLiveHeartbeats()).toBe(1);
