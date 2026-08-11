@@ -744,9 +744,17 @@ export async function executePythonWithKernel(
 export async function executePython(code: string, options?: PythonExecutorOptions): Promise<PythonResult> {
 	const cwd = options?.cwd ?? getProjectDir();
 	const deadlineMs = getExecutionDeadlineMs(options);
-	const deadlineController =
-		deadlineMs !== undefined && options?.signal === undefined ? new AbortController() : undefined;
-	const signal = deadlineController?.signal ?? options?.signal;
+	const deadlineController = deadlineMs === undefined ? undefined : new AbortController();
+	const combinedController = deadlineController && options?.signal ? new AbortController() : undefined;
+	const forwardAbort = (): void => combinedController?.abort(options?.signal?.reason);
+	if (combinedController) {
+		if (options?.signal?.aborted) forwardAbort();
+		else options?.signal?.addEventListener("abort", forwardAbort, { once: true });
+	}
+	const forwardDeadlineAbort = (): void => combinedController?.abort(deadlineController?.signal.reason);
+	if (combinedController && deadlineController)
+		deadlineController.signal.addEventListener("abort", forwardDeadlineAbort, { once: true });
+	const signal = combinedController?.signal ?? deadlineController?.signal ?? options?.signal;
 	const remainingMs = getRemainingTimeoutMs(deadlineMs);
 	const deadlineTimer =
 		deadlineController && remainingMs !== undefined
@@ -780,5 +788,9 @@ export async function executePython(code: string, options?: PythonExecutorOption
 		throw err;
 	} finally {
 		if (deadlineTimer) clearTimeout(deadlineTimer);
+		if (combinedController) {
+			options?.signal?.removeEventListener("abort", forwardAbort);
+			deadlineController?.signal.removeEventListener("abort", forwardDeadlineAbort);
+		}
 	}
 }

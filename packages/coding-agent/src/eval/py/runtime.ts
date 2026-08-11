@@ -321,7 +321,27 @@ async function runRuntimeCommand(
 	}
 }
 
+const managedVenvProvisioning = new Map<string, Promise<void>>();
+
 async function ensureWorkspaceManagedVenv(
+	cwd: string,
+	baseEnv: Record<string, string | undefined>,
+	seedPackages: readonly string[],
+	lifecycle?: PythonRuntimeLifecycleOptions,
+): Promise<void> {
+	const venvPath = resolveWorkspaceManagedPythonCandidate(cwd).venvPath;
+	const existing = managedVenvProvisioning.get(venvPath);
+	if (existing) return await existing;
+	const provisioning = ensureWorkspaceManagedVenvInner(cwd, baseEnv, seedPackages, lifecycle);
+	managedVenvProvisioning.set(venvPath, provisioning);
+	try {
+		await provisioning;
+	} finally {
+		if (managedVenvProvisioning.get(venvPath) === provisioning) managedVenvProvisioning.delete(venvPath);
+	}
+}
+
+async function ensureWorkspaceManagedVenvInner(
 	cwd: string,
 	baseEnv: Record<string, string | undefined>,
 	seedPackages: readonly string[],
