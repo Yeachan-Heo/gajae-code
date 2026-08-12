@@ -63,9 +63,10 @@ export interface MCPServerConfigBase {
 	enabled?: boolean;
 	/**
 	 * Whether an explicit runtime MCP consumer should connect this server
-	 * automatically when that consumer starts (default: true). Normal standalone
-	 * `gjc`, `gjc --tmux`, and print-mode sessions do not consume `gjc mcp`
-	 * registrations today.
+	 * automatically when that consumer starts (default: true). Ordinary
+	 * standalone `gjc`, `gjc --tmux`, and print-mode sessions honor autoload for
+	 * conventional registrations; `autoload: false` keeps a server configured
+	 * for on-demand `/mcp` connection. `--no-mcp` opts a session out entirely.
 	 */
 	autoload?: boolean;
 	/** Connection timeout in milliseconds (default: 30000) */

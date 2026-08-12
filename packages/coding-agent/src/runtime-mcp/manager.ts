@@ -252,6 +252,12 @@ export interface MCPDiscoverOptions {
 	filterBrowser?: boolean;
 	/** Only connect servers with autoload !== false (default: false) */
 	autoloadOnly?: boolean;
+	/**
+	 * Restrict discovery to GJC's native `.gjc` scopes (user + project).
+	 * Runtime MCP authority for GJC sessions; Claude Code/Codex files are
+	 * explicit import sources into `.gjc`, not implicit runtime authorities.
+	 */
+	nativeOnly?: boolean;
 	/** Called when starting to connect to servers */
 	onConnecting?: (serverNames: string[]) => void;
 	/** Load only this explicit MCP config file. */
@@ -885,6 +891,7 @@ export class MCPManager {
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,
 			autoloadOnly: options?.autoloadOnly,
+			nativeOnly: options?.nativeOnly,
 			configPath: options?.configPath,
 		});
 		const result = await this.#connectServers(configs, sources, options?.onConnecting);

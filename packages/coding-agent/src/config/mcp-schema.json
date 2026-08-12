@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/packages/coding-agent/src/config/mcp-schema.json",
   "title": "GJC MCP configuration",
-  "description": "Schema for stored MCP server definitions in mcp.json, .mcp.json, .gjc/mcp.json, and ~/.gjc/agent/mcp.json. Normal standalone gjc sessions do not consume gjc mcp registrations as runtime tools today.",
+  "description": "Schema for stored MCP server definitions in mcp.json, .mcp.json, .gjc/mcp.json, and ~/.gjc/agent/mcp.json. Ordinary standalone gjc sessions consume enabled registrations at startup (conventional autoload); --no-mcp opts a session out.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -98,7 +98,7 @@
         },
         "autoload": {
           "type": "boolean",
-          "description": "Whether an explicit runtime MCP consumer should connect this server automatically when that consumer starts (default: true). Normal standalone gjc, gjc --tmux, and print-mode sessions do not consume gjc mcp registrations today; false keeps the server configured for consumers that support explicit connection."
+          "description": "Whether an explicit runtime MCP consumer should connect this server automatically when that consumer starts (default: true). Ordinary standalone gjc, gjc --tmux, and print-mode sessions honor autoload for conventional registrations; false keeps the server configured for on-demand /mcp connection, and --no-mcp opts a session out."
         },
         "sharing": {
           "type": "string",

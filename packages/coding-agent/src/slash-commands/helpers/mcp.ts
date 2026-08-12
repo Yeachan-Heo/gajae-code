@@ -351,7 +351,11 @@ async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCom
 			readMCPConfigFile(userPath),
 			readMCPConfigFile(projectPath),
 		]);
-		const disabledSet = new Set(await readDisabledServers(userPath));
+		const [userDisabled, projectDisabled] = await Promise.all([
+			readDisabledServers(userPath),
+			readDisabledServers(projectPath),
+		]);
+		const disabledSet = new Set([...userDisabled, ...projectDisabled]);
 		const entries: Array<{ name: string; config: MCPServerConfig; scope: string }> = [];
 		for (const [name, config] of Object.entries(userConfig.mcpServers ?? {})) {
 			entries.push({ name, config, scope: "user" });
@@ -367,7 +371,9 @@ async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCom
 			entries
 				.map(({ name, config, scope }) => {
 					const type = config.type ?? "stdio";
-					const enabled = config.enabled !== false && !disabledSet.has(name) ? "enabled" : "disabled";
+					const disabled = config.enabled === false || disabledSet.has(name);
+					const autoloadOff = !disabled && config.autoload === false;
+					const status = disabled ? "disabled" : autoloadOff ? "autoload-off" : "autoload";
 					let location: string | undefined;
 					if (config.type === "http" || config.type === "sse") {
 						// Strip query string and userinfo from URLs to avoid leaking
@@ -388,7 +394,7 @@ async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCom
 					} else {
 						location = (config as { command: string }).command;
 					}
-					return `${name} | ${type} | ${enabled} | ${location ?? "(unknown)"} [${scope}]`;
+					return `${name} | ${type} | ${status} | ${location ?? "(unknown)"} [${scope}]`;
 				})
 				.join("\n"),
 		);

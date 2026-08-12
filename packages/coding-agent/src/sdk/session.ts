@@ -47,6 +47,7 @@ import {
 } from "../async";
 import { loadCapability } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
+import type { SourceMeta } from "../capability/types";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
@@ -115,7 +116,8 @@ import {
 	createOptionalRuntimeServices,
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
-import { MCPManager } from "../runtime-mcp";
+import { loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
+import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
 	getNotificationConfig,
 	isGenericNotificationHostEligible,
@@ -469,6 +471,14 @@ export interface CreateAgentSessionOptions {
 	/** Load MCP tools for a top-level session only from this caller-owned absolute config file path.
 	 * Mutually exclusive with mcpManager. */
 	mcpConfigPath?: string;
+	/**
+	 * Whether conventional MCP autoload is enabled for a top-level standalone
+	 * session (default: true). When false, native user `~/.gjc/agent/mcp.json`
+	 * and project `.gjc/mcp.json` registrations are not discovered or connected
+	 * at startup. Plugin-bundle MCPs and `mcpConfigPath` exact-file sessions
+	 * are unaffected. CLI: `--no-mcp`.
+	 */
+	enableMcpAutoload?: boolean;
 	/**
 	 * Defer connecting an exact MCP config until the interactive UI is ready.
 	 * @internal CLI-only startup optimization; SDK callers retain synchronous loading by default.
@@ -1083,6 +1093,7 @@ const MAX_EXACT_MCP_TOOL_COLLISION_NAMES = 10;
 const DEFERRED_MCP_CONFIG_STARTUP_ERROR = "MCP tools could not be loaded.";
 const MAX_EXACT_MCP_TOOL_NAME_LENGTH = 100;
 const pluginMcpManagerServers = new WeakMap<MCPManager, ReadonlySet<string>>();
+const conventionalMcpManagerServers = new WeakMap<MCPManager, ReadonlySet<string>>();
 
 class ExactMcpToolNameCollisionError extends Error {
 	constructor(toolNames: Iterable<string>) {
@@ -2051,16 +2062,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time("createAllTools", createTools, toolSession, options.toolNames);
 
-		// MCP runtime discovery is quarantined for the GJC surface. A top-level
-		// session may load only a caller-supplied exact config; project and user
-		// MCP configs are never discovered here. Existing managers remain available
-		// for legacy in-process callers, and plugin-bundle managers are created
-		// below after `customTools` is populated.
+		// A top-level session loads MCP tools from three bounded surfaces: a
+		// caller-supplied exact config (`--mcp-config`), conventional native
+		// user/project registrations (`~/.gjc/agent/mcp.json` and `.gjc/mcp.json`
+		// written by `gjc mcp add`; disabled by `--no-mcp`), and plugin-bundle
+		// MCP servers (created below after `customTools` is populated). Existing
+		// caller-supplied managers remain available for legacy in-process callers.
 		let mcpManager: MCPManager | undefined = options.mcpManager;
 		let ownsMcpManager = false;
 		const customTools: CustomTool[] = [];
 		const exactMcpToolNames: string[] = [];
 		const pluginMcpToolNames: string[] = [];
+		const conventionalMcpToolNames: string[] = [];
 		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
 
 		// Add image tools when an image role model is configured.
@@ -2181,28 +2194,76 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 		} else if (!mcpManager && !isCanonicalSubSession) {
-			// Always-on GJC plugin-bundle MCP servers. Top-level sessions own a manager
-			// and connect the validated servers; subagents inherit the parent's manager
+			// Conventional MCP autoload: top-level standalone sessions consume
+			// enabled registrations from GJC's own native configs — project
+			// `.gjc/mcp.json` and user `~/.gjc/agent/mcp.json` (written by
+			// `gjc mcp add`). Native project scope wins over native user scope on
+			// name collisions (capability priority), and plugin-bundle MCPs below
+			// override conventional entries with the same name. Claude Code/Codex
+			// MCP files are explicit import sources into `.gjc` (#4291), never
+			// implicit runtime authorities here. `--no-mcp` opts a session out;
+			// `--mcp-config` exact-file sessions never reach here. The owned manager's
+			// tools are surfaced as always-on custom tools (like plugin MCPs), so an
+			// ordinary session exposes them without needing MCP discovery mode.
+			let conventionalConfigs: Record<string, MCPServerConfig> = {};
+			let conventionalSources: Record<string, SourceMeta> = {};
+			if (options.enableMcpAutoload !== false) {
+				try {
+					const loaded = await loadAllMCPConfigs(cwd, {
+						// Project-scope native config loads by default; only an
+						// explicitly configured `mcp.enableProjectConfig: false`
+						// disables it (the legacy schema default stays false for
+						// foreign-format discovery consumers of the capability system).
+						enableProjectConfig: settings.has("mcp.enableProjectConfig")
+							? settings.get("mcp.enableProjectConfig")
+							: true,
+						autoloadOnly: true,
+						// Runtime authority is GJC's native `.gjc` config in both scopes;
+						// Claude Code/Codex MCP files are explicit import sources into
+						// `.gjc`, not implicit competing runtime authorities.
+						nativeOnly: true,
+					});
+					conventionalConfigs = loaded.configs;
+					conventionalSources = loaded.sources;
+					for (const warning of loaded.warnings) {
+						logger.warn("MCP conventional discovery warning", { warning });
+					}
+					if (loaded.configurationWarning) {
+						logger.warn("MCP configuration unavailable.");
+					}
+				} catch (error) {
+					logger.warn("Failed to discover conventional MCP servers", { error: safeErrorForLog(error) });
+				}
+			}
+			// Always-on GJC plugin-bundle MCP servers, merged over conventional
+			// servers on name collisions. Top-level sessions own a manager and
+			// connect the validated servers; subagents inherit the parent's manager
 			// via options.mcpManager and never spawn their own (prevents duplicate
-			// processes and leaks). Per the plugin product contract, connected MCP tools
-			// are surfaced as always-on tools rather than gated behind MCP selection.
+			// processes and leaks). Per the plugin product contract, connected MCP
+			// tools are surfaced as always-on tools rather than gated behind MCP
+			// selection.
 			try {
 				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
 				for (const q of quarantine) {
 					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 				}
-				if (Object.keys(configs).length > 0) {
+				const pluginNames = new Set(Object.keys(configs));
+				const mergedConfigs = { ...conventionalConfigs, ...configs };
+				const mergedSources = {
+					...conventionalSources,
+					...Object.fromEntries(
+						Object.keys(configs).map(name => [
+							name,
+							{ provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
+						]),
+					),
+				};
+				if (Object.keys(mergedConfigs).length > 0) {
 					const owned = new MCPManager(cwd, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
 					cleanupOwnedMcpManager = () => owned.disconnectAll();
 					try {
-						const sources = Object.fromEntries(
-							Object.keys(configs).map(name => [
-								name,
-								{ provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
-							]),
-						);
-						const result = await owned.connectServers(configs, sources as never);
+						const result = await owned.connectServers(mergedConfigs, mergedSources as never);
 						for (const [server, err] of result.errors) {
 							// A server that failed to connect leaves this generation
 							// incomplete: its surfaces produced no evidence, so publishing
@@ -2217,9 +2278,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							mcpManager = owned;
 							ownsMcpManager = true;
 							customTools.push(...(result.tools as CustomTool[]));
-							pluginMcpManagerServers.set(owned, new Set(result.connectedServers));
-							owned.sealConnectionSet();
-							pluginMcpToolNames.push(...result.tools.map(tool => tool.name));
+							const connectedPluginNames = new Set(
+								result.connectedServers.filter(name => pluginNames.has(name)),
+							);
+							pluginMcpManagerServers.set(owned, connectedPluginNames);
+							conventionalMcpManagerServers.set(owned, new Set(result.connectedServers));
+							for (const tool of result.tools) {
+								const serverName = tool.mcpServerName;
+								if (serverName === undefined) continue;
+								if (connectedPluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
+								else conventionalMcpToolNames.push(tool.name);
+							}
+							// Plugin-bundle connections are fixed for the session lifetime
+							// (existing plugin contract). Sessions without plugin MCPs keep
+							// a mutable connection set so `/mcp reload` can re-discover
+							// conventional registrations.
+							if (connectedPluginNames.size > 0) owned.sealConnectionSet();
 						} else {
 							try {
 								await owned.disconnectAll();
@@ -2254,22 +2328,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				});
 			}
 		} else if (isCanonicalSubSession) {
-			// Subagents inherit the parent's always-on plugin MCP tools WITHOUT
-			// owning the manager (no connect, no callbacks, no disposal). The facade
-			// is carried explicitly by the parent session scope; process-global state
-			// is never consulted for MCP routing.
+			// Subagents inherit the parent's always-on plugin and conventional MCP
+			// tools WITHOUT owning the manager (no connect, no callbacks, no
+			// disposal). The facade is carried explicitly by the parent session
+			// scope; process-global state is never consulted for MCP routing.
 			const inherited = mcpManager ?? options.inheritedMcpManager;
 			if (inherited) {
 				try {
 					const inheritedTools = inherited.getTools();
 					if (inheritedTools.length > 0) customTools.push(...(inheritedTools as CustomTool[]));
 					const pluginServers = pluginMcpManagerServers.get(inherited);
-					if (pluginServers) {
-						pluginMcpToolNames.push(
-							...inheritedTools
-								.filter(tool => tool.mcpServerName !== undefined && pluginServers.has(tool.mcpServerName))
-								.map(tool => tool.name),
-						);
+					const conventionalServers = conventionalMcpManagerServers.get(inherited);
+					for (const tool of inheritedTools) {
+						const serverName = tool.mcpServerName;
+						if (serverName === undefined) continue;
+						if (pluginServers?.has(serverName)) pluginMcpToolNames.push(tool.name);
+						else if (conventionalServers?.has(serverName)) conventionalMcpToolNames.push(tool.name);
 					}
 				} catch (error) {
 					logger.warn("Failed to inherit MCP tools in subagent", { error: safeErrorForLog(error) });
@@ -2982,6 +3056,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				...new Set([
 					...discoveryDefaultServerToolNames,
 					...(explicitMcpConfigPath !== undefined ? exactMcpToolNames : []),
+					// Conventional autoload servers are selected by default so their
+					// tools are exposed in sessions that enable MCP discovery mode.
+					...conventionalMcpToolNames,
 				]),
 			];
 			hasExplicitMCPToolSelection =
@@ -3001,11 +3078,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Custom, extension-registered, and plugin-bundle MCP tools are always
 		// included regardless of the caller's built-in tool filter. Plugin MCPs
-		// remain always-on even when generic MCP discovery is disabled.
+		// and conventional autoload MCPs remain always-on even when generic MCP
+		// discovery is disabled.
 		const alwaysInclude: string[] = [
 			...(options.customTools?.map(t => (isCustomTool(t) ? t.name : t.name)) ?? []),
 			...registeredTools.filter(t => !t.definition.defaultInactive).map(t => t.definition.name),
 			...pluginMcpToolNames,
+			...conventionalMcpToolNames,
 		];
 		const pluginMcpToolNameSet = new Set(pluginMcpToolNames);
 		for (const name of alwaysInclude) {

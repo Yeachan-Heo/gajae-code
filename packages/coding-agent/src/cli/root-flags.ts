@@ -23,6 +23,10 @@ export const ROOT_LAUNCH_FLAGS = {
 	"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 	"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
 	"mcp-config": Flags.string({ description: "Tools-only MCP config file (absolute path)" }),
+	"no-mcp": Flags.boolean({
+		description:
+			"Disable conventional MCP autoload (native user ~/.gjc/agent/mcp.json and project .gjc/mcp.json registrations)",
+	}),
 	"clipboard-transport": Flags.string({
 		description: "Clipboard transport: auto (default), native, osc52, or ssh",
 		options: ["auto", "native", "osc52", "ssh"],

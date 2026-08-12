@@ -640,6 +640,10 @@ test("ACP rejects --mcp-config instead of ignoring it", () => {
 	const parsed = parseArgs(["--mcp-config", "/tmp/gjc-mcp.json"]);
 	expect(() => resolveAcpStartupOptions(parsed, {})).toThrow("Unsupported under SDK-backed ACP: --mcp-config");
 });
+test("ACP rejects --no-mcp instead of ignoring it", () => {
+	const parsed = parseArgs(["--no-mcp"]);
+	expect(() => resolveAcpStartupOptions(parsed, {})).toThrow("Unsupported under SDK-backed ACP: --no-mcp");
+});
 test("ACP preserves --models rejection alongside --mcp-config", () => {
 	const modelsOnly = parseArgs(["--models", "openai-codex/gpt-5.6"]);
 	expect(() => resolveAcpStartupOptions(modelsOnly, {})).toThrow("Unsupported under SDK-backed ACP: --models");
