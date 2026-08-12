@@ -94,7 +94,10 @@ function migrateCacheSchema(db: Database): void {
 	if (!columns.some(column => column.name === "dynamic_model_provenance")) {
 		db.run("ALTER TABLE model_cache ADD COLUMN dynamic_model_provenance TEXT");
 	}
-	db.run("UPDATE model_cache SET version = ? WHERE version IN (2, 3, 4)", [CACHE_SCHEMA_VERSION]);
+	db.run(
+		"UPDATE model_cache SET version = ? WHERE version IN (2, 3, 4) AND dynamic_model_ids IS NOT NULL AND dynamic_model_provenance IS NOT NULL",
+		[CACHE_SCHEMA_VERSION],
+	);
 }
 
 export function readModelCache<TApi extends Api>(
