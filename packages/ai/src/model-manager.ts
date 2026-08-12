@@ -137,7 +137,9 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		cache.dynamicModelProvenance !== undefined &&
 		cache.dynamicModelProvenance === options.cacheDynamicModelProvenance;
 	const cacheProvenanceMismatch = cache?.dynamicModelIds !== undefined && !cacheDynamicModelIdsCurrent;
-	const hasAuthoritativeCache = (cache?.authoritative ?? false) || !hasDynamicFetcher;
+	const hasAuthoritativeCache =
+		!hasDynamicFetcher ||
+		((cache?.authoritative ?? false) && (cache?.dynamicModelIds === undefined || cacheDynamicModelIdsCurrent));
 	const cacheAgeMs = cache ? now() - cache.updatedAt : Number.POSITIVE_INFINITY;
 	const shouldFetchFromNetwork =
 		cacheProvenanceMismatch && strategy !== "offline"

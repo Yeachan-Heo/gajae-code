@@ -2646,6 +2646,7 @@ export class ModelRegistry {
 			if (
 				isCurrentDiscovery() &&
 				(result.fetched ||
+					result.dynamicModelIds !== undefined ||
 					result.stale ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.authGeneration !== authGeneration ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint)

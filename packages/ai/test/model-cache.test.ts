@@ -48,7 +48,7 @@ describe("model cache migrations", () => {
 		}
 	});
 
-	it("invalidates v2 cached models so the next discovery replaces them", () => {
+	it("preserves v2 cached models and lets the next discovery overwrite them", () => {
 		const legacyModel = createModel("legacy-cloud-model", "Legacy Cloud Model");
 		const legacyDb = new Database(dbPath, { create: true });
 		legacyDb.run(`
@@ -67,7 +67,8 @@ describe("model cache migrations", () => {
 		legacyDb.close();
 
 		const migrated = readModelCache<"openai-completions">("ollama-cloud", TTL_MS, Date.now, dbPath);
-		expect(migrated).toBeNull();
+		expect(migrated?.models.map(model => model.id)).toEqual(["legacy-cloud-model"]);
+		expect(migrated?.staticFingerprint).toBe("");
 
 		const replacementModel = createModel("fresh-cloud-model", "Fresh Cloud Model");
 		writeModelCache("ollama-cloud", Date.now(), [replacementModel], true, "static-v3", dbPath);
