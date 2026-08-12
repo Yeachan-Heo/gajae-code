@@ -2,12 +2,15 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
+// "hooks.md" is intentionally absent: the canonical hook-event feature
+// (feat(hooks) canonical hook event IR + normalization adapters) re-added the
+// doc after this cleanup list was written, so expecting it removed would fail
+// on current dev (the follow-up branch rebased onto dev inherits the state).
 const removedDocs = [
 	"custom-tools.md",
 	"extension-loading.md",
 	"extensions.md",
 	"gemini-manifest-extensions.md",
-	"hooks.md",
 	"marketplace.md",
 	"plugin-manager-installer-plumbing.md",
 	"skills.md",
