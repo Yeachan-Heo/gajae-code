@@ -10369,7 +10369,13 @@ export class SessionManager {
 			managedMove && managedDestinationStore
 				? { directory: path.resolve(newSessionDir), store: managedDestinationStore }
 				: null;
-		this.#adoptManagedPersistIdentity(this.#sessionFile);
+		// A transcript is only guaranteed to exist at the destination when the old file was
+		// actually present and moved (hadSessionFile). Absent/fresh/deleted-source sessions
+		// have no destination transcript yet, so adopting a strict expected identity here
+		// would invent identity for a nonexistent file; defer adoption until the first real
+		// publication (#writeEntriesAtomicallySync / #appendManagedRecordsSync) instead.
+		if (hadSessionFile) this.#adoptManagedPersistIdentity(this.#sessionFile);
+		else this.#managedPersistExpectedIdentity = undefined;
 
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
 		try {
@@ -10406,7 +10412,10 @@ export class SessionManager {
 					managedMove && managedSourceStore
 						? { directory: path.resolve(previousSessionDir), store: managedSourceStore }
 						: null;
-				this.#adoptManagedPersistIdentity(previousSessionFile);
+				// Same rationale as the forward path: only adopt strict identity when the source
+				// transcript actually existed (and was thus restorable) before the failed move.
+				if (hadSessionFile) this.#adoptManagedPersistIdentity(previousSessionFile);
+				else this.#managedPersistExpectedIdentity = undefined;
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header) applyHeaderPatch(header, { cwd: previousCwd });
 				this.#headerExportRevision++;
