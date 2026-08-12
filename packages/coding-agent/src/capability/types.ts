@@ -71,6 +71,12 @@ export interface LoadOptions {
 	includeInvalid?: boolean;
 	/** Include items disabled via settings. Default: false */
 	includeDisabled?: boolean;
+	/**
+	 * Include providers disabled via settings (for diagnostics). Default: false.
+	 * Items loaded from a disabled provider are not marked by the registry; callers
+	 * compare `_source.provider` against the disabled-provider set themselves.
+	 */
+	includeDisabledProviders?: boolean;
 	/** Explicit disabled extension IDs to apply instead of settings. */
 	disabledExtensions?: string[];
 	/** Session settings whose provider policy applies to this load. */

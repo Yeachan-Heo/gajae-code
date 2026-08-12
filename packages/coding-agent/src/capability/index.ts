@@ -212,7 +212,9 @@ async function loadImpl<T>(
 function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
 	const activeSettings = options.settings ?? settingsByCwd.get(path.normalize(options.cwd ?? getProjectDir()));
 	const activeDisabledProviders = new Set(activeSettings?.get("disabledProviders") ?? disabledProviders);
-	let providers = (capability.providers as Provider<T>[]).filter(p => !activeDisabledProviders.has(p.id));
+	let providers = (capability.providers as Provider<T>[]).filter(
+		p => options.includeDisabledProviders === true || !activeDisabledProviders.has(p.id),
+	);
 	if (options.providers) {
 		const allowed = new Set(options.providers);
 		providers = providers.filter(p => allowed.has(p.id));
