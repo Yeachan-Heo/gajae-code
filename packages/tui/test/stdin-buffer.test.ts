@@ -5,7 +5,7 @@
  * MIT License - Copyright (c) 2025 opentui
  */
 
-import { beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { parseKey, setKittyProtocolActive } from "@gajae-code/tui/keys";
 import { StdinBuffer } from "@gajae-code/tui/stdin-buffer";
 
@@ -21,6 +21,10 @@ describe("StdinBuffer", () => {
 		buffer.on("data", (sequence: string) => {
 			emittedSequences.push(sequence);
 		});
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
 	});
 
 	// Helper to process data through the buffer
@@ -391,6 +395,30 @@ describe("StdinBuffer", () => {
 			// in one write and must stay one sequence.
 			processInput("\x1b\x1b[A");
 			expect(emittedSequences).toEqual(["\x1b\x1b[A"]);
+		});
+
+		it("keeps a delayed Option continuation atomic when it arrives before the flush boundary", () => {
+			vi.useFakeTimers();
+			processInput("\x1b\x1b");
+			vi.advanceTimersByTime(9);
+			processInput("[A");
+
+			expect(emittedSequences).toEqual(["\x1b\x1b[A"]);
+		});
+
+		it("emits separate Escapes when an Option continuation arrives after the flush boundary", () => {
+			vi.useFakeTimers();
+			processInput("\x1b\x1b");
+			vi.advanceTimersByTime(10);
+			processInput("[A");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "[", "A"]);
+		});
+
+		it("does not duplicate or lose Escapes across a cancellation cut and explicit flush", () => {
+			processInput("\x1b\x1b\x1b\x1b[1;");
+			expect(emittedSequences).toEqual(["\x1b", "\x1b"]);
+			expect(buffer.flush()).toEqual(["\x1b\x1b[1;"]);
 		});
 
 		it("still cuts an ESC-cancelled incomplete sequence without splitting it", async () => {
