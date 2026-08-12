@@ -112,6 +112,47 @@ describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 		expect(disposeKernels.mock.calls[0]?.[0]).not.toBe(missionOwner);
 	});
 
+	it("drains transition-registered cleanups, which is where the SDK actually puts tool cleanups", async () => {
+		// The SDK binds a tool's `registerSessionCleanup` to
+		// registerToolSessionTransitionCleanup (sdk/session.ts), so a discoverable
+		// builtin like the autoresearch mission python tool lands in the TRANSITION
+		// set, not the one registerToolSessionCleanup fills. Draining only the latter
+		// passed every test while still orphaning the kernel on Ctrl-C in production.
+		const missionOwner = "autoresearch:mission-2";
+		const reaped: string[] = [];
+		session!.registerToolSessionTransitionCleanup(async () => {
+			reaped.push(missionOwner);
+		});
+
+		await session!.disposeChildSubprocesses();
+
+		expect(reaped).toEqual([missionOwner]);
+	});
+
+	it("drains both cleanup sets on a single signal teardown", async () => {
+		const order: string[] = [];
+		session!.registerToolSessionCleanup(() => {
+			order.push("direct");
+		});
+		session!.registerToolSessionTransitionCleanup(() => {
+			order.push("transition");
+		});
+
+		await session!.disposeChildSubprocesses();
+
+		expect(order.sort()).toEqual(["direct", "transition"]);
+	});
+
+	it("stays inside the time box when a transition cleanup hangs", async () => {
+		session!.registerToolSessionTransitionCleanup(() => new Promise<void>(() => {}));
+
+		const start = Date.now();
+		await session!.disposeChildSubprocesses(20);
+
+		expect(Date.now() - start).toBeLessThan(2_000);
+		expect(disposeKernels).toHaveBeenCalledTimes(1);
+	});
+
 	it("does not double-run a tool cleanup that graceful dispose already drained", async () => {
 		let runs = 0;
 		session!.registerToolSessionCleanup(() => {

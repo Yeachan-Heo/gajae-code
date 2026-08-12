@@ -147,7 +147,23 @@ export function createAutoresearchPythonTool(
 			params: Static<typeof paramsSchema>,
 			signal?: AbortSignal,
 		): Promise<AgentToolResult> {
-			const missionContext = await resolveMissionContext(context);
+			// A corrupt or unreadable mission must fail the same way a missing one
+			// does: an actionable error, never an ad-hoc kernel and never an opaque
+			// throw escaping the tool boundary.
+			let missionContext: AutoresearchPythonToolMissionContext | null;
+			try {
+				missionContext = await resolveMissionContext(context);
+			} catch (error) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `${AUTORESEARCH_PYTHON_TOOL_NO_MISSION_ERROR} (mission state unreadable: ${error instanceof Error ? error.message : String(error)})`,
+						},
+					],
+					isError: true,
+				};
+			}
 			if (missionContext === null) {
 				return {
 					content: [{ type: "text", text: AUTORESEARCH_PYTHON_TOOL_NO_MISSION_ERROR }],
