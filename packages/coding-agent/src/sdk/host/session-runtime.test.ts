@@ -3330,3 +3330,79 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 		await rm(cwd, { recursive: true, force: true });
 	}
 });
+
+test("SDK-only host rebinds the steering snapshot when the requester's turn wins the owner race", async () => {
+	// Review thread P1: an abort admitted while another connection owns the
+	// active turn captures its snapshot under that OLD turn; when the durable
+	// no-effect reservation reveals that the ABORTING requester's own prompt
+	// became active, the fall-through terminalizes that turn and must REBIND
+	// the admission snapshot to it — otherwise the settlement rejects the
+	// still-old token and the requester's turn keeps running.
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-snapshot-rebind-"));
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	const transport = memoryTransport();
+	const reconciliationStore = createReconciliationStore({
+		sessionFile: path.join(cwd, "session.json"),
+		sessionId: transport.sessionId,
+	});
+	let ownerReads = 0;
+	let rebindCalls = 0;
+	const settledOptions: Array<{ scope?: string; steeringSnapshotToken?: number }> = [];
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		createTransport: async () => transport,
+		terminalAbortSeams: {
+			getReconciliationStore: () => reconciliationStore,
+			getTerminalTurnEpoch: () => 7,
+			getActivePromptHandle: () => "exact-run-handle",
+			// First read: another connection owns the turn. The recheck after
+			// the durable reservation: the aborting requester now owns it.
+			getActivePromptOwnerConnectionId: () => (ownerReads++ === 0 ? undefined : "client"),
+			cancelPendingPreflightForTerminalAbort: () => {},
+			captureTerminalAbortSteeringSnapshot: () => 42,
+			rebindTerminalAbortSteeringSnapshot: () => {
+				rebindCalls += 1;
+			},
+			abortPromptAndWaitWithTerminal: async (_handle, options) => {
+				settledOptions.push({
+					scope: options.terminal?.scope,
+					steeringSnapshotToken: options.terminal?.steeringSnapshotToken,
+				});
+				return { status: "settled", terminalScope: {} };
+			},
+		},
+	});
+	const ctx = extensionContext(transport.sessionId, cwd);
+	try {
+		await handlers.get("session_start")?.({}, ctx);
+		transport.feed("client", {
+			type: "control_request",
+			id: "owner-race-abort",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "owner-race-key",
+		} as SdkFrame);
+		const deadline = Date.now() + 15_000;
+		while (!transport.sent.some(frame => frame.id === "owner-race-abort" && frame.type === "control_response")) {
+			if (Date.now() > deadline) throw new Error("Timed out waiting for the owner-race abort response");
+			await Bun.sleep(20);
+		}
+		// The fall-through terminalized the requester's rechecked turn: the
+		// admission snapshot was rebound to it and the settlement received the
+		// token instead of a stale rejection.
+		expect(rebindCalls).toBe(1);
+		expect(settledOptions).toEqual([{ scope: "turn", steeringSnapshotToken: 42 }]);
+		expect(transport.sent.find(frame => frame.id === "owner-race-abort")).toMatchObject({
+			ok: true,
+			result: expect.objectContaining({ turn: "stopped" }),
+		});
+	} finally {
+		await handlers.get("session_shutdown")?.({}, ctx);
+		await rm(cwd, { recursive: true, force: true });
+	}
+});

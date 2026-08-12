@@ -2337,6 +2337,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									session.discardTerminalAbortSteeringSnapshot(token);
 								},
+								rebindTerminalAbortSteeringSnapshot: (token: number) => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									session.rebindTerminalAbortSteeringSnapshot(token);
+								},
 								abortPromptAndWaitWithTerminal: (handle, seamOptions) => {
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									return session.abortPromptAndWait(handle, seamOptions);
@@ -2411,6 +2415,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								discardTerminalAbortSteeringSnapshot: (token: number) => {
 									if (!session) throw new Error("Terminal abort session is not initialized.");
 									session.discardTerminalAbortSteeringSnapshot(token);
+								},
+								rebindTerminalAbortSteeringSnapshot: (token: number) => {
+									if (!session) throw new Error("Terminal abort session is not initialized.");
+									session.rebindTerminalAbortSteeringSnapshot(token);
 								},
 								abortPromptAndWaitWithTerminal: (handle, seamOptions) => {
 									if (!session) throw new Error("Terminal abort session is not initialized.");

@@ -217,6 +217,12 @@ export interface SdkOnlyTerminalAbortSeams {
 	 *  FIFO entry would otherwise be consumed by a later real abort (review
 	 *  thread P1). */
 	discardTerminalAbortSteeringSnapshot?: (token: number) => void;
+	/** Rebind a captured snapshot to the CURRENT turn: the owner-mismatch
+	 *  fall-through may terminalize the aborting requester's own turn that won
+	 *  the race, while the token was captured under the other connection's
+	 *  turn — without the rebind the settlement rejects the still-old token
+	 *  and the requester's turn keeps running (review thread P1). */
+	rebindTerminalAbortSteeringSnapshot?: (token: number) => void;
 	abortPromptAndWaitWithTerminal: (
 		handle: string,
 		options: {
@@ -1871,6 +1877,16 @@ function createControlSurface(
 				}
 				handle = recheckedHandle;
 				epoch = recheckedEpoch;
+				// The requester's OWN prompt won the race: this abort now
+				// terminalizes that turn. The admission snapshot was captured
+				// under the other connection's turn — rebind it to the rechecked
+				// turn so the settlement's purge classifies steering admitted
+				// since admission as post-snapshot instead of rejecting the
+				// still-old token and leaving the requester's turn running
+				// (review thread P1).
+				if (steeringSnapshotToken !== undefined) {
+					terminalAbortSeams?.rebindTerminalAbortSteeringSnapshot?.(steeringSnapshotToken);
+				}
 			}
 			// Requester ownership: the active prompt belongs to the SDK connection
 			// that accepted it. Another connection's terminal abort must not stop it
@@ -1936,6 +1952,16 @@ function createControlSurface(
 				}
 				handle = recheckedHandle;
 				epoch = recheckedEpoch;
+				// The requester's OWN prompt won the race: this abort now
+				// terminalizes that turn. The admission snapshot was captured
+				// under the other connection's turn — rebind it to the rechecked
+				// turn so the settlement's purge classifies steering admitted
+				// since admission as post-snapshot instead of rejecting the
+				// still-old token and leaving the requester's turn running
+				// (review thread P1).
+				if (steeringSnapshotToken !== undefined) {
+					terminalAbortSeams?.rebindTerminalAbortSteeringSnapshot?.(steeringSnapshotToken);
+				}
 			}
 			let pendingReplay: SdkOnlyTerminalScopeRecord | undefined;
 			let tombstoneReplay: SdkOnlyEvictedTerminalKeyEntry | undefined;

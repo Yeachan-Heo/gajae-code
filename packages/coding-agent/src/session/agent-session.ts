@@ -11267,6 +11267,30 @@ export class AgentSession {
 	 * keyed to the CURRENT turn, which is where its admission captured it.
 	 * Removing by token keeps overlapping admissions' entries independent.
 	 */
+	/**
+	 * Rebind a captured snapshot to the CURRENT turn: the owner-mismatch
+	 * fall-through may terminalize the aborting requester's own turn that won
+	 * the race, while the token was captured under the other connection's
+	 * turn. The entry moves to the current turn's FIFO (retaining the original
+	 * admission sequence) so the settlement's purge classifies steering
+	 * admitted since admission as post-snapshot (review thread P1).
+	 */
+	rebindTerminalAbortSteeringSnapshot(token: number): void {
+		const capturedKey = this.#terminalAbortSteeringSnapshotKeys.get(token);
+		if (capturedKey === undefined) return;
+		if (this.#turnLineageIdHash === undefined) return;
+		const currentKey = `${this.#turnLineageIdHash}:${this.#promptGeneration}`;
+		if (capturedKey === currentKey) return;
+		const capturedQueue = this.#terminalAbortSteeringSnapshots.get(capturedKey);
+		const index = capturedQueue?.findIndex(entry => entry.token === token) ?? -1;
+		if (index < 0) return;
+		const [entry] = capturedQueue!.splice(index, 1);
+		if (capturedQueue!.length === 0) this.#terminalAbortSteeringSnapshots.delete(capturedKey);
+		const currentQueue = this.#terminalAbortSteeringSnapshots.get(currentKey) ?? [];
+		currentQueue.push(entry);
+		this.#terminalAbortSteeringSnapshots.set(currentKey, currentQueue);
+		this.#terminalAbortSteeringSnapshotKeys.set(token, currentKey);
+	}
 	discardTerminalAbortSteeringSnapshot(token: number): void {
 		const key = this.#terminalAbortSteeringSnapshotKeys.get(token);
 		if (!key) return;

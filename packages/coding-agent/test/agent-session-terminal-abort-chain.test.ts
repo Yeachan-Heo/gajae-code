@@ -682,6 +682,37 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await waitFor(() => !session.agent.hasQueuedMessages(), "external follow-up consumed");
 		await promptPromise;
 	}, 30_000);
+	it("terminal abort rebinds the snapshot to the requester's turn that won the race", async () => {
+		// Review thread P1: when an abort is admitted while another connection
+		// owns the active turn and the aborting requester's own prompt then
+		// becomes active, the settlement must purge with the ORIGINAL admission
+		// sequence — the session rebinds the captured token to the current turn
+		// instead of rejecting it as stale.
+		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("ok")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const handle = session.agent.activeResourceRunId;
+		// Admission capture: recorded under the CURRENT turn key.
+		const token = session.captureTerminalAbortSteeringSnapshot();
+		expect(token).toBeDefined();
+		// A client steer admitted after the snapshot.
+		await session.sendUserMessage("requester steer", { deliverAs: "steer" });
+		// The requester's turn won the race: rebind the token to the current
+		// turn (same key here — a no-op the harness turns into a same-key
+		// validation) and settle: the purge must preserve the post-snapshot
+		// steer using the ORIGINAL admission sequence.
+		session.rebindTerminalAbortSteeringSnapshot(token ?? 0);
+		const proof = await session.abortPromptAndWait(handle ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn", steeringSnapshotToken: token },
+		});
+		expect(proof.status).not.toBe("unfenced");
+		// The steer survives the purge (post-snapshot against the original
+		// admission sequence) and the rearm consumes it.
+		await waitFor(() => !session.agent.hasQueuedSteering(), "requester steer consumed");
+		await promptPromise;
+	}, 30_000);
+
 	it("terminal abort discards snapshots captured by replay-only admissions", async () => {
 		// Review thread P1: a durable same-key replay reaches the admission but
 		// never settles — its captured snapshot must be discarded, or a later

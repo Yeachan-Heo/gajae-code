@@ -2407,7 +2407,9 @@ function sdkControlSurface(
 	terminalAbortSeams?: {
 		getTerminalTurnEpoch: () => number | undefined;
 		cancelPendingPreflightForTerminalAbort: () => void;
-		captureTerminalAbortSteeringSnapshot?: () => void;
+		captureTerminalAbortSteeringSnapshot?: () => number | undefined;
+		discardTerminalAbortSteeringSnapshot?: (token: number) => void;
+		rebindTerminalAbortSteeringSnapshot?: (token: number) => void;
 	},
 ): ControlSurface & {
 	cancelPendingPreflights(): Promise<void>;
@@ -3898,6 +3900,10 @@ export function createNotificationsExtension(
 			 *  its FIFO entry would otherwise be consumed by a later real abort
 			 *  (review thread P1). */
 			discardTerminalAbortSteeringSnapshot?: (token: number) => void;
+			/** Rebind a captured snapshot to the current turn when the
+			 *  owner-mismatch fall-through terminalizes the requester's own turn
+			 *  that won the race (review thread P1). */
+			rebindTerminalAbortSteeringSnapshot?: (token: number) => void;
 			abortPromptAndWaitWithTerminal: (
 				handle: string,
 				options: {
