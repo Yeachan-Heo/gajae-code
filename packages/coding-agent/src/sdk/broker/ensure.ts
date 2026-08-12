@@ -362,13 +362,21 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		}
 		const spawnLogTail = exitedBeforeDiscovery && spawnLog ? await readBrokerSpawnLogTail(spawnLog.path) : "";
 		const marker = await readBrokerStartupFailureMarker(settings.agentDir);
+		// A marker only wins over the generic fallback when it was written by the
+		// exact child this call just spawned and reaped. The pre-spawn clear
+		// already prevents an old marker from surviving to this point, but a
+		// concurrent broker (a foreign process racing the same agent dir) could
+		// still write a marker between the clear and this read; the pid binding
+		// rejects that marker instead of misattributing a foreign failure to this
+		// spawn's caller.
+		const trustedMarker = marker && child.pid !== undefined && marker.pid === child.pid ? marker : undefined;
 		const failure = spawnError
 			? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
 			: exitedBeforeDiscovery
 				? new BrokerStartupError({
 						exitCode: child.exitCode,
 						signal: child.signalCode,
-						reason: marker?.reason ?? "Detached SDK broker exited before publishing discovery.",
+						reason: trustedMarker?.reason ?? "Detached SDK broker exited before publishing discovery.",
 						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
 					})
 				: discoveryError
