@@ -323,6 +323,40 @@ describe("model profile activation", () => {
 		}
 	});
 
+	test("built-in claude-opus retains bundled Opus 5 after live catalog discovery fails", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-stale-catalog-");
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		try {
+			authStorage.setRuntimeApiKey("anthropic", "test-anthropic-key");
+			using _hook = hookFetch(input => {
+				switch (String(input)) {
+					case "https://models.dev/api.json":
+						return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+							headers: { "Content-Type": "application/json" },
+						});
+					case "https://api.layofflabs.com/models":
+						return new Response("unavailable", { status: 503 });
+					default:
+						throw new Error(`Unexpected model discovery request: ${input}`);
+				}
+			});
+			const registry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
+			await registry.refreshProvider("anthropic", "online");
+			const prepared = await prepareModelProfileActivation({
+				session: fakeSession() as unknown as AgentSession,
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: "claude-opus",
+			});
+
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+			expect(prepared.defaultResolutionSkips).toEqual([]);
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
 	test("rejects a mixed provider-agnostic profile before mutation when a role alias is unavailable", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "open-weights-glm-deepseek",

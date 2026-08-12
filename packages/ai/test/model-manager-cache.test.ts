@@ -103,6 +103,40 @@ describe("online-if-uncached model refresh", () => {
 		expect(cached.dynamicModelIds).toEqual(["dynamic"]);
 	});
 
+	test("retains fresh cached dynamic IDs when static transport drift forces a cache re-merge", async () => {
+		const providerId = "cache-authoritative-remerge";
+		const now = 1_700_000_000_000;
+		const initialStatic = [model(providerId, "static")];
+		await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels: initialStatic,
+				cacheDbPath,
+				now: () => now,
+				fetchDynamicModels: async () => [model(providerId, "dynamic")],
+			},
+			"online",
+		);
+
+		const changedStatic = [{ ...model(providerId, "static"), baseUrl: "https://changed.example.test/v1" }];
+		const cached = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels: changedStatic,
+				cacheDbPath,
+				now: () => now,
+				fetchDynamicModels: async () => {
+					throw new Error("fresh cache must be reused");
+				},
+			},
+			"online-if-uncached",
+		);
+
+		expect(cached.fetched).toBe(false);
+		expect(cached.stale).toBe(false);
+		expect(cached.dynamicModelIds).toEqual(["dynamic"]);
+	});
+
 	test("refreshes missing and stale caches", async () => {
 		const now = 1_700_000_000_000;
 		for (const [providerId, cachedAt] of [

@@ -224,7 +224,11 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		models,
 		stale: !dynamicAuthoritative,
 		fetched: shouldFetchFromNetwork && dynamicFetchSucceeded,
-		dynamicModelIds: dynamicFetchSucceeded ? dynamicModels.map(model => model.id) : undefined,
+		dynamicModelIds: dynamicFetchSucceeded
+			? dynamicModels.map(model => model.id)
+			: shouldUseFreshCacheAsAuthoritative
+				? cache?.dynamicModelIds
+				: undefined,
 	};
 }
 
