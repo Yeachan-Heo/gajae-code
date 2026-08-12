@@ -506,18 +506,34 @@ describe("StdinBuffer", () => {
 			expect(pastes).toEqual(["hi"]);
 		});
 
-		it("decodes a long Escape run followed by a key in linear time", () => {
+		it("decodes a long Escape run followed by a key", () => {
 			// Measuring the run once keeps this linear; re-testing the whole suffix
 			// while the cut advanced two bytes at a time took over a second here.
 			const runLength = 50_000;
-			const started = Bun.nanoseconds();
 			processInput(`${"\x1b".repeat(runLength)}A`);
-			const elapsedMs = (Bun.nanoseconds() - started) / 1e6;
 
 			expect(emittedSequences.length).toBe(runLength - 1);
 			expect(emittedSequences.at(-1)).toBe("\x1b\x1bA");
 			expect(emittedSequences.slice(0, -1).every(sequence => sequence === "\x1b")).toBe(true);
-			expect(elapsedMs).toBeLessThan(250);
+		});
+
+		it("scales linearly rather than quadratically over Escape-run length", () => {
+			// Relative scaling, not an absolute wall-clock budget: a 10x longer run
+			// costs ~10x when the run boundary is measured once, but ~100x when every
+			// iteration rescans the remaining suffix.
+			const decode = (runLength: number): number => {
+				const probe = new StdinBuffer();
+				const input = `${"\x1b".repeat(runLength)}A`;
+				const started = Bun.nanoseconds();
+				probe.process(input);
+				return Bun.nanoseconds() - started;
+			};
+			decode(2_000);
+
+			const small = decode(5_000);
+			const large = decode(50_000);
+
+			expect(large / Math.max(small, 1)).toBeLessThan(30);
 		});
 
 		it("still cuts an ESC-cancelled incomplete sequence without splitting it", async () => {
