@@ -59,7 +59,13 @@ export function lookupCurrentPrCached(
 
 	const lookup = lookupCurrentPr(runGh)
 		.then(value => {
-			prCache.set(cacheKey, { value, expiresAt: now() + STATUS_LINE_PR_CACHE_TTL_MS });
+			// Bound process-lifetime memory: drop every expired entry on insert so
+			// the map holds only keys seen within one TTL window.
+			const timestamp = now();
+			for (const [key, entry] of prCache) {
+				if (entry.expiresAt <= timestamp) prCache.delete(key);
+			}
+			prCache.set(cacheKey, { value, expiresAt: timestamp + STATUS_LINE_PR_CACHE_TTL_MS });
 			return value;
 		})
 		.finally(() => {

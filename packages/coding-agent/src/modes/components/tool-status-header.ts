@@ -624,6 +624,10 @@ export class StatusLineComponent implements Component {
 		const contextPctSegmentActive =
 			effectiveSettings.leftSegments.includes("context_pct") ||
 			effectiveSettings.rightSegments.includes("context_pct");
+		// Never spawn a gh lookup when no pr segment is rendered; the pr segment
+		// treats a null value as hidden, so gating here is behavior-identical.
+		const prSegmentActive =
+			effectiveSettings.leftSegments.includes("pr") || effectiveSettings.rightSegments.includes("pr");
 
 		return {
 			session: this.session,
@@ -642,7 +646,7 @@ export class StatusLineComponent implements Component {
 			git: {
 				branch: this.#getCurrentBranch(),
 				status: this.#getGitStatus(),
-				pr: this.#lookupPr(),
+				pr: prSegmentActive ? this.#lookupPr() : null,
 			},
 			usage: this.#cachedUsage,
 		};
