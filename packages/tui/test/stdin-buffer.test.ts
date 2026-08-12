@@ -506,6 +506,20 @@ describe("StdinBuffer", () => {
 			expect(pastes).toEqual(["hi"]);
 		});
 
+		it("decodes a long Escape run followed by a key in linear time", () => {
+			// Measuring the run once keeps this linear; re-testing the whole suffix
+			// while the cut advanced two bytes at a time took over a second here.
+			const runLength = 50_000;
+			const started = Bun.nanoseconds();
+			processInput(`${"\x1b".repeat(runLength)}A`);
+			const elapsedMs = (Bun.nanoseconds() - started) / 1e6;
+
+			expect(emittedSequences.length).toBe(runLength - 1);
+			expect(emittedSequences.at(-1)).toBe("\x1b\x1bA");
+			expect(emittedSequences.slice(0, -1).every(sequence => sequence === "\x1b")).toBe(true);
+			expect(elapsedMs).toBeLessThan(250);
+		});
+
 		it("still cuts an ESC-cancelled incomplete sequence without splitting it", async () => {
 			// An incomplete alt-CSI prefix cancelled by a new ESC is not a pure
 			// ESC run and must be emitted whole, exactly as before.

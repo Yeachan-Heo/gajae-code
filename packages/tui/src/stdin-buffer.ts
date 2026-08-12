@@ -309,14 +309,26 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 				pos += 2;
 				continue;
 			}
+			// Measure the ESC run once. Testing the whole suffix on every iteration
+			// while the cut below advances only two bytes made a long run quadratic.
+			let runLength = 1;
+			while (runLength < remaining.length && remaining[runLength] === ESC) runLength++;
 			// A trailing run of nothing but ESC bytes is ambiguous: the next chunk
 			// may still deliver the continuation that turns its last ESC into a Meta
 			// prefix (ESC ESC ESC + "[A" is bare Escape then Option+Up). Splitting it
 			// now would emit an extra Escape and downgrade the wrapped key to a plain
 			// one, firing the destructive double-Escape gesture. Keep the whole run
 			// buffered; the flush timeout emits it as individual Escape presses.
-			if (/^\x1b+$/.test(remaining)) {
+			if (runLength === remaining.length) {
 				return { sequences, remainder: remaining };
+			}
+			// Only the final two ESC bytes can still form a Meta prefix for the
+			// continuation that follows the run; everything before them is a settled
+			// Escape press. Emitting them in one step keeps the walk linear.
+			if (runLength > 2) {
+				for (let index = 0; index < runLength - 2; index++) sequences.push(ESC);
+				pos += runLength - 2;
+				continue;
 			}
 			// Find the end of this escape sequence
 			let seqEnd = 1;
