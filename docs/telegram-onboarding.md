@@ -19,8 +19,8 @@ and a managed Telegram provider supervisor:
 - the Telegram supervisor owns `getUpdates`, rate limits, retries, topics,
   messages, callbacks, and delivery receipts;
 - replies and inline button taps route through the Router attachment to the
-  exact session/action. In forum chats, each session is represented by its own
-  Telegram topic.
+  exact session/action. Only coordinator/lifecycle sessions are represented by
+  Telegram topics; ordinary sessions use flat delivery.
 
 The setup command stores global notification settings in your GJC agent config
 and later sessions auto-connect when notifications are enabled.
@@ -83,7 +83,7 @@ DM. This is intentional for safe local discovery: group chats must not receive
 session names, action ids, or pending status by accident.
 
 
-Telegram private-chat topics: the managed daemon's per-session delivery uses
+Telegram private-chat topics: the managed daemon's coordinator/lifecycle delivery uses
 Telegram forum topics (`createForumTopic` + `message_thread_id`). Telegram now
 supports forum topics in **private chats** when the bot owner enables **Threaded
 Mode** for the bot in @BotFather. GJC cannot enable Threaded Mode through the Bot
@@ -105,8 +105,8 @@ and inline ask buttons only plus the one-time nudge shown below.
 
 Setup verification is capability verification, not a delivery guarantee: even when
 setup reports `threaded=verified`, the first runtime `createForumTopic` for the
-paired chat can still fail if Telegram refuses it. When per-session topics are
-unavailable, the daemon does **not** drop notifications — it routes them to the
+paired chat can still fail if Telegram refuses it. When orchestration-session
+topics are unavailable, the daemon does **not** drop notifications — it routes them to the
 normal (flat) paired chat and posts a one-time nudge: `Flat Telegram private chat
 supports outbound notifications and inline ask buttons only. Enable Threaded Mode
 in @BotFather > Bot Settings > Threads Settings for free-text replies and session
@@ -265,8 +265,8 @@ retain-configuration choice.
 
 ## 7. Use the Telegram chat
 
-The managed daemon prefers Telegram forum-topic delivery for per-session routing
-in the paired private chat. When Threaded Mode is available for the bot (verified
+The managed daemon prefers Telegram forum-topic delivery for coordinator/lifecycle
+session routing in the paired private chat. When Threaded Mode is available for the bot (verified
 during setup via `getMe.has_topics_enabled`), the daemon calls
 `createForumTopic`/`editForumTopic` and sends messages with `message_thread_id`
 against the paired `notifications.telegram.chatId`. If BotFather does not show
@@ -295,7 +295,8 @@ as `/verbose`, `/lean`, `/verbosity`, and `/redact` require Threaded Mode/topic
 routing.
 
 Flat private-chat fallback preserves outbound notifications and inline-button
-answers, but it cannot provide a separate Telegram topic per GJC session. Free-
+answers, but it cannot provide a separate Telegram topic per orchestration
+session. Free-
 text replies and in-topic config commands depend on topic routing, so enable
 Threaded Mode in @BotFather > Bot Settings > Threads Settings when you need
 multi-session reply separation or session commands from Telegram. Do not

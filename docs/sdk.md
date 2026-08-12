@@ -153,7 +153,7 @@ broker-bound CLI, or Coordinator MCP instead.
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 `resolver_unavailable`, `idempotency_conflict`, `unauthorized`.
 
-The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
+The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
 
 ### Internal inbound frames
 
@@ -578,7 +578,12 @@ It owns the single `getUpdates` poller and Telegram topic state, while
 `SessionRouter` reconstructs SDK attachments from Broker state. A provider
 restart never creates, resumes, closes, or mutates a GJC session by itself.
 
-For Telegram forum topics, the daemon archives or deletes the presentation topic when `SessionRouter` retires the current attachment. A resumed session creates or rebinds a fresh current-generation topic before sending again. Topic cleanup is best-effort and cannot change the Broker lifecycle result.
+For Telegram forum topics, the daemon deletes the presentation topic through
+`deleteForumTopic` (falling back to `closeForumTopic` when deletion is unavailable)
+when `SessionRouter` retires the current attachment or when the daemon confirms
+that no eligible local session still owns the topic. A resumed session creates or
+rebinds a fresh current-generation topic before sending again. Topic cleanup is
+best-effort and cannot change the Broker lifecycle result.
 
 ### Singleton poller and trust model
 
@@ -598,11 +603,12 @@ The trust model is intentionally strict:
 
 ### Routing in private-chat topics
 
-The paired private chat prefers per-session Telegram topics (Threaded Mode). The
-daemon tags messages by session, stores compact callback aliases for inline
-buttons, and routes replies back to the exact session/action. A forum-enabled
+The paired private chat prefers Telegram topics for coordinator/lifecycle sessions
+(Threaded Mode). The daemon tags messages by session, stores compact callback
+aliases for inline buttons, and routes replies back to the exact session/action.
+Ordinary sessions use flat delivery and do not create topics. A forum-enabled
 supergroup is no longer required: when the bot owner enables Threaded Mode in
-@BotFather, the daemon creates one topic per session in the paired private chat.
+@BotFather, the daemon creates topics only for admitted orchestration sessions.
 GJC cannot enable Threaded Mode through the Bot API; setup only verifies the
 capability and guides the manual BotFather toggle.
 

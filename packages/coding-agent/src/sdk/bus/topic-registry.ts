@@ -213,10 +213,12 @@ export function emptyTopicRegistryState(): TopicRegistryState {
  * evidence but quarantined: legacy records must never route or mutate remotely.
  */
 export function parseTopicRegistryState(value: unknown): TopicRegistryState | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("malformed Telegram topic state");
 	let state = value as TopicRegistryState;
 	if (state.version !== undefined && state.version !== 2) throw new Error("unsupported future Telegram topic state");
-	if (!state.topics || typeof state.topics !== "object" || Array.isArray(state.topics)) return undefined;
+	if (!state.topics || typeof state.topics !== "object" || Array.isArray(state.topics))
+		throw new Error("malformed Telegram topic state");
 	if (state.version === undefined) {
 		if (state.registryGeneration !== undefined) throw new Error("malformed Telegram topic state");
 		return parseTopicRegistryState({
@@ -1423,7 +1425,7 @@ export class TopicRegistry {
 	/** Durable archive jobs that are eligible for a retry at `now`. */
 	archivePendingSessionIds(now = Date.now()): string[] {
 		return [...this.topics].flatMap(([sessionId, record]) => {
-			if (record.authorityState === "archive_exhausted") {
+			if (record.authorityState === "archive_exhausted" && record.topicOrigin === "daemon_created") {
 				const currentEpoch = Math.max(this.epochs.get(sessionId) ?? 0, record.authorityEpoch ?? 0);
 				if (currentEpoch < Number.MAX_SAFE_INTEGER) {
 					const epoch = Math.min(currentEpoch + 1, Number.MAX_SAFE_INTEGER - 1);

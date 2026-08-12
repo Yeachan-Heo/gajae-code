@@ -101,6 +101,20 @@ describe("EventController.sendCompletionNotification — abort guard", () => {
 		expect(writeSpy).toHaveBeenCalledWith("\x07");
 	});
 
+	it("rings the default completion bell on macOS", () => {
+		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		settings.override("completion.notify", "on");
+		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
+		controller.sendCompletionNotification();
+
+		if (process.platform === "darwin") {
+			expect(writeSpy).toHaveBeenCalledWith("\x07");
+		} else {
+			expect(writeSpy).not.toHaveBeenCalledWith("\x07");
+		}
+	});
+
 	it("does not ring terminal bell when completion bell is disabled", () => {
 		vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);

@@ -230,9 +230,12 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * this, every ordinary interactive session declared itself ineligible, the
  * daemon rejected its identity header, no topic was created, and nothing was
  * delivered while attachments still looked healthy.
- * Generation 157 updates terminal-abort notification admission and cleanup semantics.
+ * Generation 157 adds orphan-topic reconciliation: FORUM_TOPIC_NOT_FOUND is
+ * settled as definitive, and the unsupported-method fallback closes when
+ * deleteForumTopic is unavailable on older Bot API deployments.
+ * Generation 158 updates terminal-abort notification admission and cleanup semantics.
  */
-export const DAEMON_GENERATION = 157;
+export const DAEMON_GENERATION = 158;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

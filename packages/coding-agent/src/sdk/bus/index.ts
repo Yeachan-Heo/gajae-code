@@ -3893,8 +3893,8 @@ export function createNotificationsExtension(
 			getTerminalTurnEpoch: () => number | undefined;
 			cancelPendingPreflightForTerminalAbort: () => void;
 			captureTerminalAbortSteeringSnapshot?: () => void;
-		discardTerminalAbortSteeringSnapshot?: (token: number) => void;
-		rebindTerminalAbortSteeringSnapshot?: (token: number) => void;
+			discardTerminalAbortSteeringSnapshot?: (token: number) => void;
+			rebindTerminalAbortSteeringSnapshot?: (token: number) => void;
 			abortPromptAndWaitWithTerminal: (
 				handle: string,
 				options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
@@ -4743,7 +4743,7 @@ export function createNotificationsExtension(
 			// Cleanup-initiated claims (cancel, deadline, owner disconnect) must abort the
 			// run and prove settlement. A natural `agent_end`/`agent_failed` already unwound,
 			// so aborting there would cancel the next turn instead of fencing this one.
-			options: { fence?: boolean; terminal?: { scope: AbortScope } } = {},
+			options: { fence?: boolean; terminal?: { scope: AbortScope; steeringSnapshotToken?: number } } = {},
 			extra?: PromptTerminalExtra,
 			capture?: {
 				proof?: RunSettlementProof & {
@@ -4801,6 +4801,14 @@ export function createNotificationsExtension(
 						"Prompt resources could not be fenced with an exact run handle.",
 					);
 					return;
+				}
+				// Rebind the steering snapshot to the current turn before the
+				// settlement: the token was captured under the abort's admission
+				// turn, which may differ from the now-active turn that the
+				// settlement will fence. Without the rebind the session rejects
+				// the still-old token as unknown_run (review thread P1).
+				if (options.terminal?.steeringSnapshotToken !== undefined) {
+					terminalAbortSeams?.rebindTerminalAbortSteeringSnapshot?.(options.terminal.steeringSnapshotToken);
 				}
 				let proof: RunSettlementProof;
 				try {
@@ -5079,7 +5087,8 @@ export function createNotificationsExtension(
 				// marker transaction): client steering admitted while the abort
 				// is in flight classifies as post-snapshot and is preserved at
 				// abortPromptAndWait (review thread P1).
-				terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
+				const steeringSnapshotToken = terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
+				const steeringSnapshotConsumed = false;
 				// Hash the EXACT response payload this abort will return: the durable
 				// row stores it at finalization so the response-state advance requires
 				// equality instead of trusting a non-pending placeholder (review
@@ -5746,7 +5755,10 @@ export function createNotificationsExtension(
 				await terminalizePrompt(
 					{ commandId, turnId },
 					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-					{ fence: true, terminal: { scope } },
+					{
+						fence: true,
+						terminal: { scope, ...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}) },
+					},
 					undefined,
 					captured,
 				);

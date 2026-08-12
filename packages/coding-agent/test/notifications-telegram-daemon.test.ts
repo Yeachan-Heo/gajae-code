@@ -52,6 +52,26 @@ function settings(agentDir: string): Settings {
 		},
 	}) as Settings;
 }
+function topicAdmissionBot(): {
+	bot: BotApi;
+	calls: Array<{ method: string; body: unknown }>;
+	updates: Array<Record<string, unknown>>;
+} {
+	const calls: Array<{ method: string; body: unknown }> = [];
+	const updates: Array<Record<string, unknown>> = [];
+	const bot: BotApi = {
+		call: async (method, body) => {
+			calls.push({ method, body });
+			if (method === "getUpdates") return { ok: true, result: updates };
+			if (method === "getChat")
+				return { ok: true, result: { id: (body as { chat_id?: unknown }).chat_id, type: "private" } };
+			if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 555 } };
+			if (method === "sendMessage") return { ok: true, result: { message_id: calls.length } };
+			return { ok: true, result: true };
+		},
+	};
+	return { bot, calls, updates };
+}
 
 function lifecycleSpy() {
 	const calls: string[] = [];
@@ -1119,4 +1139,118 @@ test("a throwing run-loop heartbeat renewal is contained and the daemon keeps se
 	};
 	await runScenario("state");
 	await runScenario("lock");
+});
+test("strict topic daemon retries updates before the durable registry is loaded", async () => {
+	const agentDir = tempAgentDir();
+	try {
+		const { bot, calls, updates } = topicAdmissionBot();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi: bot,
+			requireTelegramTopicEligibility: true,
+			setTimeoutImpl: ((callback: () => void) => {
+				callback();
+				return 0 as unknown as NodeJS.Timeout;
+			}) as unknown as typeof setTimeout,
+		});
+		updates.push({ update_id: 7 });
+		expect(await daemon.pollOnce()).toBe(1);
+		updates.length = 0;
+		expect(await daemon.pollOnce()).toBe(0);
+		expect(
+			calls.filter(call => call.method === "getUpdates").map(call => (call.body as { offset?: unknown }).offset),
+		).toEqual([0, 0]);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("strict topic daemon rejects malformed present registry state before topic service starts", async () => {
+	const agentDir = tempAgentDir();
+	try {
+		const topicPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		fs.mkdirSync(path.dirname(topicPath), { recursive: true });
+		fs.writeFileSync(topicPath, JSON.stringify({ version: 2 }));
+		const { bot, calls, updates } = topicAdmissionBot();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi: bot,
+			requireTelegramTopicEligibility: true,
+			setTimeoutImpl: ((callback: () => void) => {
+				callback();
+				return 0 as unknown as NodeJS.Timeout;
+			}) as unknown as typeof setTimeout,
+		});
+		await expect(daemon.loadTopics()).rejects.toThrow("malformed Telegram topic state");
+		updates.push({ update_id: 8 });
+		expect(await daemon.pollOnce()).toBe(1);
+		expect(calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+		expect(
+			calls.filter(call => call.method === "getUpdates").map(call => (call.body as { offset?: unknown }).offset),
+		).toEqual([0]);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("strict replay admits only capability-bearing identity frames", async () => {
+	// After #4336, topic admission follows config-derived eligibility.
+	const scenarios = [
+		{ enabled: false, expectedTopics: 1 },
+		{ enabled: true, expectedTopics: 1 },
+	] as const;
+	for (const scenario of scenarios) {
+		const agentDir = tempAgentDir();
+		try {
+			const { bot, calls } = topicAdmissionBot();
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+				botApi: bot,
+				requireTelegramTopicEligibility: true,
+			});
+			await daemon.loadTopics();
+			const routing = daemon.attachmentRoutingHarnessForTest();
+			const attachment = {
+				sessionId: "replay-session",
+				generation: 1,
+				isCurrent: () => true,
+				send: () => {},
+			};
+			routing.attach(attachment);
+			const session = daemon.sessions.get(attachment.sessionId);
+			if (!session) throw new Error("Expected replay attachment session.");
+			await daemon.handleSessionMessage(session, {
+				type: "event_replay_result",
+				id: session.replayId,
+				ok: true,
+				generation: 1,
+				lastSeq: 1,
+				events: [
+					{
+						seq: 1,
+						payload: {
+							type: "identity_header",
+							sessionId: attachment.sessionId,
+							repo: "replay-repo",
+							branch: "main",
+							telegramTopicsEnabled: scenario.enabled,
+						},
+					},
+				],
+			});
+			expect(calls.filter(call => call.method === "createForumTopic")).toHaveLength(scenario.expectedTopics);
+			expect(daemon.sessions.has(attachment.sessionId)).toBe(true);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	}
 });
