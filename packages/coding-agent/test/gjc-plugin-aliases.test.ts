@@ -25,6 +25,7 @@ import {
 	type GjcPluginMcpManifestEntry,
 	type GjcPluginRegistryEntry,
 	installGjcBundle,
+	type NormalizedGjcPluginBundle,
 	parseManifest,
 	previewGjcBundleUpdate,
 	readRegistry,
@@ -440,7 +441,7 @@ describe("issue #4287 acceptance 2: ambiguous/unsafe aliases fail with actionabl
 async function compileAliasWithMcpServers(manifest: Record<string, unknown>): Promise<{
 	entries: GjcPluginMcpManifestEntry[];
 	registryEntry: GjcPluginRegistryEntry;
-	bundle: Awaited<ReturnType<typeof compileGjcPluginBundle>>;
+	bundle: NormalizedGjcPluginBundle;
 }> {
 	const root = await mkTemp("gjc-alias-sec-");
 	await writeManifestBundle(root, manifest);
