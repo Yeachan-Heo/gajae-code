@@ -28,9 +28,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import { zlibSync } from "fflate";
-import { Settings, getDefault, getType } from "../config/settings";
+import { getDefault, getType, Settings } from "../config/settings";
 import {
+	type ComputerParams,
 	ComputerTool,
+	type ComputerToolDetails,
 	isComputerCallable,
 	isComputerEnabled,
 	isComputerLoadablePlatform,
@@ -38,24 +40,22 @@ import {
 	setComputerArchForTests,
 	setComputerControllerFactoryForTests,
 	setComputerPlatformForTests,
-	type ComputerParams,
-	type ComputerToolDetails,
 } from "./computer";
 import {
 	cleanupStaleScreenshotFallbackDirs,
 	resetScreenshotFallbackGcForTest,
 	SCREENSHOT_FALLBACK_DIR_PREFIX,
 } from "./computer-gc";
+import type { ToolSession } from "./index";
 import {
 	__resetResourceGcForTest,
 	__setResourceGcDepsForTest,
+	type ResourceGcDeps,
 	registerResourceGcSession,
 	resolveComputerGcPolicy,
 	sweepOnce,
-	type ResourceGcDeps,
 } from "./resource-gc";
 import { ToolAbortError } from "./tool-errors";
-import type { ToolSession } from "./index";
 
 type ToolResult = AgentToolResult<ComputerToolDetails>;
 
