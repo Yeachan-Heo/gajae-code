@@ -405,6 +405,10 @@ function link(binary: boolean): never {
 	if (lexists(target)) fs.rmSync(target, { force: true });
 	fs.symlinkSync(linkSource, target);
 	console.log(`✓ Linked ${target} -> ${linkSource}`);
+	const aliasTarget = path.join(targetDir, "가재씨");
+	if (lexists(aliasTarget)) fs.rmSync(aliasTarget, { force: true });
+	fs.symlinkSync(linkSource, aliasTarget);
+	console.log(`✓ Linked ${aliasTarget} -> ${linkSource}`);
 	if (!isOnPath(targetDir)) {
 		console.warn(`! ${targetDir} is not on your PATH — add it so \`gjc\` resolves:`);
 		console.warn(`    export PATH="${targetDir}:$PATH"`);

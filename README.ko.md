@@ -84,6 +84,14 @@ gjc @screenshot.png "뭘 바꿔야 할까?"   # 이미지 입력
 
 나이틀리 채널: `bun install -g gajae-code@nightly`. 전체 설치 매트릭스, Windows 설정, 업데이트 채널, 셸 자동완성: [docs/install.md](docs/install.md).
 
+**한국어 실행 명령어** — `가재씨`를 `gjc` 대신 사용할 수 있습니다:
+
+```sh
+가재씨 --version
+```
+
+`가재씨`는 설치 시 패키지 bin 항목으로 함께 생성되며, `gjc`와 완전히 동일하게 동작합니다. Linux·macOS(UTF-8 로케일)에서 지원됩니다.
+
 ---
 
 ## 쓰던 코딩 플랜 그대로

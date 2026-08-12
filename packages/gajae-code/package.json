@@ -24,7 +24,8 @@
 		"gjc"
 	],
 	"bin": {
-		"gjc": "bin/gjc.js"
+		"gjc": "bin/gjc.js",
+		"가재씨": "bin/gajaessi.js"
 	},
 	"dependencies": {
 		"@gajae-code/coding-agent": "catalog:"

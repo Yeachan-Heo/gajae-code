@@ -10,6 +10,16 @@ gjc --smoke-test
 
 The scoped package is also available as `@gajae-code/coding-agent`.
 
+## Korean launcher alias
+
+`가재씨` is installed alongside `gjc` as a launcher alias, so typing `가재씨` runs Gajae-Code exactly like `gjc`:
+
+```sh
+가재씨 --version
+```
+
+The alias is a package-owned bin entry created by npm/Bun during install — no shell alias or dotfile edit is required. It is supported on Linux and macOS (UTF-8 locales). On Windows the shim is created by the package manager, but invoking `가재씨` from `cmd.exe` depends on the console's active code page; use `gjc` or run from Windows Terminal / PowerShell with a UTF-8 code page (`chcp 65001`) if the Hangul alias is needed.
+
 ## Supported platforms
 
 Prebuilt standalone release binaries are published for:
