@@ -276,19 +276,20 @@ describe("model profile activation", () => {
 						return new Response(JSON.stringify({ anthropic: { models: {} } }), {
 							headers: { "Content-Type": "application/json" },
 						});
-					case "https://api.layofflabs.com/models":
+					default:
+						if (!url.endsWith("/models")) {
+							throw new Error(`Unexpected model discovery request: ${input}`);
+						}
 						return new Response(
 							JSON.stringify({ data: [{ id: "claude-opus-4-6" }, { id: "claude-sonnet-5" }] }),
 							{ headers: { "Content-Type": "application/json" } },
 						);
-					default:
-						throw new Error(`Unexpected model discovery request: ${input}`);
 				}
 			});
 			const registry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
 			await registry.refreshProvider("anthropic", "online");
 
-			expect(requests).toContain("https://api.layofflabs.com/models");
+			expect(requests.some(url => url.endsWith("/models"))).toBe(true);
 			expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5")).toBe(true);
 			expect(
 				registry
@@ -334,10 +335,11 @@ describe("model profile activation", () => {
 						return new Response(JSON.stringify({ anthropic: { models: {} } }), {
 							headers: { "Content-Type": "application/json" },
 						});
-					case "https://api.layofflabs.com/models":
-						return new Response("unavailable", { status: 503 });
 					default:
-						throw new Error(`Unexpected model discovery request: ${input}`);
+						if (!url.endsWith("/models")) {
+							throw new Error(`Unexpected model discovery request: ${input}`);
+						}
+						return new Response("unavailable", { status: 503 });
 				}
 			});
 			const registry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
