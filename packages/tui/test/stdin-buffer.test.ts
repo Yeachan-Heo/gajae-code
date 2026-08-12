@@ -353,6 +353,55 @@ describe("StdinBuffer", () => {
 			expect(flushed).toEqual(["\x1b"]);
 		});
 
+		it("emits a coalesced double-Esc chunk as two Escape presses after the flush timeout", async () => {
+			// tmux forwards a quick double-Esc as one "\x1b\x1b" chunk within
+			// escape-time; emitting it as a single sequence parses as the unbound
+			// "alt+escape" and swallows both presses (double-Esc draft clear).
+			processInput("\x1b\x1b");
+			expect(emittedSequences).toEqual([]);
+
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["\x1b", "\x1b"]);
+		});
+
+		it("emits two Esc presses split across chunks inside the flush window as two Escapes", async () => {
+			processInput("\x1b");
+			await Bun.sleep(5);
+			processInput("\x1b");
+			expect(emittedSequences).toEqual([]);
+
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["\x1b", "\x1b"]);
+		});
+
+		it("emits a triple-Esc chunk as three Escape presses", async () => {
+			processInput("\x1b\x1b\x1b");
+
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b"]);
+		});
+
+		it("flushes a coalesced double-Esc explicitly as two Escapes", () => {
+			processInput("\x1b\x1b");
+			expect(buffer.flush()).toEqual(["\x1b", "\x1b"]);
+		});
+
+		it("keeps Option-as-Meta ESC ESC sequences atomic when the continuation is present", () => {
+			// macOS Terminal "Use Option as Meta key": Option+Up arrives as ESC ESC [ A
+			// in one write and must stay one sequence.
+			processInput("\x1b\x1b[A");
+			expect(emittedSequences).toEqual(["\x1b\x1b[A"]);
+		});
+
+		it("still cuts an ESC-cancelled incomplete sequence without splitting it", async () => {
+			// An incomplete alt-CSI prefix cancelled by a new ESC is not a pure
+			// ESC run and must be emitted whole, exactly as before.
+			processInput("\x1b\x1b[1;\x1b");
+
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["\x1b\x1b[1;", "\x1b"]);
+		});
+
 		it("should handle buffer input", () => {
 			processInput(Buffer.from("\x1b[A"));
 			expect(emittedSequences).toEqual(["\x1b[A"]);
