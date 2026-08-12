@@ -71,18 +71,18 @@ source: "forked from upstream deep-interview skill and rebranded for GJC"
 - Persist interview state for resume across session interruptions
 - A multi-persona lateral-review panel convenes at ambiguity-milestone transitions (and before synthesizing any agent-supplied answer) to expose blind spots from independent perspectives
 - Refine free-text answers into a structured interpretation and confirm nothing is lost before scoring
-- After 3 consecutive agent-resolved answers (accepted auto-research candidates or auto-answers), route the next question to the user (dialectic rhythm guard)
+- After 3 consecutive agent-resolved answers (accepted auto-answers), route the next question to the user (dialectic rhythm guard)
 - Run an independent closure audit and a one-sentence goal restatement, each requiring explicit user confirmation, before crystallizing the spec
 - When `--trace` is active, use the bounded trace evidence summary as pre-question context; never dump raw logs, raw files, or unbounded search output into questions, scoring, specs, or handoffs
 </Execution_Policy>
 
 <Internal_Auto_Mode_Protocol>
-- `auto-research-greenfield.md`, `auto-answer-uncertain.md`, and `lateral-review-panel.md` are internal prompt fragments loaded on demand with bundle metadata `kind: "skill-fragment"`; they are not public skills, are never slash-command/discoverable, and must not be registered through any `skill://` route.
+- `auto-answer-uncertain.md` and `lateral-review-panel.md` are internal prompt fragments loaded on demand with bundle metadata `kind: "skill-fragment"`; they are not public skills, are never slash-command/discoverable, and must not be registered through any `skill://` route.
 - Load fragments only for the specific hook that needs them, with forked inherited context kept read-only and prompt-budgeted; summarize active interview context before spawning the architect if the payload is large.
 - Auto-mode architects are read-only: no code edits, no `.gjc/` mutation, no workflow chaining, no formatters, and no execution delegation.
 - Validate every fragment response before using it: required sections must be present, candidates/answer must match the requested shape, rationale must cite available context, confidence must be explicit, and insufficient-context fallbacks must be honored.
 - If architect spawn, fragment loading, or response validation fails, continue the normal manual interview path silently and record an internal audit note in state by incrementing `architect_failures`; do not expose tool noise to the user unless it changes the next user-facing question.
-- Track `auto_researched_rounds`, `auto_answered_rounds`, `lateral_reviews`, `auto_answer_streak`, `refined_rounds`, `architect_failures`, and `lateral_panel_failures` in state and final spec metadata.
+- Track `auto_answered_rounds`, `lateral_reviews`, `auto_answer_streak`, `refined_rounds`, `architect_failures`, and `lateral_panel_failures` in state and final spec metadata.
 </Internal_Auto_Mode_Protocol>
 
 
@@ -209,7 +209,6 @@ Run this phase only when the active deep-interview state or invocation indicates
       "last_targeted_component_id": null
     },
     "ontology_snapshots": [],
-    "auto_researched_rounds": [],
     "auto_answered_rounds": [],
     "lateral_reviews": [],
     "lateral_panel_failures": 0,
@@ -340,7 +339,7 @@ If any prompt input is too large, summarize it first and then continue from the 
 - Questions should expose ASSUMPTIONS, not gather feature lists
 - **Facts vs decisions:** answer factual questions (current stack, versions, existing patterns, external API limits) from explore/research and present them as cited confirmations; route every *decision* (goals, scope, tradeoffs, desired behavior for new work) to the user. When unsure which a question is, treat it as a decision and ask.
 - If the scope is still conceptually fuzzy (entities keep shifting, the user is naming symptoms, or the core noun is unstable), switch to an ontology-style question that asks what the thing fundamentally IS before returning to feature/detail questions
-- **Dialectic rhythm guard:** increment `state.auto_answer_streak` when a round is resolved without direct user judgment (an accepted auto-research candidate or an auto-answer); reset it to 0 on any direct, refined, or cited-confirmation answer from the user. If the streak reaches 3, route the next question directly to the user even if it looks auto-answerable, then reset. The interview is with the human, not the codebase.
+- **Dialectic rhythm guard:** increment `state.auto_answer_streak` when a round is resolved without direct user judgment (an auto-answer); reset it to 0 on any direct, refined, or cited-confirmation answer from the user. If the streak reaches 3, route the next question directly to the user even if it looks auto-answerable, then reset. The interview is with the human, not the codebase.
 
 **Question styles by dimension:**
 | Dimension | Question Style | Example |
@@ -350,12 +349,6 @@ If any prompt input is too large, summarize it first and then continue from the 
 | Success Criteria | "How do we know it works?" | "If I showed you the finished product, what would make you say 'yes, that's it'?" |
 | Context Clarity (brownfield) | "How does this fit?" | "I found JWT auth middleware in `src/auth/` (pattern: passport + JWT). Should this feature extend that path or intentionally diverge from it?" |
 | Scope-fuzzy / ontology stress | "What IS the core thing here?" | "You have named Tasks, Projects, and Workspaces across the last rounds. Which one is the core entity, and which are supporting views or containers?" |
-
-### Step 2a′: Auto-Research Greenfield Questions
-
-When the next question is for a greenfield interview and is tagged `research: true`, load `auto-research-greenfield.md` as an internal `kind: "skill-fragment"` prompt for a fork-context architect before Step 2b. Pass only the tagged question, locked topology summary, prompt-safe initial idea, trimmed prior decisions/gaps, and relevant constraints. The architect must return 2-3 ranked candidates with rationale, confidence, and fallback notes. Validate the shape before use; if valid, incorporate the candidates as concise answer options or context for the single user-facing question and append the round number to `auto_researched_rounds`. If invalid or unavailable, fall back silently to the normal generated question and increment `architect_failures`.
-
-Auto-research must never add a public skill entrypoint, never be slash-command/discoverable, never register a `skill://` handler, and never alter the one-question-per-round rule.
 
 ### Step 2b: Ask the Question
 
@@ -377,7 +370,7 @@ If the `ask` tool returns `clarificationQuestion`, treat it as a non-answer abou
 
 ### Step 2b′: Auto-Answer Opted-Out Questions
 
-After the `ask` tool resolves and before ambiguity scoring, if the user opts out of answering the current question or explicitly asks the agent to decide, load `auto-answer-uncertain.md` as an internal `kind: "skill-fragment"` prompt for a fork-context architect. Pass the opted-out question, prompt-safe transcript summary, locked topology, current scores/gaps, and any auto-research candidates used for the round. The architect must return exactly one decisive answer with rationale, confidence, and explicit uncertainty. Validate the response shape before using it; if valid, record it as the tentative answer for scoring, append the round number to `auto_answered_rounds`, and mark the transcript answer as architect-assisted.
+After the `ask` tool resolves and before ambiguity scoring, if the user opts out of answering the current question or explicitly asks the agent to decide, load `auto-answer-uncertain.md` as an internal `kind: "skill-fragment"` prompt for a fork-context architect. Pass the opted-out question, prompt-safe transcript summary, locked topology, and current scores/gaps. The architect must return exactly one decisive answer with rationale, confidence, and explicit uncertainty. Validate the response shape before using it; if valid, record it as the tentative answer for scoring, append the round number to `auto_answered_rounds`, and mark the transcript answer as architect-assisted.
 
 Auto-answer has a clarity cap: unless the architect confidence is `high` and uncertainty is negligible, no dimension score improved solely by the auto-answer may exceed `0.85`. If the auto-answer would make ambiguity cross the resolved threshold, ask the user for threshold-crossing confirmation before Phase 4: present the tentative assumption and require explicit confirmation, revision, or continued questioning. On architect failure or invalid response, continue with the user's opt-out as an unresolved gap, increment `architect_failures`, and do not block the interview.
 
@@ -622,7 +615,7 @@ The interview convenes a short multi-persona panel at **ambiguity-milestone tran
 | `refined` | 0.30 ≥ a > threshold |
 | `ready` | ≤ threshold |
 
-A transition occurs whenever the band changes versus the prior scored round — in either direction, since bidirectional scoring can move the band back up. On a transition, and also before synthesizing any agent-supplied answer (auto-research candidates, an auto-answer, or a code/brownfield auto-confirm that carries real interpretation), convene the panel before generating or asking the next question.
+A transition occurs whenever the band changes versus the prior scored round — in either direction, since bidirectional scoring can move the band back up. On a transition, and also before synthesizing any agent-supplied answer (an auto-answer, or a code/brownfield auto-confirm that carries real interpretation), convene the panel before generating or asking the next question.
 
 **Personas (run in parallel, independent context):** dispatch `researcher`, `contrarian`, and `simplifier` as parallel fork-context subagents through the `lateral-review-panel.md` fragment, each with its own copy of the prompt-safe context so no persona anchors on another's framing. Add the `architect` persona when the round changed system shape — scope expansion, a new component or integration (trigger D), or any change to ownership or architecture. Each persona is a read-only architect: no edits, no `.gjc/` mutation, no execution.
 
@@ -690,7 +683,6 @@ Spec structure:
 - Threshold Source: <resolvedThresholdSource>
 - Initial Context Summarized: {yes|no}
 - Status: {PASSED | BELOW_THRESHOLD_EARLY_EXIT}
-- Auto-Researched Rounds: {auto_researched_rounds}
 - Auto-Answered Rounds: {auto_answered_rounds}
 - Architect Failures: {architect_failures}
 - Lateral Reviews: {lateral_reviews count with milestones}
@@ -868,7 +860,7 @@ Skipping any stage is possible but reduces quality assurance:
 - Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
 - The lateral-review panel spawns read-only persona subagents (Task tool) in parallel with independent context; it is an assist layer, never an executor and never the completion authority
 - Apply the Refine gate (Step 2b″), the Dialectic Rhythm Guard (Step 2a), and the Closure + Restate gates (Phase 4) through the `ask` tool, preserving `language.instruction` for each; if any of these gates has options, the assistant must call `ask` and must not print `Question:`/`Options:` blocks as assistant prose
-- Use internal fragment auto-modes only at their documented hooks: `auto-research-greenfield.md` between Step 2a and 2b for greenfield `research: true` questions, `auto-answer-uncertain.md` as Step 2b′ after `ask` resolves and before scoring, and `lateral-review-panel.md` for the Phase 3 panel personas at ambiguity-milestone transitions and before synthesizing agent-supplied answers.
+- Use internal fragment auto-modes only at their documented hooks: `auto-answer-uncertain.md` as Step 2b′ after `ask` resolves and before scoring, and `lateral-review-panel.md` for the Phase 3 panel personas at ambiguity-milestone transitions and before synthesizing agent-supplied answers.
 - Fragment auto-modes are loaded on demand as `kind: "skill-fragment"`; they are not public workflow skills, not slash-command/discoverable, and not `skill://` registrations.
 </Tool_Usage>
 
@@ -977,7 +969,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 - [ ] Closure / Acceptance Guard and the one-sentence Restate gate both passed before crystallization
 - [ ] Interview reached ambiguity ≤ threshold OR an explicit early exit with warning
 - [ ] Spec persisted to `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly via the GJC CLI (no direct `.gjc/` edits without force override), covering every active topology component plus goal/constraints/acceptance criteria/clarity/ontology/transcript
-- [ ] Spec metadata includes the auto/lateral counters (`auto_researched_rounds`, `auto_answered_rounds`, `lateral_reviews`, `refined_rounds`, `architect_failures`, `lateral_panel_failures`)
+- [ ] Spec metadata includes the auto/lateral counters (`auto_answered_rounds`, `lateral_reviews`, `refined_rounds`, `architect_failures`, `lateral_panel_failures`)
 - [ ] Execution bridge presented via `ask`; execution invoked only after explicit approval through a public workflow entrypoint (never direct implementation); state cleaned up after handoff
 </Final_Checklist>
 

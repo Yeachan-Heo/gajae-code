@@ -26,10 +26,6 @@ const autoAnswerUncertain = () =>
 	import("./gjc/skills/deep-interview/auto-answer-uncertain.md", { with: { type: "text" } }).then(
 		module => module.default,
 	);
-const autoResearchGreenfield = () =>
-	import("./gjc/skills/deep-interview/auto-research-greenfield.md", { with: { type: "text" } }).then(
-		module => module.default,
-	);
 const lateralReviewPanel = () =>
 	import("./gjc/skills/deep-interview/lateral-review-panel.md", { with: { type: "text" } }).then(
 		module => module.default,
@@ -69,12 +65,6 @@ export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] =
 		relativePath: "skills/ultragoal/SKILL.md",
 		description: "Create and execute durable repo-native multi-goal plans over GJC goal mode artifacts.",
 		loadContent: ultragoal,
-	},
-	{
-		kind: "skill-fragment",
-		parentSkillName: "deep-interview",
-		relativePath: "skill-fragments/deep-interview/auto-research-greenfield.md",
-		loadContent: autoResearchGreenfield,
 	},
 	{
 		kind: "skill-fragment",
