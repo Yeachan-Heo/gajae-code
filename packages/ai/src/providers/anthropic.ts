@@ -1997,12 +1997,15 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						thinkingReplayRepairScope !== "all" &&
 						thinkingReplayRepairAttempts < ANTHROPIC_MAX_THINKING_REPAIRS &&
 						firstTokenTime === undefined &&
-						(thinkingSignatureInvalid ||
-							thinkingBlocksImmutable ||
-							// Masked proxy rejection: unclassifiable on its own, so the replayed
-							// request shape is the evidence. Without signed thinking blocks in
-							// flight there is nothing to repair and the error must surface.
-							(maskedProxyRejection && hasNativeThinkingBlocks(params.messages)))
+						(thinkingSignatureInvalid || thinkingBlocksImmutable || maskedProxyRejection) &&
+						// The repair can only change the request when native thinking blocks are
+						// actually in flight. Without them the rebuilt replay is byte-identical,
+						// so resending would draw the same deterministic rejection and burn the
+						// repair budget on no-ops — the error must surface instead. (For the
+						// masked proxy rejection this guard is also the classifier: the body is
+						// unclassifiable on its own, so the replayed request shape is the only
+						// evidence a thinking repair is worth attempting.)
+						hasNativeThinkingBlocks(params.messages)
 					) {
 						// "cannot be modified" means the cited blocks must be replayed byte for
 						// byte, so editing that turn again can never converge — the only recovery

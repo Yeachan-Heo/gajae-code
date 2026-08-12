@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Anthropic thinking-replay repairs no longer resend when the failed request carried no native `thinking`/`redacted_thinking` blocks. The invalid-signature and blocks-immutable 400 arms fired the repair unconditionally, but with nothing to drop the rebuilt replay is byte-identical, so each resend drew the same deterministic rejection and burned the repair budget on no-ops before the error surfaced (up to two wasted full-size round trips; the masked proxy-rejection arm already guarded against this). The repair now requires native thinking blocks in flight for every trigger class, and a rejection that provably cannot be repaired surfaces immediately.
+
 ## [0.13.1] - 2026-08-11
 
 ### Fixed

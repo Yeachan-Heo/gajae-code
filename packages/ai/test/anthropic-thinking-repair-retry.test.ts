@@ -442,6 +442,92 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(requestBodies).toHaveLength(1);
 	});
 
+	// A repair that cannot drop any native thinking block rebuilds a byte-identical
+	// request, so resending it can only draw the same deterministic 400 again. The
+	// invalid-signature rejection must surface on the first attempt when no
+	// thinking blocks are in flight instead of burning the repair budget on no-ops.
+	it("surfaces an invalid-signature 400 without resending when the request replays no thinking blocks", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "plain answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [user, assistant, { ...user, content: "next prompt", timestamp: Date.now() + 1 }],
+		};
+
+		const requestBodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			return createAnthropicSignatureInvalid400() as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("signature");
+		expect(requestBodies).toHaveLength(1);
+	});
+
+	it("surfaces a mutation 400 without resending when the request replays no thinking blocks", async () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "first",
+			timestamp: Date.now(),
+		};
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "plain answer" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const context: Context = {
+			messages: [user, assistant, { ...user, content: "next prompt", timestamp: Date.now() + 1 }],
+		};
+
+		const requestBodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			return createAnthropicThinking400() as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("cannot be modified");
+		expect(requestBodies).toHaveLength(1);
+	});
+
 	// Real captured session failure (2026-07-29): the mutation 400 says "latest
 	// assistant message" but cites `messages.1.content.1` — a HISTORICAL turn. The
 	// provider demands those blocks be replayed verbatim, so a latest-only edit is
@@ -725,30 +811,46 @@ describe("Anthropic thinking replay repair retry", () => {
 			tools: [tool],
 		});
 
-		it("keeps thinking repair active when a later forced-tool_choice fallback rebuilds params", async () => {
+		it("keeps thinking repair active when a later fast-mode fallback rebuilds params", async () => {
+			// A forced tool_choice can never carry native thinking (prepareParams
+			// strips it proactively), so the fallback that follows the repair must be
+			// one that coexists with replayed thinking: fast mode.
+			const createFastModeUnsupported400 = (): MockAnthropicRequest => ({
+				async withResponse() {
+					const error = new Error(
+						"400 invalid_request_error: 'claude-sonnet-4-6' does not support the `speed` parameter.",
+					);
+					(error as { status?: number }).status = 400;
+					throw error;
+				},
+			});
 			const requestBodies: unknown[] = [];
 			let attempt = 0;
 			const create = ((body: unknown) => {
 				requestBodies.push(body);
 				attempt += 1;
 				if (attempt === 1) return createAnthropicSignatureInvalid400() as never;
-				if (attempt === 2) return createForcedToolChoice400() as never;
+				if (attempt === 2) return createFastModeUnsupported400() as never;
 				return createSuccessfulRequest() as never;
 			}) as unknown as Anthropic["messages"]["create"];
 			const client = { messages: { create } } as Anthropic;
 
-			const result = await streamAnthropic(model, makeContext(), { client, toolChoice: "any" }).result();
+			const result = await streamAnthropic(model, makeContext(), { client, serviceTier: "priority" }).result();
 
 			expect(result.stopReason).toBe("stop");
 			expect(requestBodies).toHaveLength(3);
-			// Signature repair activates on attempt 2; the forced-tool_choice fallback
-			// rebuild (attempt 3) must not reintroduce the dropped signature, and must
-			// drop the forced tool_choice.
+			// The rejected first attempt replayed native thinking, so the repair is
+			// exercised for real, not vacuously.
+			expect(JSON.stringify(requestBodies[0])).toContain("sig_history");
+			expect((requestBodies[0] as { speed?: unknown }).speed).toBe("fast");
+			// Signature repair activates on attempt 2; the fast-mode fallback rebuild
+			// (attempt 3) must not reintroduce the dropped signature, and must drop
+			// the speed parameter.
 			expect(JSON.stringify(requestBodies[1])).not.toContain("sig_history");
+			expect((requestBodies[1] as { speed?: unknown }).speed).toBe("fast");
 			const thirdBody = JSON.stringify(requestBodies[2]);
 			expect(thirdBody).not.toContain("sig_history");
-			expect(thirdBody).not.toContain("tool_choice");
-			expect((requestBodies[2] as { tool_choice?: unknown }).tool_choice).toBeUndefined();
+			expect((requestBodies[2] as { speed?: unknown }).speed).toBeUndefined();
 			expect(thirdBody).toContain("history answer");
 		});
 
