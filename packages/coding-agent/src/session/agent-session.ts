@@ -12061,6 +12061,7 @@ export class AgentSession {
 						getSessionId: () => forkedManager.getSessionId(),
 					});
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
+					this.#assertJobManagerEndpointAdmission(forkedManager.getSessionId(), forkedManager.getSessionFile());
 				} catch (error) {
 					const forkedFile = forkedManager.getSessionFile();
 					const cleanupErrors: unknown[] = [];
@@ -12091,6 +12092,7 @@ export class AgentSession {
 					throw error;
 				}
 				this.sessionManager = forkedManager;
+				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
 				try {
 					await previousManager.close();
 				} catch (error) {
