@@ -155,6 +155,13 @@ function makeSignedAssistant(suffix: string, text: string): AssistantMessage {
 	};
 }
 
+function makePlainAssistant(text: string): AssistantMessage {
+	return {
+		...makeSignedAssistant("unused", text),
+		content: [{ type: "text", text }],
+	};
+}
+
 describe("Anthropic thinking replay repair retry", () => {
 	// The runtime tool-choice capability registry is module-global, so a forced
 	// tool_choice 400 raised by any test in this file leaks into every later test
@@ -209,6 +216,55 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(JSON.stringify(requestBodies[1])).not.toContain("synthetic_sig");
 		expect(JSON.stringify(requestBodies[1])).not.toContain("redacted_thinking");
 		expect(JSON.stringify(requestBodies[1])).toContain("visible answer");
+	});
+
+	it("skips a no-op latest repair and sends a changed all-assistant repair", async () => {
+		const user: UserMessage = { role: "user", content: "first", timestamp: Date.now() };
+		const context: Context = {
+			messages: [
+				user,
+				makeSignedAssistant("early", "early answer"),
+				{ ...user, content: "second", timestamp: Date.now() + 1 },
+				makePlainAssistant("latest answer"),
+				{ ...user, content: "next prompt", timestamp: Date.now() + 2 },
+			],
+		};
+		const requestBodies: unknown[] = [];
+		let attempt = 0;
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			attempt += 1;
+			return (attempt === 1 ? createAnthropicThinking400() : createSuccessfulRequest()) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+
+		const result = await streamAnthropic(model, context, { client: { messages: { create } } as Anthropic }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(requestBodies).toHaveLength(2);
+		expect(JSON.stringify(requestBodies[0])).toContain("sig_early");
+		expect(JSON.stringify(requestBodies[1])).not.toContain("sig_early");
+	});
+
+	it("does not send when latest and all repairs are byte-identical", async () => {
+		const user: UserMessage = { role: "user", content: "first", timestamp: Date.now() };
+		const context: Context = {
+			messages: [user, makePlainAssistant("plain answer"), { ...user, content: "next prompt" }],
+		};
+		const requestBodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			requestBodies.push(body);
+			return createAnthropicThinking400() as never;
+		}) as unknown as Anthropic["messages"]["create"];
+
+		const result = await streamAnthropic(model, context, { client: { messages: { create } } as Anthropic }).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(requestBodies).toHaveLength(1);
+		expect(result.errorMessage).toContain("both latest-assistant and all-assistant transforms produced the same");
+		expect(result.errorMessage).toContain(
+			"latest outgoing assistant message is messages[1] with 0 native thinking block(s)",
+		);
+		expect(result.errorMessage).toContain("did not change thinking mode");
 	});
 
 	// Issue #3900: behind CLIProxyAPI the same mutation rejection arrives as a
@@ -280,7 +336,7 @@ describe("Anthropic thinking replay repair retry", () => {
 		expect(JSON.stringify(requestBodies[1])).not.toContain("sig_masked");
 	});
 
-	it("escalates to a full-history repair when the masked rejection survives the latest-only repair", async () => {
+	it("keeps masked repair to one application-level attempt", async () => {
 		const user: UserMessage = {
 			role: "user",
 			content: "first",
@@ -307,14 +363,11 @@ describe("Anthropic thinking replay repair retry", () => {
 
 		const result = await streamAnthropic(model, context, { client }).result();
 
-		expect(result.stopReason).toBe("stop");
-		expect(requestBodies).toHaveLength(3);
+		expect(result.stopReason).toBe("error");
+		expect(requestBodies).toHaveLength(2);
 		const secondBody = JSON.stringify(requestBodies[1]);
 		expect(secondBody).toContain("sig_early");
 		expect(secondBody).not.toContain("sig_late");
-		const thirdBody = JSON.stringify(requestBodies[2]);
-		expect(thirdBody).not.toContain("sig_early");
-		expect(thirdBody).not.toContain("sig_late");
 	});
 
 	it("does not carry an exhausted masked repair into the next turn", async () => {
@@ -337,7 +390,7 @@ describe("Anthropic thinking replay repair retry", () => {
 		const create = ((body: unknown) => {
 			requestBodies.push(body);
 			attempt += 1;
-			return (attempt <= 3 ? createMaskedProxyRejection() : createSuccessfulRequest()) as never;
+			return (attempt <= 2 ? createMaskedProxyRejection() : createSuccessfulRequest()) as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const client = { messages: { create } } as Anthropic;
 		const providerSessionState = new Map<string, ProviderSessionState>();
@@ -345,14 +398,14 @@ describe("Anthropic thinking replay repair retry", () => {
 		const failedTurn = await streamAnthropic(model, context, { client, providerSessionState }).result();
 
 		expect(failedTurn.stopReason).toBe("error");
-		expect(requestBodies).toHaveLength(3);
+		expect(requestBodies).toHaveLength(2);
 
 		const recoveredTurn = await streamAnthropic(model, context, { client, providerSessionState }).result();
 
 		expect(recoveredTurn.stopReason).toBe("stop");
-		expect(requestBodies).toHaveLength(4);
-		expect(JSON.stringify(requestBodies[3])).toContain("sig_early");
-		expect(JSON.stringify(requestBodies[3])).toContain("sig_late");
+		expect(requestBodies).toHaveLength(3);
+		expect(JSON.stringify(requestBodies[2])).toContain("sig_early");
+		expect(JSON.stringify(requestBodies[2])).toContain("sig_late");
 	});
 
 	// A "cannot be modified" rejection is caused by blocks that stay in this
@@ -379,7 +432,7 @@ describe("Anthropic thinking replay repair retry", () => {
 		// is what makes this failure deterministic rather than a transient blip.
 		const create = ((body: unknown) => {
 			requestBodies.push(body);
-			const replaysThinking = JSON.stringify(body).includes("sig_");
+			const replaysThinking = JSON.stringify(body).includes("sig_late");
 			return (replaysThinking ? createAnthropicThinking400() : createSuccessfulRequest()) as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const client = { messages: { create } } as Anthropic;
@@ -395,7 +448,8 @@ describe("Anthropic thinking replay repair retry", () => {
 
 		expect(secondTurn.stopReason).toBe("stop");
 		expect(requestBodies).toHaveLength(3);
-		expect(JSON.stringify(requestBodies[2])).not.toContain("sig_");
+		expect(JSON.stringify(requestBodies[2])).toContain("sig_early");
+		expect(JSON.stringify(requestBodies[2])).not.toContain("sig_late");
 	});
 
 	// The masked body says nothing, so the guard must be the request: with no
@@ -446,7 +500,7 @@ describe("Anthropic thinking replay repair retry", () => {
 	// assistant message" but cites `messages.1.content.1` — a HISTORICAL turn. The
 	// provider demands those blocks be replayed verbatim, so a latest-only edit is
 	// just another mutation; the only recovery is to stop replaying native thinking.
-	it("drops thinking from EVERY assistant turn on the first mutation 400", async () => {
+	it("sends the changed latest-assistant transform on the first mutation 400", async () => {
 		const user: UserMessage = {
 			role: "user",
 			content: "first",
@@ -477,10 +531,9 @@ describe("Anthropic thinking replay repair retry", () => {
 		const firstBody = JSON.stringify(requestBodies[0]);
 		expect(firstBody).toContain("sig_early");
 		expect(firstBody).toContain("sig_late");
-		// The single repair drops every replayed signature rather than re-editing the
-		// turn the provider just refused.
+		// The latest transform changes the body, so the one repair attempt uses it.
 		const secondBody = JSON.stringify(requestBodies[1]);
-		expect(secondBody).not.toContain("sig_early");
+		expect(secondBody).toContain("sig_early");
 		expect(secondBody).not.toContain("sig_late");
 		expect(secondBody).toContain("early answer");
 	});
@@ -725,7 +778,7 @@ describe("Anthropic thinking replay repair retry", () => {
 			tools: [tool],
 		});
 
-		it("keeps thinking repair active when a later forced-tool_choice fallback rebuilds params", async () => {
+		it("does not resend when forced tool choice already made thinking repair a no-op", async () => {
 			const requestBodies: unknown[] = [];
 			let attempt = 0;
 			const create = ((body: unknown) => {
@@ -739,17 +792,10 @@ describe("Anthropic thinking replay repair retry", () => {
 
 			const result = await streamAnthropic(model, makeContext(), { client, toolChoice: "any" }).result();
 
-			expect(result.stopReason).toBe("stop");
-			expect(requestBodies).toHaveLength(3);
-			// Signature repair activates on attempt 2; the forced-tool_choice fallback
-			// rebuild (attempt 3) must not reintroduce the dropped signature, and must
-			// drop the forced tool_choice.
-			expect(JSON.stringify(requestBodies[1])).not.toContain("sig_history");
-			const thirdBody = JSON.stringify(requestBodies[2]);
-			expect(thirdBody).not.toContain("sig_history");
-			expect(thirdBody).not.toContain("tool_choice");
-			expect((requestBodies[2] as { tool_choice?: unknown }).tool_choice).toBeUndefined();
-			expect(thirdBody).toContain("history answer");
+			expect(result.stopReason).toBe("error");
+			expect(requestBodies).toHaveLength(1);
+			expect(result.errorMessage).toContain("both latest-assistant and all-assistant transforms produced the same");
+			expect(JSON.stringify(requestBodies[0])).not.toContain("sig_history");
 		});
 
 		it("keeps forced-tool_choice drop active when a later signature repair rebuilds params", async () => {

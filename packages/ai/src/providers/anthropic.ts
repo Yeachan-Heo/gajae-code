@@ -341,7 +341,18 @@ type AnthropicThinkingReplayRepairScope = "none" | "latest" | "all";
  * the session rather than a single stream, and only a completed stream re-arms
  * it — an unacceptable shape never completes, so it can never buy more repairs.
  */
-const ANTHROPIC_MAX_THINKING_REPAIRS = 2;
+const ANTHROPIC_MAX_THINKING_REPAIRS = 1;
+
+type AnthropicPayloadFingerprint = {
+	sha256: string;
+	bytes: number;
+};
+
+type AnthropicThinkingRepairCandidate = {
+	scope: Exclude<AnthropicThinkingReplayRepairScope, "none">;
+	params: MessageCreateParamsStreaming;
+	fingerprint: AnthropicPayloadFingerprint;
+};
 
 type AnthropicProviderSessionState = ProviderSessionState & {
 	strictToolsDisabled: boolean;
@@ -349,6 +360,7 @@ type AnthropicProviderSessionState = ProviderSessionState & {
 	generatedCacheBudget: GeneratedCacheBudget;
 	thinkingReplayRepairScope: AnthropicThinkingReplayRepairScope;
 	thinkingReplayRepairAttempts: number;
+	thinkingReplayRejectedPayload?: AnthropicPayloadFingerprint;
 	/**
 	 * Managed-mode escalation for the CPA alias-restore failure (issue #4338):
 	 * corrective steering recorded against one exact turn, applied by the next
@@ -382,6 +394,7 @@ function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 			state.generatedCacheBudget = 2;
 			state.thinkingReplayRepairScope = "none";
 			state.thinkingReplayRepairAttempts = 0;
+			state.thinkingReplayRejectedPayload = undefined;
 			state.cpaToolAliasSteering = undefined;
 		},
 	};
@@ -511,6 +524,74 @@ export function isAnthropicMaskedProxyRejection(error: unknown): boolean {
 	return /"type"\s*:\s*"api_error"/.test(message) && /an error occurred while processing/i.test(message);
 }
 
+function fingerprintAnthropicPayload(params: MessageCreateParamsStreaming): AnthropicPayloadFingerprint {
+	const body = JSON.stringify({ ...params, stream: true });
+	return {
+		sha256: nodeCrypto.createHash("sha256").update(body).digest("hex"),
+		bytes: Buffer.byteLength(body),
+	};
+}
+
+function anthropicPayloadChanged(left: AnthropicPayloadFingerprint, right: AnthropicPayloadFingerprint): boolean {
+	return left.bytes !== right.bytes || left.sha256 !== right.sha256;
+}
+
+function extractAnthropicCitedContentPath(error: unknown): { messageIndex: number; contentIndex: number } | undefined {
+	const message = error instanceof Error ? error.message : String(error);
+	const match = /messages\.(\d+)\.content\.(\d+)/i.exec(message);
+	if (!match) return undefined;
+	return { messageIndex: Number(match[1]), contentIndex: Number(match[2]) };
+}
+
+function countNativeThinkingBlocks(content: unknown): number {
+	if (!Array.isArray(content)) return 0;
+	return content.filter(block => {
+		if (!isRecord(block)) return false;
+		return block.type === "thinking" || block.type === "redacted_thinking";
+	}).length;
+}
+
+function describeAnthropicOutgoingPath(error: unknown, params: MessageCreateParamsStreaming): string {
+	const cited = extractAnthropicCitedContentPath(error);
+	const messages = params.messages;
+	let latestAssistantIndex = -1;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		if (messages[index]?.role === "assistant") {
+			latestAssistantIndex = index;
+			break;
+		}
+	}
+	const latest = latestAssistantIndex >= 0 ? messages[latestAssistantIndex] : undefined;
+	const latestThinking = countNativeThinkingBlocks(latest?.content);
+	const latestDescription =
+		latest === undefined
+			? "GJC's outgoing request has no assistant message"
+			: `GJC's latest outgoing assistant message is messages[${latestAssistantIndex}] with ${latestThinking} native thinking block(s)`;
+	if (!cited) return `${latestDescription}; the rejection did not contain a messages.N.content.M path`;
+	const outgoing = messages[cited.messageIndex];
+	if (!outgoing) {
+		return `Anthropic cited messages.${cited.messageIndex}.content.${cited.contentIndex}, but GJC's outgoing request has only ${messages.length} messages; ${latestDescription}`;
+	}
+	const contentBlocks = Array.isArray(outgoing.content) ? outgoing.content.length : 1;
+	return `Anthropic cited messages.${cited.messageIndex}.content.${cited.contentIndex}, but GJC's outgoing messages[${cited.messageIndex}] has role=${outgoing.role} and ${contentBlocks} content block(s); ${latestDescription}`;
+}
+
+function createAnthropicThinkingRepairNoopError(
+	error: unknown,
+	params: MessageCreateParamsStreaming,
+	fingerprint: AnthropicPayloadFingerprint,
+	capturedDiagnostic?: string,
+): Error {
+	const diagnostic = describeAnthropicOutgoingPath(error, params);
+	const terminal = new Error(
+		`Anthropic thinking-replay repair was not sent because both latest-assistant and all-assistant transforms produced the same ${fingerprint.bytes}-byte payload (sha256=${fingerprint.sha256}). ${diagnostic}. GJC did not resend the rejected body and did not change thinking mode.${capturedDiagnostic ? `\n${capturedDiagnostic}` : ""}`,
+	);
+	const status = extractHttpStatusFromError(error);
+	if (status !== undefined) (terminal as Error & { status?: number }).status = status;
+	(terminal as Error & { anthropicHttp400AlreadyCaptured?: boolean }).anthropicHttp400AlreadyCaptured = true;
+	return terminal;
+}
+
 /**
  * Anthropic rejects a request carrying more than four `cache_control`
  * breakpoints. An Anthropic-compatible gateway may attach its own block-level
@@ -585,6 +666,12 @@ export function diagnoseAnthropicContextManagementInjection(
 }
 
 async function finalizeAnthropicErrorMessage(error: unknown, dump: RawHttpRequestDump | undefined): Promise<string> {
+	if (
+		error instanceof Error &&
+		(error as Error & { anthropicHttp400AlreadyCaptured?: boolean }).anthropicHttp400AlreadyCaptured
+	) {
+		return error.message;
+	}
 	const diagnostic = diagnoseAnthropicContextManagementInjection(error, dump);
 	if (diagnostic && dump) {
 		dump.diagnostics = {
@@ -1764,17 +1851,37 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 				}
 				validateCacheControls(nextParams as AnthropicCacheParams);
+				return nextParams;
+			};
+			let params = await prepareParams();
+			const setRawRequestDump = (body: MessageCreateParamsStreaming): void => {
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
 					model: model.id,
 					method: "POST",
 					url: `${baseUrl}/v1/messages`,
-					body: nextParams,
+					body,
 				};
-				return nextParams;
 			};
-			let params = await prepareParams();
+			setRawRequestDump(params);
+			const inheritedRejectedPayload = providerSessionState?.thinkingReplayRejectedPayload;
+			if (
+				inheritedRejectedPayload &&
+				thinkingReplayRepairScope !== "none" &&
+				!anthropicPayloadChanged(inheritedRejectedPayload, fingerprintAnthropicPayload(params))
+			) {
+				throw createAnthropicThinkingRepairNoopError(
+					new Error(
+						"invalid_request_error: persisted Anthropic thinking repair did not change the outgoing payload",
+					),
+					params,
+					inheritedRejectedPayload,
+				);
+			}
+			if (providerSessionState?.thinkingReplayRejectedPayload) {
+				providerSessionState.thinkingReplayRejectedPayload = undefined;
+			}
 
 			type Block = (
 				| ThinkingContent
@@ -1852,6 +1959,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				);
 				const idleTimeoutAbortError = new Error("Anthropic stream stalled while waiting for the next event");
 				const { requestSignal } = activeAbortTracker;
+				setRawRequestDump(params);
 				const anthropicRequest = client.messages.create({ ...params, stream: true }, { signal: requestSignal });
 				let streamedReplayUnsafeContent = false;
 				let sawProviderSafetyStop = false;
@@ -2249,7 +2357,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					const maskedProxyRejection = isAnthropicMaskedProxyRejection(streamFailure);
 					if (
 						!options?.fallbackManaged &&
-						thinkingReplayRepairScope !== "all" &&
+						thinkingReplayRepairScope === "none" &&
 						thinkingReplayRepairAttempts < ANTHROPIC_MAX_THINKING_REPAIRS &&
 						firstTokenTime === undefined &&
 						(thinkingSignatureInvalid ||
@@ -2259,15 +2367,47 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							// flight there is nothing to repair and the error must surface.
 							(maskedProxyRejection && hasNativeThinkingBlocks(params.messages)))
 					) {
-						// "cannot be modified" means the cited blocks must be replayed byte for
-						// byte, so editing that turn again can never converge — the only recovery
-						// is to stop replaying native thinking at all. The invalid-signature 400
-						// cites blocks anywhere in history and needs the same full-history scope.
-						// Only the unclassifiable masked rejection is worth probing latest-first.
-						const nextScope: AnthropicThinkingReplayRepairScope =
-							thinkingSignatureInvalid || thinkingBlocksImmutable || thinkingReplayRepairScope === "latest"
-								? "all"
-								: "latest";
+						const rejectedFingerprint = fingerprintAnthropicPayload(params);
+						const scopes: Array<Exclude<AnthropicThinkingReplayRepairScope, "none">> = thinkingSignatureInvalid
+							? ["all"]
+							: ["latest", "all"];
+						let candidate: AnthropicThinkingRepairCandidate | undefined;
+						const transforms: Record<string, unknown> = {};
+						for (const scope of scopes) {
+							thinkingReplayRepairScope = scope;
+							const candidateParams = await prepareParams();
+							const fingerprint = fingerprintAnthropicPayload(candidateParams);
+							const changed = anthropicPayloadChanged(rejectedFingerprint, fingerprint);
+							transforms[scope] = { changed, sha256: fingerprint.sha256, bytes: fingerprint.bytes };
+							if (changed) {
+								candidate = { scope, params: candidateParams, fingerprint };
+								break;
+							}
+						}
+						if (rawRequestDump) {
+							rawRequestDump.diagnostics = {
+								...(rawRequestDump.diagnostics ?? {}),
+								anthropicThinkingRepair: {
+									rejected: rejectedFingerprint,
+									disposition: candidate ? `send-${candidate.scope}` : "no-op-terminal",
+									transforms,
+									outgoingMismatch: describeAnthropicOutgoingPath(streamFailure, params),
+								},
+							};
+						}
+						const captured = await finalizeAnthropicErrorMessage(streamFailure, rawRequestDump);
+						logger.warn("anthropic: thinking replay rejected; evaluated bounded repair", {
+							model: model.id,
+							disposition: candidate ? `send-${candidate.scope}` : "no-op-terminal",
+							rejectedSha256: rejectedFingerprint.sha256,
+							rejectedBytes: rejectedFingerprint.bytes,
+							diagnostic: captured,
+						});
+						if (!candidate) {
+							thinkingReplayRepairScope = "none";
+							throw createAnthropicThinkingRepairNoopError(streamFailure, params, rejectedFingerprint, captured);
+						}
+						const nextScope = candidate.scope;
 						thinkingReplayRepairAttempts++;
 						logger.debug("anthropic: repairing assistant thinking replay after provider rejection", {
 							model: model.id,
@@ -2285,7 +2425,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								providerSessionState.thinkingReplayRepairScope = nextScope;
 							}
 						}
-						params = await prepareParams();
+						params = candidate.params;
 						// The provider retry budget is deliberately NOT reset here: a repair that
 						// keeps being rejected must run out instead of renewing the budget it is
 						// supposed to consume (issue #4011).
@@ -2312,11 +2452,42 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						(thinkingSignatureInvalid || thinkingBlocksImmutable) &&
 						hasNativeThinkingBlocks(params.messages)
 					) {
+						const rejectedFingerprint = fingerprintAnthropicPayload(params);
+						thinkingReplayRepairScope = "all";
+						const candidateParams = await prepareParams();
+						const candidateFingerprint = fingerprintAnthropicPayload(candidateParams);
+						const changed = anthropicPayloadChanged(rejectedFingerprint, candidateFingerprint);
+						if (rawRequestDump) {
+							rawRequestDump.diagnostics = {
+								...(rawRequestDump.diagnostics ?? {}),
+								anthropicThinkingRepair: {
+									rejected: rejectedFingerprint,
+									disposition: changed ? "record-all-for-managed-retry" : "no-op-terminal",
+									transforms: {
+										all: { changed, sha256: candidateFingerprint.sha256, bytes: candidateFingerprint.bytes },
+									},
+									outgoingMismatch: describeAnthropicOutgoingPath(streamFailure, params),
+								},
+							};
+						}
+						const captured = await finalizeAnthropicErrorMessage(streamFailure, rawRequestDump);
+						logger.warn("anthropic: managed thinking replay rejected; evaluated repair", {
+							model: model.id,
+							disposition: changed ? "record-all-for-managed-retry" : "no-op-terminal",
+							rejectedSha256: rejectedFingerprint.sha256,
+							rejectedBytes: rejectedFingerprint.bytes,
+							diagnostic: captured,
+						});
+						if (!changed) {
+							thinkingReplayRepairScope = "none";
+							throw createAnthropicThinkingRepairNoopError(streamFailure, params, rejectedFingerprint, captured);
+						}
 						logger.debug("anthropic: recording thinking replay repair for the next managed attempt", {
 							model: model.id,
 							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
 						});
 						providerSessionState.thinkingReplayRepairScope = "all";
+						providerSessionState.thinkingReplayRejectedPayload = rejectedFingerprint;
 					}
 					if (
 						!options?.fallbackManaged &&

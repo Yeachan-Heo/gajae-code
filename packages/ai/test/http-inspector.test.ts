@@ -108,6 +108,36 @@ describe("HTTP 400 request dump sanitization", () => {
 		expect(saved).toContain("visible text");
 		expect(saved).toContain("[redacted]");
 	});
+
+	it("captures one bounded copy of a large rejected body", async () => {
+		await useTempAgentDir();
+		const largeVisibleText = "x".repeat(850_000);
+		const dump: RawHttpRequestDump = {
+			provider: "anthropic",
+			api: "anthropic-messages",
+			model: "claude-opus-5",
+			method: "POST",
+			url: "https://api.anthropic.com/v1/messages",
+			body: { messages: [{ role: "user", content: largeVisibleText }] },
+			diagnostics: {
+				anthropicThinkingRepair: {
+					disposition: "send-all",
+					rejected: { bytes: 850_000, sha256: "synthetic" },
+				},
+			},
+		};
+		const error = Object.assign(new Error("400 invalid_request_error: synthetic repair rejection"), {
+			status: 400,
+		});
+
+		const message = await finalizeErrorMessage(error, dump);
+		const filePath = /raw-http-request=(.+)$/m.exec(message)?.[1] ?? "";
+		const saved = await fs.readFile(filePath, "utf-8");
+
+		expect(saved.match(/xxxxxxxxxxxxxxxx/g)?.length).toBe(53_125);
+		expect(Buffer.byteLength(saved)).toBeLessThan(900_000);
+		expect(saved).toContain('"disposition": "send-all"');
+	});
 });
 
 describe("HTTP 400 error message safety (issue #438)", () => {

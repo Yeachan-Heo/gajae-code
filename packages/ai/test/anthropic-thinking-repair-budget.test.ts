@@ -181,10 +181,10 @@ describe("Anthropic thinking-replay repair budget (issue #4011)", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(requestBodies).toHaveLength(2);
 		expect(replayedThinkingBlockTypes(requestBodies[0])).toEqual(["thinking", "thinking"]);
-		// "cannot be modified" means the blocks must be replayed verbatim, so the
-		// retry must not ship a re-mutated version of them — it ships none.
-		expect(replayedThinkingBlockTypes(requestBodies[1])).toEqual([]);
-		expect(JSON.stringify(requestBodies[1])).not.toContain("sig_early");
+		// The latest-assistant transform changes this body, so it is the one bounded
+		// application-level repair attempt that may be sent.
+		expect(replayedThinkingBlockTypes(requestBodies[1])).toEqual(["thinking"]);
+		expect(JSON.stringify(requestBodies[1])).toContain("sig_early");
 		expect(JSON.stringify(requestBodies[1])).not.toContain("sig_late");
 		expect(JSON.stringify(requestBodies[1])).toContain("early answer");
 	});
@@ -223,19 +223,19 @@ describe("Anthropic thinking-replay repair budget (issue #4011)", () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
 
 		const first = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
-		// latest-scope repair, full-history repair, then the budget is spent.
+		// One application-level repair attempt, then the budget is spent.
 		expect(first.stopReason).toBe("error");
-		expect(requestBodies).toHaveLength(3);
+		expect(requestBodies).toHaveLength(2);
 
 		const second = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
 
 		// Re-invoking the stream must not hand out a fresh pair of repairs.
 		expect(second.stopReason).toBe("error");
 		expect(second.errorMessage).toContain("An error occurred while processing the request.");
-		expect(requestBodies).toHaveLength(4);
+		expect(requestBodies).toHaveLength(3);
 		// The spent budget remains session-scoped, but the unclassifiable masked
 		// rejection does not carry its speculative degradation into the next turn.
-		expect(replayedThinkingBlockTypes(requestBodies[3])).toEqual(["thinking", "thinking"]);
+		expect(replayedThinkingBlockTypes(requestBodies[2])).toEqual(["thinking", "thinking"]);
 	});
 
 	it("stays bounded across three turns that never complete a stream", async () => {
@@ -252,8 +252,8 @@ describe("Anthropic thinking-replay repair budget (issue #4011)", () => {
 			expect(result.stopReason).toBe("error");
 		}
 
-		// Two repairs on the first turn, then one bare request per later turn.
-		expect(requestBodies).toHaveLength(5);
+		// One repair on the first turn, then one bare request per later turn.
+		expect(requestBodies).toHaveLength(4);
 	});
 });
 
@@ -272,7 +272,7 @@ describe("Anthropic thinking-replay repair scope release (issue #4038)", () => {
 		const create = ((body: unknown) => {
 			requestBodies.push(body);
 			attempt += 1;
-			return (attempt <= 2 ? rejectingRequest(MASKED_REJECTION) : successfulRequest()) as never;
+			return (attempt === 1 ? rejectingRequest(MASKED_REJECTION) : successfulRequest()) as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const client = { messages: { create } } as Anthropic;
 		const providerSessionState = new Map<string, ProviderSessionState>();
@@ -280,20 +280,19 @@ describe("Anthropic thinking-replay repair scope release (issue #4038)", () => {
 		const first = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
 
 		expect(first.stopReason).toBe("stop");
-		expect(requestBodies).toHaveLength(3);
+		expect(requestBodies).toHaveLength(2);
 		expect(replayedThinkingBlockTypes(requestBodies[0])).toEqual(["thinking", "thinking"]);
 		expect(replayedThinkingBlockTypes(requestBodies[1])).toEqual(["thinking"]);
-		expect(replayedThinkingBlockTypes(requestBodies[2])).toEqual([]);
 
 		const second = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
 
 		expect(second.stopReason).toBe("stop");
-		expect(requestBodies).toHaveLength(4);
+		expect(requestBodies).toHaveLength(3);
 		// The blip is over and nothing ever proved the replay was at fault, so the
 		// next turn ships the signed blocks instead of staying degraded forever.
-		expect(replayedThinkingBlockTypes(requestBodies[3])).toEqual(["thinking", "thinking"]);
-		expect(JSON.stringify(requestBodies[3])).toContain("sig_early");
-		expect(JSON.stringify(requestBodies[3])).toContain("sig_late");
+		expect(replayedThinkingBlockTypes(requestBodies[2])).toEqual(["thinking", "thinking"]);
+		expect(JSON.stringify(requestBodies[2])).toContain("sig_early");
+		expect(JSON.stringify(requestBodies[2])).toContain("sig_late");
 	});
 
 	it("re-arms the repair budget for the next turn once a stream completes", async () => {
@@ -302,8 +301,8 @@ describe("Anthropic thinking-replay repair scope release (issue #4038)", () => {
 		const create = ((body: unknown) => {
 			requestBodies.push(body);
 			attempt += 1;
-			// Turn 1 spends both repairs, then completes. Turn 2 is rejected once more.
-			const rejects = attempt <= 2 || attempt === 4;
+			// Turn 1 spends one repair, then completes. Turn 2 is rejected once more.
+			const rejects = attempt === 1 || attempt === 3;
 			return (rejects ? rejectingRequest(MASKED_REJECTION) : successfulRequest()) as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const client = { messages: { create } } as Anthropic;
@@ -311,14 +310,14 @@ describe("Anthropic thinking-replay repair scope release (issue #4038)", () => {
 
 		const first = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
 		expect(first.stopReason).toBe("stop");
-		expect(requestBodies).toHaveLength(3);
+		expect(requestBodies).toHaveLength(2);
 
 		const second = await streamAnthropic(model, replayContext(), { client, providerSessionState }).result();
 
 		// A spent budget would have surfaced the rejection instead of repairing it.
 		expect(second.stopReason).toBe("stop");
-		expect(requestBodies).toHaveLength(5);
-		expect(replayedThinkingBlockTypes(requestBodies[3])).toEqual(["thinking", "thinking"]);
-		expect(replayedThinkingBlockTypes(requestBodies[4])).toEqual(["thinking"]);
+		expect(requestBodies).toHaveLength(4);
+		expect(replayedThinkingBlockTypes(requestBodies[2])).toEqual(["thinking", "thinking"]);
+		expect(replayedThinkingBlockTypes(requestBodies[3])).toEqual(["thinking"]);
 	});
 });
