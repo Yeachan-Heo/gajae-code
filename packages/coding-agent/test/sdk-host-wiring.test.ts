@@ -4898,6 +4898,108 @@ test("SDK host publishes interactive asks and idle without notification provider
 	});
 }, 30_000);
 
+test("/notify off detaches notification providers while core SDK asks and idle keep working", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-off-detach-"));
+	dirs.push(cwd);
+	const sessionId = `notify-off-detach-${Date.now()}`;
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+	const messages: Array<{ message: string; level: string }> = [];
+	const sessionContext = {
+		...context(cwd, sessionId),
+		ui: { notify: (message: string, level: string) => messages.push({ message, level }) },
+	};
+	process.env.GJC_NOTIFICATIONS = "1";
+	const handlers = start(sessionContext, undefined, () => {}, false, commands);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+
+	const openSocket = async (capabilities: string[]): Promise<[WebSocket, Record<string, unknown>[]]> => {
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities }));
+		return [socket, frames];
+	};
+
+	try {
+		// The regression only exists once notification delivery is genuinely active.
+		await waitFor(() => getTelegramFileSink(sessionId) !== undefined, "notification delivery active");
+
+		// A notification adapter is identified by the ask-selected-ack capability that
+		// only the Telegram/Slack/Discord daemons negotiate.
+		const [providerSocket, providerFrames] = await openSocket(["ask_controls_v1", "ask_selected_ack_v1"]);
+		// Real Telegram/Slack/Discord daemons close their transport on session_closed.
+		providerSocket.addEventListener("message", event => {
+			if (JSON.parse(String(event.data)).type === "session_closed") providerSocket.close();
+		});
+		const [coreSocket, coreFrames] = await openSocket(["ask_controls_v1"]);
+		await waitFor(() => getAskAnswerSource(sessionId) !== undefined, "core SDK ask source");
+
+		await commands.get("notify")!.handler("off", sessionContext);
+		expect(messages.at(-1)).toMatchObject({ message: "Notifications disabled for this session." });
+		// The provider socket is torn down rather than left silently attached.
+		await waitFor(
+			() => providerFrames.some(frame => frame.type === "session_closed" && frame.sessionId === sessionId),
+			"provider detach",
+		);
+		expect(getTelegramFileSink(sessionId)).toBeUndefined();
+		const providerFrameCount = providerFrames.length;
+
+		// Core SDK asks remain fully functional for clients such as the Stream Deck.
+		const answerSource = getAskAnswerSource(sessionId);
+		expect(answerSource).toBeDefined();
+		const answer = answerSource!.awaitAnswerRequest!(
+			{ question: "Continue after notify off", options: ["yes", "no"], interaction: "selector", controls: [] },
+			new AbortController().signal,
+		);
+		await waitFor(
+			() => coreFrames.some(frame => frame.type === "action_needed" && frame.kind === "ask"),
+			"core SDK ask after notify off",
+		);
+		const action = coreFrames.find(frame => frame.type === "action_needed" && frame.kind === "ask")!;
+		coreSocket.send(JSON.stringify({ type: "reply", id: action.id, answer: 0, token: endpoint.token }));
+		const receipt = await answer;
+		expect(receipt).toMatchObject({ source: "remote", interaction: { kind: "value", value: "yes" } });
+		if (!receipt || typeof receipt === "string") throw new Error("Expected a remote ask receipt");
+		await receipt.settle({ kind: "commit" });
+
+		// Idle notices likewise stay a core SDK capability.
+		void handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+		await waitFor(
+			() => coreFrames.some(frame => frame.type === "action_needed" && frame.kind === "idle"),
+			"core SDK idle after notify off",
+		);
+
+		// The detached provider received neither the ask nor the idle notice.
+		expect(providerFrames.slice(providerFrameCount).filter(frame => frame.type === "action_needed")).toHaveLength(0);
+
+		// A provider that ignores the detach directive still holds no authority: its
+		// control frames are refused as stale instead of answering or steering.
+		const [staleSocket, staleFrames] = await openSocket(["ask_controls_v1", "ask_selected_ack_v1"]);
+		staleSocket.send(
+			JSON.stringify({ type: "control_request", id: "stale-adapter", operation: "turn.abort", input: {} }),
+		);
+		await waitFor(
+			() => staleFrames.some(frame => frame.type === "control_response" && frame.id === "stale-adapter"),
+			"stale adapter refusal",
+		);
+		expect(
+			staleFrames.find(frame => frame.type === "control_response" && frame.id === "stale-adapter"),
+		).toMatchObject({
+			ok: false,
+			error: { code: "endpoint_stale" },
+		});
+	} finally {
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+	}
+}, 30_000);
+
 test("SDK endpoint applies typed skill, plan, goal, and config controls with observable readback", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-typed-controls-"));
 	dirs.push(cwd);

@@ -1131,6 +1131,13 @@ interface SessionRuntime {
 	disposeGateListener: () => void;
 	/** Whether notification-only delivery resources are active. */
 	notificationsActive: boolean;
+	/**
+	 * Detaches every notification-adapter socket and refuses their reattachment.
+	 * Core SDK clients keep their sockets, asks, and idle notices.
+	 */
+	detachNotificationAdapters: () => void;
+	/** Whether at least one non-adapter core SDK client is attached. */
+	hasCoreSdkClient: () => boolean;
 	/** Provider ownership state is independent from the already-published core SDK runtime. */
 	notificationOwnerState: "ready" | "retry" | "blocked";
 	/** Rejects new SDK frames while a leased terminal response drains. */
@@ -4023,6 +4030,10 @@ export function createNotificationsExtension(
 			try {
 				rt.disposeFileSink();
 			} catch {}
+			// Core SDK ask/idle stays published; only the notification adapters are
+			// detached, so `/notify off` cannot leave Telegram able to receive,
+			// present, or answer asks and idle notices.
+			rt.detachNotificationAdapters();
 			return true;
 		}
 		// Keep this exact object authoritative for the full terminal release, including
@@ -4361,6 +4372,32 @@ export function createNotificationsExtension(
 		};
 
 		const hostCapCache = new Map<string, ReadonlySet<string>>();
+		/**
+		 * Notification adapters (Telegram/Slack/Discord daemons) always negotiate
+		 * `ask_selected_ack_v1`; core SDK clients never do. Classifying by that
+		 * negotiated capability is what lets notification policy detach delivery
+		 * adapters while the core SDK ask/idle surface stays live.
+		 */
+		const isNotificationAdapterConnection = (connectionId: string): boolean =>
+			hostCapCache.get(connectionId)?.has(ASK_SELECTED_ACK_CAPABILITY) === true;
+		/** Adapter sockets refused while notification policy is disabled. */
+		const detachedAdapterConnections = new Set<string>();
+		let coreAnswerSourceActive = false;
+		/**
+		 * A live delivery target is either an attached core SDK client (Stream Deck,
+		 * ACP, CLI) or, while notification policy is enabled, an attached adapter.
+		 * Asks and idle notices are core SDK capabilities, so their answer source is
+		 * published whenever such a target exists — independently of notification
+		 * policy — and withdrawn when nothing can present them.
+		 */
+		const hasLiveActionTarget = (notificationsActive: boolean): boolean => {
+			if (notificationsActive) return true;
+			for (const connectionId of hostCapCache.keys()) {
+				if (detachedAdapterConnections.has(connectionId)) continue;
+				if (!isNotificationAdapterConnection(connectionId)) return true;
+			}
+			return false;
+		};
 
 		const configOverrides = new Map<string, unknown>();
 		const configRevision = { current: 0 };
@@ -6488,6 +6525,8 @@ export function createNotificationsExtension(
 			notificationsActive: false,
 			notificationOwnerState: "ready",
 			enableNotifications: () => {},
+			detachNotificationAdapters: () => {},
+			hasCoreSdkClient: () => false,
 			disposeGateTerminalController: () => {},
 			disposeAckRecoveryParticipant: () => {},
 			disposeGateEmitterListener: () => {},
@@ -6601,6 +6640,37 @@ export function createNotificationsExtension(
 				server.sendTo(connectionId, JSON.stringify({ type: responseType, id, ok: false, error }));
 			} catch {}
 		};
+		/**
+		 * Publishes the core SDK ask answer source exactly while a live delivery
+		 * target exists, and withdraws it otherwise. Idempotent: the ask registry is
+		 * a stack, so a duplicate registration would shadow the ACP/UI protocol
+		 * source that tests and the elicitation contract depend on.
+		 */
+		const reconcileCoreAnswerSource = (): void => {
+			const runtime = initializedRuntime;
+			const wanted = !runtime.stopping && runtime.host.started && hasLiveActionTarget(runtime.notificationsActive);
+			if (wanted === coreAnswerSourceActive) return;
+			coreAnswerSourceActive = wanted;
+			if (wanted) {
+				runtime.disposeAnswerSource = registerInteractiveAnswerSource(
+					runtime.id,
+					pendingInteractive,
+					gatePresentations,
+				);
+				return;
+			}
+			try {
+				runtime.disposeAnswerSource();
+			} catch (error) {
+				logger.warn(`notifications: core ask source release failed: ${String(error)}`);
+			}
+			runtime.disposeAnswerSource = () => {};
+			// Nothing can present a retained interactive ask anymore; settle its waiters
+			// rather than leaving the ask tool blocked on a source with no target.
+			runtime.gatePresentations?.cancelInteractive();
+			for (const pending of runtime.pendingInteractive.values()) pending.resolve(undefined);
+			runtime.pendingInteractive.clear();
+		};
 		const sendMalformed = (connectionId: string, message: string): void => {
 			try {
 				server.sendTo(
@@ -6628,6 +6698,12 @@ export function createNotificationsExtension(
 						return;
 					}
 					if (inbound.connectionId && fencedConnections.has(inbound.connectionId)) {
+						sendEndpointStale(inbound.connectionId, typedFrame);
+						return;
+					}
+					// A detached notification adapter has no control authority over this
+					// session while notification policy is disabled.
+					if (inbound.connectionId && detachedAdapterConnections.has(inbound.connectionId)) {
 						sendEndpointStale(inbound.connectionId, typedFrame);
 						return;
 					}
@@ -6662,7 +6738,19 @@ export function createNotificationsExtension(
 				);
 			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
-				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
+				// The native layer delivers `(connectionId, capabilities)` as one tuple
+				// argument, so the second parameter is absent at runtime. Normalize both
+				// shapes rather than caching a tuple as if it were a connection id.
+				const tupled = connectionId as unknown as [string, string[]] | string;
+				const negotiatedId = Array.isArray(tupled) ? tupled[0] : tupled;
+				const negotiatedCaps = Array.isArray(tupled) ? tupled[1] : capabilities;
+				if (!negotiatedId) return;
+				hostCapCache.set(negotiatedId, new Set(negotiatedCaps ?? []));
+				// A provider that (re)attaches while notification policy is disabled must not
+				// become a delivery target just because it completed the handshake.
+				if (!initializedRuntime.notificationsActive && isNotificationAdapterConnection(negotiatedId))
+					detachedAdapterConnections.add(negotiatedId);
+				reconcileCoreAnswerSource();
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
@@ -6671,6 +6759,8 @@ export function createNotificationsExtension(
 					.catch(error => logger.warn(`sdk: failed to cancel disconnected preflight: ${String(error)}`));
 				host.handleDisconnect(connectionId);
 				hostCapCache.delete(connectionId);
+				detachedAdapterConnections.delete(connectionId);
+				reconcileCoreAnswerSource();
 				// The socket is gone, so its fence has nothing left to refuse. Dropping the
 				// entry keeps the set bounded by live connections instead of growing forever.
 				fencedConnections.delete(connectionId);
@@ -6934,9 +7024,11 @@ export function createNotificationsExtension(
 					messageId?: number;
 					reason?: string;
 				};
-				const notificationOrigin = hostCapCache
-					.get(authenticatedInbound.connectionId)
-					?.has(ASK_SELECTED_ACK_CAPABILITY);
+				// A detached adapter keeps no inbound authority: free-text injection,
+				// config commands, and control commands are all refused while notification
+				// policy is disabled.
+				if (detachedAdapterConnections.has(authenticatedInbound.connectionId)) return;
+				const notificationOrigin = isNotificationAdapterConnection(authenticatedInbound.connectionId);
 				if (runtime?.policySuspended && notificationOrigin) {
 					if (inbound.kind === "control_command") {
 						const frame = sdkInboundFrame(inbound.commandJson);
@@ -7125,11 +7217,7 @@ export function createNotificationsExtension(
 			// daemon ownership. A blocked adapter must not make an interactive session
 			// undiscoverable or uncontrollable.
 			const endpoint = await sdkRuntime.startTransport();
-			initializedRuntime.disposeAnswerSource = registerInteractiveAnswerSource(
-				initializedRuntime.id,
-				pendingInteractive,
-				gatePresentations,
-			);
+			reconcileCoreAnswerSource();
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				initializedRuntime.notificationOwnerState = "retry";
@@ -7230,11 +7318,35 @@ export function createNotificationsExtension(
 			}
 
 			const startedRuntime = initializedRuntime;
+			initializedRuntime.hasCoreSdkClient = () => {
+				for (const connectionId of hostCapCache.keys())
+					if (!isNotificationAdapterConnection(connectionId)) return true;
+				return false;
+			};
+			initializedRuntime.detachNotificationAdapters = () => {
+				for (const connectionId of hostCapCache.keys()) {
+					if (!isNotificationAdapterConnection(connectionId)) continue;
+					detachedAdapterConnections.add(connectionId);
+					// Directed, not broadcast: the adapter tears down its own session view
+					// (Telegram archives the topic, Slack/Discord close their threads) while
+					// core SDK clients keep this exact endpoint and its ask/idle stream.
+					try {
+						server.sendTo(connectionId, JSON.stringify({ type: "session_closed", sessionId: startedRuntime.id }));
+					} catch (error) {
+						logger.warn(`notifications: adapter detach failed: ${String(error)}`);
+					}
+				}
+				reconcileCoreAnswerSource();
+			};
 			initializedRuntime.enableNotifications = () => {
 				const runtime = startedRuntime;
 				if (runtime.notificationsActive) return;
 				ephemeralTurns.enable();
 				runtime.notificationsActive = true;
+				// Re-enable is a full adapter reattach: the refusal set is the only thing
+				// holding providers off, so clearing it restores delivery immediately.
+				detachedAdapterConnections.clear();
+				reconcileCoreAnswerSource();
 				runtime.disposeFileSink = registerTelegramFileSink(runtime.id, async file => {
 					const generation = runtime.policyGeneration;
 					if (!canDeliverAsync(runtime, generation)) return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
