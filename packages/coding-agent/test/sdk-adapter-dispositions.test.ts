@@ -115,6 +115,7 @@ const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"auth.login": "operation_not_session_owned",
 	"skill.invoke": "invalid_input",
 	"turn.result": "invalid_request",
+	"turn.steer_status": "invalid_request",
 	"mode.plan.set": "unavailable",
 	"model.profile.set": "invalid_input",
 };
