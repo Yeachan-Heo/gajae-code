@@ -779,6 +779,8 @@ export interface AgentSessionConfig {
 	credentialSessionId?: string;
 	/** Optional provider-facing cache identity, distinct from logical session identity. */
 	providerCacheSessionId?: string;
+	/** Process-local async ownership identity, distinct from logical and provider identities. */
+	asyncJobEndpointId?: string;
 }
 
 export interface AgentSessionMemoryGuardRestoreInput
@@ -2202,6 +2204,7 @@ export class AgentSession {
 	#providerSessionId: string | undefined;
 	#credentialSessionId: string | undefined;
 	#providerCacheSessionId: string | undefined;
+	readonly #asyncJobEndpointId: string | undefined;
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
@@ -3216,6 +3219,7 @@ export class AgentSession {
 		this.#providerSessionId = config.providerSessionId;
 		this.#credentialSessionId = config.credentialSessionId;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
+		this.#asyncJobEndpointId = config.asyncJobEndpointId;
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => {
 			settleToolLineageRegistrationWindow(ctx.toolCall.id, this.#ownedRegistrationEndpoint());
@@ -6650,11 +6654,12 @@ export class AgentSession {
 	 * resolve its lineage nor register its owned tuple (review thread P1).
 	 */
 	#assertJobManagerEndpointAdmission(successorEndpointId: string): void {
+		const effectiveSuccessorEndpointId = this.#asyncJobEndpointId ?? successorEndpointId;
 		const ownManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
-		const successorOwner = AsyncJobManager.forEndpoint(successorEndpointId);
+		const successorOwner = AsyncJobManager.forEndpoint(effectiveSuccessorEndpointId);
 		if (ownManager && successorOwner !== undefined && successorOwner !== ownManager) {
 			throw new Error(
-				`Session identity transition rejected: endpoint "${successorEndpointId}" is owned by another live session's job manager.`,
+				`Session identity transition rejected: endpoint "${effectiveSuccessorEndpointId}" is owned by another live session's job manager.`,
 			);
 		}
 	}
@@ -6663,8 +6668,9 @@ export class AgentSession {
 		previousEndpointId: string,
 		options: { retirePredecessorRegistrations?: boolean } = {},
 	): void {
-		const currentEndpointId = this.sessionManager.getSessionId();
-		const predecessorOwner = AsyncJobManager.forEndpoint(previousEndpointId);
+		const effectivePreviousEndpointId = this.#asyncJobEndpointId ?? previousEndpointId;
+		const currentEndpointId = this.#asyncJobEndpointId ?? this.sessionManager.getSessionId();
+		const predecessorOwner = AsyncJobManager.forEndpoint(effectivePreviousEndpointId);
 		// Rekey and retire ONLY when the predecessor key belongs to THIS
 		// session's manager (the session-owned manager, else the process-global
 		// fallback the session uses). A predecessor key held by a FOREIGN
@@ -6674,7 +6680,11 @@ export class AgentSession {
 		const ownManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		if (predecessorOwner !== undefined && predecessorOwner !== ownManager) return;
 		if (predecessorOwner !== undefined) {
-			const rekeyed = AsyncJobManager.rekeyForEndpoint(previousEndpointId, currentEndpointId, predecessorOwner);
+			const rekeyed = AsyncJobManager.rekeyForEndpoint(
+				effectivePreviousEndpointId,
+				currentEndpointId,
+				predecessorOwner,
+			);
 			if (!rekeyed) {
 				// The successor endpoint is owned by a FOREIGN live manager. A
 				// silent no-op would leave THIS manager registered under the
@@ -6700,8 +6710,8 @@ export class AgentSession {
 		// registry across repeated transitions. Retire them as part of the
 		// rekey (review thread P2). A same-id transition (no-op rekey) keeps
 		// the session's own live tuples.
-		if (previousEndpointId !== currentEndpointId && options.retirePredecessorRegistrations !== false) {
-			retireOwnedRegistrationsForEndpoint(previousEndpointId);
+		if (effectivePreviousEndpointId !== currentEndpointId && options.retirePredecessorRegistrations !== false) {
+			retireOwnedRegistrationsForEndpoint(effectivePreviousEndpointId);
 		}
 	}
 

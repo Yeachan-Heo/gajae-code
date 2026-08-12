@@ -1398,11 +1398,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session_id upstream, where session-owning transports reject the extra
 		// downstreams (owner_busy) and degrade those turns to uncached HTTP.
 		const providerSessionId = options.providerSessionId ?? logicalSessionId;
-		// AsyncJobManager ownership follows provider identity rather than the
-		// persisted logical header. Nested managed children intentionally reuse the
-		// lifecycle-owned header, while each child provider scope is independently
-		// addressable for jobs, aborts, and detached resume.
-		const asyncJobEndpointId = providerSessionId;
+		// AsyncJobManager ownership is distinct from both the persisted logical
+		// header and provider cache affinity. Managed child transcripts may share a
+		// logical header, while unrelated top-level sessions may intentionally share
+		// providerSessionId. Bind explicit provider scopes to the independently
+		// persisted transcript path so ownership is collision-free and stable across
+		// detached resume; ordinary sessions keep the transition-aware logical id.
+		const sessionFile = sessionManager.getSessionFile();
+		const asyncJobEndpointId =
+			options.providerSessionId !== undefined && sessionFile
+				? JSON.stringify(["async-job-endpoint", providerSessionId, sessionFile])
+				: logicalSessionId;
 		const credentialSessionId = options.credentialSessionId ?? providerSessionId;
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
@@ -3360,6 +3366,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			obfuscator,
 			agentId: resolvedAgentId,
 			agentRegistry,
+			asyncJobEndpointId,
 			providerSessionId: options.providerSessionId,
 			credentialSessionId: options.credentialSessionId,
 			providerCacheSessionId: providerSessionId,

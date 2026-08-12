@@ -207,6 +207,23 @@ describe("task fork-context provider identity", () => {
 		expect(session.agent.providerSessionId).toBe("explicit-provider-session");
 	});
 
+	it("keeps top-level async ownership isolated when provider affinity is shared", async () => {
+		const firstDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-shared-provider-a-${Snowflake.next()}-`));
+		const secondDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-shared-provider-b-${Snowflake.next()}-`));
+		tempDirs.push(firstDir, secondDir);
+		const [{ session: first, authStorage: firstAuth }, { session: second, authStorage: secondAuth }] =
+			await Promise.all([
+				createSession(firstDir, { providerSessionId: "shared-provider-affinity" }),
+				createSession(secondDir, { providerSessionId: "shared-provider-affinity" }),
+			]);
+		sessions.push(first, second);
+		authStorages.push(firstAuth, secondAuth);
+
+		expect(first.agent.providerSessionId).toBe("shared-provider-affinity");
+		expect(second.agent.providerSessionId).toBe("shared-provider-affinity");
+		expect(first.sessionManager.getSessionId()).not.toBe(second.sessionManager.getSessionId());
+	});
+
 	it("does not share mutable provider state unless explicitly supplied", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-state-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
