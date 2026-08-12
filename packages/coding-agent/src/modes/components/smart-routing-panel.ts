@@ -1,5 +1,5 @@
 import { Container, getKeybindings, matchesKey, replaceTabs, Spacer, Text, truncateToWidth } from "@gajae-code/tui";
-import { sanitizeText } from "@gajae-code/utils";
+import { sanitizeDisplayLine } from "@gajae-code/utils";
 import type {
 	AutoroutingProvenance,
 	AutoroutingSetup,
@@ -74,11 +74,12 @@ function isBackspace(data: string): boolean {
 /**
  * Provider names, allowlist entries, generated selectors, and error text all
  * originate in hand-editable config or catalog data, so any of them can carry
- * tabs, control bytes, or terminal escape sequences. Strip them and bound the
- * width before the value reaches a renderer.
+ * tabs, control bytes, line breaks, or terminal escape sequences. Any of those
+ * can inject extra rows or evade the width cap, so flatten and bound the value
+ * before it reaches a renderer.
  */
 function displaySafe(text: string): string {
-	return truncateToWidth(replaceTabs(sanitizeText(text)), MAX_PANEL_LINE_WIDTH);
+	return truncateToWidth(replaceTabs(sanitizeDisplayLine(text)), MAX_PANEL_LINE_WIDTH);
 }
 
 function formatTier(tier: AutoroutingTier, tiers: TierMap | undefined): string {

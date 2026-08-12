@@ -359,7 +359,7 @@ describe("autorouting red-team adversarial suite", () => {
 	it("strips control sequences and bounds width when the TUI renders routing evidence", async () => {
 		const theme = await getThemeByName("red-claw");
 		if (!theme) throw new Error("Failed to load test theme");
-		const hostile = "\x1b]0;pwned\x07\x1b[2Jprovider/model\x07\tx";
+		const hostile = "\x1b]0;pwned\x07\x1b[2Jprovider/model\x07\tx\nINJECTED-RESULT-ROW\r\nINJECTED-CRLF-ROW";
 		const evidence: TaskRoutingEvidence = {
 			tier: "fast",
 			source: "tiers",
@@ -397,10 +397,15 @@ describe("autorouting red-team adversarial suite", () => {
 		expect(rendered).not.toContain("\t");
 		// Sanitizing must not blank the evidence, and the note must stay bounded.
 		expect(rendered).toContain("provider/model");
-		const plain = rendered.replace(/\x1b\[[0-9;]*m/g, "").replace(/\s+/g, "");
-		const longestRun = Math.max(0, ...(plain.match(/z+/g) ?? []).map(run => run.length));
-		expect(longestRun).toBeGreaterThan(0);
-		expect(longestRun).toBeLessThanOrEqual(90);
+		const routingPlain = (routing ?? "").replace(/\x1b\[[0-9;]*m/g, "").trimStart();
+		expect(Bun.stringWidth(routingPlain)).toBeLessThanOrEqual(90);
+		// An embedded newline must not become an extra result row.
+		expect(rendered).toContain("INJECTED-RESULT-ROW");
+		for (const line of rendered.split("\n")) {
+			const bare = line.replace(/\x1b\[[0-9;]*m/g, "");
+			expect(bare.startsWith("INJECTED-RESULT-ROW")).toBe(false);
+			expect(bare.startsWith("INJECTED-CRLF-ROW")).toBe(false);
+		}
 	});
 });
 it("preserves synthetic cancellation evidence and fresh resume markers", () => {

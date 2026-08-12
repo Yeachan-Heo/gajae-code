@@ -299,7 +299,7 @@ describe("smart-routing panel hostile render boundary", () => {
 		return panel.render(120).join("\n");
 	}
 
-	const HOSTILE = "\x1b]0;pwned\x07\x1b[2Jbad\x07\tname";
+	const HOSTILE = "\x1b]0;pwned\x07\x1b[2Jbad\x07\tname\nINJECTED-PANEL-ROW\r\nINJECTED-CRLF-ROW";
 
 	function hostilePanel(): SmartRoutingPanelComponent {
 		const setup: AutoroutingSetup = {
@@ -348,6 +348,20 @@ describe("smart-routing panel hostile render boundary", () => {
 		// The surrounding literal text still renders, so sanitizing did not blank the row.
 		expect(rendered).toContain("bad");
 		expect(rendered).toContain("anthropic");
+	});
+
+	test("keeps every untrusted value on a single row", () => {
+		// sanitizeText preserves LF and width truncation treats it as zero-width, so an
+		// embedded newline would otherwise inject rows and evade the one-line cap.
+		const rendered = rawRender(hostilePanel());
+		expect(rendered).not.toContain("INJECTED-PANEL-ROW\n");
+		for (const line of rendered.split("\n")) {
+			const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
+			expect(plain.startsWith("INJECTED-PANEL-ROW")).toBe(false);
+			expect(plain.startsWith("INJECTED-CRLF-ROW")).toBe(false);
+		}
+		// Flattening must preserve the text itself on the owning row.
+		expect(rendered).toContain("INJECTED-PANEL-ROW");
 	});
 
 	test("bounds oversized catalog selectors to the panel width budget", () => {

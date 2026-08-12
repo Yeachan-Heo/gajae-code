@@ -28,6 +28,18 @@ export function sanitizeText(text: string): string {
 	return sanitizeWellFormedText(text);
 }
 
+/**
+ * Sanitize untrusted text that must occupy exactly one rendered row.
+ *
+ * {@link sanitizeText} deliberately preserves `\n`, and width-based truncation
+ * treats it as zero-width, so a value carrying line breaks can still inject
+ * extra rows and evade a single-line width budget. Flatten every CR/LF run to a
+ * single space before the usual control/ANSI strip.
+ */
+export function sanitizeDisplayLine(text: string): string {
+	return sanitizeText(text.replace(/[\r\n]+/gu, " "));
+}
+
 function sanitizeWellFormedText(text: string): string {
 	CONTROL_RE.lastIndex = 0;
 	if (CONTROL_RE.exec(text) === null) return text;
