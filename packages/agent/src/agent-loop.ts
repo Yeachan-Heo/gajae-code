@@ -820,6 +820,7 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const customWireName = managedProperty(value, "customWireName");
 	const incompleteArguments = managedProperty(value, "incompleteArguments");
 	const incompleteArgumentsReason = managedProperty(value, "incompleteArgumentsReason");
+	const escapedNonAsciiArguments = managedProperty(value, "escapedNonAsciiArguments");
 	return {
 		type,
 		id,
@@ -838,6 +839,7 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 						| "ambiguous",
 				}
 			: {}),
+		...(typeof escapedNonAsciiArguments === "boolean" ? { escapedNonAsciiArguments } : {}),
 	};
 }
 
@@ -2826,6 +2828,20 @@ async function executeToolCalls(
 									? `The identity of tool call "${toolCall.name}" was ambiguous on the wire (duplicate call id or id/call_id collision), so its arguments cannot be safely attributed. Re-issue the call.`
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
 					throw new Error(detail);
+				}
+				if (toolCall.escapedNonAsciiArguments) {
+					record.argumentValidationFailed = true;
+					// The arguments decoded cleanly, but they were spelled as `\uXXXX`
+					// escapes rather than literal UTF-8. Hand-written hex is where models
+					// mistype digits, and every mistyped nibble decodes to a different but
+					// equally valid character — the payload is unverifiable and cannot be
+					// repaired after parsing, so it is rejected rather than executed on
+					// silently corrupted text.
+					throw new Error(
+						`Tool call "${toolCall.name}" spelled non-ASCII text as \\uXXXX escapes instead of literal UTF-8. ` +
+							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
+							`so the call was not executed. Re-issue it writing every non-ASCII character literally.`,
+					);
 				}
 				if (!tool) {
 					// A discoverable tool that hasn't been activated yet resolves to

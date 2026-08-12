@@ -73,7 +73,12 @@ import {
 	getStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
-import { isCompleteJson, parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
+import {
+	findUnnecessaryUnicodeEscape,
+	isCompleteJson,
+	parseJsonWithRepair,
+	parseStreamingJson,
+} from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
@@ -1740,6 +1745,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						}
 						if (orphaned.partialJson.trim()) {
 							orphaned.arguments = parseStreamingJson(orphaned.partialJson);
+							if (findUnnecessaryUnicodeEscape(orphaned.partialJson)) {
+								orphaned.escapedNonAsciiArguments = true;
+							}
 						}
 					}
 					delete (orphaned as { index?: number }).index;
@@ -2011,6 +2019,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									if (!isCompleteJson(block.partialJson)) truncatedToolCalls.add(block);
 									if (block.partialJson.trim()) {
 										block.arguments = parseStreamingJson(block.partialJson);
+										if (findUnnecessaryUnicodeEscape(block.partialJson)) {
+											block.escapedNonAsciiArguments = true;
+										}
 									}
 									delete (block as { partialJson?: string }).partialJson;
 									stream.push({
@@ -2391,6 +2402,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					truncatedToolCalls.add(block);
 					if (block.partialJson.trim()) {
 						block.arguments = parseStreamingJson(block.partialJson);
+						if (findUnnecessaryUnicodeEscape(block.partialJson)) {
+							block.escapedNonAsciiArguments = true;
+						}
 					}
 					delete (block as { partialJson?: string }).partialJson;
 				}

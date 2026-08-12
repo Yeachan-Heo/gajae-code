@@ -54,7 +54,7 @@ import {
 	iterateWithIdleTimeout,
 	resolveOpenAISdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
-import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import { findUnnecessaryUnicodeEscape, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -676,6 +676,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					return;
 				}
 				block.arguments = parseStreamingJson(block.partialArgs);
+				if (findUnnecessaryUnicodeEscape(block.partialArgs ?? "")) block.escapedNonAsciiArguments = true;
 				delete (block as { partialArgs?: string }).partialArgs;
 				stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
 			};
@@ -804,6 +805,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					partialArgs: call.arguments,
 				};
 				block.arguments = parseStreamingJson(call.arguments);
+				// The healer already normalized `call.arguments`, decoding any escapes away,
+				// so the signal has to come from its pre-round-trip sample of the raw payload.
+				if (call.escapedNonAsciiArguments) block.escapedNonAsciiArguments = true;
 				currentBlock = block;
 				output.content.push(block);
 				stream.push({ type: "toolcall_start", contentIndex: blockIndex(block), partial: output });

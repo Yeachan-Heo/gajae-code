@@ -332,4 +332,38 @@ describe("Kimi K2 leaked tool-call healing", () => {
 		expect(result.content.some(b => b.type === "toolCall")).toBe(false);
 		expect(result.stopReason).toBe("stop");
 	});
+
+	it("flags \\uXXXX-escaped arguments even though healing normalizes them away", async () => {
+		// The healer round-trips the raw payload through JSON.parse/stringify, which
+		// decodes escapes into literal characters. Sampling after that always reports
+		// clean, so this asserts the signal survives the normalization.
+		const leaked =
+			"<|tool_calls_section_begin|>" +
+			"<|tool_call_begin|>functions.ask:0<|tool_call_argument_begin|>" +
+			String.raw`{"question":"\ub9c8\uc9c0\ub9c9 \ubcd1\ubaa9"}` +
+			"<|tool_call_end|>" +
+			"<|tool_calls_section_end|>";
+		global.fetch = mockFetch([chunk(model.id, { content: leaked }), chunk(model.id, {}, "stop"), "[DONE]"]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test" }).result();
+		const toolCalls = result.content.filter((b): b is ToolCall => b.type === "toolCall");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0].arguments).toEqual({ question: "마지막 병목" });
+		expect(toolCalls[0].escapedNonAsciiArguments).toBe(true);
+	});
+
+	it("does not flag healed arguments that were written as literal UTF-8", async () => {
+		const leaked =
+			"<|tool_calls_section_begin|>" +
+			"<|tool_call_begin|>functions.ask:0<|tool_call_argument_begin|>" +
+			'{"question":"마지막 병목"}' +
+			"<|tool_call_end|>" +
+			"<|tool_calls_section_end|>";
+		global.fetch = mockFetch([chunk(model.id, { content: leaked }), chunk(model.id, {}, "stop"), "[DONE]"]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test" }).result();
+		const toolCalls = result.content.filter((b): b is ToolCall => b.type === "toolCall");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0].escapedNonAsciiArguments).toBeFalsy();
+	});
 });

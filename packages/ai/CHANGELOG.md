@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 - Anthropic streams now repair the CPA Claude-OAuth "cannot restore tool alias" 500 instead of blindly resending the unchanged request: the exact SSE signature is classified, the base tool name is extracted, and the request is corrected exactly once with steering that names the unique callable tool (or directs tool discovery when no unique match exists). Recurrence surfaces an actionable terminal error with no transport facts, so neither the provider generic 5xx retry nor the managed fallback controller re-sends; managed attempts record the steering against the same turn and the next attempt applies it (#4338).
-
+- Tool calls whose raw argument JSON spells a printable non-ASCII character as a `\uXXXX` escape instead of literal UTF-8 are now flagged with `ToolCall.escapedNonAsciiArguments`. Such a payload parses cleanly but is unverifiable — one mistyped hex digit decodes to a different, equally valid character — so the agent loop rejects it instead of executing silently corrupted text. Required control escapes and lone surrogates never trip the flag, and `\\uXXXX` (the source syntax of code being written) is not an escape and is ignored. New `findUnnecessaryUnicodeEscape` helper in `utils/json-parse`. The Kimi tool-call healer samples the signal from the raw leaked payload before its normalizing JSON round-trip, which would otherwise decode the escapes and erase the evidence.
 - Persist learned tool-choice incapabilities in a bounded, expiring, digest-keyed cache so fresh processes avoid repeating known-invalid forced-choice probes while retaining automatic revalidation and existing first-discovery fallback behavior. Credit: @probepark (#4319).
 
 ### Added

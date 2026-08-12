@@ -13,7 +13,7 @@ import {
 	type ToolCall,
 } from "@gajae-code/ai";
 import { calculateCost } from "@gajae-code/ai/models";
-import { parseStreamingJson } from "@gajae-code/ai/utils/json-parse";
+import { findUnnecessaryUnicodeEscape, parseStreamingJson } from "@gajae-code/ai/utils/json-parse";
 import { readSseJson } from "@gajae-code/utils";
 
 // Create stream class matching ProxyMessageEventStream
@@ -379,6 +379,8 @@ function processProxyEvent(
 		case "toolcall_end": {
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "toolCall") {
+				const raw = (content as { partialJson?: string }).partialJson;
+				if (raw && findUnnecessaryUnicodeEscape(raw)) content.escapedNonAsciiArguments = true;
 				delete (content as any).partialJson;
 				return {
 					type: "toolcall_end",

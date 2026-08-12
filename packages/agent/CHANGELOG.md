@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The agent loop rejects a tool call flagged `escapedNonAsciiArguments` before execution, with a retryable error telling the model to re-issue the call writing non-ASCII characters literally. Hand-spelled `\uXXXX` arguments decode into valid-looking but silently wrong text (observed as garbled Hangul in `ask` prompts), and no post-parse repair can recover the intended characters.
+
 ### Added
 
 - Reassignable `onFollowUpConsumed` hook on `Agent`: invoked with the follow-up messages the loop dequeues for the next turn, so consumers can attach per-turn state (e.g. a fresh owned-completion lineage) at actual resume admission.
