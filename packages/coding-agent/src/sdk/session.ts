@@ -420,6 +420,8 @@ export interface CreateAgentSessionOptions {
 	credentialSessionId?: string;
 	/** Runtime credential selector for multi-account auth pools. */
 	credentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
+	/** Soft runtime credential preference; quota/rate-limit failures may rotate away from it. */
+	preferredCredentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -1327,6 +1329,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (earlyCredentialSelectorProvider) {
 			installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
 		}
+		// Soft `--prefer-credential` preference. Unlike the hard-pin selector above,
+		// its provider is never ambiguous by construction: an explicit `provider/`
+		// prefix wins, otherwise `resolveRuntimePreferredCredentialSelectorProvider`
+		// resolves the single active OAuth provider the selector matches or throws.
+		// So the provider (and therefore installation) is always known synchronously
+		// here, with no deferred per-candidate install needed.
+		const preferredCredentialProvider = options.preferredCredentialSelector
+			? (options.preferredCredentialSelector.provider ??
+				authStorage.resolveRuntimePreferredCredentialSelectorProvider(options.preferredCredentialSelector.selector))
+			: undefined;
+		if (options.preferredCredentialSelector && preferredCredentialProvider) {
+			authStorage.setRuntimePreferredCredentialSelector(
+				preferredCredentialProvider,
+				options.preferredCredentialSelector.selector,
+			);
+		}
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
 		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd });
 		modelRegistry.applyConfiguredModelBindings(settings);
@@ -1417,6 +1435,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: undefined
 					: undefined;
 			if (options.credentialSelector?.provider && options.credentialSelector.provider !== candidate.provider) {
+				modelApiKeyAvailability.set(availabilityKey, false);
+				return false;
+			}
+			// A preferred (soft) credential is always installed synchronously above, so
+			// availability just needs to exclude candidates from a different provider —
+			// `--prefer-credential` names one provider's account, and letting a
+			// different-provider default model win here would silently strand the
+			// preference.
+			if (preferredCredentialProvider && preferredCredentialProvider !== candidate.provider) {
 				modelApiKeyAvailability.set(availabilityKey, false);
 				return false;
 			}
@@ -1544,13 +1571,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					},
 				);
 				model = restoredDefaultResolution.model;
+				// A restored session model from a different provider than an active
+				// `--prefer-credential` preference is discarded rather than kept: the
+				// preference names one provider's account, and silently resuming on
+				// another provider would strand it without any error.
+				if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
+					model = undefined;
+				}
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
 			});
 		}
 
 		// If still no model, try settings default.
 		// Skip settings fallback when an explicit model was requested.
-		if (!hasExplicitModel && !model && defaultRoleSpec.model) {
+		if (
+			!hasExplicitModel &&
+			!model &&
+			defaultRoleSpec.model &&
+			(!preferredCredentialProvider || defaultRoleSpec.model.provider === preferredCredentialProvider)
+		) {
 			const settingsDefaultModel = defaultRoleSpec.model;
 			logger.time("resolveSettingsDefaultModel", () => {
 				// defaultRoleSpec.model already comes from modelRegistry.getAvailable(),
@@ -2542,6 +2581,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!options.modelRegistry && !canRefreshModelsBeforeCredentialSelector) {
 				modelRegistry.refreshInBackground();
 			}
+		}
+		// Safety net: every resolution branch above already filters candidates by
+		// `preferredCredentialProvider` (session restore, settings default, fallback
+		// scan via `hasModelApiKey`), but an explicit `--model`/`--models` request for
+		// a different provider takes priority earlier in resolution and would
+		// otherwise silently ignore the preference. Fail closed with a clear error
+		// instead.
+		if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
+			throw new Error(
+				`--prefer-credential ${options.preferredCredentialSelector?.raw ?? ""} matches ${preferredCredentialProvider}, but the resolved model uses ${model.provider}`,
+			);
 		}
 		const customCommandsResult: CustomCommandsLoadResult = { commands: [], errors: [] };
 

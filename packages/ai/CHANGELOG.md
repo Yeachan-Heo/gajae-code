@@ -5,6 +5,7 @@
 ### Added
 
 - Added the authoritative OpenRouter `meta/muse-spark-1.2` catalog fallback with a 1,048,576-token context window and `minimal` through `xhigh` reasoning effort, so stale or credential-limited catalog generation still closes the Muse Spark preset alias deterministically.
+- `AuthStorage` supports a soft, per-provider preferred OAuth credential (`setRuntimePreferredCredentialSelector` / `hasRuntimePreferredCredentialSelector` / `removeRuntimePreferredCredentialSelector`, plus `AuthApiKeyOptions.preferredCredentialSelector`) that backs the coding-agent `--prefer-credential` CLI flag. A usable preferred row is placed ahead of the provider's normal balanced/earliest-reset ranking; a content-free quota or rate-limit failure marks it blocked and rotates to another active credential immediately, same as the existing session-stickiness fallback. It is mutually exclusive with the existing hard `setRuntimeCredentialSelector` pin (`--credential`) for the same provider, and `resolveRuntimePreferredCredentialSelectorProvider` resolves an unqualified selector to its single matching active OAuth provider or fails closed on ambiguity.
 
 ### Fixed
 

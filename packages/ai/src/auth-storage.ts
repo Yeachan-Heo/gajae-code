@@ -862,6 +862,8 @@ type AuthApiKeyOptions = {
 	signal?: AbortSignal;
 	/** Pin selection to one stored credential instead of using round-robin/ranking. */
 	credentialSelector?: AuthCredentialSelector;
+	/** Prefer one stored OAuth credential while preserving quota-triggered fallback. */
+	preferredCredentialSelector?: AuthCredentialSelector;
 };
 export type AuthCredentialSelectorKind = "id" | "email" | "account" | "project";
 
@@ -1065,6 +1067,8 @@ export class AuthStorage {
 	#runtimeOverrides: Map<string, string> = new Map();
 	#configOverrides: Map<string, string> = new Map();
 	#runtimeCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
+	/** Soft runtime credential preference per provider (CLI --prefer-credential); quota/rate-limit failures rotate away from it. */
+	#runtimePreferredCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
 	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
@@ -1306,6 +1310,9 @@ export class AuthStorage {
 	 */
 	setRuntimeCredentialSelector(provider: string, selector: AuthCredentialSelector): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimePreferredCredentialSelectors.has(storageProvider)) {
+			throw new Error(`Credential selector cannot be combined with a preferred credential selector for ${provider}`);
+		}
 		this.#assertCredentialSelectorUsable(storageProvider, selector);
 		this.#runtimeCredentialSelectors.set(storageProvider, selector);
 		this.#bumpGeneration("set-runtime-credential-selector", provider);
@@ -1318,6 +1325,33 @@ export class AuthStorage {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		if (this.#runtimeCredentialSelectors.delete(storageProvider)) {
 			this.#bumpGeneration("remove-runtime-credential-selector", provider);
+		}
+	}
+
+	/**
+	 * Prefer one stored OAuth credential for a provider while retaining quota
+	 * fallback to the rest of the pool (not persisted to disk). Used for CLI
+	 * `--prefer-credential`. Unlike {@link setRuntimeCredentialSelector}, a
+	 * quota/rate-limit failure on the preferred row still rotates to another
+	 * active credential instead of failing the session.
+	 */
+	setRuntimePreferredCredentialSelector(provider: string, selector: AuthCredentialSelector): void {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeCredentialSelectors.has(storageProvider)) {
+			throw new Error(`Preferred credential selector cannot be combined with a credential selector for ${provider}`);
+		}
+		this.#assertPreferredCredentialSelectorUsable(storageProvider, selector);
+		this.#runtimePreferredCredentialSelectors.set(storageProvider, selector);
+		this.#bumpGeneration("set-runtime-preferred-credential-selector", provider);
+	}
+
+	/**
+	 * Remove a runtime preferred credential selector.
+	 */
+	removeRuntimePreferredCredentialSelector(provider: string): void {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimePreferredCredentialSelectors.delete(storageProvider)) {
+			this.#bumpGeneration("remove-runtime-preferred-credential-selector", provider);
 		}
 	}
 
@@ -1351,6 +1385,35 @@ export class AuthStorage {
 	 */
 	hasRuntimeCredentialSelector(provider: string): boolean {
 		return this.#runtimeCredentialSelectors.has(resolveOAuthStorageProvider(provider));
+	}
+
+	/** Whether a provider currently has a soft runtime credential preference (`--prefer-credential`). */
+	hasRuntimePreferredCredentialSelector(provider: string): boolean {
+		return this.#runtimePreferredCredentialSelectors.has(resolveOAuthStorageProvider(provider));
+	}
+
+	/**
+	 * Resolve an unqualified preferred-credential selector (no `provider/` prefix)
+	 * to the single active OAuth provider it matches. Used so a default model from
+	 * another provider cannot silently capture an unqualified preference.
+	 */
+	resolveRuntimePreferredCredentialSelectorProvider(selector: AuthCredentialSelector): string {
+		const providers = [...this.#data.entries()]
+			.filter(([, entries]) =>
+				entries.some(
+					entry => entry.credential.type === "oauth" && this.#credentialMatchesSelector(entry, selector),
+				),
+			)
+			.map(([provider]) => provider);
+		if (providers.length === 0) {
+			throw new Error(`No active credential found matching ${this.#formatCredentialSelector(selector)}`);
+		}
+		if (providers.length > 1) {
+			throw new Error(
+				`Preferred credential selector ${this.#formatCredentialSelector(selector)} matches multiple providers; use provider/${this.#formatCredentialSelector(selector)}`,
+			);
+		}
+		return providers[0]!;
 	}
 
 	/**
@@ -1686,6 +1749,13 @@ export class AuthStorage {
 		return options?.credentialSelector ?? this.#runtimeCredentialSelectors.get(resolveOAuthStorageProvider(provider));
 	}
 
+	#getPreferredCredentialSelector(provider: string, options?: AuthApiKeyOptions): AuthCredentialSelector | undefined {
+		return (
+			options?.preferredCredentialSelector ??
+			this.#runtimePreferredCredentialSelectors.get(resolveOAuthStorageProvider(provider))
+		);
+	}
+
 	#assertCredentialSelectorUsable(provider: string, selector: AuthCredentialSelector): void {
 		if (this.#runtimeOverrides.has(provider)) {
 			throw new Error(
@@ -1699,6 +1769,26 @@ export class AuthStorage {
 		}
 		if (!this.#findCredentialBySelector(provider, selector)) {
 			throw new Error(`No credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`);
+		}
+	}
+
+	/**
+	 * Validates a preferred-credential selector (`--prefer-credential`). Unlike
+	 * {@link AuthStorage.#assertCredentialSelectorUsable}, the match must resolve
+	 * to an OAuth row specifically — the soft-preference/quota-fallback path is
+	 * meaningless for a single static API key.
+	 */
+	#assertPreferredCredentialSelectorUsable(provider: string, selector: AuthCredentialSelector): void {
+		if (this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) {
+			throw new Error(
+				`Preferred credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${provider} while an API key override is active`,
+			);
+		}
+		const selected = this.#findCredentialBySelector(provider, selector);
+		if (selected?.credential.type !== "oauth") {
+			throw new Error(
+				`No active credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`,
+			);
 		}
 	}
 
@@ -3596,6 +3686,32 @@ export class AuthStorage {
 					.map(idx => credentials[idx])
 					.filter((selection): selection is { credential: OAuthCredential; index: number } => Boolean(selection))
 					.map(selection => ({ selection, usage: null, usageChecked: false }));
+
+		// Soft `--prefer-credential` preference: reorder the preferred row to the
+		// front when it is usable, ahead of the session-stickiness reorder below so
+		// a blocked preferred row falls through to whatever the session already
+		// stuck to (its own quota-triggered fallback) instead of overriding it.
+		if (!selectedCredential) {
+			const preferredSelector = this.#getPreferredCredentialSelector(provider, options);
+			if (preferredSelector) {
+				this.#assertPreferredCredentialSelectorUsable(resolveOAuthStorageProvider(provider), preferredSelector);
+			}
+			const preferredSelection = preferredSelector
+				? this.#findCredentialBySelector(provider, preferredSelector)
+				: undefined;
+			if (
+				preferredSelection?.credential.type === "oauth" &&
+				!this.#isCredentialBlocked(providerKey, preferredSelection.index)
+			) {
+				const preferredCandidate = candidates.findIndex(
+					candidate => candidate.selection.index === preferredSelection.index,
+				);
+				if (preferredCandidate > 0) {
+					const [preferred] = candidates.splice(preferredCandidate, 1);
+					candidates.unshift(preferred);
+				}
+			}
+		}
 
 		if (!selectedCredential && sessionPreferredIndex !== undefined && !requiresProModel) {
 			const sessionPreferredCandidate = candidates.findIndex(

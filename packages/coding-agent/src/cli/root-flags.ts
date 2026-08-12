@@ -16,6 +16,10 @@ export const ROOT_LAUNCH_FLAGS = {
 		description:
 			"Stored credential selector: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/email:<addr>",
 	}),
+	"prefer-credential": Flags.string({
+		description:
+			"Preferred stored credential with quota fallback: email:<addr>, id:<n>, account:<id>, project:<id>, or provider/id:<n>",
+	}),
 	"system-prompt": Flags.string({ description: "System prompt (default: coding assistant prompt)" }),
 	"append-system-prompt": Flags.string({ description: "Append text or file contents to the system prompt" }),
 	"mcp-config": Flags.string({ description: "Tools-only MCP config file (absolute path)" }),

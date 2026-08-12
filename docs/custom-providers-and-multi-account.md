@@ -73,6 +73,16 @@ GJC_CREDENTIAL_RANKING_MODE=earliest-reset
 
 Blocked or exhausted accounts always sort last regardless of strategy. Ranking affects session start only; a running session keeps its credential.
 
+### Prefer one account, with automatic fallback
+
+`GJC_CREDENTIAL_RANKING_MODE` only weighs ranking heuristics — it cannot pin one specific account ahead of the others by identity. `--prefer-credential <selector>` does: it names one stored OAuth credential (by `id`, `email`, `account`, or `project`) to try first, ahead of the ranking strategy's normal order, while still falling back to the rest of the pool the instant that account hits a quota or rate limit:
+
+```sh
+gjc --prefer-credential email:name@example.com
+```
+
+Unlike `--credential` (a hard pin that never rotates and fails the session on exhaustion), `--prefer-credential` is soft: it wins the initial pick, and a content-free quota/rate-limit failure switches to another active credential immediately and keeps the fallback sticky for the rest of the session. See [`non-compaction-retry-policy.md` → Preferred credential quota fallback](./non-compaction-retry-policy.md#preferred-credential-quota-fallback) for the full failure-mode contract.
+
 ### Provider order across vendors
 
 Which *provider* serves a bare model alias is a separate ladder:

@@ -82,6 +82,7 @@ export default class Index extends Command {
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
 		`# Pin a stored credential for this session\n  ${APP_NAME} --credential email:me@example.com`,
+		`# Prefer a stored credential, falling back on quota limits\n  ${APP_NAME} --prefer-credential id:15`,
 		`# Activate a model profile for this session\n  ${APP_NAME} --mpreset codex-medium`,
 		`# Persist a model profile as the default\n  ${APP_NAME} --mpreset opencodego --default`,
 		`# Export a session file to HTML\n  ${APP_NAME} --export ~/.gjc/agent/sessions/v2-<scope>/session.jsonl`,

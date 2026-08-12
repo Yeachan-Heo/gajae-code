@@ -47,6 +47,7 @@ export interface Args {
 	default?: boolean;
 	apiKey?: string;
 	credential?: string;
+	preferCredential?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
 	clipboardTransport?: "auto" | "native" | "osc52" | "ssh";
@@ -223,6 +224,12 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 				throw new CliParseError("--credential requires <selector>");
 			}
 			result.credential = args[++i];
+		} else if (arg === "--prefer-credential") {
+			const next = args[i + 1];
+			if (!next || next.startsWith("-")) {
+				throw new CliParseError("--prefer-credential requires <selector>");
+			}
+			result.preferCredential = args[++i];
 		} else if (arg === "--system-prompt") {
 			result.systemPrompt = takePromptValue(args, i++, "--system-prompt", hasInlineValue);
 		} else if (arg === "--append-system-prompt") {
@@ -356,6 +363,12 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 
 	if (result.default && !result.mpreset) {
 		throw new CliParseError("--default requires --mpreset <name>");
+	}
+	if (result.credential && result.preferCredential) {
+		throw new CliParseError("--credential and --prefer-credential cannot be used together");
+	}
+	if (result.apiKey && result.preferCredential) {
+		throw new CliParseError("--api-key and --prefer-credential cannot be used together");
 	}
 	if (result.mcpConfig !== undefined && (result.listModels !== undefined || result.export !== undefined)) {
 		throw new CliParseError(

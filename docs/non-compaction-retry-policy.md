@@ -79,6 +79,23 @@ Flow (`#handleRetryableError`):
 
 `#retryPromise` resolves/clears when retry chain ends (success, cancellation, or max-exceeded), via `#resolveRetry()`.
 
+## Preferred credential quota fallback
+
+`--prefer-credential <selector>` gives one active stored OAuth credential first priority without pinning it:
+
+```bash
+gjc --prefer-credential id:15
+gjc --prefer-credential email:name@example.com
+gjc --prefer-credential anthropic/id:15
+gjc --resume --prefer-credential id:15
+```
+
+The selector works for any provider backed by a multi-account OAuth credential pool; it is not Anthropic-specific. API-key credentials and runtime `--api-key` overrides are intentionally outside this soft-selection path, and `--credential` (the hard pin) and `--prefer-credential` are mutually exclusive.
+
+A usable preferred credential is placed ahead of candidates ordered by the provider's existing balanced/earliest-reset ranking. A content-free quota or rate-limit failure marks that row blocked, switches immediately to another active candidate, and replays the request with zero delay — the same `markUsageLimitReached` credential-switch path documented above under "What starts a retry", step 7. The fallback row then remains sticky for the session like any other credential switch. Partial assistant output or tool execution still prevents replay, and exhaustion of every row surfaces the final error without a retry loop. `403 forbidden` remains an authorization failure and never mutates quota state.
+
+An unqualified selector (no `provider/` prefix) must match exactly one active OAuth provider's credential pool; an ambiguous match across providers fails startup and asks for an explicit `provider/<selector>` prefix. Once resolved, the model that the session ends up using must belong to that same provider — a default model, restored session model, or explicit `--model` from a different provider fails closed with an error naming both providers, instead of silently stranding the preference.
+
 ## Backoff and max-attempt semantics
 
 Settings:
