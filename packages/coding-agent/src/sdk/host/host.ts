@@ -45,6 +45,8 @@ export type SessionActivationGate = (input: { sessionId: string; generation: num
 export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	control?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	query?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
+	/** Test/lifecycle seam invoked synchronously before fire-and-forget dispatch. */
+	onFrameAdmitted?: (connectionId: string, frame: SdkFrame) => void;
 	/** Best-effort diagnostic observation of accepted control/query frames. */
 	onRequest?: SdkRequestObserver;
 	/** Runs before a control response is sent; identity transitions use sendTerminal. */
@@ -253,6 +255,7 @@ export class SessionSdkHost {
 				generation: this.events.generation,
 			});
 		const disposer = this.#options.onFrame((connectionId, frame) => {
+			this.#options.onFrameAdmitted?.(connectionId, frame);
 			void this.#onFrame(connectionId, frame);
 		});
 		this.#unsubscribe = typeof disposer === "function" ? disposer : undefined;

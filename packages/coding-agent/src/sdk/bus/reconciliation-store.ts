@@ -826,7 +826,17 @@ export function createReconciliationStore(options: {
 		transactTerminalScopes,
 		transactTerminalState,
 		transactTerminalKeys,
-		drain: async () => await chain,
+		drain: async () => {
+			while (true) {
+				const observed = chain;
+				await observed;
+				// Fire-and-forget frame handlers can enqueue their first transaction in
+				// a later microtask. Yield once and require the queue tail to remain
+				// stable before reporting durable quiescence.
+				await Bun.sleep(0);
+				if (chain === observed) return;
+			}
+		},
 		loadTerminalScopes: async () => {
 			await load();
 			return terminalMemory.map(s => ({ ...s }));

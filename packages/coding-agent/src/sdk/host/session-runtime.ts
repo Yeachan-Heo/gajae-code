@@ -200,6 +200,8 @@ export interface SdkOnlyReconciliationStore {
 }
 
 export interface SdkOnlyTerminalAbortSeams {
+	/** Test-only smaller retention bound; production always uses 256. */
+	maxDurableTerminalReservationsForTests?: number;
 	getReconciliationStore?: () => SdkOnlyReconciliationStore | undefined;
 	getTerminalTurnEpoch: () => number | undefined;
 	getActivePromptHandle: () => string | undefined;
@@ -391,6 +393,7 @@ export interface CreateSdkSessionRuntimeOptions {
 		token: string;
 	}): SessionSdkTransport | Promise<SessionSdkTransport>;
 	onSdkRequest?: SessionSdkHostOptions["onRequest"];
+	onFrameAdmitted?: SessionSdkHostOptions["onFrameAdmitted"];
 	/** Session settings; enables `config.patch` application on this runtime. */
 	settings?: Settings;
 	/** Mutable shadow of patched config values merged into query readback. */
@@ -1420,6 +1423,8 @@ function createControlSurface(
 				terminal: "terminal_no_effect",
 			};
 		}
+		const terminalReservationLimit =
+			terminalAbortSeams.maxDurableTerminalReservationsForTests ?? SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS;
 		// Capture the steering snapshot at ADMISSION (before any durable
 		// transaction): client steering admitted while the abort is in flight
 		// classifies as post-snapshot and is preserved at abortPromptAndWait
@@ -1748,7 +1753,7 @@ function createControlSurface(
 						// Finalized reservations become evictable completed rows: apply
 						// the SAME bounded retention as writeNoEffect so a burst of idle
 						// aborts cannot grow the document (review thread P2).
-						const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
+						const bounded = boundCompletedTerminalScopeRows(scopes, terminalReservationLimit);
 						const evicted = collectEvictedTerminalKeys(scopes, bounded);
 						const combined = [...state.keys, ...evicted];
 						// FIFO-expire the OLDEST tombstones past the cap instead of
@@ -1775,7 +1780,7 @@ function createControlSurface(
 			): Promise<void> => {
 				await store.transactTerminalState(state => {
 					const scopes = mutate(state.scopes);
-					const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
+					const bounded = boundCompletedTerminalScopeRows(scopes, terminalReservationLimit);
 					const evicted = collectEvictedTerminalKeys(scopes, bounded);
 					const combined = [...state.keys, ...evicted];
 					// FIFO-expire the OLDEST tombstones past the cap instead of
@@ -2815,6 +2820,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			onFrameAdmitted: options.onFrameAdmitted,
 			control: async (connectionId, frame) => {
 				const request = controlRequestFromFrame(frame as Record<string, unknown>);
 				// Scope preflight cancellation to the REQUESTING SDK connection: the

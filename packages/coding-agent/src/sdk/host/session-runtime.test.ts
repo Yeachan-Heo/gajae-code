@@ -64,6 +64,18 @@ function memoryTransport(): SessionSdkTransport & {
 	};
 }
 
+function admissionBarrier(target: number) {
+	const ready = Promise.withResolvers<void>();
+	let admitted = 0;
+	return {
+		onFrameAdmitted() {
+			admitted += 1;
+			if (admitted === target) ready.resolve();
+		},
+		ready: ready.promise,
+	};
+}
+
 function extensionContext(sessionId: string, cwd: string): ExtensionContext {
 	return {
 		cwd,
@@ -243,6 +255,7 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
+			onSdkRequest: undefined,
 			terminalAbortSeams: {
 				getReconciliationStore: () => reconciliationStore,
 				getTerminalTurnEpoch: () => activeEpoch,
@@ -1711,6 +1724,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
+		const admissions = admissionBarrier(9);
 		const reconciliationStore = createReconciliationStore({
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
@@ -1719,7 +1733,9 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
+			onFrameAdmitted: admissions.onFrameAdmitted,
 			terminalAbortSeams: {
+				maxDurableTerminalReservationsForTests: 8,
 				getReconciliationStore: () => reconciliationStore,
 				// No active turn: every idle abort reserves a no-effect row.
 				getTerminalTurnEpoch: () => undefined,
@@ -1745,12 +1761,8 @@ describe("SessionSdkSessionRuntime", () => {
 			// Fill the completed-scope bound (256) and overflow once so the FIRST
 			// no-effect row is evicted into a tombstone that preserves its
 			// turnDisposition (review thread P2).
-			for (let index = 0; index < 257; index++) idleAbort(`idle-${index}`, `evict-key-${index}`);
-			const deadline = Date.now() + 15_000;
-			while (!transport.sent.some(frame => frame.id === "idle-256")) {
-				if (Date.now() > deadline) throw new Error("Timed out filling the completed-scope bound");
-				await Bun.sleep(20);
-			}
+			for (let index = 0; index < 9; index++) idleAbort(`idle-${index}`, `evict-key-${index}`);
+			await admissions.ready;
 			await reconciliationStore.drain?.();
 			expect(seamCalls).toHaveLength(0);
 			// The overflowed reservation now exists only as a tombstone; replaying
@@ -1763,6 +1775,7 @@ describe("SessionSdkSessionRuntime", () => {
 				input: { mode: "terminal" },
 				idempotencyKey: "evict-key-0",
 			} as SdkFrame);
+			const deadline = Date.now() + 15_000;
 			while (!transport.sent.some(frame => frame.id === "evicted-replay")) {
 				if (Date.now() > deadline) throw new Error("Timed out waiting for the evicted-key replay");
 				await Bun.sleep(20);
@@ -1974,6 +1987,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
+		const admissions = admissionBarrier(12);
 		const reconciliationStore = createReconciliationStore({
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
@@ -1981,7 +1995,9 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
+			onFrameAdmitted: admissions.onFrameAdmitted,
 			terminalAbortSeams: {
+				maxDurableTerminalReservationsForTests: 8,
 				getReconciliationStore: () => reconciliationStore,
 				getTerminalTurnEpoch: () => undefined,
 				getActivePromptHandle: () => undefined,
@@ -1995,7 +2011,7 @@ describe("SessionSdkSessionRuntime", () => {
 			// Idle terminal aborts with distinct keys must not grow the
 			// reconciliation document without limit: completed rows are bounded
 			// and evicted keys become compact tombstones (review thread P2).
-			for (let index = 0; index < 260; index++) {
+			for (let index = 0; index < 12; index++) {
 				transport.feed("client", {
 					type: "control_request",
 					id: `bound-${index}`,
@@ -2004,13 +2020,14 @@ describe("SessionSdkSessionRuntime", () => {
 					idempotencyKey: `bound-key-${index}`,
 				} as SdkFrame);
 			}
-			// All 260 serialized transactions must settle before the bound rows and
-			// tombstones are observable (the document caps at 256 completed rows,
-			// so wait on delivered responses instead of the row count).
-			while (transport.sent.length < 260) await Bun.sleep(20);
+			// Yield once so every fire-and-forget frame handler can admit its first
+			// serialized transaction, then drain the exact durable queue. Polling all
+			// responses under the file's five-second deadline made scheduler load part
+			// of the persistence contract.
+			await admissions.ready;
 			await reconciliationStore.drain?.();
-			expect(transport.sent.length).toBeGreaterThanOrEqual(260);
-			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(256);
+			expect(transport.sent.length).toBeGreaterThanOrEqual(12);
+			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(8);
 			expect(reconciliationStore.snapshotTerminalKeys().length).toBeGreaterThan(0);
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
@@ -2031,6 +2048,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
+		const admissions = admissionBarrier(12);
 		const reconciliationStore = createReconciliationStore({
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
@@ -2038,7 +2056,9 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
+			onFrameAdmitted: admissions.onFrameAdmitted,
 			terminalAbortSeams: {
+				maxDurableTerminalReservationsForTests: 8,
 				getReconciliationStore: () => reconciliationStore,
 				getTerminalTurnEpoch: () => 7,
 				getActivePromptHandle: () => "exact-run-handle",
@@ -2052,7 +2072,7 @@ describe("SessionSdkSessionRuntime", () => {
 		const ctx = extensionContext(transport.sessionId, cwd);
 		try {
 			await handlers.get("session_start")?.({}, ctx);
-			for (let index = 0; index < 260; index++) {
+			for (let index = 0; index < 12; index++) {
 				transport.feed("client", {
 					type: "control_request",
 					id: `uncertain-${index}`,
@@ -2061,11 +2081,11 @@ describe("SessionSdkSessionRuntime", () => {
 					idempotencyKey: `uncertain-key-${index}`,
 				} as SdkFrame);
 			}
-			while (transport.sent.length < 260) await Bun.sleep(20);
+			await admissions.ready;
 			await reconciliationStore.drain?.();
-			expect(transport.sent.length).toBeGreaterThanOrEqual(260);
+			expect(transport.sent.length).toBeGreaterThanOrEqual(12);
 			// The uncertain finalizes evicted the oldest rows into tombstones.
-			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(256);
+			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(8);
 			expect(reconciliationStore.snapshotTerminalKeys().length).toBeGreaterThan(0);
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
