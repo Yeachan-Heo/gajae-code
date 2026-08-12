@@ -118,7 +118,7 @@ export const WORKFLOW_COMMAND_REF_BLOCKS: readonly CommandRefBlock[] = [
 			},
 		],
 		notes: [
-			"Before invoking `/skill:ralplan`, `/skill:team`, or `/skill:ultragoal`, persist the final spec and mark deep-interview ready for handoff.",
+			"Before invoking `/skill:ralplan`, `/skill:autoresearch`, or `/skill:ultragoal`, persist the final spec and mark deep-interview ready for handoff.",
 		],
 	},
 	{
@@ -127,7 +127,7 @@ export const WORKFLOW_COMMAND_REF_BLOCKS: readonly CommandRefBlock[] = [
 		sourcePath: skillPath("ralplan"),
 		renderOrder: 10,
 		markers: { start: "<!-- gjc:cmdref:start state -->", end: "<!-- gjc:cmdref:end state -->" },
-		commands: [stateWrite("ralplan"), stateHandoff("ralplan", ["team", "ultragoal"])],
+		commands: [stateWrite("ralplan"), stateHandoff("ralplan", ["autoresearch", "ultragoal"])],
 		examples: [
 			{
 				label: "handoff state write",
@@ -135,10 +135,10 @@ export const WORKFLOW_COMMAND_REF_BLOCKS: readonly CommandRefBlock[] = [
 			},
 		],
 		aliasesAndBridges: [
-			{ from: "ralplan", to: "team|ultragoal", rendered: "gjc state ralplan handoff --to <team|ultragoal> --json" },
+			{ from: "ralplan", to: "autoresearch|ultragoal", rendered: "gjc state ralplan handoff --to <autoresearch|ultragoal> --json" },
 		],
 		notes: [
-			"Before invoking `/skill:team` or `/skill:ultragoal`, mark ralplan ready for handoff so the skill tool's chain guard permits the transition.",
+			"Before invoking `/skill:autoresearch` or `/skill:ultragoal`, mark ralplan ready for handoff so the skill tool's chain guard permits the transition.",
 		],
 	},
 	{
@@ -166,27 +166,30 @@ export const WORKFLOW_COMMAND_REF_BLOCKS: readonly CommandRefBlock[] = [
 		],
 	},
 	{
-		skill: "team",
+		skill: "autoresearch",
 		blockId: "state",
-		sourcePath: skillPath("team"),
+		sourcePath: skillPath("autoresearch"),
 		renderOrder: 10,
 		markers: { start: "<!-- gjc:cmdref:start state -->", end: "<!-- gjc:cmdref:end state -->" },
-		commands: [stateWrite("team"), stateHandoff("team", ["ralplan", "deep-interview", "ultragoal"])],
+		commands: [
+			stateWrite("autoresearch"),
+			stateHandoff("autoresearch", ["ralplan", "deep-interview", "ultragoal"]),
+		],
 		examples: [
 			{
 				label: "handoff state write",
-				bytes: '```\ngjc state team write --input \'{"current_phase":"handoff"}\' --json\n```',
+				bytes: '```\ngjc state autoresearch write --input \'{"current_phase":"handoff"}\' --json\n```',
 			},
 		],
 		aliasesAndBridges: [
 			{
-				from: "team",
+				from: "autoresearch",
 				to: "ralplan|deep-interview|ultragoal",
-				rendered: "gjc state team handoff --to <ralplan|deep-interview|ultragoal> --json",
+				rendered: "gjc state autoresearch handoff --to <ralplan|deep-interview|ultragoal> --json",
 			},
 		],
 		notes: [
-			"When the team task-set completes OR the user requests return to planning/persistence, mark team ready for handoff.",
+			"When the research mission concludes (verdict issued) OR the user requests return to planning/persistence, mark autoresearch ready for handoff.",
 		],
 	},
 ] as const;

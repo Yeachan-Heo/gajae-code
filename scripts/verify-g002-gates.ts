@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 const repoRoot = path.join(import.meta.dir, "..");
-const EXPECTED_DEFINITIONS = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
+const EXPECTED_DEFINITIONS = ["autoresearch", "deep-interview", "ralplan", "ultragoal"] as const;
 const EXPECTED_ROLE_AGENTS = ["architect", "critic", "executor", "planner"] as const;
 const EXPECTED_PUBLIC_PACKAGE_VERSION_CATALOG_KEY = "@gajae-code/coding-agent";
 const ALLOWED_PUBLIC_PACKAGE_VERSIONS = new Map<string, string>();
@@ -66,10 +66,6 @@ const FORBIDDEN_SKILL_PATTERNS: readonly RegExp[] = [
 	/\/mcp/u,
 ];
 const FORBIDDEN_PUBLIC_WORKFLOW_EXPORT_BLOCKS = [
-	"./autoresearch",
-	"./autoresearch/*",
-	"./autoresearch/tools/*",
-	"./commands/autoresearch",
 	"./commands/ralph",
 	"./commands/ultraqa",
 	"./commands/ultrawork",
@@ -77,7 +73,6 @@ const FORBIDDEN_PUBLIC_WORKFLOW_EXPORT_BLOCKS = [
 ] as const;
 const FORBIDDEN_WORKFLOW_SURFACE_TOKENS = [
 	"autopilot",
-	"autoresearch",
 	"autoresearch-goal",
 	"performance-goal",
 	"ralph",

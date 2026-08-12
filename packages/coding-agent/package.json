@@ -199,10 +199,6 @@
 			"types": "./src/cli/commands/*.ts",
 			"import": "./src/cli/commands/*.ts"
 		},
-		"./autoresearch": null,
-		"./autoresearch/*": null,
-		"./autoresearch/tools/*": null,
-		"./commands/autoresearch": null,
 		"./commands/ralph": null,
 		"./commands/ultraqa": null,
 		"./commands/ultrawork": null,

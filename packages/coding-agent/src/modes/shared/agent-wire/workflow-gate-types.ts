@@ -9,7 +9,7 @@ export type WorkflowStage = "deep-interview" | "ralplan" | "ultragoal";
 export const WORKFLOW_GATE_V1_STAGES: readonly WorkflowStage[] = ["deep-interview", "ralplan", "ultragoal"];
 
 /** Reserved stage names that are explicitly not part of the v1 contract. */
-export const RESERVED_WORKFLOW_STAGES: readonly string[] = ["team"];
+export const RESERVED_WORKFLOW_STAGES: readonly string[] = ["autoresearch"];
 
 export type WorkflowGateKind = "question" | "approval" | "execution";
 

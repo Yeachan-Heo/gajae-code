@@ -220,7 +220,7 @@ function modeStateMatchesContext(state: ModeState, sessionId?: string, threadId?
 	return true;
 }
 
-/** Workflow skills that have a pre-approval planning posture this guard enforces. `team` never does. */
+/** Workflow skills that have a pre-approval planning posture this guard enforces. `autoresearch` never does. */
 function isPlanningSkill(skill: string): skill is "deep-interview" | "ralplan" | "ultragoal" {
 	return skill === "deep-interview" || skill === "ralplan" || skill === "ultragoal";
 }
@@ -251,7 +251,7 @@ interface ActivePlanningSkill {
  * to `active:false`, which `listActiveSkills` already filters out). If several
  * are momentarily active, prefer the most-recently-updated entry so a stale
  * planning row (e.g. a still-active ralplan `final`) can never be selected over a
- * newer executor (ultragoal/team), and a planning *return* (newer `updated_at`)
+ * newer executor (ultragoal/autoresearch), and a planning *return* (newer `updated_at`)
  * reliably wins. Ties fall back to the resolved top-level `skill`, then to the
  * first entry, matching how the HUD/chain guard pick `activeSkills[0]`.
  */

@@ -226,8 +226,8 @@ describe("gjc state doctor", () => {
 	it("detects stale active-state from raw snapshot and per-skill active entries", async () => {
 		const root = await tempDir();
 		const stateRoot = sessionStateDir(root, TEST_SESSION_ID);
-		const activeEntryPath = path.join(stateRoot, "active", "team.json");
-		await writeJson(activeEntryPath, { skill: "team", active: true, phase: "running" });
+		const activeEntryPath = path.join(stateRoot, "active", "autoresearch.json");
+		await writeJson(activeEntryPath, { skill: "autoresearch", active: true, phase: "research" });
 		await writeJson(path.join(stateRoot, "skill-active-state.json"), {
 			version: 1,
 			active: true,
@@ -239,23 +239,25 @@ describe("gjc state doctor", () => {
 		const text = await runDoctorUnchanged(root, ["doctor"]);
 		expect(text.status).toBe(1);
 		expect(text.stdout).toContain("kind=stale_active_state");
-		expect(text.stdout).toContain("fix=gjc state team clear");
+		expect(text.stdout).toContain("fix=gjc state autoresearch clear");
 		expect(text.stdout).toContain("fix=gjc state ralplan clear");
 
 		const json = await runDoctorUnchanged(root, ["doctor", "--json"]);
 		const parsed = JSON.parse(json.stdout ?? "{}");
+		// collectDoctorSummary sorts problems by skill name, so autoresearch (entry)
+		// precedes ralplan (snapshot).
 		expect(parsed.problems).toEqual([
+			expect.objectContaining({
+				type: "stale_active_state",
+				skill: "autoresearch",
+				path: activeEntryPath,
+				fixCommand: "gjc state autoresearch clear",
+			}),
 			expect.objectContaining({
 				type: "stale_active_state",
 				skill: "ralplan",
 				path: path.join(stateRoot, "skill-active-state.json"),
 				fixCommand: "gjc state ralplan clear",
-			}),
-			expect.objectContaining({
-				type: "stale_active_state",
-				skill: "team",
-				path: activeEntryPath,
-				fixCommand: "gjc state team clear",
 			}),
 		]);
 	});

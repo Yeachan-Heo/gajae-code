@@ -57,7 +57,7 @@ async function writeActiveDeepInterview(cwd: string, sessionId = "session-a", ph
 
 async function writeActiveSkill(
 	cwd: string,
-	skill: "deep-interview" | "ralplan" | "ultragoal" | "team",
+	skill: "deep-interview" | "ralplan" | "ultragoal" | "autoresearch",
 	phase: string,
 	sessionId = "session-a",
 ): Promise<void> {
@@ -175,7 +175,7 @@ describe("workflow mutation guard", () => {
 				tool("write"),
 				{ path: ".gjc/_session-session-a/state/skill-active-state.json", content: "{}" },
 			],
-			...(["deep-interview", "ralplan", "ultragoal", "team"] as const).map(
+			...(["deep-interview", "ralplan", "ultragoal", "autoresearch"] as const).map(
 				skill =>
 					[
 						`write ${skill}`,
@@ -183,7 +183,7 @@ describe("workflow mutation guard", () => {
 						{ path: `.gjc/state/sessions/session-a/${skill}-state.json`, content: "{}" },
 					] as [string, AgentTool, unknown],
 			),
-			...(["deep-interview", "ralplan", "ultragoal", "team"] as const).map(
+			...(["deep-interview", "ralplan", "ultragoal", "autoresearch"] as const).map(
 				skill =>
 					[
 						`write generated ${skill}`,
@@ -195,7 +195,7 @@ describe("workflow mutation guard", () => {
 				"apply_patch state",
 				tool("edit", { mode: "apply_patch", customWireName: "apply_patch" }),
 				{
-					input: "*** Begin Patch\n*** Update File: .gjc/state/team-state.json\n@@\n-a\n+b\n*** End Patch\n",
+					input: "*** Begin Patch\n*** Update File: .gjc/state/autoresearch-state.json\n@@\n-a\n+b\n*** End Patch\n",
 				},
 			],
 			[
@@ -206,7 +206,7 @@ describe("workflow mutation guard", () => {
 			[
 				"ast_edit state",
 				tool("ast_edit"),
-				{ paths: [".gjc/state/**/team-state.json"], ops: [{ pat: "foo", out: "bar" }] },
+				{ paths: [".gjc/state/**/autoresearch-state.json"], ops: [{ pat: "foo", out: "bar" }] },
 			],
 		];
 
@@ -749,9 +749,9 @@ describe("workflow mutation guard", () => {
 		expect(executing.blocked).toBe(false);
 	});
 
-	it("does not block product mutation while team is active", async () => {
+	it("does not block product mutation while autoresearch is active", async () => {
 		const cwd = await makeTempRoot();
-		await writeActiveSkill(cwd, "team", "running");
+		await writeActiveSkill(cwd, "autoresearch", "research");
 
 		const decision = await getWorkflowMutationDecision({
 			cwd,

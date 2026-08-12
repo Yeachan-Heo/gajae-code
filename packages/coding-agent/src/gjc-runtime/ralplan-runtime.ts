@@ -97,7 +97,7 @@ export const PLANNING_STUCK_MARKER = "PLANNING-STUCK";
 export const RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE = 1;
 /** Inclusive upper bound for `gjc.ralplan.maxReviewPassesPerLane` settings overrides. */
 export const RALPLAN_MAX_REVIEW_PASSES_PER_LANE_LIMIT = 10;
-export type RalplanAutoHandoffTarget = "off" | "ultragoal";
+export type RalplanAutoHandoffTarget = "off" | "ultragoal" | "autoresearch";
 
 export interface RalplanAutoHandoffResolution {
 	configuredTarget: RalplanAutoHandoffTarget;
@@ -106,7 +106,7 @@ export interface RalplanAutoHandoffResolution {
 	source: string;
 }
 
-const RALPLAN_AUTO_HANDOFF_TARGETS = new Set<RalplanAutoHandoffTarget>(["off", "ultragoal"]);
+const RALPLAN_AUTO_HANDOFF_TARGETS = new Set<RalplanAutoHandoffTarget>(["off", "ultragoal", "autoresearch"]);
 
 const RALPLAN_ITERATION_OPENER_STAGES = new Set<RalplanStage>(["planner", "revision"]);
 
@@ -470,7 +470,7 @@ type RalplanAutoHandoffOptions = {
 function parsePresentRalplanAutoHandoff(value: unknown): WorkflowSettingParseResult<RalplanAutoHandoffTarget> {
 	const target = parseRalplanAutoHandoffTarget(value);
 	return target === undefined
-		? { kind: "invalid", reason: "expected gjc.ralplan.autoHandoff to be one of off, ultragoal" }
+		? { kind: "invalid", reason: "expected gjc.ralplan.autoHandoff to be one of off, ultragoal, autoresearch" }
 		: { kind: "valid", value: target };
 }
 

@@ -599,7 +599,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"gjc.ralplan.autoHandoff": {
 		type: "enum",
-		values: ["off", "ultragoal"],
+		values: ["off", "ultragoal", "autoresearch"],
 		default: "off",
 	},
 	"gjc.ralplan.maxIterations": {

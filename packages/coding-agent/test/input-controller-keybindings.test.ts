@@ -581,7 +581,7 @@ describe("InputController keybinding setup", () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const session = ctx.session as unknown as { isCompacting: boolean };
 		session.isCompacting = true;
-		editor.setText("/skill:team");
+		editor.setText("/skill:autoresearch");
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
@@ -593,7 +593,7 @@ describe("InputController keybinding setup", () => {
 		expect(editor.onTabDeclined).toBeUndefined();
 		expect(spies.queueCompactionMessage).not.toHaveBeenCalled();
 		expect(spies.prompt).not.toHaveBeenCalled();
-		expect(editor.getText()).toBe("/skill:team");
+		expect(editor.getText()).toBe("/skill:autoresearch");
 	});
 
 	it("queues explicit message action during compaction", async () => {
@@ -617,14 +617,14 @@ describe("InputController keybinding setup", () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const session = ctx.session as unknown as { isBashRunning: boolean };
 		session.isBashRunning = true;
-		editor.setText("/skill:team");
+		editor.setText("/skill:autoresearch");
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
 		await editor.onQueue?.();
 		await Bun.sleep(0);
 
-		expect(spies.followUp).toHaveBeenCalledWith("/skill:team", undefined, {
+		expect(spies.followUp).toHaveBeenCalledWith("/skill:autoresearch", undefined, {
 			followUpQueuePolicy: "sequential",
 		});
 		expect(editor.getText()).toBe("");

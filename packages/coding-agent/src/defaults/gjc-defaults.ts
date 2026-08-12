@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { getAgentDir, isEnoent } from "@gajae-code/utils";
 import { BUNDLED_GJC_SKILL_CATALOG, type BundledGjcSkillCatalogEntry } from "./gjc-skills.generated";
 
-export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
+export const DEFAULT_GJC_DEFINITION_NAMES = ["autoresearch", "deep-interview", "ralplan", "ultragoal"] as const;
 export type DefaultGjcDefinitionName = (typeof DEFAULT_GJC_DEFINITION_NAMES)[number];
 export type DefaultGjcDefinitionKind = "skill" | "skill-fragment";
 export type EmbeddedDefaultGjcSkill = {

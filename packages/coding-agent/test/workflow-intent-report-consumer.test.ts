@@ -63,7 +63,7 @@ describe("workflow intent report consumer", () => {
 				"deep-interview": 0,
 				ralplan: 2,
 				ultragoal: 0,
-				team: 0,
+				autoresearch: 0,
 			},
 			escalationRequired: 2,
 			rootCauseActive: 1,
@@ -98,10 +98,10 @@ describe("workflow intent report consumer", () => {
 			...directIntent,
 			consensusReport: {
 				...directIntent.consensusReport,
-				route: "team",
-				escalationGate: { status: "required", reason: "/skill:team" },
+				route: "autoresearch",
+				escalationGate: { status: "required", reason: "/skill:autoresearch" },
 				observerSignals: directIntent.consensusReport.observerSignals.map(signal => {
-					if (signal.observer === "intent-router") return { ...signal, conclusion: "team" };
+					if (signal.observer === "intent-router") return { ...signal, conclusion: "autoresearch" };
 					if (signal.observer === "escalation-gate") return { ...signal, conclusion: "required" };
 					return signal;
 				}),
@@ -144,7 +144,7 @@ describe("workflow intent report consumer", () => {
 					"deep-interview": 0,
 					ralplan: 0,
 					ultragoal: 0,
-					team: 0,
+					autoresearch: 0,
 				},
 				escalationRequired: 0,
 				rootCauseActive: 0,
@@ -166,5 +166,35 @@ describe("workflow intent report consumer", () => {
 			},
 			observerSignals: [],
 		});
+	});
+
+	it("counts autoresearch research-mission intents as their own route", () => {
+		const entries: readonly SessionEntry[] = [
+			workflowEntry("autoresearch-1", "investigate the dataset and benchmark both approaches to report evidence"),
+			workflowEntry("autoresearch-2", "research whether the new caching layer reduces latency for this dataset and report evidence"),
+			workflowEntry("direct-1", "fix the team settings page typo"),
+		];
+
+		const collection = collectWorkflowIntentReports(entries);
+		expect(collection.totals).toEqual({
+			total: 3,
+			byRoute: {
+				direct: 1,
+				"deep-interview": 0,
+				ralplan: 0,
+				ultragoal: 0,
+				autoresearch: 2,
+			},
+			escalationRequired: 2,
+			rootCauseActive: 0,
+		});
+		expect(collection.entries[0]?.intent).toMatchObject({
+			route: "autoresearch",
+			recommendedSkill: "autoresearch",
+			recommendedInvocation: "/skill:autoresearch",
+		});
+		const summary = summarizeWorkflowConsensus(collection.entries.map(entry => entry.intent));
+		expect(summary.dominantRoute).toBe("autoresearch");
+		expect(summary.confidence).toBe("medium");
 	});
 });

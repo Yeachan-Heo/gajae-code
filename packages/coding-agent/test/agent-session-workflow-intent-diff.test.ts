@@ -254,14 +254,14 @@ describe("AgentSession workflow intent-diff tracking", () => {
 		});
 	});
 
-	it("records coordinated persistent worker requests as team escalations", async () => {
-		await session.prompt("use a team of coordinated persistent workers for this approved implementation");
+	it("records goal-directed research mission requests as autoresearch escalations", async () => {
+		await session.prompt("investigate the dataset and benchmark the two approaches to report evidence");
 
 		const [entry] = workflowIntentEntries();
 		expect(entry?.data).toMatchObject({
-			route: "team",
-			recommendedSkill: "team",
-			recommendedInvocation: "/skill:team",
+			route: "autoresearch",
+			recommendedSkill: "autoresearch",
+			recommendedInvocation: "/skill:autoresearch",
 			directTracking: "not-direct",
 		});
 	});

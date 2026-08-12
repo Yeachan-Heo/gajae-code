@@ -31,10 +31,10 @@ export const GJC_SKILL_KEYWORD_DEFINITIONS: readonly SkillKeywordDefinition[] = 
 		guidance: "Activate GJC ultragoal durable goal workflow",
 	},
 	{
-		keyword: "$team",
-		skill: "team",
+		keyword: "$autoresearch",
+		skill: "autoresearch",
 		priority: 8,
-		guidance: "Activate GJC team workflow",
+		guidance: "Activate GJC autoresearch research-mission workflow",
 	},
 ] as const;
 

@@ -2,7 +2,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-const expectedWorkflowSkills = ["deep-interview", "ralplan", "team", "ultragoal"];
+const expectedWorkflowSkills = ["autoresearch", "deep-interview", "ralplan", "ultragoal"];
 const expectedRoleAgents = ["architect", "critic", "executor", "planner"];
 const repoRoot = process.cwd();
 

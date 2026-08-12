@@ -233,7 +233,7 @@ export function buildGjcTmuxRequiredProfileCommands(
  * 3.3.0. psmux does not support the tmux `set-window-option` command at all
  * (it reports "unknown command: set-window-option") and silently drops several
  * `set-option` keys. The list lives here so every code path that tags a tmux
- * session (gjc --tmux planning, gjc session create, gjc team bootstrap)
+ * session (gjc --tmux planning, gjc session create)
  * applies the same filter.
  */
 const PSMUX_UNSUPPORTED_PROFILE_KEYS = new Set(["mouse", "set-clipboard", "mode-style"]);
@@ -270,11 +270,11 @@ export function buildGjcTmuxProfileCommands(
 	// psmux does not implement set-window-option and historically drops
 	// mouse / set-clipboard / mode-style. Filter the UX profile commands
 	// centrally so every code path that tags a session (gjc --tmux planning,
-	// gjc session create, gjc team bootstrap) drops the same set. The
+	// gjc session create) drops the same set. The
 	// GJC_PSMUX_PROFILE_FORCE override lets the operator opt back in when
 	// running on a psmux build that has caught up. The ownership-tag
 	// round-trip (set-option @gjc-*) is never filtered, since gjc session /
-	// gjc team rely on it.
+	// tmux-backed sessions rely on it.
 	// The filter is opt-in: callers that explicitly pass `opts.tmuxCommand`
 	// name a psmux-class multiplexer (psmux / pmux) when they want the UX
 	// profile filtered. Auto-detect on Windows hosts where psmux happens

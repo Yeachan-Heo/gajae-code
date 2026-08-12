@@ -783,7 +783,7 @@ describe("resolveGjcTmuxCommand (shared session/team resolver)", () => {
 	it("returns psmux on native Windows when psmux resolves and tmux.exe alias does not", () => {
 		// Reproduces the case the review flagged: a Windows host with psmux
 		// installed but no tmux.exe alias on PATH. The shared resolver must
-		// pick psmux so gjc session ... and gjc team ... talk to the same
+		// pick psmux so gjc session ... commands talk to the same
 		// multiplexer that gjc --tmux just created.
 		__setBinaryResolverForTests(candidate =>
 			candidate === "psmux" || candidate === "pmux"

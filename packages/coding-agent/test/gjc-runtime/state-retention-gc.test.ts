@@ -59,9 +59,9 @@ describe("native gjc state retention gc", () => {
 		const oldReport = await writeFileWithAge(root, "reports/old.json", 45);
 		const currentState = await writeFileWithAge(
 			root,
-			"team-state.json",
+			"autoresearch-state.json",
 			45,
-			JSON.stringify({ skill: "team", active: true }),
+			JSON.stringify({ skill: "autoresearch", active: true }),
 		);
 		const currentSnapshot = await writeFileWithAge(
 			root,
@@ -71,7 +71,7 @@ describe("native gjc state retention gc", () => {
 		);
 		const audit = await writeFileWithAge(root, "audit.jsonl", 120, '{"category":"state"}\n');
 
-		const dryRun = await runNativeStateCommand(["gc", "--skill", "team", "--dry-run"], root);
+		const dryRun = await runNativeStateCommand(["gc", "--skill", "autoresearch", "--dry-run"], root);
 		expect(dryRun.status).toBe(0);
 		const dryRunJson = JSON.parse(dryRun.stdout ?? "{}") as {
 			dry_run: boolean;
@@ -84,7 +84,7 @@ describe("native gjc state retention gc", () => {
 		expect(await exists(oldLog)).toBe(true);
 		expect(await exists(oldReport)).toBe(true);
 
-		const gc = await runNativeStateCommand(["gc", "--skill", "team"], root);
+		const gc = await runNativeStateCommand(["gc", "--skill", "autoresearch"], root);
 		expect(gc.status).toBe(0);
 		const gcJson = JSON.parse(gc.stdout ?? "{}") as { pruned: string[] };
 		expect(gcJson.pruned).toEqual(["logs/old.jsonl", "reports/old.json"]);

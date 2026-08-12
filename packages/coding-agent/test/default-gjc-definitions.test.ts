@@ -79,27 +79,32 @@ describe("default GJC definitions", () => {
 
 		expect(skills).toEqual(expected);
 		expect(workflowDefinitions).toHaveLength(4);
-		expect(definitions).toHaveLength(8);
+		expect(definitions).toHaveLength(10);
 		expect(workflowDefinitions.every(definition => definition.relativePath.startsWith("skills/"))).toBe(true);
 		expect(workflowDefinitions.every(definition => definition.content.includes(definition.name))).toBe(true);
-		expect(fragmentDefinitions).toHaveLength(4);
+		expect(fragmentDefinitions).toHaveLength(6);
 		expect(fragmentDefinitions.map(definition => definition.parentSkillName).sort()).toEqual([
+			"autoresearch",
+			"autoresearch",
 			"deep-interview",
 			"deep-interview",
 			"ultragoal",
 			"ultragoal",
 		]);
 		expect(fragmentDefinitions.map(definition => definition.relativePath).sort()).toEqual([
+			"skill-fragments/autoresearch/auto-critic.md",
+			"skill-fragments/autoresearch/auto-iterate.md",
 			"skill-fragments/deep-interview/auto-answer-uncertain.md",
 			"skill-fragments/deep-interview/lateral-review-panel.md",
 			"skill-fragments/ultragoal/ai-slop-cleaner.md",
 			"skill-fragments/ultragoal/validation-batch-contracts.md",
 		]);
-		const team = workflowDefinitions.find(definition => definition.name === "team");
-		expect(team?.content).toContain("supported surfaces only");
-		expect(team?.content).toContain("`planner` for broad context mapping/sequencing");
-		expect(team?.content).toContain("`architect` for architecture or external-doc-risk assessment");
-		expect(team?.content).not.toMatch(/auto-delegate `researcher`|`researcher` as an evidence lane/i);
+		const autoresearch = workflowDefinitions.find(definition => definition.name === "autoresearch");
+		expect(autoresearch?.content).toContain("web");
+		expect(autoresearch?.content).toContain("verdict");
+		expect(autoresearch?.content).toContain("/skill:autoresearch");
+		// The omx-shaped sigil is forbidden by verify-g002-gates.
+		expect(autoresearch?.content).not.toContain("$autoresearch");
 	});
 
 	it("exposes deep-interview fragments only through the parent-scoped fragment accessor", () => {
@@ -526,7 +531,7 @@ Project executor override body.
 		expect(routing).toContain("requirements-only and must not mutate product code");
 		expect(routing).toContain("`/skill:ralplan --deliberate`");
 		expect(routing).toContain("`/skill:ultragoal`");
-		expect(routing).toContain("`/skill:team`");
+		expect(routing).toContain("`/skill:autoresearch`");
 		expect(routing).toContain("Delegate large implementation slices to `executor`");
 		expect(routing).toContain('explicit user request to use a worktree (for example, "use worktree")');
 		expect(routing).toContain("delegate implementation through `task` with `isolated: true`");
@@ -545,7 +550,7 @@ Project executor override body.
 		).text();
 		expect(ralplan).toContain("counts as opting into execution for that skill");
 		expect(ralplan).toContain("gjc.ralplan.autoHandoff");
-		expect(ralplan).toContain("`off` (default) or `ultragoal`");
+		expect(ralplan).toContain("`off` (default), `ultragoal`, or `autoresearch`");
 		expect(ralplan).not.toContain("team_unavailable");
 		expect(ralplan).toContain("Invalid settings reject the final write before any final artifact is persisted");
 		expect(ralplan).toContain("ledger-backed runtime-owned `auto_handoff.effectiveTarget`");
@@ -665,10 +670,10 @@ Project executor override body.
 		const bundledDeepInterview = getEmbeddedDefaultGjcSkills().find(skill => skill.name === "deep-interview");
 		if (!bundledDeepInterview) throw new Error("missing bundled deep-interview skill");
 
-		expect(initial.written).toBe(8);
-		expect(initial.total).toBe(8);
+		expect(initial.written).toBe(10);
+		expect(initial.total).toBe(10);
 		expect(initial.skipped).toBe(0);
-		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(4);
+		expect(initial.files.filter(file => file.kind === "skill-fragment")).toHaveLength(6);
 		expect(installedDeepInterview).toBe(bundledDeepInterview.content);
 
 		const installedAutoAnswerFragment = await Bun.file(
@@ -678,15 +683,15 @@ Project executor override body.
 		await Bun.write(deepInterviewSkillPath, "local edit");
 		const skipped = await installDefaultGjcDefinitions({ targetRoot });
 		expect(skipped.written).toBe(0);
-		expect(skipped.skipped).toBe(8);
+		expect(skipped.skipped).toBe(10);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe("local edit");
 
 		const check = await installDefaultGjcDefinitions({ targetRoot, check: true });
 		expect(check.different).toBe(1);
-		expect(check.matching).toBe(7);
+		expect(check.matching).toBe(9);
 
 		const forced = await installDefaultGjcDefinitions({ targetRoot, force: true });
-		expect(forced.written).toBe(8);
+		expect(forced.written).toBe(10);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(installedDeepInterview);
 		expect(
 			forced.files.some(file => file.kind === "skill-fragment" && file.parentSkillName === "deep-interview"),
@@ -700,25 +705,25 @@ Project executor override body.
 		// No files on disk yet: refreshOnly must not create any (opt-in preserved).
 		const untouched = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
 		expect(untouched.written).toBe(0);
-		expect(untouched.missing).toBe(8);
+		expect(untouched.missing).toBe(10);
 		expect(await Bun.file(deepInterviewSkillPath).exists()).toBe(false);
 
 		// User opted in, then a local file went stale relative to the embedded default.
 		const installed = await installDefaultGjcDefinitions({ targetRoot });
 		const canonicalDeepInterview = await Bun.file(deepInterviewSkillPath).text();
-		expect(installed.written).toBe(8);
+		expect(installed.written).toBe(10);
 		await Bun.write(deepInterviewSkillPath, "stale content");
 
 		const refreshed = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
 		expect(refreshed.written).toBe(1);
-		expect(refreshed.matching).toBe(7);
+		expect(refreshed.matching).toBe(9);
 		expect(refreshed.missing).toBe(0);
 		expect(await Bun.file(deepInterviewSkillPath).text()).toBe(canonicalDeepInterview);
 
 		// Second refresh is a no-op once everything matches.
 		const stable = await installDefaultGjcDefinitions({ targetRoot, refreshOnly: true });
 		expect(stable.written).toBe(0);
-		expect(stable.matching).toBe(8);
+		expect(stable.matching).toBe(10);
 	});
 
 	it("does not make installed fragments reachable as skill-relative internal URL assets", async () => {
@@ -830,7 +835,7 @@ Project executor override body.
 		expect(await jsonProc.exited).toBe(0);
 		expect(jsonStderr).toBe("");
 		expect(jsonStdout).not.toContain("gjc skills list");
-		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 8 });
+		expect(JSON.parse(jsonStdout) as { skipped: number }).toMatchObject({ skipped: 10 });
 	});
 });
 

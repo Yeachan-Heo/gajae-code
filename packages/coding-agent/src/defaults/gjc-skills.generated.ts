@@ -4,7 +4,7 @@
  * Keep this module metadata-only: skill bodies are loaded through literal
  * dynamic imports only when a caller asks for their content.
  */
-export type BundledGjcSkillName = "deep-interview" | "ralplan" | "team" | "ultragoal";
+export type BundledGjcSkillName = "autoresearch" | "deep-interview" | "ralplan" | "ultragoal";
 
 export interface BundledGjcSkillCatalogEntry {
 	readonly kind: "skill" | "skill-fragment";
@@ -19,7 +19,8 @@ const deepInterview = () =>
 	import("./gjc/skills/deep-interview/SKILL.md", { with: { type: "text" } }).then(module => module.default);
 const ralplan = () =>
 	import("./gjc/skills/ralplan/SKILL.md", { with: { type: "text" } }).then(module => module.default);
-const team = () => import("./gjc/skills/team/SKILL.md", { with: { type: "text" } }).then(module => module.default);
+const autoresearch = () =>
+	import("./gjc/skills/autoresearch/SKILL.md", { with: { type: "text" } }).then(module => module.default);
 const ultragoal = () =>
 	import("./gjc/skills/ultragoal/SKILL.md", { with: { type: "text" } }).then(module => module.default);
 const autoAnswerUncertain = () =>
@@ -36,6 +37,10 @@ const validationBatchContracts = () =>
 	import("./gjc/skills/ultragoal/validation-batch-contracts.md", { with: { type: "text" } }).then(
 		module => module.default,
 	);
+const autoresearchIterate = () =>
+	import("./gjc/skills/autoresearch/auto-iterate.md", { with: { type: "text" } }).then(module => module.default);
+const autoresearchCritic = () =>
+	import("./gjc/skills/autoresearch/auto-critic.md", { with: { type: "text" } }).then(module => module.default);
 
 export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] = [
 	{
@@ -54,10 +59,10 @@ export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] =
 	},
 	{
 		kind: "skill",
-		name: "team",
-		relativePath: "skills/team/SKILL.md",
-		description: "Multi-worker GJC tmux team orchestration",
-		loadContent: team,
+		name: "autoresearch",
+		relativePath: "skills/autoresearch/SKILL.md",
+		description: "Goal-directed research missions interleaving web and data evidence into a structured verdict",
+		loadContent: autoresearch,
 	},
 	{
 		kind: "skill",
@@ -89,5 +94,17 @@ export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] =
 		parentSkillName: "ultragoal",
 		relativePath: "skill-fragments/ultragoal/validation-batch-contracts.md",
 		loadContent: validationBatchContracts,
+	},
+	{
+		kind: "skill-fragment",
+		parentSkillName: "autoresearch",
+		relativePath: "skill-fragments/autoresearch/auto-iterate.md",
+		loadContent: autoresearchIterate,
+	},
+	{
+		kind: "skill-fragment",
+		parentSkillName: "autoresearch",
+		relativePath: "skill-fragments/autoresearch/auto-critic.md",
+		loadContent: autoresearchCritic,
 	},
 ];

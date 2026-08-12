@@ -44,10 +44,6 @@ function stripInlineCode(line: string): string {
 	return line.replace(/`[^`]*`/gu, "");
 }
 
-function isRoleSelectorVerb(line: string, commandEndIndex: number): boolean {
-	return line.slice(0, commandEndIndex).endsWith("gjc team executor") && /\bgjc\s+team\s+executor\s+["'`]/u.test(line);
-}
-
 /** Generated advisory plugin skills rendered by `scripts/generate-gjc-plugins.ts`. */
 const ADVISORY_SKILLS = new Set<string>([
 	"gjc-sdk-session",
@@ -141,13 +137,12 @@ function collectCommandRefs(file: string, content: string): CommandRef[] {
 	const lines = content.split("\n");
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i] ?? "";
-		const commandPattern = /\bgjc\s+(?:state\s+)?(deep-interview|ralplan|ultragoal|team)\s+([a-z][a-z0-9-]*)\b/gu;
+		const commandPattern = /\bgjc\s+(?:state\s+)?(deep-interview|ralplan|ultragoal|autoresearch)\s+([a-z][a-z0-9-]*)\b/gu;
 		for (const match of line.matchAll(commandPattern)) {
 			const skill = match[1];
 			if (!isSkill(skill)) continue;
 			const verb = match[2] ?? "";
 			const command = match[0];
-			if (isRoleSelectorVerb(line, (match.index ?? 0) + command.length)) continue;
 			const valid = listVerbs(skill).includes(verb);
 			refs.push({ file: relative, line: i + 1, skill, verb, command, valid });
 		}

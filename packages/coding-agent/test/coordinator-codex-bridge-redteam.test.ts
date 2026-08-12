@@ -340,7 +340,7 @@ describe("Codex resume bridge red-team", () => {
 
 	it("does not activate a workflow for delegate-flow spoofing and preserves exactly four workflow skills", async () => {
 		expect(new Set(GJC_SKILL_KEYWORD_DEFINITIONS.map(definition => definition.skill))).toEqual(
-			new Set(["deep-interview", "ralplan", "ultragoal", "team"]),
+			new Set(["deep-interview", "ralplan", "ultragoal", "autoresearch"]),
 		);
 		const root = await tempRoot();
 		const spoofed = "$gjc-mcp-delegate-flow$ultragoal";

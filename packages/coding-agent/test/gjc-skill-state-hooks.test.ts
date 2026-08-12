@@ -245,13 +245,13 @@ describe("GJC native skill-state hooks", () => {
 	}
 
 	it("detects only the public GJC workflow skill surface", () => {
-		expect(detectSkillKeywords("$deep-interview then $team").map(match => match.skill)).toEqual([
+		expect(detectSkillKeywords("$deep-interview then $autoresearch").map(match => match.skill)).toEqual([
 			"deep-interview",
-			"team",
+			"autoresearch",
 		]);
 		expect(detectSkillKeywords("$autopilot deep interview")).toEqual([]);
 		expect(detectSkillKeywords("please run a consensus plan")).toEqual([]);
-		expect(detectSkillKeywords("don't assume, interview me about the coordinated team setup")).toEqual([]);
+		expect(detectSkillKeywords("don't assume, interview me about the coordinated setup")).toEqual([]);
 		expect(detectSkillKeywords("run a deep interview about ultragoal tracking")).toEqual([]);
 		expect(detectSkillKeywords("$ralplan this refactor")[0]?.skill).toBe("ralplan");
 	});
@@ -313,7 +313,7 @@ describe("GJC native skill-state hooks", () => {
 		);
 		expect(context).toContain("Sanitized effective skill config");
 		expect(context).toContain("filesystem/custom skill discovery");
-		expect(context).toContain("deep-interview, ralplan, ultragoal, team");
+		expect(context).toContain("deep-interview, ralplan, ultragoal, autoresearch");
 		const state = await readVisibleSkillActiveState(root, "session-1");
 		expect(state).toMatchObject({
 			active: true,
@@ -414,8 +414,8 @@ describe("GJC native skill-state hooks", () => {
 		const state = {
 			version: 1,
 			active: true,
-			skill: "team",
-			active_skills: [{ skill: "team", active: true, phase: "running", custom_field: "preserved" }],
+			skill: "autoresearch",
+			active_skills: [{ skill: "autoresearch", active: true, phase: "running", custom_field: "preserved" }],
 		};
 		await fs.writeFile(path.join(stateDir, "skill-active-state.json"), JSON.stringify(state));
 
@@ -504,10 +504,10 @@ describe("GJC native skill-state hooks", () => {
 			JSON.stringify({
 				version: 1,
 				active: true,
-				active_skills: [{ skill: "team", active: true, phase: "running", session_id: "session-corrupt" }],
+				active_skills: [{ skill: "autoresearch", active: true, phase: "running", session_id: "session-corrupt" }],
 			}),
 		);
-		await fs.writeFile(modeStatePath(root, "session-corrupt", "team"), "{");
+		await fs.writeFile(modeStatePath(root, "session-corrupt", "autoresearch"), "{");
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
 			const allowed = await dispatchGjcNativeSkillHook(
@@ -535,11 +535,11 @@ describe("GJC native skill-state hooks", () => {
 			JSON.stringify({
 				version: 1,
 				active: true,
-				active_skills: [{ skill: "team", active: true, phase: "running", session_id: "session-invalid" }],
+				active_skills: [{ skill: "autoresearch", active: true, phase: "running", session_id: "session-invalid" }],
 			}),
 		);
 		await fs.writeFile(
-			modeStatePath(root, "session-invalid", "team"),
+			modeStatePath(root, "session-invalid", "autoresearch"),
 			JSON.stringify({ active: true, current_phase: 7, session_id: "session-invalid" }),
 		);
 		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -1014,7 +1014,7 @@ describe("GJC native skill-state hooks", () => {
 		await dispatchGjcNativeSkillHook(
 			{
 				hookEventName: "UserPromptSubmit",
-				userPrompt: "$team coordinate this",
+				userPrompt: "$autoresearch investigate this",
 				cwd: root,
 				sessionId: "../../../escape",
 				threadId: "thread-safe",
@@ -1023,7 +1023,7 @@ describe("GJC native skill-state hooks", () => {
 		);
 
 		const state = await readVisibleSkillActiveState(root, "../../../escape");
-		expect(state?.initialized_state_path).toBe(modeStatePath(root, "../../../escape", "team"));
+		expect(state?.initialized_state_path).toBe(modeStatePath(root, "../../../escape", "autoresearch"));
 		expect(await fs.stat(activeSnapshotPath(root, "../../../escape"))).toBeDefined();
 		await expect(fs.stat(path.join(root, ".gjc", "escape"))).rejects.toThrow();
 	});
@@ -1046,7 +1046,7 @@ describe("GJC native skill-state hooks", () => {
 						enablePiUser: true,
 						enablePiProject: false,
 						customDirectories: [rawCustomDirectory],
-						includeSkills: ["ralplan", "team"],
+						includeSkills: ["ralplan", "autoresearch"],
 						ignoredSkills: ["legacy-*"],
 					},
 					disabledExtensions: ["skill:legacy", "agent:executor"],
@@ -1068,7 +1068,7 @@ describe("GJC native skill-state hooks", () => {
 		expect(context).not.toContain("~/.gjc");
 		expect(context).not.toContain(".gjc/settings.json");
 		expect(context).not.toContain("SKILL.md");
-		expect(context).not.toContain("ralplan, team]");
+		expect(context).not.toContain("ralplan, autoresearch]");
 		expect(context).not.toContain("legacy-*");
 		expect(context).not.toContain("custom-skills");
 		expect(context).not.toContain("agent:executor");
@@ -1080,7 +1080,7 @@ describe("GJC native skill-state hooks", () => {
 		const result = await dispatchGjcNativeSkillHook(
 			{
 				hookEventName: "UserPromptSubmit",
-				userPrompt: "$team coordinate this",
+				userPrompt: "$autoresearch investigate this",
 				cwd: root,
 				sessionId: "session-malicious-config",
 			},
@@ -1120,7 +1120,7 @@ describe("GJC native skill-state hooks", () => {
 			const result = await dispatchGjcNativeSkillHook(
 				{
 					hookEventName: "UserPromptSubmit",
-					userPrompt: "$team coordinate this",
+					userPrompt: "$autoresearch investigate this",
 					cwd: root,
 					sessionId: "session-malicious-recovery",
 				},
@@ -1212,7 +1212,7 @@ disabledExtensions:
 		const result = await dispatchGjcNativeSkillHook(
 			{
 				hookEventName: "UserPromptSubmit",
-				userPrompt: "$team coordinate this",
+				userPrompt: "$autoresearch investigate this",
 				cwd: root,
 				sessionId: "session-merged-config",
 			},

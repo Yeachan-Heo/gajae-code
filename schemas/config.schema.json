@@ -474,7 +474,8 @@
 							"type": "string",
 							"enum": [
 								"off",
-								"ultragoal"
+								"ultragoal",
+								"autoresearch"
 							],
 							"default": "off"
 						},
