@@ -8,9 +8,8 @@ export const loginSynthetic = createApiKeyLogin({
 	promptMessage: "Paste your Synthetic API key",
 	placeholder: "sk-...",
 	validation: {
-		kind: "chat-completions",
+		kind: "models-endpoint",
 		provider: "Synthetic",
-		baseUrl: "https://api.synthetic.new/openai/v1",
-		model: "hf:moonshotai/Kimi-K2.5",
+		modelsUrl: "https://api.synthetic.new/openai/v1/models",
 	},
 });
