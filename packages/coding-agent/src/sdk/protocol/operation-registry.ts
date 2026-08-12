@@ -6,6 +6,10 @@ export type OperationKind = "control" | "global" | "query" | "reverse";
 export type Idempotency = "idempotent" | "ordered" | "fast_lane";
 export type QueryContinuityClass = "stable_prefix" | "retained_revision" | "scalar_snapshot" | "content_addressed";
 
+/** Legacy kind-specific selectors for canonical Q26 `turn.result`. */
+export const TURN_RESULT_PROMPT_ALIAS = "turn.prompt_status";
+export const TURN_RESULT_SKILL_ALIAS = "skill.invoke_status";
+
 export interface Operation {
 	id: string;
 	sdkId: string;
@@ -15,13 +19,17 @@ export interface Operation {
 	errorCodes: string[];
 	revisionResource?: string;
 	continuityClass?: QueryContinuityClass;
+	/** Non-canonical request IDs that resolve to this operation's contract. */
+	aliases?: readonly string[];
 
 	adapterDispositions: Record<Adapter, AdapterDisposition>;
 	testIds: string[];
 }
 
 export function findOperation(kind: OperationKind, sdkId: string): Operation | undefined {
-	return OPERATIONS.find(operation => operation.kind === kind && operation.sdkId === sdkId);
+	return OPERATIONS.find(
+		operation => operation.kind === kind && (operation.sdkId === sdkId || operation.aliases?.includes(sdkId)),
+	);
 }
 
 export function adapterDispositionError(
@@ -157,12 +165,54 @@ const queries = [
 	["runtime.jobs.list", "List managed jobs."],
 	["turn.result", "Read the authoritative durable result of a submitted turn by command/turn IDs or clientRef."],
 	["models.profiles.list", "List the effective built-in and configured model profiles for this session."],
-	["skill.invoke_status", "Legacy alias for the authoritative turn result query."],
-
 	["providers.list/active", "List active providers."],
 	["session.checkpoint", "Resolve a durable transcript checkpoint into a connection-owned replay cursor."],
 	["turn.steer_status", "Read the durable acknowledgement status of a correlated steer by clientRef."],
 ] as const;
+
+// Q28 was folded into Q26; preserve the independent Q29/Q30 query identities.
+const queryIds = [
+	"Q01",
+	"Q02",
+	"Q03",
+	"Q04",
+	"Q05",
+	"Q06",
+	"Q07",
+	"Q08",
+	"Q09",
+	"Q10",
+	"Q11",
+	"Q12",
+	"Q13",
+	"Q14",
+	"Q15",
+	"Q16",
+	"Q17",
+	"Q18",
+	"Q19",
+	"Q20",
+	"Q21",
+	"Q22",
+	"Q23",
+	"Q24",
+	"Q25",
+	"Q26",
+	"Q27",
+	"Q29",
+	"Q30",
+	"Q31",
+] as const;
+
+function queryId(index: number): string {
+	const id = queryIds[index];
+	if (!id) throw new Error("Query registry IDs are out of sync with query definitions.");
+	return id;
+}
+
+const queryAliases: Readonly<Record<string, readonly string[]>> = {
+	Q26: [TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS],
+};
 
 const reverse = [
 	["terminal.create/output/release/wait", "Direct terminal lifecycle requests."],
@@ -251,7 +301,7 @@ function queryContinuityClass(id: string): QueryContinuityClass {
 }
 
 function queryDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q28", "Q29", "Q30", "Q31"].includes(id))
+	if (["Q23", "Q24", "Q25", "Q26", "Q27", "Q29", "Q30", "Q31"].includes(id))
 		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	return dispositions();
 }
@@ -306,7 +356,7 @@ export const OPERATIONS: readonly Operation[] = [
 		};
 	}),
 	...queries.map(([sdkId, description], index) => {
-		const id = `Q${String(index + 1).padStart(2, "0")}`;
+		const id = queryId(index);
 		return {
 			id,
 			sdkId,
@@ -320,6 +370,7 @@ export const OPERATIONS: readonly Operation[] = [
 						? ["invalid_request", "resource_gone", "model_profile_registry_error"]
 						: ["invalid_request", "resource_gone"],
 			continuityClass: queryContinuityClass(id),
+			...(queryAliases[id] === undefined ? {} : { aliases: queryAliases[id] }),
 			adapterDispositions: queryDisposition(id),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};

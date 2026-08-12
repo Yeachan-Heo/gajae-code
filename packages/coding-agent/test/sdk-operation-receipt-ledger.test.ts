@@ -33,6 +33,12 @@ describe("SDK broker operation receipt ledger", () => {
 		expect(mode).toBe(0o600);
 	});
 
+	it("retains the canonical digest used by durable receipt rows", () => {
+		expect(
+			operationReceiptDigest("turn.prompt", { z: { b: 2, a: "x" }, a: [3, { y: true, x: null }] }, "session-a"),
+		).toBe("c0c4f0bec2cc07ddc006ecb7bfade9a8146281ddb82820e4297d98e5fa34f305");
+	});
+
 	it("rejects clientRef substitution and leaves crash-pending rows fail closed", async () => {
 		const { agentDir, ledger } = await fixture();
 		const clientRef = "01JSDKRECEIPT0000000000001";

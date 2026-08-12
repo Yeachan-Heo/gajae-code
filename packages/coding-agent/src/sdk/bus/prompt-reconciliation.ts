@@ -1,5 +1,6 @@
 /**
- * Bounded authoritative reconciliation state for Q26 `turn.prompt_status`.
+ * Bounded prompt reconciliation state for canonical Q26 `turn.result` with
+ * `kind: "prompt"`, plus the legacy `turn.prompt_status` alias.
  *
  * Separate from the lifecycle delivery buffers (promptSubmissions /
  * promptTerminalTombstones), which exist to deliver frames and intentionally

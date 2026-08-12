@@ -1,53 +1,60 @@
 from __future__ import annotations
 
-import asyncio
 import io
 import json
-import os
 from pathlib import Path
 import re
 import runpy
-import shutil
+import subprocess
 import sys
 from typing import Any
 
 import pytest
 
-import gjc_sdk
-from gjc_sdk import Endpoint
-from gjc_sdk.frames import ControlResponse, QueryResponse
-
 ROOT = Path(__file__).resolve().parents[3]
 TEMPLATE = ROOT / "sdk-skills" / "gjc-sdk-author" / "templates" / "direct-sdk.py"
-FIXTURE = ROOT / "packages" / "coding-agent" / "test" / "helpers" / "sdk-python-fixture.ts"
-BUN = shutil.which("bun")
-NATIVE = ROOT / "packages" / "natives" / "native"
-REAL_SESSION_ENABLED = os.environ.get("GJC_REAL_SESSION_TESTS") == "1" and BUN is not None and NATIVE.exists()
+CORE_QUERIES = (
+    "session.metadata",
+    "context.get",
+    "goal.list/get",
+    "todo.list",
+    "workflow.gates.list",
+    "session.stats",
+)
 
 
-class FakeClient:
+class FakeCli:
     def __init__(self) -> None:
-        self.queries: list[str] = []
-        self.controls: list[tuple[str, dict[str, Any]]] = []
-        self.closed = False
+        self.calls: list[tuple[list[str], str]] = []
+        self.secret = "must-not-print"
 
-    async def query(self, query: str, input: dict[str, Any]) -> QueryResponse:
-        self.queries.append(query)
+    def run(
+        self,
+        args: list[str],
+        *,
+        cwd: str,
+        stdin: Any,
+        stdout: Any,
+        stderr: Any,
+        text: bool,
+        check: bool,
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append((args, cwd))
+        query_index = args.index("--query") if "--query" in args else -1
+        query = args[query_index + 1] if query_index >= 0 else None
         if query == "session.stats":
-            return QueryResponse("query", False, error={"code": "unavailable", "message": "failed-must-not-print"})
-        return QueryResponse("query", True, result={"query": query, "data": "prefix-must-not-print-suffix"})
-
-    async def control(self, operation: str, input: dict[str, Any]) -> ControlResponse:
-        self.controls.append((operation, input))
-        return ControlResponse("control", True, result={"accepted": True, "data": "prefix-must-not-print-suffix"})
-
-    async def close(self) -> None:
-        self.closed = True
+            return subprocess.CompletedProcess(args, 1, "", f"private={self.secret}")
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            json.dumps({"ok": True, "result": {"query": query or "control", "token": self.secret}}),
+            "",
+        )
 
 
 class ChallengeStdin:
-    """Answers the approval challenge read from stderr, proving the template
-    emits the challenge on stderr and never mixes prose into stdout."""
+    """Answers the approval challenge from stderr, keeping successful stdout JSON-only."""
 
     def __init__(self, capsys: pytest.CaptureFixture[str], accepted: list[str]) -> None:
         self._capsys = capsys
@@ -67,19 +74,8 @@ class FailingStdin:
         pytest.fail("approval prompt must not run")
 
 
-def configure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, client: FakeClient) -> None:
-    directory = tmp_path / ".gjc" / "state" / "sdk"
-    directory.mkdir(parents=True)
-    record = directory / "session-1.json"
-    record.write_text(json.dumps({"url": "ws://127.0.0.1:1", "token": "must-not-print", "pid": 1}), encoding="utf-8")
-    endpoint = Endpoint("session-1", "ws://127.0.0.1:1", "must-not-print", 1, False, record)
-    monkeypatch.setattr(gjc_sdk, "read_session_endpoint", lambda repo, session_id: endpoint)
-    monkeypatch.setattr(gjc_sdk, "select_live_endpoint", lambda endpoints, session_id=None: endpoints[0])
-
-    async def connect_ws(cls: type[gjc_sdk.SdkClient], repo: str, session_id: str | None = None, **kwargs: Any) -> FakeClient:
-        return client
-
-    monkeypatch.setattr(gjc_sdk.SdkClient, "connect_ws", classmethod(connect_ws))
+def configure(monkeypatch: pytest.MonkeyPatch, cli: FakeCli) -> None:
+    monkeypatch.setattr(subprocess, "run", cli.run)
 
 
 def run_template(monkeypatch: pytest.MonkeyPatch, args: list[str]) -> None:
@@ -87,27 +83,29 @@ def run_template(monkeypatch: pytest.MonkeyPatch, args: list[str]) -> None:
     runpy.run_path(str(TEMPLATE), run_name="__main__")
 
 
-def test_python_template_composes_queries_redacts_and_closes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    client = FakeClient()
-    configure(monkeypatch, tmp_path, client)
+def test_python_template_composes_queries_through_broker_cli_and_redacts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = FakeCli()
+    configure(monkeypatch, cli)
     run_template(monkeypatch, ["--repo", str(tmp_path), "--session-id", "session-1", "--mode", "inspect"])
     captured = capsys.readouterr()
-    assert client.queries == [
-        "session.metadata",
-        "context.get",
-        "goal.list/get",
-        "todo.list",
-        "workflow.gates.list",
-        "session.stats",
-    ]
+    assert [call[0][-1] for call in cli.calls] == list(CORE_QUERIES)
+    assert all(
+        args == ["gjc", "sdk", "session", "raw", "query", "session-1", "--query", query]
+        for (args, cwd), query in zip(cli.calls, CORE_QUERIES)
+    )
+    assert all(cwd == str(tmp_path) for _, cwd in cli.calls)
     assert '"status": "unavailable"' in captured.out
-    assert "must-not-print" not in captured.out + captured.err
-    assert client.closed is True
+    assert "[REDACTED]" in captured.out
+    assert cli.secret not in captured.out + captured.err
 
 
-def test_python_template_requires_exact_bound_approval(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    client = FakeClient()
-    configure(monkeypatch, tmp_path, client)
+def test_python_template_requires_exact_bound_approval(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = FakeCli()
+    configure(monkeypatch, cli)
     args = [
         "--repo",
         str(tmp_path),
@@ -125,72 +123,59 @@ def test_python_template_requires_exact_bound_approval(monkeypatch: pytest.Monke
         run_template(monkeypatch, args)
     assert denied.value.code == 1
     captured = capsys.readouterr()
-    assert client.controls == []
-    assert client.closed is False
-    assert "must-not-print" not in captured.out + captured.err
+    assert cli.calls == []
+    assert cli.secret not in captured.out + captured.err
 
     accepted: list[str] = []
     monkeypatch.setattr(sys, "stdin", ChallengeStdin(capsys, accepted))
     run_template(monkeypatch, args)
     captured = capsys.readouterr()
-    assert client.controls == [("turn.prompt", {"prompt": "hello"})]
-    assert client.closed is True
-    assert "must-not-print" not in captured.out + captured.err
+    assert cli.calls == [
+        (
+            [
+                "gjc",
+                "sdk",
+                "session",
+                "raw",
+                "control",
+                "session-1",
+                "--op",
+                "turn.prompt",
+                "--json-input",
+                '{"prompt":"hello"}',
+                "--confirm",
+            ],
+            str(tmp_path),
+        )
+    ]
+    assert cli.secret not in captured.out + captured.err
     assert len(accepted) == 1
 
     monkeypatch.setattr(sys, "stdin", io.StringIO(accepted[0] + "\n"))
     with pytest.raises(SystemExit) as replayed:
         run_template(monkeypatch, args)
     assert replayed.value.code == 1
-    assert client.controls == [("turn.prompt", {"prompt": "hello"})]
+    assert len(cli.calls) == 1
 
 
-def test_python_template_rejects_mismatched_discovery_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    client = FakeClient()
-    configure(monkeypatch, tmp_path, client)
-    record = tmp_path / ".gjc" / "state" / "sdk" / "session-1.json"
-    mismatched = Endpoint("other-session", "ws://127.0.0.1:1", "must-not-print", 1, False, record)
-    monkeypatch.setattr(gjc_sdk, "read_session_endpoint", lambda repo, session_id: mismatched)
-    with pytest.raises(SystemExit) as failed:
-        run_template(monkeypatch, ["--repo", str(tmp_path), "--session-id", "session-1", "--mode", "inspect"])
-    assert failed.value.code == 1
-    assert client.queries == []
+def test_python_template_requires_explicit_session_and_rejects_bypass_inputs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = FakeCli()
+    configure(monkeypatch, cli)
+    endpoint_path = tmp_path / ".gjc" / "state" / "sdk" / "session-1.json"
+    endpoint_path.parent.mkdir(parents=True)
+    endpoint_path.write_text('{"token":"must-not-read"}\n', encoding="utf-8")
 
+    with pytest.raises(SystemExit) as missing_session:
+        run_template(monkeypatch, ["--repo", str(tmp_path), "--mode", "inspect"])
+    assert missing_session.value.code == 1
 
-def test_python_template_rejects_forbidden_operation_before_approval(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    client = FakeClient()
-    configure(monkeypatch, tmp_path, client)
-    monkeypatch.setattr(sys, "stdin", FailingStdin())
-    with pytest.raises(SystemExit) as failed:
-        run_template(
-            monkeypatch,
-            ["--repo", str(tmp_path), "--session-id", "session-1", "--mode", "control", "--operation", "session.delete"],
-        )
-    assert failed.value.code == 1
-    assert client.controls == []
+    with pytest.raises(SystemExit) as token_argument:
+        run_template(monkeypatch, ["--repo", str(tmp_path), "--session-id", "session-1", "--token", "must-not-print"])
+    assert token_argument.value.code == 1
 
-
-def test_python_template_sanitizes_argument_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as failed:
-        run_template(monkeypatch, ["--repo", str(tmp_path), "--token", "must-not-print"])
-    assert failed.value.code == 1
-    captured = capsys.readouterr()
-    assert "must-not-print" not in captured.out + captured.err
-    assert "GJC SDK request failed safely." in captured.err
-
-
-def test_python_template_revalidates_after_approval(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    client = FakeClient()
-    configure(monkeypatch, tmp_path, client)
-    record = tmp_path / ".gjc" / "state" / "sdk" / "session-1.json"
-    original = Endpoint("session-1", "ws://127.0.0.1:1", "must-not-print", 1, False, record)
-    replacement = Endpoint("session-1", "ws://127.0.0.1:2", "replacement-token", 1, False, record)
-    reads = iter([original, replacement])
-    monkeypatch.setattr(gjc_sdk, "read_session_endpoint", lambda repo, session_id: next(reads))
-
-    accepted: list[str] = []
-    monkeypatch.setattr(sys, "stdin", ChallengeStdin(capsys, accepted))
-    with pytest.raises(SystemExit) as failed:
+    with pytest.raises(SystemExit) as secret_input:
         run_template(
             monkeypatch,
             [
@@ -203,87 +188,83 @@ def test_python_template_revalidates_after_approval(monkeypatch: pytest.MonkeyPa
                 "--operation",
                 "turn.prompt",
                 "--input",
-                '{"prompt":"hello"}',
+                '{"token":"must-not-print"}',
+            ],
+        )
+    assert secret_input.value.code == 1
+    captured = capsys.readouterr()
+    assert cli.calls == []
+    assert "must-not-print" not in captured.out + captured.err
+
+
+def test_python_template_rejects_forbidden_operation_before_approval(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cli = FakeCli()
+    configure(monkeypatch, cli)
+    monkeypatch.setattr(sys, "stdin", FailingStdin())
+    with pytest.raises(SystemExit) as failed:
+        run_template(
+            monkeypatch,
+            [
+                "--repo",
+                str(tmp_path),
+                "--session-id",
+                "session-1",
+                "--mode",
+                "control",
+                "--operation",
+                "session.delete",
             ],
         )
     assert failed.value.code == 1
-    assert client.controls == []
+    assert cli.calls == []
 
 
-async def _start_fixture() -> tuple[asyncio.subprocess.Process, dict[str, str]]:
-    assert BUN is not None
-    process = await asyncio.create_subprocess_exec(
-        BUN,
-        str(FIXTURE),
-        cwd=ROOT,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    assert process.stdout is not None
-    raw = await asyncio.wait_for(process.stdout.readline(), 30)
-    metadata = json.loads(raw)
-    assert set(("sessionId", "url", "token", "repo")) <= set(metadata)
-    return process, metadata
-
-
-async def _stop_fixture(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is None and process.stdin is not None:
-        process.stdin.write(b'{"cmd":"stop"}\n')
-        await process.stdin.drain()
-        process.stdin.close()
-    await asyncio.wait_for(process.wait(), 30)
-
-
-@pytest.mark.asyncio
-@pytest.mark.skipif(not REAL_SESSION_ENABLED, reason="requires GJC_REAL_SESSION_TESTS=1, bun, and native addon")
-async def test_python_template_control_stdout_is_pure_json() -> None:
-    """The actual contract an external consumer depends on: after a successful
-    control, the template's stdout parses directly as JSON. The approval
-    challenge must live on stderr, never mixed into stdout."""
-    process, metadata = await _start_fixture()
-    try:
-        repo = Path(metadata["repo"])
-        record = repo / ".gjc" / "state" / "sdk" / f'{metadata["sessionId"]}.json'
-        assert record.is_file(), f"host did not write a discovery record: {record}"
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            str(TEMPLATE),
+def test_python_template_binds_workflow_gate_answer_to_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = FakeCli()
+    configure(monkeypatch, cli)
+    accepted: list[str] = []
+    monkeypatch.setattr(sys, "stdin", ChallengeStdin(capsys, accepted))
+    run_template(
+        monkeypatch,
+        [
             "--repo",
-            str(repo),
+            str(tmp_path),
             "--session-id",
-            metadata["sessionId"],
+            "session-1",
             "--mode",
             "control",
             "--operation",
-            "session.rename",
+            "workflow.gate_answer",
             "--input",
-            '{"name":"repair-template-test"}',
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
-        challenge: str | None = None
-        stderr_lines: list[bytes] = []
-        while challenge is None:
-            line = await asyncio.wait_for(proc.stderr.readline(), 30)
-            if not line:
-                break
-            stderr_lines.append(line)
-            match = re.search(rb"Approval required: (APPROVE [^\n]+)", line)
-            if match:
-                challenge = match.group(1).decode()
-        assert challenge is not None, f"approval challenge was not emitted on stderr: {stderr_lines!r}"
-        proc.stdin.write(challenge.encode() + b"\n")
-        await proc.stdin.drain()
-        proc.stdin.close()
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), 60)
-        assert proc.returncode == 0, f"template failed: {stderr_bytes.decode(errors='replace')}"
-        stdout = stdout_bytes.decode(errors="replace")
-        payload = json.loads(stdout)
-        assert "Approval required" not in stdout
-        assert metadata["token"] not in stdout
-        assert payload["sessionId"] == metadata["sessionId"]
-    finally:
-        await _stop_fixture(process)
+            '{"id":"gate-1","response":"approve"}',
+        ],
+    )
+    args, cwd = cli.calls[0]
+    input_index = args.index("--json-input")
+    assert cwd == str(tmp_path)
+    assert json.loads(args[input_index + 1]) == {
+        "id": "gate-1",
+        "response": "approve",
+        "expectedSessionId": "session-1",
+    }
+
+
+def test_python_template_contains_no_endpoint_authority_bypass() -> None:
+    source = TEMPLATE.read_text(encoding="utf-8")
+    for marker in (
+        ".gjc/state/sdk",
+        "read_session_endpoint",
+        "select_live_endpoint",
+        "SdkClient",
+        "connect_ws",
+        "WebSocket",
+        "endpoint.url",
+        "endpoint.token",
+    ):
+        assert marker not in source
+    assert '["gjc", "sdk", "session", *arguments]' in source
+    assert "cwd=repo" in source

@@ -1,5 +1,6 @@
 /**
- * Public DTO contract for Q26 `turn.prompt_status` and the `clientRef`
+ * Public prompt-result DTO contract for canonical Q26 `turn.result` with
+ * `kind: "prompt"`, plus the legacy `turn.prompt_status` alias and the `clientRef`
  * correlation field on `turn.prompt`.
  *
  * Semantics:

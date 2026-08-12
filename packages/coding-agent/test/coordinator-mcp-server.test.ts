@@ -420,6 +420,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const server = await createSdkControlServer(root, controls);
 		const registered = await registerSdkSession(server, root);
 		expect(registered).toMatchObject({ ok: true, registered: true, session_state: { state: "ready_for_input" } });
+		const overflowDigest = createHash("sha256").update("private-overflow-tool-call-id").digest("hex");
 		await Bun.write(
 			path.join(root, ".gjc", "coordinator-state", "local", "repo", "sessions", "visible-session.json"),
 			JSON.stringify({
@@ -450,12 +451,16 @@ describe("Coordinator MCP canonical SDK controls", () => {
 					tool_name: "bash",
 					observed_at: "2026-08-11T00:00:00.000Z",
 					active_tool_count: 9,
+					active_tool_count_is_lower_bound: true,
 					private_args: "do not expose",
 				},
 				active_tools: [
 					{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z", tool_call_id: "private-tool-id" },
 				],
 				active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
+				active_tool_calls_overflow_count: 1,
+				active_tool_calls_overflow_digests: [overflowDigest],
+				active_tool_calls_overflow_count_is_lower_bound: true,
 			}),
 		);
 		const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
@@ -465,7 +470,12 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			status: { authority: "sdk_broker", live: true },
 			session_state: {
 				last_activity_at: "2026-08-11T00:00:00.000Z",
-				activity: { sequence: 4, tool_name: "bash", active_tool_count: 9 },
+				activity: {
+					sequence: 4,
+					tool_name: "bash",
+					active_tool_count: 9,
+					active_tool_count_is_lower_bound: true,
+				},
 				active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
 			},
 		});
@@ -477,6 +487,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(publicResult).not.toContain("session-state-secret");
 		expect(publicResult).not.toContain("private-tool-id");
 		expect(publicResult).not.toContain("do not expose");
+		expect(publicResult).not.toContain(overflowDigest);
 		expect(publicResult).not.toContain(root);
 		expect(controls).toEqual([
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
@@ -503,6 +514,9 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			activity: { sequence: 4, active_tool_count: 9 },
 			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
 			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
+			active_tool_calls_overflow_count: 1,
+			active_tool_calls_overflow_digests: [overflowDigest],
+			active_tool_calls_overflow_count_is_lower_bound: true,
 		});
 		const sent = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
@@ -534,6 +548,9 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			activity: { sequence: 4, active_tool_count: 9 },
 			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
 			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
+			active_tool_calls_overflow_count: 1,
+			active_tool_calls_overflow_digests: [overflowDigest],
+			active_tool_calls_overflow_count_is_lower_bound: true,
 		});
 	});
 	it("marks lifecycle-created sessions ready after successful SDK lifecycle binding", async () => {

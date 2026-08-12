@@ -27,6 +27,7 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { deriveIdempotencyIdentity } from "./identity";
+
 import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
 
 import {
@@ -35,7 +36,7 @@ import {
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
-import { type IndexedSession, SessionIndex, type SessionList } from "./session-index";
+import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -183,6 +184,17 @@ function pendingCleanupSessionId(response: BrokerResponse): string | undefined {
 }
 
 
+const LIFECYCLE_OPERATIONS = new Set([
+	"session.create",
+	"session.fork",
+	"session.resume",
+	"session.close",
+	"session.delete",
+]);
+
+function lifecycleFingerprint(operation: string, input: unknown): string {
+	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
+}
 function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (response.ok) return "terminal_ok";
 	if (isCleanupPending(response)) return "effect_started";
@@ -396,6 +408,7 @@ function matchesEndpointAuthority(record: IndexedSession, authority: EndpointAut
 function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): boolean {
 	return (
 		current.live &&
+		isSessionAuthorityEligible(current) &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
@@ -1203,12 +1216,19 @@ export class Broker {
 		if ("ok" in authority) return authority;
 		await this.index.refresh();
 		let record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
-		if (record && !record.live && !record.terminal && !record.terminalUncertain) {
+		if (
+			record &&
+			!record.live &&
+			!record.terminal &&
+			!record.terminalUncertain &&
+			isSessionAuthorityEligible(record)
+		) {
 			await this.heartbeatSessions();
 			await this.index.refresh();
 			record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
 		}
 		if (!record) return error("resource_gone", "session is not indexed");
+		if (!isSessionAuthorityEligible(record)) return error("resource_gone", "session endpoint record is gone");
 		if (!matchesEndpointAuthority(record, authority)) return error("endpoint_stale", "session endpoint is stale");
 		if (!record.live) return error("resource_gone", "session endpoint record is gone");
 		return this.#readEndpoint(record, authority);
@@ -1216,10 +1236,12 @@ export class Broker {
 	async #readLifecycleReplayEndpoint(sessionId: string): Promise<LifecycleReplayEndpoint | BrokerResponse> {
 		await this.index.refresh();
 		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
-		if (!record?.live) return error("resource_gone", "session endpoint record is gone");
-		const endpointMtimeMs = record.endpointMtimeMs;
+		if (!record) return error("resource_gone", "session endpoint record is gone");
 		if (record.terminalUncertain)
 			return error("terminal_uncertain", "Session ownership is uncertain and cannot be replayed safely");
+		if (!isSessionAuthorityEligible(record) || !record.live)
+			return error("resource_gone", "session endpoint record is gone");
+		const endpointMtimeMs = record.endpointMtimeMs;
 		if (
 			!Number.isSafeInteger(record.endpointGeneration) ||
 			record.endpointGeneration <= 0 ||
@@ -1344,6 +1366,7 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
@@ -1363,25 +1386,63 @@ export class Broker {
 						? listed.owned.filter(candidate => candidate.sessionId === resolveSessionId)
 						: [];
 				const match = matches.length === 1 ? matches[0] : undefined;
+				const savedSession =
+					match &&
+					match.sessionId === resolveSessionId &&
+					match.identity.nlink !== undefined &&
+					match.identity.ctimeNs !== undefined
+						? {
+								id: match.sessionId,
+								path: match.path,
+								identity: {
+									dev: match.identity.dev.toString(),
+									ino: match.identity.ino.toString(),
+									nlink: match.identity.nlink.toString(),
+									size: match.identity.size,
+									mtimeMs: match.identity.mtimeMs,
+									mtimeNs: match.identity.mtimeNs.toString(),
+									ctimeNs: match.identity.ctimeNs.toString(),
+									sha256: match.identity.sha256,
+								},
+							}
+						: undefined;
 				return {
 					...page,
 					result: {
 						...pageResult,
-						savedSession:
-							match && match.sessionId === resolveSessionId
-								? { id: match.sessionId, path: match.path }
-								: undefined,
+						...(savedSession === undefined ? {} : { savedSession }),
 					},
 				};
 			}
 			return page;
 		}
 		if (operation === "session.get_endpoint") return this.#endpoint(input);
+		if (operation === "broker.lookup_lifecycle") {
+			const requestedOperation = typeof input.operation === "string" ? input.operation : undefined;
+			const requestedFingerprint = typeof input.fingerprint === "string" ? input.fingerprint : undefined;
+			if (!idempotencyKey || !requestedOperation || !requestedFingerprint)
+				return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
+			if (!LIFECYCLE_OPERATIONS.has(requestedOperation))
+				return error("not_found", "lifecycle operation was not found");
+			const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
+			const entry = this.ledger.get(identity);
+			if (!entry) return error("not_found", "lifecycle operation was not found");
+			if (entry.fingerprint !== requestedFingerprint)
+				return error("idempotency_conflict", "lifecycle request fingerprint differs");
+			if (entry.state === "terminal_uncertain")
+				return error("terminal_uncertain", "lifecycle outcome is still uncertain");
+			return isBrokerResponse(entry.response)
+				? entry.response
+				: error("terminal_uncertain", "lifecycle outcome has no recorded response");
+		}
+
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
+		const operationKey = `${operation}\0${idempotencyKey}`;
+
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
 		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {
 			const entry = this.ledger.get(identity);
@@ -1447,7 +1508,7 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash);
+			const begun = await this.ledger.begin(identity, requestHash, { operationKey, fingerprint });
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;

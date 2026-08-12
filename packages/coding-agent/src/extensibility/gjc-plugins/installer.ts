@@ -392,8 +392,12 @@ export async function runGjcBundleTransaction(
 ): Promise<GjcBundleTransactionResult> {
 	const resolved = await resolveSource(source);
 	try {
-		// Compile + validate outside every lock (never imports plugin code).
+		// Compile + validate candidate-internal collisions and MCP policy outside
+		// every lock (never imports plugin code). Registry collisions are rechecked
+		// under both locks below, but a statically invalid candidate must not create
+		// lock roots or sweep installation remnants.
 		const bundle = await compileGjcPluginBundle(resolved.dir);
+		validateInstallPlan(bundle, []);
 		const dirName = safeDirSegment(bundle.name);
 		const root = scopeRoot(options.scope, options.cwd);
 		const finalDir = path.join(root, dirName);
@@ -450,16 +454,16 @@ export async function runGjcBundleTransaction(
 			if (decision.kind === "abort") return { status: "aborted", error: decision.error, remnants: [] };
 			if (decision.kind === "noop") return { status: "noop", entry: decision.entry, remnants: [] };
 
-			// The decision committed, so mutation may begin.
-			await fs.mkdir(root, { recursive: true });
-			await cleanupOrphans(root, dirName);
-
 			// Hard install-time collision + MCP security validation against the
 			// effective registry across BOTH scopes. Surface IDs derive from the
 			// surface name, not the bundle name, so a differently named bundle in
 			// the opposite scope can claim the same ID; only the exact target
 			// identity is excluded, since that is the entry being replaced.
 			validateInstallPlan(bundle, effective);
+
+			// The decision and all validation committed, so mutation may begin.
+			await fs.mkdir(root, { recursive: true });
+			await cleanupOrphans(root, dirName);
 
 			const unique = `${process.pid}-${randomBytes(6).toString("hex")}`;
 			const stagingDir = `${finalDir}.installing-${unique}`;

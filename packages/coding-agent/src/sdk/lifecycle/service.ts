@@ -47,6 +47,17 @@ export interface SessionLifecycleTranscriptIdentity {
 	readonly sha256: string;
 }
 
+export interface SessionLifecycleSavedSessionIdentity extends SessionLifecycleTranscriptIdentity {
+	readonly nlink: string;
+	readonly ctimeNs: string;
+}
+
+export interface SessionLifecycleSavedSession {
+	readonly id: string;
+	readonly path: string;
+	readonly identity: SessionLifecycleSavedSessionIdentity;
+}
+
 export interface SessionLifecycleCoordinatorTarget {
 	readonly coordinatorStateDir?: string;
 	readonly coordinatorSessionId?: string;
@@ -164,7 +175,7 @@ export interface SessionLifecycleListResult {
 	readonly indexSeq: number;
 	readonly sessions: readonly SessionLifecycleListEntry[];
 	readonly warnings: readonly string[];
-	readonly savedSession?: { readonly id: string; readonly path: string };
+	readonly savedSession?: SessionLifecycleSavedSession;
 }
 
 export interface SessionCreateResult {
@@ -416,6 +427,41 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 	return result;
 }
 
+function savedSessionTranscriptIdentity(value: unknown): SessionLifecycleSavedSessionIdentity | undefined {
+	if (!isRecord(value)) return undefined;
+	const { dev, ino, nlink, size, mtimeMs, mtimeNs, ctimeNs, sha256 } = value;
+	if (
+		typeof dev !== "string" ||
+		!/^\d+$/.test(dev) ||
+		typeof ino !== "string" ||
+		!/^\d+$/.test(ino) ||
+		typeof nlink !== "string" ||
+		!/^\d+$/.test(nlink) ||
+		typeof size !== "number" ||
+		!Number.isSafeInteger(size) ||
+		size < 0 ||
+		typeof mtimeMs !== "number" ||
+		!Number.isFinite(mtimeMs) ||
+		mtimeMs < 0 ||
+		typeof mtimeNs !== "string" ||
+		!/^\d+$/.test(mtimeNs) ||
+		typeof ctimeNs !== "string" ||
+		!/^\d+$/.test(ctimeNs) ||
+		typeof sha256 !== "string" ||
+		!/^[a-f0-9]{64}$/.test(sha256)
+	)
+		return undefined;
+	return { dev, ino, nlink, size, mtimeMs, mtimeNs, ctimeNs, sha256 };
+}
+
+function savedSessionFromResult(value: unknown): SessionLifecycleSavedSession | undefined {
+	if (!isRecord(value)) return undefined;
+	const identity = savedSessionTranscriptIdentity(value.identity);
+	if (typeof value.id !== "string" || typeof value.path !== "string" || value.path.length === 0 || !identity)
+		return undefined;
+	return { id: value.id, path: value.path, identity };
+}
+
 function listResult(value: unknown): SessionLifecycleListResult | undefined {
 	if (!isRecord(value) || !Array.isArray(value.sessions)) return undefined;
 	const indexSeq = value.indexSeq;
@@ -447,11 +493,9 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 		if (typeof warning !== "string") return undefined;
 		warnings.push(warning);
 	}
-	const savedSession = isRecord(value.savedSession)
-		? typeof value.savedSession.id === "string" && typeof value.savedSession.path === "string"
-			? { id: value.savedSession.id, path: value.savedSession.path }
-			: undefined
-		: undefined;
+	const savedSessionPresent = Object.hasOwn(value, "savedSession");
+	const savedSession = savedSessionPresent ? savedSessionFromResult(value.savedSession) : undefined;
+	if (savedSessionPresent && !savedSession) return undefined;
 	return { indexSeq, sessions, warnings, ...(savedSession ? { savedSession } : {}) };
 }
 type LifecycleListPage = {

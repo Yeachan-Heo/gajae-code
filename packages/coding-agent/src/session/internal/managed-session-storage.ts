@@ -9,6 +9,7 @@ import type {
 	RecoveryFsIdentity,
 	RecoveryFsRoot,
 } from "@gajae-code/natives";
+import { isEnoent, logger } from "@gajae-code/utils";
 import type { SessionStorageRangeSnapshot, SessionStorageStat } from "../session-storage";
 import {
 	classifyNativePublishOutcome,
@@ -497,28 +498,43 @@ const SCRUBBED_REMNANT_PREFIXES = [
 /** In-flight protocol steps complete in milliseconds; anything older is abandoned. */
 const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
 
+export interface ScrubbedProtocolRemnantReapResult {
+	readonly reaped: number;
+	readonly failures: number;
+}
+
+function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): ScrubbedProtocolRemnantReapResult {
+	if (failures > 0)
+		logger.warn("Managed session remnant reaping completed with failures", {
+			failureCount: failures,
+			reapedCount: reaped,
+		});
+	return { reaped, failures };
+}
+
 /**
  * Best-effort removal of scrubbed write-protocol remnants from one managed
  * directory. Only zero-length, single-link, non-symlink regular files whose
  * names carry a terminal remnant prefix and whose timestamps are older than
  * the age gate are removed: a zero-length single-link entry is exactly what
  * the scrub proof leaves behind, and non-zero entries (displaced predecessors
- * or detached receipts retained as evidence) are never touched. Failures are
- * swallowed — a concurrent same-owner writer may legitimately own or already
- * have reconciled any candidate.
+ * or detached receipts retained as evidence) are never touched. A proven
+ * concurrent disappearance (ENOENT) is benign; all other I/O failures are
+ * returned and logged once without aborting scope preparation.
  */
 export function reapScrubbedProtocolRemnantsSync(
 	directory: string,
 	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
-): number {
+): ScrubbedProtocolRemnantReapResult {
 	let names: string[];
 	try {
 		names = fs.readdirSync(directory);
-	} catch {
-		return 0;
+	} catch (error) {
+		return reportScrubbedProtocolRemnantReap(0, isEnoent(error) ? 0 : 1);
 	}
 	const cutoff = Date.now() - minAgeMs;
 	let reaped = 0;
+	let failures = 0;
 	for (const name of names) {
 		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
 		const pathname = path.join(directory, name);
@@ -528,11 +544,11 @@ export function reapScrubbedProtocolRemnantsSync(
 			if (named.mtimeMs > cutoff) continue;
 			fs.unlinkSync(pathname);
 			reaped += 1;
-		} catch {
-			// Best effort: concurrently reconciled or removed remnants are not errors.
+		} catch (error) {
+			if (!isEnoent(error)) failures += 1;
 		}
 	}
-	return reaped;
+	return reportScrubbedProtocolRemnantReap(reaped, failures);
 }
 
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);

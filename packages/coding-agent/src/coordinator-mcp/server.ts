@@ -279,6 +279,9 @@ interface CoordinatorSessionState {
 	activity?: unknown;
 	active_tools?: unknown;
 	active_tool_calls?: unknown;
+	active_tool_calls_overflow_count?: unknown;
+	active_tool_calls_overflow_digests?: unknown;
+	active_tool_calls_overflow_count_is_lower_bound?: unknown;
 }
 
 type CoordinatorEventKind =
@@ -1279,6 +1282,7 @@ function publicCoordinatorSessionState(state: CoordinatorSessionState | null): R
 				: {}),
 			...(activity.outcome === "succeeded" || activity.outcome === "failed" ? { outcome: activity.outcome } : {}),
 			active_tool_count: activity.active_tool_count,
+			...(activity.active_tool_count_is_lower_bound === true ? { active_tool_count_is_lower_bound: true } : {}),
 		};
 		if (Array.isArray(state.active_tools))
 			result.active_tools = state.active_tools.slice(0, 8).flatMap(value => {
@@ -1910,6 +1914,20 @@ async function writeSessionStateUnlocked(
 		...(Array.isArray(existing?.active_tools) ? { active_tools: existing.active_tools } : {}),
 		...(existing?.active_tool_calls && typeof existing.active_tool_calls === "object"
 			? { active_tool_calls: existing.active_tool_calls }
+			: {}),
+		...(typeof existing?.active_tool_calls_overflow_count === "number" &&
+		Number.isSafeInteger(existing.active_tool_calls_overflow_count) &&
+		existing.active_tool_calls_overflow_count >= 0
+			? { active_tool_calls_overflow_count: existing.active_tool_calls_overflow_count }
+			: {}),
+		...(Array.isArray(existing?.active_tool_calls_overflow_digests)
+			? { active_tool_calls_overflow_digests: existing.active_tool_calls_overflow_digests }
+			: {}),
+		...(typeof existing?.active_tool_calls_overflow_count_is_lower_bound === "boolean"
+			? {
+					active_tool_calls_overflow_count_is_lower_bound:
+						existing.active_tool_calls_overflow_count_is_lower_bound,
+				}
 			: {}),
 	};
 	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);

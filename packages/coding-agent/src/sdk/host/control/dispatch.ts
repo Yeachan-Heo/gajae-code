@@ -3,7 +3,6 @@ import {
 	DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
-import { isElevationAllowlisted } from "../../elevation/allowlist";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import type { ControlInput, ControlSurface, ControlValue } from "./operations";
 import { brokerRuntimeCloseCapability, hasBrokerRuntimeCloseCapability } from "./runtime-gate";
@@ -15,8 +14,6 @@ export interface ControlRequest {
 	expectedRevision?: string;
 	idempotencyKey?: string;
 	confirm?: boolean;
-	/** Top-level elevation claim selector, preserved from the control frame. */
-	elevationRequestId?: string;
 }
 
 export type ControlErrorCode = string;
@@ -122,11 +119,7 @@ function failure(
 function isInput(value: unknown): value is ControlInput {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-/**
- * Build the typed control request from a wire frame. Every runtime transport
- * mapper uses this helper so the top-level elevation claim selector cannot
- * drift between callsites.
- */
+
 export function controlRequestFromFrame(frame: Record<string, unknown>): ControlRequest {
 	return {
 		id: typeof frame.id === "string" ? frame.id : "",
@@ -135,7 +128,6 @@ export function controlRequestFromFrame(frame: Record<string, unknown>): Control
 		expectedRevision: typeof frame.expectedRevision === "string" ? frame.expectedRevision : undefined,
 		idempotencyKey: typeof frame.idempotencyKey === "string" ? frame.idempotencyKey : undefined,
 		confirm: frame.confirm === true,
-		elevationRequestId: typeof frame.elevationRequestId === "string" ? frame.elevationRequestId : undefined,
 	};
 }
 
@@ -220,7 +212,6 @@ function invoke(
 	input: ControlInput,
 	confirm: boolean | undefined,
 	idempotencyKey: string | undefined,
-	elevationRequestId: string | undefined,
 ): Promise<ControlValue> | ControlValue {
 	switch (operation) {
 		case "turn.prompt":
@@ -236,20 +227,16 @@ function invoke(
 		case "ask.answer":
 			return surface.answerAsk(text(input, "id"), input.answer);
 		case "workflow.gate_answer":
+			if (idempotencyKey === undefined)
+				return surface.answerGate(text(input, "id"), input.response, input.expectedSessionId as string | undefined);
 			return surface.answerGate(
 				text(input, "id"),
 				input.response,
 				input.expectedSessionId as string | undefined,
 				idempotencyKey,
-				elevationRequestId,
 			);
 		case "workflow.plan_approve":
-			return surface.approvePlan(
-				text(input, "id"),
-				input.choice,
-				input.expectedSessionId as string | undefined,
-				elevationRequestId,
-			);
+			return surface.approvePlan(text(input, "id"), input.choice, input.expectedSessionId as string | undefined);
 		case "skill.invoke":
 			return surface.invokeSkill(
 				text(input, "name"),
@@ -382,7 +369,6 @@ async function execute(surface: ControlSurface, row: Operation, request: Control
 				request.input as ControlInput,
 				request.confirm,
 				request.idempotencyKey,
-				request.elevationRequestId,
 			),
 		};
 	} catch (error) {
@@ -476,27 +462,6 @@ export function dispatchControl(
 		);
 	if (!isInput(request.input))
 		return Promise.resolve(failure(request.id, "invalid_input", "Control input must be an object."));
-	const elevationEnabled =
-		process.env.GJC_SDK_ELEVATION_ENABLED === "1" || process.env.GJC_SDK_ELEVATION_ENABLED === "true";
-	const elevationAllowlisted = isElevationAllowlisted("control", row.sdkId);
-	const elevationRequired = elevationEnabled && elevationAllowlisted;
-	if (elevationRequired && request.elevationRequestId === undefined)
-		return Promise.resolve(failure(request.id, "elevation_required", `${row.sdkId} requires an elevation grant.`));
-	if (request.elevationRequestId !== undefined) {
-		const claim = request.elevationRequestId.trim();
-		if (!claim || claim.length > 128)
-			return Promise.resolve(
-				failure(request.id, "invalid_input", "elevationRequestId must be a non-empty bounded string."),
-			);
-		if (!elevationAllowlisted)
-			return Promise.resolve(
-				failure(request.id, "invalid_input", "Only allowlisted elevation operations may carry elevationRequestId."),
-			);
-		if (!surface.authorizeElevationClaim?.(row.sdkId, request.input, claim))
-			return Promise.resolve(
-				failure(request.id, "elevation_required", "The elevation claim is not broker-authorized for this control."),
-			);
-	}
 	if ((row.sdkId === "context.clear" || row.sdkId === "session.delete") && request.confirm !== true)
 		return Promise.resolve(
 			failure(request.id, "invalid_input", "confirm: true is required for this destructive operation."),

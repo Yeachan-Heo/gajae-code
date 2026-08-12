@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -126,6 +126,108 @@ describe("session HTML export fidelity", () => {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+	it.skipIf(process.platform === "win32")(
+		"rejects a destination hard-link swap after alias preflight without truncating the transcript",
+		async () => {
+			const tempDir = path.join(os.tmpdir(), `gjc-html-export-race-${Snowflake.next()}`);
+			fs.mkdirSync(tempDir, { recursive: true });
+			try {
+				const session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+				session.appendMessage({ role: "user", content: "authoritative", timestamp: 1 });
+				await session.ensureOnDisk();
+				await session.flush();
+				const sessionFile = session.getSessionFile();
+				if (!sessionFile) throw new Error("Expected persisted session");
+				const outputPath = path.join(tempDir, "export.html");
+				fs.writeFileSync(outputPath, "safe destination");
+				const before = fs.readFileSync(sessionFile);
+				const openSync = fs.openSync;
+				let swapped = false;
+				let outputOpenFlags: number | undefined;
+				const open = vi.spyOn(fs, "openSync").mockImplementation(((pathname, flags, mode) => {
+					if (pathname === outputPath) outputOpenFlags = Number(flags);
+					if (!swapped && pathname === outputPath) {
+						swapped = true;
+						fs.unlinkSync(outputPath);
+						fs.linkSync(sessionFile, outputPath);
+					}
+					return openSync(pathname, flags, mode);
+				}) as typeof fs.openSync);
+				try {
+					await expect(exportSessionToHtml(session, undefined, { outputPath })).rejects.toThrow(
+						"must not overwrite the source transcript",
+					);
+					expect(swapped).toBe(true);
+					expect(outputOpenFlags).toBeDefined();
+					expect((outputOpenFlags ?? 0) & fs.constants.O_NOFOLLOW).toBe(fs.constants.O_NOFOLLOW);
+					expect((outputOpenFlags ?? 0) & fs.constants.O_TRUNC).toBe(0);
+					expect(fs.readFileSync(sessionFile)).toEqual(before);
+				} finally {
+					open.mockRestore();
+					await session.close();
+				}
+			} finally {
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
+	it.skipIf(process.platform === "win32")(
+		"rejects a source-path swap after alias preflight without truncating the transcript",
+		async () => {
+			const tempDir = path.join(os.tmpdir(), `gjc-html-export-source-race-${Snowflake.next()}`);
+			fs.mkdirSync(tempDir, { recursive: true });
+			try {
+				const session = SessionManager.create(tempDir, path.join(tempDir, "sessions"));
+				session.appendMessage({ role: "user", content: "authoritative", timestamp: 1 });
+				await session.ensureOnDisk();
+				await session.flush();
+				const sessionFile = session.getSessionFile();
+				if (!sessionFile) throw new Error("Expected persisted session");
+				const outputPath = path.join(tempDir, "export.html");
+				const swapPath = path.join(tempDir, "swapped.html");
+				fs.writeFileSync(outputPath, "safe destination");
+				const before = fs.readFileSync(sessionFile);
+				const openSync = fs.openSync;
+				let swapped = false;
+				let sourceOpenFlags: number | undefined;
+				let outputOpenFlags: number | undefined;
+				const open = vi.spyOn(fs, "openSync").mockImplementation(((pathname, flags, mode) => {
+					if (pathname === sessionFile) sourceOpenFlags = Number(flags);
+					if (pathname === outputPath) {
+						outputOpenFlags = Number(flags);
+						if (!swapped) {
+							swapped = true;
+							fs.renameSync(sessionFile, swapPath);
+							fs.renameSync(outputPath, sessionFile);
+							fs.renameSync(swapPath, outputPath);
+						}
+					}
+					return openSync(pathname, flags, mode);
+				}) as typeof fs.openSync);
+				try {
+					await expect(exportSessionToHtml(session, undefined, { outputPath })).rejects.toThrow(
+						"must not overwrite the source transcript",
+					);
+					expect(swapped).toBe(true);
+					expect(sourceOpenFlags).toBeDefined();
+					expect((sourceOpenFlags ?? 0) & fs.constants.O_NOFOLLOW).toBe(fs.constants.O_NOFOLLOW);
+					expect(outputOpenFlags).toBeDefined();
+					expect((outputOpenFlags ?? 0) & fs.constants.O_TRUNC).toBe(0);
+					expect(fs.readFileSync(outputPath)).toEqual(before);
+				} finally {
+					open.mockRestore();
+					if (swapped) {
+						fs.renameSync(sessionFile, swapPath);
+						fs.renameSync(outputPath, sessionFile);
+						fs.renameSync(swapPath, outputPath);
+					}
+					await session.close();
+				}
+			} finally {
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
 	it("rejects standalone source-path output before session loading mutates the transcript", async () => {
 		const tempDir = path.join(os.tmpdir(), `gjc-html-export-standalone-alias-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });

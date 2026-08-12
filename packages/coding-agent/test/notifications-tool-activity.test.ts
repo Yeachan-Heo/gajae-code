@@ -10,6 +10,7 @@ import type { EnsureDaemonResult } from "../src/sdk/bus/telegram-daemon";
 import { SessionSdkHost } from "../src/sdk/host";
 import { isolatedNotificationSettings } from "./helpers/notification-settings";
 import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
+import { withTelegramOrchestrationProvenance } from "./helpers/telegram-topic-test";
 
 const wait = () => new Promise(resolve => setTimeout(resolve, 0));
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -70,10 +71,12 @@ async function setup(
 					eligible: true,
 					getConfig: () => getNotificationConfig(settings),
 				});
-	createNotificationsExtension(api, {
-		...(settings ? { settings, controller } : {}),
-		...(options.ensureTelegramDaemon ? { ensureTelegramDaemon: options.ensureTelegramDaemon } : {}),
-	});
+	withTelegramOrchestrationProvenance(() =>
+		createNotificationsExtension(api, {
+			...(settings ? { settings, controller } : {}),
+			...(options.ensureTelegramDaemon ? { ensureTelegramDaemon: options.ensureTelegramDaemon } : {}),
+		}),
+	);
 	const sessionId = `tool-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,

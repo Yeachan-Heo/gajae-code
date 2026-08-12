@@ -41,7 +41,7 @@ Do not add a fifth default skill, fifth public role agent, new command, new conf
 - `packages/utils/` — shared TypeScript utilities, logging, formatting, process helpers, JSON/frontmatter, and sanitization.
 - `packages/stats/` — local observability dashboard and session/model usage aggregation.
 - `packages/typescript-edit-benchmark/` — TypeScript edit benchmark tooling.
-- External machine clients use the SDK WebSocket interface documented in `docs/sdk.md`; `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` were removed.
+- External machine clients use the broker-bound SDK session CLI, Coordinator MCP, or managed adapters documented in `docs/sdk.md`; `--mode rpc`, `--mode rpc-ui`, `--mode bridge`, and `gjc sdk serve` were removed.
 
 ## Build, test, and validation commands
 

@@ -24,6 +24,7 @@ import {
 	isGenericNotificationHostEligible,
 	isGenericNotificationSessionEnabled,
 	isProviderEffectivelyEnabled,
+	isTelegramOrchestrationSession,
 	maskToken,
 	type NotificationConfig,
 	type RedactableAction,
@@ -59,6 +60,7 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
+import { withTelegramOrchestrationProvenance } from "./helpers/telegram-topic-test";
 
 const BASE_CFG: NotificationConfig = {
 	enabled: false,
@@ -1354,6 +1356,17 @@ describe("notifications config", () => {
 		expect(hasAnyEffectivelyEnabledProvider(mixedAdapterCfg)).toBe(true);
 		expect(telegramEffectivelyEnabled(mixedAdapterCfg)).toBe(false);
 	});
+	test("isTelegramOrchestrationSession requires coordinator or lifecycle provenance", () => {
+		expect(isTelegramOrchestrationSession({})).toBe(false);
+		expect(isTelegramOrchestrationSession({ GJC_NOTIFICATIONS: "1" })).toBe(false);
+		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_ID: "coordinator-1" })).toBe(true);
+		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/session-state.json" })).toBe(
+			true,
+		);
+		expect(isTelegramOrchestrationSession({ GJC_LIFECYCLE_REQUEST_ID: "lifecycle-1" })).toBe(true);
+		expect(isTelegramOrchestrationSession({ GJC_SDK_LIFECYCLE_REQUEST: "{}" })).toBe(true);
+		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_ID: "  " })).toBe(false);
+	});
 
 	test("isGenericNotificationSessionEnabled applies precedence", () => {
 		expect(
@@ -2194,34 +2207,36 @@ describe("notifications config", () => {
 			ui: { notify: () => {} },
 		} as unknown as ExtensionCommandContext;
 
-		createNotificationsExtension(api, {
-			settings,
-			ensureTelegramDaemon: input => {
-				let ownerId: string | undefined;
-				return ensureTelegramDaemonRunning(input, {
-					pid: 4242,
-					pidAlive: pid => pid === 4242 || pid === 4243,
-					pidIncarnation: pid => `linux:${pid}`,
-					spawn: (_command, args) => {
-						ownerId = args[args.indexOf("--owner-id") + 1];
-						spawns++;
-						return { pid: 4243, unref() {} };
-					},
-					sleep: async () => {
-						if (!ownerId) throw new Error("Telegram daemon spawn did not provide an owner ID");
-						await renewDaemonHeartbeat({
-							settings,
-							ownerId,
-							acquisitionId: ownerId,
-							pid: 4243,
-							pidIncarnation: pid => `linux:${pid}`,
-						});
-					},
-					waitStepMs: 1,
-					readinessTimeoutMs: 100,
-				});
-			},
-		});
+		withTelegramOrchestrationProvenance(() =>
+			createNotificationsExtension(api, {
+				settings,
+				ensureTelegramDaemon: input => {
+					let ownerId: string | undefined;
+					return ensureTelegramDaemonRunning(input, {
+						pid: 4242,
+						pidAlive: pid => pid === 4242 || pid === 4243,
+						pidIncarnation: pid => `linux:${pid}`,
+						spawn: (_command, args) => {
+							ownerId = args[args.indexOf("--owner-id") + 1];
+							spawns++;
+							return { pid: 4243, unref() {} };
+						},
+						sleep: async () => {
+							if (!ownerId) throw new Error("Telegram daemon spawn did not provide an owner ID");
+							await renewDaemonHeartbeat({
+								settings,
+								ownerId,
+								acquisitionId: ownerId,
+								pid: 4243,
+								pidIncarnation: pid => `linux:${pid}`,
+							});
+						},
+						waitStepMs: 1,
+						readinessTimeoutMs: 100,
+					});
+				},
+			}),
+		);
 
 		const endpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 		const roots = daemonPaths(agentDir).roots;

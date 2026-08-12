@@ -61,7 +61,7 @@ const DELEGATE_META: DelegateMeta[] = [
  * `scripts/verify-gjc-skill-docs.ts` checks every skill reference against it,
  * so a skill can never advertise a verb the CLI does not ship.
  */
-export const SDK_SESSION_CLI_VERBS = ["list", "inspect", "send", "status", "tail", "elevate", "raw"] as const;
+export const SDK_SESSION_CLI_VERBS = ["list", "inspect", "send", "status", "tail", "raw"] as const;
 export type SdkSessionCliVerb = (typeof SDK_SESSION_CLI_VERBS)[number];
 
 export const SDK_SESSION_RAW_KINDS = ["control", "query", "global"] as const;
@@ -207,16 +207,16 @@ never prints. \`--agent-dir\` selects the broker state directory.
   endpoint discovery record.
 - \`gjc sdk session send <sessionId> --text <prompt>\` — ordered \`turn.prompt\`
   carrying a caller-chosen operation reference (ULID). \`--wait\` polls
-  \`turn.prompt_status\` until terminal or the wait window elapses; it never
-  cancels a running turn.
-- \`gjc sdk session status <sessionId> <opRef>\` — lossless \`turn.prompt_status\`
-  for a previously submitted operation reference.
+  \`turn.result\` with \`kind: "prompt"\` until terminal or the wait window elapses;
+  it never cancels a running turn.
+- \`gjc sdk session status <sessionId> <opRef>\` — lossless \`turn.result\` with
+  \`kind: "prompt"\` for a previously submitted operation reference.
+
 - \`gjc sdk session tail <sessionId>\` — retained transcript replay from the
   durable checkpoint followed by live event-ring frames. \`--strict\` fails
   closed on retention gaps, \`--until-idle\` exits at a terminal turn state,
   \`--all-events\` widens the emitted event kinds, and \`--cursor\` resumes from a
   saved checkpoint token that is re-minted per connection.
-- \`gjc sdk session elevate <sessionId> --kind <control|global> --op <operation> --json-input ... --confirm\` — creates an exact-digest grant request and, only on an attended TTY, submits a private 0600 operator directive consumed by the broker. The returned request id is passed to an allowlisted raw control with \`--elevation-request-id\`.
 
 ## Raw hatch
 
@@ -226,27 +226,19 @@ globals require \`--idempotency-key\`; destructive control operations accept
 \`--confirm\`. Endpoint-disclosure operations are refused by default and stay
 refused by this skill.
 
-## Lossless prompt statuses
+## Lossless prompt results
 
-\`turn.prompt_status\` reports \`accepted\`, \`in_flight\`, \`terminal_ok\`, or
-\`failed\`; only retained-record eviction yields \`unknown\`, which means
-uncertainty, never proof of non-execution. Never reuse an operation reference
-as a retry mechanism.
+\`turn.result\` with \`kind: "prompt"\` reports \`accepted\`, \`in_flight\`,
+\`terminal_ok\`, or \`failed\`; only retained-record eviction yields \`unknown\`,
+which means uncertainty, never proof of non-execution. \`turn.prompt_status\`
+remains a legacy prompt-only alias. Never reuse an operation reference as a retry
+mechanism.
 
 ## Checkpoint gaps
 
 \`tail\` reports a \`retention_gap\` with the missing sequence range and a
 \`resync\` checkpoint when retained history or the event ring dropped entries;
 \`--strict\` turns any gap into exit code 1.
-
-## Elevation behavior
-
-Elevation-gated operations are dispatched only behind broker-owned single-use
-grants whose digest binds the exact operation and input. \`elevate\` is the
-attended operator surface: it writes a private directive consumed inside the
-broker; there is no public \`elevation.answer\` operation. A crash between claim
-and dispatch is recorded truthfully as \`consumed\`/\`uncertain\` and requires a
-new grant. Default SDK scope stays grant-free.
 `;
 }
 
@@ -265,8 +257,7 @@ executable and no workflow skill is invoked.
 - \`docs/sdk.md\` — SDK overview: endpoint discovery, protocol, query and
   control surfaces, broker launch isolation, managed notification adapters.
 - \`docs/sdk-session-cli.md\` — the \`gjc sdk session\` command family: semantic
-  verbs, raw hatch, lossless statuses, broker authority, checkpoint gaps, and
-  elevation behavior.
+  verbs, raw hatch, lossless statuses, broker authority, and checkpoint gaps.
 - \`docs/sdk-embedding.md\` — embedding GJC in-process.
 - \`docs/sdk-app-guide.md\` — building applications on the SDK.
 

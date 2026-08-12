@@ -426,14 +426,13 @@ that points to @BotFather > Bot Settings > Threads Settings. Flat fallback is
 limited to outbound notifications and inline ask buttons; free-text replies and
 session commands require Threaded Mode/topic routing.
 
-### Third-party or older client lacks ask controls
+### Managed adapter lacks ask controls
 
-A custom client that omits ClientHello, or sends one without `ask_controls_v1`,
-will still receive ordinary empty-controls asks but receives
-`action_unavailable` for controlled asks after the short Hello grace or explicit
-non-capable negotiation. Upgrade it to send
-`{ "type": "hello", "protocolVersion": 3, "capabilities": ["ask_controls_v1"] }`
-on each WebSocket open; reconnecting starts a new negotiation.
+A custom client must not attach to a GJC session transport. Upgrade or configure
+the bundled managed Telegram adapter; `SessionRouter` performs its internal
+capability negotiation and rejects unsupported controlled asks without exposing
+the endpoint or credentials. Third-party controllers use Coordinator MCP or the
+SDK session CLI instead.
 
 ### Telegram 409 conflict
 

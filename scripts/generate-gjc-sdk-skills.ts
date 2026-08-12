@@ -163,37 +163,111 @@ function typeScriptTemplate(): string {
 import { createHash, randomBytes } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 
-const CORE_QUERIES = ["session.metadata", "context.get", "goal.list/get", "todo.list", "workflow.gates.list", "session.stats"] as const;
+// Trusted-local procedural policy only. The Broker and SessionRouter retain session lifecycle and attachment authority.
+
+const CORE_QUERIES = [
+	"session.metadata",
+	"context.get",
+	"goal.list/get",
+	"todo.list",
+	"workflow.gates.list",
+	"session.stats",
+] as const;
+
 const ALLOWED_CONTROLS: ReadonlySet<string> = new Set(${JSON.stringify(ALLOWED_CONTROLS)});
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 const ALLOWED_ARGUMENTS = new Set(["--repo", "--session-id", "--mode", "--operation", "--input"]);
 
-type Arguments = { repo: string; sessionId?: string; mode: "inspect" | "control"; operation?: string; input: Record<string, unknown> };
+type Arguments = {
+	repo: string;
+	sessionId: string;
+	mode: "inspect" | "control";
+	operation?: string;
+	input: Record<string, unknown>;
+};
 
 function parseArgs(argv: string[]): Arguments {
 	const values = new Map<string, string>();
 	for (let index = 0; index < argv.length; index++) {
 		const token = argv[index];
-		if (!ALLOWED_ARGUMENTS.has(token)) throw new Error("invalid_argument");
+		if (!ALLOWED_ARGUMENTS.has(token) || values.has(token)) throw new Error("invalid_argument");
 		const value = argv[++index];
 		if (!value) throw new Error("missing_argument_value");
 		values.set(token, value);
 	}
 	const repo = values.get("--repo");
+	const sessionId = values.get("--session-id");
 	if (!repo) throw new Error("missing_repo");
+	if (!sessionId) throw new Error("missing_session_id");
 	const mode = values.get("--mode") ?? "inspect";
 	if (mode !== "inspect" && mode !== "control") throw new Error("invalid_mode");
-	const rawInput = values.get("--input") ?? "{}";
-	const input: unknown = JSON.parse(rawInput);
-	if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("invalid_input");
-	return { repo, sessionId: values.get("--session-id"), mode, operation: values.get("--operation"), input: input as Record<string, unknown> };
+	let input: Record<string, unknown> = {};
+	const rawInput = values.get("--input");
+	if (rawInput) {
+		const parsed: unknown = JSON.parse(rawInput);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid_input");
+		input = parsed as Record<string, unknown>;
+	}
+	if (hasSecretField(input)) throw new Error("secret_input_forbidden");
+	return { repo, sessionId, mode, operation: values.get("--operation"), input };
+}
+
+function hasSecretField(value: unknown): boolean {
+	if (Array.isArray(value)) return value.some(hasSecretField);
+	if (!value || typeof value !== "object") return false;
+	return Object.entries(value as Record<string, unknown>).some(([key, nested]) => SECRET_FIELD.test(key) || hasSecretField(nested));
 }
 
 function redact(value: unknown): unknown {
-	if (typeof value === "string") return value;
 	if (Array.isArray(value)) return value.map(redact);
 	if (!value || typeof value !== "object") return value;
-	return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, SECRET_FIELD.test(key) ? "[REDACTED]" : redact(item)]));
+	return Object.fromEntries(
+		Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+			key,
+			SECRET_FIELD.test(key) ? "[REDACTED]" : redact(item),
+		]),
+	);
+}
+
+function parseCliJson(stdout: string): Record<string, unknown> {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(stdout);
+	} catch {
+		throw new Error("invalid_cli_response");
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid_cli_response");
+	return parsed as Record<string, unknown>;
+}
+
+async function runGjcSession(repo: string, arguments_: readonly string[]): Promise<Record<string, unknown>> {
+	const child = Bun.spawn(["gjc", "sdk", "session", ...arguments_], {
+		cwd: repo,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [exitCode, stdout] = await Promise.all([
+		child.exited,
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+	]);
+	if (exitCode !== 0) throw new Error("broker_request_failed");
+	return parseCliJson(stdout);
+}
+
+async function inspect(repo: string, sessionId: string): Promise<Record<string, unknown>> {
+	const snapshot: Record<string, unknown> = {};
+	for (const query of CORE_QUERIES) {
+		try {
+			const response = await runGjcSession(repo, ["raw", "query", sessionId, "--query", query]);
+			if (response.ok === false) throw new Error("query_unavailable");
+			snapshot[query] = { status: "confirmed", source: query, value: redact(response) };
+		} catch {
+			snapshot[query] = { status: "unavailable", source: query };
+		}
+	}
+	return snapshot;
 }
 
 async function requireApproval(sessionId: string, operation: string, input: Record<string, unknown>): Promise<void> {
@@ -215,19 +289,25 @@ async function raw(repo: string, args: string[]): Promise<unknown> {
 
 async function main(): Promise<void> {
 	const args = parseArgs(process.argv.slice(2));
-	if (!args.sessionId) throw new Error("session_id_required");
-	let result: unknown;
 	if (args.mode === "inspect") {
-		result = Object.fromEntries(await Promise.all(CORE_QUERIES.map(async query => {
-			try { return [query, { status: "confirmed", source: query, value: await raw(args.repo, ["query", args.sessionId!, "--query", query]) }]; }
-			catch { return [query, { status: "unavailable", source: query }]; }
-		})));
-	} else {
-		if (!args.operation || !ALLOWED_CONTROLS.has(args.operation)) throw new Error("operation_not_allowed");
-		if (args.operation === "workflow.gate_answer") args.input.expectedSessionId = args.sessionId;
-		await requireApproval(args.sessionId, args.operation, args.input);
-		result = await raw(args.repo, ["control", args.sessionId, "--op", args.operation, "--json-input", JSON.stringify(args.input), "--confirm"]);
+		const result = await inspect(args.repo, args.sessionId);
+		process.stdout.write(JSON.stringify(redact({ sessionId: args.sessionId, result }), null, 2) + "\\n");
+		return;
 	}
+	if (!args.operation || !ALLOWED_CONTROLS.has(args.operation)) throw new Error("operation_not_allowed");
+	const input = args.operation === "workflow.gate_answer" ? { ...args.input, expectedSessionId: args.sessionId } : args.input;
+	await requireApproval(args.sessionId, args.operation, input);
+	const result = await runGjcSession(args.repo, [
+		"raw",
+		"control",
+		args.sessionId,
+		"--op",
+		args.operation,
+		"--json-input",
+		JSON.stringify(input),
+		"--confirm",
+	]);
+	if (result.ok === false) throw new Error("control_failed");
 	process.stdout.write(JSON.stringify(redact({ sessionId: args.sessionId, result }), null, 2) + "\\n");
 }
 
@@ -240,21 +320,16 @@ function pythonTemplate(): string {
 
 from __future__ import annotations
 
-# Trusted-local procedural policy only; this template does not isolate a modified process from endpoint authority.
+# Trusted-local procedural policy only. The Broker and SessionRouter retain session lifecycle and attachment authority.
 
 import argparse
-import asyncio
-from dataclasses import asdict, is_dataclass
 import hashlib
 import json
-from pathlib import Path
 import re
 import secrets
+import subprocess
 import sys
 from typing import Any, NoReturn
-import warnings
-
-from gjc_sdk import Endpoint, SdkClient, read_session_endpoint, select_live_endpoint
 
 CORE_QUERIES = (
     "session.metadata",
@@ -274,61 +349,71 @@ class SafeArgumentParser(argparse.ArgumentParser):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = SafeArgumentParser(description="Trusted local direct GJC SDK template", allow_abbrev=False)
+    parser = SafeArgumentParser(description="Trusted local broker-bound GJC session template", allow_abbrev=False)
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--session-id")
+    parser.add_argument("--session-id", required=True)
     parser.add_argument("--mode", choices=("inspect", "control"), default="inspect")
     parser.add_argument("--operation")
     parser.add_argument("--input", default="{}")
     return parser.parse_args()
 
 
-def redact(value: Any, endpoint_token: str) -> Any:
-    if isinstance(value, str):
-        return value.replace(endpoint_token, "[REDACTED]")
-    if is_dataclass(value) and not isinstance(value, type):
-        return redact(asdict(value), endpoint_token)
+def has_secret_field(value: Any) -> bool:
     if isinstance(value, list):
-        return [redact(item, endpoint_token) for item in value]
+        return any(has_secret_field(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    return any(SECRET_FIELD.search(key) or has_secret_field(item) for key, item in value.items())
+
+
+def redact(value: Any) -> Any:
+    if isinstance(value, list):
+        return [redact(item) for item in value]
     if isinstance(value, dict):
         return {
-            key: "[REDACTED]" if SECRET_FIELD.search(key) else redact(item, endpoint_token)
+            key: "[REDACTED]" if SECRET_FIELD.search(key) else redact(item)
             for key, item in value.items()
         }
     return value
 
 
-async def inspect(client: SdkClient, endpoint_token: str) -> dict[str, Any]:
+def run_gjc_session(repo: str, arguments: list[str]) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            ["gjc", "sdk", "session", *arguments],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError("broker_request_failed") from None
+    if completed.returncode != 0:
+        raise ValueError("broker_request_failed")
+    try:
+        response: Any = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        raise ValueError("invalid_cli_response") from None
+    if not isinstance(response, dict):
+        raise ValueError("invalid_cli_response")
+    return response
+
+
+def inspect(repo: str, session_id: str) -> dict[str, Any]:
     snapshot: dict[str, Any] = {}
     for query in CORE_QUERIES:
         try:
-            response = await client.query(query, {})
-            if response.ok:
-                snapshot[query] = {"status": "confirmed", "source": query, "value": redact(response, endpoint_token)}
-            else:
-                snapshot[query] = {"status": "unavailable", "source": query}
+            response = run_gjc_session(repo, ["raw", "query", session_id, "--query", query])
+            if response.get("ok") is False:
+                raise ValueError("query_unavailable")
+            snapshot[query] = {"status": "confirmed", "source": query, "value": redact(response)}
         except Exception:
             snapshot[query] = {"status": "unavailable", "source": query}
     return snapshot
 
-def select_endpoint(repo: str, session_id: str | None) -> Endpoint:
-    directory = Path(repo) / ".gjc" / "state" / "sdk"
-    if directory.is_symlink() or not directory.is_dir():
-        raise ValueError("unsafe_discovery_directory")
-    paths = sorted(directory.glob("*.json"))
-    if any(path.is_symlink() or not path.is_file() for path in paths):
-        raise ValueError("unsafe_discovery_record")
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        endpoints = []
-        for path in paths:
-            endpoint = read_session_endpoint(repo, path.stem)
-            if endpoint is None or endpoint.session_id != path.stem:
-                raise ValueError("invalid_discovery_record")
-            endpoints.append(endpoint)
-        if caught or len({endpoint.session_id for endpoint in endpoints}) != len(endpoints):
-            raise ValueError("invalid_discovery_record")
-    return select_live_endpoint(endpoints, session_id)
 
 def require_approval(session_id: str, operation: str, operation_input: dict[str, Any]) -> None:
     payload = json.dumps(
@@ -344,46 +429,43 @@ def require_approval(session_id: str, operation: str, operation_input: dict[str,
         raise ValueError("human_approval_required")
 
 
-async def main() -> None:
+def main() -> None:
     args = parse_args()
     operation_input = json.loads(args.input)
     if not isinstance(operation_input, dict):
         raise ValueError("input must be an object")
-    endpoint = select_endpoint(args.repo, args.session_id)
+    if has_secret_field(operation_input):
+        raise ValueError("secret_input_forbidden")
+    if args.mode == "inspect":
+        result = inspect(args.repo, args.session_id)
+        print(json.dumps(redact({"sessionId": args.session_id, "result": result}), indent=2))
+        return
     operation = args.operation
-    if args.mode == "control":
-        if operation is None or operation not in ALLOWED_CONTROLS:
-            raise ValueError("operation_not_allowed")
-        if operation == "workflow.gate_answer":
-            operation_input["expectedSessionId"] = endpoint.session_id
-        require_approval(endpoint.session_id, operation, operation_input)
-        revalidated = select_endpoint(args.repo, endpoint.session_id)
-        if revalidated != endpoint:
-            raise ValueError("endpoint_changed")
-        endpoint = revalidated
-    client = await SdkClient.connect_ws(
+    if operation is None or operation not in ALLOWED_CONTROLS:
+        raise ValueError("operation_not_allowed")
+    if operation == "workflow.gate_answer":
+        operation_input = {**operation_input, "expectedSessionId": args.session_id}
+    require_approval(args.session_id, operation, operation_input)
+    result = run_gjc_session(
         args.repo,
-        endpoint.session_id,
-        token=endpoint.token,
-        url=endpoint.url,
+        [
+            "raw",
+            "control",
+            args.session_id,
+            "--op",
+            operation,
+            "--json-input",
+            json.dumps(operation_input, separators=(",", ":")),
+            "--confirm",
+        ],
     )
-    try:
-        result: object
-        if args.mode == "inspect":
-            result = await inspect(client, endpoint.token)
-        else:
-            assert operation is not None
-            response = await client.control(operation, operation_input)
-            if not response.ok:
-                raise RuntimeError("control_failed")
-            result = response
-        print(json.dumps(redact({"sessionId": endpoint.session_id, "result": result}, endpoint.token), indent=2))
-    finally:
-        await client.close()
+    if result.get("ok") is False:
+        raise ValueError("control_failed")
+    print(json.dumps(redact({"sessionId": args.session_id, "result": result}), indent=2))
 
 
 try:
-    asyncio.run(main())
+    main()
 except Exception:
     print("GJC SDK request failed safely.", file=sys.stderr)
     raise SystemExit(1)

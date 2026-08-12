@@ -4,6 +4,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
+import { scanRetainedTranscriptTail } from "../src/sdk/cli/session-cli";
+import { SessionManager } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 
@@ -23,6 +25,13 @@ function closeCaptureFd(fd: number): void {
 	}
 }
 
+function publicSessionArgs(args: string[]): string[] {
+	const action = args[0];
+	return action === "control" || action === "query" || action === "global"
+		? ["sdk", "session", "raw", ...args]
+		: ["sdk", "session", ...args];
+}
+
 async function runCli(repo: string, agentDir: string, args: string[]): Promise<CliResult> {
 	const captureDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-cli-capture-"));
 	const stdoutPath = path.join(captureDir, "stdout");
@@ -30,7 +39,7 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 	const stdoutFd = openSync(stdoutPath, "w");
 	const stderrFd = openSync(stderrPath, "w");
 	try {
-		const child = Bun.spawn([process.execPath, "run", cliEntrypoint, "daemon", "session", ...args], {
+		const child = Bun.spawn([process.execPath, "run", cliEntrypoint, ...publicSessionArgs(args)], {
 			cwd: repo,
 			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
 			stdout: stdoutFd,
@@ -53,18 +62,22 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 	}
 }
 
-describe("SDK daemon session CLI", () => {
+describe("SDK session CLI", () => {
 	let root: string;
 	let agentDir: string;
 	let stateRoot: string;
-	let endpointServer: ReturnType<typeof Bun.serve>;
+	let endpointServer: Bun.Server<undefined>;
 	let broker: Broker;
 	let receivedControl: Record<string, unknown> | undefined;
 	let endpointConnections = 0;
+	let promptStatuses = new Map<string, { status: string }>();
+	let replayEvents: Record<string, unknown>[] = [];
 
 	beforeEach(async () => {
 		endpointConnections = 0;
 		receivedControl = undefined;
+		promptStatuses = new Map();
+		replayEvents = [];
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-cli-"));
 		agentDir = path.join(root, "agent");
 		stateRoot = path.join(root, ".gjc", "state");
@@ -97,15 +110,66 @@ describe("SDK daemon session CLI", () => {
 				message(socket, message) {
 					const frame = JSON.parse(String(message)) as Record<string, unknown>;
 					if (frame.type === "event_replay") {
-						socket.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
-						return;
-					}
-					if (frame.type === "control_request") receivedControl = frame;
-					if (frame.type === "query_request" && frame.query === "session.metadata") {
 						socket.send(
-							JSON.stringify({ type: "query_response", id: frame.id, ok: true, result: { sessionId: "live" } }),
+							JSON.stringify({ type: "event_replay_result", id: frame.id, ok: true, events: replayEvents }),
 						);
 						return;
+					}
+					if (frame.type === "control_request") {
+						receivedControl = frame;
+						if (frame.operation === "turn.prompt") {
+							const input = frame.input as Record<string, unknown> | undefined;
+							const clientRef = typeof input?.clientRef === "string" ? input.clientRef : undefined;
+							socket.send(
+								JSON.stringify({
+									type: "control_response",
+									id: frame.id,
+									ok: true,
+									result: { accepted: true, ...(clientRef === undefined ? {} : { clientRef }) },
+								}),
+							);
+							return;
+						}
+					}
+					if (frame.type === "query_request") {
+						if (frame.query === "session.metadata") {
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									result: { sessionId: "live" },
+								}),
+							);
+							return;
+						}
+						if (frame.query === "turn.result") {
+							const input = frame.input as Record<string, unknown> | undefined;
+							const clientRef = typeof input?.clientRef === "string" ? input.clientRef : undefined;
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									result:
+										clientRef === undefined
+											? { status: "unknown" }
+											: (promptStatuses.get(clientRef) ?? { status: "unknown" }),
+								}),
+							);
+							return;
+						}
+						if (frame.query === "session.checkpoint") {
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									result: { checkpoint: { revision: 1, generation: 1, seq: 0 } },
+								}),
+							);
+							return;
+						}
 					}
 					socket.send(
 						JSON.stringify({
@@ -142,6 +206,50 @@ describe("SDK daemon session CLI", () => {
 		await endpointServer.stop(true);
 		await fs.rm(root, { recursive: true, force: true });
 	});
+
+	type OfflineSession = { id: string; path: string };
+
+	async function createStoppedSavedSession(): Promise<OfflineSession> {
+		const session = SessionManager.create(root, SessionManager.managedDestination(root, agentDir));
+		await session.ensureOnDisk();
+		const id = session.getSessionId();
+		const savedPath = session.getSessionFile();
+		if (!savedPath) throw new Error("Expected a retained managed session path.");
+		const registration = {
+			type: "host_registered" as const,
+			sessionId: id,
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 2,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(path.join(stateRoot, "sdk", "live.json"))).mtimeMs,
+		};
+		await broker.index.append(registration);
+		await broker.index.append({ ...registration, type: "host_unregistered" as const });
+		return { id, path: savedPath };
+	}
+
+	async function tailAfterBrokerSelectsOfflineSession(
+		mutate: (session: OfflineSession) => Promise<void>,
+		prepare?: (session: OfflineSession) => Promise<void>,
+	): Promise<{ result: CliResult; selections: number }> {
+		const session = await createStoppedSavedSession();
+		if (prepare) await prepare(session);
+		const originalHandleRequest = broker.handleRequest.bind(broker);
+		let selections = 0;
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			const response = await originalHandleRequest(operation, input, idempotencyKey);
+			if (operation === "session.list" && input.resolveSessionId === session.id && selections === 0) {
+				selections++;
+				await mutate(session);
+			}
+			return response;
+		};
+		try {
+			return { result: await runCli(root, agentDir, ["tail", session.id]), selections };
+		} finally {
+			broker.handleRequest = originalHandleRequest;
+		}
+	}
 
 	it("uses the broker and Router-owned session attachments without leaking credentials", async () => {
 		const list = await runCli(root, agentDir, ["list"]);
@@ -185,7 +293,7 @@ describe("SDK daemon session CLI", () => {
 		expect(refused.exitCode).toBe(1);
 		expect(JSON.parse(refused.stdout)).toMatchObject({ error: { code: "endpoint_credential_forbidden" } });
 
-		const disclosed = await runCli(root, agentDir, [
+		const credentialFlag = await runCli(root, agentDir, [
 			"global",
 			"--op",
 			"session.get_endpoint",
@@ -193,11 +301,183 @@ describe("SDK daemon session CLI", () => {
 			'{"sessionId":"live"}',
 			"--show-endpoint-credential",
 		]);
-		expect(disclosed.exitCode).not.toBe(0);
-		expect(`${disclosed.stdout}\n${disclosed.stderr}`).not.toContain("session-token");
+		expect(credentialFlag.exitCode).toBe(2);
+		expect(`${credentialFlag.stdout}\n${credentialFlag.stderr}`).not.toContain("session-token");
 	}, 60_000);
 
-	it("drains daemon CLI session.list continuation pages before returning sessions", async () => {
+	it("routes semantic inspect, send, status, and tail through Router-owned attachments", async () => {
+		const inspect = await runCli(root, agentDir, ["inspect", "live"]);
+		expect(inspect.exitCode, inspect.stderr).toBe(0);
+		expect(JSON.parse(inspect.stdout)).toMatchObject({
+			ok: true,
+			result: { source: "broker", session: { sessionId: "live" } },
+		});
+
+		const send = await runCli(root, agentDir, ["send", "live", "--text", "hello", "--op-ref", "semantic-ref"]);
+		expect(send.exitCode, `send stdout=${send.stdout}\nstderr=${send.stderr}`).toBe(0);
+		expect(JSON.parse(send.stdout)).toMatchObject({
+			ok: true,
+			result: {
+				operationRef: "semantic-ref",
+				status: "accepted",
+				receipt: { accepted: true, clientRef: "semantic-ref" },
+			},
+		});
+		expect(receivedControl).toMatchObject({
+			operation: "turn.prompt",
+			input: { clientRef: "semantic-ref", text: "hello" },
+		});
+
+		promptStatuses.set("semantic-ref", { status: "terminal_ok" });
+		const status = await runCli(root, agentDir, ["status", "live", "semantic-ref"]);
+		expect(status.exitCode, `status stdout=${status.stdout}\nstderr=${status.stderr}`).toBe(0);
+		expect(JSON.parse(status.stdout)).toMatchObject({
+			ok: true,
+			result: { operationRef: "semantic-ref", status: { status: "terminal_ok" }, summary: { completed: true } },
+		});
+
+		replayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 1,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live" },
+			},
+		];
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "1000"]);
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		expect(JSON.parse(tail.stdout)).toMatchObject({
+			ok: true,
+			result: { source: "session", terminal: true, items: [expect.objectContaining({ kind: "turn_end", seq: 1 })] },
+		});
+	}, 60_000);
+
+	it("bounds offline retained-transcript tail reads for a synthetic 300 MiB history", async () => {
+		const encoder = new TextEncoder();
+		const retainedTail = encoder.encode(
+			Array.from({ length: 240 }, (_, index) =>
+				JSON.stringify({ id: `tail-${index}`, payload: "x".repeat(32) }),
+			).join("\n") + "\n",
+		);
+		const prefixBytes = 300 * 1024 * 1024;
+		const size = prefixBytes + retainedTail.byteLength;
+		const reads: Array<{ start: number; end: number }> = [];
+		const entries = await scanRetainedTranscriptTail({
+			size,
+			readRange: async (start, end) => {
+				reads.push({ start, end });
+				const result = new Uint8Array(end - start);
+				const overlapStart = Math.max(start, prefixBytes);
+				const overlapEnd = Math.min(end, size);
+				if (overlapStart < overlapEnd)
+					result.set(
+						retainedTail.subarray(overlapStart - prefixBytes, overlapEnd - prefixBytes),
+						overlapStart - start,
+					);
+				return result;
+			},
+		});
+		expect(entries).toHaveLength(200);
+		expect(entries[0]).toMatchObject({ id: "tail-40" });
+		expect(entries.at(-1)).toMatchObject({ id: "tail-239" });
+		expect(reads.reduce((total, read) => total + read.end - read.start, 0)).toBeLessThan(1024 * 1024);
+		expect(reads.every(read => read.start >= prefixBytes - 1024 * 1024)).toBe(true);
+
+		const corrupt = encoder.encode('{"id":"valid"}\nnot-json\n');
+		await expect(
+			scanRetainedTranscriptTail({
+				size: corrupt.byteLength,
+				readRange: async (start, end) => corrupt.slice(start, end),
+			}),
+		).rejects.toThrow("Retained transcript history contains unparseable entries");
+	});
+
+	it("replays an unchanged Broker-identified offline transcript", async () => {
+		const session = await createStoppedSavedSession();
+		const result = await runCli(root, agentDir, ["tail", session.id]);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
+		expect(JSON.parse(result.stdout)).toMatchObject({
+			ok: true,
+			result: { source: "offline", session: { sessionId: session.id }, terminal: true },
+		});
+	}, 60_000);
+	it("fails closed when the Broker-selected offline transcript is rewritten in place with restored metadata", async () => {
+		const retainedTimestamp = 1_700_000_000;
+		const { result, selections } = await tailAfterBrokerSelectsOfflineSession(
+			async session => {
+				const before = await fs.stat(session.path, { bigint: true });
+				const original = await Bun.file(session.path).text();
+				const rewrittenId = `${session.id.slice(0, -1)}${session.id.endsWith("x") ? "y" : "x"}`;
+				const rewritten = original.replace(session.id, rewrittenId);
+				expect(rewritten).not.toBe(original);
+				await fs.writeFile(session.path, rewritten);
+				await fs.utimes(session.path, retainedTimestamp, retainedTimestamp);
+				const after = await fs.stat(session.path, { bigint: true });
+				expect(after.dev).toBe(before.dev);
+				expect(after.ino).toBe(before.ino);
+				expect(after.nlink).toBe(before.nlink);
+				expect(after.size).toBe(before.size);
+				expect(after.mtimeMs).toBe(before.mtimeMs);
+				expect(after.mtimeNs).toBe(before.mtimeNs);
+				expect(after.ctimeNs).not.toBe(before.ctimeNs);
+			},
+			async session => {
+				await fs.utimes(session.path, retainedTimestamp, retainedTimestamp);
+			},
+		);
+		expect(selections).toBe(1);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+		expect(JSON.parse(result.stdout)).toMatchObject({
+			ok: false,
+			error: { code: "retention_gap", details: { code: "retention_gap", reason: "changed" } },
+		});
+	}, 60_000);
+
+	it("fails closed when the Broker-selected offline transcript is replaced before open", async () => {
+		const { result, selections } = await tailAfterBrokerSelectsOfflineSession(async session => {
+			const replacement = path.join(root, "attacker-replacement.jsonl");
+			await fs.writeFile(replacement, '{"type":"session","id":"attacker"}\n{"marker":"attacker"}\n');
+			await fs.rename(replacement, session.path);
+		});
+		expect(selections).toBe(1);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+		expect(JSON.parse(result.stdout)).toMatchObject({
+			ok: false,
+			error: { code: "retention_gap", details: { code: "retention_gap", reason: "changed" } },
+		});
+		expect(result.stdout).not.toContain("attacker");
+	}, 60_000);
+
+	it("rejects a symlink substituted for the Broker-selected offline transcript", async () => {
+		if (process.platform === "win32") return;
+		const { result, selections } = await tailAfterBrokerSelectsOfflineSession(async session => {
+			const target = path.join(root, "attacker-symlink-target.jsonl");
+			await fs.writeFile(target, '{"type":"session","id":"attacker"}\n{"marker":"attacker"}\n');
+			await fs.unlink(session.path);
+			await fs.symlink(target, session.path);
+		});
+		expect(selections).toBe(1);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+		expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "retention_gap" } });
+		expect(result.stdout).not.toContain("attacker");
+	}, 60_000);
+
+	it("rejects a FIFO substituted for the Broker-selected offline transcript without blocking", async () => {
+		if (process.platform === "win32") return;
+		const startedAt = Date.now();
+		const { result, selections } = await tailAfterBrokerSelectsOfflineSession(async session => {
+			await fs.unlink(session.path);
+			const fifo = Bun.spawn(["mkfifo", session.path], { stdout: "ignore", stderr: "ignore" });
+			expect(await fifo.exited).toBe(0);
+		});
+		expect(selections).toBe(1);
+		expect(Date.now() - startedAt).toBeLessThan(10_000);
+		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+		expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "retention_gap" } });
+	}, 60_000);
+
+	it("drains SDK session CLI session.list continuation pages before returning sessions", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		const requests: Array<Record<string, unknown>> = [];
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
@@ -219,7 +499,7 @@ describe("SDK daemon session CLI", () => {
 		expect(requests).toEqual([{}, { cursor: "page-2" }]);
 	}, 60_000);
 
-	it("rejects a failed daemon CLI session.list continuation without returning page one", async () => {
+	it("rejects a failed SDK session CLI session.list continuation without returning page one", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		const requests: Array<Record<string, unknown>> = [];
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
@@ -240,7 +520,7 @@ describe("SDK daemon session CLI", () => {
 		expect(requests).toEqual([{}, { cursor: "page-2" }]);
 	}, 60_000);
 
-	it("rejects repeated daemon CLI session.list cursors without partial output", async () => {
+	it("rejects repeated SDK session CLI session.list cursors without partial output", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		const requests: Array<Record<string, unknown>> = [];
 		broker.handleRequest = async (operation, input, idempotencyKey) => {
@@ -266,7 +546,7 @@ describe("SDK daemon session CLI", () => {
 		expect(requests).toEqual([{}, { cursor: "repeat" }]);
 	}, 60_000);
 
-	it("rejects malformed daemon CLI session.list continuation pages without partial output", async () => {
+	it("rejects malformed SDK session CLI session.list continuation pages without partial output", async () => {
 		const originalHandleRequest = broker.handleRequest.bind(broker);
 		const requests: Array<Record<string, unknown>> = [];
 		broker.handleRequest = async (operation, input, idempotencyKey) => {

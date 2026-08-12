@@ -420,6 +420,20 @@ describe("turn.result query handler and retained aliases", () => {
 		expect(response).toMatchObject({ ok: true, result: { kind: "prompt", status: "in_flight" } });
 		expect(seen).toEqual([{ kind: "prompt", commandId: "c1", turnId: "t1" }]);
 	});
+	it("delegates the skill alias with an injected skill kind", async () => {
+		const seen: unknown[] = [];
+		const h = handlers(selector => {
+			seen.push(selector);
+			return { kind: "skill", status: "in_flight", commandId: "c1", turnId: "t1", acceptedAt: 1, startedAt: 2 };
+		});
+		const response = await h.dispatch({
+			query: "skill.invoke_status",
+			input: { commandId: "c1", turnId: "t1" },
+			connectionId: "c",
+		});
+		expect(response).toMatchObject({ ok: true, result: { kind: "skill", status: "in_flight" } });
+		expect(seen).toEqual([{ kind: "skill", commandId: "c1", turnId: "t1" }]);
+	});
 
 	it("requires kind on the canonical Q26 query", async () => {
 		const seen: unknown[] = [];
@@ -500,7 +514,7 @@ describe("turn.result query handler and retained aliases", () => {
 			cursor: "any-cursor",
 			connectionId: "c",
 		});
-		expect(response).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
+		expect(response).toMatchObject({ ok: false, error: { code: "invalid_request" } });
 	});
 
 	it("gates on installedQueries", async () => {

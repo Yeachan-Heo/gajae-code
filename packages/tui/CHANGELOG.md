@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Apple Terminal.app now retains its default keyboard mode when it does not support the Kitty keyboard protocol, avoiding the modifyOtherKeys fallback that breaks Korean/Hangul IME composition.
+
 ## [0.13.1] - 2026-08-11
 
 ### Added

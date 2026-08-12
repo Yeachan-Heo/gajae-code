@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ServerWebSocket } from "bun";
 import {
 	BUNDLE_FORMAT_VERSION,
 	BUNDLE_MANIFEST_NAME,
@@ -17,11 +16,30 @@ import {
 
 const repoRoot = path.join(import.meta.dir, "..");
 const roots: string[] = [];
-const servers: Bun.Server<undefined>[] = [];
+
+const CORE_QUERIES = [
+	"session.metadata",
+	"context.get",
+	"goal.list/get",
+	"todo.list",
+	"workflow.gates.list",
+	"session.stats",
+] as const;
+
+type CliCall = {
+	args: string[];
+	cwd: string;
+};
+
+type CliFixture = {
+	repo: string;
+	binDir: string;
+	callsPath: string;
+	secret: string;
+};
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
-	for (const server of servers.splice(0)) server.stop(true);
 });
 
 async function materialize(): Promise<{ files: Map<string, string>; root: string }> {
@@ -36,59 +54,58 @@ async function materialize(): Promise<{ files: Map<string, string>; root: string
 	return { files, root };
 }
 
-async function endpointRepo(url: string, token: string): Promise<string> {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-template-test-"));
+async function cliFixture(): Promise<CliFixture> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-template-cli-test-"));
 	roots.push(root);
-	const directory = path.join(root, ".gjc", "state", "sdk");
-	await fs.mkdir(directory, { recursive: true });
+	const repo = path.join(root, "repo");
+	const binDir = path.join(root, "bin");
+	const callsPath = path.join(root, "calls.json");
+	const secret = "template-cli-secret";
+	await fs.mkdir(repo, { recursive: true });
+	await fs.mkdir(binDir, { recursive: true });
+	const executable = path.join(binDir, "gjc");
 	await Bun.write(
-		path.join(directory, "session-1.json"),
-		JSON.stringify({ version: 1, sessionId: "session-1", url, token, pid: process.pid, stale: false }),
+		executable,
+		`#!/usr/bin/env bun
+const callsPath = Bun.env.GJC_TEMPLATE_CALLS;
+const secret = Bun.env.GJC_TEMPLATE_SECRET;
+if (!callsPath || !secret) process.exit(2);
+const calls = (await Bun.file(callsPath).exists()) ? await Bun.file(callsPath).json() : [];
+if (!Array.isArray(calls)) process.exit(2);
+const args = process.argv.slice(2);
+calls.push({ args, cwd: process.cwd() });
+await Bun.write(callsPath, JSON.stringify(calls));
+const queryIndex = args.indexOf("--query");
+const query = queryIndex === -1 ? undefined : args[queryIndex + 1];
+if (query === "session.stats") {
+	process.stderr.write("private=" + secret + "\\n");
+	process.exitCode = 1;
+} else {
+	process.stdout.write(JSON.stringify({ ok: true, result: { query: query ?? "control", token: secret } }) + "\\n");
+}
+`,
 	);
-	return root;
+	await fs.chmod(executable, 0o755);
+	return { repo, binDir, callsPath, secret };
 }
 
-function startSdkServer(frames: Array<Record<string, unknown>>): { url: string; token: string } {
-	const token = "template-test-secret";
-	const server = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
-		fetch(request) {
-			if (new URL(request.url).searchParams.get("token") !== token) return new Response("Unauthorized", { status: 401 });
-			if (!server.upgrade(request, { data: undefined })) return new Response("Upgrade failed", { status: 400 });
-		},
-		websocket: {
-			open(socket: ServerWebSocket<undefined>) {
-				socket.send(JSON.stringify({ type: "hello", connectionId: "template-test" }));
-			},
-			message(socket: ServerWebSocket<undefined>, raw: string | Buffer) {
-				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
-				frames.push(frame);
-				if (frame.type === "query_request") {
-					const failed = frame.query === "session.stats";
-					socket.send(
-						JSON.stringify(
-							failed
-								? { type: "query_response", id: frame.id, ok: false, error: { code: "unavailable", message: `failed-${token}` } }
-								: { type: "query_response", id: frame.id, ok: true, result: { query: frame.query, data: `prefix-${token}-suffix` } },
-						),
-					);
-				}
-				if (frame.type === "control_request")
-					socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result: { accepted: true } }));
-			},
-		},
-	});
-	servers.push(server);
-	return { url: `ws://127.0.0.1:${server.port}`, token };
+async function cliCalls(fixture: CliFixture): Promise<CliCall[]> {
+	if (!(await Bun.file(fixture.callsPath).exists())) return [];
+	return (await Bun.file(fixture.callsPath).json()) as CliCall[];
 }
 
 async function runTypeScriptTemplate(
+	fixture: CliFixture,
 	args: string[],
 	approval: "none" | "deny" | "accept" | { reply: string } = "none",
-	onChallenge?: () => void | Promise<void>,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = Bun.spawn(["bun", path.join(repoRoot, "sdk-skills", "gjc-sdk-author", "templates", "direct-sdk.ts"), ...args], {
+		env: {
+			...process.env,
+			PATH: `${fixture.binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+			GJC_TEMPLATE_CALLS: fixture.callsPath,
+			GJC_TEMPLATE_SECRET: fixture.secret,
+		},
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -110,7 +127,6 @@ async function runTypeScriptTemplate(
 			if (approval === "accept" && !answered) {
 				const challenge = stderr.match(/Approval required: (APPROVE [^\n]+)/)?.[1];
 				if (challenge) {
-					await onChallenge?.();
 					child.stdin.write(`${challenge}\n`);
 					child.stdin.end();
 					answered = true;
@@ -198,7 +214,10 @@ describe("generated external GJC SDK skills", () => {
 			validateBundleManifest(JSON.stringify({ bundle: "gjc-sdk-skills", formatVersion: 999, files: contentFiles }), contentFiles),
 		).toContain("unsupported");
 		expect(
-			validateBundleManifest(JSON.stringify({ bundle: "gjc-sdk-skills", formatVersion: BUNDLE_FORMAT_VERSION, files: ["gjc-sdk-bash/SKILL.md"] }), contentFiles),
+			validateBundleManifest(
+				JSON.stringify({ bundle: "gjc-sdk-skills", formatVersion: BUNDLE_FORMAT_VERSION, files: ["gjc-sdk-bash/SKILL.md"] }),
+				contentFiles,
+			),
 		).toContain("file list does not match");
 		expect(
 			validateBundleManifest(JSON.stringify({ bundle: "other-bundle", formatVersion: BUNDLE_FORMAT_VERSION, files: contentFiles }), contentFiles),
@@ -217,14 +236,11 @@ describe("generated external GJC SDK skills", () => {
 		expect(await validateInstalledBundle(installed.root)).toBeNull();
 		expect(await checkSdkSkillFiles(installed.files, installed.root, false)).toBe(0);
 
-		// A legacy unversioned install (the original five-file layout) must be
-		// rejected with a migration hint instead of being read ambiguously.
 		const legacy = await materialize();
 		await fs.rm(path.join(legacy.root, BUNDLE_MANIFEST_NAME));
 		expect(await validateInstalledBundle(legacy.root)).toContain("regenerate with `bun run generate-sdk-skills`");
 		expect(await checkSdkSkillFiles(legacy.files, legacy.root, false)).toBe(1);
 
-		// A future incompatible layout must fail closed on the version field.
 		const future = await materialize();
 		await Bun.write(
 			path.join(future.root, BUNDLE_MANIFEST_NAME),
@@ -233,12 +249,9 @@ describe("generated external GJC SDK skills", () => {
 		expect(await validateInstalledBundle(future.root)).toContain("unsupported");
 		expect(await checkSdkSkillFiles(future.files, future.root, false)).toBe(1);
 
-		// Regeneration upgrades an installed bundle in place to the versioned format.
 		const upgrade = await materialize();
 		await fs.rm(path.join(upgrade.root, BUNDLE_MANIFEST_NAME));
-		for (const [rel, content] of files) {
-			await Bun.write(path.join(upgrade.root, rel), content);
-		}
+		for (const [rel, content] of files) await Bun.write(path.join(upgrade.root, rel), content);
 		expect(await validateInstalledBundle(upgrade.root)).toBeNull();
 	});
 
@@ -308,10 +321,13 @@ describe("generated external GJC SDK skills", () => {
 		expect(await checkSdkSkillFiles(unexpected.files, unexpected.root, false)).toBe(1);
 	});
 
-	it("keeps direct-client templates fail-closed and credential-safe", () => {
+	it("keeps broker-bound templates and guidance fail-closed and outside endpoint authority", () => {
 		const files = renderSdkSkillFiles();
 		const typescript = files.get("gjc-sdk-author/templates/direct-sdk.ts") ?? "";
 		const python = files.get("gjc-sdk-author/templates/direct-sdk.py") ?? "";
+		const discover = files.get("gjc-sdk-discover/SKILL.md") ?? "";
+		const operate = files.get("gjc-sdk-operate/SKILL.md") ?? "";
+		const author = files.get("gjc-sdk-author/SKILL.md") ?? "";
 		for (const source of [typescript, python]) {
 			expect(source).toContain("human_approval_required");
 			expect(source).toContain("[REDACTED]");
@@ -319,71 +335,152 @@ describe("generated external GJC SDK skills", () => {
 			expect(source).toContain("Type the exact challenge");
 			expect(source).not.toContain("--approval");
 			expect(source).not.toContain('"--token"');
+			expect(source).not.toContain(".gjc/state/sdk");
+			expect(source).not.toContain("listSdkSessionEndpoints");
+			expect(source).not.toContain("read_session_endpoint");
+			expect(source).not.toContain("select_live_endpoint");
+			expect(source).not.toContain("SdkClient");
+			expect(source).not.toContain("connect_ws");
+			expect(source).not.toContain("WebSocket");
 			expect(source).not.toContain("mcp-serve");
 			expect(source).not.toContain("coordinator-mcp");
 		}
+		expect(typescript).toContain('Bun.spawn(["gjc", "sdk", "session"');
+		expect(python).toContain('["gjc", "sdk", "session", *arguments]');
 		expect(typescript).toContain("ALLOWED_CONTROLS.has");
 		expect(python).toContain("operation not in ALLOWED_CONTROLS");
-		// the Python approval challenge must stay off stdout so a successful
-		// control's stdout parses directly as JSON
 		expect(python).toContain("file=sys.stderr");
 		expect(python).toContain("sys.stdin.readline()");
+		expect(discover).toContain("gjc sdk session list");
+		expect(operate).toContain("gjc sdk session raw");
+		expect(author).toContain("gjc sdk session");
+		for (const source of [discover, operate, author]) {
+			expect(source).not.toContain("Read the local SDK discovery records");
+			expect(source).not.toContain("listSdkSessionEndpoints");
+			expect(source).not.toContain("read_session_endpoint");
+			expect(source).not.toContain("select_live_endpoint");
+			expect(source).not.toContain("SdkClient.connect");
+			expect(source).not.toContain("connect_ws");
+		}
 	});
 
-	it("routes TypeScript inspection through the broker raw CLI without endpoint credentials", () => {
-		const typescript = renderSdkSkillFiles().get("gjc-sdk-author/templates/direct-sdk.ts") ?? "";
-		expect(typescript).toContain('["gjc", "sdk", "session", "raw"');
-		expect(typescript).toContain('["query", args.sessionId!, "--query", query]');
-		expect(typescript).not.toContain("listSdkSessionEndpoints");
-		expect(typescript).not.toContain("SdkClient.connect");
-		expect(typescript).not.toContain("endpoint.token");
+	it("executes the TypeScript inspection recipe through the broker-bound CLI without credentials", async () => {
+		const fixture = await cliFixture();
+		const result = await runTypeScriptTemplate(fixture, [
+			"--repo",
+			fixture.repo,
+			"--session-id",
+			"session-1",
+			"--mode",
+			"inspect",
+		]);
+		expect(result.exitCode, result.stderr).toBe(0);
+		const calls = await cliCalls(fixture);
+		expect(calls).toHaveLength(CORE_QUERIES.length);
+		expect(calls.map(call => call.args)).toEqual(
+			CORE_QUERIES.map(query => ["sdk", "session", "raw", "query", "session-1", "--query", query]),
+		);
+		expect(calls.every(call => call.cwd === fixture.repo)).toBe(true);
+		expect(result.stdout).toContain('"status": "confirmed"');
+		expect(result.stdout).toContain('"status": "unavailable"');
+		expect(result.stdout).toContain("[REDACTED]");
+		expect(result.stdout + result.stderr).not.toContain(fixture.secret);
 	});
 
-	it("requires exact approval before a broker-bound control dispatch", () => {
-		const typescript = renderSdkSkillFiles().get("gjc-sdk-author/templates/direct-sdk.ts") ?? "";
-		expect(typescript).toContain("await requireApproval(args.sessionId, args.operation, args.input)");
-		expect(typescript).toContain('["control", args.sessionId, "--op", args.operation, "--json-input", JSON.stringify(args.input), "--confirm"]');
-		expect(typescript).toContain("human_approval_required");
+	it("sends no control until approval matches the exact operation, session, and input", async () => {
+		const fixture = await cliFixture();
+		const args = [
+			"--repo",
+			fixture.repo,
+			"--session-id",
+			"session-1",
+			"--mode",
+			"control",
+			"--operation",
+			"turn.prompt",
+			"--input",
+			'{"prompt":"hello"}',
+		];
+		const denied = await runTypeScriptTemplate(fixture, args, "deny");
+		expect(denied.exitCode).toBe(1);
+		expect(await cliCalls(fixture)).toEqual([]);
+		expect(denied.stderr).not.toContain(fixture.secret);
+
+		const approved = await runTypeScriptTemplate(fixture, args, "accept");
+		expect(approved.exitCode, approved.stderr).toBe(0);
+		const calls = await cliCalls(fixture);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.args).toEqual([
+			"sdk",
+			"session",
+			"raw",
+			"control",
+			"session-1",
+			"--op",
+			"turn.prompt",
+			"--json-input",
+			'{"prompt":"hello"}',
+			"--confirm",
+		]);
+		expect(approved.stdout + approved.stderr).not.toContain(fixture.secret);
+		const acceptedChallenge = approved.stderr.match(/Approval required: (APPROVE [^\n]+)/)?.[1];
+		expect(acceptedChallenge).toBeDefined();
+		const replayed = await runTypeScriptTemplate(fixture, args, { reply: acceptedChallenge! });
+		expect(replayed.exitCode).toBe(1);
+		expect(await cliCalls(fixture)).toHaveLength(1);
+	}, 15_000);
+
+	it("requires an explicit session ID and rejects secret-shaped input before invoking the CLI", async () => {
+		const fixture = await cliFixture();
+		const stateDirectory = path.join(fixture.repo, ".gjc", "state", "sdk");
+		await fs.mkdir(stateDirectory, { recursive: true });
+		await Bun.write(path.join(stateDirectory, "session-1.json"), '{"token":"must-not-read"}\n');
+
+		const missingSession = await runTypeScriptTemplate(fixture, ["--repo", fixture.repo, "--mode", "inspect"]);
+		expect(missingSession.exitCode).toBe(1);
+		const secretInput = await runTypeScriptTemplate(fixture, [
+			"--repo",
+			fixture.repo,
+			"--session-id",
+			"session-1",
+			"--mode",
+			"control",
+			"--operation",
+			"turn.prompt",
+			"--input",
+			'{"token":"must-not-print"}',
+		]);
+		expect(secretInput.exitCode).toBe(1);
+		expect(secretInput.stdout + secretInput.stderr).not.toContain("must-not-print");
+		expect(await cliCalls(fixture)).toEqual([]);
 	});
 
-	it("rejects unsupported arguments before discovery", async () => {
-		const result = await runTypeScriptTemplate(["--repo", "/missing", "--token", "must-not-print"]);
-		expect(result.exitCode).toBe(1);
-		expect(result.stdout + result.stderr).not.toContain("must-not-print");
-	});
-
-	it("does not inspect endpoint records outside the broker", () => {
-		const typescript = renderSdkSkillFiles().get("gjc-sdk-author/templates/direct-sdk.ts") ?? "";
-		expect(typescript).not.toContain(".gjc");
-		expect(typescript).not.toContain("readdir");
-		expect(typescript).not.toContain("readFile");
-	});
-
-	it("sends no control when discovery changes during approval", async () => {
-		const frames: Array<Record<string, unknown>> = [];
-		const sdk = startSdkServer(frames);
-		const repo = await endpointRepo(sdk.url, sdk.token);
-		const endpointPath = path.join(repo, ".gjc", "state", "sdk", "session-1.json");
+	it("binds workflow gate answers to the explicit session before broker dispatch", async () => {
+		const fixture = await cliFixture();
 		const result = await runTypeScriptTemplate(
+			fixture,
 			[
 				"--repo",
-				repo,
+				fixture.repo,
 				"--session-id",
 				"session-1",
 				"--mode",
 				"control",
 				"--operation",
-				"turn.prompt",
+				"workflow.gate_answer",
 				"--input",
-				'{"prompt":"hello"}',
+				'{"id":"gate-1","response":"approve"}',
 			],
 			"accept",
-			async () => {
-				const record = JSON.parse(await Bun.file(endpointPath).text()) as Record<string, unknown>;
-				await Bun.write(endpointPath, JSON.stringify({ ...record, token: "replacement-token" }));
-			},
 		);
-		expect(result.exitCode).toBe(1);
-		expect(frames).toEqual([]);
+		expect(result.exitCode, result.stderr).toBe(0);
+		const calls = await cliCalls(fixture);
+		const inputIndex = calls[0]?.args.indexOf("--json-input") ?? -1;
+		expect(inputIndex).toBeGreaterThanOrEqual(0);
+		expect(JSON.parse(calls[0]?.args[inputIndex + 1] ?? "{}")).toEqual({
+			id: "gate-1",
+			response: "approve",
+			expectedSessionId: "session-1",
+		});
 	});
 });

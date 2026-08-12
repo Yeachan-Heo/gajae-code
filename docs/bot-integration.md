@@ -1,6 +1,6 @@
 # External controller integration guide
 
-This guide is for authors of bots and orchestrators that want to drive Gajae-Code (`gjc`) without scraping terminal scrollback. Hermes, OpenClaw, GitHub bots, chatops bots, and custom schedulers are examples of external controllers; none of them need bespoke GJC behavior if they use Coordinator MCP, the broker-backed daemon session CLI, or a managed SDK-core adapter.
+This guide is for authors of bots and orchestrators that want to drive Gajae-Code (`gjc`) without scraping terminal scrollback. Hermes, OpenClaw, GitHub bots, chatops bots, and custom schedulers are examples of external controllers; none of them need bespoke GJC behavior if they use Coordinator MCP, the broker-bound SDK session CLI, or a managed SDK-core adapter.
 
 GJC is an external runner. Your controller owns queueing, identity, policy, and credentials; GJC owns the coding-agent session, workflows, tools, artifacts, and evidence inside the selected repository or worktree.
 
@@ -12,8 +12,7 @@ Use the smallest surface that fits your bot:
 | --- | --- | --- | --- |
 | Coordinator MCP | Any external controller that can discover SDK-backed sessions, send turns, answer questions, and read artifacts. | `gjc mcp-serve coordinator` | Preferred orchestration surface. `gjc mcp-serve hermes` is a compatibility alias, not a separate contract. |
 | Setup adapter | Rendering a portable MCP config and operator instructions for a controller profile. | `gjc setup hermes --root /path/to/repo` | Compatibility-oriented config renderer; does not call an LLM or validate provider credentials. |
-| SDK WebSocket | A controller that drives one live session directly: state queries, events, actions, and workflow-gate replies. | Connect to the session's loopback SDK endpoint (see [`docs/sdk.md`](./sdk.md)) | The canonical machine interface. `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. |
-| SDK session CLI | Broker-bound semantic session operations and explicit raw SDK dispatch with JSON output. | `gjc sdk session list|inspect|send|status|tail|elevate` or `gjc sdk session raw control|query|global` | Resolves authority through the broker and never renders endpoint credentials by default. |
+| SDK session CLI | Broker-bound semantic session operations and explicit raw SDK dispatch with JSON output. | `gjc sdk session list|inspect|send|status|tail` or `gjc sdk session raw control|query|global` | Resolves authority through the broker and never exposes endpoint credentials. |
 
 ## Recommended architecture
 
@@ -325,16 +324,13 @@ Use the Telegram, Discord, or Slack managed adapter for a single live session. U
 The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
 
 Key SDK workflow-gate facts:
-- The discovery file carries the endpoint URL and per-session token; a wrong
-  token is rejected at the WebSocket handshake. `server_hello` marks a
-  connection ready, and `gjc sdk session raw control|query|global` uses the same
-  protocol for shell scripts.
+- `gjc sdk session raw control|query|global` resolves through `SessionRouter` or the lifecycle facade and emits credential-free JSON. Scripts never receive the underlying transport credentials.
 
 - `action_needed.id` is an opaque, transient presentation ID. It is the only
   generic `reply.id` authority. Do not equate it with a durable workflow gate.
-- A durable workflow-gate presentation optionally includes additive SDK v3 `workflowGateId`. It correlates to Q12's durable `gate_id` only within `(sessionId, workflowGateId)` on the current authenticated endpoint; it never authorizes generic reply.
+- A durable workflow-gate presentation optionally includes additive SDK v3 `workflowGateId`. It correlates to Q12's durable `gate_id` only within `(sessionId, workflowGateId)` on the current Router-issued attachment; it never authorizes generic reply.
 - `workflow.gate_answer` and `workflow.plan_approve` use the durable `gate_id`. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 clients continue to work, but new clients must send it. Mandatory enforcement or removal may occur no earlier than SDK v4 and only after at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before resolution.
-- One session has one active answerable presentation. Additional Q12 gates stay queued while Q12 exposes durable pending records and additive SDK v3 diagnostics. A same-server reconnect replays the active action ID; a process restart quarantines old records and a rebuilt workflow remints fresh gate and presentation IDs.
+- One session has one active answerable presentation. Additional Q12 gates stay queued while Q12 exposes durable pending records and additive SDK v3 diagnostics. Router replay retains the active action ID; a process restart quarantines old records and a rebuilt workflow remints fresh gate and presentation IDs.
 - A native generic reply claim wins a direct-control race once acquired; a direct control wins only by atomically retiring the exact unclaimed active presentation. Terminal, stale, and reissued action IDs never regain authority. Do not use text, option/order, durable-ID, or history heuristics, and fail closed rather than guess when identity is unsafe or ambiguous. Do not persist private route/claim/receipt/epoch/generation state.
 - Rust/N-API compatibility is additive: legacy `ActionNeeded`, `register_ask`,
   and `registerAsk` stay uncorrelated; explicit workflow reader/registration
@@ -342,10 +338,11 @@ Key SDK workflow-gate facts:
 - The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
 
 The prior documented invariant `action_needed.id == gate_id` is incorrect for
-v3 and must not be implemented by controllers. See [`docs/sdk.md`](./sdk.md)
-for exact wire examples, Q12 tags/lifecycle diagnostics, and control payloads.
-
-`--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed along with their JSONL/HTTPS protocols and the former Python RPC client. There are no compatibility shims; migrate controllers to Coordinator MCP, the broker-backed daemon session CLI, or a managed Telegram, Discord, or Slack adapter.
+v3 and must not be implemented by controllers. See [the SDK session CLI guide](./sdk-session-cli.md)
+for broker-bound controls and [the SDK guide](./sdk.md) for Router and lifecycle
+ownership. Retired RPC and bridge transports have no compatibility shim; migrate
+controllers to Coordinator MCP, `gjc sdk session`, or a managed Telegram,
+Discord, or Slack adapter.
 
 ## Error handling playbook
 
@@ -353,11 +350,11 @@ for exact wire examples, Q12 tags/lifecycle diagnostics, and control payloads.
 | --- | --- |
 | `coordinator_mutation_class_disabled:*` | Re-render setup with the required mutation class, or keep the bot in read-only mode. |
 | `coordinator_mutation_call_not_allowed:*` | Add `allow_mutation: true` only after policy approval for that specific call. |
-| `unknown_session` | Re-list sessions; start a new managed session or register a session after its SDK endpoint is discoverable. |
+| `unknown_session` | Re-list sessions through the Broker, then start a new managed session or report a recoverable blocker. |
 | `active_turn_exists` | Poll the active turn, send with `queue: true`, or use `force: true` only when supersession is intentional. |
 | `timeout` from `await_turn` | Treat as non-terminal. Poll again or inspect `read_status`; do not mark failure solely from a bounded wait timeout. |
 | Coordinator cancellation | Use `gjc_coordinator_report_status` with `status: "cancelled"` for an intentionally stopped turn, or send replacement work with `force: true` when supersession is policy-approved. This is coordinator state, not process control. |
-| Stale session state | Check `read_status.session_state` and SDK endpoint discovery. Register a new discoverable session or report the turn failed with a recoverable blocker. |
+| Stale session state | Check `read_status.session_state` and broker-backed session status. Report a recoverable blocker rather than inspecting endpoint state. |
 | Provider/auth failure | Capture the model/provider error in `report_status` with `status: "failed"`; do not retry forever without a policy budget. |
 | Artifact denied | Keep the artifact inside allowlisted roots and avoid symlink escapes. |
 | Malformed or invalid question answer | Re-read the question/gate schema and submit a value matching the advertised shape. |

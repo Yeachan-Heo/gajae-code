@@ -887,4 +887,99 @@ describe("SDK session index", () => {
 		});
 		expect(index.listSessions().sessions[0]).toMatchObject({ terminalUncertain: true, live: false });
 	});
+	it("fences unresolved state roots, then projects either surviving root as authority", async () => {
+		for (const terminateHigherGeneration of [false, true]) {
+			const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-ambiguous-"));
+			const index = await new SessionIndex(dir).open();
+			const sessionId = `ambiguous-${terminateHigherGeneration ? "higher" : "lower"}`;
+			const alternate = await index.append({
+				...event(sessionId),
+				locator: { repo: "alternate", stateRoot: "alternate-state" },
+				endpointGeneration: 1,
+			});
+			const current = await index.append({
+				...event(sessionId),
+				locator: { repo: "current", stateRoot: "current-state" },
+				endpointGeneration: 2,
+			});
+			const terminated = terminateHigherGeneration ? current : alternate;
+			const survivor = terminateHigherGeneration ? alternate : current;
+
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: current.endpointGeneration,
+					ambiguous: true,
+					live: false,
+				}),
+			]);
+			const ambiguousSeq = index.indexSeq;
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			expect(index.indexSeq).toBe(ambiguousSeq);
+
+			await index.append({
+				type: "host_unregistered",
+				sessionId: terminated.sessionId,
+				locator: terminated.locator,
+				endpointGeneration: terminated.endpointGeneration,
+				pid: terminated.pid,
+				...(terminated.processIncarnation === undefined
+					? {}
+					: { processIncarnation: terminated.processIncarnation }),
+				...(terminated.hostIncarnation === undefined ? {} : { hostIncarnation: terminated.hostIncarnation }),
+			});
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: survivor.endpointGeneration,
+					locator: survivor.locator,
+					ambiguous: false,
+				}),
+			]);
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: survivor.endpointGeneration,
+					ambiguous: false,
+					live: true,
+				}),
+			]);
+		}
+	});
+	it("hides deleted sessions until a later registration establishes new authority", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-deleted-"));
+		const index = await new SessionIndex(dir).open();
+		const registration = await index.append(event("deleted"));
+		await index.append({
+			type: "session_deleted",
+			sessionId: registration.sessionId,
+			locator: registration.locator,
+			endpointGeneration: registration.endpointGeneration,
+			pid: registration.pid,
+			...(registration.processIncarnation === undefined
+				? {}
+				: { processIncarnation: registration.processIncarnation }),
+			...(registration.hostIncarnation === undefined ? {} : { hostIncarnation: registration.hostIncarnation }),
+		});
+		expect(index.listSessions().sessions).toEqual([]);
+
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: registration.sessionId,
+			locator: registration.locator,
+			endpointGeneration: registration.endpointGeneration,
+			pid: registration.pid,
+			...(registration.processIncarnation === undefined
+				? {}
+				: { processIncarnation: registration.processIncarnation }),
+			...(registration.hostIncarnation === undefined ? {} : { hostIncarnation: registration.hostIncarnation }),
+		});
+		expect(index.listSessions().sessions).toEqual([]);
+
+		await index.append({ ...event("deleted"), endpointGeneration: registration.endpointGeneration + 1 });
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId: "deleted", endpointGeneration: registration.endpointGeneration + 1 }),
+		]);
+	});
 });

@@ -303,6 +303,181 @@ describe("Telegram provider supervisor ownership", () => {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
+	test("strict topic admission quarantines ordinary endpoints and archives their orphaned topic", async () => {
+		const agentDir = tempAgentDir();
+		let now = 1_000;
+		const calls: string[] = [];
+		let scheduledCleanup: (() => void) | undefined;
+		const botApi: BotApi = {
+			call: async method => {
+				calls.push(method);
+				if (method === "closeForumTopic") return { ok: true, result: true };
+				return { ok: true, result: { id: 42, type: "private", message_thread_id: 100 } };
+			},
+		};
+		const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi,
+			now: () => now,
+			installationHostId: "provider-owner",
+			requireTelegramTopicEligibility: true,
+			setTimeoutImpl: callback => {
+				scheduledCleanup = () => callback();
+				return setTimeout(() => {}, 0);
+			},
+		});
+		try {
+			fs.mkdirSync(path.dirname(statePath), { recursive: true });
+			fs.writeFileSync(
+				statePath,
+				`${JSON.stringify({
+					version: 2,
+					installationHostId: "provider-owner",
+					topics: {
+						ordinary: {
+							topicId: "100",
+							topicOrigin: "daemon_created",
+							sessionUuid: "ordinary-topic",
+							identitySent: true,
+							createdAt: now,
+							authorityState: "active",
+							chatId: "42",
+							endpointKey: "ordinary-endpoint",
+							endpointDigest: "ordinary-digest",
+							endpointGeneration: 1,
+							endpointIncarnation: 0,
+							leaseOwner: "provider-owner",
+							leaseHeartbeatAt: now,
+							leaseExpiresAt: now + 60_000,
+						},
+					},
+				})}\n`,
+			);
+			await daemon.loadTopics();
+			const routing = daemon.attachmentRoutingHarnessForTest();
+			let retired = 0;
+			const attachment = {
+				sessionId: "ordinary",
+				authorityId: "ordinary-endpoint-a",
+				generation: 1,
+				isCurrent: () => true,
+				send: () => {},
+				retire: async () => {
+					retired += 1;
+				},
+			};
+			routing.attach(attachment);
+			const session = daemon.sessions.get(attachment.sessionId);
+			if (!session) throw new Error("Expected a routed Telegram attachment session.");
+			await daemon.handleSessionMessage(session, {
+				type: "event_replay_result",
+				id: session.replayId,
+				ok: true,
+				generation: 1,
+				lastSeq: 0,
+				events: [{ payload: { type: "identity_header", sessionId: "ordinary", telegramTopicsEnabled: false } }],
+			});
+			expect(retired).toBe(1);
+			expect(daemon.sessions.has("ordinary")).toBe(false);
+			expect(calls).toEqual([]);
+			const persisted = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+				topics: { ordinary: { authorityState: string; orphanedAt?: number } };
+			};
+			expect(persisted.topics.ordinary).toMatchObject({ authorityState: "disconnect_grace", orphanedAt: now });
+
+			routing.attach({ ...attachment });
+			const quarantined = daemon.sessions.get(attachment.sessionId);
+			if (!quarantined) throw new Error("Expected a quarantined Telegram attachment session.");
+			await daemon.handleSessionMessage(quarantined, {
+				type: "identity_header",
+				sessionId: "ordinary",
+				telegramTopicsEnabled: true,
+			});
+			expect(calls).toEqual([]);
+			if (!scheduledCleanup) throw new Error("Expected rejected topic cleanup to be scheduled.");
+			now += 60_001;
+			scheduledCleanup();
+			// The grace archival settles asynchronously; poll bounded instead of a
+			// fixed sleep so heavy parallel suite load cannot flake this assertion.
+			const deadline = Date.now() + 5_000;
+			let archived: { topics: { ordinary: { authorityState: string } } };
+			do {
+				await Bun.sleep(25);
+				archived = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+					topics: { ordinary: { authorityState: string } };
+				};
+			} while (archived.topics.ordinary.authorityState !== "inactive" && Date.now() < deadline);
+			expect(calls).toContain("closeForumTopic");
+			expect(archived.topics.ordinary.authorityState).toBe("inactive");
+		} finally {
+			daemon.requestStop();
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("strict topic admission requires a loaded registry and an eligible replay identity", async () => {
+		const agentDir = tempAgentDir();
+		const calls: string[] = [];
+		const botApi: BotApi = {
+			call: async method => {
+				calls.push(method);
+				return { ok: true, result: { id: 42, type: "private", message_thread_id: 100 } };
+			},
+		};
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi,
+			requireTelegramTopicEligibility: true,
+		});
+		try {
+			const routing = daemon.attachmentRoutingHarnessForTest();
+			const unloadedAttachment = {
+				sessionId: "eligible",
+				authorityId: "eligible-unloaded",
+				generation: 1,
+				isCurrent: () => true,
+				send: () => {},
+			};
+			routing.attach(unloadedAttachment);
+			const unloaded = daemon.sessions.get(unloadedAttachment.sessionId);
+			if (!unloaded) throw new Error("Expected a routed Telegram attachment session.");
+			unloaded.replayPending = false;
+			await daemon.handleSessionMessage(unloaded, {
+				type: "identity_header",
+				sessionId: "eligible",
+				telegramTopicsEnabled: true,
+			});
+			expect(calls).toEqual([]);
+
+			await daemon.loadTopics();
+			const attachment = {
+				...unloadedAttachment,
+				authorityId: "eligible-loaded",
+			};
+			routing.attach(attachment);
+			const session = daemon.sessions.get(attachment.sessionId);
+			if (!session) throw new Error("Expected a routed Telegram attachment session.");
+			await daemon.handleSessionMessage(session, {
+				type: "event_replay_result",
+				id: session.replayId,
+				ok: true,
+				generation: 1,
+				lastSeq: 0,
+				events: [{ payload: { type: "identity_header", sessionId: "eligible", telegramTopicsEnabled: true } }],
+			});
+			expect(calls.filter(method => method === "createForumTopic")).toHaveLength(1);
+		} finally {
+			daemon.requestStop();
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("Telegram daemon retained owner lifecycle", () => {
@@ -525,7 +700,7 @@ describe("Telegram daemon retained owner lifecycle", () => {
 		}
 	});
 
-	test("spawn selection uses an opaque owner on Windows source launches and preserves normal compiled selection", async () => {
+	test("spawn selection uses an opaque owner for detached launches", async () => {
 		const sourceAgentDir = tempAgentDir();
 		const compiledAgentDir = tempAgentDir();
 		try {
@@ -564,7 +739,7 @@ describe("Telegram daemon retained owner lifecycle", () => {
 			expect(sourceArgs).toEqual(expect.arrayContaining(["--owner-id", "daemon-source-nonce"]));
 			expect(compiled).toMatchObject({
 				result: "owner_spawned",
-				acquisition: { ownerId: "compiled-nonce", launcherPid: 708 },
+				acquisition: { ownerId: "daemon-compiled-nonce", launcherPid: 708 },
 				runtime: { mode: "compiled", reloadPicksUpSourceEdits: false },
 			});
 		} finally {

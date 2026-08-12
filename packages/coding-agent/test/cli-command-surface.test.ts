@@ -458,7 +458,38 @@ process.exitCode = await child.exited;`;
 		}
 	}, 15_000);
 
-	it("routes sdk session verbs and rejects the removed daemon session route", async () => {
+	it("routes every advertised SDK family and rejects the removed daemon session route", async () => {
+		const sdkHelp = Bun.spawnSync(["bun", cliEntry, "sdk", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const sdkHelpOutput = `${sdkHelp.stdout.toString()}\n${sdkHelp.stderr.toString()}`;
+		expect(sdkHelp.exitCode, sdkHelpOutput).toBe(0);
+		for (const token of ["serve", "session", "guides"]) expect(sdkHelp.stdout.toString()).toContain(token);
+
+		const serve = Bun.spawnSync(["bun", cliEntry, "sdk", "serve"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const serveOutput = `${serve.stdout.toString()}\n${serve.stderr.toString()}`;
+		expect(serve.exitCode, serveOutput).toBe(2);
+		expect(serveOutput).toContain("gjc sdk serve: specify exactly one of");
+
+		const guideAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-guides-command-"));
+		try {
+			const guides = Bun.spawnSync(["bun", cliEntry, "sdk", "guides", "list", "--agent-dir", guideAgentDir], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const guidesOutput = `${guides.stdout.toString()}\n${guides.stderr.toString()}`;
+			expect(guides.exitCode, guidesOutput).toBe(0);
+			expect(JSON.parse(guides.stdout.toString())).toMatchObject({ ok: true, result: { source: "bundled" } });
+		} finally {
+			await fs.rm(guideAgentDir, { recursive: true, force: true });
+		}
 		const help = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "--help"], {
 			cwd: repoRoot,
 			stderr: "pipe",
@@ -478,6 +509,8 @@ process.exitCode = await child.exited;`;
 			"--all-events",
 		])
 			expect(help.stdout.toString()).toContain(token);
+		expect(help.stdout.toString()).not.toContain("elevate");
+		expect(help.stdout.toString()).not.toContain("show-endpoint-credential");
 
 		const missingVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session"], {
 			cwd: repoRoot,

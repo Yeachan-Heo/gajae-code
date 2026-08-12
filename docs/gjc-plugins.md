@@ -7,6 +7,24 @@ GJC supports two distinct plugin families. Do not confuse them:
 
 A GJC plugin bundle may only **extend** existing skills/agents — it can never register a new top-level skill, slash-command, command, or agent. GJC exposes exactly four default workflow skills (`deep-interview`, `ralplan`, `team`, `ultragoal`) and four role agents (`executor`, `architect`, `planner`, `critic`); bundles add sub-skills/appendices/tools/hooks/MCPs to those existing parents only.
 
+## Loose customization vs plugin bundles
+
+A plugin manifest is **never required** to add one local MCP, hook, skill, or extension. Native loose customization has one canonical destination in each scope: `<project>/.gjc/` for project-local configuration and `~/.gjc/agent/` for user-global configuration. Claude Code and Codex layouts are explicit import sources for `/extensions` ([#4291](https://github.com/Yeachan-Heo/gajae-code/issues/4291)); they are not parallel runtime authorities. Reach for a bundle only when you want a versioned, distributable package of several surfaces with atomic install/update/uninstall, hashing, quarantine, and collision ownership.
+
+| You want… | Loose surface (no manifest) | Plugin bundle (`gajae-plugin.json`) |
+|-----------|-----------------------------|-------------------------------------|
+| **One local MCP server** | `mcpServers` map in `<project>/.gjc/mcp.json` or `~/.gjc/agent/mcp.json`; supports `command`/`args`/`env`/`cwd`/`url`/`headers`/`auth`/`oauth`/`type` | `mcps` array (or the `mcpServers` alias — see below); no `env`/`auth`/`oauth`/`headers` |
+| **One local hook** | `<project>/.gjc/hooks/pre/<tool>.ts` / `post/<tool>.ts`, or the same layout under `~/.gjc/agent/hooks/` | `hooks` array of constrained `{ name, event, target?, phase?, path }` entries |
+| **One local skill** | `.gjc/skills/<name>/SKILL.md` (project) / `~/.gjc/agent/skills/<name>/SKILL.md` (user) | `subskills` entries bound to an existing protected parent (`binds_to`/`phase`/`activation_arg`) |
+| **One local extension** | `<project>/.gjc/extensions/<name>/` or `~/.gjc/agent/extensions/<name>/`, with its extension manifest + entry | Bundles have no extension surface; extensions are loose-only |
+| **Versioned multi-surface distribution** | — | ✅ Bundle (recommended path) |
+| **Atomic install/update/uninstall, hashing, quarantine, collision ownership** | — | ✅ Bundle |
+| **A brand-new top-level workflow skill** | ✅ Loose `.gjc/skills/<name>/SKILL.md` (never via a bundle) | ❌ Forbidden (`forbidden_surface`) — bundles may only extend the four protected workflow skills |
+
+Rule of thumb: one local surface → loose file; several surfaces you want to version, hash, install atomically, and redistribute → bundle.
+
+Import is a transaction, not discovery precedence: `/extensions` selects Claude Code or Codex plus project-local or user-global scope, previews the normalized result, then writes the accepted configuration into the selected canonical `.gjc` scope. Import UI and transaction behavior belong to #4291; this bundle contract neither activates foreign layouts at runtime nor implements that UI.
+
 ## Manifest (`gajae-plugin.json`)
 
 ```json
@@ -36,14 +54,27 @@ A GJC plugin bundle may only **extend** existing skills/agents — it can never 
 | `subskills` | Inline sub-skills bound to an existing skill/agent (`binds_to`/`phase`/`activation_arg`) | Two-tier (see below) |
 | `tools` | Always-on custom tools (object entries) or legacy subskill-scoped string paths | Additive; manifest-declared name is authoritative, never overwrites an existing tool |
 | `hooks` | Constrained event hooks bound to a declared `event`/`target`/`phase` | Additive; run alongside built-ins, never replace |
-| `mcps` | MCP servers (`stdio`/`http`/`sse`) | Additive; server-name collisions are hard errors |
+| `mcps` | MCP servers (`stdio`/`http`/`sse`); the Claude Code `mcpServers` map alias is accepted and normalized to this | Additive; server-name collisions are hard errors |
 | `system_appendix` | Lower-authority text appended to the default agent system prompt | Append-only, never overrides base |
 | `agent-appendix` | Lower-authority text appended to an existing role agent's prompt | Append-only per named agent |
 
-### Forbidden / unsupported keys
+### Compatibility aliases, forbidden, and unsupported keys
 
-- **Forbidden** (`forbidden_surface`): `skills`, `slash-commands`, `commands`, `agents` — bundles may not register new top-level definitions.
-- **Unsupported** (`unsupported_surface`): `mcp`, `mcpServers` (use the canonical `mcps`), and any unknown top-level key.
+**Accepted aliases** — normalized into the canonical compiled representation at parse time, so a manifest using the alias compiles to byte-equivalent surfaces as the canonical spelling:
+
+- `mcpServers` (Claude Code / loose mcp.json map, server name → config) → normalized into the canonical `mcps` array. Per-server `type` maps to `transport`; `command` implies `stdio` and a bare `url` implies `http` when `type` is absent. Only transport-relevant fields with an end-to-end bundle runtime equivalent are accepted (`type` plus `command`/`args`/`cwd` for `stdio`, or `url` for `http`/`sse`); anything else is a targeted migration diagnostic (see below).
+
+**Targeted migration diagnostics** — the alias shape cannot be preserved, so the manifest fails with an actionable suggested canonical form instead of a generic unknown/forbidden-key error:
+
+- `mcp` (singular) — ambiguous shape; use canonical `mcps` or the `mcpServers` alias.
+- `skills` (top level) — bundles may only EXTEND the four protected workflow skills; use `subskills` or the loose `.gjc/skills/<name>/SKILL.md` surface. Never silently replaced by a bundle (`forbidden_surface`).
+- `agents` (Claude Code plugin.json) — top-level agents are protected; use `subskills` bound to `executor`/`architect`/`planner`/`critic` (`forbidden_surface`).
+- `commands` / `slash-commands` (Claude Code plugin.json) — bundles cannot register slash commands; use the loose `.gjc/commands/<name>` surface (`forbidden_surface`).
+- `hooks` written as a Claude Code plugin.json event-keyed map or `{ matcher, hooks, source }` entries — cannot be preserved as constrained GJC bundle hooks; use canonical `{ name, event, target?, phase?, path }` or the loose `.gjc/hooks/pre|post/<tool>.ts` surface (`invalid_manifest`).
+- `mcpServers` entries using `env`/`auth`/`oauth`/`headers`/`enabled`/`timeout`/`autoload`/`noInheritEnv`, or fields incompatible with the selected transport — the bundle runtime cannot preserve these semantics end to end. Move the server to canonical loose `.gjc/mcp.json` (directly or through the `/extensions` import flow in #4291) or drop the field (`unsupported_surface`).
+- Any unknown top-level key — names the full canonical key set.
+
+**Never accepted in any form:** `mcps` + `mcpServers` together, an `mcpServers` entry that cannot determine a transport, and any per-server key outside the accepted vocabulary.
 
 ## Installation
 
@@ -85,4 +116,4 @@ Extension IDs are stable: `tool:<name>`, `hook:<event>:<phase>:<target>:<name>`,
 
 - Always-on **tools**, **system appendices**, **agent appendices**, and **Tier-1 advertisement** activate at session start (additive; no-op when no bundle is installed).
 - **MCP runtime connection** and the **live hook runner** integration are gated behind the same validated registry + policy; consult the ledger/run notes for their wiring status.
-- Full enable/disable/uninstall/upgrade UX is a planned follow-up; the registry already records everything required for it (per-surface IDs + copied-file ownership).
+- Install, force update (`gjc plugin upgrade`), enable/disable, uninstall, quarantine, and hash-drift are covered by the lifecycle suite; the registry records everything required for them (per-surface IDs + copied-file ownership).

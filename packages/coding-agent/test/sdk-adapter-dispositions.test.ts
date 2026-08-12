@@ -5,6 +5,7 @@ import path from "node:path";
 import { AcpSdkAdapter } from "../src/sdk/acp";
 import { Broker } from "../src/sdk/broker";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { sendAuthorizedChatOperation } from "../src/sdk/bus/chat-command-policy";
 import { runSdkSessionCli } from "../src/sdk/cli/session-cli";
 import { SdkClient } from "../src/sdk/client";
@@ -16,6 +17,12 @@ import { startProductionSdkHost } from "./helpers/sdk-production-host";
 type MachineAdapter = Extract<Adapter, "mcp" | "acp" | "daemonCli">;
 type Expected = "forwarded" | "rejected_before_send" | "internal_only";
 type ObservedRequest = { kind: "control" | "query" | "global"; operation: string };
+
+function currentHostIncarnation(): string {
+	const incarnation = processIncarnation(process.pid);
+	if (!incarnation) throw new Error("Current process incarnation is unavailable.");
+	return incarnation;
+}
 
 type ParityRow = {
 	adapterTestId: string;
@@ -29,7 +36,7 @@ const parityRows = (
 		rows: ParityRow[];
 	}
 ).rows;
-expect(parityRows).toHaveLength(588);
+expect(parityRows).toHaveLength(582);
 const parityPrefix: Record<Adapter, string> = {
 	telegram: "T",
 	discord: "D",
@@ -108,7 +115,6 @@ const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"auth.login": "operation_not_session_owned",
 	"skill.invoke": "invalid_input",
 	"turn.result": "invalid_request",
-	"skill.invoke_status": "invalid_request",
 	"mode.plan.set": "unavailable",
 	"model.profile.set": "invalid_input",
 };
@@ -233,6 +239,24 @@ function inputFor(operation: Operation, secret = false): Record<string, unknown>
 	}
 }
 
+/** Raw lifecycle globals require typed targets; retain broker-side invalid-input probes without launching a session. */
+function daemonCliLifecycleInput(host: AdapterFixture, operation: string): Record<string, unknown> | undefined {
+	const invalidStateRoot = path.join(host.repo, ".invalid-state");
+	switch (operation) {
+		case "session.create":
+		case "session.fork":
+			return { cwd: host.repo, stateRoot: invalidStateRoot };
+		case "session.resume":
+			return { cwd: host.repo, stateRoot: invalidStateRoot, sessionId: host.sessionId };
+		case "session.close":
+			return { sessionId: host.sessionId, endpointGeneration: 0 };
+		case "session.delete":
+			return { sessionId: "missing-session" };
+		default:
+			return undefined;
+	}
+}
+
 async function fixture(): Promise<AdapterFixture> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-adapter-dispositions-"));
 	const agentDir = path.join(repo, ".gjc", "adapter-agent");
@@ -249,14 +273,18 @@ async function fixture(): Promise<AdapterFixture> {
 		return await handleRequest(operation, input, idempotencyKey);
 	};
 	const endpointMtimeMs = fs.statSync(path.join(stateRoot, "sdk", `${sessionId}.json`)).mtimeMs;
+	const hostIncarnation = currentHostIncarnation();
 	await broker.index.append({
 		type: "host_registered",
 		sessionId,
 		locator: { repo, stateRoot },
 		endpointGeneration: 1,
 		pid: process.pid,
+		processIncarnation: hostIncarnation,
+		hostIncarnation,
 		endpointMtimeMs,
 	});
+	await broker.heartbeatSessions();
 	const acpAttachment: SessionAttachment = {
 		sessionId,
 		generation: 1,
@@ -422,8 +450,10 @@ async function assertDaemonCliRow(operation: Operation, secret: boolean): Promis
 	try {
 		const expected = expectedOutcome("daemonCli", operation, secret);
 		const before = host.observed.length;
+		const lifecycleInput = operation.kind === "global" ? daemonCliLifecycleInput(host, operation.sdkId) : undefined;
 		const input =
-			operation.sdkId === "session.get_endpoint" ? { sessionId: host.sessionId } : inputFor(operation, secret);
+			lifecycleInput ??
+			(operation.sdkId === "session.get_endpoint" ? { sessionId: host.sessionId } : inputFor(operation, secret));
 		const action = operation.kind === "global" ? "global" : operation.kind === "query" ? "query" : "control";
 		const args = {
 			action,

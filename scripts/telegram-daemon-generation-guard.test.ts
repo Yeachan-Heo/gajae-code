@@ -34,6 +34,7 @@ const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
 const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
+const busIndex = "packages/coding-agent/src/sdk/bus/index.ts";
 const sessionRouter = "packages/coding-agent/src/sdk/router/session-router.ts";
 const inventory = {
 	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: ["acquireDaemonOwnership"] },
@@ -126,6 +127,16 @@ const telegramToolActivityDeclarations = {
 		"toolActivityDeliveryIsCurrent",
 		"handleSessionMessage",
 		"processTelegramUpdate",
+	],
+} as const;
+
+const telegramTopicAdmissionDeclarations = {
+	[config]: ["isTelegramOrchestrationSession"],
+	[busIndex]: ["buildIdentity", "createNotificationsExtension"],
+	[telegramDaemon]: [
+		"TelegramNotificationDaemon.#topicAdmissionAllows",
+		"TelegramNotificationDaemon.#rejectTopicAdmission",
+		"loadTopics",
 	],
 } as const;
 const helperInventory = {
@@ -331,6 +342,17 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 
 test("requires a Telegram bump for tool-activity defaults and delivery admission policy", () => {
 	for (const [file, declarations] of Object.entries(telegramToolActivityDeclarations)) {
+		for (const name of declarations) {
+			const missing = mappedHelperMutation({ family: "telegram", file, name, generationBumped: false });
+			expect(missing.protectedChanges).toContain(`telegram:${file}:${name}`);
+			expect(missing.telegramGenerationBumped).toBe(false);
+			expect(mappedHelperMutation({ family: "telegram", file, name, generationBumped: true }).telegramGenerationBumped).toBe(true);
+		}
+	}
+});
+
+test("requires a Telegram bump for topic-admission provenance, identity production, and registry policy", () => {
+	for (const [file, declarations] of Object.entries(telegramTopicAdmissionDeclarations)) {
 		for (const name of declarations) {
 			const missing = mappedHelperMutation({ family: "telegram", file, name, generationBumped: false });
 			expect(missing.protectedChanges).toContain(`telegram:${file}:${name}`);
@@ -754,7 +776,7 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(() => validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: narrowed })).toThrow("Telegram owner-lock handoff primitives");
 	});
 
-	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, chat CLI, endpoint discovery, or provider configuration authorities", () => {
+	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, topic-admission, chat CLI, endpoint discovery, or provider configuration authorities", () => {
 		for (const symbol of TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS) {
 			const telegram = mutableInventory();
 			telegram.telegram[telegramDaemon] = telegram.telegram[telegramDaemon]!.filter(name => name !== symbol);
@@ -770,6 +792,15 @@ test("fails closed when a protected native authority declaration is missing or m
 				if (remaining.length === 0) delete toolActivity.telegram[file];
 				else toolActivity.telegram[file] = remaining;
 				expect(() => validateInventory(toolActivity)).toThrow("Telegram tool-activity configuration and delivery policy");
+			}
+		}
+		for (const [file, declarations] of Object.entries(telegramTopicAdmissionDeclarations)) {
+			for (const symbol of declarations) {
+				const topicAdmission = mutableInventory();
+				const remaining = topicAdmission.telegram[file]!.filter(name => name !== symbol);
+				if (remaining.length === 0) delete topicAdmission.telegram[file];
+				else topicAdmission.telegram[file] = remaining;
+				expect(() => validateInventory(topicAdmission)).toThrow("Telegram topic-admission provenance, identity, and registry authorities");
 			}
 		}
 		for (const symbol of ["DaemonProcessReference", "defaultProcessReference"] as const) {
@@ -799,6 +830,10 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(protectedInventory.telegram[telegramDaemon]).toEqual(
 			expect.arrayContaining([...TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS]),
 		);
+	});
+	test("protects Telegram topic-admission provenance, identity production, and registry authorities", () => {
+		for (const [file, declarations] of Object.entries(telegramTopicAdmissionDeclarations))
+			expect(protectedInventory.telegram[file] ?? []).toEqual(expect.arrayContaining(declarations));
 	});
 
 	test("protects Telegram provenance and signaling authorities", () => {

@@ -1,9 +1,8 @@
 import { getAgentDir } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../client";
+import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import { DEFAULT_PENDING_CEILING_BYTES, MIN_PENDING_CEILING_BYTES, startSocketServe, startStdioServe } from "./index";
-
-const MAX_SESSION_LIST_PAGES = 10_000;
 
 type ServeMode = { kind: "stdio" } | { kind: "socket"; socketPath: string };
 
@@ -85,32 +84,29 @@ function brokerResult(value: unknown): Record<string, unknown> {
 	return isRecord(value) && isRecord(value.result) ? value.result : {};
 }
 
-function brokerSessionRows(value: Record<string, unknown>): BrokerSessionRow[] {
-	if (!Array.isArray(value.sessions)) return [];
-	return value.sessions.flatMap(item => {
+function brokerSessionRows(sessions: readonly unknown[]): BrokerSessionRow[] {
+	return sessions.flatMap(item => {
 		if (!isRecord(item) || typeof item.sessionId !== "string" || !item.sessionId) return [];
 		return [{ sessionId: item.sessionId, live: item.live === true, ambiguous: item.ambiguous === true }];
 	});
 }
 
-/**
- * Exhausts broker `session.list` cursor pagination (default page limit 100) to
- * one full snapshot; exported for tests.
- */
+/** Exhausts strict broker `session.list` pages into one full session snapshot. */
 export async function listBrokerSessions(broker: SdkClient): Promise<BrokerSessionRow[]> {
-	const rows: BrokerSessionRow[] = [];
-	let cursor: string | undefined;
-	for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
-		const listed = brokerResult(await broker.global("session.list", cursor === undefined ? {} : { cursor }));
-		rows.push(...brokerSessionRows(listed));
-		const nextCursor =
-			typeof listed.continuationCursor === "string" && listed.continuationCursor.length > 0
-				? listed.continuationCursor
-				: undefined;
-		if (!nextCursor) return rows;
-		cursor = nextCursor;
+	try {
+		const pages = await traverseSessionList(
+			{},
+			async input => await broker.global("session.list", input),
+			response => {
+				brokerResult(response);
+				return sessionListPageFromResponse(response);
+			},
+		);
+		return pages.flatMap(page => brokerSessionRows(page.sessions));
+	} catch (error) {
+		if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
+		throw error;
 	}
-	throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
 }
 
 /** Selects the session to serve through broker `session.list` truth (C10); exported for tests. */
@@ -156,19 +152,7 @@ export async function runSdkServe(argv: string[]): Promise<void> {
 		const url = typeof endpoint.url === "string" && endpoint.url ? endpoint.url : undefined;
 		const token = typeof endpoint.token === "string" ? endpoint.token : "";
 		if (!url) throw new Error("unavailable: broker returned an invalid endpoint record");
-		const options = {
-			url,
-			token,
-			pendingCeilingBytes,
-			validateDownstreamFrame: (source: string): boolean => {
-				try {
-					const frame = JSON.parse(source) as { type?: unknown; elevationRequestId?: unknown };
-					return frame.type !== "control_request" || frame.elevationRequestId === undefined;
-				} catch {
-					return true;
-				}
-			},
-		};
+		const options = { url, token, pendingCeilingBytes };
 		const handle =
 			parsed.mode.kind === "stdio"
 				? await startStdioServe(options)

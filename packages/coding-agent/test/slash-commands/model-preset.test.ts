@@ -207,6 +207,19 @@ describe("/model <preset> activation", () => {
 		});
 	});
 
+	test("/model default <preset-name> does NOT activate a preset — it assigns the default model", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "anthropic", id: "codex-medium", contextWindow: 200_000 }];
+
+		const result = await executeAcpBuiltinSlashCommand("/model default codex-medium", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(activateSpy).not.toHaveBeenCalled();
+		expect(session.model).toMatchObject({ provider: "anthropic", id: "codex-medium" });
+		expect(runtime.settings.getModelRole("default")).toBe("anthropic/codex-medium");
+		expect(output[0]).toContain("Default model set to anthropic/codex-medium");
+	});
+
 	test("/model <unknown-name> falls through to model resolution", async () => {
 		const { output, runtime } = createRuntime();
 

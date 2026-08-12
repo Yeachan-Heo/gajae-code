@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import type { SessionIndex } from "../src/sdk/broker/session-index";
+import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 import {
 	type SessionAttachment,
@@ -102,6 +102,8 @@ async function routerFixture(
 							live: true,
 							indexSeq: authority.generation,
 							terminalUncertain: authority.terminalUncertain || undefined,
+							ambiguous: false,
+							terminal: false,
 						},
 					]
 				: [],
@@ -251,6 +253,8 @@ function hungRouterFixture(): HungRouterFixture {
 				endpointMtimeMs: endpointMtimeMs.get(session.sessionId),
 				live: true,
 				indexSeq: 1,
+				ambiguous: false,
+				terminal: false,
 			})),
 			warnings: [],
 		}),
@@ -308,6 +312,176 @@ function hungRouterFixture(): HungRouterFixture {
 }
 
 describe("SessionRouter dispatch authority", () => {
+	test("withholds publication for two current state roots until one resolves", async () => {
+		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-ambiguous-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const alternateStateRoot = path.join(repo, ".gjc", "alternate-state");
+		const sessionId = "router-ambiguous";
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		fs.mkdirSync(path.dirname(endpointPath), { recursive: true });
+		fs.writeFileSync(
+			endpointPath,
+			JSON.stringify({ sessionId, url: "ws://router.test", token: "secret", pid: process.pid }),
+		);
+		const endpointMtimeMs = fs.statSync(endpointPath).mtimeMs;
+		const index = await new SessionIndex(agentDir).open();
+		const alternate = await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo, stateRoot: alternateStateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: 1,
+		});
+		const current = await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo, stateRoot },
+			endpointGeneration: 2,
+			pid: process.pid,
+			endpointMtimeMs,
+		});
+		const attachments: SessionAttachment[] = [];
+		const clients: SessionRouterClient[] = [];
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => {
+					const client: SessionRouterClient = {
+						onFrame: () => () => {},
+						request: async () => ({ events: [] }),
+						close: async () => {},
+						send: () => {},
+					};
+					clients.push(client);
+					return client;
+				},
+				onAttachment: attachment => {
+					attachments.push(attachment);
+				},
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		try {
+			await router.start();
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: current.endpointGeneration,
+					ambiguous: true,
+					live: false,
+				}),
+			]);
+			expect(attachments).toEqual([]);
+			expect(clients).toEqual([]);
+			expect(router.attachment(sessionId)).toBeNull();
+
+			await index.append({
+				type: "host_unregistered",
+				sessionId,
+				locator: alternate.locator,
+				endpointGeneration: alternate.endpointGeneration,
+				pid: alternate.pid,
+				...(alternate.processIncarnation === undefined ? {} : { processIncarnation: alternate.processIncarnation }),
+				...(alternate.hostIncarnation === undefined ? {} : { hostIncarnation: alternate.hostIncarnation }),
+			});
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
+			await router.reconcile();
+			expect(attachments).toHaveLength(1);
+			expect(clients).toHaveLength(1);
+			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+		} finally {
+			await router.stop();
+		}
+	});
+	test("publishes the lower-generation root after the higher-generation root terminates", async () => {
+		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-ambiguous-reverse-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const alternateRepo = path.join(repo, "alternate-worktree");
+		const alternateStateRoot = path.join(alternateRepo, ".gjc", "state");
+		const currentStateRoot = path.join(repo, ".gjc", "state");
+		const sessionId = "router-ambiguous-reverse";
+		const endpointPath = path.join(alternateStateRoot, "sdk", `${sessionId}.json`);
+		fs.mkdirSync(path.dirname(endpointPath), { recursive: true });
+		fs.writeFileSync(
+			endpointPath,
+			JSON.stringify({ sessionId, url: "ws://router.test", token: "alternate-secret", pid: process.pid }),
+		);
+		const alternateEndpointMtimeMs = fs.statSync(endpointPath).mtimeMs;
+		const index = await new SessionIndex(agentDir).open();
+		const alternate = await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: alternateRepo, stateRoot: alternateStateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: alternateEndpointMtimeMs,
+		});
+		const current = await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo, stateRoot: currentStateRoot },
+			endpointGeneration: 2,
+			pid: process.pid,
+			endpointMtimeMs: 1,
+		});
+		const attachments: SessionAttachment[] = [];
+		const clients: SessionRouterClient[] = [];
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => {
+					const client: SessionRouterClient = {
+						onFrame: () => () => {},
+						request: async () => ({ events: [] }),
+						close: async () => {},
+						send: () => {},
+					};
+					clients.push(client);
+					return client;
+				},
+				onAttachment: attachment => {
+					attachments.push(attachment);
+				},
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+		try {
+			await router.start();
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({ sessionId, endpointGeneration: current.endpointGeneration, ambiguous: true }),
+			]);
+			expect(attachments).toEqual([]);
+
+			await index.append({
+				type: "host_unregistered",
+				sessionId,
+				locator: current.locator,
+				endpointGeneration: current.endpointGeneration,
+				pid: current.pid,
+				...(current.processIncarnation === undefined ? {} : { processIncarnation: current.processIncarnation }),
+				...(current.hostIncarnation === undefined ? {} : { hostIncarnation: current.hostIncarnation }),
+			});
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
+			await router.reconcile();
+			expect(attachments).toHaveLength(1);
+			expect(clients).toHaveLength(1);
+			expect(attachments[0]).toMatchObject({
+				sessionId,
+				generation: alternate.endpointGeneration,
+			});
+			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+		} finally {
+			await router.stop();
+		}
+	});
 	test("contains an unreachable indexed endpoint while attaching healthy sessions", async () => {
 		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-reconcile-"));
 		tempDirs.push(repo);
@@ -346,6 +520,8 @@ describe("SessionRouter dispatch authority", () => {
 					endpointMtimeMs: endpointMtimeMs.get(session.sessionId),
 					live: true,
 					indexSeq: 1,
+					ambiguous: false,
+					terminal: false,
 				})),
 				warnings: [],
 			}),

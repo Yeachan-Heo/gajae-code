@@ -4,6 +4,10 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 
+function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
+	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
+}
+
 describe("SDK lifecycle ledger", () => {
 	it("replays terminal responses and rejects conflicts across restarts", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-"));
@@ -435,7 +439,7 @@ describe("SDK lifecycle reconciliation lookup (broker.lookup_lifecycle)", () => 
 		const originalResponse = { ok: true, result: { sessionId: "session-123" } };
 		await ledger.begin("id-1", "hash-1", {
 			operationKey: "session.create\0key-1",
-			fingerprint: '{"operation":"session.create","input":{}}',
+			fingerprint: lifecycleFingerprint("session.create", {}),
 		});
 		await ledger.transition("id-1", "terminal_ok", { response: originalResponse });
 
@@ -453,7 +457,7 @@ describe("SDK lifecycle reconciliation lookup (broker.lookup_lifecycle)", () => 
 		const errorResponse = { ok: false, error: { code: "workspace_deleted", message: "nope" } };
 		await ledger.begin("id-2", "hash-2", {
 			operationKey: "session.close\0key-2",
-			fingerprint: '{"operation":"session.close","input":{}}',
+			fingerprint: lifecycleFingerprint("session.close", {}),
 		});
 		await ledger.transition("id-2", "terminal_error", { response: errorResponse });
 
@@ -467,7 +471,7 @@ describe("SDK lifecycle reconciliation lookup (broker.lookup_lifecycle)", () => 
 		const ledger = await new LifecycleLedger(dir).open();
 		await ledger.begin("id-3", "hash-3", {
 			operationKey: "session.create\0key-3",
-			fingerprint: '{"operation":"session.create","input":{}}',
+			fingerprint: lifecycleFingerprint("session.create", {}),
 		});
 		await ledger.transition("id-3", "terminal_uncertain");
 
@@ -490,7 +494,7 @@ describe("SDK lifecycle legacy identity retirement", () => {
 		// Migrate the legacy identity to the new operation/key-based identity.
 		const migrated = await ledger.migrateIdentity("legacy-target-a", "new-identity-a", {
 			operationKey: "session.create\0caller-key-a",
-			fingerprint: '{"operation":"session.create","input":{}}',
+			fingerprint: lifecycleFingerprint("session.create", {}),
 		});
 		expect(migrated).toBeDefined();
 		expect(migrated?.identity).toBe("new-identity-a");
@@ -503,7 +507,7 @@ describe("SDK lifecycle legacy identity retirement", () => {
 		// must succeed without hitting idempotency_conflict from the legacy row.
 		const fresh = await ledger.begin("new-identity-b", "request-b", {
 			operationKey: "session.close\0caller-key-b",
-			fingerprint: '{"operation":"session.close","input":{}}',
+			fingerprint: lifecycleFingerprint("session.close", {}),
 		});
 		expect(fresh.kind).toBe("new");
 	});
@@ -515,7 +519,7 @@ describe("SDK lifecycle legacy identity retirement", () => {
 
 		const metadata = {
 			operationKey: "session.create\0caller-key-c",
-			fingerprint: '{"operation":"session.create","input":{}}',
+			fingerprint: lifecycleFingerprint("session.create", {}),
 		};
 		const first = await ledger.migrateIdentity("legacy-target-c", "new-identity-c", metadata);
 		expect(first).toBeDefined();

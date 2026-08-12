@@ -2,6 +2,8 @@
 
 ## Decision
 
+> Maintainer-only note: the harness transport details below are SDK-core private implementation details. They do not authorize dashboard, plugin, or external-controller endpoint discovery, credential handling, or raw session attachment.
+
 Ship a read-only top-level sessions dashboard. It discovers sessions with `SessionManager.listAll()` (`packages/coding-agent/src/session/session-manager.ts:6070-6079`), which scans `<agentDir>/sessions/*/*.jsonl` and returns parsed `SessionInfo`; the current-project picker uses `SessionManager.list()` and is intentionally narrower. The dashboard displays `SessionInfo.cwd`, title (falling back to `firstMessage`), modification time, message count, and opt-in presence status.
 
 Use an **opt-in presence file** for liveness: a publisher writes an adjacent `<session>.jsonl.presence.json` containing an `expiresAt` timestamp. A future expiry is `active`, an expired valid record is `stale`, and absent or malformed data is `unknown`. The dashboard only reads that sidecar and never treats transcript mtime as liveness.
@@ -12,7 +14,7 @@ Use an **opt-in presence file** for liveness: a publisher writes an adjacent `<s
 
 - `SessionManager.listAll()` is the established global storage inventory. It is a read-only scan; `listForResumePickerReadOnly()` is the scoped no-maintenance-write alternative for pickers that require strict read-only behavior.
 - Harness children receive `GJC_SESSION_ID` and `GJC_LIFECYCLE_REQUEST_ID` (`packages/coding-agent/src/harness-control-plane/sdk-transport.ts:376-379`), and `SessionManager` adopts the preallocated ID into the transcript header (`packages/coding-agent/src/session/session-manager.ts:592-597`, `3762-3768`). That is a real identity binding for harness-spawned sessions.
-- Harness resolves the session SDK endpoint and authenticates with its URL and token (`packages/coding-agent/src/harness-control-plane/sdk-transport.ts:135-177`). Root resolution fail-closes on a workspace mismatch (`packages/coding-agent/src/harness-control-plane/storage.ts:347-393`). That is a real authenticated transport for that harness lifecycle scope.
+- **Internal-only harness implementation detail.** The harness transport resolves its session attachment inside SDK core; endpoint URL/token handling never crosses into dashboard, plugin, or external-controller code. Root resolution fail-closes on a workspace mismatch (`packages/coding-agent/src/harness-control-plane/storage.ts:347-393`).
 - Coordinator mutations are gated: its contract exposes register, start, send, and stop (`packages/coding-agent/src/coordinator/contract.ts:4-23`); policy applies gating (`packages/coding-agent/src/coordinator-mcp/policy.ts:186-189`); and the server binds identity to an incarnation (`packages/coding-agent/src/coordinator-mcp/server.ts:2144+`). The `readOnly` field in `commands/coordinator.ts` is hardcoded and is not an authoritative statement that mutations do not exist.
 
 ## Alternatives

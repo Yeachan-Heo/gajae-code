@@ -38,22 +38,74 @@ describe("GJC plugin schema", () => {
 		}
 	});
 
-	test("parseManifest rejects unsupported mcp aliases", () => {
-		for (const key of ["mcp", "mcpServers"]) {
-			expectLoadError(
-				() =>
-					parseManifest(
-						{
-							kind: "gajae-code-plugin",
-							name: "aliased",
-							version: "1.0.0",
-							[key]: [],
-						},
-						`/plugin/${key}/gajae-plugin.json`,
-					),
-				"unsupported_surface",
-			);
-		}
+	test("parseManifest rejects the ambiguous singular mcp alias with an actionable diagnostic", () => {
+		expectLoadError(
+			() =>
+				parseManifest(
+					{
+						kind: "gajae-code-plugin",
+						name: "aliased",
+						version: "1.0.0",
+						mcp: [],
+					},
+					"/plugin/mcp/gajae-plugin.json",
+				),
+			"unsupported_surface",
+		);
+	});
+
+	test("parseManifest normalizes the mcpServers alias into canonical mcps entries", () => {
+		const manifest = parseManifest(
+			{
+				kind: "gajae-code-plugin",
+				name: "aliased",
+				version: "1.0.0",
+				mcpServers: {
+					docs: { type: "stdio", command: "bun", args: ["mcp/server.ts"], cwd: "." },
+					remote: { url: "https://example.com/mcp" },
+				},
+			},
+			"/plugin/mcpServers/gajae-plugin.json",
+		);
+		expect(manifest.mcps).toEqual([
+			{
+				name: "docs",
+				transport: "stdio",
+				command: "bun",
+				args: ["mcp/server.ts"],
+				cwd: ".",
+				headers: undefined,
+				sha256: undefined,
+				url: undefined,
+			},
+			{
+				name: "remote",
+				transport: "http",
+				url: "https://example.com/mcp",
+				headers: undefined,
+				command: undefined,
+				args: undefined,
+				cwd: undefined,
+				sha256: undefined,
+			},
+		]);
+	});
+
+	test("parseManifest rejects combining mcps with the mcpServers alias", () => {
+		expectLoadError(
+			() =>
+				parseManifest(
+					{
+						kind: "gajae-code-plugin",
+						name: "both",
+						version: "1.0.0",
+						mcps: [],
+						mcpServers: {},
+					},
+					"/plugin/both/gajae-plugin.json",
+				),
+			"invalid_manifest",
+		);
 	});
 
 	test("parseManifest accepts the six additive surfaces", () => {

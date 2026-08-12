@@ -290,7 +290,7 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		await stopping;
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
 			ok: false,
-			error: { code: "endpoint_stale", message: "session endpoint is stale" },
+			error: { code: "resource_gone", message: "session endpoint record is gone" },
 		});
 	} finally {
 		const shutdown = handlers.get("session_shutdown");

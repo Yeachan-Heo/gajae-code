@@ -8,7 +8,12 @@ import {
 	scanAgentSessionMethods,
 	scanSlashCommands,
 } from "../scripts/generate-sdk-operation-inventory";
-import { ADAPTERS, OPERATIONS } from "../src/sdk/protocol/operation-registry";
+import {
+	ADAPTERS,
+	OPERATIONS,
+	TURN_RESULT_PROMPT_ALIAS,
+	TURN_RESULT_SKILL_ALIAS,
+} from "../src/sdk/protocol/operation-registry";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const generator = path.join(repoRoot, "packages/coding-agent/scripts/generate-sdk-operation-inventory.ts");
@@ -36,7 +41,7 @@ describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(53);
 		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(7);
-		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(31);
+		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(30);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		for (const operation of OPERATIONS) {
 			expect(Object.keys(operation.adapterDispositions).sort()).toEqual([...ADAPTERS].sort());
@@ -64,6 +69,18 @@ describe("SDK operation inventory", () => {
 	it("accepts the committed generated matrix", () => {
 		const result = run(["--check"]);
 		expect(result.exitCode, output(result)).toBe(0);
+	});
+
+	it("keeps the generated Q26 inventory canonical while retaining validated prompt and skill aliases", async () => {
+		const records = (await Bun.file(inventory).json()) as Array<{ sourceId: string; sdkId?: string }>;
+		expect(records.find(record => record.sourceId === "registry:Q26")).toMatchObject({ sdkId: "turn.result" });
+		expect(records.some(record => record.sourceId === "registry:Q28")).toBe(false);
+		for (const alias of [TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS])
+			expect(records.some(record => record.sdkId === alias)).toBe(false);
+		expect(OPERATIONS.find(operation => operation.id === "Q26")).toMatchObject({
+			aliases: [TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS],
+			errorCodes: ["invalid_request", "resource_gone"],
+		});
 	});
 
 	it("locks private AgentSession seams out of the public SDK", async () => {

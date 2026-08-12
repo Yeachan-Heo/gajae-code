@@ -10,7 +10,11 @@ import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-regist
 import type { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { CustomToolContext } from "@gajae-code/coding-agent/extensibility/custom-tools";
 import type { ReadonlySessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getImageGenToolsWithRegistry, imageGenTool } from "@gajae-code/coding-agent/tools/image-gen";
+import {
+	getImageGenToolsWithRegistry,
+	imageGenTool,
+	UnsupportedImageProviderError,
+} from "@gajae-code/coding-agent/tools/image-gen";
 
 const originalFetch = global.fetch;
 const originalOpenRouterKey = Bun.env.OPENROUTER_API_KEY;
@@ -753,6 +757,75 @@ describe("imageGenTool OpenRouter remote images", () => {
 
 		await expect(operation).rejects.toThrow(/image deadline/);
 		expect(clients[0]?.destroy).toHaveBeenCalled();
+	});
+});
+
+describe("imageGenTool image transport capability enforcement", () => {
+	it("never sends an arbitrary provider credential to the Gemini endpoint", async () => {
+		const arbitraryProviderModel = {
+			api: "google-generative-ai",
+			provider: "arbitrary-proxy",
+			id: "gemini-image-proxy",
+			name: "Gemini Image Proxy",
+			baseUrl: "https://arbitrary-proxy.example/v1",
+			output: ["text", "image"],
+		} as Model;
+		const getApiKey = vi.fn(async () => "arbitrary-provider-key");
+		let fetchCalled = false;
+		const fetchMock: typeof fetch = (async () => {
+			fetchCalled = true;
+			return new Response();
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({ getApiKey }, [arbitraryProviderModel]),
+			model: arbitraryProviderModel,
+			settings: makeMockSettings("arbitrary-proxy/gemini-image-proxy"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		await expect(imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx)).rejects.toBeInstanceOf(
+			UnsupportedImageProviderError,
+		);
+		expect(getApiKey).not.toHaveBeenCalled();
+		expect(fetchCalled).toBe(false);
+	});
+
+	it("fails unsupported image roles with a typed error before credential resolution", async () => {
+		const unsupportedModel = {
+			api: "openai-completions",
+			provider: "unsupported-image-provider",
+			id: "image-model",
+			name: "Unsupported Image Model",
+			baseUrl: "https://unsupported.example/v1",
+			output: ["text", "image"],
+		} as Model;
+		const getApiKey = vi.fn(async () => "unsupported-provider-key");
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({ getApiKey }, [unsupportedModel]),
+			model: unsupportedModel,
+			settings: makeMockSettings("unsupported-image-provider/image-model"),
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		await expect(imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx)).rejects.toMatchObject({
+			code: "unsupported_image_provider",
+			provider: "unsupported-image-provider",
+		});
+		expect(getApiKey).not.toHaveBeenCalled();
 	});
 });
 

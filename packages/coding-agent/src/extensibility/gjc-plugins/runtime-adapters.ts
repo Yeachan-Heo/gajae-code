@@ -437,7 +437,9 @@ export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
 	const { assertMcpInstallPolicy, assertDnsResolvesPublic, assertUrlAllowed } = await import("./mcp-policy");
 	const nodePath = await import("node:path");
 
-	const configs: Record<string, any> = {};
+	// A manifest-controlled MCP name such as "constructor" or "toString" must
+	// remain an ordinary own key rather than interacting with Object.prototype.
+	const configs: Record<string, any> = Object.create(null) as Record<string, any>;
 	for (const entry of active) {
 		const disabled = new Set(entry.disabledSurfaceIds);
 		for (const m of entry.surfaces.mcps) {

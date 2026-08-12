@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
@@ -15,6 +16,16 @@ import { drainReconnects, expectedBackoffs, FakeWebSocket, withFakeTransport } f
 const SESSION_ID = "chat-reconnect-session";
 const GENERATION = 4;
 const wallClockNow = Date.now;
+
+function currentHostIncarnation(): string {
+	const incarnation = processIncarnation(process.pid);
+	if (!incarnation) throw new Error("Current process incarnation is unavailable.");
+	return incarnation;
+}
+
+// Keep the Router's independent attach deadline outside the fake reconnect clock.
+const inertAttachmentTimeout = (() => ({ unref: () => undefined })) as unknown as typeof setTimeout;
+const clearInertAttachmentTimeout = (() => undefined) as unknown as typeof clearTimeout;
 /**
  * Mirrors `REPLAY_BARRIER_LIMIT`: how many live frames one attachment holds behind an
  * outstanding replay. Too low a mirror still overflows the real barrier; too high a real
@@ -379,23 +390,18 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 		);
 		const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
 		const index = await new SessionIndex(agentDir).open();
+		const hostIncarnation = currentHostIncarnation();
 		await index.append({
 			type: "host_registered",
 			sessionId: SESSION_ID,
 			locator: { repo: agentDir, stateRoot },
 			endpointGeneration: GENERATION,
 			pid: process.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
 			endpointMtimeMs,
 		});
-		await index.append({
-			type: "host_heartbeat",
-			sessionId: SESSION_ID,
-			locator: { repo: agentDir, stateRoot },
-			endpointGeneration: GENERATION,
-			pid: process.pid,
-			endpointMtimeMs,
-			activity: { state: "active", at: Date.now() },
-		});
+		await index.checkpointLiveHeartbeats();
 
 		const provider = new FakeSlackProvider();
 		let reconcileTick: (() => void) | undefined;
@@ -423,6 +429,8 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 						return 0;
 					}) as unknown as typeof setInterval,
 					clearInterval: (() => undefined) as unknown as typeof clearInterval,
+					setTimeout: inertAttachmentTimeout,
+					clearTimeout: clearInertAttachmentTimeout,
 				},
 			},
 		);
@@ -438,18 +446,11 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 					locator: { repo: agentDir, stateRoot },
 					endpointGeneration: GENERATION + 1,
 					pid: process.pid,
+					processIncarnation: hostIncarnation,
+					hostIncarnation,
 					endpointMtimeMs,
 				});
-				await index.append({
-					type: "host_heartbeat",
-					sessionId: SESSION_ID,
-					locator: { repo: agentDir, stateRoot },
-					endpointGeneration: GENERATION + 1,
-					pid: process.pid,
-					endpointMtimeMs,
-					ts: wallClockNow(),
-					activity: { state: "active", at: Date.now() },
-				});
+				await index.checkpointLiveHeartbeats(wallClockNow());
 			},
 		});
 	} finally {
@@ -478,23 +479,18 @@ async function withAttachedDiscordRuntime(
 		);
 		const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
 		const index = await new SessionIndex(agentDir).open();
+		const hostIncarnation = currentHostIncarnation();
 		await index.append({
 			type: "host_registered",
 			sessionId: SESSION_ID,
 			locator: { repo: agentDir, stateRoot },
 			endpointGeneration: GENERATION,
 			pid: process.pid,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
 			endpointMtimeMs,
 		});
-		await index.append({
-			type: "host_heartbeat",
-			sessionId: SESSION_ID,
-			locator: { repo: agentDir, stateRoot },
-			endpointGeneration: GENERATION,
-			pid: process.pid,
-			endpointMtimeMs,
-			activity: { state: "active", at: Date.now() },
-		});
+		await index.checkpointLiveHeartbeats();
 
 		const provider = new FakeDiscordProvider();
 		let reconcileTick: (() => void) | undefined;
@@ -522,6 +518,8 @@ async function withAttachedDiscordRuntime(
 						return 0;
 					}) as unknown as typeof setInterval,
 					clearInterval: (() => undefined) as unknown as typeof clearInterval,
+					setTimeout: inertAttachmentTimeout,
+					clearTimeout: clearInertAttachmentTimeout,
 				},
 			},
 		);
@@ -599,6 +597,7 @@ test("chat daemon startup isolates an unreachable indexed endpoint from a health
 			{ sessionId: "chat-healthy", url: "ws://healthy.test/", token: "chat-healthy-secret" },
 		] as const;
 		const index = await new SessionIndex(agentDir).open();
+		const hostIncarnation = currentHostIncarnation();
 		for (const session of sessions) {
 			const endpointFile = path.join(endpointDir, `${session.sessionId}.json`);
 			await fs.writeFile(endpointFile, `${JSON.stringify({ ...session, pid: process.pid })}\n`);
@@ -609,9 +608,12 @@ test("chat daemon startup isolates an unreachable indexed endpoint from a health
 				locator: { repo: agentDir, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
+				processIncarnation: hostIncarnation,
+				hostIncarnation,
 				endpointMtimeMs,
 			});
 		}
+		await index.checkpointLiveHeartbeats();
 		const provider = new FakeSlackProvider();
 		const attachedSessions: string[] = [];
 		runtime = new ChatDaemonRuntime(

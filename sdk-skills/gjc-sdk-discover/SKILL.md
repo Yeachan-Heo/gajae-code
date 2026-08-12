@@ -1,6 +1,6 @@
 ---
 name: gjc-sdk-discover
-description: Discover and inspect trusted local GJC sessions through direct SDK v3 endpoints.
+description: Discover and inspect trusted local GJC sessions through the broker-bound session CLI.
 ---
 
 # GJC SDK session discovery
@@ -10,15 +10,15 @@ Use this skill when an external agent needs to find or inspect local GJC session
 ## Required behavior
 
 1. Resolve the repository root explicitly.
-2. Read the local SDK discovery records under `<repo>/.gjc/state/sdk/` through the maintained SDK discovery API.
-3. Select an exact session ID. Session omission is allowed only when exactly one live endpoint exists.
-4. Fail closed for missing, malformed, stale, dead, unknown, symlinked, or ambiguous discovery.
-5. Never print, persist, return, or place the endpoint token in logs, errors, source, config, environment examples, or shell history.
-6. Close every SDK client in a `finally` block.
+2. Run `gjc sdk session list` with that repository as the working directory and consume only its credential-free Broker DTO.
+3. Select an exact session ID from that DTO, then use `gjc sdk session inspect <sessionId>` or the fixed raw-query commands below.
+4. Fail closed for missing, unavailable, stale, dead, unknown, or ambiguous Broker results.
+5. Never scan `.gjc/state/sdk`, parse endpoint records, read credentials, or open a raw per-session WebSocket.
+6. Render only bounded, redacted CLI JSON; discard raw CLI stderr.
 
 ## Core inspection recipe
 
-Compose this pull-based view in order:
+Compose this pull-based view in order with `gjc sdk session raw query <sessionId> --query <query>`:
 
 1. `session.metadata`
 2. `context.get`
@@ -34,8 +34,7 @@ Fetch transcript pages and diffs only when the user's task requires them:
 
 The reads are not an atomic snapshot. For every reported field, identify its source query and classify it as `confirmed`, `inferred`, `stale`, `unavailable`, or `unknown`. Preserve partial results when independent queries succeed; never invent a missing value.
 
-## Direct client references
+## Broker-bound references
 
-- TypeScript: `@gajae-code/coding-agent/sdk`
-- Python: `gjc_sdk`
+- [SDK session CLI](../../../docs/sdk-session-cli.md)
 - Canonical templates: `gjc-sdk-author/templates/direct-sdk.ts` and `direct-sdk.py`

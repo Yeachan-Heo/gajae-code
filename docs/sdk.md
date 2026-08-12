@@ -20,61 +20,25 @@ External and managed integrations attach through SDK-core surfaces only:
 - endpoint URL/token discovery, raw WebSocket relays, and `gjc sdk serve` are not public attachment mechanisms;
 - lifecycle-equivalent per-session controls are prohibited on Telegram, Discord, Slack, ACP, MCP, and daemon CLI adapters.
 
-```bash
-bun add @gajae-code/bridge-client
-```
+For terminal-side session operation, use the broker-bound [SDK session CLI](./sdk-session-cli.md):
+`gjc sdk session list|inspect|send|status|tail` plus the explicit `raw`
+`control|query|global` hatch. The CLI resolves the exact attachment through SDK
+core and emits credential-free JSON.
 
-```ts
-import { SdkClient } from "@gajae-code/bridge-client";
-```
+## Migration from removed external transports
 
-`@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
-For terminal-side session operation, see [the SDK session CLI guide](./sdk-session-cli.md):
-`gjc sdk session list|inspect|send|status|tail` plus the explicit raw
-`control|query|global` hatch, all broker-bound and credential-free.
-
-## Migration from the removed RPC mode
-
-The retired `--mode rpc`, `rpc-ui`, and `bridge` modes are removed. The SDK v3
-WebSocket endpoint is now the canonical external control/query bus.
-
-| Retired RPC commands | SDK v3 control/query operations |
-| --- | --- |
-| `prompt`, `steer`, `follow_up`, `abort` | `turn.prompt`, `turn.steer`, `turn.follow_up`, `turn.abort` |
-| Model, thinking, queue, retry, and compaction controls | `model.*`, `thinking.*`, `queue.*`, `retry.*`, and `compaction.*` |
-| Session and transcript queries | `session.*`, `transcript.*`, `context.get`, and `session.stats` |
-| Workflow-gate response | `workflow.gate_answer` |
-
-See the [RPC-to-SDK v3 parity audit](./sdk-rpc-parity-audit.md) for the full
-matrix, partial equivalents, and evidence.
-
-For a local non-WebSocket transport, run one of these commands:
-
-```sh
-gjc sdk serve --stdio
-```
-
-```sh
-gjc sdk serve --socket <path>
-```
-
-It relays the identical SDK v3 frames over stdio or a Unix socket. Socket
-clients send an authentication preface and the socket is mode `0600`; stdio is
-one parent-owned connection.
-
-Python clients install the `gjc_sdk` package from `python/gjc-sdk`:
-
-```sh
-python -m pip install ./python/gjc-sdk
-```
-
-Import `SdkClient` with `from gjc_sdk import SdkClient`, then use
-`SdkClient.connect_ws`, `SdkClient.connect_socket`, or `SdkClient.connect_stdio`.
-The client supplies `reply.token` for replies.
+The retired `--mode rpc`, `rpc-ui`, `bridge`, and `gjc sdk serve` transports
+have no replacement wire client. Process-isolated controllers use Coordinator
+MCP, `gjc sdk session`, or a configured managed adapter. In-process applications
+use the [embedding SDK](./sdk-embedding.md).
 
 ## External-agent SDK skills
 
-The generated `sdk-skills/` bundle provides host-neutral guidance for external agents that operate local GJC sessions directly through SDK v3. It is intentionally separate from GJC's four internal workflow skills, the coordinator MCP plugin, and the SDK MCP adapter.
+The generated `sdk-skills/` bundle provides host-neutral guidance for scripts
+that invoke the broker-bound session CLI. It is intentionally separate from
+GJC's four internal workflow skills, the coordinator MCP plugin, and the SDK MCP
+adapter. Its TypeScript and Python templates do not discover endpoints or create
+transport clients.
 
 The bundle owns exactly six files:
 
@@ -85,23 +49,30 @@ The bundle owns exactly six files:
 - `gjc-sdk-author/templates/direct-sdk.ts`
 - `gjc-sdk-author/templates/direct-sdk.py`
 
-Regenerate with `bun run generate-sdk-skills`; CI checks byte-for-byte content and rejects unexpected files with `bun run check:sdk-skills`.
+Regenerate with `bun run generate-sdk-skills`; CI checks byte-for-byte content
+and rejects unexpected files with `bun run check:sdk-skills`.
 
 ### Bundle format version
 
-`manifest.json` is the versioned root of the on-disk bundle contract. It declares `formatVersion` (currently `1`) and the exact relative file closure the bundle owns. Consumers must treat any bundle whose manifest is missing, malformed, or declares an unsupported `formatVersion` as unreadable and fail closed — never guess at an unknown layout. The skill prompts are authored as static Markdown sources under `scripts/gjc-sdk-skills/prompts/`; the generator copies them verbatim and `check:sdk-skills` proves the committed bundle matches the generated artifacts byte-for-byte, so prompt text is reviewed and diffed as content, not as generator strings.
-
-The compatibility contract is additive: `formatVersion` only bumps when the layout becomes incompatible, and regeneration upgrades an installed bundle in place. A legacy unversioned bundle (the original five-file layout) is unsupported and must be rejected with a regeneration hint rather than read ambiguously.
+`manifest.json` is the versioned root of the on-disk bundle contract. It
+identifies `formatVersion` (currently `1`) and the exact relative file closure
+that regeneration owns. Consumers must treat a bundle whose manifest is missing,
+malformed, or declares an unsupported version as unreadable and fail closed. The
+skill prompts are authored as static Markdown sources under
+`scripts/gjc-sdk-skills/prompts/`; the generator copies them verbatim and
+`check:sdk-skills` proves the committed bundle matches the generated artifacts.
 
 ### Trust boundary
 
-Authentication for a direct SDK connection checks only possession of the endpoint token carried by the discovery record; there is no further per-request capability check at the transport. Once authenticated, requests reach the SDK operation registry dispatcher, which can serve managed bash, configuration, permissions, tools, extensions, and destructive session operations. The `sdk-skills/` templates and their allowlists are a procedural safety policy for reviewed local scripts — they are **not** a security boundary. A modified local script that has read the endpoint token can call more of the SDK than the templates permit, with that token's authority.
+The templates invoke only the broker-bound CLI. `SessionRouter` keeps endpoint
+resolution, credentials, SDK clients, replay, reconnect, and rotation inside SDK
+core. The templates' fixed allowlists and nonce-bound approval are trusted-local
+procedural safeguards, not capability isolation; lifecycle and attachment
+authority remain enforced by Broker and Router.
 
-The skills use a trusted-local procedural model. They require exact live-session selection, never log or persist endpoint credentials, compose a provenance-labeled inspection view from existing queries, and require single-use human approval before allowlisted lifecycle operations. They do not claim capability isolation: a modified local script that can read an endpoint token has the authority of that token.
-
-Phase 2 still does **not** provide unattended negotiation, a cross-process
-reattach/registry, or a renderer-grade full event stream. No event-plane parity
-is claimed; see the audit's [ranked Phase-2 register](./sdk-rpc-parity-audit.md#ranked-phase-2-follow-up-register--not-implemented).
+No renderer-grade cross-process event stream is exposed to external scripts.
+Use managed adapters or Coordinator MCP for event-driven orchestration; see the
+[RPC-to-SDK v3 parity audit](./sdk-rpc-parity-audit.md) for remaining gaps.
 
 ## Architecture
 
@@ -132,10 +103,12 @@ This boundary prevents a child from newly loading caller-cwd or user-global Bun 
 
 Broker and per-session discovery tokens remain in their authoritative private discovery files for SDK-core resolution. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
 
-## Protocol
+## Internal protocol
 
-JSON text frames. Field names are `camelCase`; the `type` discriminator is
-`snake_case`.
+The following frame shapes are SDK-core implementation details for maintainers.
+External integrations must not construct these frames, attach to session
+transports, or receive endpoint credentials; use a Router-issued attachment, the
+broker-bound CLI, or Coordinator MCP instead.
 
 ### Server → client
 
@@ -157,9 +130,9 @@ JSON text frames. Field names are `camelCase`; the `type` discriminator is
   "sessionId": "sess-1", "summary": "finished refactor; awaiting next step" }
 ```
 
-- `id` is an opaque, transient presentation/action ID. It is the **only** authority accepted by generic `reply.id`; use it only with the current authenticated endpoint. It is not a durable workflow ID.
-- `workflowGateId?: string` is optional, additive SDK v3 correlation metadata, present only for the active presentation of a durable workflow gate. When present, it equals that gate's Q12 `gate_id`. Its public correlation key is `(sessionId, workflowGateId)` at the current authenticated endpoint; it never authorizes generic `reply`.
-- `kind: "ask"` is answerable in interactive/TUI and SDK workflow-gate sessions. `kind: "idle"` is notify-only and ephemeral (not replayed to clients that connect later). Ordinary asks and idle frames omit `workflowGateId`.
+- `id` is an opaque, transient presentation/action ID. It is the **only** authority accepted by generic `reply.id` through the current Router-issued attachment. It is not a durable workflow ID.
+- `workflowGateId?: string` is optional, additive SDK v3 correlation metadata, present only for the active presentation of a durable workflow gate. When present, it equals that gate's Q12 `gate_id`. Its public correlation key is `(sessionId, workflowGateId)` on the current Router-issued attachment; it never authorizes generic `reply`.
+- `kind: "ask"` is answerable in interactive/TUI and SDK workflow-gate sessions. `kind: "idle"` is notify-only and ephemeral (not replayed to attachments that start later). Ordinary asks and idle frames omit `workflowGateId`.
 - `recommendedIndex?: number` is optional, zero-based display metadata for `options`. Clients must validate that it is an in-range integer and ignore malformed values. Raw option labels and reply indices remain authoritative; never decorate submitted answers or infer a recommendation from position. The additive field is wire-compatible, but Rust consumers constructing the public `ActionNeeded` struct by literal must provide `recommended_index: None` when no recommendation exists.
 - This corrects the pre-v3 documentation invariant that `action_needed.id == gate_id`: they are deliberately different values. Clients must not preserve that invariant, infer a relationship from question/options/order, or retain private route, claim, receipt, epoch, token, or endpoint-generation maps.
 
@@ -182,24 +155,12 @@ Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 
 The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
 
-### Client → server
+### Internal inbound frames
 
-`reply` — answer a pending `ask`:
-
-```json
-{ "type": "reply", "id": "act_9e31", "answer": 0, "token": "<token>" }
-```
-
-`answer` accepts:
-
-- a number — zero-based option index (`0` = first option);
-- a string — an option label, or free text;
-- an object — `{ "selected": [0, "Maybe"], "custom": "..." }` for multi-select.
-
-Optional `idempotencyKey` makes retries safe: the same key + same body re-acks;
-the same key + different body is rejected with `idempotency_conflict`.
-
-Managed threaded adapters may also send optional client → server frames through their opaque attachment: `user_message` (inject/steer a turn with free text), `config_command` (toggle verbosity/redact in-thread), `hello` (capability/version), and `ping`.
+SDK core creates inbound frames only after Router attachment checks. External
+integrations must not construct or persist them. Managed adapters use their
+opaque `SessionAttachment`, and process-isolated scripts use `gjc sdk session`;
+neither path receives transport credentials.
 
 ## Model catalog query (Q10)
 
@@ -335,28 +296,25 @@ its asynchronous preflight accepts the prompt. That receipt is a durable,
 later finalizes that claim with exactly one `SdkPromptTerminalOutcome`; cleanup
 may follow only after the claim is durable.
 
-The authoritative public reconciliation query is `Q26` /
-`turn.prompt_status`, scoped to the same live session runtime. Its `outcome`
+The authoritative public reconciliation query is `Q26` / `turn.result`, scoped
+to the same live session runtime. Callers supply `kind: "prompt"`; its `outcome`
 field is exposed only after finalization. A pending claim is never represented
-or exposed as a terminal outcome.
+or exposed as a terminal outcome. `turn.prompt_status` remains a legacy
+prompt-only alias that injects the same `kind`.
 
 Every prompt and skill status response includes `receiptState`: active records are `absent`; terminal records are `present`, `missing`, or `unknown`; unknown lookup is `unknown`. Ordinary success requires `status: "terminal_ok"`, `receiptState: "present"`, and readable non-empty text or an artifact path. A failed execution may retain a partial `present` receipt. Legacy version-1 reconciliation records without this additive field remain readable and project `unknown` rather than optimistic success.
 
 Callers that must recover from a lost acknowledgement should assign one fresh
-`clientRef` (a trimmed, non-empty string of at most 128 characters) to each logical
-prompt. Reconnect to the same session endpoint and query with exactly one selector:
+`clientRef` (a trimmed, non-empty string of at most 128 characters) to each
+logical prompt, then reconcile through the broker-bound CLI:
 
-```json
-{ "type": "query_request", "query": "turn.prompt_status",
-  "input": { "clientRef": "request-018f" } }
+```sh
+gjc sdk session raw query <sessionId> --query turn.result \
+  --json-input '{"kind":"prompt","clientRef":"request-018f"}'
 ```
 
-or:
-
-```json
-{ "type": "query_request", "query": "turn.prompt_status",
-  "input": { "commandId": "command-id", "turnId": "turn-id" } }
-```
+The alternate selector uses the same `kind` with
+`{"kind":"prompt","commandId":"command-id","turnId":"turn-id"}` as its JSON input.
 
 The result status is `accepted`, `in_flight`, `terminal_ok`, `failed`, or
 `unknown`. Known records include `acceptedAt`; in-flight and terminal records add
@@ -387,14 +345,15 @@ grace period, which is not configurable. A controlled terminal failure reaches A
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
 
-## Skill invoke reconciliation (Q28)
+## Skill invoke reconciliation
 
 `skill.invoke` accepts optional `clientRef` and returns an early accepted receipt
 `{ accepted: true, commandId, turnId, clientRef?, name, path, lineCount?, args? }` after
 durable/preflight accept (SDK control path), not after skill completion. Query prior
-status with `Q28` / `skill.invoke_status` using the same selectors as Q26. Kind-scoped
-indexes mean prompt and skill `clientRef` values never collide. Skill records use the
-same capacity/TTL limits, but an active skill record at restart settles with
+status with `Q26` / `turn.result` and `kind: "skill"`. `skill.invoke_status`
+remains a legacy skill-only alias that injects the same `kind`. Kind-scoped indexes
+mean prompt and skill `clientRef` values never collide. Skill records use the same
+capacity/TTL limits, but an active skill record at restart settles with
 `error.code = process_restart`.
 
 ## Correlated steer acknowledgement (Q30)
@@ -480,20 +439,10 @@ Generic and direct controls may race. Once the native generic claim is acquired,
 
 ### Durable workflow controls and Q12
 
-`workflow.gate_answer` and `workflow.plan_approve` operate on the durable
-Q12 `gate_id`, not `action_needed.id`. Both accept optional
-`expectedSessionId`; clients should always send the `sessionId` observed from
-the current authenticated endpoint:
-
-```json
-{ "type": "control_request", "operation": "workflow.gate_answer",
-  "input": { "id": "wg_run_stage_1", "response": "approve", "expectedSessionId": "sess-1" } }
-```
-
-```json
-{ "type": "control_request", "operation": "workflow.plan_approve",
-  "input": { "id": "wg_run_stage_1", "choice": "approve", "expectedSessionId": "sess-1" } }
-```
+`workflow.gate_answer` and `workflow.plan_approve` operate on the durable Q12
+`gate_id`, not `action_needed.id`. Managed adapters bind `expectedSessionId`
+from their current Router-issued attachment. Process-isolated operators use the
+raw-control flow documented in the [SDK session CLI guide](./sdk-session-cli.md); they do not construct protocol frames.
 
 `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 control clients continue to work; new clients must send it now. It cannot become mandatory, or be removed from the controls, before SDK v4 and at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before the gate resolver runs. Neither control accepts a presentation ID, remaps an old ID to a reminted gate, or uses heuristic matching.
 

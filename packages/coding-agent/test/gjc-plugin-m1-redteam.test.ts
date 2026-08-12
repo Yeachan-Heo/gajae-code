@@ -115,7 +115,6 @@ describe("GJC plugin Milestone 1 red-team QA", () => {
 			["forbidden commands", { commands: [{ name: "evil" }] }, "forbidden_surface"],
 			["forbidden slash commands", { "slash-commands": [{ name: "evil" }] }, "forbidden_surface"],
 			["legacy mcp alias", { mcp: { command: "node" } }, "unsupported_surface"],
-			["legacy mcpServers alias", { mcpServers: { docs: { command: "node" } } }, "unsupported_surface"],
 			["hooks not array", { hooks: { name: "audit" } }, "invalid_manifest"],
 			["hooks entry not object", { hooks: ["hooks/audit.ts"] }, "invalid_manifest"],
 			["mcps not array", { mcps: { name: "docs" } }, "invalid_manifest"],
@@ -129,6 +128,37 @@ describe("GJC plugin Milestone 1 red-team QA", () => {
 		for (const [label, overrides, code] of cases) {
 			expectLoadError(() => parseManifest(baseManifest(overrides), `redteam-${label}.json`), code);
 		}
+	});
+
+	test("mcpServers alias normalizes representable fields and rejects unrepresentable ones", () => {
+		// The Claude Code-familiar map alias is accepted when every field has an
+		// unambiguous canonical equivalent (command -> stdio).
+		const accepted = parseManifest(
+			{
+				kind: "gajae-code-plugin",
+				name: "alias",
+				version: "1.0.0",
+				mcpServers: { docs: { command: "node", args: ["s.ts"] } },
+			},
+			"redteam-mcpServers-accepted.json",
+		);
+		expect(accepted.mcps[0]).toMatchObject({ name: "docs", transport: "stdio", command: "node" });
+
+		// env cannot be preserved by the canonical mcps entry: targeted
+		// migration diagnostic, never a silent drop (loose mcp.json supports it).
+		expectLoadError(
+			() =>
+				parseManifest(
+					{
+						kind: "gajae-code-plugin",
+						name: "alias",
+						version: "1.0.0",
+						mcpServers: { docs: { command: "node", args: ["s.ts"], env: { TOKEN: "t" } } },
+					},
+					"redteam-mcpServers-env.json",
+				),
+			"unsupported_surface",
+		);
 	});
 
 	test("rejects traversal paths and never imports plugin code while compiling", async () => {

@@ -1064,7 +1064,7 @@ test("startup records identity before an early lifecycle event and publishes it 
 		const events = replay.events as Array<Record<string, unknown>>;
 		expect(events.map(event => event.payload)).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ type: "identity_header", sessionId }),
+				expect.objectContaining({ type: "identity_header", sessionId, telegramTopicsEnabled: true }),
 				expect.objectContaining({ type: "activity", sessionId, state: "busy" }),
 			]),
 		);
@@ -6972,7 +6972,7 @@ test("ordered turn.prompt ignores envelope idempotencyKey: no replay and no idem
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
-test("turn.prompt_status validates selectors and rejects invalid clientRef input", async () => {
+test("turn.result validates selectors and its prompt alias rejects invalid clientRef input", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-validation-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-validation-${Date.now()}`;
@@ -7022,7 +7022,16 @@ test("turn.prompt_status validates selectors and rejects invalid clientRef input
 			input: { clientRef: "r" },
 			cursor: "x",
 		}),
-	).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
+	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	expect(
+		await request({
+			type: "query_request",
+			id: "q-canonical-empty-cursor",
+			query: "turn.result",
+			input: { kind: "prompt", clientRef: "r" },
+			cursor: "",
+		}),
+	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
 	expect(
 		await request({
 			type: "query_request",

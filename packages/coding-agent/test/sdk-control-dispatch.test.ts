@@ -163,6 +163,26 @@ test("forwards expectedSessionId only to durable workflow controls", async () =>
 	]);
 });
 
+test("forwards an explicit workflow gate idempotency key", async () => {
+	const gate = OPERATIONS.find(operation => operation.sdkId === "workflow.gate_answer")!;
+	const calls: unknown[][] = [];
+	const surface = {
+		answerGate: (...args: unknown[]) => {
+			calls.push(args);
+			return { resolved: true };
+		},
+	} as unknown as ControlSurface;
+
+	const response = await dispatchControl(surface, gate, {
+		...request(gate),
+		input: { id: "gate", response: "approve", expectedSessionId: "session" },
+		idempotencyKey: "gate-answer-key",
+	});
+
+	expect(response.ok).toBe(true);
+	expect(calls).toEqual([["gate", "approve", "session", "gate-answer-key"]]);
+});
+
 test("forwards an optional thinking level with model.set without changing legacy calls", async () => {
 	const model = OPERATIONS.find(row => row.sdkId === "model.set")!;
 	const calls: unknown[][] = [];

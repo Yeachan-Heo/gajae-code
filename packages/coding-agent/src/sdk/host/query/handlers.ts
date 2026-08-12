@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
+import { TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
+
 import type { ActiveProviderDescriptor } from "../../providers.js";
 import { ActiveProviderResolutionError } from "../../providers.js";
+
 import {
 	assertCursorSelector,
 	type CursorEnvelope,
@@ -176,7 +179,8 @@ const names = [
 	"runtime.jobs.list",
 	"turn.result",
 	"models.profiles.list",
-	"skill.invoke_status",
+	// Q28 was folded into Q26; retain the vacant slot so Q29/Q30 remain stable.
+	undefined,
 	"providers.list/active",
 	"session.checkpoint",
 	"turn.steer_status",
@@ -201,8 +205,9 @@ export class QueryHandlers {
 					);
 				return await this.#turnResult(request);
 			}
-			if (request.query === "turn.prompt_status") return await this.#promptTurnResult(request);
-			if (request.query === "skill.invoke_status") return await this.#skillTurnResult(request);
+			if (request.query === TURN_RESULT_PROMPT_ALIAS) return await this.#promptTurnResult(request);
+
+			if (request.query === TURN_RESULT_SKILL_ALIAS) return await this.#skillTurnResult(request);
 
 			const query = request.query.startsWith("Q")
 				? request.query
@@ -219,7 +224,7 @@ export class QueryHandlers {
 					);
 				return await this.#turnResult(request);
 			}
-			if (query === "Q28") return await this.#skillTurnResult(request);
+
 			if (
 				this.surface.installedQueries instanceof Set &&
 				!this.surface.installedQueries.has(names[Number(query.slice(1)) - 1] ?? "")
@@ -584,7 +589,8 @@ export class QueryHandlers {
 		// unreachable: the bounded content cap is well under both RESPONSE_CEILING_BYTES
 		// and TARGET_PAGE_BYTES, so no revision is ever created. Reject cursors
 		// upfront instead of advertising a continuation path that can never fire.
-		if (request.cursor) return this.#error(request, "invalid_cursor", false, "turn.result does not support cursors.");
+		if (request.cursor !== undefined)
+			return this.#error(request, "invalid_request", false, "turn.result does not support cursors.");
 		if (typeof this.surface.getTurnResult !== "function") return this.#error(request, "unavailable");
 		const result = await this.surface.getTurnResult({
 			kind,
@@ -640,12 +646,12 @@ export class QueryHandlers {
 		return await this.#turnResult({ ...request, input: { ...input, kind: "prompt" } });
 	}
 	async #skillTurnResult(request: QueryRequest): Promise<QueryResponse> {
-		if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("skill.invoke_status"))
+		if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("turn.result"))
 			return this.#error(
 				request,
 				"operation_not_session_owned",
 				false,
-				"skill.invoke_status is not installed for this session.",
+				"turn.result is not installed for this session.",
 			);
 		const input = request.input ?? {};
 		if (input.kind !== undefined && input.kind !== "skill")

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export type SdkErrorCode =
 	| "invalid_input"
@@ -7,6 +7,7 @@ export type SdkErrorCode =
 	| "unavailable"
 	| "timeout"
 	| "connection_closed"
+	| "uncertain_after_send"
 	| "endpoint_credential_forbidden"
 	| (string & {});
 
@@ -70,6 +71,16 @@ export interface SdkRequestOptions {
 }
 
 export type SdkFrame = Record<string, unknown>;
+
+/** Request identity retained after an uncertain send for lifecycle reconciliation. */
+
+export interface SdkSentRecord {
+	readonly id: string;
+	readonly operation?: string;
+	readonly idempotencyKey?: string;
+	readonly fingerprint: string;
+}
+
 export type SdkFrameHandler = (frame: SdkFrame) => void;
 export type SdkReconnectHandler = () => void;
 export type SdkReconnectFailedHandler = (error: SdkClientError) => void;
@@ -106,11 +117,13 @@ type Pending = {
 	reject: (error: Error) => void;
 	timer: NodeJS.Timeout;
 	sent: boolean;
+	onResponse?: () => void;
 };
 
 /**
- * Transport facts attached to an SdkClientError with code "timeout" for a request.
- * `requestSent` proves only that WebSocket.send() returned; it never proves server acceptance.
+ * Transport facts attached to a request timeout before an outcome is known.
+ * A timeout after send is surfaced as `uncertain_after_send` with an
+ * {@link SdkSentRecord} in its details.
  */
 export interface SdkRequestTimeoutDetails {
 	requestId: string;
@@ -140,6 +153,14 @@ function parseFrame(value: unknown): Frame {
 	throw new SdkClientError("protocol_error", "SDK server sent a malformed frame.");
 }
 
+function lifecycleFingerprint(operation: string, input: unknown): string {
+	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
+}
+
+function inputFingerprint(input: unknown): string {
+	return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
 /** A transport-only v3 SDK WebSocket client with no host or session authority. */
 export class SdkClient {
 	readonly #url: string;
@@ -160,6 +181,7 @@ export class SdkClient {
 	#cycleGeneration = 0;
 	#incarnationGeneration = 0;
 	#pending = new Map<string, Pending>();
+	#sentRecords = new Map<string, SdkSentRecord>();
 	#frameHandlers = new Set<SdkFrameHandler>();
 	#reconnectHandlers = new Set<SdkReconnectHandler>();
 	#reconnectFailedHandlers = new Set<SdkReconnectFailedHandler>();
@@ -254,11 +276,15 @@ export class SdkClient {
 		const current = this.#currentSocketRecord;
 		if (current) {
 			transports.add(current);
-			this.#retire(current, new SdkClientError("connection_closed", "SDK client closed"), false);
+			this.#retire(current, new SdkClientError("connection_closed", "SDK client closed"), false, true);
 		}
 		for (const [id, pending] of this.#pending)
-			this.#settlePending(id, pending, new SdkClientError("connection_closed", "SDK client closed"));
-		await Promise.all([...transports].map(incarnation => this.#closeTransport(incarnation)));
+			this.#settlePending(id, pending, new SdkClientError("connection_closed", "SDK client closed"), true);
+		try {
+			await Promise.all([...transports].map(incarnation => this.#closeTransport(incarnation)));
+		} finally {
+			this.#sentRecords.clear();
+		}
 	}
 
 	async control(
@@ -297,19 +323,55 @@ export class SdkClient {
 		return await this.#request({ type: "broker_request", operation, input }, options);
 	}
 
-	async #request(frame: Frame, options: SdkRequestOptions): Promise<unknown> {
+	getSentRecord(id: string): SdkSentRecord | undefined {
+		return this.#sentRecords.get(id);
+	}
+	#rememberSentRecord(record: SdkSentRecord): void {
+		this.#sentRecords.set(record.id, record);
+		while (this.#sentRecords.size > 256) {
+			const oldest = this.#sentRecords.keys().next().value;
+			if (oldest === undefined) return;
+			this.#sentRecords.delete(oldest);
+		}
+	}
+	async lookupLifecycle(record: SdkSentRecord, timeoutMs?: number): Promise<unknown> {
+		if (!record.operation || !record.idempotencyKey || !record.fingerprint)
+			throw new SdkClientError(
+				"invalid_input",
+				"A lifecycle sent record requires operation, idempotencyKey, and fingerprint.",
+			);
+		return await this.#request(
+			{
+				type: "broker_request",
+				operation: "broker.lookup_lifecycle",
+				input: { operation: record.operation, fingerprint: record.fingerprint },
+			},
+			{ timeoutMs, idempotencyKey: record.idempotencyKey },
+			() => this.#sentRecords.delete(record.id),
+		);
+	}
+
+	async #request(frame: Frame, options: SdkRequestOptions, onResponse?: () => void): Promise<unknown> {
 		if (this.#closed) throw new SdkClientError("connection_closed", "SDK client closed");
 		this.#throwIfDeadlineElapsed();
 		const incarnation = await this.#connect();
 		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
 		if (timeoutMs <= 0) throw this.#deadlineError();
 		const id = randomUUID();
+		const requestFrame = {
+			...frame,
+			id,
+			...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+		};
+		const serializedRequest = JSON.stringify(requestFrame);
+		const serializedFrame = JSON.parse(serializedRequest) as Frame;
 		const deferred = Promise.withResolvers<unknown>();
 		const pending: Pending = {
 			incarnation,
 			resolve: deferred.resolve,
 			reject: deferred.reject,
 			sent: false,
+			onResponse,
 			timer: setTimeout(
 				() =>
 					this.#settlePending(
@@ -319,6 +381,7 @@ export class SdkClient {
 							requestId: id,
 							requestSent: pending.sent,
 						} satisfies SdkRequestTimeoutDetails),
+						true,
 					),
 				timeoutMs,
 			),
@@ -329,14 +392,17 @@ export class SdkClient {
 			return await deferred.promise;
 		}
 		try {
-			incarnation.socket.send(
-				JSON.stringify({
-					...frame,
-					id,
-					...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-				}),
-			);
+			incarnation.socket.send(serializedRequest);
 			pending.sent = true;
+			this.#rememberSentRecord({
+				id,
+				operation: typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined,
+				idempotencyKey: options.idempotencyKey,
+				fingerprint:
+					typeof serializedFrame.operation === "string"
+						? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
+						: inputFingerprint(serializedFrame.input ?? {}),
+			});
 		} catch (error) {
 			this.#settlePending(
 				id,
@@ -367,7 +433,8 @@ export class SdkClient {
 		const current = this.#currentSocketRecord;
 		if (current && this.#isActive(current) && current.socket.readyState === WebSocket.OPEN) return current;
 		if (current)
-			this.#retire(current, new SdkClientError("connection_closed", "SDK WebSocket connection closed"), true);
+			this.#retire(current, new SdkClientError("connection_closed", "SDK WebSocket connection closed"), true, true);
+
 		let cycle = this.#opening;
 		if (!cycle) {
 			cycle = { generation: ++this.#cycleGeneration, phase: "opening", candidate: null };
@@ -589,6 +656,7 @@ export class SdkClient {
 				? error
 				: new SdkClientError("unavailable", "SDK WebSocket connection failed", error),
 			true,
+			true,
 		);
 	}
 
@@ -635,7 +703,13 @@ export class SdkClient {
 		if (id) {
 			const pending = this.#pending.get(id);
 			if (pending?.incarnation === incarnation) {
-				this.#settlePending(id, pending, frame.ok === false || frame.status === "error" ? errorFrom(frame) : frame);
+				this.#settlePending(
+					id,
+					pending,
+					frame.ok === false || frame.status === "error" ? errorFrom(frame) : frame,
+					false,
+					true,
+				);
 			}
 		}
 		this.#notifyFrameHandlers(frame);
@@ -692,18 +766,45 @@ export class SdkClient {
 		if (reconnecting) this.#notifyReconnectHandlers();
 	}
 
-	#settlePending(id: string, pending: Pending, result: unknown): void {
+	#settlePending(
+		id: string,
+		pending: Pending,
+		result: unknown,
+		transportFailure = false,
+		responseReceived = false,
+	): void {
 		if (this.#pending.get(id) !== pending) return;
 		this.#pending.delete(id);
 		clearTimeout(pending.timer);
-		if (result instanceof Error) pending.reject(result);
-		else pending.resolve(result);
+		if (responseReceived) pending.onResponse?.();
+		if (result instanceof Error) {
+			if (
+				transportFailure &&
+				pending.sent &&
+				result instanceof SdkClientError &&
+				(result.code === "timeout" || result.code === "connection_closed")
+			)
+				pending.reject(
+					new SdkClientError(
+						"uncertain_after_send",
+						"SDK request outcome is uncertain after the frame was sent.",
+						this.#sentRecords.get(id),
+					),
+				);
+			else {
+				this.#sentRecords.delete(id);
+				pending.reject(result);
+			}
+			return;
+		}
+		this.#sentRecords.delete(id);
+		pending.resolve(result);
 	}
-	#rejectPendingFor(incarnation: Incarnation, error: SdkClientError): void {
+	#rejectPendingFor(incarnation: Incarnation, error: SdkClientError, transportFailure = false): void {
 		for (const [id, pending] of this.#pending)
-			if (pending.incarnation === incarnation) this.#settlePending(id, pending, error);
+			if (pending.incarnation === incarnation) this.#settlePending(id, pending, error, transportFailure);
 	}
-	#retire(incarnation: Incarnation, error: SdkClientError, closeSocket: boolean): void {
+	#retire(incarnation: Incarnation, error: SdkClientError, closeSocket: boolean, transportFailure = false): void {
 		if (incarnation.tornDown) return;
 		const phase = incarnation.phase;
 		incarnation.phase = "retired";
@@ -714,7 +815,7 @@ export class SdkClient {
 		incarnation.rejectOpen = undefined;
 		incarnation.resolveHello = undefined;
 		incarnation.rejectHello = undefined;
-		this.#rejectPendingFor(incarnation, error);
+		this.#rejectPendingFor(incarnation, error, transportFailure);
 		if (this.#currentSocketRecord === incarnation) this.#currentSocketRecord = null;
 		if (incarnation.cycle.candidate === incarnation) incarnation.cycle.candidate = null;
 		this.#teardown(incarnation, closeSocket);

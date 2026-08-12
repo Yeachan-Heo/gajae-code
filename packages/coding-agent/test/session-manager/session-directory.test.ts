@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import {
 	artifactTreeReplayCompatible,
 	deleteManagedSessionCandidate,
@@ -2984,7 +2985,10 @@ describe("scrubbed write-protocol remnant reaping", () => {
 		await fs.writeFile(transcriptFile, "", { mode: 0o600 });
 		await fs.utimes(transcriptFile, aged, aged);
 
-		expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toBe(remnantNames.length);
+		expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toEqual({
+			reaped: remnantNames.length,
+			failures: 0,
+		});
 
 		const remaining = await fs.readdir(scope.directoryPath);
 		expect(remaining.sort()).toEqual(
@@ -3008,9 +3012,70 @@ describe("scrubbed write-protocol remnant reaping", () => {
 		expect(remaining).toContain(MANAGED_SESSION_BINDING_FILE);
 	});
 
+	it("counts and logs an lstat failure without aborting remnant reaping", async () => {
+		const { scope } = await fixture();
+		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+		const pathname = path.join(scope.directoryPath, remnantNames[0]!);
+		await fs.writeFile(pathname, "", { mode: 0o600 });
+		await fs.utimes(pathname, aged, aged);
+		const lstatSync = syncFs.lstatSync;
+		const lstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+			if (file === pathname) throw Object.assign(new Error("injected lstat failure"), { code: "EACCES" });
+			return lstatSync(file, options as never);
+		}) as typeof syncFs.lstatSync);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toEqual({
+				reaped: 0,
+				failures: 1,
+			});
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+				failureCount: 1,
+				reapedCount: 0,
+			});
+		} finally {
+			warning.mockRestore();
+			lstat.mockRestore();
+		}
+		expect(await fs.readFile(pathname, "utf8")).toBe("");
+	});
+
+	it("counts and logs an unlink failure without aborting remnant reaping", async () => {
+		const { scope } = await fixture();
+		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+		const pathname = path.join(scope.directoryPath, remnantNames[0]!);
+		await fs.writeFile(pathname, "", { mode: 0o600 });
+		await fs.utimes(pathname, aged, aged);
+		const unlinkSync = syncFs.unlinkSync;
+		const unlink = vi.spyOn(syncFs, "unlinkSync").mockImplementation(((file: syncFs.PathLike) => {
+			if (file === pathname) throw Object.assign(new Error("injected unlink failure"), { code: "EACCES" });
+			return unlinkSync(file);
+		}) as typeof syncFs.unlinkSync);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toEqual({
+				reaped: 0,
+				failures: 1,
+			});
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+				failureCount: 1,
+				reapedCount: 0,
+			});
+		} finally {
+			warning.mockRestore();
+			unlink.mockRestore();
+		}
+		expect(await fs.readFile(pathname, "utf8")).toBe("");
+	});
+
 	it("tolerates a missing scope directory", () => {
 		expect(
 			managedSessionStorage.reapScrubbedProtocolRemnantsSync(path.join(os.tmpdir(), "gjc-reap-missing-none")),
-		).toBe(0);
+		).toEqual({
+			reaped: 0,
+			failures: 0,
+		});
 	});
 });
