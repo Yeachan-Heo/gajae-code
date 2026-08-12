@@ -1207,10 +1207,11 @@ export async function renderNotificationsSettingsShowcase(
 	const restoreChalk = await configureDeterministicTheme(entry.renderMode);
 	let component: SettingsSelectorComponent | undefined;
 	try {
-		await Settings.init({ inMemory: true });
+		const scopedSettings = await Settings.init({ inMemory: true });
 		const operations = new DeterministicNotificationsEditorOperations(entry.stateId, SHOWCASE_CLOCK);
 		component = new SettingsSelectorComponent(
 			{
+				settings: scopedSettings,
 				availableThinkingLevels: [],
 				thinkingLevel: undefined,
 				availableThemes: ["red-claw"],

@@ -8,8 +8,9 @@ import {
 	type KeybindingsManager,
 	type KeyDisplayContext,
 } from "../../config/keybindings";
-import { settings } from "../../config/settings";
 import type { StatusLinePreset, StatusLineSegmentId, StatusLineSeparatorStyle } from "../../config/settings-schema";
+import type { WorkModeStatusView } from "../../config/work-mode-view";
+import { renderWorkModeStatusLines } from "../../config/work-mode-view";
 import { theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { readVisibleSkillActiveState, type SkillActiveEntry } from "../../skill-state/active-state";
@@ -108,7 +109,8 @@ export function getAvailableActionHints(
 	const selected: StatusLineActionHint[] = [];
 	let used = 0;
 	for (const action of candidates) {
-		const bindingId = action.bindingId ?? action.id;
+		if (action.bindingId === undefined) continue;
+		const bindingId = action.bindingId;
 		if (!(bindingId in KEYBINDINGS)) continue;
 		const keys = keybindings.getKeys(bindingId);
 		if (keys.length === 0) continue;
@@ -116,8 +118,8 @@ export function getAvailableActionHints(
 			theme.fg("dim", keybindings.getDisplayString(bindingId, keyDisplayContext)) +
 			theme.fg("muted", ` ${action.title}`);
 		const nextWidth = visibleWidth(content) + (selected.length === 0 ? 0 : 3);
-		if (used + nextWidth > width) break;
-		selected.push({ id: action.id, content });
+		if (used + nextWidth > width) continue;
+		selected.push({ id: bindingId, content });
 		used += nextWidth;
 	}
 	return selected;
@@ -159,6 +161,7 @@ export class StatusLineComponent implements Component {
 	#sessionStartTime: number = Date.now();
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
+	#workModeStatus: WorkModeStatusView | null = null;
 	#skillHudEntries: SkillActiveEntry[] = [];
 	#skillHudLastFetch = 0;
 	#skillHudInFlight = false;
@@ -200,15 +203,16 @@ export class StatusLineComponent implements Component {
 		options: StatusLineComponentOptions = {},
 	) {
 		this.#settings = {
-			preset: settings.get("statusLine.preset"),
-			leftSegments: settings.get("statusLine.leftSegments"),
-			rightSegments: settings.get("statusLine.rightSegments"),
-			separator: settings.get("statusLine.separator"),
-			showHookStatus: settings.get("statusLine.showHookStatus"),
-			showSkillHud: settings.get("statusLine.showSkillHud"),
-			segmentOptions: settings.getGroup("statusLine").segmentOptions,
-			sessionAccent: settings.get("statusLine.sessionAccent"),
-			maxRows: settings.get("statusLine.maxRows"),
+			preset: session.settings.get("statusLine.preset"),
+			leftSegments: session.settings.get("statusLine.leftSegments"),
+			rightSegments: session.settings.get("statusLine.rightSegments"),
+			separator: session.settings.get("statusLine.separator"),
+			showHookStatus: session.settings.get("statusLine.showHookStatus"),
+			showSkillHud: session.settings.get("statusLine.showSkillHud"),
+			showActionHints: session.settings.get("statusLine.showActionHints"),
+			segmentOptions: session.settings.getGroup("statusLine").segmentOptions,
+			sessionAccent: session.settings.get("statusLine.sessionAccent"),
+			maxRows: session.settings.get("statusLine.maxRows"),
 		};
 		this.#version = options.version?.trim() || undefined;
 		this.#actionRegistry = options.actionRegistry;
@@ -255,6 +259,11 @@ export class StatusLineComponent implements Component {
 
 	setGoalModeStatus(status: { enabled: boolean; paused: boolean } | undefined): void {
 		this.#goalModeStatus = status ?? null;
+	}
+
+	setWorkModeStatus(status: WorkModeStatusView | undefined): void {
+		this.#workModeStatus = status ?? null;
+		this.#renderedRowsCache = undefined;
 	}
 
 	setSkillHudEntriesForTest(entries: SkillActiveEntry[]): void {
@@ -786,6 +795,13 @@ export class StatusLineComponent implements Component {
 				leftSegIds.push(segId);
 			}
 		}
+		if (this.#workModeStatus) {
+			const statusLine = renderWorkModeStatusLines(this.#workModeStatus, width)[0];
+			if (statusLine) {
+				left.push(theme.fg("muted", statusLine));
+				leftSegIds.push("model");
+			}
+		}
 
 		const right: string[] = [];
 		const actionHints =
@@ -908,6 +924,9 @@ export class StatusLineComponent implements Component {
 			width,
 			maxRows,
 			settings: this.#resolvedSettingsFingerprint,
+			workModeStatus: this.#workModeStatus
+				? [this.#workModeStatus.label, this.#workModeStatus.status, this.#workModeStatus.detail]
+				: null,
 			left: seg.left,
 			leftSegIds: seg.leftSegIds,
 			right: seg.right,
@@ -976,7 +995,10 @@ export class StatusLineComponent implements Component {
 
 			const packedRows: string[][] = [];
 			let current: string[] = [];
+			const singleItemFits = (content: string): boolean =>
+				this.#groupWidth([content], seg.leftCapWidth, seg.leftSepWidth) <= topFillWidth;
 			for (const item of items) {
+				if (!singleItemFits(item.content)) continue;
 				if (current.length === 0) {
 					current.push(item.content);
 					continue;

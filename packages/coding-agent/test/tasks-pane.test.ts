@@ -24,4 +24,16 @@ describe("TasksPaneComponent", () => {
 			}),
 		).toEqual({ value: "subagent:a", label: "Waiting Research [resumable]" });
 	});
+
+	test("sanitizes labels without changing lifecycle badges", () => {
+		expect(
+			taskItem({
+				id: "bash:safe",
+				kind: "bash",
+				label: "line one\nline two\t\x1b[31mhidden",
+				status: "failed",
+				startedAt: 1,
+			}),
+		).toEqual({ value: "bash:safe", label: "Failed line one line two hidden" });
+	});
 });

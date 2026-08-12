@@ -14,6 +14,11 @@ import { MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "./model-regi
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
 import type { Settings } from "./settings";
 
+export interface ModelResolutionSettings {
+	getModelRole(role: ModelRole | string): ModelSelectorValue | undefined;
+	getStorage(): { getModelUsageOrder(): string[] } | null;
+}
+
 /** Default model IDs for each known provider */
 export const defaultModelPerProvider: Record<KnownProvider, string> = DEFAULT_MODEL_PER_PROVIDER;
 
@@ -596,7 +601,7 @@ function isSessionInheritedAgentPattern(value: string): boolean {
 	return value === DEFAULT_MODEL_ROLE || value === `${PREFIX_MODEL_ROLE}${DEFAULT_MODEL_ROLE}`;
 }
 
-function resolveConfiguredRolePattern(value: string, settings?: Settings): string[] | undefined {
+function resolveConfiguredRolePattern(value: string, settings?: ModelResolutionSettings): string[] | undefined {
 	const normalized = value.trim();
 	if (!normalized) return undefined;
 
@@ -619,7 +624,7 @@ function resolveConfiguredRolePattern(value: string, settings?: Settings): strin
 /**
  * Expand a role alias like "pi/default" to the configured model string.
  */
-export function expandRoleAlias(value: string, settings?: Settings): string {
+export function expandRoleAlias(value: string, settings?: ModelResolutionSettings): string {
 	const normalized = value.trim();
 	if (normalized === DEFAULT_MODEL_ROLE) {
 		return normalizeModelPatternList(settings?.getModelRole("default"))[0] ?? value;
@@ -629,7 +634,10 @@ export function expandRoleAlias(value: string, settings?: Settings): string {
 	return resolved ?? value;
 }
 
-export function resolveConfiguredModelPatterns(value: ModelSelectorValue | undefined, settings?: Settings): string[] {
+export function resolveConfiguredModelPatterns(
+	value: ModelSelectorValue | undefined,
+	settings?: ModelResolutionSettings,
+): string[] {
 	const patterns = normalizeModelPatternList(value);
 	return patterns.flatMap(pattern => {
 		const resolved = resolveConfiguredRolePattern(pattern, settings);
@@ -639,7 +647,7 @@ export function resolveConfiguredModelPatterns(value: ModelSelectorValue | undef
 export interface AgentModelPatternResolutionOptions {
 	settingsOverride?: ModelSelectorValue;
 	agentModel?: ModelSelectorValue;
-	settings?: Settings;
+	settings?: ModelResolutionSettings;
 	activeModelPattern?: string;
 	fallbackModelPattern?: string;
 }
@@ -680,7 +688,7 @@ export function resolveModelRoleValue(
 	roleValue: ModelSelectorValue | undefined,
 	availableModels: Model<Api>[],
 	options?: {
-		settings?: Settings;
+		settings?: ModelResolutionSettings;
 		matchPreferences?: ModelMatchPreferences;
 		modelRegistry?: CanonicalModelRegistry;
 		sessionId?: string;
@@ -719,7 +727,7 @@ export function resolveModelRoleValue(
 
 export function extractExplicitThinkingSelector(
 	value: ModelSelectorValue | undefined,
-	settings?: Settings,
+	settings?: ModelResolutionSettings,
 ): ThinkingLevel | undefined {
 	const normalized = normalizeModelPatternList(value)[0];
 	if (!normalized || normalized === DEFAULT_MODEL_ROLE) return undefined;
@@ -758,7 +766,7 @@ export function resolveModelFromString(
  * Resolve a model from configured roles, honoring order and overrides.
  */
 export function resolveModelFromSettings(options: {
-	settings: Settings;
+	settings: ModelResolutionSettings;
 	availableModels: Model<Api>[];
 	matchPreferences?: ModelMatchPreferences;
 	roleOrder?: readonly ModelRole[];
@@ -787,7 +795,7 @@ export function resolveModelFromSettings(options: {
 export function resolveModelOverride(
 	modelPatterns: string[],
 	modelRegistry: ModelLookupRegistry,
-	settings?: Settings,
+	settings?: ModelResolutionSettings,
 	sessionId?: string,
 ): { model?: Model<Api>; thinkingLevel?: ThinkingLevel; explicitThinkingLevel: boolean } {
 	if (modelPatterns.length === 0) return { explicitThinkingLevel: false };
@@ -821,7 +829,7 @@ export interface ModelChainResolutionOptions {
 export async function resolveModelChainWithAuth(
 	modelPatterns: readonly string[],
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
-	settings?: Settings,
+	settings?: ModelResolutionSettings,
 	sessionId?: string,
 	options?: ModelChainResolutionOptions,
 ): Promise<{
@@ -887,7 +895,7 @@ export async function resolveModelOverrideWithAuthFallback(
 	modelPatterns: string[],
 	parentActiveModelPattern: string | undefined,
 	modelRegistry: ModelLookupRegistry & Pick<ModelRegistry, "getApiKey">,
-	settings?: Settings,
+	settings?: ModelResolutionSettings,
 	authSessionId?: string,
 	options?: ModelChainResolutionOptions,
 	canonicalSessionId?: string,
@@ -973,7 +981,7 @@ export async function resolveModelOverrideWithAuthFallback(
  */
 export function resolveRoleSelection(
 	roles: readonly string[],
-	settings: Settings,
+	settings: ModelResolutionSettings,
 	availableModels: Model<Api>[],
 	modelRegistry?: CanonicalModelRegistry,
 ): { model: Model<Api>; thinkingLevel?: ThinkingLevel } | undefined {

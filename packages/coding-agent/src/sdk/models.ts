@@ -8,6 +8,198 @@ import {
 	THINKING_EFFORTS,
 	type ThinkingControlMode,
 } from "@gajae-code/ai";
+import {
+	type CanonicalFreshness,
+	type CanonicalModelCatalog,
+	type CanonicalModelInputModality,
+	type CanonicalModelRecord,
+	ModelCatalogError,
+} from "../config/model-catalog";
+import type {
+	ModelOverlayConfirmation,
+	ModelOverlaySkip,
+	ModelOverlayTiming,
+	ModelOverlayUsability,
+	ModelResolutionOverlay,
+} from "../config/model-resolution-overlay";
+
+export interface SdkCanonicalFreshness {
+	readonly status: CanonicalFreshness["status"];
+	readonly reason?: string;
+	readonly timestamp?: number;
+}
+
+export interface SdkCanonicalModelRecord {
+	readonly canonicalId: string;
+	readonly provider: string;
+	readonly modelId: string;
+	readonly displayName: string;
+	readonly inputModalities: readonly CanonicalModelInputModality[];
+	readonly capabilities: readonly string[];
+	readonly reasoning: boolean;
+	readonly contextWindow: number;
+	readonly maxTokens: number;
+	readonly source: CanonicalModelRecord["source"];
+	readonly sourceVersion: string;
+	readonly revision: number;
+	readonly freshness: SdkCanonicalFreshness;
+}
+
+export interface SdkModelCatalog {
+	readonly version: 1;
+	readonly revision: number;
+	readonly records: readonly SdkCanonicalModelRecord[];
+}
+
+export interface SdkModelOverlaySkip {
+	readonly catalogRecordId: string;
+	readonly reason: string;
+	readonly selector?: string;
+}
+
+export interface SdkModelOverlayTiming {
+	readonly requestedAt?: number;
+	readonly startedAt?: number;
+	readonly appliedAt?: number;
+	readonly completedAt?: number;
+	readonly durationMs?: number;
+}
+
+export interface SdkModelOverlayConfirmation {
+	readonly status: ModelOverlayConfirmation["status"];
+	readonly timestamp?: number;
+	readonly reason?: string;
+}
+
+export interface SdkModelOverlayUsability {
+	readonly status: ModelOverlayUsability["status"];
+	readonly reason?: string;
+}
+
+export interface SdkModelResolutionOverlay {
+	readonly version: 1;
+	readonly sessionId: string;
+	readonly catalogRevision: number;
+	readonly sessionRevision: number;
+	readonly catalogRecordId: string;
+	readonly profileId?: string;
+	readonly requestedSelectors: readonly string[];
+	readonly requestedRoles: readonly string[];
+	readonly resolvedCanonicalIds: readonly string[];
+	readonly resolvedEfforts: readonly string[];
+	readonly fallbackChain: readonly string[];
+	readonly activeIndex: number | null;
+	readonly skips: readonly SdkModelOverlaySkip[];
+	readonly scope?: ModelResolutionOverlay["scope"];
+	readonly timing?: SdkModelOverlayTiming;
+	readonly confirmation?: SdkModelOverlayConfirmation;
+	readonly usability?: SdkModelOverlayUsability;
+	readonly receiptRefs: readonly string[];
+	readonly workMode?: { readonly id: string; readonly fingerprint: string };
+}
+
+function copyFreshness(value: CanonicalFreshness): SdkCanonicalFreshness {
+	return Object.freeze({
+		status: value.status,
+		...(value.reason === undefined ? {} : { reason: value.reason }),
+		...(value.timestamp === undefined ? {} : { timestamp: value.timestamp }),
+	});
+}
+
+function copyCanonicalRecord(value: CanonicalModelRecord): SdkCanonicalModelRecord {
+	return Object.freeze({
+		canonicalId: value.canonicalId,
+		provider: value.provider,
+		modelId: value.modelId,
+		displayName: value.displayName,
+		inputModalities: Object.freeze([...value.inputModalities]),
+		capabilities: Object.freeze([...value.capabilities]),
+		reasoning: value.reasoning,
+		contextWindow: value.contextWindow,
+		maxTokens: value.maxTokens,
+		source: value.source,
+		sourceVersion: value.sourceVersion,
+		revision: value.revision,
+		freshness: copyFreshness(value.freshness),
+	});
+}
+
+export function projectCanonicalModelCatalog(catalog: CanonicalModelCatalog): SdkModelCatalog {
+	return Object.freeze({
+		version: 1,
+		revision: catalog.revision,
+		records: Object.freeze(catalog.records.map(copyCanonicalRecord)),
+	});
+}
+
+function copyOverlayTiming(value: ModelOverlayTiming): SdkModelOverlayTiming {
+	return Object.freeze({
+		...(value.requestedAt === undefined ? {} : { requestedAt: value.requestedAt }),
+		...(value.startedAt === undefined ? {} : { startedAt: value.startedAt }),
+		...(value.appliedAt === undefined ? {} : { appliedAt: value.appliedAt }),
+		...(value.completedAt === undefined ? {} : { completedAt: value.completedAt }),
+		...(value.durationMs === undefined ? {} : { durationMs: value.durationMs }),
+	});
+}
+
+function copyOverlayConfirmation(value: ModelOverlayConfirmation): SdkModelOverlayConfirmation {
+	return Object.freeze({
+		status: value.status,
+		...(value.timestamp === undefined ? {} : { timestamp: value.timestamp }),
+		...(value.reason === undefined ? {} : { reason: value.reason }),
+	});
+}
+
+function copyOverlayUsability(value: ModelOverlayUsability): SdkModelOverlayUsability {
+	return Object.freeze({
+		status: value.status,
+		...(value.reason === undefined ? {} : { reason: value.reason }),
+	});
+}
+
+function copyOverlaySkip(value: ModelOverlaySkip): SdkModelOverlaySkip {
+	return Object.freeze({
+		catalogRecordId: value.catalogRecordId,
+		reason: value.reason,
+		...(value.selector === undefined ? {} : { selector: value.selector }),
+	});
+}
+
+export function projectModelResolutionOverlay(
+	overlay: ModelResolutionOverlay,
+	sessionId: string,
+): SdkModelResolutionOverlay {
+	const requestedSessionId = sessionId.trim();
+	if (!requestedSessionId || overlay.sessionId !== requestedSessionId) {
+		throw new ModelCatalogError(
+			"invalid_session_id",
+			"The requested overlay session does not match the current session.",
+		);
+	}
+	return Object.freeze({
+		version: 1,
+		sessionId: overlay.sessionId,
+		catalogRevision: overlay.catalogRevision,
+		sessionRevision: overlay.sessionRevision,
+		catalogRecordId: overlay.catalogRecordId,
+		...(overlay.profileId === undefined ? {} : { profileId: overlay.profileId }),
+		requestedSelectors: Object.freeze([...overlay.requestedSelectors]),
+		requestedRoles: Object.freeze([...overlay.requestedRoles]),
+		resolvedCanonicalIds: Object.freeze([...overlay.resolvedCanonicalIds]),
+		resolvedEfforts: Object.freeze([...overlay.resolvedEfforts]),
+		fallbackChain: Object.freeze([...overlay.fallbackChain]),
+		activeIndex: overlay.activeIndex,
+		skips: Object.freeze(overlay.skips.map(copyOverlaySkip)),
+		...(overlay.scope === undefined ? {} : { scope: overlay.scope }),
+		...(overlay.timing === undefined ? {} : { timing: copyOverlayTiming(overlay.timing) }),
+		...(overlay.confirmation === undefined ? {} : { confirmation: copyOverlayConfirmation(overlay.confirmation) }),
+		...(overlay.usability === undefined ? {} : { usability: copyOverlayUsability(overlay.usability) }),
+		receiptRefs: Object.freeze([...overlay.receiptRefs]),
+		...(overlay.workMode === undefined
+			? {}
+			: { workMode: Object.freeze({ id: overlay.workMode.id, fingerprint: overlay.workMode.fingerprint }) }),
+	});
+}
 
 export type Q10ThinkingEffort = Effort;
 export type Q10SettableThinkingLevel = typeof ThinkingLevel.Off | Q10ThinkingEffort;

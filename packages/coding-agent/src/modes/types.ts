@@ -397,6 +397,7 @@ export interface InteractiveModeContext {
 		executeSlashCommand: (name: string) => Promise<void>,
 	): void;
 	showSettingsSelector(): void;
+	showExecutionPresetSelector(): void;
 	showThemeSelector(): void;
 	showPetSelector(): void;
 	showHistorySearch(): void;

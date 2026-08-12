@@ -58,6 +58,12 @@ import { ArtifactManager } from "../session/artifacts";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
+import {
+	bindTaskExecutionPolicyController,
+	getTaskExecutionPolicyController,
+	isTaskExecutionPolicyIsolationEnforced,
+	TaskExecutionPolicyController,
+} from "./execution-policy";
 import { createManagedTaskPersistence, renderSubagentUserPrompt, runSubprocess } from "./executor";
 import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
@@ -259,6 +265,24 @@ function validateTaskIdsForScheduling(tasks: readonly TaskItem[]): string | unde
 export { loadBundledAgents as BUNDLED_AGENTS } from "./agents";
 export { discoverCommands, expandCommand, getCommand } from "./commands";
 export { discoverAgents, getAgent } from "./discovery";
+export type {
+	TaskExecutionPolicy,
+	TaskExecutionPolicyApplyResult,
+	TaskExecutionPolicyErrorCode,
+	TaskExecutionPolicyErrorReceipt,
+	TaskExecutionPolicyLaunchLease,
+	TaskExecutionPolicySnapshot,
+	TaskExecutionPolicySourceKind,
+	TaskExecutionPolicySourceReceipt,
+} from "./execution-policy";
+export {
+	bindTaskExecutionPolicyController,
+	compileTaskExecutionPolicy,
+	DEFAULT_TASK_EXECUTION_POLICY,
+	getTaskExecutionPolicyController,
+	TaskExecutionPolicyController,
+	TaskExecutionPolicyValidationError,
+} from "./execution-policy";
 export {
 	isValidAllocatedTaskId,
 	isValidTaskId,
@@ -524,6 +548,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly renderResult = renderResult;
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
+	readonly #policyController: TaskExecutionPolicyController;
 	/**
 	 * Session-lifetime durable artifact state is shared atomically by every
 	 * TaskTool created for the same parent ToolSession.
@@ -560,14 +585,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		private readonly session: ToolSession,
 		discoveredAgents: AgentDefinition[],
 		sessionRepositoryBinding: RepositoryBinding,
+		policyController?: TaskExecutionPolicyController,
 	) {
 		this.#blockedAgent = $pickenv("GJC_BLOCKED_AGENT", "PI_BLOCKED_AGENT");
 		this.#discoveredAgents = discoveredAgents;
 		this.#sessionRepositoryBinding = sessionRepositoryBinding;
+		this.#policyController =
+			policyController ?? getTaskExecutionPolicyController(session) ?? new TaskExecutionPolicyController();
 	}
 
 	#getTaskSimpleMode(): TaskSimpleMode {
-		return this.session.settings.get("task.simple");
+		const configured = this.session.settings.get("task.simple");
+		const snapshot = this.#policyController.getSnapshot();
+		return isTaskExecutionPolicyIsolationEnforced(snapshot) && snapshot.policy.simpleMode
+			? "independent"
+			: configured;
 	}
 
 	/**
@@ -787,12 +819,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * Repository authority is captured from session cwd *before* agent discovery so
 	 * multi-repo workspaces fail closed prior to context/discovery (#2901).
 	 */
-	static async create(session: ToolSession): Promise<TaskTool> {
+	static async create(
+		session: ToolSession,
+		options: { executionPolicyController?: TaskExecutionPolicyController } = {},
+	): Promise<TaskTool> {
 		const sessionRepositoryBinding = await captureRepositoryBinding(session.cwd, { displayPath: session.cwd });
 		// Authority check before discovery: session cwd must resolve to a stable binding.
 		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
 		const { agents } = await discoverAgents(session.cwd);
-		return new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
+		const boundController = getTaskExecutionPolicyController(session);
+		const policyController =
+			options.executionPolicyController ?? boundController ?? new TaskExecutionPolicyController();
+		if (boundController !== policyController) bindTaskExecutionPolicyController(session, policyController);
+		return new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding), policyController);
 	}
 
 	async execute(
@@ -1548,18 +1587,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
 		const { agent: agentName, context, schema: outputSchema } = boundParams;
 		const simpleMode = this.#getTaskSimpleMode();
+		const executionPolicySnapshot = this.#policyController.getSnapshot();
 		const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
 		const sharedContext = contextEnabled ? context?.trim() : undefined;
 		const isolationMode = this.session.settings.get("task.isolation.mode");
 		const isolationRequested = "isolated" in boundParams ? boundParams.isolated === true : false;
-		const isIsolated = isolationMode !== "none" && isolationRequested;
+		const isIsolated = isTaskExecutionPolicyIsolationEnforced(executionPolicySnapshot)
+			? executionPolicySnapshot.policy.isolation === "worktree"
+			: isolationMode !== "none" && isolationRequested;
 		const mergeMode = this.session.settings.get("task.isolation.merge");
 		const commitStyle = this.session.settings.get("task.isolation.commits");
 		const maxConcurrency = this.session.settings.get("task.maxConcurrency");
 		const taskDepth = this.session.taskDepth ?? 0;
 		const subagentLspEnabled = (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp");
 
-		if (isolationMode === "none" && "isolated" in boundParams) {
+		if (
+			isolationMode === "none" &&
+			"isolated" in boundParams &&
+			!isTaskExecutionPolicyIsolationEnforced(executionPolicySnapshot)
+		) {
 			return {
 				content: [
 					{
@@ -2005,6 +2051,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							emitProgress();
 						},
 						authStorage: this.session.authStorage,
+						executionPolicyController: this.#policyController,
+						executionPolicySnapshot,
 						modelRegistry: this.session.modelRegistry,
 						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,
@@ -2079,6 +2127,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							emitProgress();
 						},
 						authStorage: this.session.authStorage,
+						executionPolicyController: this.#policyController,
+						executionPolicySnapshot,
 						modelRegistry: this.session.modelRegistry,
 						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,

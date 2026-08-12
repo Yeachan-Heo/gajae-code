@@ -1323,7 +1323,7 @@ export class NotificationsSettingsEditorComponent implements Component, Focusabl
 				this.#preferencesDraft = undefined;
 				this.#mode = "home";
 				this.#selectedIndex = 0;
-				this.#status = `OK — ${safeDetail(result.message, "Notification preferences saved atomically.")}`;
+				this.#status = `${mutationStatus(result)} — ${safeDetail(result.message, "Notification preferences saved atomically.")}`;
 			},
 		);
 	}

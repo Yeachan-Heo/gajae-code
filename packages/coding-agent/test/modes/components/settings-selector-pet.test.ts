@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
-import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 
@@ -8,9 +8,11 @@ beforeAll(async () => {
 	await initTheme();
 });
 
+let activeSettings: Settings;
+
 beforeEach(async () => {
 	resetSettingsForTest();
-	await Settings.init({ inMemory: true });
+	activeSettings = await Settings.init({ inMemory: true });
 });
 
 afterEach(() => {
@@ -18,12 +20,14 @@ afterEach(() => {
 });
 
 function makeComponent(
+	settingsInstance: Settings,
 	petAvailable: boolean,
 	callbacks: Record<string, unknown>,
 	terminalEnv?: NodeJS.ProcessEnv,
 ): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
 		{
+			settings: settingsInstance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["dark"],
@@ -50,15 +54,15 @@ function openPetSetting(component: SettingsSelectorComponent): void {
 
 describe("SettingsSelectorComponent pet capability", () => {
 	it("shows a saved unavailable pet, permits only Off, and routes the commit through the shared policy", () => {
-		settings.set("pet.mode", "red");
+		activeSettings.set("pet.mode", "red");
 		const onChange = vi.fn();
 		const onPetPreview = vi.fn();
 		const onPetCommit = vi.fn((mode: string) => {
 			// Simulate the InteractiveMode policy: accept and persist on acceptance.
-			settings.set("pet.mode", mode as never);
+			activeSettings.set("pet.mode", mode as never);
 			return true;
 		});
-		const component = makeComponent(false, { onChange, onPetPreview, onPetCommit });
+		const component = makeComponent(activeSettings, false, { onChange, onPetPreview, onPetCommit });
 
 		openPetSetting(component);
 		const submenu = stripVTControlCharacters(component.render(80).join("\n"));
@@ -75,12 +79,12 @@ describe("SettingsSelectorComponent pet capability", () => {
 		// it through the generic onChange path; the shared policy owns both.
 		expect(onPetCommit).toHaveBeenCalledWith("off");
 		expect(onChange).not.toHaveBeenCalled();
-		expect(settings.get("pet.mode")).toBe("off");
+		expect(activeSettings.get("pet.mode")).toBe("off");
 	});
 
 	it("shows the actionable unavailable warning inside the pet submenu", () => {
-		settings.set("pet.mode", "red");
-		const component = makeComponent(false, {}, {});
+		activeSettings.set("pet.mode", "red");
+		const component = makeComponent(activeSettings, false, {}, {});
 
 		openPetSetting(component);
 		const submenu = stripVTControlCharacters(component.render(200).join("\n"));
@@ -94,8 +98,8 @@ describe("SettingsSelectorComponent pet capability", () => {
 		["TMUX", { TMUX: "/tmp/host,1,0" }],
 		["tmux TERM", { TERM: "tmux-256color" }],
 	])("shows multiplexer recovery guidance for %s without normal-terminal guidance", (_name, terminalEnv) => {
-		settings.set("pet.mode", "red");
-		const component = makeComponent(false, {}, terminalEnv);
+		activeSettings.set("pet.mode", "red");
+		const component = makeComponent(activeSettings, false, {}, terminalEnv);
 
 		openPetSetting(component);
 		const submenu = stripVTControlCharacters(component.render(200).join("\n"));
@@ -106,12 +110,12 @@ describe("SettingsSelectorComponent pet capability", () => {
 	});
 
 	it("does not persist pet.mode when the commit policy rejects at select time", () => {
-		settings.set("pet.mode", "off");
+		activeSettings.set("pet.mode", "off");
 		const onChange = vi.fn();
 		// The submenu was built while the capability looked available, but the
 		// policy rechecks at commit time and rejects (TOCTOU race).
 		const onPetCommit = vi.fn(() => false);
-		const component = makeComponent(true, { onChange, onPetCommit });
+		const component = makeComponent(activeSettings, true, { onChange, onPetCommit });
 
 		openPetSetting(component);
 		component.handleInput("\x1b[B"); // move to an enabled skin choice
@@ -119,15 +123,15 @@ describe("SettingsSelectorComponent pet capability", () => {
 
 		expect(onPetCommit).toHaveBeenCalledTimes(1);
 		expect(onChange).not.toHaveBeenCalled();
-		expect(settings.get("pet.mode")).toBe("off");
+		expect(activeSettings.get("pet.mode")).toBe("off");
 	});
 	it("rejects read-only pet commits before the shared policy can mutate widget state", () => {
-		const canWrite = vi.spyOn(Settings.instance, "canWriteDurableConfig").mockReturnValue(false);
+		const canWrite = vi.spyOn(activeSettings, "canWriteDurableConfig").mockReturnValue(false);
 		const onChange = vi.fn();
 		const onError = vi.fn();
 		const onPetCommit = vi.fn(() => true);
 		try {
-			const component = makeComponent(true, { onChange, onError, onPetCommit });
+			const component = makeComponent(activeSettings, true, { onChange, onError, onPetCommit });
 
 			openPetSetting(component);
 			component.handleInput("\x1b[B");
@@ -138,7 +142,7 @@ describe("SettingsSelectorComponent pet capability", () => {
 			);
 			expect(onPetCommit).not.toHaveBeenCalled();
 			expect(onChange).not.toHaveBeenCalled();
-			expect(settings.get("pet.mode")).toBe("off");
+			expect(activeSettings.get("pet.mode")).toBe("off");
 		} finally {
 			canWrite.mockRestore();
 		}

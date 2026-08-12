@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import * as path from "node:path";
+
 import { type Agent, type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CompactionOutcome } from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ImageContent, Message, UsageReport } from "@gajae-code/ai";
@@ -17,6 +20,12 @@ import { APP_NAME, adjustHsv, getProjectDir, logger, postmortem, sanitizeText } 
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import {
+	type ExecutionPresetScope,
+	ExecutionPresetStore,
+	loadPersistentExecutionPresetConfiguration,
+	type PersistentExecutionPresetConfiguration,
+} from "../config/execution-preset";
+import {
 	type AppKeybinding,
 	defaultMessageQueueKeysForPlatform,
 	formatKeyHint,
@@ -24,7 +33,8 @@ import {
 	KeybindingsManager,
 	type KeyDisplayContext,
 } from "../config/keybindings";
-import { isSettingsInitialized, type Settings, settings } from "../config/settings";
+import type { ScopedConfigurationMutationService } from "../config/scoped-configuration-mutation";
+import { type Settings, settings } from "../config/settings";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import type {
 	ExtensionUIContext,
@@ -52,6 +62,8 @@ import { copyToClipboard } from "../utils/clipboard";
 import type { EventBus } from "../utils/event-bus";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
+import { AttentionEventStore } from "./attention-event-store";
+import { isTaskRevealRoute, type TaskRevealRoute } from "./attention-reveal-routing";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import type { CommandPaletteAction } from "./components/command-palette";
@@ -95,7 +107,7 @@ import { SSHCommandController } from "./controllers/ssh-command-controller";
 import { SttModeController } from "./controllers/stt-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
 import { IrcObservationLedger } from "./irc-observation-ledger";
-import { JobsObserver } from "./jobs-observer";
+import { EMPTY_JOBS_SNAPSHOT, JobsObserver } from "./jobs-observer";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { PromptSuggestionController } from "./prompt-suggestion-controller";
 import { SessionObserverRegistry } from "./session-observer-registry";
@@ -336,6 +348,19 @@ export function selectShutdownDraft(editorText: string, hasActiveBtw: boolean): 
 	return hasActiveBtw ? "" : editorText;
 }
 
+export function getAttentionLedgerPath(projectRoot: string, sessionId: string): string {
+	const normalizedSessionId = sessionId.trim();
+	if (projectRoot.length === 0 || normalizedSessionId.length === 0) {
+		throw new Error("Attention ledger path requires a project root and session identifier");
+	}
+	const sessionHash = createHash("sha256").update(normalizedSessionId, "utf8").digest("hex");
+	return path.join(projectRoot, ".gjc", "state", "attention-events", `${sessionHash}.json`);
+}
+
+type ExecutionPresetWriter = Pick<ScopedConfigurationMutationService, "read" | "mutate">;
+
+const EXECUTION_PRESET_LOADING_STATUS = "Loading execution presets…";
+const EXECUTION_PRESET_SESSION_ONLY_STATUS = "Persistent execution presets are unavailable; using session scope only.";
 export class InteractiveMode implements InteractiveModeContext {
 	session: AgentSession;
 	sessionManager: SessionManager;
@@ -433,6 +458,17 @@ export class InteractiveMode implements InteractiveModeContext {
 	readonly #extensionUiController: ExtensionUiController;
 	readonly #inputController: InputController;
 	readonly #selectorController: SelectorController;
+	#executionPresetStores = new Map<ExecutionPresetScope, ExecutionPresetStore>();
+	#executionPresetGeneration = 0;
+	#executionPresetHydrated = false;
+	#executionPresetHydrationStatus: string | undefined;
+	#executionPresetHydration:
+		| {
+				readonly generation: number;
+				readonly sessionId: string;
+				readonly writer: ExecutionPresetWriter;
+		  }
+		| undefined;
 	readonly #uiHelpers: UiHelpers;
 	readonly #modeGate = new ModeGate();
 	readonly #goalModeController: GoalModeController;
@@ -456,6 +492,9 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#jobsObserver?: JobsObserver;
 	#tasksAggregator?: TasksAggregator;
+	#attentionStore?: AttentionEventStore;
+	#jobsObserverUnsubscribe?: () => void;
+	#tasksAggregatorUnsubscribe?: () => void;
 	#foregroundActivity = false;
 	#activityIndicatorSuspensions = 0;
 	#suspendedActivityIndicator?: Loader;
@@ -480,6 +519,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		keyDisplayContext: KeyDisplayContext = { platform: process.platform },
 	) {
 		this.session = session;
+		this.#resetExecutionPresetStores();
 		this.sessionManager = session.sessionManager;
 		this.session.setSdkPlanModeHandler(async on => {
 			if (on && (this.#goalModeController.enabled || this.#goalModeController.paused)) {
@@ -676,9 +716,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#todoCommandController = new TodoCommandController(this);
 		this.#selectorController = new SelectorController(this);
 		this.#inputController = new InputController(this);
+		this.#selectorController.setActionRegistry(this.#inputController.actionRegistry);
+		this.statusLine.setActionRegistry(this.#inputController.actionRegistry, () => this.keybindings);
 		// Composer shortcut discovery owns contextual action hints; retain only status telemetry in the rail.
 		this.promptSuggestion = new PromptSuggestionController(this);
 		this.#observerRegistry = new SessionObserverRegistry();
+		this.#selectorController.setSessionIdentityChangedHandler(() => {
+			this.#resetExecutionPresetStores();
+			this.resetObserverRegistry();
+		});
 	}
 
 	getCurrentSessionNotificationStatus(): NotificationSessionStatus | undefined {
@@ -836,28 +882,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.ui.requestRender();
 		});
 
-		// Event-driven monitor/cron jobs widget. Scoped to this session's owner so
-		// overlay actions cannot mutate another agent's background work.
-		const jobManager = AsyncJobManager.instance();
-		if (jobManager) {
-			const jobsObserver = new JobsObserver(jobManager, this.session.getAgentId());
-			this.#jobsObserver = jobsObserver;
-			this.statusLine.setJobs(jobsObserver.getSnapshot());
-			jobsObserver.onChange(() => {
-				this.statusLine.setJobs(jobsObserver.getSnapshot());
-				this.ui.requestRender();
-			});
-			this.#tasksAggregator = new TasksAggregator(
-				jobManager,
-				jobsObserver,
-				this.#observerRegistry,
-				this.session.getAgentId(),
-			);
-			this.#tasksAggregator.onChange(() => {
-				this.syncActivityIndicator();
-				this.ui.requestRender();
-			});
-		}
+		this.#initializeTaskObservers();
 
 		// Load initial todos
 		await this.#loadTodoList();
@@ -1225,7 +1250,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		} else if (this.isPythonMode) {
 			this.editor.borderColor = theme.getPythonModeBorderColor();
 		} else {
-			const accentEnabled = !isSettingsInitialized() || settings.get("statusLine.sessionAccent") !== false;
+			const accentEnabled = this.settings.get("statusLine.sessionAccent") !== false;
 			const sessionName = accentEnabled ? this.sessionManager.getSessionName() : undefined;
 			const hex = sessionName ? getSessionAccentHex(sessionName) : undefined;
 			const ansi = getSessionAccentAnsi(hex);
@@ -1488,11 +1513,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			unsubscribe();
 		}
 		this.#eventBusUnsubscribers = [];
-		this.#tasksAggregator?.dispose();
+		this.#disposeTaskObservers();
 		this.#observerRegistry.dispose();
 		this.#eventController.dispose();
 		this.statusLine.dispose();
-		this.#jobsObserver?.dispose();
 		this.editor.dispose();
 		if (this.#resizeHandler) {
 			process.stdout.removeListener("resize", this.#resizeHandler);
@@ -1685,7 +1709,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#getWorkingMessageAccent(): WorkingMessageAccent | undefined {
-		const accentEnabled = !isSettingsInitialized() || settings.get("statusLine.sessionAccent") !== false;
+		const accentEnabled = this.settings.get("statusLine.sessionAccent") !== false;
 		const sessionName = accentEnabled ? this.sessionManager.getSessionName() : undefined;
 		if (!sessionName) return undefined;
 		const hex = getSessionAccentHex(sessionName);
@@ -2114,6 +2138,66 @@ export class InteractiveMode implements InteractiveModeContext {
 		return identityMap;
 	}
 
+	#disposeTaskObservers(): void {
+		this.#selectorController.closeTasksPane();
+		this.#jobsObserverUnsubscribe?.();
+		this.#jobsObserverUnsubscribe = undefined;
+		this.#tasksAggregatorUnsubscribe?.();
+		this.#tasksAggregatorUnsubscribe = undefined;
+
+		const aggregator = this.#tasksAggregator;
+		this.#tasksAggregator = undefined;
+		const store = this.#attentionStore;
+		this.#attentionStore = undefined;
+		const jobsObserver = this.#jobsObserver;
+		this.#jobsObserver = undefined;
+		jobsObserver?.dispose();
+		if (aggregator) {
+			void aggregator.dispose().catch(() => undefined);
+		} else if (store) {
+			void store
+				.flush()
+				.catch(() => undefined)
+				.finally(() => store.dispose());
+		}
+		this.statusLine.setJobs(EMPTY_JOBS_SNAPSHOT);
+		this.syncActivityIndicator();
+	}
+
+	#initializeTaskObservers(): void {
+		const jobManager = AsyncJobManager.instance();
+		if (!jobManager) {
+			this.statusLine.setJobs(EMPTY_JOBS_SNAPSHOT);
+			return;
+		}
+		const projectRoot = getProjectDir();
+		const attentionStore = new AttentionEventStore({
+			path: getAttentionLedgerPath(projectRoot, this.session.sessionId),
+			rootDir: projectRoot,
+		});
+		this.#attentionStore = attentionStore;
+
+		const jobsObserver = new JobsObserver(jobManager, this.session.getAgentId());
+		this.#jobsObserver = jobsObserver;
+		this.statusLine.setJobs(jobsObserver.getSnapshot());
+		this.#jobsObserverUnsubscribe = jobsObserver.onChange(() => {
+			this.statusLine.setJobs(jobsObserver.getSnapshot());
+			this.ui.requestRender();
+		});
+		const aggregator = new TasksAggregator(
+			jobManager,
+			jobsObserver,
+			this.#observerRegistry,
+			this.session.getAgentId(),
+			attentionStore,
+		);
+		this.#tasksAggregator = aggregator;
+		this.#tasksAggregatorUnsubscribe = aggregator.onChange(() => {
+			this.syncActivityIndicator();
+			this.ui.requestRender();
+		});
+	}
+
 	showJobsOverlay(): void {
 		if (!this.#jobsObserver) {
 			this.showStatus("Background jobs are unavailable in this session");
@@ -2123,16 +2207,41 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	showTasksPane(): void {
-		if (!this.#tasksAggregator) {
+		const aggregator = this.#tasksAggregator;
+		if (!aggregator) {
 			this.showStatus("Tasks are unavailable in this session");
 			return;
 		}
-		this.#selectorController.showTasksPane(this.#tasksAggregator);
+		this.#selectorController.showTasksPane(aggregator, {
+			reveal: (route: TaskRevealRoute) => {
+				const jobsObserver = this.#jobsObserver;
+				if (!jobsObserver || !isTaskRevealRoute(route) || this.#stopped) return false;
+				const snapshot = jobsObserver.getSnapshot();
+				if (route.sourceKind === "bash") {
+					if (!snapshot.monitors.some(monitor => monitor.id === route.taskId)) return false;
+					return this.#selectorController.showJobsOverlay(jobsObserver, {
+						initialRef: { kind: "monitor", id: route.taskId },
+						safeAttentionReveal: true,
+					});
+				}
+				if (route.sourceKind === "cron") {
+					if (!snapshot.crons.some(cron => cron.id === route.taskId)) return false;
+					return this.#selectorController.showJobsOverlay(jobsObserver, {
+						initialRef: { kind: "cron", id: route.taskId },
+						safeAttentionReveal: true,
+					});
+				}
+				return false;
+			},
+			acknowledgeFailures: () => aggregator.acknowledgeFailures(),
+		});
 	}
 
 	resetObserverRegistry(): void {
 		this.#observerRegistry.resetSessions();
 		this.#observerRegistry.setMainSession(this.sessionManager.getSessionFile() ?? undefined);
+		this.#disposeTaskObservers();
+		this.#initializeTaskObservers();
 	}
 
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void> {
@@ -2184,8 +2293,138 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showCommandPalette(commands, actions, executeSlashCommand);
 	}
 
+	#resetExecutionPresetStores(): void {
+		this.#executionPresetGeneration += 1;
+		this.#executionPresetHydrated = false;
+		this.#executionPresetHydrationStatus = undefined;
+		this.#executionPresetHydration = undefined;
+		this.#executionPresetStores = new Map<ExecutionPresetScope, ExecutionPresetStore>([
+			["session", new ExecutionPresetStore({ scope: "session" })],
+		]);
+	}
+
+	#isCurrentExecutionPresetHydration(generation: number, sessionId: string, writer: ExecutionPresetWriter): boolean {
+		return (
+			generation === this.#executionPresetGeneration &&
+			sessionId === this.sessionManager.getSessionId() &&
+			this.session.getScopedConfigurationMutationService?.() === writer
+		);
+	}
+
+	#mountExecutionPresetSelector(): void {
+		const controller = this.session.getExecutionPolicyController?.();
+		if (!controller) {
+			this.showStatus("Execution presets are unavailable in this session");
+			return;
+		}
+		if (this.#executionPresetHydrationStatus) this.showStatus(this.#executionPresetHydrationStatus);
+		this.#selectorController.showExecutionPresetSelector({
+			store: this.#getExecutionPresetStore("session"),
+			controller,
+			scope: "session",
+			scopes: [...this.#executionPresetStores.keys()].filter(
+				(scope): scope is Exclude<ExecutionPresetScope, "managed"> => scope !== "managed",
+			),
+			getStoreForScope: scope => this.#getExecutionPresetStore(scope),
+		});
+	}
+
+	async #hydrateExecutionPresetStores(
+		writer: ExecutionPresetWriter,
+		generation: number,
+		sessionId: string,
+	): Promise<void> {
+		let configuration: PersistentExecutionPresetConfiguration;
+		try {
+			configuration = await loadPersistentExecutionPresetConfiguration(writer);
+		} catch {
+			if (!this.#isCurrentExecutionPresetHydration(generation, sessionId, writer)) return;
+			this.#executionPresetStores = new Map<ExecutionPresetScope, ExecutionPresetStore>([
+				["session", new ExecutionPresetStore({ scope: "session" })],
+			]);
+			this.#executionPresetHydrationStatus = EXECUTION_PRESET_SESSION_ONLY_STATUS;
+			this.#executionPresetHydrated = true;
+			this.#executionPresetHydration = undefined;
+			this.#mountExecutionPresetSelector();
+			return;
+		}
+
+		if (!this.#isCurrentExecutionPresetHydration(generation, sessionId, writer)) return;
+		try {
+			const stores = new Map<ExecutionPresetScope, ExecutionPresetStore>();
+			stores.set("session", new ExecutionPresetStore({ scope: "session" }));
+			if (configuration.status === "ready" || configuration.status === "absent") {
+				stores.set(
+					"project",
+					new ExecutionPresetStore({
+						scope: "project",
+						scopedMutationService: writer,
+						customPresets: configuration.project.customDefinitions,
+					}),
+				);
+				stores.set(
+					"user",
+					new ExecutionPresetStore({
+						scope: "user",
+						scopedMutationService: writer,
+						customPresets: configuration.user.customDefinitions,
+					}),
+				);
+				this.#executionPresetHydrationStatus = undefined;
+			} else {
+				this.#executionPresetHydrationStatus = EXECUTION_PRESET_SESSION_ONLY_STATUS;
+			}
+			this.#executionPresetStores = stores;
+			this.#executionPresetHydrated = true;
+			this.#executionPresetHydration = undefined;
+			this.#mountExecutionPresetSelector();
+		} catch {
+			if (!this.#isCurrentExecutionPresetHydration(generation, sessionId, writer)) return;
+			this.#executionPresetStores = new Map<ExecutionPresetScope, ExecutionPresetStore>([
+				["session", new ExecutionPresetStore({ scope: "session" })],
+			]);
+			this.#executionPresetHydrationStatus = EXECUTION_PRESET_SESSION_ONLY_STATUS;
+			this.#executionPresetHydrated = true;
+			this.#executionPresetHydration = undefined;
+			this.#mountExecutionPresetSelector();
+		}
+	}
+
+	#getExecutionPresetStore(scope: ExecutionPresetScope): ExecutionPresetStore {
+		const store = this.#executionPresetStores.get(scope);
+		if (!store || store.scope !== scope) throw new Error(`Execution preset scope is unavailable: ${scope}`);
+		return store;
+	}
+
 	showSettingsSelector(): void {
 		this.#selectorController.showSettingsSelector();
+	}
+	showExecutionPresetSelector(): void {
+		const controller = this.session.getExecutionPolicyController?.();
+		if (!controller) {
+			this.showStatus("Execution presets are unavailable in this session");
+			return;
+		}
+		const writer = this.session.getScopedConfigurationMutationService?.();
+		if (!writer) {
+			this.#executionPresetHydrated = true;
+			this.#mountExecutionPresetSelector();
+			return;
+		}
+		if (this.#executionPresetHydrated) {
+			this.#mountExecutionPresetSelector();
+			return;
+		}
+		const sessionId = this.sessionManager.getSessionId();
+		const generation = this.#executionPresetGeneration;
+		const hydration = this.#executionPresetHydration;
+		if (hydration?.generation === generation && hydration.sessionId === sessionId && hydration.writer === writer) {
+			this.showStatus(EXECUTION_PRESET_LOADING_STATUS);
+			return;
+		}
+		this.showStatus(EXECUTION_PRESET_LOADING_STATUS);
+		this.#executionPresetHydration = { generation, sessionId, writer };
+		void this.#hydrateExecutionPresetStores(writer, generation, sessionId);
 	}
 
 	showThemeSelector(): void {
@@ -2236,10 +2475,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showSessionSelector();
 	}
 
-	handleResumeSession(sessionPath: string): Promise<void> {
+	async handleResumeSession(sessionPath: string): Promise<void> {
 		this.#btwController.dispose();
-		this.resetObserverRegistry();
-		return this.#selectorController.handleResumeSession(sessionPath);
+		await this.#selectorController.handleResumeSession(sessionPath);
 	}
 
 	handleSessionDeleteCommand(): Promise<void> {

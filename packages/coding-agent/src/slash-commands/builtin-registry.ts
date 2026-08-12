@@ -656,6 +656,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "execution-presets",
+		description: "Select an execution preset for this session",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.showExecutionPresetSelector();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "theme",
 		description: "Open theme selector",
 		handleTui: (_command, runtime) => {

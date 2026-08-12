@@ -18,6 +18,7 @@ function createSession() {
 		state: { messages: [] },
 		isStreaming: false,
 		getAsyncJobSnapshot: () => ({ running: [] }),
+		settings: Settings.instance,
 		getCurrentModel: () => undefined,
 		isFastModeEnabled: () => false,
 		isFastModeActive: () => false,
@@ -229,5 +230,119 @@ describe("status line action hints", () => {
 		expect(narrow).toContain("no-model");
 		expect(narrow).not.toContain("Toggle plan mode");
 		expect(visibleWidth(narrow)).toBeLessThanOrEqual(30);
+	});
+	it("keeps multi-row narrow hints whole and skips an oversized first candidate for later fits", () => {
+		const registry = new ActionRegistry<void>({ context: undefined, showError: () => {} });
+		registry.register({
+			id: "app.message.sendNow",
+			title: "First hint that is too wide",
+			category: "Test",
+			bindingId: "app.message.sendNow",
+			domains: ["composer"],
+			availability: () => true,
+			execute: () => {},
+		});
+		registry.register({
+			id: "app.commandPalette.open",
+			title: "Later clue",
+			category: "Test",
+			bindingId: "app.commandPalette.open",
+			domains: ["composer"],
+			availability: () => true,
+			execute: () => {},
+		});
+		registry.register({
+			id: "app.plan.toggle",
+			title: "Fits now",
+			category: "Test",
+			bindingId: "app.plan.toggle",
+			domains: ["composer"],
+			availability: () => true,
+			execute: () => {},
+		});
+		const keybindings = KeybindingsManager.inMemory({
+			"app.message.sendNow": "ctrl+enter",
+			"app.commandPalette.open": "p",
+			"app.plan.toggle": "t",
+		});
+		const width = 26;
+		const context = { platform: "linux" as const };
+		const hints = getAvailableActionHints(registry, () => keybindings, width, "composer", context);
+		expect(hints.map(hint => hint.id)).toEqual(["app.commandPalette.open", "app.plan.toggle"]);
+
+		const component = new StatusLineComponent(createSession(), {
+			actionRegistry: registry,
+			getKeybindings: () => keybindings,
+			keyDisplayContext: context,
+		});
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: [],
+			separator: "none",
+			maxRows: 2,
+			showActionHints: true,
+			showSkillHud: false,
+		});
+
+		const rows = component.render(width).map(line => Bun.stripANSI(line));
+		expect(rows).toHaveLength(2);
+		expect(rows.some(row => row.includes("P Later clue"))).toBe(true);
+		expect(rows.some(row => row.includes("T Fits now"))).toBe(true);
+		expect(rows.join("\n")).not.toContain("First hint that is too wide");
+		expect(rows.every(row => visibleWidth(row) <= width)).toBe(true);
+	});
+	it("budgets first-row padding at the exact boundary and keeps a later hint", () => {
+		const registry = new ActionRegistry<void>({ context: undefined, showError: () => {} });
+		registry.register({
+			id: "app.message.sendNow",
+			title: "First candidate too wide",
+			category: "Test",
+			bindingId: "app.message.sendNow",
+			domains: ["composer"],
+			availability: () => true,
+			execute: () => {},
+		});
+		registry.register({
+			id: "app.commandPalette.open",
+			title: "Q",
+			category: "Test",
+			bindingId: "app.commandPalette.open",
+			domains: ["composer"],
+			availability: () => true,
+			execute: () => {},
+		});
+		const keybindings = KeybindingsManager.inMemory({
+			"app.message.sendNow": "ctrl+enter",
+			"app.commandPalette.open": "p",
+		});
+		const context = { platform: "linux" as const };
+		const component = new StatusLineComponent(createSession(), {
+			actionRegistry: registry,
+			getKeybindings: () => keybindings,
+			keyDisplayContext: context,
+		});
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: [],
+			rightSegments: ["model"],
+			separator: "none",
+			showActionHints: false,
+			maxRows: 2,
+			showSkillHud: false,
+		});
+		const modelOnly = component.render(120).join("\n");
+		const width = visibleWidth(modelOnly) - 1;
+		expect(width).toBeGreaterThan(0);
+		expect(
+			getAvailableActionHints(registry, () => keybindings, width, "composer", context).map(hint => hint.id),
+		).toEqual(["app.commandPalette.open"]);
+
+		component.updateSettings({ showActionHints: true });
+		const rows = component.render(width).map(line => Bun.stripANSI(line));
+		expect(rows.every(row => visibleWidth(row) <= width)).toBe(true);
+		expect(rows.join("\n")).toContain("P Q");
+		expect(rows.join("\n")).not.toContain("no-model");
+		expect(rows.join("\n")).not.toContain("First candidate too wide");
 	});
 });

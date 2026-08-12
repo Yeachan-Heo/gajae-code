@@ -96,8 +96,8 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		"task.agentModelOverrides": { executor: "provider-a/original-executor" },
 		"modelProfile.default": "old-profile",
 	});
-	const flush = vi.fn(async () => {});
-	settings.flush = flush as typeof settings.flush;
+	const flushOrThrow = vi.fn(async () => {});
+	settings.flushOrThrow = flushOrThrow as typeof settings.flushOrThrow;
 	const setCalls: Array<{ path: string; value: unknown }> = [];
 	const originalSet = settings.set.bind(settings);
 	settings.set = ((path: never, value: never) => {
@@ -136,7 +136,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 		showError: vi.fn(),
 		restoreComposer: vi.fn(),
 	};
-	return { ctx, settings, session, flush, setCalls };
+	return { ctx, settings, session, flushOrThrow, setCalls };
 }
 
 async function selectFirstProfile(controller: SelectorController, setDefault = false): Promise<void> {
@@ -167,6 +167,26 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("CUSTOM");
 		expect(rendered).not.toContain("profile-a");
 		expect(rendered).toContain("Browse all models");
+	});
+
+	test("renders image generation intent from the injected settings layer", async () => {
+		installTestTheme();
+		const settings = Settings.isolated({
+			"providers.image": "custom",
+			"providers.imageModel": "project-image-model",
+			"providers.imageCustomUrl": "https://images.example.test/v1/",
+		});
+		const selector = createSelector(() => {}, { settings });
+		await Bun.sleep(10);
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Image Generation: custom (project-image-model)");
+
+		settings.override("providers.image", "gemini");
+		settings.override("providers.imageModel", "gemini-image-model");
+		selector.refreshPresetProfiles();
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Image Generation: gemini (gemini-image-model)");
+		expect(rendered).not.toContain("Image Generation: custom (project-image-model)");
 	});
 
 	test("provider focus does not auto-expand until right arrow", async () => {
@@ -320,8 +340,10 @@ describe("model selector profiles", () => {
 		installTestTheme();
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(rendered).toContain("provider-a/default DEFAULT (high)");
-		expect(rendered).not.toContain("provider-a/alternate DEFAULT");
+		expect(rendered).toContain("provider-a/default [DEFAULT] (high)");
+		const noColorRendered = Bun.stripANSI(selector.render(220).join("\n"));
+		expect(noColorRendered).toContain("provider-a/default [DEFAULT] (high)");
+		expect(rendered).not.toContain("provider-a/alternate [DEFAULT]");
 	});
 
 	test("without active profile DEFAULT badge follows persisted default model", async () => {
@@ -337,8 +359,8 @@ describe("model selector profiles", () => {
 		installTestTheme();
 
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(rendered).toContain("provider-a/alternate DEFAULT (inherit)");
-		expect(rendered).not.toContain("provider-a/default DEFAULT");
+		expect(rendered).toContain("provider-a/alternate [DEFAULT] (inherit)");
+		expect(rendered).not.toContain("provider-a/default [DEFAULT]");
 	});
 
 	test("direct fallback chains make the runtime fallback both Current and DEFAULT", async () => {
@@ -378,6 +400,35 @@ describe("model selector profiles", () => {
 		expect(rendered).not.toContain("DEFAULT: provider-a/default");
 	});
 
+	test("refreshRoleAssignments in preset view preserves preset content", async () => {
+		installTestTheme();
+		const selector = createSelector(() => {}, {
+			currentModel: defaultModel,
+			currentThinkingLevel: ThinkingLevel.High,
+			activeModelProfile: "profile-a",
+		});
+		await Bun.sleep(10);
+		installTestTheme();
+
+		selector.handleInput("\x1b[B"); // Select CUSTOM.
+		selector.handleInput("\x1b[C"); // Expand CUSTOM.
+		const before = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(before).toContain("Model presets");
+		expect(before).toContain("Profile Alpha");
+		expect(before).toContain("Browse all models");
+
+		selector.refreshRoleAssignments({
+			currentModel: alternateModel,
+			currentThinkingLevel: ThinkingLevel.Low,
+			activeModelProfile: "profile-a",
+		});
+		const after = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(after).toContain("Model presets");
+		expect(after).toContain("Profile Alpha");
+		expect(after).toContain("Browse all models");
+		expect(after).toContain("Current: preset Profile Alpha · provider-a/alternate (low)");
+	});
+
 	test("Apply for this session activates profile through setModelTemporary", async () => {
 		const { ctx, settings, session } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
@@ -388,20 +439,20 @@ describe("model selector profiles", () => {
 		expect(session.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-a/alternate" });
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
-		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha");
+		expect(ctx.showStatus).toHaveBeenCalledWith("Model profile: Profile Alpha applied.");
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
 	test("Set as default persists and flushes modelProfile.default", async () => {
-		const { ctx, flush, setCalls } = createControllerContext();
+		const { ctx, flushOrThrow, setCalls } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
 		await selectFirstProfile(controller, true);
 
-		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
+		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha saved and applied.");
 		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
 		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
-		expect(flush).toHaveBeenCalledTimes(1);
-		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
+		expect(flushOrThrow).toHaveBeenCalledTimes(1);
+		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha saved and applied.");
 		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
@@ -421,7 +472,7 @@ describe("model selector profiles", () => {
 	});
 
 	test("settings Default Model Profile applies the profile live and persists it", async () => {
-		const { ctx, session, flush, setCalls } = createControllerContext();
+		const { ctx, session, flushOrThrow, setCalls } = createControllerContext();
 		const controller = new SelectorController(ctx as never);
 
 		controller.handleSettingChange("modelProfile.default", "profile-a");
@@ -431,12 +482,12 @@ describe("model selector profiles", () => {
 		expect(session.model?.id).toBe("default");
 		expect(setCalls).toContainEqual({ path: "modelProfile.default", value: "profile-a" });
 		expect(setCalls).toContainEqual({ path: "defaultThinkingLevel", value: ThinkingLevel.High });
-		expect(flush).toHaveBeenCalledTimes(1);
-		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha");
+		expect(flushOrThrow).toHaveBeenCalledTimes(1);
+		expect(ctx.showStatus).toHaveBeenCalledWith("Default model profile: Profile Alpha saved and applied.");
 	});
 
 	test("settings Default Model Profile surfaces credential errors without switching", async () => {
-		const { ctx, settings, session } = createControllerContext({ missingCredentials: true });
+		const { ctx, settings, session, setCalls, flushOrThrow } = createControllerContext({ missingCredentials: true });
 		const controller = new SelectorController(ctx as never);
 
 		controller.handleSettingChange("modelProfile.default", "profile-a");
@@ -448,5 +499,7 @@ describe("model selector profiles", () => {
 		expect(session.setModelTemporaryCalls).toEqual([]);
 		expect(session.model).toBe(alternateModel);
 		expect(settings.get("modelProfile.default")).toBe("old-profile");
+		expect(setCalls).toEqual([]);
+		expect(flushOrThrow).not.toHaveBeenCalled();
 	});
 });

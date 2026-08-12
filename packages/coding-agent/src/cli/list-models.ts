@@ -1,9 +1,9 @@
 /**
  * List available models with optional fuzzy search
  */
-import { type Api, getSupportedEfforts, type Model } from "@gajae-code/ai";
 import { fuzzyFilter } from "@gajae-code/tui";
 import { formatNumber } from "@gajae-code/utils";
+import { type CanonicalModelCatalog, projectModelRegistry } from "../config/model-catalog";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	discoverAndLoadExtensions,
@@ -53,63 +53,63 @@ function renderTable<T extends Record<string, string>>(rows: T[], headers: T): v
 }
 
 /**
+ * Project the registry's base model facts before CLI filtering or formatting.
+ * The projection intentionally reads all model data through the canonical catalog
+ * boundary and never exposes a raw model or session-scoped state.
+ */
+export function projectListModelCatalog(
+	modelRegistry: Pick<ModelRegistry, "getAvailable">,
+	searchPattern?: string,
+): CanonicalModelCatalog {
+	const catalog = projectModelRegistry(modelRegistry.getAvailable(), { catalogRevision: 1 });
+	if (!searchPattern) return catalog;
+	const records = fuzzyFilter(
+		[...catalog.records],
+		searchPattern,
+		record =>
+			`${record.canonicalId} ${record.provider} ${record.modelId} ${record.displayName} ${record.capabilities.join(" ")}`,
+	);
+	return Object.freeze({ ...catalog, records: Object.freeze([...records]) });
+}
+
+/**
  * List available models, optionally filtered by search pattern
  */
 export async function listModels(modelRegistry: ModelRegistry, searchPattern?: string): Promise<void> {
-	const models = modelRegistry.getAvailable();
+	const catalog = projectListModelCatalog(modelRegistry, searchPattern);
+	const records = catalog.records;
 
-	if (models.length === 0) {
-		writeLine("No models available. Set API keys in environment variables.");
+	if (records.length === 0) {
+		writeLine(
+			searchPattern
+				? `No models matching "${searchPattern}"`
+				: "No models available. Set API keys in environment variables.",
+		);
 		return;
 	}
 
-	let filteredModels: Model<Api>[] = models;
-	if (searchPattern) {
-		filteredModels = fuzzyFilter(models, searchPattern, model => `${model.provider} ${model.id}`);
-	}
+	const filteredRecords = [...records];
 
-	const filteredCanonical = modelRegistry
-		.getCanonicalModels({ availableOnly: true, candidates: filteredModels })
-		.map(record => {
-			const selected = modelRegistry.resolveCanonicalModel(record.id, {
-				availableOnly: true,
-				candidates: filteredModels,
-			});
-			if (!selected) return undefined;
-			return {
-				canonical: record.id,
-				selected: `${selected.provider}/${selected.id}`,
-				variants: String(record.variants.length),
-				context: formatNumber(selected.contextWindow),
-				maxOut: formatNumber(selected.maxTokens),
-			} satisfies CanonicalRow;
-		})
-		.filter((row): row is CanonicalRow => row !== undefined)
-		.sort((left, right) => left.canonical.localeCompare(right.canonical));
+	const canonicalRows = filteredRecords.map(record => ({
+		canonical: record.canonicalId,
+		selected: `${record.provider}/${record.modelId}`,
+		variants: "1",
+		context: formatNumber(record.contextWindow),
+		maxOut: formatNumber(record.maxTokens),
+	})) satisfies CanonicalRow[];
 
-	if (filteredModels.length === 0 && filteredCanonical.length === 0) {
-		writeLine(`No models matching "${searchPattern}"`);
-		return;
-	}
-
-	filteredModels.sort((left, right) => {
-		const providerCmp = left.provider.localeCompare(right.provider);
-		if (providerCmp !== 0) return providerCmp;
-		return left.id.localeCompare(right.id);
-	});
-
-	const providerRows = filteredModels.map(model => ({
-		provider: model.provider,
-		model: model.id,
-		context: formatNumber(model.contextWindow),
-		maxOut: formatNumber(model.maxTokens),
-		thinking: model.thinking ? getSupportedEfforts(model).join(",") : model.reasoning ? "yes" : "-",
-		images: model.input.includes("image") ? "yes" : "no",
+	const providerRows = filteredRecords.map(record => ({
+		provider: record.provider,
+		model: record.modelId,
+		context: formatNumber(record.contextWindow),
+		maxOut: formatNumber(record.maxTokens),
+		thinking: record.reasoning ? "yes" : "-",
+		images: record.inputModalities.includes("image") ? "yes" : "no",
 	})) satisfies ProviderRow[];
 
-	if (filteredCanonical.length > 0) {
+	if (canonicalRows.length > 0) {
 		writeLine("Canonical models");
-		renderTable(filteredCanonical, {
+		renderTable(canonicalRows, {
 			canonical: "canonical",
 			selected: "selected",
 			variants: "variants",

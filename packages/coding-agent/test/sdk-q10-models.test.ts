@@ -95,6 +95,17 @@ describe("Q10 model projection", () => {
 			"reasoning",
 			"thinking",
 		]);
+		expect(JSON.stringify(rows)).not.toContain("private.invalid");
+		expect(JSON.stringify(rows)).not.toContain("secret");
+	});
+
+	it("keeps the Q10 manifest free of catalog and session-overlay fields", () => {
+		const row = projectQ10Models({ models: [model()] })[0];
+		expect(row).toBeDefined();
+		expect(row).not.toHaveProperty("canonicalId");
+		expect(row).not.toHaveProperty("catalogRevision");
+		expect(row).not.toHaveProperty("sessionId");
+		expect(row).not.toHaveProperty("fallbackChain");
 	});
 
 	it("does not annotate a non-current row or an undefined current thinking level", () => {

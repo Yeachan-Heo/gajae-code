@@ -2,7 +2,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
+import { RetiredImageSecretGateError } from "@gajae-code/coding-agent/config/retired-image-secret-gate";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 
@@ -10,18 +11,21 @@ beforeAll(async () => {
 	await initTheme();
 });
 
+let activeSettings: Settings;
+
 beforeEach(async () => {
 	resetSettingsForTest();
-	await Settings.init({ inMemory: true });
+	activeSettings = await Settings.init({ inMemory: true });
 });
 
 afterEach(() => {
 	resetSettingsForTest();
 });
 
-function createSelector(): SettingsSelectorComponent {
+function createSelector(settingsInstance: Settings): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
 		{
+			settings: settingsInstance,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["dark"],
@@ -44,8 +48,8 @@ function focusMemoryTab(comp: SettingsSelectorComponent): void {
 
 describe("SettingsSelectorComponent memory tab", () => {
 	it("reveals condition-gated Hindsight rows the moment memory.backend changes via the submenu", () => {
-		settings.set("memory.backend", "off");
-		const comp = createSelector();
+		activeSettings.set("memory.backend", "off");
+		const comp = createSelector(activeSettings);
 		focusMemoryTab(comp);
 
 		const before = comp.render(120).join("\n");
@@ -59,51 +63,62 @@ describe("SettingsSelectorComponent memory tab", () => {
 		comp.handleInput("\x1b[B");
 		comp.handleInput("\n");
 
-		expect(settings.get("memory.backend")).toBe("hindsight");
+		expect(activeSettings.get("memory.backend")).toBe("hindsight");
 		const after = comp.render(120).join("\n");
 		expect(after).toContain("Memory Backend");
 		expect(after).toContain("Hindsight API URL");
 		expect(after).toContain("Hindsight Auto Recall");
 	});
-	it("reports malformed-YAML repair errors without changing an interactive control", async () => {
+	it("fails closed before selector materialization when the owned config is malformed", async () => {
 		const testDir = fs.mkdtempSync(path.join(os.tmpdir(), "settings-selector-recovery-"));
 		const agentDir = path.join(testDir, "agent");
+		const malformedSecret = "malformed-image-secret";
 		fs.mkdirSync(agentDir, { recursive: true });
 		resetSettingsForTest();
-		await Bun.write(path.join(agentDir, "config.yml"), "theme: [");
+		await Bun.write(
+			path.join(agentDir, "config.yml"),
+			`providers:\n  imageCustomKey: ${malformedSecret}\n  invalid: [\n`,
+		);
 
-		const errors: string[] = [];
-		const changes: Array<{ path: string; value: unknown }> = [];
 		let cleanupError: unknown;
+		let caught: unknown;
+		let scopedSettings: Settings | undefined;
+		let component: SettingsSelectorComponent | undefined;
+		const changes: Array<{ path: string; value: unknown }> = [];
 		try {
-			await Settings.init({ cwd: testDir, agentDir });
-			const component = new SettingsSelectorComponent(
-				{
-					availableThinkingLevels: [],
-					thinkingLevel: undefined,
-					availableThemes: ["blue-crab"],
-					availableModelProfiles: [],
-					cwd: testDir,
-				},
-				{
-					onChange: (path, value) => changes.push({ path, value }),
-					onError: message => errors.push(message),
-					onCancel: () => {},
-				},
+			try {
+				scopedSettings = await Settings.init({ cwd: testDir, agentDir });
+				component = new SettingsSelectorComponent(
+					{
+						settings: scopedSettings,
+						availableThinkingLevels: [],
+						thinkingLevel: undefined,
+						availableThemes: ["blue-crab"],
+						availableModelProfiles: [],
+						cwd: testDir,
+					},
+					{
+						onChange: (settingPath, value) => changes.push({ path: settingPath, value }),
+						onCancel: () => {},
+					},
+				);
+			} catch (error) {
+				caught = error;
+			}
+
+			expect(caught).toBeInstanceOf(RetiredImageSecretGateError);
+			if (!(caught instanceof RetiredImageSecretGateError)) return;
+			expect(caught.source).toBe("global-config");
+			expect(caught.code).toBe("RETIRED_IMAGE_SECRET_GATE_BLOCKED");
+			expect(caught.message).toBe(
+				"Settings startup blocked by an unreadable, malformed, racing, or retired image credential source (global-config).",
 			);
-
-			component.handleInput("\n");
-			component.handleInput("\n");
-
-			expect(errors).toEqual([
-				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
-			]);
+			expect(caught.message).not.toContain(malformedSecret);
+			expect(scopedSettings).toBeUndefined();
+			expect(component).toBeUndefined();
 			expect(changes).toEqual([]);
-			expect(settings.get("theme.dark")).toBe("red-claw");
-			component.handleInput("\x1b");
-			expect(component.render(120).join("\n")).toContain("red-claw");
 		} finally {
-			Settings.instance.getStorage()?.close();
+			scopedSettings?.getStorage()?.close();
 			try {
 				fs.rmSync(testDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 			} catch (error) {
@@ -116,8 +131,8 @@ describe("SettingsSelectorComponent memory tab", () => {
 	});
 
 	it("hides Hindsight rows again when the backend is switched back to off without leaving the tab", () => {
-		settings.set("memory.backend", "hindsight");
-		const comp = createSelector();
+		activeSettings.set("memory.backend", "hindsight");
+		const comp = createSelector(activeSettings);
 		focusMemoryTab(comp);
 
 		expect(comp.render(120).join("\n")).toContain("Hindsight API URL");
@@ -129,7 +144,7 @@ describe("SettingsSelectorComponent memory tab", () => {
 		comp.handleInput("\x1b[A");
 		comp.handleInput("\n");
 
-		expect(settings.get("memory.backend")).toBe("off");
+		expect(activeSettings.get("memory.backend")).toBe("off");
 		const after = comp.render(120).join("\n");
 		expect(after).toContain("Memory Backend");
 		expect(after).not.toContain("Hindsight API URL");

@@ -10,19 +10,13 @@ import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-regist
 import { SETTINGS_SCHEMA } from "@gajae-code/coding-agent/config/settings-schema";
 import type { CustomToolContext } from "@gajae-code/coding-agent/extensibility/custom-tools";
 import type { ReadonlySessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import {
-	getImageGenToolsWithRegistry,
-	imageGenTool,
-	setConfiguredImageModel,
-	setPreferredImageProvider,
-} from "@gajae-code/coding-agent/tools/image-gen";
+import { createImageGenTool, getImageGenTools, imageGenTool } from "@gajae-code/coding-agent/tools/image-gen";
 
 const originalFetch = global.fetch;
 const originalOpenRouterKey = Bun.env.OPENROUTER_API_KEY;
 const originalGeminiKey = Bun.env.GEMINI_API_KEY;
 const originalGoogleKey = Bun.env.GOOGLE_API_KEY;
 const originalOpenAIBaseUrl = Bun.env.OPENAI_BASE_URL;
-const originalCustomImageKey = Bun.env.TEST_CUSTOM_IMAGE_API_KEY;
 const generatedImagePaths: string[] = [];
 
 afterEach(async () => {
@@ -49,13 +43,6 @@ afterEach(async () => {
 	} else {
 		Bun.env.GOOGLE_API_KEY = originalGoogleKey;
 	}
-	if (originalCustomImageKey === undefined) {
-		delete Bun.env.TEST_CUSTOM_IMAGE_API_KEY;
-	} else {
-		Bun.env.TEST_CUSTOM_IMAGE_API_KEY = originalCustomImageKey;
-	}
-	setPreferredImageProvider("auto");
-	setConfiguredImageModel(null);
 });
 
 function clearFallbackImageProviderEnv(): void {
@@ -64,7 +51,46 @@ function clearFallbackImageProviderEnv(): void {
 	delete Bun.env.GOOGLE_API_KEY;
 }
 
+function removeProviderSeparators(value: string): string {
+	return value.replace(/[\s\p{Cc}\p{Cf}]/gu, "");
+}
+
 const MAX_IMAGE_BYTES = 35 * 1024 * 1024;
+
+const PROVIDER_BODY_LIMIT_BYTES = 64 * 1024 * 1024;
+const PROVIDER_CHUNK_BYTES = 1024 * 1024;
+
+function chunkedProviderResponse(
+	status: number,
+	tailSecret: string,
+): {
+	response: Response;
+	cancel: ReturnType<typeof vi.fn>;
+	pulls: () => number;
+} {
+	const bodyChunkCount = PROVIDER_BODY_LIMIT_BYTES / PROVIDER_CHUNK_BYTES;
+	const filler = new Uint8Array(PROVIDER_CHUNK_BYTES);
+	let pulls = 0;
+	const cancel = vi.fn();
+	const body = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			pulls++;
+			if (pulls <= bodyChunkCount) {
+				controller.enqueue(filler);
+			} else if (pulls === bodyChunkCount + 1) {
+				controller.enqueue(new TextEncoder().encode(tailSecret));
+			} else {
+				controller.close();
+			}
+		},
+		cancel,
+	});
+	return {
+		response: new Response(body, { status, headers: { "content-type": "application/json" } }),
+		cancel,
+		pulls: () => pulls,
+	};
+}
 const OPENROUTER_MODEL = {
 	api: "google-generative-ai",
 	provider: "google",
@@ -87,8 +113,21 @@ function makeOpenRouterCtx(): CustomToolContext {
 	};
 }
 
+function makeOpenAIImageCtx(model: Model, apiKey: string): CustomToolContext {
+	return {
+		...makeOpenRouterCtx(),
+		model,
+		modelRegistry: {
+			getApiKey: async () => apiKey,
+		} as unknown as ModelRegistry,
+	};
+}
+
+function makeConfiguredImageTool(provider: "antigravity" | "openrouter", model: string | null = null) {
+	return createImageGenTool({ provider, model });
+}
+
 function mockOpenRouterResponse(imageUrl: string): void {
-	setPreferredImageProvider("openrouter");
 	Bun.env.OPENROUTER_API_KEY = "test-openrouter-key";
 	const fetchMock: typeof fetch = (async () =>
 		new Response(
@@ -145,7 +184,7 @@ function mockImageRequests(nextResponse?: (options: https.RequestOptions, call: 
 }
 
 async function executeOpenRouter(signal?: AbortSignal) {
-	const result = await imageGenTool.execute(
+	const result = await makeConfiguredImageTool("openrouter").execute(
 		"call-openrouter",
 		{ subject: "a cat" },
 		undefined,
@@ -224,6 +263,367 @@ describe("imageGenTool", () => {
 		if (!savedPath) throw new Error("Expected generated image path");
 		expect(savedPath.endsWith(".webp")).toBe(true);
 		expect(await Bun.file(savedPath).bytes()).toEqual(Buffer.from("fake-webp"));
+	});
+
+	it("bounds provider response and revised-prompt text while redacting active keys, bearer/token material, and controls", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const activeKey = "active-image-key-secret";
+		const opaqueToken = "opaque-token-material";
+		const splitActiveKey = `${activeKey.slice(0, 8)}\u0000 \n\t${activeKey.slice(8)}`;
+
+		const providerText = [
+			"safe-status=completed",
+			activeKey,
+			`Bearer ${activeKey}`,
+			`token=${opaqueToken}`,
+			"control\u0000\u001b[31m",
+			splitActiveKey,
+			"x".repeat(6000),
+		].join(" ");
+
+		const fetchMock: typeof fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					output: [
+						{
+							type: "image_generation_call",
+							result: Buffer.from("safe-image").toString("base64"),
+							revised_prompt: providerText,
+						},
+						{ type: "message", content: [{ type: "output_text", text: providerText }] },
+					],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			)) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-5.5",
+			name: "GPT 5.5",
+			baseUrl: "https://api.openai.com/v1",
+		} as Model;
+		const ctx: CustomToolContext = {
+			...makeOpenRouterCtx(),
+			model,
+			modelRegistry: {
+				getApiKey: async () => activeKey,
+			} as unknown as ModelRegistry,
+		};
+
+		const result = await imageGenTool.execute("redaction-success", { subject: "a cat" }, undefined, ctx);
+		const responseText = result.details?.responseText;
+		const revisedPrompt = result.details?.revisedPrompt;
+		for (const text of [responseText, revisedPrompt]) {
+			expect(text).toBeDefined();
+			if (!text) continue;
+			expect(text.length).toBeLessThanOrEqual(4096);
+			expect(text).toContain("safe-status=completed");
+			expect(text).toContain("Bearer [redacted]");
+			expect(text).toContain("token=[redacted]");
+			expect(text).not.toContain(activeKey);
+			expect(removeProviderSeparators(text)).not.toContain(removeProviderSeparators(activeKey));
+
+			expect(text).not.toContain(opaqueToken);
+			expect(text).not.toContain("\u0000");
+			expect(text).not.toContain("\u001b");
+		}
+		const renderedItem = result.content.find(item => item.type === "text");
+		if (renderedItem?.type !== "text") throw new Error("Expected text content item");
+		const rendered = renderedItem.text;
+		expect(rendered).toContain("safe-status=completed");
+		expect(rendered).not.toContain(activeKey);
+		expect(removeProviderSeparators(rendered)).not.toContain(removeProviderSeparators(activeKey));
+		expect(rendered).not.toContain(opaqueToken);
+		expect(rendered).not.toContain("\u0000");
+		expect(rendered).not.toContain("\u001b");
+	});
+
+	it("returns a bounded generic error for malformed 2xx JSON containing provider secrets", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const activeKey = "active-malformed-image-key-secret";
+		const opaqueToken = "opaque-malformed-provider-token-material";
+		const malformedBody = [
+			"not-json",
+			activeKey,
+			`Bearer ${activeKey}`,
+			`token=${opaqueToken}`,
+			"control\u0000\u001b[31m",
+			"x".repeat(128 * 1024),
+		].join(" ");
+		const fetchMock: typeof fetch = (async () =>
+			new Response(malformedBody, {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			})) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-5.5",
+			name: "GPT 5.5",
+			baseUrl: "https://api.openai.com/v1",
+		} as Model;
+		const ctx: CustomToolContext = {
+			...makeOpenRouterCtx(),
+			model,
+			modelRegistry: {
+				getApiKey: async () => activeKey,
+			} as unknown as ModelRegistry,
+		};
+
+		let caught: unknown;
+		try {
+			await imageGenTool.execute("malformed-2xx", { subject: "a cat" }, undefined, ctx);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		if (!(caught instanceof Error)) return;
+		expect(caught.message).toBe("Provider returned a malformed image response.");
+		expect(caught.message.length).toBeLessThanOrEqual(128);
+		expect(caught.message).not.toContain(activeKey);
+		expect(caught.message).not.toContain(opaqueToken);
+		expect(caught.message).not.toContain("\u0000");
+		expect(caught.message).not.toContain("\u001b");
+	});
+
+	it("cancels a chunked oversized 2xx provider response without Content-Length and redacts tail bytes", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const activeKey = "active-chunked-2xx-image-key-secret";
+		const tailSecret = "chunked-2xx-tail-provider-secret";
+		const streamed = chunkedProviderResponse(200, tailSecret);
+		const fetchMock: typeof fetch = (async () => streamed.response) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-5.5",
+			name: "GPT 5.5",
+			baseUrl: "https://api.openai.com/v1",
+		} as Model;
+
+		let caught: unknown;
+		try {
+			await imageGenTool.execute(
+				"chunked-oversized-2xx",
+				{ subject: "a cat" },
+				undefined,
+				makeOpenAIImageCtx(model, activeKey),
+			);
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(streamed.response.headers.has("content-length")).toBe(false);
+		expect(streamed.pulls()).toBeGreaterThan(PROVIDER_BODY_LIMIT_BYTES / PROVIDER_CHUNK_BYTES);
+		expect(streamed.pulls()).toBeLessThanOrEqual(PROVIDER_BODY_LIMIT_BYTES / PROVIDER_CHUNK_BYTES + 2);
+		expect(caught).toBeInstanceOf(Error);
+		if (!(caught instanceof Error)) return;
+		expect(caught.message).toBe("Provider image response exceeded the supported size.");
+		expect(caught.message).not.toContain(activeKey);
+		expect(caught.message).not.toContain(tailSecret);
+	});
+
+	it("cancels a chunked oversized non-2xx provider response without Content-Length and redacts tail bytes", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const activeKey = "active-chunked-error-image-key-secret";
+		const tailSecret = "chunked-error-tail-provider-secret";
+		const streamed = chunkedProviderResponse(503, tailSecret);
+		const fetchMock: typeof fetch = (async () => streamed.response) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-5.5",
+			name: "GPT 5.5",
+			baseUrl: "https://api.openai.com/v1",
+		} as Model;
+
+		let caught: unknown;
+		try {
+			await imageGenTool.execute(
+				"chunked-oversized-error",
+				{ subject: "a cat" },
+				undefined,
+				makeOpenAIImageCtx(model, activeKey),
+			);
+		} catch (error) {
+			caught = error;
+		}
+
+		expect(streamed.response.headers.has("content-length")).toBe(false);
+		expect(streamed.pulls()).toBeGreaterThan(PROVIDER_BODY_LIMIT_BYTES / PROVIDER_CHUNK_BYTES);
+		expect(streamed.pulls()).toBeLessThanOrEqual(PROVIDER_BODY_LIMIT_BYTES / PROVIDER_CHUNK_BYTES + 2);
+		expect(caught).toBeInstanceOf(Error);
+		if (!(caught instanceof Error)) return;
+		expect(caught.message).toBe("Provider image response exceeded the supported size.");
+		expect(caught.message).not.toContain(activeKey);
+		expect(caught.message).not.toContain(tailSecret);
+	});
+
+	it("returns a bounded generic error for malformed 2xx SSE containing provider secrets", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const activeKey = "active-malformed-sse-image-key-secret";
+		const opaqueToken = "opaque-malformed-sse-provider-token-material";
+		const validEvent = {
+			type: "response.output_item.done",
+			item: { type: "message", content: [{ type: "output_text", text: activeKey }] },
+		};
+		const malformedSse = [
+			`data: ${JSON.stringify(validEvent)}`,
+			`data: ${activeKey}\u0000${opaqueToken}${"x".repeat(128 * 1024)}`,
+		].join("\n\n");
+		const fetchMock: typeof fetch = (async () =>
+			new Response(`${malformedSse}\n\n`, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			})) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-5.5",
+			name: "GPT 5.5",
+			baseUrl: "https://api.openai.com/v1",
+		} as Model;
+		const ctx: CustomToolContext = {
+			...makeOpenRouterCtx(),
+			model,
+			modelRegistry: {
+				getApiKey: async () => activeKey,
+			} as unknown as ModelRegistry,
+		};
+
+		let caught: unknown;
+		try {
+			await imageGenTool.execute("malformed-sse", { subject: "a cat" }, undefined, ctx);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		if (!(caught instanceof Error)) return;
+		expect(caught.message).toBe("Provider returned a malformed image response.");
+		expect(caught.message.length).toBeLessThanOrEqual(128);
+		expect(caught.message).not.toContain(activeKey);
+		expect(caught.message).not.toContain(opaqueToken);
+		expect(caught.message).not.toContain("\u0000");
+		expect(caught.message).not.toContain("\u001b");
+	});
+
+	it("redacts active keys split across provider SSE chunks after removing controls and whitespace", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const activeKey = "active-sse-chunk-image-key-secret";
+		const opaqueToken = "opaque-sse-chunk-provider-token-material-with-extra-length";
+		const midpoint = Math.floor(activeKey.length / 2);
+		const firstChunk = `${activeKey.slice(0, midpoint)}\u0000`;
+		const secondChunk = ` \n\t${activeKey.slice(midpoint)}`;
+		const events = [
+			{
+				type: "response.output_item.done",
+				item: { type: "message", content: [{ type: "output_text", text: `prefix ${firstChunk}` }] },
+			},
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "message",
+					content: [{ type: "output_text", text: `${secondChunk} suffix ${opaqueToken}` }],
+				},
+			},
+		];
+		const sseBody = `${events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")}`;
+		const fetchMock: typeof fetch = (async () =>
+			new Response(sseBody, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			})) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-5.5",
+			name: "GPT 5.5",
+			baseUrl: "https://api.openai.com/v1",
+		} as Model;
+		const ctx: CustomToolContext = {
+			...makeOpenRouterCtx(),
+			model,
+			modelRegistry: {
+				getApiKey: async () => activeKey,
+			} as unknown as ModelRegistry,
+		};
+
+		const result = await imageGenTool.execute("split-sse-key", { subject: "a cat" }, undefined, ctx);
+		const responseText = result.details?.responseText;
+		expect(responseText).toBeDefined();
+		if (!responseText) return;
+		expect(removeProviderSeparators(responseText)).not.toContain(removeProviderSeparators(activeKey));
+		expect(responseText).not.toContain(opaqueToken);
+		expect(responseText).not.toContain("\u0000");
+		const renderedItem = result.content.find(item => item.type === "text");
+		if (renderedItem?.type !== "text") throw new Error("Expected text content item");
+		expect(removeProviderSeparators(renderedItem.text)).not.toContain(removeProviderSeparators(activeKey));
+		expect(renderedItem.text).not.toContain(opaqueToken);
+		expect(renderedItem.text).not.toContain("\u0000");
+	});
+
+	it("keeps safe HTTP status evidence while bounding and redacting provider error text", async () => {
+		delete Bun.env.OPENAI_BASE_URL;
+		const activeKey = "active-image-error-key-secret";
+		const opaqueToken = "opaque-error-token-material";
+		const providerError = [
+			"safe-status=retryable",
+			activeKey,
+			`Bearer ${activeKey}`,
+			`token=${opaqueToken}`,
+			"control\u0001\u001b[2J",
+			"x".repeat(6000),
+		].join(" ");
+		const fetchMock: typeof fetch = (async () =>
+			new Response(JSON.stringify({ error: { message: providerError } }), {
+				status: 503,
+				headers: { "content-type": "application/json" },
+			})) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const model = {
+			api: "openai-responses",
+			provider: "openai",
+			id: "gpt-5.5",
+			name: "GPT 5.5",
+			baseUrl: "https://api.openai.com/v1",
+		} as Model;
+		const ctx: CustomToolContext = {
+			...makeOpenRouterCtx(),
+			model,
+			modelRegistry: {
+				getApiKey: async () => activeKey,
+			} as unknown as ModelRegistry,
+		};
+
+		let caught: unknown;
+		try {
+			await imageGenTool.execute("redaction-error", { subject: "a cat" }, undefined, ctx);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Error);
+		if (!(caught instanceof Error)) return;
+		expect(caught.message).toContain("503");
+		expect(caught.message).toContain("safe-status=retryable");
+		expect(caught.message).toContain("Bearer [redacted]");
+		expect(caught.message).toContain("token=[redacted]");
+		expect(caught.message).not.toContain(activeKey);
+		expect(caught.message).not.toContain(opaqueToken);
+		expect(caught.message).not.toContain("\u0001");
+		expect(caught.message).not.toContain("\u001b");
+		expect(caught.message.length).toBeLessThan(4300);
 	});
 
 	it("uses OPENAI_BASE_URL for OpenAI image generation when active model still has the default OpenAI URL", async () => {
@@ -323,6 +723,7 @@ describe("imageGenTool", () => {
 	it("routes configured custom image models through their configured base URL", async () => {
 		let requestUrl: string | undefined;
 		let requestBody: unknown;
+		let selectorSeen: unknown;
 		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
 			requestUrl = input.toString();
 			requestBody = JSON.parse(String(init?.body));
@@ -335,20 +736,120 @@ describe("imageGenTool", () => {
 		}) as unknown as typeof fetch;
 		fetchMock.preconnect = originalFetch.preconnect;
 		global.fetch = fetchMock;
-		Bun.env.TEST_CUSTOM_IMAGE_API_KEY = "test-custom-key";
-		setConfiguredImageModel({
+
+		const ctx: CustomToolContext = {
+			...makeOpenRouterCtx(),
+			modelRegistry: {
+				getApiKey: async (
+					_model: Model,
+					_sessionId?: string,
+					options?: { credentialSelector?: { kind: string; value: string } },
+				) => {
+					selectorSeen = options?.credentialSelector;
+					return "test-custom-key";
+				},
+				getSessionCredentialType: () => "api_key",
+			} as unknown as ModelRegistry,
+		};
+		const customTool = createImageGenTool({
 			provider: "custom",
 			model: "proxy-image-model",
 			customUrl: "https://images.example.test/v1/",
-			customKeyEnv: "TEST_CUSTOM_IMAGE_API_KEY",
+			credentialSelector: { kind: "id", value: "credential-1" },
 		});
-
-		const result = await imageGenTool.execute("call-custom", { subject: "a cat" }, undefined, makeOpenRouterCtx());
+		const result = await customTool.execute("call-custom", { subject: "a cat" }, undefined, ctx);
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
+		expect(selectorSeen).toEqual({ kind: "id", value: "credential-1" });
 		expect(requestUrl).toBe("https://images.example.test/v1/responses");
 		expect(requestBody).toMatchObject({ model: "proxy-image-model", tool_choice: { type: "image_generation" } });
 		expect(result.details?.provider).toBe("openai");
+	});
+
+	it("keeps configuration isolated between image tool instances", async () => {
+		const requests: Array<{ url: string; body: { model?: string } }> = [];
+		const fetchMock: typeof fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requests.push({ url: input.toString(), body: JSON.parse(String(init?.body)) as { model?: string } });
+			return new Response(
+				JSON.stringify({
+					output: [{ type: "image_generation_call", result: Buffer.from("fake-webp").toString("base64") }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const modelRegistry = {
+			getApiKey: async () => "test-custom-key",
+			getSessionCredentialType: () => "api_key",
+		} as unknown as ModelRegistry;
+		const ctx: CustomToolContext = { ...makeOpenRouterCtx(), modelRegistry };
+		const firstTools = await getImageGenTools(
+			modelRegistry,
+			OPENROUTER_MODEL,
+			{
+				provider: "custom",
+				model: "first-model",
+				customUrl: "https://first-images.example.test/v1/",
+				credentialSelector: { kind: "id", value: "first" },
+			},
+			"test-session",
+		);
+		const secondTools = await getImageGenTools(
+			modelRegistry,
+			OPENROUTER_MODEL,
+			{
+				provider: "custom",
+				model: "second-model",
+				customUrl: "https://second-images.example.test/v1/",
+				credentialSelector: { kind: "id", value: "second" },
+			},
+			"test-session",
+		);
+		expect(firstTools).toHaveLength(1);
+		expect(secondTools).toHaveLength(1);
+		const first = firstTools[0]!;
+		const second = secondTools[0]!;
+
+		const firstResult = await first.execute("first", { subject: "a cat" }, undefined, ctx);
+		const secondResult = await second.execute("second", { subject: "a dog" }, undefined, ctx);
+		generatedImagePaths.push(...(firstResult.details?.imagePaths ?? []), ...(secondResult.details?.imagePaths ?? []));
+
+		expect(requests.map(request => ({ url: request.url, model: request.body.model }))).toEqual([
+			{ url: "https://first-images.example.test/v1/responses", model: "first-model" },
+			{ url: "https://second-images.example.test/v1/responses", model: "second-model" },
+		]);
+	});
+
+	it("does not look up credentials or call the network for custom intent without an explicit selector", async () => {
+		let lookupCount = 0;
+		let fetchCalled = false;
+		const fetchMock: typeof fetch = (async () => {
+			fetchCalled = true;
+			return new Response("unexpected");
+		}) as unknown as typeof fetch;
+		fetchMock.preconnect = originalFetch.preconnect;
+		global.fetch = fetchMock;
+		const ctx: CustomToolContext = {
+			...makeOpenRouterCtx(),
+			modelRegistry: {
+				getApiKey: async () => {
+					lookupCount++;
+					return "should-not-be-used";
+				},
+			} as unknown as ModelRegistry,
+		};
+		const tool = createImageGenTool({
+			provider: "custom",
+			model: "project-model",
+			customUrl: "https://project-images.example.test/v1/",
+		});
+
+		await expect(tool.execute("project-intent", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(
+			/No image API credentials found/,
+		);
+		expect(lookupCount).toBe(0);
+		expect(fetchCalled).toBe(false);
 	});
 });
 
@@ -405,7 +906,6 @@ describe("providers.image settings schema", () => {
 
 describe("imageGenTool antigravity provider", () => {
 	it("uses structured getOAuthAccess metadata (access token + projectId) for the request", async () => {
-		setPreferredImageProvider("antigravity");
 		let requestUrl: string | undefined;
 		let authorization: string | undefined;
 		let requestBody: { project?: string } | undefined;
@@ -428,7 +928,12 @@ describe("imageGenTool antigravity provider", () => {
 			},
 		});
 
-		const result = await imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx);
+		const result = await makeConfiguredImageTool("antigravity").execute(
+			"call-1",
+			{ subject: "a cat" },
+			undefined,
+			ctx,
+		);
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
 		expect(requestUrl).toBe(ANTIGRAVITY_URL);
@@ -439,7 +944,6 @@ describe("imageGenTool antigravity provider", () => {
 	});
 
 	it("falls back to JSON-parsed getApiKeyForProvider credentials when OAuth access is absent", async () => {
-		setPreferredImageProvider("antigravity");
 		let authorization: string | undefined;
 		let requestBody: { project?: string } | undefined;
 
@@ -458,7 +962,12 @@ describe("imageGenTool antigravity provider", () => {
 			getApiKeyForProvider: async () => JSON.stringify({ token: "json-token", projectId: "project-json" }),
 		});
 
-		const result = await imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx);
+		const result = await makeConfiguredImageTool("antigravity").execute(
+			"call-1",
+			{ subject: "a cat" },
+			undefined,
+			ctx,
+		);
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
 		expect(authorization).toBe("Bearer json-token");
@@ -466,7 +975,6 @@ describe("imageGenTool antigravity provider", () => {
 	});
 
 	it("does not register for malformed JSON credentials without a token field", async () => {
-		setPreferredImageProvider("antigravity");
 		clearFallbackImageProviderEnv();
 
 		const modelRegistry = {
@@ -476,12 +984,14 @@ describe("imageGenTool antigravity provider", () => {
 			getApiKeyForProvider: async () => JSON.stringify({ projectId: "project-without-token" }),
 		} as unknown as ModelRegistry;
 
-		const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+		const tools = await getImageGenTools(modelRegistry, ANTIGRAVITY_MODEL, {
+			provider: "antigravity",
+			model: null,
+		});
 		expect(tools).toHaveLength(0);
 	});
 
 	it("does not register for empty or whitespace antigravity credentials", async () => {
-		setPreferredImageProvider("antigravity");
 		clearFallbackImageProviderEnv();
 
 		for (const credential of ["", "   \n\t  "]) {
@@ -492,13 +1002,15 @@ describe("imageGenTool antigravity provider", () => {
 				getApiKeyForProvider: async () => credential,
 			} as unknown as ModelRegistry;
 
-			const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+			const tools = await getImageGenTools(modelRegistry, ANTIGRAVITY_MODEL, {
+				provider: "antigravity",
+				model: null,
+			});
 			expect(tools).toHaveLength(0);
 		}
 	});
 
 	it("accepts JSON credentials with accessToken and honors projectId", async () => {
-		setPreferredImageProvider("antigravity");
 		let authorization: string | undefined;
 		let requestBody: { project?: string } | undefined;
 
@@ -518,7 +1030,12 @@ describe("imageGenTool antigravity provider", () => {
 				JSON.stringify({ accessToken: "access-token-json", projectId: "project-access" }),
 		});
 
-		const result = await imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx);
+		const result = await makeConfiguredImageTool("antigravity").execute(
+			"call-1",
+			{ subject: "a cat" },
+			undefined,
+			ctx,
+		);
 		generatedImagePaths.push(...(result.details?.imagePaths ?? []));
 
 		expect(authorization).toBe("Bearer access-token-json");
@@ -527,7 +1044,6 @@ describe("imageGenTool antigravity provider", () => {
 	});
 
 	it("registers OAuth access without projectId but fails loudly before fetch", async () => {
-		setPreferredImageProvider("antigravity");
 		let fetchCalled = false;
 		const fetchMock: typeof fetch = (async () => {
 			fetchCalled = true;
@@ -545,19 +1061,23 @@ describe("imageGenTool antigravity provider", () => {
 			},
 		} as unknown as ModelRegistry;
 
-		const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+		const tools = await getImageGenTools(modelRegistry, ANTIGRAVITY_MODEL, {
+			provider: "antigravity",
+			model: null,
+		});
 		expect(tools).toHaveLength(1);
 
 		const ctx = makeAntigravityCtx(modelRegistry);
-		await expect(imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(
-			/projectId.*google-antigravity|google-antigravity.*projectId/s,
-		);
-		await expect(imageGenTool.execute("call-2", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(/login/);
+		await expect(
+			makeConfiguredImageTool("antigravity").execute("call-1", { subject: "a cat" }, undefined, ctx),
+		).rejects.toThrow(/projectId.*google-antigravity|google-antigravity.*projectId/s);
+		await expect(
+			makeConfiguredImageTool("antigravity").execute("call-2", { subject: "a cat" }, undefined, ctx),
+		).rejects.toThrow(/login/);
 		expect(fetchCalled).toBe(false);
 	});
 
 	it("registers the tool for a raw-token-only credential but fails loudly without a projectId", async () => {
-		setPreferredImageProvider("antigravity");
 		let fetchCalled = false;
 		const fetchMock: typeof fetch = (async () => {
 			fetchCalled = true;
@@ -573,14 +1093,19 @@ describe("imageGenTool antigravity provider", () => {
 			getApiKeyForProvider: async () => "raw-token",
 		} as unknown as ModelRegistry;
 
-		const tools = await getImageGenToolsWithRegistry(modelRegistry, ANTIGRAVITY_MODEL);
+		const tools = await getImageGenTools(modelRegistry, ANTIGRAVITY_MODEL, {
+			provider: "antigravity",
+			model: null,
+		});
 		expect(tools).toHaveLength(1);
 
 		const ctx = makeAntigravityCtx(modelRegistry);
-		await expect(imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(
-			/projectId.*google-antigravity|google-antigravity.*projectId/s,
-		);
-		await expect(imageGenTool.execute("call-2", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(/login/);
+		await expect(
+			makeConfiguredImageTool("antigravity").execute("call-1", { subject: "a cat" }, undefined, ctx),
+		).rejects.toThrow(/projectId.*google-antigravity|google-antigravity.*projectId/s);
+		await expect(
+			makeConfiguredImageTool("antigravity").execute("call-2", { subject: "a cat" }, undefined, ctx),
+		).rejects.toThrow(/login/);
 		expect(fetchCalled).toBe(false);
 	});
 });

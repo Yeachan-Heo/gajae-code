@@ -99,4 +99,21 @@ describe("TasksAggregator status contract", () => {
 		expect(aggregator.getSnapshot().rows.map(row => row.id)).toContain("bash:running");
 		aggregator.dispose();
 	});
+	test("keeps the existing manager-owned acknowledgement path without a store", async () => {
+		let acknowledged = false;
+		const manager = { onChange: noop, getAllJobs: () => [], getSubagentRecords: () => [] };
+		const observer = {
+			onChange: noop,
+			getSnapshot: () => ({ monitors: [], crons: [], failedUnacknowledged: false }),
+			acknowledgeFailures: () => {
+				acknowledged = true;
+			},
+			getMonitorOutput: () => "",
+		};
+		const sessions = { onChange: noop, getSessions: () => [] };
+		const aggregator = new TasksAggregator(manager as never, observer as never, sessions as never);
+		await aggregator.acknowledgeFailures();
+		expect(acknowledged).toBe(true);
+		aggregator.dispose();
+	});
 });

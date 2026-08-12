@@ -16,14 +16,20 @@ import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
  * provider and generation rather than silently defaulting to unavailable.
  */
 
+let scopedSettings: Settings;
+
 beforeAll(async () => {
-	await Settings.init({ inMemory: true, cwd: process.cwd() });
+	scopedSettings = await Settings.init({ inMemory: true, cwd: process.cwd() });
 	const theme = await getThemeByName("red-claw");
 	if (!theme) throw new Error("Failed to load test theme");
 	setThemeInstance(theme);
 });
 
-function baseContext(cwd: string): {
+function baseContext(
+	settingsInstance: Settings,
+	cwd: string,
+): {
+	settings: Settings;
 	availableThinkingLevels: [];
 	thinkingLevel: undefined;
 	availableThemes: string[];
@@ -31,6 +37,7 @@ function baseContext(cwd: string): {
 	cwd: string;
 } {
 	return {
+		settings: settingsInstance,
 		availableThinkingLevels: [],
 		thinkingLevel: undefined,
 		availableThemes: ["red-claw"],
@@ -59,7 +66,11 @@ describe("GJC Bundles settings integration through the production selector", () 
 		);
 
 		const selector = new SettingsSelectorComponent(
-			{ ...baseContext("/tmp/does-not-need-to-exist"), gjcRuntimeSnapshot: store, gjcActivationGeneration: 7 },
+			{
+				...baseContext(scopedSettings, "/tmp/does-not-need-to-exist"),
+				gjcRuntimeSnapshot: store,
+				gjcActivationGeneration: 7,
+			},
 			{ onCancel: () => {}, onChange: () => {} },
 		);
 
@@ -82,7 +93,7 @@ describe("GJC Bundles settings integration through the production selector", () 
 	});
 
 	test("a missing provider degrades honestly instead of crashing", () => {
-		const selector = new SettingsSelectorComponent(baseContext("/tmp/does-not-need-to-exist"), {
+		const selector = new SettingsSelectorComponent(baseContext(scopedSettings, "/tmp/does-not-need-to-exist"), {
 			onCancel: () => {},
 			onChange: () => {},
 		});

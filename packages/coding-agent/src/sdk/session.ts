@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import * as path from "node:path";
 import {
 	Agent,
@@ -44,8 +45,12 @@ import {
 } from "../append-only-mode";
 import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
 import { loadCapability } from "../capability";
+import { findRepoRoot } from "../capability/fs";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
+import { loadPersistentExecutionPresetConfiguration } from "../config/execution-preset";
+import { type CanonicalModelCatalog, projectModelRegistry } from "../config/model-catalog";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
+import { createModelResolutionOverlay, type ModelResolutionOverlayInput } from "../config/model-resolution-overlay";
 import {
 	formatModelString,
 	parseModelPattern,
@@ -54,7 +59,10 @@ import {
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
+import { normalizeModelSelectorValue } from "../config/model-selector-value";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "../config/prompt-templates";
+import { runRetiredImageSecretGate } from "../config/retired-image-secret-gate";
+import { ScopedConfigurationMutationService } from "../config/scoped-configuration-mutation";
 import { Settings, type SkillsSettings } from "../config/settings";
 import { CursorExecHandlers } from "../cursor";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
@@ -138,9 +146,23 @@ import {
 	loadProjectContextFiles as loadContextFilesInternal,
 	loadProjectContextFilesResult as loadContextFilesResultInternal,
 } from "../system-prompt";
+import {
+	bindTaskExecutionPolicyController,
+	FAILED_PERSISTENT_TASK_EXECUTION_POLICY,
+	isTaskMcpAllowed,
+	isTaskToolAllowed,
+	type TaskExecutionPolicy,
+	type TaskExecutionPolicyApplyResult,
+	TaskExecutionPolicyController,
+	type TaskExecutionPolicySnapshot,
+} from "../task/execution-policy";
 import { AgentOutputManager } from "../task/output-manager";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
-import { isMCPBridgeTool, selectRestorableDiscoveredBuiltinToolNames } from "../tool-discovery/tool-index";
+import {
+	buildDiscoverableToolSearchIndex,
+	isMCPBridgeTool,
+	selectRestorableDiscoveredBuiltinToolNames,
+} from "../tool-discovery/tool-index";
 import {
 	applyConfiguredSearchTimeout,
 	BashTool,
@@ -160,8 +182,6 @@ import {
 	ReadTool,
 	ResolveTool,
 	SearchTool,
-	setConfiguredImageModel,
-	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
 	type Tool,
@@ -170,12 +190,18 @@ import {
 	WriteTool,
 } from "../tools";
 import { ToolContextStore } from "../tools/context";
-import { getImageGenTools } from "../tools/image-gen";
+import { getImageGenTools, type ImageProviderConfig } from "../tools/image-gen";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
+import {
+	projectCanonicalModelCatalog,
+	projectModelResolutionOverlay,
+	type SdkModelCatalog,
+	type SdkModelResolutionOverlay,
+} from "./models";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -432,6 +458,10 @@ export interface CreateAgentSessionOptions {
 	requireYieldTool?: boolean;
 	/** Task recursion depth (for subagent sessions). Default: 0 */
 	taskDepth?: number;
+	/** Optional immutable launch policy snapshot used by subagent sessions. */
+	executionPolicySnapshot?: TaskExecutionPolicySnapshot;
+	/** Optional initial session policy; not persisted. */
+	taskExecutionPolicy?: TaskExecutionPolicy;
 	/** Current role-agent type/name for nested task sessions. */
 	currentAgentType?: string;
 	/** Parent Hindsight state to alias for subagent private memory backend compatibility. */
@@ -512,6 +542,13 @@ export interface CreateAgentSessionResult {
 	startDeferredMcpConfig?: () => Promise<DeferredMcpConfigStartupResult>;
 	/** Starts a deferred memory backend. Present only when deferMemoryBackendStartup was requested. */
 	startDeferredMemoryBackend?: () => void;
+	/** Per-session task execution policy controls; no persistence or model coupling. */
+	/** Read the immutable policy snapshot captured by this session's task controller. */
+	readonly getExecutionPolicy?: () => TaskExecutionPolicySnapshot;
+	/** Validate and apply a future-only task launch policy without throwing. */
+	readonly applyExecutionPolicy?: (input: unknown) => TaskExecutionPolicyApplyResult;
+	/** Clear the session policy and restore default launch behavior. */
+	readonly clearExecutionPolicy?: () => TaskExecutionPolicySnapshot;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
 	/** LSP servers configured for lazy startup in interactive mode */
@@ -523,6 +560,10 @@ export interface CreateAgentSessionResult {
 	 * this session published. Undefined when no GJC bundles participated.
 	 */
 	gjcRuntimeSnapshot?: GjcRuntimeSnapshotProvider;
+	/** Base-only canonical model catalog projection for SDK callers. */
+	getModelCatalog?: () => SdkModelCatalog;
+	/** Explicit current-session resolution overlay projection; never another session's overlay. */
+	getModelResolutionOverlay?: () => SdkModelResolutionOverlay | undefined;
 }
 
 export interface DeferredMcpConfigStartupResult {
@@ -724,6 +765,209 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 }
 
 // Internal Helpers
+const MODEL_OVERLAY_ROLES = ["default", "executor", "planner", "critic", "architect"] as const;
+
+type ModelCatalogProjectionSurface = {
+	readonly getModelCatalog: () => SdkModelCatalog;
+	readonly getModelResolutionOverlay: () => SdkModelResolutionOverlay | undefined;
+};
+
+function canonicalRecordForSelector(
+	catalog: CanonicalModelCatalog,
+	selector: string,
+): CanonicalModelCatalog["records"][number] | undefined {
+	const normalized = selector.trim();
+	if (!normalized) return undefined;
+	return catalog.records.find(
+		record => normalized === record.canonicalId || normalized.startsWith(`${record.canonicalId}:`),
+	);
+}
+
+function canonicalRecordForModel(
+	catalog: CanonicalModelCatalog,
+	model: Model,
+): CanonicalModelCatalog["records"][number] | undefined {
+	return catalog.records.find(record => record.provider === model.provider && record.modelId === model.id);
+}
+
+const REDACTED_SELECTOR = "<redacted-selector>";
+const SAFE_SELECTOR_PATTERN =
+	/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\/[A-Za-z0-9][A-Za-z0-9._-]{0,191}(?::(?:inherit|off|minimal|low|medium|high|xhigh|max))?$/iu;
+const SAFE_OVERLAY_REASONS = new Set([
+	"auth",
+	"new_turn",
+	"other",
+	"quota",
+	"rate_limit",
+	"resolution",
+	"server",
+	"unknown",
+	"unauthenticated",
+	"unknown_model",
+]);
+
+function sanitizeConfiguredSelector(value: string): string {
+	const selector = value.trim();
+	if (!selector || selector.length > 256 || /[\p{Cc}\p{Cf}]/u.test(selector)) return REDACTED_SELECTOR;
+	return SAFE_SELECTOR_PATTERN.test(selector) ? selector : REDACTED_SELECTOR;
+}
+
+const REDACTED_ROLE = "<redacted-role>";
+const REDACTED_PROFILE = "<redacted-profile>";
+const SAFE_OVERLAY_LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/u;
+
+function sanitizeOverlayLabel(value: unknown, redacted: string): string {
+	if (typeof value !== "string") return redacted;
+	const normalized = value.trim();
+	return normalized && SAFE_OVERLAY_LABEL_PATTERN.test(normalized) ? normalized : redacted;
+}
+
+function sanitizeConfiguredRole(value: string): string {
+	return sanitizeOverlayLabel(value, REDACTED_ROLE);
+}
+
+function sanitizeProfileId(value: string | undefined): string | undefined {
+	return value === undefined ? undefined : sanitizeOverlayLabel(value, REDACTED_PROFILE);
+}
+
+function selectorStrings(value: unknown): readonly string[] {
+	const values =
+		typeof value === "string"
+			? normalizeModelSelectorValue(value)
+			: Array.isArray(value)
+				? normalizeModelSelectorValue(value.filter((entry): entry is string => typeof entry === "string"))
+				: [];
+	return Object.freeze([...new Set(values.map(sanitizeConfiguredSelector))]);
+}
+
+function safeOverlayReason(value: unknown): string {
+	if (typeof value !== "string") return "unknown";
+	const reason = value.trim();
+	return SAFE_OVERLAY_REASONS.has(reason) ? reason : "unknown";
+}
+
+function modelCatalogProjectionSurface(
+	modelRegistry: ModelRegistry,
+	session: AgentSession,
+): ModelCatalogProjectionSurface {
+	let catalogRevision = 1;
+	let catalogFingerprint = "";
+	let catalog: CanonicalModelCatalog | undefined;
+	let overlayRevision = 0;
+	let overlayFingerprint = "";
+	let overlay: ReturnType<typeof createModelResolutionOverlay> | undefined;
+
+	const refreshCatalog = (): CanonicalModelCatalog => {
+		const next = projectModelRegistry(modelRegistry.getAll(), { catalogRevision });
+		const nextFingerprint = JSON.stringify(next.records);
+		if (catalog === undefined) {
+			catalog = next;
+			catalogFingerprint = nextFingerprint;
+			return catalog;
+		}
+		if (nextFingerprint !== catalogFingerprint) {
+			catalogRevision += 1;
+			catalog = projectModelRegistry(modelRegistry.getAll(), { catalogRevision });
+			catalogFingerprint = JSON.stringify(catalog.records);
+		}
+		return catalog;
+	};
+
+	const buildOverlayInput = (currentCatalog: CanonicalModelCatalog): ModelResolutionOverlayInput | undefined => {
+		const currentModel = session.model;
+		if (!currentModel) return undefined;
+		const currentRecord = canonicalRecordForModel(currentCatalog, currentModel);
+		if (!currentRecord) return undefined;
+
+		const requestedSelectors: string[] = [];
+		const requestedRoles: string[] = [];
+		const resolvedCanonicalIds: string[] = [currentRecord.canonicalId];
+		const roleSelectors = new Map<string, readonly string[]>();
+		for (const [role, value] of Object.entries(session.settings.getModelRoles())) {
+			const selectors = selectorStrings(value);
+			if (selectors.length > 0) roleSelectors.set(sanitizeConfiguredRole(role), selectors);
+		}
+		for (const [role, value] of Object.entries(session.settings.get("task.agentModelOverrides"))) {
+			const selectors = selectorStrings(value);
+			if (selectors.length > 0) roleSelectors.set(sanitizeConfiguredRole(role), selectors);
+		}
+		const roles = [...new Set([...MODEL_OVERLAY_ROLES, ...roleSelectors.keys()])];
+		for (const role of roles) {
+			const selectors = new Set<string>();
+			for (const selector of selectorStrings(session.getConfiguredModelChain(role))) selectors.add(selector);
+			for (const selector of roleSelectors.get(role) ?? []) selectors.add(selector);
+			if (selectors.size === 0) continue;
+			requestedRoles.push(role);
+			for (const selector of selectors) {
+				requestedSelectors.push(selector);
+				const record = canonicalRecordForSelector(currentCatalog, selector);
+				if (record && !resolvedCanonicalIds.includes(record.canonicalId))
+					resolvedCanonicalIds.push(record.canonicalId);
+			}
+		}
+
+		const runtimeFallback = session.getDefaultFallbackRuntimeSnapshot();
+		const fallbackActiveIndex = runtimeFallback.activeIndex;
+		const fallbackSkips = runtimeFallback.skips;
+		const hasFallbackEvidence =
+			runtimeFallback.chain.entries.length > 1 &&
+			(fallbackActiveIndex > 0 || fallbackSkips.length > 0 || runtimeFallback.tried.length > 0);
+		const fallbackEntries = hasFallbackEvidence ? runtimeFallback.chain.entries : [];
+		const fallbackChain: string[] = [];
+		const fallbackRecordIndexes: number[] = [];
+		for (let index = 0; index < fallbackEntries.length; index += 1) {
+			const selector = selectorStrings(fallbackEntries[index])[0];
+			const record = selector === undefined ? undefined : canonicalRecordForSelector(currentCatalog, selector);
+			if (!record) continue;
+			fallbackRecordIndexes.push(index);
+			fallbackChain.push(record.canonicalId);
+			if (!resolvedCanonicalIds.includes(record.canonicalId)) resolvedCanonicalIds.push(record.canonicalId);
+		}
+		const activeIndex = hasFallbackEvidence ? fallbackRecordIndexes.indexOf(fallbackActiveIndex) : -1;
+		const skips = (hasFallbackEvidence ? fallbackSkips : []).flatMap(skip => {
+			const selector = selectorStrings(skip.selector)[0];
+			const record = selector === undefined ? undefined : canonicalRecordForSelector(currentCatalog, selector);
+			return record
+				? [{ catalogRecordId: record.canonicalId, reason: safeOverlayReason(skip.reason), selector }]
+				: [];
+		});
+		const resolvedEfforts = session.thinkingLevel === undefined ? [] : [String(session.thinkingLevel)];
+		const workMode = session.getCurrentWorkModeQualification();
+		return {
+			sessionId: session.sessionId,
+			catalogRevision: currentCatalog.revision,
+			sessionRevision: 1,
+			catalogRecordId: currentRecord.canonicalId,
+			profileId: sanitizeProfileId(session.getActiveModelProfile()),
+			requestedSelectors,
+			requestedRoles,
+			resolvedCanonicalIds,
+			resolvedEfforts,
+			fallbackChain,
+			activeIndex: activeIndex >= 0 ? activeIndex : null,
+			skips,
+			scope: "session",
+			receiptRefs: [],
+			...(workMode === undefined ? {} : { workMode }),
+		};
+	};
+
+	return {
+		getModelCatalog: () => projectCanonicalModelCatalog(refreshCatalog()),
+		getModelResolutionOverlay: () => {
+			const currentCatalog = refreshCatalog();
+			const input = buildOverlayInput(currentCatalog);
+			if (!input) return undefined;
+			const fingerprint = JSON.stringify({ ...input, sessionRevision: undefined });
+			if (overlay === undefined || fingerprint !== overlayFingerprint) {
+				overlayRevision += 1;
+				overlayFingerprint = fingerprint;
+				overlay = createModelResolutionOverlay({ ...input, sessionRevision: overlayRevision }, currentCatalog);
+			}
+			return projectModelResolutionOverlay(overlay, session.sessionId);
+		},
+	};
+}
 
 function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
 	return {
@@ -1100,7 +1344,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
+	await runRetiredImageSecretGate({ cwd, agentDir });
+	const loadContext = Object.freeze({
+		cwd: path.resolve(cwd),
+		home: homedir(),
+		repoRoot: await findRepoRoot(cwd),
+	});
 	const eventBus = options.eventBus ?? new EventBus();
+	let taskExecutionPolicyController: TaskExecutionPolicyController;
+	const enforceExecutionPolicySnapshot = options.executionPolicySnapshot !== undefined;
+	const allowsExecutionPolicyTool = (snapshot: TaskExecutionPolicySnapshot, name: string): boolean =>
+		!enforceExecutionPolicySnapshot || (isTaskToolAllowed(snapshot, name) && isTaskMcpAllowed(snapshot, name));
 
 	registerSshCleanup();
 	registerPythonCleanup();
@@ -1180,7 +1434,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (earlyCredentialSelectorProvider) {
 			installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
 		}
-		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
+		const settings =
+			options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir, loadContext }));
+		const scopedMutationService = new ScopedConfigurationMutationService({
+			loadContext,
+			agentDir,
+			reloadAndVerify: context => settings.reloadAndVerifyScope(context),
+		});
+		taskExecutionPolicyController = options.executionPolicySnapshot
+			? TaskExecutionPolicyController.fromSnapshot(options.executionPolicySnapshot)
+			: new TaskExecutionPolicyController(options.taskExecutionPolicy);
+		if (!isCanonicalSubSession && !enforceExecutionPolicySnapshot && options.taskExecutionPolicy === undefined) {
+			try {
+				const persistent = await loadPersistentExecutionPresetConfiguration(scopedMutationService);
+				if (persistent.status === "ready" && persistent.activePolicy !== null) {
+					const applied = taskExecutionPolicyController.tryApply(persistent.activePolicy);
+					if (!applied.ok) taskExecutionPolicyController.tryApply(FAILED_PERSISTENT_TASK_EXECUTION_POLICY);
+				} else if (persistent.status !== "absent" && persistent.status !== "ready") {
+					taskExecutionPolicyController.tryApply(FAILED_PERSISTENT_TASK_EXECUTION_POLICY);
+				}
+			} catch {
+				taskExecutionPolicyController.tryApply(FAILED_PERSISTENT_TASK_EXECUTION_POLICY);
+			}
+		}
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
 		const canRefreshModelsBeforeCredentialSelector =
@@ -1226,26 +1502,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const imageProvider = settings.get("providers.image");
 		const imageModel = settings.get("providers.imageModel");
 		const imageCustomUrl = settings.get("providers.imageCustomUrl");
-		const imageCustomKey = settings.get("providers.imageCustomKey");
-		const imageCustomKeyEnv = settings.get("providers.imageCustomKeyEnv");
-		if (
-			imageProvider === "auto" ||
-			imageProvider === "openai" ||
-			imageProvider === "gemini" ||
-			imageProvider === "openrouter" ||
-			imageProvider === "antigravity" ||
-			imageProvider === "alibaba" ||
-			imageProvider === "custom"
-		) {
-			setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
-			setConfiguredImageModel({
-				provider: imageProvider,
-				model: imageModel ?? null,
-				customUrl: imageCustomUrl,
-				customKey: imageCustomKey,
-				customKeyEnv: imageCustomKeyEnv,
-			});
-		}
+		const imageCredentialSelector =
+			imageProvider === "custom" &&
+			options.credentialSelector &&
+			(!options.credentialSelector.provider || options.credentialSelector.provider === "openai")
+				? options.credentialSelector.selector
+				: undefined;
+		const imageConfig: ImageProviderConfig = {
+			provider: imageProvider,
+			model: imageModel ?? null,
+			customUrl: imageCustomUrl,
+			...(imageCredentialSelector ? { credentialSelector: imageCredentialSelector } : {}),
+		};
 
 		const sessionManager =
 			options.sessionManager ??
@@ -1616,8 +1884,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			bashRestrictionProfile: options.bashRestrictionProfile,
 			goalToolAllowedOps: options.goalToolAllowedOps,
 			discoverableToolAllowedNames: options.discoverableToolAllowedNames,
-			getToolByName: name => session?.getToolByName(name),
-			getToolForExecution: name => session?.getToolForExecution(name),
+			getToolByName: name => {
+				const snapshot = taskExecutionPolicyController.getSnapshot();
+				if (!allowsExecutionPolicyTool(snapshot, name)) return undefined;
+				return session?.getToolByName(name);
+			},
+			getToolForExecution: name => {
+				const snapshot = taskExecutionPolicyController.getSnapshot();
+				if (!allowsExecutionPolicyTool(snapshot, name)) return undefined;
+				return session?.getToolForExecution(name);
+			},
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
@@ -1633,10 +1909,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			setTodoPhases: phases => session.setTodoPhases(phases),
 			// Generic tool discovery (unified — covers built-in + MCP + extension)
 			isToolDiscoveryEnabled: () => session.isToolDiscoveryEnabled(),
-			getDiscoverableTools: filter => session.getDiscoverableTools(filter),
+			getDiscoverableTools: filter => {
+				const snapshot = taskExecutionPolicyController.getSnapshot();
+				return session.getDiscoverableTools(filter).filter(tool => allowsExecutionPolicyTool(snapshot, tool.name));
+			},
 			getDiscoverableToolSearchIndex: () => session.getDiscoverableToolSearchIndex(),
 			getSelectedDiscoveredToolNames: () => session.getSelectedDiscoveredToolNames(),
-			activateDiscoveredTools: toolNames => session.activateDiscoveredTools(toolNames),
+			activateDiscoveredTools: toolNames => {
+				const snapshot = taskExecutionPolicyController.getSnapshot();
+				return session.activateDiscoveredTools(toolNames.filter(name => allowsExecutionPolicyTool(snapshot, name)));
+			},
 			getCheckpointState: () => session.getCheckpointState(),
 			setCheckpointState: state => session.setCheckpointState(state ?? undefined),
 			getToolChoiceQueue: () => session.toolChoiceQueue,
@@ -1679,6 +1961,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getTelemetry: () => agent?.telemetry,
 			buildForkContextSeed: forkOptions => session.buildForkContextSeed(forkOptions),
 		};
+		bindTaskExecutionPolicyController(toolSession, taskExecutionPolicyController);
 
 		// Wire process-wide internal URL singletons owned by their real classes.
 		// Top-level sessions install the active snapshots; subagents inherit them.
@@ -1730,7 +2013,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
 
 		// Add image tools when the active model or configured image providers can generate images.
-		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
+		const imageGenTools = await logger.time("getImageGenTools", () =>
+			getImageGenTools(modelRegistry, model, imageConfig, providerSessionId),
+		);
 		if (imageGenTools.length > 0) {
 			customTools.push(...(imageGenTools as unknown as CustomTool[]));
 		}
@@ -2231,6 +2516,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			toolRegistry.delete("edit");
 			builtinCandidateTools = builtinCandidateTools.filter(tool => tool.name !== "edit");
 		}
+		const creationPolicySnapshot = taskExecutionPolicyController.getSnapshot();
+		for (const [name] of toolRegistry) {
+			if (enforceExecutionPolicySnapshot && !allowsExecutionPolicyTool(creationPolicySnapshot, name)) {
+				toolRegistry.delete(name);
+			}
+		}
+		builtinCandidateTools = builtinCandidateTools.filter(
+			tool => !enforceExecutionPolicySnapshot || allowsExecutionPolicyTool(creationPolicySnapshot, tool.name),
+		);
 
 		const hasDeferrableTools = Array.from(toolRegistry.values()).some(tool => tool.deferrable === true);
 		if (!hasDeferrableTools) {
@@ -2275,6 +2569,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getToolContext: () => toolContextStore.getContext(),
 			emitEvent: event => cursorEventEmitter?.(event),
 			createEventEmitter: () => agent.createExternalEventEmitterForCurrentRun(),
+			...(enforceExecutionPolicySnapshot
+				? { isToolAllowed: (name: string) => allowsExecutionPolicyTool(creationPolicySnapshot, name) }
+				: {}),
 		});
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
@@ -2395,7 +2692,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					]),
 				]
 			: toolNamesFromRegistry;
-		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
+		const normalizedRequested = requestedToolNames.filter(
+			name => toolRegistry.has(name) && allowsExecutionPolicyTool(creationPolicySnapshot, name),
+		);
 		const explicitRequestedToolNames = hasExplicitToolNames ? normalizedRequested : [];
 		const requestedToolNameSet = new Set(normalizedRequested);
 		// Normalize the user-facing mcp.discoveryMode alias once at session construction.
@@ -2406,7 +2705,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				: settings.get("mcp.discoveryMode") || explicitMcpConfigPath !== undefined
 					? "mcp-only"
 					: "off";
-		const mcpDiscoveryEnabled = effectiveDiscoveryMode !== "off";
+		const mcpDiscoveryEnabled =
+			effectiveDiscoveryMode !== "off" &&
+			(!enforceExecutionPolicySnapshot ||
+				creationPolicySnapshot.source.kind === "default" ||
+				creationPolicySnapshot.policy.mcpDiscovery === "configured");
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
@@ -2732,15 +3035,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				streamSimple(streamModel, context, {
 					...streamOptions,
 					onAuthError: async (provider, oldKey, error) => {
+						const effectiveAffinityId = agent.providerSessionId ?? agent.sessionId;
 						await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 							signal: streamOptions?.signal,
-							sessionId: agent.sessionId,
+							sessionId: effectiveAffinityId,
 						});
 						logger.debug("Retrying provider request after credential invalidation", {
 							provider,
 							error: error instanceof Error ? error.message : String(error),
 						});
-						return modelRegistry.getApiKeyForProvider(provider, agent.sessionId);
+						return modelRegistry.getApiKeyForProvider(provider, effectiveAffinityId);
 					},
 				}),
 			cursorExecHandlers,
@@ -2830,8 +3134,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillWarnings,
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
+			workModeScopedMutationService: scopedMutationService,
 			taskDepth,
 			toolRegistry,
+			toolActivationAllowed: enforceExecutionPolicySnapshot
+				? name => allowsExecutionPolicyTool(creationPolicySnapshot, name)
+				: undefined,
 			workflowGateToolSession: toolSession,
 			transformContext,
 			onPayload,
@@ -2868,6 +3176,38 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
 		});
+		session.bindExecutionPolicyController(taskExecutionPolicyController);
+		if (enforceExecutionPolicySnapshot) {
+			const originalActivateDiscoveredTools = session.activateDiscoveredTools.bind(session);
+			session.activateDiscoveredTools = async toolNames => {
+				const snapshot = taskExecutionPolicyController.getSnapshot();
+				return originalActivateDiscoveredTools(toolNames.filter(name => allowsExecutionPolicyTool(snapshot, name)));
+			};
+			const originalSetActiveToolsByName = session.setActiveToolsByName.bind(session);
+			session.setActiveToolsByName = async toolNames => {
+				const snapshot = taskExecutionPolicyController.getSnapshot();
+				return originalSetActiveToolsByName(toolNames.filter(name => allowsExecutionPolicyTool(snapshot, name)));
+			};
+			const originalGetDiscoverableTools = session.getDiscoverableTools.bind(session);
+			session.getDiscoverableTools = filter => {
+				const snapshot = taskExecutionPolicyController.getSnapshot();
+				return originalGetDiscoverableTools(filter).filter(tool => allowsExecutionPolicyTool(snapshot, tool.name));
+			};
+			session.getDiscoverableToolSearchIndex = () =>
+				buildDiscoverableToolSearchIndex(session.getDiscoverableTools());
+			const originalGetToolForExecution = session.getToolForExecution.bind(session);
+			session.getToolForExecution = name => {
+				const snapshot = taskExecutionPolicyController.getSnapshot();
+				if (!allowsExecutionPolicyTool(snapshot, name)) return undefined;
+				return originalGetToolForExecution(name);
+			};
+			const originalGetToolByName = session.getToolByName.bind(session);
+			session.getToolByName = name => {
+				const snapshot = taskExecutionPolicyController.getSnapshot();
+				if (!allowsExecutionPolicyTool(snapshot, name)) return undefined;
+				return originalGetToolByName(name);
+			};
+		}
 		session.configWarnings.push(...contextFileWarnings);
 		hasSession = true;
 		if (asyncJobManager) {
@@ -3039,12 +3379,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						if (collidingToolNames.length > 0) {
 							throw new ExactMcpToolNameCollisionError(collidingToolNames);
 						}
-						if (!cancelled && !session.isDisposed) {
+						if (!cancelled && !session.isDisposed && mcpDiscoveryEnabled) {
 							await session.refreshMCPTools(resultTools);
-							if (
-								!session.isDisposed &&
-								(!mcpDiscoveryEnabled || !existingSession.hasPersistedMCPToolSelection)
-							) {
+							if (!session.isDisposed && !existingSession.hasPersistedMCPToolSelection) {
 								await session.activateDiscoveredTools(toolNames);
 							}
 						}
@@ -3067,16 +3404,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// creation result through every controller.
 		session.gjcRuntimeSnapshot = gjcRuntimeStore;
 		session.gjcActivationGeneration = gjcActivationGeneration;
+		const modelProjection = modelCatalogProjectionSurface(modelRegistry, session);
+		const getExecutionPolicy = (): TaskExecutionPolicySnapshot => taskExecutionPolicyController.getSnapshot();
+		const applyExecutionPolicy = (input: unknown): TaskExecutionPolicyApplyResult =>
+			taskExecutionPolicyController.tryApply(input);
+		const clearExecutionPolicy = (): TaskExecutionPolicySnapshot => taskExecutionPolicyController.clear();
 		return {
 			session,
 			extensionsResult,
 			setToolUIContext,
+			getExecutionPolicy,
+			...(enforceExecutionPolicySnapshot ? {} : { applyExecutionPolicy, clearExecutionPolicy }),
 			mcpManager: ownsMcpManager && mcpManager?.isToolsOnly() ? undefined : mcpManager,
 			startDeferredMcpConfig,
 			startDeferredMemoryBackend: options.deferMemoryBackendStartup ? startMemoryBackend : undefined,
 			modelFallbackMessage,
 			lspServers,
 			eventBus,
+			getModelCatalog: modelProjection.getModelCatalog,
+			getModelResolutionOverlay: modelProjection.getModelResolutionOverlay,
 			gjcRuntimeSnapshot: gjcRuntimeStore,
 		};
 	} catch (error) {

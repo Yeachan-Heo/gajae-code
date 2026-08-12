@@ -30,7 +30,7 @@ import { transferSessionMessageIdentity } from "../../session/session-manager";
 import type { ResolveToolDetails } from "../../tools/resolve";
 import { computeIrcSplitWidths, getIrcSidebarSemanticToken } from "../components/irc-sidebar";
 import type { IrcObservationRecord } from "../irc-observation-ledger";
-import { interruptHint } from "../shared";
+import { interruptHint, sanitizeStatusText } from "../shared";
 import { buildAbortDisplayMessage } from "../utils/abort-message";
 import { emitHostStatus } from "../utils/host-status";
 import { consumeInjectedOptimisticSignature } from "../utils/injected-user-submission";
@@ -113,6 +113,30 @@ function friendlyRetryReason(errorMessage: string | undefined): string {
 	}
 }
 
+const FALLBACK_SELECTOR_MAX_LENGTH = 256;
+const FALLBACK_PROVIDER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+const FALLBACK_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$/u;
+
+/** Keep fallback status bounded to canonical provider/model selector syntax. */
+export function safeFallbackModelSelector(value: unknown): string {
+	if (typeof value !== "string") return "unknown";
+	const selector = sanitizeStatusText(value);
+	if (selector.length === 0 || selector.length > FALLBACK_SELECTOR_MAX_LENGTH) return "unknown";
+	const slash = selector.indexOf("/");
+	if (slash <= 0 || slash === selector.length - 1) return "unknown";
+	const provider = selector.slice(0, slash);
+	const model = selector.slice(slash + 1);
+	if (!FALLBACK_PROVIDER_RE.test(provider) || !FALLBACK_MODEL_RE.test(model)) return "unknown";
+	if (model.split("/").some(segment => segment === "." || segment === "..")) return "unknown";
+	return `${provider}/${model}`;
+}
+
+export function formatModelFallbackStatus(
+	event: Pick<Extract<AgentSessionEvent, { type: "model_fallback_switched" }>, "from" | "to">,
+): string {
+	return `Fallback model: ${safeFallbackModelSelector(event.from)} → ${safeFallbackModelSelector(event.to)}`;
+}
+
 type AgentSessionEventHandlers = {
 	[E in AgentSessionEventKind]: (event: Extract<AgentSessionEvent, { type: E }>) => Promise<void>;
 };
@@ -161,6 +185,7 @@ export class EventController {
 			model_fallback_switched: e => this.#handleModelFallbackSwitched(e),
 			thinking_level_changed: async () => {},
 			goal_updated: async () => {},
+			work_mode: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}
 
@@ -570,7 +595,7 @@ export class EventController {
 	async #handleModelFallbackSwitched(
 		event: Extract<AgentSessionEvent, { type: "model_fallback_switched" }>,
 	): Promise<void> {
-		this.ctx.showStatus(`Fallback model: ${event.from} → ${event.to}`);
+		this.ctx.showStatus(formatModelFallbackStatus(event));
 		this.ctx.statusLine.invalidate();
 		this.ctx.ui.requestRender();
 	}

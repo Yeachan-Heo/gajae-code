@@ -289,6 +289,15 @@ export function observeAgentSessionEvent(event: AgentSessionEvent): AgentWireOwn
 				semantic: false,
 				coalesceKey: null,
 			});
+		case "work_mode":
+			return obs(event, {
+				kind: "rpc_work_mode",
+				signal: null,
+				evidence: {},
+				severity: "info",
+				semantic: true,
+				coalesceKey: null,
+			});
 		case "agent_end":
 			return obs(event, {
 				kind: "rpc_agent_completed",

@@ -8,6 +8,7 @@
 ### Added
 
 - Added first-class `cline-pass` and `commandcode-goat` provider presets with documented API endpoints, environment-variable credentials, non-hardcoded live model discovery from models.dev and the Command Code Provider API, and prefix-based Claude routing.
+- Completed the competitive UX work: source-preserving effective configuration with scoped compare-and-set, curated Work Modes, immutable model-catalog overlays, attention-oriented task supervision, immutable child-execution policies with reusable presets, truthful production TUI selectors, cancellation-safe lock-guarded persistence, and exact terminal visual evidence.
 
 ### Fixed
 

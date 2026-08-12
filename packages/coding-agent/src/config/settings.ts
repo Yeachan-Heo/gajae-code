@@ -25,7 +25,9 @@ import {
 	setDefaultTabWidth,
 } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { findRepoRoot } from "../capability/fs";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
+import type { LoadContext } from "../capability/types";
 import type { ModelRole } from "../config/model-registry";
 import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
@@ -47,7 +49,19 @@ import {
 	reserveAtomicYamlUpdateSlot,
 	setByPath,
 } from "./atomic-yaml-patch";
+import type { EffectiveConfigurationResult, EffectiveConfigurationSourceRecord } from "./effective-configuration";
+import { EFFECTIVE_CONFIGURATION_SOURCE_RANKS, EffectiveConfigurationResolver } from "./effective-configuration";
 import { isModelSelectorValue, type ModelSelectorValue, normalizeModelSelectorValue } from "./model-selector-value";
+import {
+	RetiredImageSecretGateError,
+	runRetiredImageSecretGate,
+	validateRetiredImagePolicy,
+} from "./retired-image-secret-gate";
+import {
+	NativeProjectSettingsStore,
+	type ScopedConfigurationReloadContext,
+	type ScopedConfigurationSnapshot,
+} from "./scoped-configuration-mutation";
 
 import {
 	type BashInterceptorRule,
@@ -110,6 +124,8 @@ export type SettingsAtomicPatch = { path: SettingPath; op: "set"; value: unknown
 export type SettingsAtomicReceipt = CasReceipt;
 
 export interface SettingsOptions {
+	/** Canonical discovery context shared with owned project readers and writers. */
+	loadContext?: LoadContext;
 	/** Current working directory for project settings discovery */
 	cwd?: string;
 	/** Agent directory for config.yml storage */
@@ -232,6 +248,60 @@ function rawSettingsRecord(value: unknown): RawSettings | undefined {
 	return value as RawSettings;
 }
 
+type EffectiveRecordMetadata = Pick<
+	EffectiveConfigurationSourceRecord,
+	"sourceId" | "rank" | "ownership" | "safePath" | "physicalIdentity" | "revision" | "digest" | "stability"
+>;
+
+function appendEffectiveConfigurationRecords(
+	value: unknown,
+	canonicalPrefix: string,
+	metadata: EffectiveRecordMetadata,
+	records: EffectiveConfigurationSourceRecord[],
+): void {
+	if (value && typeof value === "object" && !Array.isArray(value)) {
+		const entries = Object.entries(value as Record<string, unknown>);
+		if (entries.length === 0 && canonicalPrefix.length > 0) {
+			records.push({
+				...metadata,
+				canonicalKey: canonicalPrefix,
+				presence: { presence: "present", value: {} },
+			});
+			return;
+		}
+		for (const [key, child] of entries) {
+			const canonicalKey = canonicalPrefix.length > 0 ? `${canonicalPrefix}.${key}` : key;
+			appendEffectiveConfigurationRecords(child, canonicalKey, metadata, records);
+		}
+		return;
+	}
+	if (canonicalPrefix.length === 0) return;
+	records.push({
+		...metadata,
+		canonicalKey: canonicalPrefix,
+		presence: { presence: "present", value },
+	});
+}
+
+function effectiveSourceMetadata(
+	sourceId: string,
+	rank: EffectiveConfigurationSourceRecord["rank"],
+	ownership: EffectiveConfigurationSourceRecord["ownership"],
+	safePath: string,
+	identity: string,
+	partial: Pick<EffectiveConfigurationSourceRecord, "revision" | "digest"> = {},
+): EffectiveRecordMetadata {
+	return {
+		sourceId,
+		rank,
+		ownership,
+		safePath,
+		physicalIdentity: { kind: "known", identity },
+		stability: { state: "stable" },
+		...partial,
+	};
+}
+
 function shallowModelSelectorRecord(value: unknown): Record<string, ModelSelectorValue> {
 	const record = rawSettingsRecord(value);
 	if (!record) return {};
@@ -336,6 +406,7 @@ function applySettingsPatch(raw: RawSettings, patch: SettingsPatch): void {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class Settings implements NotificationSettingsReader {
+	#loadContext: LoadContext;
 	#configPath: string | null;
 	#cwd: string;
 	#agentDir: string;
@@ -351,6 +422,9 @@ export class Settings implements NotificationSettingsReader {
 	/** Raw notification syntax from the last durable config read, before local replay. */
 	#durableRawNotificationConfig: RawSettings | undefined = {};
 	/** Project settings from .Anthropic model/settings.yml etc */
+	#nativeProjectSettingsStore: NativeProjectSettingsStore;
+	#nativeProjectSnapshot: ScopedConfigurationSnapshot | undefined;
+	#discoveredSettings: readonly SettingsCapabilityItem[] = [];
 	#project: RawSettings = {};
 	/** Runtime overrides (not persisted) */
 	#overrides: RawSettings = {};
@@ -387,10 +461,20 @@ export class Settings implements NotificationSettingsReader {
 	#persist: boolean;
 
 	private constructor(options: SettingsOptions = {}) {
-		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
+		const fallbackCwd = path.normalize(options.cwd ?? getProjectDir());
+		this.#loadContext = Object.freeze({
+			cwd: path.normalize(options.loadContext?.cwd ?? fallbackCwd),
+			home: path.normalize(options.loadContext?.home ?? os.homedir()),
+			repoRoot: options.loadContext?.repoRoot ?? null,
+		});
+		this.#cwd = this.#loadContext.cwd;
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.resolve(this.#agentDir, "config.yml");
 		this.#persist = !options.inMemory;
+		this.#nativeProjectSettingsStore = new NativeProjectSettingsStore({
+			loadContext: this.#loadContext,
+			agentDir: this.#agentDir,
+		});
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
@@ -442,7 +526,7 @@ export class Settings implements NotificationSettingsReader {
 	 * Load settings for an explicit workspace without changing the global singleton.
 	 * Managed-session policy resolution must be bound to the workspace being opened.
 	 */
-	static loadForScope(options: { cwd: string; agentDir?: string }): Promise<Settings> {
+	static loadForScope(options: { cwd: string; agentDir?: string; loadContext?: LoadContext }): Promise<Settings> {
 		const instance = new Settings(options);
 		return instance.#load();
 	}
@@ -486,13 +570,38 @@ export class Settings implements NotificationSettingsReader {
 	 * Returns the merged value from global + project + overrides, or the default.
 	 */
 	get<P extends SettingPath>(path: P): SettingValue<P> {
-		const segments = path.split(".");
-		const value = getByPath(this.#merged, segments);
+		const effective = this.#resolveEffectiveConfiguration(path);
+		const value =
+			effective.state === "resolved" ? structuredClone(effective.value) : getByPath(this.#merged, path.split("."));
 		if (value !== undefined) {
 			const pathScopedValue = resolvePathScopedStringArray(path, value, this.#cwd);
 			return (pathScopedValue ?? value) as SettingValue<P>;
 		}
 		return getDefault(path);
+	}
+
+	/** Return the source-preserving resolver view used by configuration explain consumers. */
+	getEffectiveConfigurationResolver(): EffectiveConfigurationResolver {
+		return new EffectiveConfigurationResolver(this.#effectiveConfigurationRecords());
+	}
+
+	/** Reload a scope through this Settings instance and verify the committed snapshot. */
+	async reloadAndVerifyScope(context: ScopedConfigurationReloadContext): Promise<boolean> {
+		if (context.scope === "user") {
+			if (!this.#persist || this.#configPath === null) return false;
+			this.#replaceGlobalWithDurable(await this.#loadYaml(this.#configPath));
+		} else {
+			this.#project = await this.#loadProjectSettings();
+			this.#sanitizeModelSelectorRecords();
+			this.#rebuildMerged();
+			this.#fireAllHooks();
+		}
+		try {
+			const snapshot = await this.#nativeProjectSettingsStore.read(context.scope);
+			return snapshot.safePath === context.safePath && snapshot.digest === context.after.digest;
+		} catch {
+			return false;
+		}
 	}
 
 	/**
@@ -504,6 +613,17 @@ export class Settings implements NotificationSettingsReader {
 	getGlobal<P extends SettingPath>(path: P): SettingValue<P> | undefined {
 		const value = getByPath(this.#global, path.split("."));
 		return value === undefined ? undefined : (value as SettingValue<P>);
+	}
+
+	/**
+	 * Read a setting value from the runtime override layer only.
+	 *
+	 * Unlike {@link get}, this excludes durable global/project settings and schema
+	 * defaults. Runtime overrides are cloned so callers cannot mutate the layer.
+	 */
+	getOverride<P extends SettingPath>(path: P): SettingValue<P> | undefined {
+		const value = getByPath(this.#overrides, path.split("."));
+		return value === undefined ? undefined : (structuredClone(value) as SettingValue<P>);
 	}
 
 	/**
@@ -884,8 +1004,17 @@ export class Settings implements NotificationSettingsReader {
 		// debounce before the clone can enqueue a durable selector, preventing it
 		// from waiting behind a slot only this instance can open.
 		await this.flush();
+		if (this.#persist) {
+			await runRetiredImageSecretGate({ cwd, agentDir: this.#agentDir });
+			await this.#refreshDurableSettings();
+		}
 		const cloned = new Settings({
 			cwd,
+			loadContext: {
+				cwd: path.normalize(cwd),
+				home: this.#loadContext.home,
+				repoRoot: await findRepoRoot(cwd),
+			},
 			agentDir: this.#agentDir,
 			inMemory: !this.#persist,
 		});
@@ -902,6 +1031,7 @@ export class Settings implements NotificationSettingsReader {
 		cloned.#durableRawNotificationConfig = structuredClone(this.#durableRawNotificationConfig);
 		cloned.#durableNotificationFingerprint = this.#durableNotificationFingerprint;
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
+		if (!this.#persist) cloned.#discoveredSettings = structuredClone(this.#discoveredSettings);
 		cloned.#overrides = structuredClone(this.#overrides);
 		if (cloned.#hasRecoveredConfigSyntax) {
 			cloned.#sanitizeModelSelectorRecords();
@@ -1115,14 +1245,18 @@ export class Settings implements NotificationSettingsReader {
 	// ─────────────────────────────────────────────────────────────────────────
 
 	async #load(): Promise<Settings> {
-		// Project settings load (loadCapability scans cwd) is independent of the
-		// persist chain (storage open → legacy migration → global config.yml read),
-		// so kick it off first and await after the persist chain completes. The
-		// persist steps remain sequential: migration may write config.yml, which
-		// #loadYaml then reads; migration's db fallback needs #storage opened.
-		const projectPromise = this.#loadProjectSettings();
+		if (this.#persist) {
+			await runRetiredImageSecretGate({ cwd: this.#cwd, agentDir: this.#agentDir });
+		}
 
 		try {
+			// Project settings load (loadCapability scans cwd) is independent of the
+			// persist chain (storage open → legacy migration → global config.yml read),
+			// so kick it off only after the retired-image gate has completed. The
+			// persist steps remain sequential: migration may write config.yml, which
+			// #loadYaml then reads; migration's db fallback needs #storage opened.
+			const projectPromise = this.#loadProjectSettings();
+
 			if (this.#persist) {
 				this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
 				await this.#migrateFromLegacy();
@@ -1205,6 +1339,7 @@ export class Settings implements NotificationSettingsReader {
 			return {};
 		}
 		const parsedRaw = parsed as RawSettings;
+		validateRetiredImagePolicy(parsedRaw, { source: "global-config" });
 		if (filePath === this.#configPath) this.#captureRawNotificationConfig(parsedRaw);
 		if (filePath === this.#configPath) {
 			try {
@@ -1227,6 +1362,7 @@ export class Settings implements NotificationSettingsReader {
 			this.#schemaMigrationPending = true;
 		}
 		const migrated = this.#migrateRawSettings(parsedRaw);
+		validateRetiredImagePolicy(migrated, { source: "global-config" });
 		const reconciled = reconcileSettingsSchema(migrated);
 		if (typeof configSchemaVersion === "number" && configSchemaVersion > CONFIG_SCHEMA_VERSION) {
 			reconciled.report.issues.push({
@@ -1236,27 +1372,63 @@ export class Settings implements NotificationSettingsReader {
 			});
 		}
 		this.#schemaReport = reconciled.report;
+		validateRetiredImagePolicy(reconciled.settings, { source: "global-config" });
 		return reconciled.settings;
 	}
 
 	async #loadProjectSettings(): Promise<RawSettings> {
-		try {
-			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
-			let merged: RawSettings = {};
-			for (const item of result.items as SettingsCapabilityItem[]) {
-				if (item.level !== "project") continue;
-				const { settings, rejectedNotifications } = this.#stripProjectNotificationSettings(
-					item.data as RawSettings,
-				);
-				if (rejectedNotifications) {
-					logger.warn("Settings: ignoring project notification settings", { path: item.path });
+		let nativeProject: RawSettings = {};
+		if (this.#loadContext.repoRoot !== null) {
+			try {
+				const nativeTarget = path.resolve(this.#loadContext.repoRoot, ".gjc", "config.yml");
+				const legacy = await loadCapability(settingsCapability.id, {
+					cwd: this.#loadContext.repoRoot,
+					providers: ["native"],
+				});
+				for (const item of legacy.items as SettingsCapabilityItem[]) {
+					if (item.level !== "project" || path.resolve(item.path) === nativeTarget) continue;
+					const { settings, rejectedNotifications } = this.#stripProjectNotificationSettings(
+						item.data as RawSettings,
+					);
+					if (rejectedNotifications)
+						logger.warn("Settings: ignoring project notification settings", { path: item.path });
+					nativeProject = this.#deepMerge(nativeProject, settings);
 				}
-				merged = this.#deepMerge(merged, settings);
+			} catch (error) {
+				if (error instanceof RetiredImageSecretGateError) throw error;
 			}
-			return this.#migrateRawSettings(merged);
-		} catch {
-			return {};
 		}
+		try {
+			const snapshot = await this.#nativeProjectSettingsStore.read("project");
+			this.#nativeProjectSnapshot = snapshot;
+			nativeProject = this.#deepMerge(nativeProject, structuredClone(snapshot.data) as RawSettings);
+		} catch {
+			this.#nativeProjectSnapshot = undefined;
+		}
+
+		try {
+			const result = await loadCapability(settingsCapability.id, {
+				cwd: this.#cwd,
+				excludeProviders: ["native"],
+			});
+			this.#discoveredSettings = Object.freeze(
+				result.items.filter((item): item is SettingsCapabilityItem => item._source.level !== "native"),
+			);
+		} catch (error) {
+			if (error instanceof RetiredImageSecretGateError) throw error;
+			this.#discoveredSettings = [];
+		}
+
+		validateRetiredImagePolicy(nativeProject, { source: "project-config", project: true });
+		const { settings, rejectedNotifications } = this.#stripProjectNotificationSettings(nativeProject);
+		if (rejectedNotifications) {
+			logger.warn("Settings: ignoring project notification settings", {
+				path: this.#nativeProjectSettingsStore.target("project"),
+			});
+		}
+		const migrated = this.#migrateRawSettings(settings);
+		validateRetiredImagePolicy(migrated, { source: "project-config", project: true });
+		return migrated;
 	}
 
 	async #normalizeAfterLoad(): Promise<void> {
@@ -1422,22 +1594,33 @@ export class Settings implements NotificationSettingsReader {
 		try {
 			const parsed = JSON.parse(await Bun.file(settingsJsonPath).text());
 			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				settings = this.#deepMerge(settings, this.#migrateRawSettings(parsed));
+				validateRetiredImagePolicy(parsed, { source: "global-legacy-json" });
+				const migratedSettings = this.#migrateRawSettings(parsed as RawSettings);
+				validateRetiredImagePolicy(migratedSettings, { source: "global-legacy-json" });
+				settings = this.#deepMerge(settings, migratedSettings);
 				migrated = true;
 				try {
 					fs.renameSync(settingsJsonPath, `${settingsJsonPath}.bak`);
 				} catch {}
 			}
-		} catch {}
+		} catch (error) {
+			if (error instanceof RetiredImageSecretGateError) throw error;
+		}
 
 		// 2. Migrate from agent.db
 		try {
 			const dbSettings = this.#storage?.getSettings();
 			if (dbSettings) {
-				settings = this.#deepMerge(settings, this.#migrateRawSettings(dbSettings as RawSettings));
+				validateRetiredImagePolicy(dbSettings, { source: "legacy-db" });
+				const migratedSettings = this.#migrateRawSettings(dbSettings as RawSettings);
+				validateRetiredImagePolicy(migratedSettings, { source: "legacy-db" });
+				settings = this.#deepMerge(settings, migratedSettings);
 				migrated = true;
 			}
-		} catch {}
+		} catch (error) {
+			if (error instanceof RetiredImageSecretGateError) throw error;
+		}
+		validateRetiredImagePolicy(settings, { source: "global-config" });
 
 		// 3. Write merged settings through the shared atomic YAML pipeline.
 		if (migrated && Object.keys(settings).length > 0) {
@@ -1451,7 +1634,9 @@ export class Settings implements NotificationSettingsReader {
 					})),
 				);
 				logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
-			} catch {}
+			} catch (error) {
+				if (error instanceof RetiredImageSecretGateError) throw error;
+			}
 		}
 	}
 
@@ -2023,6 +2208,82 @@ export class Settings implements NotificationSettingsReader {
 			sanitized[key] = value;
 		}
 		return { settings: sanitized, rejectedNotifications };
+	}
+
+	#resolveEffectiveConfiguration(canonicalKey: string): EffectiveConfigurationResult {
+		return this.getEffectiveConfigurationResolver().resolve(canonicalKey);
+	}
+
+	#effectiveConfigurationRecords(): readonly EffectiveConfigurationSourceRecord[] {
+		const records: EffectiveConfigurationSourceRecord[] = [];
+		const userPath = this.#configPath ?? path.resolve(this.#agentDir, "config.yml");
+		appendEffectiveConfigurationRecords(
+			this.#global,
+			"",
+			effectiveSourceMetadata(
+				"owned:user",
+				EFFECTIVE_CONFIGURATION_SOURCE_RANKS.ownedUser,
+				"owned",
+				userPath,
+				`path:${path.resolve(userPath)}`,
+			),
+			records,
+		);
+		const projectSource = this.#nativeProjectSnapshot?.data ?? this.#project;
+		if (Object.keys(projectSource).length > 0) {
+			const projectPath =
+				this.#nativeProjectSnapshot?.safePath ??
+				(this.#loadContext.repoRoot === null
+					? path.resolve(this.#cwd, ".gjc", "config.yml")
+					: path.resolve(this.#loadContext.repoRoot, ".gjc", "config.yml"));
+			appendEffectiveConfigurationRecords(
+				projectSource,
+				"",
+				effectiveSourceMetadata(
+					"owned:project",
+					EFFECTIVE_CONFIGURATION_SOURCE_RANKS.ownedNativeProject,
+					"owned",
+					projectPath,
+					`path:${path.resolve(projectPath)}`,
+					this.#nativeProjectSnapshot
+						? { revision: this.#nativeProjectSnapshot.revision, digest: this.#nativeProjectSnapshot.digest }
+						: {},
+				),
+				records,
+			);
+		}
+		for (const item of this.#discoveredSettings) {
+			const source = item._source;
+			const rank =
+				source.level === "project"
+					? EFFECTIVE_CONFIGURATION_SOURCE_RANKS.discoveredProject
+					: EFFECTIVE_CONFIGURATION_SOURCE_RANKS.discoveredUser;
+			appendEffectiveConfigurationRecords(
+				item.data,
+				"",
+				effectiveSourceMetadata(
+					`discovered:${source.provider}:${source.path}`,
+					rank,
+					"discovered",
+					source.path,
+					`path:${path.resolve(source.path)}`,
+				),
+				records,
+			);
+		}
+		appendEffectiveConfigurationRecords(
+			this.#overrides,
+			"",
+			effectiveSourceMetadata(
+				"runtime:session",
+				EFFECTIVE_CONFIGURATION_SOURCE_RANKS.session,
+				"runtime",
+				userPath,
+				`runtime:${userPath}`,
+			),
+			records,
+		);
+		return records;
 	}
 
 	#deepMerge(base: RawSettings, overrides: RawSettings): RawSettings {

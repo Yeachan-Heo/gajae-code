@@ -24,6 +24,7 @@ import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-age
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
 import { $credentialEnv, hookFetch, Snowflake } from "@gajae-code/utils";
+import { YAML } from "bun";
 
 describe("model roles", () => {
 	test("default is the only built-in model role", () => {
@@ -166,6 +167,57 @@ describe("ModelRegistry", () => {
 			}
 		};
 	}
+	describe("custom model profile atomic roots", () => {
+		const profileConfig = {
+			display_name: "Bootstrap",
+			required_providers: ["my-oai"],
+			model_mapping: { default: "my-oai/gpt-custom" },
+		};
+		const invalidRoots = [
+			["scalar", "scalar root\n"],
+			["array", "- first\n- second\n"],
+		] as const;
+
+		test.each(
+			invalidRoots,
+		)("rejects create, rename, and delete for a %s root without rewriting it", async (_kind, original) => {
+			const modelsPath = path.join(tempDir, "models.yml");
+			fs.writeFileSync(modelsPath, original);
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			const mutations: Array<() => Promise<unknown>> = [
+				() => registry.saveCustomModelProfile("bootstrap", profileConfig),
+				() => registry.renameCustomModelProfile("bootstrap", "Renamed"),
+				() => registry.deleteCustomModelProfile("bootstrap"),
+			];
+
+			for (const mutation of mutations) {
+				await expect(mutation()).rejects.toThrow();
+				expect(fs.readFileSync(modelsPath, "utf8")).toBe(original);
+				expect(registry.getModelProfile("bootstrap")).toBeUndefined();
+			}
+		});
+
+		test.each([
+			["missing", false],
+			["empty", true],
+		] as const)("bootstraps a custom profile from a %s models.yml", async (_kind, writeEmpty) => {
+			const modelsPath = path.join(tempDir, "models.yml");
+			if (writeEmpty) fs.writeFileSync(modelsPath, "");
+			const registry = new ModelRegistry(authStorage, modelsPath);
+
+			const created = await registry.saveCustomModelProfile("bootstrap", profileConfig);
+
+			expect(created).toEqual({
+				name: "bootstrap",
+				displayName: "Bootstrap",
+				requiredProviders: ["my-oai"],
+				modelMapping: { default: "my-oai/gpt-custom" },
+				source: "user",
+			});
+			expect(registry.getModelProfile("bootstrap")).toEqual(created);
+			expect(YAML.parse(fs.readFileSync(modelsPath, "utf8"))).toEqual({ profiles: { bootstrap: profileConfig } });
+		});
+	});
 
 	test("forwards caller cancellation through model and provider key lookups", async () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);

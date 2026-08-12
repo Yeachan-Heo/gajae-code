@@ -76,6 +76,7 @@ export function agentSessionEventType(event: AgentSessionEvent): AgentWireEventT
 		case "model_fallback_switched":
 		case "thinking_level_changed":
 		case "goal_updated":
+		case "work_mode":
 			return event.type;
 		default:
 			return assertNever(event);

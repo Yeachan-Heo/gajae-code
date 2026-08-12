@@ -1,25 +1,41 @@
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
+import type { Model } from "@gajae-code/ai";
+
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, isPetMode, Loader, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
-import type { AppKeybinding } from "../../config/keybindings";
+
 import {
 	activateModelProfile,
 	type MaterializeModelProfileForDeletionResult,
-	materializeActiveModelProfileAssignment,
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	restoreMaterializedModelProfileForDeletion,
 } from "../../config/model-profile-activation";
-import { formatModelProfileDisplayLabel, recommendModelProfileForProvider } from "../../config/model-profiles";
+import {
+	formatModelProfileDisplayLabel,
+	type ModelProfileDefinition,
+	recommendModelProfileForProvider,
+} from "../../config/model-profiles";
 import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
-import { selectorHead } from "../../config/model-selector-value";
+import { type ModelSelectorValue, selectorHead } from "../../config/model-selector-value";
+
 import type { ModelProfileConfig } from "../../config/models-config-schema";
-import { type Settings, type SettingsAtomicReceipt, settings } from "../../config/settings";
+import type { Settings, SettingsAtomicReceipt } from "../../config/settings";
+import type { WorkModePreviewResult } from "../../config/work-mode-result";
+import {
+	createWorkModePaletteEntries,
+	createWorkModePreviewView,
+	createWorkModeSelectorCards,
+	createWorkModeStatusView,
+	type WorkModeId,
+	type WorkModePaletteEntry,
+	type WorkModeScope,
+} from "../../config/work-mode-view";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -38,6 +54,7 @@ import {
 	getSymbolTheme,
 	previewTheme,
 	restoreThemePreview,
+	setAutoThemeMapping,
 	setColorBlindMode,
 	setSymbolPreset,
 	setTheme,
@@ -126,14 +143,14 @@ import {
 	IMAGE_PROVIDER_DEFAULTS,
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
-	setConfiguredImageModel,
-	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
 } from "../../tools";
 import { copyToClipboard } from "../../utils/clipboard";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
+import type { ActionRegistry, WorkModeActionId } from "../action-registry";
+import type { TaskRevealRoute } from "../attention-reveal-routing";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
 import {
@@ -146,12 +163,21 @@ import {
 	type CustomModelPresetWizardSubmit,
 } from "../components/custom-model-preset-wizard";
 import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "../components/custom-provider-wizard";
+import {
+	ExecutionPresetSelectorComponent,
+	type ExecutionPresetSelectorSource,
+} from "../components/execution-preset-selector";
 import { ExtensionDashboard } from "../components/extensions";
 import type { PetMode } from "../components/gajae-pet-widget";
 import { HistorySearchComponent } from "../components/history-search";
 import { HookSelectorComponent } from "../components/hook-selector";
-import { JobsOverlayComponent } from "../components/jobs-overlay";
-import { ModelSelectorComponent } from "../components/model-selector";
+import { JobsOverlayComponent, type JobsOverlayOptions } from "../components/jobs-overlay";
+import { isJobRef, type JobRef } from "../components/jobs-overlay-model";
+import {
+	ModelSelectorComponent,
+	type ModelSelectorSelection,
+	type ModelSelectorWorkModeAdapter,
+} from "../components/model-selector";
 import type {
 	NotificationsEditorOperations,
 	PreparedNotificationProviderConfiguration,
@@ -165,7 +191,6 @@ import {
 	PlanPreviewOverlay,
 	type PlanPreviewResult,
 } from "../components/plan-preview-overlay";
-
 import { PluginSelectorComponent } from "../components/plugin-selector";
 import {
 	type ProviderOnboardingAction,
@@ -174,8 +199,8 @@ import {
 import { SessionObserverOverlayComponent } from "../components/session-observer-overlay";
 import { SessionSelectorComponent } from "../components/session-selector";
 import { dashboardSessions, SessionsDashboardComponent } from "../components/sessions-dashboard";
-import { SettingsSelectorComponent } from "../components/settings-selector";
-import { TasksPaneComponent } from "../components/tasks-pane";
+import { type SettingsMutationResult, SettingsSelectorComponent } from "../components/settings-selector";
+import { TasksPaneComponent, type TasksPaneRevealResult } from "../components/tasks-pane";
 import { ThemeSelectorComponent } from "../components/theme-selector";
 import { ThinkingSelectorComponent } from "../components/thinking-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
@@ -185,9 +210,16 @@ import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { JobsObserver } from "../jobs-observer";
 import type { SessionObserverRegistry } from "../session-observer-registry";
+import { sanitizeStatusText } from "../shared";
 import type { TasksAggregator } from "../tasks-aggregator";
 import type { TranscriptItemRegistry } from "../transcript-item-registry";
+
 import { acquireResumeProgressLease, type ResumeProgressLease } from "../utils/ui-helpers";
+
+export interface TasksPaneOwnerCallbacks {
+	reveal?(route: TaskRevealRoute): TasksPaneRevealResult;
+	acknowledgeFailures?(): unknown | Promise<unknown>;
+}
 
 const CALLBACK_SERVER_PROVIDERS = new Set<string>([
 	"anthropic",
@@ -210,6 +242,31 @@ function isThemePreviewSuperseded(result: { success: boolean; error?: string }):
 	return !result.success && result.error?.includes("superseded by a newer request") === true;
 }
 
+function safeVisibleError(error: unknown): string {
+	return sanitizeStatusText(error instanceof Error ? error.message : String(error)) || "Unknown error";
+}
+
+type ModelSelectorRecord = Record<string, ModelSelectorValue>;
+
+interface ModelAssignmentSnapshot {
+	model: Model | undefined;
+	thinkingLevel: ThinkingLevel | undefined;
+	modelRoles: ModelSelectorRecord;
+	agentModelOverrides: ModelSelectorRecord;
+	globalModelRoles: ModelSelectorRecord | undefined;
+	globalAgentModelOverrides: ModelSelectorRecord | undefined;
+	modelProfileDefault: string | undefined;
+	globalModelProfileDefault: string | undefined;
+	defaultThinkingLevel: ThinkingLevel | undefined;
+	globalDefaultThinkingLevel: Exclude<ThinkingLevel, "inherit"> | undefined;
+	configuredDefaultChain: readonly string[] | undefined;
+	activeModelProfile: string | undefined;
+	sessionDefaultModelSelector: string | undefined;
+	runtimeDefaultSelector: string | undefined;
+	hasRuntimeModelRoleOverrides: boolean;
+	hasRuntimeAgentModelOverrides: boolean;
+}
+
 /**
  * Snapshot the persisted status-line settings that the status-line component
  * cares about. Preview, cancel-restore, and commit paths all share this so the
@@ -222,6 +279,7 @@ export function buildStatusLineSettings(settingsInstance: Settings): StatusLineS
 		rightSegments: settingsInstance.get("statusLine.rightSegments"),
 		separator: settingsInstance.get("statusLine.separator"),
 		showHookStatus: settingsInstance.get("statusLine.showHookStatus"),
+		showActionHints: settingsInstance.get("statusLine.showActionHints"),
 		sessionAccent: settingsInstance.get("statusLine.sessionAccent"),
 		maxRows: settingsInstance.get("statusLine.maxRows"),
 		segmentOptions: settingsInstance.get("statusLine.segmentOptions"),
@@ -1195,6 +1253,36 @@ export function createNotificationsEditorOperations(
 	};
 }
 
+export interface WorkModePaletteActionRegistrationOptions {
+	readonly entries?: readonly WorkModePaletteEntry[];
+	readonly launch: (modeId: WorkModeId) => void | Promise<void>;
+}
+
+/** Register the canonical Work Mode actions on the shared ActionRegistry. */
+export function registerWorkModePaletteActions(
+	actionRegistry: ActionRegistry<void>,
+	options: WorkModePaletteActionRegistrationOptions,
+): readonly WorkModeActionId[] {
+	const entries = options.entries ?? createWorkModePaletteEntries();
+	const registered: WorkModeActionId[] = [];
+
+	for (const entry of entries) {
+		const id = entry.id;
+		if (actionRegistry.get(id)) continue;
+		actionRegistry.register({
+			id,
+			title: entry.label,
+			category: entry.category,
+			domains: ["composer"],
+			exclusiveGroup: "model",
+			availability: () => !entry.disabled,
+			execute: () => options.launch(entry.modeId),
+		});
+		registered.push(id);
+	}
+	return Object.freeze(registered);
+}
+
 export class SelectorController {
 	#transcriptViewerOpen = false;
 	#transcriptViewer?: TranscriptViewerOverlay;
@@ -1202,6 +1290,10 @@ export class SelectorController {
 	#sessionsDashboard?: SessionsDashboardComponent;
 	#tasksPane?: TasksPaneComponent;
 	#closeTasksPane?: () => void;
+	#onSessionIdentityChanged?: (previousSessionId: string) => void;
+
+	#actionRegistry: ActionRegistry<void> | undefined;
+	#durableSettingReports = new Map<string, Promise<void>>();
 
 	#credentialAutoImportStateStore?: CredentialAutoImportStateStore;
 
@@ -1211,6 +1303,46 @@ export class SelectorController {
 		private readonly clipboard: (text: string) => void = copyToClipboard,
 	) {
 		this.#credentialAutoImportStateStore = credentialAutoImportStateStore;
+		if (typeof this.ctx.session.subscribe === "function") {
+			this.ctx.session.subscribe(event => {
+				if (event.type === "model_fallback_switched") {
+					this.ctx.statusLine.setWorkModeStatus?.(undefined);
+					this.ctx.ui.requestRender();
+					return;
+				}
+				if (
+					event.type === "work_mode" &&
+					event.event.phase === "turn_finalize" &&
+					(event.event.caseId === "turn_finalize.ready" || event.event.caseId === "turn_finalize.degraded")
+				) {
+					this.ctx.statusLine.setWorkModeStatus?.(undefined);
+					this.ctx.ui.requestRender();
+					return;
+				}
+				if (event.type !== "work_mode" || event.event.phase === "preview") return;
+				const observedFingerprint =
+					"observedFingerprint" in event.event ? event.event.observedFingerprint : undefined;
+				this.ctx.statusLine.setWorkModeStatus?.(
+					createWorkModeStatusView(event.event, {
+						currentProfileId:
+							this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
+						currentFingerprint: observedFingerprint,
+						currentPhase: event.event.phase,
+					}),
+				);
+				this.ctx.ui.requestRender();
+			});
+		}
+	}
+	#registerWorkModeActions(actionRegistry: ActionRegistry<void>): void {
+		registerWorkModePaletteActions(actionRegistry, {
+			launch: modeId => this.showModelSelector({ initialWorkModeId: modeId }),
+		});
+	}
+
+	setActionRegistry(actionRegistry: ActionRegistry<void>): void {
+		this.#actionRegistry = actionRegistry;
+		this.#registerWorkModeActions(actionRegistry);
 	}
 
 	isTranscriptViewerOpen(): boolean {
@@ -1255,6 +1387,14 @@ export class SelectorController {
 		this.ctx.ui.setFocus(focus);
 		this.ctx.ui.requestRender();
 	}
+	showExecutionPresetSelector(source: ExecutionPresetSelectorSource): void {
+		this.showSelector(done => {
+			const selector = new ExecutionPresetSelectorComponent(source, {
+				onCancel: done,
+			});
+			return { component: selector, focus: selector };
+		});
+	}
 
 	showCommandPalette(
 		commands: SlashCommand[],
@@ -1262,15 +1402,34 @@ export class SelectorController {
 		executeSlashCommand: (name: string) => Promise<void>,
 	): void {
 		const seenCommands = new Set<string>();
-		const entries: CommandPaletteEntry[] = [
-			...actions.map(action => ({
+		const registryActions: CommandPaletteEntry[] | undefined = this.#actionRegistry
+			?.all()
+			.filter(action => this.#actionRegistry?.isAvailable(action.id) === true)
+			.map(action => ({
+				id: `action:${action.id}`,
+				label: action.title,
+				description: action.category,
+				keybinding:
+					action.bindingId === undefined
+						? undefined
+						: this.ctx.keybindings.getDisplayString(action.bindingId) || undefined,
+				searchText: action.id,
+				handler: async () => {
+					await this.#actionRegistry?.execute(action.id);
+				},
+			}));
+		const actionEntries =
+			registryActions ??
+			actions.map(action => ({
 				id: `action:${action.id}`,
 				label: action.label,
 				description: action.id,
-				keybinding: this.ctx.keybindings.getDisplayString(action.id as AppKeybinding) || undefined,
+				keybinding: undefined,
 				searchText: action.id,
 				handler: action.handler,
-			})),
+			}));
+		const entries: CommandPaletteEntry[] = [
+			...actionEntries,
 			...commands
 				.filter(command => {
 					if (seenCommands.has(command.name)) return false;
@@ -1294,7 +1453,7 @@ export class SelectorController {
 					void Promise.resolve()
 						.then(() => entry.handler?.())
 						.catch(error => {
-							this.ctx.showError(error instanceof Error ? error.message : String(error));
+							this.ctx.showError(safeVisibleError(error));
 						});
 				},
 				done,
@@ -1408,17 +1567,29 @@ export class SelectorController {
 		this.showSelector(done => {
 			let wizard: CustomModelPresetWizardComponent;
 			const submit = async (input: CustomModelPresetWizardSubmit): Promise<void> => {
+				let profile: ModelProfileDefinition;
 				try {
-					const profile = await this.ctx.session.modelRegistry.saveCustomModelProfile(input.name, input.profile);
-					await this.ctx.session.modelRegistry.refresh("offline");
-					await this.ctx.notifyConfigChanged?.();
-					this.ctx.showStatus(`Custom model preset created: ${formatModelProfileDisplayLabel(profile)}`);
-					done();
-					this.ctx.ui.requestRender();
+					profile = await this.ctx.session.modelRegistry.saveCustomModelProfile(input.name, input.profile);
 				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					wizard.setSubmitError(`Preset creation failed: ${message}`);
+					wizard.setSubmitError(`Preset creation failed: ${safeVisibleError(err)}`);
+					return;
 				}
+				let refreshError: string | undefined;
+				try {
+					await this.ctx.session.modelRegistry.refresh("offline");
+				} catch (error) {
+					refreshError = safeVisibleError(error);
+				}
+				const configRefresh = await this.#awaitConfigRefresh();
+				const degradedError =
+					refreshError ?? (configRefresh.ok ? undefined : `Settings refresh failed: ${configRefresh.error}`);
+				this.ctx.showStatus(
+					degradedError
+						? `Custom model preset created: ${formatModelProfileDisplayLabel(profile)} saved, but refresh failed: ${degradedError}`
+						: `Custom model preset created: ${formatModelProfileDisplayLabel(profile)}`,
+				);
+				done();
+				this.ctx.ui.requestRender();
 			};
 			wizard = new CustomModelPresetWizardComponent(
 				snapshot,
@@ -1446,16 +1617,29 @@ export class SelectorController {
 			this.ctx.ui.requestRender();
 			return;
 		}
+		let renamed: ModelProfileDefinition;
 		try {
-			const renamed = await this.ctx.session.modelRegistry.renameCustomModelProfile(profileName, input);
-			await this.ctx.session.modelRegistry.refresh("offline");
-			await this.ctx.notifyConfigChanged?.();
-			modelSelector.refreshPresetProfiles(renamed.name);
-			this.ctx.showStatus(`Custom model preset renamed: ${formatModelProfileDisplayLabel(renamed)}`);
-			this.ctx.ui.requestRender();
+			renamed = await this.ctx.session.modelRegistry.renameCustomModelProfile(profileName, input);
 		} catch (err) {
-			this.ctx.showError(`Preset rename failed: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Preset rename failed: ${safeVisibleError(err)}`);
+			return;
 		}
+		let refreshError: string | undefined;
+		try {
+			await this.ctx.session.modelRegistry.refresh("offline");
+		} catch (error) {
+			refreshError = safeVisibleError(error);
+		}
+		const configRefresh = await this.#awaitConfigRefresh();
+		modelSelector.refreshPresetProfiles(renamed.name);
+		const degradedError =
+			refreshError ?? (configRefresh.ok ? undefined : `Settings refresh failed: ${configRefresh.error}`);
+		this.ctx.showStatus(
+			degradedError
+				? `Custom model preset renamed: ${formatModelProfileDisplayLabel(renamed)} saved, but refresh failed: ${degradedError}`
+				: `Custom model preset renamed: ${formatModelProfileDisplayLabel(renamed)}`,
+		);
+		this.ctx.ui.requestRender();
 	}
 
 	async #deleteCustomModelPreset(profileName: string, modelSelector: ModelSelectorComponent): Promise<void> {
@@ -1474,41 +1658,32 @@ export class SelectorController {
 		const activeProfile = this.ctx.session.getActiveModelProfile?.();
 		const defaultProfile = this.ctx.settings.get("modelProfile.default");
 		let snapshot: MaterializeModelProfileForDeletionResult | undefined;
-		let deletedProfile: ModelProfileConfig | undefined;
-		const refreshSelectorState = (refreshedProfileName?: string): void => {
+		const refreshSelectorState = (): void => {
 			modelSelector.refreshRoleAssignments({
 				currentModel: this.ctx.session.model,
 				currentThinkingLevel: this.ctx.session.thinkingLevel,
 				activeModelProfile:
 					this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
 			});
-			modelSelector.refreshPresetProfiles(refreshedProfileName);
+			modelSelector.refreshPresetProfiles();
 		};
-		try {
-			if (activeProfile === profileName || defaultProfile === profileName) {
+		if (activeProfile === profileName || defaultProfile === profileName) {
+			try {
 				snapshot = await materializeModelProfileForDeletion({
 					session: this.ctx.session,
 					modelRegistry: this.ctx.session.modelRegistry,
 					settings: this.ctx.settings,
 					profileName,
 				});
+			} catch (error) {
+				this.ctx.showError(`Preset delete failed: ${safeVisibleError(error)}`);
+				return;
 			}
-			deletedProfile = await this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName);
-			await this.ctx.session.modelRegistry.refresh("offline");
-			await this.ctx.notifyConfigChanged?.();
-			refreshSelectorState();
-			this.ctx.showStatus(`Custom model preset deleted: ${profileLabel}`);
-			this.ctx.ui.requestRender();
-		} catch (err) {
-			let presetRestoreError: unknown;
-			if (deletedProfile) {
-				try {
-					await this.ctx.session.modelRegistry.saveCustomModelProfile(profileName, deletedProfile);
-					await this.ctx.session.modelRegistry.refresh("offline");
-				} catch (restoreErr) {
-					presetRestoreError = restoreErr;
-				}
-			}
+		}
+
+		try {
+			await this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName);
+		} catch (error) {
 			if (snapshot) {
 				try {
 					await restoreMaterializedModelProfileForDeletion({
@@ -1516,23 +1691,35 @@ export class SelectorController {
 						session: this.ctx.session,
 						snapshot,
 					});
-				} catch (restoreErr) {
-					refreshSelectorState(deletedProfile ? profileName : undefined);
+					const rollbackRefresh = await this.#awaitConfigRefresh();
+					if (!rollbackRefresh.ok) throw new Error(`Rollback settings refresh failed: ${rollbackRefresh.error}`);
+				} catch (rollbackError) {
 					this.ctx.showError(
-						`Preset delete failed and settings rollback failed: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`,
+						`Preset delete failed and settings rollback failed: ${safeVisibleError(rollbackError)}`,
 					);
 					return;
 				}
 			}
-			if (deletedProfile) refreshSelectorState(profileName);
-			if (presetRestoreError) {
-				this.ctx.showError(
-					`Preset delete failed and preset restore failed: ${presetRestoreError instanceof Error ? presetRestoreError.message : String(presetRestoreError)}`,
-				);
-				return;
-			}
-			this.ctx.showError(`Preset delete failed: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Preset delete failed: ${safeVisibleError(error)}`);
+			return;
 		}
+
+		let refreshError: string | undefined;
+		try {
+			await this.ctx.session.modelRegistry.refresh("offline");
+		} catch (error) {
+			refreshError = safeVisibleError(error);
+		}
+		const configRefresh = await this.#awaitConfigRefresh();
+		refreshSelectorState();
+		const degradedError =
+			refreshError ?? (configRefresh.ok ? undefined : `Settings refresh failed: ${configRefresh.error}`);
+		this.ctx.showStatus(
+			degradedError
+				? `Custom model preset deleted: ${profileLabel} saved, but refresh failed: ${degradedError}`
+				: `Custom model preset deleted: ${profileLabel}`,
+		);
+		this.ctx.ui.requestRender();
 	}
 
 	async #handleImageGenerationConfig(): Promise<void> {
@@ -1555,9 +1742,10 @@ export class SelectorController {
 			model = model.trim() || defaultModel;
 		}
 		let customUrl: string | undefined;
-		let customKey: string | undefined;
 		if (normalized === "custom") {
-			customUrl = await this.ctx.showHookInput("Custom image endpoint base URL");
+			customUrl = await this.ctx.showHookInput(
+				"Custom image endpoint base URL (requires explicit user credential selection; plaintext keys are not accepted)",
+			);
 			if (!customUrl?.trim()) {
 				this.ctx.showStatus("Custom image endpoint requires a base URL");
 				return;
@@ -1565,7 +1753,6 @@ export class SelectorController {
 			model = await this.ctx.showHookInput("Custom image model", IMAGE_PROVIDER_DEFAULTS.openai);
 			if (model === undefined) return;
 			model = model.trim() || IMAGE_PROVIDER_DEFAULTS.openai;
-			customKey = await this.ctx.showHookInput("Custom image endpoint API key");
 		}
 		const scope = await this.ctx.showHookInput(
 			"Scope: 'session' (this session only) or 'default' (persist)",
@@ -1588,25 +1775,44 @@ export class SelectorController {
 			| "antigravity"
 			| "alibaba"
 			| "custom";
-		setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
-		setConfiguredImageModel({
-			provider: imageProvider,
-			model: model ?? null,
-			customUrl: customUrl?.trim(),
-			customKey: customKey?.trim(),
-		});
-
-		if (persistDefault) {
-			this.ctx.settings.set("providers.image", imageProvider);
-			if (model) this.ctx.settings.set("providers.imageModel", model);
-			if (customUrl?.trim()) this.ctx.settings.set("providers.imageCustomUrl", customUrl.trim());
-			if (customKey?.trim()) this.ctx.settings.set("providers.imageCustomKey", customKey.trim());
+		const trimmedCustomUrl = customUrl?.trim();
+		let refresh: { ok: true } | { ok: false; error: string } = { ok: true };
+		try {
+			if (persistDefault) {
+				this.ctx.settings.set("providers.image", imageProvider);
+				if (model) this.ctx.settings.set("providers.imageModel", model);
+				else this.ctx.settings.unset("providers.imageModel");
+				if (trimmedCustomUrl) this.ctx.settings.set("providers.imageCustomUrl", trimmedCustomUrl);
+				else this.ctx.settings.unset("providers.imageCustomUrl");
+				await this.ctx.settings.flushOrThrow();
+				refresh = await this.#awaitConfigRefresh();
+			} else {
+				this.ctx.settings.override("providers.image", imageProvider);
+				if (model) this.ctx.settings.override("providers.imageModel", model);
+				else this.ctx.settings.clearOverride("providers.imageModel");
+				if (trimmedCustomUrl) this.ctx.settings.override("providers.imageCustomUrl", trimmedCustomUrl);
+				else this.ctx.settings.clearOverride("providers.imageCustomUrl");
+			}
+		} catch (error) {
+			this.ctx.showError(`Image generation settings were not saved: ${safeVisibleError(error)}`);
+			return;
 		}
 
 		const displayModel =
 			model ?? (normalized !== "auto" && normalized !== "custom" ? IMAGE_PROVIDER_DEFAULTS[normalized] : undefined);
 		const label = normalized === "auto" ? "Auto" : `${normalized}${displayModel ? ` (${displayModel})` : ""}`;
-		this.ctx.showStatus(`Image Generation: ${label}${persistDefault ? " (default)" : " (session)"}`);
+		const credentialNotice =
+			normalized === "custom"
+				? "; requires an explicit user credential selection (plaintext keys are not accepted)"
+				: "";
+		const statusCopy = persistDefault
+			? refresh.ok
+				? "saved and applied"
+				: `saved, but settings refresh failed: ${refresh.error}`
+			: "applied for this session";
+		this.ctx.showStatus(
+			`Image Generation: ${label}${persistDefault ? " (default)" : " (session)"}: ${statusCopy}${credentialNotice}`,
+		);
 		this.ctx.ui.requestRender();
 	}
 
@@ -1623,7 +1829,7 @@ export class SelectorController {
 					done();
 					this.ctx.ui.requestRender();
 				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
+					const message = safeVisibleError(err);
 					wizard.setSubmitError(`Provider setup failed: ${message}`);
 				}
 			};
@@ -1659,9 +1865,12 @@ export class SelectorController {
 					try {
 						await this.ctx.session.setThinkingLevelForControl(level, persistDefault);
 					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						this.ctx.showError(
+							`${persistDefault ? "Default reasoning effort was not saved" : "Reasoning effort was not applied"}: ${safeVisibleError(error)}`,
+						);
 						return;
 					}
+					const refresh = persistDefault ? await this.#awaitConfigRefresh() : { ok: true as const };
 					done();
 
 					const effectiveLevel = this.ctx.session.thinkingLevel ?? ThinkingLevel.Off;
@@ -1673,11 +1882,12 @@ export class SelectorController {
 					this.ctx.statusLine.invalidate();
 					this.ctx.updateEditorBorderColor();
 					this.ctx.updateEditorTopBorder();
-					if (persistDefault) void this.ctx.notifyConfigChanged?.();
 					this.ctx.ui.requestRender();
 					const scopeLabel = persistDefault ? "Default reasoning effort" : "Reasoning effort";
 					this.ctx.showStatus(
-						`${scopeLabel} set to ${requestedLabel}. Effective effort: ${effectiveLevel}.${clampedSuffix}`,
+						refresh.ok
+							? `${scopeLabel} set to ${requestedLabel}. Effective effort: ${effectiveLevel}.${clampedSuffix}`
+							: `${scopeLabel} saved and applied. Effective effort: ${effectiveLevel}.${clampedSuffix} Settings refresh failed: ${refresh.error}`,
 					);
 				},
 				() => {
@@ -1695,16 +1905,35 @@ export class SelectorController {
 
 				const selector = new SettingsSelectorComponent(
 					{
+						settings: this.ctx.settings,
 						availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
 						thinkingLevel: this.ctx.session.thinkingLevel,
 						availableThemes,
 						availableModelProfiles: [...this.ctx.session.modelRegistry.getModelProfiles().keys()],
+						workModeCards: createWorkModeSelectorCards(),
 						cwd: getProjectDir(),
 						gjcRuntimeSnapshot: this.ctx.session.gjcRuntimeSnapshot,
 						gjcActivationGeneration: this.ctx.session.gjcActivationGeneration,
 					},
 					{
-						onChange: (id, value) => this.handleSettingChange(id, value),
+						onChange: (id, value) => {
+							this.handleSettingChange(id, value);
+							if (
+								id !== "modelProfile.default" &&
+								id !== "theme.dark" &&
+								id !== "theme.light" &&
+								id.includes(".")
+							) {
+								void this.#reportDurableSetting(id);
+							}
+						},
+						onModelProfileSelect: profileName => this.#selectModelProfileFromSettings(profileName),
+						onModelProfileClear: () => this.#clearModelProfileAndReport(),
+						onWorkModeSelect: modeId => {
+							queueMicrotask(() => this.showModelSelector({ initialWorkModeId: modeId }));
+						},
+						onThemeCommit: (path, themeName, previousRenderedTheme) =>
+							this.#commitThemeMapping(path, themeName, previousRenderedTheme),
 						onError: message => this.ctx.showError(message),
 						onThemePreview: themeName => {
 							return previewTheme(themeName).then(result => {
@@ -1714,13 +1943,13 @@ export class SelectorController {
 								this.#refreshThemeUi();
 							});
 						},
-						onThemePreviewCancel: themeName => {
-							return restoreThemePreview(themeName).then(result => {
-								if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
-									this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
-								}
-								this.#refreshThemeUi();
-							});
+						onThemePreviewCancel: async themeName => {
+							const result = await restoreThemePreview(themeName);
+							this.#refreshThemeUi();
+							if (!result.success && result.error) {
+								this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
+								throw new Error(result.error);
+							}
 						},
 						onPetPreview: mode => {
 							this.ctx.previewPetMode(mode as PetMode);
@@ -1729,7 +1958,8 @@ export class SelectorController {
 						onStatusLinePreview: previewSettings => {
 							// Update status line with preview settings
 							this.ctx.statusLine.updateSettings({
-								...buildStatusLineSettings(settings),
+								...buildStatusLineSettings(this.ctx.settings),
+
 								...previewSettings,
 							});
 							this.ctx.updateEditorTopBorder();
@@ -1748,7 +1978,7 @@ export class SelectorController {
 						onCancel: () => {
 							done();
 							// Restore status line to saved settings
-							this.ctx.statusLine.updateSettings(buildStatusLineSettings(settings));
+							this.ctx.statusLine.updateSettings(buildStatusLineSettings(this.ctx.settings));
 							this.ctx.updateEditorTopBorder();
 							this.ctx.ui.requestRender();
 						},
@@ -1766,48 +1996,421 @@ export class SelectorController {
 		this.ctx.ui.requestRender();
 	}
 
+	async #awaitConfigRefresh(): Promise<{ ok: true } | { ok: false; error: string }> {
+		try {
+			await this.ctx.notifyConfigChanged?.();
+			return { ok: true };
+		} catch (error) {
+			return { ok: false, error: safeVisibleError(error) };
+		}
+	}
+
+	#snapshotModelAssignmentState(): ModelAssignmentSnapshot {
+		const settings = this.ctx.settings;
+		const session = this.ctx.session;
+		const activeModelProfile = session.getActiveModelProfile?.();
+		const runtime = session as unknown as {
+			getDefaultFallbackRuntimeModel?: () => string | undefined;
+		};
+		const modelRoles = structuredClone(settings.get("modelRoles"));
+		const agentModelOverrides = structuredClone(settings.get("task.agentModelOverrides"));
+		const globalModelRoles = settings.getGlobal("modelRoles");
+		const globalAgentModelOverrides = settings.getGlobal("task.agentModelOverrides");
+		const configuredDefaultChain = session.getConfiguredModelChain("default");
+		const sessionDefaultModelSelector = session.getSessionDefaultModelSelector?.();
+		const currentModelSelector = session.model ? `${session.model.provider}/${session.model.id}` : undefined;
+		const runtimeDefaultSelector =
+			runtime.getDefaultFallbackRuntimeModel?.() ??
+			(currentModelSelector && sessionDefaultModelSelector && currentModelSelector !== sessionDefaultModelSelector
+				? currentModelSelector
+				: undefined);
+		return {
+			model: session.model,
+			thinkingLevel: session.thinkingLevel,
+			modelRoles,
+			agentModelOverrides,
+			globalModelRoles: globalModelRoles === undefined ? undefined : structuredClone(globalModelRoles),
+			globalAgentModelOverrides:
+				globalAgentModelOverrides === undefined ? undefined : structuredClone(globalAgentModelOverrides),
+			modelProfileDefault: settings.get("modelProfile.default"),
+			globalModelProfileDefault: settings.getGlobal("modelProfile.default"),
+			defaultThinkingLevel: settings.get("defaultThinkingLevel"),
+			globalDefaultThinkingLevel: settings.getGlobal("defaultThinkingLevel"),
+			configuredDefaultChain: configuredDefaultChain ? [...configuredDefaultChain] : undefined,
+			activeModelProfile,
+			sessionDefaultModelSelector,
+			runtimeDefaultSelector,
+			hasRuntimeModelRoleOverrides: activeModelProfile !== undefined,
+			hasRuntimeAgentModelOverrides: activeModelProfile !== undefined,
+		};
+	}
+
+	#restoreModelAssignmentSettings(snapshot: ModelAssignmentSnapshot): void {
+		const settings = this.ctx.settings;
+		const failures: string[] = [];
+		const attempt = (label: string, operation: () => void): void => {
+			try {
+				operation();
+			} catch (error) {
+				failures.push(`${label}: ${safeVisibleError(error)}`);
+			}
+		};
+		attempt("model roles", () => {
+			if (snapshot.globalModelRoles === undefined) settings.unset("modelRoles");
+			else settings.set("modelRoles", snapshot.globalModelRoles);
+		});
+		attempt("agent model overrides", () => {
+			if (snapshot.globalAgentModelOverrides === undefined) settings.unset("task.agentModelOverrides");
+			else settings.set("task.agentModelOverrides", snapshot.globalAgentModelOverrides);
+		});
+		attempt("model profile", () => {
+			if (snapshot.globalModelProfileDefault === undefined) settings.unset("modelProfile.default");
+			else settings.set("modelProfile.default", snapshot.globalModelProfileDefault);
+		});
+		attempt("default thinking level", () => {
+			if (snapshot.globalDefaultThinkingLevel === undefined) settings.unset("defaultThinkingLevel");
+			else settings.set("defaultThinkingLevel", snapshot.globalDefaultThinkingLevel);
+		});
+		attempt("model-role overrides", () => {
+			settings.clearOverride("modelRoles");
+			if (snapshot.hasRuntimeModelRoleOverrides) settings.override("modelRoles", snapshot.modelRoles);
+		});
+		attempt("agent-role overrides", () => {
+			settings.clearOverride("task.agentModelOverrides");
+			if (snapshot.hasRuntimeAgentModelOverrides) {
+				settings.override("task.agentModelOverrides", snapshot.agentModelOverrides);
+			}
+		});
+		attempt("model-profile override", () => settings.clearOverride("modelProfile.default"));
+		if (failures.length > 0) throw new Error(failures.join("; "));
+	}
+
+	async #restoreModelAssignmentRuntime(snapshot: ModelAssignmentSnapshot): Promise<void> {
+		const session = this.ctx.session;
+		const failures: string[] = [];
+		const attempt = async (label: string, operation: () => void | Promise<void>): Promise<void> => {
+			try {
+				await operation();
+			} catch (error) {
+				failures.push(`${label}: ${safeVisibleError(error)}`);
+			}
+		};
+		await attempt("runtime model", async () => {
+			const previousModel = snapshot.model;
+			const currentModel = session.model;
+			const modelChanged =
+				previousModel !== undefined &&
+				(currentModel === undefined ||
+					currentModel.provider !== previousModel.provider ||
+					currentModel.id !== previousModel.id ||
+					session.thinkingLevel !== snapshot.thinkingLevel);
+			if (modelChanged && previousModel) {
+				await session.setModelTemporary(previousModel, snapshot.thinkingLevel, { cause: "rollback" });
+			} else if (previousModel === undefined && currentModel !== undefined) {
+				throw new Error("Previous runtime model is unavailable.");
+			}
+		});
+		await attempt("thinking level", () => {
+			if (snapshot.thinkingLevel !== undefined && session.thinkingLevel !== snapshot.thinkingLevel) {
+				session.setThinkingLevel(snapshot.thinkingLevel);
+			}
+		});
+		await attempt("session default", () => {
+			if (
+				snapshot.sessionDefaultModelSelector !== undefined &&
+				session.getSessionDefaultModelSelector?.() !== snapshot.sessionDefaultModelSelector
+			) {
+				session.recordResumeDefaultModel?.(snapshot.sessionDefaultModelSelector);
+			}
+		});
+		await attempt("runtime default", () => {
+			const runtime = session as unknown as {
+				setDefaultFallbackRuntimeModel?: (selector: string) => void;
+				clearDefaultFallbackRuntimeModel?: () => void;
+			};
+			if (snapshot.runtimeDefaultSelector !== undefined) {
+				if (!runtime.setDefaultFallbackRuntimeModel) throw new Error("Previous runtime default is unavailable.");
+				runtime.setDefaultFallbackRuntimeModel(snapshot.runtimeDefaultSelector);
+			} else {
+				runtime.clearDefaultFallbackRuntimeModel?.();
+			}
+		});
+		await attempt("active model profile", () => {
+			if (session.getActiveModelProfile?.() !== snapshot.activeModelProfile) {
+				session.setActiveModelProfile?.(snapshot.activeModelProfile);
+			}
+		});
+		await attempt("configured default chain", () => {
+			const currentChain = session.getConfiguredModelChain("default");
+			const previousChain = snapshot.configuredDefaultChain;
+			const chainChanged =
+				currentChain?.length !== previousChain?.length ||
+				currentChain?.some((entry, index) => entry !== previousChain?.[index]) === true;
+			if (chainChanged) {
+				session.setConfiguredModelChain(
+					"default",
+					previousChain ?? [],
+					"rollback",
+					snapshot.activeModelProfile,
+					true,
+				);
+			}
+		});
+		if (failures.length > 0) throw new Error(failures.join("; "));
+	}
+
+	async #rollbackModelAssignment(
+		snapshot: ModelAssignmentSnapshot,
+		modelSelector: ModelSelectorComponent,
+	): Promise<string | undefined> {
+		const failures: string[] = [];
+		try {
+			this.#restoreModelAssignmentSettings(snapshot);
+		} catch (error) {
+			failures.push(`settings rollback failed: ${safeVisibleError(error)}`);
+		}
+		try {
+			await this.#restoreModelAssignmentRuntime(snapshot);
+		} catch (error) {
+			failures.push(`runtime rollback failed: ${safeVisibleError(error)}`);
+		}
+		try {
+			await this.ctx.settings.flushOrThrow();
+		} catch (error) {
+			failures.push(`rollback flush failed: ${safeVisibleError(error)}`);
+		}
+		const refresh = await this.#awaitConfigRefresh();
+		if (!refresh.ok) failures.push(`rollback settings refresh failed: ${refresh.error}`);
+		try {
+			modelSelector.refreshRoleAssignments({
+				currentModel: this.ctx.session.model,
+				currentThinkingLevel: this.ctx.session.thinkingLevel,
+				activeModelProfile:
+					this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
+			});
+		} catch (error) {
+			failures.push(`selector rollback refresh failed: ${safeVisibleError(error)}`);
+		}
+		return failures.length > 0 ? failures.join("; ") : undefined;
+	}
+
+	#reportDurableSetting(id: string): Promise<void> {
+		const existing = this.#durableSettingReports.get(id);
+		if (existing) return existing;
+
+		let pending!: Promise<void>;
+		pending = (async () => {
+			try {
+				try {
+					await this.ctx.settings.flushOrThrow();
+				} catch (error) {
+					this.ctx.showError(`Setting ${id} failed to save: ${safeVisibleError(error)}`);
+					this.ctx.ui.requestRender();
+					return;
+				}
+				const refresh = await this.#awaitConfigRefresh();
+				this.ctx.showStatus(
+					refresh.ok
+						? `Setting ${id} saved and applied.`
+						: `Setting ${id} saved, but settings refresh failed: ${refresh.error}`,
+				);
+				this.ctx.ui.requestRender();
+			} finally {
+				void Bun.sleep(0).then(() => {
+					if (this.#durableSettingReports.get(id) === pending) this.#durableSettingReports.delete(id);
+				});
+			}
+		})();
+		this.#durableSettingReports.set(id, pending);
+		return pending;
+	}
+
+	async #selectModelProfileFromSettings(profileName: string): Promise<SettingsMutationResult> {
+		try {
+			return await this.#applyModelProfile(profileName, true);
+		} catch (error) {
+			return { status: "failed", error: safeVisibleError(error) };
+		}
+	}
+
+	async #commitThemeMapping(
+		changedPath: "theme.dark" | "theme.light",
+		themeName: string,
+		previousRenderedTheme?: string,
+	): Promise<SettingsMutationResult> {
+		if (!this.ctx.settings.canWriteDurableConfig()) {
+			return {
+				status: "failed",
+				error: "Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			};
+		}
+
+		const previousMapping = this.ctx.settings.get(changedPath);
+		const previousGlobalMapping = this.ctx.settings.getGlobal(changedPath);
+		const previousThemeCandidate = previousRenderedTheme ?? getCurrentThemeName();
+		const previousTheme =
+			typeof previousThemeCandidate === "string" && previousThemeCandidate.trim().length > 0
+				? previousThemeCandidate
+				: undefined;
+		const mode = changedPath === "theme.dark" ? "dark" : "light";
+		let mappingChanged = false;
+		try {
+			this.ctx.settings.set(changedPath, themeName);
+			mappingChanged = true;
+			setAutoThemeMapping(mode, themeName);
+			await this.ctx.settings.flushOrThrow();
+
+			const activePath = getDetectedThemeSettingsPath();
+			const activeTheme = this.ctx.settings.get(activePath);
+			if (typeof activeTheme !== "string" || activeTheme.trim().length === 0) {
+				throw new Error("Active theme mapping is unavailable.");
+			}
+			const applied = await restoreThemePreview(activeTheme);
+			if (!applied.success) {
+				throw new Error(safeVisibleError(applied.error ?? "Theme application failed."));
+			}
+			const refresh = await this.#awaitConfigRefresh();
+			if (!refresh.ok) throw new Error(`Settings refresh failed: ${refresh.error}`);
+
+			this.ctx.showStatus("Theme mapping saved and applied.");
+			this.#refreshThemeUi();
+			return { status: "applied" };
+		} catch (error) {
+			const failure = safeVisibleError(error);
+			let rollbackError: string | undefined;
+			if (mappingChanged) {
+				try {
+					if (previousGlobalMapping === undefined) this.ctx.settings.unset(changedPath);
+					else this.ctx.settings.set(changedPath, previousGlobalMapping);
+					if (typeof previousMapping === "string") {
+						setAutoThemeMapping(mode, previousMapping);
+					} else {
+						rollbackError = "mapping rollback unavailable: previous theme mapping is unknown.";
+					}
+					await this.ctx.settings.flushOrThrow();
+				} catch (restoreError) {
+					const mappingFailure = `mapping rollback failed: ${safeVisibleError(restoreError)}`;
+					rollbackError = rollbackError ? `${rollbackError}; ${mappingFailure}` : mappingFailure;
+				}
+			}
+			if (previousTheme === undefined) {
+				const restoreFailure = "rendered theme rollback unavailable: previous theme is unknown.";
+				rollbackError = rollbackError ? `${rollbackError}; ${restoreFailure}` : restoreFailure;
+			} else {
+				const restored = await restoreThemePreview(previousTheme);
+				if (!restored.success) {
+					const restoreFailure = `rendered theme rollback failed: ${safeVisibleError(restored.error ?? "Theme restoration failed.")}`;
+					rollbackError = rollbackError ? `${rollbackError}; ${restoreFailure}` : restoreFailure;
+				}
+			}
+			this.#refreshThemeUi();
+			const message = rollbackError
+				? `Theme mapping failed: ${failure}; ${rollbackError}`
+				: `Theme mapping was not saved: ${failure}`;
+			this.ctx.showStatus(message);
+			return rollbackError ? { status: "degraded", error: message } : { status: "failed", error: message };
+		}
+	}
+
+	async #clearModelProfileAndReport(): Promise<SettingsMutationResult> {
+		const profileName =
+			this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default") ?? undefined;
+		if (!profileName) {
+			this.ctx.session.setActiveModelProfile?.(undefined);
+			const refresh = await this.#awaitConfigRefresh();
+			if (!refresh.ok) {
+				return { status: "degraded", error: `Settings refresh failed: ${refresh.error}` };
+			}
+			return { status: "applied" };
+		}
+
+		let snapshot: MaterializeModelProfileForDeletionResult | undefined;
+		try {
+			snapshot = await materializeModelProfileForDeletion({
+				session: this.ctx.session,
+				modelRegistry: this.ctx.session.modelRegistry,
+				settings: this.ctx.settings,
+				profileName,
+			});
+			const refresh = await this.#awaitConfigRefresh();
+			if (!refresh.ok) {
+				try {
+					await restoreMaterializedModelProfileForDeletion({
+						settings: this.ctx.settings,
+						session: this.ctx.session,
+						snapshot,
+					});
+					const rollbackRefresh = await this.#awaitConfigRefresh();
+					if (!rollbackRefresh.ok) throw new Error(`Rollback settings refresh failed: ${rollbackRefresh.error}`);
+				} catch (rollbackError) {
+					return {
+						status: "failed",
+						error: `Default model profile clear failed: ${refresh.error}; rollback failed: ${safeVisibleError(rollbackError)}`,
+					};
+				}
+				return { status: "failed", error: `Default model profile clear failed: ${refresh.error}` };
+			}
+			this.ctx.showStatus("Default model profile cleared and applied; inheriting configured model settings.");
+			this.ctx.statusLine.setWorkModeStatus?.(undefined);
+
+			this.ctx.statusLine.invalidate();
+			this.ctx.updateEditorBorderColor();
+			this.ctx.ui.requestRender();
+			return { status: "applied" };
+		} catch (error) {
+			if (snapshot) {
+				try {
+					await restoreMaterializedModelProfileForDeletion({
+						settings: this.ctx.settings,
+						session: this.ctx.session,
+						snapshot,
+					});
+				} catch (rollbackError) {
+					return {
+						status: "failed",
+						error: `Default model profile clear failed: ${safeVisibleError(error)}; rollback failed: ${safeVisibleError(rollbackError)}`,
+					};
+				}
+			}
+			return { status: "failed", error: `Default model profile clear failed: ${safeVisibleError(error)}` };
+		}
+	}
+
 	showThemeSelector(): void {
 		getAvailableThemes().then(availableThemes => {
 			const initialTheme = getCurrentThemeName() ?? "red-claw";
 			this.showSelector(done => {
-				const restoreAndClose = () => {
-					void restoreThemePreview(initialTheme).then(result => {
-						if (!result.success && result.error) {
-							this.ctx.showError(`Failed to restore theme preview: ${result.error}`);
-						}
-						this.#refreshThemeUi();
-					});
+				const restoreAndClose = async (): Promise<void> => {
+					const result = await restoreThemePreview(initialTheme);
+					this.#refreshThemeUi();
+					if (!result.success && result.error) {
+						this.ctx.showError(`Failed to restore theme preview: ${safeVisibleError(result.error)}`);
+						return;
+					}
 					done();
 				};
 				const selector = new ThemeSelectorComponent(
 					initialTheme,
 					availableThemes,
 					themeName => {
-						if (!settings.canWriteDurableConfig()) {
-							this.ctx.showError(
-								"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+						void (async () => {
+							const result = await this.#commitThemeMapping(
+								getDetectedThemeSettingsPath(),
+								themeName,
+								initialTheme,
 							);
-							restoreAndClose();
-							return;
-						}
-						try {
-							settings.set(getDetectedThemeSettingsPath(), themeName);
-						} catch (error) {
-							if (!settings.canWriteDurableConfig()) {
-								this.ctx.showError(error instanceof Error ? error.message : String(error));
-								restoreAndClose();
+							if (result.status !== "applied") {
+								this.ctx.showError(result.error);
 								return;
 							}
-							throw error;
-						}
-						this.#refreshThemeUi();
-						done();
+							done();
+						})();
 					},
 					restoreAndClose,
 					themeName => {
 						void previewTheme(themeName).then(result => {
 							if (!result.success && result.error) {
-								this.ctx.showError(`Failed to preview theme: ${result.error}`);
+								this.ctx.showError(`Failed to preview theme: ${safeVisibleError(result.error)}`);
 							}
 							this.#refreshThemeUi();
 						});
@@ -1819,7 +2422,8 @@ export class SelectorController {
 	}
 
 	showPetSelector(): void {
-		const stored = settings.get("pet.mode");
+		const stored = this.ctx.settings.get("pet.mode");
+
 		const initial: PetMode = isPetMode(stored) ? stored : "off";
 		this.showSelector(done => {
 			// Live-preview via previewMode (no editor re-mount, so the overlay stays);
@@ -1941,20 +2545,23 @@ export class SelectorController {
 			case "thinkingLevel":
 			case "defaultThinkingLevel":
 				this.ctx.session.setThinkingLevel(value as ThinkingLevel, true);
+				this.ctx.statusLine.setWorkModeStatus?.(undefined);
+
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				break;
 
 			case "modelProfile.default": {
-				// Applying the default profile live mirrors the /model preset flow so the
-				// running session switches immediately, not only on next startup.
-				const profileName = typeof value === "string" ? value : "";
-				if (!profileName) break;
-				this.#applyModelProfile(profileName, true)
-					.then(() => this.ctx.ui.requestRender())
-					.catch(error => {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					});
+				// The settings surface owns the awaited profile transaction. Keep this
+				// branch side-effect-free so no generic setting write precedes preparation.
+				const profileName = typeof value === "string" ? value.trim() : "";
+				const action = profileName
+					? this.#selectModelProfileFromSettings(profileName)
+					: this.#clearModelProfileAndReport();
+				void action.then(result => {
+					if (result.status === "failed") this.ctx.showError(result.error);
+					this.ctx.ui.requestRender();
+				});
 				break;
 			}
 			case "clearOnShrink":
@@ -2046,6 +2653,7 @@ export class SelectorController {
 				break;
 			}
 			case "statusLine.showActionHints": {
+				this.ctx.statusLine.updateSettings(buildStatusLineSettings(this.ctx.settings));
 				this.ctx.updateEditorChrome();
 				break;
 			}
@@ -2071,7 +2679,8 @@ export class SelectorController {
 			case "statusLineGitShowUntracked":
 			case "statusLineTimeFormat":
 			case "statusLineTimeShowSeconds": {
-				this.ctx.statusLine.updateSettings(buildStatusLineSettings(settings));
+				this.ctx.statusLine.updateSettings(buildStatusLineSettings(this.ctx.settings));
+
 				this.ctx.updateEditorTopBorder();
 				this.ctx.ui.requestRender();
 				break;
@@ -2101,36 +2710,6 @@ export class SelectorController {
 					setSearchHardTimeoutMs(value * 1000);
 				}
 				break;
-			case "providers.image":
-			case "providers.imageModel":
-			case "providers.imageCustomUrl":
-			case "providers.imageCustomKey":
-			case "providers.imageCustomKeyEnv": {
-				const imgProvider = this.ctx.settings.get("providers.image");
-				const imgModel = this.ctx.settings.get("providers.imageModel");
-				const imgCustomUrl = this.ctx.settings.get("providers.imageCustomUrl");
-				const imgCustomKey = this.ctx.settings.get("providers.imageCustomKey");
-				const imgCustomKeyEnv = this.ctx.settings.get("providers.imageCustomKeyEnv");
-				if (
-					imgProvider === "auto" ||
-					imgProvider === "openai" ||
-					imgProvider === "gemini" ||
-					imgProvider === "openrouter" ||
-					imgProvider === "antigravity" ||
-					imgProvider === "alibaba" ||
-					imgProvider === "custom"
-				) {
-					setPreferredImageProvider(imgProvider === "custom" ? "auto" : imgProvider);
-					setConfiguredImageModel({
-						provider: imgProvider,
-						model: imgModel ?? null,
-						customUrl: imgCustomUrl,
-						customKey: imgCustomKey,
-						customKeyEnv: imgCustomKeyEnv,
-					});
-				}
-				break;
-			}
 
 			// MCP update injection - live subscribe/unsubscribe
 			case "mcp.notifications":
@@ -2142,12 +2721,118 @@ export class SelectorController {
 		}
 	}
 
+	async #applyPersistentModelAssignment(
+		selection: Extract<ModelSelectorSelection, { kind: "assignment" }>,
+		modelSelector: ModelSelectorComponent,
+	): Promise<void> {
+		const { model, role, thinkingLevel, selector: selectedSelector } = selection;
+		if (role === null) throw new Error("Temporary model selections cannot be persisted.");
+		const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles ?? [role];
+		const includesDefault = targetRoles.includes("default");
+		const includesRoleAgent = targetRoles.some(targetRole => targetRole !== "default");
+		if (includesRoleAgent) {
+			const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
+			if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
+
+		const value = selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
+		const assignments = new Map<GjcModelAssignmentTargetId, string>();
+		for (const targetRole of targetRoles) assignments.set(targetRole, value);
+		const defaultSelector =
+			selectedSelector && thinkingLevel && selectedSelector.endsWith(`:${thinkingLevel}`)
+				? selectedSelector.slice(0, -thinkingLevel.length - 1)
+				: selectedSelector;
+		const snapshot = this.#snapshotModelAssignmentState();
+		let mutationStarted = false;
+		try {
+			if (includesDefault) {
+				mutationStarted = true;
+				await this.ctx.session.setModel(model, "default", {
+					selector: defaultSelector,
+					thinkingLevel,
+					cause: "user-selection",
+				});
+				if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+					this.ctx.session.setThinkingLevel(thinkingLevel);
+				}
+			}
+
+			mutationStarted = true;
+			const materializedProfile = materializeActiveModelProfileAssignments({
+				session: this.ctx.session,
+				settings: this.ctx.settings,
+				assignments,
+			});
+			if (!materializedProfile) {
+				for (const targetRole of targetRoles) {
+					const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+					if (target.settingsPath === "modelRoles") {
+						this.ctx.settings.setModelRole(targetRole, value);
+					} else {
+						this.ctx.settings.setAgentModelOverride(targetRole, value);
+					}
+				}
+			}
+			await this.ctx.settings.flushOrThrow();
+		} catch (error) {
+			if (mutationStarted) {
+				const rollbackError = await this.#rollbackModelAssignment(snapshot, modelSelector);
+				if (rollbackError) {
+					throw new Error(`Model assignment failed: ${safeVisibleError(error)}; ${rollbackError}`);
+				}
+			}
+			throw error;
+		}
+
+		const refresh = await this.#awaitConfigRefresh();
+		let selectorRefreshError: string | undefined;
+		try {
+			modelSelector.refreshRoleAssignments({
+				currentModel: this.ctx.session.model,
+				currentThinkingLevel: this.ctx.session.thinkingLevel,
+				activeModelProfile:
+					this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
+			});
+		} catch (error) {
+			selectorRefreshError = safeVisibleError(error);
+		}
+		if (!includesDefault) this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
+		this.ctx.statusLine.setWorkModeStatus?.(undefined);
+
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
+		const labels = targetRoles.map(
+			targetRole => GJC_MODEL_ASSIGNMENT_TARGETS[targetRole].tag ?? targetRole.toUpperCase(),
+		);
+		const successMessage =
+			selection.roles !== undefined
+				? includesDefault
+					? `All model targets set to ${value} for ${labels.join(", ")}.`
+					: `Role-agent models set to ${value} for ${labels.join(", ")}.`
+				: role === "default"
+					? `Default model: ${selectedSelector ?? model.id}`
+					: `${role} agent model: ${value}`;
+		const degradedReason = !refresh.ok
+			? `settings refresh failed: ${refresh.error}`
+			: selectorRefreshError
+				? `selector refresh failed: ${selectorRefreshError}`
+				: undefined;
+		this.ctx.showStatus(
+			degradedReason
+				? selection.roles !== undefined
+					? `Model targets saved and applied, but ${degradedReason}.`
+					: `${role === "default" ? "Default model" : `${role} agent model`} saved and applied, but ${degradedReason}.`
+				: successMessage,
+		);
+		this.ctx.ui.requestRender();
+	}
+
 	/**
 	 * Activate a model profile through the shared /model + /settings path: swap the
 	 * live session model (and, when persistDefault, persist it as the startup
 	 * default) then refresh the status surfaces. Rethrows so callers surface errors.
 	 */
-	async #applyModelProfile(profileName: string, persistDefault: boolean): Promise<void> {
+	async #applyModelProfile(profileName: string, persistDefault: boolean): Promise<SettingsMutationResult> {
 		const profileLabel = formatModelProfileDisplayLabel(
 			this.ctx.session.modelRegistry.getModelProfile(profileName) ?? { name: profileName },
 		);
@@ -2160,22 +2845,46 @@ export class SelectorController {
 			},
 			{ persistDefault },
 		);
+		const refresh = persistDefault ? await this.#awaitConfigRefresh() : { ok: true as const };
+		this.ctx.statusLine.setWorkModeStatus?.(undefined);
 		this.ctx.statusLine.invalidate();
 		this.ctx.updateEditorBorderColor();
-		this.ctx.showStatus(persistDefault ? `Default model profile: ${profileLabel}` : `Model profile: ${profileLabel}`);
+		const label = persistDefault ? `Default model profile: ${profileLabel}` : `Model profile: ${profileLabel}`;
+		this.ctx.showStatus(
+			refresh.ok
+				? persistDefault
+					? `${label} saved and applied.`
+					: `${label} applied.`
+				: `${label} saved and applied, but settings refresh failed: ${refresh.error}`,
+		);
+		return refresh.ok ? { status: "applied" } : { status: "degraded", error: refresh.error };
 	}
 
-	showModelSelector(options?: { temporaryOnly?: boolean }): void {
+	#createWorkModeAdapter(): ModelSelectorWorkModeAdapter {
+		const cards = createWorkModeSelectorCards();
+		return {
+			cards,
+			preview: async (modeId: string) => {
+				const result = await this.ctx.session.previewWorkMode(modeId);
+				return { result, view: createWorkModePreviewView(modeId, result) };
+			},
+			apply: async (modeId: string, scope: WorkModeScope, preview: WorkModePreviewResult) => {
+				const request = {
+					modeId: modeId as WorkModeId,
+					scope,
+					acceptedPreview: preview,
+					confirmationAccepted: preview.state === "degraded" ? true : undefined,
+				} as const;
+				return scope === "turn"
+					? await this.ctx.session.stageWorkMode(request)
+					: await this.ctx.session.applyWorkMode(request);
+			},
+		};
+	}
+
+	showModelSelector(options?: { temporaryOnly?: boolean; initialWorkModeId?: string }): void {
 		this.showSelector(done => {
 			let modelSelector: ModelSelectorComponent;
-			const refreshRoleAssignments = () => {
-				modelSelector.refreshRoleAssignments({
-					currentModel: this.ctx.session.model,
-					currentThinkingLevel: this.ctx.session.thinkingLevel,
-					activeModelProfile:
-						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-				});
-			};
 			modelSelector = new ModelSelectorComponent(
 				this.ctx.ui,
 				this.ctx.session.model,
@@ -2183,9 +2892,25 @@ export class SelectorController {
 				this.ctx.session.modelRegistry,
 				this.ctx.session.scopedModels,
 				async selection => {
-					const isTrackedSingleAssignment =
-						selection.kind === "assignment" && selection.role !== null && selection.roles === undefined;
 					try {
+						if (selection.kind === "workMode") {
+							if (selection.event.phase !== "preview") {
+								const observedFingerprint =
+									"observedFingerprint" in selection.event ? selection.event.observedFingerprint : undefined;
+								this.ctx.statusLine.setWorkModeStatus(
+									createWorkModeStatusView(selection.event, {
+										currentProfileId:
+											this.ctx.session.getActiveModelProfile?.() ??
+											this.ctx.settings.get("modelProfile.default"),
+										currentFingerprint: observedFingerprint,
+										currentPhase: selection.event.phase,
+									}),
+								);
+							}
+							done();
+							this.ctx.ui.requestRender();
+							return;
+						}
 						if (selection.kind === "createProfile") {
 							done();
 							this.showCustomModelPresetWizard(selection.profile);
@@ -2220,143 +2945,20 @@ export class SelectorController {
 							this.ctx.session.setDefaultFallbackRuntimeModel(
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
 							);
+							this.ctx.statusLine.setWorkModeStatus?.(undefined);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Temporary model: ${selectedSelector ?? model.id}`);
 							done();
 							this.ctx.ui.requestRender();
-						} else if (selection.roles !== undefined) {
-							const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles;
-							const includesDefault = targetRoles.includes("default");
-							const includesRoleAgent = targetRoles.some(targetRole => targetRole !== "default");
-							if (includesRoleAgent) {
-								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
-									model,
-									this.ctx.session.sessionId,
-								);
-								if (!apiKey) {
-									throw new Error(`No API key for ${model.provider}/${model.id}`);
-								}
-							}
-							const value =
-								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
-							const assignments = new Map<GjcModelAssignmentTargetId, string>();
-							for (const targetRole of targetRoles) assignments.set(targetRole, value);
-							const defaultSelector =
-								selectedSelector && thinkingLevel && selectedSelector.endsWith(`:${thinkingLevel}`)
-									? selectedSelector.slice(0, -thinkingLevel.length - 1)
-									: selectedSelector;
-
-							if (includesDefault) {
-								await this.ctx.session.setModel(model, "default", {
-									selector: defaultSelector,
-									thinkingLevel,
-									cause: "user-selection",
-								});
-								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(thinkingLevel);
-								}
-							}
-							const materializedProfile = materializeActiveModelProfileAssignments({
-								session: this.ctx.session,
-								settings: this.ctx.settings,
-								assignments,
-							});
-							if (!materializedProfile) {
-								for (const targetRole of targetRoles) {
-									const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
-									if (target.settingsPath === "modelRoles") {
-										this.ctx.settings.setModelRole(targetRole, value);
-									} else {
-										this.ctx.settings.setAgentModelOverride(targetRole, value);
-									}
-								}
-							}
-							modelSelector.refreshRoleAssignments({
-								currentModel: this.ctx.session.model,
-								currentThinkingLevel: this.ctx.session.thinkingLevel,
-								activeModelProfile:
-									this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-							});
-							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
-							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorBorderColor();
-							await this.ctx.notifyConfigChanged?.();
-							const labels = targetRoles.map(
-								targetRole => GJC_MODEL_ASSIGNMENT_TARGETS[targetRole].tag ?? targetRole.toUpperCase(),
-							);
-							this.ctx.showStatus(
-								includesDefault
-									? `All model targets set to ${value} for ${labels.join(", ")}.`
-									: `Role-agent models set to ${value} for ${labels.join(", ")}.`,
-							);
-							done();
-							this.ctx.ui.requestRender();
-						} else if (role === "default") {
-							// Default: update agent state and persist as the active default model.
-							await this.ctx.session.setModel(model, role, {
-								selector: selectedSelector,
-								thinkingLevel,
-								cause: "user-selection",
-							});
-							const value = formatModelSelectorValue(
-								selectedSelector ?? `${model.provider}/${model.id}`,
-								thinkingLevel,
-							);
-							if (
-								!materializeActiveModelProfileAssignment({
-									session: this.ctx.session,
-									settings: this.ctx.settings,
-									role,
-									selector: value,
-								})
-							) {
-								this.ctx.settings.setModelRole(role, value);
-							}
-							if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-								this.ctx.session.setThinkingLevel(thinkingLevel);
-							}
-							refreshRoleAssignments();
-							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorBorderColor();
-							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
-							this.ctx.ui.requestRender();
 						} else {
-							const apiKey = await this.ctx.session.modelRegistry.getApiKey(model, this.ctx.session.sessionId);
-							if (!apiKey) {
-								throw new Error(`No API key for ${model.provider}/${model.id}`);
-							}
-							const value =
-								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
-							const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
-							const materializedProfile = materializeActiveModelProfileAssignments({
-								session: this.ctx.session,
-								settings: this.ctx.settings,
-								assignments,
-							});
-							if (!materializedProfile) {
-								const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
-								if (target.settingsPath === "modelRoles") {
-									this.ctx.settings.setModelRole(role, value);
-								} else {
-									this.ctx.settings.setAgentModelOverride(role, value);
-								}
-							}
-							refreshRoleAssignments();
-							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
-							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorBorderColor();
-							await this.ctx.notifyConfigChanged?.();
-							this.ctx.showStatus(`${role} agent model: ${value}`);
+							await this.#applyPersistentModelAssignment(selection, modelSelector);
+							if (selection.roles !== undefined) done();
 							this.ctx.ui.requestRender();
 						}
 					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-						if (isTrackedSingleAssignment) {
-							refreshRoleAssignments();
-							this.ctx.ui.requestRender();
-							throw error;
-						}
+						this.ctx.showError(safeVisibleError(error));
+						if (selection.kind === "assignment" || selection.kind === "profile") throw error;
 					}
 				},
 				() => {
@@ -2365,6 +2967,7 @@ export class SelectorController {
 				},
 				{
 					...options,
+					workModeAdapter: this.#createWorkModeAdapter(),
 					sessionId: this.ctx.session.sessionId,
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
 					activeModelProfile:
@@ -2529,8 +3132,7 @@ export class SelectorController {
 					let wantsSummary = false;
 					let customInstructions: string | undefined;
 
-					const branchSummariesEnabled = settings.get("branchSummary.enabled");
-
+					const branchSummariesEnabled = this.ctx.settings.get("branchSummary.enabled");
 					while (branchSummariesEnabled) {
 						const summaryChoice = await this.ctx.showHookSelector("Summarize branch?", [
 							"No summary",
@@ -2608,7 +3210,7 @@ export class SelectorController {
 						this.ctx.showStatus("Navigated to selected point");
 					} catch (error) {
 						if (this.ctx.isStopped?.()) return;
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						this.ctx.showError(safeVisibleError(error));
 					} finally {
 						if (summaryLoader) {
 							summaryLoader.stop();
@@ -2626,7 +3228,7 @@ export class SelectorController {
 					this.ctx.sessionManager.appendLabelChange(entryId, label);
 					this.ctx.ui.requestRender();
 				},
-				settings.get("treeFilterMode"),
+				this.ctx.settings.get("treeFilterMode"),
 			);
 			return { component: selector, focus: selector };
 		});
@@ -2645,7 +3247,7 @@ export class SelectorController {
 					// unhandled rejection that can kill the process. Do not auto-retry.
 					done();
 					void this.handleResumeSession(sessionPath).catch(error => {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
+						this.ctx.showError(safeVisibleError(error));
 					});
 				},
 				() => {
@@ -2715,6 +3317,7 @@ export class SelectorController {
 			return false;
 		}
 		this.ctx.resetIrcSidebarSession();
+		this.ctx.resetObserverRegistry();
 
 		this.#refreshSessionTerminalTitle();
 
@@ -2830,7 +3433,10 @@ export class SelectorController {
 			progressLease.clear();
 			this.#clearTransientSessionUi({ restoreBackground: false, clearSpecializedLoaders: true });
 			const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
-			if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
+			if (switchingToDifferentSession) {
+				this.#onSessionIdentityChanged?.(previousSessionId);
+				this.ctx.resetIrcSidebarSession();
+			}
 			this.#refreshSessionTerminalTitle();
 			this.ctx.updateEditorBorderColor();
 
@@ -2873,7 +3479,7 @@ export class SelectorController {
 							await this.ctx.session.setModel(currentDefault);
 							this.ctx.showStatus(`Switched to ${currentDefault.provider}/${currentDefault.id}`);
 						} catch (err) {
-							this.ctx.showError(err instanceof Error ? err.message : String(err));
+							this.ctx.showError(safeVisibleError(err));
 						}
 					}
 					this.ctx.ui.requestRender();
@@ -3037,7 +3643,7 @@ export class SelectorController {
 			}
 			this.ctx.ui.requestRender();
 		} catch (error: unknown) {
-			this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
+			this.ctx.showError(`Login failed: ${safeVisibleError(error)}`);
 		} finally {
 			if (useManualInput) {
 				manualInput.clear(`Manual OAuth input cleared for ${providerId}`);
@@ -3058,7 +3664,7 @@ export class SelectorController {
 			);
 			this.ctx.ui.requestRender();
 		} catch (error: unknown) {
-			this.ctx.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+			this.ctx.showError(`Logout failed: ${safeVisibleError(error)}`);
 		}
 	}
 
@@ -3377,7 +3983,12 @@ export class SelectorController {
 	 * confirm. Built from nested SelectLists (list -> detail -> confirm) so focus
 	 * stays on the active SelectList.
 	 */
-	showJobsOverlay(observer: JobsObserver): void {
+	showJobsOverlay(
+		observer: JobsObserver,
+		launch: JobsOverlayOptions | JobRef = {},
+		safeAttentionReveal = false,
+	): boolean {
+		const options = isJobRef(launch) ? { initialRef: launch, safeAttentionReveal } : launch;
 		let overlay: JobsOverlayComponent | undefined;
 		const close = () => {
 			this.ctx.editorContainer.clear();
@@ -3385,27 +3996,38 @@ export class SelectorController {
 			this.ctx.ui.setFocus(this.ctx.editor);
 			this.ctx.ui.requestRender();
 		};
-		overlay = new JobsOverlayComponent(observer, {
-			close,
-			requestRender: () => {
-				if (overlay) this.ctx.ui.setFocus(overlay.getFocus());
-				this.ctx.ui.requestRender();
+		overlay = new JobsOverlayComponent(
+			observer,
+			{
+				close,
+				requestRender: () => {
+					if (overlay) this.ctx.ui.setFocus(overlay.getFocus());
+					this.ctx.ui.requestRender();
+				},
 			},
-		});
+			options,
+		);
+		if (!overlay.isInitialRevealAvailable()) return false;
+		this.#closeTasksPane?.();
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(overlay);
 		this.ctx.ui.setFocus(overlay.getFocus());
 		this.ctx.ui.requestRender();
+		return true;
 	}
 
-	showTasksPane(aggregator: TasksAggregator): void {
+	showTasksPane(aggregator: TasksAggregator, ownerCallbacks?: TasksPaneOwnerCallbacks): void {
 		if (this.#closeTasksPane) {
 			this.#closeTasksPane();
 			return;
 		}
+		let pane: TasksPaneComponent | undefined;
 		let unsubscribe: (() => void) | undefined;
 		const close = () => {
 			unsubscribe?.();
+			unsubscribe = undefined;
+			pane?.dispose();
+			pane = undefined;
 			this.#tasksPane = undefined;
 			this.#closeTasksPane = undefined;
 			this.ctx.editorContainer.clear();
@@ -3414,17 +4036,28 @@ export class SelectorController {
 			this.ctx.ui.requestRender();
 		};
 		this.#closeTasksPane = close;
-		this.#tasksPane = new TasksPaneComponent(aggregator, {
+		pane = new TasksPaneComponent(aggregator, {
 			close,
 			requestRender: () => {
 				if (this.#tasksPane) this.ctx.ui.setFocus(this.#tasksPane.getFocus());
 				this.ctx.ui.requestRender();
 			},
+			reveal: ownerCallbacks?.reveal ?? (() => false),
+			acknowledgeFailures: ownerCallbacks?.acknowledgeFailures ?? (() => aggregator.acknowledgeFailures()),
 		});
+		this.#tasksPane = pane;
 		unsubscribe = aggregator.onChange(() => this.#tasksPane?.refresh());
 		this.ctx.editorContainer.clear();
-		this.ctx.editorContainer.addChild(this.#tasksPane);
-		this.ctx.ui.setFocus(this.#tasksPane.getFocus());
+		this.ctx.editorContainer.addChild(pane);
+		this.ctx.ui.setFocus(pane.getFocus());
 		this.ctx.ui.requestRender();
+	}
+
+	closeTasksPane(): void {
+		this.#closeTasksPane?.();
+	}
+
+	setSessionIdentityChangedHandler(handler: (previousSessionId: string) => void): void {
+		this.#onSessionIdentityChanged = handler;
 	}
 }

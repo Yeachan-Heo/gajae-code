@@ -3477,24 +3477,6 @@ export const SETTINGS_SCHEMA = {
 			description: "Base URL for custom OpenAI-compatible image endpoint",
 		},
 	},
-	"providers.imageCustomKey": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom API Key",
-			description: "API key for custom OpenAI-compatible image endpoint",
-		},
-	},
-	"providers.imageCustomKeyEnv": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom API Key Env",
-			description: "Environment variable name holding the API key for custom image endpoint",
-		},
-	},
 
 	"providers.kimiApiFormat": {
 		type: "enum",

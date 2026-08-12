@@ -155,6 +155,9 @@ function createContext(currentSessionFile: string): {
 		resetIrcSidebarSession: vi.fn(() => {
 			calls.push("resetIrcSidebarSession");
 		}),
+		resetObserverRegistry: vi.fn(() => {
+			calls.push("resetObserverRegistry");
+		}),
 
 		showHookConfirm,
 		shutdown: vi.fn(async () => undefined),
@@ -196,10 +199,17 @@ describe("SelectorController session deletion", () => {
 	it("resets manual viewport intent before rendering a different session", async () => {
 		const { ctx, calls } = createContext("/tmp/project/sessions/a.jsonl");
 		const controller = new SelectorController(ctx);
+		controller.setSessionIdentityChangedHandler(previousSessionId => {
+			calls.push(`rebind:${previousSessionId}`);
+		});
 
 		await controller.handleResumeSession("/tmp/project/sessions/b.jsonl");
 
 		expect(calls).toContain("rebuildInitialMessages:replace-identity");
+		expect(calls).toContain("rebind:/tmp/project/sessions/a.jsonl");
+		expect(calls.indexOf("rebind:/tmp/project/sessions/a.jsonl")).toBeLessThan(
+			calls.indexOf("resetIrcSidebarSession"),
+		);
 		expect(calls.indexOf("rebuildInitialMessages:replace-identity")).toBeLessThan(
 			calls.indexOf("chatContainer.clear"),
 		);
@@ -228,9 +238,14 @@ describe("SelectorController session deletion", () => {
 		const sessionPath = "/tmp/project/sessions/a.jsonl";
 		const { ctx, calls } = createContext(sessionPath);
 		const controller = new SelectorController(ctx);
+		let rebinds = 0;
+		controller.setSessionIdentityChangedHandler(() => {
+			rebinds++;
+		});
 
 		await controller.handleResumeSession(sessionPath);
 
+		expect(rebinds).toBe(0);
 		expect(calls).toContain("rebuildInitialMessages:reconcile-same-transcript");
 		expect(calls).not.toContain("rebuildInitialMessages:replace-identity");
 	});
@@ -417,6 +432,7 @@ describe("SelectorController session deletion", () => {
 			"ui.requestRender",
 			"session.newSession",
 			"resetIrcSidebarSession",
+			"resetObserverRegistry",
 			"loadingAnimation.stop",
 			"statusContainer.clear",
 			"pendingMessagesContainer.clear",
@@ -493,6 +509,7 @@ describe("SelectorController session deletion", () => {
 		expect(calls).toEqual([
 			"session.newSession",
 			"resetIrcSidebarSession",
+			"resetObserverRegistry",
 			"loadingAnimation.stop",
 			"statusContainer.clear",
 			"pendingMessagesContainer.clear",

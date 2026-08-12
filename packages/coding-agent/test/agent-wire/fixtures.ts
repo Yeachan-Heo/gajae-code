@@ -4,6 +4,7 @@
  * raw args, raw command output) so redaction can be asserted by tests.
  */
 
+import { computeWorkModeFingerprint, unavailableFingerprintFact } from "../../src/config/work-mode-result";
 import type { AgentWireEventType } from "../../src/modes/shared/agent-wire/event-contract";
 import type { AgentSessionEvent } from "../../src/session/agent-session";
 
@@ -20,7 +21,34 @@ const message = (id: string) => ({
 	content: [{ type: "text", text: RAW_SECRET }],
 });
 
+const workModeUnavailableFingerprint = computeWorkModeFingerprint({
+	catalog: unavailableFingerprintFact("catalog_source_unavailable"),
+	bundledDefinition: unavailableFingerprintFact("builtin_source_unavailable"),
+	effectiveDefinition: unavailableFingerprintFact("model_profile_registry_unavailable"),
+	registryResolution: unavailableFingerprintFact("model_profile_registry_unavailable"),
+	readiness: unavailableFingerprintFact("provider_readiness_unavailable"),
+	roles: [
+		unavailableFingerprintFact("role_resolution_unavailable"),
+		unavailableFingerprintFact("role_resolution_unavailable"),
+		unavailableFingerprintFact("role_resolution_unavailable"),
+		unavailableFingerprintFact("role_resolution_unavailable"),
+		unavailableFingerprintFact("role_resolution_unavailable"),
+	],
+	fallback: unavailableFingerprintFact("fallback_resolution_unavailable"),
+	confirmation: { required: false, roleDegradation: [] },
+});
+
 export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
+	work_mode: {
+		type: "work_mode",
+		event: {
+			phase: "preview",
+			state: "unavailable",
+			fingerprint: workModeUnavailableFingerprint,
+			reason: "catalog_source_unavailable",
+			details: { code: "catalog_source_unavailable", category: "catalog" },
+		},
+	},
 	agent_start: ev({ type: "agent_start" }),
 	agent_end: ev({ type: "agent_end", messages: [], stopReason: "completed" }),
 	turn_start: ev({ type: "turn_start" }),

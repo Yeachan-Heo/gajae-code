@@ -54,6 +54,7 @@ const AGENT_SESSION_EVENT_TYPE_REGISTRY: Record<AgentWireEventType, true> = {
 	model_fallback_switched: true,
 	thinking_level_changed: true,
 	goal_updated: true,
+	work_mode: true,
 };
 
 /** Every agent-session event type, derived from the exhaustive registry. */

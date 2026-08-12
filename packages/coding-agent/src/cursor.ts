@@ -22,8 +22,8 @@ interface CursorExecBridgeOptions {
 	getToolContext?: () => AgentToolContext | undefined;
 	emitEvent?: (event: AgentEvent) => void;
 	createEventEmitter?: () => ((event: AgentEvent) => void) | undefined;
+	isToolAllowed?: (name: string) => boolean;
 }
-
 function createToolResultMessage(
 	toolCallId: string,
 	toolName: string,
@@ -48,13 +48,27 @@ function buildToolErrorResult(message: string): AgentToolResult<unknown> {
 	};
 }
 
+function isToolAllowed(options: CursorExecBridgeOptions, toolName: string): boolean {
+	if (options.isToolAllowed === undefined) return true;
+	try {
+		return options.isToolAllowed(toolName) === true;
+	} catch {
+		return false;
+	}
+}
+
+function getTool(options: CursorExecBridgeOptions, toolName: string): AgentTool | undefined {
+	if (!isToolAllowed(options, toolName)) return undefined;
+	return options.tools.get(toolName);
+}
+
 async function executeTool(
 	options: CursorExecBridgeOptions,
 	toolName: string,
 	toolCallId: string,
 	args: Record<string, unknown>,
 ): Promise<ToolResultMessage> {
-	const tool = options.tools.get(toolName);
+	const tool = getTool(options, toolName);
 	if (!tool) {
 		const result = buildToolErrorResult(`Tool "${toolName}" not available`);
 		return createToolResultMessage(toolCallId, toolName, result, true);
@@ -106,6 +120,10 @@ async function executeTool(
 
 async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, toolCallId: string) {
 	const toolName = "delete";
+	if (!isToolAllowed(options, toolName)) {
+		const result = buildToolErrorResult(`Tool "${toolName}" not available`);
+		return createToolResultMessage(toolCallId, toolName, result, true);
+	}
 	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: { path: pathArg } });
 
 	const absolutePath = resolveToCwd(pathArg, options.cwd);
@@ -270,7 +288,8 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		const options = this.#optionsForCall();
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		const toolName = "bash";
-		const tool = options.tools.get(toolName);
+		const tool = getTool(options, toolName);
+
 		if (!tool) {
 			const result = buildToolErrorResult(`Tool "${toolName}" not available`);
 			return createToolResultMessage(toolCallId, toolName, result, true);
@@ -377,9 +396,11 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		const options = this.#optionsForCall();
 		const toolName = call.toolName || call.name;
 		const toolCallId = decodeToolCallId(call.toolCallId);
-		const tool = options.tools.get(toolName);
+		const tool = getTool(options, toolName);
 		if (!tool) {
-			const availableTools = Array.from(options.tools.keys()).filter(name => name.startsWith("mcp__"));
+			const availableTools = Array.from(options.tools.keys()).filter(
+				name => name.startsWith("mcp__") && isToolAllowed(options, name),
+			);
 			const message = formatMcpToolErrorMessage(toolName, availableTools);
 			const result = buildToolErrorResult(message);
 			return createToolResultMessage(toolCallId, toolName, result, true);

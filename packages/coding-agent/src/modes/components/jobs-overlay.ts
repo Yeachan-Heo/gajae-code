@@ -6,7 +6,9 @@ import {
 	buildConfirmItems,
 	buildJobDetailItems,
 	buildJobsListItems,
+	isJobRefPresent,
 	type JobRef,
+	type JobsOverlayModelOptions,
 	parseJobRef,
 } from "./jobs-overlay-model";
 
@@ -35,8 +37,8 @@ export class JobsSelectorComponent extends Container {
 }
 
 export interface JobsOverlayController {
-	acknowledgeFailures(): void;
 	getSnapshot(): JobsSnapshot;
+
 	getMonitorOutput(id: string): string;
 	cancelMonitor(id: string): boolean;
 	deleteCron(id: string): boolean;
@@ -47,23 +49,42 @@ export interface JobsOverlayCallbacks {
 	requestRender(): void;
 }
 
+export interface JobsOverlayOptions extends JobsOverlayModelOptions {
+	readonly initialRef?: JobRef;
+}
+
 type JobsOverlayView = "list" | "detail" | "confirm";
 type JobsOverlayAction = "cancel" | "delete";
 
 export class JobsOverlayComponent extends Container {
 	readonly #controller: JobsOverlayController;
 	readonly #callbacks: JobsOverlayCallbacks;
+	readonly #options: JobsOverlayOptions;
 	#view: JobsOverlayView = "list";
 	#ref: JobRef | undefined;
 	#action: JobsOverlayAction | undefined;
 	#selectList: SelectList | undefined;
+	#initialRevealAvailable = true;
 
-	constructor(controller: JobsOverlayController, callbacks: JobsOverlayCallbacks) {
+	constructor(controller: JobsOverlayController, callbacks: JobsOverlayCallbacks, options: JobsOverlayOptions = {}) {
 		super();
 		this.#controller = controller;
 		this.#callbacks = callbacks;
-		this.#controller.acknowledgeFailures();
-		this.#renderList();
+		this.#options = options;
+		const initialRef = this.#options.initialRef;
+		if (initialRef && !isJobRefPresent(this.#controller.getSnapshot(), initialRef)) {
+			this.#initialRevealAvailable = false;
+			this.#renderUnavailable();
+		} else if (initialRef) {
+			this.#renderDetail(initialRef);
+		} else {
+			this.#renderList();
+		}
+	}
+
+	/** False means an attention reveal raced with owner removal and was not mounted. */
+	isInitialRevealAvailable(): boolean {
+		return this.#initialRevealAvailable;
 	}
 
 	getFocus(): SelectList {
@@ -102,12 +123,29 @@ export class JobsOverlayComponent extends Container {
 		this.#callbacks.requestRender();
 	}
 
+	#renderUnavailable(): void {
+		this.#view = "detail";
+		this.#ref = undefined;
+		this.#action = undefined;
+		this.#replaceList(
+			[
+				{
+					value: "close",
+					label: "Job reveal unavailable",
+					description: "The background job is no longer present.",
+				},
+			],
+			() => this.#callbacks.close(),
+			() => this.#callbacks.close(),
+		);
+	}
+
 	#renderList(): void {
 		this.#view = "list";
 		this.#ref = undefined;
 		this.#action = undefined;
 		const snapshot = this.#controller.getSnapshot();
-		const built = buildJobsListItems(snapshot);
+		const built = buildJobsListItems(snapshot, this.#options);
 		const items = built.length > 0 ? built : [{ value: "close", label: "No active monitor or cron jobs" }];
 		this.#replaceList(
 			items,
@@ -125,17 +163,23 @@ export class JobsOverlayComponent extends Container {
 			this.#renderList();
 			return;
 		}
+		if (!isJobRefPresent(this.#controller.getSnapshot(), ref)) {
+			this.#renderUnavailable();
+			return;
+		}
 		this.#view = "detail";
 		this.#ref = ref;
 		this.#action = undefined;
-		const output = ref.kind === "monitor" ? this.#controller.getMonitorOutput(ref.id) : "";
-		const items = buildJobDetailItems(this.#controller.getSnapshot(), ref, output);
+		const output =
+			this.#options.safeAttentionReveal || ref.kind !== "monitor" ? "" : this.#controller.getMonitorOutput(ref.id);
+		const items = buildJobDetailItems(this.#controller.getSnapshot(), ref, output, this.#options);
 		this.#replaceList(
 			items,
 			item => {
 				if (item.value === "action:cancel") this.#renderConfirm("cancel");
 				else if (item.value === "action:delete") this.#renderConfirm("delete");
 				else if (item.value === "back") this.#renderList();
+				else if (item.value === "close") this.#callbacks.close();
 			},
 			() => this.#callbacks.close(),
 		);

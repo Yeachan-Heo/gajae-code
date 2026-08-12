@@ -11,6 +11,7 @@ import {
 	materializeActiveModelProfileAssignments,
 	materializeModelProfileForDeletion,
 	prepareModelProfileActivation,
+	restoreMaterializedModelProfileForDeletion,
 } from "../src/config/model-profile-activation";
 
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
@@ -367,6 +368,46 @@ describe("model profile activation", () => {
 		).rejects.toThrow('Model profile "hard-required" requires credentials for: provider-a.');
 	});
 
+	test("reports strict and alternative readiness evidence without conjunction gating", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "readiness-evidence",
+			requiredProviders: ["provider-a", "provider-strict", "provider-alt-a", "provider-alt-b"],
+			alternativeProviderGroups: [["provider-alt-a", "provider-alt-b"]],
+			modelMapping: { default: "provider-a/default" },
+			source: "user",
+		};
+
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: fakeRegistry({ missingProviders: ["provider-strict"], profiles: [profile] }),
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toMatchObject({
+			missingStrictProviders: ["provider-strict"],
+			unsatisfiedAlternativeGroups: [],
+		});
+
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: fakeRegistry({
+					missingProviders: ["provider-alt-a", "provider-alt-b"],
+					profiles: [profile],
+				}),
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toMatchObject({
+			missingStrictProviders: [],
+			unsatisfiedAlternativeGroups: [["provider-alt-a", "provider-alt-b"]],
+			presentation: {
+				unsatisfiedAlternativeGroups: [["provider-alt-a", "provider-alt-b"]],
+			},
+		});
+	});
+
 	test("accepts the kNoAuth sentinel for required keyless providers", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "keyless-required",
@@ -399,7 +440,7 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		settings.flush = async () => {
+		settings.flushOrThrow = async () => {
 			throw new Error("flush failed");
 		};
 
@@ -428,7 +469,7 @@ describe("model profile activation", () => {
 				settings,
 				profileName: "profile-a",
 			});
-			settings.flush = async () => {
+			settings.flushOrThrow = async () => {
 				throw new Error("flush failed");
 			};
 
@@ -534,6 +575,8 @@ describe("model profile activation", () => {
 			executor: "provider-c/executor",
 			architect: "provider-b/executor",
 		});
+		await applyPreparedModelProfileActivation(prepared);
+		expect(prepared.session.getConfiguredModelChain("default")).toEqual(["provider-c/default:high"]);
 	});
 	test.each([
 		[
@@ -774,6 +817,73 @@ describe("model profile activation", () => {
 		]);
 	});
 
+	test("materialize-clear installs the resolved alternative default chain and explicit restore restores the previous chain", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "alternative-default-profile",
+			requiredProviders: ["provider-a", "provider-b", "provider-c"],
+			alternativeProviderGroups: [["provider-a", "provider-c"]],
+			modelMapping: { default: ["provider-a/default:high", "provider-b/executor"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		const previousChain = ["provider-c/default", "provider-b/executor"];
+		session.setConfiguredModelChain("default", previousChain);
+		const settings = Settings.isolated({ "modelProfile.default": profile.name });
+
+		const snapshot = await materializeModelProfileForDeletion({
+			session,
+			modelRegistry: fakeRegistry({ missingProviders: ["provider-a"], profiles: [profile] }),
+			settings,
+			profileName: profile.name,
+		});
+
+		expect(session.getConfiguredModelChain("default")).toEqual(["provider-c/default:high", "provider-b/executor"]);
+		expect(settings.get("modelRoles")).toEqual({
+			default: ["provider-c/default:high", "provider-b/executor"],
+		});
+		expect(settings.get("modelProfile.default")).toBeUndefined();
+		expect(snapshot.previousDefaultChain).toEqual(previousChain);
+
+		await restoreMaterializedModelProfileForDeletion({ settings, session, snapshot });
+
+		expect(session.getConfiguredModelChain("default")).toEqual(previousChain);
+		expect(settings.get("modelRoles")).toEqual({});
+		expect(settings.get("modelProfile.default")).toBe(profile.name);
+	});
+
+	test("materialize-clear restores the previous chain when durability flush fails", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "alternative-default-profile",
+			requiredProviders: ["provider-a", "provider-b", "provider-c"],
+			alternativeProviderGroups: [["provider-a", "provider-c"]],
+			modelMapping: { default: ["provider-a/default:high", "provider-b/executor"] },
+			source: "user",
+		};
+		const session = fakeSession();
+		const previousChain = ["provider-c/default", "provider-b/executor"];
+		session.setConfiguredModelChain("default", previousChain);
+		const settings = Settings.isolated({ "modelProfile.default": profile.name });
+		let flushCalls = 0;
+		settings.flushOrThrow = async () => {
+			flushCalls += 1;
+			if (flushCalls === 1) throw new Error("flush failed");
+		};
+
+		await expect(
+			materializeModelProfileForDeletion({
+				session,
+				modelRegistry: fakeRegistry({ missingProviders: ["provider-a"], profiles: [profile] }),
+				settings,
+				profileName: profile.name,
+			}),
+		).rejects.toThrow("flush failed");
+
+		expect(flushCalls).toBe(2);
+		expect(session.getConfiguredModelChain("default")).toEqual(previousChain);
+		expect(settings.get("modelRoles")).toEqual({});
+		expect(settings.get("modelProfile.default")).toBe(profile.name);
+	});
+
 	test("materializing a default override stores the selected default and clears the profile", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({ "modelProfile.default": "profile-a" });
@@ -853,9 +963,9 @@ describe("model profile activation", () => {
 			setCalls.push(path);
 			return originalSet(path, value);
 		}) as typeof settings.set;
-		let flushCount = 0;
-		settings.flush = async () => {
-			flushCount += 1;
+		let flushOrThrowCount = 0;
+		settings.flushOrThrow = async () => {
+			flushOrThrowCount += 1;
 		};
 
 		await activateModelProfile(
@@ -871,7 +981,7 @@ describe("model profile activation", () => {
 		]);
 		expect(settings.get("defaultThinkingLevel")).toBe(ThinkingLevel.High);
 		expect(settings.get("modelProfile.default")).toBe("profile-a");
-		expect(flushCount).toBe(1);
+		expect(flushOrThrowCount).toBe(1);
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
@@ -927,7 +1037,7 @@ describe("model profile activation", () => {
 			settings,
 			profileName: "profile-a",
 		});
-		settings.flush = async () => {
+		settings.flushOrThrow = async () => {
 			throw new Error("flush failed");
 		};
 
@@ -1045,6 +1155,18 @@ describe("model-profile-activation: xiaomi token-plan regions", () => {
 		expect(mimoEco!.requiredProviders).toEqual(["xiaomi"]);
 	});
 
+	it("activates mimo-medium with a single xiaomi token-plan credential", async () => {
+		const registry = stubXiaomiRegistry(["xiaomi-token-plan-sgp"]);
+		const prepared = await prepareModelProfileActivation({
+			session: stubXiaomiSession(),
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings: stubXiaomiSettings(),
+			profileName: "mimo-medium",
+		});
+		expect(prepared.profileName).toBe("mimo-medium");
+		expect(prepared.defaultModel?.provider).toBe("xiaomi-token-plan-sgp");
+	});
+
 	it("activation succeeds with only xiaomi-token-plan-sgp", async () => {
 		const registry = stubXiaomiRegistry(["xiaomi-token-plan-sgp"]);
 		const session = stubXiaomiSession();
@@ -1096,12 +1218,11 @@ describe("model-profile-activation: xiaomi token-plan regions", () => {
 				profileName: "mimo-pro",
 			}),
 		).rejects.toThrow(
-			formatModelProfileCredentialError("mimo-pro", [
-				"xiaomi",
-				"xiaomi-token-plan-sgp",
-				"xiaomi-token-plan-ams",
-				"xiaomi-token-plan-cn",
-			]),
+			formatModelProfileCredentialError(
+				"mimo-pro",
+				["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"],
+				[["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"]],
+			),
 		);
 	});
 

@@ -49,6 +49,13 @@ import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import {
+	isTaskMcpAllowed,
+	isTaskToolAllowed,
+	TaskExecutionPolicyController,
+	type TaskExecutionPolicyLaunchLease,
+	type TaskExecutionPolicySnapshot,
+} from "./execution-policy";
 import { validateAllocatedTaskId } from "./id";
 import { classifyProviderRetryFromTransport, providerNameFromModel } from "./provider-retry-status";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
@@ -234,6 +241,12 @@ export interface ExecutorOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	/** Parent session's execution policy controller; leases snapshot per launch. */
+	executionPolicyController?: TaskExecutionPolicyController;
+	/** Immutable launch snapshot used by this child session. */
+	executionPolicySnapshot?: TaskExecutionPolicySnapshot;
+	/** Caller-owned launch lease; the executor releases it exactly once. */
+	executionPolicyLease?: TaskExecutionPolicyLaunchLease;
 	/** Parent session's registry; shared by child sessions for IRC routing and roster visibility. */
 	agentRegistry?: AgentRegistry;
 	/**
@@ -779,7 +792,54 @@ export function createSubagentSettings(baseSettings: Settings, inheritedServiceT
 /**
  * Run a single agent in-process.
  */
+function policyRejectedResult(
+	options: ExecutorOptions,
+	reason: "worktree_required" | "current_required",
+): SingleResult {
+	const summary =
+		reason === "worktree_required"
+			? "Execution policy rejected launch: worktree isolation owner is unavailable."
+			: "Execution policy rejected launch: current-session isolation is required.";
+	return {
+		index: options.index,
+		id: options.id,
+		agent: options.agent.name,
+		agentSource: options.agent.source,
+		task: options.task,
+		assignment: options.assignment,
+		description: options.description,
+		exitCode: 1,
+		output: "",
+		stderr: summary,
+		truncated: false,
+		durationMs: 0,
+		tokens: 0,
+		modelOverride: options.modelOverride,
+		error: summary,
+		setupFailure: { summary },
+	};
+}
+
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	const controller = options.executionPolicyController ?? new TaskExecutionPolicyController();
+	const lease = options.executionPolicyLease ?? controller.acquireLaunchLease();
+	const snapshot = options.executionPolicySnapshot ?? lease.snapshot;
+	try {
+		if (snapshot.source.kind === "session") {
+			if (snapshot.policy.isolation === "worktree" && !options.worktree) {
+				return policyRejectedResult(options, "worktree_required");
+			}
+			if (snapshot.policy.isolation === "current" && options.worktree) {
+				return policyRejectedResult(options, "current_required");
+			}
+		}
+		return await runSubprocessWithPolicy({ ...options, executionPolicySnapshot: snapshot });
+	} finally {
+		lease?.release();
+	}
+}
+
+async function runSubprocessWithPolicy(options: ExecutorOptions): Promise<SingleResult> {
 	const {
 		cwd,
 		agent,
@@ -849,7 +909,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const settings = options.settings ?? Settings.isolated();
 	const subagentSettings = createSubagentSettings(settings, options.inheritedServiceTier);
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
-	const maxRuntimeMs = Math.max(0, Math.trunc(Number(settings.get("task.maxRuntimeMs") ?? 0) || 0));
+	const configuredMaxRuntimeMs = Math.max(0, Math.trunc(Number(settings.get("task.maxRuntimeMs") ?? 0) || 0));
+	const executionPolicy = options.executionPolicySnapshot;
+	const maxRuntimeMs =
+		executionPolicy?.source.kind === "session" ? (executionPolicy.policy.maxDurationMs ?? 0) : configuredMaxRuntimeMs;
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
 	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
@@ -874,6 +937,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		if (allowEvalPy || allowEvalJs) expanded.push("eval");
 		expanded.push("bash");
 		toolNames = Array.from(new Set(expanded));
+	}
+	if (executionPolicy && toolNames) {
+		toolNames = toolNames.filter(
+			name => isTaskToolAllowed(executionPolicy, name) && isTaskMcpAllowed(executionPolicy, name),
+		);
 	}
 
 	const modelPatterns = normalizeModelPatterns(modelOverride ?? agent.model);
@@ -1561,7 +1629,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			// Subagents do not inherit or discover MCP runtime tools in the GJC surface.
-			const enableMCP = false;
+			const enableMCP =
+				executionPolicy?.source.kind === "session" ? executionPolicy.policy.mcpDiscovery === "configured" : false;
 
 			// Derive subagent-scoped telemetry from the parent's config so the
 			// child loop's spans nest under the parent's active execute_tool span
@@ -1688,6 +1757,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					sessionManager,
 					hasUI: false,
 					spawns: spawnsEnv,
+					executionPolicySnapshot: executionPolicy,
 					taskDepth: childDepth,
 					currentAgentType: agent.name,
 					gjcSubskillToolContext: {

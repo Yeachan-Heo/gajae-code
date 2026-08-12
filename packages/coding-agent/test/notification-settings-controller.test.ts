@@ -46,6 +46,8 @@ import {
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
+let testSettings: Settings;
+
 function receipt(): CasReceipt {
 	return {
 		revisions: [],
@@ -187,11 +189,13 @@ function selectorOperations(
 		preflight?: (signal: AbortSignal) => Promise<NotificationsPreflightResult>;
 		enableGlobally?: () => Promise<NotificationsMutationResult>;
 		commitPreferences?: (preferences: NotificationsEditorPreferences) => Promise<NotificationsMutationResult>;
+		refreshHealth?: NotificationsEditorOperations["refreshHealth"];
+		reconcileCurrentSession?: NotificationsEditorOperations["reconcileCurrentSession"];
 	} = {},
 ): NotificationsEditorOperations {
 	return {
 		loadState: async () => editorState(),
-		refreshHealth: async () => health(),
+		refreshHealth: async refreshInput => await (input.refreshHealth?.(refreshInput) ?? Promise.resolve(health())),
 		sendTest: async () => ({ ok: true, adapter: "telegram", chatId: "chat", detail: "delivered" }),
 		recover: async () => recovery(),
 		reconnect: async () => "attached",
@@ -238,13 +242,15 @@ function selectorOperations(
 		setSessionLocal: async () => sessionResult(),
 		commitPreferences: async preferences =>
 			await (input.commitPreferences?.(preferences) ?? Promise.resolve({ message: "saved" })),
-		reconcileCurrentSession: async () => sessionResult(),
+		reconcileCurrentSession: async () =>
+			await (input.reconcileCurrentSession?.() ?? Promise.resolve(sessionResult())),
 	};
 }
 
 function selector(operations: NotificationsEditorOperations): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
 		{
+			settings: testSettings,
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["red-claw"],
@@ -279,7 +285,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
 	resetSettingsForTest();
-	await Settings.init({ inMemory: true });
+	testSettings = await Settings.init({ inMemory: true });
 });
 
 describe("notification settings controller adapter", () => {
@@ -1054,5 +1060,31 @@ describe("notification settings selector lifecycle", () => {
 
 		expect(commits).toHaveLength(1);
 		expect(commits[0]?.sound).toBe("none");
+	});
+	it("shows degraded preference apply status after a successful local refresh", async () => {
+		const refreshHealth = vi.fn(async () => health());
+		const reconcileCurrentSession = vi.fn(async () => sessionResult());
+		const component = selector(
+			selectorOperations({
+				refreshHealth,
+				reconcileCurrentSession,
+				commitPreferences: async () => ({
+					outcome: "degraded",
+					message: "Preferences saved, but daemon apply degraded.",
+				}),
+			}),
+		);
+		selectNotifications(component);
+		await flush();
+
+		activateActionWithDescription(component, "Draft safe scalar preferences, then save them atomically.");
+		activateActionWithDescription(component, "Atomically persist this preference draft.");
+		await flush();
+
+		expect(reconcileCurrentSession).toHaveBeenCalledTimes(1);
+		expect(refreshHealth).toHaveBeenCalledWith({ probe: false });
+		const rendered = Bun.stripANSI(component.render(240).join("\n"));
+		expect(rendered).toContain("WARNING\n    Preferences saved, but daemon apply degraded.");
+		expect(rendered).not.toContain("OK\n    Preferences saved, but daemon apply degraded.");
 	});
 });

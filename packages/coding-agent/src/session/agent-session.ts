@@ -207,10 +207,23 @@ import {
 } from "../config/model-resolver";
 import { normalizeModelSelectorValue } from "../config/model-selector-value";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
+import type { ScopedConfigurationMutationService } from "../config/scoped-configuration-mutation";
 import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
 import type { SettingPath } from "../config/settings-schema";
 import { getDefault } from "../config/settings-schema";
+import type {
+	WorkModeOperationEvent,
+	WorkModePreviewResult,
+	WorkModeTurnFinalizeEvent,
+} from "../config/work-mode-result";
+import {
+	type TopLevelUserAdmissionToken,
+	type WorkModeApplicationRequest,
+	type WorkModeStagedTurn,
+	WorkModeTransaction,
+	type WorkModeTurnLeaseLineage,
+} from "../config/work-mode-transaction";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
 import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
@@ -327,6 +340,7 @@ import {
 import { assertWorkflowMutationAllowed } from "../skill-state/workflow-mutation-guard";
 import { invalidateHostMetadata } from "../ssh/connection-manager";
 import { buildVolatileProjectContext } from "../system-prompt";
+import type { TaskExecutionPolicyController } from "../task/execution-policy";
 import { resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import {
 	buildDiscoverableToolSearchIndex,
@@ -460,6 +474,45 @@ function appendCompactionStateContext(summary: string, stateContext: string[]): 
 
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
 
+const REDACTED_MODEL_SELECTOR = "<redacted-model>";
+const SAFE_MODEL_SELECTOR_PATTERN =
+	/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\/[A-Za-z0-9][A-Za-z0-9._-]{0,191}(?::(?:inherit|off|minimal|low|medium|high|xhigh|max))?$/iu;
+const SAFE_FALLBACK_REASON_CODES = new Set([
+	"auth",
+	"new_turn",
+	"other",
+	"quota",
+	"rate_limit",
+	"resolution",
+	"server",
+	"unknown",
+	"unauthenticated",
+	"unknown_model",
+]);
+
+/** Keep fallback event selectors bounded to provider/model plus an optional thinking suffix. */
+export function sanitizeModelFallbackSelector(value: unknown): string {
+	if (typeof value !== "string") return REDACTED_MODEL_SELECTOR;
+	const selector = value.trim();
+	if (!selector || selector.length > 256 || /[\p{Cc}\p{Cf}]/u.test(selector)) return REDACTED_MODEL_SELECTOR;
+	return SAFE_MODEL_SELECTOR_PATTERN.test(selector) ? selector : REDACTED_MODEL_SELECTOR;
+}
+
+/** Fallback reasons are transport-visible codes, never provider diagnostic prose. */
+export function sanitizeModelFallbackReason(value: unknown): string {
+	if (typeof value !== "string") return "unknown";
+	const reason = value.trim();
+	return SAFE_FALLBACK_REASON_CODES.has(reason) ? reason : "unknown";
+}
+
+const SAFE_FALLBACK_LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/u;
+
+function sanitizeModelFallbackLabel(value: unknown, fallback: string): string {
+	if (typeof value !== "string") return fallback;
+	const label = value.trim();
+	return SAFE_FALLBACK_LABEL_PATTERN.test(label) ? label : fallback;
+}
+
 /** Session-specific events that extend the core AgentEvent */
 export type AutoCompactionContinuationSkipReason = "auto_continue_disabled_non_resumable_tail";
 
@@ -505,7 +558,8 @@ export type AgentSessionEvent =
 	| { type: "subagent_steer_message"; message: CustomMessage }
 	| { type: "notice"; level: "info" | "warning" | "error"; message: string; source?: string }
 	| { type: "thinking_level_changed"; thinkingLevel: ThinkingLevel | undefined }
-	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
+	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState }
+	| { type: "work_mode"; event: WorkModeOperationEvent };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -564,6 +618,11 @@ export interface AgentSessionConfig {
 	skillsSettings?: SkillsSettings;
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
+	/** Optional producer-owned Work Mode transaction; omitted for hosts without Work Mode controls. */
+	workModeTransaction?: WorkModeTransaction;
+	/** Injected sole durable writer for Work Mode project/user defaults. */
+	workModeScopedMutationService?: Pick<ScopedConfigurationMutationService, "read" | "mutate">;
+
 	/** Task recursion depth for nested sessions. Top-level sessions use 0. */
 	taskDepth?: number;
 	/** Tool registry for LSP and settings */
@@ -597,6 +656,9 @@ export interface AgentSessionConfig {
 	/** Rebuild the SSH tool from current capability discovery results. */
 	reloadSshTool?: () => Promise<AgentTool | null>;
 	requestedToolNames?: ReadonlySet<string>;
+	/** Optional activation guard. Tool names rejected by this predicate never become active or model-facing. */
+	toolActivationAllowed?: (toolName: string) => boolean;
+
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
 	/** Optional accessor for live MCP server instructions, injected as untrusted user-role request data. */
@@ -780,11 +842,22 @@ export type TemporaryModelReason =
 	| "temporary-cycle"
 	| "profile-preview"
 	| "extension-temporary"
+	| "work-mode-turn"
 	| "other";
 
 /** Opaque handle for a non-destructive temporary provider-session scope. */
 export interface TemporaryProviderSessionScope {
 	readonly reason: TemporaryModelReason;
+}
+
+export interface AgentSessionFallbackRuntimeSnapshot {
+	readonly chain: ConfiguredFallbackChain;
+	readonly maxAttempts: number;
+	readonly activeIndex: number;
+	readonly attemptsUsed: number;
+	readonly skips: readonly { selector: string; reason: string }[];
+	readonly tried: readonly { selector: string; triggerClass: FallbackTriggerClass; reason: string }[];
+	readonly exhaustedForTurn: boolean;
 }
 
 interface TemporaryProviderSessionScopeRecord {
@@ -794,6 +867,21 @@ interface TemporaryProviderSessionScopeRecord {
 	thinkingLevel: ThinkingLevel | undefined;
 	fallbackController: FallbackChainController | undefined;
 	providerSessionState: Map<string, ProviderSessionState>;
+}
+
+type WorkModeLineageContinuationKind = "retry" | "profile_internal_fallback";
+
+interface WorkModeLineageContinuation {
+	readonly kind: WorkModeLineageContinuationKind;
+	readonly lineage: WorkModeTurnLeaseLineage;
+	readonly generation: number;
+}
+
+interface WorkModeTurnLineageState {
+	readonly operationId: string;
+	lineage: WorkModeTurnLeaseLineage;
+	logicalRunId?: string;
+	pending?: WorkModeLineageContinuation;
 }
 
 class RemoteCompactionFallbackHealth implements RemoteCompactionFallbackHealthHooks {
@@ -1737,12 +1825,25 @@ function agentContinueBusyRescheduleDelayMs(attempt: number): number {
 	const exponential = AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1);
 	return Math.min(exponential, AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS);
 }
+const TASK_EXECUTION_POLICY_CONTROLLER_CONFLICT_ERROR =
+	"AgentSession already owns a different task execution policy controller.";
+const TASK_EXECUTION_POLICY_CONTROLLER_DISPOSED_ERROR =
+	"Cannot bind a task execution policy controller after AgentSession disposal has started.";
 
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settings: Settings;
 	readonly notificationSessionController: NotificationSessionController | undefined;
+	#workModeTransaction: WorkModeTransaction | undefined;
+	#workModeStagedTurn: WorkModeStagedTurn | undefined;
+	#workModeLineage: WorkModeTurnLineageState | undefined;
+	#workModeAdmissionToken: TopLevelUserAdmissionToken | undefined;
+	#workModeAdmittedOperationId: string | undefined;
+	#workModeAdmissionSettled = false;
+	#workModeDispatchFenced = false;
+	#workModeEvents: WorkModeOperationEvent[] = [];
+	#workModeQualification: { readonly id: string; readonly fingerprint: string } | undefined;
 	readonly taskDepth: number;
 	readonly yieldQueue: YieldQueue;
 	// True from the start of a handoff transition through commit/rollback. While
@@ -1984,6 +2085,9 @@ export class AgentSession {
 	#providerSessionId: string | undefined;
 	#providerCacheSessionId: string | undefined;
 	#isDisposed = false;
+	#taskExecutionPolicyController: TaskExecutionPolicyController | undefined;
+	readonly #workModeScopedMutationService: Pick<ScopedConfigurationMutationService, "read" | "mutate"> | undefined;
+
 	#disposePromise: Promise<void> | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
 	readonly #toolSessionTransitionCleanups = new Set<() => Promise<void> | void>();
@@ -1999,6 +2103,11 @@ export class AgentSession {
 		// previously recorded run id rather than throwing inside the callback.
 		if (!handle) return;
 		this.#activeLogicalRunId = handle.logicalRunId;
+		const workModeLineage = this.#workModeLineage;
+		if (workModeLineage) {
+			workModeLineage.logicalRunId = String(handle.logicalRunId);
+			if (workModeLineage.pending) workModeLineage.pending = undefined;
+		}
 	}
 
 	#turnIndex = 0;
@@ -2048,6 +2157,8 @@ export class AgentSession {
 	#getMcpServerInstructions: (() => Map<string, string> | undefined) | undefined;
 	#reloadSshTool: (() => Promise<AgentTool | null>) | undefined;
 	#requestedToolNames: ReadonlySet<string> | undefined;
+	readonly #toolActivationAllowed: (toolName: string) => boolean;
+
 	#baseSystemPrompt: string[];
 	#initialWorkspaceTree: WorkspaceTree | undefined;
 	/** Throttle cache for the per-turn volatile workspace-tree scan (see #buildVolatileProjectContextMessage). */
@@ -2365,6 +2476,7 @@ export class AgentSession {
 	}
 
 	async #closeSessionAdmission(): Promise<void> {
+		await this.#settleWorkModeAdmissionBeforeGate("turn_admission_disposed");
 		this.#sessionAdmissionClosed = true;
 		const queued = this.#sessionAdmissionQueue.splice(0);
 		for (const entry of queued) {
@@ -2594,6 +2706,7 @@ export class AgentSession {
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#workModeScopedMutationService = config.workModeScopedMutationService;
 		this.#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(
 			config.workerIntegrationRequest ??
 				(async signal => {
@@ -2653,10 +2766,20 @@ export class AgentSession {
 		this.#customCommands = config.customCommands ?? [];
 		this.#skillsSettings = config.skillsSettings;
 		this.#modelRegistry = config.modelRegistry;
+		this.#workModeTransaction =
+			config.workModeTransaction ??
+			new WorkModeTransaction({
+				session: this,
+				modelRegistry: this.#modelRegistry,
+				settings: this.settings,
+				scopedMutationService: this.#workModeScopedMutationService,
+				emit: event => this.#recordWorkModeEvent(event),
+			});
 		if (config.providerSessionState) {
 			this.#providerSessionState = config.providerSessionState;
 		}
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#toolActivationAllowed = config.toolActivationAllowed ?? (() => true);
 		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
@@ -3081,10 +3204,8 @@ export class AgentSession {
 		this.#rebindProviderSessionState(scope.providerSessionState);
 		this.#defaultFallbackController = scope.fallbackController;
 		const previousEditMode = this.#resolveActiveEditMode();
-		if (scope.model) {
-			this.#setAgentModelWithReasoningContext(scope.model);
-			this.#syncAppendOnlyContext(scope.model);
-		}
+		this.#setAgentModelWithReasoningContext(scope.model);
+		this.#syncAppendOnlyContext(scope.model);
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
 		this.#pendingThinkingLevelControlSuccess = undefined;
@@ -3416,6 +3537,30 @@ export class AgentSession {
 	get isDisposed(): boolean {
 		return this.#isDisposed;
 	}
+	bindExecutionPolicyController(controller: TaskExecutionPolicyController): void {
+		if (this.#isDisposed) throw new Error(TASK_EXECUTION_POLICY_CONTROLLER_DISPOSED_ERROR);
+		const boundController = this.#taskExecutionPolicyController;
+		if (boundController === undefined) {
+			this.#taskExecutionPolicyController = controller;
+			return;
+		}
+		if (boundController !== controller) throw new Error(TASK_EXECUTION_POLICY_CONTROLLER_CONFLICT_ERROR);
+	}
+
+	getScopedConfigurationMutationService(): Pick<ScopedConfigurationMutationService, "read" | "mutate"> | undefined {
+		return this.#workModeScopedMutationService;
+	}
+
+	getExecutionPolicyController(): TaskExecutionPolicyController | undefined {
+		return this.#taskExecutionPolicyController;
+	}
+
+	#clearExecutionPolicyController(): void {
+		const controller = this.#taskExecutionPolicyController;
+		if (controller === undefined) return;
+		controller.clear();
+		this.#taskExecutionPolicyController = undefined;
+	}
 
 	registerToolSessionCleanup(cleanup: () => Promise<void> | void): () => void {
 		if (this.#isDisposed) throw new Error("Cannot register tool cleanup after session disposal has started.");
@@ -3560,6 +3705,33 @@ export class AgentSession {
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
+
+	#recordWorkModeEvent(event: WorkModeOperationEvent): void {
+		const frozenEvent = Object.freeze(event);
+		this.#workModeEvents.push(frozenEvent);
+		const state = "state" in frozenEvent ? frozenEvent.state : undefined;
+		const acceptedFingerprint = "acceptedFingerprint" in frozenEvent ? frozenEvent.acceptedFingerprint : undefined;
+		const catalog = acceptedFingerprint?.payload.catalog;
+		this.#workModeQualification =
+			frozenEvent.phase !== "turn_finalize" &&
+			(state === "ready" || state === "degraded") &&
+			acceptedFingerprint !== undefined &&
+			catalog?.presence === "present"
+				? { id: catalog.value.modeId, fingerprint: acceptedFingerprint.digest }
+				: undefined;
+		if (
+			"caseId" in frozenEvent &&
+			(frozenEvent.caseId === "turn_admission.unavailable.runtime.rollback_failed" ||
+				frozenEvent.caseId === "turn_finalize.unavailable.restore_failed")
+		) {
+			this.#workModeDispatchFenced = true;
+		}
+		this.#emit({ type: "work_mode", event: frozenEvent });
+		if ("caseId" in frozenEvent && frozenEvent.phase === "turn_admission" && frozenEvent.state === "unavailable") {
+			this.#workModeStagedTurn = undefined;
+			this.#workModeAdmissionToken = undefined;
+		}
+	}
 
 	/** Emit an event to all listeners without letting one subscriber poison lifecycle settlement. */
 	#emit(event: AgentSessionEvent): void {
@@ -4442,6 +4614,15 @@ export class AgentSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			const workModeLineage = this.#workModeLineage;
+			if (
+				workModeLineage?.logicalRunId !== undefined &&
+				activePromptHandle !== undefined &&
+				workModeLineage.logicalRunId !== String(activePromptHandle)
+			) {
+				return;
+			}
+			const finalReason = event.stopReason === "cancelled" ? "cancelled" : "completed";
 			// Cooperative mid-run maintenance interruption (issue #2035). The loop
 			// ended the run losslessly after #runMidRunMaintenance did prune/
 			// compact/promote; this handler is the SINGLE continuation owner. Resume
@@ -4451,6 +4632,7 @@ export class AgentSession {
 			// "aborted" settles without resuming; the generation guard drops the
 			// continuation if a newer prompt/abort has moved the run on.
 			if (event.stopReason === "maintenance") {
+				await this.#finalizeWorkModeForForeignSuccessor("handoff");
 				this.#lastAssistantMessage = undefined;
 				const outcome = event.maintenanceOutcome;
 				if (
@@ -4497,6 +4679,7 @@ export class AgentSession {
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				this.#resolveRetry();
+				await this.#finalizeWorkModeForForeignSuccessor(finalReason);
 				return;
 			}
 
@@ -4513,10 +4696,12 @@ export class AgentSession {
 			if (this.#skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
 				this.#skipPostTurnMaintenanceAssistantTimestamp = undefined;
 				this.#lastSuccessfulYieldToolCallId = undefined;
+				await this.#finalizeWorkModeForForeignSuccessor(finalReason);
 				return;
 			}
 
 			if (this.#assistantEndedWithSuccessfulYield(msg)) {
+				await this.#finalizeWorkModeForForeignSuccessor(finalReason);
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				if (msg.stopReason !== "error" && msg.stopReason !== "aborted" && (await this.#checkGoalCompletion(msg))) {
 					return;
@@ -4526,19 +4711,22 @@ export class AgentSession {
 			this.#lastSuccessfulYieldToolCallId = undefined;
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
+			let retryInitiated = false;
 			if (this.#isRetryableError(msg)) {
 				const transportFailure = (msg as AssistantMessage & { transportFailure?: TransportFailureFacts })
 					.transportFailure;
 				const messageScope = this.#assistantAttemptScopes.get(msg);
-				const didRetry = await this.#handleRetryableError(
+				const retryDecision = await this.#handleRetryableError(
 					msg,
 					false,
 					transportFailure,
 					messageScope?.scope ?? event.scope,
 					messageScope?.wasClean ?? false,
 				);
-				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+				retryInitiated = typeof retryDecision === "boolean" ? retryDecision : retryDecision.type === "retry";
+				if (retryInitiated) return; // Retry was initiated, don't proceed to compaction
 			}
+			if (!retryInitiated) await this.#finalizeWorkModeForForeignSuccessor(finalReason);
 			if (this.#retryAttempt > 0) {
 				// A prior retry ended on a non-retryable (terminal) message: emit
 				// the terminal retry-end and reset so observers clear retry state.
@@ -4709,6 +4897,7 @@ export class AgentSession {
 		onError?: (error: unknown) => void;
 		resourceRunId?: string;
 		maintenanceContinuation?: boolean;
+		workModeContinuation?: WorkModeLineageContinuation;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
 			? this.#reserveDeferredAgentEndForContinuation()
@@ -4763,6 +4952,26 @@ export class AgentSession {
 					if (!canContinue()) {
 						settleLease();
 						return;
+					}
+					if (options?.workModeContinuation) {
+						if (!this.#isCurrentWorkModeContinuation(options.workModeContinuation)) {
+							await this.#finalizeWorkModeForForeignSuccessor("handoff");
+							settleLease();
+							skip("queue_drained");
+							return;
+						}
+						if (this.#workModeDispatchFenced) {
+							settleLease();
+							fail(new Error("Work Mode dispatch is fenced pending recovery."));
+							return;
+						}
+					} else {
+						await this.#finalizeWorkModeForForeignSuccessor("handoff");
+						if (this.#workModeDispatchFenced) {
+							settleLease();
+							fail(new Error("Work Mode dispatch is fenced pending recovery."));
+							return;
+						}
 					}
 					try {
 						if (!options?.skipCompactionCheck) {
@@ -6201,6 +6410,7 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
+		this.#clearExecutionPolicyController();
 	}
 	/**
 	 * Strict writer close for ACP session delete. On the first attempt it flushes
@@ -6936,7 +7146,15 @@ export class AgentSession {
 			nextSelectedDiscoveredBuiltinToolNames?: string[];
 		},
 	): Promise<void> {
-		toolNames = [...new Set([...toolNames.map(name => name.toLowerCase()), ...this.#mandatoryMCPToolNames])];
+		toolNames = [...new Set([...toolNames.map(name => name.toLowerCase()), ...this.#mandatoryMCPToolNames])].filter(
+			name => {
+				try {
+					return this.#toolActivationAllowed(name);
+				} catch {
+					return false;
+				}
+			},
+		);
 		const previousSelectedMCPToolNames = options?.previousSelectedMCPToolNames ?? this.getSelectedMCPToolNames();
 		const previousSelectedDiscoveredBuiltinToolNames =
 			options?.previousSelectedDiscoveredBuiltinToolNames ?? this.#getSelectedDiscoveredBuiltinToolNames();
@@ -7983,6 +8201,13 @@ export class AgentSession {
 	#attachAskTool(): void {
 		const askTool = this.#toolRegistry.get("ask");
 		if (!askTool || this.getActiveToolNames().includes(askTool.name)) return;
+		let allowed = false;
+		try {
+			allowed = this.#toolActivationAllowed(askTool.name);
+		} catch {
+			return;
+		}
+		if (!allowed) return;
 		this.#setGuardedAgentTools([...this.agent.state.tools, askTool]);
 		this.#invalidateDiscoveryCaches();
 		void this.refreshBaseSystemPrompt().catch(error => {
@@ -8477,7 +8702,15 @@ export class AgentSession {
 				: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
 			if (deepInterviewUserIntentEpoch !== undefined)
 				this.#deepInterviewGenuineUserMessageEpochs.set(message, deepInterviewUserIntentEpoch);
-			await this.refreshGjcSubskillTools();
+			const workModeAdmissionToken = this.#claimWorkModeAdmissionToken(message, admissionGeneration);
+			try {
+				await this.refreshGjcSubskillTools();
+			} catch (error) {
+				if (workModeAdmissionToken && !this.#workModeAdmissionSettled) {
+					await this.#settleWorkModeAdmissionBeforeGate("turn_admission_setup_failed");
+				}
+				throw error;
+			}
 
 			if (eagerTodoPrelude?.toolChoice) {
 				this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
@@ -8491,6 +8724,7 @@ export class AgentSession {
 					prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
 					admissionLease: admission,
 					resetRetryReplaySafety: true,
+					workModeAdmissionToken,
 				});
 			} finally {
 				// Clean up residual eager-todo directive if the prompt never consumed it
@@ -8638,6 +8872,123 @@ export class AgentSession {
 		});
 	}
 
+	#claimWorkModeAdmissionToken(message: AgentMessage, generation: number): TopLevelUserAdmissionToken | undefined {
+		const staged = this.#workModeStagedTurn;
+		if (
+			!staged ||
+			message.role !== "user" ||
+			!("attribution" in message) ||
+			message.attribution !== "user" ||
+			staged.targetEligibleUserAdmissionGeneration !== generation ||
+			this.#workModeAdmissionToken
+		) {
+			return undefined;
+		}
+		const token = Object.freeze({
+			tokenId: `work-mode-token-${Snowflake.next()}`,
+			operationId: staged.operationId,
+			targetEligibleUserAdmissionGeneration: generation,
+		});
+		this.#workModeAdmissionToken = token;
+		this.#workModeAdmissionSettled = false;
+		return token;
+	}
+
+	async #admitStagedWorkModeAtFinalDispatch(token: TopLevelUserAdmissionToken): Promise<void> {
+		if (this.#workModeAdmissionSettled || token !== this.#workModeAdmissionToken) return;
+		const staged = this.#workModeStagedTurn;
+		if (!staged || staged.operationId !== token.operationId || !this.#workModeTransaction)
+			throw new Error("Work Mode turn admission was not accepted.");
+		const event = await this.#workModeTransaction.admitTurn(staged, {
+			admissionTokenId: token.tokenId,
+			rootLogicalRunId: String(this.#activeLogicalRunId ?? `session:${this.sessionId}`),
+			targetGeneration: token.targetEligibleUserAdmissionGeneration,
+		});
+		const readyAdmission = "state" in event && (event.state === "ready" || event.state === "degraded");
+		const ownershipRetained =
+			!this.#workModeAdmissionSettled &&
+			token === this.#workModeAdmissionToken &&
+			this.#workModeStagedTurn === staged;
+		if (readyAdmission && !ownershipRetained) {
+			const lease = this.#workModeTransaction.getTurnLease(staged.operationId);
+			if (lease) {
+				const reason = this.#isDisposed ? "disposed" : this.#handoffTransitionActive ? "handoff" : "cancelled";
+				await this.#workModeTransaction.finalizeTurn(staged.operationId, reason);
+			}
+			return;
+		}
+		this.#workModeAdmissionSettled = true;
+		if (readyAdmission) {
+			const lease = this.#workModeTransaction.getTurnLease(staged.operationId);
+			if (!lease) throw new Error("Work Mode turn admission lease is unavailable.");
+			this.#workModeAdmittedOperationId = staged.operationId;
+			this.#workModeLineage = { operationId: staged.operationId, lineage: lease.lineage };
+			return;
+		}
+		throw new Error("Work Mode turn admission was not accepted.");
+	}
+
+	async #settleWorkModeAdmissionBeforeGate(
+		reason:
+			| "turn_admission_cancelled"
+			| "turn_admission_handoff_cancelled"
+			| "turn_admission_disposed"
+			| "turn_admission_setup_failed"
+			| "preflight_unexpected",
+	): Promise<void> {
+		this.#workModeQualification = undefined;
+		const token = this.#workModeAdmissionToken;
+		const staged = this.#workModeStagedTurn;
+		if (!token || !staged || this.#workModeAdmissionSettled || !this.#workModeTransaction) return;
+		this.#workModeAdmissionSettled = true;
+		this.#workModeStagedTurn = undefined;
+		this.#workModeTransaction.settlePreGate(staged, reason, token.tokenId);
+		this.#workModeAdmissionToken = undefined;
+	}
+
+	#retainWorkModeContinuation(kind: WorkModeLineageContinuationKind): WorkModeLineageContinuation | undefined {
+		const state = this.#workModeLineage;
+		const transaction = this.#workModeTransaction;
+		if (!state || !transaction || state.pending) return undefined;
+		if (state.lineage.rootAdmissionGeneration !== this.#promptGeneration) return undefined;
+		const lineage: WorkModeTurnLeaseLineage = {
+			...state.lineage,
+			continuationEpoch: state.lineage.continuationEpoch + 1,
+		};
+		if (!transaction.isValidTurnLineage(state.operationId, lineage, kind)) return undefined;
+		if (!transaction.retainTurnLineage(state.operationId, lineage, kind)) return undefined;
+		const continuation: WorkModeLineageContinuation = {
+			kind,
+			lineage,
+			generation: this.#promptGeneration,
+		};
+		state.lineage = lineage;
+		state.pending = continuation;
+		return continuation;
+	}
+
+	#isCurrentWorkModeContinuation(continuation: WorkModeLineageContinuation): boolean {
+		const state = this.#workModeLineage;
+		return (
+			state?.pending === continuation &&
+			state.lineage === continuation.lineage &&
+			state.operationId === continuation.lineage.operationId &&
+			continuation.generation === this.#promptGeneration &&
+			this.#workModeTransaction?.getTurnLease(state.operationId) !== undefined
+		);
+	}
+
+	async #finalizeWorkModeForForeignSuccessor(
+		reason: "completed" | "error" | "aborted" | "cancelled" | "handoff" | "disposed",
+	): Promise<void> {
+		const state = this.#workModeLineage;
+		if (!state || !this.#workModeTransaction?.getTurnLease(state.operationId)) {
+			if (state && !this.#workModeTransaction?.getTurnLease(state.operationId)) this.#workModeLineage = undefined;
+			return;
+		}
+		await this.finalizeWorkModeTurn(reason);
+	}
+
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
@@ -8649,6 +9000,7 @@ export class AgentSession {
 			skipPostPromptRecoveryWait?: boolean;
 			predecessorAgentEndHold?: symbol;
 			admissionLease?: SessionAdmissionLease;
+			workModeAdmissionToken?: TopLevelUserAdmissionToken;
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 			onFinalPreflight?: (context: { hasPendingNextTurnMessages: boolean }) => Promise<boolean>;
 			resetRetryReplaySafety?: boolean;
@@ -8671,6 +9023,11 @@ export class AgentSession {
 		let hindsightRecall: string | undefined;
 		try {
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
+			await this.#finalizeWorkModeForForeignSuccessor("handoff");
+			if (this.#workModeDispatchFenced) throw new Error("Work Mode dispatch is fenced pending recovery.");
+			if (options?.workModeAdmissionToken) {
+				await this.#admitStagedWorkModeAtFinalDispatch(options.workModeAdmissionToken);
+			}
 			if (options?.resetRetryReplaySafety) this.#resetRetryReplaySafety();
 			if (message.role === "user") {
 				await this.#resetDefaultFallbackForNewTurn();
@@ -8884,10 +9241,12 @@ export class AgentSession {
 			};
 			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 			else options?.onPreflightAccepted?.();
+			if (this.#workModeDispatchFenced) throw new Error("Work Mode dispatch is fenced pending recovery.");
 			if (options?.onFinalPreflight && !(await options.onFinalPreflight({ hasPendingNextTurnMessages }))) {
 				this.#resetInjectedContextSignatures();
 				return;
 			}
+			if (this.#workModeDispatchFenced) throw new Error("Work Mode dispatch is fenced pending recovery.");
 			this.#throwIfPromptPreflightCancelled(generation, preflightSignal);
 			if (pendingNextTurnMessageCount > 0) {
 				this.#pendingNextTurnMessages.splice(0, pendingNextTurnMessageCount);
@@ -8907,6 +9266,24 @@ export class AgentSession {
 				await this.#waitForPostPromptRecovery();
 			}
 		} catch (error) {
+			if (
+				options?.workModeAdmissionToken &&
+				this.#workModeAdmissionSettled &&
+				this.#workModeStagedTurn &&
+				this.#workModeTransaction?.getTurnLease(this.#workModeStagedTurn.operationId)
+			) {
+				await this.finalizeWorkModeTurn("error");
+			}
+			if (options?.workModeAdmissionToken && !this.#workModeAdmissionSettled) {
+				const reason = this.#isDisposed
+					? "turn_admission_disposed"
+					: this.#handoffTransitionActive
+						? "turn_admission_handoff_cancelled"
+						: isPromptPreflightCancelledError(error)
+							? "turn_admission_cancelled"
+							: "turn_admission_setup_failed";
+				await this.#settleWorkModeAdmissionBeforeGate(reason);
+			}
 			// Session identity changes historically cancel local setup silently. Only SDK
 			// submissions provide an acceptance callback and require an explicit terminal
 			// preflight failure for their remote request authority.
@@ -9174,6 +9551,8 @@ export class AgentSession {
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
+		await this.#finalizeWorkModeForForeignSuccessor("handoff");
+		if (this.#workModeDispatchFenced) throw new Error("Work Mode dispatch is fenced pending recovery.");
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText));
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -9209,6 +9588,8 @@ export class AgentSession {
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
+		await this.#finalizeWorkModeForForeignSuccessor("handoff");
+		if (this.#workModeDispatchFenced) throw new Error("Work Mode dispatch is fenced pending recovery.");
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		this.#followUpMessages.push(this.#createQueuedDisplayEntry(displayText));
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -10208,7 +10589,18 @@ export class AgentSession {
 							: message.role === "user"
 								? this.#getUserMessageText(message)
 								: text;
-					await this.refreshGjcSubskillTools();
+					const workModeAdmissionToken =
+						!selected && message.role === "user"
+							? this.#claimWorkModeAdmissionToken(message, this.#promptGeneration)
+							: undefined;
+					try {
+						await this.refreshGjcSubskillTools();
+					} catch (cause) {
+						if (workModeAdmissionToken && !this.#workModeAdmissionSettled) {
+							await this.#settleWorkModeAdmissionBeforeGate("turn_admission_setup_failed");
+						}
+						throw cause;
+					}
 					if (message.role === "custom") await this.#syncSkillPromptActiveStateSafely(message, true);
 					if (selected) {
 						const displayTag = message.role === "custom" ? readPendingDisplayTag(message.details) : undefined;
@@ -10220,6 +10612,7 @@ export class AgentSession {
 						await this.#promptWithMessage(message, messageText, {
 							admissionLease: admission,
 							resetRetryReplaySafety: true,
+							workModeAdmissionToken,
 							onRunAccepted: () => {
 								runAccepted = true;
 								if (selected) {
@@ -10603,6 +10996,64 @@ export class AgentSession {
 	// Model Management
 	// =========================================================================
 
+	/** Preview a curated Work Mode without mutating runtime or durable configuration. */
+	async previewWorkMode(modeId: string): Promise<WorkModePreviewResult> {
+		if (!this.#workModeTransaction) throw new Error("Work Mode transaction is unavailable.");
+		return await this.#workModeTransaction.preflight(modeId);
+	}
+
+	/** Apply a Work Mode through the producer-owned transaction. */
+	async applyWorkMode(request: WorkModeApplicationRequest): Promise<WorkModeOperationEvent> {
+		this.#workModeQualification = undefined;
+		if (!this.#workModeTransaction) throw new Error("Work Mode transaction is unavailable.");
+		return await this.#workModeTransaction.apply(request);
+	}
+
+	/** Stage a Work Mode for the next eligible direct user turn. */
+	async stageWorkMode(request: WorkModeApplicationRequest): Promise<WorkModeOperationEvent> {
+		this.#workModeQualification = undefined;
+		if (!this.#workModeTransaction) throw new Error("Work Mode transaction is unavailable.");
+		const event = await this.#workModeTransaction.stageTurn({
+			...request,
+			targetEligibleUserAdmissionGeneration: this.#promptGeneration,
+		});
+		const operationId = request.operationId ?? ("operationId" in event ? event.operationId : undefined);
+		this.#workModeStagedTurn = operationId ? this.#workModeTransaction.getStagedTurn(operationId) : undefined;
+		return event;
+	}
+
+	getWorkModeEvents(): readonly WorkModeOperationEvent[] {
+		return Object.freeze([...this.#workModeEvents]);
+	}
+
+	getCurrentWorkModeQualification(): { readonly id: string; readonly fingerprint: string } | undefined {
+		const qualification = this.#workModeQualification;
+		return qualification === undefined ? undefined : Object.freeze({ ...qualification });
+	}
+
+	getWorkModeStagedTurn(): WorkModeStagedTurn | undefined {
+		const staged = this.#workModeStagedTurn;
+		return staged && this.#workModeTransaction?.getStagedTurn(staged.operationId) ? staged : undefined;
+	}
+
+	async finalizeWorkModeTurn(
+		reason: "completed" | "error" | "aborted" | "cancelled" | "handoff" | "disposed",
+	): Promise<WorkModeTurnFinalizeEvent | undefined> {
+		const operationId = this.#workModeAdmittedOperationId ?? this.#workModeStagedTurn?.operationId;
+		if (!this.#workModeTransaction || !operationId) {
+			this.#workModeQualification = undefined;
+			return undefined;
+		}
+		const event = await this.#workModeTransaction.finalizeTurn(operationId, reason);
+		this.#workModeQualification = undefined;
+		this.#workModeStagedTurn = undefined;
+		this.#workModeAdmittedOperationId = undefined;
+		this.#workModeAdmissionToken = undefined;
+		this.#workModeAdmissionSettled = false;
+		this.#workModeLineage = undefined;
+		return event;
+	}
+
 	/**
 	 * Set model directly.
 	 * Validates API key, saves to session and settings.
@@ -10713,10 +11164,41 @@ export class AgentSession {
 		this.#defaultFallbackExhaustedLastTurn = false;
 	}
 
-	/**
-	 * Seed default fallback state after guarded auth-aware model resolution skips chain entries.
-	 * The configured chain's role, origin, and identity are retained by the controller.
-	 */
+	/** Capture in-memory fallback-controller state for a temporary Work Mode activation. */
+	getDefaultFallbackRuntimeSnapshot(): AgentSessionFallbackRuntimeSnapshot {
+		const controller = this.#defaultFallbackChain();
+		return Object.freeze({
+			chain: Object.freeze({ ...controller.chain, entries: Object.freeze([...controller.chain.entries]) }),
+			maxAttempts: controller.maxAttempts,
+			activeIndex: controller.activeIndex,
+			attemptsUsed: controller.attemptsUsed,
+			skips: Object.freeze(controller.skips.map(skip => Object.freeze({ ...skip }))),
+			tried: Object.freeze(controller.tried.map(failure => Object.freeze({ ...failure }))),
+			exhaustedForTurn: controller.exhaustedForTurn,
+		});
+	}
+
+	setDefaultFallbackRuntimeChain(
+		chain: readonly string[],
+		activeIndex: number,
+		skips: readonly { selector: string; reason: string }[],
+	): void {
+		this.#defaultFallbackController = new FallbackChainController(
+			{ role: "default", entries: [...chain], origin: "work-mode-turn", explicitHead: true },
+			this.settings.get("fallback.maxAttempts"),
+		);
+		this.#defaultFallbackController.seedResolution(activeIndex, [...skips]);
+	}
+
+	restoreDefaultFallbackRuntimeSnapshot(snapshot: AgentSessionFallbackRuntimeSnapshot): void {
+		this.#defaultFallbackController = new FallbackChainController(snapshot.chain, snapshot.maxAttempts);
+		this.#defaultFallbackController.activeIndex = snapshot.activeIndex;
+		this.#defaultFallbackController.attemptsUsed = snapshot.attemptsUsed;
+		this.#defaultFallbackController.skips = [...snapshot.skips];
+		this.#defaultFallbackController.tried = snapshot.tried.map(failure => ({ ...failure }));
+		this.#defaultFallbackController.exhaustedForTurn = snapshot.exhaustedForTurn;
+	}
+
 	seedDefaultFallbackResolution(activeIndex: number, skips: Array<{ selector: string; reason: string }>): void {
 		const controller = this.#defaultFallbackChain();
 		controller.seedResolution(activeIndex, skips);
@@ -13337,6 +13819,7 @@ export class AgentSession {
 	}
 
 	#setAgentModelWithReasoningContext(model: Model | undefined): void {
+		this.#workModeQualification = undefined;
 		this.#reasoningControlContextGeneration++;
 		this.agent.setModel(model);
 	}
@@ -14947,17 +15430,22 @@ export class AgentSession {
 			const to = selector;
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
 			this.setThinkingLevel(resolved.explicitThinkingLevel ? resolved.thinkingLevel : this.thinkingLevel);
+			const safeFrom = sanitizeModelFallbackSelector(from);
+			const safeTo = sanitizeModelFallbackSelector(to);
+			const safeReason = sanitizeModelFallbackReason(reason);
 			if (from !== to) {
 				this.#emit({
 					type: "model_fallback_switched",
 					eventId: crypto.randomUUID(),
-					from,
-					to,
-					reason,
-					role:
+					from: safeFrom,
+					to: safeTo,
+					reason: safeReason,
+					role: sanitizeModelFallbackLabel(
 						controller.chain.origin === "subagent"
 							? (controller.chain.identity ?? controller.chain.role)
 							: controller.chain.role,
+						"unknown",
+					),
 					scope: controller.chain.origin === "subagent" ? "subagent-call" : "session",
 					activeIndex: controller.activeIndex,
 					chainLength: controller.chain.entries.length,
@@ -14977,13 +15465,15 @@ export class AgentSession {
 		const event: Extract<AgentSessionEvent, { type: "model_fallback_switched" }> = {
 			type: "model_fallback_switched",
 			eventId: crypto.randomUUID(),
-			from,
-			to,
-			reason: "resolution",
-			role:
+			from: sanitizeModelFallbackSelector(from),
+			to: sanitizeModelFallbackSelector(to),
+			reason: sanitizeModelFallbackReason("resolution"),
+			role: sanitizeModelFallbackLabel(
 				controller.chain.origin === "subagent"
 					? (controller.chain.identity ?? controller.chain.role)
 					: controller.chain.role,
+				"unknown",
+			),
 			scope: controller.chain.origin === "subagent" ? "subagent-call" : "session",
 			activeIndex: controller.activeIndex,
 			chainLength: controller.chain.entries.length,
@@ -14997,8 +15487,19 @@ export class AgentSession {
 	}
 
 	#fallbackExhaustionError(controller: FallbackChainController): string {
-		const tried = controller.tried.map(failure => `${failure.selector} (${failure.reason})`).join(", ") || "none";
-		const skipped = controller.skips.map(skip => `${skip.selector} (${skip.reason})`).join(", ") || "none";
+		const tried =
+			controller.tried
+				.map(
+					failure =>
+						`${sanitizeModelFallbackSelector(failure.selector)} (${sanitizeModelFallbackReason(failure.reason)})`,
+				)
+				.join(", ") || "none";
+		const skipped =
+			controller.skips
+				.map(
+					skip => `${sanitizeModelFallbackSelector(skip.selector)} (${sanitizeModelFallbackReason(skip.reason)})`,
+				)
+				.join(", ") || "none";
 		return `Model fallback chain exhausted; models tried: ${tried}; models skipped: ${skipped}`;
 	}
 
@@ -15203,6 +15704,14 @@ export class AgentSession {
 			this.#modelRegistry.suppressSelector(failedSelector, Date.now() + trigger.retryAfterMs);
 		}
 
+		const workModeWasActive = this.#workModeLineage !== undefined;
+		const workModeContinuation = this.#retainWorkModeContinuation(
+			managedFallback ? "profile_internal_fallback" : "retry",
+		);
+		if (workModeWasActive && !workModeContinuation) await this.#finalizeWorkModeForForeignSuccessor("handoff");
+		if (this.#workModeDispatchFenced) {
+			return managedOutcome ? { type: "terminal", terminal: { stopReason: "error", messages: [message] } } : false;
+		}
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
 			if (managedFallback && !credentialRotated) await this.#markFailedCredential(trigger);
 			let advanced = outcome !== "advance";
@@ -15216,7 +15725,7 @@ export class AgentSession {
 			}
 			if (!advanced) {
 				const errorMessage = resolutionError
-					? `${this.#fallbackExhaustionError(controller)}; resolution failed: ${resolutionError instanceof Error ? resolutionError.message : String(resolutionError)}`
+					? `${this.#fallbackExhaustionError(controller)}; resolution failed: unknown`
 					: this.#fallbackExhaustionError(controller);
 				this.emitNotice("error", errorMessage, "fallback");
 				if (managedOutcome && ownership) {
@@ -15229,6 +15738,7 @@ export class AgentSession {
 				controller.resetSticky();
 				this.#retryAttempt = 0;
 				this.#resolveRetry();
+				await this.#finalizeWorkModeForForeignSuccessor("handoff");
 				return;
 			}
 
@@ -15293,6 +15803,7 @@ export class AgentSession {
 						finalError: "Retry cancelled",
 					});
 					this.#resolveRetry();
+					await this.#finalizeWorkModeForForeignSuccessor("cancelled");
 					return;
 				}
 			}
@@ -15311,12 +15822,26 @@ export class AgentSession {
 					finalError: "Retry cancelled",
 				});
 				this.#resolveRetry();
+				await this.#finalizeWorkModeForForeignSuccessor("cancelled");
 				return;
 			}
 			if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
 			this.#retryNowRequested = false;
 
 			if (managedOutcome) {
+				if (workModeContinuation && !this.#isCurrentWorkModeContinuation(workModeContinuation)) {
+					const attempt = this.#retryAttempt;
+					this.#retryAttempt = 0;
+					await this.#emitSessionEvent({
+						type: "auto_retry_end",
+						success: false,
+						attempt,
+						finalError: "Retry continuation was superseded",
+					});
+					this.#resolveRetry();
+					await this.#finalizeWorkModeForForeignSuccessor("handoff");
+					return;
+				}
 				try {
 					await this.#checkEstimatedContextBeforePrompt();
 					if (ownershipCancelled()) {
@@ -15329,9 +15854,13 @@ export class AgentSession {
 							finalError: "Retry continuation was superseded",
 						});
 						this.#resolveRetry();
+						await this.#finalizeWorkModeForForeignSuccessor("handoff");
 						return;
 					}
-					await this.agent.continue(this.#managedFallbackPromptOptions());
+					await this.agent.continue({
+						...this.#managedFallbackPromptOptions(),
+						onRunAccepted: handle => this.#acceptRunHandle(handle),
+					});
 					return;
 				} catch (error) {
 					const attempt = this.#retryAttempt;
@@ -15346,6 +15875,7 @@ export class AgentSession {
 					} finally {
 						this.#resolveRetry();
 					}
+					await this.#finalizeWorkModeForForeignSuccessor("error");
 					throw error;
 				}
 			}
@@ -15357,8 +15887,15 @@ export class AgentSession {
 				allowDuringCancelAndSubmit: true,
 				suppressPredecessorAgentEnd: resourceRunId !== undefined,
 				resourceRunId,
-				onError: () => this.#failRetryRecovery("Retry continuation failed to start"),
-				onSkip: () => this.#failRetryRecovery("Retry continuation was superseded"),
+				onError: () => {
+					void this.#finalizeWorkModeForForeignSuccessor("error");
+					this.#failRetryRecovery("Retry continuation failed to start");
+				},
+				onSkip: () => {
+					void this.#finalizeWorkModeForForeignSuccessor("handoff");
+					this.#failRetryRecovery("Retry continuation was superseded");
+				},
+				workModeContinuation,
 			});
 		};
 

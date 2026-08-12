@@ -24,7 +24,6 @@ function snapshot(over: Partial<JobsSnapshot> = {}): JobsSnapshot {
 function makeOverlayController(over: Partial<JobsSnapshot> = {}) {
 	const calls: string[] = [];
 	const controller: JobsOverlayController = {
-		acknowledgeFailures: () => calls.push("ack"),
 		getSnapshot: () => snapshot(over),
 		getMonitorOutput: () => "line one\nlast line\n",
 		cancelMonitor: id => {
@@ -157,7 +156,7 @@ describe("jobs overlay model", () => {
 		harness.overlay.handleInput("\x1b");
 
 		expect(harness.closed).toBe(1);
-		expect(harness.calls).toEqual(["ack"]);
+		expect(harness.calls).toEqual([]);
 	});
 
 	test("JobsOverlayComponent confirm accepts y and returns to list", () => {
@@ -174,7 +173,7 @@ describe("jobs overlay model", () => {
 		expect(harness.overlay.render(100).join("\n")).toContain("Yes, cancel this monitor");
 		harness.overlay.handleInput("y");
 
-		expect(harness.calls).toEqual(["ack", "cancel:m1"]);
+		expect(harness.calls).toEqual(["cancel:m1"]);
 		expect(harness.overlay.render(100).join("\n")).toContain("monitor · tail server.log");
 	});
 
@@ -201,7 +200,7 @@ describe("jobs overlay model", () => {
 			harness.overlay.handleInput("\n");
 			harness.overlay.handleInput(key);
 
-			expect(harness.calls).toEqual(["ack"]);
+			expect(harness.calls).toEqual([]);
 			expect(harness.overlay.render(100).join("\n")).toContain("Delete this cron");
 		}
 	});

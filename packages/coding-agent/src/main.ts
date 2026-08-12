@@ -32,6 +32,7 @@ import { activateModelProfile, ModelProfileCredentialError } from "./config/mode
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
+import { runRetiredImageSecretGate } from "./config/retired-image-secret-gate";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
@@ -1302,6 +1303,7 @@ export async function runRootCommand(
 		const managedAgentDir = parsedArgs.sessionDir
 			? undefined
 			: (deps.resolveManagedAgentDirForScope ?? resolveManagedAgentDirForScope)(resumeCwd);
+		await runRetiredImageSecretGate({ cwd: resumeCwd, agentDir: managedAgentDir ?? getAgentDir() });
 		const sessions = parsedArgs.sessionDir
 			? await (deps.listForResumePickerReadOnly ?? SessionManager.listForResumePickerReadOnly)(
 					resumeCwd,
@@ -1360,30 +1362,11 @@ export async function runRootCommand(
 	}
 
 	const notifs: (InteractiveModeNotify | null)[] = [];
-
-	// Create AuthStorage and ModelRegistry upfront
-	const authStorage = await logger.time("discoverModels", deps.discoverAuthStorage ?? discoverAuthStorage);
-	const modelRegistry = new ModelRegistry(authStorage);
+	const cwd = getProjectDir();
+	const agentDir = getAgentDir();
 
 	if (parsedArgs.version) {
 		process.stdout.write(`${VERSION}\n`);
-		process.exit(0);
-	}
-
-	if (parsedArgs.listModels !== undefined) {
-		await modelRegistry.refresh("online-if-uncached");
-		const searchPattern = typeof parsedArgs.listModels === "string" ? parsedArgs.listModels : undefined;
-		await runListModelsCommand({
-			modelRegistry,
-			cwd: getProjectDir(),
-			extensionFactories: [
-				{ factory: getBundledGrokBuildExtensionFactory(), name: BUNDLED_GROK_BUILD_EXTENSION_ID },
-			],
-			settingsExtensions: [],
-			disabledExtensionIds: [],
-			disableExtensionDiscovery: true,
-			searchPattern,
-		});
 		process.exit(0);
 	}
 
@@ -1401,9 +1384,31 @@ export async function runRootCommand(
 		process.exit(0);
 	}
 
-	const cwd = getProjectDir();
+	await runRetiredImageSecretGate({ cwd, agentDir });
+
+	// Create AuthStorage and ModelRegistry upfront
+	const authStorage = await logger.time("discoverModels", deps.discoverAuthStorage ?? discoverAuthStorage, agentDir);
+	const modelRegistry = new ModelRegistry(authStorage);
+
+	if (parsedArgs.listModels !== undefined) {
+		await modelRegistry.refresh("online-if-uncached");
+		const searchPattern = typeof parsedArgs.listModels === "string" ? parsedArgs.listModels : undefined;
+		await runListModelsCommand({
+			modelRegistry,
+			cwd,
+			extensionFactories: [
+				{ factory: getBundledGrokBuildExtensionFactory(), name: BUNDLED_GROK_BUILD_EXTENSION_ID },
+			],
+			settingsExtensions: [],
+			disabledExtensionIds: [],
+			disableExtensionDiscovery: true,
+			searchPattern,
+		});
+		process.exit(0);
+	}
 	const settingsInstance =
-		deps.settings ?? (await logger.time("settings:init", deps.initializeSettings ?? Settings.init, { cwd }));
+		deps.settings ??
+		(await logger.time("settings:init", deps.initializeSettings ?? Settings.init, { cwd, agentDir }));
 	if (parsedArgs.mode === "acp") {
 		applyAcpDefaultSettingOverrides(settingsInstance);
 	}

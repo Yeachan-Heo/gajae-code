@@ -14,17 +14,16 @@ import {
 	truncateToWidth,
 } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
+import { isAuthenticatedOrKeyless } from "../../config/model-auth";
 import {
 	getModelProfilePresentation,
 	groupModelProfilesForPresetLanding,
 	type ModelProfileDefinition,
+	type ModelProfileProviderReadiness,
+	resolveModelProfileProviderReadiness,
 } from "../../config/model-profiles";
 import type { GjcModelAssignmentTargetId, ModelRegistry } from "../../config/model-registry";
-import {
-	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
-	GJC_MODEL_ASSIGNMENT_TARGETS,
-	isAuthenticated,
-} from "../../config/model-registry";
+import { GJC_MODEL_ASSIGNMENT_TARGET_IDS, GJC_MODEL_ASSIGNMENT_TARGETS } from "../../config/model-registry";
 import {
 	formatModelSelectorValue,
 	resolveConfiguredModelPatterns,
@@ -36,17 +35,23 @@ import type { ModelProfileConfig } from "../../config/models-config-schema";
 import { getProviderAuthHealth } from "../../config/provider-auth-health";
 import { compareRankedProviders, type ProviderAuthState } from "../../config/provider-ranking";
 import type { Settings } from "../../config/settings";
+import type { WorkModeOperationEvent, WorkModePreviewResult } from "../../config/work-mode-result";
+import {
+	createWorkModeScopeSelectionView,
+	renderWorkModePreviewLines,
+	renderWorkModeScopeLines,
+	type WorkModePreviewView,
+	type WorkModeScope,
+	type WorkModeSelectorCard,
+} from "../../config/work-mode-view";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
 import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
-import { getConfiguredImageModel } from "../../tools/image-gen";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 
-function makeInvertedBadge(label: string, color: ThemeColor): string {
-	const fgAnsi = theme.getFgAnsi(color);
-	const bgAnsi = fgAnsi.replace(/\x1b\[38;/g, "\x1b[48;");
-	return `${bgAnsi}\x1b[30m ${label} \x1b[39m\x1b[49m`;
+function makeRoleBadge(label: string, color: ThemeColor): string {
+	return theme.fg(color, `[${label}]`);
 }
 
 function normalizeSearchText(value: string): string {
@@ -145,6 +150,13 @@ export type ModelSelectorSelection =
 			profileName: string;
 	  }
 	| {
+			kind: "workMode";
+			modeId: string;
+			scope: WorkModeScope;
+			preview: WorkModePreviewView;
+			event: WorkModeOperationEvent;
+	  }
+	| {
 			kind: "imageGeneration";
 	  };
 
@@ -215,8 +227,14 @@ interface PresetImageGenerationRow {
 	kind: "imageGeneration";
 }
 
+interface PresetWorkModeRow {
+	kind: "workMode";
+	card: WorkModeSelectorCard;
+}
+
 type PresetLandingRow =
 	| PresetGroupRow
+	| PresetWorkModeRow
 	| PresetProfileRow
 	| PresetCreateRow
 	| PresetCreateUnavailableRow
@@ -227,8 +245,22 @@ type PresetLandingRow =
 // Stable logical identity for a preset landing row, independent of its current
 // list position. Used to relocate the cursor after the expanded group changes so
 // navigation does not silently overshoot the destination group header/profiles.
+export interface ModelSelectorWorkModeAdapter {
+	readonly cards: readonly WorkModeSelectorCard[];
+	readonly preview?: (
+		modeId: string,
+	) => Promise<{ readonly result: WorkModePreviewResult; readonly view: WorkModePreviewView }>;
+	readonly apply?: (
+		modeId: string,
+		scope: WorkModeScope,
+		preview: WorkModePreviewResult,
+	) => Promise<WorkModeOperationEvent>;
+}
+
 function presetRowIdentity(row: PresetLandingRow): string {
 	switch (row.kind) {
+		case "workMode":
+			return `workMode:${row.card.modeId}`;
 		case "group":
 			return `group:${row.groupId}`;
 		case "profile":
@@ -260,8 +292,14 @@ function isPrintableCharacter(keyData: string): boolean {
 	return keyData.length === 1 && keyData >= " " && keyData !== "\x7f";
 }
 
-function profileRequiredProviders(profile: ModelProfileDefinition): string[] {
-	return [...new Set(profile.requiredProviders)].sort((a, b) => a.localeCompare(b));
+function profileProviderIds(profile: ModelProfileDefinition): string[] {
+	return [...new Set([...profile.requiredProviders, ...(profile.alternativeProviderGroups ?? []).flat()])].sort(
+		(a, b) => a.localeCompare(b),
+	);
+}
+
+function sanitizeProviderId(providerId: string): string {
+	return sanitizeText(providerId).replace(/\s+/g, " ").trim() || "unknown provider";
 }
 
 function isInheritedRoleSelector(value: string): boolean {
@@ -372,8 +410,19 @@ export class ModelSelectorComponent extends Container {
 	#selectedActionIndex: number = 0;
 	#pendingThinkingChoice?: PendingThinkingChoice;
 	#selectedThinkingIndex: number = 0;
-	#assignmentState: "idle" | "assigning" = "idle";
+	#selectionInFlight?: Promise<void>;
 	#closeAfterAssignment = false;
+	#workModeAdapter?: ModelSelectorWorkModeAdapter;
+	#workModePreview?: {
+		readonly modeId: string;
+		readonly result: WorkModePreviewResult;
+		readonly view: WorkModePreviewView;
+	};
+	#workModeScopeMenuOpen = false;
+	#workModeScopeIndex = 0;
+	#workModeSelectionInFlight?: Promise<void>;
+	#initialWorkModeId?: string;
+	#workModeGeneration = 0;
 
 	// Preset landing state
 	#viewMode: ModelSelectorViewMode = "presets";
@@ -384,6 +433,8 @@ export class ModelSelectorComponent extends Container {
 	#presetScopeIndex: number = 0;
 	#providerAuthById = new Map<string, boolean>();
 	#providerAuthPending: boolean = false;
+	#providerAuthUnavailable = new Set<string>();
+
 	#presetLoginHint?: string;
 	#authSessionId?: string;
 
@@ -402,6 +453,8 @@ export class ModelSelectorComponent extends Container {
 		options?: {
 			temporaryOnly?: boolean;
 			initialSearchInput?: string;
+			workModeAdapter?: ModelSelectorWorkModeAdapter;
+			initialWorkModeId?: string;
 			sessionId?: string;
 			isFastForProvider?: (provider?: string) => boolean;
 			isFastForSubagentProvider?: (provider?: string) => boolean;
@@ -419,6 +472,8 @@ export class ModelSelectorComponent extends Container {
 		this.#scopedModels = scopedModels;
 		this.#onSelectCallback = onSelect;
 		this.#onCancelCallback = onCancel;
+		this.#workModeAdapter = options?.workModeAdapter;
+		this.#initialWorkModeId = options?.initialWorkModeId;
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
 		this.#currentModel = _currentModel;
@@ -434,7 +489,11 @@ export class ModelSelectorComponent extends Container {
 			options?.isCurrentModelFastModeActive ??
 			(() => (this.#currentModel ? this.#isFastForProvider(this.#currentModel.provider) : false));
 		const initialSearchInput = options?.initialSearchInput;
-		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
+		this.#viewMode = this.#initialWorkModeId
+			? "presets"
+			: this.#temporaryOnly || initialSearchInput || scopedModels.length > 0
+				? "models"
+				: "presets";
 
 		// Load current role assignments from settings
 		this.#rebuildRoleModels();
@@ -480,11 +539,21 @@ export class ModelSelectorComponent extends Container {
 		// Load models and do initial render
 		this.#loadModels().then(() => {
 			this.#buildProviderTabs();
-			if (this.#viewMode === "presets" && (this.#modelRegistry.getModelProfiles?.().size ?? 0) === 0) {
+			if (
+				this.#viewMode === "presets" &&
+				(this.#modelRegistry.getModelProfiles?.().size ?? 0) === 0 &&
+				!this.#initialWorkModeId
+			) {
 				this.#viewMode = "models";
 			}
 			if (this.#viewMode === "presets") {
 				void this.#refreshProviderAuth();
+				if (this.#initialWorkModeId) {
+					const target = this.#getPresetRows().findIndex(
+						row => row.kind === "workMode" && row.card.modeId === this.#initialWorkModeId,
+					);
+					if (target >= 0) this.#presetCursor = target;
+				}
 				this.#renderPresetLanding();
 			} else {
 				this.#updateTabBar();
@@ -576,6 +645,12 @@ export class ModelSelectorComponent extends Container {
 		if ("currentModel" in options) this.#currentModel = options.currentModel;
 		if ("currentThinkingLevel" in options) this.#currentThinkingLevel = options.currentThinkingLevel;
 		if ("activeModelProfile" in options) this.#activeModelProfile = options.activeModelProfile;
+		if (this.#viewMode === "presets") {
+			this.#rebuildRoleModels();
+			this.#renderPresetLanding();
+			this.#tui.requestRender();
+			return;
+		}
 		this.#refreshCatalogView();
 	}
 
@@ -1172,8 +1247,13 @@ export class ModelSelectorComponent extends Container {
 		return undefined;
 	}
 
+	#getWorkModeCards(): readonly WorkModeSelectorCard[] {
+		return this.#workModeAdapter?.cards ?? [];
+	}
+
 	#getPresetRows(): PresetLandingRow[] {
 		const rows: PresetLandingRow[] = [];
+		for (const card of this.#getWorkModeCards()) rows.push({ kind: "workMode", card });
 		for (const [groupId, profiles] of this.#getPresetGroups()) {
 			rows.push({ kind: "group", groupId, profiles });
 			if (this.#expandedPresetProviderId === groupId) {
@@ -1201,50 +1281,112 @@ export class ModelSelectorComponent extends Container {
 		return this.#modelRegistry.getModelProfile?.(name) ?? this.#modelRegistry.getModelProfiles?.().get(name);
 	}
 
-	#isProviderAuthenticated(providerId: string): boolean | undefined {
-		return this.#providerAuthById.get(providerId);
+	#resolveProfileReadiness(profile: ModelProfileDefinition): ModelProfileProviderReadiness {
+		const authenticatedProviders = new Set(
+			[...this.#providerAuthById].filter(([, authenticated]) => authenticated).map(([provider]) => provider),
+		);
+		return resolveModelProfileProviderReadiness(profile, authenticatedProviders);
 	}
 
-	#getMissingProviders(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): string[] {
+	#formatProfileReadinessHint(profile: ModelProfileDefinition): string | undefined {
+		const readiness = this.#resolveProfileReadiness(profile);
+		const requirements = [
+			...readiness.presentation.strictMissingProviders.map(provider => `/login ${sanitizeProviderId(provider)}`),
+			...readiness.presentation.unsatisfiedAlternativeGroups.map(
+				group => `/login for one of ${group.map(sanitizeProviderId).join(" or ")}`,
+			),
+		];
+		if (requirements.length === 0) return undefined;
+		const displayName = getModelProfilePresentation(profile).displayName;
+		return `${displayName}: run ${requirements.join(" and ")}`;
+	}
+
+	#formatProfileAuthHint(profile: ModelProfileDefinition): string | undefined {
+		if (this.#providerAuthPending) return undefined;
+		const unavailable = profileProviderIds(profile).filter(provider => this.#providerAuthUnavailable.has(provider));
+		if (unavailable.length > 0) {
+			const displayName = getModelProfilePresentation(profile).displayName;
+			return `${displayName}: authentication status unavailable for ${unavailable
+				.map(sanitizeProviderId)
+				.join(", ")}. Retry by reopening the model selector.`;
+		}
+		return this.#formatProfileReadinessHint(profile);
+	}
+
+	#formatMissingProviderHint(
+		profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[],
+	): string | undefined {
 		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
-		const providers = new Set<string>();
-		for (const profile of profiles) for (const provider of profileRequiredProviders(profile)) providers.add(provider);
-		return [...providers]
-			.filter(provider => this.#isProviderAuthenticated(provider) !== true)
-			.sort((a, b) => a.localeCompare(b));
+		const hints = profiles
+			.map(profile => this.#formatProfileAuthHint(profile))
+			.filter((hint): hint is string => hint !== undefined);
+		if (hints.length === 0) return undefined;
+		return profiles.length > 1 ? `Choose one preset profile: ${hints.join(" OR ")}.` : hints[0];
 	}
 
 	#isPresetAuthenticated(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): boolean {
-		return this.#getMissingProviders(profileOrProfiles).length === 0;
+		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
+		return profiles.some(profile => this.#resolveProfileReadiness(profile).usable);
+	}
+
+	#hasProviderAuthUnavailable(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): boolean {
+		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
+		return profiles.some(profile =>
+			profileProviderIds(profile).some(provider => this.#providerAuthUnavailable.has(provider)),
+		);
+	}
+
+	#formatProviderAuthUnavailableHint(): string | undefined {
+		if (this.#providerAuthUnavailable.size === 0) return undefined;
+		const providers = [...this.#providerAuthUnavailable].sort((a, b) => a.localeCompare(b)).map(sanitizeProviderId);
+		return `  Authentication status unavailable for ${providers.join(", ")}. Retry by reopening the model selector.`;
 	}
 
 	/**
 	 * A preset group is a list of alternative presets, not an all-or-nothing
-	 * bundle. Treat the group as usable when at least one member preset has all
-	 * of its required providers authenticated.
+	 * bundle. Treat the group as usable when at least one member preset is ready.
 	 */
 	#isPresetGroupUsable(profiles: ModelProfileDefinition[]): boolean {
-		return profiles.some(profile => this.#isPresetAuthenticated(profile));
+		return this.#isPresetAuthenticated(profiles);
 	}
 
 	async #refreshProviderAuth(): Promise<void> {
-		const providers = new Set<string>();
-		for (const profiles of this.#getPresetGroups().values()) {
-			for (const profile of profiles)
-				for (const provider of profileRequiredProviders(profile)) providers.add(provider);
+		this.#providerAuthPending = true;
+		this.#providerAuthUnavailable.clear();
+		this.#presetLoginHint = undefined;
+		try {
+			const providers = new Set<string>();
+			for (const profiles of this.#getPresetGroups().values()) {
+				for (const profile of profiles) for (const provider of profileProviderIds(profile)) providers.add(provider);
+			}
+			const providerIds = [...providers];
+			this.#providerAuthPending = providerIds.length > 0;
+			this.#renderPresetLanding();
+			const results = await Promise.allSettled(
+				providerIds.map(async provider => {
+					const apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.#authSessionId);
+					return [provider, isAuthenticatedOrKeyless(apiKey)] as const;
+				}),
+			);
+			const authById = new Map<string, boolean>();
+			for (let index = 0; index < providerIds.length; index++) {
+				const provider = providerIds[index];
+				const result = results[index];
+				if (!provider || !result) continue;
+				if (result.status === "fulfilled") {
+					authById.set(provider, result.value[1]);
+				} else {
+					authById.set(provider, false);
+					this.#providerAuthUnavailable.add(provider);
+				}
+			}
+			this.#providerAuthById = authById;
+		} finally {
+			this.#providerAuthPending = false;
+			if (this.#viewMode === "presets") this.#renderPresetLanding();
+			else this.#refreshCatalogView();
+			this.#tui.requestRender();
 		}
-		this.#providerAuthPending = providers.size > 0;
-		this.#renderPresetLanding();
-		const entries = await Promise.all(
-			[...providers].map(async provider => {
-				const apiKey = await this.#modelRegistry.getApiKeyForProvider(provider, this.#authSessionId);
-				return [provider, isAuthenticated(apiKey)] as const;
-			}),
-		);
-		this.#providerAuthById = new Map(entries);
-		this.#providerAuthPending = false;
-		this.#renderPresetLanding();
-		this.#tui.requestRender();
 	}
 
 	#clampPresetCursor(): void {
@@ -1274,7 +1416,8 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
 			selected.kind === "alreadySaved" ||
-			selected.kind === "imageGeneration"
+			selected.kind === "imageGeneration" ||
+			selected.kind === "workMode"
 		)
 			return;
 		if (this.#expandedPresetProviderId === selected.groupId) return;
@@ -1291,7 +1434,8 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
 			selected.kind === "alreadySaved" ||
-			selected.kind === "imageGeneration"
+			selected.kind === "imageGeneration" ||
+			selected.kind === "workMode"
 		)
 			return;
 		if (this.#expandedPresetProviderId !== selected.groupId) return;
@@ -1360,7 +1504,13 @@ export class ModelSelectorComponent extends Container {
 		this.#headerContainer.clear();
 		this.#tabBar = null;
 		this.#listContainer.clear();
-		this.#headerContainer.addChild(new Text(theme.fg("accent", "Model presets"), 0, 0));
+		this.#headerContainer.addChild(
+			new Text(
+				theme.fg("accent", this.#getWorkModeCards().length > 0 ? "Model & Work Modes" : "Model presets"),
+				0,
+				0,
+			),
+		);
 		for (const line of this.#formatCurrentSessionLines()) {
 			this.#headerContainer.addChild(new Text(line, 0, 0));
 		}
@@ -1369,6 +1519,19 @@ export class ModelSelectorComponent extends Container {
 			const row = rows[i];
 			const selected = i === this.#presetCursor;
 			const prefix = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+			if (row.kind === "workMode") {
+				const cardLabel = `${row.card.label} — ${row.card.taskContext} [${row.card.profileId}]`;
+				const rendered = row.card.disabled
+					? theme.fg("dim", cardLabel)
+					: selected
+						? theme.fg("accent", cardLabel)
+						: cardLabel;
+				this.#listContainer.addChild(new Text(`${prefix}${rendered}`, 0, 0));
+				if (selected && row.card.disabledReason) {
+					this.#listContainer.addChild(new Text(theme.fg("dim", `    ${row.card.disabledReason}`), 0, 0));
+				}
+				continue;
+			}
 			if (row.kind === "create") {
 				const label = "Create custom preset";
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
@@ -1392,18 +1555,18 @@ export class ModelSelectorComponent extends Container {
 				continue;
 			}
 			if (row.kind === "imageGeneration") {
-				const config = getConfiguredImageModel();
-				const current =
-					config && config.provider !== "auto"
-						? `${config.provider}${config.model ? ` (${config.model})` : ""}`
-						: "Auto";
+				const provider = this.#settings.get("providers.image");
+				const model = this.#settings.get("providers.imageModel");
+				const current = provider !== "auto" ? `${provider}${model ? ` (${model})` : ""}` : "Auto";
 				const label = `Image Generation: ${current}`;
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}
 			if (row.kind === "group") {
 				const authenticated = this.#isPresetGroupUsable(row.profiles);
-				const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+				const unavailable = this.#hasProviderAuthUnavailable(row.profiles);
+				const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : unavailable ? "?" : "✗";
+
 				const containsActive =
 					this.#activeModelProfile !== undefined &&
 					row.profiles.some(profile => profile.name === this.#activeModelProfile);
@@ -1415,19 +1578,33 @@ export class ModelSelectorComponent extends Container {
 			}
 			const presentation = getModelProfilePresentation(row.profile);
 			const authenticated = this.#isPresetAuthenticated(row.profile);
-			const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+			const unavailable = this.#hasProviderAuthUnavailable(row.profile);
+			const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : unavailable ? "?" : "✗";
+
 			const isActive = row.profile.name === this.#activeModelProfile;
 			const label = `  ${mark} ${presentation.displayName}`;
 			const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
 			const activeSuffix = isActive ? theme.fg("muted", " (current)") : "";
 			this.#listContainer.addChild(new Text(`${prefix}${renderedLabel}${activeSuffix}`, 0, 0));
 		}
+		if (this.#errorMessage) {
+			this.#listContainer.addChild(new Spacer(1));
+			for (const line of String(this.#errorMessage).split("\n")) {
+				this.#listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
+			}
+		}
 		if (this.#presetLoginHint) {
 			this.#listContainer.addChild(new Spacer(1));
 			this.#listContainer.addChild(new Text(theme.fg("warning", `  ${this.#presetLoginHint}`), 0, 0));
 		}
+		const authUnavailableHint = this.#formatProviderAuthUnavailableHint();
+		if (authUnavailableHint) {
+			this.#listContainer.addChild(new Spacer(1));
+			this.#listContainer.addChild(new Text(theme.fg("warning", authUnavailableHint), 0, 0));
+		}
 		const previewProfile = this.#getProfileByName(this.#previewProfileName);
 		if (previewProfile) this.#renderPresetPreview(previewProfile);
+		if (this.#workModePreview) this.#renderWorkModePreview(this.#workModePreview.view);
 	}
 
 	#renderPresetPreview(profile: ModelProfileDefinition): void {
@@ -1453,9 +1630,18 @@ export class ModelSelectorComponent extends Container {
 			const actionLabels = this.#getPresetScopeLabels(profile);
 			for (let i = 0; i < actionLabels.length; i++) {
 				const label = actionLabels[i] ?? "";
+				const managementId =
+					isCustomUserProfile(profile) && i >= 2
+						? sanitizeText(profile.name).replace(/\s+/g, " ").trim()
+						: undefined;
+				const visibleLabel = managementId ? `${label} (${managementId})` : label;
 				const prefix = i === this.#presetScopeIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 				this.#listContainer.addChild(
-					new Text(`${prefix}${i === this.#presetScopeIndex ? theme.fg("accent", label) : label}`, 0, 0),
+					new Text(
+						`${prefix}${i === this.#presetScopeIndex ? theme.fg("accent", visibleLabel) : visibleLabel}`,
+						0,
+						0,
+					),
 				);
 			}
 			this.#listContainer.addChild(new Spacer(1));
@@ -1467,6 +1653,110 @@ export class ModelSelectorComponent extends Container {
 				new Text(theme.fg("muted", "  Press Enter to apply or d to set as default"), 0, 0),
 			);
 		}
+	}
+
+	#renderWorkModePreview(view: WorkModePreviewView): void {
+		this.#listContainer.addChild(new Spacer(1));
+		this.#listContainer.addChild(new Text(theme.fg("muted", `  Work Mode preview: ${view.label}`), 0, 0));
+		for (const line of renderWorkModePreviewLines(view)) {
+			this.#listContainer.addChild(new Text(`  ${line}`, 0, 0));
+		}
+		if (!this.#workModeScopeMenuOpen) return;
+		if (view.state === "unavailable") {
+			this.#listContainer.addChild(new Text(theme.fg("dim", `  Recovery: ${view.recovery.label}`), 0, 0));
+			return;
+		}
+		this.#listContainer.addChild(new Spacer(1));
+		const scopes = createWorkModeScopeSelectionView({
+			selectedScope: this.#getSelectedWorkModeScope(),
+		});
+		for (const line of renderWorkModeScopeLines(scopes)) this.#listContainer.addChild(new Text(`  ${line}`, 0, 0));
+		this.#listContainer.addChild(new Spacer(1));
+		this.#listContainer.addChild(
+			new Text(
+				theme.fg(
+					"dim",
+					view.confirmationRequired
+						? `  ${view.recovery.label} | Enter: confirm | Up/Down: scope | Esc: back`
+						: "  Enter: apply selected scope | Up/Down: scope | Esc: back",
+				),
+				0,
+				0,
+			),
+		);
+	}
+
+	#getSelectedWorkModeScope(): WorkModeScope {
+		return ["turn", "session", "project", "user"][this.#workModeScopeIndex] as WorkModeScope;
+	}
+
+	#openWorkModePreview(modeId: string): void {
+		const adapter = this.#workModeAdapter;
+		if (!adapter?.preview || this.#workModeSelectionInFlight) return;
+		const card = this.#getWorkModeCards().find(candidate => candidate.modeId === modeId);
+		if (card?.disabled) {
+			this.#errorMessage = card.disabledReason ?? "Work Mode unavailable.";
+			this.#renderPresetLanding();
+			return;
+		}
+		const generation = ++this.#workModeGeneration;
+		const operation = Promise.resolve()
+			.then(() => adapter.preview!(modeId))
+			.then(result => {
+				if (generation !== this.#workModeGeneration) return;
+				this.#workModePreview = { modeId, result: result.result, view: result.view };
+				this.#workModeScopeMenuOpen = true;
+				this.#workModeScopeIndex = 0;
+				this.#errorMessage = undefined;
+				this.#renderPresetLanding();
+				this.#tui.requestRender();
+			})
+			.catch(() => {
+				if (generation !== this.#workModeGeneration) return;
+				this.#errorMessage = "Work Mode preview is unavailable. Retry from the selector.";
+				this.#renderPresetLanding();
+				this.#tui.requestRender();
+			})
+			.finally(() => {
+				if (generation === this.#workModeGeneration) this.#workModeSelectionInFlight = undefined;
+			});
+		this.#workModeSelectionInFlight = operation;
+	}
+
+	#applyWorkMode(): void {
+		const adapter = this.#workModeAdapter;
+		const preview = this.#workModePreview;
+		if (!adapter?.apply || !preview || this.#workModeSelectionInFlight) return;
+		if (preview.view.state === "unavailable") return;
+		const generation = ++this.#workModeGeneration;
+		const scope = this.#getSelectedWorkModeScope();
+		const operation = Promise.resolve()
+			.then(() => adapter.apply!(preview.modeId, scope, preview.result))
+			.then(async event => {
+				if (generation !== this.#workModeGeneration) return;
+				await this.#onSelectCallback({
+					kind: "workMode",
+					modeId: preview.modeId,
+					scope,
+					preview: preview.view,
+					event,
+				});
+				if (generation !== this.#workModeGeneration) return;
+				this.#workModePreview = undefined;
+				this.#workModeScopeMenuOpen = false;
+				this.#renderPresetLanding();
+				this.#tui.requestRender();
+			})
+			.catch(() => {
+				if (generation !== this.#workModeGeneration) return;
+				this.#errorMessage = "Work Mode could not be applied. Re-preview and try again.";
+				this.#renderPresetLanding();
+				this.#tui.requestRender();
+			})
+			.finally(() => {
+				if (generation === this.#workModeGeneration) this.#workModeSelectionInFlight = undefined;
+			});
+		this.#workModeSelectionInFlight = operation;
 	}
 
 	#formatDiscoveryErrorHint(error: string | undefined): string | undefined {
@@ -1539,8 +1829,9 @@ export class ModelSelectorComponent extends Container {
 
 			const isSelected = i === this.#selectedIndex;
 
-			// Build role badges (inverted: color as background, black text)
+			// Build semantic role badges with a bracketed text fallback for no-color terminals.
 			const roleBadgeTokens: string[] = [];
+
 			// Whether a non-subagent (modelRoles) badge on the CURRENT model row already
 			// rendered the current-model EFFECTIVE glyph. Only that case should suppress
 			// the standalone current glyph below — a subagent-only match must NOT, since
@@ -1550,7 +1841,7 @@ export class ModelSelectorComponent extends Container {
 				const roleInfo = GJC_MODEL_ASSIGNMENT_TARGETS[role];
 				const assigned = this.#roles[role];
 				if (roleInfo.tag && assigned && modelsAreEqual(assigned.model, item.model)) {
-					const badge = makeInvertedBadge(roleInfo.tag, roleInfo.color ?? "muted");
+					const badge = makeRoleBadge(roleInfo.tag, roleInfo.color ?? "muted");
 					const thinkingLabel = getThinkingLevelMetadata(assigned.thinkingLevel).label;
 
 					// Subagent roles (task.agentModelOverrides) run under task.serviceTier,
@@ -1755,7 +2046,7 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
-		if (this.#assignmentState === "assigning") {
+		if (this.#selectionInFlight) {
 			if (getKeybindings().matches(keyData, "tui.select.cancel")) {
 				this.#closeAfterAssignment = true;
 			}
@@ -1818,6 +2109,31 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#handlePresetLandingInput(keyData: string): void {
+		if (this.#selectionInFlight) return;
+		if (this.#workModeSelectionInFlight) return;
+		if (this.#workModePreview) {
+			if (matchesKey(keyData, "up")) {
+				this.#workModeScopeIndex = (this.#workModeScopeIndex + 3) % 4;
+				this.#renderPresetLanding();
+				return;
+			}
+			if (matchesKey(keyData, "down")) {
+				this.#workModeScopeIndex = (this.#workModeScopeIndex + 1) % 4;
+				this.#renderPresetLanding();
+				return;
+			}
+			if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+				this.#applyWorkMode();
+				return;
+			}
+			if (getKeybindings().matches(keyData, "tui.select.cancel")) {
+				this.#workModePreview = undefined;
+				this.#workModeScopeMenuOpen = false;
+				this.#renderPresetLanding();
+				return;
+			}
+			return;
+		}
 		if (keyData === "d" || keyData === "D") {
 			if (this.#previewProfileName) {
 				this.#presetScopeMenuOpen = true;
@@ -1902,29 +2218,89 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 
+	#surfaceSelectionError(error: unknown): void {
+		this.#errorMessage = error instanceof Error ? error.message : String(error);
+		try {
+			this.refreshRoleAssignments();
+		} catch {
+			// Preserve the error state even if assignment refresh fails.
+		}
+		try {
+			if (this.#viewMode === "presets") this.#renderPresetLanding();
+			else this.#updateList();
+			this.#tui.requestRender();
+		} catch {
+			// Preserve the error state even if a failed render cannot be presented.
+		}
+	}
+
+	#runSelection(selection: ModelSelectorSelection, onSuccess?: () => void): Promise<void> {
+		const inFlight = this.#selectionInFlight;
+		if (inFlight) return inFlight;
+
+		let action: Promise<void>;
+		action = Promise.resolve()
+			.then(async () => {
+				await this.#onSelectCallback(selection);
+				onSuccess?.();
+				this.#errorMessage = undefined;
+			})
+			.catch(error => this.#surfaceSelectionError(error))
+			.finally(() => {
+				if (this.#selectionInFlight !== action) return;
+				this.#selectionInFlight = undefined;
+				const shouldClose = this.#closeAfterAssignment;
+				this.#closeAfterAssignment = false;
+				if (shouldClose) this.#onCancelCallback();
+				else {
+					try {
+						this.#tui.requestRender();
+					} catch {
+						// Keep the settled callback state even if a render request fails.
+					}
+				}
+			});
+		this.#selectionInFlight = action;
+		return action;
+	}
+
+	#runPresetAction(selection: ModelSelectorSelection): Promise<void> {
+		return this.#runSelection(selection);
+	}
 	#handlePresetEnter(): void {
+		if (this.#workModePreview) {
+			this.#applyWorkMode();
+			return;
+		}
 		if (this.#presetScopeMenuOpen && this.#previewProfileName) {
 			const profile = this.#getProfileByName(this.#previewProfileName);
 			if (!profile) return;
 			if (this.#presetScopeIndex === 2 && isCustomUserProfile(profile)) {
-				this.#onSelectCallback({ kind: "renameProfile", profileName: this.#previewProfileName });
+				void this.#runPresetAction({ kind: "renameProfile", profileName: this.#previewProfileName });
+
 				return;
 			}
 			if (this.#presetScopeIndex === 3 && isCustomUserProfile(profile)) {
-				this.#onSelectCallback({ kind: "deleteProfile", profileName: this.#previewProfileName });
+				void this.#runPresetAction({ kind: "deleteProfile", profileName: this.#previewProfileName });
+
 				return;
 			}
-			const missing = this.#getMissingProviders(profile);
-			if (missing.length > 0) {
-				this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
+			if (this.#providerAuthPending) {
+				this.#presetLoginHint = undefined;
+				return;
+			}
+			const missingHint = this.#formatMissingProviderHint(profile);
+			if (missingHint) {
+				this.#presetLoginHint = missingHint;
 				this.#renderPresetLanding();
 				return;
 			}
-			this.#onSelectCallback({
+			void this.#runPresetAction({
 				kind: "profile",
 				profileName: this.#previewProfileName,
 				setDefault: this.#presetScopeIndex === 1,
 			});
+
 			return;
 		}
 		if (this.#previewProfileName) {
@@ -1935,8 +2311,12 @@ export class ModelSelectorComponent extends Container {
 		}
 		const row = this.#getSelectedPresetRow();
 		if (!row) return;
+		if (row.kind === "workMode") {
+			this.#openWorkModePreview(row.card.modeId);
+			return;
+		}
 		if (row.kind === "create") {
-			this.#onSelectCallback({ kind: "createProfile", profile: this.#buildCustomModelProfileSnapshot() });
+			void this.#runPresetAction({ kind: "createProfile", profile: this.#buildCustomModelProfileSnapshot() });
 			return;
 		}
 		if (row.kind === "alreadySaved" || row.kind === "createUnavailable") {
@@ -1947,16 +2327,19 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 		if (row.kind === "imageGeneration") {
-			this.#onSelectCallback({ kind: "imageGeneration" });
+			void this.#runPresetAction({ kind: "imageGeneration" });
 			return;
 		}
 		if (row.kind === "group") {
 			// A group is a list of alternative presets; only surface a login hint
 			// when none of its members are usable. A partially-usable group stays
 			// navigable so the user can drill in and pick a usable member.
+			if (this.#providerAuthPending) {
+				this.#presetLoginHint = undefined;
+				return;
+			}
 			if (!this.#isPresetGroupUsable(row.profiles)) {
-				const missing = this.#getMissingProviders(row.profiles);
-				this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
+				this.#presetLoginHint = this.#formatMissingProviderHint(row.profiles);
 				this.#renderPresetLanding();
 				return;
 			}
@@ -1971,9 +2354,13 @@ export class ModelSelectorComponent extends Container {
 			this.#renderPresetLanding();
 			return;
 		}
-		const missing = this.#getMissingProviders(row.profile);
-		if (missing.length > 0 && !isCustomUserProfile(row.profile)) {
-			this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
+		if (this.#providerAuthPending) {
+			this.#presetLoginHint = undefined;
+			return;
+		}
+		const missingHint = this.#formatMissingProviderHint(row.profile);
+		if (missingHint && !isCustomUserProfile(row.profile)) {
+			this.#presetLoginHint = missingHint;
 			this.#renderPresetLanding();
 			return;
 		}
@@ -2161,15 +2548,15 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 
-		// For temporary role, don't save to settings - just notify caller
 		if (role === null) {
-			this.#onSelectCallback({
+			const selection: Extract<ModelSelectorSelection, { kind: "assignment" }> = {
 				kind: "assignment",
 				model: item.model,
 				role: null,
 				thinkingLevel: itemThinkingLevel,
 				selector: item.selector,
-			});
+			};
+			void this.#runSelection(selection);
 			return;
 		}
 
@@ -2188,56 +2575,38 @@ export class ModelSelectorComponent extends Container {
 			thinkingLevel: selectedThinkingLevel,
 			selector: selectorValue,
 		};
-		if (this.#isTrackedSingleAssignment(selection)) {
-			void this.#handleTrackedAssignment(selection);
-			return;
-		}
-
-		// Update local state for UI
-		for (const targetRole of roles ?? [role]) {
-			this.#roles[targetRole] = { model: item.model, thinkingLevel: selectedThinkingLevel };
-		}
-
-		// Notify caller (for updating agent state if needed)
-		this.#onSelectCallback(selection);
-
-		// Update list to show new badges
-		this.#updateList();
-	}
-	#isTrackedSingleAssignment(selection: Extract<ModelSelectorSelection, { kind: "assignment" }>): boolean {
-		return selection.role !== null && selection.roles === undefined;
+		void this.#runSelection(selection, () => {
+			for (const targetRole of roles ?? [role]) {
+				this.#roles[targetRole] = { model: item.model, thinkingLevel: selectedThinkingLevel };
+			}
+			this.#updateList();
+		});
 	}
 
-	async #handleTrackedAssignment(selection: Extract<ModelSelectorSelection, { kind: "assignment" }>): Promise<void> {
-		if (this.#assignmentState !== "idle") return;
-		this.#assignmentState = "assigning";
-		this.#tui.requestRender();
-		try {
-			await Promise.resolve(this.#onSelectCallback(selection));
-		} catch {
-			// The controller reports tracked assignment failures before rethrowing.
-		} finally {
-			this.#assignmentState = "idle";
-			const shouldClose = this.#closeAfterAssignment;
-			this.#closeAfterAssignment = false;
-			if (shouldClose) this.#onCancelCallback();
-			else this.#tui.requestRender();
-		}
+	override dispose(): void {
+		this.#workModeGeneration += 1;
+		this.#workModeSelectionInFlight = undefined;
+		this.#workModePreview = undefined;
+		this.#workModeScopeMenuOpen = false;
+		if (this.#viewMode === "presets") this.#renderPresetLanding();
+		else this.#updateList();
+		super.dispose();
 	}
 
 	getSearchInput(): Input {
 		return this.#searchInput;
 	}
 	async __testSelectProfile(profileName: string, setDefault: boolean): Promise<void> {
-		await this.#onSelectCallback({ kind: "profile", profileName, setDefault });
+		await this.#runPresetAction({ kind: "profile", profileName, setDefault });
 	}
+
 	async __testSelectAssignment(
 		selection: Omit<Extract<ModelSelectorSelection, { kind: "assignment" }>, "kind">,
 	): Promise<void> {
-		await this.#onSelectCallback({ kind: "assignment", ...selection });
+		await this.#runSelection({ kind: "assignment", ...selection });
 	}
 	async __testSelectPresetAction(profileName: string, action: "rename" | "delete"): Promise<void> {
-		await this.#onSelectCallback({
+		await this.#runPresetAction({
 			kind: action === "rename" ? "renameProfile" : "deleteProfile",
 			profileName,
 		});

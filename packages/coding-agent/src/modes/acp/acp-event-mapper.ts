@@ -265,6 +265,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "turn_start":
 		case "turn_end":
 		case "message_start":
+		case "work_mode":
 			return [];
 		case "auto_compaction_start":
 			return [

@@ -2,13 +2,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel, type Model, type ToolCall } from "@gajae-code/ai";
+import {
+	type Api,
+	type AssistantMessage,
+	getBundledModel,
+	type Model,
+	registerCustomApi,
+	type ToolCall,
+	unregisterCustomApis,
+} from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
+import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import {
 	AgentSession,
 	type AgentSessionEvent,
@@ -21,6 +30,9 @@ import { z } from "zod";
 
 type AutoRetryStartEvent = Extract<AgentSessionEvent, { type: "auto_retry_start" }>;
 type AutoRetryEndEvent = Extract<AgentSessionEvent, { type: "auto_retry_end" }>;
+
+const AUTH_AFFINITY_API = "auth-affinity-regression" as Api;
+const AUTH_AFFINITY_SOURCE = "agent-session-retry-fallback-auth-affinity";
 
 function trackRetryEvents(session: AgentSession): {
 	retryStartEvents: AutoRetryStartEvent[];
@@ -217,6 +229,7 @@ describe("AgentSession retry fallback", () => {
 		}
 		authStorage.close();
 		tempDir.removeSync();
+		unregisterCustomApis(AUTH_AFFINITY_SOURCE);
 		vi.restoreAllMocks();
 	});
 
@@ -1599,6 +1612,132 @@ describe("AgentSession retry fallback", () => {
 
 		expect(calls).toBe(2);
 		expect(invalidation).toHaveBeenCalledTimes(1);
+	});
+
+	it("uses stable provider cache affinity for pre-output auth retry after a logical session transition", async () => {
+		const model = {
+			api: AUTH_AFFINITY_API,
+			provider: "auth-affinity-provider",
+			id: "auth-affinity-model",
+			name: "Auth affinity model",
+			baseUrl: "https://auth-affinity.example.test",
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			maxTokens: 1024,
+			contextWindow: 8192,
+		} as Model;
+		const firstKey = "auth-affinity-first-key";
+		const replacementKey = "auth-affinity-replacement-key";
+		await authStorage.set(model.provider, [
+			{ type: "api_key", key: firstKey },
+			{ type: "api_key", key: replacementKey },
+		]);
+
+		const streamKeys: string[] = [];
+		registerCustomApi(
+			AUTH_AFFINITY_API,
+			(_requestedModel, _context, options) => {
+				streamKeys.push(options?.apiKey ?? "");
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamKeys.length === 1) {
+						stream.fail(Object.assign(new Error("401 authentication_error"), { status: 401 }));
+						return;
+					}
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: [{ type: "text", text: "recovered after auth rotation" }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+			AUTH_AFFINITY_SOURCE,
+		);
+
+		const invalidation = vi.spyOn(authStorage, "invalidateCredentialMatching");
+		const providerKeyLookup = vi.spyOn(modelRegistry, "getApiKeyForProvider");
+		const settings = Settings.isolated({ "compaction.enabled": false, "retry.enabled": false });
+		const created = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			authStorage,
+			modelRegistry,
+			model,
+			settings,
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			agentId: "auth-affinity-regression-agent",
+			disableExtensionDiscovery: true,
+			extensions: [],
+			toolNames: [],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			notificationHostModeSupported: false,
+			sdkHostModeSupported: false,
+			skipPythonPreflight: true,
+			workspaceTree: {
+				rootPath: tempDir.path(),
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+		});
+		session = created.session;
+
+		const predecessorLogicalId = created.session.sessionId;
+		expect(created.session.agent.providerSessionId).toBe(predecessorLogicalId);
+		await created.session.newSession();
+		const successorLogicalId = created.session.sessionId;
+		expect(successorLogicalId).not.toBe(predecessorLogicalId);
+		expect(created.session.agent.providerSessionId).toBe(predecessorLogicalId);
+
+		const lookupsBeforePrompt = providerKeyLookup.mock.calls.length;
+		await created.session.prompt("pre-output auth retry after logical session transition");
+		await created.session.waitForIdle();
+
+		expect(streamKeys).toHaveLength(2);
+		expect(new Set(streamKeys).size).toBe(2);
+		expect(new Set(streamKeys)).toEqual(new Set([firstKey, replacementKey]));
+		const firstAttemptedKey = streamKeys[0];
+		const replacementAttemptedKey = streamKeys[1];
+		expect(invalidation).toHaveBeenCalledWith(
+			model.provider,
+			firstAttemptedKey,
+			expect.objectContaining({ sessionId: predecessorLogicalId }),
+		);
+		const invalidationOptions = invalidation.mock.calls.at(-1)?.[2];
+		expect(invalidationOptions).not.toMatchObject({ sessionId: successorLogicalId });
+		const replacementLookups = providerKeyLookup.mock.calls
+			.slice(lookupsBeforePrompt)
+			.filter(call => call[0] === model.provider);
+		expect(replacementLookups.length).toBeGreaterThanOrEqual(2);
+		expect(replacementLookups.at(-1)?.[1]).toBe(predecessorLogicalId);
+		expect(replacementLookups.at(-1)?.[1]).not.toBe(successorLogicalId);
+		expect(replacementAttemptedKey).toBe(firstAttemptedKey === firstKey ? replacementKey : firstKey);
+		expect(getLastAssistantMessage(created.session)).toMatchObject({
+			stopReason: "stop",
+			content: [{ type: "text", text: "recovered after auth rotation" }],
+		});
 	});
 
 	it("uses managed fallback accounting for an idle yield under a configured chain", async () => {

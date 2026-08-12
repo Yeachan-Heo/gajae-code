@@ -14,7 +14,7 @@ import {
 	TabBar,
 	Text,
 } from "@gajae-code/tui";
-import { type SettingPath, settings } from "../../config/settings";
+import type { SettingPath, Settings } from "../../config/settings";
 import type {
 	SettingTab,
 	StatusLinePreset,
@@ -22,10 +22,11 @@ import type {
 	StatusLineSeparatorStyle,
 } from "../../config/settings-schema";
 import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
+import { createWorkModeSelectorCards, type WorkModeSelectorCard } from "../../config/work-mode-view";
 import type { GjcRuntimeSnapshotProvider } from "../../extensibility/gjc-plugins/runtime-quarantine";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
-import { getTabBarTheme } from "../shared";
+import { getTabBarTheme, sanitizeStatusText } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 import { GjcBundleSettingsComponent } from "./gjc-bundle-settings";
 import {
@@ -84,6 +85,7 @@ class TextInputSubmenu extends Container {
 
 class SelectSubmenu extends Container {
 	#selectList: SelectList;
+	#actionPending = false;
 	#previewText: Text | null = null;
 	#previewUpdateRequestId: number = 0;
 
@@ -92,22 +94,19 @@ class SelectSubmenu extends Container {
 		description: string,
 		options: ReadonlyArray<SelectItem>,
 		currentValue: string,
-		onSelect: (value: string) => void,
-		onCancel: () => void,
+		onSelect: (value: string) => void | Promise<void>,
+		onCancel: () => void | Promise<void>,
 		onSelectionChange?: (value: string) => void | Promise<void>,
 		private readonly getPreview?: () => string,
 	) {
 		super();
-
 		// Title
 		this.addChild(new Text(theme.bold(theme.fg("accent", title)), 0, 0));
-
 		// Description
 		if (description) {
 			this.addChild(new Spacer(1));
 			this.addChild(new Text(theme.fg("muted", description), 0, 0));
 		}
-
 		// Preview (if provided)
 		if (getPreview) {
 			this.addChild(new Spacer(1));
@@ -115,25 +114,53 @@ class SelectSubmenu extends Container {
 			this.#previewText = new Text(getPreview(), 0, 0);
 			this.addChild(this.#previewText);
 		}
-
 		// Spacer
 		this.addChild(new Spacer(1));
-
 		// Select list
 		this.#selectList = new SelectList(options, Math.min(options.length, 10), getSelectListTheme());
-
 		// Pre-select current value
 		const currentIndex = options.findIndex(o => o.value === currentValue);
 		if (currentIndex !== -1) {
 			this.#selectList.setSelectedIndex(currentIndex);
 		}
-
 		this.#selectList.onSelect = item => {
-			onSelect(item.value);
+			if (this.#actionPending) return;
+			try {
+				const result = onSelect(item.value);
+				if (result && typeof (result as Promise<void>).then === "function") {
+					this.#actionPending = true;
+					void (result as Promise<void>).then(
+						() => {
+							this.#actionPending = false;
+						},
+						() => {
+							this.#actionPending = false;
+						},
+					);
+				}
+			} catch {
+				// Synchronous commit helpers report their own errors and keep the submenu open.
+			}
 		};
-
-		this.#selectList.onCancel = onCancel;
-
+		this.#selectList.onCancel = () => {
+			if (this.#actionPending) return;
+			try {
+				const result = onCancel();
+				if (result && typeof (result as Promise<void>).then === "function") {
+					this.#actionPending = true;
+					void (result as Promise<void>).then(
+						() => {
+							this.#actionPending = false;
+						},
+						() => {
+							this.#actionPending = false;
+						},
+					);
+				}
+			} catch {
+				// Synchronous cancellation helpers leave the submenu open when restoration fails.
+			}
+		};
 		if (onSelectionChange) {
 			this.#selectList.onSelectionChange = item => {
 				const requestId = ++this.#previewUpdateRequestId;
@@ -151,9 +178,7 @@ class SelectSubmenu extends Container {
 				}
 			};
 		}
-
 		this.addChild(this.#selectList);
-
 		// Hint
 		this.addChild(new Spacer(1));
 		this.addChild(new Text(theme.fg("dim", "  Enter to select · Esc to go back"), 0, 0));
@@ -166,6 +191,7 @@ class SelectSubmenu extends Container {
 	}
 
 	handleInput(data: string): void {
+		if (this.#actionPending) return;
 		this.#selectList.handleInput(data);
 	}
 }
@@ -232,14 +258,14 @@ function effectiveCustomSegments(
 	};
 }
 
-function getSavedUsageMode(): UsageMode {
-	const segmentOptions = settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions;
+function getSavedUsageMode(settingsInstance: Settings): UsageMode {
+	const segmentOptions = settingsInstance.get("statusLine.segmentOptions") as StatusLineSegmentOptions;
 	return segmentOptions.usage?.mode === "remaining" ? "remaining" : "used";
 }
 
-function getUsageModeSettings(mode: string): StatusLineSegmentOptions {
+function getUsageModeSettings(settingsInstance: Settings, mode: string): StatusLineSegmentOptions {
 	const normalizedMode: UsageMode = mode === "remaining" ? "remaining" : "used";
-	const segmentOptions = settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions;
+	const segmentOptions = settingsInstance.get("statusLine.segmentOptions") as StatusLineSegmentOptions;
 	return {
 		...segmentOptions,
 		usage: {
@@ -269,24 +295,25 @@ class StatusLineCustomEditor extends Container {
 	#previewHighlightSegment: StatusLineSegmentId | undefined;
 
 	constructor(
+		private readonly settingsInstance: Settings,
 		private readonly callbacks: SettingsCallbacks,
 		private readonly done: (value?: string) => void,
 	) {
 		super();
-		const preset = settings.get("statusLine.preset");
+		const preset = settingsInstance.get("statusLine.preset");
 		const seeded = effectiveCustomSegments(
 			preset,
-			settings.get("statusLine.leftSegments"),
-			settings.get("statusLine.rightSegments"),
+			settingsInstance.get("statusLine.leftSegments"),
+			settingsInstance.get("statusLine.rightSegments"),
 		);
 		this.#draft = {
 			preset: "custom",
 			leftSegments: seeded.leftSegments,
 			rightSegments: seeded.rightSegments,
-			separator: settings.get("statusLine.separator"),
+			separator: settingsInstance.get("statusLine.separator"),
 			segmentOptions: effectiveSegmentOptions(
 				preset,
-				settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+				settingsInstance.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
 			),
 		};
 		this.#preview();
@@ -602,23 +629,25 @@ class StatusLineCustomEditor extends Container {
 
 	#restorePreview(): void {
 		this.callbacks.onStatusLinePreview?.({
-			preset: settings.get("statusLine.preset"),
-			leftSegments: settings.get("statusLine.leftSegments"),
-			rightSegments: settings.get("statusLine.rightSegments"),
-			separator: settings.get("statusLine.separator"),
-			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
-			sessionAccent: settings.get("statusLine.sessionAccent"),
+			preset: this.settingsInstance.get("statusLine.preset"),
+			leftSegments: this.settingsInstance.get("statusLine.leftSegments"),
+			rightSegments: this.settingsInstance.get("statusLine.rightSegments"),
+			separator: this.settingsInstance.get("statusLine.separator"),
+			segmentOptions: cloneSegmentOptions(
+				this.settingsInstance.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+			),
+			sessionAccent: this.settingsInstance.get("statusLine.sessionAccent"),
 			previewHighlightSegment: undefined,
 		});
 	}
 
 	#save(): void {
-		const saved = commitInteractiveSettings(this.callbacks, () => {
-			settings.set("statusLine.preset", "custom");
-			settings.set("statusLine.leftSegments", [...this.#draft.leftSegments]);
-			settings.set("statusLine.rightSegments", [...this.#draft.rightSegments]);
-			settings.set("statusLine.separator", this.#draft.separator);
-			settings.set(
+		const saved = commitInteractiveSettings(this.settingsInstance, this.callbacks, () => {
+			this.settingsInstance.set("statusLine.preset", "custom");
+			this.settingsInstance.set("statusLine.leftSegments", [...this.#draft.leftSegments]);
+			this.settingsInstance.set("statusLine.rightSegments", [...this.#draft.rightSegments]);
+			this.settingsInstance.set("statusLine.separator", this.#draft.separator);
+			this.settingsInstance.set(
 				"statusLine.segmentOptions",
 				cloneSegmentOptions(this.#draft.segmentOptions) as Record<string, unknown>,
 			);
@@ -661,6 +690,8 @@ function getSettingsTabs(): Tab[] {
  * Some settings (like thinking level) are managed by the session, not Settings.
  */
 export interface SettingsRuntimeContext {
+	/** Active Settings instance for this settings surface. */
+	settings: Settings;
 	/** Available thinking levels (from session) */
 	availableThinkingLevels: Effort[];
 	/** Current thinking level (from session) */
@@ -669,6 +700,8 @@ export interface SettingsRuntimeContext {
 	availableThemes: string[];
 	/** Available model profile names (from the model registry) */
 	availableModelProfiles: string[];
+	/** Curated Work Modes surfaced here without persisting a Work Mode identifier. */
+	workModeCards?: readonly WorkModeSelectorCard[];
 	/** Working directory for plugins tab */
 	cwd: string;
 	/** Whether this terminal can render the pet overlay. */
@@ -697,7 +730,25 @@ export interface StatusLinePreviewSettings {
 	maxRows?: number;
 }
 
+export type SettingsMutationResult =
+	| { status: "applied" }
+	| { status: "degraded"; error: string }
+	| { status: "failed"; error: string };
+
 export interface SettingsCallbacks {
+	/** Apply and persist a selected default model profile before closing its submenu. */
+	onModelProfileSelect?: (profileName: string) => Promise<SettingsMutationResult>;
+	/** Deactivate/materialize and clear the default model profile before closing its submenu. */
+	onModelProfileClear?: () => Promise<SettingsMutationResult>;
+	/** Open the shared Work Mode selector; this callback must not persist a Work Mode ID. */
+	onWorkModeSelect?: (modeId: string) => void | Promise<void>;
+	/** Apply the active theme mapping and persist it before closing its submenu. */
+	onThemeCommit?: (
+		path: "theme.dark" | "theme.light",
+		themeName: string,
+		previousRenderedTheme?: string,
+	) => Promise<SettingsMutationResult>;
+
 	/** Called when any setting value changes */
 	onChange: (path: SettingPath, newValue: unknown) => void;
 	/** Called for theme preview while browsing theme settings */
@@ -726,10 +777,16 @@ export interface SettingsCallbacks {
 	/** Called when settings panel is closed */
 	onCancel: () => void;
 }
-function commitInteractiveSettings(callbacks: SettingsCallbacks, commit: () => void): boolean {
-	if (!settings.canWriteDurableConfig()) {
+function commitInteractiveSettings(
+	settingsInstance: Settings,
+	callbacks: SettingsCallbacks,
+	commit: () => void,
+): boolean {
+	if (!settingsInstance.canWriteDurableConfig()) {
 		callbacks.onError?.(
-			"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			sanitizeStatusText(
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			),
 		);
 		return false;
 	}
@@ -737,11 +794,8 @@ function commitInteractiveSettings(callbacks: SettingsCallbacks, commit: () => v
 		commit();
 		return true;
 	} catch (error) {
-		if (!settings.canWriteDurableConfig()) {
-			callbacks.onError?.(error instanceof Error ? error.message : String(error));
-			return false;
-		}
-		throw error;
+		callbacks.onError?.(sanitizeStatusText(error instanceof Error ? error.message : String(error)));
+		return false;
 	}
 }
 
@@ -751,6 +805,10 @@ function commitInteractiveSettings(callbacks: SettingsCallbacks, commit: () => v
  */
 export class SettingsSelectorComponent extends Container {
 	#tabBar: TabBar;
+	#activeThemePreview: { theme: string } | null = null;
+	#themeRestoreInFlight = false;
+	#queuedTabId: SettingTab | "plugins" | "gjc-bundles" | null = null;
+	#suppressTabChange = false;
 	#currentList: SettingsList | null = null;
 	#pluginComponent: PluginSettingsComponent | null = null;
 	#gjcBundleComponent: GjcBundleSettingsComponent | null = null;
@@ -772,8 +830,9 @@ export class SettingsSelectorComponent extends Container {
 
 		// Tab bar
 		this.#tabBar = new TabBar("Settings", getSettingsTabs(), getTabBarTheme());
-		this.#tabBar.onTabChange = () => {
-			this.#switchToTab(this.#tabBar.getActiveTab().id as SettingTab | "plugins" | "gjc-bundles");
+		this.#tabBar.onTabChange = tab => {
+			if (this.#suppressTabChange) return;
+			this.#switchToTab(tab.id as SettingTab | "plugins" | "gjc-bundles");
 		};
 
 		this.addChild(this.#tabBar);
@@ -789,6 +848,41 @@ export class SettingsSelectorComponent extends Container {
 	}
 
 	#switchToTab(tabId: SettingTab | "plugins" | "gjc-bundles"): void {
+		if (this.#suppressTabChange) return;
+		if (this.#themeRestoreInFlight) {
+			this.#queuedTabId = tabId;
+			return;
+		}
+		if (this.#activeThemePreview && tabId !== this.#currentTabId) {
+			this.#queuedTabId = tabId;
+			const preview = this.#activeThemePreview;
+			const previousTabIndex = getSettingsTabs().findIndex(tab => tab.id === this.#currentTabId);
+			this.#themeRestoreInFlight = true;
+			void Promise.resolve(this.callbacks.onThemePreviewCancel?.(preview.theme)).then(
+				() => {
+					this.#activeThemePreview = null;
+					this.#themeRestoreInFlight = false;
+					const queuedTabId = this.#queuedTabId;
+					this.#queuedTabId = null;
+					if (queuedTabId) this.#renderTab(queuedTabId);
+				},
+				error => {
+					this.#themeRestoreInFlight = false;
+					this.#queuedTabId = null;
+					this.callbacks.onError?.(sanitizeStatusText(error instanceof Error ? error.message : String(error)));
+					if (previousTabIndex >= 0) {
+						this.#suppressTabChange = true;
+						this.#tabBar.setActiveIndex(previousTabIndex);
+						this.#suppressTabChange = false;
+					}
+				},
+			);
+			return;
+		}
+		this.#renderTab(tabId);
+	}
+
+	#renderTab(tabId: SettingTab | "plugins" | "gjc-bundles"): void {
 		if (this.#currentTabId === "notifications" && tabId !== "notifications" && !this.#disposeNotificationsEditor()) {
 			return;
 		}
@@ -896,7 +990,7 @@ export class SettingsSelectorComponent extends Container {
 	 * Get the current value for a setting.
 	 */
 	#getCurrentValue(def: SettingDef): unknown {
-		return settings.get(def.path);
+		return this.context.settings.get(def.path);
 	}
 
 	#getSubmenuCurrentValue(path: SettingPath, value: unknown): string {
@@ -929,7 +1023,10 @@ export class SettingsSelectorComponent extends Container {
 		} else if (def.path === "theme.dark" || def.path === "theme.light") {
 			options = this.context.availableThemes.map(t => ({ value: t, label: t }));
 		} else if (def.path === "modelProfile.default") {
-			options = this.context.availableModelProfiles.map(p => ({ value: p, label: p }));
+			options = [
+				{ value: "", label: "None (inherit)" },
+				...this.context.availableModelProfiles.map(p => ({ value: p, label: p })),
+			];
 		}
 		if (def.path === "statusLine.preset") {
 			options = options.filter(option => option.value !== "custom");
@@ -944,15 +1041,20 @@ export class SettingsSelectorComponent extends Container {
 		}
 		// Preview handlers
 		let onPreview: ((value: string) => void | Promise<void>) | undefined;
-		let onPreviewCancel: (() => void) | undefined;
+		let onPreviewCancel: (() => void | Promise<void>) | undefined;
+		let activeThemeBeforePreview = currentValue;
 
 		if (def.path === "theme.dark" || def.path === "theme.light") {
-			const activeThemeBeforePreview = getCurrentThemeName() ?? currentValue;
+			activeThemeBeforePreview = getCurrentThemeName() ?? currentValue;
 			onPreview = value => {
+				this.#activeThemePreview = {
+					theme: activeThemeBeforePreview,
+				};
 				return this.callbacks.onThemePreview?.(value);
 			};
-			onPreviewCancel = () => {
-				return this.callbacks.onThemePreviewCancel?.(activeThemeBeforePreview);
+			onPreviewCancel = async () => {
+				await this.callbacks.onThemePreviewCancel?.(activeThemeBeforePreview);
+				this.#activeThemePreview = null;
 			};
 		} else if (def.path === "statusLine.preset") {
 			onPreview = value => {
@@ -967,16 +1069,16 @@ export class SettingsSelectorComponent extends Container {
 				this.#updateStatusPreview();
 			};
 			onPreviewCancel = () => {
-				const currentPreset = settings.get("statusLine.preset");
+				const currentPreset = this.context.settings.get("statusLine.preset");
 				const presetDef = getPreset(currentPreset);
 				const savedCustomSettings =
 					currentPreset === "custom"
 						? {
-								leftSegments: settings.get("statusLine.leftSegments"),
-								rightSegments: settings.get("statusLine.rightSegments"),
-								separator: settings.get("statusLine.separator"),
+								leftSegments: this.context.settings.get("statusLine.leftSegments"),
+								rightSegments: this.context.settings.get("statusLine.rightSegments"),
+								separator: this.context.settings.get("statusLine.separator"),
 								segmentOptions: cloneSegmentOptions(
-									settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+									this.context.settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
 								),
 							}
 						: {};
@@ -996,7 +1098,7 @@ export class SettingsSelectorComponent extends Container {
 				this.#updateStatusPreview();
 			};
 			onPreviewCancel = () => {
-				const separator = settings.get("statusLine.separator");
+				const separator = this.context.settings.get("statusLine.separator");
 				this.callbacks.onStatusLinePreview?.({ separator, previewHighlightSegment: undefined });
 				this.#updateStatusPreview();
 			};
@@ -1007,7 +1109,7 @@ export class SettingsSelectorComponent extends Container {
 			};
 			onPreviewCancel = () => {
 				this.callbacks.onStatusLinePreview?.({
-					maxRows: settings.get("statusLine.maxRows"),
+					maxRows: this.context.settings.get("statusLine.maxRows"),
 					previewHighlightSegment: undefined,
 				});
 				this.#updateStatusPreview();
@@ -1025,6 +1127,9 @@ export class SettingsSelectorComponent extends Container {
 		// Provide status line preview for theme selection
 		const isThemeSetting = def.path === "theme.dark" || def.path === "theme.light";
 		const getPreview = isThemeSetting ? this.callbacks.getStatusLinePreview : undefined;
+		const themePath: "theme.dark" | "theme.light" | undefined =
+			def.path === "theme.dark" || def.path === "theme.light" ? def.path : undefined;
+		const onThemeCommit: SettingsCallbacks["onThemeCommit"] = this.callbacks.onThemeCommit;
 
 		return new SelectSubmenu(
 			def.label,
@@ -1032,13 +1137,53 @@ export class SettingsSelectorComponent extends Container {
 			options,
 			currentValue,
 			value => {
+				if (def.path === "modelProfile.default") {
+					return (async () => {
+						try {
+							const result =
+								value === ""
+									? await this.callbacks.onModelProfileClear?.()
+									: await this.callbacks.onModelProfileSelect?.(value);
+							if (!result) {
+								this.callbacks.onError?.("Default model profile action is unavailable.");
+								return;
+							}
+							if (result.status !== "applied") {
+								this.callbacks.onError?.(sanitizeStatusText(result.error));
+								return;
+							}
+							done(value);
+						} catch (error) {
+							this.callbacks.onError?.(
+								sanitizeStatusText(error instanceof Error ? error.message : String(error)),
+							);
+						}
+					})();
+				}
+				if (themePath && onThemeCommit) {
+					return (async () => {
+						try {
+							const result = await onThemeCommit(themePath, value, activeThemeBeforePreview);
+							if (result.status !== "applied") {
+								this.callbacks.onError?.(sanitizeStatusText(result.error));
+								return;
+							}
+							this.#activeThemePreview = null;
+							done(value);
+						} catch (error) {
+							this.callbacks.onError?.(
+								sanitizeStatusText(error instanceof Error ? error.message : String(error)),
+							);
+						}
+					})();
+				}
 				if (def.path === "pet.mode") {
 					// The shared pet commit policy rechecks capability immediately
 					// before mutation and persists only on acceptance; the settings
 					// surface must not persist ahead of that result.
 					let accepted = false;
 					if (
-						!commitInteractiveSettings(this.callbacks, () => {
+						!commitInteractiveSettings(this.context.settings, this.callbacks, () => {
 							accepted = this.callbacks.onPetCommit?.(value) ?? false;
 						})
 					) {
@@ -1047,12 +1192,17 @@ export class SettingsSelectorComponent extends Container {
 					done(accepted ? value : undefined);
 					return;
 				}
-				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
+				if (
+					!commitInteractiveSettings(this.context.settings, this.callbacks, () =>
+						this.#setSettingValue(def.path, value),
+					)
+				)
+					return;
 				this.callbacks.onChange(def.path, value);
 				done(value);
 			},
-			() => {
-				onPreviewCancel?.();
+			async () => {
+				await onPreviewCancel?.();
 				done();
 			},
 			onPreview,
@@ -1080,7 +1230,12 @@ export class SettingsSelectorComponent extends Container {
 			value => {
 				// Empty string clears the setting; undefined-typed string settings
 				// store "" which the browser.ts expandPath ignores (no-op fallback).
-				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
+				if (
+					!commitInteractiveSettings(this.context.settings, this.callbacks, () =>
+						this.#setSettingValue(def.path, value),
+					)
+				)
+					return;
 				this.callbacks.onChange(def.path, value);
 				wrappedDone(value);
 			},
@@ -1093,17 +1248,17 @@ export class SettingsSelectorComponent extends Container {
 	 */
 	#setSettingValue(path: SettingPath, value: string): void {
 		// Handle number conversions
-		const currentValue = settings.get(path);
+		const currentValue = this.context.settings.get(path);
 		if (path === "compaction.thresholdPercent" && value === "default") {
-			settings.set(path, -1 as never);
+			this.context.settings.set(path, -1 as never);
 		} else if (path === "compaction.thresholdTokens" && value === "default") {
-			settings.set(path, -1 as never);
+			this.context.settings.set(path, -1 as never);
 		} else if (typeof currentValue === "number") {
-			settings.set(path, Number(value) as never);
+			this.context.settings.set(path, Number(value) as never);
 		} else if (typeof currentValue === "boolean") {
-			settings.set(path, (value === "true") as never);
+			this.context.settings.set(path, (value === "true") as never);
 		} else {
-			settings.set(path, value as never);
+			this.context.settings.set(path, value as never);
 		}
 	}
 
@@ -1138,10 +1293,10 @@ export class SettingsSelectorComponent extends Container {
 			getSettingsListTheme(),
 			(id, newValue) => {
 				if (id === STATUS_LINE_USAGE_MODE_ID) {
-					const segmentOptions = getUsageModeSettings(newValue);
+					const segmentOptions = getUsageModeSettings(this.context.settings, newValue);
 					if (
-						!commitInteractiveSettings(this.callbacks, () => {
-							settings.set("statusLine.segmentOptions", segmentOptions as Record<string, unknown>);
+						!commitInteractiveSettings(this.context.settings, this.callbacks, () => {
+							this.context.settings.set("statusLine.segmentOptions", segmentOptions as Record<string, unknown>);
 						})
 					) {
 						this.#refreshCurrentTabItems(defs);
@@ -1162,7 +1317,11 @@ export class SettingsSelectorComponent extends Container {
 
 				if (def.type === "boolean") {
 					const boolValue = newValue === "true";
-					if (!commitInteractiveSettings(this.callbacks, () => settings.set(path, boolValue as never))) {
+					if (
+						!commitInteractiveSettings(this.context.settings, this.callbacks, () =>
+							this.context.settings.set(path, boolValue as never),
+						)
+					) {
 						this.#refreshCurrentTabItems(defs);
 						return;
 					}
@@ -1172,7 +1331,11 @@ export class SettingsSelectorComponent extends Container {
 						this.#triggerStatusLinePreview();
 					}
 				} else if (def.type === "enum") {
-					if (!commitInteractiveSettings(this.callbacks, () => settings.set(path, newValue as never))) {
+					if (
+						!commitInteractiveSettings(this.context.settings, this.callbacks, () =>
+							this.context.settings.set(path, newValue as never),
+						)
+					) {
 						this.#refreshCurrentTabItems(defs);
 						return;
 					}
@@ -1191,6 +1354,33 @@ export class SettingsSelectorComponent extends Container {
 		this.addChild(this.#currentList);
 	}
 
+	#buildWorkModeItem(): SettingItem {
+		const cards = this.context.workModeCards ?? createWorkModeSelectorCards();
+		return {
+			id: "workMode.selector",
+			label: "Work Modes",
+			description: "Choose a curated Work Mode without persisting a Work Mode identifier.",
+			currentValue: "open",
+			submenu: (_currentValue, done) =>
+				new SelectSubmenu(
+					"Work Modes",
+					"Enter opens the shared preview; no Work Mode ID is written to settings.",
+					cards.map(card => ({
+						value: card.modeId,
+						label: card.label,
+						description: `${card.taskContext} (${card.profileId})${card.disabledReason ? ` — ${card.disabledReason}` : ""}`,
+						disabled: card.disabled,
+					})),
+					cards[0]?.modeId ?? "",
+					async modeId => {
+						await this.callbacks.onWorkModeSelect?.(modeId);
+						done(modeId);
+					},
+					() => done(),
+				),
+		};
+	}
+
 	/** Map a definition list to UI items, dropping any whose condition is false. */
 	#buildItemsForDefs(defs: SettingDef[]): SettingItem[] {
 		const items: SettingItem[] = [];
@@ -1203,7 +1393,9 @@ export class SettingsSelectorComponent extends Container {
 
 	#buildItemsForTab(defs: SettingDef[], tabId: SettingTab): SettingItem[] {
 		const items = this.#buildItemsForDefs(defs);
+
 		if (tabId === "appearance") {
+			items.unshift(this.#buildWorkModeItem());
 			const customEditorCallbacks: SettingsCallbacks = {
 				...this.callbacks,
 				onStatusLinePreview: previewSettings => {
@@ -1217,7 +1409,8 @@ export class SettingsSelectorComponent extends Container {
 				description:
 					"Edit custom status line segments, placement, separator, and typed segment options with live previews.",
 				currentValue: "open",
-				submenu: (_currentValue, done) => new StatusLineCustomEditor(customEditorCallbacks, done),
+				submenu: (_currentValue, done) =>
+					new StatusLineCustomEditor(this.context.settings, customEditorCallbacks, done),
 			};
 			const presetIndex = items.findIndex(item => item.id === "statusLine.preset");
 			if (presetIndex >= 0) {
@@ -1230,7 +1423,7 @@ export class SettingsSelectorComponent extends Container {
 					id: STATUS_LINE_USAGE_MODE_ID,
 					label: "Status Line Usage Mode",
 					description: "Show provider quota in the status line as used or remaining.",
-					currentValue: getSavedUsageMode(),
+					currentValue: getSavedUsageMode(this.context.settings),
 					values: [...USAGE_MODE_VALUES],
 				};
 				if (presetIndex >= 0) {
@@ -1264,12 +1457,14 @@ export class SettingsSelectorComponent extends Container {
 	 */
 	#triggerStatusLinePreview(): void {
 		const statusLineSettings: StatusLinePreviewSettings = {
-			preset: settings.get("statusLine.preset"),
-			leftSegments: settings.get("statusLine.leftSegments"),
-			rightSegments: settings.get("statusLine.rightSegments"),
-			separator: settings.get("statusLine.separator"),
-			segmentOptions: cloneSegmentOptions(settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions),
-			sessionAccent: settings.get("statusLine.sessionAccent"),
+			preset: this.context.settings.get("statusLine.preset"),
+			leftSegments: this.context.settings.get("statusLine.leftSegments"),
+			rightSegments: this.context.settings.get("statusLine.rightSegments"),
+			separator: this.context.settings.get("statusLine.separator"),
+			segmentOptions: cloneSegmentOptions(
+				this.context.settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
+			),
+			sessionAccent: this.context.settings.get("statusLine.sessionAccent"),
 			previewHighlightSegment: undefined,
 		};
 		this.callbacks.onStatusLinePreview?.(statusLineSettings);

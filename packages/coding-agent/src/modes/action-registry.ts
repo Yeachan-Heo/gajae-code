@@ -1,14 +1,28 @@
 import type { AppKeybinding } from "../config/keybindings";
 
+export type WorkModeActionId =
+	| "work-mode:quick-edit"
+	| "work-mode:daily-coding"
+	| "work-mode:deep-plan"
+	| "work-mode:review"
+	| "work-mode:autonomous";
+
+export type ActionId = AppKeybinding | WorkModeActionId;
+
 export type FocusDomain = "composer" | "selector" | "overlay" | "global";
 
 export interface ActionMetadata {
-	id: AppKeybinding;
+	id: ActionId;
 	title: string;
 	category: string;
 	bindingId?: AppKeybinding;
 	domains: readonly FocusDomain[];
 	exclusiveGroup?: string | false;
+}
+
+export interface KeyboundActionMetadata extends ActionMetadata {
+	id: AppKeybinding;
+	bindingId: AppKeybinding;
 }
 
 const action = (
@@ -17,7 +31,7 @@ const action = (
 	category: string,
 	domains: FocusDomain[],
 	exclusiveGroup?: string | false,
-): ActionMetadata => ({
+): KeyboundActionMetadata => ({
 	id,
 	title,
 	category,
@@ -26,7 +40,7 @@ const action = (
 	exclusiveGroup,
 });
 
-export const APP_ACTION_METADATA: readonly ActionMetadata[] = [
+export const APP_ACTION_METADATA: readonly KeyboundActionMetadata[] = [
 	action("app.interrupt", "Interrupt", "Session", ["global"], false),
 	action("app.clear", "Clear", "Session", ["global"]),
 	action("app.exit", "Exit", "Session", ["global"]),
@@ -85,10 +99,10 @@ export interface ActionRegistryOptions<Context> {
 }
 
 export class ActionRegistry<Context> {
-	readonly #actions = new Map<AppKeybinding, ActionDefinition<Context>>();
-	readonly #busy = new Set<AppKeybinding>();
+	readonly #actions = new Map<ActionId, ActionDefinition<Context>>();
+	readonly #busy = new Set<ActionId>();
 	readonly #busyGroups = new Set<string>();
-	readonly #availability = new Map<AppKeybinding, boolean>();
+	readonly #availability = new Map<ActionId, boolean>();
 	#availabilityResetQueued = false;
 
 	constructor(private readonly options: ActionRegistryOptions<Context>) {}
@@ -98,14 +112,14 @@ export class ActionRegistry<Context> {
 		this.#actions.set(action.id, action);
 	}
 
-	get(id: AppKeybinding): ActionDefinition<Context> | undefined {
+	get(id: ActionId): ActionDefinition<Context> | undefined {
 		return this.#actions.get(id);
 	}
 	all(): readonly ActionDefinition<Context>[] {
 		return [...this.#actions.values()];
 	}
 
-	#reportError(id: AppKeybinding, phase: "availability" | "execution", error: unknown): void {
+	#reportError(id: ActionId, phase: "availability" | "execution", error: unknown): void {
 		const cause = error instanceof Error ? error.message : String(error);
 		try {
 			this.options.showError(`Action ${id} ${phase} failed: ${cause}`);
@@ -114,7 +128,7 @@ export class ActionRegistry<Context> {
 		}
 	}
 
-	#evaluateAvailability(id: AppKeybinding, action: ActionDefinition<Context>): boolean {
+	#evaluateAvailability(id: ActionId, action: ActionDefinition<Context>): boolean {
 		const cached = this.#availability.get(id);
 		if (cached !== undefined) return cached;
 		let available: boolean;
@@ -139,12 +153,12 @@ export class ActionRegistry<Context> {
 		return action.exclusiveGroup === false ? undefined : (action.exclusiveGroup ?? "default");
 	}
 
-	isAvailable(id: AppKeybinding): boolean {
+	isAvailable(id: ActionId): boolean {
 		const action = this.#actions.get(id);
 		return action ? this.#evaluateAvailability(id, action) : false;
 	}
 
-	async execute(id: AppKeybinding): Promise<boolean> {
+	async execute(id: ActionId): Promise<boolean> {
 		const current = this.#actions.get(id);
 		if (!current || this.#busy.has(id) || !this.#evaluateAvailability(id, current)) return false;
 		const group = this.#exclusiveGroup(current);

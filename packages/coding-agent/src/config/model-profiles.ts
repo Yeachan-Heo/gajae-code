@@ -50,11 +50,66 @@ export function deriveModelProfileMappedProviders(definition: Pick<ModelProfileD
  * Model mappings may reference fallback providers, but those references are
  * resolution-time candidates rather than activation requirements.
  */
-export function aggregateModelProfileRequiredProviders(
-	requiredProviders: readonly string[],
-	_definition: Pick<ModelProfileDefinition, "modelMapping">,
-): string[] {
+export function aggregateModelProfileRequiredProviders(requiredProviders: readonly string[]): string[] {
 	return [...new Set(requiredProviders)];
+}
+
+export interface ModelProfileProviderReadinessPresentation {
+	/** Provider ids safe to echo in UI or user-facing errors. */
+	strictMissingProviders: string[];
+	/** Each entry is an OR group: one provider from the group is sufficient. */
+	unsatisfiedAlternativeGroups: string[][];
+}
+
+export interface ModelProfileProviderReadiness {
+	usable: boolean;
+	missingStrictProviders: string[];
+	unsatisfiedAlternativeGroups: string[][];
+	presentation: ModelProfileProviderReadinessPresentation;
+}
+
+function safeModelProfileProviderId(provider: string): string {
+	return sanitizeText(provider).replace(/\s+/g, " ").trim().slice(0, 128) || "(unknown provider)";
+}
+
+/**
+ * Resolve profile credential readiness once for every consumer.
+ *
+ * Providers outside an alternative group are strict AND requirements. Each
+ * alternative group is an OR requirement: one authenticated member satisfies
+ * the group. The returned evidence keeps exact provider ids for activation and
+ * exposes a sanitized presentation projection for UI/errors.
+ */
+export function resolveModelProfileProviderReadiness(
+	definition: Pick<ModelProfileDefinition, "requiredProviders" | "alternativeProviderGroups">,
+	authenticatedProviders: ReadonlySet<string>,
+): ModelProfileProviderReadiness {
+	const requiredProviders = [...new Set(definition.requiredProviders)];
+	const alternativeGroups: string[][] = [];
+	const seenGroups = new Set<string>();
+	for (const group of definition.alternativeProviderGroups ?? []) {
+		const normalizedGroup = [...new Set(group)];
+		const groupKey = normalizedGroup.join("\u0000");
+		if (seenGroups.has(groupKey)) continue;
+		seenGroups.add(groupKey);
+		alternativeGroups.push(normalizedGroup);
+	}
+	const alternativeProviders = new Set(alternativeGroups.flat());
+	const missingStrictProviders = requiredProviders.filter(
+		provider => !alternativeProviders.has(provider) && !authenticatedProviders.has(provider),
+	);
+	const unsatisfiedAlternativeGroups = alternativeGroups.filter(
+		group => !group.some(provider => authenticatedProviders.has(provider)),
+	);
+	return {
+		usable: missingStrictProviders.length === 0 && unsatisfiedAlternativeGroups.length === 0,
+		missingStrictProviders,
+		unsatisfiedAlternativeGroups,
+		presentation: {
+			strictMissingProviders: missingStrictProviders.map(safeModelProfileProviderId),
+			unsatisfiedAlternativeGroups: unsatisfiedAlternativeGroups.map(group => group.map(safeModelProfileProviderId)),
+		},
+	};
 }
 
 const profile = (
@@ -64,7 +119,7 @@ const profile = (
 	alternativeProviderGroups?: readonly (readonly string[])[],
 ): ModelProfileDefinition => ({
 	name,
-	requiredProviders: aggregateModelProfileRequiredProviders(requiredProviders, { modelMapping }),
+	requiredProviders: aggregateModelProfileRequiredProviders(requiredProviders),
 	alternativeProviderGroups,
 	modelMapping,
 	source: "builtin",
@@ -479,7 +534,7 @@ export function mergeModelProfiles(userProfiles?: ModelsConfig["profiles"]): Map
 		profiles.set(name, {
 			name,
 			displayName: definition.display_name,
-			requiredProviders: aggregateModelProfileRequiredProviders(definition.required_providers, { modelMapping }),
+			requiredProviders: aggregateModelProfileRequiredProviders(definition.required_providers),
 			modelMapping,
 			source: "user",
 		});

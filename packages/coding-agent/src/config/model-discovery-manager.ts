@@ -24,6 +24,18 @@ export interface ProviderDiscoveryState {
 	error?: string;
 }
 
+export function safeDiscoveryDiagnostic(cause: unknown): string {
+	const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+	const status = message.match(/\bHTTP\s+(\d{3})\b/i)?.[1];
+	if (status !== undefined) return `HTTP ${status}`;
+	if (/authentication|unauthori[sz]ed|forbidden|invalid\s+(?:api\s+)?key|credential/i.test(message)) {
+		return "authentication failed";
+	}
+	if (/timeout|timed\s*out|deadline|abort/i.test(message)) return "request timed out";
+	if (/connection|network|socket|fetch|econn|dns|refused/i.test(message)) return "connection refused";
+	return "discovery failed";
+}
+
 export interface DiscoveryRefreshToken {
 	provider: string;
 	generation: number;
@@ -175,7 +187,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 				try {
 					return await callbacks.fetchModels(provider, apiKey);
 				} catch (cause) {
-					error = cause instanceof Error ? cause.message : String(cause);
+					error = safeDiscoveryDiagnostic(cause);
 					return null;
 				}
 			},
@@ -204,7 +216,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			status,
 			optional: provider.optional ?? false,
 			stale: result.stale || status === "cached",
-			fetchedAt: error ? cached?.updatedAt : Date.now(),
+			fetchedAt: result.fetched === true ? Date.now() : cached?.updatedAt,
 			models: result.models.map(model => model.id),
 			error,
 		};
