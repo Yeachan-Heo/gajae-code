@@ -51,6 +51,7 @@ type DurablePhase =
 	| { kind: "prepare_throw"; failure: AutoroutingPreflightFailure }
 	| { kind: "post_fence"; class: FallbackTriggerClass }
 	| { kind: "rename_failure" }
+	| { kind: "uncertain_publish" }
 	| { kind: "reservation_failure" };
 
 type CandidateScript = {
@@ -91,6 +92,7 @@ type LedgerRun = {
 	resumeVisible: boolean;
 	terminal: "preflight_exhausted" | "post_acceptance_failure" | "accepted" | undefined;
 	managed: boolean;
+	uncertainArtifactId: string | undefined;
 };
 
 type HarnessContext = {
@@ -250,6 +252,7 @@ async function openStagedCandidate(ctx: HarnessContext, attemptId: string): Prom
  */
 async function runScriptedLedger(scripts: CandidateScript[], managed = false): Promise<LedgerRun> {
 	const ctx = await createHarnessContext(managed);
+	let uncertainArtifactId: string | undefined;
 	const attempts: AutoroutingAttempt[] = [];
 	const failedSnapshots: Array<{ before: ResidueSnapshot; after: ResidueSnapshot }> = [];
 	const consumed = new Set<string>();
@@ -305,6 +308,32 @@ async function runScriptedLedger(scripts: CandidateScript[], managed = false): P
 			await manager.flush();
 			await manager.discardStaged();
 			await manager.discardStaged();
+			attempts.push({ selector: script.selector, phase: "durable", code: "post_acceptance_failure" });
+			const after = await residueSnapshot(ctx);
+			failedSnapshots.push({ before, after });
+			terminal = "post_acceptance_failure";
+			break;
+		}
+		if (ctx.managed && durable.kind === "uncertain_publish") {
+			manager.appendSessionInit({ systemPrompt: "test", task: script.selector, tools: [] });
+			const uncertainArtifact = await manager.saveArtifact(`candidate-${script.selector}`, "tool");
+			await manager.flush();
+			const store = ctx.parentArtifacts.getManagedStore();
+			if (!store) throw new Error("managed artifact store unavailable");
+			const realMove = store.moveFileNoReplace.bind(store);
+			// Native completes the rename and still fails to prove durability/identity.
+			const move = spyOn(store, "moveFileNoReplace").mockImplementation((source, destination, expected, options) => {
+				realMove(source, destination, expected, options);
+				throw new ManagedTreeMoveOutcomeError("managed_publish_fsync_failed", false);
+			});
+			try {
+				await expect(manager.commitStagedNestedManaged()).rejects.toThrow(/committed without proof/);
+			} finally {
+				move.mockRestore();
+			}
+			// The executor's post-fence handler runs the same compensation path.
+			await manager.rollbackCommittedStaged();
+			uncertainArtifactId = uncertainArtifact;
 			attempts.push({ selector: script.selector, phase: "durable", code: "post_acceptance_failure" });
 			const after = await residueSnapshot(ctx);
 			failedSnapshots.push({ before, after });
@@ -410,6 +439,7 @@ async function runScriptedLedger(scripts: CandidateScript[], managed = false): P
 		parentModelSubstitution,
 		terminal,
 		managed,
+		uncertainArtifactId,
 	};
 }
 
@@ -906,6 +936,28 @@ describe("autorouting preflight contract", () => {
 });
 
 describe("managed staged publication certainty", () => {
+	it("keeps the durable preflight lifecycle non-destructive when a publish commits without proof", async () => {
+		const run = await runScriptedLedger(
+			[{ selector: "provider/uncertain", probe: { kind: "pass" }, durable: { kind: "uncertain_publish" } }],
+			true,
+		);
+		expect(run.terminal).toBe("post_acceptance_failure");
+		expect(run.attempts.at(-1)).toEqual({
+			selector: "provider/uncertain",
+			phase: "durable",
+			code: "post_acceptance_failure",
+		});
+		// The transcript really did land, so nothing it references may be reclaimed.
+		expect(run.finalExists).toBe(true);
+		expect(run.uncertainArtifactId).toBeDefined();
+		// snapshotTree stores base64 contents, so assert the payloads themselves survived.
+		expect(run.artifactTree).toContain(Buffer.from("candidate-provider/uncertain").toString("base64"));
+		expect(run.artifactTree).toContain(Buffer.from("parent-sibling").toString("base64"));
+		// No live handle or lifecycle start may leak from a publication that never proved itself.
+		expect(run.liveHandles).toBe(0);
+		expect(run.lifecycleStarts).toBe(0);
+	});
+
 	it("preserves owned artifacts when a managed publish commits without proof", async () => {
 		const ctx = await createHarnessContext(true);
 		const manager = await openStagedCandidate(ctx, "attempt-uncertain");
@@ -933,6 +985,7 @@ describe("managed staged publication certainty", () => {
 		// The transcript really is published, so the artifacts it references must survive.
 		expect(store.readExpected(path.basename(ctx.finalPath))).not.toBeNull();
 		const artifactTree = await snapshotTree(ctx.artifactRoot);
-		expect(artifactTree).toContain(stagedArtifactId ?? "missing");
+		expect(stagedArtifactId).toBeDefined();
+		expect(artifactTree).toContain(Buffer.from("candidate-owned-artifact").toString("base64"));
 	});
 });
