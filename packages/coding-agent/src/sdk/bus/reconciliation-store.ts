@@ -597,6 +597,8 @@ export interface ReconciliationStore {
 			keys: EvictedTerminalKeyEntry[];
 		},
 	): Promise<void>;
+	/** Wait until every previously admitted reconciliation transaction settles. */
+	drain?(): Promise<void>;
 	transactTerminalKeys(mutator: (keys: EvictedTerminalKeyEntry[]) => EvictedTerminalKeyEntry[]): Promise<void>;
 	snapshotTerminalKeys(): EvictedTerminalKeyEntry[];
 	loadTerminalScopes(): Promise<DurableTerminalScopeRecord[]>;
@@ -824,6 +826,7 @@ export function createReconciliationStore(options: {
 		transactTerminalScopes,
 		transactTerminalState,
 		transactTerminalKeys,
+		drain: async () => await chain,
 		loadTerminalScopes: async () => {
 			await load();
 			return terminalMemory.map(s => ({ ...s }));

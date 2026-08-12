@@ -196,6 +196,7 @@ export interface SdkOnlyReconciliationStore {
 			keys: SdkOnlyEvictedTerminalKeyEntry[];
 		},
 	): Promise<void>;
+	drain?(): Promise<void>;
 }
 
 export interface SdkOnlyTerminalAbortSeams {

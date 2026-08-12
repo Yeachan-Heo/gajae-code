@@ -1751,6 +1751,7 @@ describe("SessionSdkSessionRuntime", () => {
 				if (Date.now() > deadline) throw new Error("Timed out filling the completed-scope bound");
 				await Bun.sleep(20);
 			}
+			await reconciliationStore.drain?.();
 			expect(seamCalls).toHaveLength(0);
 			// The overflowed reservation now exists only as a tombstone; replaying
 			// its key must return the original no_active_turn/terminal_no_effect
@@ -2006,7 +2007,8 @@ describe("SessionSdkSessionRuntime", () => {
 			// All 260 serialized transactions must settle before the bound rows and
 			// tombstones are observable (the document caps at 256 completed rows,
 			// so wait on delivered responses instead of the row count).
-			for (let attempt = 0; attempt < 100 && transport.sent.length < 260; attempt += 1) await Bun.sleep(50);
+			while (transport.sent.length < 260) await Bun.sleep(20);
+			await reconciliationStore.drain?.();
 			expect(transport.sent.length).toBeGreaterThanOrEqual(260);
 			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(256);
 			expect(reconciliationStore.snapshotTerminalKeys().length).toBeGreaterThan(0);
@@ -2059,7 +2061,8 @@ describe("SessionSdkSessionRuntime", () => {
 					idempotencyKey: `uncertain-key-${index}`,
 				} as SdkFrame);
 			}
-			for (let attempt = 0; attempt < 100 && transport.sent.length < 260; attempt += 1) await Bun.sleep(50);
+			while (transport.sent.length < 260) await Bun.sleep(20);
+			await reconciliationStore.drain?.();
 			expect(transport.sent.length).toBeGreaterThanOrEqual(260);
 			// The uncertain finalizes evicted the oldest rows into tombstones.
 			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(256);
