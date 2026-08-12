@@ -12,6 +12,7 @@ import {
 	parseLaunchWorktreeMode,
 	planLaunchWorktree,
 	prepareLaunchWorktree,
+	resolveWorktreeBucketForPath,
 } from "@gajae-code/coding-agent/gjc-runtime/launch-worktree";
 
 const cleanupRoots: string[] = [];
@@ -32,6 +33,18 @@ function testSlug(value: string): string {
 	const prefix = readable || "default";
 	const digest = crypto.createHash("sha256").update(value).digest("hex").slice(0, 8);
 	return `${prefix}-${digest}`;
+}
+
+/** Runs `body` with the bucket override applied, restoring the caller's environment. */
+function withWorktreeBucketDir<T>(value: string, body: () => T): T {
+	const previous = process.env.GJC_WORKTREE_DIR;
+	process.env.GJC_WORKTREE_DIR = value;
+	try {
+		return body();
+	} finally {
+		if (previous === undefined) delete process.env.GJC_WORKTREE_DIR;
+		else process.env.GJC_WORKTREE_DIR = previous;
+	}
 }
 
 async function createRepo(prefix: string): Promise<string> {
@@ -382,6 +395,56 @@ describe("default launch worktrees", () => {
 		);
 	});
 
+	it("adopts an existing sibling bucket named by the GJC_WORKTREE_DIR template", async () => {
+		const repo = await createRepo("gjc-launch-bucket-env-");
+		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.worktrees`);
+		cleanupPaths.push(bucket);
+
+		const ensured = withWorktreeBucketDir("{repo}.worktrees", () =>
+			ensureLaunchWorktree(planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" })),
+		);
+
+		expect(ensured.enabled && (await fs.realpath(ensured.worktreePath))).toBe(
+			await fs.realpath(path.join(bucket, testSlug("feature/demo"))),
+		);
+		expect(run("git", ["branch", "--show-current"], path.join(bucket, testSlug("feature/demo")))).toBe(
+			"feature/demo",
+		);
+		expect(fsSync.existsSync(path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`))).toBe(
+			false,
+		);
+	});
+
+	it("keeps the template repo-scoped so two repos never share one worktree path", async () => {
+		const first = await createRepo("gjc-launch-bucket-shared-a-");
+		const second = await createRepo("gjc-launch-bucket-shared-b-");
+		const shared = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-bucket-shared-root-"));
+		cleanupPaths.push(shared);
+
+		const plans = withWorktreeBucketDir(path.join(shared, "{repo}"), () => [
+			planLaunchWorktree(first, { enabled: true, detached: false, name: "feature/demo" }),
+			planLaunchWorktree(second, { enabled: true, detached: false, name: "feature/demo" }),
+		]);
+
+		expect(plans[0].enabled && path.dirname(plans[0].worktreePath)).toBe(path.join(shared, path.basename(first)));
+		expect(plans[1].enabled && path.dirname(plans[1].worktreePath)).toBe(path.join(shared, path.basename(second)));
+	});
+
+	it("expands a home-relative override and falls back to the default bucket when unset", async () => {
+		const repo = await createRepo("gjc-launch-bucket-home-");
+		const homePlan = withWorktreeBucketDir("~/gjc-worktrees", () =>
+			planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" }),
+		);
+		const blankPlan = withWorktreeBucketDir("   ", () =>
+			planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" }),
+		);
+
+		expect(homePlan.enabled && path.dirname(homePlan.worktreePath)).toBe(path.join(os.homedir(), "gjc-worktrees"));
+		expect(blankPlan.enabled && path.dirname(blankPlan.worktreePath)).toBe(
+			path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`),
+		);
+	});
+
 	it("uses the launch worktree as the generated tmux cwd", async () => {
 		const repo = await createRepo("gjc-session-worktree-");
 		const launch = prepareLaunchWorktree(repo, ["--worktree"]);
@@ -401,5 +464,120 @@ describe("default launch worktrees", () => {
 
 		expect(plan?.cwd).toBe(launch.cwd);
 		expect(plan?.newSessionArgs).toContain(launch.cwd);
+	});
+});
+
+describe("GJC_WORKTREE_DIR path red-team", () => {
+	it("fails closed when a {repo}-less template points two repos at one worktree path", async () => {
+		const first = await createRepo("gjc-launch-bucket-collision-a-");
+		const second = await createRepo("gjc-launch-bucket-collision-b-");
+		const shared = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-bucket-collision-root-"));
+		cleanupPaths.push(shared);
+		const bucket = path.join(shared, "one-bucket-for-everything");
+
+		const ensured = withWorktreeBucketDir(bucket, () =>
+			ensureLaunchWorktree(planLaunchWorktree(first, { enabled: true, detached: false, name: "feature/demo" })),
+		);
+		expect(ensured.enabled && ensured.created).toBe(true);
+
+		// The second repo resolves to the SAME worktree path. Adoption must be refused:
+		// the path belongs to a different repository (git-common-dir mismatch), so the
+		// launch must fail closed with worktree_path_conflict instead of reusing it.
+		expect(() =>
+			withWorktreeBucketDir(bucket, () =>
+				ensureLaunchWorktree(planLaunchWorktree(second, { enabled: true, detached: false, name: "feature/demo" })),
+			),
+		).toThrow(/worktree_path_conflict/);
+		expect(run("git", ["branch", "--show-current"], ensured.enabled ? ensured.worktreePath : "")).toBe(
+			"feature/demo",
+		);
+	});
+
+	it("fails closed when same-basename repos in different parents share a {repo} root", async () => {
+		const parentA = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-bucket-twin-a-"));
+		const parentB = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-bucket-twin-b-"));
+		cleanupPaths.push(parentA, parentB);
+		const twinA = path.join(parentA, "app");
+		const twinB = path.join(parentB, "app");
+		for (const twin of [twinA, twinB]) {
+			await fs.mkdir(twin);
+			run("git", ["init"], twin);
+			run("git", ["config", "user.email", "test@example.com"], twin);
+			run("git", ["config", "user.name", "Test User"], twin);
+			await Bun.write(path.join(twin, "README.md"), "hello\n");
+			run("git", ["add", "README.md"], twin);
+			run("git", ["commit", "-m", "init"], twin);
+		}
+		const shared = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-bucket-twin-root-"));
+		cleanupPaths.push(shared);
+
+		// {repo} expands to the basename only, so both twins land in <shared>/app/<slug>.
+		const template = path.join(shared, "{repo}");
+		const ensured = withWorktreeBucketDir(template, () =>
+			ensureLaunchWorktree(planLaunchWorktree(twinA, { enabled: true, detached: false, name: "feature/demo" })),
+		);
+		expect(ensured.enabled && ensured.created).toBe(true);
+		expect(() =>
+			withWorktreeBucketDir(template, () =>
+				ensureLaunchWorktree(planLaunchWorktree(twinB, { enabled: true, detached: false, name: "feature/demo" })),
+			),
+		).toThrow(/worktree_path_conflict/);
+	});
+
+	it("pins the traversal contract: ../ segments resolve against the repository parent", async () => {
+		const repo = await createRepo("gjc-launch-bucket-traversal-");
+		const plan = withWorktreeBucketDir(path.join("..", "{repo}-wt"), () =>
+			planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" }),
+		);
+		expect(plan.enabled && path.dirname(plan.worktreePath)).toBe(
+			path.resolve(path.dirname(repo), "..", `${path.basename(repo)}-wt`),
+		);
+	});
+
+	it("treats a backslash home prefix literally on POSIX", async () => {
+		const repo = await createRepo("gjc-launch-bucket-backslash-");
+		const plan = withWorktreeBucketDir("~\\gjc-worktrees\\{repo}", () =>
+			planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" }),
+		);
+		// POSIX has no `~\` home form: the value must NOT expand to the home directory
+		// and must stay a relative template resolved against the repository parent.
+		expect(plan.enabled && plan.worktreePath.startsWith(os.homedir())).toBe(false);
+		expect(plan.enabled && path.dirname(plan.worktreePath)).toBe(
+			path.join(path.dirname(repo), `~\\gjc-worktrees\\${path.basename(repo)}`),
+		);
+	});
+});
+
+describe("resolveWorktreeBucketForPath Windows semantics", () => {
+	const home = "C:\\Users\\kim";
+	const repo = "C:\\repos\\app";
+
+	it("expands ~/ and ~\\ against the injected Windows home", () => {
+		expect(resolveWorktreeBucketForPath(repo, "~/wt/{repo}", home, path.win32)).toBe("C:\\Users\\kim\\wt\\app");
+		expect(resolveWorktreeBucketForPath(repo, "~\\wt\\{repo}", home, path.win32)).toBe("C:\\Users\\kim\\wt\\app");
+		expect(resolveWorktreeBucketForPath(repo, "~", home, path.win32)).toBe(home);
+	});
+
+	it("honors absolute drive paths and resolves relatives against the repo parent", () => {
+		expect(resolveWorktreeBucketForPath(repo, "D:\\wt\\{repo}", home, path.win32)).toBe("D:\\wt\\app");
+		expect(resolveWorktreeBucketForPath(repo, "{repo}.worktrees", home, path.win32)).toBe("C:\\repos\\app.worktrees");
+		expect(resolveWorktreeBucketForPath(repo, ".worktrees", home, path.win32)).toBe("C:\\repos\\.worktrees");
+	});
+
+	it("keeps UNC repos on their share for the default and relative templates", () => {
+		const uncRepo = "\\\\server\\share\\app";
+		expect(resolveWorktreeBucketForPath(uncRepo, undefined, home, path.win32)).toBe(
+			"\\\\server\\share\\app.gajae-code-worktrees",
+		);
+		expect(resolveWorktreeBucketForPath(uncRepo, "{repo}.worktrees", home, path.win32)).toBe(
+			"\\\\server\\share\\app.worktrees",
+		);
+	});
+
+	it("preserves repo basename case verbatim and treats blanks as the default", () => {
+		expect(resolveWorktreeBucketForPath("C:\\repos\\App", "{repo}.worktrees", home, path.win32)).toBe(
+			"C:\\repos\\App.worktrees",
+		);
+		expect(resolveWorktreeBucketForPath(repo, "   ", home, path.win32)).toBe("C:\\repos\\app.gajae-code-worktrees");
 	});
 });

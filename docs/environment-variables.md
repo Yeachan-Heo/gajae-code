@@ -492,13 +492,23 @@ LSP project configuration may control declarative matching, activation, and capa
 
 ## 6) Storage and config root paths
 
-These are consumed via `@gajae-code/utils/dirs` and affect where coding-agent stores data.
+`GJC_CONFIG_DIR`, `GJC_CODING_AGENT_DIR`, and `PWD` are consumed via `@gajae-code/utils/dirs` and affect where coding-agent stores data. `GJC_WORKTREE_DIR` is read at launch, before settings load, by `gjc-runtime/launch-worktree.ts`.
 
 | Variable              | Default / behavior                                                            |
 | --------------------- | ----------------------------------------------------------------------------- |
 | `GJC_CONFIG_DIR`       | Config root dirname under home (default `.gjc`)                               |
 | `GJC_CODING_AGENT_DIR` | Full override for agent directory (default `~/<GJC_CONFIG_DIR or .gjc>/agent`) |
 | `PWD`                 | Used when matching canonical current working directory in path helpers        |
+| `GJC_WORKTREE_DIR`     | Directory holding `--worktree` launch worktrees (default `{repo}.gajae-code-worktrees`) |
+
+`GJC_WORKTREE_DIR` is a path template. `{repo}` expands to the repository directory name, which keeps one exported value repo-scoped so two repositories that share a branch name never resolve to the same worktree. A relative value resolves against the repository's parent directory — the default's own shape — so `{repo}.worktrees` adopts an existing sibling bucket and `.worktrees` parks a hidden bucket beside the repository; an absolute value (or a leading `~/`) is used as given. An unset or blank value keeps the default bucket.
+
+```sh
+# Reuse an existing <repo>.worktrees convention instead of a second bucket
+export GJC_WORKTREE_DIR='{repo}.worktrees'
+# Or park every repo's worktrees on one volume, still repo-scoped
+export GJC_WORKTREE_DIR='/Volumes/dev/worktrees/{repo}'
+```
 
 ---
 
