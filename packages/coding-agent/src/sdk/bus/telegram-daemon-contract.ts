@@ -220,8 +220,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * and lease renewal to identities with coordinator or lifecycle provenance.
  * Generation 154 archives private-chat topics through deleteForumTopic, settles
  * TOPIC_ID_INVALID as definitive, and drains durable archive retries periodically.
+ * Generation 155 unifies the duplicated durable terminal-retention write path
+ * (bus and SDK-only host runtimes) into a single `boundTerminalRetentionState`
+ * helper in `session/terminal-abort.ts` (#4329).
  */
-export const DAEMON_GENERATION = 154;
+export const DAEMON_GENERATION = 155;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
