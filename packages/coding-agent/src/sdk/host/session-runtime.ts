@@ -33,6 +33,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../model-profile-model";
 import { projectQ10Models } from "../models.js";
+import { PromptDeadlineManager } from "../prompt-deadline-manager";
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
@@ -433,6 +434,16 @@ export interface InvocationReconciliation {
 	lookup(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
 	lookupResult(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
 	hydrate(): Promise<void>;
+	claimPendingOutcome(
+		kind: InvocationKind,
+		correlation: InvocationCorrelation,
+		outcome: { kind: string; code: string; message: string; provenance?: string },
+	): Promise<unknown>;
+	finalizeOutcome(
+		kind: InvocationKind,
+		correlation: InvocationCorrelation,
+		outcome?: { kind: string; code: string; message: string; provenance?: string },
+	): Promise<void>;
 }
 
 export function createInvocationReconciliation(
@@ -665,6 +676,31 @@ export function createInvocationReconciliation(
 			return result.status === "unknown" ? result : { kind, ...result };
 		},
 		hydrate,
+		async claimPendingOutcome(kind, correlation, outcome) {
+			const record = records.get(key(kind, correlation));
+			if (!record || record.terminalAt !== undefined || record.kind !== kind) return outcome;
+			const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
+			if (pending !== undefined) return pending;
+			(record as unknown as Record<string, unknown>).pendingOutcome = outcome;
+			await persist();
+			return outcome;
+		},
+		async finalizeOutcome(kind, correlation, outcome) {
+			const record = records.get(key(kind, correlation));
+			if (!record || record.terminalAt !== undefined || record.kind !== kind) return;
+			const finalOutcome = (outcome ??
+				(record as unknown as { pendingOutcome?: { kind: string; code: string; message: string } })
+					.pendingOutcome) as { kind: string; code: string; message: string } | undefined;
+			record.terminalAt = Date.now();
+			if (finalOutcome?.kind === "failed") {
+				record.status = "failed";
+				record.error = { code: finalOutcome.code, message: finalOutcome.message };
+			} else {
+				record.status = "terminal_ok";
+			}
+			(record as unknown as Record<string, unknown>).pendingOutcome = undefined;
+			await persist();
+		},
 	};
 }
 
@@ -2525,6 +2561,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				cursors: CursorRegistry;
 				reconciliation: InvocationReconciliation;
 				steerReconciliation: KindAwareReconciliation;
+				deadlineManager: PromptDeadlineManager;
 				pending: Array<{
 					kind: InvocationKind;
 					correlation: InvocationCorrelation;
@@ -2575,6 +2612,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// the full batch for the transition pass below (review thread P1).
 				current.drainedInvocations = drained.map(({ kind, correlation }) => ({ kind, correlation }));
 			}
+			if (current.activeInvocation?.kind === "prompt") {
+				current.deadlineManager.onAccepted(current.activeInvocation.correlation);
+			}
 		}
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
@@ -2589,13 +2629,23 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					: current.activeInvocation
 						? [current.activeInvocation]
 						: [];
-			for (const invocation of transitions)
-				await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, { type });
+			for (const invocation of transitions) {
+				await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, { type } as never);
+				if ((type as string) === "agent_end" || (type as string) === "agent_failed") {
+					if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+				}
+			}
 			current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
 		} catch {
 			observed = false;
 		}
 		if (type === "agent_end") {
+			if (current.activeInvocation?.kind === "prompt") {
+				current.deadlineManager.clear(current.activeInvocation.correlation);
+			} else if (current.drainedInvocations) {
+				for (const inv of current.drainedInvocations)
+					if (inv.kind === "prompt") current.deadlineManager.clear(inv.correlation);
+			}
 			current.activeInvocation = undefined;
 			current.drainedInvocations = undefined;
 			// The turn is over: no connection owns it anymore. Clearing here means
@@ -2624,6 +2674,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	api.on("turn_end", (_event, ctx) =>
 		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
 	);
+	api.on("tool_execution_start", async (_event, ctx) => {
+		const current = active;
+		if (!current?.activeInvocation || current.activeInvocation.kind !== "prompt") return;
+		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_start");
+		void ctx;
+	});
+	api.on("tool_execution_end", async (_event, ctx) => {
+		const current = active;
+		if (!current?.activeInvocation || current.activeInvocation.kind !== "prompt") return;
+		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_end");
+		void ctx;
+	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&
 		error !== null &&
@@ -2649,6 +2711,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			store: createReconciliationStore({ sessionFile, sessionId }),
 		});
 		await steerReconciliation.hydrateFromStore();
+		const deadlineManager = new PromptDeadlineManager({
+			reconciliation,
+			getLeaseMs: () => {
+				const v = options.settings?.get("sdk.promptDeadlineMs" as never) as number | undefined;
+				return typeof v === "number" && Number.isFinite(v) ? v : 1_800_000;
+			},
+			getMaxMs: () => {
+				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
+				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
+			},
+		});
 		const pending: Array<{
 			kind: InvocationKind;
 			correlation: InvocationCorrelation;
@@ -2927,6 +3000,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			cursors,
 			reconciliation,
 			steerReconciliation,
+			deadlineManager,
 			pending,
 			registerBroker,
 			fenceGateResolutions: () => {
@@ -2954,6 +3028,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					cursors,
 					reconciliation,
 					steerReconciliation,
+					deadlineManager,
 					pending,
 					registerBroker,
 					fenceGateResolutions: () => {
@@ -2972,6 +3047,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const stopActive = async (): Promise<void> => {
 		const current = active;
 		if (!current) return;
+		current.deadlineManager.clearAll();
 		current.fenceGateResolutions();
 		try {
 			await current.waitForGateResolutionQuiescence();

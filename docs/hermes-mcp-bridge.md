@@ -243,6 +243,12 @@ Each event is a bounded JSONL record with `schema_version`, monotonic namespace-
 }
 ```
 
+## Long-running delegated turns
+
+A delegated prompt accepted through `gjc_delegate_execute` (which routes to `turn.prompt`) is governed by the same progress-aware SDK prompt deadline as any direct SDK prompt. The SDK accepts the prompt with `sdk.promptDeadlineMs` (`1_800_000` ms) as an inactivity lease and renews it only from attributable tool-execution progress (`tool_execution_start` / `tool_execution_end`) for the exact accepted `commandId`/`turnId`. Renewals are bounded by the hard maximum `sdk.promptMaxRuntimeMs` (`21_600_000` ms). Healthy long-running Ultragoal work therefore does not hit `prompt_deadline_exceeded` while it is still making attributable progress, yet a wedged or stuck turn still terminates deterministically.
+
+Coordinator clients must persist the returned `session_id` and `turn_id`, observe terminal status through `gjc_coordinator_read_turn` / `gjc_coordinator_await_turn` / Q26 `turn.result` reconciliation (`accepted` / `in_flight` / `terminal_ok` / `failed`), and reconcile after disconnect/restart rather than blindly replaying the prompt. The bounded `await_turn` poll timeout (`timeout_ms`) is distinct from the SDK prompt terminal deadline; await time-outs do not kill the turn.
+
 ## Smoke check
 
 ```bash

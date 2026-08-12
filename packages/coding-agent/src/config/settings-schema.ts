@@ -293,6 +293,12 @@ export const SETTINGS_SCHEMA = {
 		description: "SDK-owned prompt deadline; ACP has no separate timeout.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
 	},
+	"sdk.promptMaxRuntimeMs": {
+		type: "number",
+		default: 21_600_000,
+		description: "Hard maximum runtime for an SDK prompt from acceptance, bounding progress-aware renewals.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
+	},
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },

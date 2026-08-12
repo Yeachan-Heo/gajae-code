@@ -599,7 +599,15 @@ prompt.
 
 `sdk.promptDeadlineMs` defaults to `1_800_000`. It accepts only safe integers in
 `[60_000, 86_400_000]`; there is no disable value. The SDK snapshots the setting
-when the prompt is durably accepted. Terminalization then has a fixed `10_000` ms
+when the prompt is durably accepted as the initial inactivity lease. Fresh
+**attributable** progress for the exact accepted `commandId`/`turnId` — `tool_execution_start` /
+`tool_execution_end` observed at the prompt/agent runtime boundary — renews the deadline to
+`lastProgressAt + sdk.promptDeadlineMs`, bounded by the hard maximum `sdk.promptMaxRuntimeMs`
+(default `21_600_000`, same `60_000–86_400_000` range). Only tool-execution boundaries for the
+accepted turn count; heartbeats, streaming text/thinking deltas, retries, other turns/sessions, and
+unrelated session noise do not renew the lease, and out-of-order delivery never shortens it. The
+hard maximum is never unbounded: every renewal is capped at `acceptedAt + sdk.promptMaxRuntimeMs` so a
+wedged or continuously noisy prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms
 grace period, which is not configurable. A controlled terminal failure reaches ACP
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.

@@ -105,7 +105,7 @@ function settingDefinitionToJsonSchema(settingPath: string, definition: SettingD
 		schema.exclusiveMinimum = 0;
 		schema.maximum = 1;
 	}
-	if (settingPath === "sdk.promptDeadlineMs") {
+	if (settingPath === "sdk.promptDeadlineMs" || settingPath === "sdk.promptMaxRuntimeMs") {
 		schema.type = "integer";
 		schema.minimum = 60_000;
 		schema.maximum = 86_400_000;

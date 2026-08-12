@@ -13,6 +13,13 @@ import subprocess
 import sys
 from typing import Any, NoReturn
 
+# Long-running prompts: the SDK deadline is a progress-aware lease (sdk.promptDeadlineMs is
+# an inactivity lease renewed only by attributable tool_execution_start/end for the exact
+# accepted commandId/turnId, bounded by sdk.promptMaxRuntimeMs). Persist session_id/turn_id
+# and reconcile via turn.result (Q26) rather than blindly replaying; heartbeats/streaming/
+# retries/other-turn activity do not renew. Distinguish the bounded await_turn poll timeout
+# from the SDK terminal deadline.
+
 CORE_QUERIES = (
     "session.metadata",
     "context.get",

@@ -537,6 +537,10 @@ Example controller loop:
 
 Hermes and OpenClaw can use the same MCP tool contract. Their names here are examples of controller products, not privileged integration modes.
 
+## Long-running prompts are progress-aware
+
+`sdk.promptDeadlineMs` (default `1_800_000` ms) is an inactivity lease, not a fixed wall-clock kill. The SDK renews the accepted prompt's terminal deadline from attributable `tool_execution_start` / `tool_execution_end` events for the exact `commandId`/`turnId`, bounded by `sdk.promptMaxRuntimeMs` (default `21_600_000` ms, max `86_400_000`). Persist `session_id` / `turn_id` from the accepted prompt and reconcile via `turn.result` (Q26) or `gjc sdk session status` rather than replaying blindly. Heartbeats, streaming chatter, retries, and other-turn activity do not extend the lease. Distinguish `timeout_ms` on `await_turn` / coordinator await from the SDK terminal deadline.
+
 ## Security and credential boundaries
 
 - Do not put provider API keys, GitHub tokens, or bot secrets in prompts.

@@ -115,6 +115,13 @@
 					"default": 1800000,
 					"minimum": 60000,
 					"maximum": 86400000
+				},
+				"promptMaxRuntimeMs": {
+					"type": "integer",
+					"description": "Hard maximum runtime for an SDK prompt from acceptance, bounding progress-aware renewals.",
+					"default": 21600000,
+					"minimum": 60000,
+					"maximum": 86400000
 				}
 			},
 			"additionalProperties": false
