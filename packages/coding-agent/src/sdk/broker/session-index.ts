@@ -880,9 +880,13 @@ export class SessionIndex {
 					indexSeq: scan.diagnosis.validPrefixSeq,
 					events,
 				});
-				const log = scan.validLogEvents.map(event => JSON.stringify(event)).join("\n");
 				await replaceAtomically(snapshotFor(this.#agentDir), snapshot);
-				await replaceAtomically(logFor(this.#agentDir), log ? `${log}\n` : "");
+				// The republished snapshot already carries the full surviving history (after
+				// compaction), so the log must be truncated to match: leaving the original
+				// events in place keeps every subsequent #scan() parsing them under the lock
+				// — the same starvation the compaction above is meant to end. This mirrors
+				// #rotate(), which writes an empty log after snapshotting.
+				await replaceAtomically(logFor(this.#agentDir), "");
 				await this.#replayUnderLock();
 				return { ...scan.diagnosis, repaired: true, quarantinePath };
 			});

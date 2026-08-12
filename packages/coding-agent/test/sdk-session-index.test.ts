@@ -218,7 +218,9 @@ describe("SDK session index", () => {
 		await expect(index.append(event("blocked-before-repair"))).rejects.toThrow("--repair-session-index");
 		expect(await index.repair()).toMatchObject({ status: "corrupt", repaired: true, validPrefixSeq: 2 });
 
+
 		await index.append(event("after"));
+		await index.compact();
 
 		expect(JSON.parse(await fs.readFile(snapshotFile, "utf8")).indexSeq).toBe(3);
 
@@ -833,6 +835,10 @@ describe("SDK session index", () => {
 			events: SessionIndexEvent[];
 		};
 		expect(snapshot.events.length).toBeLessThanOrEqual(maxRows);
+		// Repair truncates the log to match the snapshot: the pre-repair events are all
+		// covered by the republished snapshot, so leaving them in place would force every
+		// later #scan() to re-parse the full history under the lock.
+		expect((await fs.readFile(path.join(sessionsDir, "index.jsonl"), "utf8")).trim()).toBe("");
 
 		// A second client must still take the shared index lock while the repaired index
 		// is in normal use, within a bound far below the 60s launch budget.
