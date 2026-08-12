@@ -228,8 +228,8 @@ describe("model profile activation", () => {
 			session,
 			modelRegistry: {
 				...baseRegistry,
-				getAll: () => available,
-				getAvailable: () => available,
+				getAvailable: baseRegistry.getAll,
+				getAvailableForProfileActivation: () => available,
 			} as unknown as ModelRegistry,
 			settings: Settings.isolated(),
 			profileName: "claude-opus",

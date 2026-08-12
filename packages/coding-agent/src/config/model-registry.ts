@@ -3692,6 +3692,28 @@ export class ModelRegistry {
 		this.#availableModelsEnvFingerprint = envFingerprint;
 		return this.#availableModelsCache;
 	}
+
+	/**
+	 * Get authenticated models, excluding bundled entries that a fresh provider
+	 * catalog has positively shown to be unavailable. Bundled entries remain
+	 * usable until live catalog evidence exists so offline startup is unchanged.
+	 */
+	getAvailableForProfileActivation(): Model<Api>[] {
+		return this.getAvailable().filter(model => {
+			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
+			if (!evidence?.fresh) return true;
+			if (
+				evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
+				evidence.endpoint !==
+					this.#normalizeDiscoveryEvidenceEndpoint(
+						this.#getProviderBaseUrlForDiscovery(model.provider) ?? model.baseUrl ?? "",
+					)
+			)
+				return true;
+			return evidence.modelIds.has(model.id);
+		});
+	}
+
 	#hasFreshOrStaticModelEvidence(model: Model<Api>): boolean {
 		const evidence = this.#providerActivity.get(model.provider);
 		if (

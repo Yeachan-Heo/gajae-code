@@ -95,6 +95,7 @@ export interface PrepareModelProfileActivationOptions {
 			Pick<
 				ModelRegistry,
 				| "getAvailable"
+				| "getAvailableForProfileActivation"
 				| "resolveModelByLookupAlias"
 				| "lookupAliasExists"
 				| "clearCanonicalVariant"
@@ -953,7 +954,10 @@ export async function prepareModelProfileActivation(
 			);
 		}
 
-		const availableModels = options.modelRegistry.getAvailable?.() ?? options.modelRegistry.getAll();
+		const availableModels =
+			options.modelRegistry.getAvailableForProfileActivation?.() ??
+			options.modelRegistry.getAvailable?.() ??
+			options.modelRegistry.getAll();
 		let bindings = resolveProfileBindings(profile);
 		if (missingProviders.length > 0 && alternativeGroups.length > 0) {
 			bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);
