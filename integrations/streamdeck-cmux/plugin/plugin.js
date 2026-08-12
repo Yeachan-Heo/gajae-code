@@ -3,6 +3,7 @@ import { readdir, readFile, appendFile, stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { ANSWER_SLOT_COUNT, optionIndexForSlot, pageAction, pageCount, pendingAsk, sdkMessages, usesPagedLayout } from "./sdk-ask-state.js";
+import { nextSelectedSessionId } from "./focus-state.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -39,6 +40,7 @@ let selectedSessionId = null;
 const sdkClients = new Map();
 let topologyState = { windows: [], workspaces: [], panes: [], allSurfaces: [], surfaces: [], selectedTty: null };
 let refreshInFlight = null;
+let focusRefreshInFlight = null;
 let socket;
 const imageCache = new Map();
 let frequentProjects = [];
@@ -361,10 +363,25 @@ async function sdkMetadata(session) {
 function sessionKey(session) {
   return session?.sessionId ?? (session?.surface ? `cmux:${session.surface.surface}` : `tty:${session?.tty ?? session?.pid ?? "unknown"}`);
 }
+
+async function refreshFocus() {
+  if (focusRefreshInFlight) return focusRefreshInFlight;
+  focusRefreshInFlight = (async () => {
+    const topology = await cmuxTopology();
+    topologyState = topology;
+    const next = nextSelectedSessionId(sessions, topology.selectedTty, selectedSessionId, sessionKey);
+    if (next === selectedSessionId) return;
+    selectedSessionId = next;
+    await renderAll();
+    log(`focus refresh selected=${selectedSessionId ?? "none"} focusedTty=${topology.selectedTty ?? "none"}`);
+  })().finally(() => { focusRefreshInFlight = null; });
+  return focusRefreshInFlight;
+}
 async function refresh() {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
-    const [endpoints, ttys, topology, projects] = await Promise.all([discoverEndpoints(), processTtys(), cmuxTopology(), discoverFrequentProjects()]);
+    const [endpoints, ttys, projects] = await Promise.all([discoverEndpoints(), processTtys(), discoverFrequentProjects()]);
+    const topology = await cmuxTopology();
     syncSdkEndpoints(endpoints);
     topologyState = topology;
     frequentProjects = projects;
@@ -401,9 +418,7 @@ async function refresh() {
     });
     const focusedRow = rows.find(row => row.tty === topology.selectedTty);
     sessions = focusedRow ? [focusedRow, ...rows.filter(row => row !== focusedRow)].slice(0, 11) : rows.slice(0, 11);
-    const focusedSession = sessions.find(row => row.tty === topology.selectedTty);
-    if (focusedSession) selectedSessionId = sessionKey(focusedSession);
-    else if (!selectedSessionId || !sessions.some(row => sessionKey(row) === selectedSessionId)) selectedSessionId = sessionKey(sessions[0]);
+    selectedSessionId = nextSelectedSessionId(sessions, topology.selectedTty, selectedSessionId, sessionKey);
     await renderAll();
     log(`refresh sessions=${sessions.length} contexts=${contexts.size} selected=${selectedSessionId ?? "none"} focusedTty=${topology.selectedTty ?? "none"} focusedEndpoint=${endpointByTty.get(topology.selectedTty)?.sessionId ?? "none"} endpoints=${endpoints.length} projects=${projects.map(project => `${project.label}:${project.sessionCount}`).join(",") || "none"}`);
   })().finally(() => { refreshInFlight = null; });
@@ -775,7 +790,8 @@ async function keyUp(context, state, heldMs) {
   }
 }
 
-const periodic = setInterval(() => refresh().catch(error => log(`refresh error ${error}`)), 4000);
+const focusPeriodic = setInterval(() => refreshFocus().catch(error => log(`focus refresh error ${error}`)), 500);
+const periodic = setInterval(() => refresh().catch(error => log(`refresh error ${error}`)), 10000);
 
 socket = new WebSocket(`ws://127.0.0.1:${port}`);
 socket.addEventListener("open", () => {
@@ -805,5 +821,5 @@ socket.addEventListener("message", async event => {
     }
   } catch (error) { log(`message error ${error}`); }
 });
-socket.addEventListener("close", () => { clearInterval(periodic); process.exit(0); });
+socket.addEventListener("close", () => { clearInterval(focusPeriodic); clearInterval(periodic); process.exit(0); });
 socket.addEventListener("error", error => log(`socket error ${error}`));
