@@ -315,7 +315,13 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 					// here keeps an unterminated sequence from swallowing the next key.
 					// seqEnd === 1 is excluded so Meta sequences (ESC ESC) still parse.
 					if (remaining[seqEnd] === ESC && seqEnd >= 2 && !continuesAsStringTerminator(remaining, seqEnd)) {
-						sequences.push(candidate);
+						// A cut candidate of nothing but ESC bytes is real Escape key
+						// presses, not an Option-as-Meta prefix: a following ESC proves
+						// no continuation (like "[A") belongs to it. Emitting the pair
+						// as one sequence would parse as the unbound "alt+escape" and
+						// silently swallow both presses.
+						if (/^\x1b+$/.test(candidate)) sequences.push(...candidate.split(""));
+						else sequences.push(candidate);
 						pos += seqEnd;
 						break;
 					}
@@ -713,7 +719,16 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			return pendingMeta === undefined ? [] : [pendingMeta];
 		}
 
-		const sequences = pendingMeta === undefined ? [this.#buffer] : [pendingMeta, this.#buffer];
+		// A buffer of nothing but ESC bytes at flush time is N real Escape key
+		// presses that arrived faster than the flush window (tmux forwards a
+		// quick double-Esc as one "\x1b\x1b" chunk within escape-time). Keeping
+		// the pair atomic is only correct while a continuation can still turn it
+		// into an Option-as-Meta sequence (ESC ESC [ A); once the flush timeout
+		// fires, no continuation is coming, and emitting the pair as one
+		// sequence parses as the unbound "alt+escape" — silently swallowing
+		// both presses and breaking the double-Esc draft-clear gesture.
+		const flushedBuffer = /^\x1b{2,}$/.test(this.#buffer) ? this.#buffer.split("") : [this.#buffer];
+		const sequences = pendingMeta === undefined ? flushedBuffer : [pendingMeta, ...flushedBuffer];
 		this.#buffer = "";
 		this.#pendingKittyPrintableCodepoint = undefined;
 		return sequences;
