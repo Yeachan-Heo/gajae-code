@@ -705,7 +705,8 @@ test("publishes exact durable authority generation 152 at serving epoch 87", () 
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
 	// Generation 153: strict orchestration admission fences Telegram topics.
-	expect(DAEMON_GENERATION).toBe(153);
+	// Generation 154: branch daemon generation bump (b595e10ea).
+	expect(DAEMON_GENERATION).toBe(154);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {

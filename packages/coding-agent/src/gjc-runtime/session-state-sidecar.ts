@@ -6,7 +6,9 @@ import type { AssistantMessage } from "@gajae-code/ai/core";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
+import { PLATFORM_EXCLUDED_TOOL_DESCRIPTORS, TOOL_DESCRIPTORS } from "../tools/descriptors";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
+import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
 import {
 	isValidOwnerIntent,
 	lifecyclePaths,
@@ -46,14 +48,35 @@ export type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | 
 type FinalResponseSource = "agent_end" | "launch_error";
 const MAX_PUBLIC_ERROR_MESSAGE_LENGTH = 2000;
 const HEARTBEAT_MS = 1000;
-const MAX_PUBLIC_ACTIVE_TOOLS = 8;
-const MAX_ACTIVE_TOOL_CALLS = 64;
-const MAX_ACTIVE_TOOL_CALLS_OVERFLOW_DIGESTS = MAX_ACTIVE_TOOL_CALLS;
-const SAFE_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
-const ACTIVE_TOOL_CALL_KEY = /^[a-f0-9]{64}$/;
 
-type LastPayloadCacheEntry = { mtimeMs: number; size: number; payload: Record<string, unknown> };
-const lastPayloadByStateFile = new Map<string, LastPayloadCacheEntry>();
+/**
+ * Bound on the PUBLIC tool-activity list persisted in the coordinator-shared state file.
+ * The list is a "what is running right now" snapshot, not a log: an unbounded public list
+ * would let a fan-out turn grow the payload every coordinator reader must parse.
+ *
+ * Only the public projection is capped. The private `in_flight` table is exact current
+ * state — capping it would silently drop a live correlation and make `active_tool_count`
+ * a lie — so it holds every currently in-flight call and is emptied by their own ends.
+ */
+const MAX_ACTIVE_TOOL_ENTRIES = 8;
+/** Recorded whenever the caller could not prove a canonical public label for a tool. */
+export const UNPROVEN_TOOL_LABEL = "custom";
+/**
+ * The closed vocabulary a persisted or published tool label may draw from: `custom`, or
+ * the canonical name of a built-in tool descriptor.
+ *
+ * A pattern test is not a safety property — `cat`, `curl`, or any other token-shaped
+ * string passes one — so an arbitrary label is never accepted merely because it looks
+ * safe. Platform-excluded descriptors are included so a snapshot written on one host
+ * stays readable on another; the writer still only ever produces labels for the tools it
+ * actually resolved.
+ */
+const RUNTIME_TOOL_LABELS: ReadonlySet<string> = new Set([
+	UNPROVEN_TOOL_LABEL,
+	...Object.keys(TOOL_DESCRIPTORS),
+	...Object.keys(PLATFORM_EXCLUDED_TOOL_DESCRIPTORS),
+]);
+
 const stateFileWriteChains = new Map<string, Promise<void>>();
 
 /** Test-only counters for runtime sidecar hot-path assertions. */
@@ -68,8 +91,450 @@ interface RuntimeStateEvent {
 	type: string;
 	messages?: unknown[];
 	toolCallId?: unknown;
-	toolName?: unknown;
 	isError?: unknown;
+}
+
+export type RuntimeToolActivityPhase = "started" | "finished";
+/**
+ * A finished call's outcome. `cancelled` is the only honest answer for a call that was
+ * still in flight when the session settled: it neither succeeded nor failed, and nothing
+ * observed its end.
+ */
+export type RuntimeToolActivityOutcome = "success" | "failure" | "cancelled";
+const RUNTIME_TOOL_ACTIVITY_OUTCOMES: readonly RuntimeToolActivityOutcome[] = ["success", "failure", "cancelled"];
+/** Full SHA-256 hex: a prefix would let distinct calls collide into one correlation slot. */
+const TOOL_CALL_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * What a session is doing right now, split into a bounded public projection and the
+ * minimum private state needed to keep that projection exact.
+ *
+ * Deliberately carries no tool arguments, results, command text, paths, output, prompt or
+ * model text, environment values, or credentials — only a proven public tool label, a
+ * phase, and timing.
+ */
+export interface RuntimeToolActivity {
+	seq: number;
+	last_activity_at: string;
+	tool: string;
+	phase: RuntimeToolActivityPhase;
+	outcome: RuntimeToolActivityOutcome | null;
+	elapsed_ms: number | null;
+	/** Exact number of in-flight calls; derived with `active_tools`, so it can never be smaller. */
+	active_tool_count: number;
+	/** Public projection of the newest in-flight calls, capped at `MAX_ACTIVE_TOOL_ENTRIES`. */
+	active_tools: Array<{ tool: string; started_at: string }>;
+	/**
+	 * Private exact correlation state. Each digest is one-way over the session id and the
+	 * tool call id, so no raw call id is persisted, and the whole field is stripped by
+	 * `publicRuntimeToolActivity` before any coordinator reader sees the snapshot.
+	 */
+	in_flight: Array<{ digest: string; tool: string; started_at: string }>;
+}
+
+/**
+ * Collapses anything the caller could not prove into `custom`.
+ *
+ * Public safety comes from the caller's proof plus this closed vocabulary, never from a
+ * syntax check: a label that merely looks like a token is still model-influenced text.
+ */
+export function safeRuntimeToolLabel(value: unknown): string {
+	return typeof value === "string" && RUNTIME_TOOL_LABELS.has(value) ? value : UNPROVEN_TOOL_LABEL;
+}
+
+/**
+ * Whether a label read back from disk is already one this writer could have produced.
+ * Persisted text is never normalized into `custom`: silently rewriting arbitrary disk
+ * content into a valid-looking label would publish a value nothing ever proved.
+ */
+function isSafeRuntimeToolLabel(value: unknown): value is string {
+	return typeof value === "string" && RUNTIME_TOOL_LABELS.has(value);
+}
+
+/** Exact own-key sets. An unknown key means the row was written by something else. */
+const RUNTIME_TOOL_ACTIVITY_KEYS: readonly string[] = [
+	"seq",
+	"last_activity_at",
+	"tool",
+	"phase",
+	"outcome",
+	"elapsed_ms",
+	"active_tool_count",
+	"active_tools",
+	"in_flight",
+];
+const IN_FLIGHT_TOOL_CALL_KEYS: readonly string[] = ["digest", "tool", "started_at"];
+const ACTIVE_TOOL_KEYS: readonly string[] = ["tool", "started_at"];
+
+/**
+ * An object read back from disk must carry EXACTLY the keys this writer emits.
+ *
+ * Tolerating extra keys would let a hand-edited or foreign writer smuggle `args`,
+ * `result`, `raw_id`, or a credential through every projection: the validator would
+ * ignore them and the reader would still see them in the file. Unknown keys make the
+ * whole activity malformed instead.
+ */
+function hasExactOwnKeys(value: object, keys: readonly string[]): boolean {
+	const own = Object.keys(value);
+	return own.length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+
+/** A timestamp is accepted only in the exact canonical form this writer emits. */
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+	if (typeof value !== "string" || value.length === 0) return false;
+	const parsed = new Date(value);
+	return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+export function toolActivityPhaseForEvent(event: RuntimeStateEvent): RuntimeToolActivityPhase | null {
+	if (event.type === "tool_execution_start") return "started";
+	if (event.type === "tool_execution_end") return "finished";
+	return null;
+}
+
+/**
+ * Length-delimited UTF-16 code units of one identity field.
+ *
+ * JavaScript strings are UTF-16 code-unit sequences, and a call id may legitimately be
+ * any of them. Hashing the default UTF-8 encoding would map every distinct LONE
+ * SURROGATE to the same replacement character, so two different call ids would produce
+ * one digest and collide into a single in-flight correlation slot. Every code unit is
+ * hashed exactly, big-endian, behind its own uint32 length so no concatenation of two
+ * fields can be reinterpreted as a different pair.
+ */
+function utf16IdentityField(value: string): Uint8Array {
+	const bytes = new Uint8Array(4 + value.length * 2);
+	const view = new DataView(bytes.buffer);
+	view.setUint32(0, value.length, false);
+	for (let index = 0; index < value.length; index++) view.setUint16(4 + index * 2, value.charCodeAt(index), false);
+	return bytes;
+}
+
+function toolCallDigest(sessionId: string, toolCallId: unknown): string | null {
+	// An all-whitespace id carries no correlation, but a non-empty one is hashed over its
+	// exact code units: trimming first would collapse ` a` and `a ` into one in-flight slot.
+	if (typeof toolCallId !== "string" || toolCallId.trim().length === 0) return null;
+	return createHash("sha256")
+		.update(utf16IdentityField(sessionId))
+		.update(utf16IdentityField(toolCallId))
+		.digest("hex");
+}
+
+function validInFlightToolCall(value: unknown): value is RuntimeToolActivity["in_flight"][number] {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	if (!hasExactOwnKeys(value, IN_FLIGHT_TOOL_CALL_KEYS)) return false;
+	const entry = value as Record<string, unknown>;
+	return (
+		typeof entry.digest === "string" &&
+		TOOL_CALL_DIGEST_PATTERN.test(entry.digest) &&
+		isSafeRuntimeToolLabel(entry.tool) &&
+		isCanonicalIsoTimestamp(entry.started_at)
+	);
+}
+
+function validPublicActiveTool(value: unknown): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	if (!hasExactOwnKeys(value, ACTIVE_TOOL_KEYS)) return false;
+	const entry = value as Record<string, unknown>;
+	return isSafeRuntimeToolLabel(entry.tool) && isCanonicalIsoTimestamp(entry.started_at);
+}
+
+/** The count and the capped list are always derived together, so they cannot contradict. */
+function projectedActiveTools(
+	inFlight: RuntimeToolActivity["in_flight"],
+): Pick<RuntimeToolActivity, "active_tool_count" | "active_tools"> {
+	return {
+		active_tool_count: inFlight.length,
+		// Newest wins on overflow: the snapshot answers "what is running now".
+		active_tools: inFlight
+			.slice(-MAX_ACTIVE_TOOL_ENTRIES)
+			.map(entry => ({ tool: entry.tool, started_at: entry.started_at })),
+	};
+}
+
+export type RuntimeToolActivityReadout =
+	| { kind: "absent" }
+	| { kind: "malformed" }
+	| { kind: "valid"; activity: RuntimeToolActivity };
+
+/**
+ * Re-validates an activity snapshot read back from disk.
+ *
+ * `absent` and `malformed` are deliberately distinct outcomes: an absent snapshot may be
+ * seeded from sequence 1, while a malformed one must never be replaced by a lower
+ * sequence. The public counters are re-derived from the private in-flight table rather
+ * than trusted from disk, so a hand-edited file cannot publish a contradiction.
+ */
+export function classifyRuntimeToolActivity(value: unknown): RuntimeToolActivityReadout {
+	if (value === undefined) return { kind: "absent" };
+	if (!value || typeof value !== "object" || Array.isArray(value)) return { kind: "malformed" };
+	if (!hasExactOwnKeys(value, RUNTIME_TOOL_ACTIVITY_KEYS)) return { kind: "malformed" };
+	const activity = value as Record<string, unknown>;
+	if (typeof activity.seq !== "number" || !Number.isSafeInteger(activity.seq) || activity.seq < 1)
+		return { kind: "malformed" };
+	if (!isCanonicalIsoTimestamp(activity.last_activity_at)) return { kind: "malformed" };
+	if (!isSafeRuntimeToolLabel(activity.tool)) return { kind: "malformed" };
+	if (activity.phase !== "started" && activity.phase !== "finished") return { kind: "malformed" };
+	// A started call has not finished, so it can carry neither an outcome nor a duration.
+	// A finished one must name an allowlisted outcome, and only a matched success/failure
+	// may carry a duration: an unmatched or cancelled call has no measured interval.
+	if (activity.phase === "started") {
+		if (activity.outcome !== null || activity.elapsed_ms !== null) return { kind: "malformed" };
+	} else {
+		if (!RUNTIME_TOOL_ACTIVITY_OUTCOMES.includes(activity.outcome as RuntimeToolActivityOutcome))
+			return { kind: "malformed" };
+		if (activity.elapsed_ms !== null) {
+			if (activity.outcome === "cancelled") return { kind: "malformed" };
+			// A duration is milliseconds of wall clock. Beyond the safe-integer range it is
+			// no longer an exact value, so it can never be one this writer measured.
+			if (
+				typeof activity.elapsed_ms !== "number" ||
+				!Number.isSafeInteger(activity.elapsed_ms) ||
+				activity.elapsed_ms < 0
+			)
+				return { kind: "malformed" };
+		}
+	}
+	// One invalid private row makes the whole snapshot malformed. Filtering rows and
+	// continuing would publish an exact-looking count derived from a file that was
+	// already corrupt.
+	if (!Array.isArray(activity.in_flight) || !activity.in_flight.every(validInFlightToolCall))
+		return { kind: "malformed" };
+	// The public rows are validated in their own right, not merely re-derived: an extra
+	// key on a public row is exactly what a coordinator reader would receive.
+	if (!Array.isArray(activity.active_tools) || !activity.active_tools.every(validPublicActiveTool))
+		return { kind: "malformed" };
+	const inFlight = (activity.in_flight as RuntimeToolActivity["in_flight"]).map(entry => ({
+		digest: entry.digest,
+		tool: entry.tool,
+		started_at: entry.started_at,
+	}));
+	if (new Set(inFlight.map(entry => entry.digest)).size !== inFlight.length) return { kind: "malformed" };
+	// A cancelled outcome is terminal settlement: it is only ever written together with an
+	// emptied in-flight set, so a cancelled snapshot that still claims live calls was not
+	// produced here.
+	if (activity.outcome === "cancelled" && inFlight.length > 0) return { kind: "malformed" };
+	// The persisted public counters must already equal the projection of the private set;
+	// repairing a contradiction here would republish a hand-edited file as authoritative.
+	const projected = projectedActiveTools(inFlight);
+	if (
+		activity.active_tool_count !== projected.active_tool_count ||
+		JSON.stringify(activity.active_tools) !== JSON.stringify(projected.active_tools)
+	)
+		return { kind: "malformed" };
+	return {
+		kind: "valid",
+		activity: {
+			seq: activity.seq,
+			last_activity_at: activity.last_activity_at,
+			tool: activity.tool,
+			phase: activity.phase,
+			outcome: (activity.outcome as RuntimeToolActivityOutcome | null) ?? null,
+			elapsed_ms: activity.elapsed_ms as number | null,
+			...projected,
+			in_flight: inFlight,
+		},
+	};
+}
+
+export function normalizedRuntimeToolActivity(value: unknown): RuntimeToolActivity | null {
+	const readout = classifyRuntimeToolActivity(value);
+	return readout.kind === "valid" ? readout.activity : null;
+}
+
+/** The lifecycle states that are authority that nothing can still be running. */
+const TERMINAL_LIFECYCLE_STATES: ReadonlySet<string> = new Set(["completed", "errored"]);
+
+/**
+ * Whether an individually valid snapshot is consistent with the lifecycle state it would
+ * be published NEXT TO.
+ *
+ * The two fields are written by different authorities — the runtime sidecar annotates
+ * activity, the Coordinator writes lifecycle — so each can be valid while the pair is a
+ * contradiction: a settled session that still claims a tool is starting, or a live one
+ * whose calls were cancelled by a terminal it never reached. Publishing either would tell
+ * a coordinator reader something no writer ever observed.
+ *
+ * A terminal snapshot may still describe the call that just ended, and the terminal
+ * `cancelled` shape is exactly how settlement reports orphaned calls, so both stay
+ * publishable.
+ */
+function activityMatchesLifecycle(activity: RuntimeToolActivity, lifecycleState: unknown): boolean {
+	if (typeof lifecycleState === "string" && TERMINAL_LIFECYCLE_STATES.has(lifecycleState)) {
+		if (activity.phase === "started") return false;
+		return activity.in_flight.length === 0 && activity.active_tool_count === 0;
+	}
+	return activity.outcome !== "cancelled";
+}
+
+/**
+ * The only activity shape a coordinator reader may see: the private correlation digests
+ * are dropped here, so no projection can leak them, and a snapshot that contradicts the
+ * lifecycle state it accompanies is withheld entirely.
+ *
+ * Withheld, never repaired: the bytes on disk are preserved exactly as written — a
+ * malformed or contradictory snapshot is evidence — while every public projection shows
+ * nothing rather than a reconciled guess.
+ */
+export function publicRuntimeToolActivity(value: unknown, lifecycleState: unknown): Record<string, unknown> | null {
+	const activity = normalizedRuntimeToolActivity(value);
+	if (!activity || !activityMatchesLifecycle(activity, lifecycleState)) return null;
+	return {
+		seq: activity.seq,
+		last_activity_at: activity.last_activity_at,
+		tool: activity.tool,
+		phase: activity.phase,
+		outcome: activity.outcome,
+		elapsed_ms: activity.elapsed_ms,
+		active_tool_count: activity.active_tool_count,
+		active_tools: activity.active_tools,
+	};
+}
+
+/**
+ * What the caller observed at the exact moment the agent event was dispatched.
+ *
+ * Both the timestamp and the label are captured at that synchronous boundary, never
+ * re-derived here: a later lookup would see a tool registry that may already have been
+ * replaced, and a later clock reading would fold subscriber and lock latency into the
+ * measured interval.
+ */
+export interface CoordinatorToolObservation {
+	/** Canonical public label proven at the observation boundary; anything else is `custom`. */
+	label: string;
+	/** Wall clock captured when the agent event was observed, before any queueing or lock wait. */
+	observedAt: string;
+}
+
+interface RuntimeToolObservation {
+	phase: RuntimeToolActivityPhase;
+	/** Canonical public label proven by the caller; anything else records `custom`. */
+	label: string | undefined;
+	/** One-way correlation digest, or null when the event carried no usable call id. */
+	digest: string | null;
+	isError: boolean;
+	/** Wall clock captured when the event was observed, before any queueing or lock wait. */
+	observedAt: string;
+}
+
+function nextInFlightToolCalls(
+	previous: RuntimeToolActivity["in_flight"],
+	observation: RuntimeToolObservation,
+	tool: string,
+): RuntimeToolActivity["in_flight"] {
+	// An event without a usable call id cannot be correlated, so it must neither add nor
+	// remove exact accounting state.
+	if (observation.digest === null) return previous;
+	if (observation.phase === "started") {
+		// A valid start is idempotent by digest, and a repeat keeps the first observation.
+		if (previous.some(entry => entry.digest === observation.digest)) return previous;
+		// Never capped: every live correlation is kept so the count stays exact.
+		return [...previous, { digest: observation.digest, tool, started_at: observation.observedAt }];
+	}
+	// Only a confirmed active call is closed; a duplicate or unmatched end changes nothing.
+	const index = previous.findIndex(entry => entry.digest === observation.digest);
+	if (index < 0) return previous;
+	return previous.filter((_entry, position) => position !== index);
+}
+
+/** Sequence is monotonic; at the safe-integer ceiling it stops rather than wrapping. */
+function nextRuntimeToolActivitySeq(previous: number): number {
+	return Number.isSafeInteger(previous + 1) ? previous + 1 : previous;
+}
+
+/**
+ * Milliseconds between two observed events, or `null` when there is no exact answer.
+ *
+ * The reader accepts only a non-negative safe integer, because past that a millisecond
+ * count is no longer an exact value and so cannot be one anything measured. The writer
+ * therefore has to reach the same verdict on the same rule, or it can persist a number its
+ * own validator calls malformed — and a malformed snapshot fences out every later activity
+ * write on that session.
+ *
+ * Two canonical timestamps really can be that far apart: the representable `Date` range
+ * spans 1.728e16 ms, nearly twice `MAX_SAFE_INTEGER`. Saturating at the ceiling would
+ * publish a duration nothing observed, so an unmeasurable interval is reported as exactly
+ * that — the outcome still stands, only the interval is absent.
+ */
+function measuredElapsedMs(startedAtMs: number, observedAtMs: number): number | null {
+	if (!Number.isFinite(startedAtMs) || !Number.isFinite(observedAtMs)) return null;
+	const elapsed = Math.round(observedAtMs - startedAtMs);
+	return Number.isSafeInteger(elapsed) && elapsed >= 0 ? elapsed : null;
+}
+
+function nextRuntimeToolActivity(
+	previous: RuntimeToolActivity | null,
+	observation: RuntimeToolObservation,
+): RuntimeToolActivity {
+	const priorInFlight = previous?.in_flight ?? [];
+	const match =
+		observation.phase === "finished" && observation.digest !== null
+			? priorInFlight.find(entry => entry.digest === observation.digest)
+			: undefined;
+	// A matched end reports the label its own START proved. Re-labelling from the end
+	// event would read a registry that may have been replaced mid-call, so one call could
+	// open as `bash` and close as something else. An unmatched end proved nothing.
+	const tool = match ? match.tool : safeRuntimeToolLabel(observation.label);
+	const startedAtMs = match ? Date.parse(match.started_at) : Number.NaN;
+	const inFlight = nextInFlightToolCalls(priorInFlight, observation, tool);
+	return {
+		seq: nextRuntimeToolActivitySeq(previous?.seq ?? 0),
+		last_activity_at: observation.observedAt,
+		tool,
+		phase: observation.phase,
+		outcome: observation.phase === "started" ? null : observation.isError ? "failure" : "success",
+		// Both ends are event observation times, so lock contention cannot compress a real
+		// interval into near zero.
+		elapsed_ms: measuredElapsedMs(startedAtMs, Date.parse(observation.observedAt)),
+		...projectedActiveTools(inFlight),
+		in_flight: inFlight,
+	};
+}
+
+/**
+ * Settle the activity snapshot a terminal lifecycle transition inherits.
+ *
+ * A settled session cannot still be running a tool, and later tool events are fenced out,
+ * so an unmatched start would otherwise leave a nonzero `active_tool_count` forever. The
+ * orphans are represented honestly — finished, `cancelled`, no elapsed interval — rather
+ * than claimed as a success or a failure nothing observed.
+ *
+ * The same helper serves the runtime `agent_end`/postmortem path and the Coordinator's
+ * canonical terminal repair so the two writers cannot settle differently.
+ *
+ * Two shapes need settling, not one. An orphaned in-flight call is the obvious case. The
+ * other is a `phase: started` snapshot with NOTHING correlated — a start whose call id was
+ * missing or blank never entered the in-flight table, so no end can ever close it — and
+ * leaving it would write the prohibited terminal+started pair, a settled session that
+ * still claims a tool is starting. An already-finished snapshot with nothing in flight is
+ * returned unchanged: a normal terminal transition is not an activity event.
+ */
+export function terminallySettledRuntimeToolActivity(value: unknown, observedAt: string): RuntimeToolActivityReadout {
+	const readout = classifyRuntimeToolActivity(value);
+	if (readout.kind !== "valid") return readout;
+	const previous = readout.activity;
+	if (previous.in_flight.length === 0 && previous.phase !== "started") return readout;
+	const previousMs = Date.parse(previous.last_activity_at);
+	const observedMs = Date.parse(observedAt);
+	// Terminal authority wins even at the sequence ceiling, where seq stays put; the
+	// last-observation timestamp never moves backwards.
+	const lastActivityAt =
+		isCanonicalIsoTimestamp(observedAt) && (!Number.isFinite(previousMs) || observedMs >= previousMs)
+			? observedAt
+			: previous.last_activity_at;
+	return {
+		kind: "valid",
+		activity: {
+			seq: nextRuntimeToolActivitySeq(previous.seq),
+			last_activity_at: lastActivityAt,
+			tool: previous.tool,
+			phase: "finished",
+			outcome: "cancelled",
+			elapsed_ms: null,
+			...projectedActiveTools([]),
+			in_flight: [],
+		},
+	};
 }
 
 export interface OwnerTerminalContext {
@@ -377,207 +842,22 @@ export function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 	return null;
 }
 
+/** True for every event the coordinator-shared file records: lifecycle state or tool activity. */
 export function eventAffectsCoordinatorRuntimeState(event: RuntimeStateEvent): boolean {
-	return stateForEvent(event) !== null || toolActivityForEvent(event) !== null;
-}
-
-function safeToolName(value: unknown): string {
-	return typeof value === "string" && SAFE_TOOL_NAME.test(value) ? value : "custom";
-}
-
-type ToolActivityEvent =
-	| { phase: "started"; toolCallKey: string; toolName: string }
-	| { phase: "finished"; toolCallKey: string; toolName: string; outcome: "succeeded" | "failed" };
-
-type ActiveToolCall = { tool_name: string; started_at: string };
-type ActiveToolCalls = Record<string, ActiveToolCall>;
-
-function toolActivityForEvent(event: RuntimeStateEvent): ToolActivityEvent | null {
-	if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return null;
-	if (typeof event.toolCallId !== "string") return null;
-	const toolCallKey = createHash("sha256").update(event.toolCallId).digest("hex");
-	if (event.type === "tool_execution_start")
-		return { phase: "started", toolCallKey, toolName: safeToolName(event.toolName) };
-	return {
-		phase: "finished",
-		toolCallKey,
-		toolName: safeToolName(event.toolName),
-		outcome: event.isError === true ? "failed" : "succeeded",
-	};
-}
-
-function runtimeStateFromPrevious(value: unknown): RuntimeState {
-	return value === "ready_for_input" ||
-		value === "running" ||
-		value === "needs_user_input" ||
-		value === "completed" ||
-		value === "errored"
-		? value
-		: "running";
-}
-
-function validActiveToolCall(value: unknown): value is ActiveToolCall {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const entry = value as Record<string, unknown>;
-	return (
-		Object.keys(entry).length === 2 &&
-		Object.hasOwn(entry, "tool_name") &&
-		Object.hasOwn(entry, "started_at") &&
-		typeof entry.tool_name === "string" &&
-		SAFE_TOOL_NAME.test(entry.tool_name) &&
-		typeof entry.started_at === "string" &&
-		Number.isFinite(Date.parse(entry.started_at))
-	);
-}
-
-function validActiveToolCalls(value: unknown): value is ActiveToolCalls {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const entries = Object.entries(value);
-	return (
-		entries.length <= MAX_ACTIVE_TOOL_CALLS &&
-		entries.every(([key, entry]) => ACTIVE_TOOL_CALL_KEY.test(key) && validActiveToolCall(entry))
-	);
-}
-
-function validActiveToolCallsOverflowCount(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
-function validActiveToolCallsOverflowDigests(value: unknown): value is string[] {
-	return (
-		Array.isArray(value) &&
-		value.length <= MAX_ACTIVE_TOOL_CALLS_OVERFLOW_DIGESTS &&
-		new Set(value).size === value.length &&
-		value.every(digest => typeof digest === "string" && ACTIVE_TOOL_CALL_KEY.test(digest))
-	);
-}
-
-function activeToolCallsOverflowCount(previous: Record<string, unknown>): number {
-	return validActiveToolCallsOverflowCount(previous.active_tool_calls_overflow_count)
-		? previous.active_tool_calls_overflow_count
-		: 0;
-}
-
-function activeToolCallsOverflowDigests(previous: Record<string, unknown>): string[] {
-	return validActiveToolCallsOverflowDigests(previous.active_tool_calls_overflow_digests)
-		? [...previous.active_tool_calls_overflow_digests]
-		: [];
-}
-
-function activeToolCallsOverflowCountIsLowerBound(previous: Record<string, unknown>): boolean {
-	return previous.active_tool_calls_overflow_count_is_lower_bound === true;
-}
-
-function validActiveToolCallsOverflowState(payload: Record<string, unknown>): boolean {
-	const hasOverflowCount = Object.hasOwn(payload, "active_tool_calls_overflow_count");
-	const hasOverflowDigests = Object.hasOwn(payload, "active_tool_calls_overflow_digests");
-	const hasLowerBound = Object.hasOwn(payload, "active_tool_calls_overflow_count_is_lower_bound");
-	if (
-		(hasOverflowCount && !validActiveToolCallsOverflowCount(payload.active_tool_calls_overflow_count)) ||
-		(hasOverflowDigests && !validActiveToolCallsOverflowDigests(payload.active_tool_calls_overflow_digests)) ||
-		(hasLowerBound && typeof payload.active_tool_calls_overflow_count_is_lower_bound !== "boolean") ||
-		(hasOverflowDigests && !hasOverflowCount) ||
-		(hasLowerBound && (!hasOverflowCount || !hasOverflowDigests))
-	)
-		return false;
-	const overflowDigests = activeToolCallsOverflowDigests(payload);
-	if (activeToolCallsOverflowCount(payload) !== overflowDigests.length) return false;
-	const activeToolCalls = payload.active_tool_calls;
-	return (
-		!validActiveToolCalls(activeToolCalls) || !overflowDigests.some(digest => Object.hasOwn(activeToolCalls, digest))
-	);
-}
-
-function evictOldestActiveToolCall(activeToolCalls: ActiveToolCalls): string | null {
-	let oldestKey: string | undefined;
-	let oldestStartedAt = Number.POSITIVE_INFINITY;
-	for (const [key, entry] of Object.entries(activeToolCalls)) {
-		const startedAt = Date.parse(entry.started_at);
-		if (startedAt < oldestStartedAt) {
-			oldestKey = key;
-			oldestStartedAt = startedAt;
-		}
-	}
-	if (!oldestKey) return null;
-	delete activeToolCalls[oldestKey];
-	return oldestKey;
-}
-
-function activityFieldsForEvent(
-	previous: Record<string, unknown>,
-	activityEvent: ToolActivityEvent,
-	now: string,
-	nowMs: number,
-): Record<string, unknown> {
-	const activeToolCalls: ActiveToolCalls = validActiveToolCalls(previous.active_tool_calls)
-		? { ...previous.active_tool_calls }
-		: {};
-	const overflowDigests = activeToolCallsOverflowDigests(previous);
-	let overflowCountIsLowerBound = activeToolCallsOverflowCountIsLowerBound(previous);
-	const prior = activeToolCalls[activityEvent.toolCallKey];
-	const overflowDigestIndex = overflowDigests.indexOf(activityEvent.toolCallKey);
-	if (activityEvent.phase === "started") {
-		if (!prior && overflowDigestIndex === -1) {
-			const evictedToolCallKey =
-				Object.keys(activeToolCalls).length >= MAX_ACTIVE_TOOL_CALLS
-					? evictOldestActiveToolCall(activeToolCalls)
-					: null;
-			if (evictedToolCallKey) {
-				if (overflowDigests.length < MAX_ACTIVE_TOOL_CALLS_OVERFLOW_DIGESTS)
-					overflowDigests.push(evictedToolCallKey);
-				else overflowCountIsLowerBound = true;
-			}
-			activeToolCalls[activityEvent.toolCallKey] = { tool_name: activityEvent.toolName, started_at: now };
-		}
-	} else {
-		if (prior) delete activeToolCalls[activityEvent.toolCallKey];
-		else if (overflowDigestIndex !== -1) overflowDigests.splice(overflowDigestIndex, 1);
-	}
-	const previousActivity =
-		previous.activity && typeof previous.activity === "object" && !Array.isArray(previous.activity)
-			? (previous.activity as Record<string, unknown>)
-			: null;
-	const sequence =
-		previousActivity &&
-		typeof previousActivity.sequence === "number" &&
-		Number.isSafeInteger(previousActivity.sequence) &&
-		previousActivity.sequence >= 0
-			? Math.min(Number.MAX_SAFE_INTEGER, previousActivity.sequence + 1)
-			: 1;
-	const activeTools = Object.values(activeToolCalls)
-		.sort((left, right) => Date.parse(left.started_at) - Date.parse(right.started_at))
-		.slice(0, MAX_PUBLIC_ACTIVE_TOOLS);
-	const startedAt = activityEvent.phase === "started" ? now : prior?.started_at;
-	const elapsedMs = startedAt ? Math.max(0, nowMs - Date.parse(startedAt)) : undefined;
-	return {
-		last_activity_at: now,
-		activity: {
-			sequence,
-			kind: "tool_execution",
-			phase: activityEvent.phase,
-			tool_name: activityEvent.toolName,
-			observed_at: now,
-			...(startedAt ? { started_at: startedAt } : {}),
-			...(elapsedMs === undefined ? {} : { elapsed_ms: elapsedMs }),
-			...(activityEvent.phase === "finished" ? { outcome: activityEvent.outcome } : {}),
-			active_tool_count: Math.min(
-				Number.MAX_SAFE_INTEGER,
-				Object.keys(activeToolCalls).length + overflowDigests.length,
-			),
-			...(overflowCountIsLowerBound ? { active_tool_count_is_lower_bound: true } : {}),
-		},
-		active_tools: activeTools,
-		active_tool_calls: activeToolCalls,
-		active_tool_calls_overflow_count: overflowDigests.length,
-		active_tool_calls_overflow_digests: overflowDigests,
-		...(overflowCountIsLowerBound ? { active_tool_calls_overflow_count_is_lower_bound: true } : {}),
-	};
+	return stateForEvent(event) !== null || toolActivityPhaseForEvent(event) !== null;
 }
 
 class PreviousRuntimeStateReadError extends Error {
 	constructor() {
 		super("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
 		this.name = "PreviousRuntimeStateReadError";
+	}
+}
+
+class RuntimeToolActivityRefusedError extends Error {
+	constructor(reason: string) {
+		super(`Refusing to overwrite the coordinator tool-activity snapshot: ${reason}.`);
+		this.name = "RuntimeToolActivityRefusedError";
 	}
 }
 
@@ -628,11 +908,6 @@ function validPreviousRuntimeStatePayload(value: unknown): value is Record<strin
 		(typeof payload.updated_at !== "string" || !Number.isFinite(Date.parse(payload.updated_at)))
 	)
 		return false;
-	if (
-		(Object.hasOwn(payload, "active_tool_calls") && !validActiveToolCalls(payload.active_tool_calls)) ||
-		!validActiveToolCallsOverflowState(payload)
-	)
-		return false;
 	if (payload.ready_for_input !== undefined) {
 		const expectedReady = payload.state === "ready_for_input" || payload.state === "completed";
 		if (payload.ready_for_input !== expectedReady) return false;
@@ -647,40 +922,38 @@ function readPreviousPayload(stateFile: string): Record<string, unknown> {
 	try {
 		raw = fsSync.readFileSync(stateFile, "utf8");
 	} catch (error) {
-		lastPayloadByStateFile.delete(stateFile);
 		if (isAbsentStateFileError(error)) return {};
 		throw new PreviousRuntimeStateReadError();
 	}
 	try {
 		return parsePreviousPayload(raw);
 	} catch (error) {
-		lastPayloadByStateFile.delete(stateFile);
 		if (error instanceof PreviousRuntimeStateReadError) throw error;
 		throw new PreviousRuntimeStateReadError();
 	}
 }
 
+/**
+ * Reads the authoritative bytes on disk, every time, inside the state-file lock.
+ *
+ * There is deliberately no metadata (mtime+size) cache here: another process holding the
+ * same lock can rewrite this file to a same-size terminal payload within one filesystem
+ * timestamp tick, and a cache hit would then let a late tool event overwrite a settled
+ * session back into a running-looking one. The file is small and the read happens once
+ * per lock acquisition.
+ */
 async function readPreviousPayloadForEvent(stateFile: string): Promise<Record<string, unknown>> {
 	let stat: fsSync.Stats;
 	try {
 		stat = await fs.stat(stateFile);
 	} catch (error) {
-		lastPayloadByStateFile.delete(stateFile);
 		if (isAbsentStateFileError(error)) return {};
 		throw new PreviousRuntimeStateReadError();
 	}
-	if (!stat.isFile()) {
-		lastPayloadByStateFile.delete(stateFile);
-		throw new PreviousRuntimeStateReadError();
-	}
-	const cached = lastPayloadByStateFile.get(stateFile);
-	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.payload;
+	if (!stat.isFile()) throw new PreviousRuntimeStateReadError();
 	try {
-		const payload = parsePreviousPayload(await Bun.file(stateFile).text());
-		lastPayloadByStateFile.set(stateFile, { mtimeMs: stat.mtimeMs, size: stat.size, payload });
-		return payload;
+		return parsePreviousPayload(await fs.readFile(stateFile, "utf8"));
 	} catch (error) {
-		lastPayloadByStateFile.delete(stateFile);
 		if (error instanceof PreviousRuntimeStateReadError) throw error;
 		throw new PreviousRuntimeStateReadError();
 	}
@@ -705,14 +978,6 @@ function shouldSkipRuntimeStateWrite(
 	return nowMs - previousUpdatedAt < HEARTBEAT_MS;
 }
 
-function rememberWrittenPayload(stateFile: string, payload: Record<string, unknown>): void {
-	try {
-		const stat = fsSync.statSync(stateFile);
-		lastPayloadByStateFile.set(stateFile, { mtimeMs: stat.mtimeMs, size: stat.size, payload });
-	} catch {
-		lastPayloadByStateFile.delete(stateFile);
-	}
-}
 function shouldPreserveTerminalPayload(previous: RuntimeStateSidecarPayload, input: RuntimeStateIdentity): boolean {
 	if (!validRuntimeStateMarker(previous)) return false;
 	if (previous.state !== "completed" && previous.state !== "errored") return false;
@@ -775,6 +1040,17 @@ function basePayload(input: {
 }): Record<string, unknown> {
 	const identity = normalizedIdentity(input.context);
 	if (identity.sessionId !== input.sessionId) throw new PreviousRuntimeStateReadError();
+	// A lifecycle transition says nothing about tool activity, so a valid snapshot is
+	// carried forward and a malformed one verbatim: dropping it would silently reset the
+	// per-session sequence, and the public projection refuses to publish it either way.
+	// A TERMINAL transition is the one exception — it is authority that nothing can still
+	// be running, so any orphaned in-flight call is settled here.
+	const terminal = input.state === "completed" || input.state === "errored";
+	const readout = terminal
+		? terminallySettledRuntimeToolActivity(input.previous.activity, input.now)
+		: classifyRuntimeToolActivity(input.previous.activity);
+	const activity =
+		readout.kind === "absent" ? undefined : readout.kind === "valid" ? readout.activity : input.previous.activity;
 	return {
 		schema_version: 1,
 		session_id: identity.sessionId,
@@ -791,25 +1067,7 @@ function basePayload(input: {
 		workdir: identity.workdir,
 		branch: branchForContext(input.context),
 		session_file: identity.sessionFile,
-		...(typeof input.previous.last_activity_at === "string"
-			? { last_activity_at: input.previous.last_activity_at }
-			: {}),
-		...(input.previous.activity && typeof input.previous.activity === "object"
-			? { activity: input.previous.activity }
-			: {}),
-		...(Array.isArray(input.previous.active_tools) ? { active_tools: input.previous.active_tools } : {}),
-		...(validActiveToolCalls(input.previous.active_tool_calls)
-			? { active_tool_calls: input.previous.active_tool_calls }
-			: {}),
-		...(validActiveToolCallsOverflowCount(input.previous.active_tool_calls_overflow_count)
-			? { active_tool_calls_overflow_count: input.previous.active_tool_calls_overflow_count }
-			: {}),
-		...(validActiveToolCallsOverflowDigests(input.previous.active_tool_calls_overflow_digests)
-			? { active_tool_calls_overflow_digests: input.previous.active_tool_calls_overflow_digests }
-			: {}),
-		...(input.previous.active_tool_calls_overflow_count_is_lower_bound === true
-			? { active_tool_calls_overflow_count_is_lower_bound: true }
-			: {}),
+		...(activity === undefined ? {} : { activity }),
 		...(input.context.ownerTerminal ? { owner_generation: input.context.ownerTerminal.generation } : {}),
 	};
 }
@@ -972,13 +1230,20 @@ async function writeStateFileSync(stateFile: string, payload: Record<string, unk
 	await writeStateFile(stateFile, payload);
 }
 
+/**
+ * The state-file critical section, shared byte-for-byte with the Coordinator MCP writer.
+ *
+ * The shared implementation writes the base Coordinator's regular-file `<file>.lock`
+ * owner JSON, so both writers recognize each other's owners. The base RUNTIME guarded
+ * this same path with the generic directory-style lock instead, so a leftover
+ * `<file>.lock/` directory is also recognized and reclaimed under its own protocol rather
+ * than faulting forever.
+ */
 async function withStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
 	try {
-		return await withFileLock(stateFile, operation, { staleMs: 30_000, retries: 12_000, retryDelayMs: 5 });
+		return await withSessionStateFileLock(stateFile, operation);
 	} catch (error) {
-		if (error instanceof Error && error.message.startsWith("Failed to acquire lock")) {
-			throw new PreviousRuntimeStateReadError();
-		}
+		if (error instanceof SessionStateLockUnavailableError) throw new PreviousRuntimeStateReadError();
 		throw error;
 	}
 }
@@ -987,14 +1252,28 @@ function coordinatorTransactionLockFile(stateFile: string): string {
 	return path.resolve(path.dirname(stateFile), "..", "locks", "mutation.lock");
 }
 
+/**
+ * The outer namespace-wide transaction lock. It guards no single JSON document of its
+ * own, so it stays on the generic directory-style lock rather than the state-file owner
+ * protocol.
+ */
 async function withCoordinatorTransactionLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
-	return await withStateFileLock(coordinatorTransactionLockFile(stateFile), operation);
+	try {
+		return await withFileLock(coordinatorTransactionLockFile(stateFile), operation, {
+			staleMs: 30_000,
+			retries: 12_000,
+			retryDelayMs: 5,
+		});
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("Failed to acquire lock"))
+			throw new PreviousRuntimeStateReadError();
+		throw error;
+	}
 }
 
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
 	await fs.mkdir(path.dirname(stateFile), { recursive: true });
 	await Bun.write(stateFile, `${JSON.stringify(payload)}\n`);
-	rememberWrittenPayload(stateFile, payload);
 }
 
 function contextWithManagedOwnerGeneration(context: RuntimeStateContext): RuntimeStateContext {
@@ -1004,15 +1283,93 @@ function contextWithManagedOwnerGeneration(context: RuntimeStateContext): Runtim
 	return ownerTerminal ? { ...context, ownerTerminal } : context;
 }
 
+/**
+ * Annotates the existing coordinator-shared runtime state with a tool-activity snapshot.
+ *
+ * Activity is an annotation on a lifecycle state, never a lifecycle state of its own: it
+ * refuses to seed a state file, refuses to touch a session that already settled, and leaves
+ * `updated_at` alone so the running-heartbeat cadence stays measured from lifecycle writes.
+ */
+async function persistCoordinatorRuntimeToolActivity(
+	event: RuntimeStateEvent,
+	context: RuntimeStateContext,
+	stateFile: string,
+	phase: RuntimeToolActivityPhase,
+	label: string | undefined,
+	observedAt: string,
+): Promise<void> {
+	const identity = normalizedIdentity(context);
+	await serializeStateFileWrite(
+		stateFile,
+		async () =>
+			await withCoordinatorTransactionLock(
+				stateFile,
+				async () =>
+					await withStateFileLock(stateFile, async () => {
+						const previous = await readPreviousPayloadForEvent(stateFile);
+						if (Object.keys(previous).length === 0) return;
+						assertPreviousRuntimeStateIdentity(previous, identity);
+						// A tool event that lands after the session settled must never
+						// resurrect it into a live-looking state.
+						if (previous.state === "completed" || previous.state === "errored") return;
+						const readout = classifyRuntimeToolActivity(previous.activity);
+						// Fail closed rather than replace an unreadable snapshot, or a sequence
+						// that can no longer advance, with a lower one.
+						if (readout.kind === "malformed")
+							throw new RuntimeToolActivityRefusedError("the persisted snapshot is malformed");
+						const priorActivity = readout.kind === "valid" ? readout.activity : null;
+						if (!Number.isSafeInteger((priorActivity?.seq ?? 0) + 1))
+							throw new RuntimeToolActivityRefusedError("its sequence cannot advance safely");
+						await writeStateFile(stateFile, {
+							...previous,
+							activity: nextRuntimeToolActivity(priorActivity, {
+								phase,
+								label,
+								digest: toolCallDigest(identity.sessionId, event.toolCallId),
+								isError: event.isError === true,
+								observedAt,
+							}),
+						});
+					}),
+			),
+	);
+}
+
 export async function persistCoordinatorRuntimeStateFromEvent(
 	event: RuntimeStateEvent,
 	context: RuntimeStateContext,
+	/**
+	 * What the caller observed at the synchronous agent-event boundary: the canonical
+	 * public label it proved against the ACTIVE tool object, and the wall clock it read
+	 * there. Without one, a tool event records `custom` at this writer's own clock — the
+	 * sidecar never trusts a model-supplied name.
+	 */
+	observation?: CoordinatorToolObservation,
 ): Promise<void> {
+	// The caller's observation time wins so that queueing, subscriber latency, and lock
+	// contention cannot compress a real elapsed interval into near zero. A value this
+	// writer could not have produced is not trusted enough to persist.
+	const observedAt =
+		observation && isCanonicalIsoTimestamp(observation.observedAt)
+			? observation.observedAt
+			: new Date().toISOString();
 	__sessionStateSidecarPerfCounters.persistFromEventCalls += 1;
 	const stateFile = runtimeStateFileForContext(context);
-	const eventState = stateForEvent(event);
-	const activityEvent = toolActivityForEvent(event);
-	if (!stateFile || (!eventState && !activityEvent)) return;
+	const state = stateForEvent(event);
+	if (!stateFile) return;
+	if (!state) {
+		const activityPhase = toolActivityPhaseForEvent(event);
+		if (!activityPhase) return;
+		await persistCoordinatorRuntimeToolActivity(
+			event,
+			context,
+			stateFile,
+			activityPhase,
+			observation?.label,
+			observedAt,
+		);
+		return;
+	}
 	context = contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	await serializeStateFileWrite(
@@ -1026,7 +1383,6 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity);
-						const state = eventState ?? runtimeStateFromPrevious(previous.state);
 						const finalResponse = finalResponseForEvent(event);
 						const terminalReceipt =
 							state === "completed" || state === "errored"
@@ -1053,7 +1409,6 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 										ended_at: now,
 									}
 								: {}),
-							...(activityEvent ? activityFieldsForEvent(previous, activityEvent, now, nowMs) : {}),
 							...(finalResponse ? { final_response: finalResponse } : {}),
 							...(terminalReceipt?.receipt === "missing"
 								? {

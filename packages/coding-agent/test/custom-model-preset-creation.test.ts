@@ -334,8 +334,21 @@ describe("custom model preset creation", () => {
 		await expect(Bun.file(modelsPath).exists()).resolves.toBe(false);
 	});
 
-	it("rejects invalid persisted profile selectors with clear messages", async () => {
-		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+	it("rejects invalid profile mappings before persistence without changing existing profiles", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		await Bun.write(
+			modelsPath,
+			[
+				"profiles:",
+				"  existing:",
+				"    required_providers: [my-oai]",
+				"    model_mapping:",
+				"      default: my-oai/original",
+				"",
+			].join("\n"),
+		);
+		const before = await Bun.file(modelsPath).text();
+		const registry = new ModelRegistry(authStorage, modelsPath);
 
 		await expect(
 			registry.saveCustomModelProfile("broken", {
@@ -344,6 +357,7 @@ describe("custom model preset creation", () => {
 				model_mapping: { default: "missing,selector" },
 			}),
 		).rejects.toThrow("Expected modelId or provider/modelId with optional :effort suffix");
+		expect(await Bun.file(modelsPath).text()).toBe(before);
 	});
 
 	it("surfaces create custom preset with the generated current model snapshot", async () => {

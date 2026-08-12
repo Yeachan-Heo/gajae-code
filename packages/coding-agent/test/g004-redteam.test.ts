@@ -10,6 +10,11 @@ import {
 	persistCoordinatorRuntimeStateFromPostmortem,
 } from "../src/gjc-runtime/session-state-sidecar";
 import { WorkerIntegrationRequestScheduler } from "../src/session/agent-session";
+import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
+
+// Coordinator state writes serialize on a lock whose removals go through identity-bound
+// native primitives; point them at a working implementation.
+installExactIdentityNatives();
 
 const tempDirs: string[] = [];
 const ORIGINAL_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];

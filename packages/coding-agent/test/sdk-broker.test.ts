@@ -789,6 +789,34 @@ describe("SDK broker identity and discovery", () => {
 		const owner = (await import("../src/sdk/broker/ensure")).brokerOwnerForTest(dir);
 		await owner?.stop();
 	}, 15_000);
+	it("refuses concurrent launches when a live lock owner has not published discovery", async () => {
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(
+			path.join(lock, "owner.json"),
+			JSON.stringify({ version: 1, ownerId: "live-unpublished-owner", pid: process.pid, acquiredAt: Date.now() }),
+			{ mode: 0o600 },
+		);
+		const contenders = Array.from({ length: 3 }, () => new Broker({ agentDir: dir }));
+		try {
+			const outcomes = await Promise.allSettled(contenders.map(broker => broker.start()));
+
+			expect(outcomes.map(outcome => outcome.status)).toEqual(["rejected", "rejected", "rejected"]);
+			for (const outcome of outcomes) {
+				if (outcome.status === "rejected")
+					expect(String(outcome.reason)).toContain(`Broker lock is held by a live owner (pid ${process.pid})`);
+			}
+			expect(await readBrokerDiscovery(dir)).toBeNull();
+			expect(contenders.map(broker => broker.status())).toEqual([null, null, null]);
+			expect(JSON.parse(await fs.readFile(path.join(lock, "owner.json"), "utf8"))).toMatchObject({
+				ownerId: "live-unpublished-owner",
+				pid: process.pid,
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 5_000);
 	it("preserves legacy Windows publication and heartbeat when retained self-reap is unsupported", async () => {
 		const dir = await temp();
 		const now = Date.now();

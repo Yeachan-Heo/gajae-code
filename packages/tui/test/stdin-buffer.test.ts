@@ -5,7 +5,7 @@
  * MIT License - Copyright (c) 2025 opentui
  */
 
-import { beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { parseKey, setKittyProtocolActive } from "@gajae-code/tui/keys";
 import { StdinBuffer } from "@gajae-code/tui/stdin-buffer";
 
@@ -21,6 +21,10 @@ describe("StdinBuffer", () => {
 		buffer.on("data", (sequence: string) => {
 			emittedSequences.push(sequence);
 		});
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
 	});
 
 	// Helper to process data through the buffer
@@ -351,6 +355,221 @@ describe("StdinBuffer", () => {
 
 			const flushed = buffer.flush();
 			expect(flushed).toEqual(["\x1b"]);
+		});
+
+		it("emits a coalesced double-Esc chunk as two Escape presses after the flush timeout", async () => {
+			// tmux forwards a quick double-Esc as one "\x1b\x1b" chunk within
+			// escape-time; emitting it as a single sequence parses as the unbound
+			// "alt+escape" and swallows both presses (double-Esc draft clear).
+			processInput("\x1b\x1b");
+			expect(emittedSequences).toEqual([]);
+
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["\x1b", "\x1b"]);
+		});
+
+		it("emits two Esc presses split across chunks inside the flush window as two Escapes", async () => {
+			processInput("\x1b");
+			await Bun.sleep(5);
+			processInput("\x1b");
+			expect(emittedSequences).toEqual([]);
+
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["\x1b", "\x1b"]);
+		});
+
+		it("emits a triple-Esc chunk as three Escape presses", async () => {
+			processInput("\x1b\x1b\x1b");
+
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b"]);
+		});
+
+		it("flushes a coalesced double-Esc explicitly as two Escapes", () => {
+			processInput("\x1b\x1b");
+			expect(buffer.flush()).toEqual(["\x1b", "\x1b"]);
+		});
+
+		it("keeps Option-as-Meta ESC ESC sequences atomic when the continuation is present", () => {
+			// macOS Terminal "Use Option as Meta key": Option+Up arrives as ESC ESC [ A
+			// in one write and must stay one sequence.
+			processInput("\x1b\x1b[A");
+			expect(emittedSequences).toEqual(["\x1b\x1b[A"]);
+		});
+
+		it("preserves a Meta-wrapped arrow after a preceding bare Escape", () => {
+			// macOS Terminal can batch bare Escape then Option+Up as ESC ESC ESC [ A.
+			// The bare Escape must not consume the Meta wrapper and turn this into
+			// a destructive double-Escape gesture followed by plain Up.
+			processInput("\x1b\x1b\x1b[A");
+			expect(emittedSequences).toEqual(["\x1b", "\x1b\x1b[A"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["escape", "alt+up"]);
+		});
+
+		it("preserves a Meta-wrapped arrow when the chunk splits after the third Escape", () => {
+			// Same ESC ESC ESC [ A bytes as above, but the read boundary falls after
+			// the Escape run. Only the final two bytes stay buffered as the ambiguous
+			// Meta candidate, so the continuation still forms the wrapper instead of a
+			// plain Up after a destructive double-Escape gesture.
+			vi.useFakeTimers();
+			processInput("\x1b\x1b\x1b");
+			expect(emittedSequences).toEqual(["\x1b"]);
+
+			vi.advanceTimersByTime(9);
+			processInput("[A");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b\x1b[A"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["escape", "alt+up"]);
+		});
+
+		it("emits three Escapes when the split continuation arrives after the flush boundary", () => {
+			vi.useFakeTimers();
+			processInput("\x1b\x1b\x1b");
+			vi.advanceTimersByTime(10);
+			processInput("[A");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b", "[", "A"]);
+		});
+
+		it("preserves a Meta-wrapped SS3 key after a preceding bare Escape", () => {
+			processInput("\x1b\x1b\x1bOP");
+			expect(emittedSequences).toEqual(["\x1b", "\x1b\x1bOP"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["escape", "alt+f1"]);
+		});
+
+		it("keeps a delayed Option continuation atomic when it arrives before the flush boundary", () => {
+			vi.useFakeTimers();
+			processInput("\x1b\x1b");
+			vi.advanceTimersByTime(9);
+			processInput("[A");
+
+			expect(emittedSequences).toEqual(["\x1b\x1b[A"]);
+		});
+
+		it("emits separate Escapes when an Option continuation arrives after the flush boundary", () => {
+			vi.useFakeTimers();
+			processInput("\x1b\x1b");
+			vi.advanceTimersByTime(10);
+			processInput("[A");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "[", "A"]);
+		});
+
+		it("does not duplicate or lose Escapes across a cancellation cut and explicit flush", () => {
+			processInput("\x1b\x1b\x1b\x1b[1;");
+			expect(emittedSequences).toEqual(["\x1b", "\x1b"]);
+			expect(buffer.flush()).toEqual(["\x1b\x1b[1;"]);
+		});
+
+		it("resolves an Escape run into individual presses when a bracketed paste follows", () => {
+			// A paste start proves no Meta continuation is coming for the buffered
+			// Escape run. Emitting the run as one sequence parses as the unbound
+			// alt+escape and swallows every press.
+			const pastes: string[] = [];
+			buffer.on("paste", text => pastes.push(text));
+
+			processInput("\x1b\x1b\x1b\x1b[200~hi\x1b[201~");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["escape", "escape", "escape"]);
+			expect(pastes).toEqual(["hi"]);
+		});
+
+		it("resolves an even Escape run before a bracketed paste", () => {
+			const pastes: string[] = [];
+			buffer.on("paste", text => pastes.push(text));
+
+			processInput("\x1b\x1b\x1b\x1b\x1b[200~hi\x1b[201~");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b", "\x1b"]);
+			expect(pastes).toEqual(["hi"]);
+		});
+
+		it("decodes an Escape run before a paste identically when the chunk splits", () => {
+			const pastes: string[] = [];
+			buffer.on("paste", text => pastes.push(text));
+
+			processInput("\x1b\x1b\x1b");
+			processInput("\x1b[200~hi\x1b[201~");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b"]);
+			expect(pastes).toEqual(["hi"]);
+		});
+
+		it("decodes an Escape run before a paste identically byte by byte", () => {
+			const pastes: string[] = [];
+			buffer.on("paste", text => pastes.push(text));
+
+			for (const byte of "\x1b\x1b\x1b\x1b[200~hi\x1b[201~") processInput(byte);
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b"]);
+			expect(pastes).toEqual(["hi"]);
+		});
+
+		it("decodes a long Escape run followed by a key", () => {
+			// Measuring the run once keeps this linear; re-testing the whole suffix
+			// while the cut advanced two bytes at a time took over a second here.
+			const runLength = 50_000;
+			processInput(`${"\x1b".repeat(runLength)}A`);
+
+			expect(emittedSequences.length).toBe(runLength - 1);
+			expect(emittedSequences.at(-1)).toBe("\x1b\x1bA");
+			expect(emittedSequences.slice(0, -1).every(sequence => sequence === "\x1b")).toBe(true);
+		});
+
+		it("keeps only the ambiguous Meta candidate buffered across chunks", () => {
+			// Retaining the whole run made every later read rescan it. Only the final
+			// two bytes can still become a Meta prefix, so the rest settle immediately.
+			for (let index = 0; index < 64; index++) processInput("\x1b");
+
+			expect(emittedSequences).toEqual(Array(62).fill("\x1b"));
+			expect(buffer.flush()).toEqual(["\x1b", "\x1b"]);
+		});
+
+		it("scales linearly over Escape-run length delivered byte by byte", () => {
+			// The cross-chunk counterpart: rescanning the retained run on every read
+			// cost 2.4s at 50k bytes before the buffered run was bounded.
+			const decodePerByte = (runLength: number): number => {
+				const probe = new StdinBuffer();
+				probe.on("data", () => {});
+				const started = Bun.nanoseconds();
+				for (let index = 0; index < runLength; index++) probe.process("\x1b");
+				return Bun.nanoseconds() - started;
+			};
+			decodePerByte(2_000);
+
+			const small = decodePerByte(5_000);
+			const large = decodePerByte(50_000);
+
+			expect(large / Math.max(small, 1)).toBeLessThan(30);
+		});
+
+		it("scales linearly rather than quadratically over Escape-run length", () => {
+			// Relative scaling, not an absolute wall-clock budget: a 10x longer run
+			// costs ~10x when the run boundary is measured once, but ~100x when every
+			// iteration rescans the remaining suffix.
+			const decode = (runLength: number): number => {
+				const probe = new StdinBuffer();
+				const input = `${"\x1b".repeat(runLength)}A`;
+				const started = Bun.nanoseconds();
+				probe.process(input);
+				return Bun.nanoseconds() - started;
+			};
+			decode(2_000);
+
+			const small = decode(5_000);
+			const large = decode(50_000);
+
+			expect(large / Math.max(small, 1)).toBeLessThan(30);
+		});
+
+		it("still cuts an ESC-cancelled incomplete sequence without splitting it", async () => {
+			// An incomplete alt-CSI prefix cancelled by a new ESC is not a pure
+			// ESC run and must be emitted whole, exactly as before.
+			processInput("\x1b\x1b[1;\x1b");
+
+			await Bun.sleep(15);
+			expect(emittedSequences).toEqual(["\x1b\x1b[1;", "\x1b"]);
 		});
 
 		it("should handle buffer input", () => {

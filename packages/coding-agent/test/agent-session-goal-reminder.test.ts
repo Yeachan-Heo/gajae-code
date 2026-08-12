@@ -15,6 +15,11 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { logger, TempDir } from "@gajae-code/utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
+
+// Coordinator state writes serialize on a lock whose removals go through identity-bound
+// native primitives; point them at a working implementation.
+installExactIdentityNatives();
 
 describe("AgentSession active goal reminders", () => {
 	let tempDir: TempDir;

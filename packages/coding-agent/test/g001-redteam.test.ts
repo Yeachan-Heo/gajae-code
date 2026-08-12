@@ -51,7 +51,7 @@ describe("G001 red-team adversarial contracts", () => {
 		expect(manager.checkDelta("anything", { source: "text" })).toEqual([]);
 	});
 
-	it("ignores unknown sidecar event types and keeps predicate equivalent to stateForEvent", () => {
+	it("ignores unknown sidecar event types and records only lifecycle or tool-activity events", () => {
 		const events = [
 			{ type: "message_update", message: {}, assistantMessageEvent: {} },
 			{ type: "notice", level: "info", message: "background" },
@@ -59,10 +59,15 @@ describe("G001 red-team adversarial contracts", () => {
 			{ type: "agent_start" },
 			{ type: "agent_end", messages: [] },
 			{ type: "unknown_future_event", payload: true },
+			{ type: "tool_execution_start", toolCallId: "call-1" },
 		] as const;
 
 		for (const event of events) {
-			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(stateForEvent(event as never) !== null);
+			const recorded = event.type === "turn_start" || event.type === "agent_start" || event.type === "agent_end";
+			// A tool event annotates activity without ever carrying a lifecycle state.
+			const activity = event.type === "tool_execution_start";
+			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(recorded || activity);
+			expect(stateForEvent(event as never) !== null).toBe(recorded);
 		}
 		expect(eventAffectsCoordinatorRuntimeState(events[5] as never)).toBe(false);
 		expect(stateForEvent(events[5] as never)).toBeNull();

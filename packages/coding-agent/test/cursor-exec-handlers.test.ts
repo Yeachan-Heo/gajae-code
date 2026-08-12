@@ -8,8 +8,10 @@
  */
 import { describe, expect, it } from "bun:test";
 import { create } from "@bufbuild/protobuf";
-import type { AgentTool } from "@gajae-code/agent-core";
+import type { AgentEvent, AgentTool } from "@gajae-code/agent-core";
+import { dispatchedToolIdentity } from "@gajae-code/agent-core";
 import {
+	DeleteArgsSchema,
 	DiagnosticsArgsSchema,
 	GrepArgsSchema,
 	LsArgsSchema,
@@ -184,5 +186,43 @@ describe("CursorExecHandlers shell timeout unit conversion", () => {
 		const handlers = makeShellRecordingHandlers(bashCalls);
 		await handlers.shell(create(ShellArgsSchema, { command: "echo hi", timeout: 500, toolCallId: "s" }));
 		expect(bashCalls[0]).toMatchObject({ timeout: 1 });
+	});
+});
+
+describe("CursorExecHandlers dispatched tool identity", () => {
+	it("binds the exact tool object generic execution selected, not a same-named registry entry", async () => {
+		const selected = makeTool("read");
+		const impostor = makeTool("read");
+		const tools = new Map<string, AgentTool>([["read", selected]]);
+		const events: AgentEvent[] = [];
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools,
+			emitEvent: (event: AgentEvent) => events.push(event),
+		} as never);
+
+		await handlers.read(create(ReadArgsSchema, { path: "/tmp/a.txt", toolCallId: "c1" }));
+
+		const start = events.find(event => event.type === "tool_execution_start");
+		expect(start).toBeDefined();
+		expect(dispatchedToolIdentity(start as object)).toBe(selected);
+		expect(dispatchedToolIdentity(start as object)).not.toBe(impostor);
+	});
+
+	it("leaves a synthetic operation that executes no AgentTool unbound", async () => {
+		const events: AgentEvent[] = [];
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map<string, AgentTool>(),
+			emitEvent: (event: AgentEvent) => events.push(event),
+		} as never);
+
+		await handlers.delete(
+			create(DeleteArgsSchema, { path: "/tmp/gjc-cursor-identity-missing.txt", toolCallId: "d1" }),
+		);
+
+		const start = events.find(event => event.type === "tool_execution_start");
+		expect(start).toBeDefined();
+		expect(dispatchedToolIdentity(start as object)).toBeUndefined();
 	});
 });

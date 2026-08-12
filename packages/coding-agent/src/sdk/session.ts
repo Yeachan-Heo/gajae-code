@@ -2710,9 +2710,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// All built-in tools are active (conditional tools like git/ask return null from factory if disabled)
 		const toolRegistry = new Map<string, Tool>();
+		/**
+		 * Identity — not name — provenance for the coordinator-visible tool label.
+		 *
+		 * Every tool object this builder constructs from a built-in descriptor is recorded
+		 * here as it is created, BEFORE extension, MCP, and custom tools overwrite registry
+		 * names below. An extension or custom tool that registers itself as `bash` replaces
+		 * the registry entry with an object that was never recorded, so the label resolves to
+		 * `custom` instead of impersonating the built-in.
+		 */
+		const builtinToolIdentities = new Set<object>();
 		let builtinCandidateTools = [...builtinTools];
 		for (const tool of builtinTools) {
 			toolRegistry.set(tool.name, tool);
+			builtinToolIdentities.add(tool);
 		}
 		const goalStateToolNames = ["goal"] as const;
 		if (settings.get("goal.enabled")) {
@@ -2727,6 +2738,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					const wrappedGoalStateTool = wrapToolWithMetaNotice(goalStateTool);
 					builtinCandidateTools.push(wrappedGoalStateTool);
 					toolRegistry.set(wrappedGoalStateTool.name, wrappedGoalStateTool);
+					builtinToolIdentities.add(wrappedGoalStateTool);
 				}
 			}
 		}
@@ -2735,7 +2747,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		if (extensionRunner) {
 			for (const tool of toolRegistry.values()) {
-				toolRegistry.set(tool.name, new ExtensionToolWrapper(tool, extensionRunner));
+				const wrapped = new ExtensionToolWrapper(tool, extensionRunner);
+				// A wrapper built from a proven built-in inherits that provenance; one built
+				// from an extension/custom tool does not.
+				if (builtinToolIdentities.has(tool)) builtinToolIdentities.add(wrapped);
+				toolRegistry.set(tool.name, wrapped);
 			}
 		}
 		if (model?.provider === "cursor") {
@@ -2752,6 +2768,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const wrappedResolveTool = wrapToolWithMetaNotice(resolveTool);
 				builtinCandidateTools.push(wrappedResolveTool);
 				toolRegistry.set(wrappedResolveTool.name, wrappedResolveTool);
+				builtinToolIdentities.add(wrappedResolveTool);
 			}
 		}
 		// Exact-config MCP tools cannot claim a name already represented by the final candidate catalog.
@@ -3402,6 +3419,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			taskDepth,
 			workflowGatePublication: isCanonicalSubSession ? "local" : "endpoint",
 			toolRegistry,
+			builtinToolIdentities,
 			workflowGateToolSession: toolSession,
 			transformContext,
 			onPayload,

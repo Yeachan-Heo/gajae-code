@@ -17,5 +17,7 @@ export * from "./run-resource-ledger";
 export * from "./telemetry";
 // Thinking selectors
 export * from "./thinking";
+// Dispatch-bound tool identity (non-serializable side channel keyed by event object)
+export * from "./tool-dispatch-identity";
 // Types
 export * from "./types";

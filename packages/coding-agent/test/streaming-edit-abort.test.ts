@@ -134,6 +134,24 @@ function buildEditTool(): AgentTool {
 	};
 }
 
+// Yield between stream deltas with a microtask instead of `await Bun.sleep(0)`.
+// Bun.sleep(0) registers a real timer: on a CPU-contended shard (dozens of
+// parallel test-file processes competing for the same cores) the timer phase
+// can be delayed by tens of milliseconds per turn, so an O(lineCount) chain of
+// per-delta timer yields scaled with shard load rather than diff size — this
+// is what pushed the 200-line NO-FALSE-ABORT case past Bun's 5s per-test
+// deadline under full-shard pressure (see #4342). The guard under test
+// (`AgentSession#maybeAbortStreamingEdit`) needs each `toolcall_delta` to be
+// independently observable by the consuming async iterator; it does no real
+// async I/O per delta in the no-removed-lines-missing path, so a microtask
+// yield is sufficient to hand control back to the event stream's `for await`
+// consumer between deltas. Harness overhead stays O(1) per delta instead of
+// O(timer-queue-depth) while the streaming-abort interleaving (producer never
+// runs more than one delta ahead of the consumer) is preserved.
+async function yieldBetweenDeltas(): Promise<void> {
+	await Promise.resolve();
+}
+
 function createStreamForDiff(
 	path: string,
 	chunks: string[],
@@ -192,7 +210,7 @@ function createStreamForDiff(
 					delta: chunk,
 					partial: createAssistantMessage([partialCall], "stop"),
 				});
-				await Bun.sleep(0);
+				await yieldBetweenDeltas();
 			}
 
 			if (aborted) return;

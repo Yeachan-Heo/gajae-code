@@ -20,6 +20,11 @@ import { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
+
+// Coordinator state writes serialize on a lock whose removals go through identity-bound
+// native primitives; point them at a working implementation.
+installExactIdentityNatives();
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 	const deadline = Date.now() + 4_000;

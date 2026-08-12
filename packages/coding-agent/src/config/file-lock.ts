@@ -260,6 +260,27 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 	}
 }
 
+/**
+ * @internal
+ * READ-ONLY verdict on an EXISTING generic `<file>.lock/` directory that another lock
+ * protocol has collided with: is its owner gone, by this protocol's own rules?
+ *
+ * Exposed so a foreign holder of the same path never has to reimplement this protocol's
+ * owner parsing or liveness rules. Reusing them is what makes the two implementations
+ * agree: `processStartTime` here is the portable `ps` value that `info.start_time` was
+ * written from, so a live owner is proved live rather than compared against a value from a
+ * different clock source and then reaped. A live owner is never reported stale by elapsed
+ * time alone.
+ *
+ * Deletion is deliberately NOT offered. This protocol can only re-read an owner token and
+ * then unlink a pathname, which a successor can take over in between; a caller that must
+ * remove the directory has to do it under an identity-bound primitive that refuses when
+ * the object is no longer the one that was judged.
+ */
+export async function genericFileLockDirIsStale(lockDir: string, staleMs: number): Promise<boolean> {
+	return (await staleLockSnapshot(lockDir, staleMs)).stale;
+}
+
 async function tryAcquireLock(
 	lockPath: string,
 	ownerHostId?: string,

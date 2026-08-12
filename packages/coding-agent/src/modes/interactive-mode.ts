@@ -1367,7 +1367,11 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
 		}
+		// Re-mounting after a cancelled action must invalidate the editor so the
+		// inline prompt suggestion is rendered again on the restored composer.
+		this.editor.invalidate();
 		this.ui.setFocus(this.editor);
+		this.ui.requestRender();
 	}
 
 	#createPetWidget(editor: CustomEditor): GajaePetWidget {

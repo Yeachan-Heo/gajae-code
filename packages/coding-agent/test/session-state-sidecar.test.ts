@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
-import { createHash } from "node:crypto";
 
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -9,6 +8,7 @@ import { postmortem } from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
+	classifyRuntimeToolActivity,
 	eventAffectsCoordinatorRuntimeState,
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -22,6 +22,7 @@ import {
 	persistCoordinatorRuntimeInputReady,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorRuntimeStateFromPostmortem,
+	publicRuntimeToolActivity,
 	readTerminalRuntimeStateMarker,
 	stateForEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
@@ -31,8 +32,13 @@ import {
 	observeOwnerTerminal,
 	replaceOwnerGeneration,
 } from "../src/gjc-runtime/tmux-owner-isolation";
+import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 
 const tempDirs: string[] = [];
+// Every write below serializes on the coordinator state lock, whose removals go through
+// identity-bound native primitives. Point them at a working implementation so these tests
+// exercise the sidecar rather than the compiled addon's availability.
+installExactIdentityNatives();
 
 type RuntimePayload = Record<string, unknown>;
 
@@ -82,6 +88,7 @@ function git(cwd: string, args: string[]): void {
 
 afterEach(async () => {
 	FileLockTestHooks.afterParentMkdir = undefined;
+	setSystemTime();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
 	if (ORIGINAL_SESSION_ID === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
@@ -152,314 +159,24 @@ describe("coordinator runtime state sidecar", () => {
 	});
 	it("reports whether events affect coordinator runtime state", () => {
 		const events = [
-			{ event: { type: "message_update", message: {}, assistantMessageEvent: {} }, affects: false },
-			{ event: { type: "notice", level: "info", message: "background notice" }, affects: false },
-			{ event: { type: "turn_start" }, affects: true },
-			{ event: { type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash" }, affects: true },
-			{ event: { type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash" }, affects: true },
-			{ event: { type: "agent_start" }, affects: true },
-			{ event: { type: "agent_end", messages: [] }, affects: true },
+			{
+				event: { type: "message_update", message: {}, assistantMessageEvent: {} },
+				affects: false,
+				lifecycle: false,
+			},
+			{ event: { type: "notice", level: "info", message: "background notice" }, affects: false, lifecycle: false },
+			{ event: { type: "turn_start" }, affects: true, lifecycle: true },
+			{ event: { type: "agent_start" }, affects: true, lifecycle: true },
+			{ event: { type: "agent_end", messages: [] }, affects: true, lifecycle: true },
+			// Tool events carry no lifecycle state, but they do change the shared file.
+			{ event: { type: "tool_execution_start", toolCallId: "call-1" }, affects: true, lifecycle: false },
+			{ event: { type: "tool_execution_end", toolCallId: "call-1" }, affects: true, lifecycle: false },
 		] as const;
 
-		for (const { event, affects } of events) {
+		for (const { event, affects, lifecycle } of events) {
 			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(affects);
+			expect(stateForEvent(event as never) !== null).toBe(lifecycle);
 		}
-		expect(stateForEvent({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash" })).toBeNull();
-	});
-
-	it("persists bounded public-safe tool activity while preserving lifecycle state", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "state.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "activity-session";
-		try {
-			setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-			await persistCoordinatorRuntimeStateFromEvent(
-				{ type: "turn_start" },
-				{ sessionId: "fallback", cwd: root, sessionFile: null },
-			);
-			setSystemTime(new Date("2026-01-01T00:00:01.000Z"));
-			await persistCoordinatorRuntimeStateFromEvent(
-				{ type: "tool_execution_start", toolCallId: "private-tool-call-id", toolName: "bash" },
-				{ sessionId: "fallback", cwd: root, sessionFile: null },
-			);
-			setSystemTime(new Date("2026-01-01T00:00:03.500Z"));
-			await persistCoordinatorRuntimeStateFromEvent(
-				{ type: "tool_execution_end", toolCallId: "private-tool-call-id", toolName: "bad\nlabel", isError: true },
-				{ sessionId: "fallback", cwd: root, sessionFile: null },
-			);
-
-			const payload = await readJson(stateFile);
-			expect(payload).toMatchObject({
-				state: "running",
-				last_activity_at: "2026-01-01T00:00:03.500Z",
-				activity: {
-					sequence: 2,
-					kind: "tool_execution",
-					phase: "finished",
-					tool_name: "custom",
-					started_at: "2026-01-01T00:00:01.000Z",
-					elapsed_ms: 2500,
-					outcome: "failed",
-					active_tool_count: 0,
-				},
-				active_tools: [],
-			});
-			expect(JSON.stringify(payload.active_tools)).not.toContain("private-tool-call-id");
-		} finally {
-			setSystemTime();
-		}
-	});
-
-	it("keeps the active-tool count truthful when the public list is bounded", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "state.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "bounded-activity-session";
-		for (let index = 0; index < 9; index++)
-			await persistCoordinatorRuntimeStateFromEvent(
-				{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
-				{ sessionId: "fallback", cwd: root, sessionFile: null },
-			);
-
-		const payload = await readJson(stateFile);
-		expect(payload.activity).toMatchObject({ sequence: 9, active_tool_count: 9 });
-		expect(payload.active_tools).toHaveLength(8);
-	});
-	it("bounds unmatched tool-call correlations and records evictions", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "state.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "bounded-tool-call-correlations";
-		const firstStartedAt = Date.parse("2026-01-01T00:00:00.000Z");
-		try {
-			for (let index = 0; index < 65; index++) {
-				setSystemTime(new Date(firstStartedAt + index));
-				await persistCoordinatorRuntimeStateFromEvent(
-					{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
-					{ sessionId: "fallback", cwd: root, sessionFile: null },
-				);
-			}
-
-			const payload = await readJson(stateFile);
-			const activeToolCalls = payload.active_tool_calls as Record<string, unknown>;
-			expect(Object.keys(activeToolCalls)).toHaveLength(64);
-			expect(payload).toMatchObject({
-				activity: { sequence: 65, active_tool_count: 65 },
-				active_tool_calls_overflow_count: 1,
-				active_tool_calls_overflow_digests: [createHash("sha256").update("tool-0").digest("hex")],
-			});
-			expect(payload.active_tools).toHaveLength(8);
-			expect(activeToolCalls[createHash("sha256").update("tool-0").digest("hex")]).toBeUndefined();
-			expect(activeToolCalls[createHash("sha256").update("tool-64").digest("hex")]).toEqual({
-				tool_name: "read",
-				started_at: "2026-01-01T00:00:00.064Z",
-			});
-		} finally {
-			setSystemTime();
-		}
-	});
-	it("settles only known overflowed tool-call correlations", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "state.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "overflow-settlement";
-		const firstStartedAt = Date.parse("2026-01-01T00:00:00.000Z");
-		const overflowedToolCallKeys = ["tool-0", "tool-1"].map(toolCallId =>
-			createHash("sha256").update(toolCallId).digest("hex"),
-		);
-		try {
-			for (let index = 0; index < 66; index++) {
-				setSystemTime(new Date(firstStartedAt + index));
-				await persistCoordinatorRuntimeStateFromEvent(
-					{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
-					{ sessionId: "fallback", cwd: root, sessionFile: null },
-				);
-			}
-
-			let payload = await readJson(stateFile);
-			expect(payload).toMatchObject({
-				activity: { active_tool_count: 66 },
-				active_tool_calls_overflow_count: 2,
-				active_tool_calls_overflow_digests: overflowedToolCallKeys,
-			});
-
-			setSystemTime(new Date(firstStartedAt + 66));
-			await persistCoordinatorRuntimeStateFromEvent(
-				{ type: "tool_execution_end", toolCallId: "unknown-tool", toolName: "read" },
-				{ sessionId: "fallback", cwd: root, sessionFile: null },
-			);
-			payload = await readJson(stateFile);
-			expect(payload).toMatchObject({
-				activity: { active_tool_count: 66 },
-				active_tool_calls_overflow_count: 2,
-				active_tool_calls_overflow_digests: overflowedToolCallKeys,
-			});
-
-			setSystemTime(new Date(firstStartedAt + 67));
-			await persistCoordinatorRuntimeStateFromEvent(
-				{ type: "tool_execution_end", toolCallId: "tool-0", toolName: "read" },
-				{ sessionId: "fallback", cwd: root, sessionFile: null },
-			);
-			payload = await readJson(stateFile);
-			expect(payload).toMatchObject({
-				activity: { active_tool_count: 65 },
-				active_tool_calls_overflow_count: 1,
-				active_tool_calls_overflow_digests: [overflowedToolCallKeys[1]],
-			});
-
-			setSystemTime(new Date(firstStartedAt + 68));
-			await persistCoordinatorRuntimeStateFromEvent(
-				{ type: "tool_execution_end", toolCallId: "tool-0", toolName: "read" },
-				{ sessionId: "fallback", cwd: root, sessionFile: null },
-			);
-			payload = await readJson(stateFile);
-			expect(payload).toMatchObject({
-				activity: { active_tool_count: 65 },
-				active_tool_calls_overflow_count: 1,
-				active_tool_calls_overflow_digests: [overflowedToolCallKeys[1]],
-			});
-		} finally {
-			setSystemTime();
-		}
-	});
-
-	it("bounds overflow correlation evidence and marks active counts as lower bounds", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "state.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "bounded-overflow-evidence";
-		for (let index = 0; index < 129; index++)
-			await persistCoordinatorRuntimeStateFromEvent(
-				{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
-				{ sessionId: "fallback", cwd: root, sessionFile: null },
-			);
-
-		const payload = await readJson(stateFile);
-		expect(payload).toMatchObject({
-			activity: { active_tool_count: 128, active_tool_count_is_lower_bound: true },
-			active_tool_calls_overflow_count: 64,
-			active_tool_calls_overflow_count_is_lower_bound: true,
-		});
-		expect(payload.active_tool_calls).toHaveProperty(createHash("sha256").update("tool-128").digest("hex"));
-		expect(payload.active_tool_calls_overflow_digests).toHaveLength(64);
-	});
-
-	it("refuses malformed persisted overflow correlation evidence", async () => {
-		const root = await tempRoot();
-		const validDigest = createHash("sha256").update("tool-0").digest("hex");
-		const invalidOverflowStates: Array<Record<string, unknown>> = [
-			{
-				active_tool_calls_overflow_count: 1,
-				active_tool_calls_overflow_digests: ["not-a-tool-call-digest"],
-			},
-			{
-				active_tool_calls_overflow_count: 1,
-				active_tool_calls_overflow_digests: [],
-			},
-			{
-				active_tool_calls_overflow_count: 2,
-				active_tool_calls_overflow_digests: [validDigest, validDigest],
-			},
-			{
-				active_tool_calls_overflow_count: 65,
-				active_tool_calls_overflow_digests: Array.from({ length: 65 }, (_, index) =>
-					createHash("sha256").update(`tool-${index}`).digest("hex"),
-				),
-			},
-			{
-				active_tool_calls_overflow_count: 1,
-				active_tool_calls_overflow_digests: [validDigest],
-				active_tool_calls_overflow_count_is_lower_bound: "true",
-			},
-		];
-		for (const [index, overflowState] of invalidOverflowStates.entries()) {
-			const sessionId = `invalid-overflow-correlations-${index}`;
-			const stateFile = path.join(root, `${sessionId}.json`);
-			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
-			const evidence = JSON.stringify({
-				schema_version: 1,
-				session_id: sessionId,
-				state: "running",
-				cwd: root,
-				workdir: root,
-				session_file: null,
-				...overflowState,
-			});
-			await Bun.write(stateFile, evidence);
-
-			await expect(
-				persistCoordinatorRuntimeStateFromEvent(
-					{ type: "tool_execution_start", toolCallId: "tool-next", toolName: "read" },
-					{ sessionId: "fallback", cwd: root, sessionFile: null },
-				),
-			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
-			expect(await Bun.file(stateFile).text()).toBe(evidence);
-		}
-	});
-
-	it("refuses malformed and oversized persisted tool-call correlation tables", async () => {
-		const root = await tempRoot();
-		const invalidToolCalls: unknown[] = [
-			{ "not-a-tool-call-digest": { tool_name: "read", started_at: "2026-01-01T00:00:00.000Z" } },
-			Object.fromEntries(
-				Array.from({ length: 65 }, (_, index) => [
-					createHash("sha256").update(`tool-${index}`).digest("hex"),
-					{ tool_name: "read", started_at: "2026-01-01T00:00:00.000Z" },
-				]),
-			),
-		];
-		for (const [index, activeToolCalls] of invalidToolCalls.entries()) {
-			const sessionId = `invalid-tool-call-correlations-${index}`;
-			const stateFile = path.join(root, `${sessionId}.json`);
-			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
-			const evidence = JSON.stringify({
-				schema_version: 1,
-				session_id: sessionId,
-				state: "running",
-				cwd: root,
-				workdir: root,
-				session_file: null,
-				active_tool_calls: activeToolCalls,
-			});
-			await Bun.write(stateFile, evidence);
-
-			await expect(
-				persistCoordinatorRuntimeStateFromEvent(
-					{ type: "tool_execution_start", toolCallId: "tool-next", toolName: "read" },
-					{ sessionId: "fallback", cwd: root, sessionFile: null },
-				),
-			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
-			expect(await Bun.file(stateFile).text()).toBe(evidence);
-		}
-	});
-
-	it("saturates an exhausted activity sequence without wrapping", async () => {
-		const root = await tempRoot();
-		const stateFile = path.join(root, "state.json");
-		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
-		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "saturated-activity-session";
-		await Bun.write(
-			stateFile,
-			JSON.stringify({
-				schema_version: 1,
-				session_id: "saturated-activity-session",
-				state: "running",
-				cwd: root,
-				workdir: root,
-				session_file: null,
-				activity: { sequence: Number.MAX_SAFE_INTEGER },
-			}),
-		);
-
-		await persistCoordinatorRuntimeStateFromEvent(
-			{ type: "tool_execution_start", toolCallId: "tool-1", toolName: "read" },
-			{ sessionId: "fallback", cwd: root, sessionFile: null },
-		);
-
-		expect((await readJson(stateFile)).activity).toMatchObject({ sequence: Number.MAX_SAFE_INTEGER });
 	});
 
 	it("skips duplicate same-state running writes within the heartbeat", async () => {
@@ -2439,4 +2156,667 @@ describe("coordinator runtime state sidecar", () => {
 			}),
 		).rejects.toThrow();
 	});
+});
+
+describe("coordinator runtime tool activity", () => {
+	const SESSION_ID = "activity-session";
+	const T0 = "2026-03-01T00:00:00.000Z";
+
+	/** One seeded running session per test: env, a lifecycle write at T0, and its state file. */
+	async function runningSession(name: string): Promise<string> {
+		const root = await tempRoot();
+		const stateFile = path.join(root, `${name}.json`);
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		setSystemTime(new Date(T0));
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
+		);
+		return stateFile;
+	}
+
+	function context(stateFile: string) {
+		return { sessionId: SESSION_ID, cwd: path.dirname(stateFile), sessionFile: null };
+	}
+
+	/**
+	 * Emit one tool event carrying the observation the AgentSession boundary would have
+	 * captured: the wall clock read there, and the label it proved for a START.
+	 */
+	async function toolEvent(
+		stateFile: string,
+		phase: "start" | "end",
+		input: { at: string; callId?: unknown; label?: string; isError?: boolean; extra?: Record<string, unknown> },
+	): Promise<void> {
+		setSystemTime(new Date(input.at));
+		await persistCoordinatorRuntimeStateFromEvent(
+			{
+				type: phase === "start" ? "tool_execution_start" : "tool_execution_end",
+				toolCallId: input.callId,
+				...(phase === "end" ? { isError: input.isError === true } : {}),
+				...input.extra,
+			} as Parameters<typeof persistCoordinatorRuntimeStateFromEvent>[0],
+			context(stateFile),
+			{ label: input.label ?? "custom", observedAt: input.at },
+		);
+	}
+
+	async function activityOf(stateFile: string): Promise<Record<string, unknown>> {
+		return (await readJson(stateFile)).activity as Record<string, unknown>;
+	}
+
+	it("records a bounded started snapshot without advancing the lifecycle heartbeat", async () => {
+		const stateFile = await runningSession("activity-start");
+
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "bash" });
+
+		expect(await readJson(stateFile)).toMatchObject({
+			state: "running",
+			// The heartbeat cadence is measured from lifecycle writes, so an activity
+			// annotation must not advance updated_at.
+			updated_at: T0,
+			activity: {
+				seq: 1,
+				phase: "started",
+				tool: "bash",
+				outcome: null,
+				elapsed_ms: null,
+				last_activity_at: "2026-03-01T00:00:01.000Z",
+				active_tool_count: 1,
+				active_tools: [{ tool: "bash", started_at: "2026-03-01T00:00:01.000Z" }],
+			},
+		});
+	});
+
+	for (const { name, isError, outcome } of [
+		{ name: "success", isError: false, outcome: "success" },
+		{ name: "failure", isError: true, outcome: "failure" },
+	]) {
+		it(`closes a matching tool_execution_end as ${name} with elapsed time and a bumped sequence`, async () => {
+			const stateFile = await runningSession(`activity-end-${name}`);
+
+			await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "read" });
+			await toolEvent(stateFile, "end", {
+				at: "2026-03-01T00:00:03.500Z",
+				callId: "call-1",
+				label: "read",
+				isError,
+			});
+
+			expect(await activityOf(stateFile)).toMatchObject({
+				seq: 2,
+				last_activity_at: "2026-03-01T00:00:03.500Z",
+				tool: "read",
+				phase: "finished",
+				outcome,
+				elapsed_ms: 2500,
+				active_tool_count: 0,
+				active_tools: [],
+			});
+		});
+	}
+
+	it("ignores the raw model tool name and records custom when no proven label is supplied", async () => {
+		const stateFile = await runningSession("activity-untrusted-label");
+
+		await toolEvent(stateFile, "start", {
+			at: "2026-03-01T00:00:01.000Z",
+			callId: "call-1",
+			extra: { toolName: "PROMPT_SECRET_123" },
+		});
+
+		const raw = await Bun.file(stateFile).text();
+		expect(raw).not.toContain("PROMPT_SECRET_123");
+		expect(await activityOf(stateFile)).toMatchObject({ tool: "custom", active_tools: [{ tool: "custom" }] });
+	});
+
+	it("preserves the last activity snapshot and sequence across a lifecycle write", async () => {
+		const stateFile = await runningSession("activity-preserve");
+
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "edit" });
+		setSystemTime(new Date("2026-03-01T00:00:05.000Z"));
+		await persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, context(stateFile));
+
+		const afterLifecycle = await readJson(stateFile);
+		expect(afterLifecycle.updated_at).toBe("2026-03-01T00:00:05.000Z");
+		expect(afterLifecycle.activity).toMatchObject({ seq: 1, tool: "edit", active_tool_count: 1 });
+
+		// The preserved sequence is the base for the next activity event, so the
+		// per-session sequence stays monotonic across lifecycle transitions.
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:00:06.000Z", callId: "call-1", label: "edit" });
+		expect(await activityOf(stateFile)).toMatchObject({ seq: 2, phase: "finished", elapsed_ms: 5000 });
+	});
+
+	it("settles orphaned active tools when the runtime reaches agent_end", async () => {
+		const stateFile = await runningSession("activity-terminal");
+
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "bash" });
+		setSystemTime(new Date("2026-03-01T00:00:02.000Z"));
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), context(stateFile));
+		const terminal = await readJson(stateFile);
+
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:09.000Z", callId: "call-late", label: "bash" });
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:00:10.000Z", callId: "call-late", label: "bash" });
+
+		// A settled session cannot still be running a tool. The orphan is reported as
+		// cancelled — never as a success or failure nothing observed — and the sequence
+		// advances so a reader can see the settlement happened.
+		expect(terminal).toMatchObject({
+			state: "completed",
+			activity: {
+				seq: 2,
+				last_activity_at: "2026-03-01T00:00:02.000Z",
+				tool: "bash",
+				phase: "finished",
+				outcome: "cancelled",
+				elapsed_ms: null,
+				active_tool_count: 0,
+				active_tools: [],
+				in_flight: [],
+			},
+		});
+		// Later tool events remain fenced and cannot resurrect the session.
+		expect(await readJson(stateFile)).toEqual(terminal);
+	});
+
+	it("preserves the previous activity when a terminal transition has nothing in flight", async () => {
+		const stateFile = await runningSession("activity-terminal-settled");
+
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "bash" });
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:00:02.000Z", callId: "call-1", label: "bash" });
+		const before = await activityOf(stateFile);
+		setSystemTime(new Date("2026-03-01T00:00:03.000Z"));
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), context(stateFile));
+
+		const after = await readJson(stateFile);
+		expect(after.state).toBe("completed");
+		expect(after.activity).toEqual(before);
+	});
+
+	it("keeps a malformed activity snapshot hidden rather than re-seeding it at a terminal transition", async () => {
+		const stateFile = await runningSession("activity-terminal-malformed");
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "bash" });
+		const payload = await readJson(stateFile);
+		payload.activity = { ...(payload.activity as Record<string, unknown>), phase: "exfiltrating" };
+		await Bun.write(stateFile, `${JSON.stringify(payload)}\n`);
+
+		setSystemTime(new Date("2026-03-01T00:00:04.000Z"));
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), context(stateFile));
+
+		const after = await readJson(stateFile);
+		expect(after.state).toBe("completed");
+		expect(after.activity).toEqual(payload.activity);
+		expect(publicRuntimeToolActivity(after.activity, after.state)).toBeNull();
+	});
+
+	it("settles an uncorrelated started snapshot at a terminal transition", async () => {
+		const stateFile = await runningSession("activity-terminal-uncorrelated");
+		// A start whose call id carries no correlation: the phase advances but nothing
+		// enters the in-flight table, so no later end can ever close it.
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "   ", label: "bash" });
+		expect(await activityOf(stateFile)).toMatchObject({ phase: "started", active_tool_count: 0 });
+
+		setSystemTime(new Date("2026-03-01T00:00:05.000Z"));
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), context(stateFile));
+
+		const after = await readJson(stateFile);
+		expect(after.state).toBe("completed");
+		// A settled session cannot still be starting a tool, so the writer must not leave
+		// the prohibited terminal+started pair on disk for a reader to hide.
+		expect(after.activity).toMatchObject({ phase: "finished", outcome: "cancelled", elapsed_ms: null });
+		expect(publicRuntimeToolActivity(after.activity, after.state)).toMatchObject({
+			phase: "finished",
+			outcome: "cancelled",
+		});
+	});
+
+	it("keeps exact accounting above the public cap and drains back to zero", async () => {
+		const stateFile = await runningSession("activity-accounting");
+
+		// Far more concurrent calls than the public list holds. The private set is
+		// current state, not history, so none of them may be silently dropped.
+		const LIVE_CALLS = 65;
+		for (let index = 0; index < LIVE_CALLS; index++) {
+			await toolEvent(stateFile, "start", {
+				at: new Date(Date.UTC(2026, 2, 1, 0, 0, index + 1)).toISOString(),
+				callId: `call-${index}`,
+				label: "bash",
+			});
+		}
+		const started = await activityOf(stateFile);
+		expect(started).toMatchObject({ seq: LIVE_CALLS, active_tool_count: LIVE_CALLS });
+		expect((started.active_tools as unknown[]).length).toBe(8);
+		expect((started.in_flight as unknown[]).length).toBe(LIVE_CALLS);
+
+		// A duplicate start for a live call is idempotent; it never double-counts.
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:02:00.000Z", callId: "call-0", label: "bash" });
+		expect(await activityOf(stateFile)).toMatchObject({ seq: 66, active_tool_count: LIVE_CALLS });
+
+		// call-0 is far outside the public top 8, but ending it still removes exactly
+		// one entry from the exact total.
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:02:01.000Z", callId: "call-0", label: "bash" });
+		expect(await activityOf(stateFile)).toMatchObject({ seq: 67, active_tool_count: 64, elapsed_ms: 120_000 });
+
+		// A duplicate end and an unmatched end change nothing but the snapshot header.
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:02:02.000Z", callId: "call-0", label: "bash" });
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:02:03.000Z", callId: "never-started", label: "bash" });
+		expect(await activityOf(stateFile)).toMatchObject({ seq: 69, active_tool_count: 64, elapsed_ms: null });
+
+		// A missing call id cannot correlate, so it must not corrupt accounting.
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:02:04.000Z", label: "bash" });
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:02:05.000Z", callId: "   ", label: "bash" });
+		expect(await activityOf(stateFile)).toMatchObject({ seq: 71, active_tool_count: 64 });
+
+		// Ending every remaining live call drains the set to exactly zero.
+		for (let index = 1; index < LIVE_CALLS; index++) {
+			await toolEvent(stateFile, "end", {
+				at: new Date(Date.UTC(2026, 2, 1, 0, 3, index)).toISOString(),
+				callId: `call-${index}`,
+				label: "bash",
+			});
+		}
+		const drained = await activityOf(stateFile);
+		expect(drained).toMatchObject({ active_tool_count: 0, active_tools: [], in_flight: [] });
+	}, 15_000);
+
+	it("keeps distinct whitespace-bearing call ids distinct", async () => {
+		const stateFile = await runningSession("activity-whitespace-ids");
+
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: " call-a", label: "bash" });
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:02.000Z", callId: "call-a ", label: "bash" });
+		expect(await activityOf(stateFile)).toMatchObject({ active_tool_count: 2 });
+
+		// Ending one exact id closes exactly one correlation, never both.
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:00:03.000Z", callId: " call-a", label: "bash" });
+		expect(await activityOf(stateFile)).toMatchObject({ active_tool_count: 1, elapsed_ms: 2000 });
+	});
+
+	it("keeps call ids that differ only by an unpaired surrogate distinct", async () => {
+		const stateFile = await runningSession("activity-surrogate-ids");
+
+		// Two DIFFERENT lone surrogates. UTF-8 encoding replaces each with the same
+		// replacement character, so a UTF-8 digest would fuse these into one correlation
+		// slot and let one call's end close the other's.
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-\ud800", label: "bash" });
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:02.000Z", callId: "call-\ud801", label: "bash" });
+		const started = await activityOf(stateFile);
+		expect(started).toMatchObject({ active_tool_count: 2 });
+		const digests = (started.in_flight as Array<{ digest: string }>).map(entry => entry.digest);
+		expect(new Set(digests).size).toBe(2);
+		for (const digest of digests) expect(digest).toMatch(/^[0-9a-f]{64}$/);
+
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:00:03.000Z", callId: "call-\ud800", label: "bash" });
+		expect(await activityOf(stateFile)).toMatchObject({ active_tool_count: 1, elapsed_ms: 2000 });
+	});
+
+	it("persists a full-length correlation digest, never a truncated prefix", async () => {
+		const stateFile = await runningSession("activity-digest-length");
+
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "bash" });
+
+		const inFlight = (await activityOf(stateFile)).in_flight as Array<{ digest: string }>;
+		expect(inFlight).toHaveLength(1);
+		expect(inFlight[0]?.digest).toMatch(/^[0-9a-f]{64}$/);
+	});
+
+	it("does not seed a state file from a tool event alone", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "activity-unseeded.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "tool_execution_start", toolCallId: "call-1" },
+			context(stateFile),
+			{ label: "bash", observedAt: "2026-03-01T00:00:01.000Z" },
+		);
+
+		expect(await Bun.file(stateFile).exists()).toBe(false);
+	});
+
+	it("persists no tool arguments, results, raw call ids, or correlation digests", async () => {
+		const stateFile = await runningSession("activity-privacy");
+
+		await toolEvent(stateFile, "start", {
+			at: "2026-03-01T00:00:01.000Z",
+			callId: "toolu_RAWCALLID",
+			label: "bash",
+			extra: { toolName: "bash", args: { command: "printf SECRET_TOKEN", cwd: "/home/agent/private" } },
+		});
+		await toolEvent(stateFile, "end", {
+			at: "2026-03-01T00:00:02.000Z",
+			callId: "toolu_RAWCALLID",
+			label: "bash",
+			extra: { result: { content: [{ type: "text", text: "SECRET_TOKEN" }] } },
+		});
+
+		const raw = await Bun.file(stateFile).text();
+		expect(raw).not.toContain("SECRET_TOKEN");
+		expect(raw).not.toContain("printf");
+		expect(raw).not.toContain("/home/agent/private");
+		expect(raw).not.toContain("toolu_RAWCALLID");
+		expect(raw).not.toContain("args");
+		expect(raw).not.toContain("result");
+		// The private correlation state never reaches a public projection.
+		const publicActivity = publicRuntimeToolActivity((await readJson(stateFile)).activity, "running");
+		expect(JSON.stringify(publicActivity)).not.toContain("digest");
+		expect(Object.keys(publicActivity ?? {})).not.toContain("in_flight");
+	});
+
+	it("refuses to overwrite a malformed activity snapshot with a lower sequence", async () => {
+		const stateFile = await runningSession("activity-malformed");
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "bash" });
+
+		const payload = await readJson(stateFile);
+		// A valid prior sequence with a phase the reader cannot trust.
+		payload.activity = { ...(payload.activity as Record<string, unknown>), phase: "exfiltrating" };
+		await Bun.write(stateFile, `${JSON.stringify(payload)}\n`);
+
+		await expect(
+			toolEvent(stateFile, "start", { at: "2026-03-01T00:00:02.000Z", callId: "call-2", label: "bash" }),
+		).rejects.toThrow(/refus/i);
+		expect(await readJson(stateFile)).toEqual(payload);
+	});
+
+	it("refuses an activity write whose sequence cannot advance safely", async () => {
+		const stateFile = await runningSession("activity-overflow");
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "bash" });
+
+		const payload = await readJson(stateFile);
+		payload.activity = { ...(payload.activity as Record<string, unknown>), seq: Number.MAX_SAFE_INTEGER };
+		await Bun.write(stateFile, `${JSON.stringify(payload)}\n`);
+
+		await expect(
+			toolEvent(stateFile, "end", { at: "2026-03-01T00:00:02.000Z", callId: "call-1", label: "bash" }),
+		).rejects.toThrow(/refus/i);
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: Number.MAX_SAFE_INTEGER });
+	});
+
+	it("timestamps tool activity from event observation, not from lock acquisition", async () => {
+		const stateFile = await runningSession("activity-lock-delay");
+		const observed = { start: "", end: "" };
+
+		// Both events observe their wall clock before the lock is contended; only
+		// persistence is delayed, so elapsed must describe the events themselves.
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			// The namespace transaction lock is the one directory-style lock left on this
+			// path; the state file itself uses the shared regular-file owner protocol.
+			if (!lockPath.endsWith(`mutation.lock.lock`)) return;
+			setSystemTime(new Date("2026-03-01T00:05:00.000Z"));
+			await Bun.sleep(5);
+		};
+		observed.start = "2026-03-01T00:00:01.000Z";
+		await toolEvent(stateFile, "start", { at: observed.start, callId: "call-1", label: "bash" });
+		observed.end = "2026-03-01T00:00:02.500Z";
+		await toolEvent(stateFile, "end", { at: observed.end, callId: "call-1", label: "bash" });
+
+		expect(await activityOf(stateFile)).toMatchObject({
+			last_activity_at: observed.end,
+			elapsed_ms: 1500,
+		});
+	});
+
+	/**
+	 * The reader refuses an `elapsed_ms` outside the safe-integer range, because beyond it
+	 * a millisecond count is no longer exact and so was never measured. The writer must
+	 * therefore not be able to produce one: two canonical timestamps at the extremes of the
+	 * representable range are 1.728e16 ms apart, and persisting that would leave the writer
+	 * holding bytes its own validator calls malformed — which fences out every later
+	 * activity write on this session.
+	 */
+	it("persists a null elapsed rather than a duration its own reader would reject", async () => {
+		const stateFile = await runningSession("activity-elapsed-overflow");
+		const start = "-271821-04-20T00:00:00.000Z";
+		const end = "+275760-09-13T00:00:00.000Z";
+		expect(new Date(start).toISOString()).toBe(start);
+		expect(new Date(end).toISOString()).toBe(end);
+		expect(Number.isSafeInteger(Date.parse(end) - Date.parse(start))).toBe(false);
+
+		await toolEvent(stateFile, "start", { at: start, callId: "call-1", label: "bash" });
+		await toolEvent(stateFile, "end", { at: end, callId: "call-1", label: "bash" });
+
+		// Not saturated to MAX_SAFE_INTEGER, and not refused: the outcome is still the one
+		// that was observed, with the interval reported as unmeasured.
+		const finished = await activityOf(stateFile);
+		expect(finished).toMatchObject({ seq: 2, phase: "finished", outcome: "success", elapsed_ms: null });
+
+		// The writer's own strict reader accepts what it just wrote, and the snapshot is
+		// still publicly projectable.
+		expect(classifyRuntimeToolActivity(finished).kind).toBe("valid");
+		expect(publicRuntimeToolActivity(finished, "running")).toMatchObject({
+			seq: 2,
+			tool: "bash",
+			phase: "finished",
+			elapsed_ms: null,
+		});
+
+		// And the next write is accepted rather than fenced out by this writer's own bytes.
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:03.000Z", callId: "call-2", label: "bash" });
+		expect(await activityOf(stateFile)).toMatchObject({ seq: 3, phase: "started", tool: "bash" });
+	});
+
+	it("keeps measuring an ordinary interval exactly", async () => {
+		const stateFile = await runningSession("activity-elapsed-ordinary");
+
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "bash" });
+		await toolEvent(stateFile, "end", { at: "2026-03-01T00:00:03.250Z", callId: "call-1", label: "bash" });
+
+		expect(await activityOf(stateFile)).toMatchObject({ phase: "finished", outcome: "success", elapsed_ms: 2250 });
+	});
+	it("refuses the next activity write after malformed bytes, without touching them", async () => {
+		const stateFile = await runningSession("activity-refuse-preserves-bytes");
+		await toolEvent(stateFile, "start", { at: "2026-03-01T00:00:01.000Z", callId: "call-1", label: "bash" });
+		const payload = await readJson(stateFile);
+		payload.activity = { ...(payload.activity as Record<string, unknown>), elapsed_ms: -1, phase: "finished" };
+		const corruptBytes = `${JSON.stringify(payload)}\n`;
+		await Bun.write(stateFile, corruptBytes);
+
+		await expect(
+			toolEvent(stateFile, "start", { at: "2026-03-01T00:00:02.000Z", callId: "call-2", label: "bash" }),
+		).rejects.toThrow(/refus/i);
+		expect(await Bun.file(stateFile).text()).toBe(corruptBytes);
+	});
+});
+
+describe("persisted runtime tool activity validation", () => {
+	const AT = "2026-03-01T00:00:02.000Z";
+	const DIGEST_A = `a${"0".repeat(63)}`;
+	const DIGEST_B = `b${"1".repeat(63)}`;
+
+	function snapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			seq: 4,
+			last_activity_at: AT,
+			tool: "bash",
+			phase: "started",
+			outcome: null,
+			elapsed_ms: null,
+			active_tool_count: 1,
+			active_tools: [{ tool: "bash", started_at: AT }],
+			in_flight: [{ digest: DIGEST_A, tool: "bash", started_at: AT }],
+			...overrides,
+		};
+	}
+
+	it("accepts a snapshot this writer could have produced", () => {
+		const valid = snapshot();
+		const readout = classifyRuntimeToolActivity(valid);
+		expect(readout.kind).toBe("valid");
+		expect(readout.kind === "valid" && readout.activity).toEqual(valid as never);
+	});
+
+	it("distinguishes an absent snapshot from a malformed one", () => {
+		expect(classifyRuntimeToolActivity(undefined)).toEqual({ kind: "absent" });
+		expect(classifyRuntimeToolActivity(null)).toEqual({ kind: "malformed" });
+		expect(classifyRuntimeToolActivity([])).toEqual({ kind: "malformed" });
+	});
+
+	for (const { name, overrides } of [
+		{ name: "an out-of-range sequence", overrides: { seq: 0 } },
+		{ name: "a non-integer sequence", overrides: { seq: 1.5 } },
+		{ name: "an unparseable phase", overrides: { phase: "exfiltrating" } },
+		{ name: "an unproven tool label", overrides: { tool: "cat /etc/passwd" } },
+		// A label is safe because the writer proved it against the closed built-in
+		// descriptor set, not because it happens to look like a bare token.
+		{ name: "an arbitrary token-shaped label", overrides: { tool: "curl" } },
+		{ name: "an unknown root key", overrides: { raw_id: "toolu_RAWCALLID" } },
+		{
+			name: "an unknown key on a private row",
+			overrides: { in_flight: [{ digest: DIGEST_A, tool: "bash", started_at: AT, args: { command: "id" } }] },
+		},
+		{
+			name: "an unknown key on a public row",
+			overrides: { active_tools: [{ tool: "bash", started_at: AT, credential: "sk-live" }] },
+		},
+		{
+			name: "an elapsed time beyond exact integer range",
+			overrides: { phase: "finished", outcome: "success", elapsed_ms: Number.MAX_SAFE_INTEGER + 2 },
+		},
+		{
+			name: "a cancelled outcome still claiming a live call",
+			overrides: { phase: "finished", outcome: "cancelled", elapsed_ms: null },
+		},
+		{
+			name: "a non-canonical snapshot timestamp",
+			overrides: { last_activity_at: "2026-03-01T00:00:02Z" },
+		},
+		{
+			name: "a non-canonical start timestamp",
+			overrides: { in_flight: [{ digest: DIGEST_A, tool: "bash", started_at: "2026-03-01 00:00:02" }] },
+		},
+		{
+			name: "an invalid private row",
+			overrides: { in_flight: [{ digest: DIGEST_A, tool: "bash", started_at: AT }, { tool: "bash" }] },
+		},
+		{
+			name: "a truncated digest",
+			overrides: { in_flight: [{ digest: DIGEST_A.slice(0, 16), tool: "bash", started_at: AT }] },
+		},
+		{
+			name: "an unproven label on a private row",
+			overrides: { in_flight: [{ digest: DIGEST_A, tool: "rm -rf /", started_at: AT }] },
+		},
+		{
+			name: "duplicate digests",
+			overrides: {
+				active_tool_count: 2,
+				active_tools: [
+					{ tool: "bash", started_at: AT },
+					{ tool: "bash", started_at: AT },
+				],
+				in_flight: [
+					{ digest: DIGEST_A, tool: "bash", started_at: AT },
+					{ digest: DIGEST_A, tool: "bash", started_at: AT },
+				],
+			},
+		},
+		{ name: "a count contradicting the private set", overrides: { active_tool_count: 5 } },
+		{ name: "a list contradicting the private set", overrides: { active_tools: [{ tool: "edit", started_at: AT }] } },
+		{ name: "a started phase carrying an outcome", overrides: { outcome: "success" } },
+		{ name: "a started phase carrying an elapsed time", overrides: { elapsed_ms: 10 } },
+		{ name: "a finished phase with no outcome", overrides: { phase: "finished", outcome: null } },
+		{
+			name: "a finished phase with an unlisted outcome",
+			overrides: { phase: "finished", outcome: "exfiltrated" },
+		},
+		{
+			name: "a cancelled outcome claiming a measured interval",
+			overrides: { phase: "finished", outcome: "cancelled", elapsed_ms: 10 },
+		},
+		{
+			name: "a negative elapsed time",
+			overrides: { phase: "finished", outcome: "success", elapsed_ms: -1 },
+		},
+		{
+			name: "a fractional elapsed time",
+			overrides: { phase: "finished", outcome: "success", elapsed_ms: 1.5 },
+		},
+	]) {
+		it(`refuses a snapshot with ${name}`, () => {
+			expect(classifyRuntimeToolActivity(snapshot(overrides))).toEqual({ kind: "malformed" });
+			expect(publicRuntimeToolActivity(snapshot(overrides), "running")).toBeNull();
+		});
+	}
+
+	it("accepts the honest shapes a settled or unmatched call produces", () => {
+		for (const overrides of [
+			// A cancelled snapshot is only ever written with the in-flight set emptied.
+			{ phase: "finished", outcome: "success", elapsed_ms: null },
+			{ phase: "finished", outcome: "failure", elapsed_ms: 0 },
+			{
+				phase: "finished",
+				outcome: "cancelled",
+				elapsed_ms: null,
+				active_tool_count: 0,
+				active_tools: [],
+				in_flight: [],
+			},
+			{
+				active_tool_count: 2,
+				active_tools: [
+					{ tool: "bash", started_at: AT },
+					{ tool: "edit", started_at: AT },
+				],
+				in_flight: [
+					{ digest: DIGEST_A, tool: "bash", started_at: AT },
+					{ digest: DIGEST_B, tool: "edit", started_at: AT },
+				],
+			},
+		]) {
+			expect(classifyRuntimeToolActivity(snapshot(overrides)).kind).toBe("valid");
+		}
+	});
+
+	// Each of these snapshots is individually valid. What makes it unpublishable is the
+	// LIFECYCLE state it would be published next to: a settled session cannot be running a
+	// tool, and a live one cannot have had its calls cancelled by a terminal it never reached.
+	for (const lifecycle of ["completed", "errored"] as const) {
+		it(`hides a started activity snapshot from a ${lifecycle} session`, () => {
+			const started = snapshot();
+			expect(classifyRuntimeToolActivity(started).kind).toBe("valid");
+			expect(publicRuntimeToolActivity(started, lifecycle)).toBeNull();
+		});
+
+		it(`hides a terminal-incompatible in-flight count from a ${lifecycle} session`, () => {
+			const stillRunning = snapshot({ phase: "finished", outcome: "success", elapsed_ms: 5 });
+			expect(classifyRuntimeToolActivity(stillRunning).kind).toBe("valid");
+			expect(publicRuntimeToolActivity(stillRunning, lifecycle)).toBeNull();
+		});
+
+		it(`publishes the terminal cancelled shape for a ${lifecycle} session`, () => {
+			const settled = snapshot({
+				phase: "finished",
+				outcome: "cancelled",
+				elapsed_ms: null,
+				active_tool_count: 0,
+				active_tools: [],
+				in_flight: [],
+			});
+			expect(publicRuntimeToolActivity(settled, lifecycle)).toMatchObject({
+				phase: "finished",
+				outcome: "cancelled",
+			});
+		});
+	}
+
+	for (const lifecycle of ["running", "ready_for_input", "starting"] as const) {
+		it(`hides a cancelled outcome from a ${lifecycle} session`, () => {
+			const cancelled = snapshot({
+				phase: "finished",
+				outcome: "cancelled",
+				elapsed_ms: null,
+				active_tool_count: 0,
+				active_tools: [],
+				in_flight: [],
+			});
+			expect(classifyRuntimeToolActivity(cancelled).kind).toBe("valid");
+			expect(publicRuntimeToolActivity(cancelled, lifecycle)).toBeNull();
+		});
+
+		it(`still publishes a live started snapshot for a ${lifecycle} session`, () => {
+			expect(publicRuntimeToolActivity(snapshot(), lifecycle)).toMatchObject({
+				phase: "started",
+				active_tool_count: 1,
+			});
+		});
+	}
 });

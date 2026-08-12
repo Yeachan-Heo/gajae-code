@@ -796,6 +796,18 @@ export class Agent {
 		this.#maintainContext = fn;
 	}
 
+	/**
+	 * Publish an event produced OUTSIDE the agent loop (a provider that executed the tool
+	 * itself, a host bridge, a replay).
+	 *
+	 * Identity is the PRODUCER's to prove: whoever dispatched the call binds the tool object
+	 * it actually ran (see `bindDispatchedToolIdentity`) before handing the event here, and
+	 * that binding is never touched from this side. Re-resolving `event.toolName` against the
+	 * mutable current tool list would let a mid-run `setTools`, MCP reload, or plain name
+	 * collision overwrite a proven object with one that never ran — and would invent an
+	 * identity for replays and host bridges that never executed an AgentTool at all. An
+	 * unbound external event stays unbound; unproven provenance is `custom`.
+	 */
 	emitExternalEvent(event: AgentEvent) {
 		switch (event.type) {
 			case "message_start":

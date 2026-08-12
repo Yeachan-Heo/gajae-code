@@ -13,6 +13,7 @@ import {
 	awaitCodexWakePublishesForTest,
 	createCoordinatorMcpServer,
 } from "../src/coordinator-mcp/server";
+import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
@@ -36,12 +37,17 @@ import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
 import { type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
+import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 import {
 	cleanupFixtureRoot,
 	createFixtureBrokerEnvironment,
 	createFixtureRootCleanup,
 } from "./helpers/fixture-broker-cleanup";
 import { prepareExactSessionAuthority } from "./helpers/sdk-exact-session-authority";
+
+// Coordinator state writes serialize on a lock whose removals go through identity-bound
+// native primitives; point them at a working implementation.
+installExactIdentityNatives();
 
 const tempDirs: string[] = [];
 
@@ -423,7 +429,6 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const server = await createSdkControlServer(root, controls);
 		const registered = await registerSdkSession(server, root);
 		expect(registered).toMatchObject({ ok: true, registered: true, session_state: { state: "ready_for_input" } });
-		const overflowDigest = createHash("sha256").update("private-overflow-tool-call-id").digest("hex");
 		await Bun.write(
 			path.join(root, ".gjc", "coordinator-state", "local", "repo", "sessions", "visible-session.json"),
 			JSON.stringify({
@@ -446,24 +451,6 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				source: "coordinator",
 				live: true,
 				reason: "Bearer session-state-secret",
-				last_activity_at: "2026-08-11T00:00:00.000Z",
-				activity: {
-					sequence: 4,
-					kind: "tool_execution",
-					phase: "started",
-					tool_name: "bash",
-					observed_at: "2026-08-11T00:00:00.000Z",
-					active_tool_count: 9,
-					active_tool_count_is_lower_bound: true,
-					private_args: "do not expose",
-				},
-				active_tools: [
-					{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z", tool_call_id: "private-tool-id" },
-				],
-				active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
-				active_tool_calls_overflow_count: 1,
-				active_tool_calls_overflow_digests: [overflowDigest],
-				active_tool_calls_overflow_count_is_lower_bound: true,
 			}),
 		);
 		const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
@@ -471,16 +458,6 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			ok: true,
 			session: { session_id: "visible-session" },
 			status: { authority: "sdk_broker", live: true },
-			session_state: {
-				last_activity_at: "2026-08-11T00:00:00.000Z",
-				activity: {
-					sequence: 4,
-					tool_name: "bash",
-					active_tool_count: 9,
-					active_tool_count_is_lower_bound: true,
-				},
-				active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
-			},
 		});
 		const publicResult = JSON.stringify(status);
 		expect(publicResult).not.toContain("broker-endpoint-secret");
@@ -488,74 +465,330 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(publicResult).not.toContain("session-endpoint-secret");
 		expect(publicResult).not.toContain("session-record-secret");
 		expect(publicResult).not.toContain("session-state-secret");
-		expect(publicResult).not.toContain("private-tool-id");
-		expect(publicResult).not.toContain("do not expose");
-		expect(publicResult).not.toContain(overflowDigest);
+
 		expect(publicResult).not.toContain(root);
 		expect(controls).toEqual([
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
 		]);
-		await expect(
-			server.callTool("gjc_coordinator_register_session", {
-				session_id: "visible-session",
-				cwd: root,
-				tmux_session: "visible-session",
-				tmux_target: "visible-session:0.0",
-				idempotency_key: "preserve-activity-registration",
-				allow_mutation: true,
+	});
+	const ACTIVITY_AT = "2026-03-01T00:00:02.000Z";
+	/** Full-length correlation digests; anything shorter is refused as malformed. */
+	const DIGEST_A = `a${"0".repeat(63)}`;
+	const DIGEST_B = `b${"1".repeat(63)}`;
+
+	function sessionStatePath(root: string): string {
+		return path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json");
+	}
+
+	/** A sidecar-shaped snapshot, including the private correlation state readers must never see. */
+	function activitySnapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+		return {
+			seq: 4,
+			last_activity_at: ACTIVITY_AT,
+			tool: "bash",
+			phase: "started",
+			outcome: null,
+			elapsed_ms: null,
+			active_tool_count: 1,
+			active_tools: [{ tool: "bash", started_at: ACTIVITY_AT }],
+			in_flight: [{ digest: DIGEST_A, tool: "bash", started_at: ACTIVITY_AT }],
+			...overrides,
+		};
+	}
+
+	/** Annotate the coordinator's own session state exactly as the runtime sidecar does. */
+	async function annotateSessionState(root: string, activity: unknown, state = "running"): Promise<void> {
+		const file = sessionStatePath(root);
+		const payload = JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
+		await Bun.write(
+			file,
+			JSON.stringify({
+				...payload,
+				state,
+				ready_for_input: false,
+				live: state === "running",
+				source: "agent_session_event",
+				activity,
 			}),
-		).resolves.toMatchObject({ ok: true });
-		const lifecyclePayload = JSON.parse(
-			await fs.readFile(
-				path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
-				"utf8",
-			),
-		) as Record<string, unknown>;
-		expect(lifecyclePayload).toMatchObject({
-			last_activity_at: "2026-08-11T00:00:00.000Z",
-			activity: { sequence: 4, active_tool_count: 9 },
-			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
-			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
-			active_tool_calls_overflow_count: 1,
-			active_tool_calls_overflow_digests: [overflowDigest],
-			active_tool_calls_overflow_count_is_lower_bound: true,
+		);
+	}
+
+	async function readStatusActivity(
+		server: ReturnType<typeof createCoordinatorMcpServer>,
+	): Promise<{ status: Record<string, unknown>; activity: Record<string, unknown> | undefined }> {
+		const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
+		const sessionState = status.session_state as Record<string, unknown>;
+		return { status, activity: sessionState.activity as Record<string, unknown> | undefined };
+	}
+
+	it("projects a public-safe tool activity snapshot into coordinator session state", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		await annotateSessionState(root, activitySnapshot());
+
+		const { status, activity } = await readStatusActivity(server);
+		expect(status).toMatchObject({ ok: true, session_state: { state: "running" } });
+		expect(activity).toEqual({
+			seq: 4,
+			last_activity_at: ACTIVITY_AT,
+			tool: "bash",
+			phase: "started",
+			outcome: null,
+			elapsed_ms: null,
+			active_tool_count: 1,
+			active_tools: [{ tool: "bash", started_at: ACTIVITY_AT }],
 		});
-		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+		const serialized = JSON.stringify(status);
+		expect(serialized).not.toContain(DIGEST_A);
+		expect(serialized).not.toContain("in_flight");
+	});
+
+	it("bounds the public active-tool list while publishing the exact count", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		// Only the public list is capped; the private set is exact current state.
+		const inFlight = Array.from({ length: 12 }, (_entry, index) => ({
+			digest: `${index.toString(16)}${"c".repeat(63)}`,
+			tool: "bash",
+			started_at: ACTIVITY_AT,
+		}));
+		await annotateSessionState(
+			root,
+			activitySnapshot({
+				seq: 12,
+				active_tool_count: 12,
+				active_tools: inFlight.slice(-8).map(({ digest: _digest, ...entry }) => entry),
+				in_flight: inFlight,
+			}),
+		);
+
+		const { status, activity } = await readStatusActivity(server);
+		expect(activity).toMatchObject({ seq: 12, tool: "bash", active_tool_count: 12 });
+		const activeTools = activity?.active_tools as Array<Record<string, unknown>>;
+		expect(activeTools).toHaveLength(8);
+		expect(activeTools.every(entry => Object.keys(entry).sort().join(",") === "started_at,tool")).toBe(true);
+		expect(JSON.stringify(status)).not.toContain("in_flight");
+	});
+
+	for (const { name, activity } of [
+		{ name: "an unparseable phase", activity: { phase: "exfiltrating", note: "LEAKY-NOTE" } },
+		{
+			name: "an unproven tool label from disk",
+			activity: { tool: "bash --command 'echo LEAKY-NOTE'" },
+		},
+		{
+			name: "a truncated correlation digest",
+			activity: { in_flight: [{ digest: "abc123", tool: "bash", started_at: ACTIVITY_AT }] },
+		},
+		{
+			name: "a public count contradicting the private set",
+			activity: { active_tool_count: 9, note: "LEAKY-NOTE" },
+		},
+		{
+			name: "a duplicated correlation digest",
+			activity: {
+				active_tool_count: 2,
+				active_tools: [
+					{ tool: "bash", started_at: ACTIVITY_AT },
+					{ tool: "bash", started_at: ACTIVITY_AT },
+				],
+				in_flight: [
+					{ digest: DIGEST_A, tool: "bash", started_at: ACTIVITY_AT },
+					{ digest: DIGEST_A, tool: "bash", started_at: ACTIVITY_AT },
+				],
+			},
+		},
+	]) {
+		it(`omits a snapshot carrying ${name} instead of publishing it`, async () => {
+			const root = await tempRoot();
+			const server = await createSdkControlServer(root, []);
+			await registerSdkSession(server, root);
+			await annotateSessionState(root, activitySnapshot(activity));
+
+			const { status, activity: published } = await readStatusActivity(server);
+			expect(status.session_state).toMatchObject({ state: "running" });
+			expect(published).toBeUndefined();
+			expect(JSON.stringify(status)).not.toContain("LEAKY-NOTE");
+		});
+	}
+
+	it("omits an activity value that is not an object at all", async () => {
+		const root = await tempRoot();
+		const server = await createSdkControlServer(root, []);
+		await registerSdkSession(server, root);
+		await annotateSessionState(root, "LEAKY-NOTE");
+
+		const { status, activity } = await readStatusActivity(server);
+		expect(status.session_state).toMatchObject({ state: "running" });
+		expect(activity).toBeUndefined();
+		expect(JSON.stringify(status)).not.toContain("LEAKY-NOTE");
+	});
+
+	it("waits for a state lock held in the shared owner format and keeps the activity snapshot", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		await annotateSessionState(root, activitySnapshot());
+
+		// The runtime sidecar holds this exact lock through the shared implementation;
+		// a coordinator lifecycle write must queue behind it, not fault on its format.
+		let releasedAt = 0;
+		const held = withSessionStateFileLock(sessionStatePath(root), async () => {
+			await Bun.sleep(150);
+			releasedAt = Date.now();
+		});
+		await Bun.sleep(25);
+
+		const response = await server.callTool("gjc_coordinator_send_prompt", {
 			session_id: "visible-session",
-			prompt: "complete and repair projections",
-			idempotency_key: "repair-activity-turn",
+			prompt: "work",
+			idempotency_key: "state-lock-1",
 			allow_mutation: true,
 		});
-		const turnId = (sent as { turn_id?: unknown }).turn_id;
-		if (typeof turnId !== "string") throw new Error("expected turn id");
-		await expect(
-			server.callTool("gjc_coordinator_report_status", {
-				session_id: "visible-session",
-				turn_id: turnId,
-				status: "completed",
-				summary: "repaired terminal projection",
-				idempotency_key: "repair-activity-terminal",
-				allow_mutation: true,
+		const wroteAt = Date.now();
+		await held;
+
+		expect(response).toMatchObject({ ok: true, session_state: { state: "running" } });
+		expect(releasedAt).toBeGreaterThan(0);
+		expect(wroteAt).toBeGreaterThanOrEqual(releasedAt);
+		expect((await readStatusActivity(server)).activity).toMatchObject({ seq: 4, active_tool_count: 1 });
+	});
+
+	it("settles orphaned active tools when canonical terminal repair completes the session", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const prompted = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "repair-prompt-1",
+			allow_mutation: true,
+		});
+		expect(prompted).toMatchObject({ ok: true });
+		// Two calls the runtime started and never ended before the report arrived.
+		await annotateSessionState(
+			root,
+			activitySnapshot({
+				seq: 7,
+				active_tool_count: 2,
+				active_tools: [
+					{ tool: "bash", started_at: ACTIVITY_AT },
+					{ tool: "edit", started_at: ACTIVITY_AT },
+				],
+				in_flight: [
+					{ digest: DIGEST_A, tool: "bash", started_at: ACTIVITY_AT },
+					{ digest: DIGEST_B, tool: "edit", started_at: ACTIVITY_AT },
+				],
 			}),
-		).resolves.toMatchObject({ ok: true });
-		const repairedPayload = JSON.parse(
-			await fs.readFile(
-				path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
-				"utf8",
-			),
-		) as Record<string, unknown>;
-		expect(repairedPayload).toMatchObject({
-			state: "completed",
-			last_activity_at: "2026-08-11T00:00:00.000Z",
-			activity: { sequence: 4, active_tool_count: 9 },
-			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
-			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
-			active_tool_calls_overflow_count: 1,
-			active_tool_calls_overflow_digests: [overflowDigest],
-			active_tool_calls_overflow_count_is_lower_bound: true,
+		);
+
+		// A terminal report rebuilds every legacy projection from canonical state.
+		const report = await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: prompted.turn_id,
+			status: "completed",
+			summary: "done",
+			idempotency_key: "repair-report-1",
+			allow_mutation: true,
+		});
+		expect(report).toMatchObject({ ok: true, session_state: { state: "completed" } });
+
+		const persisted = JSON.parse(await Bun.file(sessionStatePath(root)).text()) as Record<string, unknown>;
+		expect(persisted.state).toBe("completed");
+		// A settled session cannot still be running a tool, and the orphans are named
+		// cancelled rather than claimed as a success nothing observed.
+		expect(persisted.activity).toMatchObject({
+			seq: 8,
+			tool: "bash",
+			phase: "finished",
+			outcome: "cancelled",
+			elapsed_ms: null,
+			active_tool_count: 0,
+			active_tools: [],
+			in_flight: [],
+		});
+		expect((report.session_state as Record<string, unknown>).activity).toMatchObject({
+			seq: 8,
+			outcome: "cancelled",
+			active_tool_count: 0,
+			active_tools: [],
 		});
 	});
+
+	it("preserves the previous activity when a terminal repair has nothing in flight", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const prompted = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "settled-prompt-1",
+			allow_mutation: true,
+		});
+		expect(prompted).toMatchObject({ ok: true });
+		const settled = {
+			seq: 7,
+			last_activity_at: ACTIVITY_AT,
+			tool: "bash",
+			phase: "finished",
+			outcome: "success",
+			elapsed_ms: 1200,
+			active_tool_count: 0,
+			active_tools: [],
+			in_flight: [],
+		};
+		await annotateSessionState(root, settled);
+
+		const report = await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: prompted.turn_id,
+			status: "completed",
+			summary: "done",
+			idempotency_key: "settled-report-1",
+			allow_mutation: true,
+		});
+		expect(report).toMatchObject({ ok: true, session_state: { state: "completed" } });
+
+		const persisted = JSON.parse(await Bun.file(sessionStatePath(root)).text()) as Record<string, unknown>;
+		expect(persisted.activity).toEqual(settled);
+	});
+
+	it("keeps a malformed activity snapshot hidden across canonical terminal repair", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls);
+		await registerSdkSession(server, root);
+		const prompted = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "work",
+			idempotency_key: "malformed-prompt-1",
+			allow_mutation: true,
+		});
+		expect(prompted).toMatchObject({ ok: true });
+		await annotateSessionState(root, activitySnapshot({ phase: "exfiltrating", note: "LEAKY-NOTE" }));
+
+		const report = await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			turn_id: prompted.turn_id,
+			status: "completed",
+			summary: "done",
+			idempotency_key: "malformed-report-1",
+			allow_mutation: true,
+		});
+		expect(report).toMatchObject({ ok: true, session_state: { state: "completed" } });
+		// Never re-seeded into a valid-looking snapshot, and never published.
+		expect(JSON.stringify(report)).not.toContain("LEAKY-NOTE");
+		const persisted = JSON.parse(await Bun.file(sessionStatePath(root)).text()) as Record<string, unknown>;
+		expect(persisted.activity).toMatchObject({ phase: "exfiltrating", note: "LEAKY-NOTE" });
+		expect((report.session_state as Record<string, unknown>).activity).toBeUndefined();
+	});
+
 	it("marks lifecycle-created sessions ready after successful SDK lifecycle binding", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

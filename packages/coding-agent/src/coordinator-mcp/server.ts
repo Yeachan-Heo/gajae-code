@@ -4,14 +4,18 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isKnownSinkPeerClosedError } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
-
-import { withFileLock } from "../config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
+import { SessionStateLockUnavailableError, withSessionStateFileLock } from "../gjc-runtime/session-state-lock";
+import {
+	classifyRuntimeToolActivity,
+	publicRuntimeToolActivity,
+	terminallySettledRuntimeToolActivity,
+} from "../gjc-runtime/session-state-sidecar";
 import { listMcpDelegateHostContexts } from "../hooks/mcp-delegate-host-context";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
@@ -275,13 +279,11 @@ interface CoordinatorSessionState {
 	source: "coordinator" | "agent_session_event";
 	live: boolean | null;
 	reason: string | null;
-	last_activity_at?: string;
+	/**
+	 * Tool-activity snapshot owned by the runtime sidecar; never lifecycle state. It is
+	 * carried opaquely because only the sidecar's validator decides what is publishable.
+	 */
 	activity?: unknown;
-	active_tools?: unknown;
-	active_tool_calls?: unknown;
-	active_tool_calls_overflow_count?: unknown;
-	active_tool_calls_overflow_digests?: unknown;
-	active_tool_calls_overflow_count_is_lower_bound?: unknown;
 }
 
 type CoordinatorEventKind =
@@ -1246,7 +1248,10 @@ function publicLifecycleReceipt(result: Record<string, unknown>, sessionId: stri
 
 function publicCoordinatorSessionState(state: CoordinatorSessionState | null): Record<string, unknown> | null {
 	if (!state) return null;
-	const result: Record<string, unknown> = {
+	// The sidecar owns the one projection that strips its private correlation state and
+	// withholds any snapshot that contradicts the lifecycle state published beside it.
+	const activity = publicRuntimeToolActivity(state.activity, state.state);
+	return {
 		session_id: state.session_id,
 		state: state.state,
 		ready_for_input: state.ready_for_input,
@@ -1254,57 +1259,8 @@ function publicCoordinatorSessionState(state: CoordinatorSessionState | null): R
 		last_turn_id: state.last_turn_id,
 		updated_at: state.updated_at,
 		...(typeof state.live === "boolean" ? { live: state.live } : {}),
+		...(activity ? { activity } : {}),
 	};
-	const activity = asRecord(state.activity);
-	if (
-		typeof state.last_activity_at === "string" &&
-		Number.isFinite(Date.parse(state.last_activity_at)) &&
-		activity &&
-		typeof activity.sequence === "number" &&
-		Number.isSafeInteger(activity.sequence) &&
-		activity.sequence > 0 &&
-		activity.kind === "tool_execution" &&
-		(activity.phase === "started" || activity.phase === "finished") &&
-		typeof activity.tool_name === "string" &&
-		/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(activity.tool_name) &&
-		typeof activity.observed_at === "string" &&
-		Number.isFinite(Date.parse(activity.observed_at)) &&
-		typeof activity.active_tool_count === "number" &&
-		Number.isSafeInteger(activity.active_tool_count) &&
-		activity.active_tool_count >= 0
-	) {
-		result.last_activity_at = state.last_activity_at;
-		result.activity = {
-			sequence: activity.sequence,
-			kind: activity.kind,
-			phase: activity.phase,
-			tool_name: activity.tool_name,
-			observed_at: activity.observed_at,
-			...(typeof activity.started_at === "string" && Number.isFinite(Date.parse(activity.started_at))
-				? { started_at: activity.started_at }
-				: {}),
-			...(typeof activity.elapsed_ms === "number" &&
-			Number.isSafeInteger(activity.elapsed_ms) &&
-			activity.elapsed_ms >= 0
-				? { elapsed_ms: activity.elapsed_ms }
-				: {}),
-			...(activity.outcome === "succeeded" || activity.outcome === "failed" ? { outcome: activity.outcome } : {}),
-			active_tool_count: activity.active_tool_count,
-			...(activity.active_tool_count_is_lower_bound === true ? { active_tool_count_is_lower_bound: true } : {}),
-		};
-		if (Array.isArray(state.active_tools))
-			result.active_tools = state.active_tools.slice(0, 8).flatMap(value => {
-				const tool = asRecord(value);
-				return tool &&
-					typeof tool.tool_name === "string" &&
-					/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(tool.tool_name) &&
-					typeof tool.started_at === "string" &&
-					Number.isFinite(Date.parse(tool.started_at))
-					? [{ tool_name: tool.tool_name, started_at: tool.started_at }]
-					: [];
-			});
-	}
-	return result;
 }
 
 function eventTimestamp(record: Record<string, unknown>): string | null {
@@ -1894,14 +1850,27 @@ async function writeSessionStateUnlocked(
 		live?: boolean | null;
 		reason?: string | null;
 		source?: CoordinatorSessionState["source"];
+		/** Rebuild the lifecycle fields from canonical state instead of the previous projection. */
 		overwrite?: boolean;
 	} = {},
 ): Promise<CoordinatorSessionState> {
-	const existing = await readSessionState(namespaceDir, sessionId);
-	const previous = options.overwrite ? null : existing;
+	const persisted = await readSessionState(namespaceDir, sessionId);
+	// An overwrite is a canonical lifecycle repair, not proof that tool activity ended.
+	const previous = options.overwrite ? null : persisted;
 	const hasCurrentTurn = Object.hasOwn(options, "currentTurnId");
 	const hasLastTurn = Object.hasOwn(options, "lastTurnId");
 	const hasLive = Object.hasOwn(options, "live");
+	const updatedAt = new Date().toISOString();
+	// A coordinator write says nothing about tool activity, so every lifecycle path —
+	// including canonical repair — carries the sidecar's snapshot and its sequence
+	// forward. A TERMINAL lifecycle state is the one exception: it is authority that
+	// nothing can still be running, so it settles orphaned in-flight calls through the
+	// exact helper the runtime uses. A malformed snapshot is preserved verbatim rather
+	// than reset to a lower sequence; the public projection refuses to publish it either way.
+	const terminal = state === "completed" || state === "errored";
+	const activity = terminal
+		? terminallySettledRuntimeToolActivity(persisted?.activity, updatedAt)
+		: classifyRuntimeToolActivity(persisted?.activity);
 	const payload: CoordinatorSessionState = {
 		schema_version: 1,
 		session_id: sessionId,
@@ -1913,30 +1882,13 @@ async function writeSessionStateUnlocked(
 				? (previous?.current_turn_id ?? null)
 				: null,
 		last_turn_id: hasLastTurn ? (options.lastTurnId ?? null) : (previous?.last_turn_id ?? null),
-		updated_at: new Date().toISOString(),
+		updated_at: updatedAt,
 		source: options.source ?? "coordinator",
 		live: hasLive ? (options.live ?? null) : (previous?.live ?? null),
 		reason: options.reason ?? null,
-		...(typeof existing?.last_activity_at === "string" ? { last_activity_at: existing.last_activity_at } : {}),
-		...(existing?.activity && typeof existing.activity === "object" ? { activity: existing.activity } : {}),
-		...(Array.isArray(existing?.active_tools) ? { active_tools: existing.active_tools } : {}),
-		...(existing?.active_tool_calls && typeof existing.active_tool_calls === "object"
-			? { active_tool_calls: existing.active_tool_calls }
-			: {}),
-		...(typeof existing?.active_tool_calls_overflow_count === "number" &&
-		Number.isSafeInteger(existing.active_tool_calls_overflow_count) &&
-		existing.active_tool_calls_overflow_count >= 0
-			? { active_tool_calls_overflow_count: existing.active_tool_calls_overflow_count }
-			: {}),
-		...(Array.isArray(existing?.active_tool_calls_overflow_digests)
-			? { active_tool_calls_overflow_digests: existing.active_tool_calls_overflow_digests }
-			: {}),
-		...(typeof existing?.active_tool_calls_overflow_count_is_lower_bound === "boolean"
-			? {
-					active_tool_calls_overflow_count_is_lower_bound:
-						existing.active_tool_calls_overflow_count_is_lower_bound,
-				}
-			: {}),
+		...(activity.kind === "absent"
+			? {}
+			: { activity: activity.kind === "valid" ? activity.activity : persisted?.activity }),
 	};
 	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);
 	if (
@@ -1964,8 +1916,24 @@ async function writeSessionStateUnlocked(
 	return payload;
 }
 
+/**
+ * Serialize a coordinator state mutation on the same lock the runtime sidecar takes.
+ *
+ * Both writers contend for `<file>.lock`, so they must use one implementation and one
+ * on-disk owner format. That format is the base Coordinator's regular-file owner JSON,
+ * now shared: a directory-style lock here would make a base-version `<file>.lock` regular
+ * file permanently unusable (`ENOTDIR` on `<file>.lock/info`), stranding the session. The
+ * base runtime did use a directory at this path, so the shared implementation reclaims
+ * that shape too. Live owners are waited for; dead and malformed ones are reclaimed by
+ * that implementation's own liveness and staleness checks.
+ */
 async function withSessionStateLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
-	return await withFileLock(stateFile, operation, { staleMs: 30_000, retries: 12_000, retryDelayMs: 5 });
+	try {
+		return await withSessionStateFileLock(stateFile, operation);
+	} catch (error) {
+		if (error instanceof SessionStateLockUnavailableError) throw new Error("coordinator_state_unreadable");
+		throw error;
+	}
 }
 
 async function writeSessionState(

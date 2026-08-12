@@ -1,0 +1,1275 @@
+import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
+import * as fsSync from "node:fs";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { NativeExactUnlinkResult } from "@gajae-code/natives";
+import { processStartTime, removeFileLockDirForGc } from "../src/config/file-lock";
+import * as sessionStateLock from "../src/gjc-runtime/session-state-lock";
+import {
+	reclaimStaleSessionStateLock,
+	SessionStateLockTestHooks,
+	SessionStateLockUnavailableError,
+	setSessionStateLockNativeBindings,
+	withSessionStateFileLock,
+} from "../src/gjc-runtime/session-state-lock";
+import {
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	persistCoordinatorRuntimeStateFromEvent,
+} from "../src/gjc-runtime/session-state-sidecar";
+import { exactIdentityNativeBindings, installExactIdentityNatives } from "./helpers/exact-identity-natives";
+
+/**
+ * The state-file lock has TWO on-disk shapes to survive, because the two base writers did
+ * not agree: the base Coordinator wrote a regular `<file>.lock` owner JSON, while the base
+ * runtime guarded the same path with the generic directory-style lock. Both are exercised
+ * here, along with the shapes neither wrote and which must therefore fail closed.
+ */
+
+const SESSION_ID = "lock-session";
+const ORIGINAL_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+const tempDirs: string[] = [];
+
+installExactIdentityNatives();
+
+afterEach(async () => {
+	SessionStateLockTestHooks.afterStaleInspection = undefined;
+	SessionStateLockTestHooks.beforeStaleRemoval = undefined;
+	SessionStateLockTestHooks.afterLockTypeDecision = undefined;
+	SessionStateLockTestHooks.afterTransitionStaleInspection = undefined;
+	SessionStateLockTestHooks.beforeTransitionStaleRemoval = undefined;
+	SessionStateLockTestHooks.beforeLegacyDirectoryRemoval = undefined;
+	SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict = undefined;
+	SessionStateLockTestHooks.ownerAccessStrategy = undefined;
+	SessionStateLockTestHooks.probeProcessSignal = undefined;
+	SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
+	installExactIdentityNatives();
+	setSystemTime();
+	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
+	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+async function tempRoot(): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-state-lock-"));
+	tempDirs.push(dir);
+	return dir;
+}
+
+async function readJson(file: string): Promise<Record<string, unknown>> {
+	return JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
+}
+
+async function seededRunningSession(name: string): Promise<{ root: string; stateFile: string }> {
+	const root = await tempRoot();
+	const stateFile = path.join(root, `${name}.json`);
+	process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+	setSystemTime(new Date("2026-03-01T00:00:00.000Z"));
+	await persistCoordinatorRuntimeStateFromEvent(
+		{ type: "turn_start" },
+		{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
+	);
+	return { root, stateFile };
+}
+
+/** One activity write through the full acquire path, so the lock is actually contended. */
+async function writeToolActivity(root: string, callId: string, at: string): Promise<void> {
+	setSystemTime(new Date(at));
+	await persistCoordinatorRuntimeStateFromEvent(
+		{ type: "tool_execution_start", toolCallId: callId },
+		{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
+		{ label: "bash", observedAt: at },
+	);
+}
+
+/** A pid that no process can hold, so liveness is provably dead rather than unknown. */
+const DEAD_PID = 2 ** 22 - 1;
+
+async function writeGenericLockDir(lockFile: string, info: Record<string, unknown>): Promise<void> {
+	await fs.mkdir(lockFile, { recursive: true });
+	await Bun.write(path.join(lockFile, "info"), JSON.stringify(info));
+}
+
+function installCleanupPendingNative(lockFile: string, result: NativeExactUnlinkResult, detachOriginal = true): void {
+	setSessionStateLockNativeBindings(() => ({
+		...exactIdentityNativeBindings,
+		exactRemoveDirectoryTree(target, snapshot) {
+			const observed = exactIdentityNativeBindings.snapshotDirectoryTree(target);
+			if (!observed.ok || JSON.stringify(observed.snapshot) !== JSON.stringify(snapshot))
+				return { ok: false, code: "identity_mismatch" };
+			if (detachOriginal) fsSync.renameSync(target, `${lockFile}.removing`);
+			return result;
+		},
+	}));
+}
+
+/**
+ * The claim record whose holder is currently inside a pathname transition.
+ *
+ * It is a regular owner record at `<file>.lock.transition`, in the same format as the
+ * record it guards, so its liveness is proved from the pid it names rather than from how
+ * long it has been sitting there.
+ */
+function liveTransitionPath(lockFile: string): string {
+	const candidate = `${lockFile}.transition`;
+	if (!fsSync.existsSync(candidate)) throw new Error("no transition claim was held during the stale-removal window");
+	return candidate;
+}
+
+/** Inode identity, so a break-and-recreate is not mistaken for survival. */
+function transitionToken(transitionPath: string): string {
+	const stat = fsSync.lstatSync(transitionPath);
+	return `${stat.dev}:${stat.ino}`;
+}
+
+/**
+ * Inode identity AND payload of every entry beneath `dir`.
+ *
+ * A legacy directory is a TREE, so survival has to be proved as a tree: re-reading the
+ * owner token proves nothing about a successor that recreated the path, and a matching
+ * `info` payload proves nothing about a different inode. Recording dev/ino alongside the
+ * bytes of every file makes a break-and-recreate impossible to mistake for survival.
+ */
+function directoryTreeIdentity(dir: string): string {
+	const walk = (relative: string): string[] => {
+		const absolute = relative === "" ? dir : path.join(dir, relative);
+		const stat = fsSync.lstatSync(absolute, { bigint: true });
+		const line = `${relative}|${stat.dev}:${stat.ino}:${stat.nlink}:${stat.size}:${stat.mtimeNs}`;
+		if (!stat.isDirectory()) return [`${line}|${fsSync.readFileSync(absolute).toString("hex")}`];
+		return [
+			line,
+			...fsSync
+				.readdirSync(absolute)
+				.sort()
+				.flatMap(name => walk(relative === "" ? name : `${relative}/${name}`)),
+		];
+	};
+	return walk("").join("\n");
+}
+
+/**
+ * Make a HELD claim look abandoned, without touching one byte of it.
+ *
+ * Backdating the record itself is not an option any more: its `mtime` is part of the
+ * identity its holder will release against, so writing to it would forge a different
+ * object rather than age the same one. Moving the clock forward instead leaves the record
+ * exactly as its holder wrote it and puts every elapsed-time heuristic far past any
+ * abandonment window — which is precisely the claim under test: only the owner's liveness
+ * decides, never the clock.
+ *
+ * @returns a restore for the frozen test clock.
+ */
+function ageWorldPastAnyStaleWindow(): () => void {
+	const frozen = Date.now();
+	setSystemTime(new Date(frozen + 600_000));
+	return () => setSystemTime(new Date(frozen));
+}
+
+describe("coordinator session state lock", () => {
+	it("serializes a concurrent writer behind the current lock holder", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-current");
+		// System time is frozen in these tests, so order is recorded explicitly.
+		const order: string[] = [];
+		const held = withSessionStateFileLock(stateFile, async () => {
+			await Bun.sleep(120);
+			order.push("holder-released");
+		});
+		await Bun.sleep(20);
+
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+		order.push("waiter-wrote");
+		await held;
+
+		expect(order).toEqual(["holder-released", "waiter-wrote"]);
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+	});
+
+	it("never creates a lock directory that would strand a base regular-file writer", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-no-enotdir");
+		const observed: Array<string | undefined> = [];
+		await withSessionStateFileLock(stateFile, async () => {
+			observed.push(fsSync.statSync(`${stateFile}.lock`).isFile() ? "file" : "dir");
+		});
+
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+
+		expect(observed).toEqual(["file"]);
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1 });
+	});
+
+	it("waits for a live regular owner instead of reclaiming it by age", async () => {
+		const { stateFile } = await seededRunningSession("lock-live-regular");
+		const lockFile = `${stateFile}.lock`;
+		// This process is unambiguously alive, and its recorded start time is the portable
+		// value a current writer stamps. Age alone must not make it reclaimable.
+		await fs.writeFile(
+			lockFile,
+			JSON.stringify({
+				pid: process.pid,
+				start_time: processStartTime(process.pid) ?? "unknown",
+				token: "live-owner-token",
+			}),
+		);
+		const stale = new Date(Date.now() - 600_000);
+		await fs.utimes(lockFile, stale, stale);
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(fsSync.existsSync(lockFile)).toBe(true);
+		expect((await readJson(lockFile)).token).toBe("live-owner-token");
+	});
+
+	/**
+	 * `process.kill(pid, 0)` answers three different questions with one call, and only one
+	 * of its answers means the owner is gone.
+	 *
+	 * `ESRCH` is the proof of death. `EPERM` is the opposite: the process EXISTS, this
+	 * process just may not signal it — which is the normal answer for an owner running as
+	 * another user, under a different container UID, or behind a sandbox policy. Anything
+	 * else is a question the OS declined to answer at all. Treating either of the last two
+	 * as death authorizes deleting a lock whose holder is still writing behind it, and the
+	 * exact-identity unlink cannot save it: the record still IS the record that was judged,
+	 * so the compare-and-delete matches and the live owner loses its lock.
+	 *
+	 * The probe is injected because the answer is a property of the OS and the caller's
+	 * privileges, not of anything the test can arrange on disk.
+	 */
+	describe("owner liveness the OS will not answer", () => {
+		/** The pid names a real process; this process may just not signal it. */
+		const EPERM_PROBE = (): never => {
+			throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+		};
+		/** Neither proof of death nor proof of life. */
+		const UNKNOWN_PROBE = (): never => {
+			throw Object.assign(new Error("input/output error"), { code: "EIO" });
+		};
+
+		for (const { name, probe } of [
+			{ name: "refuses the signal (EPERM)", probe: EPERM_PROBE },
+			{ name: "answers nothing usable", probe: UNKNOWN_PROBE },
+		]) {
+			it(`never reclaims a regular owner whose liveness probe ${name}, however old`, async () => {
+				const { stateFile } = await seededRunningSession(`lock-unsignalable-${name.slice(0, 6)}`);
+				const lockFile = `${stateFile}.lock`;
+				const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "unsignalable-owner" });
+				await fs.writeFile(lockFile, record);
+				// Old enough that every elapsed-time heuristic would call it abandoned.
+				const stale = new Date(Date.now() - 600_000);
+				await fs.utimes(lockFile, stale, stale);
+				SessionStateLockTestHooks.probeProcessSignal = probe;
+
+				await reclaimStaleSessionStateLock(lockFile);
+
+				expect(fsSync.existsSync(lockFile)).toBe(true);
+				expect(await fs.readFile(lockFile, "utf8")).toBe(record);
+			});
+		}
+
+		it("never breaks a transition claim whose holder refuses the signal, however old", async () => {
+			const { stateFile } = await seededRunningSession("lock-unsignalable-transition");
+			const lockFile = `${stateFile}.lock`;
+			const transitionFile = `${lockFile}.transition`;
+			const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "unsignalable-transition" });
+			await fs.writeFile(transitionFile, record);
+			const stale = new Date(Date.now() - 600_000);
+			await fs.utimes(transitionFile, stale, stale);
+			SessionStateLockTestHooks.probeProcessSignal = EPERM_PROBE;
+
+			const entered: string[] = [];
+			// Every chance to break it: the contender retries the claim throughout.
+			const contender = withSessionStateFileLock(stateFile, async () => {
+				entered.push("entered");
+			});
+			await Promise.race([contender, Bun.sleep(300)]);
+
+			// The claim record is untouched, so no transition ran and no state lock was taken.
+			expect(await fs.readFile(transitionFile, "utf8")).toBe(record);
+			expect(entered).toEqual([]);
+
+			// Its holder finally gives it up, and only then does the contender proceed.
+			await fs.rm(transitionFile);
+			await contender;
+			expect(entered).toEqual(["entered"]);
+		});
+
+		it("reclaims an owner the probe proves gone, however alive its pid looks", async () => {
+			const { stateFile } = await seededRunningSession("lock-probed-dead");
+			const lockFile = `${stateFile}.lock`;
+			// A pid that is unambiguously alive right now, recorded with the start time a
+			// current writer stamps: only the probe's ESRCH says this owner is gone.
+			await fs.writeFile(
+				lockFile,
+				JSON.stringify({
+					pid: process.pid,
+					start_time: processStartTime(process.pid) ?? "unknown",
+					token: "probed-dead-owner",
+				}),
+			);
+			SessionStateLockTestHooks.probeProcessSignal = () => {
+				throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+			};
+
+			await reclaimStaleSessionStateLock(lockFile);
+
+			expect(fsSync.existsSync(lockFile)).toBe(false);
+		});
+
+		/**
+		 * Unknown liveness never authorizes a deletion, but recorded IDENTITY still can:
+		 * an unsignalable pid whose start time provably belongs to a different incarnation
+		 * is a reused pid, and the owner that wrote this record is gone.
+		 */
+		it("still reclaims an unsignalable owner whose recorded incarnation is provably gone", async () => {
+			const { stateFile } = await seededRunningSession("lock-unsignalable-reused-pid");
+			const lockFile = `${stateFile}.lock`;
+			// The reader has to actually produce a value; without one the mismatch would be
+			// indeterminate rather than proved, and the record would have to survive.
+			expect(processStartTime(process.pid)).not.toBeNull();
+			await fs.writeFile(
+				lockFile,
+				JSON.stringify({
+					pid: process.pid,
+					start_time: "Thu Jan  1 00:00:00 1970",
+					token: "reused-pid-owner",
+				}),
+			);
+			SessionStateLockTestHooks.probeProcessSignal = EPERM_PROBE;
+
+			await reclaimStaleSessionStateLock(lockFile);
+
+			expect(fsSync.existsSync(lockFile)).toBe(false);
+		});
+	});
+
+	it("reclaims a base regular-file lock left by a dead owner instead of faulting", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-dead-owner");
+		// The exact base owner JSON, written by a pid that no longer exists.
+		await fs.writeFile(
+			`${stateFile}.lock`,
+			JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "base-owner-token" }),
+		);
+
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+		// A regular file, never a directory: `<file>.lock/info` would strand base writers.
+		expect(fsSync.existsSync(`${stateFile}.lock`)).toBe(false);
+	});
+
+	it("reclaims a malformed owner file only once it is stale", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-malformed-owner");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, "not-json");
+		// A malformed owner has no pid to prove liveness with, so it is reclaimable
+		// only after its own mtime goes stale.
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(lockFile, stale, stale);
+
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+	});
+
+	it("leaves a successor owner that claimed the path after the stale verdict", async () => {
+		const { stateFile } = await seededRunningSession("lock-successor");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, "not-json");
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(lockFile, stale, stale);
+
+		const successor = JSON.stringify({
+			pid: process.pid,
+			start_time: processStartTime(process.pid) ?? "unknown",
+			token: "successor-token",
+		});
+		// Exactly the reclaim TOCTOU window: the stale record is replaced by a live
+		// successor between the inspection and the unlink.
+		SessionStateLockTestHooks.afterStaleInspection = async () => {
+			await fs.writeFile(lockFile, successor);
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(await fs.readFile(lockFile, "utf8")).toBe(successor);
+	});
+
+	it("keeps a current contender out of the lock path until the stale record is removed", async () => {
+		const { stateFile } = await seededRunningSession("lock-final-window");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
+
+		const order: string[] = [];
+		const contenderEntered = Promise.withResolvers<void>();
+		const releaseContender = Promise.withResolvers<void>();
+		let contender: Promise<void> | undefined;
+		let entries = 0;
+		let enteredDuringWindow = false;
+
+		// The FINAL window: identity has just been re-validated and the unlink has not
+		// happened yet. A current contender that slips in here takes the pathname, and the
+		// unlink below then reaps ITS live lock.
+		SessionStateLockTestHooks.beforeStaleRemoval = async () => {
+			if (contender) return;
+			order.push("window-open");
+			contender = withSessionStateFileLock(stateFile, async () => {
+				entries++;
+				order.push("contender-entered");
+				contenderEntered.resolve();
+				await releaseContender.promise;
+			});
+			// Every chance to win the race: the contender fails `wx`, reclaims, and retries
+			// many times over this interval.
+			await Promise.race([contenderEntered.promise, Bun.sleep(300)]);
+			enteredDuringWindow = order.includes("contender-entered");
+			order.push("window-closed");
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+		order.push("stale-removed");
+
+		await contenderEntered.promise;
+		// The successor holds the pathname with ITS OWN owner record — the reclaimer
+		// removed the stale record it validated, never a successor's live lock.
+		const heldOwner = JSON.parse(await fs.readFile(lockFile, "utf8")) as Record<string, unknown>;
+		expect(heldOwner.pid).toBe(process.pid);
+		expect(heldOwner.token).not.toBe("dead-owner-token");
+
+		releaseContender.resolve();
+		await contender;
+
+		expect(enteredDuringWindow).toBe(false);
+		expect(entries).toBe(1);
+		expect(order).toEqual(["window-open", "window-closed", "stale-removed", "contender-entered"]);
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+	});
+
+	it("never breaks a transition claim whose holder is still inside it, however old it looks", async () => {
+		const { stateFile } = await seededRunningSession("lock-live-transition");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
+
+		const order: string[] = [];
+		const contenderEntered = Promise.withResolvers<void>();
+		const releaseContender = Promise.withResolvers<void>();
+		let contender: Promise<void> | undefined;
+		let entries = 0;
+		let heldTransition = "";
+		let transitionSurvived = false;
+		let enteredDuringWindow = false;
+
+		// Inside the transition, holding it, with the final identity check already done: a
+		// process pause or a stalled filesystem here is indistinguishable from an old claim.
+		SessionStateLockTestHooks.beforeStaleRemoval = async () => {
+			if (contender) return;
+			order.push("window-open");
+			heldTransition = liveTransitionPath(lockFile);
+			const token = transitionToken(heldTransition);
+			const restoreClock = ageWorldPastAnyStaleWindow();
+
+			contender = withSessionStateFileLock(stateFile, async () => {
+				entries++;
+				order.push("contender-entered");
+				contenderEntered.resolve();
+				await releaseContender.promise;
+			});
+			// Every chance to break it: the contender retries the claim throughout.
+			await Promise.race([contenderEntered.promise, Bun.sleep(300)]);
+			transitionSurvived = fsSync.existsSync(heldTransition) && transitionToken(heldTransition) === token;
+			enteredDuringWindow = order.includes("contender-entered");
+			restoreClock();
+			order.push("window-closed");
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+		order.push("stale-removed");
+
+		await contenderEntered.promise;
+		// The same claim record, never removed and never replaced by a breaker's own.
+		expect(transitionSurvived).toBe(true);
+		expect(enteredDuringWindow).toBe(false);
+
+		releaseContender.resolve();
+		await contender;
+
+		expect(entries).toBe(1);
+		expect(order).toEqual(["window-open", "window-closed", "stale-removed", "contender-entered"]);
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+		// Released with its holder: a claim is never left behind for age-based cleanup.
+		expect(fsSync.existsSync(heldTransition)).toBe(false);
+	});
+
+	it("never removes a live legacy directory owner, however old its timestamp", async () => {
+		const { stateFile } = await seededRunningSession("lock-live-directory");
+		const lockFile = `${stateFile}.lock`;
+		await writeGenericLockDir(lockFile, {
+			pid: process.pid,
+			start_time: processStartTime(process.pid) ?? undefined,
+			timestamp: Date.now() - 600_000,
+		});
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
+		expect(await readJson(path.join(lockFile, "info"))).toMatchObject({ pid: process.pid });
+	});
+
+	it("reclaims a legacy directory lock whose owner is dead and completes the write", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-dead-directory");
+		const lockFile = `${stateFile}.lock`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+	});
+
+	it("continues after native cleanup durably detaches a stale legacy directory", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-detached-directory");
+		const lockFile = `${stateFile}.lock`;
+		const detachedLock = `${lockFile}.removing`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+		installCleanupPendingNative(lockFile, {
+			ok: false,
+			code: "cleanup_pending",
+			payloadDurable: true,
+			detachedPath: detachedLock,
+		});
+
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+		expect(fsSync.statSync(detachedLock).isDirectory()).toBe(true);
+	});
+
+	it("refuses a detached cleanup receipt whose payload is not durable", async () => {
+		const { stateFile } = await seededRunningSession("lock-nondurable-directory");
+		const lockFile = `${stateFile}.lock`;
+		const detachedLock = `${lockFile}.removing`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+		installCleanupPendingNative(lockFile, {
+			ok: false,
+			code: "cleanup_pending",
+			payloadDurable: false,
+			detachedPath: detachedLock,
+		});
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+		expect(fsSync.statSync(detachedLock).isDirectory()).toBe(true);
+	});
+
+	it("refuses a detached cleanup receipt naming a different retained path", async () => {
+		const { stateFile } = await seededRunningSession("lock-wrong-detached-directory");
+		const lockFile = `${stateFile}.lock`;
+		const detachedLock = `${lockFile}.removing`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+		installCleanupPendingNative(lockFile, {
+			ok: false,
+			code: "cleanup_pending",
+			payloadDurable: true,
+			detachedPath: `${lockFile}.unexpected`,
+		});
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+		expect(fsSync.statSync(detachedLock).isDirectory()).toBe(true);
+	});
+
+	it("refuses cleanup pending while the authorized lock still occupies its pathname", async () => {
+		const { stateFile } = await seededRunningSession("lock-undetached-directory");
+		const lockFile = `${stateFile}.lock`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+		installCleanupPendingNative(
+			lockFile,
+			{ ok: false, code: "cleanup_pending", payloadDurable: true, detachedPath: `${lockFile}.removing` },
+			false,
+		);
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
+	});
+
+	it("reclaims a legacy directory lock with no readable owner only once it is stale", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-malformed-directory");
+		const lockFile = `${stateFile}.lock`;
+		await fs.mkdir(lockFile, { recursive: true });
+		await Bun.write(path.join(lockFile, "info"), "not-json");
+
+		// Fresh: nothing proves the owner is gone, so the directory stays.
+		await reclaimStaleSessionStateLock(lockFile);
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
+
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(lockFile, stale, stale);
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+	});
+
+	it("refuses to delete a legacy directory whose owner token changed", async () => {
+		const root = await tempRoot();
+		const lockDir = path.join(root, "state.json.lock");
+		const observed = { pid: DEAD_PID, start_time: "whenever", timestamp: 1 };
+		await writeGenericLockDir(lockDir, { ...observed, timestamp: 2 });
+
+		// A contender that inspected an earlier owner must not reap the successor that
+		// legitimately reclaimed this path in the meantime.
+		expect(await removeFileLockDirForGc(lockDir, observed)).toBe("owner_changed");
+		expect(fsSync.statSync(lockDir).isDirectory()).toBe(true);
+	});
+
+	for (const { name, create } of [
+		{
+			name: "a symlink",
+			create: async (lockFile: string, target: string) => {
+				await fs.symlink(target, lockFile);
+			},
+		},
+		{
+			name: "a FIFO",
+			create: async (lockFile: string) => {
+				const proc = Bun.spawnSync(["mkfifo", lockFile], { stdout: "ignore", stderr: "ignore" });
+				if (proc.exitCode !== 0) throw new Error("mkfifo unavailable");
+			},
+		},
+	]) {
+		it(`fails closed on ${name} at the lock path without reading or removing it`, async () => {
+			const { root, stateFile } = await seededRunningSession(`lock-${name.replace(/\W+/g, "-")}`);
+			const lockFile = `${stateFile}.lock`;
+			const target = path.join(root, "protected-target");
+			await Bun.write(target, "protected");
+			await create(lockFile, target);
+
+			await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toThrow(
+				/Existing runtime state marker is invalid or unreadable/,
+			);
+			await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+
+			// Neither the lock path nor whatever it points at was touched.
+			expect(fsSync.lstatSync(lockFile).isFile()).toBe(false);
+			expect(await Bun.file(target).text()).toBe("protected");
+			expect((await readJson(stateFile)).activity).toBeUndefined();
+		});
+	}
+
+	/**
+	 * The type decision (`lstat`) and the owner read are two syscalls on ONE pathname, and
+	 * between them the path can be swapped for a shape whose bytes this code must never
+	 * read by name: a symlink hands over an attacker-chosen target, a FIFO with no writer
+	 * never returns. So the owner read has to happen on a descriptor that was opened
+	 * no-follow and non-blocking and then PROVED regular from that same descriptor — never
+	 * on the pathname the decision was made about.
+	 */
+	it("refuses a lock path swapped to a symlink after the type decision", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-swap-symlink");
+		const lockFile = `${stateFile}.lock`;
+		const target = path.join(root, "swap-target.json");
+		// Bytes a PATH read accepts without complaint: a well-formed owner whose pid is
+		// provably dead. Following the swap therefore reclaims, and unlinks, this pathname.
+		await Bun.write(target, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "target-owner-token" }));
+		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
+
+		SessionStateLockTestHooks.afterLockTypeDecision = async () => {
+			SessionStateLockTestHooks.afterLockTypeDecision = undefined;
+			await fs.rm(lockFile);
+			await fs.symlink(target, lockFile);
+		};
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+
+		// The swapped-in link is still a link — it was never opened, read, or unlinked —
+		// and the target it points at was never touched.
+		expect(fsSync.lstatSync(lockFile).isSymbolicLink()).toBe(true);
+		expect(JSON.parse(await fs.readFile(target, "utf8")).token).toBe("target-owner-token");
+	});
+
+	it("refuses a lock path swapped to a FIFO after the type decision instead of blocking on it", async () => {
+		const { stateFile } = await seededRunningSession("lock-swap-fifo");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
+
+		SessionStateLockTestHooks.afterLockTypeDecision = async () => {
+			SessionStateLockTestHooks.afterLockTypeDecision = undefined;
+			await fs.rm(lockFile);
+			const proc = Bun.spawnSync(["mkfifo", lockFile], { stdout: "ignore", stderr: "ignore" });
+			if (proc.exitCode !== 0) throw new Error("mkfifo unavailable");
+		};
+
+		const reclaim = reclaimStaleSessionStateLock(lockFile).then(
+			() => "completed" as const,
+			error => (error instanceof SessionStateLockUnavailableError ? ("refused" as const) : ("faulted" as const)),
+		);
+		// A by-name read of a writerless FIFO never returns. Bound the observation so the
+		// defect is a deterministic failed expectation rather than a hung suite.
+		const outcome = await Promise.race([reclaim, Bun.sleep(1_500).then(() => "blocked" as const)]);
+		// Hand a blocked reader its EOF, if one was left behind, so the suite can still exit.
+		if (outcome === "blocked") Bun.spawnSync(["sh", "-c", `: > ${JSON.stringify(lockFile)}`]);
+
+		expect(outcome).toBe("refused");
+		expect(fsSync.lstatSync(lockFile).isFIFO()).toBe(true);
+	});
+
+	/**
+	 * A pathname transition claim keeps CURRENT writers of this protocol out of the window.
+	 * It cannot keep out a base or legacy writer, which never takes the claim at all and
+	 * simply creates the path. Only an identity-bound delete — one that refuses unless the
+	 * object still IS the record that was judged — survives that, so each of the three
+	 * removals below is proved against a successor that appears in its final window.
+	 */
+	it("leaves a base successor that replaced the stale state record inside the removal window", async () => {
+		const { stateFile } = await seededRunningSession("lock-state-exact-cas");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
+
+		const successor = JSON.stringify({
+			pid: process.pid,
+			start_time: processStartTime(process.pid) ?? "unknown",
+			token: "base-successor-token",
+		});
+		let replaced = false;
+		// The identity has just been re-proved and the delete has not happened. A base
+		// writer takes the pathname here without ever seeing the transition claim.
+		SessionStateLockTestHooks.beforeStaleRemoval = async () => {
+			replaced = true;
+			await fs.rm(lockFile);
+			await fs.writeFile(lockFile, successor);
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(replaced).toBe(true);
+		expect(await fs.readFile(lockFile, "utf8")).toBe(successor);
+
+		// And the successor is respected as a LIVE lock: nothing enters behind it.
+		const entered: string[] = [];
+		const contender = withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		await Promise.race([contender, Bun.sleep(200)]);
+		expect(entered).toEqual([]);
+
+		await fs.rm(lockFile);
+		await contender;
+		expect(entered).toEqual(["entered"]);
+	});
+
+	it("leaves a successor that replaced the stale transition record inside its removal window", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-exact-cas");
+		const lockFile = `${stateFile}.lock`;
+		// The claim is its own regular owner record, reclaimed by the same exact-identity
+		// rule as the state record it guards — not by an ownerless directory protocol.
+		const transitionFile = `${lockFile}.transition`;
+		await fs.writeFile(
+			transitionFile,
+			JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-transition-token" }),
+		);
+
+		const successor = JSON.stringify({
+			pid: process.pid,
+			start_time: processStartTime(process.pid) ?? "unknown",
+			token: "transition-successor-token",
+		});
+		let replaced = false;
+		SessionStateLockTestHooks.beforeTransitionStaleRemoval = async () => {
+			replaced = true;
+			await fs.rm(transitionFile);
+			await fs.writeFile(transitionFile, successor);
+		};
+
+		const entered: string[] = [];
+		const contender = withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		await Promise.race([contender, Bun.sleep(300)]);
+
+		expect(replaced).toBe(true);
+		expect(await fs.readFile(transitionFile, "utf8")).toBe(successor);
+		// A live claim holder means no transition ran, so no state lock was taken either.
+		expect(entered).toEqual([]);
+
+		await fs.rm(transitionFile);
+		await contender;
+		expect(entered).toEqual(["entered"]);
+	});
+
+	/**
+	 * A write that fails after the exclusive create leaves a partial record its own writer
+	 * must retract. What authorizes that retraction is the writer's OWN open file — never
+	 * whatever the PATHNAME happens to name once the cleanup finally runs.
+	 *
+	 * Between the fault and the catch, the record can be stale-reclaimed and the freed
+	 * pathname taken by a successor. Capturing "whatever is there now" and handing it to
+	 * the identity-bound unlink deletes that successor's live lock, and the
+	 * compare-and-delete cannot object: the capture and the authorization are the same
+	 * foreign object. Holding the created descriptor open through the cleanup is what makes
+	 * the proof sound — the created inode cannot be recycled underneath a successor while
+	 * this process still has it open.
+	 */
+	for (const target of ["state", "transition"] as const) {
+		it(`leaves a successor that took the ${target} owner path while a failed writer was cleaning up`, async () => {
+			const { stateFile } = await seededRunningSession(`lock-write-failure-${target}`);
+			const lockFile = `${stateFile}.lock`;
+			const ownerFile = target === "state" ? lockFile : `${lockFile}.transition`;
+			const successor = JSON.stringify({
+				pid: process.pid,
+				start_time: processStartTime(process.pid) ?? "unknown",
+				token: `${target}-write-failure-successor-token`,
+			});
+
+			let faulted = false;
+			SessionStateLockTestHooks.ownerRecordWriteFault = async file => {
+				if (file !== ownerFile) return;
+				SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
+				faulted = true;
+				// The record this writer created, half written.
+				await fs.writeFile(file, '{"pid":');
+				// A stale reclaim frees the pathname, and a successor claims it — both
+				// before the failed writer's catch cleanup gets to run.
+				await fs.rm(file);
+				await fs.writeFile(file, successor);
+				throw new Error("simulated owner record write fault");
+			};
+
+			await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+				SessionStateLockUnavailableError,
+			);
+
+			expect(faulted).toBe(true);
+			// The successor's record — its own inode and its own token — is untouched.
+			expect(await fs.readFile(ownerFile, "utf8")).toBe(successor);
+
+			// And it still holds real authority: nothing enters behind it until it is gone.
+			const entered: string[] = [];
+			const contender = withSessionStateFileLock(stateFile, async () => {
+				entered.push("entered");
+			});
+			await Promise.race([contender, Bun.sleep(200)]);
+			expect(entered).toEqual([]);
+
+			await fs.rm(ownerFile);
+			await contender;
+			expect(entered).toEqual(["entered"]);
+		});
+	}
+
+	/**
+	 * The other side of that refusal: when the pathname still names the writer's own
+	 * record, the retraction must actually happen. A half-written record left behind would
+	 * strand the pathname until the stale window elapsed, which is the cost that makes
+	 * "refuse unless proven" worth paying rather than an excuse to never clean up.
+	 */
+	it("retracts its own half-written record when the pathname still names it", async () => {
+		const { stateFile } = await seededRunningSession("lock-write-failure-retract");
+		const lockFile = `${stateFile}.lock`;
+
+		let faulted = false;
+		SessionStateLockTestHooks.ownerRecordWriteFault = async file => {
+			if (file !== lockFile) return;
+			SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
+			faulted = true;
+			// Written through the pathname, so the inode is still the one this writer
+			// created — the record is partial, not foreign.
+			await fs.writeFile(file, '{"pid":');
+			throw new Error("simulated owner record write fault");
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+
+		expect(faulted).toBe(true);
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+		// The pathname is immediately usable again, with no stale window to wait out.
+		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
+	});
+
+	it("preserves an owner-write failure when exact retraction also fails", async () => {
+		const { stateFile } = await seededRunningSession("lock-write-primary-error");
+		const primary = new Error("primary owner write failure");
+		const cleanup = new Error("owner retraction failure");
+		SessionStateLockTestHooks.ownerRecordWriteFault = () => {
+			throw primary;
+		};
+		setSessionStateLockNativeBindings(() => ({
+			exactUnlink() {
+				throw cleanup;
+			},
+			snapshotDirectoryTree() {
+				throw new Error("unexpected directory snapshot");
+			},
+			exactRemoveDirectoryTree() {
+				throw new Error("unexpected directory removal");
+			},
+		}));
+
+		const observed = await withSessionStateFileLock(stateFile, async () => "unreachable").catch(error => error);
+		expect(observed).toBeInstanceOf(SessionStateLockUnavailableError);
+		const aggregate = (observed as Error & { cause?: unknown }).cause;
+		expect(aggregate).toBeInstanceOf(AggregateError);
+		const [preservedPrimary, preservedCleanup] = (aggregate as AggregateError).errors;
+		expect(preservedPrimary).toBe(primary);
+		expect(preservedCleanup).toBeInstanceOf(SessionStateLockUnavailableError);
+		expect((preservedCleanup as Error & { cause?: unknown }).cause).toBe(cleanup);
+	});
+
+	it("preserves an operation failure when owner release also fails", async () => {
+		const { stateFile } = await seededRunningSession("lock-operation-primary-error");
+		const lockFile = `${stateFile}.lock`;
+		const primary = new Error("primary state operation failure");
+		const release = new Error("owner release failure");
+		setSessionStateLockNativeBindings(() => ({
+			exactUnlink(target) {
+				if (target === lockFile) throw release;
+				try {
+					fsSync.unlinkSync(target);
+					return { ok: true };
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: false, code: "not_found" };
+					throw error;
+				}
+			},
+			snapshotDirectoryTree() {
+				throw new Error("unexpected directory snapshot");
+			},
+			exactRemoveDirectoryTree() {
+				throw new Error("unexpected directory removal");
+			},
+		}));
+
+		const observed = await withSessionStateFileLock(stateFile, () => {
+			throw primary;
+		}).catch(error => error);
+		expect(observed).toBeInstanceOf(AggregateError);
+		const [preservedPrimary, preservedRelease] = (observed as AggregateError).errors;
+		expect(preservedPrimary).toBe(primary);
+		expect(preservedRelease).toBeInstanceOf(SessionStateLockUnavailableError);
+		expect((preservedRelease as Error & { cause?: unknown }).cause).toBe(release);
+	});
+
+	it("releases the owner record after a synchronous operation throw", async () => {
+		const { stateFile } = await seededRunningSession("lock-operation-sync-throw");
+		const lockFile = `${stateFile}.lock`;
+		const primary = new Error("synchronous state operation failure");
+
+		const observed = await withSessionStateFileLock(stateFile, () => {
+			throw primary;
+		}).catch(error => error);
+
+		expect(observed).toBe(primary);
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+		expect(await withSessionStateFileLock(stateFile, async () => "reacquired")).toBe("reacquired");
+	});
+
+	it("leaves a legacy directory whose tree changed before the exact removal", async () => {
+		const { stateFile } = await seededRunningSession("lock-legacy-exact-cas");
+		const lockFile = `${stateFile}.lock`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+
+		let changed = false;
+		SessionStateLockTestHooks.beforeLegacyDirectoryRemoval = async () => {
+			changed = true;
+			// A successor took the directory over and put its own payload in it while
+			// leaving the owner token this reclaimer read untouched: re-reading the token
+			// proves nothing, only the whole captured tree does.
+			await Bun.write(path.join(lockFile, "successor-payload"), "successor");
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(changed).toBe(true);
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
+		expect(await Bun.file(path.join(lockFile, "successor-payload")).text()).toBe("successor");
+		expect(await readJson(path.join(lockFile, "info"))).toMatchObject({ pid: DEAD_PID });
+	});
+
+	/**
+	 * The stale VERDICT and the tree that gets deleted have to be the same object.
+	 *
+	 * The verdict is produced by the generic protocol against a PATHNAME, and a legacy
+	 * writer never takes the transition claim: it can remove the directory the verdict was
+	 * about and create a brand-new LIVE one at the same path. A reclaimer that snapshots
+	 * "whatever is there now" then hands the successor's own tree to the exact removal,
+	 * which of course matches — the compare-and-delete protected the object it was given,
+	 * but the authorization belonged to a different one. So the identity has to BRACKET
+	 * the verdict: capture before, capture after, and remove only when they are the same.
+	 */
+	it("leaves a live legacy directory owner that replaced the stale one after the verdict", async () => {
+		const { stateFile } = await seededRunningSession("lock-legacy-verdict-identity");
+		const lockFile = `${stateFile}.lock`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+
+		let replaced = false;
+		let successorIdentity = "";
+		// Exactly the window the verdict authorizes: it has just been rendered against the
+		// dead owner's directory, and the identity that will be deleted is not fixed yet.
+		SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict = async () => {
+			if (replaced) return;
+			replaced = true;
+			await fs.rm(lockFile, { recursive: true, force: true });
+			await writeGenericLockDir(lockFile, {
+				pid: process.pid,
+				start_time: processStartTime(process.pid) ?? undefined,
+				timestamp: Date.now(),
+			});
+			successorIdentity = directoryTreeIdentity(lockFile);
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(replaced).toBe(true);
+		// Byte-for-byte and inode-for-inode the successor's own tree, never re-created.
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
+		expect(directoryTreeIdentity(lockFile)).toBe(successorIdentity);
+		expect(await readJson(path.join(lockFile, "info"))).toMatchObject({ pid: process.pid });
+
+		// And it is respected as a LIVE owner: nothing acquires the lock behind it.
+		const entered: string[] = [];
+		const contender = withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		await Promise.race([contender, Bun.sleep(200)]);
+		expect(entered).toEqual([]);
+		expect(directoryTreeIdentity(lockFile)).toBe(successorIdentity);
+
+		await fs.rm(lockFile, { recursive: true, force: true });
+		await contender;
+		expect(entered).toEqual(["entered"]);
+	});
+
+	it("fails closed and touches nothing when identity-bound deletion is unavailable", async () => {
+		const { stateFile } = await seededRunningSession("lock-native-unavailable");
+		const lockFile = `${stateFile}.lock`;
+		const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" });
+		await fs.writeFile(lockFile, record);
+
+		// Exactly what an absent compiled addon does: resolution itself fails.
+		setSessionStateLockNativeBindings(() => {
+			throw new Error("pi_natives addon is unavailable");
+		});
+
+		// No `fs.rm` fallback: a process that cannot prove what it is deleting refuses.
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+
+		expect(fsSync.lstatSync(lockFile).isFile()).toBe(true);
+		expect(await fs.readFile(lockFile, "utf8")).toBe(record);
+		// And nothing was left claimed on the way out: no unreleasable record strands the
+		// pathname for the next contender once the primitive is back.
+		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+	});
+
+	it("keeps the namespace mutation lock directory-style", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "session-states", "namespace-session.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		setSystemTime(new Date("2026-03-01T00:00:00.000Z"));
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
+		);
+
+		// The outer namespace transaction lock guards no single JSON document of its own,
+		// so it stays on the generic directory protocol rather than the owner-file one.
+		// Holding the inner state-file lock parks a writer between the two, which is the
+		// only window where the outer lock is observable on disk.
+		const release = Promise.withResolvers<void>();
+		const holder = withSessionStateFileLock(stateFile, () => release.promise);
+		await Bun.sleep(20);
+		const persist = persistCoordinatorRuntimeStateFromEvent(
+			{ type: "tool_execution_start", toolCallId: "call-1" },
+			{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
+			{ label: "bash", observedAt: "2026-03-01T00:00:01.000Z" },
+		);
+		await Bun.sleep(40);
+
+		const mutationLock = path.join(root, "locks", "mutation.lock.lock");
+		expect(fsSync.statSync(mutationLock).isDirectory()).toBe(true);
+		expect(fsSync.existsSync(path.join(mutationLock, "info"))).toBe(true);
+		expect(fsSync.statSync(`${stateFile}.lock`).isFile()).toBe(true);
+
+		release.resolve();
+		await holder;
+		await persist;
+		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+	});
+
+	it("re-reads authoritative bytes instead of trusting matching file metadata", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-terminal-race");
+
+		// Pad `reason` so the terminal payload below can be shrunk to the exact same
+		// byte length; only then does a metadata-only cache report a false hit.
+		const seeded = await readJson(stateFile);
+		await Bun.write(stateFile, `${JSON.stringify({ ...seeded, reason: "p".repeat(64) })}\n`);
+
+		await writeToolActivity(root, "call-1", "2026-03-01T00:00:01.000Z");
+		const running = await readJson(stateFile);
+		expect(running.state).toBe("running");
+
+		// Another process settles the session at the SAME byte length and the SAME
+		// mtime, so file metadata alone cannot distinguish the two payloads.
+		const terminalBytesFor = (reason: string): string =>
+			`${JSON.stringify({ ...running, state: "completed", ready_for_input: true, live: false, reason })}\n`;
+		const runningBytes = `${JSON.stringify(running)}\n`;
+		const delta = runningBytes.length - terminalBytesFor("").length;
+		expect(delta).toBeGreaterThan(0);
+		const terminalBytes = terminalBytesFor("x".repeat(delta));
+		expect(terminalBytes.length).toBe(runningBytes.length);
+		expect(terminalBytes).not.toBe(runningBytes);
+
+		const priorStat = fsSync.statSync(stateFile);
+		await fs.writeFile(stateFile, terminalBytes);
+		await fs.utimes(stateFile, priorStat.atime, priorStat.mtime);
+		// `utimes` truncates sub-millisecond precision, so compare at ms resolution.
+		const rewritten = fsSync.statSync(stateFile);
+		expect(Math.floor(rewritten.mtimeMs)).toBe(Math.floor(priorStat.mtimeMs));
+		expect(rewritten.size).toBe(priorStat.size);
+
+		// A late tool event must observe the terminal bytes on disk and refuse to
+		// resurrect the session.
+		await writeToolActivity(root, "call-late", "2026-03-01T00:00:09.000Z");
+
+		expect(await Bun.file(stateFile).text()).toBe(terminalBytes);
+		expect((await readJson(stateFile)).state).toBe("completed");
+	});
+
+	/**
+	 * Windows has neither `O_NOFOLLOW` nor `O_NONBLOCK`, so the no-follow descriptor the
+	 * POSIX path is built on does not exist there. Refusing every acquisition on that
+	 * ground is not a safe compatibility fallback — the identity-bound deletion primitive
+	 * is cross-platform, so it breaks a supported runtime outright. The fallback has to
+	 * actually work AND still refuse every shape the owner protocol never writes, which is
+	 * what the four cases below pin down. The strategy is selected explicitly so the
+	 * Windows flow is exercised on whatever filesystem this suite runs on.
+	 */
+	/**
+	 * Platform identity has precedence over whatever constants a runtime happens to expose.
+	 * Bun/Node builds are allowed to publish numeric POSIX constants even where the kernel
+	 * cannot provide their no-follow semantics; a win32 process must therefore select the
+	 * Windows validation bracket explicitly rather than falling into the POSIX branch.
+	 */
+	it("selects the Windows owner strategy before considering POSIX flag availability", () => {
+		const detect = (
+			sessionStateLock as typeof sessionStateLock & {
+				detectedSessionStateLockOwnerAccessStrategy?: (
+					platform: NodeJS.Platform,
+					posixNoFollowAvailable: boolean,
+				) => string;
+			}
+		).detectedSessionStateLockOwnerAccessStrategy;
+		expect(detect?.("win32", true)).toBe("windows-validated");
+		expect(detect?.("linux", true)).toBe("posix-nofollow");
+		expect(detect?.("aix", false)).toBe("unsupported");
+	});
+
+	describe("owner records without no-follow flags", () => {
+		it("creates, captures, and releases a regular owner record under the windows strategy", async () => {
+			const { root, stateFile } = await seededRunningSession("lock-windows-owner");
+			const lockFile = `${stateFile}.lock`;
+			SessionStateLockTestHooks.ownerAccessStrategy = "windows-validated";
+
+			const observed: Array<string | undefined> = [];
+			await withSessionStateFileLock(stateFile, async () => {
+				observed.push(fsSync.lstatSync(lockFile).isFile() ? "file" : "other");
+				observed.push(
+					(JSON.parse(await fs.readFile(lockFile, "utf8")) as { pid: number }).pid === process.pid
+						? "self-owned"
+						: "foreign",
+				);
+			});
+
+			expect(observed).toEqual(["file", "self-owned"]);
+			// Released against the identity captured from the writing handle.
+			expect(fsSync.existsSync(lockFile)).toBe(false);
+			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+
+			// And the lock still serializes a real state write afterwards.
+			await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
+			expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
+		});
+
+		it("never reads or removes a symlink swapped in under the windows strategy", async () => {
+			const { root, stateFile } = await seededRunningSession("lock-windows-symlink");
+			const lockFile = `${stateFile}.lock`;
+			const target = path.join(root, "windows-swap-target.json");
+			// Bytes a by-name read accepts: a well-formed owner whose pid is provably dead.
+			await Bun.write(target, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "target-owner-token" }));
+			await fs.writeFile(
+				lockFile,
+				JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }),
+			);
+			SessionStateLockTestHooks.ownerAccessStrategy = "windows-validated";
+			// After the outer type decision, so the refusal has to come from the owner
+			// capture's own pre-`lstat` rather than from the earlier check.
+			SessionStateLockTestHooks.afterLockTypeDecision = async () => {
+				SessionStateLockTestHooks.afterLockTypeDecision = undefined;
+				await fs.rm(lockFile);
+				await fs.symlink(target, lockFile);
+			};
+
+			const refusal = await reclaimStaleSessionStateLock(lockFile).then(
+				() => null,
+				(error: unknown) => error,
+			);
+
+			expect(refusal).toBeInstanceOf(SessionStateLockUnavailableError);
+			// The refusal came from the owner capture's own pre-`lstat`, not from the outer
+			// type decision the swap already got past.
+			expect((refusal as SessionStateLockUnavailableError).cause).toMatchObject({
+				message: "Lock path is a reparse point, not an owner file.",
+			});
+			expect(fsSync.lstatSync(lockFile).isSymbolicLink()).toBe(true);
+			expect(JSON.parse(await fs.readFile(target, "utf8")).token).toBe("target-owner-token");
+		});
+
+		it("leaves a regular-file replacement that landed after the windows capture", async () => {
+			const { stateFile } = await seededRunningSession("lock-windows-replacement");
+			const lockFile = `${stateFile}.lock`;
+			await fs.writeFile(
+				lockFile,
+				JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }),
+			);
+			SessionStateLockTestHooks.ownerAccessStrategy = "windows-validated";
+
+			const successor = JSON.stringify({
+				pid: process.pid,
+				start_time: processStartTime(process.pid) ?? "unknown",
+				token: "windows-successor-token",
+			});
+			let replaced = false;
+			// The identity has been captured through the validated handle and the exact
+			// unlink has not run: only the CAS stands between here and a reaped live lock.
+			SessionStateLockTestHooks.beforeStaleRemoval = async () => {
+				replaced = true;
+				await fs.rm(lockFile);
+				await fs.writeFile(lockFile, successor);
+			};
+
+			await reclaimStaleSessionStateLock(lockFile);
+
+			expect(replaced).toBe(true);
+			expect(await fs.readFile(lockFile, "utf8")).toBe(successor);
+		});
+
+		it("fails closed when neither owner-access strategy is available", async () => {
+			const { stateFile } = await seededRunningSession("lock-no-owner-strategy");
+			const lockFile = `${stateFile}.lock`;
+			const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" });
+			await fs.writeFile(lockFile, record);
+			SessionStateLockTestHooks.ownerAccessStrategy = "unsupported";
+
+			await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+			await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+				SessionStateLockUnavailableError,
+			);
+
+			expect(await fs.readFile(lockFile, "utf8")).toBe(record);
+			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+		});
+	});
+});

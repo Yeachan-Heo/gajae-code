@@ -1,11 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { type Component, Container } from "@gajae-code/tui";
 
-/** Component whose render() always throws, mirroring a tool renderer fed an undefined field. */
+/** Component whose render() always throws. */
 class ThrowingComponent implements Component {
 	invalidate(): void {}
 	render(_width: number): string[] {
-		// The exact shape of the original crash: a string op on undefined.
 		const value = undefined as unknown as string;
 		return [value.trim()];
 	}

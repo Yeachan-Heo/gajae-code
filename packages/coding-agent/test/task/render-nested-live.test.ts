@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { AgentProgress, TaskResultReceipt, TaskToolDetails } from "@gajae-code/coding-agent/task";
 import { taskToolRenderer } from "@gajae-code/coding-agent/task/render";
+import { type Component, Container } from "@gajae-code/tui";
 import { collectProviderDegradationGroups } from "../../src/task/provider-retry-status";
 
 // Defends the live-rendering contract for the `task` tool: while a Level-1
@@ -73,6 +74,36 @@ describe("task renderer: nested live rendering", () => {
 			cost: 0,
 			durationMs: 0,
 		};
+	}
+
+	class FixedLines implements Component {
+		constructor(private readonly lines: string[]) {}
+		invalidate(): void {}
+		render(_width: number): string[] {
+			return this.lines;
+		}
+	}
+
+	function renderAbsentResults(
+		options: { isPartial: boolean },
+		progress: AgentProgress[] = [],
+	): Promise<{ lines: string[]; text: string }> {
+		return getThemeByName("red-claw").then(theme => {
+			const component = taskToolRenderer.renderResult(
+				{
+					content: [{ type: "text", text: "Task completed." }],
+					details: {
+						projectAgentsDir: null,
+						totalDurationMs: 0,
+						...(progress.length > 0 ? { progress } : {}),
+					} as unknown as TaskToolDetails,
+				},
+				{ expanded: false, ...options },
+				theme!,
+			);
+			const lines = component.render(160);
+			return { lines, text: Bun.stripANSI(lines.join("\n")) };
+		});
 	}
 
 	async function render(progress: AgentProgress): Promise<string> {
@@ -392,6 +423,48 @@ describe("task renderer: nested live rendering", () => {
 		// Completed entries are emitted before the in-flight snapshot.
 		expect(epsilonIdx).toBeLessThan(zetaIdx);
 	});
+
+	it("renders a pending state for partial task details without results", async () => {
+		const { text } = await renderAbsentResults({ isPartial: true });
+
+		expect(text).toContain("Task results pending");
+		expect(text).not.toContain("Task result details unavailable");
+	});
+
+	it("appends unavailable details after final progress with no results", async () => {
+		const { text } = await renderAbsentResults({ isPartial: false }, [
+			makeRunningSubProgress("8-Restored", "Restored progress remains visible"),
+		]);
+
+		expect(text).toContain("Restored progress remains visible");
+		expect(text).toContain("Task result details unavailable");
+	});
+
+	it("renders restored missing results between siblings without generic containment", async () => {
+		const theme = await getThemeByName("red-claw");
+		expect(theme).toBeDefined();
+		const taskResult = taskToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: "Task completed." }],
+				details: { projectAgentsDir: null, totalDurationMs: 0 } as unknown as TaskToolDetails,
+			},
+			{ expanded: false, isPartial: false },
+			theme!,
+		);
+		const container = new Container();
+		container.addChild(new FixedLines(["before"]));
+		container.addChild(taskResult);
+		container.addChild(new FixedLines(["after"]));
+
+		const lines = container.render(80);
+		const text = Bun.stripANSI(lines.join("\n"));
+
+		expect(lines).toContain("before");
+		expect(lines).toContain("after");
+		expect(text).toContain("Task result details unavailable");
+		expect(text).not.toContain("render error");
+	});
+
 	it("aggregates direct retry siblings once per owning list without hiding healthy or separate nested work", async () => {
 		const retry = (id: string): AgentProgress => ({
 			...makeRunningSubProgress(id, `${id}\tretrying`),

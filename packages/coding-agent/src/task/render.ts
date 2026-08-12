@@ -987,12 +987,17 @@ export function renderResult(
 
 			const lines: string[] = [];
 
+			// Tool details can be restored from a persisted session or arrive through
+			// a runtime update, so the declared receipt array is not sufficient at
+			// this rendering boundary.
+			const resultsUnavailable = !Array.isArray(details.results);
+			const results = resultsUnavailable ? [] : details.results;
 			const hasProgress = Boolean(details.progress && details.progress.length > 0);
-			const shouldRenderProgress = hasProgress && (isPartial || details.results.length === 0);
-			const hasResults = details.results.length > 0;
+			const shouldRenderProgress = hasProgress && (isPartial || results.length === 0);
+			const hasResults = results.length > 0;
 			if (hasResults) {
-				details.results.forEach((res, i) => {
-					const isLast = !shouldRenderProgress && i === details.results.length - 1;
+				results.forEach((res, i) => {
+					const isLast = !shouldRenderProgress && i === results.length - 1;
 					lines.push(...renderAgentResult(res, isLast, expanded, theme));
 				});
 			}
@@ -1004,10 +1009,10 @@ export function renderResult(
 				});
 			}
 			if (hasResults && !shouldRenderProgress) {
-				const abortedCount = details.results.filter(r => r.status === "aborted").length;
-				const mergeFailedCount = details.results.filter(r => r.status === "merge_failed").length;
-				const successCount = details.results.filter(r => r.status === "completed").length;
-				const failCount = details.results.length - successCount - mergeFailedCount - abortedCount;
+				const abortedCount = results.filter(r => r.status === "aborted").length;
+				const mergeFailedCount = results.filter(r => r.status === "merge_failed").length;
+				const successCount = results.filter(r => r.status === "completed").length;
+				const failCount = results.length - successCount - mergeFailedCount - abortedCount;
 				let summary = `${theme.fg("dim", "Total:")} `;
 				if (abortedCount > 0) {
 					summary += theme.fg("error", `${abortedCount} aborted`);
@@ -1027,9 +1032,18 @@ export function renderResult(
 				summary += `${theme.sep.dot}${theme.fg("dim", formatDuration(details.totalDurationMs))}`;
 				lines.push(summary);
 			}
+			if (resultsUnavailable && !isPartial) {
+				lines.push(theme.fg("dim", "Task result details unavailable"));
+			}
 
 			if (lines.length === 0) {
-				const text = fallbackText.trim() ? fallbackText : "No results";
+				const text = resultsUnavailable
+					? isPartial
+						? "Task results pending"
+						: "Task result details unavailable"
+					: fallbackText.trim()
+						? fallbackText
+						: "No results";
 				const result = [theme.fg("dim", truncateToWidth(text, width))];
 				if (!hasDynamicRetry) cached = { key, lines: result };
 				return result;

@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import type {
-	AgentEvent,
-	AgentTool,
-	AgentToolContext,
-	AgentToolResult,
-	AgentToolUpdateCallback,
+import {
+	type AgentEvent,
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolResult,
+	type AgentToolUpdateCallback,
+	bindDispatchedToolIdentity,
 } from "@gajae-code/agent-core";
 import type {
 	CursorMcpCall,
@@ -16,11 +17,23 @@ import type {
 import { sanitizeText } from "@gajae-code/utils";
 import { resolveToCwd } from "./tools/path-utils";
 
+/**
+ * Emitter for events this bridge produces.
+ *
+ * `dispatchedTool` is the tool object the bridge SELECTED and is about to execute — passed
+ * alongside the event, never inside it, so the object never reaches an AgentEvent field, a
+ * serialized payload, or any wire envelope. The handler binds it as provenance (object
+ * identity only) at this producer boundary, because it is the only place that knows which
+ * object actually ran: a consumer re-resolving `toolName` later reads a mutable registry.
+ * Synthetic operations that execute no AgentTool pass nothing and stay unbound.
+ */
+type CursorExecEventEmitter = (event: AgentEvent, dispatchedTool?: AgentTool) => void;
+
 interface CursorExecBridgeOptions {
 	cwd: string;
 	tools: Map<string, AgentTool>;
 	getToolContext?: () => AgentToolContext | undefined;
-	emitEvent?: (event: AgentEvent) => void;
+	emitEvent?: CursorExecEventEmitter;
 	createEventEmitter?: () => ((event: AgentEvent) => void) | undefined;
 }
 
@@ -60,7 +73,9 @@ async function executeTool(
 		return createToolResultMessage(toolCallId, toolName, result, true);
 	}
 
-	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args });
+	// `tool` is the object this call will run; pass it so the start event carries proven
+	// provenance instead of a name a consumer would have to re-resolve later.
+	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args }, tool);
 
 	let result: AgentToolResult<unknown>;
 	let isError = false;
@@ -191,9 +206,20 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 	}
 
 	#optionsForCall(): CursorExecBridgeOptions {
+		const emit = this.options.createEventEmitter ? this.options.createEventEmitter() : this.options.emitEvent;
+		// Producer boundary: bind the selected object to the event BEFORE it leaves this
+		// bridge, so the run-scoped Agent emitter (and every consumer after it) receives an
+		// event whose provenance is already proven and never re-resolved from a registry
+		// that may have been replaced in the meantime.
+		const emitWithIdentity: CursorExecEventEmitter | undefined = emit
+			? (event: AgentEvent, dispatchedTool?: AgentTool) => {
+					bindDispatchedToolIdentity(event, dispatchedTool);
+					emit(event);
+				}
+			: undefined;
 		return {
 			...this.options,
-			emitEvent: this.options.createEventEmitter ? this.options.createEventEmitter() : this.options.emitEvent,
+			emitEvent: emitWithIdentity,
 		};
 	}
 
@@ -283,7 +309,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			timeout: timeoutSeconds,
 		};
 
-		options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: toolArgs });
+		options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: toolArgs }, tool);
 
 		let result: AgentToolResult<unknown>;
 		let isError = false;

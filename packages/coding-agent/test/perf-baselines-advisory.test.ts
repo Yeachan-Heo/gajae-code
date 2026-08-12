@@ -3,6 +3,7 @@ import { afterEach, beforeAll, describe, expect, it, mock, spyOn } from "bun:tes
 import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 
 const originalStateFileEnv = process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
 const originalSessionIdEnv = process.env.GJC_COORDINATOR_SESSION_ID;
@@ -31,6 +32,9 @@ beforeAll(async () => {
 		"../src/modes/controllers/event-controller"
 	));
 	({ persistCoordinatorRuntimeStateFromEvent } = await import("../src/gjc-runtime/session-state-sidecar"));
+	// Coordinator state writes serialize on a lock whose removals go through identity-bound
+	// native primitives; point them at a working implementation.
+	installExactIdentityNatives();
 	const { initTheme } = await import("../src/modes/theme/theme");
 	await initTheme();
 });

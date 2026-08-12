@@ -2,6 +2,8 @@
 import { readdir, readFile, appendFile, stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { ANSWER_SLOT_COUNT, optionIndexForSlot, pageAction, pageCount, pendingAsk, sdkMessages, usesPagedLayout } from "./sdk-ask-state.js";
+import { nextSelectedSessionId } from "./focus-state.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -38,6 +40,7 @@ let selectedSessionId = null;
 const sdkClients = new Map();
 let topologyState = { windows: [], workspaces: [], panes: [], allSurfaces: [], surfaces: [], selectedTty: null };
 let refreshInFlight = null;
+let focusRefreshInFlight = null;
 let socket;
 const imageCache = new Map();
 let frequentProjects = [];
@@ -194,23 +197,14 @@ function connectSdkEndpoint(endpoint) {
   ws.addEventListener("message", event => {
     try {
       const envelope = JSON.parse(String(event.data));
-      const messages = envelope.type === "event_replay_result" && envelope.id === replayId && Array.isArray(envelope.events) ? envelope.events : [envelope];
+      const messages = sdkMessages(envelope, replayId);
       let changed = false;
       for (const message of messages) {
-        if (message.type === "action_needed" && message.kind === "ask") {
-          const selectedOptionIndices = Array.isArray(message.selectedOptionIndices) ? message.selectedOptionIndices.filter(index => Number.isInteger(index) && index >= 0) : null;
-          const controls = Array.isArray(message.controls) ? message.controls.filter(control => control && control.id === "navigation_forward" && control.kind === "navigation") : [];
-          client.pending = {
-            id: message.id,
-            question: String(message.question || "Question"),
-            options: Array.isArray(message.options) ? message.options.map(String) : [],
-            recommendedIndex: Number.isInteger(message.recommendedIndex) ? message.recommendedIndex : null,
-            selectedOptionIndices,
-            controls,
-            multi: selectedOptionIndices !== null,
-          };
+        const pending = pendingAsk(message);
+        if (pending) {
+          client.pending = pending;
           changed = true;
-          log(`sdk ask session=${endpoint.sessionId} options=${client.pending.options.length} id=${message.id}`);
+          log(`sdk ask session=${endpoint.sessionId} options=${client.pending.options.length} pages=${pageCount(client.pending)} id=${message.id}`);
         } else if (message.type === "action_resolved" && client.pending?.id === message.id) {
           client.pending = null;
           changed = true;
@@ -246,9 +240,9 @@ function focusedPendingAsk() {
   if (!pending || pending.options.length === 0) return null;
   if (pending.multi) {
     const navigation = pending.controls.find(control => control.id === "navigation_forward");
-    return pending.options.length <= 4 && navigation ? pending : null;
+    return navigation ? pending : null;
   }
-  return pending.controls.length === 0 && pending.options.length <= 5 ? pending : null;
+  return pending;
 }
 
 async function answerFocusedAsk(index, context) {
@@ -258,15 +252,22 @@ async function answerFocusedAsk(index, context) {
   if (!client || !pending || client.ws.readyState !== WebSocket.OPEN) { alert(context); return; }
   let answer;
   let suffix;
-  if (pending.multi && index === 4) {
-    const control = pending.controls.find(candidate => candidate.id === "navigation_forward");
-    if (!control?.enabled) { alert(context); return; }
-    answer = { controlId: control.id };
-    suffix = `control-${control.id}`;
+  const page = pageAction(pending, context?.heldMs ?? 0);
+  if (index === ANSWER_SLOT_COUNT - 1 && page?.kind === "page") {
+    pending.page = page.page;
+    log(`sdk ask page session=${session.sessionId} id=${pending.id} page=${pending.page + 1}/${pageCount(pending)}`);
+    await renderAll();
+    ok(context);
+    return;
+  }
+  if (index === ANSWER_SLOT_COUNT - 1 && page?.kind === "control") {
+    answer = { controlId: page.control.id };
+    suffix = `control-${page.control.id}`;
   } else {
-    if (index < 0 || index >= pending.options.length) { alert(context); return; }
-    answer = index;
-    suffix = String(index);
+    const optionIndex = optionIndexForSlot(pending, index);
+    if (optionIndex === null) { alert(context); return; }
+    answer = optionIndex;
+    suffix = String(optionIndex);
   }
   client.ws.send(JSON.stringify({ type: "reply", id: pending.id, answer, token: client.token, idempotencyKey: `streamdeck-${pending.id}-${suffix}` }));
   ok(context);
@@ -362,10 +363,25 @@ async function sdkMetadata(session) {
 function sessionKey(session) {
   return session?.sessionId ?? (session?.surface ? `cmux:${session.surface.surface}` : `tty:${session?.tty ?? session?.pid ?? "unknown"}`);
 }
+
+async function refreshFocus() {
+  if (focusRefreshInFlight) return focusRefreshInFlight;
+  focusRefreshInFlight = (async () => {
+    const topology = await cmuxTopology();
+    topologyState = topology;
+    const next = nextSelectedSessionId(sessions, topology.selectedTty, selectedSessionId, sessionKey);
+    if (next === selectedSessionId) return;
+    selectedSessionId = next;
+    await renderAll();
+    log(`focus refresh selected=${selectedSessionId ?? "none"} focusedTty=${topology.selectedTty ?? "none"}`);
+  })().finally(() => { focusRefreshInFlight = null; });
+  return focusRefreshInFlight;
+}
 async function refresh() {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
-    const [endpoints, ttys, topology, projects] = await Promise.all([discoverEndpoints(), processTtys(), cmuxTopology(), discoverFrequentProjects()]);
+    const [endpoints, ttys, projects] = await Promise.all([discoverEndpoints(), processTtys(), discoverFrequentProjects()]);
+    const topology = await cmuxTopology();
     syncSdkEndpoints(endpoints);
     topologyState = topology;
     frequentProjects = projects;
@@ -402,9 +418,7 @@ async function refresh() {
     });
     const focusedRow = rows.find(row => row.tty === topology.selectedTty);
     sessions = focusedRow ? [focusedRow, ...rows.filter(row => row !== focusedRow)].slice(0, 11) : rows.slice(0, 11);
-    const focusedSession = sessions.find(row => row.tty === topology.selectedTty);
-    if (focusedSession) selectedSessionId = sessionKey(focusedSession);
-    else if (!selectedSessionId || !sessions.some(row => sessionKey(row) === selectedSessionId)) selectedSessionId = sessionKey(sessions[0]);
+    selectedSessionId = nextSelectedSessionId(sessions, topology.selectedTty, selectedSessionId, sessionKey);
     await renderAll();
     log(`refresh sessions=${sessions.length} contexts=${contexts.size} selected=${selectedSessionId ?? "none"} focusedTty=${topology.selectedTty ?? "none"} focusedEndpoint=${endpointByTty.get(topology.selectedTty)?.sessionId ?? "none"} endpoints=${endpoints.length} projects=${projects.map(project => `${project.label}:${project.sessionCount}`).join(",") || "none"}`);
   })().finally(() => { refreshInFlight = null; });
@@ -480,22 +494,32 @@ async function renderContext(context, state) {
       const pending = focusedPendingAsk();
       const index = Number(settings.answerSlot);
       if (pending) {
-        if (pending.multi && index === 4) {
-          const control = pending.controls.find(candidate => candidate.id === "navigation_forward");
-          const selectedCount = pending.selectedOptionIndices.length;
-          title(context, control?.enabled ? `${String(control.label || "DONE").toUpperCase()}\n${selectedCount} SELECTED` : "SELECT\nOPTION");
-          await image(context, `answer-control${control?.enabled ? "" : "-disabled"}`);
+        if (usesPagedLayout(pending) && index === ANSWER_SLOT_COUNT - 1) {
+          const action = pageAction(pending);
+          const pages = pageCount(pending);
+          if (action?.kind === "page") {
+            title(context, `MORE OPTIONS\n${pending.page + 1}/${pages}`);
+            await image(context, "answer-control");
+          } else if (action?.kind === "control") {
+            const selectedCount = pending.selectedOptionIndices.length;
+            title(context, `${String(action.control.label || "DONE").toUpperCase()}\n${selectedCount} SELECTED`);
+            await image(context, "answer-control");
+          } else {
+            title(context, pages > 1 ? `BACK TO START\n${pending.page + 1}/${pages}` : "SELECT\nOPTION");
+            await image(context, "answer-control-disabled");
+          }
           return;
         }
-        const option = pending.options[index];
+        const optionIndex = optionIndexForSlot(pending, index);
+        const option = optionIndex === null ? undefined : pending.options[optionIndex];
         if (pending.multi) {
-          const selected = pending.selectedOptionIndices.includes(index);
-          title(context, option ? `${selected ? "☑" : "☐"} OPTION ${index + 1}\n${wrapKeyText(option, 11, 2)}` : `NO OPTION\n${index + 1}`);
-          await image(context, option ? `answer-${index}${selected ? "-selected" : pending.recommendedIndex === index ? "-recommended" : ""}` : `answer-${index}`);
+          const selected = optionIndex !== null && pending.selectedOptionIndices.includes(optionIndex);
+          title(context, option ? `${selected ? "☑" : "☐"} OPTION ${optionIndex + 1}\n${wrapKeyText(option, 11, 2)}` : `NO OPTION\n${index + 1}`);
+          await image(context, option ? `answer-${index}${selected ? "-selected" : pending.recommendedIndex === optionIndex ? "-recommended" : ""}` : `answer-${index}`);
           return;
         }
-        title(context, option ? `ANSWER ${index + 1}\n${wrapKeyText(option, 11, 2)}` : `NO OPTION\n${index + 1}`);
-        await image(context, `answer-${index}${pending.recommendedIndex === index ? "-recommended" : ""}`);
+        title(context, option ? `ANSWER ${optionIndex + 1}\n${wrapKeyText(option, 11, 2)}` : `NO OPTION\n${index + 1}`);
+        await image(context, `answer-${index}${pending.recommendedIndex === optionIndex ? "-recommended" : ""}`);
         return;
       }
     }
@@ -733,7 +757,7 @@ async function keyUp(context, state, heldMs) {
   if (action === LAUNCH_ACTION) { await launchPreset(settings.preset, context); return; }
   if (action === SKILL_ACTION) { await sendFocusedGjcText(`/skill:${settings.skill}`, context, false); return; }
   if (action === CONTROL_ACTION) {
-    if (settings.answerSlot !== undefined && focusedPendingAsk()) { await answerFocusedAsk(Number(settings.answerSlot), context); return; }
+    if (settings.answerSlot !== undefined && focusedPendingAsk()) { await answerFocusedAsk(Number(settings.answerSlot), { ...context, heldMs }); return; }
     if (settings.type === "cmuxClose") { await closeFocusedCmuxTab(context); return; }
     if (settings.type === "fixedFolder") { await openFixedFolder(settings, context); return; }
     if (settings.type === "frequentProject") { await openFrequentProject(settings, context); return; }
@@ -766,7 +790,8 @@ async function keyUp(context, state, heldMs) {
   }
 }
 
-const periodic = setInterval(() => refresh().catch(error => log(`refresh error ${error}`)), 4000);
+const focusPeriodic = setInterval(() => refreshFocus().catch(error => log(`focus refresh error ${error}`)), 500);
+const periodic = setInterval(() => refresh().catch(error => log(`refresh error ${error}`)), 10000);
 
 socket = new WebSocket(`ws://127.0.0.1:${port}`);
 socket.addEventListener("open", () => {
@@ -796,5 +821,5 @@ socket.addEventListener("message", async event => {
     }
   } catch (error) { log(`message error ${error}`); }
 });
-socket.addEventListener("close", () => { clearInterval(periodic); process.exit(0); });
+socket.addEventListener("close", () => { clearInterval(focusPeriodic); clearInterval(periodic); process.exit(0); });
 socket.addEventListener("error", error => log(`socket error ${error}`));

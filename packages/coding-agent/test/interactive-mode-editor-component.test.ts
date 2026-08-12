@@ -751,6 +751,16 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(refreshSpy).toHaveBeenCalled();
 	});
 
+	it("invalidates the restored composer after cancelling another action", () => {
+		const invalidate = vi.spyOn(mode.editor, "invalidate");
+		const requestRender = vi.spyOn(mode.ui, "requestRender");
+
+		mode.restoreComposer();
+
+		expect(invalidate).toHaveBeenCalledTimes(1);
+		expect(requestRender).toHaveBeenCalled();
+	});
+
 	it("preserves a pending pet mode across editor replacement", () => {
 		const originalProtocol = TERMINAL.imageProtocol;
 		vi.spyOn(mode, "refreshSlashCommandState").mockResolvedValue();
