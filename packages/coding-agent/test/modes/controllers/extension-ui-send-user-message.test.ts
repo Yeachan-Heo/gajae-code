@@ -244,4 +244,55 @@ describe("ExtensionUiController.#sendExtensionUserMessage absent/malformed conte
 		expect(fixture.requestRender).toHaveBeenCalled();
 		expect(fixture.addMessageToChat).not.toHaveBeenCalled();
 	});
+
+	for (const scenario of [
+		{ label: "array with null element", content: [null] as never },
+		{ label: "array with undefined element", content: [undefined] as never },
+		{ label: "array with null element during active turn", content: [null] as never, streaming: true },
+		{ label: "array with undefined element during active turn", content: [undefined] as never, streaming: true },
+	] as const) {
+		it(`rejects ${scenario.label} with typed invalid_input without TypeError or mutation`, async () => {
+			const fixture = createFixture(scenario.streaming ?? false);
+			fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
+			const actions = fixture.getActions();
+			const rejectionTracker = trackUnhandledRejections();
+
+			// The exact element-level crash vector: [null]/[undefined] passes the
+			// container guard but normalizeInjectedUserContent dereferences part.type
+			// and throws an untyped TypeError synchronously before send.catch attaches.
+			await expect(actions.sendUserMessage(scenario.content)).rejects.toMatchObject({
+				code: "invalid_input",
+				name: "Error",
+			});
+
+			await Bun.sleep(10);
+
+			expect(fixture.addToHistory).not.toHaveBeenCalled();
+			expect(fixture.addMessageToChat).not.toHaveBeenCalled();
+			expect(fixture.updatePendingMessagesDisplay).not.toHaveBeenCalled();
+			expect(fixture.requestRender).not.toHaveBeenCalled();
+			expect(fixture.sendUserMessage).not.toHaveBeenCalled();
+			expect(fixture.optimisticInjectedSignatures.size).toBe(0);
+			expect(rejectionTracker.sawUnhandled()).toBe(false);
+		});
+	}
+
+	it("preserves valid delivery after rejecting malformed array elements on the same resident session", async () => {
+		const fixture = createFixture(false);
+		fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
+		const actions = fixture.getActions();
+
+		await expect(actions.sendUserMessage([null] as never)).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+		expect(fixture.sendUserMessage).not.toHaveBeenCalled();
+
+		await expect(
+			actions.sendUserMessage([{ type: "text", text: "valid after element rejection" }]),
+		).resolves.toBeUndefined();
+
+		expect(fixture.sendUserMessage).toHaveBeenCalledTimes(1);
+		expect(fixture.addToHistory).toHaveBeenCalledTimes(1);
+		expect(fixture.addToHistory).toHaveBeenCalledWith("valid after element rejection");
+	});
 });

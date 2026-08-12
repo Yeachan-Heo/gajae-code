@@ -7,6 +7,31 @@ import type { InteractiveModeContext } from "../types";
  * `AgentSession.sendUserMessage` (text parts joined with "\n") so the resulting
  * text matches the eventual user `message_start` payload.
  */
+/**
+ * Validate extension `sendUserMessage` content at the owning interactive
+ * boundary, before session delivery and UI bookkeeping. Returns a typed
+ * `invalid_input` Error when the content container or any array element is
+ * absent/null/malformed — exactly the shapes that would make
+ * `normalizeInjectedUserContent`'s `for-of` dereference (`part.type`) throw an
+ * untyped TypeError synchronously before the caller's `send.catch` is attached
+ * (unhandled rejection → resident crash).
+ */
+export function extensionUserMessageContentError(content: string | (TextContent | ImageContent)[]): Error | undefined {
+	if (typeof content === "string") return undefined;
+	if (!Array.isArray(content)) {
+		return Object.assign(new Error("sendUserMessage requires string or content-array content."), {
+			code: "invalid_input",
+		});
+	}
+	for (const part of content) {
+		if (part === null || typeof part !== "object") {
+			return Object.assign(new Error("sendUserMessage content array contains a null or non-object part."), {
+				code: "invalid_input",
+			});
+		}
+	}
+	return undefined;
+}
 export function normalizeInjectedUserContent(content: string | (TextContent | ImageContent)[]): {
 	text: string;
 	images: ImageContent[];

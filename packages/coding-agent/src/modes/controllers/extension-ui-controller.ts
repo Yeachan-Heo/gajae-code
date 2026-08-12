@@ -43,7 +43,7 @@ import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
 import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
 import { emitHostStatus } from "../utils/host-status";
-import { applyInjectedUserSubmission } from "../utils/injected-user-submission";
+import { applyInjectedUserSubmission, extensionUserMessageContentError } from "../utils/injected-user-submission";
 import { classifyHookSelectorBellEvent, ringTerminalBell } from "../utils/terminal-bell";
 
 const MAX_WIDGET_LINES = 10;
@@ -1493,18 +1493,15 @@ export class ExtensionUiController {
 		if (this.#isStopped()) return Promise.resolve();
 		// Validate at the owning boundary BEFORE session delivery and UI bookkeeping:
 		// applyInjectedUserSubmission → normalizeInjectedUserContent iterates content
-		// synchronously and throws an untyped TypeError on absent/null content, which
-		// happens before the send.catch handler below is attached, leaving the typed
-		// invalid_input rejection from AgentSession unobserved (unhandled rejection) and
-		// crashing the resident process. Reject as a typed nonfatal control error so
-		// callers can surface it without losing session continuity.
-		if (typeof content !== "string" && !Array.isArray(content)) {
-			return Promise.reject(
-				Object.assign(new Error("sendUserMessage requires string or content-array content."), {
-					code: "invalid_input",
-				}),
-			);
-		}
+		// and dereferences part.type synchronously. Absent/null content (the
+		// container) OR null/undefined/non-object array elements throw an untyped
+		// TypeError synchronously — before the send.catch handler below is attached,
+		// leaving the typed invalid_input rejection from AgentSession unobserved
+		// (unhandled rejection) and crashing the resident process. Reject as a typed
+		// nonfatal control error so callers can surface it without losing session
+		// continuity.
+		const invalidContentError = extensionUserMessageContentError(content);
+		if (invalidContentError) return Promise.reject(invalidContentError);
 		// Compute queued BEFORE send: prompt() may flip session.isStreaming synchronously.
 		const queued = Boolean(options?.deliverAs) || this.ctx.session.isStreaming;
 		// Call send first so the busy/queued path finds the session queue populated
