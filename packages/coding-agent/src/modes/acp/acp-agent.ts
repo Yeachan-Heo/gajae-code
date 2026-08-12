@@ -1690,9 +1690,9 @@ export class AcpAgent implements Agent {
 			// when no earlier attempt can still acknowledge.
 			waiter.pendingCancelAttempts = (waiter.pendingCancelAttempts ?? 0) + 1;
 			if (!waiter.cancelAttemptResolve) {
-				waiter.cancelAttempt = new Promise<boolean>(resolve => {
-					waiter.cancelAttemptResolve = resolve;
-				});
+				const deferred = Promise.withResolvers<boolean>();
+				waiter.cancelAttempt = deferred.promise;
+				waiter.cancelAttemptResolve = deferred.resolve;
 			}
 		}
 		try {
@@ -1729,8 +1729,17 @@ export class AcpAgent implements Agent {
 		} catch (error) {
 			if (!waiter) record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
-			// an earlier attempt may still acknowledge (review thread P2).
-			if (waiter && (waiter.pendingCancelAttempts ?? 0) <= 1) waiter.cancelAttemptResolve?.(false);
+			// an earlier attempt may still acknowledge (review thread P2). After
+			// every attempt of this wave failed, RE-ARM the aggregate: a later
+			// cancellation wave must get a fresh resolver — a stale resolved-false
+			// promise would let the prompt path observe the old failure
+			// immediately and report cancelled while the retry is still pending
+			// (review thread P2).
+			if (waiter && (waiter.pendingCancelAttempts ?? 0) <= 1) {
+				waiter.cancelAttemptResolve?.(false);
+				waiter.cancelAttempt = undefined;
+				waiter.cancelAttemptResolve = undefined;
+			}
 			throw error;
 		} finally {
 			if (waiter) {

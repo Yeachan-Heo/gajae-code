@@ -574,3 +574,66 @@ test("any successful cancel resolves the waiter immediately while an earlier att
 		fixture.dispose();
 	}
 });
+
+test("a failed cancel wave re-arms the aggregation for the next wave", async () => {
+	// Review thread P2: after a cancel wave ends with every attempt failing,
+	// the aggregate must be cleared — a later cancellation wave needs a fresh
+	// resolver, or the prompt path observes the stale resolved-false promise
+	// immediately and reports cancelled while the retry is still pending (and
+	// even after the retry fails with abort_unacknowledged).
+	let promptFrameArrived: () => void = () => {};
+	const promptFrameSeen = new Promise<void>(resolve => {
+		promptFrameArrived = resolve;
+	});
+	const promptGate = Promise.withResolvers<void>();
+	let releaseAbortB: () => void = () => {};
+	const abortBGate = new Promise<void>(resolve => {
+		releaseAbortB = resolve;
+	});
+	const fixture = await createFixture({
+		promptResponse: async () => {
+			promptFrameArrived();
+			await promptGate.promise;
+			return { ok: false, error: { code: "busy", message: "preflight busy" } };
+		},
+		abortResponses: [
+			// Wave 1: the only attempt fails (no_active_turn is not an
+			// acknowledgement).
+			{ ok: true, result: { turn: "no_active_turn", terminal: "terminal_no_effect" } },
+			// Wave 2: the retry is still pending when the prompt rejects.
+			async () => {
+				await abortBGate;
+				return { ok: true, result: { turn: "no_active_turn", terminal: "terminal_no_effect" } };
+			},
+		],
+		cancelSettlementGraceMs: 60_000,
+	});
+	try {
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000001",
+			prompt: [{ type: "text", text: "hold the turn" }],
+		} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
+		const settled = pending.then(
+			resolved => ({ resolved }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		await bounded(promptFrameSeen, "prompt frame arrival");
+		// Wave 1 fails entirely: the aggregate resolves false and re-arms.
+		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId } as CancelNotification)).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		// Wave 2: the retry is in flight when the prompt preflight rejects.
+		const retryPromise = fixture.agent.cancel({ sessionId: fixture.sessionId } as CancelNotification);
+		promptGate.resolve();
+		// The retry then fails too: the prompt must NOT settle as cancelled on
+		// a stale false from the previous wave — it awaits the NEW attempt and
+		// surfaces the transport error.
+		releaseAbortB();
+		const outcome = await bounded(settled, "prompt settlement after the failed wave");
+		expect("rejected" in outcome).toBe(true);
+		await expect(retryPromise).rejects.toMatchObject({ code: "abort_unacknowledged" });
+	} finally {
+		fixture.dispose();
+	}
+});
