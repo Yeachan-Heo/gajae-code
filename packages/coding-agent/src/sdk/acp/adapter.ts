@@ -554,6 +554,7 @@ export class AcpSdkAdapter {
 	}
 
 	#reportReconnectFailure(error: unknown): void {
+		if (error instanceof SessionRouterError) return;
 		const typed =
 			error instanceof SdkClientError
 				? error
@@ -580,9 +581,10 @@ export class AcpSdkAdapter {
 		if (this.#closed) return;
 		try {
 			if (!this.#router) return;
-			if (!this.#attachment?.isCurrent()) throw new SessionRouterError("pre_send");
+			if (!this.#attachment?.isCurrent()) return;
 			for (const leaseId of this.#leases.values()) await this.#sendSession({ type: "provider_heartbeat", leaseId });
 		} catch (error) {
+			if (error instanceof SessionRouterError && error.phase === "pre_send") return;
 			this.#reportReconnectFailure(error);
 		}
 	}

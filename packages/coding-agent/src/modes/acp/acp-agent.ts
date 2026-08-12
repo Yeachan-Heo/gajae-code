@@ -1118,6 +1118,7 @@ export class AcpAgent implements Agent {
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
+	readonly #knownSessionMcpServers = new Map<string, SessionLifecycleMcpServer[]>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
 	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
 	readonly #pendingCloseIdempotencyKeys = new Map<string, string>();
@@ -1260,6 +1261,7 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
+		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
@@ -1276,6 +1278,7 @@ export class AcpAgent implements Agent {
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
+		if (mcpServers.length > 0) this.#knownSessionMcpServers.set(params.sessionId, mcpServers);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
 		await this.#replaySession(params.sessionId);
 		const response = await this.#sessionState(params.sessionId);
@@ -1287,6 +1290,7 @@ export class AcpAgent implements Agent {
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
+		if (mcpServers.length > 0) this.#knownSessionMcpServers.set(params.sessionId, mcpServers);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
 		const response = await this.#sessionState(params.sessionId);
 		this.#scheduleBootstrap(params.sessionId);
@@ -1312,6 +1316,7 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
+		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
 			const response = { sessionId: id, ...(await this.#sessionState(id)) };
@@ -1400,6 +1405,7 @@ export class AcpAgent implements Agent {
 				} catch (error) {
 					if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
 						this.#knownSessionCwds.delete(params.sessionId);
+						this.#knownSessionMcpServers.delete(params.sessionId);
 						this.#knownSessionMetadata.delete(params.sessionId);
 						return {};
 					}
@@ -1413,6 +1419,7 @@ export class AcpAgent implements Agent {
 				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
 			);
 			this.#knownSessionCwds.delete(params.sessionId);
+			this.#knownSessionMcpServers.delete(params.sessionId);
 			this.#knownSessionMetadata.delete(params.sessionId);
 			this.#pendingDeleteLocators.delete(params.sessionId);
 			return {};
@@ -2061,6 +2068,7 @@ export class AcpAgent implements Agent {
 					await this.#teardownSession(id, "attachment failed", false);
 				} finally {
 					this.#knownSessionCwds.delete(id);
+					this.#knownSessionMcpServers.delete(id);
 				}
 			} else if (adapter) {
 				try {
@@ -2081,6 +2089,14 @@ export class AcpAgent implements Agent {
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
+		if (error instanceof SdkClientError && error.code !== "reconnect_exhausted") {
+			logger.warn(`ACP session ${id} transport failure is not reconnect_exhausted (${error.code}); ignoring terminal recovery.`);
+			return;
+		}
+		if (!(error instanceof SdkClientError)) {
+			logger.warn(`ACP session ${id} non-transport error reached reconnect handler; ignoring terminal recovery.`);
+			return;
+		}
 		const detail = error.message || "SDK transport reconnect failed.";
 		const terminal = new AcpSdkAdapterError("connection_closed", `ACP session transport was lost: ${detail}`);
 		void this.#recoverSessionAfterTransportFailureAsync(id, adapter, record.cwd, terminal);
@@ -2094,16 +2110,28 @@ export class AcpAgent implements Agent {
 	): Promise<void> {
 		await this.#failSession(id, adapter, error);
 		if (this.#disposed || this.#knownSessionCwds.get(id) !== cwd) return;
+		const mcpServers = this.#knownSessionMcpServers.get(id) ?? [];
 		try {
-			await this.#attachExisting(id, cwd);
-		} catch {
-			// The affected prompt was rejected and the stale adapter was removed. A later load/resume retries discovery.
+			await this.#attachExisting(id, cwd, mcpServers);
+		} catch (attachError) {
+			const detail = attachError instanceof Error ? attachError.message : String(attachError);
+			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${detail}`);
+			try {
+				await this.#connection.sessionUpdate({
+					sessionId: id,
+					update: {
+						sessionUpdate: "session_info_update",
+						_meta: { gjcRecoverFailed: true, gjcRecoverError: detail },
+					},
+				});
+			} catch {}
 		}
 	}
 
 	async #discardNewSession(id: string): Promise<void> {
 		await this.#teardownSession(id, "discarded", true);
 		this.#knownSessionCwds.delete(id);
+		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
 	}
 
@@ -2116,6 +2144,7 @@ export class AcpAgent implements Agent {
 			if (attaching) await Promise.allSettled([attaching.task]);
 			await this.#teardownSession(id, "closed", true);
 			this.#knownSessionCwds.delete(id);
+			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
 			return {};
 		} finally {
@@ -3393,6 +3422,7 @@ export class AcpAgent implements Agent {
 		this.#attaching.clear();
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
+		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
 		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();

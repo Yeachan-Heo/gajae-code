@@ -466,7 +466,8 @@ export class SessionRouter {
 		if (!expectedAttachment || publishing?.capability !== expectedAttachment || !publishing.initializingPublication)
 			await this.#serialReconcile(this.#runEpoch);
 		const attached = this.#sessions.get(sessionId);
-		if (!attached || !this.#attachmentPublished(attached)) throw new SessionRouterError("pre_send");
+		if (!attached || !this.#attachmentPublished(attached))
+			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not published.");
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation)
 			throw new SessionRouterError("pre_send", "SDK session endpoint changed before command dispatch.");
 		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
@@ -605,14 +606,14 @@ export class SessionRouter {
 	async listBrokerSessions(input: Record<string, unknown>, idempotencyKey: string): Promise<Record<string, unknown>> {
 		const operation = "session.list";
 		const discovery = await readSdkBrokerDiscovery(this.#agentDir);
-		if (!discovery) throw new SessionRouterError("pre_send");
+		if (!discovery) throw new SessionRouterError("pre_send", "SDK broker discovery is unavailable.");
 		let client: SessionRouterClient;
 		try {
 			client = this.#deps.createBrokerClient
 				? await this.#deps.createBrokerClient()
 				: await SdkClient.connect(discovery.url, discovery.token);
 		} catch {
-			throw new SessionRouterError("pre_send");
+			throw new SessionRouterError("pre_send", "SDK broker connection failed.");
 		}
 		try {
 			const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
@@ -980,7 +981,7 @@ export class SessionRouter {
 				disposeFrames();
 				disposeReconnect?.();
 				barrier.detached = true;
-				if (!attached?.published) publication.reject(new SessionRouterError("pre_send"));
+				if (!attached?.published) publication.reject(new SessionRouterError("pre_send", "SDK session publication was detached before completion."));
 				barrier.held = undefined;
 			},
 		};
