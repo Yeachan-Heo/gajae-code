@@ -2090,7 +2090,9 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
 		if (error instanceof SdkClientError && error.code !== "reconnect_exhausted") {
-			logger.warn(`ACP session ${id} transport failure is not reconnect_exhausted (${error.code}); ignoring terminal recovery.`);
+			logger.warn(
+				`ACP session ${id} transport failure is not reconnect_exhausted (${error.code}); ignoring terminal recovery.`,
+			);
 			return;
 		}
 		if (!(error instanceof SdkClientError)) {

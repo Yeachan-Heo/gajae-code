@@ -981,7 +981,10 @@ export class SessionRouter {
 				disposeFrames();
 				disposeReconnect?.();
 				barrier.detached = true;
-				if (!attached?.published) publication.reject(new SessionRouterError("pre_send", "SDK session publication was detached before completion."));
+				if (!attached?.published)
+					publication.reject(
+						new SessionRouterError("pre_send", "SDK session publication was detached before completion."),
+					);
 				barrier.held = undefined;
 			},
 		};

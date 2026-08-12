@@ -20,7 +20,8 @@ function createRouterHarness(): RouterHarness {
 	};
 	const router = {
 		request: async (_sid: string, frame: Record<string, unknown>) => {
-			if (frame.type === "register_provider") return { ok: true, result: { leaseId: `lease-${String(frame.capability)}` } };
+			if (frame.type === "register_provider")
+				return { ok: true, result: { leaseId: `lease-${String(frame.capability)}` } };
 			return { ok: true, result: {} };
 		},
 	};
@@ -73,7 +74,10 @@ test("4356 SessionRouterError is not wrapped as reconnect_exhausted transport lo
 });
 
 test("4356 no SessionRouterError throw site uses the bare default message", async () => {
-	const files = ["packages/coding-agent/src/sdk/router/session-router.ts", "packages/coding-agent/src/sdk/acp/adapter.ts"];
+	const files = [
+		"packages/coding-agent/src/sdk/router/session-router.ts",
+		"packages/coding-agent/src/sdk/acp/adapter.ts",
+	];
 	for (const file of files) {
 		const text = await Bun.file(file).text();
 		const bare = [...text.matchAll(/throw new SessionRouterError\("pre_send"\)/g)];
@@ -103,6 +107,8 @@ test("4356 session/load path preserves mcpServers declaration", async () => {
 	expect(agentText).toContain("loadSession");
 	expect(agentText).toContain("resumeSession");
 	// Both must update knownSessionMcpServers when a non-empty declaration is present.
-	const loadPreserves = agentText.includes("loadSession") && agentText.includes("#knownSessionMcpServers.set(params.sessionId, mcpServers)");
+	const loadPreserves =
+		agentText.includes("loadSession") &&
+		agentText.includes("#knownSessionMcpServers.set(params.sessionId, mcpServers)");
 	expect(loadPreserves).toBe(true);
 });
