@@ -913,6 +913,20 @@ function transportFactsFromError(error: unknown): TransportFailureFacts | undefi
 	return value.transportFailure as TransportFailureFacts;
 }
 
+/**
+ * True only for the explicit "no credential found for this candidate" signal thrown at the
+ * auth_resolve preflight step, never for an unexpected exception the credential lookup itself
+ * raised (keychain access denied, corrupted store, I/O failure). auth_resolve is the one op
+ * that always advances to the next candidate regardless of any transient marker, so it must
+ * only ever be reached via this explicit, typed signal — not by inferring intent from which
+ * preflight phase happened to be executing when an unrelated error was thrown.
+ */
+function isCredentialMissingSignal(error: unknown): boolean {
+	return Boolean(
+		error && typeof error === "object" && (error as { credentialMissing?: unknown }).credentialMissing === true,
+	);
+}
+
 export function classifyAutoroutingPreflightFailure(
 	error: unknown,
 	op: Extract<AutoroutingPreflightFailure, { kind: "local" }>["op"],
@@ -923,9 +937,14 @@ export function classifyAutoroutingPreflightFailure(
 		error && typeof error === "object" && typeof (error as { transient?: unknown }).transient === "boolean"
 			? (error as { transient: boolean }).transient
 			: undefined;
+	// An exception raised while op is auth_resolve is only the deliberate missing-credential
+	// signal when it carries the explicit marker; any other error surfacing during that window
+	// (an unexpected keychain/config failure) must fail closed like every other unclassified
+	// local error, not silently advance as if credentials were simply absent.
+	const resolvedOp = op === "auth_resolve" && !isCredentialMissingSignal(error) ? "preflight_validation" : op;
 	return {
 		kind: "local",
-		op,
+		op: resolvedOp,
 		// Local setup failures are fail-closed: only an explicit transient marker
 		// can advance a candidate. Unknown session/tool errors are terminal.
 		transient: typedTransient === true,
@@ -1719,7 +1738,14 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			) {
 				preflightOperation = "auth_resolve";
 				const exactKey = await awaitAbortable(modelRegistry.getApiKey(model, options.parentSessionId));
-				if (!exactKey) throw Object.assign(new Error("autorouting credential unavailable"), { transient: false });
+				if (!exactKey)
+					throw Object.assign(new Error("autorouting credential unavailable"), {
+						transient: false,
+						// Explicit signal: credentials were looked up successfully and are simply absent for
+						// this candidate. Distinguishes the deliberate "advance to next candidate" case from
+						// an unexpected error the lookup itself threw (see classifyAutoroutingPreflightFailure).
+						credentialMissing: true,
+					});
 			}
 			authFallbackUsed = resolvedAuthFallbackUsed;
 			if (model) {
@@ -2729,7 +2755,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const attempts: AutoroutingAttempt[] = [];
 	const consumed = new Set<string>();
 	const skips = buildBoundedRoutingSkips(options.autoroutingSkips);
-	const candidates = options.autoroutingCandidates.map(boundedSelector).filter(selector => selector.length > 0);
+	// Candidates were already validated and pinned against the live model snapshot by
+	// normalizeTierSelector before reaching here. boundedSelector is an evidence/telemetry
+	// sanitizer (NFKC normalization, control-char stripping, 256-char truncation) meant for
+	// text that gets rendered or persisted; running it on the live selector could compose
+	// characters differently or truncate a long-but-valid selector, sending execution to a
+	// model that never passed preflight. Only bound the copies that reach evidence/telemetry
+	// (attempts, skips, requestedSelector), never the selector actually used for modelOverride.
+	const candidates = options.autoroutingCandidates.filter(selector => selector.length > 0);
 	const routedOptions = options.routing ? { ...options.routing, ...skips } : options.routing;
 	if (candidates.length === 0)
 		return preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "all_candidates_skipped");

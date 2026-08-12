@@ -2714,7 +2714,7 @@ describe("autorouting boundary red-team generation 5 delta re-attacks", () => {
 describe("C7 disposition oracle for auth resolution and post-fence transport", () => {
 	it("keeps auth resolution advancing while transport failures stay terminal after the fence", () => {
 		const auth = classifyAutoroutingPreflightFailure(
-			Object.assign(new Error("auth unavailable"), { transient: false }),
+			Object.assign(new Error("auth unavailable"), { transient: false, credentialMissing: true }),
 			"auth_resolve",
 		);
 		const transientSession = classifyAutoroutingPreflightFailure(
@@ -2725,21 +2725,31 @@ describe("C7 disposition oracle for auth resolution and post-fence transport", (
 			{ transportFailure: { kind: "transport" as const, status: 503 } },
 			"session_open",
 		);
-		const observed = { auth, transientSession, postFence };
+		// An unmarked exception surfacing while op is auth_resolve must NOT be treated as the
+		// deliberate missing-credential signal: an unexpected keychain/config error must fail
+		// closed (terminal), not silently advance as if credentials were simply absent.
+		const unexpectedAuthError = classifyAutoroutingPreflightFailure(
+			Object.assign(new Error("keychain access denied"), { transient: false }),
+			"auth_resolve",
+		);
+		const observed = { auth, transientSession, postFence, unexpectedAuthError };
 		const pass =
 			auth.kind === "local" &&
 			auth.op === "auth_resolve" &&
 			transientSession.kind === "local" &&
 			transientSession.transient === true &&
 			postFence.kind === "transport" &&
-			postFence.class === "server";
+			postFence.class === "server" &&
+			unexpectedAuthError.kind === "local" &&
+			unexpectedAuthError.op !== "auth_resolve" &&
+			unexpectedAuthError.transient === false;
 		record(
 			"gen5-fence-disposition",
 			"AC13",
 			`${rootCommand} -t gen5-fence-disposition`,
 			observed,
 			pass,
-			"Auth resolution or transient bootstrap classification changed, or typed post-fence transport facts were not preserved.",
+			"Auth resolution or transient bootstrap classification changed, typed post-fence transport facts were not preserved, or an unmarked auth_resolve exception was wrongly treated as the deliberate missing-credential signal.",
 		);
 		expect(pass).toBe(true);
 	});
@@ -3116,5 +3126,106 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 		expect(pass).toBe(true);
 		await rm(root, { recursive: true, force: true });
 		await rm(successRoot, { recursive: true, force: true });
+	});
+
+	it("C9 the live routed selector reaches session creation byte-exact, unaffected by evidence bounding", async () => {
+		// boundedSelector (NFKC-normalize, strip control chars, truncate to 256) exists to bound
+		// text that is rendered or persisted as evidence/telemetry. It must never be applied to the
+		// selector actually used to resolve and execute the model: candidates were already validated
+		// against the live snapshot by normalizeTierSelector, so re-transforming the live selector
+		// could compose characters differently or truncate a long-but-valid id, sending execution to
+		// a model that never passed preflight. Use an id long enough that boundedSelector's 256-char
+		// cap would corrupt it if applied to the live selector, and confirm the exact byte-for-byte
+		// selector reaches createAgentSession's resolved model.
+		const root = await mkdtemp(path.join(tmpdir(), "autorouting-gen9-live-selector-"));
+		const finalPath = path.join(root, "candidate.jsonl");
+		const longId = `over-256-chars-${"x".repeat(280)}`;
+		const longSelector = `test/${longId}`;
+		const models = [
+			model("test", longId, true, {
+				headers: {},
+				compat: {},
+				thinking: { mode: "effort", minLevel: "minimal", maxLevel: "high" },
+			}),
+		];
+		const authStorage = await AuthStorage.create(":memory:");
+		const modelRegistry = new ModelRegistry(authStorage);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue(models);
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(models);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async () => "key");
+		const originalCreate = sdkModule.createAgentSession;
+		let capturedModelId: string | undefined;
+		const createSpy = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedModelId = options?.model?.id;
+			const result = await originalCreate(options);
+			vi.spyOn(result.session, "prompt").mockImplementation(async (_message, promptOptions) => {
+				if (promptOptions?.onPreflightAcceptCommit) await promptOptions.onPreflightAcceptCommit();
+				else promptOptions?.onPreflightAccepted?.();
+				result.session.agent.emitExternalEvent({
+					type: "tool_execution_end",
+					toolCallId: "gen9-yield",
+					toolName: "yield",
+					result: { content: [], details: { status: "success", data: {} } },
+					isError: false,
+				} as never);
+			});
+			vi.spyOn(result.session, "waitForIdle").mockResolvedValue(undefined);
+			return result;
+		});
+		let result: Awaited<ReturnType<typeof runSubprocess>> | undefined;
+		try {
+			result = await runSubprocess({
+				cwd: root,
+				agent: taskAgent,
+				task: "gen9 live selector",
+				assignment: "gen9 live selector",
+				index: 0,
+				id: "gen9-live-selector",
+				modelOverride: [longSelector],
+				settings: Settings.isolated(),
+				modelRegistry,
+				runMode: "initial",
+				autoroutingPreflight: true,
+				autoroutingCandidates: [longSelector],
+				autoroutingSkips: [],
+				routing: {
+					tier: "fast",
+					source: "tiers",
+					// The evidence-side requestedSelector/effectiveModel are legitimately bounded to
+					// <=256 chars by assertRoutingEvidenceInvariant; that bounding is correct and not
+					// under test here. Only the *live* selector must reach execution untransformed.
+					requestedSelector: "test/short-placeholder",
+					effectiveModel: "test/short-placeholder",
+					substitutions: [],
+				},
+				sessionFile: finalPath,
+			});
+		} finally {
+			createSpy.mockRestore();
+			authStorage.close();
+			await rm(root, { recursive: true, force: true });
+		}
+		const observed = {
+			capturedModelId,
+			expectedModelId: longId,
+			capturedModelIdLength: capturedModelId?.length,
+			exitCode: result?.exitCode,
+			preflightFenceCrossed: result?.preflightFenceCrossed,
+			attempts: result?.routing?.attempts,
+		};
+		const pass =
+			capturedModelId === longId &&
+			(capturedModelId?.length ?? 0) > 256 &&
+			result?.exitCode === 0 &&
+			result?.preflightFenceCrossed === true;
+		record(
+			"gen9-c9-live-selector-untransformed",
+			"AC13",
+			rootCommand,
+			observed,
+			pass,
+			"The live routed selector was truncated or otherwise transformed by evidence-bounding logic before reaching session creation, causing execution to diverge from the preflight-validated candidate.",
+		);
+		expect(pass).toBe(true);
 	});
 });

@@ -616,6 +616,55 @@ describe("autorouting preflight contract", () => {
 		}
 	});
 
+	it("terminalizes the ledger when the credential lookup itself throws, instead of advancing as if credentials were absent", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "gjc-real-preflight-credential-error-"));
+		const jobs = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: async () => {} });
+		AsyncJobManager.setInstance(jobs);
+		const model = {
+			provider: "test",
+			id: "model",
+			name: "model",
+			api: "openai-completions",
+			baseUrl: "https://example.invalid",
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+			input: [],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			headers: {},
+			compat: {},
+		} as never;
+		// getApiKey throwing (keychain access denied, corrupted store) is NOT the same as returning
+		// undefined (no credential configured). Only the latter is the deliberate "advance" signal;
+		// the former must fail closed on the very first candidate.
+		const result = await runSubprocess({
+			cwd: root,
+			agent,
+			task: "credential lookup error",
+			assignment: "credential lookup error",
+			index: 0,
+			id: "credential-lookup-error",
+			runMode: "initial",
+			settings: Settings.isolated(),
+			modelRegistry: {
+				authStorage: {},
+				getAvailable: () => [model],
+				getApiKey: async () => {
+					throw new Error("keychain access denied");
+				},
+			} as never,
+			autoroutingPreflight: true,
+			autoroutingCandidates: ["test/model", "test/second"],
+			routing,
+			sessionFile: path.join(root, "candidate.jsonl"),
+		});
+		// Only the first candidate is attempted; the ledger did not advance past the credential
+		// lookup error as though it were a plain missing-credential skip.
+		const attempted = new Set((result.routing?.attempts ?? []).map(attempt => attempt.selector));
+		expect(attempted).toEqual(new Set(["test/model"]));
+		expect(result.routing?.attempts?.some(attempt => attempt.code === "credential_unavailable")).toBe(false);
+		expect(result.routing?.terminal).toBe("preflight_exhausted");
+	});
+
 	it("preserves terminal evidence when every candidate is skipped before execution", async () => {
 		const result = await runSubprocess({
 			cwd: process.cwd(),
@@ -647,6 +696,27 @@ describe("autorouting preflight contract", () => {
 				"preflight_validation",
 			),
 		).toMatchObject({ kind: "transport", class: "rate_limit" });
+	});
+
+	it("only the explicit missing-credential signal advances at auth_resolve; an unmarked lookup error fails closed", () => {
+		// The deliberate "no credential for this candidate" throw carries credentialMissing: true.
+		expect(
+			classifyAutoroutingPreflightFailure(
+				Object.assign(new Error("autorouting credential unavailable"), {
+					transient: false,
+					credentialMissing: true,
+				}),
+				"auth_resolve",
+			),
+		).toEqual({ kind: "local", op: "auth_resolve", transient: false });
+		// An unrelated exception the credential lookup itself throws (keychain access denied,
+		// corrupted store, I/O failure) must NOT be reclassified as the deliberate signal just
+		// because it happened during the auth_resolve window -- it must fail closed like every
+		// other unclassified local error.
+		const unexpected = classifyAutoroutingPreflightFailure(new Error("keychain access denied"), "auth_resolve");
+		expect(unexpected.kind).toBe("local");
+		expect(unexpected).not.toMatchObject({ op: "auth_resolve" });
+		expect(unexpected).toMatchObject({ transient: false });
 	});
 
 	it("enforces phase/code pairing and bounded attempt evidence", () => {
