@@ -19018,6 +19018,10 @@ export class AgentSession {
 				}
 
 				if (switchingToDifferentSession) {
+					const predecessorEndpointId = this.#asyncJobEndpointId(
+						previousSessionState.sessionId,
+						previousSessionState.sessionFile,
+					);
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
@@ -19036,7 +19040,7 @@ export class AgentSession {
 								ownerShutdownManager,
 								ownerShutdownLease,
 								ownerId,
-								previousSessionState.sessionId,
+								predecessorEndpointId,
 							);
 							this.#suppressOwnAsyncJobDeliveries();
 							this.emitNotice(
@@ -19053,7 +19057,7 @@ export class AgentSession {
 						// Every predecessor job/delivery has settled. Only now can its
 						// tuple evidence be retired; doing this immediately after rekey
 						// made rollback restore live jobs without their owned tuples.
-						retireOwnedRegistrationsForEndpoint(previousSessionState.sessionId);
+						retireOwnedRegistrationsForEndpoint(predecessorEndpointId);
 						this.sessionManager.retireEphemeralArtifactsAfterTransition();
 						await this.#runToolSessionTransitionCleanups();
 					}

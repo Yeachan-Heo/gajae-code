@@ -248,14 +248,17 @@ describe("task fork-context provider identity", () => {
 		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
 
-		const previousManager = await SessionManager.open(previousSessionFile!);
+		expect(await session.switchSession(previousSessionFile!)).toBe(true);
+		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeUndefined();
+		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
+
 		const { session: reopened, authStorage: reopenedAuth } = await createSession(tempDir, {
 			providerSessionId,
-			sessionManager: previousManager,
+			sessionManager: await SessionManager.open(successorSessionFile!),
 		});
 		sessions.push(reopened);
 		authStorages.push(reopenedAuth);
-		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeDefined();
+		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeDefined();
 	}, 15_000);
 
 	it("does not share mutable provider state unless explicitly supplied", async () => {
