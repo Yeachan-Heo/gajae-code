@@ -416,11 +416,18 @@ export async function scanSkillsFromDir(
 					warnings.push(
 						`Skill frontmatter exceeded ${SKILL_FRONTMATTER_SCAN_TOTAL_BYTES} byte scan cap: ${skillPath}`,
 					);
+				} else {
+					warnings.push(
+						`Skill file has no parseable frontmatter (expected a leading \`---\` YAML block with name/description): ${skillPath}`,
+					);
 				}
 				return;
 			}
 			if (frontmatter.enabled === false) return;
-			if (requireDescription && !frontmatter.description) return;
+			if (requireDescription && !frontmatter.description) {
+				warnings.push(`Skill is missing a description in frontmatter: ${skillPath}`);
+				return;
+			}
 			const skillDirName = path.basename(path.dirname(skillPath));
 			const rawName = frontmatter.name;
 			const name = typeof rawName === "string" ? rawName.trim() || skillDirName : skillDirName;

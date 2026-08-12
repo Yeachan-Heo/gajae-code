@@ -700,13 +700,15 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 154 at serving epoch 87", () => {
+test("publishes exact durable authority generation 155 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
 	// Generation 153: strict orchestration admission fences Telegram topics.
-	// Generation 154: branch daemon generation bump (b595e10ea).
-	expect(DAEMON_GENERATION).toBe(154);
+	// Generation 154: private-chat archives dispatch deleteForumTopic, settle
+	// TOPIC_ID_INVALID, and drain durable archive retries periodically.
+	// Generation 155: terminal-abort notification admission and cleanup semantics.
+	expect(DAEMON_GENERATION).toBe(155);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {
@@ -846,7 +848,7 @@ test("terminal archive states cannot be revived by lease or orphan transitions",
 	for (let attempt = 0; attempt < 9; attempt++) registry.scheduleArchiveRetry("session", attempt);
 	expect(registry.get("session")?.authorityState).toBe("archive_pending");
 	expect(registry.acquireLease("session", "host", 10, 1_000, 500)).toBe(false);
-	expect(registry.archivePendingSessionIds(70_000)).toEqual(["session"]);
+	expect(registry.archivePendingSessionIds(1_000_000)).toEqual(["session"]);
 	expect(registry.archiveExhaustedSessionIds()).toEqual([]);
 	expect(registry.markOrphaned("session", 10)).toBe(false);
 	expect(registry.clearOrphaned("session")).toBe(false);

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -90,7 +90,11 @@ describe("skills", () => {
 			expect(validSkill).toBeDefined();
 			expect(validSkill?.description).toBe("A valid skill for testing purposes.");
 			expect(validSkill?.source).toBe("test");
-			expect(warnings).toHaveLength(0);
+			// The fixture root also contains skills with missing descriptions and
+			// missing frontmatter; those must produce actionable diagnostics
+			// instead of silent skips.
+			expect(warnings.some(w => w.message.includes("missing a description"))).toBe(true);
+			expect(warnings.some(w => w.message.includes("no parseable frontmatter"))).toBe(true);
 		});
 
 		it("should load skill when name doesn't match parent directory", async () => {
@@ -219,16 +223,18 @@ describe("skills", () => {
 			expect(skills.map(s => s.name)).toEqual(expectedFixtureSkillOrder);
 		});
 
-		it("should ignore Codex and Claude skills even when their source toggles are enabled", async () => {
+		it("never loads Claude/Codex convention skills at runtime; they are import sources only", async () => {
 			const tempHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-skills-home-"));
 			const tempProjectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-skills-project-"));
+			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHomeDir);
 
 			try {
 				for (const root of [
-					path.join(tempHomeDir, ".codex", "skills", "codex-user-skill"),
 					path.join(tempProjectDir, ".codex", "skills", "codex-project-skill"),
-					path.join(tempHomeDir, ".claude", "skills", "claude-user-skill"),
 					path.join(tempProjectDir, ".claude", "skills", "claude-project-skill"),
+					path.join(tempHomeDir, ".codex", "skills", "codex-user-skill"),
+					path.join(tempHomeDir, ".claude", "skills", "claude-user-skill"),
+					path.join(tempProjectDir, ".gjc", "skills", "native-project-skill"),
 				]) {
 					await fs.mkdir(root, { recursive: true });
 					await fs.writeFile(
@@ -239,26 +245,32 @@ describe("skills", () => {
 					);
 				}
 
+				// Even with every legacy convention toggle enabled, `.claude` and
+				// `.codex` layouts are explicit import sources into `.gjc`: they are
+				// never loaded as session skills. Only the native location loads.
 				const { skills } = await loadSkills({
 					cwd: tempProjectDir,
 					enableCodexUser: true,
 					enableClaudeUser: true,
 					enableClaudeProject: true,
-					enablePiUser: false,
-					enablePiProject: false,
 				});
 
-				expect(skills).toEqual([]);
+				expect(skills.map(skill => skill.name)).toEqual(["native-project-skill"]);
+				expect(skills[0]?.source).toBe("native:project");
 			} finally {
+				homedirSpy.mockRestore();
 				await fs.rm(tempProjectDir, { recursive: true, force: true });
 				await fs.rm(tempHomeDir, { recursive: true, force: true });
 			}
 		});
 
-		it("does not register the Claude skill provider by default", async () => {
+		it("does not register Claude/Codex skill capability providers", async () => {
 			const capability = getCapability<CapabilitySkill>(skillCapability.id);
 			expect(capability).toBeDefined();
-			expect(capability?.providers.some(provider => provider.id === "claude")).toBe(false);
+			const providers = capability?.providers ?? [];
+			for (const id of ["claude", "codex"]) {
+				expect(providers.some(provider => provider.id === id)).toBe(false);
+			}
 		});
 
 		it("should filter out ignoredSkills", async () => {
@@ -386,6 +398,146 @@ description: Skill loaded from a tilde-expanded custom directory.
 			expect(skills).toHaveLength(0);
 		});
 
+		it("discovers native project and user skills with zero configuration", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-zero-config-skills-"));
+			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-zero-config-home-"));
+			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+			try {
+				for (const [root, name] of [
+					[path.join(tempDir, ".gjc", "skills", "project-skill"), "project-skill"],
+					[path.join(tempDir, ".claude", "skills", "claude-skill"), "claude-skill"],
+					[path.join(tempDir, ".codex", "skills", "codex-skill"), "codex-skill"],
+					[path.join(tempHome, ".gjc", "agent", "skills", "user-skill"), "user-skill"],
+				]) {
+					await fs.mkdir(root, { recursive: true });
+					await fs.writeFile(
+						path.join(root, "SKILL.md"),
+						["---", `name: ${name}`, "description: Zero-config skill", "---", "", `# ${name}`].join("\n"),
+					);
+				}
+
+				// No explicit settings at all: filesystem skill discovery is on by
+				// default and every canonical native location is loaded. Claude/Codex
+				// convention copies are import sources and never load directly.
+				const { skills } = await loadSkills({ cwd: tempDir });
+				expect(skills.map(skill => skill.name).sort()).toEqual(["project-skill", "user-skill"]);
+			} finally {
+				homedirSpy.mockRestore();
+				await fs.rm(tempDir, { recursive: true, force: true });
+				await fs.rm(tempHome, { recursive: true, force: true });
+			}
+		});
+
+		it("project scope shadows user scope, and the nearest project ancestor wins", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-precedence-skills-"));
+			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-precedence-home-"));
+			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+			try {
+				// Mark the repo root so the ancestor walk covers the nested package.
+				await fs.mkdir(path.join(tempDir, ".git"));
+				const nested = path.join(tempDir, "packages", "nested");
+				const write = async (root: string, name: string, body: string) => {
+					await fs.mkdir(root, { recursive: true });
+					await fs.writeFile(
+						path.join(root, "SKILL.md"),
+						["---", `name: ${name}`, "description: shared skill", "---", "", body].join("\n"),
+					);
+				};
+				await write(path.join(tempHome, ".gjc", "agent", "skills", "shared"), "shared", "user body");
+				await write(path.join(tempDir, ".gjc", "skills", "shared"), "shared", "root body");
+				await write(path.join(nested, ".gjc", "skills", "shared"), "shared", "nested body");
+
+				const { skills, warnings } = await loadSkills({ cwd: nested });
+				const shared = skills.find(skill => skill.name === "shared");
+				expect(shared).toBeDefined();
+				expect(shared?.source).toBe("native:project");
+				expect(shared?.filePath).toContain(path.join(nested, ".gjc", "skills", "shared"));
+				// Shadowed duplicates are diagnosed, not silent: root project copy and
+				// the user copy both collide with the nearest-ancestor winner.
+				expect(warnings.filter(w => w.message.includes("name collision")).length).toBe(2);
+
+				// Drop the nested copy: the repo-root project copy still beats user.
+				await fs.rm(path.join(nested, ".gjc"), { recursive: true, force: true });
+				const { skills: next } = await loadSkills({ cwd: nested });
+				expect(next.find(skill => skill.name === "shared")?.filePath).toContain(
+					path.join(tempDir, ".gjc", "skills", "shared"),
+				);
+
+				// Drop all project copies: the user copy finally wins.
+				await fs.rm(path.join(tempDir, ".gjc"), { recursive: true, force: true });
+				const { skills: userWins } = await loadSkills({ cwd: nested });
+				expect(userWins.find(skill => skill.name === "shared")?.filePath).toContain(
+					path.join(tempHome, ".gjc", "agent", "skills", "shared"),
+				);
+			} finally {
+				homedirSpy.mockRestore();
+				await fs.rm(tempDir, { recursive: true, force: true });
+				await fs.rm(tempHome, { recursive: true, force: true });
+			}
+		});
+
+		it("keeps the legacy alias working and never lets disk skills replace bundled workflows", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-protected-skills-"));
+			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-protected-home-"));
+			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+			try {
+				const root = path.join(tempDir, ".gjc", "skills", "ralplan");
+				await fs.mkdir(root, { recursive: true });
+				await fs.writeFile(
+					path.join(root, "SKILL.md"),
+					["---", "name: ralplan", "description: On-disk impostor", "---", "", "# Impostor"].join("\n"),
+				);
+
+				// The disk copy is still scanned (installed defaults are a documented
+				// surface), but the session merge in sdk/session.ts keeps the bundled
+				// definition authoritative (covered by sdk-skills.test.ts) and the
+				// project-scope copy is diagnosed as a protected-name collision.
+				const { skills, warnings } = await loadSkills({ cwd: tempDir });
+				expect(skills.some(skill => skill.name === "ralplan")).toBe(true);
+				expect(warnings.some(w => w.message.includes("bundled GJC workflow skill"))).toBe(true);
+
+				// The legacy alias still disables the scope explicitly.
+				const legacyDisabled = await loadSkills({ cwd: tempDir, enablePiProject: false });
+				expect(legacyDisabled.skills).toHaveLength(0);
+			} finally {
+				homedirSpy.mockRestore();
+				await fs.rm(tempDir, { recursive: true, force: true });
+				await fs.rm(tempHome, { recursive: true, force: true });
+			}
+		});
+
+		it("trust flags disable their scope while the master switch disables everything", async () => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trust-skills-"));
+			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trust-home-"));
+			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
+			try {
+				const write = async (root: string, name: string) => {
+					await fs.mkdir(root, { recursive: true });
+					await fs.writeFile(
+						path.join(root, "SKILL.md"),
+						["---", `name: ${name}`, `description: ${name} body`, "---", "", `# ${name}`].join("\n"),
+					);
+				};
+				await write(path.join(tempDir, ".gjc", "skills", "project-helper"), "project-helper");
+				await write(path.join(tempHome, ".gjc", "agent", "skills", "user-helper"), "user-helper");
+
+				const userOff = await loadSkills({ cwd: tempDir, trustUserSkills: false });
+				expect(userOff.skills.map(s => s.name)).toEqual(["project-helper"]);
+
+				const projectOff = await loadSkills({ cwd: tempDir, trustProjectSkills: false });
+				expect(projectOff.skills.map(s => s.name)).toEqual(["user-helper"]);
+
+				const allOff = await loadSkills({ cwd: tempDir, trustProjectSkills: false, trustUserSkills: false });
+				expect(allOff.skills).toHaveLength(0);
+
+				const masterOff = await loadSkills({ cwd: tempDir, enabled: false });
+				expect(masterOff.skills).toHaveLength(0);
+			} finally {
+				homedirSpy.mockRestore();
+				await fs.rm(tempDir, { recursive: true, force: true });
+				await fs.rm(tempHome, { recursive: true, force: true });
+			}
+		});
 		it("should filter skills with includeSkills glob patterns", async () => {
 			// Load all skills from fixtures
 			const { skills: allSkills } = await loadSkills({

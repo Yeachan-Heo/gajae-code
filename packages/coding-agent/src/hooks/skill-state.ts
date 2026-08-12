@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import type { SkillDiscoverySettings } from "../config/skill-settings-defaults";
+import { resolveSkillScopeTrust, type SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { detectDeepInterviewPlaintextAskLeak } from "../deep-interview/plaintext-gate-guard";
 import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
@@ -81,18 +81,22 @@ export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillC
 		(input.disabledExtensions ?? []).filter(extension => extension.startsWith("skill:")),
 	);
 	const customDirectoryCount = countNonEmptyStrings(settings.customDirectories);
+	const projectTrusted = resolveSkillScopeTrust(settings, "project");
+	const userTrusted = resolveSkillScopeTrust(settings, "user");
 
 	return [
 		"Sanitized effective skill config for filesystem/custom skill discovery; bundled GJC workflow activation remains available for exactly deep-interview, ralplan, ultragoal, team.",
 		`Skill discovery booleans: ${[
 			formatBoolean("enabled", settings.enabled),
 			formatBoolean("enableSkillCommands", settings.enableSkillCommands),
-			formatBoolean("enablePiUser", settings.enablePiUser),
+			formatBoolean("trustProjectSkills", settings.trustProjectSkills),
+			formatBoolean("trustUserSkills", settings.trustUserSkills),
 			formatBoolean("enablePiProject", settings.enablePiProject),
+			formatBoolean("enablePiUser", settings.enablePiUser),
 			formatBoolean("enableCodexUser", settings.enableCodexUser),
 			formatBoolean("enableClaudeUser", settings.enableClaudeUser),
 			formatBoolean("enableClaudeProject", settings.enableClaudeProject),
-		].join(", ")}.`,
+		].join(", ")}. Effective scope trust: project=${projectTrusted}; user=${userTrusted}.`,
 		`Skill discovery filters: includeSkills.count=${includeSkillCount}; ignoredSkills.count=${ignoredSkillCount}; disabledSkillExtensions.count=${disabledSkillExtensionCount}.`,
 		`Custom skill directories: count=${customDirectoryCount}.`,
 	].join(" ");

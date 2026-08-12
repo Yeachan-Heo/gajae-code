@@ -188,3 +188,63 @@ describe.skipIf(process.platform !== "darwin")(
 		});
 	},
 );
+
+describe.skipIf(process.platform !== "win32")(
+	"ManagedSessionDescendantStore.appendSync Windows sharing-violation retry (#4330)",
+	() => {
+		it("completes the append once a transient destination holder releases", async () => {
+			const { store, filePath, relativePath } = await createStore();
+			const beforeBytes = fs.readFileSync(filePath);
+			const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m-retry-holder" })}\n`, "utf8");
+			const root = path.dirname(filePath);
+			const marker = path.join(root, "append-holder-ready");
+			const holder = path.join(root, "append-holder.cjs");
+			// `r+` opens without delete sharing (same semantics the native
+			// path-identity suite relies on), so the managed replace's destination
+			// open fails with STATUS_SHARING_VIOLATION until the child closes.
+			fs.writeFileSync(
+				holder,
+				`const fs = require("node:fs");\n` +
+					`const [file, ready, holdMs] = process.argv.slice(2);\n` +
+					`const fd = fs.openSync(file, "r+");\n` +
+					`fs.writeFileSync(ready, "ready");\n` +
+					`setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number(holdMs));\n`,
+			);
+			const child = Bun.spawn([process.execPath, holder, filePath, marker, "1500"], {
+				cwd: root,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			try {
+				let ready = false;
+				for (let attempt = 0; attempt < 400 && !ready; attempt++) {
+					ready = fs.existsSync(marker);
+					if (!ready) Bun.sleepSync(25);
+				}
+				expect(ready).toBe(true);
+
+				store.appendSync(relativePath, record);
+
+				const afterBytes = fs.readFileSync(filePath);
+				expect(afterBytes.equals(Buffer.concat([beforeBytes, record]))).toBe(true);
+				expect(afterBytes.toString("utf8").trimEnd().split("\n")).toHaveLength(2);
+			} finally {
+				await child.exited;
+			}
+		});
+
+		it("exhausts the bounded retry with a specific failure and leaves the transcript untouched", async () => {
+			const { store, filePath, relativePath } = await createStore();
+			const beforeBytes = fs.readFileSync(filePath);
+			const record = Buffer.from(`${JSON.stringify({ type: "message", id: "m-blocked" })}\n`, "utf8");
+			const holder = fs.openSync(filePath, "r+");
+			try {
+				expect(() => store.appendSync(relativePath, record)).toThrow("managed_replace_failed:sharing_violation");
+			} finally {
+				fs.closeSync(holder);
+			}
+			const afterBytes = fs.readFileSync(filePath);
+			expect(afterBytes.equals(beforeBytes)).toBe(true);
+			expect(afterBytes.toString("utf8").includes('"id":"m-blocked"')).toBe(false);
+		});
+	},
+);

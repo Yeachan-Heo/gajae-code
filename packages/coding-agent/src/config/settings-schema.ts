@@ -3496,9 +3496,29 @@ export const SETTINGS_SCHEMA = {
 
 	"skills.enableClaudeProject": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enableClaudeProject },
 
-	"skills.enablePiUser": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enablePiUser },
+	"skills.trustProjectSkills": {
+		type: "boolean",
+		ui: {
+			tab: "customization",
+			label: "Trust Project Skills",
+			description:
+				"Load skills from project .gjc/skills, .claude/skills, and .codex/skills. Set to false to ignore project-controlled skills while keeping user skills.",
+		},
+	},
 
-	"skills.enablePiProject": { type: "boolean", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.enablePiProject },
+	"skills.trustUserSkills": {
+		type: "boolean",
+		ui: {
+			tab: "customization",
+			label: "Trust User Skills",
+			description:
+				"Load skills from ~/.gjc/agent/skills (and legacy ~/.gjc/skills / <config>/skills). Set to false to ignore user-installed skills while keeping project skills.",
+		},
+	},
+
+	"skills.enablePiUser": { type: "boolean", ui: { tab: "customization", label: "Trust User Skills (legacy)" } },
+
+	"skills.enablePiProject": { type: "boolean", ui: { tab: "customization", label: "Trust Project Skills (legacy)" } },
 
 	"skills.customDirectories": { type: "array", default: DEFAULT_SKILL_DISCOVERY_SETTINGS.customDirectories },
 

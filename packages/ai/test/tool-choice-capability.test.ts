@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, it } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@gajae-code/utils";
@@ -385,8 +386,76 @@ describe("durable tool-choice capability cache", () => {
 			database.close();
 		}
 	});
-});
 
+	it("does not retire the cache when a transient SQLITE_ERROR occurs during operation", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-transient-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		markToolChoiceIncapability(model("named"), "auto");
+
+		expect(fsSync.existsSync(cachePath)).toBe(true);
+
+		// A generic SQLITE_ERROR (e.g. from a future binding or driver edge case)
+		// must not be treated as corruption and must not delete the cache.
+		let injected = false;
+		configureToolChoiceCapabilityCacheForTests({
+			path: cachePath,
+			simulateOperationError: () => {
+				if (injected) return undefined;
+				injected = true;
+				return Object.assign(new Error("simulated transient SQLITE_ERROR"), { code: "SQLITE_ERROR" });
+			},
+		});
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		expect(fsSync.existsSync(cachePath)).toBe(true);
+
+		// After the transient error, the cache is intact and data is still hydrated.
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
+	it("does not delete a concurrently recreated valid cache during corruption retirement", async () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-recreate-race-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		await fs.writeFile(cachePath, "not a sqlite database");
+
+		// Race scenario:
+		// 1. withCapabilityCache stats the corrupt file → captures its byte size
+		// 2. openCapabilityCache opens the corrupt file → fails with SQLITE_NOTADB
+		// 3. beforeCorruptRetire replaces the file with a valid DB (concurrent recreation)
+		// 4. retireCorruptCapabilityCache size-checks: size differs → skips deletion
+		configureToolChoiceCapabilityCacheForTests({
+			path: cachePath,
+			beforeCorruptRetire: () => {
+				fsSync.rmSync(cachePath, { force: true });
+				const replacement = new Database(cachePath, { create: true });
+				replacement.run(`
+					CREATE TABLE IF NOT EXISTS tool_choice_capabilities (
+						key_digest TEXT PRIMARY KEY NOT NULL,
+						max_support TEXT NOT NULL,
+						support_rank INTEGER NOT NULL,
+						observed_at INTEGER NOT NULL
+					) STRICT
+				`);
+				replacement.run("INSERT INTO tool_choice_capabilities VALUES ('test', 'auto', 1, 1000)");
+				replacement.run("PRAGMA user_version = 1");
+				replacement.close();
+			},
+		});
+
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		// The valid replacement must survive — identity check prevented deletion.
+		expect(fsSync.existsSync(cachePath)).toBe(true);
+		const replacement = new Database(cachePath, { readonly: true });
+		try {
+			expect(replacement.query("SELECT COUNT(*) AS count FROM tool_choice_capabilities").get()).toEqual({
+				count: 1,
+			});
+		} finally {
+			replacement.close();
+		}
+	});
+});
 describe("isForcedToolChoiceUnsupportedError", () => {
 	it("matches unsupported forced tool_choice 400s", () => {
 		expect(

@@ -266,7 +266,7 @@ describe("SkillDiscoveryTool", () => {
 			source: "user",
 		});
 		expect(userScope.details?.candidates).toEqual([]);
-		expect(userScope.details?.notice).toContain("`skills.enablePiUser` is false");
+		expect(userScope.details?.notice).toContain("`skills.trustUserSkills` is false");
 
 		// A disabled scope is mentioned even under source "all" when nothing was found.
 		const projectOff = runtimeSkillSettings({ "skills.enablePiProject": false });
@@ -274,7 +274,7 @@ describe("SkillDiscoveryTool", () => {
 			query: "no-such-skill-anywhere",
 		});
 		expect(allScope.details?.candidates).toEqual([]);
-		expect(allScope.details?.notice).toContain("`skills.enablePiProject` is false");
+		expect(allScope.details?.notice).toContain("`skills.trustProjectSkills` is false");
 
 		// Fully enabled policy with a non-matching query: genuinely empty, no notice.
 		const enabled = runtimeSkillSettings();
@@ -562,5 +562,116 @@ describe("SkillDiscoveryTool", () => {
 			if (originalHome === undefined) delete process.env.HOME;
 			else process.env.HOME = originalHome;
 		}
+	});
+
+	it("advertises project .claude/skills and .codex/skills as import candidates with zero configuration", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-skills-"));
+		await makeSkill(path.join(cwd, ".claude", "skills"), "claude-helper", "Claude convention helper");
+		await makeSkill(path.join(cwd, ".codex", "skills"), "codex-helper", "Codex convention helper");
+
+		// No skills.* settings at all: convention skills are discoverable in a
+		// normal session as import candidates — never as invokable candidates —
+		// and each diagnostic names the copy command that enables the skill.
+		const zeroConfig = Settings.isolated({ "skill.enabled": true });
+		const result = await new SkillDiscoveryTool(createSession(cwd, { settings: zeroConfig })).execute("call", {});
+		expect(result.details?.candidates).toEqual([]);
+		const diagnostics = result.details?.diagnostics ?? [];
+		expect(diagnostics.some(message => message.includes('"claude-helper"') && message.includes(".claude"))).toBe(
+			true,
+		);
+		expect(diagnostics.some(message => message.includes('"codex-helper"') && message.includes(".codex"))).toBe(true);
+		const importDiagnostics = diagnostics.filter(message =>
+			message.includes("import sources are not loaded directly"),
+		);
+		expect(importDiagnostics.some(message => message.includes('"claude-helper"'))).toBe(true);
+		expect(importDiagnostics.some(message => message.includes('"codex-helper"'))).toBe(true);
+		expect(importDiagnostics.every(message => message.includes(".gjc/skills/"))).toBe(true);
+	});
+
+	it("applies runtime precedence: project .gjc beats user, convention copies stay import candidates", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-precedence-"));
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-precedence-home-"));
+		const originalHome = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			await makeSkill(path.join(home, ".gjc", "skills"), "shared", "User copy");
+			await makeSkill(path.join(cwd, ".codex", "skills"), "shared", "Codex copy");
+			await makeSkill(path.join(cwd, ".claude", "skills"), "shared", "Claude copy");
+			const nativePath = await makeSkill(path.join(cwd, ".gjc", "skills"), "shared", "Native copy");
+
+			const result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
+				"call",
+				{ query: "shared" },
+			);
+			expect(result.details?.candidates).toEqual([
+				expect.objectContaining({
+					name: "shared",
+					description: "Native copy",
+					path: nativePath,
+					source: "project",
+				}),
+			]);
+			// The shadowed user copy is diagnosed as shadowed; the convention copies
+			// are neither candidates nor shadowing noise once the name resolved.
+			expect(result.details?.diagnostics?.some(message => message.includes("higher-precedence"))).toBe(true);
+			expect(result.details?.diagnostics?.some(message => message.includes("import sources"))).toBe(false);
+
+			// Drop the native copy: the user-scope copy wins at runtime while the
+			// convention copies remain import candidates with enablement guidance.
+			await fs.rm(path.join(cwd, ".gjc"), { recursive: true, force: true });
+			const userWins = await new SkillDiscoveryTool(
+				createSession(cwd, { settings: runtimeSkillSettings() }),
+			).execute("call", { query: "shared" });
+			expect(userWins.details?.candidates[0]?.path).toContain(path.join(".gjc", "skills", "shared"));
+			expect(userWins.details?.candidates[0]?.source).toBe("user");
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+		}
+	});
+
+	it("diagnoses protected-name collisions, ignored, disabled, and include-filtered skills", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discovery-diagnostics-"));
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "ralplan", "On-disk built-in impostor");
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "ignored-one", "Ignored helper");
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "disabled-one", "Disabled helper");
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "excluded-one", "Include-filtered helper");
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "visible-one", "Visible helper");
+
+		const settings = runtimeSkillSettings({
+			"skills.ignoredSkills": ["ignored-*"],
+			"skills.includeSkills": ["visible-*"],
+			disabledExtensions: ["skill:disabled-one"],
+		});
+		const result = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {});
+		expect(result.details?.candidates.map(candidate => candidate.name)).toEqual(["visible-one"]);
+		const diagnostics = result.details?.diagnostics ?? [];
+		expect(diagnostics.some(message => message.includes("bundled GJC workflow skill"))).toBe(true);
+		expect(diagnostics.some(message => message.includes("skills.ignoredSkills"))).toBe(true);
+		expect(diagnostics.some(message => message.includes("disabledExtensions"))).toBe(true);
+		expect(diagnostics.some(message => message.includes("skills.includeSkills"))).toBe(true);
+	});
+
+	it("diagnoses invalid frontmatter and missing descriptions", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-invalid-skill-diagnostics-"));
+		const noFrontmatterDir = path.join(cwd, ".gjc", "skills", "no-frontmatter");
+		await fs.mkdir(noFrontmatterDir, { recursive: true });
+		await fs.writeFile(path.join(noFrontmatterDir, "SKILL.md"), "# No Frontmatter\n\nPlain markdown body.\n", "utf8");
+		const noDescriptionDir = path.join(cwd, ".gjc", "skills", "no-description");
+		await fs.mkdir(noDescriptionDir, { recursive: true });
+		await fs.writeFile(
+			path.join(noDescriptionDir, "SKILL.md"),
+			"---\nname: no-description\n---\n\n# No Description\n",
+			"utf8",
+		);
+
+		const result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
+			"call",
+			{},
+		);
+		expect(result.details?.candidates).toEqual([]);
+		const diagnostics = result.details?.diagnostics ?? [];
+		expect(diagnostics.some(message => message.includes("no parseable frontmatter"))).toBe(true);
+		expect(diagnostics.some(message => message.includes("missing a description"))).toBe(true);
 	});
 });

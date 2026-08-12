@@ -119,6 +119,8 @@ function mergeRawSkillConfig(
 	const rawSkills = readNestedRecord(raw, "skills");
 	const enabled = readBoolean(rawSkills.enabled);
 	const enableSkillCommands = readBoolean(rawSkills.enableSkillCommands);
+	const trustProjectSkills = readBoolean(rawSkills.trustProjectSkills);
+	const trustUserSkills = readBoolean(rawSkills.trustUserSkills);
 	const enablePiUser = readBoolean(rawSkills.enablePiUser);
 	const enablePiProject = readBoolean(rawSkills.enablePiProject);
 	const enableCodexUser = readBoolean(rawSkills.enableCodexUser);
@@ -133,6 +135,8 @@ function mergeRawSkillConfig(
 		...currentSkills,
 		...(enabled !== undefined ? { enabled } : {}),
 		...(enableSkillCommands !== undefined ? { enableSkillCommands } : {}),
+		...(trustProjectSkills !== undefined ? { trustProjectSkills } : {}),
+		...(trustUserSkills !== undefined ? { trustUserSkills } : {}),
 		...(enablePiUser !== undefined ? { enablePiUser } : {}),
 		...(enablePiProject !== undefined ? { enablePiProject } : {}),
 		...(enableCodexUser !== undefined ? { enableCodexUser } : {}),

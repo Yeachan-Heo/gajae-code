@@ -4,7 +4,7 @@ Extragoal composes the existing `ultragoal` workflow with an **external final re
 
 The bundled default workflow skill set is an explicit product decision, so — like the [GJC dogfood template](./gjc-dogfood-skill-template.md) — this stays a local skill template instead of changing the default workflow surface. Extragoal is **not** a bundled workflow skill; `gjc extragoal` does not exist.
 
-The installable skill body is everything from the first frontmatter marker down; the frontmatter must be the **first line** of the installed file or the skill scan silently skips it (the scan requires a parsed `description`). Install into the user-level scan location:
+The installable skill body is everything from the first frontmatter marker down; the frontmatter must be the **first line** of the installed file or the skill scan skips it with a diagnostic (the scan requires a parsed `description`). Install into the user-level scan location:
 
 ```sh
 mkdir -p ~/.gjc/agent/skills/extragoal
@@ -13,19 +13,12 @@ sed -n '/^---$/,$p' docs/extragoal-skill-template.md > ~/.gjc/agent/skills/extra
 
 For a single project, install to `<project>/.gjc/skills/extragoal/SKILL.md` with the same extraction. Do not commit that project `.gjc` copy unless the project explicitly wants a local override.
 
-Filesystem skill discovery is off by default, so enable it once. Set `skills.enabled`, then enable **only the scan that matches where you installed** — `enablePiUser` and `enablePiProject` default to `false`, and enabling the project scan opts every future session into repo-local `.gjc/skills` discovery, so do not enable it for a user-only install:
+Filesystem skill discovery is **on by default**: no configuration is needed. Start a new session and `/skill:extragoal` should autocomplete. To disable a scope later, use the user-facing trust settings — `skills.trustUserSkills` for the user install above, `skills.trustProjectSkills` for a project install (see [docs/skills.md](./skills.md)):
 
 ```sh
-gjc config set skills.enabled true
-
-# for the user-level install (~/.gjc/agent/skills/):
-gjc config set skills.enablePiUser true
-
-# OR, for the project-level install (<project>/.gjc/skills/):
-gjc config set skills.enablePiProject true
+# only if you want to stop loading personal skills:
+gjc config set skills.trustUserSkills false
 ```
-
-Then verify in a new session: `/skill:extragoal` should autocomplete.
 
 ---
 name: extragoal

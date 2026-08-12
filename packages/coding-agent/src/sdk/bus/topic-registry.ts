@@ -1456,7 +1456,10 @@ export class TopicRegistry {
 		const attempt = (previous?.attempt ?? 0) + 1;
 		const exhausted = attempt > 8 || now - firstAttemptAt > 24 * 60 * 60 * 1000;
 		const effectiveAttempt = Math.min(attempt, 8);
-		const backoffMs = exhausted ? 1_000 : Math.min(60_000, 250 * 2 ** effectiveAttempt);
+		// Post-budget retries stay discoverable but are paced: a permanently
+		// ambiguous archive drained by a periodic sweep must not redispatch (and
+		// bump the authority epoch) every sweep tick forever.
+		const backoffMs = exhausted ? 15 * 60_000 : Math.min(60_000, 250 * 2 ** effectiveAttempt);
 		const job = {
 			sessionId,
 			topicId: record.topicId,

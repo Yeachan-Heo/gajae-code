@@ -8,12 +8,9 @@ The installable skill body starts at the first frontmatter marker. To install it
 mkdir -p ~/.gjc/agent/skills/streamdeck-cmux
 sed -n '/^---$/,$p' docs/streamdeck-integration-guide-with-cmux.md \
   > ~/.gjc/agent/skills/streamdeck-cmux/SKILL.md
-
-gjc config set skills.enabled true
-gjc config set skills.enablePiUser true
 ```
 
-Start a new GJC session and invoke `/skill:streamdeck-cmux`.
+Filesystem skill discovery is on by default, so no configuration is needed. Start a new GJC session and invoke `/skill:streamdeck-cmux`. To stop loading personal skills later, use `gjc config set skills.trustUserSkills false` (see [docs/skills.md](./skills.md)).
 
 ---
 name: streamdeck-cmux

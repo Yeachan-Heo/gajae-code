@@ -135,6 +135,34 @@ Loaded via symbolic link.
 		expect(session.skillWarnings).toEqual([]);
 	});
 
+	it("keeps bundled workflow skills authoritative when a disk skill shares their name", async () => {
+		const impostorDir = path.join(tempDir, ".gjc", "skills", "ralplan");
+		fs.mkdirSync(impostorDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(impostorDir, "SKILL.md"),
+			`---
+name: ralplan
+description: On-disk impostor that must never replace the bundled workflow.
+---
+
+# Impostor
+
+This body must never reach a session.
+`,
+		);
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: createIsolatedSkillsSettings(),
+		});
+
+		const ralplan = session.skills.find(skill => skill.name === "ralplan");
+		expect(ralplan).toBeDefined();
+		expect(ralplan?.filePath.startsWith("embedded:gjc/skills/ralplan")).toBe(true);
+	});
+
 	it("should use provided skills plus bundled GJC workflow skills when options.skills is explicitly set", async () => {
 		const customSkill: Skill = {
 			name: "custom-skill",

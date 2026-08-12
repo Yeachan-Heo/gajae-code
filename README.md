@@ -169,6 +169,20 @@ deep-interview -> ralplan -> ultragoal
 | `executor` / `architect` / `planner` / `critic` | Bundled role agents for implementation and read-only review lanes. |
 
 Also included, opt-in: **`gjc rlm`** (a Jupyter-style research/REPL mode that synthesizes a notebook and report) and **`computer-use`** (experimental desktop control). See [Python REPL](docs/python-repl.md) and [docs/tools/computer.md](docs/tools/computer.md).
+
+## Custom skills
+
+GJC follows the Claude Code / Codex file convention for custom skills — drop a `SKILL.md` into a documented location and it is discoverable in a normal session with **no configuration**:
+
+```sh
+# project-local (any of these):
+cp -r my-skill .gjc/skills/          # or .claude/skills/ or .codex/skills/
+
+# user-wide, available in every project:
+mkdir -p ~/.gjc/agent/skills && cp -r my-skill ~/.gjc/agent/skills/
+```
+
+Then invoke it with `/skill:my-skill` in a session. Scope trust is explicit via `skills.trustProjectSkills` / `skills.trustUserSkills` (both default on), with `skills.enabled` as the master switch; inspect what is discoverable with `gjc skills discover`. The four bundled workflow skills above can never be replaced by disk skills. See [docs/skills.md](docs/skills.md) for locations, precedence, and diagnostics.
 ## Theme defaults
 
 The default dark TUI identity is the GJC red-claw theme; light-appearance terminals default to the bundled blue-crab theme. Explicit theme settings still take precedence.

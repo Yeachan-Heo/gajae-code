@@ -218,9 +218,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * same way instead of terminating the daemon (#4200).
  * Generation 153 restricts Telegram forum-topic ownership, replay, routing, callbacks,
  * and lease renewal to identities with coordinator or lifecycle provenance.
- * Generation 154 updates terminal-abort notification admission and cleanup semantics.
+ * Generation 154 archives private-chat topics through deleteForumTopic, settles
+ * TOPIC_ID_INVALID as definitive, and drains durable archive retries periodically.
+ * Generation 155 updates terminal-abort notification admission and cleanup semantics.
  */
-export const DAEMON_GENERATION = 154;
+export const DAEMON_GENERATION = 155;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

@@ -139,6 +139,120 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it("retries a transient destination sharing violation and succeeds after the holder releases", async () => {
+		// Issue #4330: a concurrent holder that denies delete sharing on the
+		// destination makes the exact-replace destination open fail with
+		// STATUS_SHARING_VIOLATION before any namespace mutation. The native
+		// destination open retries a bounded number of times, so releasing the
+		// holder within the budget completes the replacement exactly once.
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged.json");
+		const destination = path.join(root, "state.json");
+		const marker = path.join(root, "holder-ready");
+		const holder = path.join(root, "holder.cjs");
+		await fs.writeFile(source, "new-state");
+		await fs.writeFile(destination, "old-state");
+		const sourceStat = await fs.stat(source, { bigint: true });
+		const destinationStat = await fs.stat(destination, { bigint: true });
+		const parent = await parentIdentity(source);
+		const sourceIdentity = {
+			...parent,
+			dev: sourceStat.dev,
+			ino: sourceStat.ino,
+			size: sourceStat.size,
+			mtimeNs: sourceStat.mtimeNs,
+			sha256: sha256("new-state"),
+		};
+		const destinationIdentity = {
+			...parent,
+			dev: destinationStat.dev,
+			ino: destinationStat.ino,
+			size: destinationStat.size,
+			mtimeNs: destinationStat.mtimeNs,
+			sha256: sha256("old-state"),
+		};
+		// `r+` opens without delete sharing (same share semantics the existing
+		// "refuses exact unlink while another writer can mutate the file" test
+		// relies on), so the parent's DELETE-requesting destination open fails
+		// with STATUS_SHARING_VIOLATION until the child closes.
+		await Bun.write(
+			holder,
+			`const fs = require("node:fs");
+const [file, ready, holdMs] = process.argv.slice(2);
+const fd = fs.openSync(file, "r+");
+fs.writeFileSync(ready, "ready");
+setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number(holdMs));\n`,
+		);
+		const child = Bun.spawn([process.execPath, holder, destination, marker, "1500"], {
+			cwd: root,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		try {
+			let ready = false;
+			for (let attempt = 0; attempt < 400 && !ready; attempt++) {
+				ready = await Bun.file(marker).exists();
+				if (!ready) await Bun.sleep(25);
+			}
+			expect(ready).toBe(true);
+
+			const result = exactReplacePath(source, destination, sourceIdentity, destinationIdentity);
+			expect(result.ok).toBe(true);
+			expect(result.windowsErrorCode).toBeUndefined();
+			expect(await fs.readFile(destination, "utf8")).toBe("new-state");
+			await expect(fs.access(source)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await child.exited;
+		}
+	});
+
+	it("exhausts the transient retry budget with a specific sharing violation instead of mutating", async () => {
+		// A holder that never releases within the bounded budget must fail with
+		// the specific pre-mutation category (not a bare io_error), preserve the
+		// underlying Windows status without leaking paths, and leave both the
+		// staged source and the destination untouched so the caller can retry.
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged.json");
+		const destination = path.join(root, "state.json");
+		await fs.writeFile(source, "new-state");
+		await fs.writeFile(destination, "old-state");
+		const sourceStat = await fs.stat(source, { bigint: true });
+		const destinationStat = await fs.stat(destination, { bigint: true });
+		const parent = await parentIdentity(source);
+		const sourceIdentity = {
+			...parent,
+			dev: sourceStat.dev,
+			ino: sourceStat.ino,
+			size: sourceStat.size,
+			mtimeNs: sourceStat.mtimeNs,
+			sha256: sha256("new-state"),
+		};
+		const destinationIdentity = {
+			...parent,
+			dev: destinationStat.dev,
+			ino: destinationStat.ino,
+			size: destinationStat.size,
+			mtimeNs: destinationStat.mtimeNs,
+			sha256: sha256("old-state"),
+		};
+		const holder = await fs.open(destination, "r+");
+		try {
+			const result = exactReplacePath(source, destination, sourceIdentity, destinationIdentity);
+			expect(result.ok).toBe(false);
+			expect(result.code).toBe("sharing_violation");
+			expect(result.windowsErrorCode).toBe("0xC0000043");
+			// Pre-mutation: no detached/retained namespace evidence, so nothing was
+			// renamed or unlinked and the caller may safely retry.
+			expect(result.detachedPath).toBeUndefined();
+			expect(result.retainedSuccessorPath).toBeUndefined();
+			expect(result.retainedPlaceholderPath).toBeUndefined();
+			expect(result.retainedUnknownPath).toBeUndefined();
+			expect(await fs.readFile(destination, "utf8")).toBe("old-state");
+			expect(await fs.readFile(source, "utf8")).toBe("new-state");
+		} finally {
+			await holder.close();
+		}
+	});
+
 	it("rejects a substituted staged source before deleting the exact destination", async () => {
 		const root = await temporaryDirectory();
 		const source = path.join(root, "staged.json");

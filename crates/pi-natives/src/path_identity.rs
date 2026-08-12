@@ -186,6 +186,11 @@ pub struct NativeExactUnlinkResult {
 	/// A retained cleanup entry whose identity could not be verified. This is
 	/// neither a stale detached object nor a publisher successor.
 	pub retained_unknown_path: Option<String>,
+	/// Hex-formatted Windows NTSTATUS of the underlying pre-mutation failure
+	/// (e.g. `0xC0000043` for `STATUS_SHARING_VIOLATION`). Path-free by design;
+	/// always absent on success, on non-Windows platforms, and after any
+	/// namespace mutation.
+	pub windows_error_code: Option<String>,
 }
 
 /// Bounded, path-free evidence for one publish operation.
@@ -347,6 +352,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
 	}
 
@@ -359,6 +365,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
 	}
 
@@ -371,6 +378,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
 	}
 
@@ -384,6 +392,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
 	}
 
@@ -401,6 +410,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
 	}
 
@@ -418,6 +428,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
+			windows_error_code: None,
 		}
 	}
 
@@ -436,6 +447,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: Some(successor_path),
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
 	}
 
@@ -466,6 +478,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
 	}
 
@@ -479,6 +492,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
+			windows_error_code: None,
 		}
 	}
 
@@ -492,6 +506,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: Some(successor_path),
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
 	}
 
@@ -505,6 +520,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
 	}
 
@@ -518,6 +534,7 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
+			windows_error_code: None,
 		}
 	}
 
@@ -530,7 +547,162 @@ impl NativeExactUnlinkResult {
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
+			windows_error_code: None,
 		}
+	}
+
+	#[allow(dead_code, reason = "used only by the Windows exact-replace retry path")]
+	/// Attach path-free Windows NTSTATUS evidence to a pre-mutation failure.
+	/// Only call sites that have not touched the namespace may use this; a
+	/// post-mutation failure already carries its detached/retained paths.
+	fn with_windows_error_code(mut self, windows_error_code: String) -> Self {
+		self.windows_error_code = Some(windows_error_code);
+		self
+	}
+}
+
+#[cfg(any(windows, test))]
+/// STATUS_SHARING_VIOLATION: a concurrent handle denies the share mode this
+/// open requested. This is the Windows transient conflict issue #4330 exists
+/// for: another holder without delete sharing makes the exact-replace
+/// destination `NtCreateFile` fail before any namespace mutation, and the
+/// failure disappears as soon as the holder releases. Every other NTSTATUS is
+/// surfaced unchanged.
+const STATUS_SHARING_VIOLATION: i32 = 0xc000_0043u32 as i32;
+
+#[cfg(any(windows, test))]
+/// True only for pre-mutation Windows failures that are transient and safe to
+/// retry at the exact-replace destination open. Sharing violations happen
+/// before anything was renamed or unlinked, so retrying cannot publish twice;
+/// permission, path, disk-full, and identity failures are never retried.
+const fn is_retryable_exact_replace_status(status: i32) -> bool {
+	status == STATUS_SHARING_VIOLATION
+}
+
+#[cfg(any(windows, test))]
+/// STATUS_INVALID_PARAMETER: the synthetic NTSTATUS used for early,
+/// pre-syscall name validation rejections in the status-returning open path
+/// (e.g. an embedded NUL or an oversized name), which never reach
+/// `NtCreateFile` and so have no real NTSTATUS to report. Distinct from
+/// `STATUS_SHARING_VIOLATION` and never retried.
+const STATUS_INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
+
+/// Bound on transient retries for the exact-replace destination open on
+/// Windows, matching the reporter's controlled 30 x 100 ms reproduction window
+/// (~1.2 s of contention) with margin. The delay keeps the retry hot loop from
+/// busy-spinning the persistence fence; the bound keeps a persistent holder
+/// from freezing a session for more than ~3 s.
+#[cfg(any(windows, test))]
+const EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT: u32 = 30;
+#[cfg(any(windows, test))]
+const EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS: u64 = 100;
+
+#[cfg(any(windows, test))]
+/// Open a Windows handle with bounded transient retry on sharing violations.
+/// `open` returns the raw NTSTATUS on failure; only
+/// [`is_retryable_exact_replace_status`] failures are retried, and only up to
+/// [`EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT`] attempts with a bounded delay
+/// between them. This is the narrow pre-mutation syscall boundary: the caller
+/// must ensure nothing has been renamed or unlinked before the open.
+fn open_with_transient_retry<T>(mut open: impl FnMut() -> Result<T, i32>) -> Result<T, i32> {
+	for attempt in 0..EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT {
+		match open() {
+			Ok(handle) => return Ok(handle),
+			Err(status)
+				if is_retryable_exact_replace_status(status)
+					&& attempt + 1 < EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT =>
+			{
+				std::thread::sleep(std::time::Duration::from_millis(
+					EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS,
+				));
+			},
+			Err(status) => return Err(status),
+		}
+	}
+	unreachable!("the retry bound guarantees at least one attempt")
+}
+
+#[cfg(any(windows, test))]
+/// Path-free, hex-formatted Windows NTSTATUS evidence for a pre-mutation
+/// failure, e.g. `0xC0000043` for STATUS_SHARING_VIOLATION.
+fn native_windows_error_code(status: i32) -> String {
+	format!("0x{status:08X}")
+}
+
+#[cfg(test)]
+mod exact_replace_windows_retry_policy_tests {
+	use super::{
+		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
+		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
+		open_with_transient_retry,
+	};
+
+	#[test]
+	fn retry_policy_accepts_only_sharing_violations() {
+		assert!(is_retryable_exact_replace_status(STATUS_SHARING_VIOLATION));
+		// Permission, path-not-found, disk-full, and identity failures are never
+		// retried: none of them is a transient holder release.
+		for status in [
+			0xc000_0022u32 as i32,
+			0xc000_0034u32 as i32,
+			0xc000_003au32 as i32,
+			0xc000_007fu32 as i32,
+			0xc000_000du32 as i32,
+		] {
+			assert!(!is_retryable_exact_replace_status(status), "0x{status:08X} must not retry");
+		}
+		assert!(!is_retryable_exact_replace_status(0));
+	}
+
+	#[test]
+	fn retry_budget_and_delay_are_bounded() {
+		assert_eq!(EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT, 30);
+		assert_eq!(EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, 100);
+	}
+
+	#[test]
+	fn windows_error_code_is_hex_and_path_free() {
+		assert_eq!(native_windows_error_code(STATUS_SHARING_VIOLATION), "0xC0000043");
+		assert_eq!(native_windows_error_code(0xc000_0022u32 as i32), "0xC0000022");
+	}
+
+	#[test]
+	fn transient_retry_succeeds_once_the_holder_releases() {
+		let mut failures = 3;
+		let attempts = std::cell::Cell::new(0);
+		let opened = open_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			if failures > 0 {
+				failures -= 1;
+				Err(STATUS_SHARING_VIOLATION)
+			} else {
+				Ok(42u8)
+			}
+		});
+		assert_eq!(opened, Ok(42u8));
+		assert_eq!(attempts.get(), 4, "3 retryable failures then success");
+	}
+
+	#[test]
+	fn transient_retry_exhausts_the_budget_and_reports_the_status() {
+		let attempts = std::cell::Cell::new(0);
+		let opened: Result<u8, i32> = open_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			Err(STATUS_SHARING_VIOLATION)
+		});
+		assert_eq!(opened, Err(STATUS_SHARING_VIOLATION));
+		assert_eq!(attempts.get(), EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT);
+	}
+
+	#[test]
+	fn non_retryable_failures_return_without_retrying() {
+		let attempts = std::cell::Cell::new(0);
+		let opened: Result<u8, i32> = open_with_transient_retry(|| {
+			attempts.set(attempts.get() + 1);
+			Err(0xc000_0022u32 as i32)
+		});
+		assert_eq!(opened, Err(0xc000_0022u32 as i32));
+		assert_eq!(attempts.get(), 1, "non-sharing failures are never retried");
 	}
 }
 
@@ -5344,9 +5516,12 @@ mod platform {
 	};
 
 	use super::{
+		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, sha256,
+		NativeOwnerOnlySecurityResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
+		is_retryable_exact_replace_status, native_windows_error_code, open_with_transient_retry,
+		sha256,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -5355,6 +5530,39 @@ mod platform {
 	unsafe extern "system" {
 		fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
 		fn GetProcAddress(module: *mut c_void, procedure_name: *const u8) -> *mut c_void;
+	}
+
+	// Test-only fault injection for the exact-replace destination open retry:
+	// the next N destination opens report a synthetic STATUS_SHARING_VIOLATION
+	// before the real NtCreateFile runs, letting Windows tests exercise the
+	// bounded retry loop without racing a real concurrent holder. Mirrors the
+	// rename_exchange injection in the unix platform module.
+	#[cfg(test)]
+	thread_local! {
+		static EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT: std::cell::Cell<u32> =
+			const { std::cell::Cell::new(0) };
+	}
+
+	#[cfg(test)]
+	pub(super) fn inject_exact_replace_destination_open_sharing_violations(count: u32) {
+		EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT.with(|target| target.set(count));
+	}
+
+	#[cfg(test)]
+	fn take_injected_exact_replace_destination_open_sharing_violation() -> bool {
+		EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT.with(|target| {
+			let current = target.get();
+			if current == 0 {
+				return false;
+			}
+			target.set(current - 1);
+			true
+		})
+	}
+
+	#[cfg(not(test))]
+	const fn take_injected_exact_replace_destination_open_sharing_violation() -> bool {
+		false
 	}
 
 	const SECURITY_OWNER_DACL: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
@@ -5665,12 +5873,30 @@ mod platform {
 		directory: bool,
 		share_access: u32,
 	) -> Result<HANDLE, &'static str> {
+		open_relative_with_share_status(parent, name, desired_access, directory, share_access)
+			.map_err(ntstatus_code)
+	}
+
+	/// Status-returning variant of [`open_relative_with_share`] used by the
+	/// exact-replace destination open so the raw NTSTATUS survives for
+	/// transient-sharing-violation classification and path-free diagnostics.
+	fn open_relative_with_share_status(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+		desired_access: u32,
+		directory: bool,
+		share_access: u32,
+	) -> Result<HANDLE, i32> {
 		let mut name: Vec<u16> = name.encode_wide().collect();
 		if name.is_empty()
 			|| name.iter().any(|unit| *unit == 0)
 			|| name.len() > (u16::MAX as usize / 2)
 		{
-			return Err("io_error");
+			// This never reaches NtCreateFile, so there is no real NTSTATUS to report;
+			// STATUS_INVALID_PARAMETER is the synthetic status for this rejection, and
+			// [`ntstatus_code`] maps it back to "io_error" for callers of the
+			// string-returning wrapper.
+			return Err(STATUS_INVALID_PARAMETER);
 		}
 		let mut object_name = UnicodeString {
 			length:         (name.len() * size_of::<u16>()) as u16,
@@ -5712,7 +5938,7 @@ mod platform {
 			)
 		};
 		if create_status < 0 {
-			return Err(ntstatus_code(create_status));
+			return Err(create_status);
 		}
 		Ok(handle)
 	}
@@ -6113,16 +6339,39 @@ mod platform {
 			return NativeExactUnlinkResult::failure("io_error");
 		};
 		// The destination is opened relative to the source's retained no-follow parent;
-		// no destination pathname is reopened after this point.
-		let destination_handle = match open_relative_with_share(
-			parent_handle,
-			destination_name,
-			FILE_READ_ATTRIBUTES | 0x0001_0000 | FILE_WRITE_ATTRIBUTES | FILE_READ_DATA,
-			false,
-			FILE_SHARE_READ | FILE_SHARE_DELETE,
-		) {
+		// no destination pathname is reopened after this point. This open is the only
+		// pre-mutation syscall that can transiently fail with STATUS_SHARING_VIOLATION
+		// (a concurrent holder denying delete sharing, issue #4330): it happens before
+		// any rename or unlink, so the bounded retry below can never publish twice. The
+		// same open in a later phase would be post-mutation evidence and is
+		// deliberately NOT retried — a failure there is surfaced with its retained
+		// paths instead.
+		let destination_handle = match open_with_transient_retry(|| {
+			if take_injected_exact_replace_destination_open_sharing_violation() {
+				return Err(STATUS_SHARING_VIOLATION);
+			}
+			open_relative_with_share_status(
+				parent_handle,
+				destination_name,
+				FILE_READ_ATTRIBUTES | 0x0001_0000 | FILE_WRITE_ATTRIBUTES | FILE_READ_DATA,
+				false,
+				FILE_SHARE_READ | FILE_SHARE_DELETE,
+			)
+		}) {
 			Ok(handle) => handle,
-			Err(code) => return NativeExactUnlinkResult::failure(code),
+			Err(status) => {
+				return NativeExactUnlinkResult::failure(
+					if is_retryable_exact_replace_status(status) {
+						// Retry budget exhausted: the holder never released. Surface the
+						// specific category instead of a bare io_error so the session crash
+						// log and operator diagnostics can identify a sharing conflict.
+						"sharing_violation"
+					} else {
+						ntstatus_code(status)
+					},
+				)
+				.with_windows_error_code(native_windows_error_code(status));
+			},
 		};
 		let destination = HeldExact { target: destination_handle, ancestors: Vec::new() };
 
@@ -6334,6 +6583,7 @@ mod platform {
 					retained_successor_path: None,
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
+					windows_error_code: None,
 				};
 			},
 		};
@@ -6429,6 +6679,7 @@ mod platform {
 					retained_successor_path: None,
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
+					windows_error_code: None,
 				};
 			},
 		};
@@ -7698,6 +7949,7 @@ mod platform {
 							retained_successor_path: None,
 							retained_placeholder_path: None,
 							retained_unknown_path: None,
+							windows_error_code: None,
 						};
 					},
 				}
@@ -7711,6 +7963,7 @@ mod platform {
 					retained_successor_path: None,
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
+					windows_error_code: None,
 				};
 			},
 		};

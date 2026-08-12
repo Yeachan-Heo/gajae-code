@@ -4,9 +4,11 @@ import { getProjectDir } from "@gajae-code/utils";
 import { skillCapability } from "../capability/skill";
 import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
+import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
 import type { SkillPromptDetails } from "../session/messages";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 import type { LoadedSubskillActivation } from "./gjc-plugins";
 import { buildSubskillInjection } from "./gjc-plugins/injection";
@@ -109,6 +111,15 @@ export interface LoadSkillsOptions extends SkillsSettings {
 }
 
 /**
+ * Skill providers loaded into sessions. Only native `.gjc` skills are live
+ * filesystem skills; Claude/Codex convention skills are explicit import
+ * sources into `.gjc` (see skill-management.ts) and are never loaded directly.
+ */
+const LOADABLE_SKILL_PROVIDERS = new Set(["native"]);
+
+const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
+
+/**
  * Load skills from all configured locations.
  * Returns skills and any validation warnings.
  */
@@ -116,8 +127,6 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	const {
 		cwd = getProjectDir(),
 		enabled = true,
-		enablePiUser = true,
-		enablePiProject = true,
 		customDirectories = [],
 		ignoredSkills = [],
 		includeSkills = [],
@@ -129,17 +138,24 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		return { skills: [], warnings: [] };
 	}
 
-	// GJC only accepts native `.gjc` skills. Other providers may still exist for
-	// their own capabilities, but their skill surfaces are intentionally ignored.
+	const projectTrusted = resolveSkillScopeTrust(options, "project");
+	const userTrusted = resolveSkillScopeTrust(options, "user");
+
+	// Skill scope trust decides which canonical locations are loaded: project
+	// scope covers `.gjc/skills` (walk-up), user scope covers `~/.gjc/agent/skills`
+	// and the legacy user roots. Claude/Codex convention skills are import
+	// sources into `.gjc`, never loaded directly.
 	function isSourceEnabled(source: SourceMeta): boolean {
 		const { provider, level } = source;
-		if (provider !== "native") return false;
-		if (level === "user") return enablePiUser;
-		if (level === "project") return enablePiProject;
+		if (!LOADABLE_SKILL_PROVIDERS.has(provider)) return false;
+		if (level === "user") return userTrusted;
+		if (level === "project") return projectTrusted;
 		return false;
 	}
 
-	// Use capability API to load all skills
+	// Use capability API to load all skills. `all` (rather than `items`) keeps
+	// shadowed duplicates so this function can apply the documented precedence
+	// itself: project scope beats user scope.
 	const result = await loadCapability<CapabilitySkill>(skillCapability.id, { cwd, disabledExtensions });
 
 	const skillMap = new Map<string, Skill>();
@@ -161,14 +177,23 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	const disabledSkillNames = new Set(
 		(disabledExtensions ?? []).filter(id => id.startsWith("skill:")).map(id => id.slice(6)),
 	);
-	// Filter skills by source and patterns first
-	const filteredSkills = result.items.filter(capSkill => {
-		if (disabledSkillNames.has(capSkill.name)) return false;
-		if (!isSourceEnabled(capSkill._source)) return false;
-		if (matchesIgnorePatterns(capSkill.name)) return false;
-		if (!matchesIncludePatterns(capSkill.name)) return false;
-		return true;
-	});
+
+	// Apply scope trust and policy filters, then order candidates by documented
+	// precedence. `all` is already in native provider order with project dirs
+	// before user dirs; a stable sort by level lifts every project item above
+	// every user item, giving: project `.gjc/skills` > user roots.
+	const filteredSkills = result.all
+		.filter(capSkill => {
+			if (!isSourceEnabled(capSkill._source)) return false;
+			if (disabledSkillNames.has(capSkill.name)) return false;
+			if (matchesIgnorePatterns(capSkill.name)) return false;
+			if (!matchesIncludePatterns(capSkill.name)) return false;
+			return true;
+		})
+		.sort((a, b) => {
+			const levelOrder = { project: 0, user: 1 } as const;
+			return levelOrder[a.level] - levelOrder[b.level];
+		});
 
 	// Batch resolve all real paths in parallel
 	const realPaths = await Promise.all(
@@ -189,6 +214,17 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		// Skip silently if we've already loaded this exact file (via symlink)
 		if (realPathSet.has(resolvedPath)) {
 			continue;
+		}
+
+		// A project-controlled copy of a bundled workflow skill name is a potential
+		// workflow-routing hijack: warn, and let the session merge keep the bundled
+		// definition authoritative (sdk/session.ts). User-scope copies are not
+		// warned about: installed defaults legitimately mirror bundled skills.
+		if (capSkill.level === "project" && BUILT_IN_SKILL_NAMES.has(capSkill.name)) {
+			collisionWarnings.push({
+				skillPath: capSkill.path,
+				message: `name collision: "${capSkill.name}" is a bundled GJC workflow skill; the bundled definition takes precedence in sessions and this project copy is never used`,
+			});
 		}
 
 		const existing = skillMap.get(capSkill.name);

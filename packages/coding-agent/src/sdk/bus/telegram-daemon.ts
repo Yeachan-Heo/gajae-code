@@ -342,6 +342,7 @@ const MODEL_CHOICE_TTL_MS = 10 * 60 * 1_000;
 const BTW_PENDING_TTL_MS = 300_000;
 const PICKER_CALLBACK_PREFIX = "p:";
 const ADOPTION_INTENT_SWEEP_INTERVAL_MS = 60_000;
+const ARCHIVE_RETRY_SWEEP_INTERVAL_MS = 15_000;
 const BTW_MAX_PENDING = 256;
 
 /** How long a compensation fence retries a failed topic-registry persist before giving up (40 × 250ms ≈ 10s). */
@@ -506,7 +507,10 @@ function topicArchiveSettled(response: unknown): boolean {
 	if (result.ok === true && result.result === true) return true;
 	if (result.ok !== false || result.error_code !== 400 || typeof result.description !== "string") return false;
 	const description = result.description.trim();
-	return /^(?:Bad Request: )?(?:TOPIC_NOT_FOUND|THREAD_NOT_FOUND|topic (?:already|is already) closed|message thread (?:not found|is not modified))$/i.test(
+	// TOPIC_ID_INVALID is Telegram's definitive answer for a topic that was
+	// already deleted (observed from editForumTopic/deleteForumTopic against a
+	// user-deleted private-chat topic); retrying it can never succeed.
+	return /^(?:Bad Request: )?(?:TOPIC_NOT_FOUND|THREAD_NOT_FOUND|TOPIC_ID_INVALID|topic (?:already|is already) closed|message thread (?:not found|is not modified))$/i.test(
 		description,
 	);
 }
@@ -4320,6 +4324,10 @@ export class TelegramNotificationDaemon {
 	#adoptionIntentTtlMs: number;
 	/** Periodic sweep handle for expired adoption intents. */
 	#adoptionSweepTimer: NodeJS.Timeout | undefined;
+	/** Periodic drain for durable archive retries whose backoff has elapsed. */
+	#archiveRetryTimer: NodeJS.Timeout | undefined;
+	/** Serializes archive retry sweeps so a slow Telegram call cannot stack sweeps. */
+	#archiveRetrySweepInFlight = false;
 	/** In-flight submissions close the pre-sidecar race across picker and direct-path entry points. */
 	readonly #adoptionStartingTopics = new Set<number>();
 
@@ -4971,6 +4979,13 @@ export class TelegramNotificationDaemon {
 			remove: async (attachment: SessionAttachment, reason: "removed" | "replaced" | "replaced_same_generation") =>
 				await this.#onSessionRemoved(attachment, reason),
 			ownsLogicalSession: (sessionId: string) => this.#logicalSessionOwners.has(sessionId),
+		};
+	}
+
+	/** @internal Test-only access to the durable archive retry drain. */
+	archiveReconciliationHarnessForTest() {
+		return {
+			reconcilePendingTopicDeletes: () => this.reconcilePendingTopicDeletes(),
 		};
 	}
 	#attachmentIsCurrent(session: AttachmentSession): boolean {
@@ -7947,10 +7962,19 @@ export class TelegramNotificationDaemon {
 				)
 			)
 				return "pre_dispatch_cancelled";
-			const res = (await this.botApi.call("closeForumTopic", {
-				chat_id: this.opts.chatId,
-				message_thread_id: Number(record.topicId),
-			})) as { ok?: boolean };
+			// closeForumTopic is supergroup-forum-only; Telegram rejects it for a
+			// private Threaded Mode chat with `400 the chat is not a supergroup
+			// forum`, so a private-chat archive would retry forever and the stale
+			// thread would stay visible. deleteForumTopic is the only archive
+			// operation Telegram offers for private-chat topics; scope stays safe
+			// because only orphaned daemon-created topics reach this dispatch.
+			const res = (await this.botApi.call(
+				(await this.pairedChatIsPrivate()) ? "deleteForumTopic" : "closeForumTopic",
+				{
+					chat_id: this.opts.chatId,
+					message_thread_id: Number(record.topicId),
+				},
+			)) as { ok?: boolean };
 			if (!topicArchiveSettled(res)) {
 				this.topics.scheduleArchiveRetry(sessionId, this.runtime.now(), "archive result was not definitive");
 				await this.persistTopics();
@@ -8301,6 +8325,41 @@ export class TelegramNotificationDaemon {
 		if (this.#adoptionSweepTimer !== undefined) {
 			(this.opts.clearIntervalImpl ?? clearInterval)(this.#adoptionSweepTimer);
 			this.#adoptionSweepTimer = undefined;
+		}
+	}
+
+	/** Retry crash-interrupted or ambiguous topic archives only when the durable backoff permits it. */
+	private async reconcilePendingTopicDeletes(): Promise<void> {
+		for (const sessionId of this.topics.archivePendingSessionIds(this.runtime.now()))
+			await this.archiveTopic(sessionId);
+	}
+
+	private startArchiveRetryTimer(): void {
+		const setIntervalImpl = this.opts.setIntervalImpl ?? setInterval;
+		this.#archiveRetryTimer = setIntervalImpl(() => {
+			if (this.#archiveRetrySweepInFlight) return;
+			this.#archiveRetrySweepInFlight = true;
+			// Route the sweep through effect admission: shutdown closes admission
+			// before the final registry persist, and an in-flight sweep is joined
+			// by effects.join() so it cannot race ownership release.
+			void this.effects
+				.admit(() => this.reconcilePendingTopicDeletes())
+				.catch(error => {
+					if ((error as Error)?.name === "AbortError") return;
+					logger.warn(
+						`notifications: archive retry sweep failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+					);
+				})
+				.finally(() => {
+					this.#archiveRetrySweepInFlight = false;
+				});
+		}, ARCHIVE_RETRY_SWEEP_INTERVAL_MS);
+	}
+
+	private stopArchiveRetryTimer(): void {
+		if (this.#archiveRetryTimer !== undefined) {
+			(this.opts.clearIntervalImpl ?? clearInterval)(this.#archiveRetryTimer);
+			this.#archiveRetryTimer = undefined;
 		}
 	}
 
@@ -12264,6 +12323,7 @@ export class TelegramNotificationDaemon {
 			if (!this.validationMode()) {
 				await this.loadAdoptionIntents();
 				this.startAdoptionSweepTimer();
+				this.startArchiveRetryTimer();
 			}
 			if (!this.validationMode()) {
 				await this.loadSeenUpdateIds();
@@ -12356,6 +12416,7 @@ export class TelegramNotificationDaemon {
 				this.stopFlushTimer();
 				this.stopTypingTimer();
 				this.stopAdoptionSweepTimer();
+				this.stopArchiveRetryTimer();
 				let persisted = false;
 				const sessionEffectsQuiesced = await this.effects.join(BTW_SHUTDOWN_JOIN_MS);
 				let completed = false;

@@ -2,7 +2,7 @@
 
 Issue #93 requested a gaebal-gajae/operator dogfood skill. The live issue has no comment approving a fifth bundled default workflow skill, so this stays a local template instead of changing the default workflow surface. Operators can copy it into a user or project override when they want GJC-first session guidance.
 
-The installable skill body is everything from the first frontmatter marker down; the frontmatter must be the **first line** of the installed file or the skill scan silently skips it (the scan requires a parsed `description`). Install into the user-level scan location (`~/.gjc/agent/skills/`, not `~/.gjc/skills/`):
+The installable skill body is everything from the first frontmatter marker down; the frontmatter must be the **first line** of the installed file or the skill scan skips it with a diagnostic (the scan requires a parsed `description`). Install into the user-level scan location (`~/.gjc/agent/skills/`, not `~/.gjc/skills/`):
 
 ```sh
 mkdir -p ~/.gjc/agent/skills/gjc-dogfood
@@ -11,19 +11,7 @@ sed -n '/^---$/,$p' docs/gjc-dogfood-skill-template.md > ~/.gjc/agent/skills/gjc
 
 For a single project, install to `<project>/.gjc/skills/gjc-dogfood/SKILL.md` with the same extraction. Do not commit that project `.gjc` copy unless the project explicitly wants a local override.
 
-Filesystem skill discovery is off by default, so enable it once. Set `skills.enabled`, then enable **only the scan that matches where you installed** — `enablePiUser` and `enablePiProject` default to `false` in `DEFAULT_SKILL_DISCOVERY_SETTINGS`, and enabling the project scan opts every future session into repo-local `.gjc/skills` discovery, so do not enable it for a user-only install:
-
-```sh
-gjc config set skills.enabled true
-
-# for the user-level install (~/.gjc/agent/skills/):
-gjc config set skills.enablePiUser true
-
-# OR, for the project-level install (<project>/.gjc/skills/):
-gjc config set skills.enablePiProject true
-```
-
-Then verify in a new session: `/skill:gjc-dogfood` should autocomplete.
+Filesystem skill discovery is **on by default**: no configuration is needed. Start a new session and `/skill:gjc-dogfood` should autocomplete. To disable a scope later, use the user-facing trust settings — `skills.trustUserSkills` for the user install above, `skills.trustProjectSkills` for a project install (see [docs/skills.md](./skills.md)):
 
 ---
 name: gjc-dogfood

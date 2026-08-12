@@ -1048,10 +1048,11 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
 
 function withEmbeddedDefaultGjcSkills(skills: Skill[]): Skill[] {
 	const byName = new Map(skills.map(skill => [skill.name, skill]));
+	// The four public GJC workflow skills are a product invariant: even if a
+	// caller-supplied or filesystem skill shares a name, the bundled definition
+	// wins so workflow routing can never be silently hijacked.
 	for (const defaultSkill of getEmbeddedDefaultGjcSkills()) {
-		if (!byName.has(defaultSkill.name)) {
-			byName.set(defaultSkill.name, defaultSkill);
-		}
+		byName.set(defaultSkill.name, defaultSkill);
 	}
 	return [...byName.values()];
 }
@@ -1687,8 +1688,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillWarnings = skillsResult.warnings;
 		} else {
 			// GJC's four public workflow skills are bundled into the binary so the
-			// default workflow surface survives accidental .gjc deletion. Arbitrary
-			// filesystem skill discovery remains gated by skills.enabled above.
+			// default workflow surface survives accidental .gjc deletion. Filesystem
+			// skill discovery is enabled by default (`skills.enabled`), so this
+			// branch only runs when the user explicitly disabled it.
 			skills = getEmbeddedDefaultGjcSkills();
 			skillWarnings = [];
 		}

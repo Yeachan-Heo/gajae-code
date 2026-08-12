@@ -28,6 +28,8 @@ let nowForTests: (() => number) | undefined;
 let beforeExpiredDeleteForTests: (() => void) | undefined;
 let beforeMalformedDeleteForTests: (() => void) | undefined;
 let onCacheOpenForTests: (() => void) | undefined;
+let simulateCacheOperationErrorForTests: (() => Error | undefined) | undefined;
+let beforeCorruptRetireForTests: (() => void) | undefined;
 
 /**
  * Claude Mythos accepts tools but rejects forced tool use (Anthropic 400:
@@ -81,12 +83,16 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 	beforeExpiredDelete?: () => void;
 	beforeMalformedDelete?: () => void;
 	onCacheOpen?: () => void;
+	simulateOperationError?: () => Error | undefined;
+	beforeCorruptRetire?: () => void;
 }): void {
 	cachePathOverride = options?.path;
 	nowForTests = options?.now;
 	beforeExpiredDeleteForTests = options?.beforeExpiredDelete;
 	beforeMalformedDeleteForTests = options?.beforeMalformedDelete;
 	onCacheOpenForTests = options?.onCacheOpen;
+	simulateCacheOperationErrorForTests = options?.simulateOperationError;
+	beforeCorruptRetireForTests = options?.beforeCorruptRetire;
 	clearToolChoiceIncapabilityRegistryForTests();
 }
 
@@ -370,8 +376,14 @@ function persistToolChoiceCapability(
 function withCapabilityCache<T>(operation: (database: Database) => T): T | undefined {
 	if (process.env.NODE_ENV === "test" && cachePathOverride === undefined) return;
 	const cachePath = cachePathOverride ?? getToolChoiceCapabilityCachePath();
+	let openedFileSize: number | undefined;
 	try {
 		fs.mkdirSync(path.dirname(cachePath), { recursive: true, mode: 0o700 });
+		try {
+			openedFileSize = fs.statSync(cachePath).size;
+		} catch {
+			// File does not exist yet (first run); nothing to identity-check on retirement.
+		}
 		const database = openCapabilityCache(cachePath);
 		try {
 			try {
@@ -379,6 +391,8 @@ function withCapabilityCache<T>(operation: (database: Database) => T): T | undef
 			} catch {
 				// Cache access remains fail-open on filesystems without POSIX modes.
 			}
+			const simulatedError = simulateCacheOperationErrorForTests?.();
+			if (simulatedError) throw simulatedError;
 			return operation(database);
 		} finally {
 			database.close();
@@ -388,7 +402,10 @@ function withCapabilityCache<T>(operation: (database: Database) => T): T | undef
 			cachePath: path.basename(cachePath),
 			error: error instanceof Error ? error.message : String(error),
 		});
-		if (isCorruptCapabilityCacheError(error)) retireCorruptCapabilityCache(cachePath);
+		if (isCorruptCapabilityCacheError(error)) {
+			beforeCorruptRetireForTests?.();
+			retireCorruptCapabilityCache(cachePath, openedFileSize);
+		}
 	}
 }
 
@@ -453,13 +470,24 @@ function isCorruptCapabilityCacheError(error: unknown): boolean {
 	if (error instanceof CapabilityCacheCorruptionError) return true;
 	if (!error || typeof error !== "object") return false;
 	const code = (error as { code?: unknown }).code;
-	return code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB" || code === "SQLITE_ERROR";
+	return code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB";
 }
 
-function retireCorruptCapabilityCache(cachePath: string): void {
+/**
+ * Removes a confirmed-corrupt cache file and its WAL/SHM siblings. The file
+ * size captured before the corrupt open (`openedFileSize`) is checked before
+ * unlinking so a concurrently recreated valid replacement database with a
+ * different file size is never deleted.
+ */
+function retireCorruptCapabilityCache(cachePath: string, openedFileSize?: number): void {
 	for (const suffix of ["", "-wal", "-shm"]) {
+		const target = `${cachePath}${suffix}`;
 		try {
-			fs.rmSync(`${cachePath}${suffix}`, { force: true });
+			if (openedFileSize !== undefined && suffix === "") {
+				const stat = fs.statSync(target);
+				if (stat.size !== openedFileSize) continue;
+			}
+			fs.rmSync(target, { force: true });
 		} catch {
 			// A best-effort cache reset must never break provider fallback behavior.
 		}

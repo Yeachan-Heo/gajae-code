@@ -1,19 +1,23 @@
 /**
- * Handles `gjc skills` for inspecting bundled workflow skill definitions.
+ * Handles `gjc skills` for inspecting bundled workflow skills and
+ * filesystem-discovered custom skills.
  */
+import { Settings } from "../config/settings";
 import {
 	DEFAULT_GJC_DEFINITION_NAMES,
 	type EmbeddedDefaultGjcSkill,
 	getEmbeddedDefaultGjcSkills,
 } from "../defaults/gjc-defaults";
+import { discoverRuntimeSkills, type RuntimeSkillDiscoveryCandidate } from "../extensibility/runtime-skill-discovery";
 
-export type SkillsAction = "list" | "read";
+export type SkillsAction = "list" | "read" | "discover";
 
 export interface SkillsCommandArgs {
 	action: SkillsAction;
 	name?: string;
 	flags?: {
 		json?: boolean;
+		source?: "all" | "project" | "user";
 	};
 }
 
@@ -45,6 +49,11 @@ function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+function formatCandidate(candidate: RuntimeSkillDiscoveryCandidate): string {
+	const useWhen = candidate.useWhen && candidate.useWhen.length > 0 ? ` [when: ${candidate.useWhen.join(", ")}]` : "";
+	return `${candidate.name}\t${candidate.source}\t${candidate.description}\t${candidate.path}${useWhen}`;
+}
+
 export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 	if (cmd.action === "list") {
 		const skills = listEmbeddedSkills();
@@ -54,6 +63,33 @@ export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 		}
 		for (const skill of skills) {
 			process.stdout.write(`${skill.name}\t${skill.description}\t${skill.path}\n`);
+		}
+		return;
+	}
+
+	if (cmd.action === "discover") {
+		const source = cmd.flags?.source ?? "all";
+		const settings = await Settings.loadForScope({ cwd: process.cwd() });
+		const result = await discoverRuntimeSkills({
+			cwd: process.cwd(),
+			source,
+			policy: {
+				...settings.getGroup("skills"),
+				disabledExtensions: settings.get("disabledExtensions"),
+			},
+		});
+		if (cmd.flags?.json) {
+			writeJson({ candidates: result.candidates, diagnostics: result.diagnostics.messages });
+			return;
+		}
+		for (const candidate of result.candidates) {
+			process.stdout.write(`${formatCandidate(candidate)}\n`);
+		}
+		if (result.diagnostics.messages.length > 0) {
+			process.stdout.write("\nDiagnostics:\n");
+			for (const message of result.diagnostics.messages) {
+				process.stdout.write(`- ${message}\n`);
+			}
 		}
 		return;
 	}

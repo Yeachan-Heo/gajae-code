@@ -2603,7 +2603,7 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean",
-					"default": false
+					"default": true
 				},
 				"enableSkillCommands": {
 					"type": "boolean",
@@ -2621,13 +2621,19 @@
 					"type": "boolean",
 					"default": false
 				},
-				"enablePiUser": {
+				"trustProjectSkills": {
 					"type": "boolean",
-					"default": false
+					"description": "Load skills from project .gjc/skills, .claude/skills, and .codex/skills. Set to false to ignore project-controlled skills while keeping user skills."
+				},
+				"trustUserSkills": {
+					"type": "boolean",
+					"description": "Load skills from ~/.gjc/agent/skills (and legacy ~/.gjc/skills / <config>/skills). Set to false to ignore user-installed skills while keeping project skills."
+				},
+				"enablePiUser": {
+					"type": "boolean"
 				},
 				"enablePiProject": {
-					"type": "boolean",
-					"default": false
+					"type": "boolean"
 				},
 				"customDirectories": {
 					"type": "array",

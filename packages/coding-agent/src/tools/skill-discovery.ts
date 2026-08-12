@@ -1,7 +1,11 @@
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { discoverRuntimeSkills, type RuntimeSkillDiscoveryCandidate } from "../extensibility/runtime-skill-discovery";
+import {
+	describeDisabledSkillScopes,
+	discoverRuntimeSkills,
+	type RuntimeSkillDiscoveryCandidate,
+} from "../extensibility/runtime-skill-discovery";
 import skillDiscoveryDescription from "../prompts/tools/skill-discovery.md" with { type: "text" };
 import type { ToolSession } from ".";
 
@@ -23,11 +27,18 @@ export interface SkillDiscoveryToolDetails {
 	count: number;
 	/**
 	 * Present only when zero candidates were returned AND discovery config gates
-	 * (`skills.enabled` / `skills.enablePiProject` / `skills.enablePiUser`)
+	 * (`skills.enabled` / `skills.trustProjectSkills` / `skills.trustUserSkills`)
 	 * prevented some or all of the requested scope from being searched. Without
 	 * this, a disabled config is indistinguishable from "no skills exist".
 	 */
 	notice?: string;
+	/**
+	 * Human-readable diagnostics for skills that were scanned but not
+	 * advertised (protected-name collisions with bundled workflow skills,
+	 * include/ignore/disable policy filters, invalid frontmatter, shadowing,
+	 * scan failures). Bounded; empty when nothing was filtered.
+	 */
+	diagnostics?: string[];
 }
 
 export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema, SkillDiscoveryToolDetails> {
@@ -65,16 +76,20 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 	): Promise<AgentToolResult<SkillDiscoveryToolDetails>> {
 		return untilAborted(signal, async () => {
 			const source = input.source ?? "all";
-			const candidates = await discoverRuntimeSkills({
+			const result = await discoverRuntimeSkills({
 				cwd: this.#session.cwd,
 				query: input.query,
 				source,
 				limit: input.limit,
 				policy: this.#getRuntimeSkillPolicy(),
 			});
-			const details: SkillDiscoveryToolDetails = { candidates, count: candidates.length };
-			if (candidates.length === 0) {
-				const notice = this.#disabledPolicyNotice(source);
+			const details: SkillDiscoveryToolDetails = {
+				candidates: result.candidates,
+				count: result.candidates.length,
+			};
+			if (result.diagnostics.messages.length > 0) details.diagnostics = result.diagnostics.messages;
+			if (result.candidates.length === 0) {
+				const notice = describeDisabledSkillScopes(source, this.#getRuntimeSkillPolicy());
 				if (notice) details.notice = notice;
 			}
 			return {
@@ -82,28 +97,5 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 				details,
 			};
 		});
-	}
-
-	/**
-	 * Explain an empty result that is caused by disabled discovery config rather
-	 * than by an actually empty skill catalog.
-	 */
-	#disabledPolicyNotice(source: "all" | "project" | "user"): string | undefined {
-		const policy = this.#getRuntimeSkillPolicy();
-		if (policy.enabled !== true) {
-			return "Runtime skill discovery is disabled: `skills.enabled` is false, so no skill directories were searched. Enable it with `gjc config set skills.enabled true` (project and user scopes additionally require `skills.enablePiProject` / `skills.enablePiUser`).";
-		}
-		const skipped: string[] = [];
-		const commands: string[] = [];
-		if ((source === "all" || source === "project") && policy.enablePiProject !== true) {
-			skipped.push("project (`skills.enablePiProject` is false)");
-			commands.push("`gjc config set skills.enablePiProject true`");
-		}
-		if ((source === "all" || source === "user") && policy.enablePiUser !== true) {
-			skipped.push("user (`skills.enablePiUser` is false)");
-			commands.push("`gjc config set skills.enablePiUser true`");
-		}
-		if (skipped.length === 0) return undefined;
-		return `Skill discovery skipped disabled scope(s): ${skipped.join(", ")}. Enable them with ${commands.join(" and ")}.`;
 	}
 }

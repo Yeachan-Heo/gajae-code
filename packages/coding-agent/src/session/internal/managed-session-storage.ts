@@ -75,6 +75,9 @@ export class ManagedReplaceError extends Error {
 	readonly retainedSuccessorPath: string | undefined;
 	readonly retainedPlaceholderPath: string | undefined;
 	readonly retainedUnknownPath: string | undefined;
+	/** Path-free Windows NTSTATUS of the underlying pre-mutation failure, when
+	 * the native layer preserved one (e.g. `0xC0000043` for a sharing violation). */
+	readonly windowsErrorCode: string | undefined;
 	readonly replacementCause: unknown;
 
 	constructor(result: NativeExactUnlinkResult, cleanupReceiptPath: string, replacementCause?: unknown) {
@@ -87,6 +90,7 @@ export class ManagedReplaceError extends Error {
 		this.retainedSuccessorPath = result.retainedSuccessorPath;
 		this.retainedPlaceholderPath = result.retainedPlaceholderPath;
 		this.retainedUnknownPath = result.retainedUnknownPath;
+		this.windowsErrorCode = result.windowsErrorCode;
 		this.replacementCause = replacementCause;
 	}
 }
@@ -2850,6 +2854,15 @@ function replaceManagedFileGeneratedSync(
 				identity: publishedReceiptIdentity,
 				predecessor: expectedDestination,
 			};
+			// Transient Windows sharing violations (a concurrent holder denying delete
+			// sharing on the destination, issue #4330) are retried at the narrow
+			// pre-mutation syscall boundary inside the native `exactReplacePath`: the
+			// destination open is retried a bounded number of times while nothing has
+			// been renamed or unlinked, and only `sharing_violation`/`io_error` with no
+			// detached/retained paths can ever reach this throw from that open. This
+			// TypeScript layer deliberately never retries: once `exactReplacePath`
+			// returns, any failure that carries a detached/retained path is
+			// post-mutation evidence and must surface unchanged for receipt recovery.
 			const replaced = nativeSessionStorage().exactReplacePath(
 				staging,
 				destination,
