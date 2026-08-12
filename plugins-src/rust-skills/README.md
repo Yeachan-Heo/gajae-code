@@ -23,3 +23,7 @@ gjc plugin uninstall rust-skills
 ## Attribution
 
 Corpus vendored from [leonardomso/rust-skills](https://github.com/leonardomso/rust-skills) v1.5.1 (MIT). Packaging and the two GJC rule files are by Gajae Code. See `skills/rust-skills/LICENSE`.
+
+## Provenance
+
+Corpus vendored from [leonardomso/rust-skills](https://github.com/leonardomso/rust-skills) v1.5.1 (MIT) via the tracking fork [jason931225/rust-skills](https://github.com/jason931225/rust-skills), pinned at `fd2a861ab0406a4ac536a55274d14ea6fd1ca9c9`. See `PROVENANCE.json` for the mechanical refresh procedure.

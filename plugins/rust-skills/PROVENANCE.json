@@ -1,0 +1,9 @@
+{
+  "corpus": "skills/rust-skills",
+  "upstream": "https://github.com/leonardomso/rust-skills",
+  "fork": "https://github.com/jason931225/rust-skills",
+  "commit": "fd2a861ab0406a4ac536a55274d14ea6fd1ca9c9",
+  "version": "1.5.1",
+  "license": "MIT",
+  "refresh": "shallow-clone the fork at the new tip, re-copy SKILL.md + rules/ + LICENSE + README.md into skills/rust-skills, bump commit and version here, then run bun scripts/generate-gjc-plugins.ts"
+}
