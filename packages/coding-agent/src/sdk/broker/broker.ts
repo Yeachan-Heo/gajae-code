@@ -183,7 +183,6 @@ function pendingCleanupSessionId(response: BrokerResponse): string | undefined {
 	return typeof response.error.cleanup?.sessionId === "string" ? response.error.cleanup.sessionId : undefined;
 }
 
-
 const LIFECYCLE_OPERATIONS = new Set([
 	"session.create",
 	"session.fork",
