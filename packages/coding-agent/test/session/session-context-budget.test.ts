@@ -6,10 +6,8 @@
  * canonical accept, fail-closed fallback, ceiling, safe-integer bound, and
  * warning emission — is covered without process/module reloads. The production
  * default (512 MiB) is verified through a clean-subprocess probe because the
- * test preload deliberately pins the in-process budget to 64 MiB so the
- * overflow-reliant fixtures keep triggering the preflight; the subprocess
- * asserts the real production resolution, so the pin cannot drift from
- * production semantics silently.
+ * in-process budget may differ from the production default; the subprocess
+ * asserts the real production resolution.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";

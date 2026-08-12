@@ -2628,9 +2628,10 @@ function measureJsonLikeBytes(value: unknown, visited = new Set<object>()): numb
 
 /** Measure one materialized {@link SessionContext} and throw when over the budget. */
 function assertSessionContextWithinBudget(context: SessionContext): SessionContext {
+	const budgetBytes = effectiveSessionContextBudgetBytes();
 	const measuredBytes = measureJsonLikeBytes(context);
-	if (measuredBytes > SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES) {
-		throw new SessionContextTooLargeError(measuredBytes);
+	if (measuredBytes > budgetBytes) {
+		throw new SessionContextTooLargeError(measuredBytes, budgetBytes);
 	}
 	return context;
 }
@@ -3997,8 +3998,9 @@ function createTranscriptSnapshotHandle(
 		},
 		materialize(): Uint8Array {
 			if (closed) throw new Error("transcript_handle_closed");
-			if (size > SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES - TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
-				throw new SessionContextTooLargeError(size, SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES);
+			const budgetBytes = effectiveSessionContextBudgetBytes();
+			if (size > budgetBytes - TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
+				throw new SessionContextTooLargeError(size, budgetBytes);
 			}
 			const output = Buffer.allocUnsafe(size);
 			for (let offset = 0; offset < size; offset += TRANSCRIPT_CAPTURE_CHUNK_BYTES) {
@@ -6544,6 +6546,8 @@ export const SessionManagerTestHooks: {
 	lastSidecarInitError?: string;
 	/** Test-only generated-ID cache capacity override. */
 	coldIdHashMaxEntriesOverride?: number;
+	/** Test-only session-context budget override (in-process; does not leak to subprocesses). */
+	sessionContextBudgetBytesOverride?: number;
 } = {};
 
 function materializedCacheMaxBytes(): number {
@@ -6583,6 +6587,13 @@ function coldIdHashMaxEntries(): number {
 	if (override === undefined) return 1_000_000;
 	if (!Number.isSafeInteger(override) || override < 1 || override > COLD_ID_HASH_CAPACITY)
 		throw new RangeError(`coldIdHashMaxEntriesOverride must be between 1 and ${COLD_ID_HASH_CAPACITY}.`);
+	return override;
+}
+function effectiveSessionContextBudgetBytes(): number {
+	const override = SessionManagerTestHooks.sessionContextBudgetBytesOverride;
+	if (override === undefined) return SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES;
+	if (!Number.isSafeInteger(override) || override < 1)
+		throw new RangeError("sessionContextBudgetBytesOverride must be a positive safe integer.");
 	return override;
 }
 
