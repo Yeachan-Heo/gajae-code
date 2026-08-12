@@ -5,6 +5,7 @@
 ### Added
 
 - Reassignable `onFollowUpConsumed` hook on `Agent`: invoked with the follow-up messages the loop dequeues for the next turn, so consumers can attach per-turn state (e.g. a fresh owned-completion lineage) at actual resume admission.
+- `AgentPromptOptions.onRunAccepted` now receives a typed acceptance payload containing `consumedQueuedMessages`, allowing consumers to bind ownership and other per-message state only to the queued messages actually claimed by the accepted run.
 
 ## [0.13.1] - 2026-08-11
 
