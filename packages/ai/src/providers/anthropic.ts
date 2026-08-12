@@ -344,6 +344,24 @@ type AnthropicProviderSessionState = ProviderSessionState & {
 	generatedCacheBudget: GeneratedCacheBudget;
 	thinkingReplayRepairScope: AnthropicThinkingReplayRepairScope;
 	thinkingReplayRepairAttempts: number;
+	/**
+	 * Managed-mode escalation for the CPA alias-restore failure (issue #4338):
+	 * corrective steering recorded against one exact turn, applied by the next
+	 * managed attempt that rebuilds the same turn and released on success.
+	 */
+	cpaToolAliasSteering?: AnthropicCpaToolAliasSteering;
+};
+
+type AnthropicCpaToolAliasSteering = {
+	/** Corrective steering text appended to the next build of the same turn. */
+	message: string;
+	/**
+	 * Fingerprint of the last user message when the failure was recorded. The
+	 * steering only applies to a rebuild of the same logical turn; a later turn
+	 * with a different prompt expires it instead of replaying a stale
+	 * correction.
+	 */
+	turnFingerprint: string;
 };
 
 function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
@@ -359,6 +377,7 @@ function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 			state.generatedCacheBudget = 2;
 			state.thinkingReplayRepairScope = "none";
 			state.thinkingReplayRepairAttempts = 0;
+			state.cpaToolAliasSteering = undefined;
 		},
 	};
 	return state;
@@ -507,6 +526,60 @@ export function isAnthropicCacheBreakpointOverflowError(error: unknown): boolean
 	// Observed: "A maximum of 4 blocks with cache_control may be provided. Found 5."
 	// Stay tolerant of phrasing drift around the limit and the reported total.
 	return /maximum of \d+ blocks/i.test(message) || /at most \d+ blocks/i.test(message);
+}
+
+/**
+ * CPA's Claude-OAuth layer cloaks downstream tool names into
+ * `mcp__<server>__<token>_<base>` aliases upstream. When the model emits a
+ * tool call whose alias embeds a token that appears nowhere in the request,
+ * CPA cannot restore the name and kills the whole stream with an HTTP 500 SSE
+ * `error` event instead of forwarding the call (issue #4338). The signature is
+ * precise and machine-parseable: it quotes the rejected alias and the failure
+ * mode verbatim. Native Anthropic never emits this phrasing, so the text itself
+ * is the route gate.
+ */
+const CPA_TOOL_ALIAS_RESTORE_PATTERN =
+	/cannot restore Claude OAuth MCP tool alias \\?"([^"\\\\]+)\\?": no unique request-local match/i;
+
+/**
+ * Aliases observed as `mcp__<server>__<token>_<base>` with a 12-character
+ * lowercase-alphanumeric token segment (`find` = `yw7zaf6emg3l` in both
+ * captured traces). Tolerate 8-16 chars so extraction survives token-length
+ * drift while staying out of the base name; a base that itself contains
+ * underscores (`todo_write`) is preserved by the trailing `.+`.
+ */
+const CPA_TOOL_ALIAS_BASE_PATTERN = /^mcp__[^_]+__[a-z0-9]{8,16}_(.+)$/;
+
+export interface CpaToolAliasRestoreFailure {
+	/** The rejected tool-call name exactly as CPA quoted it. */
+	alias: string;
+	/**
+	 * Base tool name parsed out of the alias (`mcp__<server>__<token>_<base>`
+	 * → `<base>`), when the alias shape is well-formed. `undefined` for a
+	 * malformed alias — callers must then fall back to direct discovery and
+	 * never invent a name.
+	 */
+	baseName?: string;
+}
+
+/**
+ * Classifies the CPA alias-restore signature and extracts the rejected alias
+ * plus its base tool name. Claims only statusless in-stream SSE error events
+ * and HTTP 5xx failures: a non-5xx status carrying this text is not the
+ * observed CPA delivery shape and is left to the other classifiers.
+ */
+export function parseCpaToolAliasRestoreFailure(error: unknown): CpaToolAliasRestoreFailure | undefined {
+	const status = extractHttpStatusFromError(error);
+	if (status !== undefined && status < 500) return undefined;
+	const message = error instanceof Error ? error.message : String(error);
+	const match = CPA_TOOL_ALIAS_RESTORE_PATTERN.exec(message);
+	if (!match) return undefined;
+	const alias = match[1]!;
+	return { alias, baseName: CPA_TOOL_ALIAS_BASE_PATTERN.exec(alias)?.[1] };
+}
+
+export function isCpaToolAliasRestoreFailure(error: unknown): boolean {
+	return parseCpaToolAliasRestoreFailure(error) !== undefined;
 }
 
 function hasStrictAnthropicTools(params: MessageCreateParamsStreaming): boolean {
@@ -1398,6 +1471,93 @@ export function applyAnthropicUsageExtras(usage: Usage, source: AnthropicUsageLi
 	}
 }
 
+/**
+ * Unique request-local tool whose wire name equals the parsed base, if any.
+ * Only an exact, singular match is trusted; zero or multiple matches yield
+ * `undefined` so the repair never guesses among ambiguous aliases.
+ */
+function resolveCpaCallableToolName(
+	params: MessageCreateParamsStreaming,
+	failure: CpaToolAliasRestoreFailure,
+): string | undefined {
+	if (failure.baseName === undefined) return undefined;
+	const tools = params.tools as Array<{ name?: string }> | undefined;
+	if (!tools) return undefined;
+	let match: string | undefined;
+	for (const tool of tools) {
+		if (tool.name !== failure.baseName) continue;
+		if (match !== undefined) return undefined;
+		match = tool.name;
+	}
+	return match;
+}
+
+/**
+ * Corrective steering for the one retry after a CPA alias-restore failure. A
+ * provable unique callable name is stated deterministically; otherwise the
+ * model is directed at tool discovery instead of being handed an invented
+ * name, mirroring the agent loop's "not found → discover and activate"
+ * guidance. The rejected alias is echoed verbatim so the model knows which
+ * call was wrong; nothing else from the request is quoted.
+ */
+function buildCpaToolAliasSteering(failure: CpaToolAliasRestoreFailure, callableToolName?: string): string {
+	const rejected = `Your previous tool call "${failure.alias}" was rejected by the Claude OAuth proxy: the tool name is not callable in this request.`;
+	if (callableToolName !== undefined) {
+		return `${rejected} The callable tool is "${callableToolName}". Call it by exactly that name; do not construct or reconstruct prefixed or aliased tool names.`;
+	}
+	return `${rejected} If you need this capability, call \`search_tool_bm25\` to discover and activate the matching tool, then retry.`;
+}
+
+/**
+ * Actionable terminal error for a CPA alias-restore failure that survived the
+ * single corrective attempt. Deliberately statusless: no HTTP status, no
+ * transport facts, and no recognizable status phrase, so neither the provider
+ * generic 5xx retry nor the managed fallback controller re-sends the unchanged
+ * request. Only the rejected alias and the deterministic callable name (when
+ * provable) are quoted — never the request body or headers.
+ */
+function createCpaToolAliasTerminalError(failure: CpaToolAliasRestoreFailure, callableToolName?: string): Error {
+	const base = `Claude OAuth proxy rejected tool call "${failure.alias}": the proxy cannot restore the Claude OAuth MCP tool alias (no unique request-local match), and the corrective retry was rejected again.`;
+	const guidance =
+		callableToolName !== undefined
+			? ` The callable tool name is "${callableToolName}"; call it by exactly that name.`
+			: ` No unique callable tool name could be determined; discover the correct tool name before retrying.`;
+	return new Error(`${base}${guidance} The turn was not re-sent.`);
+}
+
+/**
+ * Stable identity for the logical turn currently being prompted: the
+ * serialized content of the last user message. Fallback rebuilds of the same
+ * turn keep the same fingerprint; the next user prompt changes it.
+ */
+function cpaTurnFingerprint(messages: Message[]): string {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "user") continue;
+		const content = message.content;
+		const serialized = typeof content === "string" ? content : JSON.stringify(content);
+		return `${serialized.length}:${serialized}`;
+	}
+	return "";
+}
+
+/**
+ * Append corrective steering as a trailing user turn, preserving role
+ * alternation by merging into the last user message when it is already a user
+ * turn.
+ */
+function appendCpaSteeringToMessages(params: MessageCreateParamsStreaming, text: string): void {
+	const messages = params.messages as MessageParam[];
+	const last = messages[messages.length - 1];
+	if (last && last.role === "user") {
+		last.content = Array.isArray(last.content)
+			? [...last.content, { type: "text", text }]
+			: `${last.content}\n\n${text}`;
+	} else {
+		messages.push({ role: "user", content: text });
+	}
+}
+
 export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 	model: Model<"anthropic-messages">,
 	context: Context,
@@ -1477,6 +1637,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			let strictFallbackErrorMessage: string | undefined;
 			let dropFastMode = providerSessionState?.fastModeDisabled ?? false;
 			let droppedForcedToolChoice = false;
+			// Exactly one corrective retry per request for the CPA alias-restore
+			// signature (issue #4338); recurrence terminalizes instead of resending.
+			let cpaAliasRepairApplied = false;
 			let thinkingReplayRepairScope: AnthropicThinkingReplayRepairScope =
 				providerSessionState?.thinkingReplayRepairScope ?? "none";
 			let thinkingReplayRepairAttempts = providerSessionState?.thinkingReplayRepairAttempts ?? 0;
@@ -1516,6 +1679,18 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				const replacementPayload = await options?.onPayload?.(nextParams, model, options?.attemptScope);
 				if (replacementPayload !== undefined) {
 					nextParams = replacementPayload as typeof nextParams;
+				}
+				// Managed-mode CPA steering (issue #4338): a previous managed attempt of
+				// this exact turn recorded a corrective tool-name message. Apply it only
+				// while the turn is unchanged; a different user prompt expires it so a
+				// stale correction never leaks into a later turn.
+				const cpaSteering = providerSessionState?.cpaToolAliasSteering;
+				if (cpaSteering) {
+					if (cpaSteering.turnFingerprint === cpaTurnFingerprint(context.messages)) {
+						appendCpaSteeringToMessages(nextParams, cpaSteering.message);
+					} else {
+						providerSessionState.cpaToolAliasSteering = undefined;
+					}
 				}
 				validateCacheControls(nextParams as AnthropicCacheParams);
 				rawRequestDump = {
@@ -1937,6 +2112,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						providerSessionState.thinkingReplayRepairScope = "none";
 						providerSessionState.thinkingReplayRepairAttempts = 0;
 					}
+					// Release a recorded CPA steering once any stream completes: a
+					// successful stream consumed it, and a failed one ends the turn (a
+					// later turn's different user prompt would expire it anyway).
+					if (providerSessionState?.cpaToolAliasSteering) {
+						providerSessionState.cpaToolAliasSteering = undefined;
+					}
 					break;
 				} catch (streamError) {
 					const localAbortReason = activeAbortTracker.getLocalAbortReason();
@@ -2111,6 +2292,75 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						providerRetryAttempt = 0;
 						resetOutputForRetry();
 						continue;
+					}
+					// CPA (Claude-OAuth proxy) alias-restore failure (issue #4338): the
+					// proxy 500s the whole stream because the model emitted a cloaked
+					// `mcp__<server>__<token>_<base>` tool name whose random token segment
+					// matches nothing in the request. The generic 5xx retry below would
+					// blindly re-send the unchanged request and re-sample the same drift;
+					// instead, correct the request exactly once and terminalize on
+					// recurrence. The narrow CPA phrase is the route gate, so native
+					// Anthropic and non-CPA proxies are untouched.
+					const cpaAliasFailure = parseCpaToolAliasRestoreFailure(streamFailure);
+					if (cpaAliasFailure && firstTokenTime === undefined) {
+						if (options?.fallbackManaged) {
+							// The managed fallback controller owns retries: never retry
+							// inside the attempt it handed us. Record the corrective
+							// steering against this exact turn and surface the raw error;
+							// the controller's next attempt rebuilds the request with the
+							// steering. Without shared session state there is nowhere to
+							// record, so fall through to the controller unchanged.
+							if (!providerSessionState) throw streamFailure;
+							const turnFingerprint = cpaTurnFingerprint(context.messages);
+							if (providerSessionState.cpaToolAliasSteering?.turnFingerprint === turnFingerprint) {
+								// The steering was already applied to this attempt and the proxy
+								// rejected again: the single corrective attempt is spent. Surface
+								// an actionable terminal error instead of another unchanged
+								// resend.
+								throw createCpaToolAliasTerminalError(
+									cpaAliasFailure,
+									resolveCpaCallableToolName(params, cpaAliasFailure),
+								);
+							}
+							providerSessionState.cpaToolAliasSteering = {
+								message: buildCpaToolAliasSteering(
+									cpaAliasFailure,
+									resolveCpaCallableToolName(params, cpaAliasFailure),
+								),
+								turnFingerprint,
+							};
+							logger.debug("anthropic: recording CPA tool alias steering for the next managed attempt", {
+								model: model.id,
+								alias: cpaAliasFailure.alias,
+								baseName: cpaAliasFailure.baseName,
+								error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+							});
+							throw streamFailure;
+						}
+						if (!cpaAliasRepairApplied) {
+							cpaAliasRepairApplied = true;
+							logger.debug("anthropic: repairing CPA tool alias restore failure with corrective steering", {
+								model: model.id,
+								alias: cpaAliasFailure.alias,
+								baseName: cpaAliasFailure.baseName,
+								error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+							});
+							appendCpaSteeringToMessages(
+								params,
+								buildCpaToolAliasSteering(cpaAliasFailure, resolveCpaCallableToolName(params, cpaAliasFailure)),
+							);
+							// Exactly one corrective attempt per request: the provider retry
+							// budget is deliberately NOT reset, so a persistent failure runs
+							// out instead of renewing the budget it is supposed to consume
+							// (issue #4011), and the recurrence branch below terminalizes
+							// before the generic 5xx retry can re-send the unchanged request.
+							resetOutputForRetry();
+							continue;
+						}
+						throw createCpaToolAliasTerminalError(
+							cpaAliasFailure,
+							resolveCpaCallableToolName(params, cpaAliasFailure),
+						);
 					}
 					const isTransientEnvelopeFailure =
 						isTransientStreamParseError(streamFailure) || isTransientStreamEnvelopeError(streamFailure);
