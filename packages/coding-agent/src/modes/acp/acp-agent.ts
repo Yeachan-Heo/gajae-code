@@ -1750,7 +1750,14 @@ export class AcpAgent implements Agent {
 			// promise would let the prompt path observe the old failure
 			// immediately and report cancelled while the retry is still pending
 			// (review thread P2).
-			if (waiter && (waiter.pendingCancelAttempts ?? 0) <= 1) {
+			// Only clear and re-arm the aggregate when the LAST in-flight
+			// attempt fails AND the entire wave was unacknowledged: a
+			// failing attempt that follows an acknowledged one must not
+			// erase the already-resolved successful aggregate, or a later
+			// cancel installs a fresh unresolved cancelAttempt that a
+			// concurrent prompt-preflight rejection awaits past the grace
+			// bound (review thread P2).
+			if (waiter && (waiter.pendingCancelAttempts ?? 0) <= 1 && !waiter.cancelAcknowledged) {
 				waiter.cancelAttemptResolve?.(false);
 				waiter.cancelAttempt = undefined;
 				waiter.cancelAttemptResolve = undefined;

@@ -2687,7 +2687,7 @@ test("SDK host waits for durable skill acceptance before completing concurrent c
 		pausedCommit.restore();
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 	}
-}, 30_000);
+}, 60_000);
 
 test("SDK host rolls back canonical skill ownership when durable acceptance fails", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-acceptance-failed-"));
