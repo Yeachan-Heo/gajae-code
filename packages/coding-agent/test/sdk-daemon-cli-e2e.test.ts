@@ -356,9 +356,9 @@ describe("SDK session CLI", () => {
 	it("bounds offline retained-transcript tail reads for a synthetic 300 MiB history", async () => {
 		const encoder = new TextEncoder();
 		const retainedTail = encoder.encode(
-			Array.from({ length: 240 }, (_, index) =>
+			`${Array.from({ length: 240 }, (_, index) =>
 				JSON.stringify({ id: `tail-${index}`, payload: "x".repeat(32) }),
-			).join("\n") + "\n",
+			).join("\n")}\n`,
 		);
 		const prefixBytes = 300 * 1024 * 1024;
 		const size = prefixBytes + retainedTail.byteLength;

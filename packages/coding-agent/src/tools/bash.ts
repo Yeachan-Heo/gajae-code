@@ -1081,7 +1081,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// while the caller only set the legacy PI_CODING_AGENT_DIR alias would
 		// silently ignore the caller's override.
 		const explicitAgentDirOverride =
-			expandedEnv?.["GJC_CODING_AGENT_DIR"] !== undefined || expandedEnv?.["PI_CODING_AGENT_DIR"] !== undefined;
+			expandedEnv?.GJC_CODING_AGENT_DIR !== undefined || expandedEnv?.PI_CODING_AGENT_DIR !== undefined;
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
 				sessionFile: null,

@@ -13,8 +13,8 @@ const removedDocs = [
 	"gemini-manifest-extensions.md",
 	"marketplace.md",
 	"plugin-manager-installer-plumbing.md",
-// "skills.md" is intentionally absent: the skill zero-code discovery feature
-// (#4349) re-added the doc after this cleanup list was written.
+	// "skills.md" is intentionally absent: the skill zero-code discovery feature
+	// (#4349) re-added the doc after this cleanup list was written.
 	"slash-command-internals.md",
 	"task-agent-discovery.md",
 ] as const;
