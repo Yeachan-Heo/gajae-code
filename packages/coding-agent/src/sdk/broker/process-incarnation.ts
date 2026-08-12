@@ -111,6 +111,7 @@ export function processIncarnation(pid: number, options: ProcessIncarnationOptio
 	if (platform === process.platform && options.runCommand === undefined) {
 		try {
 			const nativeProcess = nativeProcessBindings().Process.fromPid(pid) as { incarnation?: unknown } | null;
+			if (nativeProcess === null) return undefined;
 			if (isProcessIncarnation(nativeProcess?.incarnation)) return nativeProcess.incarnation;
 		} catch {
 			// Fall through to the platform-specific reader.

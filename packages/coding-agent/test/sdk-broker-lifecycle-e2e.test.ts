@@ -6,6 +6,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { NotificationServer } from "@gajae-code/natives";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { openLifecycleSessionManager, runSessionHost, watchSessionHostBrokerLiveness } from "../src/commands/sdk";
 import { planLaunchWorktree } from "../src/gjc-runtime/launch-worktree";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
@@ -814,6 +815,22 @@ test("broker reads Windows process incarnations as canonical FILETIME ticks with
 		}),
 	).toBe("windows:133830291061234568");
 });
+
+test.skipIf(process.platform !== "win32")(
+	"broker does not spawn PowerShell when the native binding authoritatively reports an absent process",
+	() => {
+		const fromPid = vi.spyOn(nativeProcessBindings().Process, "fromPid").mockReturnValue(null);
+		const spawn = vi.spyOn(Bun, "spawnSync");
+		try {
+			expect(processIncarnation(2_147_483_647)).toBeUndefined();
+			expect(fromPid).toHaveBeenCalledWith(2_147_483_647);
+			expect(spawn).not.toHaveBeenCalled();
+		} finally {
+			spawn.mockRestore();
+			fromPid.mockRestore();
+		}
+	},
+);
 
 test("broker fails closed for failed or malformed Windows FILETIME process-incarnation output", () => {
 	const options = {
