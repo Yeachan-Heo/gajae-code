@@ -194,14 +194,19 @@ async function createFixture(
 							frame.operation === "turn.prompt"
 								? (options.promptAcknowledgement ?? { commandId, turnId, accepted: true })
 								: frame.operation === "turn.abort"
-									? (options.abortAcknowledgement ?? {
-											ok: true,
-											selection: "owned",
-											turn: "stopped",
-											ownedWork: "stopped",
-											automaticDelivery: "none",
-											resumeOnOwnedCompletion: false,
-										})
+									? (options.abortAcknowledgement ??
+										(() => {
+											const scope =
+												(frame.input as { scope?: string })?.scope === "owned" ? "owned" : "turn";
+											return {
+												ok: true,
+												selection: scope,
+												turn: "stopped",
+												ownedWork: scope === "owned" ? "stopped" : "left_running",
+												automaticDelivery: scope === "owned" ? "none" : "enabled",
+												resumeOnOwnedCompletion: scope !== "owned",
+											};
+										})())
 									: {},
 					}),
 				);
@@ -620,7 +625,7 @@ test("ACP keeps the authoritative terminal when it arrives inside the cancel gra
 
 test("ACP rejects a no_active_turn disposition as a cancel acknowledgement", async () => {
 	const fixture = await createFixture({
-		abortAcknowledgement: { ok: true, selection: "owned", turn: "no_active_turn", terminal: "terminal_no_effect" },
+		abortAcknowledgement: { ok: true, selection: "turn", turn: "no_active_turn", terminal: "terminal_no_effect" },
 	});
 	try {
 		// no_active_turn provides no proof the worker was stopped (it can also be a
@@ -639,7 +644,7 @@ test("ACP rejects an uncertain disposition as a cancel acknowledgement without s
 		cancelSettlementGraceMs: 25,
 		abortAcknowledgement: {
 			ok: true,
-			selection: "owned",
+			selection: "turn",
 			turn: "uncertain",
 			ownedWork: "uncertain",
 			automaticDelivery: "none",
@@ -687,16 +692,16 @@ test("ACP rejects a terminal disposition that echoes a foreign scope", async () 
 	const fixture = await createFixture({
 		abortAcknowledgement: {
 			ok: true,
-			selection: "turn",
+			selection: "owned",
 			turn: "stopped",
-			ownedWork: "left_running",
-			automaticDelivery: "enabled",
-			resumeOnOwnedCompletion: true,
+			ownedWork: "stopped",
+			automaticDelivery: "none",
+			resumeOnOwnedCompletion: false,
 		},
 	});
 	try {
-		// The default cancel requests scope "owned"; a disposition answering
-		// selection "turn" belongs to another abort and must not settle this one.
+		// The default cancel requests scope "turn"; a disposition answering
+		// selection "owned" belongs to another abort and must not settle this one.
 		await expect(
 			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "foreign-scope cancel"),
 		).rejects.toThrow("SDK did not acknowledge cancellation");
@@ -708,7 +713,7 @@ test("ACP rejects a terminal disposition that echoes a foreign scope", async () 
 test("ACP rejects the deterministic no_effect and no_store dispositions as cancel acknowledgements", async () => {
 	for (const turn of ["no_effect", "no_store"]) {
 		const fixture = await createFixture({
-			abortAcknowledgement: { ok: true, selection: "owned", turn, terminal: "terminal_no_effect" },
+			abortAcknowledgement: { ok: true, selection: "turn", turn, terminal: "terminal_no_effect" },
 		});
 		try {
 			// A no-effect disposition is no proof the worker was stopped: the

@@ -1036,12 +1036,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	await waitFor(() => promptInputs.length === 2, "second prompt delivery");
 	await bounded(agent.cancel({ sessionId: created.sessionId }), "cancel acknowledgement");
 	expect(controlOperations).toContain("turn.abort");
-	// A client cancel is a C04 terminal abort with scope "owned": ending the turn
-	// also stops exact owned subagents and background tasks. Each cancel carries a
-	// fresh bounded idempotency key for deterministic replay.
+	// A client cancel is a C04 terminal abort with scope "turn": it ends the turn
+	// but leaves exact owned subagents and background tasks running. Each cancel
+	// carries a fresh bounded idempotency key for deterministic replay.
 	expect(abortFrames.at(-1)).toMatchObject({
 		operation: "turn.abort",
-		input: { mode: "terminal", scope: "owned" },
+		input: { mode: "terminal", scope: "turn" },
 		idempotencyKey: expect.any(String),
 	});
 	await Bun.sleep(20);
@@ -1067,8 +1067,9 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			return payload.sessionUpdate === "agent_message_chunk" && /failed/i.test(payload.content?.text ?? "");
 		}),
 	).toHaveLength(0);
-	// `_meta.gjc.abortScope: "turn"` opts out of owned termination: the turn still
-	// aborts, but exact owned subagents and background tasks keep running.
+	// `_meta.gjc.abortScope: "turn"` matches the default now: the turn aborts and
+	// exact owned subagents and background tasks keep running, same as a plain
+	// cancel.
 	await bounded(
 		agent.cancel({ sessionId: created.sessionId, _meta: { gjc: { abortScope: "turn" } } }),
 		"turn-scope cancel acknowledgement",

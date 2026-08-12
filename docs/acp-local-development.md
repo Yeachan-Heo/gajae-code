@@ -104,6 +104,14 @@ paseo stop <agent-id>             # exercises session/cancel
 paseo delete <agent-id>
 ```
 
+`paseo stop <agent-id>` sends an ACP `session/cancel`, which by default stops only
+the current turn (matching the SDK `turn.abort` default); owned background work
+(subagents, background jobs) keeps running. To keep owned cancels that also stop
+exact owned work, set `GJC_ACP_ABORT_SCOPE=owned` in the provider's `env` entry
+(shown in the full example in
+[External control readiness](./external-control-readiness.md#paseo-custom-agent))
+and restart the Paseo daemon.
+
 Paseo runs its daemon as a separate long-lived process, so it needs its own
 restart after a config change — but not after a GJC rebuild, since it spawns
 `gjc` per session. `--wait-timeout 3m` stops the CLI from waiting; it does not

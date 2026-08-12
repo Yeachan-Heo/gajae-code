@@ -232,14 +232,19 @@ export function createFixture(
 								frame.operation === "turn.prompt"
 									? { commandId, turnId, accepted: true }
 									: frame.operation === "turn.abort"
-										? (options.abortAcknowledgement ?? {
-												ok: true,
-												selection: "owned",
-												turn: "stopped",
-												ownedWork: "stopped",
-												automaticDelivery: "none",
-												resumeOnOwnedCompletion: false,
-											})
+										? (options.abortAcknowledgement ??
+											(() => {
+												const scope =
+													(frame.input as { scope?: string })?.scope === "owned" ? "owned" : "turn";
+												return {
+													ok: true,
+													selection: scope,
+													turn: "stopped",
+													ownedWork: scope === "owned" ? "stopped" : "left_running",
+													automaticDelivery: scope === "owned" ? "none" : "enabled",
+													resumeOnOwnedCompletion: scope !== "owned",
+												};
+											})())
 										: {},
 						}),
 					);

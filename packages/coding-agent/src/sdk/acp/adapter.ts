@@ -285,14 +285,17 @@ export class AcpSdkAdapter {
 		});
 	}
 	/**
-	 * Ends the active turn with a C04 terminal abort. The default `scope:"owned"`
-	 * also stops exact causal owned work (background Bash/task jobs, detached
-	 * subagents) so an external client that cancels a turn terminates everything
-	 * that turn spawned; `scope:"turn"` leaves owned work running so its
-	 * completion can resume the root worker. A fresh bounded idempotency key per
-	 * call keeps terminal-abort replay deterministic across retries.
+	 * Ends the active turn with a C04 terminal abort. The default `scope:"turn"`
+	 * only stops the current turn, matching the SDK `turn.abort` default and
+	 * other ACP clients' cancel behavior; `scope:"owned"` additionally stops
+	 * exact causal owned work (background Bash/task jobs, detached subagents) so
+	 * an external client can terminate everything a turn spawned. Paseo keeps
+	 * owned cancels through its provider config env
+	 * (`GJC_ACP_ABORT_SCOPE=owned`) without source changes. A fresh bounded
+	 * idempotency key per call keeps terminal-abort replay deterministic across
+	 * retries.
 	 */
-	async cancel(scope: AbortScope = "owned"): Promise<unknown> {
+	async cancel(scope: AbortScope = "turn"): Promise<unknown> {
 		return await this.control("turn.abort", { mode: "terminal", scope, idempotencyKey: randomUUID() });
 	}
 	async setModel(params: JsonObject | string): Promise<unknown> {

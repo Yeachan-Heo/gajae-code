@@ -587,9 +587,9 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | Variable | Values | Default | Behavior |
 | --- | --- | --- | --- |
 | `GJC_ACP_PERMISSION_MODE` | `prompt`, `auto`, `always-allow` | `prompt` | Controls whether ACP tool calls use the client's permission prompt or the SDK allow policy. `auto` and `always-allow` both allow gated tool calls without prompting. Invalid values fail safely to `prompt`. |
-| `GJC_ACP_ABORT_SCOPE` | `turn`, `owned` | `owned` | Selects the C04 terminal-abort scope for ACP `session/cancel`. `owned` (the default) stops the active turn **and** exact owned subagents and background tasks; `turn` aborts only the turn and leaves owned work running so its completion can resume the root worker. Invalid values fail safely to `owned`. |
+| `GJC_ACP_ABORT_SCOPE` | `turn`, `owned` | `turn` | Selects the C04 terminal-abort scope for ACP `session/cancel`. `turn` (the default) aborts only the active turn and leaves owned work running so its completion can resume the root worker; `owned` also stops exact owned subagents and background tasks. Invalid values fail safely to `turn`. |
 
-ACP client metadata at `_meta.gjc.permissionHandling` takes precedence when the client supplies that field; the process environment is the fallback. The same precedence applies to the cancel scope: `_meta.gjc.abortScope` on the `session/cancel` notification wins over `GJC_ACP_ABORT_SCOPE` (when `_meta.gjc.abortScope` is present but invalid, the value fails safe to `owned` and the environment fallback is not consulted). JetBrains Air custom agents can set the fallback per agent in `acp.json`:
+ACP client metadata at `_meta.gjc.permissionHandling` takes precedence when the client supplies that field; the process environment is the fallback. The same precedence applies to the cancel scope: `_meta.gjc.abortScope` on the `session/cancel` notification wins over `GJC_ACP_ABORT_SCOPE` (when `_meta.gjc.abortScope` is present but invalid, the value fails safe to `turn` and the environment fallback is not consulted). JetBrains Air custom agents can set the fallback per agent in `acp.json`:
 
 ```json
 {
