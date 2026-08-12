@@ -19,7 +19,7 @@ import type { ActionRegistry, FocusDomain } from "../action-registry";
 import { EMPTY_JOBS_SNAPSHOT, type JobsSnapshot } from "../jobs-observer";
 import { sanitizeStatusText } from "../shared";
 import { renderSkillHudBar } from "./skill-hud/render";
-import { lookupCurrentPr } from "./status-line/gh";
+import { lookupCurrentPrCached } from "./status-line/gh";
 import {
 	canReuseCachedPr,
 	createPrCacheContext,
@@ -399,6 +399,10 @@ export class StatusLineComponent implements Component {
 
 		this.#prLookupInFlight = true;
 		const lookupContext = currentContext;
+		if (!lookupContext) {
+			this.#prLookupInFlight = false;
+			return stalePr ?? null;
+		}
 
 		// Fire async lookup, keep stale value visible until resolved
 		(async () => {
@@ -415,7 +419,7 @@ export class StatusLineComponent implements Component {
 			};
 			try {
 				// Requires `gh repo set-default` to be configured; fails gracefully if not
-				const pr = await lookupCurrentPr();
+				const pr = await lookupCurrentPrCached(`${lookupContext.repoId ?? ""}\0${lookupContext.branch}`);
 				setCachedPr(pr);
 			} finally {
 				this.#prLookupInFlight = false;

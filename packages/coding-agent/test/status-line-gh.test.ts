@@ -1,6 +1,10 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { Subprocess } from "bun";
-import { lookupCurrentPr } from "../src/modes/components/status-line/gh";
+import {
+	clearCurrentPrCache,
+	lookupCurrentPr,
+	lookupCurrentPrCached,
+} from "../src/modes/components/status-line/gh";
 import type { RunGh } from "../src/utils/gh";
 
 function textStream(text: string): ReadableStream<Uint8Array> {
@@ -14,6 +18,10 @@ afterEach(() => {
 });
 
 describe("status-line GitHub PR lookup", () => {
+	beforeEach(() => {
+		clearCurrentPrCache();
+	});
+
 	it("detaches gh from TUI stdin", async () => {
 		const ghPath = "/usr/bin/gh";
 		vi.spyOn(Bun, "which").mockReturnValue(ghPath);
@@ -47,6 +55,36 @@ describe("status-line GitHub PR lookup", () => {
 
 		await expect(lookupCurrentPr(runGh)).resolves.toBeNull();
 		expect(timeoutMs).toBe(5_000);
+	});
+
+	it("negative-caches failed lookups across callers", async () => {
+		let calls = 0;
+		const runGh: RunGh = async () => {
+			calls += 1;
+			return { exitCode: 1, stdout: "", stderr: "no pull requests found", timedOut: false };
+		};
+
+		await expect(lookupCurrentPrCached("/repo/.git/HEAD\0feature", runGh, () => 1_000)).resolves.toBeNull();
+		await expect(lookupCurrentPrCached("/repo/.git/HEAD\0feature", runGh, () => 2_000)).resolves.toBeNull();
+		expect(calls).toBe(1);
+	});
+
+	it("deduplicates concurrent lookups across callers", async () => {
+		let calls = 0;
+		let resolveLookup!: (value: Awaited<ReturnType<RunGh>>) => void;
+		const result = new Promise<Awaited<ReturnType<RunGh>>>(resolve => {
+			resolveLookup = resolve;
+		});
+		const runGh: RunGh = async () => {
+			calls += 1;
+			return result;
+		};
+
+		const first = lookupCurrentPrCached("/repo/.git/HEAD\0feature", runGh);
+		const second = lookupCurrentPrCached("/repo/.git/HEAD\0feature", runGh);
+		expect(calls).toBe(1);
+		resolveLookup({ exitCode: 1, stdout: "", stderr: "no pull requests found", timedOut: false });
+		await expect(Promise.all([first, second])).resolves.toEqual([null, null]);
 	});
 
 	it("accepts canonical GitHub Enterprise PR URLs over HTTP(S)", async () => {
