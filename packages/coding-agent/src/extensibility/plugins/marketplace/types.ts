@@ -173,6 +173,14 @@ export interface InstalledPluginEntry {
 	gitCommitSha?: string;
 	/** GJC extension — not in Anthropic Code's type. CLI/UI concern only in v1. */
 	enabled?: boolean;
+	/** SHA-256 tree digest of the manager-owned cache at grant time. */
+	treeDigest?: {
+		version: 1;
+		algorithm: "sha256";
+		hex: string;
+	};
+	/** Explicit marketplace rule-authority grant. Absent entries have no rule authority. */
+	trustGrant?: "gjc-marketplace-rule-authority.v1";
 }
 
 /**

@@ -17,6 +17,7 @@ import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../ca
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
+import { resolveTrustedPluginRuleRoot } from "../extensibility/plugins/marketplace/plugin-rule-authority";
 import type { ForkContextPolicy } from "../task/types";
 import { parseThinkingLevel } from "../thinking";
 
@@ -182,7 +183,7 @@ export function buildRuleFromMarkdown(
 	},
 ): Rule {
 	const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
-	const { condition, scope } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
+	const { condition, scope, mutationTargetGlobs } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
 
 	let globs: string[] | undefined;
 	if (Array.isArray(frontmatter.globs)) {
@@ -217,6 +218,7 @@ export function buildRuleFromMarkdown(
 		interruptMode,
 		repeatMode,
 		repeatGap,
+		mutationTargetGlobs,
 		_source: source,
 	};
 }
@@ -736,6 +738,8 @@ export interface ClaudePluginEntry {
 	lastUpdated: string;
 	gitCommitSha?: string;
 	enabled?: boolean;
+	treeDigest?: { version: 1; algorithm: "sha256"; hex: string };
+	trustGrant?: "gjc-marketplace-rule-authority.v1";
 }
 
 /**
@@ -848,6 +852,188 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 	// as both user and project registry and producing duplicates / disambiguation errors.
 	if (path.resolve(cwd) === os.homedir()) return undefined;
 	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
+}
+const trustedRuleRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
+
+function pluginCacheDirForHome(home: string): string {
+	return path.join(getPluginsDir(home), "cache", "plugins");
+}
+
+async function admitTrustedRootsFromRegistry(
+	content: string,
+	registryPath: string,
+	cacheDir: string,
+	forcedScope?: "user" | "project",
+): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
+	const roots: ClaudePluginRoot[] = [];
+	const warnings: string[] = [];
+	const registry = parseClaudePluginsRegistry(content);
+	if (!registry) {
+		return { roots, warnings: [`Failed to parse GJC plugin registry: ${registryPath}`] };
+	}
+	for (const [pluginId, entries] of Object.entries(registry.plugins)) {
+		if (!Array.isArray(entries) || entries.length === 0) continue;
+		for (const entry of entries) {
+			const admitted = await resolveTrustedPluginRuleRoot(
+				pluginId,
+				{ ...entry, scope: forcedScope ?? entry.scope },
+				cacheDir,
+			);
+			if (admitted.warning) warnings.push(admitted.warning);
+			if (!admitted.root) continue;
+			if (roots.some(r => r.id === admitted.root!.id && r.path === admitted.root!.path)) continue;
+			roots.push({
+				id: admitted.root.id,
+				marketplace: admitted.root.marketplace,
+				plugin: admitted.root.plugin,
+				version: admitted.root.version,
+				path: admitted.root.path,
+				scope: admitted.root.scope,
+			});
+		}
+	}
+	return { roots, warnings };
+}
+
+/**
+ * List plugin roots that may contribute Rule items. Unlike listClaudePluginRoots,
+ * this refuses repo-editable installPath values that are not the manager-owned
+ * cache identity with a matching recorded digest and explicit trust grant.
+ */
+export async function listTrustedPluginRuleRoots(
+	home: string,
+	cwd?: string,
+): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
+	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
+	const cacheKey = `trusted-rules:${home}:${resolvedProjectPath ?? ""}`;
+	const cached = trustedRuleRootsCache.get(cacheKey);
+	if (cached) return cached;
+
+	const roots: ClaudePluginRoot[] = [];
+	const warnings: string[] = [];
+	const cacheDir = pluginCacheDirForHome(home);
+	const gjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
+	const gjcContent = await readFile(gjcRegistryPath);
+	if (gjcContent) {
+		const admitted = await admitTrustedRootsFromRegistry(gjcContent, gjcRegistryPath, cacheDir);
+		roots.push(...admitted.roots);
+		warnings.push(...admitted.warnings);
+	}
+
+	const projectRoots: ClaudePluginRoot[] = [];
+	if (resolvedProjectPath) {
+		const projectContent = await readFile(resolvedProjectPath);
+		if (projectContent) {
+			const admitted = await admitTrustedRootsFromRegistry(projectContent, resolvedProjectPath, cacheDir, "project");
+			projectRoots.push(...admitted.roots);
+			warnings.push(...admitted.warnings);
+		}
+	}
+
+	if (projectRoots.length > 0) {
+		const projectIds = new Set(projectRoots.map(r => r.id));
+		const deduped = roots.filter(r => !projectIds.has(r.id));
+		roots.length = 0;
+		roots.push(...projectRoots, ...deduped);
+	}
+
+	const result = { roots, warnings };
+	trustedRuleRootsCache.set(cacheKey, result);
+	return result;
+}
+
+export async function realpathNoFollowContained(root: string, target: string): Promise<string | null> {
+	const resolvedRoot = path.resolve(root);
+	const resolvedTarget = path.resolve(target);
+	const relative = path.relative(resolvedRoot, resolvedTarget);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) return null;
+
+	let current = resolvedRoot;
+	try {
+		const rootStat = await fs.promises.lstat(current);
+		if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) return null;
+	} catch {
+		return null;
+	}
+
+	if (relative === "") return current;
+	for (const part of relative.split(path.sep)) {
+		if (!part || part === ".") continue;
+		if (part === "..") return null;
+		current = path.join(current, part);
+		let stat: fs.Stats;
+		try {
+			stat = await fs.promises.lstat(current);
+		} catch {
+			return null;
+		}
+		if (stat.isSymbolicLink()) return null;
+	}
+	return current;
+}
+
+export async function loadContainedFilesFromDir<T>(
+	_ctx: LoadContext,
+	dir: string,
+	pluginRoot: string,
+	provider: string,
+	level: "user" | "project",
+	options: {
+		extensions?: string[];
+		transform: (name: string, content: string, path: string, source: SourceMeta) => T | null;
+	},
+): Promise<LoadResult<T>> {
+	const items: T[] = [];
+	const warnings: string[] = [];
+	const containedDir = await realpathNoFollowContained(pluginRoot, dir);
+	if (!containedDir) {
+		return {
+			items,
+			warnings: [`[claude-plugins] Rejected rules directory outside plugin root or via symlink: ${dir}`],
+		};
+	}
+
+	let entries: fs.Dirent[];
+	try {
+		entries = await fs.promises.readdir(containedDir, { withFileTypes: true });
+	} catch {
+		return { items, warnings };
+	}
+
+	const extensions = new Set((options.extensions ?? ["md", "mdc"]).map(ext => ext.toLowerCase()));
+	for (const entry of entries) {
+		if (!entry.isFile() || entry.isSymbolicLink()) {
+			if (entry.isSymbolicLink()) {
+				warnings.push(`[claude-plugins] Rejected symlinked rule member: ${path.join(containedDir, entry.name)}`);
+			}
+			continue;
+		}
+		const ext = path.extname(entry.name).slice(1).toLowerCase();
+		if (!extensions.has(ext)) continue;
+		const filePath = path.join(containedDir, entry.name);
+		const containedFile = await realpathNoFollowContained(pluginRoot, filePath);
+		if (!containedFile) {
+			warnings.push(`[claude-plugins] Rejected rule file outside plugin root or via symlink: ${filePath}`);
+			continue;
+		}
+		const content = await readFile(containedFile);
+		if (content === null) {
+			warnings.push(`Failed to read file: ${containedFile}`);
+			continue;
+		}
+		try {
+			const item = options.transform(
+				entry.name,
+				content,
+				containedFile,
+				createSourceMeta(provider, containedFile, level),
+			);
+			if (item !== null) items.push(item);
+		} catch (err) {
+			warnings.push(`Failed to parse ${containedFile}: ${err}`);
+		}
+	}
+	return { items, warnings };
 }
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
@@ -973,6 +1159,7 @@ export async function listClaudePluginRoots(
  */
 export function clearClaudePluginRootsCache(): void {
 	pluginRootsCache.clear();
+	trustedRuleRootsCache.clear();
 	preloadedPluginRoots = [];
 	// Re-warm preloaded roots asynchronously so sync LSP config reads stay valid
 	if (lastPreloadHome) {

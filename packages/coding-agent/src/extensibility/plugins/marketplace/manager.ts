@@ -14,6 +14,7 @@ import { isEnoent, logger, pathIsWithin } from "@gajae-code/utils";
 
 import { cachePlugin, getCachedPluginPath } from "./cache";
 import { classifySource, fetchMarketplace, parseMarketplaceCatalog, promoteCloneToCache } from "./fetcher";
+import { hashPluginTree, PLUGIN_RULE_TRUST_GRANT } from "./plugin-rule-authority";
 import {
 	addInstalledPlugin,
 	addMarketplaceEntry,
@@ -329,12 +330,15 @@ export class MarketplaceManager {
 		const now = new Date().toISOString();
 		// Carry over enabled flag from existing entry — a disabled plugin must stay disabled after upgrade
 		const wasDisabled = existing?.some(e => e.enabled === false);
+		const treeDigest = await hashPluginTree(cachePath);
 		const installedEntry: InstalledPluginEntry = {
 			scope,
 			installPath: cachePath,
 			version,
 			installedAt: now,
 			lastUpdated: now,
+			treeDigest,
+			trustGrant: PLUGIN_RULE_TRUST_GRANT,
 			...(wasDisabled ? { enabled: false } : {}),
 		};
 

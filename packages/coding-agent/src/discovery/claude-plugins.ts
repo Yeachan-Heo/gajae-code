@@ -20,7 +20,10 @@ import {
 	type ClaudePluginRoot,
 	createSourceMeta,
 	listClaudePluginRoots,
+	listTrustedPluginRuleRoots,
+	loadContainedFilesFromDir,
 	loadFilesFromDir,
+	realpathNoFollowContained,
 	scanSkillsFromDir,
 } from "./helpers";
 
@@ -197,17 +200,42 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const items: Rule[] = [];
 	const warnings: string[] = [];
 
-	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd);
+	const { roots, warnings: rootWarnings } = await listTrustedPluginRuleRoots(ctx.home, ctx.cwd);
 	warnings.push(...rootWarnings);
 
 	const results = await Promise.all(
 		roots.map(async root => {
+			if (await rootContainsGjcManifest(root.path)) {
+				return {
+					result: { items: [] as Rule[], warnings: [] as string[] },
+					warning: `[claude-plugins] Skipping gajae-code plugin root (binding-only): ${root.path}`,
+				};
+			}
 			const { dir: rulesDir, warning } = await resolvePluginDir(root, ["rules"], "rules");
-			const result = await loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, root.scope, {
-				extensions: ["md", "mdc"],
-				transform: (name, content, path, source) =>
-					buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
-			});
+			const containedRulesDir = await realpathNoFollowContained(root.path, rulesDir);
+			if (!containedRulesDir) {
+				return {
+					result: {
+						items: [] as Rule[],
+						warnings: [
+							`[claude-plugins] Rejected rules directory outside plugin root or via symlink: ${rulesDir}`,
+						],
+					},
+					warning,
+				};
+			}
+			const result = await loadContainedFilesFromDir<Rule>(
+				ctx,
+				containedRulesDir,
+				root.path,
+				PROVIDER_ID,
+				root.scope,
+				{
+					extensions: ["md", "mdc"],
+					transform: (name, content, path, source) =>
+						buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
+				},
+			);
 			return { result, warning };
 		}),
 	);
