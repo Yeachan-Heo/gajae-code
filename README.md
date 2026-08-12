@@ -343,6 +343,17 @@ Pick from Settings (`Appearance -> Dark theme` / `Light theme`) or `/theme`.
 | `codex` | Crisp dark blue-gray palette with sharper coding-session contrast. | A Codex-like dark workspace. |
 | `opencode` | OpenCode-inspired dark palette with punchier terminal accents. | OpenCode muscle memory in the bundled picker. |
 
+## Troubleshooting
+
+When a tool, skill, hook, extension, slash command, MCP server, or plugin bundle does not appear as expected, start here:
+
+```sh
+gjc customize doctor         # human-readable provenance and remediation
+gjc customize doctor --json # stable JSON for CI/setup tooling
+```
+
+`gjc customize doctor` is the single read-only troubleshooting surface. It reports every discovered customization, its source convention and scope (`gjc`, Claude project, Codex project, plugin, explicit config), effective precedence and shadowing, loaded/enabled/disabled/quarantined/rejected/stored-only status, bounded reason codes, remediation commands, trust requirements, and whether a restart/new session is required. Credentials, endpoint tokens, auth headers, and unsafe raw config dumps are never printed.
+
 ## Development
 
 ```sh
