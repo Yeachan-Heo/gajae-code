@@ -630,7 +630,7 @@ export function createReconciliationStore(options: {
 		if (!filePath) return;
 		const directory = path.dirname(filePath);
 		await fileFs.mkdir(directory, { recursive: true, mode: 0o700 });
-		const temporary = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomUUID()}.tmp`;
+		const temporary = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
 		try {
 			await fileFs.writeFile(temporary, `${JSON.stringify(document)}\n`, { mode: 0o600 });
 			try {
