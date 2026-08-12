@@ -2755,8 +2755,14 @@ function sdkControlSurface(
 				entry => entry.connectionId === requesterConnectionId,
 			);
 			if (pendingPreflight) {
-				if (requesterConnectionId) await cancelPendingPreflightsForConnection(requesterConnectionId);
-				else await cancelPendingPreflights();
+				// Fire-and-forget the cancel: the preflight signal is aborted
+				// immediately (synchronously inside cancelPreflight), but the
+				// full cleanup (settleRun awaiting executionSettled) may be
+				// gated by a durable acceptance commit that this same abort
+				// path fences. Awaiting it would deadlock. The response is
+				// published once the pending writes settle.
+				if (requesterConnectionId) void cancelPendingPreflightsForConnection(requesterConnectionId);
+				else void cancelPendingPreflights();
 				return { aborted: true, disposition: "preflight_cancelled" };
 			}
 			return await abortOwnedPrompt(requesterConnectionId);
