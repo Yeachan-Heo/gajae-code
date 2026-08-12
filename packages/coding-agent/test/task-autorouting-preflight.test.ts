@@ -331,8 +331,11 @@ async function runScriptedLedger(scripts: CandidateScript[], managed = false): P
 			} finally {
 				move.mockRestore();
 			}
-			// The executor's post-fence handler runs the same compensation path.
+			// Mirror the executor's full compensation: post-fence rollback, then the
+			// pre-fence discard its `finally` always runs when the fence never opened.
 			await manager.rollbackCommittedStaged();
+			await manager.discardStaged();
+			await manager.discardStaged();
 			uncertainArtifactId = uncertainArtifact;
 			attempts.push({ selector: script.selector, phase: "durable", code: "post_acceptance_failure" });
 			const after = await residueSnapshot(ctx);
@@ -956,6 +959,48 @@ describe("managed staged publication certainty", () => {
 		// No live handle or lifecycle start may leak from a publication that never proved itself.
 		expect(run.liveHandles).toBe(0);
 		expect(run.lifecycleStarts).toBe(0);
+	});
+
+	it("keeps staged evidence when the destination probe cannot prove absence", async () => {
+		const ctx = await createHarnessContext(true);
+		const manager = await openStagedCandidate(ctx, "attempt-unreadable");
+		manager.appendSessionInit({ systemPrompt: "test", task: "unreadable-probe", tools: [] });
+		const stagedArtifactId = await manager.saveArtifact("candidate-unreadable-probe", "tool");
+		expect(stagedArtifactId).toBeDefined();
+		await manager.flush();
+
+		const store = ctx.parentArtifacts.getManagedStore();
+		if (!store) throw new Error("managed artifact store unavailable");
+		const stagedName = `${path.basename(ctx.finalPath, ".jsonl")}`;
+		expect(stagedName.length).toBeGreaterThan(0);
+		const realRead = store.readExpected.bind(store);
+		const finalName = path.basename(ctx.finalPath);
+		// The move reports a possibly-committed failure and the destination cannot be read,
+		// so absence is unproven and every compensation must fail closed.
+		const move = spyOn(store, "moveFileNoReplace").mockImplementation(() => {
+			throw new ManagedTreeMoveOutcomeError("managed_publish_identity_unknown", false);
+		});
+		const read = spyOn(store, "readExpected").mockImplementation((relativePath: string) => {
+			if (relativePath === finalName) throw new Error("managed_read_failed");
+			return realRead(relativePath);
+		});
+
+		try {
+			await expect(manager.commitStagedNestedManaged()).rejects.toThrow(/committed without proof/);
+			// Executor compensation: post-fence rollback then the pre-fence discard.
+			await manager.rollbackCommittedStaged();
+			await manager.discardStaged();
+		} finally {
+			read.mockRestore();
+			move.mockRestore();
+		}
+
+		// The staged transcript never moved, and nothing proved it safe to reclaim.
+		const stagingTree = await snapshotTree(ctx.stagingRoot);
+		expect(stagingTree).toContain("attempt-unreadable.jsonl");
+		const artifactTree = await snapshotTree(ctx.artifactRoot);
+		expect(artifactTree).toContain(Buffer.from("candidate-unreadable-probe").toString("base64"));
+		expect(artifactTree).toContain(Buffer.from("parent-sibling").toString("base64"));
 	});
 
 	it("preserves owned artifacts when a managed publish commits without proof", async () => {

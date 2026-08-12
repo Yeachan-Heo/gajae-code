@@ -407,5 +407,12 @@ describe("smart-routing panel hostile render boundary", () => {
 		expect(rendered).not.toContain("\x1b]0;");
 		expect(rendered).not.toContain("\x1b[2J");
 		expect(rendered).not.toContain("\x07");
+		// The error string is free-form, so it must also stay on exactly one row.
+		for (const line of rendered.split("\n")) {
+			const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
+			expect(plain.startsWith("INJECTED-PANEL-ROW")).toBe(false);
+			expect(plain.startsWith("INJECTED-CRLF-ROW")).toBe(false);
+			expect(Bun.stringWidth(plain)).toBeLessThanOrEqual(MAX_PANEL_LINE_WIDTH);
+		}
 	});
 });

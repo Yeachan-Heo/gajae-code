@@ -6999,6 +6999,12 @@ export class SessionManager {
 				publishedFinalSnapshot?: ManagedFileSnapshot;
 				publishedFinalBytes?: Buffer;
 				deferArtifactFinalize?: boolean;
+				/**
+				 * A publish that native code could neither prove nor disprove. The transcript may
+				 * already be visible at the destination, so no later cleanup may reclaim the
+				 * staging or artifacts it references.
+				 */
+				preservedUnproven?: boolean;
 		  }
 		| undefined;
 	#stagedArtifactParent: ArtifactManager | null = null;
@@ -18888,6 +18894,9 @@ export class SessionManager {
 				// Absence must be proven; an unreadable destination stays fail-closed.
 				if (destination || probeErrors.length > 0) {
 					staged.publishedFinalSnapshot = destination ?? undefined;
+					// Latch the uncertainty so no later compensation reclaims what a possibly
+					// published transcript references.
+					staged.preservedUnproven = true;
 					throw new AggregateError(
 						[toError(error), ...probeErrors],
 						"Staged publication may have committed without proof; artifacts and staging were preserved for recovery.",
@@ -18975,6 +18984,9 @@ export class SessionManager {
 	async discardStaged(): Promise<void> {
 		const staged = this.#stagedPublication;
 		if (!staged || staged.committed || staged.discarded) return;
+		// An unproven publish may already be visible at the destination; reclaiming its
+		// staging or artifacts would strand that transcript with dangling references.
+		if (staged.preservedUnproven) return;
 		const cleanupErrors: Error[] = [];
 		const captureCleanupError = (error: unknown): void => {
 			const normalized = toError(error);
