@@ -170,11 +170,11 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "gpt-5.6-luna:xhigh",
 	}),
 	profile("claude-opus", ["anthropic"], {
-		default: "anthropic/claude-opus-5:xhigh",
+		default: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
 		executor: "anthropic/claude-sonnet-5",
-		planner: "anthropic/claude-opus-5:low",
-		critic: "anthropic/claude-opus-5:high",
-		architect: "anthropic/claude-opus-5:xhigh",
+		planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+		critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+		architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
 	}),
 	profile("claude-fable", ["anthropic"], {
 		default: "anthropic/claude-fable-5:xhigh",

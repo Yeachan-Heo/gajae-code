@@ -99,6 +99,11 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				maxLevel: ThinkingLevel.XHigh,
 			}),
 			model("anthropic", "claude-sonnet-5"),
+			model("anthropic", "claude-opus-4-6", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
 			model("opencode-go", "deepseek-v4-pro"),
 			model("opencode-go", "kimi-k3"),
 			model("opencode-go", "mimo-v2.5-pro"),
@@ -210,6 +215,50 @@ describe("model profile activation", () => {
 			executor: "provider-b/executor",
 			architect: "provider-a/architect",
 		});
+	});
+
+	test("built-in claude-opus falls back to Opus 4.6 when Opus 5 is absent", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
+		expect(profile).toBeDefined();
+		const baseRegistry = fakeRegistry({ profiles: [profile!] });
+		const available = baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5");
+		const session = fakeSession();
+
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: {
+				...baseRegistry,
+				getAll: () => available,
+				getAvailable: () => available,
+			} as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			profileName: "claude-opus",
+		});
+
+		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(prepared.defaultChain).toEqual(["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"]);
+		expect(prepared.agentModelOverrides).toEqual({
+			executor: "anthropic/claude-sonnet-5",
+			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+		});
+	});
+
+	test("built-in claude-opus retains Opus 5 when the catalog exposes it", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
+		expect(profile).toBeDefined();
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: fakeRegistry({ profiles: [profile!] }),
+			settings: Settings.isolated(),
+			profileName: "claude-opus",
+		});
+
+		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
 	});
 
 	test("rejects a mixed provider-agnostic profile before mutation when a role alias is unavailable", async () => {
