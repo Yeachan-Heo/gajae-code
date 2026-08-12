@@ -307,7 +307,7 @@ export interface ResolvedTmuxBinary {
 
 /**
  * Resolve the tmux command GJC should invoke. Honors the existing
- * GJC_TMUX_COMMAND / GJC_TEAM_TMUX_COMMAND overrides; on Windows when no
+ * GJC_TMUX_COMMAND override; on Windows when no
  * override is set, psmux (installed as psmux, pmux, or tmux) is picked
  * automatically so the default gjc --tmux flow lands on a real multiplexer.
  */
@@ -315,7 +315,7 @@ export function resolveGjcTmuxBinary(options: ResolveGjcTmuxBinaryOptions = {}):
 	const env = options.env ?? process.env;
 	const platform = options.platform ?? process.platform;
 	const runner = options.runner ?? readSpawnRunner();
-	const explicit = env.GJC_TMUX_COMMAND?.trim() || env.GJC_TEAM_TMUX_COMMAND?.trim();
+	const explicit = env.GJC_TMUX_COMMAND?.trim();
 	if (explicit) {
 		const isPsmux =
 			platform === "win32"

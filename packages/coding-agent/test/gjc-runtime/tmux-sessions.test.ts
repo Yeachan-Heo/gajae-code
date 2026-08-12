@@ -345,9 +345,7 @@ describe("GJC tmux session management", () => {
 		expect(hint).toContain(
 			"Recover through GJC so it reuses that persisted authority; do not retry against ambient tmux/psmux or a raw `-L` namespace",
 		);
-		expect(hint).toContain(
-			"GJC_TMUX_COMMAND and GJC_TEAM_TMUX_COMMAND are binary overrides, not shell command lines",
-		);
+		expect(hint).toContain("GJC_TMUX_COMMAND is a binary override, not a shell command line");
 	});
 
 	it("hydrates native Windows tmux sessions from exact option reads when list-sessions omits user options", () => {

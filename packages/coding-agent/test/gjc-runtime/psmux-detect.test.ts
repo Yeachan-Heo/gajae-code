@@ -506,16 +506,6 @@ describe("resolveGjcTmuxBinary", () => {
 		expect(resolved.isPsmux).toBe(false);
 	});
 
-	it("falls back to GJC_TEAM_TMUX_COMMAND when GJC_TMUX_COMMAND is unset", () => {
-		const resolved = resolveGjcTmuxBinary({
-			platform: "linux",
-			env: { GJC_TEAM_TMUX_COMMAND: "team-tmux" },
-			runner: failingRunner(),
-		});
-		expect(resolved.command).toBe("team-tmux");
-		expect(resolved.viaExplicitOverride).toBe(true);
-	});
-
 	it("returns tmux as the POSIX default when no override and no binary on PATH", () => {
 		__setBinaryResolverForTests(() => null);
 		const resolved = resolveGjcTmuxBinary({
@@ -748,7 +738,7 @@ describe("resolveGjcTmuxBinary", () => {
 	it("treats an explicit Windows psmux path as psmux without relying on the version banner", () => {
 		const resolved = resolveGjcTmuxBinary({
 			platform: "win32",
-			env: { GJC_TEAM_TMUX_COMMAND: "C:\\tools\\psmux.exe" },
+			env: { GJC_TMUX_COMMAND: "C:\\tools\\psmux.exe" },
 			runner: buildRunner(tmuxVersionOutput()),
 		});
 		expect(resolved.command).toBe("C:\\tools\\psmux.exe");

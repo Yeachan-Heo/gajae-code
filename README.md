@@ -232,7 +232,7 @@ Set up Gajae-Code (gjc) as your coding-agent backend on this machine. gjc is alr
         GJC_COORDINATOR_MCP_MUTATIONS=sessions,questions,reports
 
 4. To delegate coding work, prefer one call per workflow:
-   gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team
+   gjc_delegate_plan / gjc_delegate_execute
    with { cwd, task, allow_mutation: true, idempotency_key: <fresh-uuid> }.
    Each starts an isolated worktree session and returns a durable turn_id and artifacts.
 

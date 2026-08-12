@@ -56,14 +56,14 @@ export function envDisabled(value: string | undefined): boolean {
  * Resolve the tmux (or tmux-compatible multiplexer) command GJC should invoke.
  *
  * This is the shared entry point used by every GJC code path that needs to talk
- * to a multiplexer: `gjc --tmux` planning, `gjc session ...`, `gjc team ...`,
+ * to a multiplexer: `gjc --tmux` planning and `gjc session ...`,
  * the lifecycle controller, and the harness resident owner. Routing all of
  * them through the same resolver means a single `GJC_TMUX_COMMAND` override or
  * a single Windows psmux / pmux detection wins for the whole process — the
  * failure mode where `gjc --tmux` creates a psmux-backed session and then
  * `gjc session status` fails because it queries literal `tmux` is closed off.
  *
- * Explicit `GJC_TMUX_COMMAND` / `GJC_TEAM_TMUX_COMMAND` overrides are honored on
+ * Explicit `GJC_TMUX_COMMAND` overrides are honored on
  * every platform. On native Windows without an override the resolver walks
  * `psmux`, then `pmux`, then `tmux` and uses the first binary present on PATH.
  * On POSIX the resolver returns `tmux` (the historical default) and only
@@ -124,10 +124,10 @@ export const GJC_TMUX_UNTAGGED_REASON = "gjc_tmux_session_untagged";
 export function buildGjcTmuxUntaggedSessionHint(tmuxCommand: string): string {
 	return (
 		`the active multiplexer "${tmuxCommand}" lists this session but did not return GJC's ${GJC_TMUX_PROFILE_OPTION} ownership tag; ` +
-		"GJC-managed sessions and `gjc team` require a tmux provider that round-trips tmux user options. " +
+		"GJC-managed sessions require a tmux provider that round-trips tmux user options. " +
 		"On Windows psmux, GJC persists a ProviderAuthority that binds the exact executable identity and an isolated `-L <namespace>` server namespace for the owner generation. " +
 		"Recover through GJC so it reuses that persisted authority; do not retry against ambient tmux/psmux or a raw `-L` namespace. " +
-		"GJC_TMUX_COMMAND and GJC_TEAM_TMUX_COMMAND are binary overrides, not shell command lines."
+		"GJC_TMUX_COMMAND is a binary override, not a shell command line."
 	);
 }
 
