@@ -168,7 +168,7 @@ deep-interview -> ralplan -> ultragoal
 | `team` | Coordinates tmux-backed workers when parallelism is worth it. |
 | `executor` / `architect` / `planner` / `critic` | Bundled role agents for implementation and read-only review lanes. |
 
-Also included, opt-in: **`gjc rlm`** (a Jupyter-style research/REPL mode that synthesizes a notebook and report) and **`computer-use`** (experimental desktop control). See [Python REPL](docs/python-repl.md) and [docs/tools/computer.md](docs/tools/computer.md).
+Also included, opt-in: **`computer-use`** (experimental desktop control). See [Python REPL](docs/python-repl.md) and [docs/tools/computer.md](docs/tools/computer.md).
 
 ## Custom skills
 

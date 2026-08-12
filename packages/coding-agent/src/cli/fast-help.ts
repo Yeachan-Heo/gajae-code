@@ -24,7 +24,6 @@ export function getExtraHelpText(): string {
   ${APP_NAME} mcp-serve            - Serve the MCP integration endpoint
   ${APP_NAME} contribute-pr        - Prepare contribution/PR workflow artifacts
   ${APP_NAME} migrate              - Run migration helpers
-  ${APP_NAME} rlm                  - Run RLM helpers
   ${APP_NAME} update               - Update GJC installation artifacts
   ${APP_NAME} plugin               - Install, remove, and list plugins
   ${APP_NAME} web-search           - Search the web from the CLI (alias: q)

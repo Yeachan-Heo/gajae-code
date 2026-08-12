@@ -62,7 +62,6 @@ export const commands: CommandEntry[] = [
 	},
 	{ name: "deep-interview", load: () => import("./commands/deep-interview").then(m => m.default) },
 	{ name: "migrate", load: () => import("./commands/migrate").then(m => m.default) },
-	{ name: "rlm", load: () => import("./commands/rlm").then(m => m.default) },
 	{ name: "update", load: () => import("./commands/update").then(m => m.default) },
 	{ name: "read", load: () => import("./commands/read").then(m => m.default) },
 	{ name: "customize", load: () => import("./commands/customize").then(m => m.default) },
