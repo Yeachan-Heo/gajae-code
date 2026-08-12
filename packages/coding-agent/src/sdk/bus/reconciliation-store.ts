@@ -9,7 +9,7 @@
  * Non-terminal records with a pending outcome finalize that exact claim on bootstrap.
  * Outcome-less skills retain the existing failed/process_restart settlement.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
@@ -630,7 +630,7 @@ export function createReconciliationStore(options: {
 		if (!filePath) return;
 		const directory = path.dirname(filePath);
 		await fileFs.mkdir(directory, { recursive: true, mode: 0o700 });
-		const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+		const temporary = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomUUID()}.tmp`;
 		try {
 			await fileFs.writeFile(temporary, `${JSON.stringify(document)}\n`, { mode: 0o600 });
 			try {
