@@ -176,6 +176,41 @@ describe("online-if-uncached model refresh", () => {
 		expect(offline.dynamicModelIds).toBeUndefined();
 	});
 
+	test("withholds matching cached dynamic IDs during offline refresh", async () => {
+		const providerId = "cache-offline-provenance";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: provenance,
+				now: () => now,
+				fetchDynamicModels: async () => [model(providerId, "dynamic")],
+			},
+			"online",
+		);
+
+		const offline = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: provenance,
+				now: () => now,
+				fetchDynamicModels: async () => {
+					throw new Error("offline refresh must not fetch");
+				},
+			},
+			"offline",
+		);
+
+		expect(offline.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+		expect(offline.dynamicModelIds).toBeUndefined();
+	});
+
 	test("refreshes missing and stale caches", async () => {
 		const now = 1_700_000_000_000;
 		for (const [providerId, cachedAt] of [

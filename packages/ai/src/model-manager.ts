@@ -163,7 +163,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				models: cachedModels,
 				stale: false,
 				fetched: false,
-				dynamicModelIds: cacheDynamicModelIdsCurrent ? cache.dynamicModelIds : undefined,
+				dynamicModelIds:
+					strategy === "online-if-uncached" && cacheDynamicModelIdsCurrent ? cache.dynamicModelIds : undefined,
 			};
 		}
 		const repairedModels = mergeDynamicModels(staticModels, cachedModels);
@@ -183,7 +184,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			models: repairedModels,
 			stale: false,
 			fetched: false,
-			dynamicModelIds: cacheDynamicModelIdsCurrent ? cache.dynamicModelIds : undefined,
+			dynamicModelIds:
+				strategy === "online-if-uncached" && cacheDynamicModelIdsCurrent ? cache.dynamicModelIds : undefined,
 		};
 	}
 
