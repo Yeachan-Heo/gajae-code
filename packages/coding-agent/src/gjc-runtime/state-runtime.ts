@@ -14,11 +14,7 @@ import {
 	syncSkillActiveState,
 } from "../skill-state/active-state";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
-import {
-	buildRalplanHudSummary,
-	buildUltragoalHudSummary,
-	deriveDeepInterviewHud,
-} from "../skill-state/workflow-hud";
+import { buildRalplanHudSummary, buildUltragoalHudSummary, deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import {
 	type AuditEntry,
 	buildWorkflowStateReceipt,

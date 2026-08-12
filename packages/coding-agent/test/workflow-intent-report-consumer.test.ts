@@ -171,7 +171,10 @@ describe("workflow intent report consumer", () => {
 	it("counts autoresearch research-mission intents as their own route", () => {
 		const entries: readonly SessionEntry[] = [
 			workflowEntry("autoresearch-1", "investigate the dataset and benchmark both approaches to report evidence"),
-			workflowEntry("autoresearch-2", "research whether the new caching layer reduces latency for this dataset and report evidence"),
+			workflowEntry(
+				"autoresearch-2",
+				"research whether the new caching layer reduces latency for this dataset and report evidence",
+			),
 			workflowEntry("direct-1", "fix the team settings page typo"),
 		];
 

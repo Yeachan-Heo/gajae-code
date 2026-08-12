@@ -94,7 +94,6 @@ async function seedFileLock(base: string, id: string, pid: number): Promise<stri
 }
 
 async function collectRecord(adapter: GcStoreAdapter, ctx: GcContext, recordPath: string): Promise<GcRecord> {
-
 	const result = await adapter.collect(ctx);
 	expect(result.errors).toEqual([]);
 	const record = result.records.find(candidate => candidate.path === recordPath);
@@ -164,11 +163,7 @@ describe("gc red-team invariants", () => {
 			expect(rec.action).toBe("none");
 		}
 
-		const report = await collectGcReport(
-			[harnessLeasesGcAdapter, fileLocksGcAdapter],
-			ctx,
-			true,
-		);
+		const report = await collectGcReport([harnessLeasesGcAdapter, fileLocksGcAdapter], ctx, true);
 		expect(report.counts.removed).toBe(0);
 		expect(report.counts.failed).toBe(0);
 		expect(report.counts.would_remove).toBe(0);
@@ -185,11 +180,7 @@ describe("gc red-team invariants", () => {
 		const lockDir = await seedFileLock(base, "unknown", UNKNOWN_PID);
 		const ctx = ctxFor(base, registryDir, adversarialProbe);
 
-		const report = await collectGcReport(
-			[harnessLeasesGcAdapter, fileLocksGcAdapter],
-			ctx,
-			true,
-		);
+		const report = await collectGcReport([harnessLeasesGcAdapter, fileLocksGcAdapter], ctx, true);
 		const records = [
 			report.stores.harness_leases.find(record => record.path === leaseFile),
 			report.stores.file_locks.find(record => record.path === lockDir),
@@ -246,7 +237,7 @@ describe("gc red-team invariants", () => {
 		expect(report.counts.removed).toBe(1);
 		expect(report.counts.failed).toBe(1);
 		expect(computeExitCode(report)).toBe(1);
-});
+	});
 
 	test("TOCTOU prune skip is reported as skipped, not removed or failed, and exits zero", async () => {
 		const adapter = fakeAdapter("file_locks", [record("file_locks", "became-live")], async () => ({

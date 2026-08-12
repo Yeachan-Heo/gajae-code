@@ -135,7 +135,11 @@ export const WORKFLOW_COMMAND_REF_BLOCKS: readonly CommandRefBlock[] = [
 			},
 		],
 		aliasesAndBridges: [
-			{ from: "ralplan", to: "autoresearch|ultragoal", rendered: "gjc state ralplan handoff --to <autoresearch|ultragoal> --json" },
+			{
+				from: "ralplan",
+				to: "autoresearch|ultragoal",
+				rendered: "gjc state ralplan handoff --to <autoresearch|ultragoal> --json",
+			},
 		],
 		notes: [
 			"Before invoking `/skill:autoresearch` or `/skill:ultragoal`, mark ralplan ready for handoff so the skill tool's chain guard permits the transition.",
@@ -171,10 +175,7 @@ export const WORKFLOW_COMMAND_REF_BLOCKS: readonly CommandRefBlock[] = [
 		sourcePath: skillPath("autoresearch"),
 		renderOrder: 10,
 		markers: { start: "<!-- gjc:cmdref:start state -->", end: "<!-- gjc:cmdref:end state -->" },
-		commands: [
-			stateWrite("autoresearch"),
-			stateHandoff("autoresearch", ["ralplan", "deep-interview", "ultragoal"]),
-		],
+		commands: [stateWrite("autoresearch"), stateHandoff("autoresearch", ["ralplan", "deep-interview", "ultragoal"])],
 		examples: [
 			{
 				label: "handoff state write",

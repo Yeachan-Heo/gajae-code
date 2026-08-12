@@ -251,7 +251,7 @@ describe("workflow state writer drift guard", () => {
 		);
 		expect(write.status).toBe(0);
 		await expectPersistedEnvelope(statePath);
-});
+	});
 
 	it("persists required-on-write envelope for explicit legacy migration", async () => {
 		const root = await tempDir();

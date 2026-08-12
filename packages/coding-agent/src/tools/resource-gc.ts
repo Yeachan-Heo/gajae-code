@@ -19,11 +19,7 @@ function safeProbeWindowsJobMemory(): WindowsJobMemoryProbeResult {
 import { logger } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 import { computeMemoryGuardDomain } from "../runtime/memory-domain";
-import {
-	chooseMemoryGuardAction,
-	MemoryGuardHost,
-	resolveMemoryGuardPolicy,
-} from "../runtime/memory-guard";
+import { chooseMemoryGuardAction, MemoryGuardHost, resolveMemoryGuardPolicy } from "../runtime/memory-guard";
 import type { MemoryGuardPolicy } from "../runtime/memory-guard-contract";
 import { resolveEffectiveMemoryLimit } from "../runtime/memory-limit";
 import { listTabsForGc, releaseTabIfGcEligible, type TabGcSnapshot } from "./browser/tab-supervisor";

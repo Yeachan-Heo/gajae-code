@@ -498,7 +498,7 @@ describe("resource GC controller", () => {
 			}),
 		);
 		expect(runGc).toHaveBeenCalledTimes(1);
-});
+	});
 	it("schedules an enabled guard at its configured check interval", async () => {
 		const clock = controlledScheduler();
 		const runGc = vi.fn();

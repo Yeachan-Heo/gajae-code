@@ -35,12 +35,7 @@ import { FileSessionStorage, probeSessionRetirement, retireSessionTranscript } f
 import { buildGcReportText } from "./gc-render";
 import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
 
-export type GcStore =
-	| "harness_leases"
-	| "file_locks"
-	| "tmux_sessions"
-	| "registry_entries"
-	| "local_roots";
+export type GcStore = "harness_leases" | "file_locks" | "tmux_sessions" | "registry_entries" | "local_roots";
 
 export const GC_STORES: readonly GcStore[] = [
 	"harness_leases",

@@ -1476,7 +1476,10 @@ describe("config-root workflow settings migration", () => {
 			source,
 			'{"gjc.deepInterview.ambiguityThreshold":0.8,"gjc.ralplan.autoHandoff":"off","gjc.ralplan.maxIterations":"bad"}',
 		);
-		const oldSourceHash = nodeCrypto.createHash("sha256").update('{"gjc.ralplan.autoHandoff":"ultragoal"}').digest("hex");
+		const oldSourceHash = nodeCrypto
+			.createHash("sha256")
+			.update('{"gjc.ralplan.autoHandoff":"ultragoal"}')
+			.digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({

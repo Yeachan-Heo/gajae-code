@@ -77,7 +77,13 @@ describe("GJC skill-active state", () => {
 
 	it("filters root fallback entries to the current session", async () => {
 		await withTempCwd(async cwd => {
-			await syncSkillActiveState({ cwd, skill: "autoresearch", active: true, phase: "running", sessionId: "sess-a" });
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				active: true,
+				phase: "running",
+				sessionId: "sess-a",
+			});
 			await syncSkillActiveState({
 				cwd,
 				skill: "deep-interview",
@@ -658,7 +664,13 @@ describe("GJC skill-active state", () => {
 	it("planning pipeline collapse keeps downstream planning skill while preserving autoresearch alongside ultragoal", async () => {
 		await withTempCwd(async cwd => {
 			await syncSkillActiveState({ cwd, skill: "ralplan", phase: "planner", active: true, sessionId: "sess-pipe" });
-			await syncSkillActiveState({ cwd, skill: "autoresearch", phase: "research", active: true, sessionId: "sess-pipe" });
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				phase: "research",
+				active: true,
+				sessionId: "sess-pipe",
+			});
 			await syncSkillActiveState({ cwd, skill: "ultragoal", phase: "active", active: true, sessionId: "sess-pipe" });
 
 			const visible = await readVisibleSkillActiveState(cwd, "sess-pipe");
@@ -784,7 +796,13 @@ describe("GJC skill-active state", () => {
 	it("local active-entry writes invalidate the visible-state cache immediately", async () => {
 		await withTempCwd(async cwd => {
 			invalidateVisibleSkillActiveStateCache();
-			await syncSkillActiveState({ cwd, skill: "autoresearch", phase: "research", active: true, sessionId: "sess-local" });
+			await syncSkillActiveState({
+				cwd,
+				skill: "autoresearch",
+				phase: "research",
+				active: true,
+				sessionId: "sess-local",
+			});
 			expect((await readVisibleSkillActiveState(cwd, "sess-local"))?.active_skills?.[0]?.phase).toBe("research");
 
 			await writeActiveEntry(

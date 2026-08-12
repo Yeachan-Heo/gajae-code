@@ -184,5 +184,4 @@ describe("workflow HUD summary builders", () => {
 		});
 		expect(hud.chips?.some(chip => chip.label === "ledger")).toBe(false);
 	});
-
 });

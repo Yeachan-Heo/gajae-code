@@ -62,7 +62,6 @@ const ARTIFACT_RETENTION: RetentionPolicy = { category: "artifact" };
 const LEDGER_RETENTION: RetentionPolicy = { category: "ledger" };
 const LOG_RETENTION: RetentionPolicy = { category: "log", maxAgeDays: 30 };
 const REPORT_RETENTION: RetentionPolicy = { category: "report", maxAgeDays: 30 };
-const AGENTS_RETENTION: RetentionPolicy = { category: "agents" };
 const PRUNE_RETENTION: RetentionPolicy = { category: "prune/delete", maxAgeDays: 30 };
 const FORCE_RETENTION: RetentionPolicy = { category: "force", maxAgeDays: 90 };
 
