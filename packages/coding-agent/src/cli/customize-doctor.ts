@@ -1491,6 +1491,7 @@ function formatMcpSummary(item: CustomizeDoctorItem): string {
 	if (!mcp) return "";
 	const parts: string[] = [`transport: ${mcp.transport ?? "unknown"}`];
 	if (mcp.command) parts.push(`command: ${mcp.command}`);
+	if (mcp.args && mcp.args.length > 0) parts.push(`args: ${mcp.args.join(" ")}`);
 	if (mcp.url) parts.push(`url: ${mcp.url}`);
 	if (mcp.envKeys && mcp.envKeys.length > 0) parts.push(`env: ${mcp.envKeys.join(",")}`);
 	if (mcp.hasHeaders) parts.push("headers: present (values redacted)");
