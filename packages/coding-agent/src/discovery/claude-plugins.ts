@@ -16,8 +16,8 @@ import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
 import { rootContainsGjcManifest } from "../extensibility/gjc-plugins";
 import {
-	type ClaudePluginRoot,
 	buildRuleFromMarkdown,
+	type ClaudePluginRoot,
 	createSourceMeta,
 	listClaudePluginRoots,
 	loadFilesFromDir,
@@ -220,7 +220,6 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 
 	return { items, warnings };
 }
-
 
 // =============================================================================
 // Hooks
