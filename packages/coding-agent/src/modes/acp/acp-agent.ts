@@ -1725,11 +1725,7 @@ export class AcpAgent implements Agent {
 		} finally {
 			if (waiter) {
 				waiter.pendingCancelAttempts = Math.max(0, (waiter.pendingCancelAttempts ?? 1) - 1);
-				if (
-					waiter.pendingCancelAttempts === 0 &&
-					!waiter.cancelAcknowledged &&
-					record.activePrompt === waiter
-				) {
+				if (waiter.pendingCancelAttempts === 0 && !waiter.cancelAcknowledged && record.activePrompt === waiter) {
 					record.cancelRequested = false;
 				}
 			}
