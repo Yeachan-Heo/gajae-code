@@ -14237,6 +14237,11 @@ export class SessionManager {
 			this.#managedPersistExpectedIdentity = undefined;
 			return;
 		}
+		const sessionDir = path.resolve(path.dirname(sessionFile));
+		if (sessionDir !== path.resolve(this.destination.directory)) {
+			this.#managedPersistExpectedIdentity = undefined;
+			return;
+		}
 		const descriptor = this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile));
 		if (!descriptor) throw new Error("managed_persist_identity_unavailable");
 		this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(descriptor);

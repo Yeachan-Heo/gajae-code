@@ -12920,7 +12920,11 @@ export class AgentSession {
 		},
 	): Promise<DefaultModelSelectionResult> {
 		// Scheduled continuations share this admission queue, so idle settlement
-		// must happen before selection acquires its lease.
+		// must happen before selection acquires its lease. But a reentrant
+		// selection from inside an active admission (e.g. before_agent_start)
+		// must reject immediately instead of deadlocking on waitForIdle.
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		await this.waitForIdle();
 		return this.#withSessionAdmission("selection", async () => {
 			options?.onBeforeMutation?.();
