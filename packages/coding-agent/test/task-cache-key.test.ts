@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Message, ProviderSessionState } from "@gajae-code/ai/types";
 import { Snowflake } from "@gajae-code/utils";
+import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
 import { createAgentSession } from "../src/sdk";
 import type { AgentSession, ForkContextSeed } from "../src/session/agent-session";
@@ -223,6 +224,39 @@ describe("task fork-context provider identity", () => {
 		expect(second.agent.providerSessionId).toBe("shared-provider-affinity");
 		expect(first.sessionManager.getSessionId()).not.toBe(second.sessionManager.getSessionId());
 	});
+
+	it("rekeys explicit provider ownership to the successor transcript and frees the predecessor", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-transition-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const providerSessionId = "shared-provider-affinity";
+		const { session, authStorage } = await createSession(tempDir, { providerSessionId });
+		sessions.push(session);
+		authStorages.push(authStorage);
+
+		const previousSessionId = session.sessionManager.getSessionId();
+		const previousSessionFile = session.sessionManager.getSessionFile();
+		expect(previousSessionFile).toBeDefined();
+		const previousEndpoint = JSON.stringify(["async-job-endpoint", providerSessionId, previousSessionFile]);
+		const manager = AsyncJobManager.forEndpoint(previousEndpoint);
+		expect(manager).toBeDefined();
+
+		expect(await session.newSession()).toBe(true);
+		const successorSessionFile = session.sessionManager.getSessionFile();
+		expect(successorSessionFile).toBeDefined();
+		expect(session.sessionManager.getSessionId()).not.toBe(previousSessionId);
+		const successorEndpoint = JSON.stringify(["async-job-endpoint", providerSessionId, successorSessionFile]);
+		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
+		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
+
+		const previousManager = await SessionManager.open(previousSessionFile!);
+		const { session: reopened, authStorage: reopenedAuth } = await createSession(tempDir, {
+			providerSessionId,
+			sessionManager: previousManager,
+		});
+		sessions.push(reopened);
+		authStorages.push(reopenedAuth);
+		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeDefined();
+	}, 15_000);
 
 	it("does not share mutable provider state unless explicitly supplied", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-state-${Snowflake.next()}-`));

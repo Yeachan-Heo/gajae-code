@@ -3366,7 +3366,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			obfuscator,
 			agentId: resolvedAgentId,
 			agentRegistry,
-			asyncJobEndpointId,
+			asyncJobProviderSessionId: options.providerSessionId,
 			providerSessionId: options.providerSessionId,
 			credentialSessionId: options.credentialSessionId,
 			providerCacheSessionId: providerSessionId,
