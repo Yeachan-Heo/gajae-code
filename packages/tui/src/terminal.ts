@@ -51,6 +51,10 @@ export function keyboardEnhancementEnabled(): boolean {
 	return $flag("GJC_TUI_KEYBOARD_PROTOCOL", true);
 }
 
+function isAppleTerminal(): boolean {
+	return $env.TERM_PROGRAM === "Apple_Terminal";
+}
+
 /**
  * Minimal terminal interface for TUI
  */
@@ -794,18 +798,18 @@ export class ProcessTerminal implements Terminal {
 		}
 		this.#safeWrite("\x1b[?u");
 		this.#stdinBuffer?.noteProbeIssued();
-		// Windows Terminal and conhost do not implement the Kitty keyboard
+		// Windows Terminal and Apple Terminal do not implement the Kitty keyboard
 		// protocol, so the query above never activates it there. They do honor the
-		// modifyOtherKeys fallback below — but that mode breaks Windows CJK/Hangul
-		// IME composition: Alt+Enter (and other chords) bypass the IME commit, so
-		// the syllable still being composed is never delivered to the app and the
+		// modifyOtherKeys fallback below — but that mode breaks CJK/Hangul IME
+		// composition: Alt+Enter (and other chords) bypass the IME commit, so the
+		// syllable still being composed is never delivered to the app and the
 		// action fires on empty text (e.g. queue-message no-ops unless the user
 		// types a trailing space to force a commit first). Skip the fallback on
-		// win32; legacy encodings still deliver Alt+Enter (ESC CR) and the newline
-		// chords, and IME composition works again. Opt back in with
+		// these terminals; legacy encodings still deliver Alt+Enter (ESC CR) and
+		// the newline chords, and IME composition works again. Opt back in with
 		// GJC_TUI_KEYBOARD_PROTOCOL=0 disabling all enhancement, or force-enable
-		// elsewhere if a Kitty-capable Windows terminal appears.
-		if (process.platform === "win32") {
+		// elsewhere if a Kitty-capable terminal appears.
+		if (process.platform === "win32" || isAppleTerminal()) {
 			return;
 		}
 		this.#modifyOtherKeysTimeout = setTimeout(() => {

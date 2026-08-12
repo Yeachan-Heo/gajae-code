@@ -45,7 +45,7 @@ A forced render (`requestRender(true)`) resets previous-line caches and cursor b
 1. Enables raw mode and bracketed paste.
 2. Attaches resize handler.
 3. Creates a `StdinBuffer` to split partial escape chunks into complete sequences.
-4. Queries Kitty keyboard protocol support (`CSI ? u`), then enables protocol flags if supported; otherwise enables modifyOtherKeys fallback after a short timeout.
+4. Queries Kitty keyboard protocol support (`CSI ? u`), then enables protocol flags if supported; otherwise enables the modifyOtherKeys fallback after a short timeout, except on Windows and Apple Terminal where that fallback breaks CJK/Hangul IME composition.
 5. Queries OSC 11 background color and enables Mode 2031 appearance notifications for dark/light theme detection.
 6. On Windows, attempts VT input enablement via `kernel32` mode flags.
    `StdinBuffer` behavior:

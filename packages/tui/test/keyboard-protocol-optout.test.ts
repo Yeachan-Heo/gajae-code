@@ -5,6 +5,7 @@ const stdinIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isT
 const stdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
 const originalKeyboardProtocolEnv = Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
+const originalTermProgram = Bun.env.TERM_PROGRAM;
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
 
 function setPlatform(platform: NodeJS.Platform): void {
@@ -45,6 +46,7 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 		restoreProperty(process.stdout, "isTTY", stdoutIsTtyDescriptor);
 		restoreProperty(process.stdin, "setRawMode", stdinSetRawModeDescriptor);
 		restoreEnv("GJC_TUI_KEYBOARD_PROTOCOL", originalKeyboardProtocolEnv);
+		restoreEnv("TERM_PROGRAM", originalTermProgram);
 		restoreProperty(process, "platform", platformDescriptor);
 	});
 
@@ -111,6 +113,25 @@ describe("ProcessTerminal keyboard-protocol opt-out (GJC_TUI_KEYBOARD_PROTOCOL)"
 
 		// The Kitty query is still emitted (harmless where unsupported), but the
 		// modifyOtherKeys fallback that breaks Windows Hangul/CJK IME is skipped.
+		expect(writes).toContain(KITTY_QUERY);
+
+		vi.advanceTimersByTime(150);
+		expect(writes).not.toContain(MODIFY_OTHER_KEYS);
+
+		terminal.stop();
+	});
+
+	it("skips only the modifyOtherKeys fallback in Apple Terminal to preserve Hangul IME composition", () => {
+		vi.useFakeTimers();
+		setPlatform("darwin");
+		delete Bun.env.GJC_TUI_KEYBOARD_PROTOCOL;
+		Bun.env.TERM_PROGRAM = "Apple_Terminal";
+		expect(keyboardEnhancementEnabled()).toBe(true);
+
+		const { terminal, writes } = setupTerminal();
+
+		// Apple Terminal does not answer the Kitty query. Its modifyOtherKeys mode
+		// breaks CJK/Hangul IME composition, so only the fallback is withheld.
 		expect(writes).toContain(KITTY_QUERY);
 
 		vi.advanceTimersByTime(150);
