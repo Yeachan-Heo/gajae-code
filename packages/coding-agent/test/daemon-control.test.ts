@@ -1436,6 +1436,60 @@ describe("ChatDaemonController ownership safety", () => {
 		expect(signals).toEqual([]);
 	});
 
+	test("treats EPERM liveness probes as an existing chat daemon owner", async () => {
+		const agentDir = tempAgentDir();
+		const s = setPrivateAgentDir(
+			Settings.isolated({
+				"notifications.enabled": true,
+				"notifications.discord.botToken": "discord-token",
+				"notifications.discord.applicationId": "app",
+				"notifications.discord.guildId": "guild",
+				"notifications.discord.parentChannelId": "parent",
+			}) as Settings,
+			agentDir,
+		);
+		const identity = crypto
+			.createHash("sha256")
+			.update(["discord-token", "app", "guild", "parent", "false", "lean"].join("\0"))
+			.digest("hex")
+			.slice(0, 16);
+		const paths = chatDaemonPaths(agentDir, "discord");
+		fs.mkdirSync(paths.dir, { recursive: true });
+		fs.writeFileSync(
+			paths.state,
+			JSON.stringify({
+				version: 1,
+				kind: "discord",
+				pid: 77,
+				ownerId: "owner-a",
+				identity,
+				incarnation: "linux:12345",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+				transportHealthy: true,
+				generation: chatDaemonGeneration("discord"),
+			}),
+		);
+		const kill = spyOn(process, "kill").mockImplementation(() => {
+			throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+		});
+		let spawns = 0;
+		try {
+			const controller = new ChatDaemonController(s, "discord", {
+				pidIncarnation: () => "linux:12345",
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			});
+			expect((await controller.status()).health).toBe("running");
+			expect(await controller.ensure()).toBe("attached");
+			expect(spawns).toBe(0);
+		} finally {
+			kill.mockRestore();
+		}
+	});
+
 	test("refuses Darwin default TERM/KILL without opening the native numeric-PID signal path", async () => {
 		const agentDir = tempAgentDir();
 		const s = setPrivateAgentDir(
