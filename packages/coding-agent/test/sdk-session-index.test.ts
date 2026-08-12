@@ -218,7 +218,6 @@ describe("SDK session index", () => {
 		await expect(index.append(event("blocked-before-repair"))).rejects.toThrow("--repair-session-index");
 		expect(await index.repair()).toMatchObject({ status: "corrupt", repaired: true, validPrefixSeq: 2 });
 
-
 		await index.append(event("after"));
 		await index.compact();
 

@@ -4982,7 +4982,8 @@ export async function reapDeadSessionRegistrations(
 			if (session.terminal || session.terminalUncertain) return false;
 			const recordedIncarnation = session.hostIncarnation ?? session.processIncarnation;
 			return (
-				observeProcess(session.pid, recordedIncarnation, pid => processIncarnationForBroker(broker, pid)) === "exited"
+				observeProcess(session.pid, recordedIncarnation, pid => processIncarnationForBroker(broker, pid)) ===
+				"exited"
 			);
 		})
 		.slice(0, Math.max(0, limit));
