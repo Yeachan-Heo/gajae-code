@@ -119,7 +119,7 @@ High-level delegation tools:
 - `gjc_delegate_plan`
 - `gjc_delegate_execute`
 
-The `gjc_delegate_*` tools package common GJC workflows for hosts that want to delegate an entire planning, execution, or team turn without manually composing `start_session` and `send_prompt`. They use the same coordinator mutation gates and workdir allowlists as the lower-level session tools.
+The `gjc_delegate_*` tools package common GJC workflows for hosts that want to delegate an entire planning or execution turn without manually composing `start_session` and `send_prompt`. They use the same coordinator mutation gates and workdir allowlists as the lower-level session tools.
 
 ### Start a managed GJC session
 

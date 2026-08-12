@@ -39,7 +39,7 @@ Use GJC first for coding, review, planning, and follow-up sessions. Treat OMX as
 ## During work
 
 - Keep session names and branch names issue-scoped.
-- Prefer GJC workflow skills only when they fit: `deep-interview` for unclear requirements, `ralplan` for planning, `ultragoal` for durable ledgers, and `team` for coordinated tmux execution.
+- Prefer GJC workflow skills only when they fit: `deep-interview` for unclear requirements, `ralplan` for planning, `ultragoal` for durable ledgers, and `autoresearch` for goal-directed research missions.
 - Keep evidence in the session: issue reads, focused tests/checks, screenshots only when visual behavior matters, and PR URLs.
 - When GJC is weaker than OMX, finish the urgent work with the smallest safe fallback and file a gajae-code follow-up issue with the missing capability, exact command/session context, expected behavior, and evidence.
 

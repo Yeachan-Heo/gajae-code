@@ -144,7 +144,7 @@ A meetup host can also turn the same analysis into a playful, MBTI-like “Gajae
 
 3. C / D — Craft vs Delegate
    - C: 직접 구현/수정/탐색 중심.
-   - D: subagent, executor, architect, critic, team, parallel delegation 사용이 강함.
+   - D: subagent, executor, architect, critic, autoresearch, parallel delegation 사용이 강함.
 
 4. X / O — Explore vs Operate
    - X: 새로운 모델/provider/tool/research/실험 주제가 많음.

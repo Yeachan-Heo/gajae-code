@@ -2,7 +2,7 @@
 
 This is the repo-owned contract for future Gajae-Code UI, web, dashboard, terminal, and TUI visual work. It adapts the useful OMO design-reference and visual-QA workflow without vendoring any third-party design corpus.
 
-It is not a fifth bundled workflow skill. Gajae-Code's public workflow surface remains `deep-interview`, `ralplan`, `ultragoal`, and `team`; use this document as planning/review guidance inside those workflows or direct implementation.
+It is not a fifth bundled workflow skill. Gajae-Code's public workflow surface remains `deep-interview`, `ralplan`, `ultragoal`, and `autoresearch`; use this document as planning/review guidance inside those workflows or direct implementation.
 
 ## Required branch before implementation
 

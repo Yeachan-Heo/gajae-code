@@ -4,7 +4,7 @@ This document maps the main parts of the `gajae-code` repository. The root READM
 
 ## Product shape
 
-Gajae-Code (`gjc`) is centered on `packages/coding-agent/`. The public workflow surface is intentionally fixed at four source-bundled skills and four public role subagents. Runtime state, specs, plans, goals, team state, and local overrides live under `.gjc/`.
+Gajae-Code (`gjc`) is centered on `packages/coding-agent/`. The public workflow surface is intentionally fixed at four source-bundled skills and four public role subagents. Runtime state, specs, plans, goals, research missions, and local overrides live under `.gjc/`.
 
 Default workflow skills are embedded from:
 
@@ -27,7 +27,7 @@ The runtime can still discover project/user overrides, but the bundled defaults 
 Main `gjc` CLI and product runtime.
 
 - `packages/coding-agent/package.json` exposes the `gjc` binary at `src/cli.ts` and the SDK/barrel entrypoint at `src/index.ts`.
-- `packages/coding-agent/src/cli.ts` is the executable bootstrap. It registers CLI commands such as `setup`, `deep-interview`, `ralplan`, `ultragoal`, `team`, and the default launch path.
+- `packages/coding-agent/src/cli.ts` is the executable bootstrap. It registers CLI commands such as `setup`, `deep-interview`, `ralplan`, `ultragoal`, `autoresearch`, and the default launch path.
 - `packages/coding-agent/src/main.ts` adapts CLI options into session creation and dispatches interactive, print, and ACP modes; process-isolated clients use the broker-bound session CLI, Coordinator MCP, or managed adapters.
 - `packages/coding-agent/src/sdk/session.ts` assembles settings, model registry, auth, workspace/context discovery, skills, rules, tools, system prompt, and the underlying `@gajae-code/agent-core` agent.
 - `packages/coding-agent/src/tools/index.ts` is the built-in tool registry for file/code/runtime tools such as read, bash, edit, AST tools, eval, find/search, LSP, browser, task/subagent, recipe, IRC, todo, web search, and write. Memory backends are private integrations, not public coding-harness tools.
