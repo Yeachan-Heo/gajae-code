@@ -32,9 +32,11 @@ import { type SlashCommand, slashCommandCapability } from "../capability/slash-c
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { Capability, LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { Settings, type Settings as SettingsInstance } from "../config/settings";
+import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { initializeWithSettings, loadCapability } from "../discovery";
 import { inspectClaudeConvention } from "../discovery/claude";
 import { inspectCodexConvention } from "../discovery/codex";
+import { scanSkillsFromDir } from "../discovery/helpers";
 import { summarizeGjcPluginObservability } from "../extensibility/gjc-plugins/observability";
 import { loadEffectiveGjcPluginRegistry } from "../extensibility/gjc-plugins/registry";
 import { getEnabledPlugins } from "../extensibility/plugins/loader";
@@ -42,7 +44,9 @@ import { loadSkills } from "../extensibility/skills";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import { loadAllMCPConfigs } from "../runtime-mcp/config";
 import { readDisabledServers } from "../runtime-mcp/config-writer";
+import { canonicalizeMCPEndpoint } from "../runtime-mcp/pool-key";
 import { redactMCPEndpoint } from "../runtime-mcp/redaction";
+import { expandTilde } from "../tools/path-utils";
 
 // =============================================================================
 // Public types (stable JSON contract)
@@ -54,11 +58,14 @@ export type CustomizeSurfaceKind = "mcp" | "skill" | "hook" | "tool" | "extensio
  * Provenance class of a discovered item — the reusable read model for the
  * `/extensions` surface (#4291) and CI/setup tooling.
  *
- * - `canonical`: project/global `.gjc` entries — the primary load path.
- * - `convention`: other registered conventions (claude-plugins, agents,
+ * - `canonical`: project/global `.gjc` entries and GJC bundled defaults — the
+ *   primary load path and the persisted authority for sessions.
+ * - `convention`: items from registered non-native conventions that are part of
+ *   the discovery load path (claude-plugins, claude/codex hooks, agents,
  *   cursor, gemini, opencode, windsurf, cline, github, mcp-json, ssh).
- * - `import-candidate`: Claude Code / Codex project (+ global) files. Not in
- *   the load path; candidates for a future `gjc mcp import <host>`-style import.
+ * - `import-candidate`: Claude Code / Codex project (+ global) files on
+ *   surfaces GJC deliberately never loads. Reported for provenance only; never
+ *   active runtime authority. Candidates for a future import flow (#4291).
  * - `imported`: items carrying explicit import provenance (reserved; no import
  *   command exists yet, so nothing emits this today).
  * - `plugin`: plugin bundles (npm plugin packages + GJC plugin bundles).
@@ -154,6 +161,8 @@ export interface CustomizeDoctorSurface {
 	items: CustomizeDoctorItem[];
 	/** Skill-surface policy notes (why discovery is off or scoped). */
 	skillScopeNotes?: string[];
+	/** Surface-level warnings (for example a failed startup projection). */
+	warnings?: string[];
 }
 
 export interface CustomizeDoctorReport {
@@ -222,17 +231,18 @@ const SURFACE_DESCRIPTION: Record<CustomizeSurfaceKind, string> = {
 const SOURCE_CLASS_DESCRIPTIONS: Array<{ sourceClass: CustomizeSourceClass; description: string }> = [
 	{
 		sourceClass: "canonical",
-		description: "Project/global .gjc entries — the primary, authoritative load path for sessions.",
+		description:
+			"Project/global .gjc entries and GJC bundled defaults — the primary, authoritative load path for sessions.",
 	},
 	{
 		sourceClass: "convention",
 		description:
-			"Items from other registered conventions (claude-plugins, agents, cursor, gemini, opencode, windsurf, cline, github, mcp-json, ssh) that are part of the discovery load path.",
+			"Items from other registered conventions (claude-plugins, claude/codex hooks, agents, cursor, gemini, opencode, windsurf, cline, github, mcp-json, ssh) that are part of the discovery load path.",
 	},
 	{
 		sourceClass: "import-candidate",
 		description:
-			"Claude Code / Codex project (and global) files that GJC deliberately does not load. Reported for provenance as candidates for a future import; never active runtime state.",
+			"Claude Code / Codex project (and global) files on surfaces GJC deliberately never loads. Reported for provenance as import candidates; never active runtime authority.",
 	},
 	{
 		sourceClass: "imported",
@@ -266,13 +276,14 @@ function restartRequiredFor(kind: CustomizeSurfaceKind): boolean {
 function sourceClassFor(provider: string): CustomizeSourceClass {
 	switch (provider) {
 		case "native":
+		case "bundled":
 			return "canonical";
-		case "claude":
-		case "codex":
-			return "import-candidate";
 		case "plugin":
 		case "gjc-bundle":
 			return "plugin";
+		// "claude"/"codex" items arriving through the registry (hooks) are load-path
+		// participants, so they classify as "convention"; the import-candidate class
+		// is only assigned by the direct foreign-convention inspection below.
 		default:
 			return "convention";
 	}
@@ -281,6 +292,7 @@ function sourceClassFor(provider: string): CustomizeSourceClass {
 function conventionForProvider(provider: string): string {
 	switch (provider) {
 		case "native":
+		case "bundled":
 			return "gjc";
 		case "claude":
 			return "claude-project";
@@ -309,7 +321,7 @@ function conventionForProvider(provider: string): string {
 		case "plugin":
 			return "plugin";
 		case "custom":
-			return "custom-directory";
+			return "explicit-config";
 		default:
 			return provider;
 	}
@@ -334,6 +346,8 @@ interface DiscoveredEntry<T> {
 	shadowed: boolean;
 	shadowedBy?: { provider: string; scope: string };
 	invalidReason?: string;
+	/** Canonical dashboard id (`capability.toExtensionId`), when defined. */
+	extensionId?: string;
 }
 
 interface DiscoveredSet<T> {
@@ -345,7 +359,11 @@ async function discoverCapability<T extends { _source: SourceMeta }>(
 	capability: Capability<T>,
 	cwd: string,
 	activeSettings: SettingsInstance,
-	options: { nameOf: (item: T) => string; pathOf: (item: T) => string },
+	options: {
+		nameOf: (item: T) => string;
+		pathOf: (item: T) => string;
+		extensionIdOf?: (item: T) => string | undefined;
+	},
 ): Promise<DiscoveredSet<T>> {
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	const result = await loadCapability<T>(capability.id, {
@@ -384,6 +402,7 @@ async function discoverCapability<T extends { _source: SourceMeta }>(
 			shadowed,
 			shadowedBy,
 			invalidReason: capability.validate?.(item),
+			extensionId: options.extensionIdOf?.(item),
 		});
 	}
 
@@ -439,7 +458,9 @@ function safeMcpSummary(server: MCPServer, connectable: boolean): McpSafeSummary
 		transport: server.transport ?? (server.command ? "stdio" : server.url ? "http" : undefined),
 		command: server.command,
 		args: redactArgs(server.args),
-		url: redactMCPEndpoint(server.url),
+		// The canonical redactor runs values through the URL API, which
+		// percent-encodes the "<redacted>" placeholder; decode it for display.
+		url: redactMCPEndpoint(server.url)?.replaceAll("%3Credacted%3E", REDACTED),
 		envKeys,
 		hasHeaders: server.headers !== undefined && Object.keys(server.headers).length > 0,
 		hasAuth: server.auth !== undefined,
@@ -495,13 +516,25 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 	const { entries, precedence } = await discoverCapability(mcpCapability, cwd, activeSettings, {
 		nameOf: server => server.name,
 		pathOf: server => server._source.path,
+		extensionIdOf: server => mcpCapability.toExtensionId?.(server),
 	});
 	const disabledServers = new Set(await readDisabledServers(getMCPConfigPath("user", cwd)));
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	// The startup projection: `loadAllMCPConfigs` is what a session uses when
-	// connecting MCP servers (`/mcp connect` or `--mcp-config`).
-	const connectableNames = new Set(Object.keys((await loadAllMCPConfigs(cwd)).configs));
+	// connecting MCP servers (`/mcp connect` or `--mcp-config`). A single
+	// policy-violating endpoint (for example userinfo in a URL) fails the whole
+	// projection closed at startup, so catch it and report instead of losing
+	// the surface.
+	let connectableNames = new Set<string>();
+	const surfaceWarnings: string[] = [];
+	try {
+		connectableNames = new Set(Object.keys((await loadAllMCPConfigs(cwd)).configs));
+	} catch (error) {
+		surfaceWarnings.push(
+			`Startup MCP projection failed closed: ${error instanceof Error ? error.message : String(error)}. Sessions cannot connect any discovered server until this is fixed.`,
+		);
+	}
 
 	const items: CustomizeDoctorItem[] = entries.map(entry => {
 		const server = entry.item as MCPServer;
@@ -515,7 +548,7 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 				[`Fix ${entry.path}`],
 			);
 		}
-		if (disabledExts.has(`mcp:${entry.name}`)) {
+		if (entry.extensionId !== undefined && disabledExts.has(entry.extensionId)) {
 			return finalizeItem(
 				base,
 				"disabled",
@@ -545,6 +578,24 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 				],
 			);
 		}
+		// Startup endpoint policy: conversion canonicalizes http/sse endpoints
+		// before the enabled filter, so a violating endpoint (userinfo, relative
+		// URL) rejects the server even when it is disabled. Reuse the canonical
+		// validator rather than duplicating the policy.
+		if (server.url !== undefined) {
+			try {
+				canonicalizeMCPEndpoint(server.url);
+			} catch (error) {
+				return finalizeItem(
+					base,
+					"rejected",
+					"policy-blocked",
+					`MCP endpoint rejected by startup policy: ${error instanceof Error ? error.message : String(error)}.`,
+					[`Fix the endpoint in ${entry.path} (no userinfo; absolute http(s) URL)`],
+					{ mcp: safeMcpSummary(server, false) },
+				);
+			}
+		}
 		if (server.enabled === false || disabledServers.has(entry.name)) {
 			return finalizeItem(
 				base,
@@ -565,13 +616,21 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 		);
 	});
 
-	return { kind: "mcp", displayName: SURFACE_DISPLAY.mcp, description: SURFACE_DESCRIPTION.mcp, precedence, items };
+	return {
+		kind: "mcp",
+		displayName: SURFACE_DISPLAY.mcp,
+		description: SURFACE_DESCRIPTION.mcp,
+		precedence,
+		items,
+		warnings: surfaceWarnings.length > 0 ? surfaceWarnings : undefined,
+	};
 }
 
 async function collectSkills(cwd: string, activeSettings: SettingsInstance): Promise<CustomizeDoctorSurface> {
 	const { entries, precedence } = await discoverCapability(skillCapability, cwd, activeSettings, {
 		nameOf: skill => skill.name,
 		pathOf: skill => skill.path,
+		extensionIdOf: skill => skillCapability.toExtensionId?.(skill),
 	});
 	const skillsEnabled = activeSettings.get("skills.enabled") === true;
 	const disabledExts = disabledExtensionIds(activeSettings);
@@ -624,7 +683,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				["gjc config set skills.enabled true"],
 			);
 		}
-		if (disabledExts.has(`skill:${entry.name}`)) {
+		if (entry.extensionId !== undefined && disabledExts.has(entry.extensionId)) {
 			return finalizeItem(
 				base,
 				"disabled",
@@ -684,6 +743,133 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 		);
 	});
 
+	// Explicit-config skills (skills.customDirectories). Session startup scans
+	// these outside the capability registry via loadSkills (providerId "custom");
+	// mirror that scan with the same helper and options so the report cannot
+	// drift from startup.
+	const customDirs = activeSettings.get("skills.customDirectories") ?? [];
+	for (const dir of [...customDirs].sort()) {
+		const scan = await scanSkillsFromDir(
+			{ cwd, home: os.homedir(), repoRoot: null },
+			{ dir: expandTilde(dir), providerId: "custom", level: "user", requireDescription: true },
+		);
+		for (const skill of scan.items) {
+			const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
+				name: skill.name,
+				kind: "skill",
+				sourceClass: "canonical",
+				convention: "explicit-config",
+				provider: "custom",
+				providerName: "Custom",
+				scope: "user",
+				path: skill.path,
+				trust: TRUST_BY_KIND.skill,
+				restartRequired: restartRequiredFor("skill"),
+				precedence: { priority: 0 },
+			};
+			if (!skillsEnabled) {
+				items.push(
+					finalizeItem(
+						base,
+						"disabled",
+						"policy-blocked",
+						"Skill discovery is disabled (skills.enabled is false), so this skill is not loaded by sessions.",
+						["gjc config set skills.enabled true"],
+					),
+				);
+				continue;
+			}
+			if (disabledExts.has(`skill:${skill.name}`)) {
+				items.push(
+					finalizeItem(
+						base,
+						"disabled",
+						"disabled-extension",
+						`Skill "${skill.name}" is disabled via the disabledExtensions setting.`,
+						["gjc config set disabledExtensions '[]'", "or re-enable it in the extension dashboard"],
+					),
+				);
+				continue;
+			}
+			if (loadedNames.has(skill.name)) {
+				items.push(
+					finalizeItem(base, "loaded", "loaded", "Loaded by session startup from skills.customDirectories.", []),
+				);
+				continue;
+			}
+			const collisionWinner = items.find(i => i.name === skill.name && i.status === "loaded");
+			if (collisionWinner) {
+				items.push(
+					finalizeItem(
+						base,
+						"shadowed",
+						"shadowed-by-precedence",
+						`Custom-directory skill "${skill.name}" loses the name collision to the already-loaded ${collisionWinner.convention}/${collisionWinner.scope} skill of the same name.`,
+						[`Rename ${skill.path} to make it loadable`],
+						{
+							precedence: {
+								priority: 0,
+								shadowedBy: { provider: collisionWinner.provider, scope: collisionWinner.scope },
+							},
+						},
+					),
+				);
+				continue;
+			}
+			items.push(
+				finalizeItem(
+					base,
+					"stored-only",
+					"policy-blocked",
+					"Discovered in skills.customDirectories but not present in the session skill list (include/ignore pattern or a name collision with another custom directory).",
+					["Check skills.ignoredSkills and skills.includeSkills"],
+				),
+			);
+		}
+	}
+
+	// Bundled GJC workflow skills are a product invariant: sessions always
+	// include them, and a discovered same-name skill takes precedence when
+	// skills.enabled is true (sdk/session.ts withEmbeddedDefaultGjcSkills).
+	for (const embedded of getEmbeddedDefaultGjcSkills()) {
+		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
+			name: embedded.name,
+			kind: "skill",
+			sourceClass: "canonical",
+			convention: "gjc",
+			provider: "bundled",
+			providerName: "GJC Bundled",
+			scope: "native",
+			path: embedded.filePath,
+			trust: TRUST_BY_KIND.skill,
+			restartRequired: restartRequiredFor("skill"),
+			precedence: { priority: 0 },
+		};
+		const winner = items.find(i => i.name === embedded.name && i.status === "loaded");
+		if (winner) {
+			items.push(
+				finalizeItem(
+					base,
+					"shadowed",
+					"shadowed-by-precedence",
+					`Bundled workflow skill; the discovered ${winner.convention}/${winner.scope} skill with the same name takes precedence at session startup.`,
+					[],
+					{ precedence: { priority: 0, shadowedBy: { provider: winner.provider, scope: winner.scope } } },
+				),
+			);
+		} else {
+			items.push(
+				finalizeItem(
+					base,
+					"loaded",
+					"loaded",
+					"Bundled GJC workflow skill — always available to sessions (product invariant), even when skills.enabled is false.",
+					[],
+				),
+			);
+		}
+	}
+
 	return {
 		kind: "skill",
 		displayName: SURFACE_DISPLAY.skill,
@@ -698,9 +884,8 @@ async function collectHooks(cwd: string, activeSettings: SettingsInstance): Prom
 	return collectNotExecutedAtStartup("hook", hookCapability, cwd, activeSettings, {
 		nameOf: hook => hook.name,
 		pathOf: hook => hook.path,
-		toExtensionId: hook => `hook:${hook.type}:${hook.tool}:${hook.name}`,
 		notExecutedDetail:
-			"Discovered and shown in the extension dashboard, but standalone sessions do not execute hook files. Runtime hooks come from GJC plugin bundles.",
+			"Discovered and shown in the extension dashboard, but standalone sessions do not execute hook files. Runtime hooks come from validated GJC plugin bundles.",
 		notExecutedRemediation: ["See `gjc plugin list` for plugin bundles that contribute runtime hooks"],
 	});
 }
@@ -709,9 +894,8 @@ async function collectTools(cwd: string, activeSettings: SettingsInstance): Prom
 	return collectNotExecutedAtStartup("tool", toolCapability, cwd, activeSettings, {
 		nameOf: tool => tool.name,
 		pathOf: tool => tool.path,
-		toExtensionId: tool => `tool:${tool.name}`,
 		notExecutedDetail:
-			"Discovered and shown in the extension dashboard, but standalone sessions do not execute custom tool modules. Runtime custom tools come from GJC plugin bundles and MCP servers.",
+			"Discovered and shown in the extension dashboard, but standalone sessions do not execute custom tool modules. Runtime custom tools come from validated GJC plugin bundles and MCP servers.",
 		notExecutedRemediation: ["See `gjc plugin list` for plugin bundles that contribute runtime tools"],
 	});
 }
@@ -720,9 +904,8 @@ async function collectExtensions(cwd: string, activeSettings: SettingsInstance):
 	return collectNotExecutedAtStartup("extension", extensionModuleCapability, cwd, activeSettings, {
 		nameOf: ext => ext.name,
 		pathOf: ext => ext.path,
-		toExtensionId: ext => `extension-module:${ext.name}`,
 		notExecutedDetail:
-			"Filesystem extension modules are quarantined at session startup and are never loaded from disk. Use plugin bundles for runtime extensions.",
+			"Discovered and shown in the extension dashboard, but session startup does not load filesystem extension modules. Runtime extensions come from validated GJC plugin bundles.",
 		notExecutedRemediation: ["See `gjc plugin list` for plugin bundles that contribute extensions"],
 	});
 }
@@ -730,7 +913,6 @@ async function collectExtensions(cwd: string, activeSettings: SettingsInstance):
 interface NotExecutedOptions<T extends { _source: SourceMeta }> {
 	nameOf: (item: T) => string;
 	pathOf: (item: T) => string;
-	toExtensionId: (item: T) => string;
 	notExecutedDetail: string;
 	notExecutedRemediation: string[];
 }
@@ -745,6 +927,7 @@ async function collectNotExecutedAtStartup<T extends { _source: SourceMeta }>(
 	const { entries, precedence } = await discoverCapability(capability, cwd, activeSettings, {
 		nameOf: options.nameOf,
 		pathOf: options.pathOf,
+		extensionIdOf: item => capability.toExtensionId?.(item),
 	});
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
@@ -760,13 +943,12 @@ async function collectNotExecutedAtStartup<T extends { _source: SourceMeta }>(
 				[`Fix ${entry.path}`],
 			);
 		}
-		const extensionId = options.toExtensionId(entry.item);
-		if (disabledExts.has(extensionId)) {
+		if (entry.extensionId !== undefined && disabledExts.has(entry.extensionId)) {
 			return finalizeItem(
 				base,
 				"disabled",
 				"disabled-extension",
-				`"${entry.name}" is disabled via the disabledExtensions setting (${extensionId}).`,
+				`"${entry.name}" is disabled via the disabledExtensions setting (${entry.extensionId}).`,
 				["gjc config set disabledExtensions '[]'", "or re-enable it in the extension dashboard"],
 			);
 		}
@@ -791,15 +973,6 @@ async function collectNotExecutedAtStartup<T extends { _source: SourceMeta }>(
 				],
 			);
 		}
-		if (kind === "extension") {
-			return finalizeItem(
-				base,
-				"quarantined",
-				"quarantined",
-				options.notExecutedDetail,
-				options.notExecutedRemediation,
-			);
-		}
 		return finalizeItem(base, "stored-only", "managed", options.notExecutedDetail, options.notExecutedRemediation);
 	});
 
@@ -810,6 +983,7 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 	const { entries, precedence } = await discoverCapability(slashCommandCapability, cwd, activeSettings, {
 		nameOf: cmd => cmd.name,
 		pathOf: cmd => cmd.path,
+		extensionIdOf: cmd => slashCommandCapability.toExtensionId?.(cmd),
 	});
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
@@ -823,7 +997,7 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 				`Fix ${entry.path}`,
 			]);
 		}
-		if (disabledExts.has(`slash-command:${entry.name}`)) {
+		if (entry.extensionId !== undefined && disabledExts.has(entry.extensionId)) {
 			return finalizeItem(
 				base,
 				"disabled",
@@ -936,8 +1110,10 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 
 	// GJC plugin bundles (convention "gjc-bundle") — canonical registry +
 	// observability; never raw locators or config values.
-	const bundleEntries = await loadEffectiveGjcPluginRegistry(cwd);
-	const observability = await summarizeGjcPluginObservability(cwd);
+	// Read-only: migrate:false keeps the doctor from persisting registry
+	// migrations/legacy discovery (startup activation owns those writes).
+	const bundleEntries = await loadEffectiveGjcPluginRegistry(cwd, { migrate: false });
+	const observability = await summarizeGjcPluginObservability(cwd, { migrate: false });
 	const items: CustomizeDoctorItem[] = [...npmItems];
 	for (const entry of bundleEntries) {
 		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
@@ -1013,11 +1189,14 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 // =============================================================================
 // Foreign conventions (Claude project / Codex project)
 //
-// GJC deliberately does not register the `.claude`/`.codex` providers (see the
-// "Stop loading home Claude and Codex prompts" change) so other hosts' project
-// configs are never injected into sessions. The doctor still reports files in
-// those conventions by invoking the canonical provider load functions directly
-// (without registering them) and marks every such item as `ignored`.
+// Claude Code / Codex project hooks are discovered by the registered
+// claude-hooks/codex-hooks providers (see discovery/index.ts) and appear in the
+// Hooks surface above; sessions surface them in the extension dashboard but do
+// not execute hook files. Every OTHER `.claude`/`.codex` surface (MCP, skills,
+// tools, extensions, commands, prompts, settings) is deliberately not part of
+// the load path: the doctor reports those files by invoking the canonical
+// provider load functions directly (without registering the providers) and
+// marks every such item as `ignored`.
 // =============================================================================
 
 interface ForeignConventionDescriptor {
@@ -1119,7 +1298,7 @@ function foreignItem(
 async function collectForeignConventions(cwd: string): Promise<ForeignConventionCollection> {
 	const ctx: LoadContext = { cwd, home: os.homedir(), repoRoot: await findRepoRoot(cwd) };
 	const itemsByKind: Map<CustomizeSurfaceKind, CustomizeDoctorItem[]> = new Map();
-	const policyNote = `${FOREIGN_CONVENTIONS.map(d => d.dirName).join("/")} conventions are not part of the GJC load path: GJC deliberately does not load ${FOREIGN_CONVENTIONS.map(d => d.providerName).join(" or ")} project configs. Files there are reported below for provenance but are never discovered by sessions.`;
+	const policyNote = `${FOREIGN_CONVENTIONS.map(d => d.dirName).join(" and ")} project hooks are discovered by GJC (see the Hooks surface); all other ${FOREIGN_CONVENTIONS.map(d => d.providerName).join(" / ")} project config surfaces (MCP servers, skills, tools, extensions, commands, prompts, settings) are not part of the GJC load path. Those files are reported below as import candidates for provenance but are never discovered by sessions.`;
 
 	for (const desc of FOREIGN_CONVENTIONS) {
 		const inspection = await desc.inspect(ctx);
@@ -1129,9 +1308,10 @@ async function collectForeignConventions(cwd: string): Promise<ForeignConvention
 		for (const skill of inspection.skills.items) {
 			pushForeign(itemsByKind, "skill", foreignItem("skill", desc, skill.name, skill.path, undefined));
 		}
-		for (const hook of inspection.hooks.items) {
-			pushForeign(itemsByKind, "hook", foreignItem("hook", desc, hook.name, hook.path, undefined));
-		}
+		// Hooks are intentionally skipped here: the registered claude-hooks and
+		// codex-hooks providers already surface .claude/.codex hooks in the Hooks
+		// surface, so reporting them again as ignored import candidates would
+		// double-count and contradict the load path.
 		for (const tool of inspection.tools.items) {
 			pushForeign(itemsByKind, "tool", foreignItem("tool", desc, tool.name, tool.path, undefined));
 		}
@@ -1192,7 +1372,11 @@ export async function runCustomizeDoctor(
 ): Promise<CustomizeDoctorReport> {
 	const projectDir = cwd ?? getProjectDir();
 	const settings = activeSettings ?? (await Settings.init({ cwd: projectDir }));
-	if (!activeSettings) initializeWithSettings(settings);
+	// Mirror session startup: the capability system and the downstream startup
+	// consumers (loadAllMCPConfigs, loadSlashCommands) resolve provider policy
+	// from the initialized session settings, so the doctor must initialize with
+	// the same settings even when a caller supplied them.
+	initializeWithSettings(settings);
 
 	const warnings: string[] = [];
 	const surfaces: CustomizeDoctorSurface[] = [];
@@ -1344,6 +1528,7 @@ export function renderCustomizeDoctorText(report: CustomizeDoctorReport): string
 
 	for (const surface of report.surfaces) {
 		lines.push(`${surface.displayName} (${surface.kind}) — ${surface.items.length} discovered`);
+		for (const warning of surface.warnings ?? []) lines.push(`  warning: ${warning}`);
 		for (const p of surface.precedence) {
 			lines.push(
 				`  precedence: ${p.displayName} (${p.provider}) priority ${p.priority} ${p.enabled ? "enabled" : "disabled"}`,

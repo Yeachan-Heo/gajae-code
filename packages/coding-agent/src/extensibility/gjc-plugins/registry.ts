@@ -319,9 +319,20 @@ export async function updateRegistry(
 
 /**
  * Effective registry for a cwd: user + project entries in deterministic order.
+ *
+ * Defaults to the startup semantics (legacy-entry discovery + migration, which
+ * may persist the migrated registry). Read-only inspection surfaces (for
+ * example `gjc customize doctor`) pass `{ migrate: false }` so reporting never
+ * writes to the registry.
  */
-export async function loadEffectiveGjcPluginRegistry(cwd: string): Promise<GjcPluginRegistryEntry[]> {
-	const [user, project] = await Promise.all([readRegistry("user", cwd), readRegistry("project", cwd)]);
+export async function loadEffectiveGjcPluginRegistry(
+	cwd: string,
+	options: { migrate?: boolean } = {},
+): Promise<GjcPluginRegistryEntry[]> {
+	const [user, project] = await Promise.all([
+		readRegistry("user", cwd, options),
+		readRegistry("project", cwd, options),
+	]);
 	return sortRegistryEntries([...user.plugins, ...project.plugins]);
 }
 

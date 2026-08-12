@@ -65,9 +65,15 @@ function rowsForEntry(entry: GjcPluginRegistryEntry, quarantinedIds: Map<string,
 /**
  * Build the observability summary for the effective registry at `cwd`, including
  * hash-drift and session-collision quarantine status.
+ *
+ * Pass `{ migrate: false }` from read-only inspection surfaces (for example
+ * `gjc customize doctor`) so reporting never persists registry migrations.
  */
-export async function summarizeGjcPluginObservability(cwd: string): Promise<PluginObservabilitySummary> {
-	const effective = await loadEffectiveGjcPluginRegistry(cwd);
+export async function summarizeGjcPluginObservability(
+	cwd: string,
+	options: { migrate?: boolean } = {},
+): Promise<PluginObservabilitySummary> {
+	const effective = await loadEffectiveGjcPluginRegistry(cwd, options);
 	const preQuarantine: SessionQuarantine[] = [];
 	for (const entry of effective) {
 		if (!entry.enabled) continue;
