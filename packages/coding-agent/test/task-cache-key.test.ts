@@ -269,6 +269,41 @@ describe("task fork-context provider identity", () => {
 		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeDefined();
 	}, 15_000);
 
+	it("canonicalizes an aliased explicit transcript before registering and rekeying ownership", async () => {
+		if (process.platform === "win32") return;
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-alias-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const realDir = path.join(tempDir, "real");
+		const aliasDir = path.join(tempDir, "alias");
+		fs.mkdirSync(realDir);
+		fs.symlinkSync(realDir, aliasDir, "dir");
+		const providerSessionId = "aliased-provider-affinity";
+		const aliasedSessionFile = path.join(aliasDir, "session.jsonl");
+		const sessionManager = await SessionManager.open(aliasedSessionFile, aliasDir);
+		const { session, authStorage } = await createSession(tempDir, { providerSessionId, sessionManager });
+		sessions.push(session);
+		authStorages.push(authStorage);
+
+		const canonicalPredecessorFile = resolveEquivalentPath(path.resolve(aliasedSessionFile));
+		const predecessorEndpoint = JSON.stringify(["async-job-endpoint", providerSessionId, canonicalPredecessorFile]);
+		const manager = AsyncJobManager.forEndpoint(predecessorEndpoint);
+		expect(manager).toBeDefined();
+		expect(
+			AsyncJobManager.forEndpoint(JSON.stringify(["async-job-endpoint", providerSessionId, aliasedSessionFile])),
+		).toBeUndefined();
+
+		expect(await session.newSession()).toBe(true);
+		const successorFile = session.sessionManager.getSessionFile();
+		expect(successorFile).toBeDefined();
+		const successorEndpoint = JSON.stringify([
+			"async-job-endpoint",
+			providerSessionId,
+			resolveEquivalentPath(path.resolve(successorFile!)),
+		]);
+		expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBeUndefined();
+		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
+	}, 15_000);
+
 	it("does not share mutable provider state unless explicitly supplied", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-state-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

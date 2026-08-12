@@ -31,6 +31,7 @@ import {
 	logger,
 	postmortem,
 	prompt,
+	resolveEquivalentPath,
 	Snowflake,
 } from "@gajae-code/utils";
 import {
@@ -1407,7 +1408,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionFile = sessionManager.getSessionFile();
 		const asyncJobEndpointId =
 			options.providerSessionId !== undefined && sessionFile
-				? JSON.stringify(["async-job-endpoint", providerSessionId, sessionFile])
+				? JSON.stringify([
+						"async-job-endpoint",
+						providerSessionId,
+						resolveEquivalentPath(path.resolve(sessionFile)),
+					])
 				: logicalSessionId;
 		const credentialSessionId = options.credentialSessionId ?? providerSessionId;
 		const modelApiKeyAvailability = new Map<string, boolean>();
