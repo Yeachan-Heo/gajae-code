@@ -2707,7 +2707,6 @@ export class AgentSession {
 		this.#promptInFlightCount++;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
-			this.#acquirePowerAssertion();
 		}
 	}
 	/**

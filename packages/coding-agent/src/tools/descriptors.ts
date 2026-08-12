@@ -324,6 +324,16 @@ const loaders: Record<string, Loader> = {
 		cached("checkpoint", () => import("./checkpoint")).then(module => module.RewindTool.createIf(session)),
 	task: session => cached("task", () => import("../task")).then(module => module.TaskTool.create(session)),
 	subagent: session => cached("subagent", () => import("./subagent")).then(module => new module.SubagentTool(session)),
+	python: session =>
+		cached("python", () => import("../autoresearch/python-tool")).then(module =>
+			module.createAutoresearchSessionPythonTool({
+				cwd: session.cwd,
+				getSessionId: () => session.getSessionId?.() ?? null,
+				registerSessionCleanup: (cleanup: () => Promise<void> | void) => {
+					session.registerSessionCleanup?.(cleanup);
+				},
+			}),
+		),
 	job: session => cached("job", () => import("./job")).then(module => module.JobTool.createIf(session)),
 	monitor: session =>
 		cached("monitor", () => import("./monitor")).then(module => module.MonitorTool.createIf(session)),
@@ -404,6 +414,12 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 		["debug", "Debug", "Debug a running process with DAP (debugger adapter protocol)", "discoverable"],
 		["bisect", "Bisect", "Find the commit that introduced a regression", "discoverable"],
 		["eval", "Eval", "Execute Python or JavaScript code in an in-process eval backend", "discoverable"],
+		[
+			"python",
+			"Python",
+			"Execute Python in the persistent autoresearch mission kernel (every call is recorded as a notebook cell)",
+			"discoverable",
+		],
 		["calc", "Calc", "Evaluate a mathematical expression", "discoverable"],
 		["ssh", "SSH", "Execute a command on a remote host over SSH", "discoverable"],
 		["github", "GitHub", "Interact with GitHub issues, pull requests, and repositories", "discoverable"],

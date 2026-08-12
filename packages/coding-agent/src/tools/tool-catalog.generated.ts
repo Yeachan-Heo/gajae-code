@@ -681,6 +681,35 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 		"summary": "Execute Python or JavaScript code in an in-process eval backend",
 		"concurrency": "exclusive"
 	},
+	"python": {
+		"name": "python",
+		"label": "Python",
+		"description": "Execute Python in the persistent mission kernel. Variables, imports, and loaded data persist across calls like notebook cells; every call is recorded as a cell in the mission notebook. Use action \"clear\" to dispose the kernel subprocess when the mission is done.",
+		"parameters": {
+			"type": "object",
+			"properties": {
+				"action": {
+					"default": "execute",
+					"description": "\"execute\" runs `code` in the persistent mission kernel and is the default. \"clear\" disposes the mission kernel and frees its subprocess; the next execute starts a fresh kernel.",
+					"type": "string",
+					"enum": [
+						"execute",
+						"clear"
+					]
+				},
+				"code": {
+					"description": "Python source to execute when action is \"execute\" (required then, ignored for \"clear\").",
+					"type": "string"
+				}
+			},
+			"additionalProperties": false
+		},
+		"strict": true,
+		"deferrable": true,
+		"loadMode": "discoverable",
+		"summary": "Execute Python in the persistent autoresearch mission kernel (every call is recorded as a notebook cell)",
+		"concurrency": "exclusive"
+	},
 	"calc": {
 		"name": "calc",
 		"label": "Calc",

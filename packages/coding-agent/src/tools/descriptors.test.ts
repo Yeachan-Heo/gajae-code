@@ -99,6 +99,7 @@ describe("tool descriptor compatibility gate", () => {
 			"debug",
 			"bisect",
 			"eval",
+			"python",
 			"calc",
 			"ssh",
 			"github",
