@@ -3,7 +3,7 @@
  *
  * One source of truth for the beginner-safe operational vocabulary so the
  * guided human surface and the machine-readable JSON never drift:
- * - the terse action verbs plus operator aliases (e.g. `restart` -> `reload`),
+ * - the terse action verbs plus the retired `reload` operator alias,
  * - process exit codes,
  * - concise vs. `--verbose` human rendering of statuses and results, and
  * - actionable recovery guidance for a token/chat ownership mismatch.
@@ -15,15 +15,15 @@
 import type { DaemonAction, DaemonOperationResult, DaemonRecovery, DaemonStatus } from "./control-types";
 
 /** Canonical daemon actions accepted as the leading verb. */
-export const DAEMON_CANONICAL_ACTIONS: readonly DaemonAction[] = ["list", "status", "stop", "reload"];
+export const DAEMON_CANONICAL_ACTIONS: readonly DaemonAction[] = ["list", "status", "stop", "restart"];
 
 /**
- * Operator-friendly aliases resolved to a canonical action. `restart` is the
- * routine "reload if running, otherwise start" verb; it maps onto `reload`,
- * whose default already spawns a fresh owner when none is running.
+ * `restart` is the routine "reload if running, otherwise start" verb. Keep
+ * `reload` only as an input compatibility token; internal callers must use
+ * the canonical restart action.
  */
 export const DAEMON_ACTION_ALIASES: Readonly<Record<string, DaemonAction>> = {
-	restart: "reload",
+	reload: "restart",
 };
 
 /** Every token accepted in the leading action position (canonical + aliases). */

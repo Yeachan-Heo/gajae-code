@@ -1,5 +1,5 @@
 /**
- * Manage GJC background daemons (status/list/stop/reload).
+ * Manage GJC background daemons (status/list/stop/restart).
  */
 import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
 import {
@@ -54,7 +54,7 @@ export default class Daemon extends Command {
 		force: Flags.boolean({ description: "Allow hard-kill escalation when graceful stop times out" }),
 		"graceful-timeout-ms": Flags.string({ description: "Cooperative stop timeout before escalation" }),
 		"kill-timeout-ms": Flags.string({ description: "Wait for old pid death after SIGKILL" }),
-		"spawn-if-stopped": Flags.boolean({ description: "On reload, spawn even when no daemon is running" }),
+		"spawn-if-stopped": Flags.boolean({ description: "On restart, spawn even when no daemon is running" }),
 		smoke: Flags.boolean({ description: "Internal: run worker smoke without configuration or network" }),
 		"owner-id": Flags.string({ description: "Internal: daemon owner id" }),
 		"agent-dir": Flags.string({ description: "Internal: daemon state directory" }),

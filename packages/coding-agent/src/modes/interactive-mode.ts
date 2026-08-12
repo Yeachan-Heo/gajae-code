@@ -25,6 +25,8 @@ import {
 	type KeyDisplayContext,
 } from "../config/keybindings";
 import { isSettingsInitialized, type Settings, settings } from "../config/settings";
+import { compactCrashIndex, resolveCrashStatePaths } from "../crash/index-store";
+import { crashNudgeGate, maybeShowCrashNudge } from "../crash/nudge";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import type {
 	ExtensionUIContext,
@@ -928,6 +930,26 @@ export class InteractiveMode implements InteractiveModeContext {
 				}),
 			);
 		}
+		// Crash nudge (interactive-only, local-only). Runs after the first render
+		// and routes through the centralized status surface — never `console.*`.
+		if (crashNudgeGate({ enabled: settings.get("crashReport.nudge"), interactive: true, quiet: startupQuiet })) {
+			const crashNudgeTimer = setTimeout(() => {
+				void (async () => {
+					try {
+						const paths = resolveCrashStatePaths();
+						const index = await compactCrashIndex({ paths });
+						if (this.#stopped) return;
+						await maybeShowCrashNudge(message => this.showStatus(message, { dim: true }), { paths, index });
+					} catch (error) {
+						logger.debug("Crash nudge skipped", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				})();
+			}, 0);
+			crashNudgeTimer.unref?.();
+		}
+
 		if (starReminderGate.schedule) {
 			scheduleLaunchStarReminderAfterFirstRender({
 				confirm: (title, message) =>

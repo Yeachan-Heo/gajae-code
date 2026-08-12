@@ -258,6 +258,17 @@ export interface ManagedAppendReceipt {
 	identity: ManagedFileIdentity;
 }
 
+function sameManagedIdentity(left: ManagedFileIdentity, right: ManagedFileIdentity): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
 export interface ManagedBoundedAppendExpectation {
 	readonly dev: string;
 	readonly ino: string;
@@ -1423,6 +1434,41 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 
+	replaceExpectedIdentitySync(relativePath: string, bytes: Uint8Array, expected: ManagedFileIdentity): void {
+		this.#beforeMutation();
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		if (!this.#authority) {
+			const current = captureManagedFileIdentityStreamingNoFollow(resolved);
+			if (!sameManagedIdentity(current, expected)) throw new Error("managed_replace_identity_mismatch");
+			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
+			this.#assertBound();
+			return;
+		}
+		const relative = this.#relative(resolved);
+		const observed = this.#authority.stat(relative);
+		if (!observed.ok || !observed.identity) throw new Error(observed.code ?? "managed_replace_missing");
+		const current = managedFileIdentityFromNative(observed.identity);
+		if (!sameManagedIdentity(current, expected)) throw new Error("managed_replace_identity_mismatch");
+		const expectedSha256 =
+			typeof observed.identity.sha256 === "string" && /^[0-9a-f]{64}$/i.test(observed.identity.sha256)
+				? observed.identity.sha256.toLowerCase()
+				: this.readExpected(relativePath)?.identity.sha256;
+		if (!expectedSha256) throw new Error("managed_replace_identity_unavailable");
+		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
+			relative,
+			bytes,
+			observed.identity.dev,
+			observed.identity.ino,
+			observed.identity.size,
+			observed.identity.mtimeNs,
+			observed.identity.ctimeNs,
+			expectedSha256,
+		);
+		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
+		this.#assertBound();
+	}
+
 	replaceExpected(relativePath: string, bytes: Uint8Array, expected: ManagedFileSnapshot): void {
 		this.#beforeMutation();
 		this.#assertBound();
@@ -1528,6 +1574,24 @@ export class ManagedSessionDescendantStore {
 			throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
 		this.#assertBound();
 		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
+	}
+
+	appendExpectedIdentitySync(
+		relativePath: string,
+		bytes: Uint8Array,
+		expected: ManagedFileIdentity,
+	): ManagedAppendReceipt {
+		const bounded = this.captureBoundedAppendExpectation(relativePath);
+		if (
+			!bounded ||
+			bounded.dev !== expected.dev.toString() ||
+			bounded.ino !== expected.ino.toString() ||
+			bounded.size !== String(expected.size) ||
+			bounded.mtimeNs !== expected.mtimeNs.toString() ||
+			bounded.ctimeNs !== expected.ctimeNs.toString()
+		)
+			throw new Error("managed_append_identity_mismatch");
+		return this.appendExpectedSync(relativePath, bytes, bounded);
 	}
 
 	appendSync(relativePath: string, bytes: Uint8Array): ManagedAppendReceipt {

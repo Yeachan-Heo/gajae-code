@@ -49,6 +49,12 @@ export interface SdkReconnectExhaustedDetails {
 	readonly reason: SdkReconnectTerminationReason;
 }
 
+/**
+ * Deadline a one-shot request client waits for a reply. Long-lived session
+ * clients override it per request; see `SESSION_REQUEST_TIMEOUT_MS`.
+ */
+export const DEFAULT_SDK_REQUEST_TIMEOUT_MS = 10_000;
+
 export interface SdkClientOptions {
 	timeoutMs?: number;
 	/** Absolute wall-clock deadline shared by connect, hello, retry, and request work. */
@@ -193,7 +199,7 @@ export class SdkClient {
 	constructor(url: string, token: string, options: SdkClientOptions = {}) {
 		this.#url = url;
 		this.#token = token;
-		this.#timeoutMs = options.timeoutMs ?? 10_000;
+		this.#timeoutMs = options.timeoutMs ?? DEFAULT_SDK_REQUEST_TIMEOUT_MS;
 		this.#closeGraceMs = Math.max(1, Math.min(this.#timeoutMs, 1_000));
 		this.#deadline =
 			typeof options.deadline === "number" && Number.isFinite(options.deadline) ? options.deadline : undefined;

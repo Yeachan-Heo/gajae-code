@@ -14,6 +14,7 @@ import {
 	ManagedSessionScopeTestHooks,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWrite,
+	prepareManagedSessionScopeForWriteSync,
 	reconcileManagedTombstones,
 	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
@@ -3011,6 +3012,42 @@ describe("scrubbed write-protocol remnant reaping", () => {
 		for (const name of remnantNames) expect(remaining).not.toContain(name);
 		expect(remaining).toContain(MANAGED_SESSION_BINDING_FILE);
 	});
+
+	it("reaps an over-limit poisoned scope before binding publication and preserves protected entries", async () => {
+		const { scope } = await fixture();
+		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+		for (let index = 0; index <= MANAGED_ARTIFACT_MAX_FILES; index += 1) {
+			const pathname = path.join(scope.directoryPath, `.gjc-receipt-remove-poison-${index}`);
+			await fs.writeFile(pathname, "", { mode: 0o600 });
+			await fs.utimes(pathname, aged, aged);
+		}
+		const evidence = path.join(scope.directoryPath, ".gjc-receipt-remove-evidence");
+		await fs.writeFile(evidence, "retained receipt payload", { mode: 0o600 });
+		await fs.utimes(evidence, aged, aged);
+		const young = path.join(scope.directoryPath, ".gjc-receipt-remove-young");
+		await fs.writeFile(young, "", { mode: 0o600 });
+		const unrelated = path.join(scope.directoryPath, "unrelated.jsonl");
+		await fs.writeFile(unrelated, "", { mode: 0o600 });
+		const hardlink = path.join(scope.directoryPath, ".gjc-receipt-remove-hardlink");
+		const hardlinkAlias = path.join(scope.directoryPath, "hardlink-alias");
+		await fs.writeFile(hardlink, "", { mode: 0o600 });
+		await fs.link(hardlink, hardlinkAlias);
+		await fs.utimes(hardlink, aged, aged);
+		const symlink = path.join(scope.directoryPath, ".gjc-receipt-remove-symlink");
+		if (process.platform !== "win32") await fs.symlink(unrelated, symlink);
+
+		expect(prepareManagedSessionScopeForWriteSync(scope)).toMatchObject({ kind: "resolved" });
+
+		expect(await fs.readFile(evidence, "utf8")).toBe("retained receipt payload");
+		await expect(fs.access(young)).resolves.toBeNull();
+		await expect(fs.access(unrelated)).resolves.toBeNull();
+		await expect(fs.access(hardlink)).resolves.toBeNull();
+		await expect(fs.access(hardlinkAlias)).resolves.toBeNull();
+		if (process.platform !== "win32") expect((await fs.lstat(symlink)).isSymbolicLink()).toBe(true);
+		expect(await fs.readFile(path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE), "utf8")).toContain(
+			'"layoutVersion":2',
+		);
+	}, 20_000);
 
 	it("counts and logs an lstat failure without aborting remnant reaping", async () => {
 		const { scope } = await fixture();

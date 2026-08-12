@@ -153,7 +153,7 @@ describe("computer enforcement red-team probes", () => {
 				observed: `code=${resultCode(permission)} message=${resultMessage(permission)} nativeScreenshotCalls=${permissionCalls}`,
 				verdict:
 					resultCode(permission) === "COMPUTER_PERMISSION_REQUIRED" &&
-					resultMessage(permission).includes("screen-recording or accessibility permission")
+					resultMessage(permission).includes("Screen & System Audio Recording or Accessibility")
 						? "passed"
 						: "failed",
 			});

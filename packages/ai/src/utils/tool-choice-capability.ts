@@ -1,3 +1,8 @@
+import { Database } from "bun:sqlite";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { getToolChoiceCapabilityCachePath } from "@gajae-code/utils/dirs";
 import { extractHttpStatusFromError } from "@gajae-code/utils/fetch-retry";
 import * as logger from "@gajae-code/utils/logger";
 import type { Api, Model, ToolChoice, ToolChoiceCompat, ToolChoiceSupport, ToolChoiceSupportSource } from "../types";
@@ -11,6 +16,18 @@ const supportRank: Record<ToolChoiceSupport, number> = {
 
 const registry = new Map<string, ToolChoiceSupport>();
 const loggedRegistryKeys = new Set<string>();
+const registryExpiresAt = new Map<string, number>();
+const CACHE_SCHEMA_VERSION = 1;
+const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const EMPTY_CACHE_TTL_MS = 5 * 60 * 1000;
+const CACHE_MAX_ENTRIES = 256;
+const REGISTRY_MAX_ENTRIES = 256;
+
+let cachePathOverride: string | undefined;
+let nowForTests: (() => number) | undefined;
+let beforeExpiredDeleteForTests: (() => void) | undefined;
+let beforeMalformedDeleteForTests: (() => void) | undefined;
+let onCacheOpenForTests: (() => void) | undefined;
 
 /**
  * Claude Mythos accepts tools but rejects forced tool use (Anthropic 400:
@@ -45,21 +62,44 @@ export function toolChoiceRegistryKey(model: Model<Api>): string {
 
 /** Returns the current runtime tool-choice capability override for a model. */
 export function getToolChoiceCapabilityOverride(model: Model<Api>): ToolChoiceSupport | undefined {
-	return registry.get(toolChoiceRegistryKey(model));
+	const key = toolChoiceRegistryKey(model);
+	hydrateToolChoiceCapability(key);
+	return registry.get(key);
 }
 
 /** Clears runtime tool-choice capability overrides for tests. */
 export function clearToolChoiceIncapabilityRegistryForTests(): void {
 	registry.clear();
 	loggedRegistryKeys.clear();
+	registryExpiresAt.clear();
+}
+
+/** Overrides durable-cache dependencies for isolated tests. */
+export function configureToolChoiceCapabilityCacheForTests(options?: {
+	path?: string;
+	now?: () => number;
+	beforeExpiredDelete?: () => void;
+	beforeMalformedDelete?: () => void;
+	onCacheOpen?: () => void;
+}): void {
+	cachePathOverride = options?.path;
+	nowForTests = options?.now;
+	beforeExpiredDeleteForTests = options?.beforeExpiredDelete;
+	beforeMalformedDeleteForTests = options?.beforeMalformedDelete;
+	onCacheOpenForTests = options?.onCacheOpen;
+	clearToolChoiceIncapabilityRegistryForTests();
 }
 
 /** Records a discovered maximum supported tool-choice level for a model. */
 export function markToolChoiceIncapability(model: Model<Api>, maxSupport: ToolChoiceSupport, reason?: string): void {
 	const key = toolChoiceRegistryKey(model);
+	hydrateToolChoiceCapability(key);
 	const existing = registry.get(key);
 	const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
 	registry.set(key, next);
+	const persisted = persistToolChoiceCapability(key, next);
+	if (persisted) registry.set(key, persisted.support);
+	registryExpiresAt.set(key, (persisted?.observedAt ?? currentTime()) + CACHE_TTL_MS);
 
 	if (!loggedRegistryKeys.has(key)) {
 		loggedRegistryKeys.add(key);
@@ -85,12 +125,13 @@ export function resolveToolChoice(
 	compat?: ToolChoiceCompat,
 ): ResolveToolChoiceResult {
 	const derived = deriveToolChoiceSupport(compat ?? model.compat);
-	const runtime = registry.get(toolChoiceRegistryKey(model));
+	const registryKey = toolChoiceRegistryKey(model);
+	hydrateToolChoiceCapability(registryKey);
+	const runtime = registry.get(registryKey);
 	const support = runtime && supportRank[runtime] < supportRank[derived.support] ? runtime : derived.support;
 	const supportSource: ToolChoiceSupportSource = support === derived.support ? derived.source : "runtime";
 	const requestedInfo = requestedToolChoiceLevel(requested);
 	const clampLevel = requestedInfo.requestedLevel === "none" ? "auto" : requestedInfo.requestedLevel;
-	const registryKey = toolChoiceRegistryKey(model);
 
 	if (requested === undefined) {
 		return {
@@ -249,5 +290,209 @@ function safeHostname(baseUrl: string): string | undefined {
 		return new URL(baseUrl).hostname;
 	} catch {
 		return undefined;
+	}
+}
+
+function hydrateToolChoiceCapability(registryKey: string): void {
+	const now = currentTime();
+	const expiresAt = registryExpiresAt.get(registryKey);
+	if (expiresAt !== undefined && now < expiresAt) return;
+	registry.delete(registryKey);
+	registryExpiresAt.delete(registryKey);
+	const hydrated = withCapabilityCache(database => {
+		const digest = capabilityKeyDigest(registryKey);
+		const row = database
+			.query("SELECT max_support, support_rank, observed_at FROM tool_choice_capabilities WHERE key_digest = ?")
+			.get(digest) as { max_support?: unknown; support_rank?: unknown; observed_at?: unknown } | null;
+		if (!row) return false;
+		if (
+			!isToolChoiceSupport(row.max_support) ||
+			row.support_rank !== supportRank[row.max_support] ||
+			!isValidObservedAt(row.observed_at, now)
+		) {
+			beforeMalformedDeleteForTests?.();
+			database.run(
+				"DELETE FROM tool_choice_capabilities WHERE key_digest = ? AND max_support = ? AND support_rank = ? AND observed_at = ?",
+				[
+					digest,
+					typeof row.max_support === "string" ? row.max_support : String(row.max_support),
+					typeof row.support_rank === "number" ? row.support_rank : -1,
+					typeof row.observed_at === "number" ? row.observed_at : -1,
+				],
+			);
+			return false;
+		}
+		if (now - row.observed_at >= CACHE_TTL_MS) {
+			beforeExpiredDeleteForTests?.();
+			database.run("DELETE FROM tool_choice_capabilities WHERE key_digest = ? AND observed_at = ?", [
+				digest,
+				row.observed_at,
+			]);
+			return false;
+		}
+		registry.set(registryKey, row.max_support);
+		registryExpiresAt.set(registryKey, row.observed_at + CACHE_TTL_MS);
+		return true;
+	});
+	if (hydrated === false && !registryExpiresAt.has(registryKey)) {
+		registryExpiresAt.set(registryKey, now + EMPTY_CACHE_TTL_MS);
+	}
+	pruneRegistry(now);
+}
+
+function persistToolChoiceCapability(
+	registryKey: string,
+	maxSupport: ToolChoiceSupport,
+): { support: ToolChoiceSupport; observedAt: number } | undefined {
+	return withCapabilityCache(database => {
+		const write = database.transaction(() => {
+			const digest = capabilityKeyDigest(registryKey);
+			const observedAt = currentTime();
+			database.run(
+				"INSERT INTO tool_choice_capabilities (key_digest, max_support, support_rank, observed_at) VALUES (?, ?, ?, ?) ON CONFLICT(key_digest) DO UPDATE SET max_support = excluded.max_support, support_rank = excluded.support_rank, observed_at = excluded.observed_at WHERE excluded.support_rank <= tool_choice_capabilities.support_rank",
+				[digest, maxSupport, supportRank[maxSupport], observedAt],
+			);
+			database.run(
+				"DELETE FROM tool_choice_capabilities WHERE key_digest NOT IN (SELECT key_digest FROM tool_choice_capabilities ORDER BY observed_at DESC, key_digest DESC LIMIT ?)",
+				[CACHE_MAX_ENTRIES],
+			);
+			const row = database
+				.query("SELECT max_support, observed_at FROM tool_choice_capabilities WHERE key_digest = ?")
+				.get(digest) as { max_support?: unknown; observed_at?: unknown } | null;
+			return row && isToolChoiceSupport(row.max_support) && typeof row.observed_at === "number"
+				? { support: row.max_support, observedAt: row.observed_at }
+				: undefined;
+		});
+		return write();
+	});
+}
+
+function withCapabilityCache<T>(operation: (database: Database) => T): T | undefined {
+	if (process.env.NODE_ENV === "test" && cachePathOverride === undefined) return;
+	const cachePath = cachePathOverride ?? getToolChoiceCapabilityCachePath();
+	try {
+		fs.mkdirSync(path.dirname(cachePath), { recursive: true, mode: 0o700 });
+		const database = openCapabilityCache(cachePath);
+		try {
+			try {
+				fs.chmodSync(cachePath, 0o600);
+			} catch {
+				// Cache access remains fail-open on filesystems without POSIX modes.
+			}
+			return operation(database);
+		} finally {
+			database.close();
+		}
+	} catch (error) {
+		logger.debug("Tool-choice capability cache unavailable", {
+			cachePath: path.basename(cachePath),
+			error: error instanceof Error ? error.message : String(error),
+		});
+		if (isCorruptCapabilityCacheError(error)) retireCorruptCapabilityCache(cachePath);
+	}
+}
+
+function openCapabilityCache(cachePath: string): Database {
+	onCacheOpenForTests?.();
+	const database = new Database(cachePath, { create: true, strict: true });
+	try {
+		database.run("PRAGMA busy_timeout = 3000");
+		database.run("PRAGMA journal_mode = WAL");
+		database.run("PRAGMA synchronous = FULL");
+		const initialize = database.transaction(() => {
+			const version = database.query("PRAGMA user_version").get() as { user_version?: number } | null;
+			const schemaVersion = version?.user_version ?? 0;
+			if (schemaVersion === 0) {
+				database.run(`
+				CREATE TABLE IF NOT EXISTS tool_choice_capabilities (
+					key_digest TEXT PRIMARY KEY NOT NULL,
+					max_support TEXT NOT NULL,
+					support_rank INTEGER NOT NULL,
+					observed_at INTEGER NOT NULL
+				) STRICT
+			`);
+				assertCapabilityCacheSchema(database);
+				database.run(`PRAGMA user_version = ${CACHE_SCHEMA_VERSION}`);
+				return;
+			}
+			if (schemaVersion !== CACHE_SCHEMA_VERSION) {
+				throw new CapabilityCacheCorruptionError("unsupported cache schema version");
+			}
+			assertCapabilityCacheSchema(database);
+		});
+		initialize();
+		return database;
+	} catch (error) {
+		database.close();
+		throw error;
+	}
+}
+
+function assertCapabilityCacheSchema(database: Database): void {
+	const columns = database.query("PRAGMA table_info(tool_choice_capabilities)").all() as Array<{
+		name?: unknown;
+		type?: unknown;
+		notnull?: unknown;
+		pk?: unknown;
+	}>;
+	const actual = columns.map(column => [column.name, column.type, column.notnull, column.pk]);
+	const expected = [
+		["key_digest", "TEXT", 1, 1],
+		["max_support", "TEXT", 1, 0],
+		["support_rank", "INTEGER", 1, 0],
+		["observed_at", "INTEGER", 1, 0],
+	];
+	if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+		throw new CapabilityCacheCorruptionError("invalid cache schema");
+	}
+}
+
+class CapabilityCacheCorruptionError extends Error {}
+
+function isCorruptCapabilityCacheError(error: unknown): boolean {
+	if (error instanceof CapabilityCacheCorruptionError) return true;
+	if (!error || typeof error !== "object") return false;
+	const code = (error as { code?: unknown }).code;
+	return code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB" || code === "SQLITE_ERROR";
+}
+
+function retireCorruptCapabilityCache(cachePath: string): void {
+	for (const suffix of ["", "-wal", "-shm"]) {
+		try {
+			fs.rmSync(`${cachePath}${suffix}`, { force: true });
+		} catch {
+			// A best-effort cache reset must never break provider fallback behavior.
+		}
+	}
+}
+
+function capabilityKeyDigest(registryKey: string): string {
+	return crypto.createHash("sha256").update(registryKey).digest("hex");
+}
+
+function isToolChoiceSupport(value: unknown): value is ToolChoiceSupport {
+	return value === "none" || value === "auto" || value === "required" || value === "named";
+}
+
+function isValidObservedAt(value: unknown, now: number): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= now;
+}
+
+function currentTime(): number {
+	return nowForTests?.() ?? Date.now();
+}
+
+function pruneRegistry(now: number): void {
+	for (const [key, expiresAt] of registryExpiresAt) {
+		if (expiresAt <= now) {
+			registryExpiresAt.delete(key);
+			registry.delete(key);
+		}
+	}
+	while (registryExpiresAt.size > REGISTRY_MAX_ENTRIES) {
+		const oldestKey = registryExpiresAt.keys().next().value;
+		if (typeof oldestKey !== "string") break;
+		registryExpiresAt.delete(oldestKey);
+		registry.delete(oldestKey);
 	}
 }

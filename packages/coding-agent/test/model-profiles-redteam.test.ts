@@ -5,6 +5,7 @@ import {
 	resolveProfileBindings,
 } from "@gajae-code/coding-agent/config/model-profiles";
 import { ModelsConfigSchema, ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
+import { normalizeModelSelectorValue } from "../src/config/model-selector-value";
 
 function issuePaths(error: { issues: Array<{ path: PropertyKey[] }> }): string[] {
 	return error.issues.map(issue => issue.path.join("."));
@@ -166,9 +167,11 @@ describe("model profile red-team schema and catalog cases", () => {
 	test("every builtin selector satisfies public selector validation", () => {
 		const failures: string[] = [];
 		for (const profile of BUILTIN_MODEL_PROFILES) {
-			for (const [role, selector] of Object.entries(profile.modelMapping)) {
-				if (!ProfileModelSelectorSchema.safeParse(selector).success)
-					failures.push(`${profile.name}.${role}=${selector}`);
+			for (const [role, selectorValue] of Object.entries(profile.modelMapping)) {
+				for (const selector of normalizeModelSelectorValue(selectorValue)) {
+					if (!ProfileModelSelectorSchema.safeParse(selector).success)
+						failures.push(`${profile.name}.${role}=${selector}`);
+				}
 			}
 		}
 

@@ -8,6 +8,7 @@ import { logger } from "@gajae-code/utils";
 import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
+import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
 import {
 	type SessionAttachment,
 	SessionRouter,
@@ -15,6 +16,7 @@ import {
 	SessionRouterError,
 	type SessionRouterFrame,
 } from "../src/sdk/router";
+import { SESSION_REQUEST_TIMEOUT_MS } from "../src/sdk/session-reconnect";
 
 const tempDirs: string[] = [];
 
@@ -34,6 +36,7 @@ interface RouterFixtureAuthority {
 interface RouterFixtureClient {
 	sent: Record<string, unknown>[];
 	requests: Record<string, unknown>[];
+	requestOptions: ({ timeoutMs?: number } | undefined)[];
 	client: SessionRouterClient;
 	emit: (frame: Record<string, unknown>) => void;
 	reconnect: () => void;
@@ -119,6 +122,7 @@ async function routerFixture(
 			createClient: async () => {
 				const sent: Record<string, unknown>[] = [];
 				const requests: Record<string, unknown>[] = [];
+				const requestOptions: ({ timeoutMs?: number } | undefined)[] = [];
 				let handler: ((frame: Record<string, unknown>) => void) | undefined;
 				let reconnectHandler: (() => void) | undefined;
 				const client: SessionRouterClient = {
@@ -134,8 +138,9 @@ async function routerFixture(
 							if (reconnectHandler === next) reconnectHandler = undefined;
 						};
 					},
-					request: async operation => {
+					request: async (operation, requestOption) => {
 						requests.push(operation);
+						requestOptions.push(requestOption);
 						return { events: [] };
 					},
 					close: async () => {},
@@ -144,6 +149,7 @@ async function routerFixture(
 				clients.push({
 					sent,
 					requests,
+					requestOptions,
 					client,
 					emit: frame => handler?.(frame),
 					reconnect: () => reconnectHandler?.(),
@@ -712,6 +718,45 @@ describe("SessionRouter dispatch authority", () => {
 				fixture.router.request(fixture.sessionId, { type: "query_request" }, 1, impostor),
 			).rejects.toBeInstanceOf(SessionRouterError);
 			expect(fixture.clients[0]?.requests.filter(frame => frame.type === "query_request")).toEqual([]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("dispatches session requests on the long-lived session budget, not the one-shot transport default", async () => {
+		const fixture = await routerFixture();
+		try {
+			await fixture.router.request(
+				fixture.sessionId,
+				{ type: "query_request", id: "q10", query: "models.list/current", input: {} },
+				1,
+			);
+			const dispatched = fixture.clients[0]!;
+			const index = dispatched.requests.findIndex(frame => frame.type === "query_request");
+			expect(index).toBeGreaterThanOrEqual(0);
+			// A cold host's first credential-collecting Q10 outruns the transport's
+			// 10s one-shot default and loses the session it was created for (#4258).
+			expect(dispatched.requestOptions[index]?.timeoutMs).toBe(SESSION_REQUEST_TIMEOUT_MS);
+			expect(SESSION_REQUEST_TIMEOUT_MS).toBeGreaterThan(HEARTBEAT_TTL_MS);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("preserves a caller-supplied request budget instead of widening it", async () => {
+		const fixture = await routerFixture();
+		try {
+			await fixture.router.request(
+				fixture.sessionId,
+				{ type: "control_request", id: "abort", operation: "turn.abort", input: {} },
+				1,
+				undefined,
+				{ timeoutMs: 1_500 },
+			);
+			const dispatched = fixture.clients[0]!;
+			const index = dispatched.requests.findIndex(frame => frame.type === "control_request");
+			expect(index).toBeGreaterThanOrEqual(0);
+			expect(dispatched.requestOptions[index]?.timeoutMs).toBe(1_500);
 		} finally {
 			await fixture.router.stop();
 		}

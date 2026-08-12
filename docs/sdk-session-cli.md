@@ -36,8 +36,12 @@ row is credential-free and carries:
 - `hostIncarnation` and `identityProvenance` (`composite` | `legacy`);
 - `activity` (`{state: active|idle, at}`) and `lastHeartbeatAt`;
 - `terminalUncertain`, `lifecycleRequestId`, `endpointMtimeMs`;
-- `ambiguous` when the same `sessionId` maps to more than one `stateRoot`
-  (cross-repo duplicate).
+- `ambiguous` when the same `sessionId` has more than one unresolved
+  authority-fencing `stateRoot` (cross-repo duplicate). A proven non-endpoint
+  bookkeeping registration (the direct-session GC fence row, endpoint
+  generation 0) stays indexed without fencing endpoint attachment; every other
+  unresolved root, including an unproven generation-0 `lifecycle_terminal`
+  claim, still fences.
 
 ### inspect
 

@@ -11,7 +11,7 @@
  *   `continueAfterMaintenance:false`) and retries exactly once; a skipped forced
  *   compaction rethrows the original typed error with zero retries.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { Agent, AgentBusyError, type AgentMessage } from "@gajae-code/agent-core";
@@ -27,14 +27,15 @@ import { AuthStorage } from "../../src/session/auth-storage";
 import {
 	buildSessionContext,
 	RESUME_TRANSCRIPT_MAX_BYTES,
-	SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES,
 	SessionContextTooLargeError,
 	type SessionEntry,
 	SessionManager,
+	SessionManagerTestHooks,
 } from "../../src/session/session-manager";
 import { FileSessionStorage } from "../../src/session/session-storage";
 import { assistantMsg, userMsg } from "../utilities";
 
+const TEST_BUDGET_BYTES = 64 * 1024 * 1024;
 const BIG_TEXT = "x".repeat(40_000_000);
 // 2 × chars + 16 B per the accountant formula: comfortably over the 64 MiB budget.
 const BIG_MEASURED_BYTES = 2 * BIG_TEXT.length + 16;
@@ -48,6 +49,15 @@ function bigAssistantEntry(): Extract<SessionEntry, { type: "message" }> {
 		message: assistantMsg(BIG_TEXT),
 	};
 }
+// Pin the session-context budget to 64 MiB for this file only, in-process via the
+// test hook. This does not leak into spawned subprocesses (unlike process.env) and
+// keeps the 40 MiB fixtures deterministic under any production default.
+beforeAll(() => {
+	SessionManagerTestHooks.sessionContextBudgetBytesOverride = TEST_BUDGET_BYTES;
+});
+afterAll(() => {
+	delete SessionManagerTestHooks.sessionContextBudgetBytesOverride;
+});
 
 describe("R1 nearest model-change role + hasExplicitDefaultModel isolation", () => {
 	function freshManager(): SessionManager {
@@ -111,7 +121,7 @@ describe("R1 nearest model-change role + hasExplicitDefaultModel isolation", () 
 describe("R3 synchronous context preflight (D5/D5a)", () => {
 	it("free buildSessionContext throws the exported instanceof-stable error over the budget", () => {
 		const entries = [bigAssistantEntry()];
-		expect(BIG_MEASURED_BYTES).toBeGreaterThan(SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES);
+		expect(BIG_MEASURED_BYTES).toBeGreaterThan(TEST_BUDGET_BYTES);
 		try {
 			buildSessionContext(entries);
 			throw new Error("Expected SessionContextTooLargeError");
@@ -121,7 +131,7 @@ describe("R3 synchronous context preflight (D5/D5a)", () => {
 				expect(error.code).toBe("context_too_large");
 				expect(error.name).toBe("SessionContextTooLargeError");
 				expect(error.measuredBytes).toBeGreaterThan(error.budgetBytes);
-				expect(error.budgetBytes).toBe(SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES);
+				expect(error.budgetBytes).toBe(TEST_BUDGET_BYTES);
 			}
 		}
 	});
@@ -168,7 +178,7 @@ describe("R3 synchronous context preflight (D5/D5a)", () => {
 			const inspected = await SessionManager.inspectSessionTailReadOnly(sessionFile, storage);
 			expect(inspected).toMatchObject({ kind: "error", reason: "context_too_large" });
 			if ("size" in inspected) {
-				expect(inspected.size).toBeGreaterThan(SESSION_CONTEXT_MATERIALIZATION_BUDGET_BYTES);
+				expect(inspected.size).toBeGreaterThan(TEST_BUDGET_BYTES);
 			}
 		} finally {
 			tempDir.removeSync();

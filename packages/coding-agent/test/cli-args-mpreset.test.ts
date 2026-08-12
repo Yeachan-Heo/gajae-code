@@ -130,6 +130,23 @@ describe("CLI credential selector args", () => {
 	test("rejects malformed credential selector", () => {
 		expect(() => parseCliCredentialSelector("openai-codex/nope")).toThrow("Invalid --credential selector");
 	});
+
+	test("parses --prefer-credential for new and resumed sessions", () => {
+		expect(parseArgs(["--prefer-credential", "id:15"]).preferCredential).toBe("id:15");
+		const resumed = parseArgs(["--resume", "--prefer-credential", "anthropic/id:15"]);
+		expect(resumed.resume).toBe(true);
+		expect(resumed.preferCredential).toBe("anthropic/id:15");
+	});
+
+	test("rejects missing or conflicting preferred credential selectors", () => {
+		expect(() => parseArgs(["--prefer-credential"])).toThrow("--prefer-credential requires <selector>");
+		expect(() => parseArgs(["--credential", "id:15", "--prefer-credential", "id:14"])).toThrow(
+			"--credential and --prefer-credential cannot be used together",
+		);
+		expect(() => parseArgs(["--api-key", "test-key", "--prefer-credential", "id:14"])).toThrow(
+			"--api-key and --prefer-credential cannot be used together",
+		);
+	});
 });
 
 describe("MCP config CLI args", () => {

@@ -296,6 +296,74 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("unqualified preferred credential overrides a default model from another provider", async () => {
+		// `runtime-provider` is registered with a config apiKey (via `registerRuntimeProvider`
+		// in `beforeEach`), which is intentionally incompatible with a preferred-credential
+		// selector (`#assertPreferredCredentialSelectorUsable` rejects providers with an active
+		// API-key override). The preferred row therefore has to live on a real OAuth-backed
+		// provider; a bundled provider with no separate config registration here works.
+		const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!anthropicModel) throw new Error("Expected a bundled anthropic model");
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "token-test-primary",
+				refresh: "refresh-test-primary",
+				expires: Date.now() + 60 * 60_000,
+				email: "primary@example.test",
+			},
+		]);
+		const preferredRow = authStorage.exportSnapshot().credentials.find(entry => entry.provider === "anthropic");
+		if (!preferredRow) throw new Error("Expected an anthropic credential row");
+		const settings = Settings.isolated();
+		// Default points at `runtime-provider`, a different provider than the preference.
+		settings.setModelRole("default", "runtime-provider/runtime-model");
+
+		const { session } = await createAgentSession({
+			...buildSessionOptions(),
+			settings,
+			preferredCredentialSelector: {
+				selector: { kind: "id", value: String(preferredRow.id) },
+				raw: `id:${preferredRow.id}`,
+			},
+		});
+		try {
+			// The settings default model role ("runtime-provider/runtime-model") is skipped
+			// because its provider mismatches the preference; the resolved model falls back to
+			// whichever anthropic candidate the fallback scan finds first — provider correctness
+			// is the invariant under test, not a specific catalog entry.
+			expect(session.model?.provider).toBe("anthropic");
+			expect(authStorage.hasRuntimePreferredCredentialSelector("anthropic")).toBe(true);
+			expect(authStorage.hasRuntimePreferredCredentialSelector("runtime-provider")).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("a model resolved from another provider than the preferred credential fails closed", async () => {
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "token-test-primary",
+				refresh: "refresh-test-primary",
+				expires: Date.now() + 60 * 60_000,
+				email: "primary@example.test",
+			},
+		]);
+		const preferredRow = authStorage.exportSnapshot().credentials.find(entry => entry.provider === "anthropic");
+		if (!preferredRow) throw new Error("Expected an anthropic credential row");
+
+		await expect(
+			createAgentSession({
+				...buildSessionOptions("runtime-provider/runtime-model"),
+				preferredCredentialSelector: {
+					selector: { kind: "id", value: String(preferredRow.id) },
+					raw: `id:${preferredRow.id}`,
+				},
+			}),
+		).rejects.toThrow(/--prefer-credential id:\d+ matches anthropic, but the resolved model uses runtime-provider/);
+	});
+
 	test("persists model substitution metadata on new session model_change", async () => {
 		const effectiveModel: Model = {
 			id: "gpt-5.5",

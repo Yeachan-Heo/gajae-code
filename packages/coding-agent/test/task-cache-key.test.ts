@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Message, ProviderSessionState } from "@gajae-code/ai/types";
-import { Snowflake } from "@gajae-code/utils";
+import { resolveEquivalentPath, Snowflake } from "@gajae-code/utils";
+import { AsyncJobManager, asyncJobEndpointId } from "../src/async";
 import { Settings } from "../src/config/settings";
 import { createAgentSession } from "../src/sdk";
 import type { AgentSession, ForkContextSeed } from "../src/session/agent-session";
@@ -84,6 +85,61 @@ async function withLifecycleIdentity<T>(sessionId: string, run: () => Promise<T>
 		else process.env.GJC_SESSION_ID = previousSessionId;
 	}
 }
+
+describe("async job endpoint id derivation", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(() => {
+		while (tempDirs.length > 0) {
+			const tempDir = tempDirs.pop();
+			if (tempDir && fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back to the logical session id without an explicit provider scope", () => {
+		expect(asyncJobEndpointId(undefined, "logical-id", "/tmp/anything.jsonl")).toBe("logical-id");
+		expect(asyncJobEndpointId("provider", "logical-id", undefined)).toBe("logical-id");
+	});
+
+	it("collapses symlink and dot-segment transcript aliases onto one endpoint key", () => {
+		if (process.platform === "win32") return;
+		const tempDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-alias-${Snowflake.next()}-`)));
+		tempDirs.push(tempDir);
+		const realDir = path.join(tempDir, "real");
+		fs.mkdirSync(realDir);
+		const realFile = path.join(realDir, "session.jsonl");
+		fs.writeFileSync(realFile, "");
+		fs.symlinkSync(realDir, path.join(tempDir, "alias-dir"), "dir");
+		fs.symlinkSync(realFile, path.join(tempDir, "alias-file.jsonl"));
+
+		const canonical = asyncJobEndpointId("provider", "logical-id", realFile);
+		expect(canonical).toBe(JSON.stringify(["async-job-endpoint", "provider", realFile]));
+		// Directory-symlink alias, file-symlink alias, and a dot-segment path all
+		// designate the same transcript, so all must key the same manager.
+		expect(asyncJobEndpointId("provider", "logical-id", path.join(tempDir, "alias-dir", "session.jsonl"))).toBe(
+			canonical,
+		);
+		expect(asyncJobEndpointId("provider", "logical-id", path.join(tempDir, "alias-file.jsonl"))).toBe(canonical);
+		expect(asyncJobEndpointId("provider", "logical-id", path.join(realDir, "..", "real", "session.jsonl"))).toBe(
+			canonical,
+		);
+	});
+
+	it("keeps distinct transcripts and distinct provider scopes on distinct keys", () => {
+		const tempDir = fs.realpathSync(
+			fs.mkdtempSync(path.join(os.tmpdir(), `pi-endpoint-distinct-${Snowflake.next()}-`)),
+		);
+		tempDirs.push(tempDir);
+		const first = path.join(tempDir, "a.jsonl");
+		const second = path.join(tempDir, "b.jsonl");
+		expect(asyncJobEndpointId("provider", "logical-id", first)).not.toBe(
+			asyncJobEndpointId("provider", "logical-id", second),
+		);
+		expect(asyncJobEndpointId("provider-a", "logical-id", first)).not.toBe(
+			asyncJobEndpointId("provider-b", "logical-id", first),
+		);
+	});
+});
 
 describe("task fork-context provider identity", () => {
 	const sessions: AgentSession[] = [];
@@ -206,6 +262,99 @@ describe("task fork-context provider identity", () => {
 
 		expect(session.agent.providerSessionId).toBe("explicit-provider-session");
 	});
+
+	it("keeps top-level async ownership isolated when provider affinity is shared", async () => {
+		const firstDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-shared-provider-a-${Snowflake.next()}-`));
+		const secondDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-shared-provider-b-${Snowflake.next()}-`));
+		tempDirs.push(firstDir, secondDir);
+		const [{ session: first, authStorage: firstAuth }, { session: second, authStorage: secondAuth }] =
+			await Promise.all([
+				createSession(firstDir, { providerSessionId: "shared-provider-affinity" }),
+				createSession(secondDir, { providerSessionId: "shared-provider-affinity" }),
+			]);
+		sessions.push(first, second);
+		authStorages.push(firstAuth, secondAuth);
+
+		expect(first.agent.providerSessionId).toBe("shared-provider-affinity");
+		expect(second.agent.providerSessionId).toBe("shared-provider-affinity");
+		expect(first.sessionManager.getSessionId()).not.toBe(second.sessionManager.getSessionId());
+	});
+
+	it("rekeys explicit provider ownership to the successor transcript and frees the predecessor", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-transition-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const providerSessionId = "shared-provider-affinity";
+		const { session, authStorage } = await createSession(tempDir, { providerSessionId });
+		sessions.push(session);
+		authStorages.push(authStorage);
+
+		const previousSessionId = session.sessionManager.getSessionId();
+		const previousSessionFile = session.sessionManager.getSessionFile();
+		expect(previousSessionFile).toBeDefined();
+		const previousEndpoint = JSON.stringify([
+			"async-job-endpoint",
+			providerSessionId,
+			resolveEquivalentPath(path.resolve(previousSessionFile!)),
+		]);
+		const manager = AsyncJobManager.forEndpoint(previousEndpoint);
+		expect(manager).toBeDefined();
+
+		expect(await session.newSession()).toBe(true);
+		const successorSessionFile = session.sessionManager.getSessionFile();
+		expect(successorSessionFile).toBeDefined();
+		expect(session.sessionManager.getSessionId()).not.toBe(previousSessionId);
+		const successorEndpoint = JSON.stringify([
+			"async-job-endpoint",
+			providerSessionId,
+			resolveEquivalentPath(path.resolve(successorSessionFile!)),
+		]);
+		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
+		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
+
+		expect(await session.switchSession(previousSessionFile!)).toBe(true);
+		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeUndefined();
+		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBe(manager);
+
+		const { session: reopened, authStorage: reopenedAuth } = await createSession(tempDir, {
+			providerSessionId,
+			sessionManager: await SessionManager.open(successorSessionFile!),
+		});
+		sessions.push(reopened);
+		authStorages.push(reopenedAuth);
+		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeDefined();
+	}, 15_000);
+
+	it("registers construction-time ownership under the shared canonical endpoint key", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-alias-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const providerSessionId = "aliased-provider-affinity";
+		const { session, authStorage } = await createSession(tempDir, { providerSessionId });
+		sessions.push(session);
+		authStorages.push(authStorage);
+
+		// The constructor must register under exactly the key the transition path
+		// recomputes; any divergence strands ownership on the first transition.
+		const predecessorFile = session.sessionManager.getSessionFile();
+		expect(predecessorFile).toBeDefined();
+		const predecessorEndpoint = asyncJobEndpointId(
+			providerSessionId,
+			session.sessionManager.getSessionId(),
+			predecessorFile,
+		);
+		const manager = AsyncJobManager.forEndpoint(predecessorEndpoint);
+		expect(manager).toBeDefined();
+		expect(AsyncJobManager.endpointIdOf(manager!)).toBe(predecessorEndpoint);
+
+		expect(await session.newSession()).toBe(true);
+		const successorEndpoint = asyncJobEndpointId(
+			providerSessionId,
+			session.sessionManager.getSessionId(),
+			session.sessionManager.getSessionFile(),
+		);
+		expect(successorEndpoint).not.toBe(predecessorEndpoint);
+		expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBeUndefined();
+		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
+	}, 15_000);
 
 	it("does not share mutable provider state unless explicitly supplied", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-task-provider-state-${Snowflake.next()}-`));

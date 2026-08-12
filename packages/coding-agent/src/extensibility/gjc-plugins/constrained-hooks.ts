@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
+import { normalizePluginHook } from "../../hooks/normalize";
 import { bundleIdentity } from "./lifecycle-reconciliation";
 import { verifyImplementationHash } from "./metadata";
 import { resolveWithinRoot } from "./paths";
@@ -106,6 +107,19 @@ export class ConstrainedPluginHookDescriptor {
 	}
 
 	async load(): Promise<ConstrainedPluginHook> {
+		const normalized = normalizePluginHook({
+			declaredEvent: this.event,
+			target: this.target,
+			phase: this.phase,
+			plugin: this.plugin,
+			source: this.relativePath,
+		});
+		if (!normalized.hook) {
+			throw new GjcPluginLoadError(
+				"invalid_hook",
+				normalized.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "),
+			);
+		}
 		if (this.implementationHash) await verifyImplementationHash(this.relativePath, this.implementationHash);
 		const registered: { event: string; handler: (...a: any[]) => unknown }[] = [];
 		const deny = (method: string) => () => {
@@ -171,6 +185,25 @@ export async function loadConstrainedPluginHooks(input: { cwd: string }): Promis
 	const invalidHookIds = new Set<string>();
 	for (const entry of effective) {
 		if (!entry.enabled) continue;
+		for (const hook of entry.surfaces.hooks) {
+			if (entry.disabledSurfaceIds.includes(hook.extensionId)) continue;
+			const normalized = normalizePluginHook({
+				declaredEvent: hook.event,
+				target: hook.target,
+				phase: hook.phase,
+				plugin: entry.name,
+				source: hook.relativePath,
+			});
+			if (normalized.hook) continue;
+			invalidHookIds.add(`${entry.scope}:${entry.name}:${hook.extensionId}`);
+			preQuarantine.push({
+				identity: bundleIdentity(entry.scope, entry.name),
+				plugin: entry.name,
+				surfaceId: hook.extensionId,
+				code: "invalid_hook",
+				message: normalized.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "),
+			});
+		}
 		const drift = await verifyEntryHashes(entry);
 		if (drift) preQuarantine.push(drift);
 		for (const hook of entry.surfaces.hooks) {

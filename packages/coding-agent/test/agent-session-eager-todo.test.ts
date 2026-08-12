@@ -4,6 +4,11 @@ import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import { type AssistantMessage, getBundledModel, type TextContent, type ToolCall } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import {
+	clearToolChoiceIncapabilityRegistryForTests,
+	configureToolChoiceCapabilityCacheForTests,
+	markToolChoiceIncapability,
+} from "@gajae-code/ai/utils/tool-choice-capability";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { initializeLocalRoot } from "@gajae-code/coding-agent/internal-urls";
@@ -202,6 +207,8 @@ describe("AgentSession eager todo enforcement", () => {
 	});
 
 	afterEach(async () => {
+		configureToolChoiceCapabilityCacheForTests();
+		clearToolChoiceIncapabilityRegistryForTests();
 		managedAppendSpy?.mockRestore();
 		managedAppendSpy = undefined;
 		fileWriterSpy?.mockRestore();
@@ -383,6 +390,20 @@ describe("AgentSession eager todo enforcement", () => {
 			lastMessageText: "list all work trees",
 		});
 		expect(observedCalls[0]?.messageTexts[0]).toContain("todo_write");
+	});
+
+	it("sends the reminder without named forcing after cached incapability hydration", async () => {
+		const cachePath = path.join(tempDir.path(), "tool-choice-capabilities.db");
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		markToolChoiceIncapability(session.model!, "auto", "first-process discovery");
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+
+		await session.prompt("list all work trees");
+
+		expect(observedCalls).toHaveLength(1);
+		expect(observedCalls[0]?.toolChoice).toBeUndefined();
+		expect(observedCalls[0]?.toolNames).toEqual(["todo_write", "bash"]);
+		expect(observedCalls[0]?.messageTexts).toEqual([expect.any(String), "list all work trees"]);
 	});
 
 	it("drops the eager choice when todo_write becomes inactive before the model call", async () => {

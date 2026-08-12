@@ -242,7 +242,7 @@ describe("parseDaemonArgs", () => {
 	test("parses all kinds and internal worker flags", () => {
 		const parsed = parseDaemonArgs([
 			"daemon",
-			"reload",
+			"restart",
 			"telegram",
 			"discord",
 			"slack",
@@ -253,7 +253,7 @@ describe("parseDaemonArgs", () => {
 			"1500",
 		]);
 		expect(parsed).toMatchObject({
-			action: "reload",
+			action: "restart",
 			kinds: ["telegram", "discord", "slack"],
 			all: true,
 			json: true,
@@ -282,8 +282,9 @@ describe("parseDaemonArgs", () => {
 		).rejects.toBeInstanceOf(UnknownDaemonKindError);
 	});
 
-	test("resolves the restart alias to reload and parses --verbose/-v", () => {
-		expect(parseDaemonArgs(["daemon", "restart"])?.action).toBe("reload");
+	test("keeps restart canonical and accepts reload as an alias", () => {
+		expect(parseDaemonArgs(["daemon", "restart"])?.action).toBe("restart");
+		expect(parseDaemonArgs(["daemon", "reload"])?.action).toBe("restart");
 		expect(parseDaemonArgs(["daemon", "restart", "telegram"])?.kinds).toEqual(["telegram"]);
 		expect(parseDaemonArgs(["daemon", "status", "--verbose"])?.verbose).toBe(true);
 		expect(parseDaemonArgs(["daemon", "status", "-v"])?.verbose).toBe(true);
@@ -292,11 +293,11 @@ describe("parseDaemonArgs", () => {
 });
 
 describe("daemon operator contract", () => {
-	test("resolveDaemonAction maps canonical verbs and the restart alias", () => {
+	test("resolveDaemonAction maps canonical restart and the reload alias", () => {
 		expect(resolveDaemonAction("status")).toBe("status");
-		expect(resolveDaemonAction("reload")).toBe("reload");
-		expect(resolveDaemonAction("restart")).toBe("reload");
-		expect(DAEMON_ACTION_ALIASES.restart).toBe("reload");
+		expect(resolveDaemonAction("reload")).toBe("restart");
+		expect(resolveDaemonAction("restart")).toBe("restart");
+		expect(DAEMON_ACTION_ALIASES.reload).toBe("restart");
 		expect(resolveDaemonAction("bogus")).toBeUndefined();
 		expect(resolveDaemonAction(undefined)).toBeUndefined();
 	});
@@ -1948,6 +1949,23 @@ describe("ChatDaemonController ownership safety", () => {
 			expect(spawns).toBe(0);
 		});
 
+		test("acknowledges an update-recovery restart while globally disabled without spawning delivery", async () => {
+			const agentDir = tempAgentDir();
+			const settings = configuredSettings(agentDir);
+			settings.set("notifications.enabled", false);
+			let spawns = 0;
+			const controller = new ChatDaemonController(settings, kind, {
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			});
+			const result = await controller.reload({ allowDisabledNoop: true });
+			expect(result.ok).toBe(true);
+			expect(result.message).toContain("leaving daemon stopped");
+			expect(spawns).toBe(0);
+		});
+
 		test.each([
 			["lower", chatDaemonGeneration(kind) - 1, "owner_spawned", "stale"],
 			["equal", chatDaemonGeneration(kind), "attached", "running"],
@@ -2746,7 +2764,7 @@ describe("runDaemonCommand", () => {
 		expect(parsed[0].ownerId).toBe("o1");
 	});
 
-	test("reload prints a human result line", async () => {
+	test("restart prints a human result line", async () => {
 		const status: DaemonStatus = {
 			kind: "telegram",
 			configured: true,
@@ -2762,7 +2780,7 @@ describe("runDaemonCommand", () => {
 		};
 		const out = await captureStdout(() =>
 			runDaemonCommand(
-				{ action: "reload", kinds: ["telegram"], all: false, json: false, force: false },
+				{ action: "restart", kinds: ["telegram"], all: false, json: false, force: false },
 				{ controllers: [fakeController(status, result)] },
 			),
 		);
@@ -2770,7 +2788,7 @@ describe("runDaemonCommand", () => {
 		expect(out).toContain("reloaded telegram daemon");
 	});
 
-	test("a refused reload surfaces recovery guidance and exits non-zero", async () => {
+	test("a refused restart surfaces recovery guidance and exits non-zero", async () => {
 		const prevExit = process.exitCode;
 		const status: DaemonStatus = {
 			kind: "telegram",
@@ -2788,7 +2806,7 @@ describe("runDaemonCommand", () => {
 		};
 		const out = await captureStdout(() =>
 			runDaemonCommand(
-				{ action: "reload", kinds: ["telegram"], all: false, json: false, force: false },
+				{ action: "restart", kinds: ["telegram"], all: false, json: false, force: false },
 				{ controllers: [fakeController(status, result)] },
 			),
 		);

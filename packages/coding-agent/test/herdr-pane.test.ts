@@ -1,0 +1,322 @@
+import { describe, expect, it } from "bun:test";
+import {
+	buildHerdrReleaseArgs,
+	buildHerdrReportArgs,
+	createHerdrReporter,
+	type HerdrReportProcess,
+	type HerdrSessionEvent,
+	resolveHerdrPaneEnvironment,
+} from "../src/utils/herdr-pane";
+
+function paneEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+	return { HERDR_ENV: "1", HERDR_PANE_ID: "pane-7", ...extra } as NodeJS.ProcessEnv;
+}
+
+interface SpawnCall {
+	command: string[];
+	killed: boolean;
+}
+
+function recordingSpawn(exitCode = 0) {
+	const calls: SpawnCall[] = [];
+	let unrefCount = 0;
+	const spawn = (command: string[]): HerdrReportProcess => {
+		const call: SpawnCall = { command, killed: false };
+		calls.push(call);
+		return {
+			exited: Promise.resolve(exitCode),
+			kill() {
+				call.killed = true;
+			},
+			unref() {
+				unrefCount += 1;
+			},
+		};
+	};
+	return { calls, spawn, unrefCount: () => unrefCount };
+}
+
+/** Emitter standing in for AgentSession.subscribe. */
+function eventSource() {
+	let listener: ((event: HerdrSessionEvent) => void) | null = null;
+	let unsubscribed = 0;
+	return {
+		subscribe(next: (event: HerdrSessionEvent) => void) {
+			listener = next;
+			return () => {
+				unsubscribed += 1;
+				listener = null;
+			};
+		},
+		emit(event: HerdrSessionEvent) {
+			listener?.(event);
+		},
+		get attached() {
+			return listener !== null;
+		},
+		get unsubscribeCount() {
+			return unsubscribed;
+		},
+	};
+}
+
+const PANE = { paneId: "pane-7", binPath: "/usr/bin/herdr" };
+
+describe("resolveHerdrPaneEnvironment", () => {
+	it("returns null outside a Herdr pane even when a binary is resolvable", () => {
+		expect(resolveHerdrPaneEnvironment({ env: {} as NodeJS.ProcessEnv, which: () => "/usr/bin/herdr" })).toBeNull();
+		expect(
+			resolveHerdrPaneEnvironment({
+				env: { HERDR_ENV: "0", HERDR_PANE_ID: "pane-7" } as NodeJS.ProcessEnv,
+				which: () => "/usr/bin/herdr",
+			}),
+		).toBeNull();
+	});
+
+	it("requires a pane id", () => {
+		expect(
+			resolveHerdrPaneEnvironment({ env: { HERDR_ENV: "1" } as NodeJS.ProcessEnv, which: () => "/usr/bin/herdr" }),
+		).toBeNull();
+	});
+
+	it("prefers HERDR_BIN_PATH over a PATH lookup", () => {
+		expect(
+			resolveHerdrPaneEnvironment({
+				env: paneEnv({ HERDR_BIN_PATH: "/opt/herdr/herdr" }),
+				which: () => "/usr/bin/herdr",
+			}),
+		).toEqual({ paneId: "pane-7", binPath: "/opt/herdr/herdr" });
+	});
+
+	it("falls back to a PATH lookup and reports null when the binary is absent", () => {
+		expect(resolveHerdrPaneEnvironment({ env: paneEnv(), which: () => "/usr/bin/herdr" })).toEqual({
+			paneId: "pane-7",
+			binPath: "/usr/bin/herdr",
+		});
+		expect(resolveHerdrPaneEnvironment({ env: paneEnv(), which: () => null })).toBeNull();
+	});
+
+	it("rejects a pane id that is not an opaque identifier", () => {
+		for (const paneId of ["--source", "pane 7", "pane;rm -rf /", "$(id)", "-x"]) {
+			expect(
+				resolveHerdrPaneEnvironment({ env: paneEnv({ HERDR_PANE_ID: paneId }), which: () => "/usr/bin/herdr" }),
+			).toBeNull();
+		}
+	});
+
+	it("does not throw when the PATH lookup itself fails", () => {
+		expect(
+			resolveHerdrPaneEnvironment({
+				env: paneEnv(),
+				which: () => {
+					throw new Error("which exploded");
+				},
+			}),
+		).toBeNull();
+	});
+});
+
+describe("herdr reporter argv", () => {
+	it("emits the documented custom-integration argv", () => {
+		expect(buildHerdrReportArgs("pane-7", "working", 3)).toEqual([
+			"pane",
+			"report-agent",
+			"pane-7",
+			"--source",
+			"custom:gjc",
+			"--agent",
+			"gjc",
+			"--state",
+			"working",
+			"--seq",
+			"3",
+		]);
+		expect(buildHerdrReleaseArgs("pane-7", 4)).toEqual([
+			"pane",
+			"release-agent",
+			"pane-7",
+			"--source",
+			"custom:gjc",
+			"--agent",
+			"gjc",
+			"--seq",
+			"4",
+		]);
+	});
+
+	it("never forwards prompt or message content as arguments", () => {
+		const { calls, spawn } = recordingSpawn();
+		const source = eventSource();
+		createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+		source.emit({ type: "agent_start" });
+		source.emit({ type: "message_start", toolName: "s3cret-token" } as HerdrSessionEvent);
+		source.emit({ type: "tool_execution_start", toolName: "bash" });
+
+		const argv = calls.flatMap(call => call.command).join(" ");
+		expect(argv).not.toContain("s3cret-token");
+		expect(argv).not.toContain("bash");
+	});
+});
+
+describe("herdr reporter state machine", () => {
+	it("reports idle at startup and detaches the process handle", () => {
+		const { calls, spawn, unrefCount } = recordingSpawn();
+		const reporter = createHerdrReporter(PANE, eventSource().subscribe, { env: paneEnv(), spawn });
+
+		expect(reporter.state).toBe("idle");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.command).toEqual(["/usr/bin/herdr", ...buildHerdrReportArgs("pane-7", "idle", 1)]);
+		expect(unrefCount()).toBe(1);
+	});
+
+	it("tracks working/idle across a turn and dedupes repeated states", () => {
+		const { calls, spawn } = recordingSpawn();
+		const source = eventSource();
+		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+
+		source.emit({ type: "agent_start" });
+		expect(reporter.state).toBe("working");
+		source.emit({ type: "tool_execution_start", toolName: "read" });
+		source.emit({ type: "tool_execution_end", toolName: "read" });
+		expect(reporter.state).toBe("working");
+		source.emit({ type: "agent_end" });
+		expect(reporter.state).toBe("idle");
+
+		expect(calls.map(call => call.command.at(-3))).toEqual(["idle", "working", "idle"]);
+	});
+
+	it("reports blocked while the ask tool owns the turn", () => {
+		const { calls, spawn } = recordingSpawn();
+		const source = eventSource();
+		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+
+		source.emit({ type: "agent_start" });
+		source.emit({ type: "tool_execution_start", toolName: "ask" });
+		expect(reporter.state).toBe("blocked");
+		source.emit({ type: "tool_execution_end", toolName: "ask" });
+		expect(reporter.state).toBe("working");
+
+		expect(calls.map(call => call.command.at(-3))).toEqual(["idle", "working", "blocked", "working"]);
+	});
+
+	it("stays blocked until the outermost nested ask completes", () => {
+		const { spawn } = recordingSpawn();
+		const source = eventSource();
+		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+
+		source.emit({ type: "agent_start" });
+		source.emit({ type: "tool_execution_start", toolName: "ask" });
+		source.emit({ type: "tool_execution_start", toolName: "ask" });
+		source.emit({ type: "tool_execution_end", toolName: "ask" });
+		expect(reporter.state).toBe("blocked");
+		source.emit({ type: "tool_execution_end", toolName: "ask" });
+		expect(reporter.state).toBe("working");
+	});
+
+	it("does not leave a turn stuck blocked when a cancelled ask never ends", () => {
+		const { spawn } = recordingSpawn();
+		const source = eventSource();
+		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+
+		source.emit({ type: "agent_start" });
+		source.emit({ type: "tool_execution_start", toolName: "ask" });
+		expect(reporter.state).toBe("blocked");
+		source.emit({ type: "agent_end" });
+		expect(reporter.state).toBe("idle");
+		source.emit({ type: "agent_start" });
+		expect(reporter.state).toBe("working");
+	});
+
+	it("assigns strictly increasing sequence numbers including the release", () => {
+		const { calls, spawn } = recordingSpawn();
+		const source = eventSource();
+		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+
+		source.emit({ type: "agent_start" });
+		source.emit({ type: "agent_end" });
+		reporter.release();
+
+		const seqs = calls.map(call => Number(call.command.at(-1)));
+		expect(seqs).toEqual([1, 2, 3, 4]);
+	});
+
+	it("releases the authority exactly once and unsubscribes", () => {
+		const { calls, spawn } = recordingSpawn();
+		const source = eventSource();
+		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+
+		reporter.release();
+		reporter.release();
+
+		expect(source.attached).toBe(false);
+		expect(source.unsubscribeCount).toBe(1);
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.command).toEqual(["/usr/bin/herdr", ...buildHerdrReleaseArgs("pane-7", 2)]);
+	});
+
+	it("ignores events and reports after release", () => {
+		const { calls, spawn } = recordingSpawn();
+		const source = eventSource();
+		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+
+		reporter.release();
+		source.emit({ type: "agent_start" });
+		reporter.report("working");
+
+		expect(calls).toHaveLength(2);
+	});
+
+	it("keeps reporting after a spawn throws synchronously", () => {
+		let attempts = 0;
+		const source = eventSource();
+		const reporter = createHerdrReporter(PANE, source.subscribe, {
+			env: paneEnv(),
+			spawn: () => {
+				attempts += 1;
+				throw new Error("ENOENT");
+			},
+		});
+
+		source.emit({ type: "agent_start" });
+		expect(reporter.state).toBe("working");
+		expect(attempts).toBe(2);
+	});
+
+	it("does not produce an unhandled rejection when the herdr process fails", async () => {
+		const source = eventSource();
+		createHerdrReporter(PANE, source.subscribe, {
+			env: paneEnv(),
+			spawn: () => ({
+				exited: Promise.reject(new Error("spawn herdr ENOENT")),
+				kill() {},
+				unref() {},
+			}),
+		});
+
+		// A pending rejection would surface on the next microtask drain.
+		await Bun.sleep(0);
+		expect(source.attached).toBe(true);
+	});
+
+	it("kills a herdr invocation that never exits", async () => {
+		const calls: SpawnCall[] = [];
+		const source = eventSource();
+		createHerdrReporter(PANE, source.subscribe, {
+			env: paneEnv(),
+			spawn: (command: string[]) => {
+				const call: SpawnCall = { command, killed: false };
+				calls.push(call);
+				return {
+					exited: new Promise<number>(() => {}),
+					kill() {
+						call.killed = true;
+					},
+					unref() {},
+				};
+			},
+		});
+
+		await Bun.sleep(1600);
+		expect(calls[0]?.killed).toBe(true);
+	}, 5000);
+});

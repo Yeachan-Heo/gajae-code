@@ -375,4 +375,266 @@ describe("managed strict-resume target races", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("initializes an initially missing managed target with bounded mode enabled", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bounded-create-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "new.jsonl");
+		let manager: SessionManager | undefined;
+		try {
+			manager = await SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled");
+			expect(storage.existsSync(sourceFile)).toBe(true);
+			expect(manager.getSessionFile()).toBe(sourceFile);
+		} finally {
+			await manager?.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("propagates retained authority stat failures instead of pathname fallback", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-retained-stat-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		storage.writeTextSync(sourceFile, transcript());
+		SessionManagerTestHooks.beforeManagedSourceStat = () => {
+			throw new Error("source_changed");
+		};
+		try {
+			await expect(SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled")).rejects.toThrow(
+				"source_changed",
+			);
+			expect(storage.readTextSync(sourceFile)).toBe(transcript());
+		} finally {
+			SessionManagerTestHooks.beforeManagedSourceStat = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("propagates retained root disappearance instead of treating the target as missing", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-retained-root-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		storage.writeTextSync(sourceFile, transcript());
+		SessionManagerTestHooks.beforeManagedSourceStat = async () => {
+			await fs.rm(destination.directory, { recursive: true, force: true });
+		};
+		try {
+			await expect(
+				SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled"),
+			).rejects.toThrow();
+			expect(storage.existsSync(sourceFile)).toBe(false);
+		} finally {
+			SessionManagerTestHooks.beforeManagedSourceStat = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects root replacement after missing-target authority acceptance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-missing-root-race-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		const replacement = transcript().replaceAll("rejected-open", "replacement");
+		SessionManagerTestHooks.beforeManagedMissingInit = async () => {
+			await fs.rm(destination.directory, { recursive: true, force: true });
+			await fs.mkdir(destination.directory, { recursive: true });
+			storage.writeTextSync(sourceFile, replacement);
+		};
+		try {
+			await expect(
+				SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled"),
+			).rejects.toThrow();
+			expect(storage.readTextSync(sourceFile)).toBe(replacement);
+		} finally {
+			SessionManagerTestHooks.beforeManagedMissingInit = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves an occupant installed immediately before missing-target publication", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-missing-publish-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		const replacement = transcript().replaceAll("rejected-open", "replacement");
+		SessionManagerTestHooks.beforeManagedMissingPublish = () => {
+			storage.writeTextSync(sourceFile, replacement);
+		};
+		try {
+			await expect(
+				SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled"),
+			).rejects.toThrow();
+			expect(storage.readTextSync(sourceFile)).toBe(replacement);
+		} finally {
+			SessionManagerTestHooks.beforeManagedMissingPublish = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not recreate a managed root removed immediately before missing publication", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-missing-publish-root-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		SessionManagerTestHooks.beforeManagedMissingPublish = async () => {
+			await fs.rm(destination.directory, { recursive: true, force: true });
+		};
+		try {
+			await expect(
+				SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled"),
+			).rejects.toThrow();
+			expect(storage.existsSync(destination.directory)).toBe(false);
+			expect(storage.existsSync(sourceFile)).toBe(false);
+		} finally {
+			SessionManagerTestHooks.beforeManagedMissingPublish = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects replacement after missing-target publication without mutating the successor", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-missing-return-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		const replacement = transcript().replaceAll("rejected-open", "replacement");
+		SessionManagerTestHooks.beforeManagedMissingReturn = () => {
+			storage.writeTextSync(sourceFile, replacement);
+		};
+		try {
+			await expect(SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled")).rejects.toThrow(
+				"Could not open session: unstable",
+			);
+			expect(storage.readTextSync(sourceFile)).toBe(replacement);
+		} finally {
+			SessionManagerTestHooks.beforeManagedMissingReturn = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not recreate a managed root removed after the final publication assertion", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-missing-asserted-root-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		SessionManagerTestHooks.afterManagedMissingAssertion = async () => {
+			await fs.rm(destination.directory, { recursive: true, force: true });
+		};
+		try {
+			await expect(
+				SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled"),
+			).rejects.toThrow();
+			expect(storage.existsSync(destination.directory)).toBe(false);
+			expect(storage.existsSync(sourceFile)).toBe(false);
+		} finally {
+			SessionManagerTestHooks.afterManagedMissingAssertion = undefined;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not rewrite a successor installed after managed resume acceptance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-close-successor-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		const replacement = transcript().replaceAll("rejected-open", "replacement");
+		storage.writeTextSync(sourceFile, transcript());
+		const manager = await SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled");
+		storage.writeTextSync(sourceFile, replacement);
+		try {
+			await expect(manager.close()).rejects.toThrow("managed_replace_identity_mismatch");
+			expect(storage.readTextSync(sourceFile)).toBe(replacement);
+		} finally {
+			await manager.close().catch(() => undefined);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not append to a successor installed after managed resume acceptance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-append-successor-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		const replacement = transcript().replaceAll("rejected-open", "replacement");
+		storage.writeTextSync(sourceFile, transcript());
+		const manager = await SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled");
+		storage.writeTextSync(sourceFile, replacement);
+		try {
+			expect(() => manager.appendMessage({ role: "user", content: "must not persist", timestamp: 1 })).toThrow(
+				"managed_replace_identity_mismatch",
+			);
+			expect(storage.readTextSync(sourceFile)).toBe(replacement);
+		} finally {
+			await manager.close().catch(() => undefined);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("restores full resident state and identity when managed switch identity fails", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-switch-identity-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		storage.writeTextSync(sourceFile, transcript());
+		let manager: SessionManager | undefined;
+		try {
+			manager = await SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled");
+			const originalSessionId = manager.getSessionId();
+			const originalSessionFile = manager.getSessionFile();
+			const targetFile = path.join(destination.directory, "target.jsonl");
+			storage.writeTextSync(targetFile, transcript().replaceAll("rejected-open", "target-session"));
+			// Inject failure: delete the target file right before identity adoption
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = async (filePath: string) => {
+				if (filePath === targetFile) {
+					storage.unlinkSync(targetFile);
+				}
+			};
+			await expect(manager.setSessionFile(targetFile)).rejects.toThrow();
+			// Verify the manager fully restored to the original session
+			expect(manager.getSessionId()).toBe(originalSessionId);
+			expect(manager.getSessionFile()).toBe(originalSessionFile);
+			// Verify the original session content is intact (not cross-session)
+			expect(storage.existsSync(sourceFile)).toBe(true);
+			expect(storage.readTextSync(sourceFile)).toBe(transcript());
+		} finally {
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = undefined;
+			await manager?.close().catch(() => undefined);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });

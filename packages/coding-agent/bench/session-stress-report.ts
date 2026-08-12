@@ -462,7 +462,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;margin:12px 0 22px}th{b
 <h1>Synthetic Long-Running Session Stress Report</h1>
 		<div class="subtitle">${escapeHtml(representedOperations.map(operationLabel).join(", ") || "N/A")} evidence across ${escapeHtml(representedScenarios.map(scenarioName).join(", ") || "N/A")}.</div>
 
-		<div class="meta"><span>Evidence SHA: ${escapeHtml(matrix.gitSha ?? "unknown")}</span><span>${escapeHtml(matrix.cpu ?? "unknown CPU")}</span><span>${escapeHtml(matrix.platform)} ${escapeHtml(matrix.arch)}</span><span>Bun ${escapeHtml(matrix.bunVersion)}</span><span>GC ${escapeHtml(matrix.gcStrategy ?? gib.gcStrategy ?? "N/A")}</span><span>Secondary artifacts ${escapeHtml(matrix.secondaryArtifacts ?? gib.secondaryArtifacts ?? "N/A")}</span><span>Report ${escapeHtml(generatedAt)}</span></div>
+		<div class="meta"><span>Matrix SHA: ${escapeHtml(matrix.gitSha ?? "unknown")}</span><span>Fork SHA: ${escapeHtml(gib.gitSha ?? "unknown")}</span><span>${escapeHtml(matrix.cpu ?? "unknown CPU")}</span><span>${escapeHtml(matrix.platform)} ${escapeHtml(matrix.arch)}</span><span>Bun ${escapeHtml(matrix.bunVersion)}</span><span>GC ${escapeHtml(matrix.gcStrategy ?? gib.gcStrategy ?? "N/A")}</span><span>Secondary artifacts ${escapeHtml(matrix.secondaryArtifacts ?? gib.secondaryArtifacts ?? "N/A")}</span><span>Report ${escapeHtml(generatedAt)}</span></div>
 </header>
 <div class="body">
 <section>
@@ -554,7 +554,8 @@ ${renderGibRows(gib, gibModes)}
 <tr><th>Near-GiB fork JSON</th><td class="mono">${escapeHtml(path.resolve(args.gibPath))}</td></tr>
 <tr><th>Matrix generated</th><td>${escapeHtml(matrix.generatedAt)}</td></tr>
 <tr><th>Fork corpus generated</th><td>${escapeHtml(gib.generatedAt)}</td></tr>
-<tr><th>Git SHA</th><td class="mono">${escapeHtml(matrix.gitSha ?? "unknown")}</td></tr>
+<tr><th>Matrix Git SHA</th><td class="mono">${escapeHtml(matrix.gitSha ?? "unknown")}</td></tr>
+<tr><th>Fork corpus Git SHA</th><td class="mono">${escapeHtml(gib.gitSha ?? "unknown")}</td></tr>
 </tbody></table>
 </section>
 <div class="footer-note">Generated directly from the cited JSON and SVG evidence. HTML and PDF contain the same report body; PDF is browser-printed from this HTML.</div>

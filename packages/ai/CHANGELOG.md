@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Persist learned tool-choice incapabilities in a bounded, expiring, digest-keyed cache so fresh processes avoid repeating known-invalid forced-choice probes while retaining automatic revalidation and existing first-discovery fallback behavior. Credit: @probepark (#4319).
+
+### Added
+
+- Added the authoritative OpenRouter `meta/muse-spark-1.2` catalog fallback with a 1,048,576-token context window and `minimal` through `xhigh` reasoning effort, so stale or credential-limited catalog generation still closes the Muse Spark preset alias deterministically.
+- `AuthStorage` supports a soft, per-provider preferred OAuth credential (`setRuntimePreferredCredentialSelector` / `hasRuntimePreferredCredentialSelector` / `removeRuntimePreferredCredentialSelector`, plus `AuthApiKeyOptions.preferredCredentialSelector`) that backs the coding-agent `--prefer-credential` CLI flag. A usable preferred row is placed ahead of the provider's normal balanced/earliest-reset ranking; a content-free quota or rate-limit failure marks it blocked and rotates to another active credential immediately, same as the existing session-stickiness fallback. It is mutually exclusive with the existing hard `setRuntimeCredentialSelector` pin (`--credential`) for the same provider, and `resolveRuntimePreferredCredentialSelectorProvider` resolves an unqualified selector to its single matching active OAuth provider or fails closed on ambiguity.
+
+### Changed
+
+- Model discovery now retains the authoritative dynamic provider model IDs separately from the merged static/cache catalog. Consumers can distinguish a fresh provider omission from bundled offline availability through `ModelResolutionResult.dynamicModelIds`; cache schema v5 persists those IDs through fresh-cache reuse and static transport re-merges, scoped to the credential-and-endpoint provenance that produced them.
+
 ### Fixed
 
 - A deterministic Anthropic thinking-replay rejection now converges under a managed fallback attempt instead of repeating forever (#4262). Every coding-agent turn prompts with `fallbackManaged: true`, and the whole in-provider thinking-replay repair sits behind `!options?.fallbackManaged` because the fallback controller owns retries — the shipping CLI therefore never repaired anything: each turn rebuilt the same replay from the same history, drew the same 400, and the session burned one rejected request per turn without ever self-healing (reported as ~1 rejected 1.3 MB request every 12s, ~300/h, never converging). The provider still does not retry inside a managed attempt — it records the full-history repair escalation on the provider session state instead, so the next managed attempt builds a repaired replay at the cost of zero extra round trips. Only the two deterministic rejections (`blocks ... cannot be modified`, ``Invalid `signature` in `thinking` block``) qualify; the proxy-masked generic `api_error` names no cause and may be a transient blip, so it still never costs the session its native replay.

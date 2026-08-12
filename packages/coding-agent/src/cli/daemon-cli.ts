@@ -22,7 +22,7 @@ import {
 } from "../daemon/operator-contract";
 import { runChatDaemonInternal } from "../sdk/bus/chat-daemon-cli";
 
-export type DaemonCliAction = "list" | "status" | "stop" | "reload";
+export type DaemonCliAction = "list" | "status" | "stop" | "restart";
 export type DaemonInternalCliAction = "discord-internal" | "slack-internal";
 export type DaemonCommandAction = DaemonCliAction | DaemonInternalCliAction;
 
@@ -49,6 +49,7 @@ export interface DaemonCommandArgs {
 	gracefulTimeoutMs?: number;
 	killTimeoutMs?: number;
 	spawnIfStopped?: boolean;
+	allowDisabledNoop?: boolean;
 	smoke?: boolean;
 	ownerId?: string;
 	agentDir?: string;
@@ -59,6 +60,7 @@ export interface DaemonCommandArgs {
 export interface DaemonCommandDeps {
 	settings?: Settings;
 	controllers?: BuiltInDaemonController[];
+	setExitCode?: (code: number) => void;
 }
 
 const INTERNAL_ACTIONS: DaemonInternalCliAction[] = ["discord-internal", "slack-internal"];
@@ -147,15 +149,22 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 		killTimeoutMs: cmd.killTimeoutMs,
 		force: cmd.force,
 		spawnIfStopped: cmd.spawnIfStopped,
+		allowDisabledNoop: cmd.allowDisabledNoop,
 	};
 	const results: DaemonOperationResult[] = [];
 	for (const controller of controllers) {
-		results.push(cmd.action === "reload" ? await controller.reload(opts) : await controller.stop(opts));
+		results.push(cmd.action === "restart" ? await controller.reload(opts) : await controller.stop(opts));
 	}
 	if (cmd.json) {
 		process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
 	} else {
 		process.stdout.write(`${results.map(formatDaemonResult).join("\n")}\n`);
 	}
-	if (results.some(r => !r.ok)) process.exitCode = DAEMON_EXIT.failure;
+	if (results.some(r => !r.ok))
+		(
+			deps.setExitCode ??
+			(code => {
+				process.exitCode = code;
+			})
+		)(DAEMON_EXIT.failure);
 }

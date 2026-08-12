@@ -2,8 +2,8 @@
  * Check for and install updates.
  */
 import { getProjectDir } from "@gajae-code/utils";
-import { Command, Flags } from "@gajae-code/utils/cli";
-import { runUpdateCommand } from "../cli/update-cli";
+import { Args, Command, Flags } from "@gajae-code/utils/cli";
+import { runManagedNotifyRecovery, runUpdateCommand } from "../cli/update-cli";
 import { Settings } from "../config/settings";
 import {
 	isUpdateChannel,
@@ -24,8 +24,20 @@ export default class Update extends Command {
 		}),
 	};
 
+	static args = {
+		action: Args.string({
+			description: "Internal post-update recovery action (update-recovery)",
+			required: false,
+			options: ["update-recovery"],
+		}),
+	};
+
 	async run(): Promise<void> {
-		const { flags } = await this.parse(Update);
+		const { args, flags } = await this.parse(Update);
+		if (args.action === "update-recovery") {
+			await runManagedNotifyRecovery({});
+			return;
+		}
 		let channel: UpdateChannel | undefined;
 		if (flags.channel !== undefined) {
 			if (!isUpdateChannel(flags.channel)) {

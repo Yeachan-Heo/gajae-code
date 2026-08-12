@@ -1090,6 +1090,10 @@ export function prepareManagedSessionScopeForWriteSync(
 				policy,
 			);
 		stage = "store";
+		// This must precede the first managed-store mutation: binding publication
+		// reconciles receipts with the normal 50k fail-closed bound, while an older
+		// macOS scope can contain only proven, terminal zero-byte remnants above it.
+		reapScrubbedProtocolRemnantsSync(scope.directoryPath);
 		let store: ManagedSessionDescendantStore;
 		const openManagedStore = (): ManagedSessionDescendantStore => {
 			const next = buildStore();

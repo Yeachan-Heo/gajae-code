@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Fatal crash records now end with a machine-readable identity line (`gjc-crash-record.v1 fp:<32hex> fpv:1 id:<random>`) whose 128-bit fingerprint is computed from the already-captured diagnostic text with typed normalization (paths/home/uuid/hex/long-digit placeholders, `404` and `500` kept distinct, no line/column numbers in frames). The fatal path also appends one bounded (≤512 B) `O_APPEND` line to a new crash event journal beside the crash log; failures are swallowed and a latch makes a crash-during-crash skip journal work. New `getCrashEventsPath()` / `getCrashIndexPath()` resolvers, and `redactCrashSecrets` is now exported.
+
 ## [0.13.1] - 2026-08-11
 
 ## [0.12.21] - 2026-08-09

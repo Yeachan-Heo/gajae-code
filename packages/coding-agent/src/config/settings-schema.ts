@@ -1576,6 +1576,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"crashReport.nudge": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			label: "Crash Report Nudge",
+			description:
+				"At interactive startup, show one rate-limited line when unreported crash signatures exist. Reads local state only; nothing is ever transmitted without the explicit consent flow in `gjc crash report`.",
+		},
+	},
+
 	collapseChangelog: {
 		type: "boolean",
 		default: false,

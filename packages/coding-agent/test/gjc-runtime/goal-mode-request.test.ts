@@ -16,6 +16,7 @@ import {
 	loadEntriesFromFile,
 	SessionContextTooLargeError,
 	type SessionEntry,
+	SessionManagerTestHooks,
 } from "@gajae-code/coding-agent/session/session-manager";
 
 const TEST_SESSION_ID = "test-session";
@@ -25,11 +26,16 @@ let priorSessionId: string | undefined;
 beforeAll(() => {
 	priorSessionId = process.env.GJC_SESSION_ID;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	// Pin the session-context budget to 64 MiB in-process via the test hook so the
+	// 40 MiB overflow fixture is deterministic under any production default. This
+	// does not leak into spawned subprocesses (unlike process.env).
+	SessionManagerTestHooks.sessionContextBudgetBytesOverride = 64 * 1024 * 1024;
 });
 
 afterAll(() => {
 	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
 	else delete process.env.GJC_SESSION_ID;
+	delete SessionManagerTestHooks.sessionContextBudgetBytesOverride;
 });
 
 async function tempDir(): Promise<string> {

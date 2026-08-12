@@ -17,7 +17,7 @@ import {
 	requestPreparedSessionActivation,
 	SessionActivationError,
 } from "../session-activation";
-import { ACP_SESSION_RECONNECT } from "../session-reconnect";
+import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
 
 /**
  * Exact identity of one attached SDK session endpoint. Providers persist it next to
@@ -483,7 +483,13 @@ export class SessionRouter {
 				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 			}
 		}
-		const response = await attached.client.request(this.#prepareFrame(attached, frame), options);
+		// A caller that sized its own budget keeps it; everything else gets the
+		// long-lived session budget instead of the transport's one-shot default,
+		// which a cold host's first credential-collecting query outruns (#4258).
+		const response = await attached.client.request(this.#prepareFrame(attached, frame), {
+			...options,
+			timeoutMs: options?.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+		});
 		if (
 			!this.#attachmentPublished(attached) ||
 			(expectedGeneration !== undefined && attached.generation !== expectedGeneration) ||

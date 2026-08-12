@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { injectAlibabaTokenPlanModels, injectImageGenerationModels } from "../scripts/generate-models";
+import {
+	injectAlibabaTokenPlanModels,
+	injectImageGenerationModels,
+	injectMuseSparkModels,
+} from "../scripts/generate-models";
 import type { Model } from "../src/types";
 
 describe("injectImageGenerationModels", () => {
@@ -84,5 +88,33 @@ describe("injectAlibabaTokenPlanModels", () => {
 		expect(
 			models.filter(model => model.provider === "alibaba-token-plan" && model.id === "qwen3.8-max"),
 		).toHaveLength(1);
+	});
+});
+
+describe("injectMuseSparkModels", () => {
+	it("adds and corrects the authoritative OpenRouter Muse Spark route exactly once", () => {
+		const models: Model[] = [];
+
+		injectMuseSparkModels(models);
+		models[0]!.reasoning = false;
+		models[0]!.contextWindow = 1;
+		injectMuseSparkModels(models);
+
+		expect(models).toEqual([
+			expect.objectContaining({
+				id: "meta/muse-spark-1.2",
+				provider: "openrouter",
+				api: "openai-completions",
+				reasoning: true,
+				contextWindow: 1_048_576,
+				maxTokens: 131_072,
+				input: ["text", "image"],
+				thinking: {
+					mode: "effort",
+					minLevel: "minimal",
+					maxLevel: "xhigh",
+				},
+			}),
+		]);
 	});
 });

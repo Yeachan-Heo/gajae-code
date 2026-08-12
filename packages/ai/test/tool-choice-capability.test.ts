@@ -1,7 +1,12 @@
+import { Database } from "bun:sqlite";
 import { beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { TempDir } from "@gajae-code/utils";
 import type { Model, ToolChoice, ToolChoiceSupport } from "../src/types";
 import {
 	clearToolChoiceIncapabilityRegistryForTests,
+	configureToolChoiceCapabilityCacheForTests,
 	deriveToolChoiceSupport,
 	getToolChoiceCapabilityOverride,
 	isCodexStatuslessNamedToolChoiceNotFoundError,
@@ -33,6 +38,7 @@ function statusError(status: number, message: string): Error & { status: number 
 }
 
 beforeEach(() => {
+	configureToolChoiceCapabilityCacheForTests();
 	clearToolChoiceIncapabilityRegistryForTests();
 });
 
@@ -157,6 +163,227 @@ describe("tool-choice registry", () => {
 		expect(toolChoiceRegistryKey(model("named"))).toBe(
 			"openai-completions|openai|https://api.openai.example/v1|wire-id",
 		);
+	});
+});
+
+describe("durable tool-choice capability cache", () => {
+	it("hydrates a learned incapability across simulated fresh processes", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		markToolChoiceIncapability(model("named"), "auto", "secret raw provider error");
+
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		const resolved = resolveToolChoice(model("named"), { type: "function", name: "todo_write" });
+		expect(resolved.support).toBe("auto");
+		expect(resolved.resolvedChoice).toBeUndefined();
+		expect(resolved.supportSource).toBe("runtime");
+	});
+
+	it("memoizes an empty durable lookup without hiding later revalidation", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-empty-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let now = 1_000;
+		let opens = 0;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now, onCacheOpen: () => opens++ });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		expect(opens).toBe(1);
+
+		now += 5 * 60 * 1000;
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		expect(opens).toBe(2);
+	});
+
+	it("bounds empty lookup memoization", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-empty-bound-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let opens = 0;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, onCacheOpen: () => opens++ });
+		for (let index = 0; index < 300; index++) {
+			resolveToolChoice({ ...model("named"), wireModelId: `wire-${index}` }, "required");
+		}
+		expect(opens).toBe(300);
+
+		resolveToolChoice({ ...model("named"), wireModelId: "wire-0" }, "required");
+		expect(opens).toBe(301);
+		resolveToolChoice({ ...model("named"), wireModelId: "wire-299" }, "required");
+		expect(opens).toBe(301);
+	});
+
+	it("expires learned support so provider behavior is re-probed", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-ttl-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let now = 1_000;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		markToolChoiceIncapability(model("named"), "auto");
+
+		now += 30 * 24 * 60 * 60 * 1000;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+	});
+
+	it("revalidates expiry inside a long-lived process", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-live-ttl-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let now = 1_000;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		markToolChoiceIncapability(model("named"), "auto");
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+
+		now += 30 * 24 * 60 * 60 * 1000;
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+	});
+
+	it("does not delete a capability refreshed while an expired row is being revalidated", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-expiry-race-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let now = 1_000;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		markToolChoiceIncapability(model("named"), "auto");
+
+		now += 30 * 24 * 60 * 60 * 1000;
+		configureToolChoiceCapabilityCacheForTests({
+			path: cachePath,
+			now: () => now,
+			beforeExpiredDelete: () => {
+				const database = new Database(cachePath);
+				try {
+					database.run("UPDATE tool_choice_capabilities SET observed_at = ? WHERE max_support = ?", [now, "auto"]);
+				} finally {
+					database.close();
+				}
+			},
+		});
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
+	it("refreshes durable and in-memory expiry when the same incapability is observed again", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-refresh-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let now = 1_000;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		markToolChoiceIncapability(model("named"), "auto");
+
+		now += 29 * 24 * 60 * 60 * 1000;
+		markToolChoiceIncapability(model("named"), "auto");
+		now += 2 * 24 * 60 * 60 * 1000;
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
+	it("recovers from a corrupted cache without changing fallback behavior", async () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-corrupt-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		await fs.writeFile(cachePath, "not a sqlite database");
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		markToolChoiceIncapability(model("named"), "auto");
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
+	it("recovers from an invalid version-zero schema", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-schema-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		const database = new Database(cachePath);
+		try {
+			database.run("CREATE TABLE tool_choice_capabilities (wrong TEXT)");
+		} finally {
+			database.close();
+		}
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		markToolChoiceIncapability(model("named"), "auto");
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
+	it("does not delete a row repaired while malformed data is being cleaned", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-malformed-race-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		markToolChoiceIncapability(model("named"), "auto");
+		const database = new Database(cachePath);
+		try {
+			database.run("UPDATE tool_choice_capabilities SET support_rank = 3");
+		} finally {
+			database.close();
+		}
+
+		configureToolChoiceCapabilityCacheForTests({
+			path: cachePath,
+			beforeMalformedDelete: () => {
+				const repair = new Database(cachePath);
+				try {
+					repair.run("UPDATE tool_choice_capabilities SET support_rank = 1");
+				} finally {
+					repair.close();
+				}
+			},
+		});
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
+	it("isolates api, provider, base URL, and wire model without persisting raw keys or errors", async () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-isolation-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		const target = model("named");
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		markToolChoiceIncapability(target, "auto", "credential=super-secret raw-error-body");
+
+		for (const isolated of [
+			{ ...target, api: "openai-responses" as const },
+			{ ...target, provider: "other-provider" },
+			{ ...target, baseUrl: "https://other.example/v1" },
+			{ ...target, wireModelId: "other-wire-id" },
+		]) {
+			expect(resolveToolChoice(isolated, "required").support).toBe("named");
+		}
+
+		const bytes = await fs.readFile(cachePath);
+		expect((await fs.stat(cachePath)).mode & 0o777).toBe(0o600);
+		const persisted = bytes.toString("utf8");
+		expect(persisted).not.toContain(target.baseUrl);
+		expect(persisted).not.toContain(target.provider);
+		expect(persisted).not.toContain(target.wireModelId ?? "");
+		expect(persisted).not.toContain("super-secret");
+		expect(persisted).not.toContain("raw-error-body");
+	});
+
+	it("serializes concurrent process writes and preserves the lowest support", async () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-concurrent-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		const script = `
+			import { configureToolChoiceCapabilityCacheForTests, markToolChoiceIncapability } from ${JSON.stringify(
+				path.resolve(import.meta.dir, "../src/utils/tool-choice-capability.ts"),
+			)};
+			const model = ${JSON.stringify(model("named"))};
+			configureToolChoiceCapabilityCacheForTests({ path: process.argv[1] });
+			markToolChoiceIncapability(model, process.argv[2]);
+		`;
+		const processes = ["required", "auto", "required", "auto"].map(support =>
+			Bun.spawn([process.execPath, "-e", script, cachePath, support], { stdout: "pipe", stderr: "pipe" }),
+		);
+		const exits = await Promise.all(processes.map(process => process.exited));
+		expect(exits).toEqual([0, 0, 0, 0]);
+
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+		const database = new Database(cachePath, { readonly: true });
+		try {
+			expect(database.query("SELECT COUNT(*) AS count FROM tool_choice_capabilities").get()).toEqual({ count: 1 });
+		} finally {
+			database.close();
+		}
 	});
 });
 

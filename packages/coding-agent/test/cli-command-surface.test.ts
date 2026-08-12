@@ -161,6 +161,7 @@ process.exitCode = await child.exited;`;
 			"team",
 			"ultragoal",
 			"gc",
+			"crash",
 			"ralplan",
 			"config",
 			"stats",

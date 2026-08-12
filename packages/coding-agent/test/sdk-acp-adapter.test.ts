@@ -9,6 +9,7 @@ import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SdkClientError } from "../src/sdk/client";
 import { MAX_REVERSE_PAYLOAD_BYTES } from "../src/sdk/host";
 import type { SessionAttachment } from "../src/sdk/router";
+import { SESSION_ABORT_TIMEOUT_MS, SESSION_REQUEST_TIMEOUT_MS } from "../src/sdk/session-reconnect";
 
 class FakeSdkClient {
 	connectionId = "acp-connection";
@@ -72,6 +73,7 @@ type RouterHarness = {
 	router: unknown;
 	attachment: SessionAttachment;
 	requests: Record<string, unknown>[];
+	requestOptions: ({ timeoutMs?: number } | undefined)[];
 	sent: Record<string, unknown>[];
 	setCurrent: (current: boolean) => void;
 };
@@ -80,6 +82,7 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 	let current = true;
 	let nextLease = 0;
 	const requests: Record<string, unknown>[] = [];
+	const requestOptions: ({ timeoutMs?: number } | undefined)[] = [];
 	const sent: Record<string, unknown>[] = [];
 	const attachment: SessionAttachment = {
 		sessionId: "session-1",
@@ -92,8 +95,15 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 		},
 	};
 	const router = {
-		request: async (_sessionId: string, frame: Record<string, unknown>) => {
+		request: async (
+			_sessionId: string,
+			frame: Record<string, unknown>,
+			_generation?: number,
+			_attachment?: SessionAttachment,
+			options?: { timeoutMs?: number },
+		) => {
 			requests.push(frame);
+			requestOptions.push(options);
 			if (frame.type === "register_provider")
 				return {
 					ok: true,
@@ -104,7 +114,7 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 			return { ok: true, result: { accepted: true } };
 		},
 	};
-	return { router, attachment, requests, sent, setCurrent: value => (current = value) };
+	return { router, attachment, requests, requestOptions, sent, setCurrent: value => (current = value) };
 }
 
 const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
@@ -115,6 +125,32 @@ const waitFor = async (predicate: () => boolean, label: string): Promise<void> =
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 };
+
+test("ACP abort keeps the one-shot reply deadline while other session commands take the session budget", async () => {
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+	});
+	await adapter.start();
+	await adapter.cancel();
+	await adapter.prompt({ prompt: "hello" });
+	await adapter.query("models.list/current");
+
+	const budgetFor = (predicate: (frame: Record<string, unknown>) => boolean): number | undefined => {
+		const index = harness.requests.findIndex(predicate);
+		if (index < 0) throw new Error("expected frame was never dispatched");
+		return harness.requestOptions[index]?.timeoutMs;
+	};
+
+	// A cancel is awaited before ACP can arm any settlement path, so it must not
+	// inherit the wide session reply budget the cold catalog query needs (#4258).
+	expect(budgetFor(frame => frame.operation === "turn.abort")).toBe(SESSION_ABORT_TIMEOUT_MS);
+	expect(SESSION_ABORT_TIMEOUT_MS).toBeLessThan(SESSION_REQUEST_TIMEOUT_MS);
+	expect(budgetFor(frame => frame.operation === "turn.prompt")).toBeUndefined();
+	expect(budgetFor(frame => frame.query === "models.list/current")).toBeUndefined();
+});
 
 test("ACP SDK adapter maps native and extension methods and keeps endpoint credentials machine-only", async () => {
 	const harness = createRouterHarness();

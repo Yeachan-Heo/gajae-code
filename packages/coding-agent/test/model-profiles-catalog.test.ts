@@ -12,13 +12,17 @@ import {
 import { parseModelString, splitSelectorThinkingSuffix } from "@gajae-code/coding-agent/config/model-resolver";
 import { ProfileModelSelectorSchema } from "@gajae-code/coding-agent/config/models-config-schema";
 import modelsJson from "../../ai/src/models.json";
-import { normalizeModelSelectorValue, selectorHead } from "../src/config/model-selector-value";
+import { type ModelSelectorValue, normalizeModelSelectorValue, selectorHead } from "../src/config/model-selector-value";
 
 type Role = "default" | "executor" | "planner" | "critic" | "architect";
 
 const roles: Role[] = ["default", "executor", "planner", "critic", "architect"];
 
-const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mapping: Record<Role, string> }> = [
+const expectedProfiles: Array<{
+	name: string;
+	requiredProviders: string[];
+	mapping: Record<Role, ModelSelectorValue>;
+}> = [
 	{
 		name: "codex-eco",
 		requiredProviders: ["openai-codex"],
@@ -119,6 +123,39 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
+		name: "open-weights-spark",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "muse-spark-1.2:low",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-spark-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "deepseek-v4-flash:high",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-spark-luna",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "gpt-5.6-luna:high",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
 		name: "open-weights-glm-deepseek",
 		requiredProviders: [],
 		mapping: {
@@ -177,11 +214,11 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		name: "claude-opus",
 		requiredProviders: ["anthropic"],
 		mapping: {
-			default: "anthropic/claude-opus-5:xhigh",
+			default: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
 			executor: "anthropic/claude-sonnet-5",
-			planner: "anthropic/claude-opus-5:low",
-			critic: "anthropic/claude-opus-5:high",
-			architect: "anthropic/claude-opus-5:xhigh",
+			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
 		},
 	},
 	{
@@ -589,7 +626,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 46-profile matrix cell-for-cell", () => {
+	test("contains exact 49-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -607,6 +644,9 @@ describe("built-in model profile catalog", () => {
 			"open-weights-deepseek",
 			"open-weights-kimi",
 			"open-weights-luna",
+			"open-weights-spark",
+			"open-weights-spark-deepseek",
+			"open-weights-spark-luna",
 			"open-weights-glm-deepseek",
 			"open-weights-kimi-deepseek",
 			"open-weights-kimi-glm",
@@ -720,12 +760,13 @@ describe("built-in model profile catalog", () => {
 		const missing: string[] = [];
 		for (const profile of BUILTIN_MODEL_PROFILES) {
 			for (const role of roles) {
-				const selector = profile.modelMapping[role];
-				expect(selector).toBeDefined();
-				expect(ProfileModelSelectorSchema.safeParse(selector).success).toBe(true);
-				const head = selectorHead(selector) ?? "";
-				if (head.includes("/")) expect(parseModelString(head)).toBeDefined();
-				if (!selectorExists(head)) missing.push(`${profile.name}.${role}=${selector}`);
+				const selectorValue = profile.modelMapping[role];
+				expect(selectorValue).toBeDefined();
+				for (const selector of normalizeModelSelectorValue(selectorValue)) {
+					expect(ProfileModelSelectorSchema.safeParse(selector).success).toBe(true);
+					if (selector.includes("/")) expect(parseModelString(selector)).toBeDefined();
+					if (!selectorExists(selector)) missing.push(`${profile.name}.${role}=${selector}`);
+				}
 			}
 		}
 		expect(missing).toEqual([]);
@@ -786,6 +827,9 @@ describe("built-in model profile catalog", () => {
 			"open-weights-deepseek",
 			"open-weights-kimi",
 			"open-weights-luna",
+			"open-weights-spark",
+			"open-weights-spark-deepseek",
+			"open-weights-spark-luna",
 			"open-weights-glm-deepseek",
 			"open-weights-kimi-deepseek",
 			"open-weights-kimi-glm",

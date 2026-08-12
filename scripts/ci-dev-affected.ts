@@ -985,8 +985,7 @@ function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total:
 		tasks,
 		`test:@gajae-code/coding-agent:shard-${shard}-of-${total}`,
 		`Test @gajae-code/coding-agent shard ${shard}/${total}`,
-		["bun", "test", "--isolate", `--shard=${shard}/${total}`],
-		resolvePackageCwd("packages/coding-agent"),
+		["bun", "test", "packages/coding-agent", "--isolate", `--shard=${shard}/${total}`],
 	);
 }
 

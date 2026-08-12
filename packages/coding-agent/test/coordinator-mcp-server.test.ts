@@ -76,6 +76,8 @@ type SdkControlServerOptions = {
 
 	promptAckTimeoutMs?: number;
 	controlOptions?: Array<{ idempotencyKey?: string; timeoutMs?: number }>;
+	/** Per-query transport options, in dispatch order, parallel to the recorded query names. */
+	queryOptions?: Array<{ timeoutMs?: number } | undefined>;
 	/** Every raw session frame the server sent, in order (activation frames included). */
 	sessionFrames?: Array<Record<string, unknown>>;
 	sessionFrameResult?: (frame: Record<string, unknown>) => unknown;
@@ -338,7 +340,7 @@ async function createSdkControlServer(
 				createClient: async endpoint => {
 					const client: SessionRouterClient = {
 						onFrame: _handler => () => {},
-						request: async frame => {
+						request: async (frame, requestOptions) => {
 							if (frame.type === "control_request") {
 								const control = {
 									operation: String(frame.operation),
@@ -356,6 +358,7 @@ async function createSdkControlServer(
 							if (frame.type === "query_request") {
 								const query = String(frame.query);
 								queries.push(query);
+								serverOptions.queryOptions?.push(requestOptions);
 								return queryResult(
 									query,
 									typeof frame.cursor === "string" ? frame.cursor : undefined,
@@ -1769,6 +1772,52 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				allow_mutation: true,
 			}),
 		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+	});
+
+	it("bounds every Q12 snapshot page by the remaining snapshot budget", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const queries: string[] = [];
+		const queryOptions: Array<{ timeoutMs?: number } | undefined> = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			queries,
+			(query, cursor) => {
+				if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
+				return cursor
+					? { ok: true, page: { items: [], complete: true, revision: "q12-budget" } }
+					: {
+							ok: true,
+							page: {
+								items: [],
+								complete: false,
+								preview: true,
+								continuationCursor: "page-2",
+								revision: "q12-budget",
+							},
+						};
+			},
+			undefined,
+			undefined,
+			undefined,
+			{ queryOptions },
+		);
+		await registerSdkSession(server, root);
+		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
+		expect(listed).toMatchObject({ ok: true, reconciliation: { complete: true } });
+
+		const q12Budgets = queries
+			.map((query, index) => (query === "Q12" ? queryOptions[index]?.timeoutMs : undefined))
+			.filter((timeoutMs): timeoutMs is number => timeoutMs !== undefined);
+		// The snapshot deadline is only checked between pages, so a page that carried
+		// no budget of its own would outlive the whole 5s bound on the Router default.
+		expect(q12Budgets).toHaveLength(queries.filter(query => query === "Q12").length);
+		for (const timeoutMs of q12Budgets) {
+			expect(timeoutMs).toBeGreaterThan(0);
+			expect(timeoutMs).toBeLessThanOrEqual(5_000);
+		}
+		expect(q12Budgets.length).toBeGreaterThanOrEqual(2);
 	});
 
 	it("diagnoses malformed gate rows without misclassifying legal Q12 pagination", async () => {

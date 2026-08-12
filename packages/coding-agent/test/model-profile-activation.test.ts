@@ -2,7 +2,7 @@ import { describe, expect, it, test, vi } from "bun:test";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 
 import type { Model } from "@gajae-code/ai";
-import { TempDir } from "@gajae-code/utils";
+import { hookFetch, TempDir } from "@gajae-code/utils";
 import {
 	activateModelProfile,
 	applyPreparedModelProfileActivation,
@@ -17,9 +17,10 @@ import {
 
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
-import { kNoAuth, type ModelRegistry } from "../src/config/model-registry";
+import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession, type DefaultFallbackRuntimeState } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
 const model = (provider: string, id: string, thinking?: Model["thinking"]): Model =>
@@ -99,6 +100,11 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				maxLevel: ThinkingLevel.XHigh,
 			}),
 			model("anthropic", "claude-sonnet-5"),
+			model("anthropic", "claude-opus-4-6", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
 			model("opencode-go", "deepseek-v4-pro"),
 			model("opencode-go", "kimi-k3"),
 			model("opencode-go", "mimo-v2.5-pro"),
@@ -210,6 +216,218 @@ describe("model profile activation", () => {
 			executor: "provider-b/executor",
 			architect: "provider-a/architect",
 		});
+	});
+
+	test("built-in claude-opus falls back to Opus 4.6 when Opus 5 is absent", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
+		expect(profile).toBeDefined();
+		const baseRegistry = fakeRegistry({ profiles: [profile!] });
+		const available = baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5");
+		const session = fakeSession();
+
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: {
+				...baseRegistry,
+				getAvailable: baseRegistry.getAll,
+				getAvailableForProfileActivation: () => available,
+			} as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			profileName: "claude-opus",
+		});
+
+		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(prepared.defaultChain).toEqual(["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"]);
+		expect(prepared.agentModelOverrides).toEqual({
+			executor: "anthropic/claude-sonnet-5",
+			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+		});
+	});
+
+	test("built-in claude-opus retains Opus 5 when the catalog exposes it", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
+		expect(profile).toBeDefined();
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: fakeRegistry({ profiles: [profile!] }),
+			settings: Settings.isolated(),
+			profileName: "claude-opus",
+		});
+
+		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+	});
+
+	test("built-in claude-opus skips a bundled Opus 5 absent from fresh live catalog evidence", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-live-catalog-");
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		try {
+			authStorage.setRuntimeApiKey("anthropic", "test-anthropic-key");
+			const requests: string[] = [];
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				requests.push(url);
+				switch (url) {
+					case "https://models.dev/api.json":
+						return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+							headers: { "Content-Type": "application/json" },
+						});
+					default:
+						if (!url.endsWith("/models")) {
+							throw new Error(`Unexpected model discovery request: ${input}`);
+						}
+						return new Response(
+							JSON.stringify({ data: [{ id: "claude-opus-4-6" }, { id: "claude-sonnet-5" }] }),
+							{ headers: { "Content-Type": "application/json" } },
+						);
+				}
+			});
+			const registry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
+			await registry.refreshProvider("anthropic", "online");
+
+			expect(requests.some(url => url.endsWith("/models"))).toBe(true);
+			expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5")).toBe(true);
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.filter(candidate => candidate.provider === "anthropic")
+					.map(candidate => candidate.id),
+			).not.toContain("claude-opus-5");
+			const session = fakeSession();
+			session.model = undefined;
+			session.thinkingLevel = undefined;
+			session.sessionId = "parent-session";
+			const prepared = await prepareModelProfileActivation({
+				session: session as unknown as AgentSession,
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: "claude-opus",
+			});
+
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
+			expect(prepared.defaultResolutionSkips).toEqual([
+				{ selector: "anthropic/claude-opus-5:xhigh", reason: "unknown_model" },
+			]);
+			expect(prepared.agentModelOverrides).toMatchObject({
+				executor: "anthropic/claude-sonnet-5",
+				planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+				critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+				architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:high"],
+			});
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("built-in claude-opus retains bundled Opus 5 after live catalog discovery fails", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-stale-catalog-");
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		try {
+			authStorage.setRuntimeApiKey("anthropic", "test-anthropic-key");
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				switch (url) {
+					case "https://models.dev/api.json":
+						return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+							headers: { "Content-Type": "application/json" },
+						});
+					default:
+						if (!url.endsWith("/models")) {
+							throw new Error(`Unexpected model discovery request: ${input}`);
+						}
+						return new Response("unavailable", { status: 503 });
+				}
+			});
+			const registry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
+			await registry.refreshProvider("anthropic", "online");
+			const prepared = await prepareModelProfileActivation({
+				session: fakeSession() as unknown as AgentSession,
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: "claude-opus",
+			});
+
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+			expect(prepared.defaultResolutionSkips).toEqual([]);
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("fresh catalog omission does not exclude a same-id custom Anthropic replacement", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-custom-overlay-");
+		const modelsPath = `${tempDir.path()}/models.yml`;
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		try {
+			await Bun.write(
+				modelsPath,
+				JSON.stringify({
+					providers: {
+						anthropic: {
+							baseUrl: "https://custom-anthropic.example.test/v1",
+							api: "anthropic-messages",
+							apiKey: "TEST_ANTHROPIC_KEY",
+							models: [{ id: "claude-opus-5" }],
+						},
+					},
+				}),
+			);
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://custom-anthropic.example.test/models") {
+					return new Response(JSON.stringify({ data: [{ id: "claude-opus-4-6" }] }), {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected model discovery request: ${input}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			await registry.refreshProvider("anthropic", "online");
+
+			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe("https://custom-anthropic.example.test/v1");
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+			).toBe(true);
+
+			registry.registerProvider("anthropic", {
+				baseUrl: "https://runtime-anthropic.example.test/v1",
+				api: "anthropic-messages",
+				apiKey: "TEST_RUNTIME_ANTHROPIC_KEY",
+				models: [
+					{
+						id: "claude-opus-5",
+						name: "Runtime Opus 5",
+						reasoning: true,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 200_000,
+						maxTokens: 8_000,
+					},
+				],
+			});
+			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe("https://runtime-anthropic.example.test/v1");
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+			).toBe(true);
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
 	});
 
 	test("rejects a mixed provider-agnostic profile before mutation when a role alias is unavailable", async () => {
@@ -348,6 +566,75 @@ describe("model profile activation", () => {
 
 		expect(prepared.defaultModel).toBe(beta);
 		expect(prepared.agentModelOverrides.executor).toBe("glm-5.2:low");
+	});
+
+	test("resolves Muse Spark through an authenticated provider and preserves xhigh effort", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "open-weights-spark");
+		if (!profile) throw new Error("Missing open-weights-spark profile");
+		const kilo = model("kilo", "meta/muse-spark-1.2", {
+			mode: "effort",
+			minLevel: ThinkingLevel.Minimal,
+			maxLevel: ThinkingLevel.XHigh,
+		});
+		const openrouter = model("openrouter", "meta/muse-spark-1.2", {
+			mode: "effort",
+			minLevel: ThinkingLevel.Minimal,
+			maxLevel: ThinkingLevel.XHigh,
+		});
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getAll: () => [kilo, openrouter],
+			getAvailable: () => [kilo, openrouter],
+			getApiKeyForProvider: async (provider: string) => (provider === "openrouter" ? "key-openrouter" : undefined),
+			lookupAliasExists: (alias: string) => alias === "muse-spark-1.2",
+			resolveModelByLookupAlias: (_alias: string, options?: { candidates?: readonly Model[] }) =>
+				options?.candidates?.[0],
+		};
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(prepared.defaultModel).toBe(openrouter);
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(prepared.agentModelOverrides).toEqual({
+			executor: "muse-spark-1.2:low",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		});
+	});
+
+	test("fails Muse Spark preset activation before mutation when no provider exposes the alias", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "open-weights-spark");
+		if (!profile) throw new Error("Missing open-weights-spark profile");
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getAll: () => [],
+			getAvailable: () => [],
+			lookupAliasExists: (alias: string) => alias === "muse-spark-1.2",
+			resolveModelByLookupAlias: () => undefined,
+		};
+		const session = fakeSession();
+
+		await expect(
+			prepareModelProfileActivation({
+				session,
+				modelRegistry: registry as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toMatchObject({
+			constructor: ModelProfileCredentialError,
+			code: "authentication_failed",
+			providers: ["muse-spark-1.2"],
+		});
+		expect(session.model?.id).toBe("initial");
+		expect(session.getActiveModelProfile()).toBeUndefined();
 	});
 
 	test("keeps unauthenticated fallback heads and authenticated mixed-provider tails", async () => {
@@ -2235,6 +2522,56 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 			profileName: profile.name,
 		});
 		expect(prepared.defaultChain).toEqual(["litellm/grok-4.3:medium"]);
+	});
+
+	test("routes Muse Spark's bare alias through a unique provider-prefixed proxy model in always mode", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "open-weights-spark");
+		if (!profile) throw new Error("Missing open-weights-spark profile");
+		const registry = proxyRegistry({ profiles: [profile] });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: {
+				...registry,
+				getAll: () => [
+					...registry.getAll(),
+					proxyModel("meta/muse-spark-1.2", {
+						mode: "effort",
+						minLevel: ThinkingLevel.Minimal,
+						maxLevel: ThinkingLevel.XHigh,
+					}),
+				],
+			} as unknown as ModelRegistry,
+			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm", "modelProfile.proxyMode": "always" }),
+			profileName: profile.name,
+		});
+
+		expect(prepared.defaultChain).toEqual(["litellm/meta/muse-spark-1.2:medium"]);
+		expect(prepared.agentModelOverrides.architect).toBe("litellm/meta/muse-spark-1.2:xhigh");
+	});
+
+	test("fails closed when multiple provider-prefixed proxy models share the Muse Spark alias", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "open-weights-spark");
+		if (!profile) throw new Error("Missing open-weights-spark profile");
+		const registry = proxyRegistry({ profiles: [profile] });
+
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: {
+					...registry,
+					getAll: () => [
+						...registry.getAll(),
+						proxyModel("meta/muse-spark-1.2"),
+						proxyModel("other/muse-spark-1.2"),
+					],
+				} as unknown as ModelRegistry,
+				settings: Settings.isolated({
+					"modelProfile.proxyProvider": "litellm",
+					"modelProfile.proxyMode": "always",
+				}),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow(/does not expose an unambiguous model for "muse-spark-1\.2"/);
 	});
 
 	test("fails closed pointing at the proxy when a routable provider is missing and the proxy is unauthenticated", async () => {

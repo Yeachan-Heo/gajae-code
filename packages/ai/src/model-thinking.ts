@@ -210,6 +210,9 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 			source.reasoning = true;
 			source.name = "DeepSeek V4 Flash 0731";
 		}
+		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
+			source.reasoning = true;
+		}
 		const model = refreshModelThinking(source);
 		applyGeneratedModelPolicy(model);
 		models[index] = model;
@@ -730,6 +733,13 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 }
 
 function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
+	// Meta documents Muse Spark 1.2 as accepting the full minimal..xhigh
+	// reasoning range. Keep that capability provider-independent so runtime
+	// model discovery/merge cannot downgrade the bundled OpenRouter entry to
+	// the generic openai-completions ceiling of `high`.
+	if (model.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
+		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+	}
 	if (model.api === "anthropic-messages") {
 		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 	}

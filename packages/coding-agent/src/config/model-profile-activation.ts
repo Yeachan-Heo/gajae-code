@@ -95,6 +95,7 @@ export interface PrepareModelProfileActivationOptions {
 			Pick<
 				ModelRegistry,
 				| "getAvailable"
+				| "getAvailableForProfileActivation"
 				| "resolveModelByLookupAlias"
 				| "lookupAliasExists"
 				| "clearCanonicalVariant"
@@ -575,7 +576,9 @@ function rewriteSelectorForProxy(
 	const proxyModels = allModels.filter(model => model.provider === proxyProvider);
 	if (slash < 0) {
 		if (proxyMode === "fallback") return selector;
-		const matches = proxyModels.filter(model => model.id === baseSelector);
+		const exactMatches = proxyModels.filter(model => model.id === baseSelector);
+		const finalSegmentMatches = proxyModels.filter(model => model.id.split("/").at(-1) === baseSelector);
+		const matches = exactMatches.length > 0 ? exactMatches : finalSegmentMatches;
 		if (matches.length !== 1) {
 			throw new Error(
 				`Configured proxy "${proxyProvider}" does not expose an unambiguous model for "${baseSelector}"`,
@@ -953,7 +956,10 @@ export async function prepareModelProfileActivation(
 			);
 		}
 
-		const availableModels = options.modelRegistry.getAvailable?.() ?? options.modelRegistry.getAll();
+		const availableModels =
+			options.modelRegistry.getAvailableForProfileActivation?.() ??
+			options.modelRegistry.getAvailable?.() ??
+			options.modelRegistry.getAll();
 		let bindings = resolveProfileBindings(profile);
 		if (missingProviders.length > 0 && alternativeGroups.length > 0) {
 			bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);

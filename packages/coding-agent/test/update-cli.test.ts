@@ -12,6 +12,7 @@ import {
 	formatVerificationFailureForTest,
 	fsyncFileForTest,
 	getLatestReleaseForTest,
+	hasManagedNotifySetup,
 	parseReportedVersionForTest,
 	parseUpdateArgs,
 	replaceBinaryForUpdate,
@@ -19,9 +20,12 @@ import {
 	resolveUpdateDecision,
 	resolveUpdateMethodForTest,
 	runBinaryUpdateFlow,
+	runManagedNotifyRecovery,
 	runPackageManagerUpdateForTest,
+	runPostUpdateRecoveryForTest,
 	runUpdateCommand,
 } from "../src/cli/update-cli";
+import { Settings } from "../src/config/settings";
 import { distTagForChannel, isUpdateChannel } from "../src/config/update-channel";
 import { initTheme } from "../src/modes/theme/theme";
 import { DEFAULT_NPM_REGISTRY } from "../src/utils/npm-registry";
@@ -37,6 +41,18 @@ async function makeTempDir(): Promise<string> {
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+describe("update-cli recovery command surface", () => {
+	it("advertises update-recovery so verified runtimes can feature-probe it", async () => {
+		const result = Bun.spawnSync([process.execPath, "src/cli.ts", "update", "--help"], {
+			cwd: path.join(repoRoot, "packages", "coding-agent"),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString()).toContain("update-recovery");
+	});
 });
 
 describe("update-cli release lookup", () => {
@@ -488,6 +504,318 @@ describe("update-cli command verification failures", () => {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
 		}
+	});
+});
+
+describe("update-cli managed notification recovery", () => {
+	const release = {
+		tag: "v999.0.0",
+		version: "999.0.0",
+		registry: DEFAULT_NPM_REGISTRY,
+		warnings: [],
+	};
+
+	function configuredSettings(overrides: Record<string, unknown> = {}): Settings {
+		return Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.telegram.enabled": true,
+			"notifications.telegram.botToken": "telegram-secret",
+			"notifications.telegram.chatId": "42",
+			...overrides,
+		} as never);
+	}
+
+	it("executes recovery through the verified runtime with an argv array and propagates nonzero exits", async () => {
+		const argv: Array<readonly string[]> = [];
+		await runPostUpdateRecoveryForTest(
+			"/verified path/gjc;not-a-shell",
+			async args => {
+				argv.push(args);
+				return 0;
+			},
+			async () => true,
+		);
+		expect(argv).toEqual([["/verified path/gjc;not-a-shell", "update", "update-recovery"]]);
+		await expect(
+			runPostUpdateRecoveryForTest(
+				"/verified/gjc",
+				async () => 23,
+				async () => true,
+			),
+		).rejects.toThrow("the verified installed runtime exited 23");
+	});
+
+	it("uses the bounded legacy handoff only when the verified target lacks update-recovery", async () => {
+		const argv: string[][] = [];
+		await runPostUpdateRecoveryForTest(
+			"/older stable/gjc",
+			async args => {
+				argv.push(args);
+				return 0;
+			},
+			async () => false,
+			async () => ["discord"],
+		);
+		expect(argv).toEqual([
+			["/older stable/gjc", "daemon", "stop", "discord", "--force"],
+			["/older stable/gjc", "daemon", "reload", "discord"],
+			["/older stable/gjc", "notify", "recovery"],
+		]);
+	});
+
+	it("targets a Slack-only durable provider during legacy recovery", async () => {
+		const argv: string[][] = [];
+		await runPostUpdateRecoveryForTest(
+			"/older stable/gjc",
+			async args => {
+				argv.push(args);
+				return 0;
+			},
+			async () => false,
+			async () => ["slack"],
+		);
+		expect(argv).toEqual([
+			["/older stable/gjc", "daemon", "stop", "slack", "--force"],
+			["/older stable/gjc", "daemon", "reload", "slack"],
+			["/older stable/gjc", "notify", "recovery"],
+		]);
+	});
+
+	it("fails fast when a legacy recovery stage fails", async () => {
+		const argv: string[][] = [];
+		await expect(
+			runPostUpdateRecoveryForTest(
+				"/older/gjc",
+				async args => {
+					argv.push(args);
+					return args[2] === "reload" ? 17 : 0;
+				},
+				async () => false,
+				async () => ["slack"],
+			),
+		).rejects.toThrow("legacy post-update daemon reload exited 17");
+		expect(argv).toEqual([
+			["/older/gjc", "daemon", "stop", "slack", "--force"],
+			["/older/gjc", "daemon", "reload", "slack"],
+		]);
+	});
+
+	it("uses canonical global provider completeness, including globally disabled configured credentials", () => {
+		expect(hasManagedNotifySetup(Settings.isolated())).toBe(false);
+		expect(hasManagedNotifySetup(configuredSettings({ "notifications.enabled": false }))).toBe(true);
+		expect(hasManagedNotifySetup(configuredSettings({ "notifications.telegram.enabled": false }))).toBe(false);
+		expect(
+			hasManagedNotifySetup(
+				configuredSettings({
+					"notifications.telegram.botToken": " ",
+					"notifications.discord.enabled": true,
+				}),
+			),
+		).toBe(false);
+		expect(
+			hasManagedNotifySetup(
+				configuredSettings({
+					"notifications.discord.enabled": true,
+					"notifications.discord.botToken": "discord-secret",
+					"notifications.discord.applicationId": "app",
+					"notifications.discord.guildId": "guild",
+					"notifications.discord.parentChannelId": "channel",
+					"notifications.telegram.enabled": "malformed",
+				}),
+			),
+		).toBe(true);
+	});
+
+	it.each(["binary", "bun", "npm"] as const)("runs the verified %s lifecycle in exact order", async method => {
+		const calls: string[] = [];
+		const target =
+			method === "binary"
+				? { method, path: "/verified/gjc" }
+				: method === "npm"
+					? { method, packageName: "gajae-code" }
+					: { method };
+		await runUpdateCommand(
+			{ force: false, check: false },
+			{
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => target,
+				performUpdate: async () => {
+					calls.push("verified install");
+					return { ok: true, path: "/verified/gjc" };
+				},
+				runPostUpdateRecovery: async runtimePath => {
+					expect(runtimePath).toBe("/verified/gjc");
+					await runManagedNotifyRecovery({
+						settings: async () => configuredSettings({ "notifications.enabled": false }),
+						stopDaemon: async settings => {
+							expect(settings).toBeDefined();
+							calls.push("stop --force");
+						},
+						restartDaemon: async () => {
+							calls.push("restart");
+						},
+						recoverNotifications: async () => {
+							calls.push("notify recovery");
+						},
+					});
+				},
+				refreshInstalledDefaultSkills: async () => {
+					calls.push("refresh defaults");
+				},
+			},
+		);
+		expect(calls).toEqual(["verified install", "stop --force", "restart", "notify recovery", "refresh defaults"]);
+	});
+
+	it.each([
+		["stop", ["verified install", "stop --force"]],
+		["restart", ["verified install", "stop --force", "restart"]],
+		["recovery", ["verified install", "stop --force", "restart", "notify recovery"]],
+	] as [string, string[]][])("fails closed after %s lifecycle failure", async (failure, expectedCalls) => {
+		const calls: string[] = [];
+		const errors: string[] = [];
+		const exits: number[] = [];
+		const sentinel = new Error("exit");
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => errors.push(String(message)));
+		try {
+			await expect(
+				runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => release,
+						resolveUpdateTarget: async () => ({ method: "bun" }),
+						performUpdate: async () => {
+							calls.push("verified install");
+							return { ok: true, path: "/verified/gjc" };
+						},
+						runPostUpdateRecovery: async () =>
+							await runManagedNotifyRecovery({
+								settings: async () => configuredSettings(),
+								stopDaemon: async () => {
+									calls.push("stop --force");
+									if (failure === "stop") throw new Error("stop failed");
+								},
+								restartDaemon: async () => {
+									calls.push("restart");
+									if (failure === "restart") throw new Error("restart failed");
+								},
+								recoverNotifications: async () => {
+									calls.push("notify recovery");
+									if (failure === "recovery") throw new Error("recovery failed");
+								},
+							}),
+						refreshInstalledDefaultSkills: async () => {
+							calls.push("refresh defaults");
+						},
+						exit: code => {
+							exits.push(code);
+							throw sentinel;
+						},
+					},
+				),
+			).rejects.toBe(sentinel);
+			expect(calls).toEqual(expectedCalls);
+			expect(exits).toEqual([1]);
+			const stage =
+				failure === "stop" ? "daemon stop --force" : failure === "restart" ? "daemon restart" : "notify recovery";
+			expect(errors.join("\n")).toContain(`Post-update ${stage} failed`);
+			expect(errors.join("\n")).not.toContain("telegram-secret");
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("reports recovery failure as partial success after the installed runtime verifies", async () => {
+		const errors: string[] = [];
+		const sentinel = new Error("exit");
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => errors.push(String(message)));
+		try {
+			await expect(
+				runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => release,
+						resolveUpdateTarget: async () => ({ method: "bun" }),
+						performUpdate: async () => ({ ok: true, path: "/verified/gjc" }),
+						runPostUpdateRecovery: async () => {
+							throw new Error("restart failed");
+						},
+						exit: () => {
+							throw sentinel;
+						},
+					},
+				),
+			).rejects.toBe(sentinel);
+			expect(errors.join("\n")).toContain(
+				"Updated to 999.0.0, but post-update recovery failed: Error: restart failed",
+			);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("does not initialize notification recovery for checks, up-to-date responses, failed installs, or missing verified runtime identity", async () => {
+		let settingsCalls = 0;
+		const lifecycle = {
+			runPostUpdateRecovery: async () => {
+				settingsCalls += 1;
+			},
+		};
+		await runUpdateCommand({ force: false, check: true }, { getLatestRelease: async () => release, ...lifecycle });
+		await runUpdateCommand(
+			{ force: false, check: false },
+			{ getLatestRelease: async () => ({ ...release, version: "0.0.1" }), ...lifecycle },
+		);
+		await runUpdateCommand(
+			{ force: false, check: false },
+			{
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method: "bun" }),
+				performUpdate: async () => {
+					throw new Error("rollback verified");
+				},
+				...lifecycle,
+				exit: () => undefined as never,
+			},
+		);
+		await runUpdateCommand(
+			{ force: false, check: false },
+			{
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method: "bun" }),
+				performUpdate: async () => {},
+				...lifecycle,
+			},
+		);
+		expect(settingsCalls).toBe(0);
+	});
+
+	it("runs the verified runtime for an unconfigured install but performs no lifecycle operations", async () => {
+		const calls: string[] = [];
+		await runUpdateCommand(
+			{ force: false, check: false },
+			{
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method: "bun" }),
+				performUpdate: async () => ({ ok: true, path: "/verified/gjc" }),
+				runPostUpdateRecovery: async runtimePath => {
+					expect(runtimePath).toBe("/verified/gjc");
+					await runManagedNotifyRecovery({
+						settings: async () => Settings.isolated(),
+						stopDaemon: async () => {
+							calls.push("stop");
+						},
+						restartDaemon: async () => {
+							calls.push("restart");
+						},
+						recoverNotifications: async () => {
+							calls.push("recovery");
+						},
+					});
+				},
+			},
+		);
+		expect(calls).toEqual([]);
 	});
 });
 

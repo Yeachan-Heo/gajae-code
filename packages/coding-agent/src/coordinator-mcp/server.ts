@@ -336,6 +336,8 @@ const UNOBSERVED_COMPENSATION_CODE = "broker_compensation_unobserved";
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
+/** Wall-clock bound `readCompleteQ12Snapshot` promises its callers, pages included. */
+const Q12_SNAPSHOT_BUDGET_MS = 5_000;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
@@ -2988,7 +2990,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		complete: boolean;
 		reason: "pagination_malformed" | "query_unavailable" | null;
 	}> {
-		const deadline = Date.now() + 5_000;
+		const deadline = Date.now() + Q12_SNAPSHOT_BUDGET_MS;
 		const items: unknown[] = [];
 		const cursors = new Set<string>();
 		let cursor: string | undefined;
@@ -3002,13 +3004,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		}
 		try {
 			for (let pageCount = 0; pageCount < 8 && Date.now() <= deadline; pageCount++) {
+				// The snapshot deadline is only checked between pages, so each page has to
+				// carry what is left of it. Without that budget the page inherits the
+				// Router's session reply budget and one wedged page outlives the whole
+				// snapshot bound this function promises its callers.
 				const response = asRecord(
-					await requestSessionFrame(target, {
-						type: "query_request",
-						query: "Q12",
-						input: {},
-						...(cursor === undefined ? {} : { cursor }),
-					}),
+					await requestSessionFrame(
+						target,
+						{
+							type: "query_request",
+							query: "Q12",
+							input: {},
+							...(cursor === undefined ? {} : { cursor }),
+						},
+						{ timeoutMs: Math.max(1, deadline - Date.now()) },
+					),
 				);
 				if (response?.ok !== true) return { items: [], revision, complete: false, reason: "query_unavailable" };
 				const page = asRecord(response.page);

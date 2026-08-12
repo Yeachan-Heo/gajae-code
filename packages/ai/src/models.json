@@ -65253,6 +65253,31 @@
 				"maxLevel": "high"
 			}
 		},
+		"meta/muse-spark-1.2": {
+			"id": "meta/muse-spark-1.2",
+			"name": "Meta: Muse Spark 1.2",
+			"api": "openai-completions",
+			"provider": "openrouter",
+			"baseUrl": "https://openrouter.ai/api/v1",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 1.25,
+				"output": 4.25,
+				"cacheRead": 0.15,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "minimal",
+				"maxLevel": "xhigh"
+			}
+		},
 		"minimax/minimax-m1": {
 			"id": "minimax/minimax-m1",
 			"name": "MiniMax: MiniMax M1",

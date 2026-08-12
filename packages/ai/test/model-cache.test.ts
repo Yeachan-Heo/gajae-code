@@ -78,6 +78,43 @@ describe("model cache migrations", () => {
 		expect(overwritten?.staticFingerprint).toBe("static-v3");
 	});
 
+	it("preserves a v4 row with authoritative dynamic IDs and provenance", () => {
+		const legacyModel = createModel("dynamic-cloud-model", "Dynamic Cloud Model");
+		const legacyDb = new Database(dbPath, { create: true });
+		legacyDb.run(`
+			CREATE TABLE model_cache (
+				provider_id TEXT PRIMARY KEY,
+				version INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				authoritative INTEGER NOT NULL DEFAULT 0,
+				static_fingerprint TEXT NOT NULL DEFAULT '',
+				dynamic_model_ids TEXT,
+				dynamic_model_provenance TEXT,
+				models TEXT NOT NULL
+			)
+		`);
+		legacyDb.run(
+			`INSERT INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, dynamic_model_provenance, models)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			[
+				"ollama-cloud",
+				4,
+				Date.now(),
+				1,
+				"static-v4",
+				JSON.stringify([legacyModel.id]),
+				"provenance-v4",
+				JSON.stringify([legacyModel]),
+			],
+		);
+		legacyDb.close();
+
+		const migrated = readModelCache<"openai-completions">("ollama-cloud", TTL_MS, Date.now, dbPath);
+		expect(migrated?.models.map(model => model.id)).toEqual(["dynamic-cloud-model"]);
+		expect(migrated?.dynamicModelIds).toEqual(["dynamic-cloud-model"]);
+		expect(migrated?.dynamicModelProvenance).toBe("provenance-v4");
+	});
+
 	it("closes only the exact shared database owner before root removal", async () => {
 		writeModelCache("ollama-cloud", Date.now(), [createModel("owned", "Owned")], true, "static", dbPath);
 		expect(closeModelCache(path.join(tempDir, "other.db"))).toBe(false);

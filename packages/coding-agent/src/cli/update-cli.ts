@@ -10,15 +10,19 @@ import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, isEnoent, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
+import { Settings } from "../config/settings";
 import { distTagForChannel, isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/update-channel";
 import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
 import { theme } from "../modes/theme/theme";
+import { getNotificationConfig, type NotificationProvider, resolveNotificationProvider } from "../sdk/bus/config";
 import {
 	DEFAULT_NPM_REGISTRY,
 	fetchLatestPackageVersion,
 	type Installer,
 	type NpmRegistryLookupOptions,
 } from "../utils/npm-registry";
+import { runDaemonCommand } from "./daemon-cli";
+import { runNotifyCommand } from "./notify-cli";
 
 const RELEASE_REPO = "Yeachan-Heo/gajae-code";
 const PACKAGE = "@gajae-code/coding-agent";
@@ -602,9 +606,9 @@ async function updateViaPackageManager(options: PackageManagerUpdateOptions): Pr
 /**
  * Update via bun package manager.
  */
-async function updateViaBun(expectedVersion: string): Promise<void> {
+async function updateViaBun(expectedVersion: string): Promise<InstalledVersionVerification> {
 	console.log(chalk.dim("Updating via bun..."));
-	await updateViaPackageManager({
+	return await updateViaPackageManager({
 		managerName: "bun",
 		expectedVersion,
 		runInstall: async version => await $`bun install -g ${PACKAGE}@${version}`.nothrow(),
@@ -612,9 +616,9 @@ async function updateViaBun(expectedVersion: string): Promise<void> {
 	});
 }
 
-async function updateViaNpm(packageName: string, expectedVersion: string): Promise<void> {
+async function updateViaNpm(packageName: string, expectedVersion: string): Promise<InstalledVersionVerification> {
 	console.log(chalk.dim(`Updating npm-managed install via npm (${packageName})...`));
-	await updateViaPackageManager({
+	return await updateViaPackageManager({
 		managerName: "npm",
 		expectedVersion,
 		runInstall: async version => await $`npm install -g ${packageName}@${version}`.nothrow(),
@@ -735,7 +739,11 @@ function formatRegistryProvenance(version: string, registry: string | undefined)
 /**
  * Download a release binary to a target path, replacing an existing file.
  */
-async function updateViaBinaryAt(targetPath: string, expectedVersion: string, registry?: string): Promise<void> {
+async function updateViaBinaryAt(
+	targetPath: string,
+	expectedVersion: string,
+	registry?: string,
+): Promise<InstalledVersionVerification> {
 	const binaryName = getBinaryName();
 	const url = buildReleaseBinaryUrl(expectedVersion);
 	const registryNote = formatRegistryProvenance(expectedVersion, registry);
@@ -753,6 +761,7 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string, re
 	printVerifiedVersion(expectedVersion);
 	if (verification.cleanupWarning) console.warn(chalk.yellow(verification.cleanupWarning));
 	printRestartGuidance();
+	return verification;
 }
 
 /**
@@ -761,18 +770,151 @@ async function updateViaBinaryAt(targetPath: string, expectedVersion: string, re
 export interface UpdateCommandDependencies {
 	getLatestRelease?: (options?: LatestReleaseLookupOptions) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
-	performUpdate?: (target: UpdateTarget, expectedVersion: string, registry?: string) => Promise<void>;
+	performUpdate?: (
+		target: UpdateTarget,
+		expectedVersion: string,
+		registry?: string,
+	) => Promise<InstalledVersionVerification | undefined>;
 	refreshInstalledDefaultSkills?: () => Promise<void>;
+	settings?: () => Promise<Settings>;
+	stopDaemon?: (settings: Settings) => Promise<void>;
+	restartDaemon?: (settings: Settings) => Promise<void>;
+	recoverNotifications?: (settings: Settings) => Promise<void>;
+	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
 	exit?: (code: number) => never;
 }
 
-async function performUpdate(target: UpdateTarget, expectedVersion: string, registry?: string): Promise<void> {
+export type PostUpdateRecoverySpawn = (argv: string[]) => Promise<number>;
+export type PostUpdateRecoverySupportCheck = (runtimePath: string) => Promise<boolean>;
+export type LegacyRecoveryDaemonKinds = () => Promise<NotificationProvider[]>;
+
+/**
+ * A complete, non-quarantined provider with provider-level desired intent is a
+ * durable managed-notify setup. The global switch is deliberately excluded:
+ * disabling delivery must not leave credential-backed daemon locks unrecovered.
+ */
+export function hasManagedNotifySetup(settings: Settings): boolean {
+	return managedNotifyDaemonKinds(settings).length > 0;
+}
+
+function managedNotifyDaemonKinds(settings: Settings): NotificationProvider[] {
+	const config = getNotificationConfig(settings);
+	return (["telegram", "discord", "slack"] as const).filter(provider => {
+		const resolution = resolveNotificationProvider(config, provider);
+		return resolution.configured && !resolution.quarantined && resolution.desiredEnabled;
+	});
+}
+
+async function stopManagedDaemon(settings: Settings): Promise<void> {
+	const kinds = managedNotifyDaemonKinds(settings);
+	let failed = false;
+	await runDaemonCommand(
+		{ action: "stop", kinds, all: false, json: false, force: true },
+		{
+			settings,
+			setExitCode: code => {
+				if (code !== 0) failed = true;
+			},
+		},
+	);
+	if (failed) throw new Error("daemon stop reported failure");
+}
+
+async function restartManagedDaemon(settings: Settings): Promise<void> {
+	const kinds = managedNotifyDaemonKinds(settings);
+	let failed = false;
+	await runDaemonCommand(
+		{ action: "restart", kinds, all: false, json: false, force: false, allowDisabledNoop: true },
+		{
+			settings,
+			setExitCode: code => {
+				if (code !== 0) failed = true;
+			},
+		},
+	);
+	if (failed) throw new Error("daemon restart reported failure");
+}
+
+async function recoverManagedNotifications(settings: Settings): Promise<void> {
+	await runNotifyCommand({ action: "recovery", rawArgs: [], forceDaemonLock: false }, { settings });
+}
+
+async function spawnPostUpdateRecovery(argv: string[]): Promise<number> {
+	const child = Bun.spawn(argv, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+	return await child.exited;
+}
+
+async function supportsUpdateRecovery(runtimePath: string): Promise<boolean> {
+	const child = Bun.spawn([runtimePath, "update", "--help"], { stdout: "pipe", stderr: "pipe" });
+	const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+	return exitCode === 0 && stdout.includes("update-recovery");
+}
+
+async function runLegacyPostUpdateRecovery(
+	runtimePath: string,
+	spawn: PostUpdateRecoverySpawn,
+	managedKinds: LegacyRecoveryDaemonKinds,
+): Promise<void> {
+	const kinds = await managedKinds();
+	if (kinds.length === 0) return;
+	for (const [name, argv] of [
+		["daemon stop --force", [runtimePath, "daemon", "stop", ...kinds, "--force"]],
+		["daemon reload", [runtimePath, "daemon", "reload", ...kinds]],
+		["notify recovery", [runtimePath, "notify", "recovery"]],
+	] as const) {
+		const exitCode = await spawn([...argv]);
+		if (exitCode !== 0) throw new Error(`legacy post-update ${name} exited ${exitCode}`);
+	}
+}
+
+export async function runPostUpdateRecoveryForTest(
+	runtimePath: string,
+	spawn: PostUpdateRecoverySpawn = spawnPostUpdateRecovery,
+	supportsRecovery: PostUpdateRecoverySupportCheck = supportsUpdateRecovery,
+	managedKinds: LegacyRecoveryDaemonKinds = async () => managedNotifyDaemonKinds(await Settings.init()),
+): Promise<void> {
+	if (!(await supportsRecovery(runtimePath))) {
+		await runLegacyPostUpdateRecovery(runtimePath, spawn, managedKinds);
+		return;
+	}
+	const exitCode = await spawn([runtimePath, "update", "update-recovery"]);
+	if (exitCode !== 0) throw new Error(`the verified installed runtime exited ${exitCode}`);
+}
+
+async function runPostUpdateRecovery(runtimePath: string): Promise<void> {
+	await runPostUpdateRecoveryForTest(runtimePath);
+}
+
+export async function runManagedNotifyRecovery(
+	deps: Pick<UpdateCommandDependencies, "settings" | "stopDaemon" | "restartDaemon" | "recoverNotifications">,
+): Promise<void> {
+	const settings = await (deps.settings ?? (() => Settings.init()))();
+	if (!hasManagedNotifySetup(settings)) return;
+	const stages: readonly [string, (settings: Settings) => Promise<void>][] = [
+		["daemon stop --force", deps.stopDaemon ?? stopManagedDaemon],
+		["daemon restart", deps.restartDaemon ?? restartManagedDaemon],
+		["notify recovery", deps.recoverNotifications ?? recoverManagedNotifications],
+	];
+	for (const [name, run] of stages) {
+		try {
+			await run(settings);
+		} catch (error) {
+			throw new Error(`Post-update ${name} failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+}
+
+async function performUpdate(
+	target: UpdateTarget,
+	expectedVersion: string,
+	registry?: string,
+): Promise<InstalledVersionVerification> {
 	if (target.method === "bun") {
-		await updateViaBun(expectedVersion);
+		return await updateViaBun(expectedVersion);
 	} else if (target.method === "npm") {
-		await updateViaNpm(target.packageName, expectedVersion);
+		return await updateViaNpm(target.packageName, expectedVersion);
 	} else {
-		await updateViaBinaryAt(target.path, expectedVersion, registry);
+		return await updateViaBinaryAt(target.path, expectedVersion, registry);
 	}
 }
 
@@ -881,14 +1023,24 @@ export async function runUpdateCommand(
 
 	if (opts.check) return;
 
+	let installedVersion: string | undefined;
 	try {
 		const resolved = target ?? (await resolveTarget());
-		await update(resolved, release.version, release.registry);
+		const verification = await update(resolved, release.version, release.registry);
+		if (verification?.path) {
+			installedVersion = release.version;
+			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
+		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
-		console.error(chalk.red(`Update failed: ${err}`));
+		const prefix = installedVersion
+			? `Updated to ${installedVersion}, but post-update recovery failed`
+			: "Update failed";
+		console.error(chalk.red(`${prefix}: ${err}`));
 		return exit(1);
 	}
 
+	// The installed runtime completes recovery before this old updater process
+	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
 }
 
@@ -926,6 +1078,9 @@ ${chalk.bold("Options:")}
   -c, --check               Check for updates without installing
   -f, --force               Force reinstall even if up to date
   --channel <stable|nightly>  Release channel to update from (default: stable or startup.updateChannel setting)
+
+${chalk.bold("After a verified update:")}
+  When a complete managed notification provider is configured, GJC serially stops the daemon with --force, restarts it, then runs notify recovery. Globally disabled delivery still receives this lock recovery.
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} update                    Update to latest version

@@ -487,6 +487,11 @@ export function getGithubCacheDbPath(): string {
 	return dirs.rootSubdir(path.join("cache", "github-cache.db"), "cache");
 }
 
+/** Get the durable tool-choice capability cache path. */
+export function getToolChoiceCapabilityCachePath(): string {
+	return dirs.rootSubdir(path.join("cache", "tool-choice-capabilities.db"), "cache");
+}
+
 /** Get the natives directory (~/.gjc/natives). */
 export function getNativesDir(): string {
 	return dirs.rootSubdir("natives", "cache");
@@ -594,6 +599,16 @@ export function getTerminalSessionsDir(agentDir?: string): string {
 /** Get the crash log path (~/.gjc/agent/gjc-crash.log). */
 export function getCrashLogPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "gjc-crash.log", "state");
+}
+
+/** Get the crash event journal path (~/.gjc/agent/gjc-crash-events.jsonl). */
+export function getCrashEventsPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-crash-events.jsonl", "state");
+}
+
+/** Get the compacted crash signature index path (~/.gjc/agent/gjc-crash-index.json). */
+export function getCrashIndexPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-crash-index.json", "state");
 }
 
 /** Get the debug log path (~/.gjc/agent/gjc-debug.log). */

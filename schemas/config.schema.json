@@ -1190,6 +1190,17 @@
 			},
 			"additionalProperties": false
 		},
+		"crashReport": {
+			"type": "object",
+			"properties": {
+				"nudge": {
+					"type": "boolean",
+					"description": "At interactive startup, show one rate-limited line when unreported crash signatures exist. Reads local state only; nothing is ever transmitted without the explicit consent flow in `gjc crash report`.",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
 		"collapseChangelog": {
 			"type": "boolean",
 			"description": "Show condensed changelog after updates",

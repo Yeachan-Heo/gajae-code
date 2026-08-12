@@ -1,6 +1,6 @@
 {
   "kind": "computer-redteam-test-report",
-  "generatedAt": "2026-08-11T02:24:08.909Z",
+  "generatedAt": "2026-08-12T00:45:22.987Z",
   "commands": [
     "bun --cwd=packages/coding-agent test src/tools/computer.enforcement.test.ts",
     "cd packages/coding-agent && bun x tsc --noEmit -p ."
@@ -28,7 +28,7 @@
       "caseId": "permission-revoked",
       "scenario": "Screenshot native seam denies screen-recording permission.",
       "expectedBehavior": "Action is refused with COMPUTER_PERMISSION_REQUIRED and user-facing permission guidance.",
-      "observed": "code=COMPUTER_PERMISSION_REQUIRED message=COMPUTER_PERMISSION_REQUIRED: screen recording permission missing The host needs screen-recording or accessibility permission. Ask the user to grant it. nativeScreenshotCalls=1",
+      "observed": "code=COMPUTER_PERMISSION_REQUIRED message=COMPUTER_PERMISSION_REQUIRED: screen recording permission missing Grant Screen & System Audio Recording or Accessibility to the exact GJC launcher named in the diagnostic, then fully quit and relaunch GJC. nativeScreenshotCalls=1",
       "verdict": "passed"
     },
     {

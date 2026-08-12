@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "kind": "session-boundary-test-report",
-  "sourceCommit": "b41feb2ad",
-  "sourceTree": "db03b6e7c0eca42772332afe8ec78bf2cdacf293",
-  "cumulativeDiffSha256": "c477d6e40799ef03ff5e3ce3361a3818d0f70978ae5736667a4e642b39504041",
+  "sourceCommit": "9f389479d5c3641a64d4c0840f0ae4e83db43ab0",
+  "sourceTree": "237bf2b93b5bcc47e927b062756704add7f5d51f",
+  "cumulativeDiffSha256": "c7bf53d9273f92df9d9750df1554360ace99546c04ad4eaf6477c01b8c44abae",
   "results": [
     {
       "id": "package-typecheck",
@@ -13,12 +13,12 @@
     },
     {
       "id": "focused-session-boundary",
-      "command": "bun test packages/coding-agent/test/session-manager-resume-oversized.test.ts packages/coding-agent/test/settings-session-memory.test.ts packages/coding-agent/test/modes/controllers/session-command.test.ts packages/coding-agent/test/session/session-memory-storage-contracts.test.ts packages/coding-agent/test/session/session-memory-integration.test.ts packages/coding-agent/test/session/session-memory-latency.test.ts packages/coding-agent/test/session/session-memory-sidecar.test.ts packages/coding-agent/test/session/session-memory-crash.test.ts packages/coding-agent/test/session/session-memory-rollout.test.ts",
+      "command": "bun test packages/coding-agent/test/session-manager-rejected-open-cleanup.test.ts packages/coding-agent/test/session-manager-resume-oversized.test.ts packages/coding-agent/test/settings-session-memory.test.ts packages/coding-agent/test/modes/controllers/session-command.test.ts packages/coding-agent/test/session/session-memory-storage-contracts.test.ts packages/coding-agent/test/session/session-memory-integration.test.ts packages/coding-agent/test/session/session-memory-latency.test.ts packages/coding-agent/test/session/session-memory-sidecar.test.ts packages/coding-agent/test/session/session-memory-crash.test.ts packages/coding-agent/test/session/session-memory-rollout.test.ts",
       "status": "passed",
-      "testsPassed": 227,
+      "testsPassed": 273,
       "testsSkipped": 1,
       "testsFailed": 0,
-      "assertions": 22154,
+      "assertions": 22311,
       "artifact": "artifacts/session-source-bound-focused-tests.xml"
     },
     {
@@ -28,7 +28,8 @@
       "testsPassed": 1,
       "testsFailed": 0,
       "assertions": 14,
-      "artifact": "artifacts/session-source-bound-latency-tests.xml"
+      "artifact": "artifacts/session-source-bound-latency-tests.xml",
+      "evidenceSourceCommit": "b41feb2ad1934a6958e4429102b92132005333cf"
     },
     {
       "id": "opt-in-rss",
@@ -37,7 +38,8 @@
       "testsPassed": 13,
       "testsFailed": 0,
       "assertions": 76,
-      "artifact": "artifacts/session-source-bound-rss-tests.xml"
+      "artifact": "artifacts/session-source-bound-rss-tests.xml",
+      "evidenceSourceCommit": "b41feb2ad1934a6958e4429102b92132005333cf"
     },
     {
       "id": "no-gc-rss-negative-control",
@@ -46,7 +48,8 @@
       "testsPassed": 11,
       "testsFailed": 2,
       "artifact": "artifacts/session-source-bound-rss-none-tests.xml",
-      "evidence": "No-GC failed the 60k first-build 64 MiB RSS ceiling at 122748928 bytes and the million-record 128 MiB allocator ceiling at 135643136 bytes."
+      "evidence": "No-GC failed the 60k first-build 64 MiB RSS ceiling at 122748928 bytes and the million-record 128 MiB allocator ceiling at 135643136 bytes.",
+      "evidenceSourceCommit": "b41feb2ad1934a6958e4429102b92132005333cf"
     },
     {
       "id": "mandatory-computer-redteam",

@@ -188,7 +188,13 @@ import {
 } from "@gajae-code/utils";
 
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
-import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager, type OwnerSubagentShutdownLease } from "../async";
+import {
+	type AsyncJob,
+	type AsyncJobDeliveryState,
+	AsyncJobManager,
+	asyncJobEndpointId as deriveAsyncJobEndpointId,
+	type OwnerSubagentShutdownLease,
+} from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -779,6 +785,8 @@ export interface AgentSessionConfig {
 	credentialSessionId?: string;
 	/** Optional provider-facing cache identity, distinct from logical session identity. */
 	providerCacheSessionId?: string;
+	/** Explicit provider affinity whose persisted transcript path scopes async ownership. */
+	asyncJobProviderSessionId?: string;
 }
 
 export interface AgentSessionMemoryGuardRestoreInput
@@ -2225,6 +2233,7 @@ export class AgentSession {
 	#providerSessionId: string | undefined;
 	#credentialSessionId: string | undefined;
 	#providerCacheSessionId: string | undefined;
+	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
@@ -3239,6 +3248,7 @@ export class AgentSession {
 		this.#providerSessionId = config.providerSessionId;
 		this.#credentialSessionId = config.credentialSessionId;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
+		this.#asyncJobProviderSessionId = config.asyncJobProviderSessionId;
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
 		this.agent.afterToolCall = ctx => {
 			settleToolLineageRegistrationWindow(ctx.toolCall.id, this.#ownedRegistrationEndpoint());
@@ -6658,7 +6668,12 @@ export class AgentSession {
 	 * resolving the predecessor and a queued subagent resume can neither
 	 * resolve its lineage nor register its owned tuple (review thread P1).
 	 */
-	#assertJobManagerEndpointAdmission(successorEndpointId: string): void {
+	#asyncJobEndpointId(sessionId: string, sessionFile: string | undefined): string {
+		return deriveAsyncJobEndpointId(this.#asyncJobProviderSessionId, sessionId, sessionFile);
+	}
+
+	#assertJobManagerEndpointAdmission(successorSessionId: string, successorSessionFile: string | undefined): void {
+		const successorEndpointId = this.#asyncJobEndpointId(successorSessionId, successorSessionFile);
 		const ownManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		const successorOwner = AsyncJobManager.forEndpoint(successorEndpointId);
 		if (ownManager && successorOwner !== undefined && successorOwner !== ownManager) {
@@ -6669,10 +6684,15 @@ export class AgentSession {
 	}
 
 	#rekeyJobManagerForSessionIdentity(
-		previousEndpointId: string,
+		previousSessionId: string,
+		previousSessionFile: string | undefined,
 		options: { retirePredecessorRegistrations?: boolean } = {},
 	): void {
-		const currentEndpointId = this.sessionManager.getSessionId();
+		const previousEndpointId = this.#asyncJobEndpointId(previousSessionId, previousSessionFile);
+		const currentEndpointId = this.#asyncJobEndpointId(
+			this.sessionManager.getSessionId(),
+			this.sessionManager.getSessionFile(),
+		);
 		const predecessorOwner = AsyncJobManager.forEndpoint(previousEndpointId);
 		// Rekey and retire ONLY when the predecessor key belongs to THIS
 		// session's manager (the session-owned manager, else the process-global
@@ -11836,16 +11856,17 @@ export class AgentSession {
 			this.agent.reset();
 			if (!options?.drop) await this.sessionManager.flush();
 			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
+			const noLeasePreviousSessionFile = this.sessionManager.getSessionFile();
 			const prepared = await this.sessionManager.prepareNewSession(options);
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				this.#assertJobManagerEndpointAdmission(prepared.sessionId);
+				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				this.sessionManager.commitPreparedNewSession(prepared);
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
 				// aborts classify in the successor session (review thread P1).
-				this.#rekeyJobManagerForSessionIdentity(noLeasePreviousSessionIdentity);
+				this.#rekeyJobManagerForSessionIdentity(noLeasePreviousSessionIdentity, noLeasePreviousSessionFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
@@ -11873,6 +11894,7 @@ export class AgentSession {
 		if (!manager) throw new Error("Owner subagent shutdown manager became unavailable.");
 		if (!ownerId) throw new Error("Owner subagent shutdown owner became unavailable.");
 		const previousSessionIdentity = this.sessionManager.getSessionId();
+		const previousSessionIdentityFile = this.sessionManager.getSessionFile();
 		try {
 			try {
 				manager.runOwnerProducerCleanupsStrict({ ownerId });
@@ -11915,12 +11937,12 @@ export class AgentSession {
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				this.#assertJobManagerEndpointAdmission(prepared.sessionId);
+				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				this.sessionManager.commitPreparedNewSession(prepared);
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
 				// aborts classify in the successor session (review thread P1).
-				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity);
+				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionIdentityFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
@@ -12132,6 +12154,7 @@ export class AgentSession {
 						getSessionId: () => forkedManager.getSessionId(),
 					});
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
+					this.#assertJobManagerEndpointAdmission(forkedManager.getSessionId(), forkedManager.getSessionFile());
 				} catch (error) {
 					const forkedFile = forkedManager.getSessionFile();
 					const cleanupErrors: unknown[] = [];
@@ -12162,6 +12185,7 @@ export class AgentSession {
 					throw error;
 				}
 				this.sessionManager = forkedManager;
+				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
 				try {
 					await previousManager.close();
 				} catch (error) {
@@ -12178,11 +12202,11 @@ export class AgentSession {
 				try {
 					await initializeLocalRoot(this.#localProtocolOptions(prepared));
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
-					this.#assertJobManagerEndpointAdmission(prepared.sessionId);
+					this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 					this.sessionManager.commitPreparedNewSession(prepared);
 					// Fork commits a successor endpoint identity; re-register the
 					// manager under it (review thread P1).
-					this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity);
+					this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
 					await this.#runToolSessionTransitionCleanups();
 				} catch (error) {
 					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
@@ -14427,13 +14451,13 @@ export class AgentSession {
 				// Last fallible action: verified local:// readiness from immutable staged options.
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
-				this.#assertJobManagerEndpointAdmission(prepared.sessionId);
+				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
 				// Handoff commits a successor endpoint identity; re-register the
 				// manager under it (review thread P1).
-				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId);
+				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId, rollbackSessionState.sessionFile);
 				committed = true;
 				await this.#runToolSessionTransitionCleanups();
 				this.agent.reset();
@@ -18938,7 +18962,7 @@ export class AgentSession {
 				// re-register the manager under it so post-transition lineage
 				// bindings resolve and owned aborts classify in the successor
 				// session (review thread P1).
-				this.#rekeyJobManagerForSessionIdentity(previousSessionState.sessionId, {
+				this.#rekeyJobManagerForSessionIdentity(previousSessionState.sessionId, previousSessionState.sessionFile, {
 					retirePredecessorRegistrations: false,
 				});
 				if (switchingToDifferentSession) this.sessionManager.stageAdoptedArtifactManagerForTransition();
@@ -19087,6 +19111,10 @@ export class AgentSession {
 				}
 
 				if (switchingToDifferentSession) {
+					const predecessorEndpointId = this.#asyncJobEndpointId(
+						previousSessionState.sessionId,
+						previousSessionState.sessionFile,
+					);
 					let ownerShutdownSettled = true;
 					if (ownerShutdownManager && ownerShutdownLease && ownerId) {
 						try {
@@ -19105,7 +19133,7 @@ export class AgentSession {
 								ownerShutdownManager,
 								ownerShutdownLease,
 								ownerId,
-								previousSessionState.sessionId,
+								predecessorEndpointId,
 							);
 							this.#suppressOwnAsyncJobDeliveries();
 							this.emitNotice(
@@ -19122,7 +19150,7 @@ export class AgentSession {
 						// Every predecessor job/delivery has settled. Only now can its
 						// tuple evidence be retired; doing this immediately after rekey
 						// made rollback restore live jobs without their owned tuples.
-						retireOwnedRegistrationsForEndpoint(previousSessionState.sessionId);
+						retireOwnedRegistrationsForEndpoint(predecessorEndpointId);
 						this.sessionManager.retireEphemeralArtifactsAfterTransition();
 						await this.#runToolSessionTransitionCleanups();
 					}
@@ -19151,10 +19179,18 @@ export class AgentSession {
 				// The switch never committed: rotate the manager's endpoint
 				// registration back to the predecessor before restoring it
 				// (review thread P1 — the map key must track the session id).
-				const rekeyed = AsyncJobManager.rekeyForEndpoint(
+				const successorEndpointId = this.#asyncJobEndpointId(
 					this.sessionManager.getSessionId(),
+					this.sessionManager.getSessionFile(),
+				);
+				const predecessorEndpointId = this.#asyncJobEndpointId(
 					previousSessionState.sessionId,
-					AsyncJobManager.forEndpoint(this.sessionManager.getSessionId()),
+					previousSessionState.sessionFile,
+				);
+				const rekeyed = AsyncJobManager.rekeyForEndpoint(
+					successorEndpointId,
+					predecessorEndpointId,
+					AsyncJobManager.forEndpoint(successorEndpointId),
 				);
 				if (!rekeyed) {
 					// Another top-level session claimed the freed predecessor endpoint
@@ -19292,11 +19328,11 @@ export class AgentSession {
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
-				this.#assertJobManagerEndpointAdmission(prepared.sessionId);
+				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				this.sessionManager.commitPreparedNewSession(prepared);
 				// Branch commits a successor endpoint identity; re-register the
 				// manager under it (review thread P1).
-				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity);
+				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);

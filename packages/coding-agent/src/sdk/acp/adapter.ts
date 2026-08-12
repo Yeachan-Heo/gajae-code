@@ -6,7 +6,7 @@ import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-l
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type SessionAttachment, type SessionRouter, SessionRouterError } from "../router";
-import { ACP_SESSION_RECONNECT } from "../session-reconnect";
+import { ACP_SESSION_RECONNECT, SESSION_ABORT_TIMEOUT_MS } from "../session-reconnect";
 import type { SessionLifecycleMcpServer } from "./mcp";
 
 type JsonObject = Record<string, unknown>;
@@ -313,13 +313,20 @@ export class AcpSdkAdapter {
 
 		const invalid = validateAdapterControl(operation, payload);
 		if (invalid) throw new AcpSdkAdapterError(invalid.code, invalid.message);
-		return await this.#requestSession({
-			type: "control_request",
-			operation,
-			input: payload,
-			...(confirm === undefined ? {} : { confirm: confirm === true }),
-			...(typeof idempotencyKey === "string" && idempotencyKey ? { idempotencyKey } : {}),
-		});
+		return await this.#requestSession(
+			{
+				type: "control_request",
+				operation,
+				input: payload,
+				...(confirm === undefined ? {} : { confirm: confirm === true }),
+				...(typeof idempotencyKey === "string" && idempotencyKey ? { idempotencyKey } : {}),
+			},
+			false,
+			// A cancel must not inherit the Router's wide session reply budget: the
+			// caller awaits this acknowledgement before any settlement path can bound
+			// the turn, so a wedged host would stretch cancellation by that budget.
+			operation === "turn.abort" ? { timeoutMs: SESSION_ABORT_TIMEOUT_MS } : undefined,
+		);
 	}
 	async query(query: string, input: JsonObject = {}, cursor?: string): Promise<unknown> {
 		return await this.#requestSession({
@@ -342,7 +349,7 @@ export class AcpSdkAdapter {
 		return envelope?.result ?? response;
 	}
 
-	async #requestSession(frame: JsonObject, raw = false): Promise<unknown> {
+	async #requestSession(frame: JsonObject, raw = false, options?: { timeoutMs: number }): Promise<unknown> {
 		const router = this.#router;
 		if (!router)
 			throw new AcpSdkAdapterError(
@@ -358,6 +365,7 @@ export class AcpSdkAdapter {
 			{ ...frame, id: randomUUID() },
 			attachment.generation,
 			attachment,
+			options,
 		);
 		if (!attachment.isCurrent())
 			throw new SessionRouterError("ambiguous", "SDK session attachment changed while awaiting command response.");

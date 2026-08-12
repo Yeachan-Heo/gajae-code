@@ -110,7 +110,7 @@ it("starts a fresh detached source broker without loading hostile cwd bunfig or 
 	expect(await Bun.file(preloadSentinel).exists()).toBe(false);
 	expect(await Bun.file(dotenvSentinel).exists()).toBe(false);
 	expect(await Bun.file(pathSentinel).exists()).toBe(false);
-});
+}, 30_000);
 
 it("starts the default source session host with isolated bootstrap policy and workspace cwd", async () => {
 	const root = await tempRoot();

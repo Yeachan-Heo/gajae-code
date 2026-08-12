@@ -8,7 +8,8 @@
 
 export type DaemonKind = "telegram" | "discord" | "slack";
 
-export type DaemonAction = "list" | "status" | "stop" | "reload";
+/** `reload` remains the controller result verb; `restart` is the CLI canonical action. */
+export type DaemonAction = "list" | "status" | "stop" | "restart" | "reload";
 
 export type DaemonHealth = "not_configured" | "stopped" | "running" | "stale" | "stopping" | "error";
 
@@ -45,6 +46,12 @@ export interface DaemonOperationOptions {
 	force?: boolean;
 	/** For reload: spawn a fresh owner even when none is currently running. */
 	spawnIfStopped?: boolean;
+	/**
+	 * A post-update recovery has already force-stopped every selected daemon.
+	 * When global delivery is disabled, acknowledge its canonical restart stage
+	 * without spawning a transport that would resume delivery.
+	 */
+	allowDisabledNoop?: boolean;
 }
 
 export interface DaemonRecovery {

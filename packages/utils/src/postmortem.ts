@@ -5,12 +5,17 @@
  * in response to process exit, signals, or fatal exceptions. It is intended to
  * allow reliably releasing resources or shutting down subprocesses, files, sockets, etc.
  */
+
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import inspector from "node:inspector";
 import * as path from "node:path";
 import { isMainThread } from "node:worker_threads";
 import { BROKEN_PIPE_EXIT_CODE, createProcessStdoutEpipeClassifier } from "./broken-pipe";
-import { getCrashLogPath } from "./dirs";
+import { computeCrashFingerprint, formatCrashRecordMarker } from "./crash-fingerprint";
+import { appendFatalCrashEvent } from "./crash-journal";
+import { redactCrashSecrets } from "./crash-redaction";
+import { getCrashEventsPath, getCrashLogPath } from "./dirs";
 import * as logger from "./logger";
 import { safeStderrWrite } from "./safe-stderr";
 
@@ -406,47 +411,17 @@ export const CRASH_LOG_MAX_BYTES = 512 * 1024;
 export const CRASH_RECORD_MAX_BYTES = 64 * 1024;
 const CRASH_RECORD_TRUNCATION_MARKER = "\n… [crash record truncated]\n\n";
 
-/**
- * Best-effort scrub of credential material from a crash record before it is
- * persisted indefinitely. Covers bearer/basic-style headers, key=value or
- * JSON key forms of common credential names, and well-known vendor token
- * shapes. Normal messages and stack frames are untouched; matches are
- * replaced in place so surrounding diagnostic context survives.
- */
-function redactCrashSecrets(text: string): string {
-	let redacted = text;
-	redacted = redacted.replace(/\b(?:Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "«redacted-auth»");
-	redacted = redacted.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "«redacted-jwt»");
-	redacted = redacted.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "«redacted-api-key»");
-	// `gh[opsur]_` covers the classic PAT/OAuth/server/user/refresh prefixes;
-	// fine-grained PATs use an entirely different `github_pat_` prefix and would
-	// otherwise survive into a log the module keeps indefinitely.
-	redacted = redacted.replace(/\bgh[opsur]_[A-Za-z0-9]{16,}\b/g, "«redacted-github-token»");
-	redacted = redacted.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "«redacted-github-token»");
-	redacted = redacted.replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, "«redacted-slack-token»");
-	// AKIA is the long-term access key id; ASIA is the temporary/STS one, which is
-	// the shape that actually shows up in a crashed request. The id alone is not
-	// the credential: an STS payload carries `SecretAccessKey` and `SessionToken`
-	// alongside it, so the labeled-value rule below must name both. `secret_key`
-	// does not match `SecretAccessKey` (the canonical field has `Access` in the
-	// middle), and `access_token` does not match `SessionToken`.
-	redacted = redacted.replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "«redacted-aws-key»");
-	redacted = redacted.replace(
-		/(?<![A-Za-z0-9_])(["']?(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|client[_-]?secret|secret[_-]?key|secret[_-]?access[_-]?key|password|passwd|authorization)["']?\s*[=:]\s*["']?)[^\s"',;}\]]{8,}/gi,
-		"$1«redacted»",
-	);
-	return redacted;
-}
+export { redactCrashSecrets };
 
 /**
- * Bound one record to CRASH_RECORD_MAX_BYTES without splitting a UTF-8
- * sequence. Keeps the header (timestamp/label/message) at the front, where
- * the diagnostic value is highest.
+ * Bound one record to `maxBytes` without splitting a UTF-8 sequence. Keeps the
+ * header (timestamp/label/message) at the front, where the diagnostic value is
+ * highest.
  */
-function boundCrashRecord(report: string): string {
-	if (Buffer.byteLength(report, "utf8") <= CRASH_RECORD_MAX_BYTES) return report;
+function boundCrashRecord(report: string, maxBytes: number = CRASH_RECORD_MAX_BYTES): string {
+	if (Buffer.byteLength(report, "utf8") <= maxBytes) return report;
 	const bytes = Buffer.from(report, "utf8");
-	const budget = CRASH_RECORD_MAX_BYTES - Buffer.byteLength(CRASH_RECORD_TRUNCATION_MARKER, "utf8");
+	const budget = maxBytes - Buffer.byteLength(CRASH_RECORD_TRUNCATION_MARKER, "utf8");
 	let end = budget;
 	// Drop trailing continuation bytes of a truncated multi-byte sequence.
 	while (end > 0 && (bytes[end - 1] & 0xc0) === 0x80) end--;
@@ -468,29 +443,35 @@ function boundCrashRecord(report: string): string {
  * original fatal) and uses synchronous IO so the record lands before
  * `process.exit`. Returns the path written, or `undefined` on failure.
  */
-export function recordFatalCrash(
-	label: string,
-	reason: unknown,
-	options: { path?: string; now?: Date } = {},
-): string | undefined {
+export function recordFatalCrash(label: string, reason: unknown, options: CrashRecordOptions = {}): string | undefined {
 	return writeCrashRecord(label, describeFatal(reason), options);
 }
 
-function writeCrashRecord(
-	label: string,
-	fatal: FatalDiagnostic,
-	options: { path?: string; now?: Date } = {},
-): string | undefined {
+interface CrashRecordOptions {
+	path?: string;
+	now?: Date;
+}
+
+function writeCrashRecord(label: string, fatal: FatalDiagnostic, options: CrashRecordOptions = {}): string | undefined {
 	try {
 		const target = options.path ?? getCrashLogPath();
 		const now = options.now ?? new Date();
 		const stack = fatal.stack ? `${redactCrashSecrets(fatal.stack)}\n` : "";
 		const payload = fatal.payload ? `${redactCrashSecrets(fatal.payload)}\n` : "";
-		const report = boundCrashRecord(
+		// Identity is computed from the already-captured diagnostic text only; the
+		// throwable is never read again here.
+		const fingerprint = computeCrashFingerprint(fatal);
+		const recordId = randomBytes(8).toString("hex");
+		const markerLine = `${formatCrashRecordMarker(fingerprint.fingerprint, fingerprint.version, recordId)}\n`;
+		// The marker is the record's identity, so it is budgeted first and appended
+		// after truncation: an oversized body can never evict it.
+		const body = boundCrashRecord(
 			`${now.toISOString()} pid=${process.pid} [${label}] ` +
 				`${redactCrashSecrets(fatal.name)}: ${redactCrashSecrets(fatal.message)}\n` +
-				`${stack}${payload}\n`,
+				`${stack}${payload}`,
+			CRASH_RECORD_MAX_BYTES - Buffer.byteLength(markerLine, "utf8") - 1,
 		);
+		const report = `${body}${markerLine}\n`;
 		fs.mkdirSync(path.dirname(target), { recursive: true });
 		let existingSize = 0;
 		try {
@@ -508,6 +489,25 @@ function writeCrashRecord(
 		try {
 			fs.chmodSync(target, 0o600);
 		} catch {}
+		// The journal always lives beside the crash log it describes, so an
+		// overridden crash-log path (tests, alternate agent dirs) keeps its events
+		// in the same scope instead of leaking into the user's agent dir.
+		const eventsPath =
+			options.path === undefined
+				? getCrashEventsPath()
+				: path.join(path.dirname(target), path.basename(getCrashEventsPath()));
+		appendFatalCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: fingerprint.fingerprint,
+				fpv: fingerprint.version,
+				recordId,
+				at: now.getTime(),
+				errorName: fingerprint.errorName,
+				messageClass: fingerprint.messageClass,
+			},
+			eventsPath,
+		);
 		return target;
 	} catch {
 		return undefined;
