@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- The model selector now prompts for a reasoning level when assigning any reasoning-capable model to the DEFAULT target, not just OpenAI/OpenAI-Codex models. Selecting e.g. an Anthropic reasoning model for DEFAULT opens the same "Reasoning for Default" menu as role-agent assignments and persists the choice as an explicit `:level` suffix in `modelRoles.default`, so the pinned effort survives restarts instead of silently inheriting `defaultThinkingLevel`. Non-reasoning models and temporary model switches are unaffected.
+
 ## [0.13.1] - 2026-08-11
 
 ### Added

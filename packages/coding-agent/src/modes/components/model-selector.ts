@@ -2435,7 +2435,12 @@ export class ModelSelectorComponent extends Container {
 function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
 	if (model.reasoning !== true) return false;
 	if (model.provider === "openai" || model.provider === "openai-codex") return true;
-	return role !== null && GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "task.agentModelOverrides";
+	if (role === null) return false;
+	// DEFAULT assignments prompt for a reasoning level regardless of provider so
+	// non-OpenAI reasoning models (e.g. Anthropic) can pin an explicit effort in
+	// modelRoles.default instead of silently inheriting defaultThinkingLevel.
+	if (role === "default") return true;
+	return GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "task.agentModelOverrides";
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {

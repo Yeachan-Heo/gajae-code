@@ -112,6 +112,26 @@ function createOpenAIModel(provider: "openai" | "openai-codex", id: string, reas
 	};
 }
 
+function createAnthropicReasoningModel(id: string): Model {
+	return {
+		id,
+		name: id,
+		api: "anthropic-messages",
+		provider: "anthropic",
+		baseUrl: "https://api.anthropic.com",
+		reasoning: true,
+		thinking: {
+			minLevel: Effort.Low,
+			maxLevel: Effort.XHigh,
+			mode: "anthropic-adaptive",
+		},
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 64000,
+	} as Model;
+}
+
 function createOllamaCloudModel(id: string): Model {
 	return {
 		id,
@@ -192,11 +212,18 @@ describe("ModelSelector canonical model selection", () => {
 		expect(actionRendered).not.toContain("Set as TASK");
 
 		selector.handleInput("\n");
+		// Reasoning-capable model on the DEFAULT target: the reasoning menu opens,
+		// seeded from the existing DEFAULT (low) binding.
+		expect(selected).toBeUndefined();
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Default: low");
+
+		selector.handleInput("\n");
 		const selectedAfterEnter = selected;
 		if (!selectedAfterEnter) throw new Error("Expected Enter to select a model");
 		expect(selectedAfterEnter.model).toBe(model);
 		expect(selectedAfterEnter.role).toBe("default");
-		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Low);
 		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}`);
 	});
 
@@ -523,6 +550,79 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterThinking.role).toBe("default");
 		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("prompts for reasoning before assigning Anthropic reasoning default models", async () => {
+		installTestTheme();
+		const model = createAnthropicReasoningModel("claude-fable-5");
+		const settings = Settings.isolated({});
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+
+		// The reasoning menu must open instead of committing the assignment.
+		expect(selected).toBeUndefined();
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Default: off");
+		expect(thinkingRendered).toContain("xhigh");
+
+		// Levels are [off, low, medium, high, xhigh]; pick xhigh.
+		for (let i = 0; i < 4; i++) selector.handleInput("\x1b[B");
+		const afterNav = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(afterNav).toContain("Reasoning for Default: xhigh");
+		selector.handleInput("\n");
+
+		const selectedAfterThinking = selected;
+		if (!selectedAfterThinking) throw new Error("Expected Anthropic selection after reasoning choice");
+		expect(selectedAfterThinking.model).toBe(model);
+		expect(selectedAfterThinking.role).toBe("default");
+		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("does not prompt when assigning Anthropic non-reasoning models to default", async () => {
+		installTestTheme();
+		const reasoningModel = createAnthropicReasoningModel("claude-plain-base");
+		const model = {
+			...reasoningModel,
+			id: "claude-plain",
+			name: "claude-plain",
+			reasoning: false,
+			thinking: undefined,
+		} as Model;
+		const settings = Settings.isolated({});
+
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			settings,
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+
+		const selectedDirect = selected;
+		if (!selectedDirect) throw new Error("Expected direct non-reasoning selection");
+		expect(selectedDirect.role).toBe("default");
+		expect(selectedDirect.selector).toBe(`${model.provider}/${model.id}`);
 	});
 
 	test("can explicitly choose off for OpenAI reasoning default models", async () => {

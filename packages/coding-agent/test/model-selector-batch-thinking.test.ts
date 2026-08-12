@@ -73,10 +73,10 @@ function createSelector(
 
 /**
  * Reasoning model whose provider alone does NOT force an explicit thinking
- * choice for the DEFAULT target (unlike openai/openai-codex), mirroring
- * Anthropic reasoning models such as claude-fable-5. Role-agent targets
- * (task.agentModelOverrides) still require an explicit choice, so batch
- * assignment must surface the reasoning menu.
+ * choice (unlike openai/openai-codex), mirroring Anthropic reasoning models
+ * such as claude-fable-5. DEFAULT and role-agent targets both require an
+ * explicit choice, so single and batch assignment must surface the
+ * reasoning menu.
  */
 function createAnthropicReasoningModel(id: string): Model {
 	return {
