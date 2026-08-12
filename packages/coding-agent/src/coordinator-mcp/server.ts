@@ -276,6 +276,7 @@ interface CoordinatorSessionState {
 	current_turn_id: string | null;
 	last_turn_id: string | null;
 	updated_at: string;
+	ended_at?: string;
 	source: "coordinator" | "agent_session_event";
 	live: boolean | null;
 	reason: string | null;
@@ -1260,6 +1261,9 @@ function publicCoordinatorSessionState(state: CoordinatorSessionState | null): R
 		updated_at: state.updated_at,
 		...(typeof state.live === "boolean" ? { live: state.live } : {}),
 		...(activity ? { activity } : {}),
+		...(typeof state.ended_at === "string" && Number.isFinite(Date.parse(state.ended_at))
+			? { ended_at: state.ended_at }
+			: {}),
 	};
 }
 
@@ -1871,11 +1875,17 @@ async function writeSessionStateUnlocked(
 	const activity = terminal
 		? terminallySettledRuntimeToolActivity(persisted?.activity, updatedAt)
 		: classifyRuntimeToolActivity(persisted?.activity);
+	const isTerminalState = state === "completed" || state === "errored" || state === "stale";
+	const endedAt = isTerminalState
+		? updatedAt
+		: typeof persisted?.ended_at === "string" && Number.isFinite(Date.parse(persisted.ended_at))
+			? persisted.ended_at
+			: undefined;
 	const payload: CoordinatorSessionState = {
 		schema_version: 1,
 		session_id: sessionId,
 		state,
-		ready_for_input: state === "ready_for_input" || state === "completed",
+		ready_for_input: state === "ready_for_input",
 		current_turn_id: hasCurrentTurn
 			? (options.currentTurnId ?? null)
 			: state === "running"
@@ -1886,6 +1896,7 @@ async function writeSessionStateUnlocked(
 		source: options.source ?? "coordinator",
 		live: hasLive ? (options.live ?? null) : (previous?.live ?? null),
 		reason: options.reason ?? null,
+		...(endedAt !== undefined ? { ended_at: endedAt } : {}),
 		...(activity.kind === "absent"
 			? {}
 			: { activity: activity.kind === "valid" ? activity.activity : persisted?.activity }),

@@ -566,7 +566,7 @@ describe("coordinator runtime state sidecar", () => {
 			last_turn_id: "turn-last",
 			source: "agent_session_event",
 			event: "agent_end",
-			ready_for_input: true,
+			ready_for_input: false,
 			live: false,
 			final_response: { source: "agent_end", text: "Finished from cached chain" },
 		});
@@ -2153,6 +2153,112 @@ describe("coordinator runtime state sidecar", () => {
 				sessionId: runtimeSessionId,
 				cwd: root,
 				sessionFile: path.join(root, "session.jsonl"),
+			}),
+		).rejects.toThrow();
+	});
+
+	it("issue-4351: completed session reports ready_for_input false with authoritative ended_at", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "issue-4351-completed.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "issue-4351-completed";
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: "issue-4351-completed",
+				state: "running",
+				ready_for_input: false,
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				current_turn_id: "turn-final",
+				last_turn_id: "turn-prev",
+				live: true,
+				updated_at: "2026-08-12T00:00:00.000Z",
+				reason: null,
+			})}\n`,
+		);
+
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("done"), {
+			sessionId: "issue-4351-completed",
+			cwd: root,
+			sessionFile: null,
+		});
+
+		const payload = await readPayload(stateFile);
+		expect(payload.state).toBe("completed");
+		expect(payload.ready_for_input).toBe(false);
+		expect(payload.live).toBe(false);
+		expect(typeof payload.ended_at).toBe("string");
+		expect(Number.isFinite(Date.parse(payload.ended_at as string))).toBe(true);
+	});
+
+	it("issue-4351: errored session reports ready_for_input false", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "issue-4351-errored.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "issue-4351-errored";
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: "issue-4351-errored",
+				state: "running",
+				ready_for_input: false,
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				current_turn_id: null,
+				last_turn_id: null,
+				live: true,
+				updated_at: "2026-08-12T00:00:00.000Z",
+				reason: null,
+			})}\n`,
+		);
+
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("boom", "error"), {
+			sessionId: "issue-4351-errored",
+			cwd: root,
+			sessionFile: null,
+		});
+
+		const payload = await readPayload(stateFile);
+		expect(payload.state).toBe("errored");
+		expect(payload.ready_for_input).toBe(false);
+		expect(payload.live).toBe(false);
+	});
+
+	it("issue-4351: validation rejects a stale completed+ready_for_input:true marker", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "issue-4351-stale.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "issue-4351-stale";
+		// A pre-fix marker with the contradictory completed + ready_for_input: true.
+		await Bun.write(
+			stateFile,
+			`${JSON.stringify({
+				schema_version: 1,
+				session_id: "issue-4351-stale",
+				state: "completed",
+				ready_for_input: true,
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				current_turn_id: null,
+				last_turn_id: null,
+				live: false,
+				updated_at: "2026-08-11T00:00:00.000Z",
+				reason: null,
+			})}\n`,
+		);
+
+		// The stale marker must be rejected; the runtime must not silently preserve it.
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent(assistantEnd("re-assert completion"), {
+				sessionId: "issue-4351-stale",
+				cwd: root,
+				sessionFile: null,
 			}),
 		).rejects.toThrow();
 	});

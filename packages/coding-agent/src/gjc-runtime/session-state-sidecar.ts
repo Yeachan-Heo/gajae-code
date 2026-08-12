@@ -909,7 +909,7 @@ function validPreviousRuntimeStatePayload(value: unknown): value is Record<strin
 	)
 		return false;
 	if (payload.ready_for_input !== undefined) {
-		const expectedReady = payload.state === "ready_for_input" || payload.state === "completed";
+		const expectedReady = payload.state === "ready_for_input";
 		if (payload.ready_for_input !== expectedReady) return false;
 	}
 	if (payload.live !== undefined && payload.live !== null && payload.live !== (payload.state === "running"))
@@ -1055,7 +1055,7 @@ function basePayload(input: {
 		schema_version: 1,
 		session_id: identity.sessionId,
 		state: input.state,
-		ready_for_input: input.state === "completed" || input.state === "ready_for_input",
+		ready_for_input: input.state === "ready_for_input",
 		updated_at: input.now,
 		current_turn_id: typeof input.previous.current_turn_id === "string" ? input.previous.current_turn_id : null,
 		last_turn_id: typeof input.previous.last_turn_id === "string" ? input.previous.last_turn_id : null,
