@@ -1,0 +1,11 @@
+# Package-cwd `bun test` (the CI shard invocation: `bun test --shard=N/8` with
+# cwd packages/coding-agent) does not read the repository-root bunfig.toml, so
+# without this file the shared test preload — macOS TMPDIR canonicalization
+# that keeps `mkdtemp(os.tmpdir())` paths symlink-free for the native
+# owner-only primitive — silently never runs in package-cwd shards.
+#
+# The preload no longer pins GJC_SESSION_CONTEXT_BUDGET_BYTES; the two overflow
+# test files pin the budget in-process via SessionManagerTestHooks instead, so
+# this preload does not leak any budget mutation into spawned subprocesses.
+[test]
+preload = ["../../scripts/test-preload.ts"]
