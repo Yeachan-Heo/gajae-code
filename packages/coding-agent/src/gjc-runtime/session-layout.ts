@@ -153,9 +153,6 @@ export function auditPath(cwd: string, gjcSessionId: string): string {
 export function transactionJournalPath(cwd: string, gjcSessionId: string, mutationId: string): string {
 	return path.join(sessionStateDir(cwd, gjcSessionId), "transactions", `${encodeSessionSegment(mutationId)}.json`);
 }
-export function teamStateRoot(cwd: string, gjcSessionId: string): string {
-	return path.join(sessionStateDir(cwd, gjcSessionId), "team");
-}
 export function workflowGatePath(cwd: string, gjcSessionId: string, gateId: string): string {
 	return path.join(sessionStateDir(cwd, gjcSessionId), "workflow-gates", `${encodeSessionSegment(gateId)}.json`);
 }

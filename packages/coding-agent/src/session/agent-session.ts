@@ -309,8 +309,6 @@ import {
 	registerCoordinatorRuntimeStateFinalizer,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
-import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
-import { GjcTeamWorkerHeartbeatReporter } from "../gjc-runtime/team-worker-heartbeat";
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -656,12 +654,6 @@ export interface AgentSessionConfig {
 	workerIntegrationRequest?: (signal: AbortSignal) => Promise<void>;
 	/** Bound terminal worker-integration settlement for embedded hosts and deterministic lifecycle tests. */
 	workerIntegrationTimeoutMs?: number;
-	/**
-	 * Override the runtime-owned `gjc team` worker heartbeat reporter. Defaults to a
-	 * reporter derived from the team worker environment, or none outside a worker pane.
-	 */
-	teamWorkerHeartbeatReporter?: GjcTeamWorkerHeartbeatReporter;
-
 	/** Loaded skills (already discovered by SDK) */
 	skills?: Skill[];
 	/** Skill loading warnings (already captured by SDK) */
@@ -2273,12 +2265,8 @@ export class AgentSession {
 	}
 
 	#turnIndex = 0;
-	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler;
+	#workerIntegrationScheduler: WorkerIntegrationRequestScheduler | undefined;
 	#workerIntegrationRequestedForTurn = false;
-	/** Runtime-owned team worker heartbeat; `undefined` outside a `gjc team` worker pane. */
-	#teamWorkerHeartbeat: GjcTeamWorkerHeartbeatReporter | undefined;
-	#teamWorkerTurnsInFlight = 0;
-	#unregisterTeamWorkerAsyncJobChange: (() => void) | undefined;
 	// First-party internal before-agent-start contributors (not user hooks).
 	#beforeAgentStartContributors: BeforeAgentStartContributor[] = [];
 
@@ -2719,8 +2707,7 @@ export class AgentSession {
 		this.#promptInFlightCount++;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
-			// Runtime-owned worker liveness follows Agent turns and background jobs
-			// in #refreshTeamWorkerHeartbeat(), including internally dispatched turns.
+			this.#acquirePowerAssertion();
 		}
 	}
 	/**
@@ -2892,7 +2879,6 @@ export class AgentSession {
 		if (this.#promptInFlightCount !== 0) return undefined;
 
 		this.#releasePowerAssertion();
-		this.#refreshTeamWorkerHeartbeat();
 		let flushError: unknown;
 		try {
 			// The turn is over, so nothing can split a tool_use/tool_result pair any
@@ -2943,17 +2929,6 @@ export class AgentSession {
 		}
 		if (errors.length === 1) throw errors[0];
 		if (errors.length > 1) throw new AggregateError(errors, "Multiple deferred prompt messages failed to flush");
-	}
-
-	#refreshTeamWorkerHeartbeat(): void {
-		const hasOwnedBackgroundJob =
-			this.#agentId !== undefined &&
-			(this.#ownedAsyncJobManager?.getRunningJobs({ ownerId: this.#agentId }).length ?? 0) > 0;
-		if (this.#teamWorkerTurnsInFlight > 0 || hasOwnedBackgroundJob) {
-			this.#teamWorkerHeartbeat?.start();
-		} else {
-			this.#teamWorkerHeartbeat?.stop();
-		}
 	}
 
 	#flushPendingAgentEnd(): void {
@@ -3036,25 +3011,11 @@ export class AgentSession {
 			}
 		});
 		this.memoryBackend = config.memoryBackend ?? createMemoryBackendService(this.settings);
-		this.#workerIntegrationScheduler = new WorkerIntegrationRequestScheduler(
-			config.workerIntegrationRequest ??
-				(async signal => {
-					await requestGjcWorkerIntegrationAttempt(this.sessionManager.getCwd(), process.env, { signal }).catch(
-						error => {
-							logger.warn("GJC team worker integration request failed", { error: String(error) });
-						},
-					);
-				}),
-			config.workerIntegrationTimeoutMs,
-		);
-		// One publisher per worker process: subagent sessions share this process and its
-		// team env, so letting each create a reporter would run N timers writing the same
-		// record. The top-level session owns the pane's liveness.
-		this.#teamWorkerHeartbeat =
-			config.teamWorkerHeartbeatReporter ??
-			((config.taskDepth ?? 0) === 0
-				? GjcTeamWorkerHeartbeatReporter.forProcess(() => this.sessionManager.getCwd())
-				: undefined);
+		// Worker integration is an injected seam only: hosts that need turn-end
+		// integration supply the request, and no scheduler exists otherwise.
+		this.#workerIntegrationScheduler = config.workerIntegrationRequest
+			? new WorkerIntegrationRequestScheduler(config.workerIntegrationRequest, config.workerIntegrationTimeoutMs)
+			: undefined;
 		this.notificationSessionController = config.notificationSessionController;
 		this.taskDepth = config.taskDepth ?? 0;
 		this.#workflowGatePublication = config.workflowGatePublication ?? "endpoint";
@@ -3298,9 +3259,6 @@ export class AgentSession {
 		this.#ttsrManager = config.ttsrManager;
 		this.#obfuscator = config.obfuscator;
 		this.#agentId = config.agentId;
-		this.#unregisterTeamWorkerAsyncJobChange = this.#ownedAsyncJobManager?.onChange(() => {
-			this.#refreshTeamWorkerHeartbeat();
-		});
 		this.#agentRegistry = config.agentRegistry;
 		this.#providerSessionId = config.providerSessionId;
 		this.#credentialSessionId = config.credentialSessionId;
@@ -4405,18 +4363,6 @@ export class AgentSession {
 			this.#closedExtensionTurnGeneration = undefined;
 		} else if (event.type === "turn_end") {
 			this.#closedExtensionTurnGeneration = this.#extensionTurnGeneration;
-		}
-		if (event.type === "turn_start") {
-			this.#teamWorkerTurnsInFlight++;
-			this.#refreshTeamWorkerHeartbeat();
-		} else if (event.type === "turn_end") {
-			this.#teamWorkerTurnsInFlight = Math.max(0, this.#teamWorkerTurnsInFlight - 1);
-			this.#refreshTeamWorkerHeartbeat();
-		} else if (event.type === "agent_end") {
-			// Failed Agent runs can emit agent_end without turn_end. Reset rather than
-			// leaking a positive count that would report an idle/failed worker forever.
-			this.#teamWorkerTurnsInFlight = 0;
-			this.#refreshTeamWorkerHeartbeat();
 		}
 		if (event.type === "message_update") {
 			// Fast path: message_update maps to no sidecar state, so we must not
@@ -6500,11 +6446,11 @@ export class AgentSession {
 	}
 
 	#requestWorkerIntegrationAttempt(): void {
-		this.#workerIntegrationScheduler.enqueue();
+		this.#workerIntegrationScheduler?.enqueue();
 	}
 
 	async #flushWorkerIntegrationAttempt(): Promise<void> {
-		await this.#workerIntegrationScheduler.flush();
+		await this.#workerIntegrationScheduler?.flush();
 	}
 
 	async #flushWorkerIntegrationForAgentEnd(): Promise<void> {
@@ -7013,9 +6959,6 @@ export class AgentSession {
 		await disposeKernelSessionsByOwner(this.#evalKernelOwnerId);
 		await disposeVmContextsByOwner(this.#evalKernelOwnerId);
 		this.#releasePowerAssertion();
-		this.#unregisterTeamWorkerAsyncJobChange?.();
-		this.#unregisterTeamWorkerAsyncJobChange = undefined;
-		this.#teamWorkerHeartbeat?.dispose();
 		// Disconnect the agent event listener BEFORE closing session resources so a late
 		// provider/tool message_end cannot append to the closing SessionManager.
 		this.#disconnectFromAgent();
@@ -7065,9 +7008,6 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
-		this.#unregisterTeamWorkerAsyncJobChange?.();
-		this.#unregisterTeamWorkerAsyncJobChange = undefined;
-		this.#teamWorkerHeartbeat?.dispose();
 		const work = Promise.allSettled([
 			// kill:true so a forced exit also reaps spawned-app Chrome we own (headless
 			// always closes; connected/attached browsers only disconnect — never killed).

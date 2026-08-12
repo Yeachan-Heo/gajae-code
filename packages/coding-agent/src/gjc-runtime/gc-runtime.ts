@@ -37,7 +37,6 @@ import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSession
 
 export type GcStore =
 	| "harness_leases"
-	| "team_workers"
 	| "file_locks"
 	| "tmux_sessions"
 	| "registry_entries"
@@ -45,7 +44,6 @@ export type GcStore =
 
 export const GC_STORES: readonly GcStore[] = [
 	"harness_leases",
-	"team_workers",
 	"file_locks",
 	"tmux_sessions",
 	"registry_entries",
@@ -547,19 +545,16 @@ export async function defaultGcAdapters(): Promise<GcStoreAdapter[]> {
 	const [
 		{ harnessLeasesGcAdapter, registryEntriesGcAdapter },
 		{ fileLocksGcAdapter },
-		{ teamWorkersGcAdapter },
 		{ tmuxSessionsGcAdapter },
 		{ localRootsGcAdapter },
 	] = await Promise.all([
 		import("../harness-control-plane/gc-adapter"),
 		import("../config/file-lock-gc"),
-		import("./team-gc"),
 		import("./tmux-gc"),
 		import("../internal-urls/local-root-gc"),
 	]);
 	return [
 		harnessLeasesGcAdapter,
-		teamWorkersGcAdapter,
 		fileLocksGcAdapter,
 		tmuxSessionsGcAdapter,
 		registryEntriesGcAdapter,

@@ -36,7 +36,7 @@ source: "forked from upstream deep-interview skill and rebranded for GJC"
 
 **DIPP-7 — Prompt budget.**
 
-> Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts. If the user's initial context is oversized or likely to crowd out downstream prompts, create a concise prompt-safe summary first — one that preserves user intent, decisions, constraints, unknowns, cited files/symbols, and any explicit non-goals — and wait until that summary exists before ambiguity scoring, weakest-dimension selection, question generation, brownfield exploration prompts, spec crystallization, or any downstream execution handoff (bridge to `ralplan`, `ultragoal`, or `team`).
+> Keep prompt payloads budgeted: summarize or trim oversized initial context/history before composing question, scoring, spec, or handoff prompts. If the user's initial context is oversized or likely to crowd out downstream prompts, create a concise prompt-safe summary first — one that preserves user intent, decisions, constraints, unknowns, cited files/symbols, and any explicit non-goals — and wait until that summary exists before ambiguity scoring, weakest-dimension selection, question generation, brownfield exploration prompts, spec crystallization, or any downstream execution handoff (bridge to `ralplan` or `ultragoal`).
 
 **DIPP-8 — Artifact writes.**
 
@@ -137,7 +137,7 @@ If the user request appended after this skill as the final `User:` line is alrea
    - Do not initialize deep-interview state.
    - Do not run Round 0.
    - Do not write a pending-approval spec.
-   - Do not hand off to `ralplan`, `ultragoal`, `team`, or a role agent.
+   - Do not hand off to `ralplan`, `ultragoal`, or a role agent.
 2. **Return the request to direct implementation**:
    - Say briefly that deep-interview is unnecessary because the request is already clear and small.
    - State the direct implementation path the normal coding agent should take.
@@ -795,19 +795,19 @@ After the spec is written, mark it `pending approval` and present execution opti
    - Description: "Goal-tracked autonomous execution — drives the spec to completion with verification. Skip ralplan refinement only when the spec is concrete, low-risk, and trivially small."
    - Action: Invoke `/skill:ultragoal` with the spec file path as context only after the user explicitly selects this execution option. The spec replaces ultragoal planning input. Recommend this only when the spec needs no further planning; otherwise route through ralplan refinement first.
 
-3. **Execute with team (only when implementation-ready, simple, AND tmux parallelization is required)**
-   - Description: "N coordinated parallel agents in tmux — only when the spec is already implementation-ready and genuinely needs tmux-based interactive worker parallelization."
-   - Action: Invoke `/skill:team` with the spec file path as the shared plan only after the user explicitly selects this option. Reserve this for the narrow case where the spec is simple/ready and tmux interactive parallel workers are actually needed; otherwise prefer ralplan refinement, then ultragoal.
+3. **Continue research with autoresearch (research continuation, not execution)**
+   - Description: "Feed the crystallized spec into an autoresearch mission to deepen research grounding before any implementation planning. This is not an execution path and implements nothing."
+   - Action: Invoke `/skill:autoresearch` with the spec file path as context only after the user explicitly selects this option. The crystallized spec seeds the research mission, which then feeds the productification interview before any ralplan/ultragoal planning, per the chain deep-interview → autoresearch → productification interview → ralplan/ultragoal. Do not treat this as an execution handoff: no implementation happens here.
 
 4. **Refine further**
    - Description: "Continue interviewing to improve clarity (current: {score}%)"
    - Action: Return to Phase 2 interview loop.
 
-**IMPORTANT:** On explicit execution selection, **MUST** use the chosen bundled GJC workflow skill entrypoint (`/skill:ralplan`, `/skill:ultragoal`, or `/skill:team`) inside the agent session. `gjc ralplan` is a native CLI that accepts the documented skill flags and seeds local `.gjc/_session-{sessionid}/state` receipts; agent sessions should still drive the consensus loop through `/skill:ralplan`. Implementation handoff defaults to `/skill:ultragoal`; `/skill:team` is reserved for when tmux-based interactive worker parallelization is genuinely required, and `gjc team` is a native tmux runtime command used only when the Team workflow explicitly requires the CLI runtime. Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
+**IMPORTANT:** On explicit execution selection, **MUST** use the chosen bundled GJC workflow skill entrypoint (`/skill:ralplan` or `/skill:ultragoal`) inside the agent session. `gjc ralplan` is a native CLI that accepts the documented skill flags and seeds local `.gjc/_session-{sessionid}/state` receipts; agent sessions should still drive the consensus loop through `/skill:ralplan`. Implementation handoff defaults to `/skill:ultragoal`. The autoresearch option is a research continuation only and never an execution path. Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
 
 ### Phase 5b: Handoff before chain
 
-Before invoking `/skill:ralplan`, `/skill:team`, or `/skill:ultragoal`, the final spec must already be persisted through the native deep-interview write command (`gjc deep-interview --write --stage final …`). That command itself moves the workflow to the `handoff` phase, so no separate state write is needed for the skill tool's chain guard. Verify readiness with:
+Before invoking `/skill:ralplan` or `/skill:ultragoal`, the final spec must already be persisted through the native deep-interview write command (`gjc deep-interview --write --stage final …`). That command itself moves the workflow to the `handoff` phase, so no separate state write is needed for the skill tool's chain guard. Verify readiness with:
 
 ```
 gjc deep-interview read --json
@@ -857,7 +857,7 @@ Skipping any stage is possible but reduces quality assurance:
 - Round 0 topology confirmation happens before ambiguity scoring; Phase 2 scoring must honor locked topology and rotate targeting across active components when more than one is present
 - Use `gjc deep-interview write` / `gjc deep-interview read` for interview state persistence; the initial and subsequent deep-interview state payloads must include `threshold_source` alongside `threshold`; do not edit `.gjc/_session-{sessionid}/state` directly without force override. For incremental scoring/maintenance updates, prefer the staged-transition verbs (`stage --for <transition> --input '<json>'`, `check`, `apply`, `discard`) — stage only the current delta (one round record by `round_key`, changed facts, or changed fields), never the whole transcript; `write` is incremental by default and replaces only with an explicit `--reset`; the session is inherited from `GJC_SESSION_ID`, revision CAS is runtime-owned, and the effective `current_ambiguity` is derived and clamped by the CLI at `apply`/`write` — read it from the command output rather than setting it yourself.
 - Use the GJC workflow CLI to save the final spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly; do not use `write`, `edit`, or `ast_edit` directly on `.gjc/` paths without force override.
-- Use public GJC workflow entrypoints to bridge to ralplan, ultragoal, or team only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal; reserve team for when tmux-based interactive worker parallelization is genuinely required.
+- Use public GJC workflow entrypoints to bridge to ralplan or ultragoal only after explicit execution approval — never implement directly. Implementation handoff defaults to ultragoal.
 - The lateral-review panel spawns read-only persona subagents (Task tool) in parallel with independent context; it is an assist layer, never an executor and never the completion authority
 - Apply the Refine gate (Step 2b″), the Dialectic Rhythm Guard (Step 2a), and the Closure + Restate gates (Phase 4) through the `ask` tool, preserving `language.instruction` for each; if any of these gates has options, the assistant must call `ask` and must not print `Question:`/`Options:` blocks as assistant prose
 - Use internal fragment auto-modes only at their documented hooks: `auto-answer-uncertain.md` as Step 2b′ after `ask` resolves and before scoring, and `lateral-review-panel.md` for the Phase 3 panel personas at ambiguity-milestone transitions and before synthesizing agent-supplied answers.
@@ -988,21 +988,9 @@ gjc:
 
 If interrupted, run `/skill:deep-interview` again. The skill resumes from GJC workflow state via `gjc deep-interview read`; do not read or edit `.gjc/_session-{sessionid}/state` files directly unless an explicit force override is active.
 
-## Integration with staged team routing
-
-When team receives a vague input (no file paths, function names, or concrete anchors), it can redirect to deep-interview:
-
-```
-User: "team build me a thing"
-Team routing: "Your request is quite open-ended. Would you like to run a deep interview first to clarify requirements?"
-  [Yes, interview first] [No, expand directly]
-```
-
-If the user chooses interview, team routing invokes `/skill:deep-interview`. When the interview completes and the user selects an execution path (ultragoal by default, or team when tmux-based interactive parallelization is required), the spec becomes Phase 0 output and the chosen workflow proceeds from the approved spec.
-
 ## Approval-Gated Pipeline: deep-interview → ralplan → pending approval
 
-See the Phase 5b "Approval-Gated Refinement Path" diagram for the full flow. In short: interview → spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` → user selects "Refine with ralplan consensus" → `/skill:ralplan` (Planner/Architect/Critic consensus, plan written to `.gjc/_session-{sessionid}/plans/`) → stop at `pending approval`. Execution is always a separate approval-gated step; deep-interview and ralplan never auto-invoke ultragoal or team just because a spec or plan exists.
+See the Phase 5b "Approval-Gated Refinement Path" diagram for the full flow. In short: interview → spec at `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` → user selects "Refine with ralplan consensus" → `/skill:ralplan` (Planner/Architect/Critic consensus, plan written to `.gjc/_session-{sessionid}/plans/`) → stop at `pending approval`. Execution is always a separate approval-gated step; deep-interview and ralplan never auto-invoke ultragoal just because a spec or plan exists.
 
 ## Integration with Ralplan Gate
 

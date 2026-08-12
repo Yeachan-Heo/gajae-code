@@ -41,7 +41,6 @@ export const commands: CommandEntry[] = [
 	{ name: "session", load: () => import("./commands/session").then(m => m.default) },
 	{ name: "harness", load: () => import("./commands/harness").then(m => m.default) },
 	{ name: "coordinator", load: () => import("./commands/coordinator").then(m => m.default) },
-	{ name: "team", load: () => import("./commands/team").then(m => m.default) },
 	{ name: "ultragoal", load: () => import("./commands/ultragoal").then(m => m.default) },
 	{ name: "gc", load: () => import("./commands/gc").then(m => m.default) },
 	{ name: "crash", load: () => import("./commands/crash").then(m => m.default) },
@@ -348,25 +347,7 @@ export function normalizeResumeAlias(argv: readonly string[]): string[] {
 
 function routeLegacyRootArgv(argv: readonly string[]): string[] | undefined {
 	if (argv[0] === "coordinator-mcp") return ["mcp-serve", "coordinator", ...argv.slice(1)];
-	if (argv[0] !== "--team") return undefined;
-	const sizeValues: string[] = [];
-	const remaining: string[] = [];
-	for (let index = 1; index < argv.length; index++) {
-		const arg = argv[index] ?? "";
-		if (arg === "--team-size") {
-			sizeValues.push(argv[index + 1] ?? "");
-			index++;
-		} else if (arg.startsWith("--team-size=")) {
-			sizeValues.push(arg.slice("--team-size=".length));
-		} else {
-			remaining.push(arg);
-		}
-	}
-	const size = sizeValues[0];
-	if (sizeValues.length !== 1 || !size || !/^[1-9]\d*$/.test(size)) {
-		return ["team", "0", "invalid legacy --team-size"];
-	}
-	return ["team", size, ...remaining];
+	return undefined;
 }
 
 /**

@@ -11,7 +11,6 @@ export function getExtraHelpText(): string {
   ${APP_NAME} auth-gateway        - Run an auth-gateway forward proxy
   ${APP_NAME} harness              - Run harness control-plane commands
   ${APP_NAME} coordinator          - Manage coordinator/runtime coordination helpers
-  ${APP_NAME} team                 - Run tmux-backed coordinated execution
   ${APP_NAME} ultragoal            - Run durable goal execution workflow
   ${APP_NAME} ralplan              - Run consensus planning workflow
   ${APP_NAME} deep-interview       - Run requirements interview workflow

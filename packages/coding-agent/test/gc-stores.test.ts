@@ -5,7 +5,6 @@ import * as path from "node:path";
 import { collectFileLocksForGc, fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 import { collectGcReport, computeExitCode } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
-import { teamWorkersGcAdapter } from "@gajae-code/coding-agent/gjc-runtime/team-gc";
 import {
 	harnessLeasesGcAdapter,
 	registryEntriesGcAdapter,
@@ -217,75 +216,5 @@ describe("fileLocksGcAdapter", () => {
 		expect(report.errors).toEqual([]);
 		expect(report.warnings.length).toBeGreaterThan(0);
 		expect(computeExitCode(report)).toBe(0);
-	});
-});
-
-describe("teamWorkersGcAdapter (PID dominance)", () => {
-	test("dead-pid worker removable; live-pid worker with failed lifecycle is KEPT", async () => {
-		const base = await makeTemp();
-		const harnessRoot = path.join(base, "state", "harness");
-		const teamRoot = path.join(base, "state", "team");
-		const registryDir = path.join(base, "reg");
-		await writeJson(path.join(registryDir, "h-x.json"), {
-			sessionId: "h-x",
-			roots: [{ root: harnessRoot, updatedAt: new Date().toISOString() }],
-		});
-		const deadWorker = path.join(teamRoot, "alpha", "workers", "w-dead");
-		const liveFailedWorker = path.join(teamRoot, "alpha", "workers", "w-live-failed");
-		await writeJson(path.join(deadWorker, "heartbeat.json"), {
-			pid: DEAD_PID,
-			last_turn_at: new Date().toISOString(),
-			turn_count: 0,
-		});
-		await writeJson(path.join(deadWorker, "lifecycle.json"), {
-			pid: DEAD_PID,
-			lifecycle_state: "running",
-			stop_reason: null,
-		});
-		await writeJson(path.join(liveFailedWorker, "heartbeat.json"), {
-			pid: ALIVE_PID,
-			last_turn_at: new Date().toISOString(),
-			turn_count: 0,
-		});
-		await writeJson(path.join(liveFailedWorker, "lifecycle.json"), {
-			pid: ALIVE_PID,
-			lifecycle_state: "failed",
-			stop_reason: "crashed",
-		});
-
-		const { records } = await teamWorkersGcAdapter.collect(ctxFor(base, registryDir));
-		const dead = records.find(r => r.id === "alpha/w-dead");
-		const liveFailed = records.find(r => r.id === "alpha/w-live-failed");
-		expect(dead?.removable).toBe(true);
-		expect(dead?.status).toBe("dead");
-		// PID liveness dominates the failed lifecycle => kept.
-		expect(liveFailed?.removable).toBe(false);
-	});
-
-	test("dead heartbeat pid but LIVE lifecycle pid is KEPT (all-PID dominance)", async () => {
-		const base = await makeTemp();
-		const harnessRoot = path.join(base, "state", "harness");
-		const teamRoot = path.join(base, "state", "team");
-		const registryDir = path.join(base, "reg");
-		await writeJson(path.join(registryDir, "h-mixed.json"), {
-			sessionId: "h-mixed",
-			roots: [{ root: harnessRoot, updatedAt: new Date().toISOString() }],
-		});
-		const mixedWorker = path.join(teamRoot, "alpha", "workers", "w-mixed");
-		// heartbeat pid is dead, but the lifecycle pid is a live process => keep.
-		await writeJson(path.join(mixedWorker, "heartbeat.json"), {
-			pid: DEAD_PID,
-			last_turn_at: new Date().toISOString(),
-			turn_count: 0,
-		});
-		await writeJson(path.join(mixedWorker, "lifecycle.json"), {
-			pid: ALIVE_PID,
-			lifecycle_state: "running",
-			stop_reason: null,
-		});
-
-		const { records } = await teamWorkersGcAdapter.collect(ctxFor(base, registryDir));
-		const mixed = records.find(r => r.id === "alpha/w-mixed");
-		expect(mixed?.removable).toBe(false);
 	});
 });

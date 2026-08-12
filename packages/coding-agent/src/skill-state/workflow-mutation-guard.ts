@@ -1053,7 +1053,7 @@ function blockedWorkflowStateSkill(cwd: string, rawPath: string): CanonicalGjcWo
 	if (generatedRoot === "specs" || generatedRoot === "plans") return null;
 	if (generatedRoot !== "state") return null;
 	const fileName = segments.at(-1) ?? "";
-	for (const skillName of ["deep-interview", "ralplan", "ultragoal", "team"] as const) {
+	for (const skillName of ["deep-interview", "ralplan", "ultragoal"] as const) {
 		if (fileName === workflowModeStateFileName(skillName)) return skillName;
 	}
 	if (fileName === "skill-active-state.json") return "deep-interview";

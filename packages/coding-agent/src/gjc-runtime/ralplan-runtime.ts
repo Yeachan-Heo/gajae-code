@@ -40,7 +40,6 @@ import {
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
 } from "./state-writer";
-import { probeGjcTeamAvailability } from "./team-runtime";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { getSkillManifest } from "./workflow-manifest";
 import {
@@ -98,7 +97,7 @@ export const PLANNING_STUCK_MARKER = "PLANNING-STUCK";
 export const RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE = 1;
 /** Inclusive upper bound for `gjc.ralplan.maxReviewPassesPerLane` settings overrides. */
 export const RALPLAN_MAX_REVIEW_PASSES_PER_LANE_LIMIT = 10;
-export type RalplanAutoHandoffTarget = "off" | "ultragoal" | "team";
+export type RalplanAutoHandoffTarget = "off" | "ultragoal";
 
 export interface RalplanAutoHandoffResolution {
 	configuredTarget: RalplanAutoHandoffTarget;
@@ -107,7 +106,7 @@ export interface RalplanAutoHandoffResolution {
 	source: string;
 }
 
-const RALPLAN_AUTO_HANDOFF_TARGETS = new Set<RalplanAutoHandoffTarget>(["off", "ultragoal", "team"]);
+const RALPLAN_AUTO_HANDOFF_TARGETS = new Set<RalplanAutoHandoffTarget>(["off", "ultragoal"]);
 
 const RALPLAN_ITERATION_OPENER_STAGES = new Set<RalplanStage>(["planner", "revision"]);
 
@@ -464,7 +463,6 @@ function parseRalplanAutoHandoffTarget(value: unknown): RalplanAutoHandoffTarget
 
 type RalplanAutoHandoffOptions = {
 	planningStuck?: boolean;
-	teamAvailabilityProbe?: () => { available: true } | { available: false; reason: string };
 	/** The session's effective agent directory (see resolveWorkflowSetting). */
 	agentDir?: string;
 };
@@ -472,7 +470,7 @@ type RalplanAutoHandoffOptions = {
 function parsePresentRalplanAutoHandoff(value: unknown): WorkflowSettingParseResult<RalplanAutoHandoffTarget> {
 	const target = parseRalplanAutoHandoffTarget(value);
 	return target === undefined
-		? { kind: "invalid", reason: "expected gjc.ralplan.autoHandoff to be one of off, ultragoal, team" }
+		? { kind: "invalid", reason: "expected gjc.ralplan.autoHandoff to be one of off, ultragoal" }
 		: { kind: "valid", value: target };
 }
 
@@ -498,18 +496,7 @@ function resolveRalplanAutoHandoffTarget(
 	if (options.planningStuck) {
 		return { configuredTarget, effectiveTarget: "off", degradationReason: "planning_stuck", source };
 	}
-	if (configuredTarget !== "team")
-		return { configuredTarget, effectiveTarget: configuredTarget, degradationReason: null, source };
-
-	const availability = (options.teamAvailabilityProbe ?? probeGjcTeamAvailability)();
-	return availability.available
-		? { configuredTarget, effectiveTarget: "team", degradationReason: null, source }
-		: {
-				configuredTarget,
-				effectiveTarget: "off",
-				degradationReason: `team_unavailable:${availability.reason}`,
-				source,
-			};
+	return { configuredTarget, effectiveTarget: configuredTarget, degradationReason: null, source };
 }
 
 function parseMaxReviewPassesPerLaneValue(value: unknown): number | null {

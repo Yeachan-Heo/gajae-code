@@ -49,7 +49,7 @@ export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] =
 		kind: "skill",
 		name: "ralplan",
 		relativePath: "skills/ralplan/SKILL.md",
-		description: "Consensus planning entrypoint that auto-gates vague team/ultragoal requests before execution",
+		description: "Consensus planning entrypoint that auto-gates vague ultragoal requests before execution",
 		loadContent: ralplan,
 	},
 	{

@@ -545,9 +545,8 @@ Project executor override body.
 		).text();
 		expect(ralplan).toContain("counts as opting into execution for that skill");
 		expect(ralplan).toContain("gjc.ralplan.autoHandoff");
-		expect(ralplan).toContain("`off` (default), `ultragoal`, or `team`");
-		expect(ralplan).toContain("A `team` target degrades to `off`");
-		expect(ralplan).toContain("`team_unavailable:<reason>`");
+		expect(ralplan).toContain("`off` (default) or `ultragoal`");
+		expect(ralplan).not.toContain("team_unavailable");
 		expect(ralplan).toContain("Invalid settings reject the final write before any final artifact is persisted");
 		expect(ralplan).toContain("ledger-backed runtime-owned `auto_handoff.effectiveTarget`");
 		expect(ralplan).toContain("Reconciliation must first reach the successful final receipt");
@@ -555,29 +554,21 @@ Project executor override body.
 		expect(ralplan).toContain("do not choose an approval or handoff path before its final receipt exists");
 		expect(ralplan).toContain("planning_stuck");
 		expect(ralplan).toContain("never dispatch");
-		expect(ralplan).toContain("ordinary `off`/degraded approval flow");
+		expect(ralplan).toContain("ordinary `off` approval flow");
 		expect(ralplan).toContain("do not issue an approval `ask`");
 		expect(ralplan).toContain(
 			"mark ralplan ready for handoff so the skill tool's chain guard permits the transition",
 		);
 	});
 
-	it("documents leader-owned Ultragoal checkpoints for Team bridge workers", async () => {
-		const team = await Bun.file(
-			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "team", "SKILL.md"),
-		).text();
+	it("documents leader-owned Ultragoal checkpoints", async () => {
 		const ultragoal = await Bun.file(
 			path.join(repoRoot, "packages", "coding-agent", "src", "defaults", "gjc", "skills", "ultragoal", "SKILL.md"),
 		).text();
 
-		expect(team).toContain("current-session active GJC goal snapshot");
-		expect(ultragoal).toContain("current-session GJC goal snapshot");
-		for (const content of [team, ultragoal]) {
-			expect(content).toContain("Workers must not run `gjc ultragoal checkpoint`");
-			expect(content).toContain("checkpoint authority stays with the leader");
-			expect(content).toContain("Ultragoal does not auto-launch Team");
-			expect(content).toContain("performs no hidden goal mutation");
-		}
+		expect(ultragoal).toContain("Workers must not run `gjc ultragoal checkpoint`");
+		expect(ultragoal).toContain("checkpoint authority stays with the leader");
+		expect(ultragoal).toContain("performs no hidden goal mutation");
 	});
 
 	it("keeps bundled deep-interview skill on GJC-native workflow vocabulary", () => {
@@ -591,7 +582,7 @@ Project executor override body.
 			expect(content).toContain(required);
 		}
 		expect(content).toContain("/skill:ralplan");
-		expect(content).toContain("/skill:team");
+		expect(content).toContain("/skill:autoresearch");
 		expect(content).toContain("`gjc ralplan` is a native CLI");
 		expect(content).toContain("Direct `.gjc/` file edits are forbidden unless an explicit force override is active");
 		expect(content).toContain("do not edit `.gjc/_session-{sessionid}/state` directly without force override");

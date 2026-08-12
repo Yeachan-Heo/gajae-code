@@ -114,7 +114,7 @@ describe("GJC inshellisense completion spec", () => {
 	it("exports the real GJC command surface, aliases, and root launch flags", async () => {
 		const spec = await buildGjcFigSpec(commands, RootHelpCommand);
 
-		for (const command of ["ralplan", "team", "ultragoal", "deep-interview", "completion"]) {
+		for (const command of ["ralplan", "ultragoal", "deep-interview", "completion"]) {
 			expect(findSubcommand(spec, command), command).toBeDefined();
 		}
 		expect(names(findSubcommand(spec, "web-search")!.name)).toContain("q");

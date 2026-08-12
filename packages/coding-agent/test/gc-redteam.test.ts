@@ -13,7 +13,6 @@ import {
 	gcPidProbe,
 	runGjcGcCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
-import { teamWorkersGcAdapter } from "@gajae-code/coding-agent/gjc-runtime/team-gc";
 import { harnessLeasesGcAdapter } from "@gajae-code/coding-agent/harness-control-plane/gc-adapter";
 
 const tempDirs: string[] = [];
@@ -21,7 +20,6 @@ const originalKill = process.kill.bind(process);
 
 const EPERM_PID = 91_001;
 const UNKNOWN_PID = 91_002;
-const ALIVE_PID = 91_003;
 const DEAD_PID = 91_004;
 
 afterEach(async () => {
@@ -95,34 +93,8 @@ async function seedFileLock(base: string, id: string, pid: number): Promise<stri
 	return lockDir;
 }
 
-async function seedTeamWorker(
-	base: string,
-	registryDir: string,
-	workerId: string,
-	pid: number,
-	lifecycleState: "running" | "failed" | "stopped" = "running",
-): Promise<string> {
-	const harnessRoot = path.join(base, "state", "harness");
-	const teamRoot = path.join(base, "state", "team");
-	await writeJson(path.join(registryDir, `team-${workerId}.json`), {
-		sessionId: `team-${workerId}`,
-		roots: [{ root: harnessRoot, updatedAt: new Date().toISOString() }],
-	});
-	const workerDir = path.join(teamRoot, "red", "workers", workerId);
-	await writeJson(path.join(workerDir, "heartbeat.json"), {
-		pid,
-		last_turn_at: new Date().toISOString(),
-		turn_count: 0,
-	});
-	await writeJson(path.join(workerDir, "lifecycle.json"), {
-		pid,
-		lifecycle_state: lifecycleState,
-		stop_reason: lifecycleState === "running" ? null : "adversarial terminal state",
-	});
-	return workerDir;
-}
-
 async function collectRecord(adapter: GcStoreAdapter, ctx: GcContext, recordPath: string): Promise<GcRecord> {
+
 	const result = await adapter.collect(ctx);
 	expect(result.errors).toEqual([]);
 	const record = result.records.find(candidate => candidate.path === recordPath);
@@ -176,26 +148,24 @@ function stubKill(impl: (pid: number, sig?: string | number) => void): void {
 }
 
 describe("gc red-team invariants", () => {
-	test("EPERM-probed records are never removable across real harness/file-lock/team adapters and prune never prunes them", async () => {
+	test("EPERM-probed records are never removable across real harness/file-lock adapters and prune never prunes them", async () => {
 		const base = await makeTemp();
 		const registryDir = path.join(base, "reg");
 		const harnessLease = await seedHarnessLease(base, registryDir, "h-eperm", EPERM_PID);
 		const lockDir = await seedFileLock(base, "eperm", EPERM_PID);
-		const workerDir = await seedTeamWorker(base, registryDir, "w-eperm", EPERM_PID);
 		const ctx = ctxFor(base, registryDir, adversarialProbe);
 
 		const harnessRec = await collectRecord(harnessLeasesGcAdapter, ctx, harnessLease);
 		const fileLockRec = await collectRecord(fileLocksGcAdapter, ctx, lockDir);
-		const teamRec = await collectRecord(teamWorkersGcAdapter, ctx, workerDir);
 
-		for (const rec of [harnessRec, fileLockRec, teamRec]) {
+		for (const rec of [harnessRec, fileLockRec]) {
 			expect(rec.pid_status).toBe("eperm");
 			expect(rec.removable).toBe(false);
 			expect(rec.action).toBe("none");
 		}
 
 		const report = await collectGcReport(
-			[harnessLeasesGcAdapter, fileLocksGcAdapter, teamWorkersGcAdapter],
+			[harnessLeasesGcAdapter, fileLocksGcAdapter],
 			ctx,
 			true,
 		);
@@ -204,10 +174,8 @@ describe("gc red-team invariants", () => {
 		expect(report.counts.would_remove).toBe(0);
 		expect(report.stores.harness_leases[0]?.action).toBe("none");
 		expect(report.stores.file_locks[0]?.action).toBe("none");
-		expect(report.stores.team_workers[0]?.action).toBe("none");
 		expect(await fs.exists(harnessLease)).toBe(true);
 		expect(await fs.exists(lockDir)).toBe(true);
-		expect(await fs.exists(workerDir)).toBe(true);
 	});
 
 	test("unknown probe errors fail closed as kept, never removable, and prune mode does not remove", async () => {
@@ -215,18 +183,16 @@ describe("gc red-team invariants", () => {
 		const registryDir = path.join(base, "reg");
 		const leaseFile = await seedHarnessLease(base, registryDir, "h-unknown", UNKNOWN_PID);
 		const lockDir = await seedFileLock(base, "unknown", UNKNOWN_PID);
-		const workerDir = await seedTeamWorker(base, registryDir, "w-unknown", UNKNOWN_PID);
 		const ctx = ctxFor(base, registryDir, adversarialProbe);
 
 		const report = await collectGcReport(
-			[harnessLeasesGcAdapter, fileLocksGcAdapter, teamWorkersGcAdapter],
+			[harnessLeasesGcAdapter, fileLocksGcAdapter],
 			ctx,
 			true,
 		);
 		const records = [
 			report.stores.harness_leases.find(record => record.path === leaseFile),
 			report.stores.file_locks.find(record => record.path === lockDir),
-			report.stores.team_workers.find(record => record.path === workerDir),
 		];
 		for (const rec of records) {
 			expect(rec).toBeDefined();
@@ -238,7 +204,6 @@ describe("gc red-team invariants", () => {
 		expect(report.counts.failed).toBe(0);
 		expect(await fs.exists(leaseFile)).toBe(true);
 		expect(await fs.exists(lockDir)).toBe(true);
-		expect(await fs.exists(workerDir)).toBe(true);
 	});
 
 	test("dry-run JSON with a real reaped dead lease deletes nothing on disk and exits zero", async () => {
@@ -281,24 +246,7 @@ describe("gc red-team invariants", () => {
 		expect(report.counts.removed).toBe(1);
 		expect(report.counts.failed).toBe(1);
 		expect(computeExitCode(report)).toBe(1);
-	});
-
-	test("team workers in failed/stopped lifecycle remain non-removable when their pid is alive", async () => {
-		const base = await makeTemp();
-		const registryDir = path.join(base, "reg");
-		await seedTeamWorker(base, registryDir, "w-failed-live", ALIVE_PID, "failed");
-		await seedTeamWorker(base, registryDir, "w-stopped-live", ALIVE_PID, "stopped");
-		const result = await teamWorkersGcAdapter.collect(ctxFor(base, registryDir, adversarialProbe));
-		expect(result.errors).toEqual([]);
-		const byId = Object.fromEntries(result.records.map(r => [r.id, r]));
-
-		expect(byId["red/w-failed-live"]?.pid_status).toBe("alive");
-		expect(byId["red/w-failed-live"]?.removable).toBe(false);
-		expect(byId["red/w-failed-live"]?.status).toBe("alive");
-		expect(byId["red/w-stopped-live"]?.pid_status).toBe("alive");
-		expect(byId["red/w-stopped-live"]?.removable).toBe(false);
-		expect(byId["red/w-stopped-live"]?.status).toBe("alive");
-	});
+});
 
 	test("TOCTOU prune skip is reported as skipped, not removed or failed, and exits zero", async () => {
 		const adapter = fakeAdapter("file_locks", [record("file_locks", "became-live")], async () => ({

@@ -230,17 +230,17 @@ The Ultragoal leader owns `.gjc/_session-{sessionid}/ultragoal/goals.json` and `
 
 ### Native executor parallelism contract
 
-Native subagent parallelism is a contract for bounded `executor` delegation, not a runtime scheduler and not a Team-mode rule:
+Native subagent parallelism is a contract for bounded `executor` delegation, not a runtime scheduler:
 
 - **Use native `executor` parallelism only** when a story's expected diffs fall in genuinely different sub-domains/modules/systems, each boundable by a per-slice coordination contract.
 - **Default to direct leader edits** otherwise; sequence any work with real dependencies, shared-file overlap, or a single-domain footprint, and never parallelize work that lacks a safe contract.
 - Worker agents **MUST NOT mutate `.gjc/_session-{sessionid}/ultragoal`**, call goal tools, make checkpoint decisions, own integration, or own final verification. The Ultragoal leader keeps those responsibilities.
+- Workers must not run `gjc ultragoal checkpoint`: checkpoint authority stays with the leader after worker tasks are terminal. The leader checkpoints from worker evidence plus the current-session GJC goal snapshot, and performs no hidden goal mutation.
 
 Before workers start, each per-slice coordination contract MUST name the target files/surfaces, independence assumptions, allowed coordination channel, conflict-escalation rule, expected evidence, and terminal status. Conflict or assignment changes remain leader-owned and must be auditable through durable ledger evidence.
 
 For failed, timed-out, or contract-violating slices, record durable ledger evidence; preserve successful terminal slices only when safe; and reassign, retry, or collapse the invalid work to serial execution under an updated contract. Completion after parallel work still requires terminal worker evidence, leader integration, targeted verification, and the existing cleaner + architect + executor QA/red-team gate before checkpoint complete.
 
-Team remains explicit and separate: Team is not auto-launched, not a hidden pipeline scheduler, and never owns Ultragoal goals, checkpoints, or ledger state.
 
 ## Boundary verification (aggregate default)
 
@@ -282,18 +282,6 @@ Checkpoint contract summary — the full contract lives in the `validation-batch
 
 Cohort lanes are parallel by construction: the boundary gate freezes one `sourceHash` first, so `cleaner`, `architect`, and `qa` can run concurrently against the identical immutable snapshot and then join. Fall back to **sequential** lanes only when code is still changing (nothing can be frozen yet), when the red-team lane depends on architect fixes, or when architect findings gate the QA scope. Either way the lanes must **join before checkpoint** — no lane checkpoints independently, and repair work starts only after the join.
 
-## Use Ultragoal and Team together
-
-Use ultragoal and team together for a durable Ultragoal story that benefits from one visible tmux worker session. Ultragoal remains leader-owned: `.gjc/_session-{sessionid}/ultragoal/goals.json` stores the story plan and `.gjc/_session-{sessionid}/ultragoal/ledger.jsonl` stores checkpoints. Team is the single-worker tmux execution engine and returns task/evidence status to the leader.
-
-The leader checkpoints Ultragoal from Team evidence plus the current-session GJC goal snapshot; durable state remains leader-owned in `goals.json` and `ledger.jsonl`:
-
-```sh
-gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<team evidence mentioning .gjc/_session-{sessionid}/ultragoal and <id>>" --quality-gate-json <quality-gate-json-or-path>
-```
-
-Workers do not own ultragoal goal state, do not create worker ultragoal ledgers, and do not checkpoint Ultragoal. Workers must not run `gjc ultragoal checkpoint`; checkpoint authority stays with the leader after worker tasks are terminal. Team launch remains explicit; Ultragoal does not auto-launch Team and performs no hidden goal mutation.
-
 ## Internal Ultragoal sub-skill fragments
 
 The completion-gate cleanup sweep is driven by `ai-slop-cleaner`, an internal Ultragoal sub-skill bundled as a `kind: "skill-fragment"` prompt with parent skill `ultragoal` (installed at `skill-fragments/ultragoal/ai-slop-cleaner.md`). It is analogous to deep-interview's auto-research fragment: loaded on demand for one specific hook, never a user-facing skill.
@@ -302,7 +290,7 @@ The completion-gate cleanup sweep is driven by `ai-slop-cleaner`, an internal Ul
 - It is a read-only detector+reporter over the active story's changed files only: it never edits code, writes files, mutates `.gjc/`, checkpoints, calls goal tools, or spawns workflows.
 - It classifies every finding as blocking or advisory across the full taxonomy (fallback-like masking vs. grounded, duplication, dead code, needless abstraction, boundary violations, UI/design slop, missing tests).
 - The leader and a leader-spawned `executor` own all fixes; the cleaner reruns until zero blocking findings remain. Advisory findings live in the gate report only.
-- Recursion guard: it must not spawn nested `ralplan`/`team`/`deep-interview`/`ultragoal`; broad or architectural findings are handed back to the leader as review blockers.
+- Recursion guard: it must not spawn nested `ralplan`/`deep-interview`/`ultragoal`; broad or architectural findings are handed back to the leader as review blockers.
 
 ## Boundary completion cohort gate
 
@@ -429,7 +417,7 @@ The critic must verify that the `human_blocked` classification is genuine, inclu
 
 ### Invocation and containment
 
-At each terminus, the leader gives the read-only `critic` role agent `brief.md`, `goals.json`, `ledger.jsonl`, and the cumulative change set. For completion, invoke it before assembling the final-aggregate gate JSON. For pause, invoke it after the `human_blocked` classification and before `goal({"op":"pause"})`. The terminal critic must not spawn nested `ralplan`, `team`, `deep-interview`, or `ultragoal` workflows. This creates no interactive surface: `ask` remains blocked while an Ultragoal run is active.
+At each terminus, the leader gives the read-only `critic` role agent `brief.md`, `goals.json`, `ledger.jsonl`, and the cumulative change set. For completion, invoke it before assembling the final-aggregate gate JSON. For pause, invoke it after the `human_blocked` classification and before `goal({"op":"pause"})`. The terminal critic must not spawn nested `ralplan`, `deep-interview`, or `ultragoal` workflows. This creates no interactive surface: `ask` remains blocked while an Ultragoal run is active.
 
 On repeat terminus attempts within the same run (after an `ITERATE`/`REJECT` reopen cycle or a superseded pause classification), **resume the prior terminal-critic subagent when resumable** instead of freshly spawning one: the critic already holds `brief.md`, `goals.json`, the ledger history, and its own prior findings, so re-invocation only needs the delta (new ledger events, the updated cumulative change set, and evidence addressing the prior blockers). Resume via existing `subagent` resume/steer controls; on `context_unavailable`, `not_found`, `no_runner`, or `resume_failed` — or after a process restart — fall back to a fresh `critic` spawn with the full context bundle. A resumed terminal critic remains read-only, keeps the same containment rules, and must issue a fresh verdict against the current state — a prior `ITERATE` is never carried forward as pre-judged, and each verdict is still recorded through `gjc ultragoal record-critic-verdict`.
 
