@@ -1443,8 +1443,12 @@ export class AuthStorage {
 	 *
 	 * This mutates ONLY the session-scoped sticky pointer
 	 * ({@link AuthStorage.#recordSessionCredential}), never a provider-wide
-	 * runtime override, so it cannot bleed into other sessions/subagents sharing
-	 * this `AuthStorage` instance in the same process.
+	 * runtime override, so it cannot bleed into other sessions in the same
+	 * process whose credential identity differs. The sticky pointer is keyed by
+	 * `sessionId`, and subagents/team workers inherit their parent's
+	 * `credentialSessionId` by design so they keep using the same account as
+	 * the parent — a switch therefore applies to the whole session family
+	 * sharing that identity, not to unrelated sessions.
 	 *
 	 * Fails closed rather than silently no-op when a stronger override already
 	 * decides this provider's credential every call: a hard pin

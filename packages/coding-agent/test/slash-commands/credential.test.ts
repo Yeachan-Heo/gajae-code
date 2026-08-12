@@ -127,7 +127,7 @@ describe("/credential slash command", () => {
 			consumed: true,
 		});
 
-		expect(output[0]).toContain("No active OAuth credential found");
+		expect(output[0]).toContain("No stored OAuth credential matches id:999");
 	});
 
 	test("refuses to switch while --credential hard-pins the provider", async () => {
@@ -142,6 +142,21 @@ describe("/credential slash command", () => {
 		});
 
 		expect(output[0]).toContain("--credential already pins this session");
+	});
+
+	test("switches by email to the unique OAuth-pool provider when the current model's provider has no matching row", async () => {
+		const { output, runtime, authStorage } = await createRuntime({
+			model: { provider: "anthropic", id: "claude-3-5-sonnet" },
+		});
+		// Anthropic has rows, but none matching the selector; openai-codex is the unique match.
+		await authStorage.set("openai-codex", [oauth("token-codex-c", "c@example.test")]);
+
+		await expect(executeAcpBuiltinSlashCommand("/credential email:c@example.test", runtime)).resolves.toEqual({
+			consumed: true,
+		});
+
+		expect(output[0]).toContain("Switched this session");
+		expect(await authStorage.getApiKey("openai-codex", "session-1")).toBe("token-codex-c");
 	});
 
 	test("reports an ambiguous unqualified selector across providers", async () => {

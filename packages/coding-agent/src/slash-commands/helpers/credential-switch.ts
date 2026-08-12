@@ -1,4 +1,4 @@
-import type { AuthCredentialSnapshotEntry } from "@gajae-code/ai/core";
+import type { AuthCredentialSelector, AuthCredentialSnapshotEntry } from "@gajae-code/ai/core";
 import { parseCliCredentialSelector } from "../../runtime-credential-selector";
 import type { SlashCommandRuntime } from "../types";
 
@@ -18,29 +18,56 @@ function formatProviderName(provider: string): string {
 		.join(" ");
 }
 
+/** Whether a stored OAuth snapshot row matches a credential selector. */
+function selectorMatchesRow(selector: AuthCredentialSelector, entry: AuthCredentialSnapshotEntry): boolean {
+	if (entry.credential.type !== "oauth") return false;
+	switch (selector.kind) {
+		case "id":
+			return String(entry.id) === selector.value;
+		case "email":
+			return (
+				typeof entry.credential.email === "string" &&
+				entry.credential.email.toLowerCase() === selector.value.toLowerCase()
+			);
+		case "account":
+			return entry.credential.accountId === selector.value;
+		case "project":
+			return entry.credential.projectId === selector.value;
+	}
+}
+
 /**
  * Resolve which provider a bare (unqualified) `/credential <selector>`
  * targets. Prefers the current session model's provider when it actually has
  * a matching OAuth row (the common case: switching among a provider's own
  * accounts while that provider is active). Falls back to scanning every
  * provider's stored OAuth rows for a unique match, so `/credential
- * email:me@example.com` still works when the caller's provider isn't the
- * active model's provider. Ambiguous or absent matches return an explanatory
- * string instead of a provider id.
+ * email:me@example.com` still works when the selector uniquely matches a
+ * provider other than the active one. Ambiguous or absent matches return an
+ * explanatory string instead of a provider id.
  */
 function inferProvider(
 	runtime: SlashCommandRuntime,
 	oauthRows: AuthCredentialSnapshotEntry[],
+	selector: AuthCredentialSelector,
 	selectorRaw: string,
 ): { provider: string } | { error: string } {
 	const currentProvider = runtime.session.model?.provider;
-	if (currentProvider && oauthRows.some(entry => entry.provider === currentProvider)) {
+	if (
+		currentProvider &&
+		oauthRows.some(entry => entry.provider === currentProvider && selectorMatchesRow(selector, entry))
+	) {
 		return { provider: currentProvider };
 	}
-	const matchingProviders = [...new Set(oauthRows.map(entry => entry.provider))];
+	const matchingProviders = [
+		...new Set(oauthRows.filter(entry => selectorMatchesRow(selector, entry)).map(entry => entry.provider)),
+	];
 	if (matchingProviders.length === 1) return { provider: matchingProviders[0]! };
-	if (matchingProviders.length === 0) {
+	if (oauthRows.length === 0) {
 		return { error: "No provider has any stored OAuth credentials to switch between." };
+	}
+	if (matchingProviders.length === 0) {
+		return { error: `No stored OAuth credential matches ${selector.kind}:${selector.value}.` };
 	}
 	return {
 		error: `"${selectorRaw}" is ambiguous across providers (${matchingProviders.join(", ")}). Use provider/${selectorRaw}.`,
@@ -98,7 +125,7 @@ export async function switchSessionCredentialCommand(runtime: SlashCommandRuntim
 
 	let provider = parsed.provider;
 	if (!provider) {
-		const inferred = inferProvider(runtime, oauthRows, trimmed);
+		const inferred = inferProvider(runtime, oauthRows, parsed.selector, trimmed);
 		if ("error" in inferred) return inferred.error;
 		provider = inferred.provider;
 	}
