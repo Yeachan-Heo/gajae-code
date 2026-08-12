@@ -1221,7 +1221,9 @@ async function buildSessionOptions(
 		options.rules = [];
 	}
 
-	options.disableExtensionDiscovery = true;
+	// General extension modules stay preloaded/explicit, while the SDK performs
+	// bounded native/Claude/Codex hook discovery through the canonical adapter.
+	options.disableExtensionDiscovery = false;
 	options.additionalExtensionPaths = [];
 
 	return { options };

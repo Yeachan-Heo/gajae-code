@@ -96,3 +96,15 @@ export function jetbrainsJunieModelManagerOptions(
 ): ModelManagerOptions<"anthropic-messages"> {
 	return { providerId: "jetbrains-junie" };
 }
+
+// ---------------------------------------------------------------------------
+// Kiro (Amazon Q Developer / CodeWhisperer)
+// ---------------------------------------------------------------------------
+
+export interface KiroModelManagerConfig {}
+
+export function kiroModelManagerOptions(
+	_config: KiroModelManagerConfig = {},
+): ModelManagerOptions<"kiro-codewhisperer-stream"> {
+	return { providerId: "kiro" };
+}

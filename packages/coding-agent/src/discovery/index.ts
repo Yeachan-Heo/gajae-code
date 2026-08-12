@@ -22,10 +22,12 @@ import "../capability/tool";
 // Import providers (each registers itself on import)
 import "./agents-md";
 import "./builtin";
+import "./claude-hooks";
 import "./claude-plugins";
 import "./cline";
 import "./agents";
 import "./cursor";
+import "./codex-hooks";
 import "./gemini";
 import "./opencode";
 import "./github";

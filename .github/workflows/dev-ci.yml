@@ -281,6 +281,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/sdk-session-directory.windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 
   windows-native-build-toolchain:

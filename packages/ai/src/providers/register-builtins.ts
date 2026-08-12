@@ -37,6 +37,7 @@ import type { CursorOptions } from "./cursor";
 import type { GoogleOptions } from "./google";
 import type { GoogleGeminiCliOptions } from "./google-gemini-cli";
 import type { GoogleVertexOptions } from "./google-vertex";
+import type { KiroCodeWhispererOptions } from "./kiro-codewhisperer";
 import type { OllamaChatOptions } from "./ollama";
 import type { OpenAICodexResponsesOptions } from "./openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./openai-completions";
@@ -153,6 +154,14 @@ interface BedrockProviderModule {
 	) => AssistantMessageEventStream;
 }
 
+interface KiroCodeWhispererProviderModule {
+	streamKiroCodeWhisperer: (
+		model: Model<"kiro-codewhisperer-stream">,
+		context: Context,
+		options: KiroCodeWhispererOptions,
+	) => AssistantMessageEventStream;
+}
+
 // ---------------------------------------------------------------------------
 // Module-level lazy promise caches
 // ---------------------------------------------------------------------------
@@ -168,6 +177,7 @@ let openAIResponsesProviderModulePromise: Promise<LazyProviderModule<"openai-res
 let ollamaProviderModulePromise: Promise<LazyProviderModule<"ollama-chat">> | undefined;
 let cursorProviderModulePromise: Promise<LazyProviderModule<"cursor-agent">> | undefined;
 let bedrockProviderModuleOverride: LazyProviderModule<"bedrock-converse-stream"> | undefined;
+let kiroCodeWhispererProviderModulePromise: Promise<LazyProviderModule<"kiro-codewhisperer-stream">> | undefined;
 let bedrockProviderModulePromise: Promise<LazyProviderModule<"bedrock-converse-stream">> | undefined;
 
 export function setBedrockProviderModule(module: BedrockProviderModule): void {
@@ -443,6 +453,13 @@ function loadBedrockProviderModule(): Promise<LazyProviderModule<"bedrock-conver
 	});
 	return bedrockProviderModulePromise;
 }
+function loadKiroCodeWhispererProviderModule(): Promise<LazyProviderModule<"kiro-codewhisperer-stream">> {
+	kiroCodeWhispererProviderModulePromise ||= Promise.resolve().then(() => {
+		const provider = require("./kiro-codewhisperer") as KiroCodeWhispererProviderModule;
+		return { stream: provider.streamKiroCodeWhisperer };
+	});
+	return kiroCodeWhispererProviderModulePromise;
+}
 
 /**
  * Lazy provider descriptors used by core consumers that need to inspect or
@@ -459,6 +476,7 @@ export const PROVIDER_RUNTIME_DESCRIPTORS: readonly ProviderRuntimeDescriptor<Ap
 	{ api: "openai-responses", load: loadOpenAIResponsesProviderModule },
 	{ api: "ollama-chat", load: loadOllamaProviderModule },
 	{ api: "cursor-agent", load: loadCursorProviderModule },
+	{ api: "kiro-codewhisperer-stream", load: loadKiroCodeWhispererProviderModule },
 	{ api: "bedrock-converse-stream", load: loadBedrockProviderModule },
 ] as readonly ErasedProviderRuntimeDescriptor[];
 
@@ -507,3 +525,4 @@ export const streamCursor = createLazyStream(loadCursorProviderModule);
 export const streamOllama = createLazyStream(loadOllamaProviderModule);
 
 export const streamBedrock = createLazyStream(loadBedrockProviderModule);
+export const streamKiroCodeWhisperer = createLazyStream(loadKiroCodeWhispererProviderModule);

@@ -1,5 +1,6 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
+import { logger } from "@gajae-code/utils";
 import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
 import { validateModelProfileName } from "./model-profile-contract";
@@ -48,6 +49,8 @@ type ModelProfileActivationSession = Pick<
 	clearProfileInstalledOverrides?: () => void;
 	/** Current profile-installed override keys, for deriving the activation base. */
 	getProfileInstalledOverrideKeys?: () => { modelRoles: readonly string[]; agentModelOverrides: readonly string[] };
+	/** Re-apply vendor-separated delegation (task tool + prompt) after the role layer changed. */
+	syncEagerDelegation?: () => Promise<void>;
 	getSessionDefaultModelSelector?: () => string | undefined;
 	recordResumeDefaultModel?: (selector: string | undefined) => void;
 	seedDefaultFallbackResolution?: (activeIndex: number, skips: Array<{ selector: string; reason: string }>) => void;
@@ -1295,6 +1298,18 @@ export async function applyPreparedModelProfileActivation(
 			);
 		}
 		throw error;
+	}
+	// The installed role layer decides whether this profile is vendor-separated,
+	// so delegation must be re-applied to the live session rather than only to
+	// sessions started after activation. Activation itself already succeeded; a
+	// failed refresh must not roll it back.
+	try {
+		await prepared.session.syncEagerDelegation?.();
+	} catch (error) {
+		logger.warn("Failed to sync eager delegation after model profile activation", {
+			profile: prepared.profileName,
+			error: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 

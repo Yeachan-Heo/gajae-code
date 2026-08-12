@@ -1,0 +1,182 @@
+{
+  "Name": "Gajae Code + cmux Control",
+  "Version": "1.0.0",
+  "Author": "Gajae Code",
+  "Description": "Navigate cmux windows, tabs, panes, and surfaces; control the focused Gajae Code SDK session.",
+  "Category": "Gajae Code",
+  "CategoryIcon": "images/category",
+  "CodePathMac": "bin/plugin",
+  "Icon": "images/category",
+  "SDKVersion": 2,
+  "Software": {
+    "MinimumVersion": "6.6"
+  },
+  "OS": [
+    {
+      "Platform": "mac",
+      "MinimumVersion": "13"
+    }
+  ],
+  "Actions": [
+    {
+      "Name": "Live GJC Session",
+      "UUID": "dev.gajae.streamdeck.session",
+      "Icon": "images/live",
+      "Tooltip": "Focus a live GJC SDK session in cmux or Ghostty.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/live",
+          "TitleAlignment": "bottom",
+          "FontSize": "9"
+        }
+      ]
+    },
+    {
+      "Name": "Refresh Sessions",
+      "UUID": "dev.gajae.streamdeck.refresh",
+      "Icon": "images/refresh",
+      "Tooltip": "Refresh live GJC SDK session discovery.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/refresh",
+          "TitleAlignment": "bottom",
+          "FontSize": "9"
+        }
+      ]
+    },
+    {
+      "Name": "Steer from Clipboard",
+      "UUID": "dev.gajae.streamdeck.steer",
+      "Icon": "images/steer",
+      "Tooltip": "Send clipboard text to turn.steer on the selected GJC SDK session.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/steer",
+          "TitleAlignment": "bottom",
+          "FontSize": "9"
+        }
+      ]
+    },
+    {
+      "Name": "Follow Up from Clipboard",
+      "UUID": "dev.gajae.streamdeck.follow",
+      "Icon": "images/follow",
+      "Tooltip": "Queue clipboard text through turn.follow_up on the selected GJC SDK session.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/follow",
+          "TitleAlignment": "bottom",
+          "FontSize": "9"
+        }
+      ]
+    },
+    {
+      "Name": "Escape Twice",
+      "UUID": "dev.gajae.streamdeck.abort",
+      "Icon": "images/abort-esc2",
+      "Tooltip": "Send Escape twice with a 100ms gap to the focused GJC cmux tab.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/abort-esc2",
+          "TitleAlignment": "bottom",
+          "FontSize": "9"
+        }
+      ]
+    },
+    {
+      "Name": "cmux Navigation",
+      "UUID": "dev.gajae.streamdeck.cmux-nav",
+      "Icon": "images/cmux-statusWindow",
+      "Tooltip": "Navigate cmux windows, workspaces, panes, and surfaces.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/cmux-statusWindow",
+          "TitleAlignment": "top",
+          "FontSize": "9"
+        }
+      ]
+    },
+    {
+      "Name": "Focused GJC Skill",
+      "UUID": "dev.gajae.streamdeck.skill",
+      "Icon": "images/skill-ralplan",
+      "Tooltip": "Run a skill through the GJC SDK session focused in cmux.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/skill-ralplan",
+          "TitleAlignment": "top",
+          "FontSize": "9"
+        }
+      ]
+    },
+    {
+      "Name": "Launch GJC Preset",
+      "UUID": "dev.gajae.streamdeck.launch-preset",
+      "Icon": "images/preset-frontier-heavy",
+      "Tooltip": "Launch GJC with a model preset in a new tab of the focused cmux pane.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/preset-frontier-heavy",
+          "TitleAlignment": "top",
+          "FontSize": "9"
+        }
+      ]
+    },
+    {
+      "Name": "Focused GJC Status",
+      "UUID": "dev.gajae.streamdeck.focused-status",
+      "Icon": "images/focused-text",
+      "Tooltip": "Shows whether the focused cmux tab is a GJC session.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/focused-text",
+          "TitleAlignment": "middle",
+          "FontSize": "8"
+        }
+      ]
+    },
+    {
+      "Name": "Detailed GJC Control",
+      "UUID": "dev.gajae.streamdeck.control",
+      "Icon": "images/control-model",
+      "Tooltip": "Send a common keybinding or slash command to the focused GJC cmux tab.",
+      "Controllers": [
+        "Keypad"
+      ],
+      "States": [
+        {
+          "Image": "images/control-model",
+          "TitleAlignment": "top",
+          "FontSize": "9"
+        }
+      ]
+    }
+  ]
+}

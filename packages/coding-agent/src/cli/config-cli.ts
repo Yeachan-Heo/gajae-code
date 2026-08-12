@@ -10,6 +10,9 @@ import type * as path from "node:path";
 import { APP_NAME, getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import chalk from "chalk";
+import { resolveModelProfileName } from "../config/model-profile-contract";
+import { mergeModelProfiles } from "../config/model-profiles";
+import { ModelsConfigFile } from "../config/model-registry";
 import {
 	getDefault,
 	getEnumValues,
@@ -21,6 +24,7 @@ import {
 	type SettingValue,
 	settings,
 } from "../config/settings";
+import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { theme } from "../modes/theme/theme";
 import { initXdg } from "./commands/init-xdg";
 
@@ -449,17 +453,38 @@ function handlePath(): void {
 	console.log(getAgentDir());
 }
 
+/**
+ * Configuration conflicts that no schema check can see: an explicit
+ * `task.eager false` keeps a vendor-separated profile's workers unused, so the
+ * main provider's quota pays for work the layout meant to offload.
+ */
+export function collectConfigAdvisories(): string[] {
+	const profileName = settings.get("modelProfile.default");
+	const profiles = mergeModelProfiles(ModelsConfigFile.load()?.profiles);
+	const resolvedProfileName = profileName ? resolveModelProfileName(profileName, profiles) : undefined;
+	const delegation = resolveEagerTaskDelegation({
+		settings,
+		profile: resolvedProfileName ? profiles.get(resolvedProfileName) : undefined,
+	});
+	if (!delegation.suppressedByExplicitSetting) return [];
+	return [
+		`task.eager is false while ${delegation.vendorSeparatedRoles.join(" and ")} run on a different provider than the default role; those workers will not be used. Run \`${APP_NAME} config set task.eager true\` or reset task.eager to delegate by default.`,
+	];
+}
+
 function handleDoctor(flags: { json?: boolean }): void {
 	const report = settings.getSchemaReport();
+	const advisories = collectConfigAdvisories();
 	if (flags.json) {
-		console.log(JSON.stringify(report, null, 2));
+		console.log(JSON.stringify({ ...report, advisories }, null, 2));
 		return;
 	}
-	if (report.issues.length === 0) {
+	if (report.issues.length === 0 && advisories.length === 0) {
 		console.log(chalk.green("Settings schema is healthy."));
 		return;
 	}
 	for (const issue of report.issues) console.log(`${issue.kind}\t${issue.path}\t${issue.detail}`);
+	for (const advisory of advisories) console.log(chalk.yellow(`advisory\ttask.eager\t${advisory}`));
 }
 
 type ConfigDoctorReport = {

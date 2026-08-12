@@ -1,0 +1,11 @@
+#!/bin/zsh
+set -eu
+
+gjc_bin="${GJC_STREAMDECK_GJC:-gjc}"
+
+printf '\033[1;38;5;208mGJC worktree name\033[0m (blank = plain session): '
+IFS= read -r worktree_name
+
+args=()
+[[ -n "$worktree_name" ]] && args+=(--worktree "$worktree_name")
+exec "$gjc_bin" "${args[@]}"

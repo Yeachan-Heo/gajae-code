@@ -50,7 +50,17 @@ function chatDeliveryPhase(error: unknown): ChatDeliveryPhase | undefined {
 
 	if (error instanceof ChatDeliveryError) return error.phase;
 	if (!(error instanceof SdkClientError)) return undefined;
-	return ["connection_closed", "unavailable", "timeout", "reconnect_exhausted", "protocol_error"].includes(error.code)
+	// `uncertain_after_send` is the one code that states outright that the frame
+	// reached the host: reporting it as a definite failure would tell the operator a
+	// prompt was rejected while the session may already be running it.
+	return [
+		"connection_closed",
+		"unavailable",
+		"timeout",
+		"reconnect_exhausted",
+		"protocol_error",
+		"uncertain_after_send",
+	].includes(error.code)
 		? "ambiguous"
 		: undefined;
 }

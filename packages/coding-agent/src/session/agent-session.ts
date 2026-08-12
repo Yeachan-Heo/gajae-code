@@ -224,6 +224,7 @@ import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
 import type { SettingPath } from "../config/settings-schema";
 import { getDefault } from "../config/settings-schema";
+import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
 import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
@@ -12256,6 +12257,27 @@ export class AgentSession {
 
 	getActiveModelProfile(): string | undefined {
 		return this.#activeModelProfile;
+	}
+
+	/**
+	 * Re-apply vendor-separated delegation after a profile activation changed the
+	 * role layer. `eagerTasks` is resolved at prompt build time, but under
+	 * `tools.discoveryMode: all` the `task` tool is hidden until something
+	 * activates it, and the delegation directive stays behind its
+	 * `has tools "task"` guard. Activating a vendor-separated profile mid-session
+	 * must therefore reach the live tool set, not just the next session.
+	 */
+	async syncEagerDelegation(): Promise<void> {
+		const { eagerTasks } = resolveEagerTaskDelegation({
+			settings: this.settings,
+			profile: this.#activeModelProfile
+				? this.#modelRegistry.getModelProfile?.(this.#activeModelProfile)
+				: undefined,
+		});
+		if (eagerTasks && this.#toolRegistry.has("task") && !this.getActiveToolNames().includes("task")) {
+			await this.activateDiscoveredTools(["task"]);
+		}
+		await this.refreshBaseSystemPrompt();
 	}
 
 	/** Resolver intent only for assignments owned by the active profile. */

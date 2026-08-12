@@ -1,0 +1,2 @@
+#!/bin/zsh
+exec /opt/homebrew/bin/bun "${0:A:h:h}/plugin.js" "$@"

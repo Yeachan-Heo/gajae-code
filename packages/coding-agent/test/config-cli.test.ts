@@ -286,6 +286,50 @@ describe("config CLI schema coverage", () => {
 	});
 });
 
+describe("config doctor vendor-separated delegation advisory", () => {
+	const vendorSeparatedRoles = [
+		"configSchemaVersion: 1",
+		"modelRoles:",
+		"  default: anthropic/claude-opus-5:medium",
+		"task:",
+		"  agentModelOverrides:",
+		"    executor: openai-codex/gpt-5.5:high",
+	];
+
+	async function doctorAdvisories(configLines: string[]): Promise<string[]> {
+		await Bun.write(path.join(testAgentDir, "config.yml"), `${configLines.join("\n")}\n`);
+		resetSettingsForTest();
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		await runConfigCommand({ action: "doctor", flags: { json: true } });
+		return (JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as { advisories: string[] }).advisories;
+	}
+
+	it("warns when an explicit task.eager false leaves vendor-separated workers unused", async () => {
+		const advisories = await doctorAdvisories([...vendorSeparatedRoles, "  eager: false"]);
+		expect(advisories).toHaveLength(1);
+		expect(String(advisories[0])).toContain("executor");
+		expect(String(advisories[0])).toContain("task.eager true");
+	});
+
+	it("stays silent when vendor separation already implies delegation", async () => {
+		expect(await doctorAdvisories(vendorSeparatedRoles)).toEqual([]);
+	});
+
+	it("stays silent for a single-vendor layout with task.eager false", async () => {
+		expect(
+			await doctorAdvisories([
+				"configSchemaVersion: 1",
+				"modelRoles:",
+				"  default: openai-codex/gpt-5.6-sol:low",
+				"task:",
+				"  eager: false",
+				"  agentModelOverrides:",
+				"    executor: openai-codex/gpt-5.6-terra:low",
+			]),
+		).toEqual([]);
+	});
+});
+
 describe("config doctor", () => {
 	it("reports typoed settings from a fixture config", async () => {
 		const configPath = path.join(testAgentDir, "config.yml");

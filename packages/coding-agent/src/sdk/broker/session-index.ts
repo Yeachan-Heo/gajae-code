@@ -868,15 +868,25 @@ export class SessionIndex {
 					await writeAndSync(path.join(quarantinePath, "index.snapshot.json"), scan.snapshotContents);
 				if (scan.logContents) await writeAndSync(path.join(quarantinePath, "index.jsonl"), scan.logContents);
 				await syncDirectory(path.join(quarantinePath, "index.jsonl"));
-				const events = [...scan.snapshotEvents, ...scan.validLogEvents];
+				// Repair republishes the surviving history as the new snapshot, so it must
+				// apply the same retention the ordinary snapshot path applies. Writing the
+				// raw survivor set instead let one repair of a long-lived index restore an
+				// unbounded snapshot, and every later locked transaction then re-parsed that
+				// whole history while holding the index lock — the broker burns CPU and
+				// unrelated launches time out waiting for the lock.
+				const events = compactEvents([...scan.snapshotEvents, ...scan.validLogEvents], this.#policy);
 				const snapshot = JSON.stringify({
 					version: SESSION_INDEX_SNAPSHOT_VERSION,
 					indexSeq: scan.diagnosis.validPrefixSeq,
 					events,
 				});
-				const log = scan.validLogEvents.map(event => JSON.stringify(event)).join("\n");
 				await replaceAtomically(snapshotFor(this.#agentDir), snapshot);
-				await replaceAtomically(logFor(this.#agentDir), log ? `${log}\n` : "");
+				// The republished snapshot already carries the full surviving history (after
+				// compaction), so the log must be truncated to match: leaving the original
+				// events in place keeps every subsequent #scan() parsing them under the lock
+				// — the same starvation the compaction above is meant to end. This mirrors
+				// #rotate(), which writes an empty log after snapshotting.
+				await replaceAtomically(logFor(this.#agentDir), "");
 				await this.#replayUnderLock();
 				return { ...scan.diagnosis, repaired: true, quarantinePath };
 			});
@@ -1090,26 +1100,14 @@ export class SessionIndex {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
 		}
 		if (isValidSnapshot(current) && current.indexSeq > this.indexSeq) return;
-		const tmp = `${file}.${process.pid}.tmp`;
-		await fs.writeFile(
-			tmp,
+		await replaceAtomically(
+			file,
 			JSON.stringify({
 				version: SESSION_INDEX_SNAPSHOT_VERSION,
 				indexSeq: this.indexSeq,
 				events: compactEvents(this.#events, this.#policy),
 			}),
-			{
-				mode: 0o600,
-			},
 		);
-		const h = await fs.open(tmp, "r");
-		try {
-			await h.sync();
-		} finally {
-			await h.close();
-		}
-		await fs.rename(tmp, file);
-		await syncDirectory(file);
 	}
 	/**
 	 * Broker-scheduled compaction (C3), independent of rotation size: applies the
@@ -1164,7 +1162,16 @@ export class SessionIndex {
 	async checkpointLiveHeartbeats(now = Date.now()): Promise<number> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
-			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			// An absent index holds no registration to checkpoint, so this pass must read
+			// it as "nothing to do" instead of creating one. Recreating the directory
+			// resurrects a state root its owner already retired: the broker's 5s
+			// publication watch would rebuild a removed agent dir after shutdown.
+			try {
+				await fs.stat(dirFor(this.#agentDir));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+				throw error;
+			}
 			return await withFileLock(logFor(this.#agentDir), async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) return 0;

@@ -126,6 +126,10 @@ gjc --mpreset daily               # this session only
 gjc --mpreset ultimate --default  # persist as the startup default (config.yml)
 ```
 
+### Delegation is what makes vendor separation pay off
+
+Worker roles only consume the other vendor's quota when the main agent actually delegates, and the strong "delegate by default" directive is gated behind `task.eager`. When `executor` or `planner` is pinned to a provider other than the `default` role's provider, GJC therefore turns eager delegation on for that session unless `task.eager` is set explicitly in config. Setting `task.eager false` by hand stays authoritative and keeps the separated workers idle — `gjc config doctor` reports that combination as an advisory.
+
 Activation hard-blocks when any provider in `required_providers` lacks credentials, so log in first: `/login anthropic`, `/login openai-codex`, `/login google-antigravity`, `/login xai` (and `opencode-go` via `OPENCODE_API_KEY`).
 
 ### Serving cross-vendor profiles through one OpenAI-compatible proxy

@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
@@ -16,7 +15,7 @@ import type {
 import { type SlackConversation, slackConversationKey } from "../src/sdk/bus/slack-conversation";
 import type { SlackProviderClient, SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
-import type { SessionRouterClient } from "../src/sdk/router";
+import { type SessionRouterClient, sessionAttachmentAuthorityId } from "../src/sdk/router";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
@@ -1372,21 +1371,16 @@ describe("chat daemon worker", () => {
 					rootTs: "root",
 					sessionId: host.sessionId,
 					endpointGeneration: 1,
-					attachmentAuthorityId: crypto
-						.createHash("sha256")
-						.update(
-							JSON.stringify({
-								sessionId: host.sessionId,
-								generation: 1,
-								pid: host.endpoint.pid,
-								endpointMtimeMs: host.endpointMtimeMs,
-								endpointAuthorityDigest: crypto
-									.createHash("sha256")
-									.update(JSON.stringify({ url: host.endpoint.url, token: host.endpoint.token }))
-									.digest("hex"),
-							}),
-						)
-						.digest("hex"),
+					// Derive through the Router's identity helper using the exact host
+					// process tuple; hand-rolled or test-runner pids create stale roots.
+					attachmentAuthorityId: sessionAttachmentAuthorityId({
+						sessionId: host.sessionId,
+						generation: 1,
+						pid: host.endpoint.pid,
+						endpointMtimeMs: host.endpointMtimeMs,
+						url: host.endpoint.url,
+						token: host.endpoint.token,
+					}),
 					updatedAt: Date.now(),
 					seenEventIds: [],
 					seenContextIds: [],

@@ -219,6 +219,7 @@ describe("SDK session index", () => {
 		expect(await index.repair()).toMatchObject({ status: "corrupt", repaired: true, validPrefixSeq: 2 });
 
 		await index.append(event("after"));
+		await index.compact();
 
 		expect(JSON.parse(await fs.readFile(snapshotFile, "utf8")).indexSeq).toBe(3);
 
@@ -313,6 +314,33 @@ describe("SDK session index", () => {
 			spy.mockRestore();
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
+	});
+	it("publishes the snapshot without fsyncing a read-only temp handle (Windows EPERM, #4250)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-readonly-fsync-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("windows"));
+		// Windows refuses FlushFileBuffers on a handle opened read-only with EPERM.
+		// Any read-only open of the snapshot temp must fail exactly like the reported
+		// crash, and publication must still land through a writable handle.
+		const open = fs.open.bind(fs);
+		const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			const handle = await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
+			if (rest[0] === "r" && file.endsWith(".tmp"))
+				(handle as unknown as { sync: () => Promise<void> }).sync = async () => {
+					throw Object.assign(new Error("operation not permitted, fsync"), { code: "EPERM" });
+				};
+			return handle;
+		}) as typeof fs.open);
+		try {
+			await index.snapshot();
+		} finally {
+			spy.mockRestore();
+		}
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		expect(snapshot.events.map((item: SessionIndexEvent) => item.sessionId)).toEqual(["windows"]);
+		// Publication must not leave the temp artifact behind.
+		const entries = await fs.readdir(path.join(dir, "sdk", "sessions"));
+		expect(entries.filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
 	it("accepts EBADF when closing a successfully written and synced append handle", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-close-ebadf-"));
@@ -766,6 +794,59 @@ describe("SDK session index", () => {
 			rename.mockRestore();
 		}
 		expect(replacementChecks).toBe(2);
+	});
+	it("does not recreate a retired index directory when a heartbeat pass runs", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-retired-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("heartbeat-owner"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		expect(await fs.exists(sessionsDir)).toBe(true);
+
+		// The owner retires the whole state root; the broker's periodic checkpoint must
+		// observe "nothing to check point" rather than rebuilding the tree underneath it.
+		await fs.rm(path.join(dir, "sdk"), { recursive: true, force: true });
+		expect(await index.checkpointLiveHeartbeats()).toBe(0);
+		expect(await fs.exists(sessionsDir)).toBe(false);
+		expect(await fs.exists(path.join(dir, "sdk"))).toBe(false);
+	});
+	it("repairs a long history into a retention-bounded snapshot other clients can lock promptly", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-repair-bound-"));
+		const maxRows = 50;
+		const policy = { maxRows };
+		const seed = await new SessionIndex(dir, policy).open();
+		// History that never reached a rotation boundary: the log alone carries every
+		// event, so repair is what decides whether the republished snapshot is bounded.
+		for (let i = 0; i < 400; i++) await seed.append(event(`session-${i}`));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const log = path.join(sessionsDir, "index.jsonl");
+		const before = await fs.readFile(log);
+		await fs.appendFile(log, "broken\n");
+
+		const repair = await new SessionIndex(dir, policy).repair();
+		expect(repair).toMatchObject({ status: "corrupt", repaired: true });
+		expect(await fs.readFile(path.join(repair.quarantinePath!, "index.jsonl"))).toEqual(
+			Buffer.concat([before, Buffer.from("broken\n")]),
+		);
+		// A repair republishes history as the snapshot; without retention it restores an
+		// unbounded snapshot that every later locked transaction must re-parse, which is
+		// how one broker starved every other client of the index lock.
+		const snapshot = JSON.parse(await fs.readFile(path.join(sessionsDir, "index.snapshot.json"), "utf8")) as {
+			events: SessionIndexEvent[];
+		};
+		expect(snapshot.events.length).toBeLessThanOrEqual(maxRows);
+		// Repair truncates the log to match the snapshot: the pre-repair events are all
+		// covered by the republished snapshot, so leaving them in place would force every
+		// later #scan() to re-parse the full history under the lock.
+		expect((await fs.readFile(path.join(sessionsDir, "index.jsonl"), "utf8")).trim()).toBe("");
+
+		// A second client must still take the shared index lock while the repaired index
+		// is in normal use, within a bound far below the 60s launch budget.
+		const holder = await new SessionIndex(dir, policy).open();
+		const contender = await new SessionIndex(dir, policy).open();
+		await holder.append(event("post-repair"));
+		const started = Date.now();
+		await contender.withLocked(async () => undefined);
+		expect(Date.now() - started).toBeLessThan(5_000);
 	});
 	it("serializes repair with a racing writer and resumes after the retained prefix", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));

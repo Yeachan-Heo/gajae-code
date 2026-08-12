@@ -1018,6 +1018,46 @@ describe("model profile activation", () => {
 		expect(session.getActiveModelProfile()).toBe("profile-a");
 	});
 
+	test("re-applies eager delegation after a successful activation but not after rollback", async () => {
+		const session = Object.assign(fakeSession(), { syncEagerDelegation: vi.fn(async () => {}) });
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+		expect(session.syncEagerDelegation).toHaveBeenCalledTimes(1);
+
+		const rollbackSession = Object.assign(fakeSession(), { syncEagerDelegation: vi.fn(async () => {}) });
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session: rollbackSession,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+			"flush failed",
+		);
+		expect(rollbackSession.syncEagerDelegation).not.toHaveBeenCalled();
+	});
+
+	test("a failing delegation sync never fails an already-applied activation", async () => {
+		const session = Object.assign(fakeSession(), {
+			syncEagerDelegation: vi.fn(async () => {
+				throw new Error("prompt refresh failed");
+			}),
+		});
+		const settings = Settings.isolated();
+
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		expect(session.getActiveModelProfile()).toBe("profile-a");
+		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-b/executor" });
+	});
+
 	test("materializing a profile role override persists the full effective assignment set and clears the profile", async () => {
 		const session = fakeSession();
 		const settings = Settings.isolated({

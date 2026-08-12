@@ -7,12 +7,29 @@ import * as zod from "zod/v4";
 import { hookCapability } from "../../capability/hook";
 import type { Hook } from "../../discovery";
 import { loadCapability } from "../../discovery";
+import { HookSourceConvention } from "../../hooks/events";
+import { type NormalizedHook, normalizeDirectoryHook } from "../../hooks/normalize";
 import type { HookMessage } from "../../session/messages";
 import type { SessionManager } from "../../session/session-manager";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	ExtensionFactory,
+	MessageRenderer,
+} from "../extensions/types";
 import * as typebox from "../typebox";
 import { resolvePath } from "../utils";
 import { execCommand } from "./runner";
-import type { ExecOptions, HookAPI, HookFactory, HookMessageRenderer, RegisteredCommand } from "./types";
+import type {
+	ExecOptions,
+	HookAPI,
+	HookCommandContext,
+	HookContext,
+	HookFactory,
+	HookMessageRenderer,
+	RegisteredCommand,
+} from "./types";
 
 /**
  * Generic handler function type.
@@ -71,6 +88,8 @@ export interface LoadedHook {
 	setSendMessageHandler: (handler: SendMessageHandler) => void;
 	/** Set the append entry handler for this hook's pi.appendEntry() */
 	setAppendEntryHandler: (handler: AppendEntryHandler) => void;
+	/** Canonical discovery descriptor when loaded from a known hook convention. */
+	normalization?: NormalizedHook;
 }
 
 /**
@@ -80,6 +99,11 @@ export interface LoadHooksResult {
 	/** Successfully loaded hooks */
 	hooks: LoadedHook[];
 	/** Errors encountered during loading */
+	errors: Array<{ path: string; error: string }>;
+}
+
+export interface LoadHookExtensionsResult {
+	factories: Array<{ factory: ExtensionFactory; name: string }>;
 	errors: Array<{ path: string; error: string }>;
 }
 
@@ -234,6 +258,8 @@ export async function loadHooks(paths: string[], cwd: string): Promise<LoadHooks
 export async function discoverAndLoadHooks(configuredPaths: string[], cwd: string): Promise<LoadHooksResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
+	const normalizationErrors: Array<{ path: string; error: string }> = [];
+	const normalizationByPath = new Map<string, NormalizedHook>();
 
 	// Helper to add paths without duplicates
 	const addPaths = (paths: string[]) => {
@@ -246,12 +272,129 @@ export async function discoverAndLoadHooks(configuredPaths: string[], cwd: strin
 		}
 	};
 
-	// 1. Discover hooks via capability API
+	// 1. Discover hooks via capability API and validate the provider descriptor
+	// against the canonical model before importing project-controlled code.
 	const discovered = await loadCapability<Hook>(hookCapability.id, { cwd });
-	addPaths(discovered.items.map(hook => hook.path));
+	for (const hook of discovered.items) {
+		const convention =
+			hook._source.provider === "native"
+				? HookSourceConvention.NativeGjc
+				: hook._source.provider === "claude"
+					? HookSourceConvention.ClaudeCode
+					: hook._source.provider === "codex"
+						? HookSourceConvention.Codex
+						: null;
+		if (convention) {
+			const normalized = normalizeDirectoryHook({
+				convention,
+				phase: hook.type,
+				toolName: hook.tool,
+				source: hook.path,
+				externalName: hook.name,
+			});
+			if (!normalized.hook) {
+				normalizationErrors.push({
+					path: hook.path,
+					error: normalized.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "),
+				});
+				continue;
+			}
+			normalizationByPath.set(path.resolve(hook.path), normalized.hook);
+		}
+		addPaths([hook.path]);
+	}
 
 	// 2. Explicitly configured paths (can override/add)
 	addPaths(configuredPaths.map(p => resolvePath(p, cwd)));
 
-	return loadHooks(allPaths, cwd);
+	const loaded = await loadHooks(allPaths, cwd);
+	for (const hook of loaded.hooks) {
+		hook.normalization = normalizationByPath.get(path.resolve(hook.path));
+	}
+	return { hooks: loaded.hooks, errors: [...normalizationErrors, ...loaded.errors] };
+}
+
+function toHookContext(context: ExtensionContext): HookContext {
+	return {
+		ui: {
+			select: (title, options) => context.ui.select(title, options),
+			confirm: (title, message) => context.ui.confirm(title, message),
+			input: (title, placeholder) => context.ui.input(title, placeholder),
+			notify: (message, type) => context.ui.notify(message, type),
+			setStatus: (key, text) => context.ui.setStatus(key, text),
+			custom: factory => context.ui.custom((tui, theme, _keybindings, done) => factory(tui, theme, done)),
+			setEditorText: text => context.ui.setEditorText(text),
+			getEditorText: () => context.ui.getEditorText(),
+			editor: (title, prefill, options) => context.ui.editor(title, prefill, options),
+			theme: context.ui.theme,
+		},
+		hasUI: context.hasUI,
+		cwd: context.cwd,
+		sessionManager: context.sessionManager,
+		modelRegistry: context.modelRegistry,
+		model: context.model,
+		isIdle: () => context.isIdle(),
+		abort: () => context.abort(),
+		hasQueuedMessages: () => context.hasQueuedMessages(),
+	};
+}
+
+function toHookCommandContext(context: ExtensionCommandContext): HookCommandContext {
+	return {
+		...toHookContext(context),
+		waitForIdle: () => context.waitForIdle(),
+		newSession: options => context.newSession(options),
+		branch: entryId => context.branch(entryId),
+		navigateTree: (targetId, options) => context.navigateTree(targetId, options),
+	};
+}
+
+function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
+	return (api: ExtensionAPI) => {
+		hook.setSendMessageHandler((message, options) => api.sendMessage(message, options));
+		hook.setAppendEntryHandler((customType, data) => api.appendEntry(customType, data));
+
+		for (const [event, handlers] of hook.handlers) {
+			for (const handler of handlers) {
+				const normalized = hook.normalization;
+				const adapted: HandlerFn = async (...args: unknown[]) => {
+					const payload = args[0] as { toolName?: string };
+					if (
+						normalized &&
+						event === normalized.runtimeEvent &&
+						normalized.toolName !== "*" &&
+						payload.toolName !== normalized.toolName
+					) {
+						return undefined;
+					}
+					return await handler(payload, toHookContext(args[1] as ExtensionContext));
+				};
+				(api.on as (event: string, handler: HandlerFn) => void)(event, adapted);
+			}
+		}
+
+		for (const [customType, renderer] of hook.messageRenderers) {
+			const adaptedRenderer: MessageRenderer = (message, options, theme) =>
+				renderer({ ...message, role: "hookMessage" }, options, theme);
+			api.registerMessageRenderer(customType, adaptedRenderer);
+		}
+		for (const command of hook.commands.values()) {
+			api.registerCommand(command.name, {
+				description: command.description,
+				handler: (args, context) => command.handler(args, toHookCommandContext(context)),
+			});
+		}
+	};
+}
+
+/** Load normalized directory hooks and adapt them into the authoritative ExtensionRunner path. */
+export async function discoverAndLoadHookExtensions(cwd: string): Promise<LoadHookExtensionsResult> {
+	const loaded = await discoverAndLoadHooks([], cwd);
+	return {
+		factories: loaded.hooks.map(hook => ({
+			factory: createHookExtensionFactory(hook),
+			name: `hook:${hook.resolvedPath}`,
+		})),
+		errors: loaded.errors,
+	};
 }

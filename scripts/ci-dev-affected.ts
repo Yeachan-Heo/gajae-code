@@ -414,20 +414,25 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 	return paths.some(isDarwinArm64TabWorkerSmokePath);
 }
 
-// Paths whose Windows drive-letter vs Volume-GUID canonicalization and Bun
-// `node:fs` resident-cache write semantics the fix governs. On Ubuntu the
-// windows-canonical-path regression suite is skipped by `describe.skipIf`, so a
-// Linux shard cannot verify the ENOENT fix; dev-ci consumes this emitted flag to
-// run and require the windows-latest job whenever any of these change.
+// Paths whose Windows drive-letter vs Volume-GUID canonicalization, Bun
+// `node:fs` resident-cache write semantics, or session-index snapshot fsync
+// semantics the fix governs. On Ubuntu the windows-canonical-path regression
+// suite is skipped by `describe.skipIf`, so a Linux shard cannot verify those
+// fixes; dev-ci consumes this emitted flag to run and require the
+// windows-latest job whenever any of these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
-	return changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
+	return (
+		changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
 		changedPath === "packages/coding-agent/src/session/internal/managed-session-storage.ts" ||
 		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/session-directory.ts" ||
 		changedPath === "packages/coding-agent/src/session/session-manager.ts" ||
+		changedPath === "packages/coding-agent/src/sdk/broker/session-index.ts" ||
 		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts" ||
 		changedPath === "packages/coding-agent/test/session/managed-lock-lease.windows.test.ts" ||
-		changedPath === "packages/coding-agent/test/sdk-session-directory.windows.test.ts";
+		changedPath === "packages/coding-agent/test/sdk-session-directory.windows.test.ts" ||
+		changedPath === "packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts"
+	);
 }
 
 export function needsWindowsSessionPathRegression(paths: readonly string[]): boolean {

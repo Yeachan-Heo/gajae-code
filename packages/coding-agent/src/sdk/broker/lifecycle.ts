@@ -4943,6 +4943,14 @@ export function sessionHostWorkInFlight(): boolean {
  */
 export const BROKER_DEAD_REGISTRATION_SWEEP_MS = 60_000;
 
+/**
+ * Registrations reaped per sweep. Every reap is its own locked index transaction,
+ * so an uncapped sweep over a long-lived index turns one broker into a continuous
+ * holder of the shared session-index lock and starves unrelated `gjc` launches out
+ * of their bounded retry budget. Surplus dead rows are reaped by later sweeps.
+ */
+export const BROKER_DEAD_REGISTRATION_SWEEP_LIMIT = 64;
+
 /** One reaped registration, as recorded by {@link reapDeadSessionRegistrations}. */
 export interface ReapedSessionRegistration {
 	sessionId: string;
@@ -4963,15 +4971,22 @@ export interface ReapedSessionRegistration {
  * terminal-uncertain identities are retained. Identity-level rows let the sweep
  * retire a dead losing root without disturbing the surviving authority.
  */
-export async function reapDeadSessionRegistrations(broker: BrokerIndex): Promise<ReapedSessionRegistration[]> {
+export async function reapDeadSessionRegistrations(
+	broker: BrokerIndex,
+	limit = BROKER_DEAD_REGISTRATION_SWEEP_LIMIT,
+): Promise<ReapedSessionRegistration[]> {
 	await broker.index.refresh();
-	const dead = broker.index.listSessionIdentities().filter(session => {
-		if (session.terminal || session.terminalUncertain) return false;
-		const recordedIncarnation = session.hostIncarnation ?? session.processIncarnation;
-		return (
-			observeProcess(session.pid, recordedIncarnation, pid => processIncarnationForBroker(broker, pid)) === "exited"
-		);
-	});
+	const dead = broker.index
+		.listSessionIdentities()
+		.filter(session => {
+			if (session.terminal || session.terminalUncertain) return false;
+			const recordedIncarnation = session.hostIncarnation ?? session.processIncarnation;
+			return (
+				observeProcess(session.pid, recordedIncarnation, pid => processIncarnationForBroker(broker, pid)) ===
+				"exited"
+			);
+		})
+		.slice(0, Math.max(0, limit));
 	const reaped: ReapedSessionRegistration[] = [];
 	for (const session of dead) {
 		if (!(await broker.index.unregisterIfCurrent(session))) continue;

@@ -323,6 +323,25 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 		store.dispose();
 		expect(fs.existsSync(instanceDir)).toBe(false);
 	});
+	it("disposes through a widened cache parent instead of retaining resident session bytes", () => {
+		const cacheRoot = path.join(makeTempDir(), "resident-cache");
+		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);
+		const store = EphemeralBlobStore.adoptVerifiedDir(instanceDir);
+		store.putSync(Buffer.from("resident payload", "utf8"));
+
+		// A root whose mode widened after adoption is still the same owned directory.
+		// Retaining the instance there would leak session text under a world-writable
+		// parent, which is strictly worse than completing the verified disposal.
+		fs.chmodSync(cacheRoot, 0o777);
+		try {
+			store.dispose();
+		} finally {
+			fs.chmodSync(cacheRoot, 0o700);
+		}
+		expect(fs.existsSync(instanceDir)).toBe(false);
+		expect(instanceDirectories(cacheRoot)).toEqual([]);
+	});
+
 	it("refuses to dispose a present instance directory that lost owner-only mode", () => {
 		const cacheRoot = path.join(makeTempDir(), "resident-cache");
 		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);

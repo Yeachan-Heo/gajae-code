@@ -54,6 +54,7 @@ import {
 } from "../config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "../config/prompt-templates";
 import { Settings, type SkillsSettings } from "../config/settings";
+import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import "../discovery";
@@ -93,9 +94,11 @@ import {
 	gjcActivationGenerationFor,
 } from "../extensibility/gjc-plugins/runtime-quarantine";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
+import { discoverAndLoadHookExtensions } from "../extensibility/hooks/loader";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
+import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
@@ -921,12 +924,26 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 
 export function createPluginHooksExtension(hooks: ConstrainedPluginHook[]): ExtensionFactory {
 	return api => {
-		for (const hook of hooks) {
-			// Constrained hooks have one explicit execution phase. `tool_call` is
-			// pre-execution; an after-phase tool_call hook is registered on the
-			// post-execution tool_result event so it cannot block the tool.
-			const registrationEvent = hook.event === "tool_call" && hook.phase === "after" ? "tool_result" : hook.event;
-			const target = hook.target;
+		const normalizedHooks = hooks.map(hook => ({
+			hook,
+			result: normalizePluginHook({
+				declaredEvent: hook.event,
+				target: hook.target,
+				phase: hook.phase,
+				plugin: hook.plugin,
+				source: `plugin:${hook.plugin}`,
+			}),
+		}));
+		const diagnostics = normalizedHooks.flatMap(entry => entry.result.diagnostics);
+		if (normalizedHooks.some(entry => !entry.result.hook)) {
+			throw new Error(diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "));
+		}
+
+		for (const { hook, result } of normalizedHooks) {
+			const normalized = result.hook;
+			if (!normalized) throw new Error("Hook normalization invariant violated");
+			const registrationEvent = normalized.runtimeEvent;
+			const target = normalized.toolName === "*" ? undefined : normalized.toolName;
 			const handler = target
 				? (event: { toolName?: string; tool?: { name?: string }; name?: string }, ...rest: unknown[]) => {
 						const toolName = event?.toolName ?? event?.tool?.name ?? event?.name;
@@ -2202,12 +2219,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		// MCP routing is scope-held; no process-global manager registration.
 
-		// Custom tool and extension discovery is quarantined from the public GJC utility surface.
-		// Explicit SDK extension factories are still honored; callers use them to
-		// register in-process tools/providers without enabling filesystem discovery.
+		// General extension discovery is quarantined from the public SDK surface.
+		// Recognized hook conventions are the bounded exception: their descriptors
+		// normalize before import and then adapt into the authoritative ExtensionRunner.
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
+		const discoveredHookExtensions: Array<{ factory: ExtensionFactory; name: string }> = [];
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
+		}
+		if (!options.disableExtensionDiscovery) {
+			try {
+				const hookExtensions = await discoverAndLoadHookExtensions(cwd);
+				discoveredHookExtensions.push(...hookExtensions.factories);
+				for (const error of hookExtensions.errors) {
+					logger.warn("Rejected discovered hook", { path: error.path, error: error.error });
+				}
+			} catch (error) {
+				logger.warn("Failed to discover hook extensions", { error: safeErrorForLog(error) });
+			}
 		}
 
 		// Always-on constrained plugin hooks (validated registry surfaces). Additive
@@ -2433,6 +2462,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				);
 				extensionsResult.extensions.push(loaded);
 			}
+		}
+		for (const entry of discoveredHookExtensions) {
+			const loaded = await loadExtensionFromFactory(
+				entry.factory,
+				cwd,
+				eventBus,
+				extensionsResult.runtime,
+				entry.name,
+			);
+			extensionsResult.extensions.push(loaded);
 		}
 
 		// Process provider registrations queued during extension loading.
@@ -2675,7 +2714,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
-		const eagerTasks = settings.get("task.eager");
+		// Re-resolved per prompt build so a profile activated after session start is
+		// reflected on the next refresh. Vendor-separated worker roles imply eager
+		// delegation unless `task.eager` is configured explicitly.
+		const resolveEagerTasks = (): boolean => {
+			const profileName = startupActiveModelProfile ?? settings.get("modelProfile.default");
+			const resolvedProfileName = profileName ? resolveModelProfileName(profileName, persistedProfiles) : undefined;
+			return resolveEagerTaskDelegation({
+				settings,
+				profile: resolvedProfileName ? persistedProfiles.get(resolvedProfileName) : undefined,
+			}).eagerTasks;
+		};
+		const eagerTasks = resolveEagerTasks();
 		const intentTracingEnabled = resolveIntentTracingEnabled(settings.get("tools.intentTracing"), {
 			subSession: isCanonicalSubSession,
 		});
@@ -2760,7 +2810,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				repeatToolDescriptions,
 				intentField,
 				toolDiscoveryActive: effectiveDiscoveryMode === "all" || mcpDiscoveryEnabled,
-				eagerTasks,
+				eagerTasks: resolveEagerTasks(),
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
 				subagent: options.parentTaskPrefix !== undefined,
