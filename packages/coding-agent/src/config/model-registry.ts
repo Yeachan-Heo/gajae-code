@@ -2643,8 +2643,13 @@ export class ModelRegistry {
 					...(baseUrl !== model.baseUrl ? { baseUrl } : {}),
 				};
 			});
+			const preservesExistingDescriptorEvidence =
+				(result.dynamicModelIds === undefined && !result.fetched && !result.stale) ||
+				(result.stale && result.cacheFresh && result.cacheAuthoritative && evidence?.fresh === true) ||
+				(strategy === "offline" && result.dynamicModelIds === undefined);
 			if (
 				isCurrentDiscovery() &&
+				!preservesExistingDescriptorEvidence &&
 				(result.fetched ||
 					result.dynamicModelIds !== undefined ||
 					result.stale ||

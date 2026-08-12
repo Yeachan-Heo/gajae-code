@@ -58,6 +58,10 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
 export interface ModelResolutionResult<TApi extends Api = Api> {
 	models: Model<TApi>[];
 	stale: boolean;
+	/** Whether the cache row consulted for this resolution was still within its TTL. */
+	cacheFresh: boolean;
+	/** Whether the consulted cache row was authoritative. */
+	cacheAuthoritative: boolean;
 	/** Whether this resolution successfully fetched dynamic models. */
 	fetched: boolean;
 	/**
@@ -164,6 +168,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			return {
 				models: cachedModels,
 				stale: false,
+				cacheFresh: true,
+				cacheAuthoritative: true,
 				fetched: false,
 				dynamicModelIds:
 					strategy === "online-if-uncached" && cacheDynamicModelIdsCurrent ? cache.dynamicModelIds : undefined,
@@ -185,6 +191,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		return {
 			models: repairedModels,
 			stale: false,
+			cacheFresh: true,
+			cacheAuthoritative: true,
 			fetched: false,
 			dynamicModelIds:
 				strategy === "online-if-uncached" && cacheDynamicModelIdsCurrent ? cache.dynamicModelIds : undefined,
@@ -244,6 +252,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	return {
 		models,
 		stale: !dynamicAuthoritative,
+		cacheFresh: cache?.fresh ?? false,
+		cacheAuthoritative: cache?.authoritative ?? false,
 		fetched: shouldFetchFromNetwork && dynamicFetchSucceeded,
 		dynamicModelIds: dynamicFetchSucceeded
 			? dynamicModels.map(model => model.id)
