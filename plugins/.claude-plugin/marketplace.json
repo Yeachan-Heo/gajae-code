@@ -24,6 +24,21 @@
         "agents",
         "sdk"
       ]
+    },
+    {
+      "name": "rust-skills",
+      "source": "./rust-skills",
+      "description": "Rust best-practices corpus with once-per-session auto-injected guidance for Rust files.",
+      "version": "1.5.1",
+      "author": {
+        "name": "leonardomso (corpus), Gajae Code (packaging)"
+      },
+      "keywords": [
+        "rust",
+        "rules",
+        "skills",
+        "best-practices"
+      ]
     }
   ]
 }
