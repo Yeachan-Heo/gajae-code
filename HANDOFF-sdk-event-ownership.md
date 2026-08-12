@@ -2,7 +2,12 @@
 
 - Branch: `refactor/sdk-event-ownership` (off `dev` @ `08c527fd8`)
 - Worktree: `../gajae-code.gajae-code-worktree/sdk-event-ownership`
-- Status: **investigation complete, no code changes yet**
+- Status: **Slice 1 landed** (unify duplicated durable terminal-retention writes,
+  see `refactor(sdk): unify duplicated durable terminal-retention writes` +
+  `fix(session): keep transitional reservations out of retention eviction`).
+  Slices 2-5 (canonical event projection, ask bridging into SDK core, idle
+  genesis, hosting de-gated) remain outstanding — do not re-derive or
+  duplicate the landed retention-write unification below.
 - Date: 2026-08-12
 
 ## Problem statement
@@ -92,11 +97,17 @@ comments.
 ## Sequenced plan (each slice independently shippable, PRs target `dev`)
 
 1. **Slice 1 — unify duplicated runtime logic (highest value, lowest risk):**
-   extract the shared `agent_end`/terminal-abort/publication-capture/
-   reconciliation logic used by both `bus/index.ts` and
-   `host/session-runtime.ts` into one shared session-runtime module. No
-   behavior change; existing tests in `host/session-runtime.test.ts` and bus
-   tests must pass unchanged.
+   **Landed (partial).** The durable terminal-retention write path (the
+   four hand-rolled retention-transaction call sites, 256/4096 caps) used by
+   both `bus/index.ts` and `host/session-runtime.ts` is unified; a follow-up
+   fix keeps transitional reservations out of retention eviction. Remaining
+   under this slice: the bus synchronous publication-capture path and the
+   host `agent_end` waiter array are intentionally still separate (deferred
+   to a later slice per commit `2c6cd6ecaa9`) and the broader
+   `agent_end`/terminal-abort/reconciliation logic beyond the retention-write
+   transaction has not yet been extracted into one shared session-runtime
+   module. Existing tests in `host/session-runtime.test.ts` and bus tests
+   pass unchanged (behavior-preserving, 600-case differential equivalence).
 2. **Slice 2 — canonical event projection:** SDK core emits `session_settled` /
    activity transitions once; bus subscribes instead of deriving from raw
    extension events. Preserve the one-settle-one-event invariant (idle-flood
