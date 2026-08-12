@@ -1075,7 +1075,6 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"bun",
 			"test",
 			"packages/coding-agent",
-			"--isolate",
 			"--timeout=30000",
 			"--shard=1/8",
 		]);
@@ -1096,7 +1095,6 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"bun",
 			"test",
 			"packages/coding-agent",
-			"--isolate",
 			"--timeout=30000",
 			"--shard=1/8",
 		]);
@@ -1451,7 +1449,6 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"bun",
 			"test",
 			"packages/coding-agent",
-			"--isolate",
 			"--timeout=30000",
 			"--shard=1/8",
 		]);
