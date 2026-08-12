@@ -408,12 +408,12 @@ describe("StdinBuffer", () => {
 
 		it("preserves a Meta-wrapped arrow when the chunk splits after the third Escape", () => {
 			// Same ESC ESC ESC [ A bytes as above, but the read boundary falls after
-			// the Escape run. The ambiguous odd trailing run must stay buffered so the
-			// continuation still forms the Meta wrapper instead of a plain Up after a
-			// destructive double-Escape gesture.
+			// the Escape run. Only the final two bytes stay buffered as the ambiguous
+			// Meta candidate, so the continuation still forms the wrapper instead of a
+			// plain Up after a destructive double-Escape gesture.
 			vi.useFakeTimers();
 			processInput("\x1b\x1b\x1b");
-			expect(emittedSequences).toEqual([]);
+			expect(emittedSequences).toEqual(["\x1b"]);
 
 			vi.advanceTimersByTime(9);
 			processInput("[A");
@@ -515,6 +515,33 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences.length).toBe(runLength - 1);
 			expect(emittedSequences.at(-1)).toBe("\x1b\x1bA");
 			expect(emittedSequences.slice(0, -1).every(sequence => sequence === "\x1b")).toBe(true);
+		});
+
+		it("keeps only the ambiguous Meta candidate buffered across chunks", () => {
+			// Retaining the whole run made every later read rescan it. Only the final
+			// two bytes can still become a Meta prefix, so the rest settle immediately.
+			for (let index = 0; index < 64; index++) processInput("\x1b");
+
+			expect(emittedSequences).toEqual(Array(62).fill("\x1b"));
+			expect(buffer.flush()).toEqual(["\x1b", "\x1b"]);
+		});
+
+		it("scales linearly over Escape-run length delivered byte by byte", () => {
+			// The cross-chunk counterpart: rescanning the retained run on every read
+			// cost 2.4s at 50k bytes before the buffered run was bounded.
+			const decodePerByte = (runLength: number): number => {
+				const probe = new StdinBuffer();
+				probe.on("data", () => {});
+				const started = Bun.nanoseconds();
+				for (let index = 0; index < runLength; index++) probe.process("\x1b");
+				return Bun.nanoseconds() - started;
+			};
+			decodePerByte(2_000);
+
+			const small = decodePerByte(5_000);
+			const large = decodePerByte(50_000);
+
+			expect(large / Math.max(small, 1)).toBeLessThan(30);
 		});
 
 		it("scales linearly rather than quadratically over Escape-run length", () => {

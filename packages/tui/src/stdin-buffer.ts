@@ -288,12 +288,23 @@ function splitResolvedEscapeRun(buffer: string): string[] {
 	return /^\x1b{2,}$/.test(buffer) ? buffer.split("") : [buffer];
 }
 
-function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {
+/**
+ * `knownEscapeRunLength` is the number of leading ESC bytes a previous call
+ * already measured and returned as an all-Escape remainder. Resuming the scan
+ * there keeps a run delivered across many small reads linear overall instead of
+ * re-walking the whole accumulated prefix on every chunk.
+ */
+function extractCompleteSequences(
+	buffer: string,
+	knownEscapeRunLength = 0,
+): { sequences: string[]; remainder: string; escapeRunRemainder: number } {
 	const sequences: string[] = [];
 	let pos = 0;
 
 	while (pos < buffer.length) {
-		const remaining = buffer.slice(pos);
+		// Slicing at 0 would copy the whole buffer on every call, which is the
+		// dominant cost when a long Escape run arrives as many single-byte reads.
+		const remaining = pos === 0 ? buffer : buffer.slice(pos);
 
 		// Try to extract a sequence starting at this position
 		if (remaining.startsWith(ESC)) {
@@ -311,7 +322,7 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 			}
 			// Measure the ESC run once. Testing the whole suffix on every iteration
 			// while the cut below advances only two bytes made a long run quadratic.
-			let runLength = 1;
+			let runLength = pos === 0 ? Math.max(knownEscapeRunLength, 1) : 1;
 			while (runLength < remaining.length && remaining[runLength] === ESC) runLength++;
 			// A trailing run of nothing but ESC bytes is ambiguous: the next chunk
 			// may still deliver the continuation that turns its last ESC into a Meta
@@ -320,7 +331,17 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 			// one, firing the destructive double-Escape gesture. Keep the whole run
 			// buffered; the flush timeout emits it as individual Escape presses.
 			if (runLength === remaining.length) {
-				return { sequences, remainder: remaining };
+				// Only the last two bytes of the run are still ambiguous: a Meta prefix
+				// is at most ESC ESC, so any earlier ESC is already a settled press.
+				// Emitting them now keeps the retained buffer bounded; holding the whole
+				// run made every later read rescan it, which is quadratic for a long run
+				// delivered as many small chunks. Order of emitted presses is unchanged.
+				const settled = runLength - 2;
+				if (settled > 0) {
+					for (let index = 0; index < settled; index++) sequences.push(ESC);
+					return { sequences, remainder: remaining.slice(settled), escapeRunRemainder: 2 };
+				}
+				return { sequences, remainder: remaining, escapeRunRemainder: runLength };
 			}
 			// Only the final two ESC bytes can still form a Meta prefix for the
 			// continuation that follows the run; everything before them is a settled
@@ -376,7 +397,7 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 			}
 
 			if (seqEnd > remaining.length) {
-				return { sequences, remainder: remaining };
+				return { sequences, remainder: remaining, escapeRunRemainder: 0 };
 			}
 		} else {
 			// Not an escape sequence - take a single Unicode code point. Keep a
@@ -384,7 +405,7 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 			// complete it.
 			const firstCodeUnit = remaining.charCodeAt(0);
 			if (isHighSurrogate(firstCodeUnit)) {
-				if (remaining.length === 1) return { sequences, remainder: remaining };
+				if (remaining.length === 1) return { sequences, remainder: remaining, escapeRunRemainder: 0 };
 				const secondCodeUnit = remaining.charCodeAt(1);
 				if (isLowSurrogate(secondCodeUnit)) {
 					sequences.push(remaining.slice(0, 2));
@@ -397,7 +418,7 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 		}
 	}
 
-	return { sequences, remainder: "" };
+	return { sequences, remainder: "", escapeRunRemainder: 0 };
 }
 
 export type StdinBufferOptions = {
@@ -426,6 +447,9 @@ export type StdinBufferEventMap = {
  */
 export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	#buffer: string = "";
+	// Length of the leading all-Escape run already measured in #buffer, so a run
+	// arriving as many small reads is scanned once overall instead of per chunk.
+	#bufferedEscapeRunLength = 0;
 	#timeout?: NodeJS.Timeout;
 	readonly #timeoutMs: number;
 	#pasteMode: boolean = false;
@@ -533,6 +557,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		if (this.#pasteMode) {
 			this.#pasteBuffer += this.#buffer;
 			this.#buffer = "";
+			this.#bufferedEscapeRunLength = 0;
 
 			const endIndex = this.#pasteBuffer.indexOf(BRACKETED_PASTE_END);
 			if (endIndex !== -1) {
@@ -552,7 +577,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			return;
 		}
 
-		const startIndex = this.#buffer.indexOf(BRACKETED_PASTE_START);
+		// A known all-Escape prefix cannot contain the paste introducer, so start
+		// the scan just far enough back to catch a marker straddling the boundary.
+		// Rescanning the whole retained run on every read made a long run quadratic.
+		const pasteScanFrom = Math.max(0, this.#bufferedEscapeRunLength - BRACKETED_PASTE_START.length);
+		const startIndex = this.#buffer.indexOf(BRACKETED_PASTE_START, pasteScanFrom);
 		if (startIndex !== -1) {
 			if (startIndex > 0) {
 				const beforePaste = this.#buffer.slice(0, startIndex);
@@ -574,6 +603,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.#pasteMode = true;
 			this.#pasteBuffer = this.#buffer;
 			this.#buffer = "";
+			this.#bufferedEscapeRunLength = 0;
 
 			const endIndex = this.#pasteBuffer.indexOf(BRACKETED_PASTE_END);
 			if (endIndex !== -1) {
@@ -593,8 +623,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			return;
 		}
 
-		const result = extractCompleteSequences(this.#buffer);
+		const result = extractCompleteSequences(this.#buffer, this.#bufferedEscapeRunLength);
 		this.#buffer = result.remainder;
+		// Remember an all-Escape remainder so the next chunk resumes the run scan
+		// at its end rather than re-walking every byte received so far.
+		this.#bufferedEscapeRunLength = result.escapeRunRemainder;
 
 		for (const sequence of result.sequences) {
 			if (isSgrMousePrefix(sequence) && !isSgrMouseSequence(sequence)) continue;
@@ -625,11 +658,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			}
 			const remainder = suffix.slice(index);
 			this.#buffer = "";
+			this.#bufferedEscapeRunLength = 0;
 			this.#pendingKittyPrintableCodepoint = undefined;
 			if (remainder) this.process(remainder);
 			return;
 		}
 		this.#buffer = "";
+		this.#bufferedEscapeRunLength = 0;
 		this.#pendingKittyPrintableCodepoint = undefined;
 		this.#sgrQuarantine = true;
 		this.#sgrQuarantineBytes = suffix.length;
@@ -760,6 +795,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 		if (isSgrMousePrefix(this.#buffer)) {
 			this.#buffer = "";
+			this.#bufferedEscapeRunLength = 0;
 			this.#pendingKittyPrintableCodepoint = undefined;
 			return pendingMeta === undefined ? [] : [pendingMeta];
 		}
@@ -775,6 +811,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		const flushedBuffer = splitResolvedEscapeRun(this.#buffer);
 		const sequences = pendingMeta === undefined ? flushedBuffer : [pendingMeta, ...flushedBuffer];
 		this.#buffer = "";
+		this.#bufferedEscapeRunLength = 0;
 		this.#pendingKittyPrintableCodepoint = undefined;
 		return sequences;
 	}
@@ -785,6 +822,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.#timeout = undefined;
 		}
 		this.#buffer = "";
+		this.#bufferedEscapeRunLength = 0;
 		this.#pasteMode = false;
 		this.#pasteBuffer = "";
 		this.#pendingKittyPrintableCodepoint = undefined;
