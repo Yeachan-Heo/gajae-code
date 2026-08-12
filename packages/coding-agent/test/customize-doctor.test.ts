@@ -1,0 +1,304 @@
+/**
+ * Acceptance tests for `gjc customize doctor` (#4288).
+ *
+ * Covers the issue's acceptance criteria:
+ *  1. deterministic fixture provenance/precedence across native `.gjc`,
+ *     Claude, and Codex customizations;
+ *  2. secret redaction in both text and JSON output;
+ *  3. distinct reason codes for malformed/disabled/shadowed/quarantined/
+ *     policy-blocked items;
+ *  4. agreement with the actual session-startup consumers (`loadSkills`,
+ *     `loadAllMCPConfigs`) — the doctor never claims a surface is active when
+ *     startup ignores it (including the #4349 invariant that bundled workflow
+ *     skills always win over same-name filesystem copies).
+ */
+import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	type CustomizeDoctorReport,
+	type CustomizeDoctorSurface,
+	renderCustomizeDoctorJson,
+	renderCustomizeDoctorText,
+	runCustomizeDoctor,
+} from "../src/cli/customize-doctor";
+import { Settings } from "../src/config/settings";
+import { loadSkills } from "../src/extensibility/skills";
+import { loadAllMCPConfigs } from "../src/runtime-mcp/config";
+
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+	while (tempDirs.length > 0) {
+		const dir = tempDirs.pop();
+		if (dir) await fs.rm(dir, { recursive: true, force: true });
+	}
+});
+
+async function makeTempProject(): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customize-doctor-"));
+	tempDirs.push(dir);
+	return dir;
+}
+
+async function makeSkill(skillsRoot: string, name: string, description: string): Promise<string> {
+	const filePath = path.join(skillsRoot, name, "SKILL.md");
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await Bun.write(
+		filePath,
+		["---", `name: ${name}`, `description: ${description}`, "---", "", `# ${name}`].join("\n"),
+	);
+	return filePath;
+}
+
+async function writeJson(filePath: string, value: unknown): Promise<void> {
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await Bun.write(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function surface(report: CustomizeDoctorReport, kind: CustomizeDoctorSurface["kind"]): CustomizeDoctorSurface {
+	const found = report.surfaces.find(s => s.kind === kind);
+	if (!found) throw new Error(`surface ${kind} missing from report`);
+	return found;
+}
+
+function itemsByName(report: CustomizeDoctorReport, kind: CustomizeDoctorSurface["kind"]) {
+	return new Map(surface(report, kind).items.map(item => [item.name, item]));
+}
+
+function withoutTimestamp(report: CustomizeDoctorReport): Omit<CustomizeDoctorReport, "generatedAt"> {
+	const { generatedAt: _generatedAt, ...rest } = report;
+	return rest;
+}
+
+describe("customize doctor (#4288)", () => {
+	it("reports deterministic provenance and precedence across native, Claude, and Codex fixtures", async () => {
+		const cwd = await makeTempProject();
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "fixture-native", "Native project skill");
+		await makeSkill(path.join(cwd, ".claude", "skills"), "fixture-claude", "Claude convention skill");
+		await makeSkill(path.join(cwd, ".codex", "skills"), "fixture-codex", "Codex convention skill");
+		await writeJson(path.join(cwd, ".gjc", "mcp.json"), {
+			mcpServers: { "fixture-native-mcp": { command: "true" } },
+		});
+		await writeJson(path.join(cwd, ".claude", "mcp.json"), {
+			mcpServers: { "fixture-claude-mcp": { command: "true" } },
+		});
+
+		const settings = Settings.isolated({});
+		const first = await runCustomizeDoctor(cwd, settings);
+		const second = await runCustomizeDoctor(cwd, settings);
+
+		const skills = itemsByName(first, "skill");
+		expect(skills.get("fixture-native")).toMatchObject({
+			sourceClass: "canonical",
+			convention: "gjc",
+			scope: "project",
+			status: "loaded",
+			reason: "loaded",
+		});
+		expect(skills.get("fixture-claude")).toMatchObject({
+			sourceClass: "import-candidate",
+			convention: "claude-project",
+			status: "ignored",
+			reason: "source-ignored",
+		});
+		expect(skills.get("fixture-codex")).toMatchObject({
+			sourceClass: "import-candidate",
+			convention: "codex-project",
+			status: "ignored",
+			reason: "source-ignored",
+		});
+
+		const mcps = itemsByName(first, "mcp");
+		expect(mcps.get("fixture-native-mcp")).toMatchObject({
+			sourceClass: "canonical",
+			convention: "gjc",
+			scope: "project",
+		});
+		expect(mcps.get("fixture-claude-mcp")).toMatchObject({
+			sourceClass: "import-candidate",
+			convention: "claude-project",
+			status: "ignored",
+			reason: "source-ignored",
+		});
+		// Import candidates are never active runtime authority.
+		expect(mcps.get("fixture-claude-mcp")?.mcp?.connectable).toBe(false);
+
+		// Determinism: two runs over the same fixture produce identical reports
+		// (modulo the generation timestamp).
+		expect(withoutTimestamp(second)).toEqual(withoutTimestamp(first));
+	});
+
+	it("redacts secret-bearing MCP fields in both JSON and text output", async () => {
+		const cwd = await makeTempProject();
+		await writeJson(path.join(cwd, ".gjc", "mcp.json"), {
+			mcpServers: {
+				"fixture-secret-stdio": {
+					command: "run-server",
+					args: ["--api-key", "supersecret-value", "--token=abc123token", "--plain", "visible"],
+					env: { API_TOKEN: "envsecret-value", MODE: "fast" },
+					headers: { Authorization: "Bearer headersecret-value" },
+				},
+			},
+		});
+
+		const report = await runCustomizeDoctor(cwd, Settings.isolated({}));
+		const json = renderCustomizeDoctorJson(report);
+		const text = renderCustomizeDoctorText(report);
+
+		for (const output of [json, text]) {
+			expect(output).not.toContain("supersecret-value");
+			expect(output).not.toContain("abc123token");
+			expect(output).not.toContain("envsecret-value");
+			expect(output).not.toContain("headersecret-value");
+			expect(output).toContain("<redacted>");
+		}
+
+		const item = itemsByName(report, "mcp").get("fixture-secret-stdio");
+		expect(item?.mcp?.args).toEqual(["--api-key", "<redacted>", "--token=<redacted>", "--plain", "visible"]);
+		// Env values are never emitted — names only, sorted.
+		expect(item?.mcp?.envKeys).toEqual(["API_TOKEN", "MODE"]);
+		expect(item?.mcp?.hasHeaders).toBe(true);
+	});
+
+	it("emits distinct reason codes for malformed, disabled, shadowed, quarantined, and policy-blocked items", async () => {
+		const cwd = await makeTempProject();
+		await writeJson(path.join(cwd, ".gjc", "mcp.json"), {
+			mcpServers: {
+				"fixture-broken": {},
+				"fixture-off": { command: "true", enabled: false },
+				"fixture-userinfo": { url: "https://user:passphrase@example.com/mcp" },
+			},
+		});
+		// A project copy of a bundled workflow skill name loses to the bundled
+		// definition (#4349 invariant) — a deterministic shadowed fixture.
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "ralplan", "Project copy of a bundled skill");
+		// A quarantined plugin bundle: an enabled entry whose installed file is
+		// missing on disk deterministically quarantines every declared surface.
+		const pluginRoot = path.join(cwd, ".gjc", "gjc-plugins", "fixture-bundle");
+		await writeJson(path.join(cwd, ".gjc", "gjc-plugins", "registry.json"), {
+			version: 1,
+			scope: "project",
+			plugins: [
+				{
+					name: "fixture-bundle",
+					version: "1.0.0",
+					scope: "project",
+					enabled: true,
+					pluginRoot,
+					manifestPath: path.join(pluginRoot, "gajae-plugin.json"),
+					manifestHash: "",
+					source: { kind: "path", uri: pluginRoot, resolvedAt: "2026-01-01T00:00:00.000Z" },
+					installedAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+					copiedFiles: [{ relativePath: "tools/fixture.ts", sha256: "0".repeat(64), bytes: 1 }],
+					surfaces: {
+						subskills: [],
+						tools: [
+							{
+								extensionId: "tool:fixture-tool",
+								name: "fixture-tool",
+								relativePath: "tools/fixture.ts",
+								sha256: "0".repeat(64),
+							},
+						],
+						hooks: [],
+						mcps: [],
+						systemAppendices: [],
+						agentAppendices: [],
+					},
+					disabledSurfaceIds: [],
+				},
+			],
+		});
+
+		const report = await runCustomizeDoctor(cwd, Settings.isolated({}));
+
+		const mcps = itemsByName(report, "mcp");
+		expect(mcps.get("fixture-broken")).toMatchObject({ status: "rejected", reason: "invalid-config" });
+		expect(mcps.get("fixture-off")).toMatchObject({ status: "disabled", reason: "disabled-server" });
+		expect(mcps.get("fixture-userinfo")).toMatchObject({ status: "rejected", reason: "policy-blocked" });
+		// The userinfo password is part of the rejected endpoint policy surface;
+		// it must never appear in either output format.
+		const json = renderCustomizeDoctorJson(report);
+		const text = renderCustomizeDoctorText(report);
+		expect(json).not.toContain("passphrase");
+		expect(text).not.toContain("passphrase");
+
+		// Two items share the name "ralplan": the discovered project copy
+		// (shadowed) and the bundled definition (loaded, always authoritative).
+		const ralplanCopy = surface(report, "skill").items.find(
+			item => item.name === "ralplan" && item.provider !== "bundled" && item.path.startsWith(cwd),
+		);
+		expect(ralplanCopy).toMatchObject({
+			status: "shadowed",
+			reason: "shadowed-by-precedence",
+			precedence: { shadowedBy: { provider: "bundled", scope: "native" } },
+		});
+
+		const bundles = itemsByName(report, "plugin-bundle");
+		expect(bundles.get("fixture-bundle")).toMatchObject({ status: "quarantined", reason: "quarantined" });
+		expect(bundles.get("fixture-bundle")?.quarantineCode).toBe("runtime_mismatch");
+
+		// Each fixture item is distinguishable by reason alone.
+		const reasons = new Set([
+			mcps.get("fixture-broken")?.reason,
+			mcps.get("fixture-off")?.reason,
+			mcps.get("fixture-userinfo")?.reason,
+			ralplanCopy?.reason,
+			bundles.get("fixture-bundle")?.reason,
+		]);
+		expect(reasons.size).toBe(5);
+	});
+
+	it("agrees with session-startup consumers (loadSkills, loadAllMCPConfigs)", async () => {
+		const cwd = await makeTempProject();
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "fixture-loaded", "Loaded by startup");
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "ultragoal", "Project copy of a bundled skill");
+		await makeSkill(path.join(cwd, ".claude", "skills"), "fixture-foreign", "Never loaded by startup");
+		await writeJson(path.join(cwd, ".gjc", "mcp.json"), {
+			mcpServers: { "fixture-connectable": { command: "true" } },
+		});
+
+		const settings = Settings.isolated({});
+		const report = await runCustomizeDoctor(cwd, settings);
+
+		// Startup truth: loadSkills with the same settings.
+		const startup = await loadSkills({
+			...settings.getGroup("skills"),
+			cwd,
+			disabledExtensions: settings.get("disabledExtensions"),
+		});
+		const startupNames = new Set(startup.skills.map(s => s.name));
+
+		const skills = itemsByName(report, "skill");
+		// A native project skill startup loads is reported loaded...
+		expect(startupNames.has("fixture-loaded")).toBe(true);
+		expect(skills.get("fixture-loaded")).toMatchObject({ status: "loaded", reason: "loaded" });
+		// ...a foreign-convention skill startup never loads is reported ignored...
+		expect(startupNames.has("fixture-foreign")).toBe(false);
+		expect(skills.get("fixture-foreign")).toMatchObject({ status: "ignored", reason: "source-ignored" });
+		// ...and a filesystem copy of a bundled workflow skill name is never the
+		// effective session definition (#4349): the doctor must not claim the
+		// project copy is active even though loadSkills lists it, and the
+		// bundled entry is always loaded.
+		const ultragoalCopy = surface(report, "skill").items.find(
+			item => item.name === "ultragoal" && item.provider !== "bundled" && item.path.startsWith(cwd),
+		);
+		expect(ultragoalCopy).toMatchObject({ status: "shadowed", reason: "shadowed-by-precedence" });
+		const bundled = surface(report, "skill").items.filter(
+			item => item.provider === "bundled" && item.name === "ultragoal",
+		);
+		expect(bundled).toHaveLength(1);
+		expect(bundled[0]).toMatchObject({ status: "loaded", reason: "loaded" });
+
+		// MCP startup projection agreement: connectable mirrors loadAllMCPConfigs.
+		const projection = await loadAllMCPConfigs(cwd);
+		const mcps = itemsByName(report, "mcp");
+		const fixture = mcps.get("fixture-connectable");
+		expect(Object.keys(projection.configs)).toContain("fixture-connectable");
+		expect(fixture?.mcp?.connectable).toBe(true);
+		expect(fixture?.status).toBe("stored-only");
+	});
+});
