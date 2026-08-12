@@ -85,6 +85,11 @@ const SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES = 4096;
  *  `terminalPublished` (review thread P2). Mirrors the full-bus path's 1s
  *  publication wait. */
 const SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS = 1_000;
+/** Bounded wait for in-flight workflow gate resolutions to settle during SDK
+ *  runtime shutdown before proceeding with cleanup. Unresolved resolutions
+ *  after this bound are abandoned — their durable broker state is the recovery
+ *  authority, and outcomes are inherently uncertain. */
+const GATE_RESOLUTION_QUIESCENCE_MS = 5_000;
 
 class DiffQueryError extends Error {
 	constructor(
@@ -1114,7 +1119,13 @@ async function resolveSdkWorkflowGate(
 	const completed = workflowGate.lookupCompletedResolution(response);
 	if (completed.kind === "completed") return completed.resolution;
 	if (completed.kind === "accepted_incomplete") {
-		await workflowGate.recoverAcceptedGates();
+		try {
+			await workflowGate.recoverAcceptedGates();
+		} catch {
+			throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
+				code: "terminal_uncertain",
+			});
+		}
 		const recovered = workflowGate.lookupCompletedResolution(response);
 		if (recovered.kind === "completed") return recovered.resolution;
 		throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), { code: "terminal_uncertain" });
@@ -1126,6 +1137,22 @@ async function resolveSdkWorkflowGate(
 		if ((resolution as { status?: unknown }).status === "rejected") workflowGate.clearPreparedTerminalization(id);
 		return resolution;
 	} catch (error) {
+		const completedAfterFailure = workflowGate.lookupCompletedResolution(response);
+		if (completedAfterFailure.kind === "completed") return completedAfterFailure.resolution;
+		if (completedAfterFailure.kind === "accepted_incomplete") {
+			try {
+				await workflowGate.recoverAcceptedGates();
+			} catch {
+				throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
+					code: "terminal_uncertain",
+				});
+			}
+			const recovered = workflowGate.lookupCompletedResolution(response);
+			if (recovered.kind === "completed") return recovered.resolution;
+			throw Object.assign(new Error("Workflow gate resolution outcome is uncertain."), {
+				code: "terminal_uncertain",
+			});
+		}
 		const stillPending = workflowGate.listPendingGates?.().some(gate => gate.gate_id === id) === true;
 		if (stillPending) workflowGate.clearPreparedTerminalization(id);
 		else workflowGate.quarantineGate?.(id);
@@ -2634,8 +2661,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		const waitForGateResolutionQuiescence = async (): Promise<void> => {
 			const settled = Promise.allSettled(inFlightGateResolutions);
-			const timeout = Bun.sleep(5_000).then(() => {
-				throw new Error("Timed out waiting for SDK workflow gate resolutions to settle.");
+			const timeout = Bun.sleep(GATE_RESOLUTION_QUIESCENCE_MS).then(() => {
+				logger.warn("SDK workflow gate resolution drain timed out; proceeding with uncertain outcomes.");
 			});
 			await Promise.race([settled, timeout]);
 		};

@@ -6872,7 +6872,6 @@ export class AgentSession {
 		// the addon after the runtime tore down the context it was scheduled in. The chain
 		// is already failure-absorbing, so this only waits.
 		await this.#coordinatorPersistQueue;
-		this.#workflowGateEmitter?.fence?.();
 		this.#pendingBackgroundExchanges = [];
 		this.yieldQueue.clear();
 
@@ -6884,6 +6883,7 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
+		this.#workflowGateEmitter?.fence?.();
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
 		await this.#flushWorkerIntegrationAttempt();

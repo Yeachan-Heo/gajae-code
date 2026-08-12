@@ -775,6 +775,17 @@ describe("SessionSdkSessionRuntime", () => {
 				if (Date.now() > deadline) throw new Error("Timed out waiting for the concurrent abort responses");
 				await Bun.sleep(20);
 			}
+			// The onControlResponseDelivery observer writes responseState asynchronously
+			// after the transport send; wait for BOTH durable rows to settle before
+			// asserting, so the test is not racy on the observer's transactTerminalState
+			// microtask drain.
+			while (
+				reconciliationStore.snapshotTerminalScopes().length < 2 ||
+				reconciliationStore.snapshotTerminalScopes().some(scope => scope.responseState !== "sent")
+			) {
+				if (Date.now() > deadline) throw new Error("Timed out waiting for durable responseState to settle");
+				await Bun.sleep(20);
+			}
 			expect(transport.sent.find(frame => frame.id === "conc-abort-1")).toMatchObject({
 				ok: true,
 				result: expect.objectContaining({ turn: "stopped" }),

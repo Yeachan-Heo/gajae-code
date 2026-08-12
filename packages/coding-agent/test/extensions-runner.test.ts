@@ -10,7 +10,9 @@ import { discoverAndLoadExtensions } from "@gajae-code/coding-agent/extensibilit
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
+	SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS,
 	testSetExtensionHandlerTimeoutMs,
+	testSetSessionShutdownHandlerTimeoutMs,
 } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import type { ExtensionContext } from "@gajae-code/coding-agent/extensibility/extensions/types";
 
@@ -36,6 +38,7 @@ describe("ExtensionRunner", () => {
 
 	afterEach(async () => {
 		testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
+		testSetSessionShutdownHandlerTimeoutMs(SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS);
 		authStorage.close();
 		if (process.platform === "win32") {
 			Bun.gc(true);
@@ -803,6 +806,71 @@ describe("ExtensionRunner", () => {
 			]);
 
 			warnSpy.mockRestore();
+		});
+		it("waits for session_shutdown handlers beyond the ordinary timeout", async () => {
+			const shutdownExtensionPath = path.join(tempDir.path(), "slow-session-shutdown.ts");
+			const markerPath = path.join(tempDir.path(), "session-shutdown-marker.txt");
+			fs.writeFileSync(
+				shutdownExtensionPath,
+				`
+					export default function(pi) {
+						pi.on("session_shutdown", async () => {
+							await new Promise(resolve => setTimeout(resolve, 30));
+							await Bun.write(${JSON.stringify(markerPath)}, "drained\\n");
+						});
+					}
+				`,
+			);
+			const result = await loadTestExtensions([shutdownExtensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			testSetExtensionHandlerTimeoutMs(10);
+			try {
+				await runner.emit({ type: "session_shutdown" });
+				expect(fs.readFileSync(markerPath, "utf8")).toBe("drained\n");
+				expect(warnSpy).not.toHaveBeenCalledWith("Extension handler timed out", expect.any(Object));
+			} finally {
+				warnSpy.mockRestore();
+			}
+		});
+		it("bounds session_shutdown handlers at the shutdown timeout ceiling", async () => {
+			const shutdownExtensionPath = path.join(tempDir.path(), "hung-session-shutdown.ts");
+			fs.writeFileSync(
+				shutdownExtensionPath,
+				`
+					export default function(pi) {
+						pi.on("session_shutdown", async () => {
+							await new Promise(() => {});
+						});
+					}
+				`,
+			);
+			const result = await loadTestExtensions([shutdownExtensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			testSetSessionShutdownHandlerTimeoutMs(50);
+			try {
+				const startedAt = performance.now();
+				await runner.emit({ type: "session_shutdown" });
+				const elapsedMs = performance.now() - startedAt;
+				expect(elapsedMs).toBeGreaterThanOrEqual(40);
+				expect(elapsedMs).toBeLessThan(500);
+				expect(warnSpy).toHaveBeenCalledWith("Extension handler timed out", expect.any(Object));
+			} finally {
+				warnSpy.mockRestore();
+			}
 		});
 
 		it("does not emit timeout errors for fast handlers", async () => {

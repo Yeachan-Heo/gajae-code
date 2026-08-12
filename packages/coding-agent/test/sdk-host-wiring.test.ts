@@ -5442,6 +5442,16 @@ test("session teardown drains admitted direct gate resolution before detaching i
 		registerController.mockRestore();
 	}
 });
+test("SDK runtime bounds gate resolution drain at a finite ceiling", () => {
+	// GATE_RESOLUTION_QUIESCENCE_MS is a finite constant that bounds
+	// waitForGateResolutionQuiescence. The original PR removed the bound
+	// (unbounded Promise.allSettled); this verifies it is restored.
+	// The constant is not exported, so verify through the source file.
+	const source = fs.readFileSync(path.resolve(__dirname, "../src/sdk/host/session-runtime.ts"), "utf8");
+	expect(source).toContain("GATE_RESOLUTION_QUIESCENCE_MS");
+	expect(source).toContain("Promise.race([settled, timeout])");
+	expect(source).not.toMatch(/waitForGateResolutionQuiescence[^}]*await Promise\.allSettled/);
+});
 test("PresentationArbiter drops a retired presentation before terminal persistence recovery", async () => {
 	const publications: string[] = [];
 	const closed: string[] = [];
