@@ -268,6 +268,50 @@ describe("AgentSession concurrent prompt guard", () => {
 		await send.catch(() => {});
 	});
 
+	it("sendUserMessage rejects absent content with a typed invalid_input error without crashing", async () => {
+		await createSession();
+
+		// undefined content (the exact #4393 crash vector: previously a TypeError)
+		await expect(session.sendUserMessage(undefined as never)).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+
+		// null content (typeof null === "object", also entered the iterable branch)
+		await expect(session.sendUserMessage(null as never)).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+
+		// The session is still usable after the rejected submissions.
+		expect(session.isStreaming).toBe(false);
+		expect(session.queuedMessageCount).toBe(0);
+	});
+
+	it("sendUserMessage rejects absent content even while streaming (active-turn steering race)", async () => {
+		await createSession();
+
+		// Start a turn that blocks until abort.
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		// The exact crash path: SDK steering during an active turn with absent content.
+		// Previously this threw TypeError synchronously inside the promise, crashing the
+		// resident process. It must now reject as a typed nonfatal control error.
+		await expect(session.sendUserMessage(undefined as never, { deliverAs: "steer" })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+		await expect(session.sendUserMessage(null as never, { deliverAs: "followUp" })).rejects.toMatchObject({
+			code: "invalid_input",
+		});
+
+		// No crash, no queue pollution: session continuity preserved.
+		expect(session.isStreaming).toBe(true);
+		expect(session.queuedMessageCount).toBe(0);
+
+		// Cleanup
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
 	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const firstTurn = Promise.withResolvers<void>();

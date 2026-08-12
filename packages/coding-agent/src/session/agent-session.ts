@@ -10848,6 +10848,11 @@ export class AgentSession {
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+		if (typeof content !== "string" && !Array.isArray(content)) {
+			throw Object.assign(new Error("sendUserMessage requires string or content-array content."), {
+				code: "invalid_input",
+			});
+		}
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
