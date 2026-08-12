@@ -150,6 +150,7 @@ process.exitCode = await child.exited;`;
 			"ultragoal",
 			"gc",
 			"crash",
+			"autoresearch",
 			"ralplan",
 			"config",
 			"stats",
@@ -253,7 +254,7 @@ process.exitCode = await child.exited;`;
 	}, 30_000);
 
 	it("documents the native CLI surface in command help", async () => {
-		for (const command of ["ralplan", "deep-interview", "state"]) {
+		for (const command of ["ralplan", "deep-interview", "state", "autoresearch"]) {
 			const result = Bun.spawnSync(["bun", cliEntry, command, "--help"], {
 				cwd: repoRoot,
 				stderr: "pipe",

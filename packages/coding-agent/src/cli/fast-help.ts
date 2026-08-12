@@ -13,6 +13,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} coordinator          - Manage coordinator/runtime coordination helpers
   ${APP_NAME} ultragoal            - Run durable goal execution workflow
   ${APP_NAME} ralplan              - Run consensus planning workflow
+  ${APP_NAME} autoresearch         - Run autonomous research workflow
   ${APP_NAME} deep-interview       - Run requirements interview workflow
   ${APP_NAME} skills               - List/read embedded workflow skills
   ${APP_NAME} config               - List, get, and set configuration values
