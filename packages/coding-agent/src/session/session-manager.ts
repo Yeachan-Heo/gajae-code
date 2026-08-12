@@ -18872,6 +18872,28 @@ export class SessionManager {
 			}
 		} catch (error) {
 			const cleanupErrors: Error[] = [];
+			// A managed move can commit and still report failure when native code cannot
+			// prove durability or terminal identity. Treating that as unpublished would
+			// roll the artifacts back underneath a transcript that is already visible at
+			// the destination, so probe the destination first and preserve every owned
+			// artifact when the mutation may have landed.
+			if (!published && staged.managedParentStore && !mayCleanManagedTreeStaging(error)) {
+				const probeErrors: Error[] = [];
+				let destination: ManagedFileSnapshot | null = null;
+				try {
+					destination = staged.managedParentStore.readExpected(path.basename(staged.finalSessionFile));
+				} catch (probeError) {
+					probeErrors.push(toError(probeError));
+				}
+				// Absence must be proven; an unreadable destination stays fail-closed.
+				if (destination || probeErrors.length > 0) {
+					staged.publishedFinalSnapshot = destination ?? undefined;
+					throw new AggregateError(
+						[toError(error), ...probeErrors],
+						"Staged publication may have committed without proof; artifacts and staging were preserved for recovery.",
+					);
+				}
+			}
 			if (published) {
 				try {
 					if (staged.managedParentStore) {

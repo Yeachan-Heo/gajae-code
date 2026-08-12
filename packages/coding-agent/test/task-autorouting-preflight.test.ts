@@ -10,6 +10,7 @@ import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
 import * as sdkModule from "../src/sdk";
 import { ArtifactManager } from "../src/session/artifacts";
+import { ManagedTreeMoveOutcomeError } from "../src/session/internal/managed-session-storage";
 import { resolveResumableSession, SessionManager } from "../src/session/session-manager";
 import {
 	type AutoroutingPreflightFailure,
@@ -901,5 +902,37 @@ describe("autorouting preflight contract", () => {
 		]);
 		expect(noSubstitution.parentModelSubstitution).toBe(false);
 		expect(noSubstitution.attempts.at(-1)?.selector).toBe("provider/accepted");
+	});
+});
+
+describe("managed staged publication certainty", () => {
+	it("preserves owned artifacts when a managed publish commits without proof", async () => {
+		const ctx = await createHarnessContext(true);
+		const manager = await openStagedCandidate(ctx, "attempt-uncertain");
+		manager.appendSessionInit({ systemPrompt: "test", task: "uncertain-publish", tools: [] });
+		const stagedArtifactId = await manager.saveArtifact("candidate-owned-artifact", "tool");
+		expect(stagedArtifactId).toBeDefined();
+		await manager.flush();
+
+		const store = ctx.parentArtifacts.getManagedStore();
+		if (!store) throw new Error("managed artifact store unavailable");
+		const realMove = store.moveFileNoReplace.bind(store);
+		// Native can complete the rename and still fail to prove durability or terminal
+		// identity. stagingCleanupSafe=false is the signal that the mutation may have landed.
+		const move = spyOn(store, "moveFileNoReplace").mockImplementation((source, destination, expected, options) => {
+			realMove(source, destination, expected, options);
+			throw new ManagedTreeMoveOutcomeError("managed_publish_fsync_failed", false);
+		});
+
+		try {
+			await expect(manager.commitStagedNestedManaged()).rejects.toThrow(/committed without proof/);
+		} finally {
+			move.mockRestore();
+		}
+
+		// The transcript really is published, so the artifacts it references must survive.
+		expect(store.readExpected(path.basename(ctx.finalPath))).not.toBeNull();
+		const artifactTree = await snapshotTree(ctx.artifactRoot);
+		expect(artifactTree).toContain(stagedArtifactId ?? "missing");
 	});
 });
