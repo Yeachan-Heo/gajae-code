@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { MCPManager } from "../../src/runtime-mcp/manager";
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
+import { legacyMcpMethodNotFound } from "../mcp-test-utils";
 
 const servers: Bun.Server<unknown>[] = [];
 const managers: MCPManager[] = [];
@@ -216,6 +217,7 @@ setInterval(()=>{},1000);
 				if (request.method === "initialized" || request.method === "notifications/initialized") {
 					return new Response(null, { status: 202 });
 				}
+				if (request.method === "server/discover") return legacyMcpMethodNotFound(request.id);
 				return Response.json({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "boom" } });
 			},
 		});

@@ -46,12 +46,14 @@ describe("SSE-typed MCP server configuration", () => {
 			await callTool(connection, "example", { value: "test" });
 			await disconnectServer(connection);
 
+			// auto preference probes server/discover first; the 400 default answers as a legacy server.
 			expect(requests.map(request => request.method)).toEqual([
+				"server/discover",
 				"initialize",
 				"notifications/initialized",
 				"tools/call",
 			]);
-			expect(requests[2]).toMatchObject({
+			expect(requests[3]).toMatchObject({
 				jsonrpc: "2.0",
 				method: "tools/call",
 				params: { name: "example", arguments: { value: "test" } },

@@ -7,9 +7,11 @@ import * as configValue from "../../src/config/resolve-config-value";
 import { loadMCPJsonFile } from "../../src/discovery/mcp-json";
 import * as mcpClient from "../../src/runtime-mcp/client";
 import { createMCPManager, MCPManager, resolveExactConfigStartupTimeoutMs } from "../../src/runtime-mcp/manager";
+import { legacyEraObservation } from "../../src/runtime-mcp/protocol";
 import { MCPTool } from "../../src/runtime-mcp/tool-bridge";
 import type { JsonRpcMessage, MCPServerConfig, MCPServerConnection, MCPTransport } from "../../src/runtime-mcp/types";
 import { MCPExpectedFailure } from "../../src/runtime-mcp/types";
+import { legacyMcpMethodNotFound } from "../mcp-test-utils";
 
 async function mkdtempExact(prefix: string): Promise<string> {
 	return realpath(await mkdtemp(join(tmpdir(), prefix)));
@@ -56,6 +58,14 @@ function makeConnection(name: string, close: () => Promise<void>): MCPServerConn
 		} satisfies MCPTransport,
 		serverInfo: { name: "test", version: "1" },
 		capabilities: { tools: {} },
+		protocol: legacyEraObservation({
+			preference: "auto",
+			effectiveVersion: "2025-03-26",
+			negotiation: "legacy-fallback",
+			downgradeReason: "legacy-server-signal",
+			serverInfo: { name: "test", version: "1" },
+			capabilities: { tools: true },
+		}),
 	};
 }
 
@@ -639,6 +649,7 @@ setInterval(() => {}, 1000);
 				if (request.method === "tools/list") {
 					return new Response("denied", { status: 401 });
 				}
+				if (request.method === "server/discover") return legacyMcpMethodNotFound(id);
 				return new Response(null, { status: 202 });
 			},
 		});
@@ -713,6 +724,7 @@ setInterval(() => {}, 1000);
 					);
 				}
 				if (rpc.method === "tools/list") return new Response("denied", { status: 401 });
+				if (rpc.method === "server/discover") return legacyMcpMethodNotFound(rpc.id ?? 0);
 				return new Response(null, { status: 202 });
 			},
 		});
@@ -1259,6 +1271,8 @@ setInterval(() => {}, 1000);
 					case "prompts/list":
 						promptListCalls++;
 						return Response.json({ jsonrpc: "2.0", id, result: { prompts: [] } });
+					case "server/discover":
+						return legacyMcpMethodNotFound(id);
 					default:
 						return Response.json({ jsonrpc: "2.0", id, result: {} });
 				}
@@ -1325,7 +1339,8 @@ setInterval(() => {}, 1000);
 			expect(toolResult.content).toEqual([{ type: "text", text: "exact-ok" }]);
 			expect(toolCallCount).toBe(1);
 			expect(initializeCapabilities).toEqual({});
-			expect(requestMethods).toEqual(["initialize", "notifications/initialized", "tools/list", "tools/call"]);
+			// auto preference probes server/discover first; this stub answers like a real legacy server.
+			expect(requestMethods).toEqual(["server/discover", "initialize", "notifications/initialized", "tools/list", "tools/call"]);
 			expect(result.errors.get("bad")).toBe("MCP server unavailable");
 			expect(manager.getConnectionStatus("exact")).toBe("connected");
 			expect(manager.getConnectedServers()).toEqual(["exact"]);
@@ -1506,6 +1521,7 @@ setInterval(() => {}, 1000);
 				if (request.method === "tools/list") {
 					return Response.json({ jsonrpc: "2.0", id, result: { tools: [] } });
 				}
+				if (request.method === "server/discover") return legacyMcpMethodNotFound(id);
 				return Response.json({ jsonrpc: "2.0", id, result: {} });
 			},
 		});
@@ -1642,6 +1658,7 @@ setInterval(() => {}, 1000);
 				if ("method" in body && body.method === "tools/list") {
 					return Response.json({ jsonrpc: "2.0", id, result: { tools: [] } });
 				}
+				if ("method" in body && body.method === "server/discover") return legacyMcpMethodNotFound(id);
 				return Response.json({ jsonrpc: "2.0", id, result: {} });
 			},
 		});
@@ -1706,6 +1723,7 @@ setInterval(() => {}, 1000);
 						result: { tools: [{ name: suffix, inputSchema: { type: "object" } }] },
 					});
 				}
+				if ("method" in body && body.method === "server/discover") return legacyMcpMethodNotFound(id);
 				return Response.json({ jsonrpc: "2.0", id, result: {} });
 			},
 		});
@@ -1769,6 +1787,7 @@ setInterval(() => {}, 1000);
 						result: { tools: [{ name: "fresh", inputSchema: { type: "object" } }] },
 					});
 				}
+				if ("method" in body && body.method === "server/discover") return legacyMcpMethodNotFound(id);
 				return Response.json({ jsonrpc: "2.0", id, result: {} });
 			},
 		});
@@ -1832,6 +1851,7 @@ setInterval(() => {}, 1000);
 						result: { tools: [{ name: suffix, inputSchema: { type: "object" } }] },
 					});
 				}
+				if ("method" in body && body.method === "server/discover") return legacyMcpMethodNotFound(id);
 				return Response.json({ jsonrpc: "2.0", id, result: {} });
 			},
 		});

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { MCPConnectionPool, MCPPoolAcquireAbortError, MCPPoolLeaseInvalidatedError } from "./pool";
+import { legacyEraObservation } from "./protocol";
 import { MCPPoolConfigError } from "./pool-key";
 import type { MCPRequestOptions, MCPServerConfig, MCPServerConnection, MCPTransport } from "./types";
 import { MCPExpectedFailure, MCPNotificationMethods } from "./types";
@@ -103,6 +104,14 @@ function connection(name: string, configValue: MCPServerConfig, transport: FakeT
 		transport,
 		serverInfo: { name: "fake", version: "1" },
 		capabilities: { tools: {}, resources: { subscribe: true } },
+		protocol: legacyEraObservation({
+			preference: "auto",
+			effectiveVersion: "2025-03-26",
+			negotiation: "legacy-forced",
+			downgradeReason: "stdio-transport",
+			serverInfo: { name: "fake", version: "1" },
+			capabilities: { tools: true, resources: true },
+		}),
 	};
 }
 

@@ -1,15 +1,17 @@
 /**
  * MCP (Model Context Protocol) type definitions.
  *
- * Based on MCP specification 2025-03-26:
- * https://modelcontextprotocol.io/specification/2025-03-26/
+ * Legacy sessionful surface based on MCP specification 2025-03-26; the modern
+ * stateless generation (2026-07-28, "MCP v2") is modeled in ./protocol.ts.
+ * https://modelcontextprotocol.io/specification/2026-07-28/
  */
+
+import type { SourceMeta } from "../capability/types";
+import type { MCPCacheHints, MCPProtocolObservation, MCPProtocolPreference } from "./protocol";
 
 // =============================================================================
 // JSON-RPC 2.0 Types
 // =============================================================================
-
-import type { SourceMeta } from "../capability/types";
 
 export interface JsonRpcRequest {
 	jsonrpc: "2.0";
@@ -73,6 +75,13 @@ export interface MCPServerConfigBase {
 	timeout?: number;
 	/** Pool identity mode. W2 defaults to one physical connection per session. */
 	sharing?: "per-session" | "shared";
+	/**
+	 * Protocol preference for remote (http/sse) servers: `auto` (default) negotiates
+	 * the modern 2026-07-28 stateless protocol first with a bounded, observable
+	 * legacy fallback; `2026-07-28` is strict modern-only; `legacy` forces the
+	 * bounded compatibility handshake. Ignored by stdio servers (always legacy-era).
+	 */
+	protocol?: MCPProtocolPreference;
 	/** Authentication configuration (optional) */
 	auth?: MCPAuthConfig;
 	/** OAuth configuration for servers requiring explicit client credentials */
@@ -141,6 +150,8 @@ export interface MCPImplementation {
 export interface MCPClientCapabilities {
 	roots?: { listChanged?: boolean };
 	sampling?: Record<string, never>;
+	/** Form-mode elicitation support (modern MRTR `elicitation/create` input requests). */
+	elicitation?: { form?: Record<string, never> };
 	experimental?: Record<string, unknown>;
 }
 
@@ -181,7 +192,7 @@ export interface MCPToolDefinition {
 }
 
 /** tools/list response */
-export interface MCPToolsListResult {
+export interface MCPToolsListResult extends MCPCacheHints {
 	tools: MCPToolDefinition[];
 	nextCursor?: string;
 }
@@ -238,12 +249,81 @@ export class MCPExpectedFailure extends Error {
 		this.name = "MCPExpectedFailure";
 	}
 }
+
+/** HTTP-level request failure carrying structured detail for era classification. */
+export class MCPHttpRequestError extends Error {
+	/** HTTP status code. */
+	readonly status: number;
+	/** Parsed JSON body when the error payload was JSON; undefined otherwise. */
+	readonly body: unknown;
+	constructor(status: number, message: string, body?: unknown) {
+		super(message);
+		this.name = "MCPHttpRequestError";
+		this.status = status;
+		this.body = body;
+	}
+}
+
+/** JSON-RPC error response failure carrying the protocol error code. */
+export class MCPJsonRpcError extends Error {
+	readonly code: number;
+	readonly data?: unknown;
+	constructor(code: number, message: string, data?: unknown) {
+		super(`MCP error ${code}: ${message}`);
+		this.name = "MCPJsonRpcError";
+		this.code = code;
+		this.data = data;
+	}
+}
 export interface MCPRequestOptions {
 	/** Abort signal (e.g. Escape-to-interrupt) */
 	signal?: AbortSignal;
 	/** Shared lease policy: never retry the original request after transport/auth failure. */
 	noReplay?: boolean;
+	/**
+	 * Handler for modern MRTR `input_required` results (elicitation, roots, sampling).
+	 * When absent, an `input_required` result fails explicitly instead of hanging.
+	 */
+	inputHandler?: MCPInputRequestHandler;
+	/** Extra mirrored headers for modern requests (`Mcp-Param-*` from x-mcp-header bindings). */
+	mcpParamHeaders?: Record<string, string>;
 }
+
+// =============================================================================
+// MRTR (multi round-trip) input handling
+// =============================================================================
+
+/** Context for one server input request gathered during a modern MRTR exchange. */
+export interface MCPInputRequestContext {
+	/** Server being called. */
+	serverName: string;
+	/** Original client request method (`tools/call`, `prompts/get`, `resources/read`). */
+	originMethod: string;
+	/**
+	 * Stable correlation id shared by the initial request and its exactly-once
+	 * retry, fencing the accepted input to this exchange.
+	 */
+	correlationId: string;
+	/** Request-scoped abort signal (cancellation/timeout of the original call). */
+	signal?: AbortSignal;
+}
+
+/**
+ * Outcome of gathering one server input request. `result` values are placed in
+ * the retry's `inputResponses` under the request key. `failed` outcomes abort
+ * the MRTR exchange with an explicit error — except elicitation decline/cancel,
+ * which the handler expresses as an ElicitResult-shaped `result`.
+ */
+export type MCPInputRequestHandlerResult =
+	| { kind: "result"; result: unknown }
+	| { kind: "failed"; reason: "declined" | "cancelled" | "timeout" | "unavailable" | "error"; message?: string };
+
+/** Handler for one server input request inside an `input_required` result. */
+export type MCPInputRequestHandler = (
+	key: string,
+	request: { method: string; params?: Record<string, unknown> },
+	context: MCPInputRequestContext,
+) => Promise<MCPInputRequestHandlerResult>;
 
 /** Transport interface - abstracts stdio/http */
 export interface MCPTransport {
@@ -301,6 +381,15 @@ export interface MCPServerConnection {
 	instructions?: string;
 	/** Cached prompts (populated on demand) */
 	prompts?: MCPPrompt[];
+	/**
+	 * Authoritative protocol observation for this connection (preference,
+	 * negotiated era/version, downgrade decision, deprecation state). Secret-free.
+	 */
+	protocol: MCPProtocolObservation;
+	/** Freshness deadline (ms epoch) for the cached tool catalog, from server ttlMs hints. */
+	toolsFreshUntil?: number;
+	/** Cache scope of the cached tool catalog; private entries never cross credential identities. */
+	toolsCacheScope?: "public" | "private";
 }
 
 /** MCP tool with server context */
@@ -342,13 +431,13 @@ export interface MCPResourceTemplate {
 }
 
 /** Result of resources/list */
-export interface MCPResourcesListResult {
+export interface MCPResourcesListResult extends MCPCacheHints {
 	resources: MCPResource[];
 	nextCursor?: string;
 }
 
 /** Result of resources/templates/list */
-export interface MCPResourceTemplatesListResult {
+export interface MCPResourceTemplatesListResult extends MCPCacheHints {
 	resourceTemplates: MCPResourceTemplate[];
 	nextCursor?: string;
 }
@@ -362,7 +451,7 @@ export interface MCPResourceContentItem {
 }
 
 /** Result of resources/read */
-export interface MCPResourceReadResult {
+export interface MCPResourceReadResult extends MCPCacheHints {
 	contents: MCPResourceContentItem[];
 }
 
@@ -396,7 +485,7 @@ export interface MCPPrompt {
 }
 
 /** Result of prompts/list */
-export interface MCPPromptsListResult {
+export interface MCPPromptsListResult extends MCPCacheHints {
 	prompts: MCPPrompt[];
 	nextCursor?: string;
 }
@@ -427,6 +516,27 @@ export interface MCPGetPromptParams {
 export interface MCPGetPromptResult {
 	description?: string;
 	messages: MCPPromptMessage[];
+}
+
+// =============================================================================
+// server/discover (modern era)
+// =============================================================================
+
+/** Result of the optional modern `server/discover` request. */
+export interface MCPDiscoverResult extends MCPCacheHints {
+	/** Protocol versions the server supports. */
+	supportedVersions: string[];
+	/** Capabilities the server supports. */
+	capabilities: MCPServerCapabilities;
+	/** Optional natural-language usage guidance. */
+	instructions?: string;
+	/** Result metadata; `io.modelcontextprotocol/serverInfo` carries the identity. */
+	_meta?: Record<string, unknown>;
+}
+
+/** Decoded `server/discover` payload with the extracted server identity. */
+export interface MCPDiscoverResultLite extends MCPDiscoverResult {
+	serverInfo?: MCPImplementation;
 }
 
 // =============================================================================

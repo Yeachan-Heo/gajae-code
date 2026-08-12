@@ -38,7 +38,7 @@ const SECRET_INDIRECTION_FIELDS: Record<MigrateSource, string[]> = {
 
 /** Fields recognized for a source (handled or intentionally omitted). Anything else is omitted-with-warning. */
 const RECOGNIZED_FIELDS: Record<MigrateSource, ReadonlySet<string>> = {
-	"claude-code": new Set(["type", "command", "args", "env", "url", "headers", "enabled", "timeout", "cwd"]),
+	"claude-code": new Set(["type", "command", "args", "env", "url", "headers", "enabled", "timeout", "cwd", "protocol"]),
 	codex: new Set([
 		"type",
 		"command",
@@ -50,6 +50,7 @@ const RECOGNIZED_FIELDS: Record<MigrateSource, ReadonlySet<string>> = {
 		"enabled",
 		"timeout",
 		"tool_timeout_sec",
+		"protocol",
 		// omitted-with-warning fields are still "recognized" (handled below):
 		"env_vars",
 		"env_http_headers",
@@ -58,7 +59,7 @@ const RECOGNIZED_FIELDS: Record<MigrateSource, ReadonlySet<string>> = {
 		"enabled_tools",
 		"disabled_tools",
 	]),
-	opencode: new Set(["type", "command", "args", "env", "url", "headers", "enabled", "timeout", "cwd"]),
+	opencode: new Set(["type", "command", "args", "env", "url", "headers", "enabled", "timeout", "cwd", "protocol"]),
 };
 
 /** Fields with no GJC equivalent: omitted-with-warning (named explicitly so the warning is precise). */
@@ -92,6 +93,16 @@ export function mapMcpEntry(source: MigrateSource, name: string, raw: unknown): 
 	const url = typeof raw.url === "string" ? raw.url : undefined;
 
 	const base: { enabled?: boolean; timeout?: number } = {};
+	// Preserve only a representable protocol preference (http/sse only); anything
+	// else falls back to the safe-negotiation default (`auto`) with a warning.
+	let protocol: "auto" | "2026-07-28" | "legacy" | undefined;
+	if (raw.protocol !== undefined) {
+		if (raw.protocol === "auto" || raw.protocol === "2026-07-28" || raw.protocol === "legacy") {
+			protocol = raw.protocol;
+		} else {
+			warnings.push(`omitted unsupported protocol value for "${name}" (defaulting to safe negotiation)`);
+		}
+	}
 	if (typeof raw.enabled === "boolean") base.enabled = raw.enabled;
 	if (typeof raw.timeout === "number") base.timeout = raw.timeout;
 	// Codex tool_timeout_sec -> timeout (ms).
@@ -145,6 +156,7 @@ export function mapMcpEntry(source: MigrateSource, name: string, raw: unknown): 
 		const type = rawType === "sse" ? "sse" : "http";
 		const config = { type, url, ...base } as MCPServerConfig;
 		if (headers) (config as { headers?: Record<string, string> }).headers = headers;
+		if (protocol) (config as { protocol?: "auto" | "2026-07-28" | "legacy" }).protocol = protocol;
 		return { ok: true, config, warnings };
 	}
 

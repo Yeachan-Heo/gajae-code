@@ -1,14 +1,34 @@
 /**
  * MCP Client.
  *
- * Handles connection initialization, tool listing, and tool calling.
+ * Handles connection negotiation (modern 2026-07-28 stateless vs legacy
+ * sessionful), tool listing, and tool calling. Era detection and the downgrade
+ * policy live in ./protocol.ts; legacy behavior is unchanged.
  */
 import * as path from "node:path";
 import * as url from "node:url";
 import { getProjectDir, logger, withTimeout } from "@gajae-code/utils";
-import { createHttpTransport } from "./transports/http";
+import {
+	classifyMcpProbeFailure,
+	collectXMcpHeaderBindings,
+	createMCPProtocolObservation,
+	extractMcpInputRequired,
+	isModernProtocolVersion,
+	JSONRPC_ERROR_METHOD_NOT_FOUND,
+	legacyEraObservation,
+	MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION,
+	MCP_PROTOCOL_VERSION_2026_07_28,
+	type MCPDowngradeReason,
+	type MCPModernClientContext,
+	type MCPProtocolObservation,
+	modernEraObservation,
+	normalizeMcpCacheHints,
+	resolveMCPProtocolPreference,
+} from "./protocol";
+import { createHttpTransport, HttpTransport } from "./transports/http";
 import { createStdioTransport } from "./transports/stdio";
 import type {
+	MCPDiscoverResultLite,
 	MCPGetPromptParams,
 	MCPGetPromptResult,
 	MCPHttpServerConfig,
@@ -32,7 +52,7 @@ import type {
 	MCPToolsListResult,
 	MCPTransport,
 } from "./types";
-import { MCPExpectedFailure } from "./types";
+import { MCPExpectedFailure, MCPHttpRequestError, MCPJsonRpcError } from "./types";
 
 /** MCP protocol version we support */
 const PROTOCOL_VERSION = "2025-03-26";
@@ -116,6 +136,7 @@ async function collectPaginated<T>(
 	itemKey: string,
 	items: T[],
 	decode?: (value: unknown) => unknown,
+	onPage?: (result: Record<string, unknown>) => void,
 ): Promise<void> {
 	const seenCursors = new Set<string>();
 	const failure = (detail: string) => new MCPExpectedFailure(new Error(`MCP ${method} pagination ${detail}`));
@@ -136,6 +157,7 @@ async function collectPaginated<T>(
 		if (itemCount > MAX_PAGINATION_ITEMS || (itemCount === MAX_PAGINATION_ITEMS && nextCursor))
 			throw failure("did not complete within the 10000-item budget");
 		items.push(...pageItems);
+		onPage?.(result as Record<string, unknown>);
 		if (!nextCursor) return;
 		if (page === MAX_PAGINATION_PAGES) throw failure("did not complete within the 100-page budget");
 		seenCursors.add(nextCursor);
@@ -224,6 +246,249 @@ async function initializeConnection(
 	return result;
 }
 
+/** Negotiation-local failure (distinguished from transport failures by type). */
+class ModernNegotiationError extends Error {}
+
+/** Build the per-request modern client context (2026-07-28). */
+function buildModernClientContext(options?: { advertiseRoots?: boolean }): MCPModernClientContext {
+	const capabilities: Record<string, unknown> = {};
+	if (options?.advertiseRoots !== false) {
+		capabilities.roots = { listChanged: true };
+		// Form-mode elicitation is bridged to GJC's structured ask surface (MRTR).
+		capabilities.elicitation = { form: {} };
+	}
+	return {
+		protocolVersion: MCP_PROTOCOL_VERSION_2026_07_28,
+		clientInfo: CLIENT_INFO,
+		capabilities,
+	};
+}
+
+/** Decode a `server/discover` result, including `_meta` serverInfo and cache hints. */
+function decodeDiscoverResult(value: unknown): MCPDiscoverResultLite {
+	if (
+		!isRecord(value) ||
+		!Array.isArray(value.supportedVersions) ||
+		!value.supportedVersions.every(entry => typeof entry === "string") ||
+		!isRecord(value.capabilities)
+	) {
+		throw new MCPExpectedFailure();
+	}
+	const meta = isRecord(value._meta) ? value._meta : undefined;
+	const serverInfoRaw = meta?.["io.modelcontextprotocol/serverInfo"];
+	const serverInfo =
+		isRecord(serverInfoRaw) &&
+		typeof serverInfoRaw.name === "string" &&
+		typeof serverInfoRaw.version === "string"
+			? { name: serverInfoRaw.name, version: serverInfoRaw.version }
+			: undefined;
+	const hints = normalizeMcpCacheHints(value);
+	return {
+		supportedVersions: value.supportedVersions as string[],
+		capabilities: value.capabilities as MCPServerCapabilities,
+		...(typeof value.instructions === "string" ? { instructions: value.instructions } : {}),
+		...(hints?.ttlMs !== undefined ? { ttlMs: hints.ttlMs } : {}),
+		...(hints?.cacheScope !== undefined ? { cacheScope: hints.cacheScope } : {}),
+		...(serverInfo ? { serverInfo } : {}),
+	};
+}
+
+/** Unwrap the original transport failure preserved as MCPExpectedFailure.cause. */
+function unwrapTransportFailure(error: unknown): unknown {
+	return error instanceof MCPExpectedFailure && error.cause !== undefined ? error.cause : error;
+}
+
+type ModernNegotiation =
+	| { outcome: "modern"; discovery: MCPDiscoverResultLite | null; discoverState: "yes" | "no"; versionRetry: boolean }
+	| { outcome: "legacy-fallback"; reason: MCPDowngradeReason };
+
+/**
+ * Negotiate the modern era with an HTTP server via the optional `server/discover`
+ * probe and the specification's era-detection rules. Auth, issuer/audience,
+ * redirect/SSRF/DNS, malformed-response, and other security or protocol-integrity
+ * failures NEVER authorize a downgrade; only a 400/404/405 without a recognized
+ * modern error body, or an explicit version advertisement containing only
+ * legacy-era versions, may fall back — and only under `auto`.
+ */
+async function negotiateModernEra(
+	transport: HttpTransport,
+	preference: "auto" | "2026-07-28",
+	signal: AbortSignal,
+): Promise<ModernNegotiation> {
+	const strict = preference === MCP_PROTOCOL_VERSION_2026_07_28;
+	const failStrict = (detail: string): never => {
+		throw new ModernNegotiationError(`strict 2026-07-28: ${detail}`);
+	};
+	let versionRetry = false;
+	for (;;) {
+		let discovery: MCPDiscoverResultLite;
+		try {
+			discovery = decodeDiscoverResult(await transport.request<unknown>("server/discover", {}, { signal }));
+		} catch (error) {
+			const cause = unwrapTransportFailure(error);
+			if (cause instanceof MCPHttpRequestError) {
+				const classification = classifyMcpProbeFailure(cause.status, cause.body);
+				switch (classification.class) {
+					case "auth-failure":
+					case "other-failure":
+						// Auth/security/protocol-integrity failures are never era signals.
+						throw error;
+					case "legacy-signal":
+						if (strict) failStrict("server rejected the modern probe without a recognized modern error");
+						return { outcome: "legacy-fallback", reason: "legacy-server-signal" };
+					case "modern-error": {
+						if (classification.modernErrorCode === MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION) {
+							const supported = classification.supportedVersions ?? [];
+							if (supported.includes(MCP_PROTOCOL_VERSION_2026_07_28)) {
+								// Retry the probe once with the mutually supported version.
+								if (versionRetry) {
+									throw new MCPExpectedFailure(new Error("MCP version negotiation did not converge"));
+								}
+								versionRetry = true;
+								continue;
+							}
+							if (supported.length > 0 && supported.every(v => !isModernProtocolVersion(v))) {
+								if (strict) failStrict(`server advertises only legacy-era versions (${supported.join(", ")})`);
+								return { outcome: "legacy-fallback", reason: "server-advertised-legacy-only" };
+							}
+							throw new MCPExpectedFailure(
+								new Error(
+									`MCP server does not support protocol ${MCP_PROTOCOL_VERSION_2026_07_28} (supported: ${supported.join(", ") || "unknown"})`,
+								),
+							);
+						}
+						if (classification.modernErrorCode === JSONRPC_ERROR_METHOD_NOT_FOUND) {
+							// Modern server without the optional server/discover: proceed with
+							// direct v2 calls; capabilities are learned lazily.
+							return { outcome: "modern", discovery: null, discoverState: "no", versionRetry };
+						}
+						// HeaderMismatch / MissingRequiredClientCapability: a modern server
+						// rejecting our request context — a defect or policy failure, never
+						// a downgrade signal.
+						throw new MCPExpectedFailure(
+							new Error(`MCP modern server rejected the request context (code ${classification.modernErrorCode})`),
+						);
+					}
+				}
+			}
+			if (cause instanceof MCPJsonRpcError && cause.code === JSONRPC_ERROR_METHOD_NOT_FOUND) {
+				// Ambiguous: legacy servers also answer -32601 to unknown methods. Strict
+				// mode may assume the modern era; auto treats it as a legacy signal.
+				if (strict) return { outcome: "modern", discovery: null, discoverState: "no", versionRetry };
+				return { outcome: "legacy-fallback", reason: "legacy-server-signal" };
+			}
+			// Network, timeout, abort, or malformed 2xx payloads: never downgrade.
+			throw error;
+		}
+
+		if (discovery.supportedVersions.includes(MCP_PROTOCOL_VERSION_2026_07_28)) {
+			return { outcome: "modern", discovery, discoverState: "yes", versionRetry };
+		}
+		if (discovery.supportedVersions.some(isModernProtocolVersion)) {
+			throw new MCPExpectedFailure(
+				new Error(
+					`MCP server supports only newer modern protocol versions (${discovery.supportedVersions.join(", ")}); this client implements ${MCP_PROTOCOL_VERSION_2026_07_28}`,
+				),
+			);
+		}
+		if (discovery.supportedVersions.length > 0) {
+			if (strict) failStrict(`server advertises only legacy-era versions (${discovery.supportedVersions.join(", ")})`);
+			return { outcome: "legacy-fallback", reason: "server-advertised-legacy-only" };
+		}
+		throw new MCPExpectedFailure(new Error("MCP server/discover returned no supported versions"));
+	}
+}
+
+/** Maximum MRTR retries per original request (repeated input_required rounds). */
+const MAX_MRTR_RETRIES = 3;
+
+/** True when the failure is a modern "method not found" (unknown/unsupported method). */
+function isModernMethodNotFound(error: unknown): boolean {
+	const cause = unwrapTransportFailure(error);
+	if (cause instanceof MCPJsonRpcError && cause.code === JSONRPC_ERROR_METHOD_NOT_FOUND) return true;
+	if (cause instanceof MCPHttpRequestError && cause.status === 404) return true;
+	return false;
+}
+
+/**
+ * Issue a modern-era request, resolving `input_required` (MRTR) interim results.
+ * The original request is retried with `inputResponses` and a verbatim
+ * `requestState` echo under a fresh JSON-RPC id, at most MAX_MRTR_RETRIES times;
+ * the retry is fenced to the originating exchange by a stable correlation id.
+ */
+async function requestWithInputHandling<T>(
+	connection: MCPServerConnection,
+	method: string,
+	params: Record<string, unknown>,
+	options?: MCPRequestOptions,
+): Promise<T> {
+	const stripResultType = (value: unknown): T => {
+		// A present resultType of "complete" is the modern default; drop the marker
+		// so legacy-shaped consumers see the legacy result shape.
+		if (isRecord(value) && typeof value.resultType === "string") {
+			const { resultType: _discarded, ...rest } = value;
+			return rest as T;
+		}
+		return value as T;
+	};
+
+	const initial = await connection.transport.request<unknown>(method, params, options);
+	if (connection.protocol.era !== "modern") return initial as T;
+	let inputRequired = extractMcpInputRequired(initial);
+	if (!inputRequired) return stripResultType(initial);
+
+	const handler = options?.inputHandler;
+	if (!handler) {
+		throw new MCPExpectedFailure(
+			new Error(
+				`MCP server "${connection.name}" requested additional input (input_required) for ${method}, but no interactive input handler is available`,
+			),
+		);
+	}
+	const correlationId = crypto.randomUUID();
+
+	for (let attempt = 0; attempt < MAX_MRTR_RETRIES; attempt++) {
+		const inputResponses: Record<string, unknown> = {};
+		for (const [key, request] of Object.entries(inputRequired.inputRequests)) {
+			if (options?.signal?.aborted) {
+				throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
+			}
+			if (request.method === "roots/list") {
+				// roots are answered from local state without user interaction.
+				inputResponses[key] = await defaultRequestHandler("roots/list", undefined);
+				continue;
+			}
+			const outcome = await handler(key, request, {
+				serverName: connection.name,
+				originMethod: method,
+				correlationId,
+				...(options?.signal ? { signal: options.signal } : {}),
+			});
+			if (outcome.kind === "failed") {
+				throw new MCPExpectedFailure(
+					new Error(
+						`MCP input request "${key}" for ${method} ${outcome.reason}${outcome.message ? `: ${outcome.message}` : ""}`,
+					),
+				);
+			}
+			inputResponses[key] = outcome.result;
+		}
+		// The retry is a NEW request (fresh JSON-RPC id assigned by the transport)
+		// carrying the original params plus the gathered input; inputResponses and
+		// requestState are fenced to this exchange and never reused elsewhere.
+		const retryParams: Record<string, unknown> = { ...params, inputResponses };
+		if (inputRequired.requestState !== undefined) {
+			retryParams.requestState = inputRequired.requestState;
+		}
+		const retryResult = await connection.transport.request<unknown>(method, retryParams, options);
+		inputRequired = extractMcpInputRequired(retryResult);
+		if (!inputRequired) return stripResultType(retryResult);
+	}
+	throw new MCPExpectedFailure(
+		new Error(`MCP server "${connection.name}" repeatedly requested additional input for ${method}`),
+	);
+}
+
 /**
  * Connect to an MCP server.
  * Has a 30 second timeout to prevent blocking startup.
@@ -244,6 +509,8 @@ export async function connectToServer(
 	const connectAbort = new AbortController();
 	const connectSignal = options?.signal ? AbortSignal.any([options.signal, connectAbort.signal]) : connectAbort.signal;
 
+	const preference = resolveMCPProtocolPreference(config.protocol);
+
 	const connect = async (): Promise<MCPServerConnection> => {
 		transport = await createTransport(config);
 		if (options?.onNotification) {
@@ -252,10 +519,15 @@ export async function connectToServer(
 
 		// Always install a handler for standard MCP server-to-client requests.
 		// Callers that do not advertise roots can reject roots/list via onRequest.
+		// (Modern-era transports never receive server-initiated requests; MRTR
+		// input requests arrive as input_required results instead.)
 		transport.onRequest = options?.onRequest ?? defaultRequestHandler;
 
-		try {
-			const initResult = await initializeConnection(transport, {
+		const connectLegacy = async (
+			negotiationState: "legacy-fallback" | "legacy-forced",
+			reason: MCPDowngradeReason,
+		): Promise<MCPServerConnection> => {
+			const initResult = await initializeConnection(transport!, {
 				signal: connectSignal,
 				advertiseRoots: options?.advertiseRoots,
 				async onInitialized() {
@@ -266,14 +538,73 @@ export async function connectToServer(
 					}
 				},
 			});
+			return {
+				name,
+				config,
+				transport: transport!,
+				serverInfo: initResult.serverInfo,
+				capabilities: initResult.capabilities,
+				instructions: initResult.instructions,
+				protocol: legacyEraObservation({
+					preference,
+					effectiveVersion: initResult.protocolVersion,
+					negotiation: negotiationState,
+					downgradeReason: reason,
+					serverInfo: initResult.serverInfo,
+					capabilities: {
+						tools: initResult.capabilities.tools !== undefined,
+						resources: initResult.capabilities.resources !== undefined,
+						prompts: initResult.capabilities.prompts !== undefined,
+					},
+				}),
+			};
+		};
 
+		try {
+			// stdio has no per-request HTTP era signals; it stays on the legacy handshake.
+			if ((config.type ?? "stdio") === "stdio") {
+				return await connectLegacy("legacy-forced", "stdio-transport");
+			}
+			if (preference === "legacy") {
+				return await connectLegacy("legacy-forced", "preference-legacy");
+			}
+
+			// auto / strict 2026-07-28: negotiate the modern era first.
+			if (!(transport instanceof HttpTransport)) {
+				throw new MCPExpectedFailure(new Error(`MCP server "${name}" did not produce an HTTP transport`));
+			}
+			transport.setProtocolMode("modern", buildModernClientContext(options));
+			const negotiation = await negotiateModernEra(transport, preference, connectSignal);
+			if (negotiation.outcome === "legacy-fallback") {
+				transport.setProtocolMode("legacy");
+				return await connectLegacy("legacy-fallback", negotiation.reason);
+			}
+
+			const discovery = negotiation.discovery;
+			const serverInfo = discovery?.serverInfo ?? { name, version: "unknown" };
+			const capabilities = discovery?.capabilities ?? {};
 			return {
 				name,
 				config,
 				transport,
-				serverInfo: initResult.serverInfo,
-				capabilities: initResult.capabilities,
-				instructions: initResult.instructions,
+				serverInfo,
+				capabilities,
+				instructions: discovery?.instructions,
+				protocol: modernEraObservation({
+					preference,
+					effectiveVersion: MCP_PROTOCOL_VERSION_2026_07_28,
+					negotiation: negotiation.versionRetry ? "modern-version-retry" : "modern",
+					supportedVersions: discovery?.supportedVersions,
+					serverInfo: discovery?.serverInfo ?? null,
+					capabilities: discovery
+						? {
+								tools: discovery.capabilities.tools !== undefined,
+								resources: discovery.capabilities.resources !== undefined,
+								prompts: discovery.capabilities.prompts !== undefined,
+							}
+						: undefined,
+					discover: negotiation.discoverState,
+				}),
 			};
 		} catch (error) {
 			try {
@@ -318,23 +649,69 @@ export async function listTools(
 	connection: MCPServerConnection,
 	options?: { signal?: AbortSignal },
 ): Promise<MCPToolDefinition[]> {
-	// Check if server supports tools
-	if (!connection.capabilities.tools) {
+	const modern = connection.protocol.era === "modern";
+	// Legacy gating uses the negotiated capabilities; modern servers without
+	// server/discover learn capability lazily (method-not-found means no tools).
+	if (!modern && !connection.capabilities.tools) {
 		return [];
 	}
 
-	// Return cached tools if available
+	// Return cached tools while fresh: server ttlMs hints bound freshness when present.
 	if (connection.tools) {
-		return connection.tools;
+		if (connection.toolsFreshUntil !== undefined && Date.now() >= connection.toolsFreshUntil) {
+			connection.tools = undefined;
+			connection.toolsFreshUntil = undefined;
+			connection.toolsCacheScope = undefined;
+		} else {
+			return connection.tools;
+		}
 	}
 
+	let freshUntil: number | undefined;
+	let cacheScope: "public" | "private" | undefined;
 	const allTools: MCPToolDefinition[] = [];
-	await collectPaginated(connection, options, "tools/list", "tools", allTools, decodeToolsListResult);
+	try {
+		await collectPaginated(
+			connection,
+			options,
+			"tools/list",
+			"tools",
+			allTools,
+			decodeToolsListResult,
+			page => {
+				const hints = normalizeMcpCacheHints(page);
+				if (hints?.ttlMs !== undefined) {
+					const deadline = Date.now() + hints.ttlMs;
+					freshUntil = freshUntil === undefined ? deadline : Math.min(freshUntil, deadline);
+				}
+				if (hints?.cacheScope !== undefined) cacheScope = hints.cacheScope;
+			},
+		);
+	} catch (error) {
+		if (modern && isModernMethodNotFound(error)) return [];
+		throw error;
+	}
+
+	// Modern era: HTTP clients MUST exclude tools with invalid x-mcp-header
+	// annotations rather than letting one malformed tool break the catalog.
+	const validTools = modern
+		? allTools.filter(tool => {
+				const { violations } = collectXMcpHeaderBindings(tool.inputSchema);
+				if (violations.length === 0) return true;
+				logger.warn("Excluding MCP tool with invalid x-mcp-header annotation", {
+					tool: tool.name,
+					reason: violations.join("; "),
+				});
+				return false;
+			})
+		: allTools;
 
 	// Cache tools
-	connection.tools = allTools;
+	connection.tools = validTools;
+	connection.toolsFreshUntil = freshUntil;
+	connection.toolsCacheScope = cacheScope;
 
-	return allTools;
+	return validTools;
 }
 
 /**
@@ -351,7 +728,8 @@ export async function callTool(
 		arguments: args,
 	};
 
-	return connection.transport.request<MCPToolCallResult>(
+	return requestWithInputHandling<MCPToolCallResult>(
+		connection,
 		"tools/call",
 		params as unknown as Record<string, unknown>,
 		options,
@@ -379,7 +757,8 @@ export async function listResources(
 	connection: MCPServerConnection,
 	options?: { signal?: AbortSignal },
 ): Promise<MCPResource[]> {
-	if (!connection.capabilities.resources) {
+	const modern = connection.protocol.era === "modern";
+	if (!modern && !connection.capabilities.resources) {
 		return [];
 	}
 
@@ -388,7 +767,12 @@ export async function listResources(
 	}
 
 	const allResources: MCPResource[] = [];
-	await collectPaginated(connection, options, "resources/list", "resources", allResources);
+	try {
+		await collectPaginated(connection, options, "resources/list", "resources", allResources);
+	} catch (error) {
+		if (modern && isModernMethodNotFound(error)) return [];
+		throw error;
+	}
 
 	connection.resources = allResources;
 	return allResources;
@@ -401,7 +785,8 @@ export async function listResourceTemplates(
 	connection: MCPServerConnection,
 	options?: { signal?: AbortSignal },
 ): Promise<MCPResourceTemplate[]> {
-	if (!connection.capabilities.resources) {
+	const modern = connection.protocol.era === "modern";
+	if (!modern && !connection.capabilities.resources) {
 		return [];
 	}
 
@@ -410,7 +795,12 @@ export async function listResourceTemplates(
 	}
 
 	const allTemplates: MCPResourceTemplate[] = [];
-	await collectPaginated(connection, options, "resources/templates/list", "resourceTemplates", allTemplates);
+	try {
+		await collectPaginated(connection, options, "resources/templates/list", "resourceTemplates", allTemplates);
+	} catch (error) {
+		if (modern && isModernMethodNotFound(error)) return [];
+		throw error;
+	}
 
 	connection.resourceTemplates = allTemplates;
 	return allTemplates;
@@ -425,7 +815,8 @@ export async function readResource(
 	options?: MCPRequestOptions,
 ): Promise<MCPResourceReadResult> {
 	const params: MCPResourceReadParams = { uri };
-	return connection.transport.request<MCPResourceReadResult>(
+	return requestWithInputHandling<MCPResourceReadResult>(
+		connection,
 		"resources/read",
 		params as unknown as Record<string, unknown>,
 		options,
@@ -546,7 +937,8 @@ export async function listPrompts(
 	connection: MCPServerConnection,
 	options?: { signal?: AbortSignal },
 ): Promise<MCPPrompt[]> {
-	if (!connection.capabilities.prompts) {
+	const modern = connection.protocol.era === "modern";
+	if (!modern && !connection.capabilities.prompts) {
 		return [];
 	}
 
@@ -555,7 +947,12 @@ export async function listPrompts(
 	}
 
 	const allPrompts: MCPPrompt[] = [];
-	await collectPaginated(connection, options, "prompts/list", "prompts", allPrompts);
+	try {
+		await collectPaginated(connection, options, "prompts/list", "prompts", allPrompts);
+	} catch (error) {
+		if (modern && isModernMethodNotFound(error)) return [];
+		throw error;
+	}
 
 	connection.prompts = allPrompts;
 	return allPrompts;
@@ -575,7 +972,8 @@ export async function getPrompt(
 		params.arguments = args;
 	}
 
-	return connection.transport.request<MCPGetPromptResult>(
+	return requestWithInputHandling<MCPGetPromptResult>(
+		connection,
 		"prompts/get",
 		params as unknown as Record<string, unknown>,
 		options,

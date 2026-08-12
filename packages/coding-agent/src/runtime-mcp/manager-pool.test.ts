@@ -1,11 +1,33 @@
 import { expect, test, vi } from "bun:test";
 import { rm } from "node:fs/promises";
+import { legacyMcpMethodNotFound } from "../../test/mcp-test-utils";
 import * as configValue from "../config/resolve-config-value";
 import { MCPManager } from "./manager";
 import { MCPConnectionPool } from "./pool";
 import { computeMCPPoolKey } from "./pool-key";
+import { legacyEraObservation } from "./protocol";
+import type { MCPProtocolObservation } from "./protocol";
 import type { MCPRequestOptions, MCPServerConfig, MCPServerConnection, MCPTransport } from "./types";
 
+/** Fake connections model pre-v2 stdio servers: legacy era, forced by transport. */
+function fakeLegacyProtocol(capabilities: {
+	tools?: unknown;
+	resources?: unknown;
+	prompts?: unknown;
+}): MCPProtocolObservation {
+	return legacyEraObservation({
+		preference: "auto",
+		effectiveVersion: "2025-03-26",
+		negotiation: "legacy-forced",
+		downgradeReason: "stdio-transport",
+		serverInfo: { name: "fake", version: "1" },
+		capabilities: {
+			tools: capabilities.tools !== undefined,
+			resources: capabilities.resources !== undefined,
+			prompts: capabilities.prompts !== undefined,
+		},
+	});
+}
 class ManagerFakeTransport implements MCPTransport {
 	connected = true;
 	closeCount = 0;
@@ -136,6 +158,7 @@ test("withPreparedLease admission closes before disconnectAll snapshots scoped o
 				transport: new ManagerFakeTransport(),
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			}) satisfies MCPServerConnection,
 	});
 	const manager = new MCPManager(".", null, { pool, sessionId: "admission-disconnect" });
@@ -157,6 +180,7 @@ test("withPreparedLease admission closes during reconnect before fresh entry exi
 				transport: new ManagerFakeTransport(),
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			}) satisfies MCPServerConnection,
 	});
 	const manager = new MCPManager(".", null, { pool, sessionId: "admission-reconnect" });
@@ -182,6 +206,7 @@ test("manager connection lifecycle is owned by pool leases", async () => {
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -207,6 +232,7 @@ test("manager resolves one canonical stdio cwd for transport and pool identity",
 				transport: new ManagerFakeTransport(),
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -240,6 +266,7 @@ test("manager resource subscriptions flow through the lease aggregate", async ()
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {}, resources: { subscribe: true } },
+				protocol: fakeLegacyProtocol({ tools: {}, resources: { subscribe: true } }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -285,6 +312,7 @@ test("disconnectAll cancels hanging config resolution before opening a lease", a
 				transport: new ManagerFakeTransport(),
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			}) satisfies MCPServerConnection,
 	});
 	const manager = new MCPManager(".", null, { pool, sessionId: "config-hang" });
@@ -313,6 +341,7 @@ test("caller abort after acquisition releases a hanging prepared lease", async (
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -346,6 +375,7 @@ test("disconnectAll releases an active prepared lease and settles its callback",
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -375,6 +405,7 @@ test("disconnectAll aggregates active transient release failures", async () => {
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -403,6 +434,7 @@ test("transient lease does not replace the manager-owned lease mapping", async (
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -436,6 +468,7 @@ test("prepared transient operations acquire and release through the pool", async
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -460,6 +493,7 @@ test("reconnect retires held transient leases before opening a fresh physical co
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -507,6 +541,7 @@ test("shutdown closes retired and replacement physical entries after HTTP-style 
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -541,6 +576,7 @@ test("successful HTTP-style rotations remove settled retired-release records whi
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -582,6 +618,7 @@ test("manager disconnectAll aggregates a rejecting retired HTTP-style close", as
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -624,6 +661,7 @@ test("reconnect uses the exact backoff schedule and coalesces concurrent request
 				transport: new ManagerFakeTransport(),
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -661,6 +699,7 @@ test("disconnectAll reports typed lease-release failures after clearing all stat
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -680,6 +719,7 @@ test("manager lease advertises its canonical roots through the pool", async () =
 				transport: new ManagerFakeTransport(),
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			}) satisfies MCPServerConnection,
 	});
 	const manager = new MCPManager(".", null, { pool, sessionId: "roots-session" });
@@ -708,6 +748,7 @@ test("per-session manager facades remain isolated while shared tools-only facade
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -757,6 +798,7 @@ test("shared prompt execution stays lease-bound while one manager releases", asy
 				transport,
 				serverInfo: { name: "prompt", version: "1" },
 				capabilities: { tools: {}, resources: { subscribe: true }, prompts: {} },
+				protocol: fakeLegacyProtocol({ tools: {}, resources: { subscribe: true }, prompts: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -807,6 +849,7 @@ test("shared replacement is deferred across an unrelated reconnecting server", a
 				transport,
 				serverInfo: { name: "multi", version: String(generation) },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -874,6 +917,7 @@ test("shared replacement rebind reconciles a lease acquired before a second rota
 				transport,
 				serverInfo: { name: "generation", version: String(generation) },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -947,6 +991,7 @@ test("shared initial join reconciles a lease acquired before owner rotation", as
 				transport,
 				serverInfo: { name: "initial-join", version: String(generation) },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1010,6 +1055,7 @@ test("initial join hook rejection releases the acquired lease", async () => {
 				transport,
 				serverInfo: { name: "hook-rejection", version: String(opens) },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1060,6 +1106,7 @@ test("initial join retry failure clears pending state for a subsequent connect",
 				transport,
 				serverInfo: { name: "retry-failure", version: String(generation) },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1136,6 +1183,7 @@ test("shared replacement is requeued when reconnect starts during acquisition", 
 				transport,
 				serverInfo: { name: "inverse", version: String(generation) },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1216,6 +1264,7 @@ test("queued shared replacement is dropped when teardown begins", async () => {
 				transport,
 				serverInfo: { name: "drop", version: String(generation) },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1263,6 +1312,7 @@ test("shared replacement rebind is fenced when peer disconnects during old-lease
 				transport,
 				serverInfo: { name: "race", version: String(opens) },
 				capabilities: { tools: {}, resources: { subscribe: true }, prompts: {} },
+				protocol: fakeLegacyProtocol({ tools: {}, resources: { subscribe: true }, prompts: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1316,6 +1366,7 @@ test("shared noReplay request failure coordinates one replacement without resend
 				transport,
 				serverInfo: { name: "recovery", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1358,6 +1409,7 @@ test("released shared facade tools fail live-state checks while surviving lease 
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1401,6 +1453,7 @@ test("shared restart rebinds every surviving manager lease before subsequent cal
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1444,6 +1497,7 @@ test("shared transport crash has one restart owner across manager facades", asyn
 				transport,
 				serverInfo: { name: "fake", version: "1" },
 				capabilities: { tools: {} },
+				protocol: fakeLegacyProtocol({ tools: {} }),
 			} satisfies MCPServerConnection;
 		},
 	});
@@ -1510,6 +1564,7 @@ test("shared HTTP leases use one MCP session and one callback stream while relea
 				toolsListCount += 1;
 				return Response.json({ jsonrpc: "2.0", id: message.id, result: { tools: [] } });
 			}
+			if (message.method === "server/discover") return legacyMcpMethodNotFound(message.id);
 			return Response.json({ jsonrpc: "2.0", id: message.id, result: {} });
 		},
 	});
@@ -1576,6 +1631,7 @@ test("S7-style HTTP stub keeps distinct paths and queries on one host in separat
 			if (message.method === "notifications/initialized") return new Response(null, { status: 202 });
 			if (message.method === "tools/list")
 				return Response.json({ jsonrpc: "2.0", id: message.id, result: { tools: [] } });
+			if (message.method === "server/discover") return legacyMcpMethodNotFound(message.id);
 			return Response.json({ jsonrpc: "2.0", id: message.id, result: {} });
 		},
 	});

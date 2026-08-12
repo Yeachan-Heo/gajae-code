@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { legacyEraObservation } from "../src/runtime-mcp/protocol";
 import type { MCPReconnect } from "../src/runtime-mcp/tool-bridge";
 import { DeferredMCPTool, isRetriableConnectionError, MCPTool } from "../src/runtime-mcp/tool-bridge";
 import type { MCPServerConnection, MCPToolCallResult, MCPTransport } from "../src/runtime-mcp/types";
@@ -31,6 +32,14 @@ function makeConnection(transport: MCPTransport, name = "test-server"): MCPServe
 		transport,
 		serverInfo: { name: "test", version: "1.0" },
 		capabilities: { tools: {} },
+		protocol: legacyEraObservation({
+			preference: "auto",
+			effectiveVersion: "2025-03-26",
+			negotiation: "legacy-forced",
+			downgradeReason: "stdio-transport",
+			serverInfo: { name: "test", version: "1.0" },
+			capabilities: { tools: true },
+		}),
 	};
 }
 

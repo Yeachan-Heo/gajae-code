@@ -21,6 +21,12 @@ export interface MCPServer {
 	/** MCP connection pool identity mode; defaults to one lease per session. */
 	sharing?: "per-session" | "shared";
 	timeout?: number;
+	/**
+	 * Protocol preference for remote (http/sse) servers: `auto` (default) negotiates
+	 * MCP 2026-07-28 (stateless) first with a bounded observable legacy fallback,
+	 * `2026-07-28` is strict modern-only, `legacy` forces the compatibility handshake.
+	 */
+	protocol?: "auto" | "2026-07-28" | "legacy";
 	/** Command to run (for stdio transport) */
 	command?: string;
 	/** Command arguments */

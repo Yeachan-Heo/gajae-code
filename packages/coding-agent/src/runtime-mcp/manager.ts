@@ -33,12 +33,14 @@ import {
 	MCPPoolLeaseObsoleteError,
 	MCPPoolLeaseReleaseError,
 } from "./pool";
+import type { MCPProtocolObservation } from "./protocol";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
 import type { MCPToolCache } from "./tool-cache";
 import { HttpTransport } from "./transports/http";
 import type {
 	MCPGetPromptResult,
+	MCPInputRequestHandler,
 	MCPPrompt,
 	MCPRequestOptions,
 	MCPResource,
@@ -329,6 +331,7 @@ export class MCPManager {
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
 	#sources = new Map<string, SourceMeta>();
 	#authStorage: AuthStorage | null = null;
+	#inputRequestHandler: MCPInputRequestHandler | null = null;
 	#onNotification?: (serverName: string, method: string, params: unknown) => void;
 	#onToolsChanged?: (tools: CustomTool<TSchema, MCPToolDetails>[]) => void;
 	#onResourcesChanged?: (serverName: string, uri: string) => void;
@@ -869,6 +872,16 @@ export class MCPManager {
 	}
 
 	/**
+	 * Register the handler for modern MRTR `input_required` results (structured
+	 * elicitation/roots/sampling input requests). Runtimes with an interactive
+	 * question surface (e.g. ACP `elicitation/create`) register here; without a
+	 * handler, `input_required` fails explicitly instead of hanging.
+	 */
+	setInputRequestHandler(handler: MCPInputRequestHandler | null): void {
+		this.#inputRequestHandler = handler;
+	}
+
+	/**
 	 * Discover and connect to all MCP servers from .mcp.json files.
 	 * Returns tools and any connection errors.
 	 */
@@ -1100,6 +1113,7 @@ export class MCPManager {
 					const reconnect = () => this.reconnectServer(name);
 					const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, {
 						noReplay: config.sharing === "shared",
+						inputHandler: () => this.#inputRequestHandler ?? undefined,
 					});
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
@@ -1214,6 +1228,7 @@ export class MCPManager {
 						allTools.push(
 							...MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, {
 								noReplay: task.config.sharing === "shared",
+								inputHandler: () => this.#inputRequestHandler ?? undefined,
 							}),
 						);
 					} catch (error) {
@@ -1246,7 +1261,7 @@ export class MCPManager {
 									() => this.#waitForConnection(name).then(connection => this.#connectionForLease(connection)),
 									source,
 									reconnect,
-									{ noReplay: task.config.sharing === "shared" },
+									{ noReplay: task.config.sharing === "shared", inputHandler: () => this.#inputRequestHandler ?? undefined },
 								),
 							);
 						} catch (error) {
@@ -1384,6 +1399,27 @@ export class MCPManager {
 		)
 			return "connecting";
 		return "disconnected";
+	}
+
+	/**
+	 * Get the authoritative protocol observation for a connected server
+	 * (preference, negotiated era/version, downgrade decision, deprecation state).
+	 * Secret-free; the single observation model consumed by customization doctor
+	 * (#4288) and /extensions (#4291). Returns undefined when not connected.
+	 */
+	getProtocolObservation(name: string): MCPProtocolObservation | undefined {
+		return this.#connections.get(name)?.protocol;
+	}
+
+	/**
+	 * Snapshot of protocol observations for all connected servers.
+	 */
+	getProtocolObservations(): ReadonlyMap<string, MCPProtocolObservation> {
+		const snapshot = new Map<string, MCPProtocolObservation>();
+		for (const [name, connection] of this.#connections) {
+			snapshot.set(name, connection.protocol);
+		}
+		return snapshot;
 	}
 
 	/**
@@ -1954,6 +1990,7 @@ export class MCPManager {
 			const reconnect = () => this.reconnectServer(name);
 			const customTools = MCPTool.fromTools(this.#connectionForLease(connection), serverTools, reconnect, {
 				noReplay: config.sharing === "shared",
+				inputHandler: () => this.#inputRequestHandler ?? undefined,
 			});
 			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
@@ -2019,6 +2056,7 @@ export class MCPManager {
 		const reconnect = () => this.reconnectServer(name);
 		const customTools = MCPTool.fromTools(facade, serverTools, reconnect, {
 			noReplay: connection.config.sharing === "shared",
+			inputHandler: () => this.#inputRequestHandler ?? undefined,
 		});
 		void this.toolCache?.set(name, connection.config, serverTools);
 

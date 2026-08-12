@@ -2,9 +2,18 @@
  * MCP HTTP transport (Streamable HTTP).
  *
  * Implements JSON-RPC 2.0 over HTTP POST with optional SSE streaming.
- * Based on MCP spec 2025-03-26.
+ * Legacy era: session-oriented Streamable HTTP per MCP spec 2025-03-26
+ * (`Mcp-Session-Id`, standalone GET SSE listener, DELETE termination).
+ * Modern era (2026-07-28): stateless per-request `_meta` + mirrored headers,
+ * no sessions, no standalone stream, no replay. See ../protocol.ts.
  */
 import { logger, readSseJson, Snowflake } from "@gajae-code/utils";
+import {
+	buildModernMcpHeaders,
+	type MCPModernClientContext,
+	type MCPProtocolEra,
+	withModernMeta,
+} from "../protocol";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
@@ -15,7 +24,7 @@ import type {
 	MCPSseServerConfig,
 	MCPTransport,
 } from "../../runtime-mcp/types";
-import { MCPExpectedFailure, toJsonRpcError } from "../../runtime-mcp/types";
+import { MCPExpectedFailure, MCPHttpRequestError, MCPJsonRpcError, toJsonRpcError } from "../../runtime-mcp/types";
 import {
 	cancelMCPStream,
 	MCP_MAX_CONTENT_BYTES,
@@ -25,6 +34,15 @@ import {
 	readMCPResponseText,
 } from "../content-limits";
 import { fetchPluginMcpRequest, isPluginMcpPublicNetworkBound } from "../plugin-network-boundary";
+
+/** Best-effort JSON parse of an error body for structured era classification. */
+function tryParseJsonBody(text: string): unknown {
+	try {
+		return JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * HTTP transport for MCP servers.
@@ -36,6 +54,12 @@ export class HttpTransport implements MCPTransport {
 	#sseConnection: AbortController | null = null;
 	#streamControllers = new Set<AbortController>();
 	#streamReaders = new Set<Promise<void>>();
+	/**
+	 * Negotiated protocol era. Legacy keeps the sessionful 2025-03-26 behavior;
+	 * modern (2026-07-28) is stateless: no session id, no GET stream, no DELETE.
+	 */
+	#era: MCPProtocolEra = "legacy";
+	#modernContext: MCPModernClientContext | null = null;
 
 	onClose?: () => void;
 	onError?: (error: Error) => void;
@@ -55,6 +79,25 @@ export class HttpTransport implements MCPTransport {
 
 	get url(): string {
 		return this.config.url;
+	}
+
+	/** Negotiated protocol era (defaults to legacy until the client negotiates). */
+	get era(): MCPProtocolEra {
+		return this.#era;
+	}
+
+	/**
+	 * Select the protocol era. Modern mode requires the per-request client
+	 * context (protocol version, identity, capabilities) mirrored into `_meta`
+	 * and HTTP headers on every request.
+	 */
+	setProtocolMode(era: MCPProtocolEra, modernContext?: MCPModernClientContext): void {
+		if (era === "modern" && !modernContext) {
+			throw new Error("modern MCP protocol mode requires a client context");
+		}
+		this.#era = era;
+		this.#modernContext = era === "modern" ? (modernContext ?? null) : null;
+		if (era === "modern") this.#sessionId = null;
 	}
 
 	/**
@@ -88,6 +131,9 @@ export class HttpTransport implements MCPTransport {
 	 */
 	async startSSEListener(): Promise<void> {
 		if (!this.#connected) return;
+		// The modern era removed the standalone GET stream; request-scoped SSE
+		// responses and subscriptions/listen are the only streams.
+		if (this.#era === "modern") return;
 		if (this.#sseConnection) return;
 
 		const sseConnection = new AbortController();
@@ -167,6 +213,13 @@ export class HttpTransport implements MCPTransport {
 		}
 		// Server-to-client request: has both method and id
 		if ("method" in message && "id" in message && message.id != null) {
+			if (this.#era === "modern") {
+				// 2026-07-28 forbids server-initiated JSON-RPC requests on SSE streams;
+				// server-to-client interactions use MRTR input requests instead. Do not
+				// fall back to the legacy elicitation-over-stream pattern.
+				logger.debug("Dropping server-initiated request on modern-era stream");
+				return;
+			}
 			void this.#handleServerRequest(message as JsonRpcRequest);
 			return;
 		}
@@ -219,7 +272,9 @@ export class HttpTransport implements MCPTransport {
 			jsonrpc: "2.0" as const,
 			id,
 			method,
-			params: params ?? {},
+			params: this.#era === "modern" && this.#modernContext
+				? withModernMeta(params ?? {}, this.#modernContext)
+				: (params ?? {}),
 		};
 
 		const headers: Record<string, string> = {
@@ -228,7 +283,18 @@ export class HttpTransport implements MCPTransport {
 			...this.config.headers,
 		};
 
-		if (this.#sessionId) {
+		if (this.#era === "modern" && this.#modernContext) {
+			// 2026-07-28: mirrored request metadata headers are REQUIRED.
+			Object.assign(
+				headers,
+				buildModernMcpHeaders({
+					protocolVersion: this.#modernContext.protocolVersion,
+					method,
+					params: body.params,
+				}),
+			);
+			if (options?.mcpParamHeaders) Object.assign(headers, options.mcpParamHeaders);
+		} else if (this.#sessionId) {
 			headers["Mcp-Session-Id"] = this.#sessionId;
 		}
 
@@ -248,10 +314,12 @@ export class HttpTransport implements MCPTransport {
 				signal: operationSignal,
 			});
 
-			// Check for session ID in response
-			const newSessionId = response.headers.get("Mcp-Session-Id");
-			if (newSessionId) {
-				this.#sessionId = newSessionId;
+			// Check for session ID in response (legacy era only; modern servers do not mint sessions)
+			if (this.#era !== "modern") {
+				const newSessionId = response.headers.get("Mcp-Session-Id");
+				if (newSessionId) {
+					this.#sessionId = newSessionId;
+				}
 			}
 
 			if (!response.ok) {
@@ -265,7 +333,11 @@ export class HttpTransport implements MCPTransport {
 					.filter(Boolean)
 					.join("; ");
 				const suffix = authHints ? ` [${authHints}]` : "";
-				throw new Error(`HTTP ${response.status}: ${text}${suffix}`);
+				throw new MCPHttpRequestError(
+					response.status,
+					`HTTP ${response.status}: ${text}${suffix}`,
+					tryParseJsonBody(text),
+				);
 			}
 
 			const contentType = response.headers.get("Content-Type") ?? "";
@@ -298,7 +370,7 @@ export class HttpTransport implements MCPTransport {
 				if (!result.error) {
 					throw new MCPExpectedFailure();
 				}
-				throw new MCPExpectedFailure(new Error(`MCP error ${result.error.code}: ${result.error.message}`));
+				throw new MCPExpectedFailure(new MCPJsonRpcError(result.error.code, result.error.message, result.error.data));
 			}
 
 			return result.result as T;
@@ -371,7 +443,7 @@ export class HttpTransport implements MCPTransport {
 								} else {
 									reject(
 										new MCPExpectedFailure(
-											new Error(`MCP error ${response.error.code}: ${response.error.message}`),
+											new MCPJsonRpcError(response.error.code, response.error.message, response.error.data),
 										),
 									);
 								}
@@ -547,8 +619,9 @@ export class HttpTransport implements MCPTransport {
 
 		if (!wasConnected && !this.#sessionId) return;
 
-		// Send session termination if we have a session
-		if (this.#sessionId) {
+		// Send session termination if we have a session (legacy era only;
+		// the modern era has no protocol session to terminate)
+		if (this.#era !== "modern" && this.#sessionId) {
 			try {
 				const timeout = this.config.timeout ?? 30000;
 				const headers: Record<string, string> = {

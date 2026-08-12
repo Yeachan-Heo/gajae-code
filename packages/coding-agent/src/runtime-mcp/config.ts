@@ -12,6 +12,7 @@ import { loadCapability } from "../discovery";
 import { loadMCPJsonFile } from "../discovery/mcp-json";
 import { readDisabledServers } from "./config-writer";
 import { canonicalizeMCPEndpoint } from "./pool-key";
+import { isMCPProtocolPreference } from "./protocol";
 import type { MCPServerConfig } from "./types";
 
 /** Options for loading MCP configs */
@@ -60,6 +61,7 @@ function convertToLegacyConfig(server: MCPServer): MCPServerConfig {
 		autoload: server.autoload,
 		timeout: server.timeout,
 		sharing: server.sharing,
+		protocol: server.protocol,
 		auth: server.auth,
 		oauth: server.oauth,
 	};
@@ -303,6 +305,9 @@ export function validateServerConfig(name: string, config: MCPServerConfig): str
 
 	if (config.sharing !== undefined && config.sharing !== "per-session" && config.sharing !== "shared") {
 		errors.push(`Server "${name}": sharing must be "per-session" or "shared"`);
+	}
+	if (config.protocol !== undefined && !isMCPProtocolPreference(config.protocol)) {
+		errors.push(`Server "${name}": protocol must be "auto", "2026-07-28", or "legacy"`);
 	}
 	const serverType = config.type ?? "stdio";
 
