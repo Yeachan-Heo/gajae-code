@@ -62,9 +62,7 @@ import {
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { ClientBridge } from "../../session/client-bridge";
 import {
-	boundCompletedTerminalScopeRows,
-	boundEvictedTerminalKeys,
-	collectEvictedTerminalKeys,
+	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
 	settleOwnedWork,
@@ -4917,7 +4915,6 @@ export function createNotificationsExtension(
 				// event bit stays false (no second event is ever emitted on replay).
 				logger.warn(`sdk: prompt terminal event publication failed: ${String(error)}`);
 			}
-			// eslint-disable-next-line no-console
 		};
 		const emitPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			logger.error("SDK prompt submission failed", {
@@ -5233,14 +5230,12 @@ export function createNotificationsExtension(
 						return { ok: true as const, outcome: "uncertain_replay" as const, stored: storedRow };
 					}
 				}
-				// Durable no-effect reservations for idle/already-terminal aborts are
-				// bounded like the in-memory idempotency cache so a client sending
-				// idle aborts with unique keys cannot grow the reconciliation
-				// document indefinitely (review thread P2). Only the oldest
-				// no_effect rows beyond the cap are evicted; stopped/uncertain rows
-				// are untouched.
-				const MAX_DURABLE_TERMINAL_RESERVATIONS = 256;
-				const MAX_RETAINED_TERMINAL_KEY_TOMBSTONES = 4096;
+				// Durable terminal-state writes below go through the shared
+				// `boundTerminalRetentionState` bound (see
+				// `session/terminal-abort.ts`), which the SDK-only host runtime uses
+				// too: idle aborts with unique keys cannot grow the reconciliation
+				// document, only the oldest COMPLETED rows are evicted, and evicted
+				// keys are retained as compact tombstones (review thread P2).
 				// Set when the no-effect reservation finds an existing SAME-input row
 				// or tombstone: the caller replays it instead of returning a no-active
 				// result over the original row's replay authority (review thread P2).
@@ -5284,16 +5279,7 @@ export function createNotificationsExtension(
 							// the SAME bounded retention as reserveTerminalNoEffect so a
 							// burst of idle aborts cannot grow the document (review
 							// thread P2).
-							const bounded = boundCompletedTerminalScopeRows(scopes, MAX_DURABLE_TERMINAL_RESERVATIONS);
-							const evicted = collectEvictedTerminalKeys(scopes, bounded);
-							const combined = [...state.keys, ...evicted];
-							// FIFO-expire the OLDEST tombstones past the cap instead of
-							// throwing after the destructive stop already happened (review
-							// thread P2).
-							return {
-								scopes: bounded,
-								keys: boundEvictedTerminalKeys(combined, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-							};
+							return boundTerminalRetentionState(state.keys, scopes);
 						});
 					} catch {
 						// Best-effort: the row stays reserved (replays as uncertainty)
@@ -5310,17 +5296,7 @@ export function createNotificationsExtension(
 					mutate: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
 				): Promise<void> => {
 					await durableStore.transactTerminalState(state => {
-						const scopes = mutate(state.scopes);
-						const bounded = boundCompletedTerminalScopeRows(scopes, MAX_DURABLE_TERMINAL_RESERVATIONS);
-						const evicted = collectEvictedTerminalKeys(scopes, bounded);
-						const combined = [...state.keys, ...evicted];
-						// FIFO-expire the OLDEST tombstones past the cap instead of
-						// throwing after the destructive stop already happened (review
-						// thread P2).
-						return {
-							scopes: bounded,
-							keys: boundEvictedTerminalKeys(combined, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-						};
+						return boundTerminalRetentionState(state.keys, mutate(state.scopes));
 					});
 				};
 				const replayExisting = (row: DurableTerminalScopeRecord | EvictedTerminalKeyEntry) => {
@@ -5440,22 +5416,9 @@ export function createNotificationsExtension(
 									acceptedAt: Date.now(),
 								} satisfies DurableTerminalScopeRecord,
 							];
-							const bounded = boundCompletedTerminalScopeRows(preBound, MAX_DURABLE_TERMINAL_RESERVATIONS);
-							// Retain compact key tombstones for rows evicted by the cap
-							// (review thread P2) ATOMICALLY with the scope write (review
-							// thread P2). At tombstone capacity REJECT instead of
-							// truncating: dropping replay authority would let a same-key
-							// retry after restart/expiry abort an unrelated prompt
-							// (review thread P2).
-							const evicted = collectEvictedTerminalKeys(preBound, bounded);
-							const combined = [...state.keys, ...evicted];
-							// FIFO-expire the OLDEST tombstones past the cap instead of
-							// throwing after the destructive stop already happened (review
-							// thread P2).
-							return {
-								scopes: bounded,
-								keys: boundEvictedTerminalKeys(combined, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-							};
+							// Compact key tombstones for rows evicted by the cap are
+							// retained ATOMICALLY with the scope write (review thread P2).
+							return boundTerminalRetentionState(state.keys, preBound);
 						});
 						return "ok";
 					} catch (error) {
@@ -5701,20 +5664,7 @@ export function createNotificationsExtension(
 								acceptedAt: Date.now(),
 							} satisfies DurableTerminalScopeRecord,
 						];
-						const bounded = boundCompletedTerminalScopeRows(preBound, MAX_DURABLE_TERMINAL_RESERVATIONS);
-						const evicted = collectEvictedTerminalKeys(preBound, bounded);
-						const combined = [...state.keys, ...evicted];
-						// Apply the SAME capacity rejection as the reservation: never
-						// silently drop the oldest key's replay authority, which
-						// would let a same-key retry after restart/expiry abort an
-						// unrelated later prompt (review thread P2).
-						// FIFO-expire the OLDEST tombstones past the cap instead of
-						// throwing after the destructive stop already happened (review
-						// thread P2).
-						return {
-							scopes: bounded,
-							keys: boundEvictedTerminalKeys(combined, MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-						};
+						return boundTerminalRetentionState(state.keys, preBound);
 					});
 				} catch (error) {
 					if (error instanceof TerminalIdempotencyConflictError) {

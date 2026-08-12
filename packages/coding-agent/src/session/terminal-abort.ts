@@ -1209,3 +1209,40 @@ export function collectEvictedTerminalKeys<T extends DurableScopeRetentionRow>(
 	}
 	return evicted;
 }
+
+/** Durable terminal-scope reservation cap. Idle/already-terminal aborts write
+ *  durable no-effect reservations, so a client sending idle aborts with unique
+ *  keys must not grow the reconciliation document indefinitely: only the OLDEST
+ *  COMPLETED rows beyond this cap are evicted (review thread P2). */
+export const MAX_DURABLE_TERMINAL_RESERVATIONS = 256;
+/** Retained evicted-key tombstone cap; see {@link boundEvictedTerminalKeys}. */
+export const MAX_RETAINED_TERMINAL_KEY_TOMBSTONES = 4096;
+
+/**
+ * Apply the durable terminal-scope retention bound to a pending
+ * `transactTerminalState` mutation: evict the oldest COMPLETED scope rows past
+ * {@link MAX_DURABLE_TERMINAL_RESERVATIONS}, retain a compact key tombstone for
+ * every evicted row ATOMICALLY with the scope write, and FIFO-expire tombstones
+ * past {@link MAX_RETAINED_TERMINAL_KEY_TOMBSTONES} instead of throwing after a
+ * destructive stop already happened (review thread P2).
+ *
+ * Every durable terminal-state write — admission markers, no-effect
+ * reservations, reservation finalization, and pending-marker transitions — must
+ * go through this single bound in BOTH session runtimes (the notifications-hosted
+ * bus runtime and the SDK-only host runtime); a hand-rolled copy is how the two
+ * paths drift apart.
+ */
+export function boundTerminalRetentionState<Row extends DurableScopeRetentionRow, Key extends { keyHash: string }>(
+	priorKeys: readonly Key[],
+	nextScopes: Row[],
+): { scopes: Row[]; keys: Array<Key | EvictedTerminalKey> } {
+	const scopes = boundCompletedTerminalScopeRows(nextScopes, MAX_DURABLE_TERMINAL_RESERVATIONS);
+	const evicted = collectEvictedTerminalKeys(nextScopes, scopes);
+	return {
+		scopes,
+		keys: boundEvictedTerminalKeys<Key | EvictedTerminalKey>(
+			[...priorKeys, ...evicted],
+			MAX_RETAINED_TERMINAL_KEY_TOMBSTONES,
+		),
+	};
+}
