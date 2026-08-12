@@ -116,6 +116,13 @@ export function processIncarnation(pid: number, options: ProcessIncarnationOptio
 	if (platform === process.platform && options.runCommand === undefined) {
 		try {
 			const nativeProcess = nativeProcessBindings().Process.fromPid(pid) as { incarnation?: unknown } | null;
+			// null is the native binding's authoritative absent-process result: the
+			// process is dead or its PID was never opened.  Returning undefined here
+			// avoids repeatedly spawning powershell.exe (whose Get-Process uses the same
+			// OpenProcess path and therefore cannot recover a valid incarnation either)
+			// during the broker's ~5 s liveness polling, which on Windows 11 produces a
+			// visible console window flash on every probe (#4362, #4367).
+			if (nativeProcess === null) return undefined;
 			if (isProcessIncarnation(nativeProcess?.incarnation)) return nativeProcess.incarnation;
 		} catch {
 			// Fall through to the platform-specific reader.

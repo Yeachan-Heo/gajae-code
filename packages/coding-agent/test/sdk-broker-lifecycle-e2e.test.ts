@@ -830,9 +830,101 @@ test("broker reads Windows process incarnations as canonical FILETIME ticks with
 		}),
 	).toBe("windows:133830291061234568");
 });
-test("broker reads Windows process incarnations without surfacing a console window", () => {
-	// The PowerShell fallback runs whenever the native reader cannot bind the pid. Without
-	// windowsHide the broker's liveness polling flashes a console window on every probe.
+test("native absent-process null skips PowerShell on native Windows without repeated spawns (#4362, #4367)", () => {
+	// The native binding returns null as the authoritative absent-process result.
+	// processIncarnation must return undefined without spawning powershell.exe —
+	// spawning it only allocates a console that Windows Terminal renders as a
+	// visible window flash, and Get-Process cannot recover an incarnation either
+	// because it uses the same OpenProcess path.  The test proves:
+	//   1. A single absent-pid call never spawns.
+	//   2. Repeated calls (simulating the broker's ~5s liveness poll) never spawn.
+	//   3. The null check fires on every platform, not just win32.
+	const originalPlatform = process.platform;
+	const fromPid = vi.spyOn(native.Process, "fromPid").mockReturnValue(null);
+	const spawnSync = vi.spyOn(Bun, "spawnSync");
+	try {
+		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+		// Single call: no spawn
+		expect(processIncarnation(4_242)).toBeUndefined();
+		expect(spawnSync).not.toHaveBeenCalled();
+		// Repeated calls simulating liveness polling: still no spawn
+		for (let i = 0; i < 5; i++) expect(processIncarnation(4_242)).toBeUndefined();
+		expect(spawnSync).not.toHaveBeenCalled();
+	} finally {
+		Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		fromPid.mockRestore();
+		spawnSync.mockRestore();
+	}
+});
+
+test("native absent-process null returns undefined on every native platform", () => {
+	// The null check is platform-agnostic: it fires on linux, darwin, and win32
+	// because null is always the native binding's "process does not exist" result.
+	const fromPid = vi.spyOn(native.Process, "fromPid").mockReturnValue(null);
+	try {
+		expect(processIncarnation(process.pid)).toBeUndefined();
+	} finally {
+		fromPid.mockRestore();
+	}
+});
+
+test("native throw preserves PowerShell fallback on native Windows", () => {
+	// When the native binding throws (addon not loaded, unexpected error),
+	// the PowerShell fallback must be preserved — throwing does not mean absent.
+	const originalPlatform = process.platform;
+	const fromPid = vi.spyOn(native.Process, "fromPid").mockImplementation(() => {
+		throw new Error("native binding error");
+	});
+	const spawnSync = vi.spyOn(Bun, "spawnSync").mockReturnValue({
+		exitCode: 0,
+		stdout: Buffer.from("4242\t133830291061234567\r\n", "utf8"),
+		stderr: Buffer.alloc(0),
+		success: true,
+		signalCode: null,
+		resourceUsage: undefined,
+	} as unknown as Bun.SyncSubprocess<"pipe", "ignore">);
+	try {
+		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+		expect(processIncarnation(4_242)).toBe("windows:133830291061234567");
+		expect(spawnSync).toHaveBeenCalledTimes(1);
+	} finally {
+		Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		fromPid.mockRestore();
+		spawnSync.mockRestore();
+	}
+});
+
+test("native non-canonical incarnation preserves PowerShell fallback on native Windows", () => {
+	// When the native binding returns a non-null Process whose incarnation is
+	// malformed (should not happen in practice but is defensively handled),
+	// the PowerShell fallback must be preserved.
+	const originalPlatform = process.platform;
+	const fromPid = vi
+		.spyOn(native.Process, "fromPid")
+		.mockReturnValue({ incarnation: "garbage:not-canonical" } as unknown as native.Process);
+	const spawnSync = vi.spyOn(Bun, "spawnSync").mockReturnValue({
+		exitCode: 0,
+		stdout: Buffer.from("4242\t133830291061234567\r\n", "utf8"),
+		stderr: Buffer.alloc(0),
+		success: true,
+		signalCode: null,
+		resourceUsage: undefined,
+	} as unknown as Bun.SyncSubprocess<"pipe", "ignore">);
+	try {
+		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+		expect(processIncarnation(4_242)).toBe("windows:133830291061234567");
+		expect(spawnSync).toHaveBeenCalledTimes(1);
+	} finally {
+		Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		fromPid.mockRestore();
+		spawnSync.mockRestore();
+	}
+});
+
+test("cross-platform win32 simulation still spawns PowerShell with windowsHide", () => {
+	// When simulating win32 from another host (e.g. Linux CI), the PowerShell
+	// contract is preserved for test-injected / cross-platform simulation.
+	// windowsHide must still be set so the contract is never weakened.
 	const fromPid = vi.spyOn(native.Process, "fromPid").mockReturnValue(null);
 	const spawnSync = vi.spyOn(Bun, "spawnSync").mockReturnValue({
 		exitCode: 0,
@@ -843,6 +935,8 @@ test("broker reads Windows process incarnations without surfacing a console wind
 		resourceUsage: undefined,
 	} as unknown as Bun.SyncSubprocess<"pipe", "ignore">);
 	try {
+		// On Linux, platform !== process.platform, so the native null check
+		// does not fire even when fromPid returns null — the PowerShell path runs.
 		expect(processIncarnation(4_242, { platform: "win32" })).toBe("windows:133830291061234567");
 		expect(spawnSync).toHaveBeenCalledTimes(1);
 		const options = spawnSync.mock.calls[0]?.[1] as { windowsHide?: boolean } | undefined;

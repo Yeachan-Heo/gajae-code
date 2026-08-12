@@ -236,8 +236,12 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 158 fences the master-worker lifecycle: older daemons cannot
  * continue serving while this daemon adds or removes master-channel delivery
  * authority.
+ * Generation 159 fences the Windows process-incarnation authority: the native
+ * binding fallback no longer spawns powershell.exe when it cannot bind a pid,
+ * so older daemons that may still flash a console window during liveness polling
+ * are fenced off (#4362).
  */
-export const DAEMON_GENERATION = 158;
+export const DAEMON_GENERATION = 159;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

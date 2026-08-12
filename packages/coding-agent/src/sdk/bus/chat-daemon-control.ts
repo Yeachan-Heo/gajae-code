@@ -114,10 +114,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 58 preserves exact authority through unarchive replacement fallback.
  * Discord generation 59 / Slack generation 63 derive attachment authority ids from one Router function so persisted provider bindings and live attachments cannot drift apart.
  * Discord generation 61 fences master-channel worker lifecycle and delivery authority.
+ * Discord generation 62 / Slack generation 65 fence the Windows process-incarnation
+ * authority change (#4362): the native binding fallback no longer spawns powershell.exe.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 61,
-	slack: 64,
+	discord: 62,
+	slack: 65,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
