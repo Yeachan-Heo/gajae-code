@@ -184,6 +184,7 @@ import {
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
+	resolveEquivalentPath,
 	Snowflake,
 } from "@gajae-code/utils";
 
@@ -6655,7 +6656,11 @@ export class AgentSession {
 	 */
 	#asyncJobEndpointId(sessionId: string, sessionFile: string | undefined): string {
 		return this.#asyncJobProviderSessionId !== undefined && sessionFile !== undefined
-			? JSON.stringify(["async-job-endpoint", this.#asyncJobProviderSessionId, sessionFile])
+			? JSON.stringify([
+					"async-job-endpoint",
+					this.#asyncJobProviderSessionId,
+					resolveEquivalentPath(path.resolve(sessionFile)),
+				])
 			: sessionId;
 	}
 

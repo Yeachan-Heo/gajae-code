@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai/models";
 import type { Message, ProviderSessionState } from "@gajae-code/ai/types";
-import { Snowflake } from "@gajae-code/utils";
+import { resolveEquivalentPath, Snowflake } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
 import { createAgentSession } from "../src/sdk";
@@ -236,7 +236,11 @@ describe("task fork-context provider identity", () => {
 		const previousSessionId = session.sessionManager.getSessionId();
 		const previousSessionFile = session.sessionManager.getSessionFile();
 		expect(previousSessionFile).toBeDefined();
-		const previousEndpoint = JSON.stringify(["async-job-endpoint", providerSessionId, previousSessionFile]);
+		const previousEndpoint = JSON.stringify([
+			"async-job-endpoint",
+			providerSessionId,
+			resolveEquivalentPath(path.resolve(previousSessionFile!)),
+		]);
 		const manager = AsyncJobManager.forEndpoint(previousEndpoint);
 		expect(manager).toBeDefined();
 
@@ -244,7 +248,11 @@ describe("task fork-context provider identity", () => {
 		const successorSessionFile = session.sessionManager.getSessionFile();
 		expect(successorSessionFile).toBeDefined();
 		expect(session.sessionManager.getSessionId()).not.toBe(previousSessionId);
-		const successorEndpoint = JSON.stringify(["async-job-endpoint", providerSessionId, successorSessionFile]);
+		const successorEndpoint = JSON.stringify([
+			"async-job-endpoint",
+			providerSessionId,
+			resolveEquivalentPath(path.resolve(successorSessionFile!)),
+		]);
 		expect(AsyncJobManager.forEndpoint(previousEndpoint)).toBeUndefined();
 		expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(manager);
 
