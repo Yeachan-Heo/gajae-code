@@ -4809,6 +4809,19 @@ export function createNotificationsExtension(
 					);
 					return;
 				}
+				// The requester's own prompt may have won the race while the
+				// durable no-effect reservation awaited the store (the rescan
+				// found its submission active): the admission snapshot was
+				// captured under the OTHER connection's turn, so rebind it to
+				// the CURRENT (now the requester's) turn before the settlement —
+				// otherwise the session rejects the still-old token as
+				// unknown_run and the requester's newly active turn keeps
+				// running (review thread P1). A normal requester-owned abort is
+				// a no-op rebind (the entry already lives under the current
+				// turn).
+				if (options.terminal?.steeringSnapshotToken !== undefined) {
+					terminalAbortSeams?.rebindTerminalAbortSteeringSnapshot?.(options.terminal.steeringSnapshotToken);
+				}
 				let proof: RunSettlementProof;
 				try {
 					proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(submission.executionHandle, {

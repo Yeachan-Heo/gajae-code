@@ -216,6 +216,18 @@ function start(
 							(
 								ctx as { cancelPendingPreflightForTerminalAbort?: () => void }
 							).cancelPendingPreflightForTerminalAbort?.(),
+						captureTerminalAbortSteeringSnapshot: () =>
+							(
+								ctx as { captureTerminalAbortSteeringSnapshot?: () => number | undefined }
+							).captureTerminalAbortSteeringSnapshot?.(),
+						discardTerminalAbortSteeringSnapshot: (token: number) =>
+							(
+								ctx as { discardTerminalAbortSteeringSnapshot?: (token: number) => void }
+							).discardTerminalAbortSteeringSnapshot?.(token),
+						rebindTerminalAbortSteeringSnapshot: (token: number) =>
+							(
+								ctx as { rebindTerminalAbortSteeringSnapshot?: (token: number) => void }
+							).rebindTerminalAbortSteeringSnapshot?.(token),
 						abortPromptAndWaitWithTerminal: (handle, seamOptions) =>
 							(
 								ctx as {
@@ -7624,4 +7636,83 @@ test("SDK host keeps the prompt correlation across a mid-prompt continuation age
 	expect(frames.filter(frame => frame.type === "agent_start").length).toBe(1);
 
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+});
+
+test("notification host rebinds the steering snapshot before terminalizing with a token", async () => {
+	// Review thread P1: the notification (bus) path must invoke
+	// rebindTerminalAbortSteeringSnapshot before the settlement whenever a
+	// steering admission token is present — an abort admitted under another
+	// connection's turn whose requester's prompt wins the race would otherwise
+	// have the session reject the still-old token as unknown_run.
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-notif-rebind-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-notif-rebind-${Date.now()}`;
+	const rebinds: number[] = [];
+	const sessionContext = {
+		...context(cwd, sessionId),
+		getActivePromptHandle: () => "exact-run-handle",
+		getTerminalTurnEpoch: () => 3,
+		captureTerminalAbortSteeringSnapshot: () => 42,
+		discardTerminalAbortSteeringSnapshot: (token: number) => {
+			// never expected in this flow (the settlement consumes the token)
+			rebinds.push(token);
+		},
+		rebindTerminalAbortSteeringSnapshot: (token: number) => {
+			rebinds.push(token);
+		},
+		abortPromptAndWait: async () => ({ status: "settled", terminalScope: {} }),
+	};
+	const handlers = start(sessionContext, { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	const request = async (command: Record<string, unknown>): Promise<Record<string, unknown>> => {
+		const requestId = String(command.id);
+		socket.send(JSON.stringify(command));
+		const responseType = command.type === "query_request" ? "query_response" : "control_response";
+		await waitFor(
+			() => frames.some(frame => frame.type === responseType && frame.id === requestId),
+			`${requestId} response`,
+		);
+		return frames.find(frame => frame.type === responseType && frame.id === requestId)!;
+	};
+	try {
+		const ack = await request({
+			type: "control_request",
+			id: "rebind-prompt",
+			operation: "turn.prompt",
+			input: { text: "requester turn", clientRef: "rebind-ref" },
+		});
+		expect(ack.ok).toBe(true);
+		const ackResult = ack.result as { commandId: string; turnId: string };
+		// Bind the exact run handle through the correlation-carrying agent_start
+		// so the abort reaches the ACTIVE terminalization path.
+		await handlers.get("agent_start")?.(
+			{ type: "agent_start", runId: "exact-run-handle", commandId: ackResult.commandId, turnId: ackResult.turnId },
+			sessionContext,
+		);
+		// Terminal abort: the admission captured token 42 and the
+		// terminalization passes it through — the bus must rebind it before the
+		// settlement.
+		const abort = await request({
+			type: "control_request",
+			id: "rebind-abort",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "rebind-abort-key",
+		});
+		expect(abort.ok).toBe(true);
+		expect(rebinds).toContain(42);
+	} finally {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		socket.close();
+	}
 });
