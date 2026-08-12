@@ -12,6 +12,7 @@ export type RawHttpRequestDump = {
 	url?: string;
 	headers?: Record<string, string>;
 	body?: unknown;
+	diagnostics?: Record<string, unknown>;
 };
 
 export type CapturedHttpErrorResponse = {

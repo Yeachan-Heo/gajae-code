@@ -533,6 +533,72 @@ export function isAnthropicCacheBreakpointOverflowError(error: unknown): boolean
 	return /maximum of \d+ blocks/i.test(message) || /at most \d+ blocks/i.test(message);
 }
 
+export type AnthropicContextManagementInjectionDiagnostic = {
+	strategy: string;
+	message: string;
+	captureNote: string;
+};
+
+const CLEAR_THINKING_STRATEGY_PATTERN = /\b(clear_thinking_[a-z0-9_-]{1,64})\b/i;
+
+function formatAnthropicDiagnosticBaseUrl(requestUrl: unknown): string {
+	if (typeof requestUrl !== "string") return "the configured Anthropic base URL";
+	try {
+		const url = new URL(requestUrl);
+		const basePath = url.pathname.replace(/\/v1\/messages\/?$/, "");
+		return `${url.origin}${basePath}`;
+	} catch {
+		return "the configured Anthropic base URL";
+	}
+}
+
+/**
+ * Diagnose a context-management strategy named by an Anthropic 400 but absent
+ * from the body GJC sent. This mismatch is evidence of intermediary mutation,
+ * not permission to silently enable thinking or retry the request.
+ */
+export function diagnoseAnthropicContextManagementInjection(
+	error: unknown,
+	dump: RawHttpRequestDump | undefined,
+): AnthropicContextManagementInjectionDiagnostic | undefined {
+	if (extractHttpStatusFromError(error) !== 400) return undefined;
+	if (dump?.api !== "anthropic-messages" || !isRecord(dump.body)) return undefined;
+	if (isAnthropicApiBaseUrl(dump.url)) return undefined;
+	if (Object.hasOwn(dump.body, "thinking") || Object.hasOwn(dump.body, "context_management")) return undefined;
+
+	const errorMessage = error instanceof Error ? error.message : String(error);
+	if (!/invalid_request_error/i.test(errorMessage)) return undefined;
+	const strategy = CLEAR_THINKING_STRATEGY_PATTERN.exec(errorMessage)?.[1];
+	if (!strategy) return undefined;
+	if (!/\bstrategy\b/i.test(errorMessage) || !/\bthinking\b/i.test(errorMessage)) return undefined;
+
+	const baseUrl = formatAnthropicDiagnosticBaseUrl(dump.url);
+	return {
+		strategy,
+		message: [
+			`GJC did not send \`thinking\` or \`context_management\`, but the Anthropic 400 names the \`${strategy}\` context-management strategy.`,
+			`An intermediary at ${baseUrl} likely injected that strategy into the outgoing request.`,
+			"Enable thinking explicitly for this model, or fix/replace the intermediary so it does not add clear-thinking edits to requests without thinking. GJC did not auto-enable thinking or retry because that would change request cost and semantics.",
+		].join("\n"),
+		captureNote: `The HTTP 400 references context-management strategy ${strategy}, but this captured outgoing body contains neither thinking nor context_management; an intermediary may have added it after GJC sent the request.`,
+	};
+}
+
+async function finalizeAnthropicErrorMessage(error: unknown, dump: RawHttpRequestDump | undefined): Promise<string> {
+	const diagnostic = diagnoseAnthropicContextManagementInjection(error, dump);
+	if (diagnostic && dump) {
+		dump.diagnostics = {
+			...(dump.diagnostics ?? {}),
+			anthropicContextManagement: {
+				strategy: diagnostic.strategy,
+				note: diagnostic.captureNote,
+			},
+		};
+	}
+	const message = await finalizeErrorMessage(error, dump);
+	return diagnostic ? `${message}\n\n${diagnostic.message}` : message;
+}
+
 /**
  * CPA's Claude-OAuth layer cloaks downstream tool names into
  * `mcp__<server>__<token>_<base>` aliases upstream. When the model emits a
@@ -2428,7 +2494,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			output.errorStatus = extractHttpStatusFromError(localAbortReason ?? error);
 			output.transportFailure = transportFailureFacts(localAbortReason ?? error);
 			if (output.errorKind !== "provider_safety_stop" || !output.errorMessage) {
-				output.errorMessage = localAbortReason?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
+				output.errorMessage =
+					localAbortReason?.message ?? (await finalizeAnthropicErrorMessage(error, rawRequestDump));
 			}
 			output.errorMessage = rewriteCopilotError(output.errorMessage, error, model.provider);
 			output.duration = Date.now() - startTime;
