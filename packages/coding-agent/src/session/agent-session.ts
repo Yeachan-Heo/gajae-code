@@ -7020,6 +7020,15 @@ export class AgentSession {
 			disposeVmContextsByOwner(kernelOwnerId).catch((error: unknown) =>
 				logger.warn("signal teardown: disposeVmContextsByOwner failed", { error }),
 			),
+			// Tool-owned resources (e.g. an autoresearch mission's persistent Python
+			// kernel) register their own disposer and are keyed by an owner id that is
+			// NOT #evalKernelOwnerId, so the two disposals above never reach them. Drain
+			// them here inside the same budget: without this a signal exit orphans the
+			// subprocess. #runToolSessionCleanups already clears the set, so the graceful
+			// dispose path running first makes this a no-op rather than a double free.
+			this.#runToolSessionCleanups().catch((error: unknown) =>
+				logger.warn("signal teardown: tool session cleanups failed", { error }),
+			),
 		]);
 		await Promise.race([work, Bun.sleep(timeoutMs)]);
 	}

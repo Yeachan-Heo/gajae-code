@@ -94,4 +94,52 @@ describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 		expect(releaseTabs).toHaveBeenCalledTimes(1);
 		expect(disposeVms).toHaveBeenCalledTimes(1);
 	});
+
+	it("drains tool-registered cleanups so a non-eval owner is not orphaned on signal exit", async () => {
+		// An autoresearch mission registers its kernel under its own owner id, which is
+		// deliberately distinct from the session's eval owner (spec f33). Before the
+		// signal path drained these, Ctrl-C left the subprocess running.
+		const missionOwner = "autoresearch:mission-1";
+		const reaped: string[] = [];
+		session!.registerToolSessionCleanup(async () => {
+			reaped.push(missionOwner);
+		});
+
+		await session!.disposeChildSubprocesses();
+
+		expect(reaped).toEqual([missionOwner]);
+		// The mission owner is not the eval owner the built-in disposals target.
+		expect(disposeKernels.mock.calls[0]?.[0]).not.toBe(missionOwner);
+	});
+
+	it("does not double-run a tool cleanup that graceful dispose already drained", async () => {
+		let runs = 0;
+		session!.registerToolSessionCleanup(() => {
+			runs += 1;
+		});
+
+		await session!.disposeChildSubprocesses();
+		await session!.disposeChildSubprocesses();
+
+		expect(runs).toBe(1);
+	});
+
+	it("stays inside the time box when a tool cleanup hangs", async () => {
+		session!.registerToolSessionCleanup(() => new Promise<void>(() => {}));
+
+		const start = Date.now();
+		await session!.disposeChildSubprocesses(20);
+
+		expect(Date.now() - start).toBeLessThan(2_000);
+		expect(disposeKernels).toHaveBeenCalledTimes(1);
+	});
+
+	it("never rejects when a tool cleanup throws", async () => {
+		session!.registerToolSessionCleanup(() => {
+			throw new Error("mission kernel dispose boom");
+		});
+
+		await expect(session!.disposeChildSubprocesses()).resolves.toBeUndefined();
+		expect(disposeKernels).toHaveBeenCalledTimes(1);
+	});
 });
