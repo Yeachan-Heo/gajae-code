@@ -2662,10 +2662,10 @@ export class ModelRegistry {
 					...(result.dynamicModelIds === undefined
 						? {}
 						: {
-							profileModelIds: new Set(result.dynamicModelIds),
-							profileFresh: !result.stale,
-							profileEndpoint: endpoint,
-						}),
+								profileModelIds: new Set(result.dynamicModelIds),
+								profileFresh: !result.stale,
+								profileEndpoint: endpoint,
+							}),
 					authGeneration,
 					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(models[0]?.baseUrl ?? endpoint),
 				});
