@@ -384,8 +384,10 @@ function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		// Only ESRCH proves the process is gone. EPERM and other probe failures are
+		// indeterminate and must retain ownership rather than permit replacement.
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
 	}
 }
 /** Windows process ownership uses immutable StartTime/FileTime provenance through
