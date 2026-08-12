@@ -126,6 +126,10 @@ interface PromptWaiter {
 	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
 	 *  a later failed attempt must not erase an earlier success (review thread P2). */
 	cancelAcknowledged?: boolean;
+	/** In-flight cancel attempts for this prompt: cancellation intent must stay
+	 *  set while any attempt can still acknowledge, so a failure only clears
+	 *  the shared flag when no attempt remains pending (review thread P2). */
+	pendingCancelAttempts?: number;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -1676,7 +1680,9 @@ export class AcpAgent implements Agent {
 			// acknowledgement: keep the waiter's attempt promise CUMULATIVE —
 			// it resolves true when ANY attempt acknowledged, so the second
 			// attempt's failure cannot rewrite the first's success (review
-			// thread P2).
+			// thread P2). Count in-flight attempts so a failure only clears the
+			// shared intent when no earlier attempt can still acknowledge.
+			waiter.pendingCancelAttempts = (waiter.pendingCancelAttempts ?? 0) + 1;
 			waiter.cancelAttempt = waiter.cancelAttempt
 				? waiter.cancelAttempt.then(prior => prior || cancelAttempt.promise)
 				: cancelAttempt.promise;
@@ -1710,13 +1716,16 @@ export class AcpAgent implements Agent {
 			cancelAttempt?.resolve(true);
 		} catch (error) {
 			// A failing attempt must not erase a cancellation the client already
-			// requested AND an overlapping attempt already acknowledged (e.g.
-			// the first abort stopped the turn and the second got
-			// no_active_turn): the prompt-rejection path still settles as
-			// cancelled (review thread P2).
-			if (!waiter?.cancelAcknowledged) record.cancelRequested = false;
+			// requested when an overlapping attempt already acknowledged OR is
+			// still pending and can still acknowledge (e.g. the second abort
+			// failed while the first was in flight and then stopped the turn):
+			// the prompt-rejection path still settles as cancelled (review
+			// thread P2).
+			if (!waiter?.cancelAcknowledged && (waiter?.pendingCancelAttempts ?? 0) <= 1) record.cancelRequested = false;
 			cancelAttempt?.resolve(false);
 			throw error;
+		} finally {
+			if (waiter) waiter.pendingCancelAttempts = Math.max(0, (waiter.pendingCancelAttempts ?? 1) - 1);
 		}
 	}
 

@@ -118,6 +118,10 @@ async function createFixture(
 ): Promise<Fixture> {
 	const silent = new Set(options.silentQueries ?? []);
 	const abortResponseQueue = [...(options.abortResponses ?? [])];
+	// Queue entries may be factories for deferred responses (the test drives
+	// the response ordering of overlapping cancels).
+	const resolveAbortResponse = (entry: unknown): unknown =>
+		typeof entry === "function" ? (entry as () => unknown | Promise<unknown>)() : entry;
 	const tempDir = TempDir.createSync("@acp-prompt-settle-");
 	const agentDir = path.join(tempDir.path(), "agent");
 	const cwd = path.join(tempDir.path(), "workspace");
@@ -258,7 +262,7 @@ async function createFixture(
 							promptReply !== undefined
 								? (promptReply as { result?: unknown }).result
 								: frame.operation === "turn.abort"
-									? (abortResponseQueue.shift() ?? { aborted: true })
+									? await resolveAbortResponse(abortResponseQueue.shift() ?? { aborted: true })
 									: {},
 					}),
 				);
@@ -446,18 +450,21 @@ test("a producer that never publishes a terminal is still settled by the inactiv
 	}
 });
 
-test("an acknowledged cancel survives a second overlapping cancel that fails", async () => {
-	// Review thread P2: two overlapping ACP cancel notifications each replace
-	// waiter.cancelAttempt; when the first abort stops the turn but the second
-	// consequently receives no_active_turn, the second attempt must not erase
-	// the cancellation the client already requested and the first attempt
-	// already acknowledged — a concurrent prompt-preflight rejection settles
-	// the turn as cancelled instead of surfacing a spurious error.
+test("cancel intent survives a failing second attempt while the first is still pending", async () => {
+	// Review thread P2: when two cancels genuinely overlap and the later SDK
+	// request fails BEFORE the earlier one is acknowledged, the later failure
+	// must not clear record.cancelRequested — the earlier attempt can still
+	// stop the turn, and a concurrent prompt-preflight rejection must then
+	// settle as cancelled instead of surfacing the transport error.
 	let promptFrameArrived: () => void = () => {};
 	const promptFrameSeen = new Promise<void>(resolve => {
 		promptFrameArrived = resolve;
 	});
 	const promptGate = Promise.withResolvers<void>();
+	let releaseAbortA: () => void = () => {};
+	const abortAGate = new Promise<void>(resolve => {
+		releaseAbortA = resolve;
+	});
 	const fixture = await createFixture({
 		promptResponse: async () => {
 			promptFrameArrived();
@@ -465,9 +472,13 @@ test("an acknowledged cancel survives a second overlapping cancel that fails", a
 			return { ok: false, error: { code: "busy", message: "preflight busy" } };
 		},
 		abortResponses: [
-			// First cancel: acknowledged (legacy aborted:true).
-			{ ok: true, result: { aborted: true } },
-			// Second cancel: the turn is already stopped -> no_active_turn,
+			// First cancel: its acknowledgement is deferred (still in flight
+			// when the second attempt fails).
+			async () => {
+				await abortAGate;
+				return { ok: true, result: { aborted: true } };
+			},
+			// Second cancel: the turn is not (yet) stopped -> no_active_turn,
 			// which is NOT an acknowledgement.
 			{ ok: true, result: { turn: "no_active_turn", terminal: "terminal_no_effect" } },
 		],
@@ -483,17 +494,17 @@ test("an acknowledged cancel survives a second overlapping cancel that fails", a
 			resolved => ({ resolved }),
 			(error: unknown) => ({ rejected: error as { code?: string } }),
 		);
-		// Wait until the SDK turn.prompt frame reached the server, then run the
-		// overlapping cancels while the prompt acknowledgement is still pending.
 		await bounded(promptFrameSeen, "prompt frame arrival");
-		// First cancel acknowledges; the waiter's attempt resolves true.
-		await fixture.agent.cancel({ sessionId: fixture.sessionId } as CancelNotification);
-		// Second overlapping cancel fails (abort_unacknowledged).
+		// First cancel: still pending (its acknowledgement is gated).
+		const cancelAPromise = fixture.agent.cancel({ sessionId: fixture.sessionId } as CancelNotification);
+		// Second overlapping cancel fails while the first is in flight.
 		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId } as CancelNotification)).rejects.toMatchObject({
 			code: "abort_unacknowledged",
 		});
-		// The concurrent prompt-preflight rejection now settles: the failed
-		// second attempt must not have cleared the acknowledged cancellation.
+		// The first attempt then acknowledges: the cancellation intent must
+		// still be set, so the prompt-preflight rejection settles as cancelled.
+		releaseAbortA();
+		await cancelAPromise;
 		promptGate.resolve();
 		const outcome = await bounded(settled, "prompt settlement after overlapping cancels");
 		expect("resolved" in outcome ? outcome.resolved?.stopReason : outcome.rejected?.code).toBe("cancelled");
