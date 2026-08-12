@@ -1114,7 +1114,7 @@ describe("coordinator session state lock", () => {
 		// Another process settles the session at the SAME byte length and the SAME
 		// mtime, so file metadata alone cannot distinguish the two payloads.
 		const terminalBytesFor = (reason: string): string =>
-			`${JSON.stringify({ ...running, state: "completed", ready_for_input: true, live: false, reason })}\n`;
+			`${JSON.stringify({ ...running, state: "completed", ready_for_input: false, live: false, reason })}\n`;
 		const runningBytes = `${JSON.stringify(running)}\n`;
 		const delta = runningBytes.length - terminalBytesFor("").length;
 		expect(delta).toBeGreaterThan(0);
