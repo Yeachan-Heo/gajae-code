@@ -1880,7 +1880,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
-				const isTtsrRule = rule.condition && rule.condition.length > 0 ? ttsrManager.addRule(rule) : false;
+				const hasTtsrTrigger =
+					(rule.condition && rule.condition.length > 0) ||
+					(rule.mutationTargetGlobs && rule.mutationTargetGlobs.length > 0);
+				const isTtsrRule = hasTtsrTrigger ? ttsrManager.addRule(rule) : false;
 				if (isTtsrRule) {
 					continue;
 				}
@@ -2181,7 +2184,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
-			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
+			setActiveRules([...rulebookRules, ...alwaysApplyRules], sessionManager.getSessionId());
 			if (asyncJobManager) {
 				// Register under the session endpoint so concurrent sessions'
 				// owned work settles in the correct manager (review thread P1).

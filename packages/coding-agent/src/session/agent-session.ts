@@ -198,7 +198,7 @@ import {
 	type OwnerSubagentShutdownLease,
 } from "../async";
 import { reset as resetCapabilities } from "../capability";
-import type { Rule } from "../capability/rule";
+import { clearActiveRules, getActiveRules, type Rule, setActiveRules } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
 import { activateModelProfile, materializeActiveModelProfileAssignment } from "../config/model-profile-activation";
 import {
@@ -6060,6 +6060,16 @@ export class AgentSession {
 					}
 				}
 			}
+			if (typeof value === "string" && (normalizedKey === "input" || normalizedKey === "patch")) {
+				try {
+					for (const entry of expandApplyPatchToEntries({ input: value })) {
+						rawPaths.push(entry.path);
+						if (entry.rename) rawPaths.push(entry.rename);
+					}
+				} catch {
+					// Incomplete or non-envelope payloads stay unmatched rather than scanning the stream.
+				}
+			}
 		}
 
 		const normalizedPaths = rawPaths.flatMap(pathValue => this.#normalizeTtsrPathCandidates(pathValue));
@@ -6783,12 +6793,33 @@ export class AgentSession {
 	 */
 	#syncAgentSessionId(sessionId?: string): void {
 		this.#reasoningControlContextGeneration++;
+		const previousSid = this.agent.sessionId;
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
 		this.agent.providerSessionId = this.#providerCacheSessionId ?? sid;
 		this.agent.setMetadataResolver((provider: string) =>
 			buildSessionMetadata(sid, provider, this.#modelRegistry.authStorage, this.credentialSessionId),
 		);
+		this.#rebindTtsrAndRuleSnapshots(previousSid, sid);
+	}
+
+	#rebindTtsrAndRuleSnapshots(previousSid: string | undefined, nextSid: string): void {
+		const context = this.buildDisplaySessionContext();
+		this.#ttsrManager?.rebindSessionState({
+			messageCount: context.ttsrMessageCount,
+			records:
+				context.injectedTtsrRuleRecords && context.injectedTtsrRuleRecords.length > 0
+					? context.injectedTtsrRuleRecords
+					: context.injectedTtsrRules,
+		});
+		const snapshotSource = previousSid && previousSid !== nextSid ? previousSid : nextSid;
+		const current = getActiveRules(snapshotSource);
+		if (previousSid && previousSid !== nextSid) {
+			clearActiveRules(previousSid);
+		}
+		if (current.length > 0) {
+			setActiveRules(current, nextSid);
+		}
 	}
 
 	/**
@@ -6898,6 +6929,7 @@ export class AgentSession {
 	async #dispose(): Promise<void> {
 		const admissionClosed = this.#closeSessionAdmission();
 		this.#isDisposed = true;
+		clearActiveRules(this.sessionManager.getSessionId());
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
 		this.#evalExecutionDisposing = true;

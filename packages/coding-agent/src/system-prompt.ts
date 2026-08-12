@@ -2,6 +2,7 @@
  * System prompt construction and project context loading
  */
 
+import * as fs from "node:fs";
 import * as os from "node:os";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { $env, getGpuCachePath, getProjectDir, hasFsCode, isEnoent, logger, prompt } from "@gajae-code/utils";
@@ -68,6 +69,41 @@ function dedupePromptSource(source: string | null | undefined, otherSources: Arr
 	if (!resolvedSource) return "";
 
 	return otherSources.some(otherSource => promptSourceContainsRule(otherSource, resolvedSource)) ? "" : resolvedSource;
+}
+
+function workspaceAdvertisesRule(
+	rule: { globs?: string[] },
+	workspaceTree: WorkspaceTree | undefined,
+	cwd: string,
+): boolean {
+	const globs = rule.globs?.map(glob => glob.trim()).filter(glob => glob.length > 0) ?? [];
+	if (globs.length === 0) return true;
+	const compiled = globs.map(glob => new Bun.Glob(glob));
+	const candidates: string[] = [];
+	if (workspaceTree?.rendered) {
+		for (const line of workspaceTree.rendered.split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("…") || trimmed.startsWith("...")) continue;
+			candidates.push(trimmed.replaceAll("\\", "/"));
+		}
+	}
+	if (candidates.length === 0) {
+		try {
+			for (const entry of fs.readdirSync(cwd, { withFileTypes: true })) {
+				if (entry.isFile()) candidates.push(entry.name);
+			}
+		} catch {
+			// Missing cwd stays fail-closed: no advertisement without a matching file.
+		}
+	}
+	for (const candidate of candidates) {
+		const normalized = candidate.replaceAll("\\", "/");
+		const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
+		for (const glob of compiled) {
+			if (glob.match(normalized) || glob.match(basename)) return true;
+		}
+	}
+	return false;
 }
 
 /** Neutralize tag-like sequences in embedded project context so file bodies cannot escape framing. */
@@ -616,7 +652,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles: sanitizedContextFiles,
 		agentsMdSearch: { files: agentsMdFiles.map(file => escapePromptMetadata(file)) },
 		workspaceTree,
-		rules: rules ?? [],
+		rules: (rules ?? []).filter(rule => workspaceAdvertisesRule(rule, workspaceTree, resolvedCwd)),
 		alwaysApplyRules: sanitizedAlwaysApplyRules,
 		date,
 		dateTime,

@@ -4,6 +4,15 @@ import { parseRuleConditionAndScope, type Rule } from "@gajae-code/coding-agent/
 import { buildRuleFromMarkdown } from "@gajae-code/coding-agent/discovery/helpers";
 import { TtsrManager } from "@gajae-code/coding-agent/export/ttsr";
 
+function rustInjectRule(): Rule {
+	return buildRuleFromMarkdown(
+		"rust-skills-inject.md",
+		'---\ndescription: inject\ncondition: "*.rs"\ninterruptMode: never\nrepeatMode: once\n---\nBody',
+		"/tmp/rust-skills-inject.md",
+		{ provider: "test", providerName: "test", path: "/tmp/rust-skills-inject.md", level: "user" },
+	);
+}
+
 function makeRule(partial: Partial<Rule>): Rule {
 	return {
 		name: partial.name ?? "rule",
@@ -16,7 +25,7 @@ function makeRule(partial: Partial<Rule>): Rule {
 		scope: partial.scope,
 		repeatMode: partial.repeatMode,
 		repeatGap: partial.repeatGap,
-
+		mutationTargetGlobs: partial.mutationTargetGlobs,
 		_source: partial._source ?? {
 			provider: "test",
 			providerName: "test",
@@ -103,13 +112,14 @@ describe("parseRuleConditionAndScope", () => {
 		expect(parsed.scope).toEqual(["text", "tool:edit(*.{ts,tsx})"]);
 	});
 
-	it("maps glob-like condition to edit/write scoped shorthand", () => {
+	it("maps glob-like condition to mutation-target globs instead of streamed .*", () => {
 		const parsed = parseRuleConditionAndScope({
 			condition: "*.rs",
 		});
 
-		expect(parsed.condition).toEqual([".*"]);
-		expect(parsed.scope).toEqual(["tool:edit(*.rs)", "tool:write(*.rs)"]);
+		expect(parsed.condition).toBeUndefined();
+		expect(parsed.mutationTargetGlobs).toEqual(["*.rs"]);
+		expect(parsed.scope).toEqual(["tool:edit(*.rs)", "tool:write(*.rs)", "tool:apply_patch(*.rs)"]);
 	});
 
 	it("parses per-rule repeat policy frontmatter", () => {
@@ -178,6 +188,39 @@ describe("TtsrManager disabled behavior", () => {
 
 		expect(rulebookRules).toEqual([conditionalWithDescription]);
 		expect(alwaysApplyRules).toEqual([conditionalAlwaysApply]);
+	});
+});
+
+describe("TtsrManager mutation-target trigger", () => {
+	it("matches resolved edit/write paths and apply-patch envelopes, not streamed .*", () => {
+		const manager = new TtsrManager();
+		const rule = rustInjectRule();
+		expect(rule.mutationTargetGlobs).toEqual(["*.rs"]);
+		expect(rule.condition).toBeUndefined();
+		expect(manager.addRule(rule)).toBe(true);
+
+		expect(manager.checkDelta("anything", { source: "text" })).toEqual([]);
+		expect(
+			manager.checkDelta("path: src/lib.rs", {
+				source: "tool",
+				toolName: "edit",
+				filePaths: ["src/lib.rs"],
+			}),
+		).toEqual([rule]);
+		expect(
+			manager.checkDelta("path: src/main.ts", {
+				source: "tool",
+				toolName: "write",
+				filePaths: ["src/main.ts"],
+			}),
+		).toEqual([]);
+		expect(
+			manager.checkDelta("*** Begin Patch\n*** Update File: crates/foo/src/lib.rs\n+fn x() {}\n*** End Patch", {
+				source: "tool",
+				toolName: "apply_patch",
+				filePaths: ["crates/foo/src/lib.rs"],
+			}),
+		).toEqual([rule]);
 	});
 });
 

@@ -65,6 +65,8 @@ export interface ResolveContext {
 	getAuthorizedArtifactsDirs?: () => readonly string[];
 	/** Caller's abort signal. */
 	signal?: AbortSignal;
+	/** Session identity used by session-scoped protocol snapshots such as rule://. */
+	sessionId?: string;
 	/** Scope-held MCP facade used for mcp:// resolution; never inferred from process-global state. */
 	mcpManager?: import("../runtime-mcp/manager").MCPManager;
 }

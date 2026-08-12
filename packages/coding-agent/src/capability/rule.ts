@@ -7,7 +7,7 @@
 import { defineCapability } from ".";
 import type { SourceMeta } from "./types";
 
-const CONDITION_GLOB_SCOPE_TOOLS = ["edit", "write"] as const;
+const CONDITION_GLOB_SCOPE_TOOLS = ["edit", "write", "apply_patch"] as const;
 
 /**
  * Parsed frontmatter from rule files.
@@ -56,6 +56,8 @@ export interface Rule {
 	repeatMode?: "once" | "after-gap";
 	/** Per-rule TTSR repeat gap override (falls back to global ttsr.repeatGap). */
 	repeatGap?: number;
+	/** Canonical mutation-target globs matched at edit/write/apply-patch dispatch. */
+	mutationTargetGlobs?: string[];
 	/** Source metadata */
 	_source: SourceMeta;
 }
@@ -187,18 +189,23 @@ function isLikelyFileGlob(value: string): boolean {
  * - `condition` accepts string or string[]
  * - `scope` accepts string or string[]
  * - legacy `ttsr_trigger` / `ttsrTrigger` are accepted as a `condition` fallback
- * - condition tokens that look like file globs become scope shorthands:
- *   `*.rs` => `tool:edit(*.rs)`, `tool:write(*.rs)` and a catch-all condition `.*`
+ * - condition tokens that look like file globs become mutation-target globs
+ *   matched against resolved edit/write/apply-patch paths at dispatch time.
+ *   They are never compiled as streamed `.*` regexes.
  */
-export function parseRuleConditionAndScope(frontmatter: RuleFrontmatter): Pick<Rule, "condition" | "scope"> {
+export function parseRuleConditionAndScope(
+	frontmatter: RuleFrontmatter,
+): Pick<Rule, "condition" | "scope" | "mutationTargetGlobs"> {
 	const rawCondition = frontmatter.condition ?? frontmatter.ttsr_trigger ?? frontmatter.ttsrTrigger;
 	const parsedCondition = normalizeRuleField(rawCondition);
 	const parsedScope = normalizeScopeField(frontmatter.scope);
 
 	const inferredScope: string[] = [];
 	const condition: string[] = [];
+	const mutationTargetGlobs: string[] = [];
 	for (const token of parsedCondition ?? []) {
 		if (isLikelyFileGlob(token)) {
+			mutationTargetGlobs.push(token);
 			for (const toolName of CONDITION_GLOB_SCOPE_TOOLS) {
 				inferredScope.push(`tool:${toolName}(${token})`);
 			}
@@ -207,35 +214,45 @@ export function parseRuleConditionAndScope(frontmatter: RuleFrontmatter): Pick<R
 		condition.push(token);
 	}
 
-	if (condition.length === 0 && inferredScope.length > 0) {
-		condition.push(".*");
-	}
-
 	const scope = [...(parsedScope ?? []), ...inferredScope];
 	return {
 		condition: condition.length > 0 ? Array.from(new Set(condition)) : undefined,
 		scope: scope.length > 0 ? Array.from(new Set(scope)) : undefined,
+		mutationTargetGlobs: mutationTargetGlobs.length > 0 ? Array.from(new Set(mutationTargetGlobs)) : undefined,
 	};
 }
 
-let activeRules: readonly Rule[] = [];
+const activeRulesBySession = new Map<string, readonly Rule[]>();
 
 /**
- * Process-global snapshot of rules the active session loaded.
+ * Session-scoped snapshot of rules the named session loaded.
  * Read by internal URL protocol handlers (rule://).
  */
-export function getActiveRules(): readonly Rule[] {
-	return activeRules;
+export function getActiveRules(sessionId?: string): readonly Rule[] {
+	if (sessionId) {
+		return activeRulesBySession.get(sessionId) ?? [];
+	}
+	if (activeRulesBySession.size === 1) {
+		return activeRulesBySession.values().next().value ?? [];
+	}
+	return [];
 }
 
-/** Replace the active rule snapshot. Called once per top-level session. */
-export function setActiveRules(value: readonly Rule[]): void {
-	activeRules = value;
+/** Replace the rule snapshot for one session. */
+export function setActiveRules(value: readonly Rule[], sessionId?: string): void {
+	const key = sessionId?.trim();
+	if (!key) return;
+	activeRulesBySession.set(key, value);
 }
 
-/** Reset the active rule snapshot. Test-only. */
+/** Drop a session's rule snapshot. */
+export function clearActiveRules(sessionId: string): void {
+	activeRulesBySession.delete(sessionId);
+}
+
+/** Reset every session rule snapshot. Test-only. */
 export function resetActiveRulesForTests(): void {
-	activeRules = [];
+	activeRulesBySession.clear();
 }
 
 export const ruleCapability = defineCapability<Rule>({

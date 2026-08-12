@@ -39,7 +39,7 @@ interface TtsrEntry {
 	rule: Rule;
 	conditions: RegExp[];
 	conditionWindows: Array<number | undefined>;
-
+	mutationTargetGlobs?: Bun.Glob[];
 	scope: TtsrScope;
 	globalPathGlobs?: Bun.Glob[];
 }
@@ -338,13 +338,14 @@ export class TtsrManager {
 			return false;
 		}
 
+		const mutationTargetGlobs = this.#compileGlobalPathGlobs(rule.mutationTargetGlobs);
 		const conditions = this.#compileConditions(rule);
-		if (conditions.length === 0) {
+		if (conditions.length === 0 && (!mutationTargetGlobs || mutationTargetGlobs.length === 0)) {
 			return false;
 		}
 
 		const scope = this.#buildScope(rule);
-		if (!this.#hasReachableScope(scope)) {
+		if (!this.#hasReachableScope(scope) && !mutationTargetGlobs) {
 			logger.warn("TTSR scope excludes all streams, skipping rule", {
 				ruleName: rule.name,
 				scope: rule.scope,
@@ -357,6 +358,7 @@ export class TtsrManager {
 			rule,
 			conditions,
 			conditionWindows,
+			mutationTargetGlobs,
 			scope,
 			globalPathGlobs,
 		});
@@ -364,6 +366,7 @@ export class TtsrManager {
 		logger.debug("TTSR rule registered", {
 			ruleName: rule.name,
 			conditions: rule.condition,
+			mutationTargetGlobs: rule.mutationTargetGlobs,
 			scope: rule.scope,
 			globs: rule.globs,
 		});
@@ -383,7 +386,9 @@ export class TtsrManager {
 		}
 		const bufferKey = this.#bufferKey(context);
 		const nextBuffer = `${this.#buffers.get(bufferKey) ?? ""}${delta}`;
-		this.#buffers.set(bufferKey, nextBuffer);
+		const streamBuffer =
+			nextBuffer.length > SAFE_REGEX_WINDOW_CAP ? nextBuffer.slice(-SAFE_REGEX_WINDOW_CAP) : nextBuffer;
+		this.#buffers.set(bufferKey, streamBuffer);
 
 		const matches: Rule[] = [];
 		for (const [name, entry] of this.#rules) {
@@ -396,7 +401,17 @@ export class TtsrManager {
 			if (!this.#matchesGlobalPaths(entry, context)) {
 				continue;
 			}
-			if (!this.#matchesCondition(entry, nextBuffer)) {
+			if (entry.mutationTargetGlobs && entry.mutationTargetGlobs.length > 0) {
+				if (context.source !== "tool") continue;
+				let matchedTarget = false;
+				for (const glob of entry.mutationTargetGlobs) {
+					if (this.#matchesGlob(glob, context.filePaths)) {
+						matchedTarget = true;
+						break;
+					}
+				}
+				if (!matchedTarget) continue;
+			} else if (!this.#matchesCondition(entry, streamBuffer)) {
 				continue;
 			}
 
@@ -404,6 +419,7 @@ export class TtsrManager {
 			logger.debug("TTSR condition matched", {
 				ruleName: name,
 				conditions: entry.rule.condition,
+				mutationTargetGlobs: entry.rule.mutationTargetGlobs,
 				source: context.source,
 				toolName: context.toolName,
 				filePaths: context.filePaths,
@@ -508,5 +524,15 @@ export class TtsrManager {
 	/** Get settings. */
 	getSettings(): Required<TtsrSettings> {
 		return this.#settings;
+	}
+
+	/** Replace injected records and message count atomically for a session switch. */
+	rebindSessionState(input: { messageCount?: number; records?: string[] | TtsrInjectionRecord[] }): void {
+		this.#injectionRecords.clear();
+		this.#buffers.clear();
+		this.restoreMessageCount(input.messageCount ?? 0);
+		if (input.records && input.records.length > 0) {
+			this.restoreInjected(input.records);
+		}
 	}
 }

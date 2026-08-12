@@ -3427,6 +3427,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
 			settings: this.session.settings,
 			signal,
+			sessionId: this.session.getSessionId?.() ?? undefined,
 			mcpManager: this.session.getMcpManager?.(),
 		});
 		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
