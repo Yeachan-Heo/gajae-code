@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
+import { NotificationServer } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { withFileLock } from "../src/config/file-lock";
@@ -60,7 +61,11 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
-import { withTelegramOrchestrationProvenance } from "./helpers/telegram-topic-test";
+import {
+	createOrchestrationNotificationsExtension,
+	withoutTelegramOrchestrationProvenance,
+	withTelegramOrchestrationProvenance,
+} from "./helpers/telegram-topic-test";
 
 const BASE_CFG: NotificationConfig = {
 	enabled: false,
@@ -1757,6 +1762,81 @@ describe("notifications config", () => {
 		}
 	}, 30000);
 
+	test("marks config-eligible sessions as Telegram topic-capable", async () => {
+		const runScenario = async (orchestration: boolean): Promise<boolean[]> => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-telegram-topic-capability-"));
+			const agentDir = path.join(cwd, ".gjc", "agent");
+			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
+			const settings = isolatedNotificationSettings(agentDir, {
+				"notifications.enabled": true,
+				"notifications.telegram.enabled": true,
+				"notifications.telegram.botToken": "1234567890:topic-capability-token",
+				"notifications.telegram.chatId": "topic-capability-chat",
+			});
+			const handlers = new Map<string, (event: unknown, context: ExtensionContext) => Promise<void> | void>();
+			const api = {
+				on(event: string, handler: (event: unknown, context: ExtensionContext) => Promise<void> | void) {
+					handlers.set(event, handler);
+				},
+				registerCommand() {},
+			} as unknown as ExtensionAPI;
+			const contextFor = (sessionId: string): ExtensionContext =>
+				({
+					cwd,
+					sessionManager: {
+						getSessionId: () => sessionId,
+						getSessionName: () => sessionId,
+					},
+					ui: { notify: () => {} },
+				}) as unknown as ExtensionContext;
+			const initialSessionId = orchestration ? "orchestration-session" : "ordinary-session";
+			let activeContext = contextFor(initialSessionId);
+			const frames: Record<string, unknown>[] = [];
+			const serverPrototype = NotificationServer.prototype as unknown as {
+				pushFrame: (frame: string) => void;
+			};
+			const originalPushFrame = serverPrototype.pushFrame;
+			serverPrototype.pushFrame = function (this: typeof serverPrototype, frame: string): void {
+				frames.push(JSON.parse(frame) as Record<string, unknown>);
+				originalPushFrame.call(this, frame);
+			};
+			const previousNotifications = process.env.GJC_NOTIFICATIONS;
+			process.env.GJC_NOTIFICATIONS = "1";
+			try {
+				const options = {
+					settings,
+					ensureTelegramDaemon: async () => "attached" as const,
+				};
+				if (orchestration) createOrchestrationNotificationsExtension(api, options);
+				else withoutTelegramOrchestrationProvenance(() => createNotificationsExtension(api, options));
+				const sessionStart = handlers.get("session_start");
+				const sessionShutdown = handlers.get("session_shutdown");
+				if (!sessionStart || !sessionShutdown) throw new Error("notifications handlers were not registered");
+				await sessionStart({}, activeContext);
+				if (orchestration) {
+					const sessionSwitch = handlers.get("session_switch");
+					if (!sessionSwitch) throw new Error("session_switch handler was not registered");
+					activeContext = contextFor("ordinary-after-switch");
+					await sessionSwitch({ previousSessionFile: undefined }, activeContext);
+				}
+				return frames
+					.filter(frame => frame.type === "identity_header")
+					.map(frame => frame.telegramTopicsEnabled === true);
+			} finally {
+				const sessionShutdown = handlers.get("session_shutdown");
+				if (sessionShutdown) await sessionShutdown({}, activeContext);
+				serverPrototype.pushFrame = originalPushFrame;
+				await cleanupFixtureRoot(cleanup);
+				resetSettingsForTest();
+				if (previousNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
+				else process.env.GJC_NOTIFICATIONS = previousNotifications;
+			}
+		};
+
+		// Config-derived eligibility: all sessions with Telegram configured are topic-capable.
+		expect(await runScenario(true)).toEqual([true, true]);
+		expect(await runScenario(false)).toEqual([true]);
+	});
 	describe("embedded provider readiness startup", () => {
 		const providerSettings = (agentDir: string) =>
 			isolatedNotificationSettings(agentDir, {

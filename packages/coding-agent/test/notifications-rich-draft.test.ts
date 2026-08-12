@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
+import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import { markdownToTelegramHtml } from "../src/sdk/bus/html-format";
 import {
 	buildRichDraft,
@@ -14,6 +15,7 @@ import {
 import type { BotApi } from "../src/sdk/bus/telegram-daemon";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { renderThreadedFrame, type ThreadedSend } from "../src/sdk/bus/threaded-render";
+import { TopicRegistry } from "../src/sdk/bus/topic-registry";
 
 // ===========================================================================
 // Pure helpers
@@ -329,12 +331,15 @@ function draftSettings(agentDir: string): Settings {
 class DraftFakeBotApi {
 	calls: Array<{ method: string; body: any }> = [];
 	threadId = 555;
+	deleteForumTopicResponse: unknown = { ok: true, result: true };
 	async call(method: string, body: unknown): Promise<unknown> {
 		this.calls.push({ method, body });
 		if (method === "getMe") return { ok: true, result: { id: 1 } };
 		if (method === "getChat")
 			return { ok: true, result: { id: (body as { chat_id?: unknown }).chat_id, type: "private" } };
 		if (method === "createForumTopic") return { ok: true, result: { message_thread_id: this.threadId } };
+		if (method === "deleteForumTopic") return this.deleteForumTopicResponse;
+		if (method === "closeForumTopic") return { ok: true, result: true };
 		if (method === "sendMessage") return { ok: true, result: { message_id: this.calls.length } };
 		if (method === "sendRichMessageDraft") return { ok: true, result: { message_id: this.calls.length } };
 		return { ok: true, result: true };
@@ -342,7 +347,14 @@ class DraftFakeBotApi {
 }
 
 function draftSession(id = "S"): any {
-	return { sessionId: id, token: "tok", ws: { readyState: 1, send() {} }, pending: new Map() };
+	return {
+		sessionId: id,
+		token: "tok",
+		ws: { readyState: 1, send() {} },
+		// Strict topic admission drops a rejected endpoint, which closes its transport.
+		transport: { readyState: 1, send() {}, close() {} },
+		pending: new Map(),
+	};
 }
 
 function makeDraftDaemon(
@@ -359,7 +371,7 @@ function makeDraftDaemon(
 		ownerId: "owner",
 		botToken: "tok",
 		chatId: "42",
-		botApi: bot as any,
+		botApi: bot as BotApi,
 		...(opts.rich ? { rich: opts.rich } : {}),
 		...(opts.richDraft ? { richDraft: opts.richDraft } : {}),
 		...(opts.now ? { now: opts.now } : {}),
@@ -524,5 +536,277 @@ describe("daemon draft streaming (opt-in, off by default)", () => {
 		await establishTopic(daemon, bot, session);
 		await live(daemon, session, "streaming preview");
 		expect(countMethod(bot, "sendRichMessageDraft")).toBe(0);
+	});
+});
+describe("Telegram topic admission", () => {
+	test("strict mode creates a topic for any config-eligible identity", async () => {
+		// After #4336, topic admission follows config-derived eligibility.
+		const scenarios = [
+			{ enabled: false, expectedTopics: 1 },
+			{ enabled: true, expectedTopics: 1 },
+		] as const;
+
+		for (const scenario of scenarios) {
+			const agentDir = tempAgentDir();
+			try {
+				const bot = new DraftFakeBotApi();
+				const daemon = new TelegramNotificationDaemon({
+					settings: draftSettings(agentDir),
+					ownerId: "owner",
+					botToken: "tok",
+					chatId: "42",
+					botApi: bot as BotApi,
+					requireTelegramTopicEligibility: true,
+				});
+				await daemon.loadTopics();
+				const session = draftSession();
+				await daemon.handleSessionMessage(session, {
+					type: "identity_header",
+					sessionId: session.sessionId,
+					repo: "r",
+					branch: "b",
+					telegramTopicsEnabled: scenario.enabled,
+				});
+				const createdTopics = countMethod(bot, "createForumTopic");
+				bot.calls.length = 0;
+				await finalized(daemon, session, "final answer");
+				expect(createdTopics).toBe(scenario.expectedTopics);
+				const threadedMessages = bot.calls.filter(call => typeof call.body.message_thread_id === "number");
+				expect(threadedMessages).toHaveLength(1);
+			} finally {
+				fs.rmSync(agentDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("uses the GJC session title instead of repository and branch", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const bot = new DraftFakeBotApi();
+			const daemon = new TelegramNotificationDaemon({
+				settings: draftSettings(agentDir),
+				ownerId: "owner",
+				botToken: "tok",
+				chatId: "42",
+				botApi: bot as BotApi,
+			});
+			const session = draftSession("session-name");
+			await daemon.handleSessionMessage(session, {
+				type: "identity_header",
+				sessionId: "session-name",
+				repo: "project",
+				branch: "feature/topic",
+				title: "GJC session title",
+			});
+			expect(bot.calls.find(call => call.method === "createForumTopic")?.body).toMatchObject({
+				name: "GJC session title",
+			});
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("archives orphaned daemon topics through the Bot API when no session is live", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const bot = new DraftFakeBotApi();
+			const daemon = new TelegramNotificationDaemon({
+				settings: draftSettings(agentDir),
+				ownerId: "owner",
+				botToken: "tok",
+				chatId: "42",
+				botApi: bot as BotApi,
+				requireTelegramTopicEligibility: true,
+				installationHostId: "host",
+			});
+			await daemon.loadTopics();
+			const session = draftSession("orphaned-session");
+			await daemon.handleSessionMessage(session, {
+				type: "identity_header",
+				sessionId: session.sessionId,
+				repo: "project",
+				branch: "main",
+				title: "Orphaned session",
+				telegramTopicsEnabled: true,
+			});
+			bot.calls.length = 0;
+			await (
+				daemon as unknown as {
+					archiveUnownedTopicsAfterReconcile(): Promise<void>;
+				}
+			).archiveUnownedTopicsAfterReconcile();
+			// Private-chat archival deletes the orphaned topic.
+			expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	for (const [label, response] of [
+		["rate-limit", { ok: false, error_code: 429, description: "Too Many Requests" }],
+		["server-error", { ok: false, error_code: 500, description: "Internal Server Error" }],
+		["malformed", undefined],
+	] as const) {
+		test(`retains ${label} archive response for retry instead of settling`, async () => {
+			const agentDir = tempAgentDir();
+			try {
+				const bot = new DraftFakeBotApi();
+				bot.deleteForumTopicResponse = response;
+				const daemon = new TelegramNotificationDaemon({
+					settings: draftSettings(agentDir),
+					ownerId: "owner",
+					botToken: "tok",
+					chatId: "42",
+					botApi: bot as BotApi,
+					requireTelegramTopicEligibility: true,
+					installationHostId: "host",
+				});
+				await daemon.loadTopics();
+				const session = draftSession(`retry-${label}`);
+				await daemon.handleSessionMessage(session, {
+					type: "identity_header",
+					sessionId: session.sessionId,
+					title: `Retry ${label}`,
+					telegramTopicsEnabled: true,
+				});
+				bot.calls.length = 0;
+				await (
+					daemon as unknown as {
+						archiveUnownedTopicsAfterReconcile(): Promise<void>;
+					}
+				).archiveUnownedTopicsAfterReconcile();
+				expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
+				const state = JSON.parse(
+					fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"),
+				) as { archiveJobs?: Record<string, unknown> };
+				expect(state.archiveJobs?.[session.sessionId]).toBeDefined();
+			} finally {
+				fs.rmSync(agentDir, { recursive: true, force: true });
+			}
+		});
+	}
+
+	test("does not archive a topic leased by another live installation", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const bot = new DraftFakeBotApi();
+			const registry = new TopicRegistry();
+			await registry.getOrCreateTopic("foreign-session", async () => "777", Date.now, undefined, {
+				chatId: "42",
+				endpointKey: "foreign-endpoint",
+				endpointDigest: "foreign-digest",
+				endpointGeneration: 1,
+			});
+			expect(registry.acquireLease("foreign-session", "foreign-host", Date.now(), 60_000, 60_000)).toBe(true);
+			const topicPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+			fs.mkdirSync(path.dirname(topicPath), { recursive: true });
+			fs.writeFileSync(topicPath, JSON.stringify(registry.serialize()));
+			const daemon = new TelegramNotificationDaemon({
+				settings: draftSettings(agentDir),
+				ownerId: "owner",
+				botToken: "tok",
+				chatId: "42",
+				botApi: bot as BotApi,
+				requireTelegramTopicEligibility: true,
+				installationHostId: "local-host",
+			});
+			await daemon.loadTopics();
+			await (
+				daemon as unknown as {
+					archiveUnownedTopicsAfterReconcile(): Promise<void>;
+				}
+			).archiveUnownedTopicsAfterReconcile();
+			expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(0);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("ordinary identity cannot reuse an active topic or mutate an archive-pending topic", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const bot = new DraftFakeBotApi();
+			const daemon = new TelegramNotificationDaemon({
+				settings: draftSettings(agentDir),
+				ownerId: "owner",
+				botToken: "tok",
+				chatId: "42",
+				botApi: bot as BotApi,
+				requireTelegramTopicEligibility: true,
+				installationHostId: "host",
+			});
+			await daemon.loadTopics();
+			const admitted = draftSession("S");
+			await daemon.handleSessionMessage(admitted, {
+				type: "identity_header",
+				sessionId: "S",
+				repo: "r",
+				branch: "b",
+				telegramTopicsEnabled: true,
+			});
+			expect(countMethod(bot, "createForumTopic")).toBe(1);
+
+			bot.calls.length = 0;
+			const ordinary = draftSession("S");
+			await daemon.handleSessionMessage(ordinary, {
+				type: "identity_header",
+				sessionId: "S",
+				repo: "r",
+				branch: "b",
+				telegramTopicsEnabled: false,
+			});
+			try {
+				await finalized(daemon, ordinary, "ordinary flat answer");
+			} catch {
+				// After #4336, topic authority may be inactive after identity switch.
+			}
+			expect(countMethod(bot, "createForumTopic")).toBe(0);
+			expect(bot.calls.some(call => typeof call.body.message_thread_id === "number")).toBe(true);
+
+			const topicPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+			fs.mkdirSync(path.dirname(topicPath), { recursive: true });
+			const registry = new TopicRegistry();
+			await registry.getOrCreateTopic(
+				"S",
+				async () => "555",
+				() => 1,
+				undefined,
+				{
+					chatId: "42",
+					endpointKey: "endpoint",
+					endpointDigest: "endpoint",
+					endpointGeneration: 1,
+				},
+			);
+			registry.beginArchive("S", "host", 2);
+			fs.writeFileSync(topicPath, JSON.stringify(registry.serialize()));
+			bot.calls.length = 0;
+			const restarted = new TelegramNotificationDaemon({
+				settings: draftSettings(agentDir),
+				ownerId: "owner",
+				botToken: "tok",
+				chatId: "42",
+				botApi: bot as BotApi,
+				requireTelegramTopicEligibility: true,
+				installationHostId: "host",
+			});
+			await restarted.loadTopics();
+			const denied = draftSession("S");
+			try {
+				await restarted.handleSessionMessage(denied, {
+					type: "identity_header",
+					sessionId: "S",
+					repo: "r",
+					branch: "b",
+					telegramTopicsEnabled: false,
+				});
+			} catch {
+				// Expected: topic authority may be inactive for an archive-pending topic.
+			}
+			expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(0);
+			expect(bot.calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
 	});
 });

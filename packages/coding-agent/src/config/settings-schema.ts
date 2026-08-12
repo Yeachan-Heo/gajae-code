@@ -416,7 +416,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Terminal Bell",
 			description:
-				"Emit a BEL character for local terminal notifications. Windows Terminal may keep BEL silent depending on profile/system sound settings; use completion.notifyCommand for a PowerShell Console.Beep workaround.",
+				"Emit a BEL character for local terminal notifications. macOS enables this by default unless explicitly disabled. Windows Terminal may keep BEL silent depending on profile/system sound settings; use completion.notifyCommand for a PowerShell Console.Beep workaround.",
 		},
 	},
 	"notifications.bellOnComplete": {

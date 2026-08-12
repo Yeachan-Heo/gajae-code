@@ -700,7 +700,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 156 at serving epoch 87", () => {
+test("publishes exact durable authority generation 157 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -710,7 +710,9 @@ test("publishes exact durable authority generation 156 at serving epoch 87", () 
 	// Generation 155: unified durable terminal-retention write path (#4329).
 	// Generation 156: session eligibility follows configuration, and threaded
 	// mode always uses threads instead of refusing a session's own declaration.
-	expect(DAEMON_GENERATION).toBe(156);
+	// Generation 157: orphan-topic reconciliation with FORUM_TOPIC_NOT_FOUND
+	// settlement and unsupported-method fallback.
+	expect(DAEMON_GENERATION).toBe(157);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {

@@ -12,13 +12,17 @@ const TELEGRAM_ORCHESTRATION_ENV_KEYS = [
 type TelegramOrchestrationEnv = Partial<Record<(typeof TELEGRAM_ORCHESTRATION_ENV_KEYS)[number], string | undefined>>;
 
 export function withTelegramOrchestrationProvenance<T>(run: () => T): T {
-	const previous = process.env.GJC_COORDINATOR_SESSION_ID;
+	const previousCoordinatorSessionId = process.env.GJC_COORDINATOR_SESSION_ID;
+	const previousSessionId = process.env.GJC_SESSION_ID;
 	process.env.GJC_COORDINATOR_SESSION_ID = "test-telegram-orchestration";
+	delete process.env.GJC_SESSION_ID;
 	try {
 		return run();
 	} finally {
-		if (previous === undefined) delete process.env.GJC_COORDINATOR_SESSION_ID;
-		else process.env.GJC_COORDINATOR_SESSION_ID = previous;
+		if (previousCoordinatorSessionId === undefined) delete process.env.GJC_COORDINATOR_SESSION_ID;
+		else process.env.GJC_COORDINATOR_SESSION_ID = previousCoordinatorSessionId;
+		if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
+		else process.env.GJC_SESSION_ID = previousSessionId;
 	}
 }
 

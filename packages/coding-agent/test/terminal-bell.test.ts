@@ -18,10 +18,22 @@ afterEach(() => {
 });
 
 describe("terminal bell notifications", () => {
-	it("is opt-in by default", () => {
+	it("honors an explicit terminal bell opt-out", () => {
+		settings.set("notifications.terminalBell", false);
 		const output = { write: vi.fn(() => true) };
 		ringTerminalBell("complete", output);
 		expect(output.write).not.toHaveBeenCalled();
+	});
+
+	it("enables the terminal bell by default on macOS", () => {
+		const output = { write: vi.fn(() => true) };
+		ringTerminalBell("complete", output);
+
+		if (process.platform === "darwin") {
+			expect(output.write).toHaveBeenCalledWith("\x07");
+		} else {
+			expect(output.write).not.toHaveBeenCalled();
+		}
 	});
 
 	it("rings for enabled ask and approval events", () => {
@@ -53,6 +65,7 @@ describe("terminal bell notifications", () => {
 		const notifyCommand = SETTINGS_SCHEMA["completion.notifyCommand"];
 
 		expect(terminalBell.ui?.description).toContain("Windows Terminal");
+		expect(terminalBell.ui?.description).toContain("macOS");
 		expect(terminalBell.ui?.description).toContain("completion.notifyCommand");
 		expect(notifyCommand.ui?.description).toContain("PowerShell [Console]::Beep");
 	});

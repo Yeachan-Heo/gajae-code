@@ -61,6 +61,9 @@
 
 
 - ACP `session/new` no longer fails with an uncertain-after-send internal error against a cold session host. Session-scoped commands were dispatched through `SessionRouter` on the SDK transport's one-shot default deadline (10s), which the first `models.list/current` (Q10) outruns whenever profile-provider credential collection has to refresh several OAuth providers — the reply landed after the deadline (measured 10002ms against an 11s answer), the outcome could then only be reported as uncertain after the frame was sent, and the ACP agent discarded the session it had just created while the immediate retry answered in ~260ms. Router-dispatched session requests now carry the long-lived session budget (two host heartbeat TTLs, matching the reconnect budget that already keeps these clients alive), and any caller-supplied timeout — coordinator prompt acknowledgement, lifecycle requests — still wins (#4258).
+### Changed
+- macOS now emits the terminal BEL for completion, approval, and ask notifications by default when `notifications.terminalBell` has not been configured; an explicit setting still controls the behavior.
+
 ## [0.13.1] - 2026-08-11
 
 ### Added
