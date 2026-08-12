@@ -69,17 +69,23 @@ Committed on `feat/abort-sdk-terminal` (lore `c04-terminal-*`), base `e92a04e3`:
 - `c04-terminal-scope-registration`: terminal scope registered + synchronously closed at abort
   (session `abortPromptAndWait` terminal option), epoch advanced so the fence never leaks onto
   later turns; `classifyOwnedCompletion` live end to end.
-- `c04-acp-owned-cancel`: the ACP surface now issues the C04 terminal abort on `session/cancel`.
+- `c04-acp-owned-cancel`: the ACP surface issues the C04 terminal abort on `session/cancel`.
   `AcpSdkAdapter.cancel(scope)` sends `turn.abort` `{mode:"terminal", scope}` with a fresh
-  bounded idempotency key per call; `AcpAgent.cancel` resolves the scope as `"owned"` by
-  default (`_meta.gjc.abortScope` on the cancel notification wins, `GJC_ACP_ABORT_SCOPE` is the
-  process fallback), accepts the terminal dispositions (`stopped` / `no_active_turn` /
+  bounded idempotency key per call; `AcpAgent.cancel` resolves the scope from
+  `_meta.gjc.abortScope` on the cancel notification (authoritative) then
+  `GJC_ACP_ABORT_SCOPE` (process fallback), **defaulting to `"turn"`** (amended: the initial
+  `"owned"` default was reverted so an ACP client cancel stops only the turn, matching the
+  SDK `turn.abort` default and other ACP clients' cancel behavior; owned termination is an
+  explicit opt-in via `_meta.gjc.abortScope: "owned"` or `GJC_ACP_ABORT_SCOPE=owned` —
+  Paseo keeps owned cancels through its provider config env without source changes),
+  accepts the terminal dispositions (`stopped` / `no_active_turn` /
   `no_effect` / `no_store` / `uncertain`) in addition to the legacy `{aborted:true}`
   plain-abort ack (broker-compat only: the C04 host always answers terminal dispositions,
   and the ack must echo the requested scope when it carries a `selection`), and keeps the
-  bounded cancel settlement grace. An external client that ends a turn (e.g. Paseo's stop)
-  therefore terminates owned subagents and background tasks, not just the turn; `scope:"turn"`
-  remains available per cancel as the leave-running opt-out.
+  bounded cancel settlement grace. With the default `scope:"turn"` an external client that
+  ends a turn leaves owned subagents and background tasks running (their completion can
+  resume the root worker as a fresh turn); `scope:"owned"`, the opt-in, terminates them,
+  not just the turn.
 - `c04-terminal-continuation-gate`: same-turn continuations denied at the final synchronous
   boundary (skip reason `terminal_turn`); fail-open without a scope.
 - `c04-terminal-durable-record`: bounded `DurableTerminalScopeRecord` (selection, fence, policy,

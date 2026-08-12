@@ -1673,10 +1673,11 @@ export class AcpAgent implements Agent {
 		// Record the client's intent before awaiting the SDK so a prompt that rejects
 		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
 		record.cancelRequested = true;
-		// C04 terminal abort: ending a turn from an external client also stops exact
-		// owned subagents and background tasks (`scope:"owned"`, the default). A
-		// client that wants background work to keep running opts out with
-		// `_meta.gjc.abortScope: "turn"` (or `GJC_ACP_ABORT_SCOPE=turn`).
+		// C04 terminal abort: an external client cancel stops the current turn
+		// (`scope:"turn"`, the default, matching the SDK `turn.abort` default and
+		// other ACP clients' cancel behavior). A client that also wants exact owned
+		// subagents and background tasks stopped opts in with
+		// `_meta.gjc.abortScope: "owned"` (or `GJC_ACP_ABORT_SCOPE=owned`).
 		const scope = resolveAcpAbortScope(params._meta, process.env);
 		const waiter = record.activePrompt;
 		const cancelAttempt = waiter ? Promise.withResolvers<boolean>() : undefined;

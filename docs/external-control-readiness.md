@@ -29,18 +29,34 @@ For the build/run/verify loop when changing ACP code locally, see [ACP local dev
 
 #### Turn-end termination of owned work
 
-An ACP `session/cancel` is a C04 terminal abort: it stops the active turn **and** the
-exact owned work that turn spawned (background Bash/task jobs, detached subagents), so an
-external client such as Paseo that ends a run terminates everything it started instead of
-leaving subagents running in the background. A fresh bounded idempotency key is issued per
-cancel, so retries replay deterministically. A cancel with no active turn is a
-deterministic no-effect (`no_active_turn`), and an unsettled stop reports `uncertain`
-instead of claiming stopped work.
+An ACP `session/cancel` is a C04 terminal abort. By default it stops only the active turn
+(`scope:"turn"`, matching the SDK `turn.abort` default and other ACP clients' cancel
+behavior); exact owned work that turn spawned (background Bash/task jobs, detached
+subagents) keeps running, and its completion can resume the root worker as a fresh turn. A
+cancel with `scope:"owned"` additionally stops exact owned work, so an external client
+such as Paseo that ends a run terminates everything it started instead of leaving
+subagents running in the background. A fresh bounded idempotency key is issued per cancel,
+so retries replay deterministically. A cancel with no active turn is a deterministic
+no-effect (`no_active_turn`), and an unsettled stop reports `uncertain` instead of
+claiming stopped work.
 
-Clients that want a cancel to leave owned background work running (its completion can then
-resume the root worker as a fresh turn) opt out per request with `_meta.gjc.abortScope:
-"turn"` on the `session/cancel` notification; `GJC_ACP_ABORT_SCOPE=turn` in the agent
-environment is the process-wide fallback. Both default to `"owned"`.
+Owned termination is an explicit opt-in: `_meta.gjc.abortScope: "owned"` on the
+`session/cancel` notification, or `GJC_ACP_ABORT_SCOPE=owned` in the agent environment as
+the process-wide fallback. Paseo keeps owned cancels through its provider config without
+source changes:
+
+```json
+{
+  "agents": {
+    "providers": {
+      "gjc": {
+        "extends": "acp",
+        "env": { "GJC_ACP_ABORT_SCOPE": "owned" }
+      }
+    }
+  }
+}
+```
 
 #### Evidence promotion policy
 

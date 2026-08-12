@@ -174,7 +174,7 @@ test("ACP SDK adapter maps native and extension methods and keeps endpoint crede
 	await adapter.start();
 	await adapter.prompt({ prompt: "hello" });
 	await adapter.cancel();
-	await adapter.cancel("turn");
+	await adapter.cancel("owned");
 	await adapter.setModel({ modelId: "provider/model" });
 	await adapter.handle("_gjc/sdk/control", { operation: "runtime.reload", input: { components: ["tools"] } });
 	await expect(adapter.handle("listSessions")).rejects.toMatchObject({ code: "operation_prohibited" });
