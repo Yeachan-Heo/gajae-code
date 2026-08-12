@@ -220,6 +220,14 @@ export async function runPluginCommand(cmd: PluginCommandArgs): Promise<void> {
 // Marketplace Handlers
 // =============================================================================
 
+function resolveMarketplacePluginId(requested: string, installedIds: Iterable<string>): string | undefined {
+	const ids = [...installedIds];
+	if (ids.includes(requested)) return requested;
+	const matches = ids.filter(id => id === requested || id.startsWith(`${requested}@`));
+	if (matches.length === 1) return matches[0];
+	return undefined;
+}
+
 async function makeMarketplaceManager(): Promise<MarketplaceManager> {
 	return new MarketplaceManager({
 		marketplacesRegistryPath: getMarketplacesRegistryPath(),
@@ -446,13 +454,15 @@ async function handleUpgrade(args: string[], flags: PluginCommandArgs["flags"]):
 	const manager = await makeMarketplaceManager();
 	try {
 		if (pluginId) {
+			const installedIds = (await manager.listInstalledPlugins()).map(p => p.id);
+			const resolvedId = resolveMarketplacePluginId(pluginId, installedIds) ?? pluginId;
 			if (flags.scope) {
-				const result = await manager.upgradePlugin(pluginId, flags.scope);
-				console.log(chalk.green(`Upgraded ${pluginId} (${flags.scope}) to ${result.version}`));
+				const result = await manager.upgradePlugin(resolvedId, flags.scope);
+				console.log(chalk.green(`Upgraded ${resolvedId} (${flags.scope}) to ${result.version}`));
 			} else {
-				const entries = await manager.upgradePluginAcrossScopes(pluginId);
+				const entries = await manager.upgradePluginAcrossScopes(resolvedId);
 				for (const entry of entries) {
-					console.log(chalk.green(`Upgraded ${pluginId} (${entry.scope}) to ${entry.version}`));
+					console.log(chalk.green(`Upgraded ${resolvedId} (${entry.scope}) to ${entry.version}`));
 				}
 			}
 		} else {
@@ -669,7 +679,7 @@ async function handleUninstall(
 	const scope = flags.scope ?? (flags.user ? "user" : flags.project ? "project" : undefined);
 	const cwd = getProjectDir();
 	const mktMgr = await makeMarketplaceManager();
-	const installedPlugins = new Set((await mktMgr.listInstalledPlugins()).map(p => p.id));
+	const installedIds = (await mktMgr.listInstalledPlugins()).map(p => p.id);
 
 	for (const name of packages) {
 		const matches = await findGjcBundlesForUninstall(cwd, name, scope);
@@ -693,9 +703,10 @@ async function handleUninstall(
 			continue;
 		}
 
-		if (installedPlugins.has(name)) {
+		const marketplaceId = resolveMarketplacePluginId(name, installedIds);
+		if (marketplaceId) {
 			try {
-				await mktMgr.uninstallPlugin(name, flags.scope);
+				await mktMgr.uninstallPlugin(marketplaceId, flags.scope);
 				console.log(chalk.green(`${theme.status.success} Uninstalled ${name}`));
 			} catch (err) {
 				console.error(chalk.red(`${theme.status.error} Failed to uninstall ${name}: ${err}`));
@@ -1161,12 +1172,13 @@ async function handleSetEnabled(
 	}
 
 	const mktMgr = await makeMarketplaceManager();
-	const installedPlugins = new Set((await mktMgr.listInstalledPlugins()).map(p => p.id));
+	const installedIds = (await mktMgr.listInstalledPlugins()).map(p => p.id);
 
 	for (const name of plugins) {
-		if (installedPlugins.has(name)) {
+		const marketplaceId = resolveMarketplacePluginId(name, installedIds);
+		if (marketplaceId) {
 			try {
-				await mktMgr.setPluginEnabled(name, enabled, flags.scope);
+				await mktMgr.setPluginEnabled(marketplaceId, enabled, flags.scope);
 				if (flags.json) {
 					console.log(JSON.stringify({ [jsonKey]: name }));
 				} else {

@@ -17,6 +17,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { COORDINATOR_MCP_TOOL_NAMES } from "../packages/coding-agent/src/coordinator/contract";
+import { assertHermeticPluginSource, buildRustSkillsProvenance, neutralizeRemoteBadges } from "./plugin-provenance";
 
 const repoRoot = path.join(import.meta.dir, "..");
 const pluginsDir = path.join(repoRoot, "plugins");
@@ -100,8 +101,19 @@ function addStaticPluginFiles(files: Map<string, string>, pluginName: string): v
 	if (!fs.existsSync(srcRoot)) {
 		throw new Error(`Missing first-party plugin source: plugins-src/${pluginName}`);
 	}
+	const hermeticProblems = assertHermeticPluginSource(srcRoot);
+	if (hermeticProblems.length > 0) {
+		throw new Error(`Hermetic plugin source failed for ${pluginName}: ${hermeticProblems.join(", ")}`);
+	}
 	for (const rel of listSourceFiles(srcRoot)) {
-		files.set(path.join(pluginName, rel), fs.readFileSync(path.join(srcRoot, rel), "utf8"));
+		let content = fs.readFileSync(path.join(srcRoot, rel), "utf8");
+		if (rel.replaceAll("\\", "/").endsWith("README.md")) {
+			content = neutralizeRemoteBadges(content);
+		}
+		files.set(path.join(pluginName, rel), content);
+	}
+	if (pluginName === RUST_SKILLS_PLUGIN) {
+		files.set(path.join(pluginName, "PROVENANCE.json"), `${JSON.stringify(buildRustSkillsProvenance(srcRoot), null, 2)}\n`);
 	}
 }
 

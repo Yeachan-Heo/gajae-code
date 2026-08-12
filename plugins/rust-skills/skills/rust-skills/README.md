@@ -1,9 +1,9 @@
 # Rust Skills
 
-![rules](https://img.shields.io/badge/rules-265-blue)
-![categories](https://img.shields.io/badge/categories-26-blue)
-![Rust](https://img.shields.io/badge/Rust-1.96%20%2F%202024%20edition-orange)
-![license](https://img.shields.io/badge/license-MIT-green)
+[badge omitted]
+[badge omitted]
+[badge omitted]
+[badge omitted]
 
 265 Rust rules your AI coding agent can use to write better code. Current for Rust 1.96 (2024 edition).
 

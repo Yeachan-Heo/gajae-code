@@ -1,9 +1,16 @@
 {
+  "schema": "gjc-plugin-provenance.v1",
   "corpus": "skills/rust-skills",
   "upstream": "https://github.com/leonardomso/rust-skills",
   "fork": "https://github.com/jason931225/rust-skills",
   "commit": "fd2a861ab0406a4ac536a55274d14ea6fd1ca9c9",
   "version": "1.5.1",
   "license": "MIT",
+  "licenseBlobHash": "663ce6f8f087dc366602ac34eefd4cf71a5d8db411359422298a1399a014a9d5",
+  "treeDigest": {
+    "version": 1,
+    "algorithm": "sha256",
+    "hex": "eae0d36d84056740d069681602a8a69961a380ca434a13919cc561316d353c08"
+  },
   "refresh": "shallow-clone the fork at the new tip, re-copy SKILL.md + rules/ + LICENSE + README.md into skills/rust-skills, bump commit and version here, then run bun scripts/generate-gjc-plugins.ts"
 }

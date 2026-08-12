@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { COORDINATOR_MCP_TOOL_NAMES } from "../packages/coding-agent/src/coordinator/contract";
 import { FIRST_PARTY_PLUGIN_DIRS, findUnexpectedPluginFiles, renderPluginFiles } from "./generate-gjc-plugins";
+import { assertHermeticPluginSource, buildRustSkillsProvenance, PLUGIN_PROVENANCE_SCHEMA } from "./plugin-provenance";
 
 const PLUGIN_DIR = "gajae-code";
 
@@ -130,6 +131,28 @@ gate(
 	"Claude marketplace lists first-party plugins",
 	FIRST_PARTY_PLUGIN_DIRS.every(dir => claudeNames.has(dir)),
 	[...claudeNames].join(", ") || "none",
+);
+const rustSrc = path.join(import.meta.dir, "..", "plugins-src", "rust-skills");
+const rustHermetic = assertHermeticPluginSource(rustSrc);
+gate("rust-skills source is hermetic", rustHermetic.length === 0, rustHermetic.join(", ") || "none");
+const expectedProvenance = buildRustSkillsProvenance(rustSrc);
+const renderedProvenance = readJson(path.join("rust-skills", "PROVENANCE.json"));
+gate(
+	"rust-skills provenance is schema-versioned and digest-bound",
+	renderedProvenance.schema === PLUGIN_PROVENANCE_SCHEMA &&
+		renderedProvenance.upstream === expectedProvenance.upstream &&
+		renderedProvenance.fork === expectedProvenance.fork &&
+		renderedProvenance.commit === expectedProvenance.commit &&
+		renderedProvenance.license === "MIT" &&
+		renderedProvenance.licenseBlobHash === expectedProvenance.licenseBlobHash &&
+		JSON.stringify(renderedProvenance.treeDigest) === JSON.stringify(expectedProvenance.treeDigest),
+	JSON.stringify(renderedProvenance),
+);
+const rustReadme = read(path.join("rust-skills", "skills", "rust-skills", "README.md"));
+gate(
+	"rust-skills README has no remote badge images",
+	!/!\[[^\]]*]\(https?:\/\//.test(rustReadme),
+	"remote markdown images must be neutralized",
 );
 
 // Manifests use the documented camelCase `mcpServers` field.
