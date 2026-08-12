@@ -11583,14 +11583,20 @@ export class AgentSession {
 					delayMs: 1,
 					generation: this.#promptGeneration,
 					shouldContinue: () => hasPreservedFollowUp() || hasPreservedSteering(),
-					// The rearmed continuation's run acceptance fires the SDK
-					// requester-ownership hooks for the messages it ACTUALLY
-					// consumed (#fireQueuedPromotionHooks over
-					// acceptance.consumedQueuedMessages inside
-					// #scheduleAgentContinue): no frozen snapshot is taken at
-					// schedule time, so a steer removed during the delay never
-					// fires a stale hook and a post-snapshot steer admitted
-					// during the delay is not missed (review thread P1).
+					// The rearmed continuation must consume the queued steer inside
+					// the run acceptance (continueQueuedMessages) rather than
+					// dequeue it later via getSteeringMessages: a terminal abort
+					// leaves a non-assistant history tail (tool result), which
+					// would otherwise select Agent.continue() and accept the run
+					// with an empty consumedQueuedMessages payload, so
+					// #fireQueuedPromotionHooks never fires and the submitting
+					// connection is not recorded as an owner — its later terminal
+					// abort is rejected as an owner mismatch (review thread P1).
+					// The preserved messages are still re-verified by
+					// shouldContinue at continuation time, so a steer removed
+					// during the delay never fires a stale hook and a post-snapshot
+					// steer admitted during the delay is not missed.
+					continueQueuedOnly: true,
 					rescheduleOnBusy: true,
 				});
 			}

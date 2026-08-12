@@ -856,6 +856,73 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await promptPromise;
 	}, 30_000);
 
+	it("rearm fires the preserved steer's ownership hook past a non-assistant tail", async () => {
+		// Review thread P1: when the terminal abort leaves a NON-assistant
+		// history tail (a tool result), the rearmed continuation must consume
+		// the preserved steer inside the run acceptance (continueQueuedMessages)
+		// so the run reports it as consumed and #fireQueuedPromotionHooks
+		// records the submitting connection as an owner — otherwise
+		// Agent.continue() replays the tail via #runLoop(undefined) with an
+		// empty consumed payload, the steer is only dequeued later through
+		// getSteeringMessages, the ownership hook never fires, and the
+		// connection's later terminal abort is rejected as an owner mismatch.
+		let promoted = 0;
+		scriptedResponses = [
+			stopReply("turn one"),
+			// The second turn's model response never emits content: the abort
+			// interrupts the delay (delayMs honors the run's AbortSignal), and
+			// the fallback path (delay elapsing before the abort) throws — both
+			// exit the run through the no-partial branch, so nothing is appended
+			// after the manual tool result and the loop never polls the steering
+			// queue again.
+			{ delayMs: 1_000, throw: "abort probe", content: [] },
+			stopReply("steer answered"),
+		];
+		await session.prompt("first turn");
+		// A completed in-flight tool's result is the history tail a terminal
+		// abort leaves in production when the grace window lets the tool
+		// finish; the harness materializes that exact state.
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "call_hold_turn",
+			toolName: "bash",
+			isError: false,
+			content: [{ type: "text", text: "tool result" }],
+			timestamp: Date.now(),
+		});
+		const promptPromise = session.prompt("second turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "second run handle");
+		const abortPromise = session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
+			graceMs: TEST_ABORT_GRACE_MS,
+			terminal: { scope: "turn" },
+		});
+		// The client steer is admitted right after the abort admission captured
+		// its steering snapshot: it classifies as post-snapshot and is
+		// preserved. It lands after the run's entry steering poll and the run
+		// never polls again (the delayed model response is interrupted by the
+		// abort), so the live loop cannot dequeue it.
+		await session.sendUserMessage("rearm steer", {
+			deliverAs: "steer",
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+		await abortPromise;
+		// The interrupt appends a synthetic empty aborted assistant message; the
+		// production abort with a completed in-flight tool leaves the tool result
+		// as the real tail. Pop the synthetic message before the rearm
+		// continuation (scheduled at +1ms) selects its dequeue strategy, so the
+		// continuation sees the non-assistant tail the P1 describes.
+		session.agent.popMessage();
+		// The rearm must consume the steer INSIDE the run acceptance (the
+		// ownership hook fires) instead of dequeueing it later via
+		// getSteeringMessages.
+		await waitFor(() => promoted === 1, "rearm steer ownership hook fired");
+		expect(promoted).toBe(1);
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		await promptPromise;
+	}, 30_000);
+
 	it("fires the queued steer's SDK ownership hook exactly once when its run accepts", async () => {
 		// Review thread P1: a streaming-diverted SDK turn.prompt accepted while
 		// the old turn is still streaming queues a steer without scheduling its
