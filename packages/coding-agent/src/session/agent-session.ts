@@ -184,12 +184,17 @@ import {
 	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
-	resolveEquivalentPath,
 	Snowflake,
 } from "@gajae-code/utils";
 
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
-import { type AsyncJob, type AsyncJobDeliveryState, AsyncJobManager, type OwnerSubagentShutdownLease } from "../async";
+import {
+	type AsyncJob,
+	type AsyncJobDeliveryState,
+	AsyncJobManager,
+	asyncJobEndpointId as deriveAsyncJobEndpointId,
+	type OwnerSubagentShutdownLease,
+} from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { Rule } from "../capability/rule";
 import type { CasReceipt } from "../config/atomic-yaml-patch";
@@ -6655,13 +6660,7 @@ export class AgentSession {
 	 * resolve its lineage nor register its owned tuple (review thread P1).
 	 */
 	#asyncJobEndpointId(sessionId: string, sessionFile: string | undefined): string {
-		return this.#asyncJobProviderSessionId !== undefined && sessionFile !== undefined
-			? JSON.stringify([
-					"async-job-endpoint",
-					this.#asyncJobProviderSessionId,
-					resolveEquivalentPath(path.resolve(sessionFile)),
-				])
-			: sessionId;
+		return deriveAsyncJobEndpointId(this.#asyncJobProviderSessionId, sessionId, sessionFile);
 	}
 
 	#assertJobManagerEndpointAdmission(successorSessionId: string, successorSessionFile: string | undefined): void {

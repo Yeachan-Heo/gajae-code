@@ -31,7 +31,6 @@ import {
 	logger,
 	postmortem,
 	prompt,
-	resolveEquivalentPath,
 	Snowflake,
 } from "@gajae-code/utils";
 import {
@@ -39,7 +38,13 @@ import {
 	providerSupportsAppendOnlyAuto,
 	resolveAppendOnlyMode,
 } from "../append-only-mode";
-import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
+import {
+	type AsyncJob,
+	AsyncJobManager,
+	asyncJobEndpointId as deriveAsyncJobEndpointId,
+	isBackgroundJobSupportEnabled,
+	jobElapsedMs,
+} from "../async";
 import { loadCapability } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import { resolveModelProfileName } from "../config/model-profile-contract";
@@ -1406,14 +1411,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// persisted transcript path so ownership is collision-free and stable across
 		// detached resume; ordinary sessions keep the transition-aware logical id.
 		const sessionFile = sessionManager.getSessionFile();
-		const asyncJobEndpointId =
-			options.providerSessionId !== undefined && sessionFile
-				? JSON.stringify([
-						"async-job-endpoint",
-						providerSessionId,
-						resolveEquivalentPath(path.resolve(sessionFile)),
-					])
-				: logicalSessionId;
+		const asyncJobEndpointId = deriveAsyncJobEndpointId(
+			options.providerSessionId === undefined ? undefined : providerSessionId,
+			logicalSessionId,
+			sessionFile,
+		);
 		const credentialSessionId = options.credentialSessionId ?? providerSessionId;
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
