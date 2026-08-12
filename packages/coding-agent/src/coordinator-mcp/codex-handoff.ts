@@ -196,7 +196,7 @@ function assertCodexHandoffOrigin(value: unknown): asserts value is CodexHandoff
 			(typeof origin.codex_host_session_id === "string" && SAFE_ID.test(origin.codex_host_session_id))
 		) ||
 		!(typeof origin.delegation_id === "string" && SAFE_ID.test(origin.delegation_id)) ||
-		!["plan", "execute", "team"].includes(origin.workflow as string) ||
+		!["plan", "execute"].includes(origin.workflow as string) ||
 		!(typeof origin.bound_at === "string" && Number.isFinite(Date.parse(origin.bound_at)))
 	)
 		throw new Error("state_corrupt");

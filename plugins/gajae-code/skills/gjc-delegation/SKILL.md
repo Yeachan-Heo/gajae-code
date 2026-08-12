@@ -1,6 +1,6 @@
 ---
 name: gjc-delegation
-description: Delegate planning, execution, and team workflows to gajae-code via the coordinator MCP server.
+description: Delegate planning and execution workflows to gajae-code via the coordinator MCP server.
 ---
 
 # GJC delegation
@@ -14,7 +14,6 @@ delegate whole workflows to GJC and receive durable turn status plus artifacts.
 | --- | --- | --- | --- |
 | `gjc_delegate_plan` | plan | /skill:ralplan | Delegate consensus planning to GJC (runs /skill:ralplan to a pending-approval plan). |
 | `gjc_delegate_execute` | execute | /skill:ultragoal | Delegate execution to GJC (runs /skill:ultragoal to completion with verification). |
-| `gjc_delegate_team` | team | /skill:team | Delegate parallel team execution to GJC (runs /skill:team with internal tmux workers). |
 
 ## Fail-closed safety
 
