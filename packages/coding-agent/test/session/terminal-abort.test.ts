@@ -921,6 +921,58 @@ test("boundCompletedTerminalScopeRows evicts the oldest completed rows but never
 	expect(bounded.some((r: { idempotencyKeyHash: string }) => r.idempotencyKeyHash === "pending-key")).toBe(true);
 });
 
+test("a transitional no_effect_reserved row survives eviction of a completed row sharing its key pair", () => {
+	// The evict set is keyed by key+input hash, so applying it to anything other
+	// than a COMPLETED row deletes a live reservation: the abort that owns it
+	// would then finalize into nothing and a same-key retry would replay
+	// uncertainty over an unfinalized reservation (review thread P2).
+	const rows = [
+		...Array.from({ length: 257 }, (_, i) => ({
+			idempotencyKeyHash: `k${i}`,
+			idempotencyInputHash: `i${i}`,
+			turnDisposition: "no_effect",
+			acceptedAt: i,
+		})),
+		{
+			// Shares the key pair of the OLDEST completed row (k0), which is the one
+			// row the cap evicts.
+			idempotencyKeyHash: "k0",
+			idempotencyInputHash: "i0",
+			turnDisposition: "no_effect_reserved",
+			acceptedAt: 0,
+		},
+	];
+	const bounded = boundCompletedTerminalScopeRows(rows, 256);
+	expect(bounded.filter(row => row.turnDisposition === "no_effect")).toHaveLength(256);
+	expect(bounded.some(row => row.turnDisposition === "no_effect" && row.idempotencyKeyHash === "k0")).toBe(false);
+	expect(bounded.filter(row => row.turnDisposition === "no_effect_reserved")).toHaveLength(1);
+	// The surviving reservation keeps the key alive, so no tombstone claims
+	// replay authority over it.
+	expect(collectEvictedTerminalKeys(rows, bounded)).toHaveLength(0);
+});
+
+test("collectEvictedTerminalKeys never mints a tombstone for a transitional reservation", () => {
+	// A reservation is not evictable, so it must not be tombstoned either — a
+	// tombstone would replay uncertainty over a reservation the owning abort can
+	// still finalize (review thread P2).
+	const reserved = {
+		idempotencyKeyHash: "reserved-key",
+		idempotencyInputHash: "reserved-input",
+		turnDisposition: "no_effect_reserved",
+		ownedWorkDisposition: "not_requested" as const,
+		acceptedAt: 1,
+	};
+	const completed = {
+		idempotencyKeyHash: "completed-key",
+		idempotencyInputHash: "completed-input",
+		turnDisposition: "stopped",
+		ownedWorkDisposition: "stopped" as const,
+		acceptedAt: 2,
+	};
+	const evicted = collectEvictedTerminalKeys([reserved, completed], []);
+	expect(evicted.map(key => key.keyHash)).toEqual(["completed-key"]);
+});
+
 test("evicted terminal scopes retain their attempt policy via a compact tombstone", () => {
 	// Register a turn-scope attempt, then overflow the scope cap so it is evicted.
 	registerTerminalTurnScope({ lineageIdHash: "lineage-tomb", promptAttemptEpoch: 5001 });

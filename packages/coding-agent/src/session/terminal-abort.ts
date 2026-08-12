@@ -1129,22 +1129,23 @@ export interface DurableScopeRetentionRow {
  * reservation (review thread P2). Returns a new array.
  */
 export function boundCompletedTerminalScopeRows<T extends DurableScopeRetentionRow>(rows: T[], cap: number): T[] {
-	const completed = rows.filter(s => s.turnDisposition !== "pending" && s.turnDisposition !== "no_effect_reserved");
+	const isCompleted = (row: T): boolean =>
+		row.turnDisposition !== "pending" && row.turnDisposition !== "no_effect_reserved";
+	const retentionKey = (row: T): string => `${row.idempotencyKeyHash ?? ""}\u0000${row.idempotencyInputHash ?? ""}`;
+	const completed = rows.filter(isCompleted);
 	if (completed.length <= cap) return rows;
 	const overflow = completed.length - cap;
 	const evict = new Set(
 		[...completed]
 			.sort((a, b) => (a.acceptedAt ?? 0) - (b.acceptedAt ?? 0))
 			.slice(0, overflow)
-			.map(s => `${s.idempotencyKeyHash ?? ""}\u0000${s.idempotencyInputHash ?? ""}`),
+			.map(retentionKey),
 	);
-	return rows.filter(
-		s =>
-			!(
-				s.turnDisposition !== "pending" &&
-				evict.has(`${s.idempotencyKeyHash ?? ""}\u0000${s.idempotencyInputHash ?? ""}`)
-			),
-	);
+	// The evict set is keyed by key+input hash, so it must only be applied to
+	// COMPLETED rows: a transitional no_effect_reserved reservation that happens
+	// to share an evicted row's key pair must survive, exactly like a pending
+	// marker (review thread P2).
+	return rows.filter(row => !(isCompleted(row) && evict.has(retentionKey(row))));
 }
 
 /**
@@ -1189,7 +1190,10 @@ export function collectEvictedTerminalKeys<T extends DurableScopeRetentionRow>(
 	const afterKeys = new Set(after.map(s => `${s.idempotencyKeyHash ?? ""}\u0000${s.idempotencyInputHash ?? ""}`));
 	const evicted: EvictedTerminalKey[] = [];
 	for (const row of before) {
-		if (row.turnDisposition === "pending") continue;
+		// A TRANSITIONAL reservation is never evictable, so it must never mint a
+		// tombstone either: the same completed-row definition as
+		// `boundCompletedTerminalScopeRows` (review thread P2).
+		if (row.turnDisposition === "pending" || row.turnDisposition === "no_effect_reserved") continue;
 		const key = `${row.idempotencyKeyHash ?? ""}\u0000${row.idempotencyInputHash ?? ""}`;
 		if (!afterKeys.has(key) && row.idempotencyKeyHash && row.idempotencyInputHash) {
 			evicted.push({
