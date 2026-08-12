@@ -12,6 +12,7 @@ import {
 	parseNotificationSettingsSnapshot,
 } from "./config";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { sweepNotificationDebris } from "./notification-service";
 import {
 	type DaemonState,
 	FilesystemTopicRegistryCasAuthority,
@@ -236,6 +237,12 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
 	const cfg = getNotificationConfig(settings);
 	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return;
+	// Startup hygiene: reclaim inert quarantine/staging debris left by crashed
+	// writers so the notifications dir cannot grow unboundedly and slow every
+	// later endpoint scan. Never blocks startup; failures are logged only.
+	void sweepNotificationDebris({ dir: daemonPaths(resolvedAgentDir).dir }).catch(error =>
+		logger.warn(`telegram-daemon: startup debris sweep failed: ${String(error)}`),
+	);
 	const installationHostId = await (deps.loadInstallationHostId ?? loadInstallationHostId)();
 	const topicRegistryAuthority = new FilesystemTopicRegistryCasAuthority(
 		path.join(daemonPaths(resolvedAgentDir).dir, "telegram-topics.json"),

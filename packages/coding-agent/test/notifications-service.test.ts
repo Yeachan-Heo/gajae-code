@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { getNotificationConfig, tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import { ensureConfiguredProviderDaemons } from "../src/sdk/bus/index";
@@ -16,9 +17,11 @@ import {
 	formatNotificationHealthReport,
 	formatNotificationRecoveryReport,
 	formatNotificationStatusReport,
+	NOTIFICATION_DEBRIS_MIN_AGE_MS,
 	recoverNotifications,
 	sanitizeDiagnostic,
 	sendNotificationTest,
+	sweepNotificationDebris,
 	writeNotificationDiagnostic,
 } from "../src/sdk/bus/notification-service";
 import type { DaemonState } from "../src/sdk/bus/telegram-daemon";
@@ -41,6 +44,8 @@ function mockFs(
 		onExactUnlink?: (file: string, store: Map<string, string>) => void;
 		exactUnlinkResult?: (file: string) => NotificationExactUnlinkResult | undefined;
 		rejectEndpointFiles?: Set<string>;
+		/** Per-file mtimeMs for the optional `stat` capability; absent files throw ENOENT. */
+		mtimes?: Record<string, number>;
 	} = {},
 ): { fs: NotificationServiceFs; unlinked: string[]; created: string[]; store: Map<string, string> } {
 	const store = new Map(Object.entries(files));
@@ -138,6 +143,11 @@ function mockFs(
 				created.push(file);
 				opts.onAcquireExclusive?.(file, store);
 			}
+		},
+		async stat(file) {
+			const mtimeMs = opts.mtimes?.[file];
+			if (mtimeMs === undefined) throw enoent();
+			return { mtimeMs };
 		},
 	};
 	return { fs, unlinked, created, store };
@@ -1218,6 +1228,196 @@ describe("notification-service recovery lock TOCTOU (owner-bound)", () => {
 			deps: { fs, pidAlive: pid => pid === 1000 },
 		});
 		expect(report.daemon.action).toBe("owner-superseded");
+		expect(unlinked).not.toContain(paths.lock);
+	});
+});
+
+describe("notification-service stale debris sweep", () => {
+	const dir = "/tmp/gjc-debris/notifications";
+	const NOW = 10 * NOTIFICATION_DEBRIS_MIN_AGE_MS;
+	const OLD = NOW - NOTIFICATION_DEBRIS_MIN_AGE_MS - 1;
+	const YOUNG = NOW - 1_000;
+
+	test("removes stale quarantine, placeholder, and dead-writer staging files only", async () => {
+		const staleTransition = path.join(dir, "transition-005aa822-3f0b-45c9-bd39-e7047b1d3be4");
+		const youngTransition = path.join(dir, "transition-11111111-2222-4333-8444-555555555555");
+		const stalePlaceholder = path.join(dir, ".gjc-exact-unlink-placeholder-abc.json");
+		const deadWriterTmp = path.join(dir, "telegram-callback-aliases.json.777.1786499330704.2o3rwhj5qax.tmp");
+		const liveWriterTmp = path.join(dir, "telegram-presentation-state.json.1000.1786546900647.sucg48nr9uk.tmp");
+		const canonical = path.join(dir, "telegram-daemon.state.json");
+		const { fs, unlinked } = mockFs(
+			{
+				[staleTransition]: "",
+				[youngTransition]: "",
+				[stalePlaceholder]: "",
+				[deadWriterTmp]: "{}",
+				[liveWriterTmp]: "{}",
+				[canonical]: daemonStateJson({ pid: 1000 }),
+			},
+			{
+				mtimes: {
+					[staleTransition]: OLD,
+					[youngTransition]: YOUNG,
+					[stalePlaceholder]: OLD,
+					[deadWriterTmp]: YOUNG,
+					[liveWriterTmp]: YOUNG,
+					[canonical]: OLD,
+				},
+			},
+		);
+		const report = await sweepNotificationDebris({
+			dir,
+			deps: { fs, now: () => NOW, pidAlive: pid => pid === 1000 },
+		});
+		expect(report.removed.sort()).toEqual(
+			[path.basename(staleTransition), path.basename(stalePlaceholder), path.basename(deadWriterTmp)].sort(),
+		);
+		// Young quarantine and a live writer's young staging file are retained.
+		expect(report.kept).toBe(2);
+		// Canonical files never match the debris patterns even when old.
+		expect(unlinked).not.toContain(canonical);
+	});
+
+	test("a stale staging file of a live writer is removed by age", async () => {
+		const oldLiveTmp = path.join(dir, "telegram-callback-aliases.json.1000.1786000000000.abcdef.tmp");
+		const { fs } = mockFs({ [oldLiveTmp]: "{}" }, { mtimes: { [oldLiveTmp]: OLD } });
+		const report = await sweepNotificationDebris({
+			dir,
+			deps: { fs, now: () => NOW, pidAlive: () => true },
+		});
+		expect(report.removed).toEqual([path.basename(oldLiveTmp)]);
+	});
+
+	test("without a stat capability only dead-writer staging files are swept", async () => {
+		const transition = path.join(dir, "transition-005aa822-3f0b-45c9-bd39-e7047b1d3be4");
+		const deadTmp = path.join(dir, "telegram-seen-updates.json.777.1786000000000.abcdef.tmp");
+		const { fs } = mockFs({ [transition]: "", [deadTmp]: "{}" });
+		const noStatFs: NotificationServiceFs = { ...fs, stat: undefined };
+		const report = await sweepNotificationDebris({
+			dir,
+			deps: { fs: noStatFs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.removed).toEqual([path.basename(deadTmp)]);
+		expect(report.kept).toBe(1);
+	});
+
+	test("recovery sweeps debris in both the endpoint and daemon dirs and reports it", async () => {
+		const settings = Settings.isolated({
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": TOKEN,
+			"notifications.telegram.chatId": "12345",
+		});
+		const paths = daemonPaths(settings.getAgentDir());
+		const stateRoot = "/tmp/gjc-debris-recovery";
+		const daemonDebris = path.join(paths.dir, "transition-005aa822-3f0b-45c9-bd39-e7047b1d3be4");
+		const endpointDebris = path.join(
+			stateRoot,
+			"sdk",
+			".gjc-delete-notification-endpoint-005aa822-3f0b-45c9-bd39-e7047b1d3be4.json",
+		);
+		const { fs } = mockFs(
+			{ [daemonDebris]: "", [endpointDebris]: "{}" },
+			{ mtimes: { [daemonDebris]: OLD, [endpointDebris]: OLD } },
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.debrisRemoved?.sort()).toEqual([path.basename(daemonDebris), path.basename(endpointDebris)].sort());
+		expect(formatNotificationRecoveryReport(report)).toContain("debris: removed 2, kept 0");
+	});
+});
+
+describe("notification-service forced stale-marker recovery", () => {
+	const settings = Settings.isolated({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": TOKEN,
+		"notifications.telegram.chatId": "12345",
+	});
+	const paths = daemonPaths(settings.getAgentDir());
+	const NOW = 1_000_000_000;
+
+	test("force reclaims an old provenance-less steal marker and clears the dead-owner lock", async () => {
+		const { fs, unlinked } = mockFs(
+			{
+				[paths.state]: daemonStateJson({ pid: 555, ownerId: "owner-a" }),
+				[paths.lock]: "lock",
+				[paths.steal]: "not json at all",
+			},
+			{ mtimes: { [paths.steal]: NOW - 120_000 } },
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-forced",
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+			forceDaemonLock: true,
+		});
+		expect(report.daemon.action).toBe("cleared-dead-owner-lock");
+		expect(unlinked).toContain(paths.lock);
+	});
+
+	test("without force the same provenance-less marker stays blocking", async () => {
+		const { fs, unlinked } = mockFs(
+			{
+				[paths.state]: daemonStateJson({ pid: 555, ownerId: "owner-a" }),
+				[paths.lock]: "lock",
+				[paths.steal]: "not json at all",
+			},
+			{ mtimes: { [paths.steal]: NOW - 120_000 } },
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-unforced",
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.daemon.action).toBe("left-contended");
+		expect(unlinked).not.toContain(paths.lock);
+	});
+
+	test("force never detaches a young marker", async () => {
+		const { fs, unlinked } = mockFs(
+			{
+				[paths.state]: daemonStateJson({ pid: 555, ownerId: "owner-a" }),
+				[paths.lock]: "lock",
+				[paths.steal]: "not json at all",
+			},
+			{ mtimes: { [paths.steal]: NOW - 1_000 } },
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-forced-young",
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+			forceDaemonLock: true,
+		});
+		expect(report.daemon.action).toBe("left-contended");
+		expect(unlinked).not.toContain(paths.lock);
+	});
+
+	test("force never detaches a valid marker even when old", async () => {
+		// A live same-incarnation owner: the normal reclaim path must refuse it
+		// (owner alive), and force must refuse it too (valid provenance).
+		const validMarker = JSON.stringify({
+			pid: process.pid,
+			incarnation: processIncarnation(process.pid),
+			createdAt: NOW - 120_000,
+			token: "live-token",
+		});
+		const { fs, unlinked } = mockFs(
+			{
+				[paths.state]: daemonStateJson({ pid: 555, ownerId: "owner-a" }),
+				[paths.lock]: "lock",
+				[paths.steal]: validMarker,
+			},
+			{ mtimes: { [paths.steal]: NOW - 120_000 } },
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot: "/tmp/gjc-forced-valid",
+			deps: { fs, now: () => NOW, pidAlive: pid => pid === process.pid },
+			forceDaemonLock: true,
+		});
+		expect(report.daemon.action).toBe("left-contended");
 		expect(unlinked).not.toContain(paths.lock);
 	});
 });
