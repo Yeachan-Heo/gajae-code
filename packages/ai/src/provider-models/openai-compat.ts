@@ -1977,36 +1977,36 @@ export function anthropicModelManagerOptions(
 					.then(payload => mapAnthropicModelsDev(payload, baseUrl))
 					.catch(() => []);
 				const references = buildAnthropicReferenceMap(modelsDevModels);
-				return (
-					fetchOpenAICompatibleModels({
-						api: "anthropic-messages",
-						provider: "anthropic",
-						baseUrl,
-						headers: buildAnthropicDiscoveryHeaders(apiKey),
-						mapModel: (
-							entry: OpenAICompatibleModelRecord,
-							defaults: Model<"anthropic-messages">,
-							_context: OpenAICompatibleModelMapperContext<"anthropic-messages">,
-						): Model<"anthropic-messages"> => {
-							const discoveredName = typeof entry.display_name === "string" ? entry.display_name : defaults.name;
-							const reference = references.get(defaults.id);
-							if (!reference) {
-								return {
-									...defaults,
-									name: discoveredName,
-								};
-							}
+				const models = await fetchOpenAICompatibleModels({
+					api: "anthropic-messages",
+					provider: "anthropic",
+					baseUrl,
+					headers: buildAnthropicDiscoveryHeaders(apiKey),
+					mapModel: (
+						entry: OpenAICompatibleModelRecord,
+						defaults: Model<"anthropic-messages">,
+						_context: OpenAICompatibleModelMapperContext<"anthropic-messages">,
+					): Model<"anthropic-messages"> => {
+						const discoveredName = typeof entry.display_name === "string" ? entry.display_name : defaults.name;
+						const reference = references.get(defaults.id);
+						if (!reference) {
 							return {
-								...reference,
-								id: defaults.id,
+								...defaults,
 								name: discoveredName,
-								api: "anthropic-messages",
-								provider: "anthropic",
-								baseUrl,
 							};
-						},
-					}) ?? null
-				);
+						}
+						return {
+							...reference,
+							id: defaults.id,
+							name: discoveredName,
+							api: "anthropic-messages",
+							provider: "anthropic",
+							baseUrl,
+						};
+					},
+				});
+				if (models === null) return null;
+				return models;
 			},
 		}),
 	};

@@ -1246,7 +1246,13 @@ export class ModelRegistry {
 	#configuredDiscoveryProviderIds: ReadonlySet<string> = new Set();
 	#descriptorDiscoveryEvidence = new Map<
 		string,
-		{ fresh: boolean; modelIds: ReadonlySet<string>; authGeneration: string; endpoint: string }
+		{
+			fresh: boolean;
+			modelIds: ReadonlySet<string>;
+			profileModelIds?: ReadonlySet<string>;
+			authGeneration: string;
+			endpoint: string;
+		}
 	>();
 	#descriptorDiscoveryGenerations = new Map<string, number>();
 	#configuredDiscoveryEvidence = new Map<
@@ -2600,7 +2606,7 @@ export class ModelRegistry {
 					? {
 							fetchDynamicModels: async () => {
 								const models = await options.fetchDynamicModels?.();
-								if (models === null) return null;
+								if (models === null || models === undefined) return null;
 								const sanitizedModels = this.#stripModelBaseUrlQueries(models ?? []);
 								if (canUseCredentialDerivedXiaomiEndpoint) {
 									credentialDerivedEndpoint = sanitizedModels[0]?.baseUrl;
@@ -2642,10 +2648,11 @@ export class ModelRegistry {
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint)
 			) {
 				this.#descriptorDiscoveryEvidence.set(options.providerId, {
-					fresh: result.fetched,
+					fresh: !result.stale,
 					modelIds: new Set(models.map(model => model.id)),
+					...(result.dynamicModelIds === undefined ? {} : { profileModelIds: new Set(result.dynamicModelIds) }),
 					authGeneration,
-					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(models[0]?.baseUrl ?? endpoint),
+					endpoint,
 				});
 			}
 			if (!isCurrentDiscovery()) {
@@ -3705,16 +3712,20 @@ export class ModelRegistry {
 	getAvailableForProfileActivation(): Model<Api>[] {
 		return this.getAvailable().filter(model => {
 			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
-			if (!evidence?.fresh) return true;
+			if (!evidence?.fresh || evidence.profileModelIds === undefined) return true;
+			const bundledModelIds = new Set(
+				(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
+					candidate => candidate.id,
+				),
+			);
+			if (!bundledModelIds.has(model.id)) return true;
 			if (
 				evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
 				evidence.endpoint !==
-					this.#normalizeDiscoveryEvidenceEndpoint(
-						this.#getProviderBaseUrlForDiscovery(model.provider) ?? model.baseUrl ?? "",
-					)
+					this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "")
 			)
 				return true;
-			return evidence.modelIds.has(model.id);
+			return evidence.profileModelIds.has(model.id);
 		});
 	}
 

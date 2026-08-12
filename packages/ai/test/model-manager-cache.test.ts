@@ -69,6 +69,40 @@ describe("online-if-uncached model refresh", () => {
 		expect(result.models.map(entry => entry.id)).toEqual(["static", "cached"]);
 	});
 
+	test("retains authoritative dynamic IDs separately from merged static models", async () => {
+		const providerId = "cache-authoritative-ids";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+
+		const fetched = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				fetchDynamicModels: async () => [model(providerId, "dynamic")],
+			},
+			"online",
+		);
+		expect(fetched.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+		expect(fetched.dynamicModelIds).toEqual(["dynamic"]);
+
+		const cached = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				fetchDynamicModels: async () => {
+					throw new Error("fresh cache must be reused");
+				},
+			},
+			"online-if-uncached",
+		);
+		expect(cached.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+		expect(cached.dynamicModelIds).toEqual(["dynamic"]);
+	});
+
 	test("refreshes missing and stale caches", async () => {
 		const now = 1_700_000_000_000;
 		for (const [providerId, cachedAt] of [
@@ -158,6 +192,24 @@ describe("online-if-uncached model refresh", () => {
 				failure,
 			).toEqual(["static"]);
 		}
+	});
+
+	test("does not present stale or failed catalog IDs as live evidence", async () => {
+		const providerId = "cache-unproven-ids";
+		const staticModels = [model(providerId, "static")];
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				fetchDynamicModels: async () => null,
+			},
+			"online",
+		);
+
+		expect(result.models.map(entry => entry.id)).toEqual(["static"]);
+		expect(result.stale).toBe(true);
+		expect(result.dynamicModelIds).toBeUndefined();
 	});
 
 	test("does not publish successful dynamic models when the cache guard denies publication", async () => {

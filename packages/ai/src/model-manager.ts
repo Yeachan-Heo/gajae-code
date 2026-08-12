@@ -58,6 +58,11 @@ export interface ModelResolutionResult<TApi extends Api = Api> {
 	stale: boolean;
 	/** Whether this resolution successfully fetched dynamic models. */
 	fetched: boolean;
+	/**
+	 * IDs returned by a current authoritative dynamic provider catalog. This is
+	 * deliberately distinct from `models`, which merges static and cached data.
+	 */
+	dynamicModelIds?: readonly string[];
 }
 
 /**
@@ -149,13 +154,21 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	) {
 		const cachedModels = passModelList<TApi>(cache.models);
 		if (!hasStaticTransportDrift(staticModels, cachedModels)) {
-			return { models: cachedModels, stale: false, fetched: false };
+			return { models: cachedModels, stale: false, fetched: false, dynamicModelIds: cache.dynamicModelIds };
 		}
 		const repairedModels = mergeDynamicModels(staticModels, cachedModels);
 		if (options.canPublishCache?.() ?? true) {
-			writeModelCache(options.providerId, now(), repairedModels, true, staticFingerprint, dbPath);
+			writeModelCache(
+				options.providerId,
+				now(),
+				repairedModels,
+				true,
+				staticFingerprint,
+				dbPath,
+				cache.dynamicModelIds,
+			);
 		}
-		return { models: repairedModels, stale: false, fetched: false };
+		return { models: repairedModels, stale: false, fetched: false, dynamicModelIds: cache.dynamicModelIds };
 	}
 
 	const [fetchedModelsDevModels, fetchedDynamicModels] = shouldFetchFromNetwork
@@ -176,7 +189,15 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), dynamicModels),
 			);
 			if (options.canPublishCache?.() ?? true) {
-				writeModelCache(options.providerId, now(), snapshotModels, true, staticFingerprint, dbPath);
+				writeModelCache(
+					options.providerId,
+					now(),
+					snapshotModels,
+					true,
+					staticFingerprint,
+					dbPath,
+					dynamicModels.map(model => model.id),
+				);
 			}
 		} else {
 			// Dynamic fetch failed — update cache with a non-authoritative snapshot so
@@ -203,6 +224,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		models,
 		stale: !dynamicAuthoritative,
 		fetched: shouldFetchFromNetwork && dynamicFetchSucceeded,
+		dynamicModelIds: dynamicFetchSucceeded ? dynamicModels.map(model => model.id) : undefined,
 	};
 }
 

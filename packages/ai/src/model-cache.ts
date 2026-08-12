@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import { getModelDbPath } from "@gajae-code/utils/dirs";
 import type { Api, Model } from "./types";
 
-const CACHE_SCHEMA_VERSION = 3;
+const CACHE_SCHEMA_VERSION = 4;
 
 interface CacheRow {
 	provider_id: string;
@@ -14,6 +14,7 @@ interface CacheRow {
 	updated_at: number;
 	authoritative: number;
 	static_fingerprint: string;
+	dynamic_model_ids: string | null;
 	models: string;
 }
 
@@ -33,6 +34,8 @@ interface CacheEntry<TApi extends Api = Api> {
 	 * match — the cache already incorporates the same static state.
 	 */
 	staticFingerprint: string;
+	/** IDs returned by the authoritative dynamic provider catalog, when retained. */
+	dynamicModelIds: string[] | undefined;
 }
 
 let sharedDb: Database | null = null;
@@ -56,6 +59,7 @@ function getDb(dbPath?: string): Database {
 			updated_at INTEGER NOT NULL,
 			authoritative INTEGER NOT NULL DEFAULT 0,
 			static_fingerprint TEXT NOT NULL DEFAULT '',
+			dynamic_model_ids TEXT,
 			models TEXT NOT NULL
 		)
 	`);
@@ -81,7 +85,10 @@ function migrateCacheSchema(db: Database): void {
 	if (!columns.some(column => column.name === "static_fingerprint")) {
 		db.run("ALTER TABLE model_cache ADD COLUMN static_fingerprint TEXT NOT NULL DEFAULT ''");
 	}
-	db.run("UPDATE model_cache SET version = ? WHERE version = 2", [CACHE_SCHEMA_VERSION]);
+	if (!columns.some(column => column.name === "dynamic_model_ids")) {
+		db.run("ALTER TABLE model_cache ADD COLUMN dynamic_model_ids TEXT");
+	}
+	db.run("UPDATE model_cache SET version = ? WHERE version IN (2, 3)", [CACHE_SCHEMA_VERSION]);
 }
 
 export function readModelCache<TApi extends Api>(
@@ -105,6 +112,7 @@ export function readModelCache<TApi extends Api>(
 			authoritative: row.authoritative === 1,
 			updatedAt: row.updated_at,
 			staticFingerprint: row.static_fingerprint ?? "",
+			dynamicModelIds: row.dynamic_model_ids === null ? undefined : (JSON.parse(row.dynamic_model_ids) as string[]),
 		};
 	} catch {
 		return null;
@@ -118,18 +126,20 @@ export function writeModelCache<TApi extends Api>(
 	authoritative: boolean,
 	staticFingerprint: string,
 	dbPath?: string,
+	dynamicModelIds?: readonly string[],
 ): void {
 	try {
 		const db = getDb(dbPath);
 		db.run(
-			`INSERT OR REPLACE INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, models)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
+			`INSERT OR REPLACE INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, models)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			[
 				providerId,
 				CACHE_SCHEMA_VERSION,
 				updatedAt,
 				authoritative ? 1 : 0,
 				staticFingerprint,
+				dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds),
 				JSON.stringify(models),
 			],
 		);
