@@ -5,8 +5,10 @@ import {
 	bindToolLineage,
 	boundCompletedTerminalScopeRows,
 	boundEvictedTerminalKeys,
+	boundTerminalRetentionState,
 	classifyOwnedCompletion,
 	classifyOwnedEnvelope,
+	collectEvictedTerminalKeys,
 	createTurnContinuationSeam,
 	type DeliveryOrigin,
 	findOwnedRegistrationsForTurn,
@@ -919,6 +921,58 @@ test("boundCompletedTerminalScopeRows evicts the oldest completed rows but never
 	expect(bounded.some((r: { idempotencyKeyHash: string }) => r.idempotencyKeyHash === "pending-key")).toBe(true);
 });
 
+test("a transitional no_effect_reserved row survives eviction of a completed row sharing its key pair", () => {
+	// The evict set is keyed by key+input hash, so applying it to anything other
+	// than a COMPLETED row deletes a live reservation: the abort that owns it
+	// would then finalize into nothing and a same-key retry would replay
+	// uncertainty over an unfinalized reservation (review thread P2).
+	const rows = [
+		...Array.from({ length: 257 }, (_, i) => ({
+			idempotencyKeyHash: `k${i}`,
+			idempotencyInputHash: `i${i}`,
+			turnDisposition: "no_effect",
+			acceptedAt: i,
+		})),
+		{
+			// Shares the key pair of the OLDEST completed row (k0), which is the one
+			// row the cap evicts.
+			idempotencyKeyHash: "k0",
+			idempotencyInputHash: "i0",
+			turnDisposition: "no_effect_reserved",
+			acceptedAt: 0,
+		},
+	];
+	const bounded = boundCompletedTerminalScopeRows(rows, 256);
+	expect(bounded.filter(row => row.turnDisposition === "no_effect")).toHaveLength(256);
+	expect(bounded.some(row => row.turnDisposition === "no_effect" && row.idempotencyKeyHash === "k0")).toBe(false);
+	expect(bounded.filter(row => row.turnDisposition === "no_effect_reserved")).toHaveLength(1);
+	// The surviving reservation keeps the key alive, so no tombstone claims
+	// replay authority over it.
+	expect(collectEvictedTerminalKeys(rows, bounded)).toHaveLength(0);
+});
+
+test("collectEvictedTerminalKeys never mints a tombstone for a transitional reservation", () => {
+	// A reservation is not evictable, so it must not be tombstoned either — a
+	// tombstone would replay uncertainty over a reservation the owning abort can
+	// still finalize (review thread P2).
+	const reserved = {
+		idempotencyKeyHash: "reserved-key",
+		idempotencyInputHash: "reserved-input",
+		turnDisposition: "no_effect_reserved",
+		ownedWorkDisposition: "not_requested" as const,
+		acceptedAt: 1,
+	};
+	const completed = {
+		idempotencyKeyHash: "completed-key",
+		idempotencyInputHash: "completed-input",
+		turnDisposition: "stopped",
+		ownedWorkDisposition: "stopped" as const,
+		acceptedAt: 2,
+	};
+	const evicted = collectEvictedTerminalKeys([reserved, completed], []);
+	expect(evicted.map(key => key.keyHash)).toEqual(["completed-key"]);
+});
+
 test("evicted terminal scopes retain their attempt policy via a compact tombstone", () => {
 	// Register a turn-scope attempt, then overflow the scope cap so it is evicted.
 	registerTerminalTurnScope({ lineageIdHash: "lineage-tomb", promptAttemptEpoch: 5001 });
@@ -1268,6 +1322,91 @@ test("boundEvictedTerminalKeys FIFO-expires the oldest tombstones past the cap",
 	expect(bounded.at(-1)?.keyHash).toBe("k-4099");
 	// Under the cap nothing is dropped.
 	expect(boundEvictedTerminalKeys(keys.slice(0, 100), 4096)).toHaveLength(100);
+});
+
+test("boundTerminalRetentionState bounds scopes and accumulates evicted-key tombstones in one pass", () => {
+	// Both session runtimes (the notifications-hosted bus runtime and the
+	// SDK-only host runtime) write durable terminal state through this single
+	// bound; a hand-rolled copy in either path is how the retention invariants
+	// drift apart (review thread P2).
+	const scopes = [
+		...Array.from({ length: 300 }, (_, i) => ({
+			idempotencyKeyHash: `k-${i}`,
+			idempotencyInputHash: `i-${i}`,
+			turnDisposition: "no_effect" as const,
+			ownedWorkDisposition: "not_requested" as const,
+			acceptedAt: i,
+		})),
+		{
+			idempotencyKeyHash: "pending-key",
+			idempotencyInputHash: "pending-input",
+			turnDisposition: "pending" as const,
+			ownedWorkDisposition: "not_requested" as const,
+			acceptedAt: 0,
+		},
+		{
+			idempotencyKeyHash: "reserved-key",
+			idempotencyInputHash: "reserved-input",
+			turnDisposition: "no_effect_reserved",
+			ownedWorkDisposition: "not_requested" as const,
+			acceptedAt: 0,
+		},
+	];
+	const priorKeys = [{ keyHash: "prior-key", inputHash: "prior-input", turnDisposition: "stopped" as const }];
+	const next = boundTerminalRetentionState(priorKeys, scopes);
+	// 300 completed rows -> the 256 newest are kept and the 44 oldest evicted.
+	expect(next.scopes.filter(row => row.turnDisposition === "no_effect")).toHaveLength(256);
+	expect(next.scopes.some(row => row.idempotencyKeyHash === "k-0")).toBe(false);
+	expect(next.scopes.some(row => row.idempotencyKeyHash === "k-43")).toBe(false);
+	expect(next.scopes.some(row => row.idempotencyKeyHash === "k-44")).toBe(true);
+	// The pending marker and the TRANSITIONAL reservation are never evicted:
+	// evicting a reserved row would replay uncertainty over an unfinalized
+	// reservation.
+	expect(next.scopes.some(row => row.idempotencyKeyHash === "pending-key")).toBe(true);
+	expect(next.scopes.some(row => row.idempotencyKeyHash === "reserved-key")).toBe(true);
+	// Pre-existing tombstones are retained ahead of this transaction's evictions,
+	// so replay authority survives successive bounded writes.
+	expect(next.keys[0]).toEqual(priorKeys[0]);
+	expect(next.keys).toHaveLength(1 + 44);
+	expect(next.keys.slice(1).map(key => key.keyHash)).toEqual(Array.from({ length: 44 }, (_, i) => `k-${i}`));
+});
+
+test("boundTerminalRetentionState FIFO-expires the oldest tombstones at the retained cap", () => {
+	// At tombstone capacity the bound must expire the OLDEST keys instead of
+	// throwing after the destructive stop already happened (review thread P2).
+	const priorKeys = Array.from({ length: 4096 }, (_, i) => ({
+		keyHash: `old-${i}`,
+		inputHash: `old-input-${i}`,
+		turnDisposition: "stopped" as const,
+	}));
+	const next = boundTerminalRetentionState(priorKeys, [
+		{
+			idempotencyKeyHash: "fresh-key",
+			idempotencyInputHash: "fresh-input",
+			turnDisposition: "no_effect" as const,
+			ownedWorkDisposition: "not_requested" as const,
+			acceptedAt: 1,
+		},
+	]);
+	expect(next.keys).toHaveLength(4096);
+	// No scope row was evicted, so the collection is already at the cap with
+	// every prior tombstone still intact.
+	expect(next.keys.some(key => key.keyHash === "old-0")).toBe(true);
+	expect(next.scopes).toHaveLength(1);
+
+	// Now force an eviction on top of a full tombstone collection: the evicted
+	// key is retained and the oldest prior tombstone expires.
+	const full = Array.from({ length: 257 }, (_, i) => ({
+		idempotencyKeyHash: `k-${i}`,
+		idempotencyInputHash: `i-${i}`,
+		turnDisposition: "no_effect" as const,
+		ownedWorkDisposition: "not_requested" as const,
+		acceptedAt: i,
+	}));
+	const expired = boundTerminalRetentionState(priorKeys, full);
+	expect(expired.keys).toHaveLength(4096);
+	expect(expired.keys.some(key => key.keyHash === "old-0")).toBe(false);
+	expect(expired.keys.at(-1)?.keyHash).toBe("k-0");
 });
 
 test("saturation evidence keeps an attempt incomplete after every evicted tool window settles", () => {

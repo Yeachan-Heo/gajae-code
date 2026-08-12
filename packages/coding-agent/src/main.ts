@@ -210,6 +210,7 @@ export function resolveAcpStartupOptions(
 		| "model"
 		| "models"
 		| "noLsp"
+		| "noMcp"
 		| "noPty"
 		| "noRules"
 		| "noSession"
@@ -250,6 +251,7 @@ export function resolveAcpStartupOptions(
 		...(parsed.messages.length > 0 ? ["initial prompt"] : []),
 		...(parsed.models?.length ? ["--models"] : []),
 		...(parsed.mcpConfig !== undefined ? ["--mcp-config"] : []),
+		...(parsed.noMcp ? ["--no-mcp"] : []),
 		...(parsed.noLsp ? ["--no-lsp"] : []),
 		...(parsed.noPty ? ["--no-pty"] : []),
 		...(parsed.noRules ? ["--no-rules"] : []),
@@ -1091,6 +1093,7 @@ async function buildSessionOptions(
 		cwd: parsed.cwd ?? getProjectDir(),
 	};
 	if (parsed.mcpConfig !== undefined) options.mcpConfigPath = parsed.mcpConfig;
+	if (parsed.noMcp === true) options.enableMcpAutoload = false;
 
 	const systemPromptSource = parsed.systemPrompt;
 	const resolvedSystemPrompt = await resolvePromptInput(systemPromptSource, "system prompt");

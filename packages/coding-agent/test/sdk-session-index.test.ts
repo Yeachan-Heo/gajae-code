@@ -847,7 +847,11 @@ describe("SDK session index", () => {
 		const started = Date.now();
 		await contender.withLocked(async () => undefined);
 		expect(Date.now() - started).toBeLessThan(5_000);
-	});
+		// The seeding above appends 400 fsynced rows; on slow CI filesystems that
+		// setup alone can exceed the 5s default per-test ceiling even though the
+		// lock-promptness contract asserted above stays far below it. Match the
+		// other heavy multi-process tests in this file.
+	}, 30_000);
 	it("serializes repair with a racing writer and resumes after the retained prefix", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const seed = await new SessionIndex(dir).open();
@@ -1141,6 +1145,34 @@ describe("SDK session index", () => {
 			expect.objectContaining({ sessionId, ambiguous: true, live: false }),
 		]);
 		expect(await index.checkpointLiveHeartbeats()).toBe(0);
+	});
+	it("recognizes the fence row when writer and reader spell the agent dir differently", async () => {
+		// The row's state root is whatever spelling the writing process used. A
+		// symlinked agent dir read back via its realpath (or the reverse) must
+		// still be recognized, or every session is re-fenced and no chat daemon
+		// can attach — the original outage, reintroduced by a stricter check.
+		const real = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-real-"));
+		const link = `${real}-link`;
+		await fs.symlink(real, link);
+		const sessionId = "symlinked-agent-dir";
+		// Reader opens through the symlink; writer recorded the realpath.
+		const index = await new SessionIndex(link).open();
+		await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: "r", stateRoot: real },
+			endpointGeneration: 0,
+			pid: process.pid,
+		});
+		const endpointRoot = await index.append(event(sessionId));
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({
+				sessionId,
+				endpointGeneration: endpointRoot.endpointGeneration,
+				ambiguous: false,
+			}),
+		]);
+		expect(await index.checkpointLiveHeartbeats()).toBe(1);
 	});
 	it("promotes the sole surviving endpoint root once a competing root unregisters", async () => {
 		// With the GC fence row plus two endpoint roots, resolving the conflict

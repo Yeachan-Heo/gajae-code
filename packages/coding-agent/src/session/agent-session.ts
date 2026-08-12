@@ -6944,7 +6944,6 @@ export class AgentSession {
 		// the addon after the runtime tore down the context it was scheduled in. The chain
 		// is already failure-absorbing, so this only waits.
 		await this.#coordinatorPersistQueue;
-		this.#workflowGateEmitter?.fence?.();
 		this.#pendingBackgroundExchanges = [];
 		this.yieldQueue.clear();
 
@@ -6956,6 +6955,7 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
+		this.#workflowGateEmitter?.fence?.();
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
 		await this.#flushWorkerIntegrationAttempt();
@@ -13082,7 +13082,11 @@ export class AgentSession {
 		},
 	): Promise<DefaultModelSelectionResult> {
 		// Scheduled continuations share this admission queue, so idle settlement
-		// must happen before selection acquires its lease.
+		// must happen before selection acquires its lease. But a reentrant
+		// selection from inside an active admission (e.g. before_agent_start)
+		// must reject immediately instead of deadlocking on waitForIdle.
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		await this.waitForIdle();
 		return this.#withSessionAdmission("selection", async () => {
 			options?.onBeforeMutation?.();

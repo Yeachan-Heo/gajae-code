@@ -41,7 +41,7 @@ When the Aside CLI is installed and the operator wants to record the Aside MCP c
 gjc mcp add aside aside mcp --project
 ```
 
-Use `--project` for repo-local evaluation records. Omit it only when the operator intentionally wants the stored definition in the user-level GJC MCP config; normal standalone GJC sessions do not consume either scope as runtime tools today.
+Use `--project` for repo-local evaluation records. Omit it only when the operator intentionally wants the stored definition in the user-level GJC MCP config; both scopes are consumed by ordinary standalone GJC sessions at startup (conventional autoload) unless disabled or opted out with `--no-mcp`.
 
 After registration, inspect the redacted definition:
 
@@ -49,7 +49,7 @@ After registration, inspect the redacted definition:
 gjc mcp list --json
 ```
 
-This is storage-only recordkeeping today. `gjc mcp add/list/remove` does not make Aside tools visible in normal `gjc`, `gjc --tmux`, or print-mode sessions. Do not paste task transcripts, browser screenshots, cookies, saved credential state, or private Aside profile paths into issues or PRs. If you need to share evidence, summarize the stored definition shape and any benign externally gathered result.
+`gjc mcp add` makes the stored server definition available to ordinary standalone `gjc`, `gjc --tmux`, and print-mode sessions as runtime tools. Do not paste task transcripts, browser screenshots, cookies, saved credential state, or private Aside profile paths into issues or PRs. If you need to share evidence, summarize the stored definition shape and any benign externally gathered result.
 
 
 Recommended prompt boundary for evaluation:
@@ -85,7 +85,7 @@ Use this checklist instead of a live login/payment/internal-site scenario:
 1. Register the MCP server definition with `gjc mcp add ... --project`.
 2. Run `gjc mcp list --json` and confirm secrets are redacted.
 3. Confirm the record is project-scoped or user-scoped as intended.
-4. Do not expect the registration to appear as model tools in a normal standalone GJC session today.
+4. Confirm the registration is consumed by a normal standalone GJC session in that project (tools appear at startup). To verify without a server, use `--no-mcp` or disable the server (`enabled: false` / `disabledServers`) for that session.
 5. If evaluating Aside behavior separately, run one public, non-personal query through the Aside-owned surface, for example: `Find the Aside public help page that describes MCP support and summarize the documented command names.`
 6. Confirm any shared evidence includes only public page titles/URLs or short snippets.
 7. Confirm no API key, Authorization header, cookie, browser profile path, screenshot, raw task transcript, or private session payload appears in terminal output, logs, issue comments, or PR text.
@@ -103,7 +103,7 @@ gjc mcp remove aside-search --project
 | --- | --- |
 | `aside` command not found | Install the Aside CLI from Aside developer settings, then use the concrete CLI path as the MCP `command` if needed. |
 | MCP server does not appear in `gjc mcp list` | Re-run `gjc mcp list --json`; confirm whether the registration was user-scoped or project-scoped. |
-| Aside tools do not appear in a normal GJC session | Expected today. `gjc mcp` stores redacted definitions for recordkeeping/inspection; normal standalone `gjc`, `gjc --tmux`, and print-mode sessions do not load those registrations as runtime tools. |
+| Aside tools do not appear in a normal GJC session | Check `gjc mcp list --json`: the server must be `autoload` status (not `enabled: false`, not in `disabledServers`, not `autoload: false`), project scope must not be disabled by an explicit `mcp.enableProjectConfig: false` setting, and the session must not have passed `--no-mcp`. |
 | Auth failure | Rotate or re-enter the Aside-side token/API key. Do not paste it into GJC prompts or issue comments. |
 | Endpoint/network failure | Check the URL, proxy, and TLS path outside GJC with a benign health check; do not dump request headers. |
 | Retrieval misses context | Narrow the query to public sources first. Do not add browser history, cookies, screenshots, or account pages unless a separate approved design covers that data flow. |

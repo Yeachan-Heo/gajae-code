@@ -30,7 +30,7 @@ import {
 } from "../types";
 import { normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
-import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import { findUnnecessaryUnicodeEscape, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { areJsonValuesEqual } from "../utils/schema";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
@@ -865,17 +865,21 @@ export async function processResponsesStream<TApi extends Api>(
 							? "conflicting"
 							: "malformed"
 					: undefined;
+				const escapedNonAscii = findUnnecessaryUnicodeEscape(rawArguments) !== undefined;
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
 					name: item.name,
 					arguments: args,
 					...(incompleteArguments ? { incompleteArguments: true, incompleteArgumentsReason } : {}),
+					...(escapedNonAscii ? { escapedNonAsciiArguments: true } : {}),
 				};
 				if (entry?.block.type === "toolCall") {
 					entry.block.id = toolCall.id;
 					entry.block.name = toolCall.name;
 					entry.block.arguments = args;
+					if (escapedNonAscii) entry.block.escapedNonAsciiArguments = true;
+					else delete entry.block.escapedNonAsciiArguments;
 					if (incompleteArguments) {
 						entry.block.incompleteArguments = true;
 						entry.block.incompleteArgumentsReason = incompleteArgumentsReason;

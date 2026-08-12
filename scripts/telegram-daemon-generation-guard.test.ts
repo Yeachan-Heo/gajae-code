@@ -131,7 +131,7 @@ const telegramToolActivityDeclarations = {
 } as const;
 
 const telegramTopicAdmissionDeclarations = {
-	[config]: ["isTelegramOrchestrationSession"],
+	[config]: ["isTelegramSessionEligible"],
 	[busIndex]: ["buildIdentity", "createNotificationsExtension"],
 	[telegramDaemon]: [
 		"TelegramNotificationDaemon.#topicAdmissionAllows",

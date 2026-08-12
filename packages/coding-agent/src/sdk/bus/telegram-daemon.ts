@@ -6534,9 +6534,19 @@ export class TelegramNotificationDaemon {
 	#logicalSessionId(session: AttachmentSession): string {
 		return session.logicalSessionId ?? session.sessionId;
 	}
-	#topicAdmissionAllows(session?: AttachmentSession): boolean {
-		if (this.opts.requireTelegramTopicEligibility === true && !this.#topicRegistryLoaded) return false;
-		return this.opts.requireTelegramTopicEligibility !== true || session?.telegramTopicsEnabled === true;
+	/**
+	 * Topic admission in threaded mode depends only on the daemon having durable
+	 * registry authority, never on what the attached session claimed about
+	 * itself. A session's self-declared eligibility is not proof of anything: a
+	 * still-running session started by an older build declares `false` forever,
+	 * and refusing it there silently downgraded every one of its notifications to
+	 * flat chat-root delivery. Threaded mode always uses threads.
+	 *
+	 * The registry fence stays: without a loaded registry the daemon cannot tell
+	 * whether a topic already exists, and creating one would duplicate it.
+	 */
+	#topicAdmissionAllows(_session?: AttachmentSession): boolean {
+		return this.opts.requireTelegramTopicEligibility !== true || this.#topicRegistryLoaded;
 	}
 	#topicAdmissionEndpointKey(attachment: SessionAttachment): string {
 		return attachment.authorityId ?? `${attachment.generation}\0${attachment.connectionId ?? "unknown"}`;

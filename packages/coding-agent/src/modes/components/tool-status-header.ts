@@ -19,7 +19,7 @@ import type { ActionRegistry, FocusDomain } from "../action-registry";
 import { EMPTY_JOBS_SNAPSHOT, type JobsSnapshot } from "../jobs-observer";
 import { sanitizeStatusText } from "../shared";
 import { renderSkillHudBar } from "./skill-hud/render";
-import { lookupCurrentPr } from "./status-line/gh";
+import { lookupCurrentPrCached } from "./status-line/gh";
 import {
 	canReuseCachedPr,
 	createPrCacheContext,
@@ -399,6 +399,10 @@ export class StatusLineComponent implements Component {
 
 		this.#prLookupInFlight = true;
 		const lookupContext = currentContext;
+		if (!lookupContext) {
+			this.#prLookupInFlight = false;
+			return stalePr ?? null;
+		}
 
 		// Fire async lookup, keep stale value visible until resolved
 		(async () => {
@@ -415,7 +419,7 @@ export class StatusLineComponent implements Component {
 			};
 			try {
 				// Requires `gh repo set-default` to be configured; fails gracefully if not
-				const pr = await lookupCurrentPr();
+				const pr = await lookupCurrentPrCached(`${lookupContext.repoId ?? ""}\0${lookupContext.branch}`);
 				setCachedPr(pr);
 			} finally {
 				this.#prLookupInFlight = false;
@@ -620,6 +624,10 @@ export class StatusLineComponent implements Component {
 		const contextPctSegmentActive =
 			effectiveSettings.leftSegments.includes("context_pct") ||
 			effectiveSettings.rightSegments.includes("context_pct");
+		// Never spawn a gh lookup when no pr segment is rendered; the pr segment
+		// treats a null value as hidden, so gating here is behavior-identical.
+		const prSegmentActive =
+			effectiveSettings.leftSegments.includes("pr") || effectiveSettings.rightSegments.includes("pr");
 
 		return {
 			session: this.session,
@@ -638,7 +646,7 @@ export class StatusLineComponent implements Component {
 			git: {
 				branch: this.#getCurrentBranch(),
 				status: this.#getGitStatus(),
-				pr: this.#lookupPr(),
+				pr: prSegmentActive ? this.#lookupPr() : null,
 			},
 			usage: this.#cachedUsage,
 		};

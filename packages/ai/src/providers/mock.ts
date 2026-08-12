@@ -77,6 +77,8 @@ export type MockContent =
 			incompleteArguments?: boolean;
 			/** Typed reason matching `ToolCall.incompleteArgumentsReason`. Defaults to `"truncated"`. */
 			incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
+			/** Simulate a provider-flagged `\uXXXX`-escaped non-ASCII argument payload. */
+			escapedNonAsciiArguments?: boolean;
 	  };
 /** One scripted response. */
 export interface MockResponse {
@@ -426,6 +428,7 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 			...(input.incompleteArguments
 				? { incompleteArguments: true, incompleteArgumentsReason: input.incompleteArgumentsReason ?? "truncated" }
 				: {}),
+			...(input.escapedNonAsciiArguments ? { escapedNonAsciiArguments: true } : {}),
 		} as ToolCall;
 	}
 	return input;

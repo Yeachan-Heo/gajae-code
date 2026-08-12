@@ -110,6 +110,86 @@ export function repairJson(json: string): string {
 	return parts.join("");
 }
 
+/**
+ * First unnecessary `\uXXXX` escape in a JSON document, or `undefined` when the
+ * document contains none.
+ *
+ * "Unnecessary" means the escape encodes a character JSON can carry literally:
+ * any non-ASCII printable character. Control characters (< U+0020) MUST be
+ * escaped, and an unpaired surrogate CANNOT be written literally, so neither
+ * counts. A `\\uXXXX` sequence is a literal backslash followed by `u` — the
+ * intended source syntax when the model is writing code or a nested JSON
+ * document — and is skipped, which is why this scans the raw text with the same
+ * string/escape state machine as {@link repairJson} instead of using a regex.
+ *
+ * Models that spell non-ASCII text as hand-written hex instead of literal UTF-8
+ * mistype the digits, and every mistyped nibble silently decodes to a different
+ * but perfectly valid character (`\uc7a5` vs `\uc7a4`). The resulting arguments
+ * parse cleanly and cannot be repaired after the fact, so the escape itself is
+ * the only observable evidence that the payload is untrustworthy.
+ */
+export function findUnnecessaryUnicodeEscape(json: string): string | undefined {
+	const len = json.length;
+	let inString = false;
+	let i = 0;
+
+	const hexAt = (start: number): number | undefined => {
+		if (start + 3 >= len) return undefined;
+		for (let k = start; k <= start + 3; k++) if (!isHexDigit(json.charCodeAt(k))) return undefined;
+		return Number.parseInt(json.slice(start, start + 4), 16);
+	};
+
+	while (i < len) {
+		if (!inString) {
+			const open = json.indexOf('"', i);
+			if (open === -1) return undefined;
+			inString = true;
+			i = open + 1;
+			continue;
+		}
+
+		// Jump straight to the next quote or backslash. A per-character walk costs
+		// ~40ms on a 1MB literal-UTF-8 payload (a large `write`), and every byte in
+		// between is by definition uninteresting.
+		const nextQuote = json.indexOf('"', i);
+		const nextBackslash = json.indexOf("\\", i);
+		if (nextQuote === -1 && nextBackslash === -1) return undefined;
+		i = nextBackslash === -1 || (nextQuote !== -1 && nextQuote < nextBackslash) ? nextQuote : nextBackslash;
+
+		if (json.charCodeAt(i) === QUOTE) {
+			inString = false;
+			i++;
+			continue;
+		}
+		if (json.charCodeAt(i + 1) !== U) {
+			// Any other escape (including `\\`) consumes its own second character,
+			// so a literal `\uXXXX` in the decoded value is never misread as one.
+			i += 2;
+			continue;
+		}
+
+		const first = hexAt(i + 2);
+		if (first === undefined) {
+			i += 2;
+			continue;
+		}
+		if (first >= 0xd800 && first <= 0xdbff) {
+			// High surrogate: only a completed pair denotes a real character.
+			const low = json.charCodeAt(i + 6) === BACKSLASH && json.charCodeAt(i + 7) === U ? hexAt(i + 8) : undefined;
+			if (low !== undefined && low >= 0xdc00 && low <= 0xdfff) {
+				return json.slice(i, i + 12);
+			}
+			i += 6;
+			continue;
+		}
+		if (first >= 0x80 && !(first >= 0xdc00 && first <= 0xdfff)) {
+			return json.slice(i, i + 6);
+		}
+		i += 6;
+	}
+	return undefined;
+}
+
 export function parseJsonWithRepair<T>(json: string): T {
 	try {
 		return JSON.parse(json) as T;

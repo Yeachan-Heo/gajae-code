@@ -7,7 +7,7 @@ import { type MCPAction, type MCPCommandArgs, runMCPCommand } from "../cli/mcp-c
 const ACTIONS: MCPAction[] = ["add", "list", "remove"];
 
 export default class MCP extends Command {
-	static description = "Store standalone MCP server definitions without loading them at runtime";
+	static description = "Register MCP servers that ordinary standalone sessions load at startup";
 	static delegateHelp = true;
 
 	static examples = [
@@ -87,15 +87,15 @@ export default class MCP extends Command {
 	}
 
 	#printHelp(): void {
-		process.stdout.write(`Store standalone MCP server definitions in GJC config without loading them at runtime
+		process.stdout.write(`Register MCP servers that ordinary standalone sessions load at startup
 
 USAGE
   $ gjc mcp [add|list|remove] [NAME] [COMMAND_OR_URL] [ARGS...] [FLAGS]
 
 COMMANDS
-  add     Store an explicit user-provided MCP server definition
-  list    List stored servers with env/header/auth values redacted
-  remove  Remove a stored server and print the removed definition redacted
+  add     Register an explicit user-provided MCP server definition
+  list    List registered servers with source, status, and env/header/auth values redacted
+  remove  Remove a registered server and print the removed definition redacted
 
 FLAGS
       --project          Use project scope (./.gjc/mcp.json) instead of user scope
@@ -117,8 +117,13 @@ EXAMPLES
   $ gjc mcp list --json
   $ gjc mcp remove context7
 
-STORAGE/RUNTIME
-  This command stores only the server definition supplied on this invocation. It does not import or inherit Claude Code, Codex, OpenCode, or other live MCP configs. Normal standalone gjc sessions do not load stored MCP registrations today. Public output redacts env, header, auth, and OAuth credential values.
+RUNTIME
+  Registrations are consumed by ordinary standalone gjc sessions at startup
+  (conventional autoload) unless disabled (enabled: false or the disabledServers
+  list), marked autoload: false, or the session opts out with --no-mcp. This
+  command stores only the definition supplied on this invocation; it does not
+  import or inherit Claude Code, Codex, OpenCode, or other live MCP configs.
+  Public output redacts env, header, auth, and OAuth credential values.
 `);
 	}
 }

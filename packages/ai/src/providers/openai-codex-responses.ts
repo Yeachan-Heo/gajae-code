@@ -57,7 +57,7 @@ import {
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
-import { parseStreamingJson } from "../utils/json-parse";
+import { findUnnecessaryUnicodeEscape, parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import {
 	adaptSchemaForStrict,
@@ -1276,6 +1276,7 @@ function handleToolCallArgumentsDone(
 	if (typeof args === "string") {
 		currentBlock.partialJson = args;
 		currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
+		if (findUnnecessaryUnicodeEscape(args)) currentBlock.escapedNonAsciiArguments = true;
 	}
 }
 
@@ -1391,6 +1392,7 @@ function handleOutputItemDone(
 			id,
 			name: codexToolCanonicalName(item.name),
 			arguments: parseStreamingJson(item.arguments || "{}"),
+			...(findUnnecessaryUnicodeEscape(item.arguments || "") ? { escapedNonAsciiArguments: true } : {}),
 		};
 		runtime.canSafelyReplayWebsocketOverSse = false;
 		stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });

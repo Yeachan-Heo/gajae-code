@@ -14,17 +14,17 @@ import { ConfigFile, type LoadResult } from "../../config/config-file";
  */
 export const SPAWN_PROVENANCE_ENV = "GJC_SPAWNED_BY_SESSION";
 /**
- * Telegram forum-topic ownership is reserved for sessions launched with
- * coordinator or lifecycle provenance. A plain notification opt-in is not
- * sufficient because it would turn every ordinary session into a topic.
+ * Telegram session eligibility: whether a session may own a forum topic and be
+ * admitted by the notification daemon.
+ *
+ * This follows the user's configuration, never how the session was launched.
+ * Gating it on coordinator/lifecycle provenance made every ordinary
+ * interactive session declare itself ineligible, and the daemon refuses an
+ * identity header that does so — so no notification was ever delivered even
+ * though the daemon looked healthy and attached.
  */
-export function isTelegramOrchestrationSession(env: NodeJS.ProcessEnv = process.env): boolean {
-	return [
-		env.GJC_COORDINATOR_SESSION_ID,
-		env.GJC_COORDINATOR_SESSION_STATE_FILE,
-		env.GJC_LIFECYCLE_REQUEST_ID,
-		env.GJC_SDK_LIFECYCLE_REQUEST,
-	].some(value => typeof value === "string" && value.trim().length > 0);
+export function isTelegramSessionEligible(cfg: NotificationConfig): boolean {
+	return isProviderEffectivelyEnabled(cfg, "telegram") && isTelegramComplete(cfg);
 }
 
 export type TelegramActivationState = "inactive" | "blocked";

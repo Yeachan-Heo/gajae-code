@@ -27,7 +27,7 @@ import type {
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { parseStreamingJson } from "../utils/json-parse";
+import { findUnnecessaryUnicodeEscape, parseStreamingJson } from "../utils/json-parse";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import { CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
@@ -564,6 +564,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (state.currentToolCall) {
 				const idx = output.content.indexOf(state.currentToolCall);
 				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
+				if (findUnnecessaryUnicodeEscape(state.currentToolCall.partialJson ?? "")) {
+					state.currentToolCall.escapedNonAsciiArguments = true;
+				}
 				delete (state.currentToolCall as any).partialJson;
 				delete (state.currentToolCall as any).index;
 				stream.push({

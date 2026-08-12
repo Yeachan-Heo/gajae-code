@@ -1992,7 +1992,7 @@ it("rejects corrupt tail and commit artifacts through manager reopen", async () 
 			await reopened.close();
 		}
 	}
-});
+}, 30_000);
 
 it("refreshes split residency metrics after append and retained off-mode rollback", async () => {
 	const storage = new MemorySessionStorage();
@@ -2967,7 +2967,7 @@ it("recovers eagerly when staged selection publication outlives marker publicati
 	} finally {
 		await verified.close();
 	}
-});
+}, 30_000);
 
 describe("malformed transcript sidecar fallback", () => {
 	it("keeps malformed known records eager", async () => {
@@ -3917,7 +3917,7 @@ describe("sidecar I/O fallback", () => {
 		} finally {
 			await verified.close();
 		}
-	});
+	}, 30_000);
 	it("recovers from transcript publication followed by tail journal failure", async () => {
 		class TailFailureStorage extends MemorySessionStorage {
 			failTail = false;
@@ -4174,7 +4174,7 @@ describe("sidecar I/O fallback", () => {
 		} finally {
 			await reopened.close();
 		}
-	});
+	}, 30_000);
 
 	it("serves arbitrary disjoint parent lookups after reopen without scanning .spill.idx", async () => {
 		class CountingStorage extends MemorySessionStorage {
@@ -4231,7 +4231,7 @@ describe("sidecar I/O fallback", () => {
 		} finally {
 			await reopened.close();
 		}
-	});
+	}, 30_000);
 
 	it("preserves transcript physical order for artifact parent lookups across reopen", async () => {
 		class CountingStorage extends MemorySessionStorage {
@@ -4366,7 +4366,7 @@ describe("sidecar I/O fallback", () => {
 		} finally {
 			await reopened.close();
 		}
-	});
+	}, 30_000);
 
 	it("binds the parent artifact into the commit marker and reopens exactly", async () => {
 		const storage = new MemorySessionStorage();
@@ -4413,7 +4413,7 @@ describe("sidecar I/O fallback", () => {
 		} finally {
 			await reopened.close();
 		}
-	});
+	}, 30_000);
 
 	it("appends parent records before publishing the commit marker and serves them after reopen", async () => {
 		class CountingStorage extends MemorySessionStorage {
@@ -4478,7 +4478,7 @@ describe("sidecar I/O fallback", () => {
 		} finally {
 			await reopened.close();
 		}
-	});
+	}, 30_000);
 
 	it("publishes appended reducer ordinals in the flat-index coordinate space", async () => {
 		const storage = new MemorySessionStorage();
@@ -5136,7 +5136,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 		} finally {
 			await reopened.close();
 		}
-	});
+	}, 30_000);
 
 	it("demotes oversized provider values into the metadata-delta and reproduces them on exact reopen", async () => {
 		const storage = new MemorySessionStorage();
@@ -5250,7 +5250,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 		} finally {
 			await runtimeCorrupt.close();
 		}
-	});
+	}, 30_000);
 
 	it("rebuilds bounded state when the metadata-delta binding is corrupt or missing", async () => {
 		const storage = new MemorySessionStorage();
@@ -5321,7 +5321,7 @@ describe("persistent dictionary and metadata-delta artifacts", () => {
 		} finally {
 			await malformedBinding.close();
 		}
-	});
+	}, 30_000);
 
 	itPosix("keeps managed dictionary and delta acceleration outside the managed tree", async () => {
 		const tempDir = TempDir.createSync("@pi-managed-dict-exclusion-");

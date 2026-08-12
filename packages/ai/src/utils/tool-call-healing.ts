@@ -17,7 +17,7 @@
  * the end of a chunk is held back until the next chunk arrives.
  */
 
-import { parseJsonWithRepair } from "./json-parse";
+import { findUnnecessaryUnicodeEscape, parseJsonWithRepair } from "./json-parse";
 
 const TOK_SECTION_BEGIN = "<|tool_calls_section_begin|>";
 const TOK_SECTION_END = "<|tool_calls_section_end|>";
@@ -34,6 +34,13 @@ export interface HealedToolCall {
 	readonly id: string;
 	readonly name: string;
 	readonly arguments: string;
+	/**
+	 * Whether the raw leaked payload spelled a printable non-ASCII character as a
+	 * `\uXXXX` escape. Captured BEFORE the normalizing round-trip below, which
+	 * decodes escapes into literal characters and would otherwise erase the only
+	 * evidence that the text is unverifiable.
+	 */
+	readonly escapedNonAsciiArguments: boolean;
 }
 
 /**
@@ -230,6 +237,10 @@ export class ToolCallHealer {
 		const name = normalizeFunctionName(rawId);
 		const id = generateHealedToolCallId();
 
+		// Sample the raw payload first: the round-trip below decodes `\uXXXX` into
+		// literal characters, so checking `argsJson` afterwards always reports clean.
+		const escapedNonAsciiArguments = findUnnecessaryUnicodeEscape(rawArgs) !== undefined;
+
 		let argsJson = rawArgs;
 		if (rawArgs.length > 0) {
 			try {
@@ -242,7 +253,7 @@ export class ToolCallHealer {
 			argsJson = "{}";
 		}
 
-		this.#completed.push({ id, name, arguments: argsJson });
+		this.#completed.push({ id, name, arguments: argsJson, escapedNonAsciiArguments });
 		this.#inCall = false;
 		this.#inArgs = false;
 		this.#pendingId = "";

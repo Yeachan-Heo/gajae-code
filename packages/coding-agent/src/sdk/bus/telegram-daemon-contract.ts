@@ -220,9 +220,19 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * and lease renewal to identities with coordinator or lifecycle provenance.
  * Generation 154 archives private-chat topics through deleteForumTopic, settles
  * TOPIC_ID_INVALID as definitive, and drains durable archive retries periodically.
- * Generation 155 updates terminal-abort notification admission and cleanup semantics.
+ * Generation 155 unifies the duplicated durable terminal-retention write path
+ * (bus and SDK-only host runtimes) into a single `boundTerminalRetentionState`
+ * helper in `session/terminal-abort.ts` (#4329).
+ * Generation 156 derives Telegram session eligibility from configuration
+ * (Telegram configured and effectively enabled) instead of coordinator or
+ * lifecycle launch provenance, and stops consulting a session's self-declared
+ * eligibility for topic admission: threaded mode always uses threads. Before
+ * this, every ordinary interactive session declared itself ineligible, the
+ * daemon rejected its identity header, no topic was created, and nothing was
+ * delivered while attachments still looked healthy.
+ * Generation 157 updates terminal-abort notification admission and cleanup semantics.
  */
-export const DAEMON_GENERATION = 155;
+export const DAEMON_GENERATION = 157;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

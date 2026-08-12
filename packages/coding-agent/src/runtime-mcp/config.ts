@@ -24,6 +24,13 @@ export interface LoadMCPConfigsOptions {
 	filterBrowser?: boolean;
 	/** Only include startup-eligible servers; exact-config sessions always enforce autoload !== false. */
 	autoloadOnly?: boolean;
+	/**
+	 * Restrict discovery to GJC's own native config (`.gjc/` project and
+	 * `~/.gjc/agent/` user scopes). Conventional standalone sessions use this
+	 * mode: Claude Code/Codex project/global MCP files are explicit import
+	 * sources into `.gjc`, not implicit competing runtime authorities.
+	 */
+	nativeOnly?: boolean;
 	/** Load only this explicit MCP config file. */
 	configPath?: string;
 }
@@ -38,6 +45,8 @@ export interface LoadMCPConfigsResult {
 	sources: Record<string, SourceMeta>;
 	/** Whether the explicit configuration was unavailable or contained invalid entries. */
 	configurationWarning: boolean;
+	/** Provider warnings surfaced during discovery (parse/skip diagnostics). */
+	warnings: string[];
 }
 
 /**
@@ -115,17 +124,35 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	let servers: MCPServer[];
 	let disabledServers: Set<string>;
 	let configurationWarning = false;
+	let warnings: string[] = [];
 	if (exactConfig) {
 		const result = await loadMCPJsonFile(options.configPath!, "project", { quiet: true });
 		servers = result.items;
 		disabledServers = new Set(result.disabledServers);
-		configurationWarning = (result.warnings?.length ?? 0) > 0;
+		warnings = result.warnings ?? [];
+		configurationWarning = warnings.length > 0;
 	} else {
-		// Load MCP servers via capability system
-		const result = await loadCapability<MCPServer>(mcpCapability.id, { cwd });
+		// Load MCP servers via capability system. Conventional standalone
+		// sessions restrict discovery to GJC's native `.gjc` scopes (nativeOnly),
+		// keeping Claude Code/Codex files as explicit import sources rather than
+		// implicit runtime authorities.
+		const result = await loadCapability<MCPServer>(mcpCapability.id, {
+			cwd,
+			providers: options?.nativeOnly === true ? ["native"] : undefined,
+		});
 		// Filter out project-level configs if disabled
 		servers = enableProjectConfig ? result.items : result.items.filter(server => server._source.level !== "project");
-		disabledServers = new Set(await readDisabledServers(getMCPConfigPath("user", cwd)));
+		// The disabledServers denylist is honored from both native scopes so a
+		// name listed in either GJC config file stays out of runtime loading.
+		// Each scope is read independently: a malformed config file in one scope
+		// must not abort discovery of valid servers in the other scope (the
+		// capability loader itself is already per-file tolerant).
+		const [userDisabled, projectDisabled] = await Promise.all([
+			readDisabledServers(getMCPConfigPath("user", cwd)).catch(() => []),
+			readDisabledServers(getMCPConfigPath("project", cwd)).catch(() => []),
+		]);
+		disabledServers = new Set([...userDisabled, ...projectDisabled]);
+		warnings = result.warnings;
 	}
 
 	// Convert to legacy format and preserve source metadata
@@ -158,7 +185,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		sources = browserResult.sources;
 	}
 
-	return { configs, exaApiKeys, sources, configurationWarning };
+	return { configs, exaApiKeys, sources, configurationWarning, warnings };
 }
 
 /** Pattern to match Exa MCP servers */

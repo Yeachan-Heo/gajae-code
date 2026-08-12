@@ -602,6 +602,16 @@ export interface ToolCall {
 	 * `incompleteArguments` continue to work.
 	 */
 	incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
+	/**
+	 * Set when the raw argument JSON spelled a printable non-ASCII character as a
+	 * `\uXXXX` escape instead of literal UTF-8. Such a payload parses cleanly but
+	 * is unverifiable: one mistyped hex digit decodes to a different, equally
+	 * valid character, so the text can be silently wrong with no in-band evidence.
+	 * The agent loop rejects the call with a retryable error instead of executing
+	 * it. Escapes that are required (control characters) or unavoidable (lone
+	 * surrogates) never set this.
+	 */
+	escapedNonAsciiArguments?: boolean;
 }
 
 export interface Usage {

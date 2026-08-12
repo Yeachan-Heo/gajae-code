@@ -24,7 +24,7 @@ import {
 	isGenericNotificationHostEligible,
 	isGenericNotificationSessionEnabled,
 	isProviderEffectivelyEnabled,
-	isTelegramOrchestrationSession,
+	isTelegramSessionEligible,
 	maskToken,
 	type NotificationConfig,
 	type RedactableAction,
@@ -1356,16 +1356,16 @@ describe("notifications config", () => {
 		expect(hasAnyEffectivelyEnabledProvider(mixedAdapterCfg)).toBe(true);
 		expect(telegramEffectivelyEnabled(mixedAdapterCfg)).toBe(false);
 	});
-	test("isTelegramOrchestrationSession requires coordinator or lifecycle provenance", () => {
-		expect(isTelegramOrchestrationSession({})).toBe(false);
-		expect(isTelegramOrchestrationSession({ GJC_NOTIFICATIONS: "1" })).toBe(false);
-		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_ID: "coordinator-1" })).toBe(true);
-		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_STATE_FILE: "/tmp/session-state.json" })).toBe(
-			true,
-		);
-		expect(isTelegramOrchestrationSession({ GJC_LIFECYCLE_REQUEST_ID: "lifecycle-1" })).toBe(true);
-		expect(isTelegramOrchestrationSession({ GJC_SDK_LIFECYCLE_REQUEST: "{}" })).toBe(true);
-		expect(isTelegramOrchestrationSession({ GJC_COORDINATOR_SESSION_ID: "  " })).toBe(false);
+	test("isTelegramSessionEligible follows configuration, not launch provenance", () => {
+		// Regression: eligibility used to require coordinator/lifecycle env, so an
+		// ordinary interactive session declared itself ineligible and the daemon
+		// refused its identity header — notifications silently never arrived.
+		expect(isTelegramSessionEligible(GLOBAL_CFG)).toBe(true);
+		expect(isTelegramSessionEligible({ ...BASE_CFG, enabled: true })).toBe(false);
+		expect(isTelegramSessionEligible({ ...GLOBAL_CFG, enabled: false })).toBe(false);
+		expect(isTelegramSessionEligible({ ...GLOBAL_CFG, botToken: undefined })).toBe(false);
+		expect(isTelegramSessionEligible({ ...GLOBAL_CFG, chatId: undefined })).toBe(false);
+		expect(isTelegramSessionEligible({ ...GLOBAL_CFG, telegram: { enabled: false } })).toBe(false);
 	});
 
 	test("isGenericNotificationSessionEnabled applies precedence", () => {

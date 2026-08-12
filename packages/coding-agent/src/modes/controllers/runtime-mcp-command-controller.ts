@@ -1466,8 +1466,9 @@ export class MCPCommandController {
 		// Disconnect all existing servers
 		await this.ctx.mcpManager.disconnectAll();
 
-		// Rediscover and connect
-		const result = await this.ctx.mcpManager.discoverAndConnect();
+		// Rediscover and connect (native `.gjc` scopes only: Claude Code/Codex
+		// MCP files are explicit import sources, not runtime authorities).
+		const result = await this.ctx.mcpManager.discoverAndConnect({ nativeOnly: true });
 		await this.ctx.session.refreshMCPTools(this.ctx.mcpManager.getTools());
 
 		// Show any connection errors

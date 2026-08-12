@@ -303,11 +303,10 @@ describe("Telegram provider supervisor ownership", () => {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
-	test("strict topic admission quarantines ordinary endpoints and archives their orphaned topic", async () => {
+	test("threaded mode admits an ordinary endpoint and keeps its topic", async () => {
 		const agentDir = tempAgentDir();
-		let now = 1_000;
+		const now = 1_000;
 		const calls: string[] = [];
-		let scheduledCleanup: (() => void) | undefined;
 		const botApi: BotApi = {
 			call: async method => {
 				calls.push(method);
@@ -325,10 +324,7 @@ describe("Telegram provider supervisor ownership", () => {
 			now: () => now,
 			installationHostId: "provider-owner",
 			requireTelegramTopicEligibility: true,
-			setTimeoutImpl: callback => {
-				scheduledCleanup = () => callback();
-				return setTimeout(() => {}, 0);
-			},
+			setTimeoutImpl: () => setTimeout(() => {}, 0),
 		});
 		try {
 			fs.mkdirSync(path.dirname(statePath), { recursive: true });
@@ -381,41 +377,21 @@ describe("Telegram provider supervisor ownership", () => {
 				lastSeq: 0,
 				events: [{ payload: { type: "identity_header", sessionId: "ordinary", telegramTopicsEnabled: false } }],
 			});
-			expect(retired).toBe(1);
-			expect(daemon.sessions.has("ordinary")).toBe(false);
-			expect(calls).toEqual([]);
+			// Threaded mode always uses threads. A session that declares itself
+			// topic-ineligible (every session still running an older build) must not
+			// be retired, quarantined, or downgraded to flat chat-root delivery, and
+			// its existing topic must stay active rather than being archived.
+			expect(retired).toBe(0);
+			expect(daemon.sessions.has("ordinary")).toBe(true);
+			// The session is admitted, so normal topic reconciliation may run; what
+			// must never happen is the topic being closed or orphaned.
+			expect(calls).not.toContain("createForumTopic");
 			const persisted = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
 				topics: { ordinary: { authorityState: string; orphanedAt?: number } };
 			};
-			expect(persisted.topics.ordinary).toMatchObject({ authorityState: "disconnect_grace", orphanedAt: now });
-
-			routing.attach({ ...attachment });
-			const quarantined = daemon.sessions.get(attachment.sessionId);
-			if (!quarantined) throw new Error("Expected a quarantined Telegram attachment session.");
-			await daemon.handleSessionMessage(quarantined, {
-				type: "identity_header",
-				sessionId: "ordinary",
-				telegramTopicsEnabled: true,
-			});
-			expect(calls).toEqual([]);
-			if (!scheduledCleanup) throw new Error("Expected rejected topic cleanup to be scheduled.");
-			now += 60_001;
-			scheduledCleanup();
-			// The grace archival settles asynchronously; poll bounded instead of a
-			// fixed sleep so heavy parallel suite load cannot flake this assertion.
-			const deadline = Date.now() + 5_000;
-			let archived: { topics: { ordinary: { authorityState: string } } };
-			do {
-				await Bun.sleep(25);
-				archived = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
-					topics: { ordinary: { authorityState: string } };
-				};
-			} while (archived.topics.ordinary.authorityState !== "inactive" && Date.now() < deadline);
-			// A private paired chat has no closeForumTopic; the archive must use
-			// deleteForumTopic (closeForumTopic is supergroup-forum-only).
-			expect(calls).toContain("deleteForumTopic");
+			expect(persisted.topics.ordinary).toMatchObject({ authorityState: "active" });
+			expect(persisted.topics.ordinary.orphanedAt).toBeUndefined();
 			expect(calls).not.toContain("closeForumTopic");
-			expect(archived.topics.ordinary.authorityState).toBe("inactive");
 		} finally {
 			daemon.requestStop();
 			fs.rmSync(agentDir, { recursive: true, force: true });

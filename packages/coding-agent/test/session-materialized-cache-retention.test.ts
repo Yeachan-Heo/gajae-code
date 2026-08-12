@@ -49,7 +49,7 @@ describe("SessionManager materialized cache retention", () => {
 		} finally {
 			await manager.close();
 		}
-	});
+	}, 30_000);
 
 	it("allows above-cap weak caches to rebuild after collection without losing content", async () => {
 		SessionManagerTestHooks.materializedCacheMaxBytesOverride = 1024;

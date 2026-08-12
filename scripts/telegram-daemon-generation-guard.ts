@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 47;
+export const GUARD_CONTRACT_VERSION = 48;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -70,7 +70,7 @@ type GuardManifest = {
  * protected because old owners must be replaced when that admission path changes.
  */
 export const protectedInventory = manifest.inventory as Inventory;
-const PROTECTED_INVENTORY_SHA256 = "228f081a2d02781eb548f218bd83dca8e82badc9d7879310ed6ebbc6293c7c63";
+const PROTECTED_INVENTORY_SHA256 = "2e76706a9ebe0362f8a48c191677f0ca682ea6d4a39b29fafedabce8e677c118";
 
 /** Transition-marker generations fence every daemon lifecycle mutation. */
 export const TRANSITION_TOKEN_PROTECTED_DECLARATIONS = [
@@ -193,9 +193,9 @@ export const TELEGRAM_TOOL_ACTIVITY_PROTECTED_DECLARATIONS = {
 	],
 } as const;
 
-/** Topic admission must preserve orchestration provenance from identity production through registry load. */
+/** Topic admission must preserve session eligibility from identity production through registry load. */
 export const TELEGRAM_TOPIC_ADMISSION_PROTECTED_DECLARATIONS = {
-	[config]: ["isTelegramOrchestrationSession"],
+	[config]: ["isTelegramSessionEligible"],
 	[busIndex]: ["buildIdentity", "createNotificationsExtension"],
 	[telegramDaemon]: [
 		"TelegramNotificationDaemon.#topicAdmissionAllows",

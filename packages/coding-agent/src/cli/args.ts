@@ -53,6 +53,8 @@ export interface Args {
 	clipboardTransport?: "auto" | "native" | "osc52" | "ssh";
 	clipboardSshHost?: string;
 	mcpConfig?: string;
+	/** Opt a standalone session out of conventional MCP autoload (mutually exclusive with --mcp-config). */
+	noMcp?: boolean;
 	thinking?: Effort;
 	continue?: boolean;
 	resume?: string | true;
@@ -260,11 +262,19 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 			if (result.mcpConfig !== undefined) {
 				throw new CliParseError("--mcp-config can only be specified once");
 			}
+			if (result.noMcp === true) {
+				throw new CliParseError("--no-mcp and --mcp-config are mutually exclusive");
+			}
 			const next = args[i + 1];
 			if (!next || next.startsWith("-") || !path.isAbsolute(next)) {
 				throw new CliParseError("--mcp-config requires <absolute-path>");
 			}
 			result.mcpConfig = args[++i];
+		} else if (arg === "--no-mcp") {
+			result.noMcp = true;
+			if (result.mcpConfig !== undefined) {
+				throw new CliParseError("--no-mcp and --mcp-config are mutually exclusive");
+			}
 		} else if (arg === "--provider-session-id") {
 			result.providerSessionId = takeFlagValue(args, i++, "--provider-session-id");
 		} else if (arg === "--no-session") {
