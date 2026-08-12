@@ -20,10 +20,13 @@ import { COORDINATOR_MCP_TOOL_NAMES } from "../packages/coding-agent/src/coordin
 
 const repoRoot = path.join(import.meta.dir, "..");
 const pluginsDir = path.join(repoRoot, "plugins");
+const pluginsSrcDir = path.join(repoRoot, "plugins-src");
 
 const DELEGATE_TOOLS = COORDINATOR_MCP_TOOL_NAMES.filter(name => name.startsWith("gjc_delegate_"));
 
 const PLUGIN_NAME = "gajae-code";
+const RUST_SKILLS_PLUGIN = "rust-skills";
+export const FIRST_PARTY_PLUGIN_DIRS = [PLUGIN_NAME, RUST_SKILLS_PLUGIN] as const;
 const NAMESPACE_LABEL = "gajae-code-plugin";
 
 interface DelegateMeta {
@@ -76,6 +79,30 @@ function readPackageVersion(): string {
 
 function json(value: unknown): string {
 	return `${JSON.stringify(value, null, 2)}\n`;
+}
+function listSourceFiles(dir: string, rel = ""): string[] {
+	if (!fs.existsSync(dir)) return [];
+	const files: string[] = [];
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const entryRel = path.join(rel, entry.name);
+		const entryPath = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			files.push(...listSourceFiles(entryPath, entryRel));
+		} else {
+			files.push(entryRel);
+		}
+	}
+	return files;
+}
+
+function addStaticPluginFiles(files: Map<string, string>, pluginName: string): void {
+	const srcRoot = path.join(pluginsSrcDir, pluginName);
+	if (!fs.existsSync(srcRoot)) {
+		throw new Error(`Missing first-party plugin source: plugins-src/${pluginName}`);
+	}
+	for (const rel of listSourceFiles(srcRoot)) {
+		files.set(path.join(pluginName, rel), fs.readFileSync(path.join(srcRoot, rel), "utf8"));
+	}
 }
 
 function coordinatorServer(projectDirToken: string): Record<string, unknown> {
@@ -330,6 +357,15 @@ export function renderPluginFiles(): Map<string, string> {
 					author: { name: "Gajae Code" },
 					keywords: ["gjc", "delegation", "mcp", "planning", "agents", "sdk"],
 				},
+				{
+					name: RUST_SKILLS_PLUGIN,
+					source: `./${RUST_SKILLS_PLUGIN}`,
+					description:
+						"Rust best-practices corpus with once-per-session auto-injected guidance for Rust files.",
+					version: "1.5.1",
+					author: { name: "leonardomso (corpus), Gajae Code (packaging)" },
+					keywords: ["rust", "rules", "skills", "best-practices"],
+				},
 			],
 		}),
 	);
@@ -373,6 +409,7 @@ export function renderPluginFiles(): Map<string, string> {
 	files.set(path.join(dir, "skills", "gjc-sdk-session", "SKILL.md"), sdkSessionSkillDoc());
 	files.set(path.join(dir, "skills", "gjc-sdk-guides", "SKILL.md"), sdkGuidesSkillDoc());
 	files.set(path.join(dir, "README.md"), readmeDoc());
+	addStaticPluginFiles(files, RUST_SKILLS_PLUGIN);
 
 	return files;
 }

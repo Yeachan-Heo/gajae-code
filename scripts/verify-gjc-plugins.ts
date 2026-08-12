@@ -18,7 +18,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { COORDINATOR_MCP_TOOL_NAMES } from "../packages/coding-agent/src/coordinator/contract";
-import { findUnexpectedPluginFiles, renderPluginFiles } from "./generate-gjc-plugins";
+import { FIRST_PARTY_PLUGIN_DIRS, findUnexpectedPluginFiles, renderPluginFiles } from "./generate-gjc-plugins";
 
 const PLUGIN_DIR = "gajae-code";
 
@@ -116,13 +116,20 @@ gate(
 		!!codexEntry.category,
 	JSON.stringify(codexEntry?.source ?? null),
 );
-const claudeMkt = readJson(claudeMarketplace) as { plugins?: Array<{ source?: unknown }> };
+const claudeMkt = readJson(claudeMarketplace) as { plugins?: Array<{ name?: unknown; source?: unknown }> };
+const firstPartySources = new Set(FIRST_PARTY_PLUGIN_DIRS.map(dir => `./${dir}`));
 const claudeSources = claudeMkt.plugins?.map(p => p.source) ?? [];
+const claudeNames = new Set(claudeMkt.plugins?.map(p => p.name) ?? []);
 gate(
 	"Claude marketplace source stays inside root",
 	claudeSources.length > 0 &&
-		claudeSources.every(s => typeof s === "string" && s === `./${PLUGIN_DIR}` && !s.includes("..")),
+		claudeSources.every(s => typeof s === "string" && firstPartySources.has(s) && !s.includes("..")),
 	claudeSources.map(s => JSON.stringify(s)).join(", ") || "none",
+);
+gate(
+	"Claude marketplace lists first-party plugins",
+	FIRST_PARTY_PLUGIN_DIRS.every(dir => claudeNames.has(dir)),
+	[...claudeNames].join(", ") || "none",
 );
 
 // Manifests use the documented camelCase `mcpServers` field.

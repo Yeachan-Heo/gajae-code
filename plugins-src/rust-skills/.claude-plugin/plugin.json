@@ -1,0 +1,7 @@
+{
+  "name": "rust-skills",
+  "description": "Rust best-practices skill (265 rules) with automatic once-per-session rule injection when editing Rust files.",
+  "version": "1.5.1",
+  "skills": "./skills",
+  "rules": "./rules"
+}

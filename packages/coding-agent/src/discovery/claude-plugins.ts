@@ -9,6 +9,7 @@ import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
 import { type Hook, hookCapability } from "../capability/hook";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
+import { type Rule, ruleCapability } from "../capability/rule";
 import { type Skill, skillCapability } from "../capability/skill";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
 import { type CustomTool, toolCapability } from "../capability/tool";
@@ -16,6 +17,7 @@ import type { LoadContext, LoadResult } from "../capability/types";
 import { rootContainsGjcManifest } from "../extensibility/gjc-plugins";
 import {
 	type ClaudePluginRoot,
+	buildRuleFromMarkdown,
 	createSourceMeta,
 	listClaudePluginRoots,
 	loadFilesFromDir,
@@ -32,6 +34,7 @@ interface ClaudePluginManifest {
 	skills?: string;
 	"slash-commands"?: string;
 	commands?: string;
+	rules?: string;
 }
 
 interface ResolvedPluginDir {
@@ -185,6 +188,39 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 
 	return { items, warnings };
 }
+
+// =============================================================================
+// Rules
+// =============================================================================
+
+async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
+	const items: Rule[] = [];
+	const warnings: string[] = [];
+
+	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd);
+	warnings.push(...rootWarnings);
+
+	const results = await Promise.all(
+		roots.map(async root => {
+			const { dir: rulesDir, warning } = await resolvePluginDir(root, ["rules"], "rules");
+			const result = await loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, root.scope, {
+				extensions: ["md", "mdc"],
+				transform: (name, content, path, source) =>
+					buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
+			});
+			return { result, warning };
+		}),
+	);
+
+	for (const { result, warning } of results) {
+		if (warning) warnings.push(warning);
+		items.push(...result.items);
+		if (result.warnings) warnings.push(...result.warnings);
+	}
+
+	return { items, warnings };
+}
+
 
 // =============================================================================
 // Hooks
@@ -380,6 +416,14 @@ registerProvider<SlashCommand>(slashCommandCapability.id, {
 	description: "Load slash commands from GJC marketplace plugins",
 	priority: PRIORITY,
 	load: loadSlashCommands,
+});
+
+registerProvider<Rule>(ruleCapability.id, {
+	id: PROVIDER_ID,
+	displayName: DISPLAY_NAME,
+	description: "Load rules from GJC marketplace plugins",
+	priority: PRIORITY,
+	load: loadRules,
 });
 
 registerProvider<Hook>(hookCapability.id, {
