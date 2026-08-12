@@ -1123,13 +1123,13 @@ interface SessionRuntime {
 	idleSeq: number;
 	/** Interactive asks awaiting a remote answer, by action id. */
 	pendingInteractive: Map<string, PendingInteractiveAsk>;
-	/** Deregisters this session's ask answer source. */
+	/** Deregisters this session's core SDK ask answer source. */
 	disposeAnswerSource: () => void;
-	/** Deregisters this session's Telegram file sink. */
+	/** Deregisters this session's notification-only Telegram file sink. */
 	disposeFileSink: () => void;
 	/** Deregisters this session's workflow-gate listener. */
 	disposeGateListener: () => void;
-	/** Whether notification-only delivery and answer resources are active. */
+	/** Whether notification-only delivery resources are active. */
 	notificationsActive: boolean;
 	/** Provider ownership state is independent from the already-published core SDK runtime. */
 	notificationOwnerState: "ready" | "retry" | "blocked";
@@ -4021,14 +4021,8 @@ export function createNotificationsExtension(
 			rt.notificationsActive = false;
 			rt.disableEphemeralTurns();
 			try {
-				rt.disposeAnswerSource();
-			} catch {}
-			try {
 				rt.disposeFileSink();
 			} catch {}
-			rt.gatePresentations?.cancelInteractive();
-			for (const pending of rt.pendingInteractive.values()) pending.resolve(undefined);
-			rt.pendingInteractive.clear();
 			return true;
 		}
 		// Keep this exact object authoritative for the full terminal release, including
@@ -4236,8 +4230,11 @@ export function createNotificationsExtension(
 			if (lifecycleRequired) return failLifecycleStartup("failed", error);
 			throw error;
 		}
-		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? true, tag);
-		gatePresentations.setPublicationSuspended(true);
+		const gatePresentations = new PresentationArbiter(
+			server,
+			() => (runtime?.notificationsActive ? runtime.redact : false),
+			tag,
+		);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
 		const inFlightGateResolutions = new Set<Promise<void>>();
 		const trackGateResolution = <T>(resolution: Promise<T>): Promise<T> => {
@@ -6692,12 +6689,7 @@ export function createNotificationsExtension(
 
 			server.onReply((err, reply) => {
 				if (err || !reply) return;
-				if (
-					runtime?.inboundFenced ||
-					runtime?.stopping ||
-					runtime?.policySuspended ||
-					runtimes.get(id) !== runtime
-				) {
+				if (runtime?.inboundFenced || runtime?.stopping || runtimes.get(id) !== runtime) {
 					try {
 						server.closeClaimInvalid(reply.replyReceiptId, "session_stopping");
 					} catch {}
@@ -6705,10 +6697,7 @@ export function createNotificationsExtension(
 				}
 				const replyGeneration = runtime.policyGeneration;
 				const replyIsCurrent = (): boolean =>
-					runtimes.get(id) === runtime &&
-					!runtime.stopping &&
-					!runtime.policySuspended &&
-					runtime.policyGeneration === replyGeneration;
+					runtimes.get(id) === runtime && !runtime.stopping && runtime.policyGeneration === replyGeneration;
 				const native = server as unknown as {
 					resolveClaim(receiptId: string, answerJson?: string, idempotencyKey?: string): void;
 					closeClaimInvalid(receiptId: string, reason: string): void;
@@ -7136,6 +7125,11 @@ export function createNotificationsExtension(
 			// daemon ownership. A blocked adapter must not make an interactive session
 			// undiscoverable or uncontrollable.
 			const endpoint = await sdkRuntime.startTransport();
+			initializedRuntime.disposeAnswerSource = registerInteractiveAnswerSource(
+				initializedRuntime.id,
+				pendingInteractive,
+				gatePresentations,
+			);
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
 				initializedRuntime.notificationOwnerState = "retry";
@@ -7241,11 +7235,6 @@ export function createNotificationsExtension(
 				if (runtime.notificationsActive) return;
 				ephemeralTurns.enable();
 				runtime.notificationsActive = true;
-				runtime.disposeAnswerSource = registerInteractiveAnswerSource(
-					runtime.id,
-					pendingInteractive,
-					gatePresentations,
-				);
 				runtime.disposeFileSink = registerTelegramFileSink(runtime.id, async file => {
 					const generation = runtime.policyGeneration;
 					if (!canDeliverAsync(runtime, generation)) return { ok: false, error: TELEGRAM_FILE_REDACTION_ERROR };
@@ -7480,7 +7469,6 @@ export function createNotificationsExtension(
 			if (policy.mode === "provisional") {
 				runtime.policyGeneration++;
 				runtime.policySuspended = true;
-				runtime.gatePresentations?.setPublicationSuspended(true);
 				runtime.redact = true;
 				runtime.verbosity = "lean";
 				runtime.stream = false;
@@ -7511,7 +7499,6 @@ export function createNotificationsExtension(
 			if (runtime.policySuspended) return;
 			if (runtime.notificationOwnerState !== "ready") return;
 			runtime.enableNotifications();
-			runtime.gatePresentations?.setPublicationSuspended(false);
 			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
 			flushPendingFinal(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
@@ -8013,10 +8000,6 @@ export function createNotificationsExtension(
 		} catch (e) {
 			logger.warn(`notifications: activity (idle) failed: ${String(e)}`);
 		}
-		if (!rt.notificationsActive) return;
-		void (typeof rt.workflowGate?.recoverAcceptedGates === "function"
-			? rt.trackGateResolution(rt.workflowGate.recoverAcceptedGates()).catch(() => {})
-			: Promise.resolve());
 		const seq = rt.idleSeq++;
 		// Re-assert the identity header so the daemon renames the topic once the
 		// session title has been auto-generated ("{repo}/{branch} - {title}"). The
@@ -8038,13 +8021,17 @@ export function createNotificationsExtension(
 							sessionId: id,
 							summary: undefined,
 						},
-						{ redact: rt.redact, sessionTag: rt.sessionTag },
+						{ redact: rt.notificationsActive ? rt.redact : false, sessionTag: rt.sessionTag },
 					),
 				),
 			);
 		} catch (e) {
 			logger.warn(`notifications: noteIdle failed: ${String(e)}`);
 		}
+		if (!rt.notificationsActive) return;
+		void (typeof rt.workflowGate?.recoverAcceptedGates === "function"
+			? rt.trackGateResolution(rt.workflowGate.recoverAcceptedGates()).catch(() => {})
+			: Promise.resolve());
 
 		// Lean: emit the latest deferred assistant answer exactly once at idle.
 		// Intermediate tool-turn narration was held on turn_end; ask lead-ins were

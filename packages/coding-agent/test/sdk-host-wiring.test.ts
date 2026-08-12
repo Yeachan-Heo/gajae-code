@@ -4830,6 +4830,74 @@ test("context.get reports live streaming state and typed queue depths without no
 	expect(settled).toMatchObject({ isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 });
 });
 
+test("SDK host publishes interactive asks and idle without notification providers", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-ask-core-"));
+	dirs.push(cwd);
+	const sessionId = `ask-core-${Date.now()}`;
+	// Notification providers intentionally remain disabled: interactive asks are a
+	// core SDK capability used by clients such as the Stream Deck.
+	const handlers = start(context(cwd, sessionId));
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["ask_controls_v1"] }));
+	await waitFor(() => getAskAnswerSource(sessionId) !== undefined, "core SDK ask source");
+	expect(getTelegramFileSink(sessionId)).toBeUndefined();
+
+	const answer = getAskAnswerSource(sessionId)!.awaitAnswerRequest!(
+		{
+			question: "Choose the rebase strategy",
+			options: ["rebase", "merge"],
+			interaction: "selector",
+			controls: [],
+			recommendedIndex: 0,
+		},
+		new AbortController().signal,
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "action_needed" && frame.kind === "ask"),
+		"core SDK action_needed ask",
+	);
+	const action = frames.find(frame => frame.type === "action_needed" && frame.kind === "ask")!;
+	expect(action).toMatchObject({
+		question: "Choose the rebase strategy",
+		options: ["rebase", "merge"],
+		recommendedIndex: 0,
+	});
+
+	socket.send(
+		JSON.stringify({
+			type: "reply",
+			id: action.id,
+			answer: 0,
+			token: endpoint.token,
+		}),
+	);
+	const receipt = await answer;
+	expect(receipt).toMatchObject({ source: "remote", interaction: { kind: "value", value: "rebase" } });
+	if (!receipt || typeof receipt === "string") throw new Error("Expected remote ask receipt");
+	expect(await receipt.settle({ kind: "commit" })).toMatchObject({ kind: "committed" });
+
+	const sessionContext = context(cwd, sessionId);
+	void handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, sessionContext);
+	await waitFor(
+		() => frames.some(frame => frame.type === "action_needed" && frame.kind === "idle"),
+		"core SDK idle action",
+	);
+	expect(frames.find(frame => frame.type === "action_needed" && frame.kind === "idle")).toMatchObject({
+		sessionId,
+		kind: "idle",
+	});
+}, 30_000);
+
 test("SDK endpoint applies typed skill, plan, goal, and config controls with observable readback", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-typed-controls-"));
 	dirs.push(cwd);
