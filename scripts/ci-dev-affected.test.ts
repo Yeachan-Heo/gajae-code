@@ -1050,7 +1050,13 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			const tasks = targeted([changedPath]);
 			const keys = tasks.map(task => task.key);
 			expect(keys).toContain(shardOne);
-			expect(tasks.find(task => task.key === shardOne)?.command).toEqual(["bun", "test", "--isolate", "--shard=1/8"]);
+			expect(tasks.find(task => task.key === shardOne)?.command).toEqual([
+				"bun",
+				"test",
+				"packages/coding-agent",
+				"--isolate",
+				"--shard=1/8",
+			]);
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([shardOne]);
 			expect(keys).toContain(isolated);
 			expect(tasks.find(task => task.key === isolated)?.command).toEqual([
@@ -1067,6 +1073,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.command).toEqual([
 			"bun",
 			"test",
+			"packages/coding-agent",
 			"--isolate",
 			"--shard=1/8",
 		]);
@@ -1417,8 +1424,14 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"test:@gajae-code/coding-agent:shard-7-of-8",
 			"test:@gajae-code/coding-agent:shard-8-of-8",
 		]);
-		expect(testShards[0]?.command).toEqual(["bun", "test", "--isolate", "--shard=1/8"]);
-		expect(testShards[0]?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
+		expect(testShards[0]?.command).toEqual([
+			"bun",
+			"test",
+			"packages/coding-agent",
+			"--isolate",
+			"--shard=1/8",
+		]);
+		expect(testShards[0]?.cwd).toBeUndefined();
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
 		expect(keys).toContain("check:@gajae-code/coding-agent");
 

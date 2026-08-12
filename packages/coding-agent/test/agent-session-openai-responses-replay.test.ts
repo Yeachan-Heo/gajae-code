@@ -935,6 +935,9 @@ describe("AgentSession OpenAI Responses replay boundaries", () => {
 				getAvailable: () => [],
 				getApiKey: async () => null,
 			},
+			// Inject the manager used by this production-path harness; the real SDK
+			// ToolSession exposes the same accessor for endpoint-owned routing.
+			getAsyncJobManager: () => manager,
 		};
 
 		const tool = await taskModule.TaskTool.create(

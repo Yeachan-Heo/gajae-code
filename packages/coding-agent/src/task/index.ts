@@ -18,9 +18,14 @@ import * as os from "node:os";
 import path from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Model, Usage } from "@gajae-code/ai/core";
+import {
+	AsyncJobManager,
+	OwnerSubagentShutdownError,
+	type ResumeRunner,
+	type SubagentRunOutcome,
+} from "@gajae-code/coding-agent/async";
 import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
-import { AsyncJobManager, OwnerSubagentShutdownError, type ResumeRunner, type SubagentRunOutcome } from "../async";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";

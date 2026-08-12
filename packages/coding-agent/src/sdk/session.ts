@@ -1398,6 +1398,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session_id upstream, where session-owning transports reject the extra
 		// downstreams (owner_busy) and degrade those turns to uncached HTTP.
 		const providerSessionId = options.providerSessionId ?? logicalSessionId;
+		// AsyncJobManager ownership follows provider identity rather than the
+		// persisted logical header. Nested managed children intentionally reuse the
+		// lifecycle-owned header, while each child provider scope is independently
+		// addressable for jobs, aborts, and detached resume.
+		const asyncJobEndpointId = providerSessionId;
 		const credentialSessionId = options.credentialSessionId ?? providerSessionId;
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
@@ -1760,7 +1765,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// from sessionManager.getSessionId(), so session.sessionId
 							// would miss the tuple and turn a left-running completion
 							// into an ordinary follow-up (review thread P1).
-							const endpointId = AsyncJobManager.endpointIdOf(asyncJobManager) ?? sessionManager.getSessionId();
+							const endpointId = AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId;
 							const registration = job ? lookupOwnedRegistration(jobId, job.generation, endpointId) : undefined;
 							const ownedCompletion = registration
 								? {
@@ -1841,7 +1846,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// pass the same endpoint the manager's completion callback resolves
 			// (review thread P1). For a top-level session this equals the
 			// session id.
-			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? sessionManager.getSessionId?.() ?? null,
+			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
@@ -1952,17 +1957,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (asyncJobManager) {
 				// Register under the session endpoint so concurrent sessions'
 				// owned work settles in the correct manager (review thread P1).
-				// `session` is not yet constructed here; the session manager id
-				// is the endpoint identity. ADMIT THE ENDPOINT FIRST: a second
+				// `session` is not yet constructed here; the provider identity is
+				// the endpoint identity. ADMIT THE ENDPOINT FIRST: a second
 				// top-level session constructed or resumed under an endpoint id
 				// already held by another LIVE manager must fail construction
 				// BEFORE the global instance is replaced — otherwise the
 				// rejected construction leaves this orphan manager as the
 				// process-global instance, redirecting global-manager
 				// consumers away from the live session (review thread P1).
-				if (!AsyncJobManager.registerForEndpoint(sessionManager.getSessionId(), asyncJobManager)) {
+				if (!AsyncJobManager.registerForEndpoint(asyncJobEndpointId, asyncJobManager)) {
 					throw new Error(
-						`Cannot construct session "${sessionManager.getSessionId()}": the endpoint id is already held by another live async job manager`,
+						`Cannot construct session "${asyncJobEndpointId}": the endpoint id is already held by another live async job manager`,
 					);
 				}
 				asyncJobManagerAdmitted = true;
@@ -3404,10 +3409,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// repeated session churn cannot saturate the registry
 						// (review thread P2). The endpoint is the manager's live
 						// registration key, which survives newSession/switchSession
-						// rekeying and may differ from the provider-facing session id.
+						// rekeying and may differ from the persisted logical session id.
 						if (!options.parentTaskPrefix) {
 							retireOwnedRegistrationsForEndpoint(
-								AsyncJobManager.endpointIdOf(asyncJobManager) ?? session.sessionId,
+								AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
 							);
 							AsyncJobManager.unregisterManager(asyncJobManager);
 						}

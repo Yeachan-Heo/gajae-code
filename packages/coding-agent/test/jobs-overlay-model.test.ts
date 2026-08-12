@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import { JobsOverlayComponent, type JobsOverlayController } from "../src/modes/components/jobs-overlay";
 import {
 	buildConfirmItems,
@@ -8,6 +8,9 @@ import {
 	parseJobRef,
 } from "../src/modes/components/jobs-overlay-model";
 import type { JobsSnapshot } from "../src/modes/jobs-observer";
+import { initTheme } from "../src/modes/theme/theme";
+
+beforeAll(() => initTheme());
 
 function snapshot(over: Partial<JobsSnapshot> = {}): JobsSnapshot {
 	return {

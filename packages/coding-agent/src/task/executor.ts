@@ -24,6 +24,7 @@ import {
 	type ServiceTier,
 } from "@gajae-code/ai/core";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
+import * as canonicalSdk from "@gajae-code/coding-agent/sdk";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
 import { ModelRegistry } from "../config/model-registry";
@@ -42,7 +43,7 @@ import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prom
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
-import { createAgentSession, discoverAuthStorage } from "../sdk";
+import { discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
@@ -1685,7 +1686,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			const { session } = await awaitAbortable(
-				createAgentSession({
+				canonicalSdk.createAgentSession({
 					cwd: worktree ?? cwd,
 					authStorage,
 					modelRegistry,
