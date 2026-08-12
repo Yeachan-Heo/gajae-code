@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	AUTORESEARCH_LEDGER_EVENT_KINDS,
+	type AutoresearchMode,
 	autoresearchClear,
 	autoresearchHandoff,
 	autoresearchIssueVerdict,
@@ -13,7 +14,6 @@ import {
 	autoresearchWrite,
 	getAutoresearchPaths,
 	runNativeAutoresearchCommand,
-	type AutoresearchMode,
 } from "@gajae-code/coding-agent/gjc-runtime/autoresearch-runtime";
 import {
 	autoresearchRlmArtifactRoot,
@@ -25,14 +25,7 @@ const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 let previousGjcSessionId: string | undefined;
 
-const runtimeSourcePath = path.join(
-	import.meta.dir,
-	"..",
-	"..",
-	"src",
-	"gjc-runtime",
-	"autoresearch-runtime.ts",
-);
+const runtimeSourcePath = path.join(import.meta.dir, "..", "..", "src", "gjc-runtime", "autoresearch-runtime.ts");
 
 beforeAll(() => {
 	previousGjcSessionId = process.env.GJC_SESSION_ID;
@@ -100,12 +93,8 @@ describe("autoresearch session layout", () => {
 		const root = "/repo";
 		const sessionDir = sessionAutoresearchDir(root, TEST_SESSION_ID);
 		expect(sessionDir).toBe(path.join(root, ".gjc", `_session-${TEST_SESSION_ID}`, "autoresearch"));
-		expect(sessionAutoresearchRunsDir(root, TEST_SESSION_ID)).toBe(
-			path.join(sessionDir, "runs"),
-		);
-		expect(autoresearchRlmArtifactRoot(root, TEST_SESSION_ID, "run-1")).toBe(
-			path.join(sessionDir, "runs", "run-1"),
-		);
+		expect(sessionAutoresearchRunsDir(root, TEST_SESSION_ID)).toBe(path.join(sessionDir, "runs"));
+		expect(autoresearchRlmArtifactRoot(root, TEST_SESSION_ID, "run-1")).toBe(path.join(sessionDir, "runs", "run-1"));
 
 		const paths = getAutoresearchPaths(root, TEST_SESSION_ID);
 		for (const candidate of [paths.dir, paths.missionPath, paths.ledgerPath]) {
@@ -432,11 +421,7 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		await expect(autoresearchHandoff({ cwd: root, specPath })).rejects.toThrow(/mission mode explicitly/);
 
 		// With the mode declared, handoff intake succeeds and asks zero questions.
-		await fs.writeFile(
-			specPath,
-			"# Spec\n\nautoresearch-mode: data\n\n## Goal\n\nMeasure throughput.\n",
-			"utf-8",
-		);
+		await fs.writeFile(specPath, "# Spec\n\nautoresearch-mode: data\n\n## Goal\n\nMeasure throughput.\n", "utf-8");
 		const receipt = await autoresearchHandoff({ cwd: root, specPath });
 
 		expect(receipt.mission.mode).toBe("data");
@@ -448,9 +433,9 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 
 	it("handoff intake fails closed when the spec path does not exist", async () => {
 		const root = await tempDir();
-		await expect(
-			autoresearchHandoff({ cwd: root, specPath: path.join(root, "missing-spec.md") }),
-		).rejects.toThrow(/could not read spec/);
+		await expect(autoresearchHandoff({ cwd: root, specPath: path.join(root, "missing-spec.md") })).rejects.toThrow(
+			/could not read spec/,
+		);
 	});
 });
 

@@ -29,6 +29,18 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { type AutoresearchDashboardInput, renderExpandedDashboard } from "../autoresearch/dashboard";
+import { loadAutoresearchDataContext, type RlmDataContext } from "../autoresearch/data-context";
+import { type EnsureAutoresearchBranchResult, ensureAutoresearchBranch } from "../autoresearch/git";
+import { type ParsedHarnessOutput, parseHarnessOutput } from "../autoresearch/harness";
+import { renderAutoresearchIteratePrompt, renderAutoresearchSetupPrompt } from "../autoresearch/prompts";
+import { extractVerdictFromLedger, synthesizeAutoresearchReport } from "../autoresearch/report";
+import {
+	AutoresearchRunsStore,
+	buildAutoresearchExperimentState,
+	createAutoresearchExperimentConfig,
+} from "../autoresearch/runs";
+import { createMissionPythonTool, missionArtifactsDir, openMissionNotebook } from "../autoresearch/session";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { sessionAutoresearchDir } from "./session-layout";
@@ -201,8 +213,7 @@ function isEnoent(error: unknown): boolean {
 
 export function getAutoresearchPaths(cwd: string, sessionId?: string | null): AutoresearchPaths {
 	const resolvedSessionId =
-		sessionId?.trim() ||
-		resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const dir = sessionAutoresearchDir(cwd, resolvedSessionId);
 	return {
 		dir,
@@ -248,14 +259,19 @@ export async function readAutoresearchMission(
 		sessionId?.trim() ||
 		(await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
 	try {
-		return normalizeAutoresearchMission(await Bun.file(getAutoresearchPaths(cwd, resolvedSessionId).missionPath).json());
+		return normalizeAutoresearchMission(
+			await Bun.file(getAutoresearchPaths(cwd, resolvedSessionId).missionPath).json(),
+		);
 	} catch (error) {
 		if (isEnoent(error)) return null;
 		throw error;
 	}
 }
 
-export async function readAutoresearchLedger(cwd: string, sessionId?: string | null): Promise<AutoresearchLedgerEvent[]> {
+export async function readAutoresearchLedger(
+	cwd: string,
+	sessionId?: string | null,
+): Promise<AutoresearchLedgerEvent[]> {
 	const resolvedSessionId =
 		sessionId?.trim() ||
 		(await resolveGjcSessionForRead(cwd, { envSessionId: process.env.GJC_SESSION_ID })).gjcSessionId;
@@ -278,8 +294,7 @@ async function appendAutoresearchLedger(
 	sessionId?: string | null,
 ): Promise<AutoresearchLedgerEvent> {
 	const resolvedSessionId =
-		sessionId?.trim() ||
-		resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getAutoresearchPaths(cwd, resolvedSessionId);
 	const entry: AutoresearchLedgerEvent = {
 		eventId: crypto.randomUUID(),
@@ -316,8 +331,7 @@ async function persistAutoresearchMission(input: {
 	await writeGuardedJsonAtomic(paths.missionPath, input.mission, {
 		cwd: input.cwd,
 		policy: "source",
-		expectedRevision:
-			existingRead.kind === "valid" ? persistedStateRevision(existingRead.value) : undefined,
+		expectedRevision: existingRead.kind === "valid" ? persistedStateRevision(existingRead.value) : undefined,
 		audit: {
 			category: "state",
 			verb: "write",
@@ -326,7 +340,10 @@ async function persistAutoresearchMission(input: {
 			sessionId: input.sessionId,
 		},
 	});
-	await writeSessionActivityMarker(input.cwd, input.sessionId, { writer: "autoresearch-runtime", path: paths.missionPath });
+	await writeSessionActivityMarker(input.cwd, input.sessionId, {
+		writer: "autoresearch-runtime",
+		path: paths.missionPath,
+	});
 	return input.mission;
 }
 
@@ -401,8 +418,7 @@ export async function autoresearchWrite(input: {
 /** clear verb: remove the mission artifact and record the kernel clear in the ledger. */
 export async function autoresearchClear(cwd: string, sessionId?: string | null): Promise<AutoresearchClearReceipt> {
 	const resolvedSessionId =
-		sessionId?.trim() ||
-		resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getAutoresearchPaths(cwd, resolvedSessionId);
 	const existing = await readAutoresearchMission(cwd, resolvedSessionId);
 	const deleted = await removeFileAudited(paths.missionPath, {
@@ -466,7 +482,10 @@ function sanitizeSpecSlug(value: string): string {
 		.replace(/[^a-z0-9._-]+/g, "-")
 		.replace(/^-+|-+$/g, "");
 	if (normalized === "") {
-		throw new AutoresearchCommandError(2, "autoresearch handoff intake could not derive a mission slug from the spec");
+		throw new AutoresearchCommandError(
+			2,
+			"autoresearch handoff intake could not derive a mission slug from the spec",
+		);
 	}
 	return normalized;
 }
@@ -765,10 +784,13 @@ function renderColdIntakeText(goal: string): string {
  * swap; the entry and snapshot are the generic per-skill machinery).
  * Best-effort: a HUD sync failure never changes command semantics.
  */
-async function reconcileAutoresearchState(cwd: string, mission: AutoresearchMission, sessionId?: string): Promise<void> {
+async function reconcileAutoresearchState(
+	cwd: string,
+	mission: AutoresearchMission,
+	sessionId?: string,
+): Promise<void> {
 	const resolvedSessionId =
-		sessionId?.trim() ||
-		resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	try {
 		await syncSkillActiveState({
 			cwd,
@@ -843,4 +865,253 @@ export async function runNativeAutoresearchCommand(
 		if (error instanceof SessionResolutionError) return { status: 1, stderr: `${error.message}\n` };
 		return { status: 1, stderr: `${error instanceof Error ? error.message : String(error)}\n` };
 	}
+}
+
+/* ------------------------------ capability surface ------------------------------ */
+
+/**
+ * Rebuilt autoresearch capability surface. Each of the eight capabilities is
+ * reachable from the runtime through a thin, mission-state-aware wrapper. All
+ * of them are read-only with respect to the ledger — none append events; the
+ * verbs above remain the only writers.
+ */
+
+/** 1. Branch isolation: ensure the worktree is on an `autoresearch/*` branch. */
+export function autoresearchBranchIsolation(cwd: string, goal: string): Promise<EnsureAutoresearchBranchResult> {
+	return ensureAutoresearchBranch(cwd, goal);
+}
+
+/** 2. Harness contract: parse `METRIC`/`ASI` lines out of captured harness output. */
+export function autoresearchHarnessOutput(output: string, primaryMetricName?: string): ParsedHarnessOutput {
+	return parseHarnessOutput(output, primaryMetricName);
+}
+
+/**
+ * 3. Durable run storage: open the session-scoped JSONL run store, seeding an
+ * in-memory experiment config from the mission when none is persisted yet.
+ */
+export async function autoresearchRunsStore(cwd: string, sessionId?: string | null): Promise<AutoresearchRunsStore> {
+	const store = await AutoresearchRunsStore.open(cwd, sessionId);
+	if (store.config === null) {
+		const mission = await readAutoresearchMission(cwd, sessionId);
+		if (mission) {
+			const branch = await ensureAutoresearchBranch(cwd, mission.objective).then(result =>
+				result.ok ? result.branchName : null,
+			);
+			store.setInMemoryConfig(
+				createAutoresearchExperimentConfig({
+					name: mission.slug,
+					goal: mission.objective,
+					primaryMetric: "metric",
+					branch,
+				}),
+			);
+		}
+	}
+	return store;
+}
+
+/** 4. TUI dashboard: render the run table (collapsed + expanded) from persisted state. */
+export async function autoresearchDashboardText(cwd: string, sessionId?: string | null, width = 120): Promise<string> {
+	const store = await autoresearchRunsStore(cwd, sessionId);
+	const mission = await readAutoresearchMission(cwd, sessionId);
+	if (!store.config) return "autoresearch: no experiment config yet";
+	const state = buildAutoresearchExperimentState(store.config, store.listLoggedRuns());
+	const pendingRun = store.getPendingRun();
+	const input: AutoresearchDashboardInput = {
+		state,
+		runtime: {
+			modeOn: mission !== null,
+			running: null,
+			pendingRun: pendingRun
+				? {
+						runNumber: pendingRun.runNumber,
+						passed: pendingRun.exitCode === 0 && !pendingRun.timedOut,
+						parsedPrimary: pendingRun.metric,
+					}
+				: null,
+		},
+	};
+	return renderExpandedDashboard(input, width);
+}
+
+/** 5. Persistent kernel + notebook: build the mission `python` tool bound to the mission. */
+export async function autoresearchMissionPythonTool(cwd: string, sessionId?: string | null) {
+	const mission = await readAutoresearchMission(cwd, sessionId);
+	if (!mission) return null;
+	const { writer, paths } = await openMissionNotebook(cwd, mission);
+	const tool = createMissionPythonTool({
+		cwd,
+		mission,
+		artifactsDir: missionArtifactsDir(cwd, mission),
+		notebook: writer,
+		registerSessionCleanup: () => {},
+	});
+	return { tool, notebook: writer, paths, mission };
+}
+
+/** 6. Synthesized report: notebook cells + final summary, carrying the mission verdict. */
+export async function autoresearchMissionReport(
+	cwd: string,
+	summary?: string,
+	sessionId?: string | null,
+): Promise<string> {
+	const mission = await readAutoresearchMission(cwd, sessionId);
+	if (!mission) throw new AutoresearchCommandError(2, "autoresearch report requires an active mission");
+	const { writer, paths } = await openMissionNotebook(cwd, mission);
+	const ledger = await readAutoresearchLedger(cwd, sessionId);
+	const verdict = extractVerdictFromLedger(ledger);
+	return synthesizeAutoresearchReport({
+		paths,
+		notebook: writer,
+		mission,
+		summary,
+		verdict,
+	});
+}
+
+export async function autoresearchDataContext(
+	cwd: string,
+	dataFlag?: string,
+	sessionId?: string | null,
+): Promise<RlmDataContext | null> {
+	const mission = await readAutoresearchMission(cwd, sessionId);
+	if (!mission) return null;
+	return loadAutoresearchDataContext({
+		cwd,
+		mode: mission.mode,
+		dataFlag,
+	});
+}
+
+/** 8. Two-phase prompts: Phase 1 (harness setup) rendered from mission/branch state. */
+export async function autoresearchSetupPrompt(
+	baseSystemPrompt: string,
+	cwd: string,
+	goal?: string,
+	sessionId?: string | null,
+): Promise<string> {
+	const mission = await readAutoresearchMission(cwd, sessionId);
+	const branch = await ensureAutoresearchBranch(cwd, goal ?? mission?.objective ?? "").then(result =>
+		result.ok ? result.branchName : null,
+	);
+	return renderAutoresearchSetupPrompt({
+		baseSystemPrompt,
+		goal: goal ?? mission?.objective ?? "",
+		workingDir: cwd,
+		branch,
+		baselineWarning: null,
+	});
+}
+
+/** 8. Two-phase prompts: Phase 2 (iterate) rendered from the persisted experiment state. */
+export async function autoresearchIteratePrompt(
+	baseSystemPrompt: string,
+	cwd: string,
+	sessionId?: string | null,
+): Promise<string> {
+	const store = await autoresearchRunsStore(cwd, sessionId);
+	const mission = await readAutoresearchMission(cwd, sessionId);
+	if (!store.config) {
+		return renderAutoresearchIteratePrompt({
+			baseSystemPrompt,
+			goal: mission?.objective ?? "",
+			workingDir: cwd,
+			branch: null,
+			baselineCommit: null,
+			metricName: "metric",
+			metricUnit: "",
+			notes: "",
+			currentSegment: 1,
+			currentSegmentRunCount: 0,
+			baselineMetric: null,
+			bestMetric: null,
+			bestRunNumber: null,
+			recentRuns: [],
+			unjustifiedRuns: [],
+			pendingRun: null,
+		});
+	}
+	const state = buildAutoresearchExperimentState(store.config, store.listLoggedRuns());
+	const current = state.results.filter(result => result.segment === state.currentSegment);
+	const recentRuns = current.slice(-3).map(result => {
+		const asiSummary = summarizePromptAsi(result.asi);
+		return {
+			run_number: result.runNumber,
+			status: result.status,
+			metric_display: formatPromptMetricValue(result.metric, state.metricUnit),
+			description: result.description,
+			has_asi_summary: Boolean(asiSummary),
+			asi_summary: asiSummary ?? "",
+			has_deviations: result.scopeDeviations.length > 0,
+			deviations: result.scopeDeviations.join(", "),
+			justified: Boolean(result.justification),
+			flagged: result.flagged,
+			flagged_reason: result.flaggedReason ?? "",
+		};
+	});
+	const unjustifiedRuns = current
+		.filter(
+			result =>
+				result.status === "keep" && !result.flagged && result.scopeDeviations.length > 0 && !result.justification,
+		)
+		.slice(-3)
+		.map(result => ({ run_number: result.runNumber, paths: result.scopeDeviations.join(", ") }));
+	const pendingRun = store.getPendingRun();
+	const bestRun = findPromptBestRun(state);
+	return renderAutoresearchIteratePrompt({
+		baseSystemPrompt,
+		goal: store.config.goal ?? mission?.objective ?? "",
+		workingDir: cwd,
+		branch: store.config.branch,
+		baselineCommit: store.config.baselineCommit,
+		metricName: state.metricName,
+		metricUnit: state.metricUnit,
+		notes: state.notes,
+		currentSegment: state.currentSegment + 1,
+		currentSegmentRunCount: current.length,
+		baselineMetric: state.bestMetric,
+		bestMetric: bestRun?.metric ?? state.bestMetric,
+		bestRunNumber: bestRun?.runNumber ?? null,
+		recentRuns,
+		unjustifiedRuns,
+		pendingRun: pendingRun
+			? {
+					runNumber: pendingRun.runNumber,
+					command: pendingRun.command,
+					parsedPrimary: pendingRun.metric,
+					passed: pendingRun.exitCode === 0 && !pendingRun.timedOut,
+				}
+			: null,
+	});
+}
+
+function summarizePromptAsi(asi: unknown): string | null {
+	if (!asi || typeof asi !== "object") return null;
+	const record = asi as Record<string, unknown>;
+	const hypothesis = typeof record.hypothesis === "string" ? record.hypothesis.trim() : "";
+	const rollback = typeof record.rollback_reason === "string" ? record.rollback_reason.trim() : "";
+	const next = typeof record.next_action_hint === "string" ? record.next_action_hint.trim() : "";
+	const summary = [hypothesis, rollback, next].filter(part => part.length > 0).join(" | ");
+	return summary.length > 0 ? summary.slice(0, 220) : null;
+}
+
+function formatPromptMetricValue(value: number, unit: string): string {
+	if (Number.isInteger(value)) return `${value}${unit}`;
+	return `${value.toFixed(2)}${unit}`;
+}
+
+function findPromptBestRun(state: {
+	results: Array<{ segment: number; status: string; metric: number; flagged: boolean; runNumber: number }>;
+	currentSegment: number;
+	bestDirection: "lower" | "higher";
+}): { metric: number; runNumber: number } | null {
+	let best: { metric: number; runNumber: number } | null = null;
+	for (const result of state.results) {
+		if (result.segment !== state.currentSegment || result.status !== "keep" || result.flagged) continue;
+		if (!best || (state.bestDirection === "lower" ? result.metric < best.metric : result.metric > best.metric)) {
+			best = { metric: result.metric, runNumber: result.runNumber };
+		}
+	}
+	return best;
 }
