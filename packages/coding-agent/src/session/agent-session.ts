@@ -11522,24 +11522,6 @@ export class AgentSession {
 							this.#externalSteerMessages.has(message) &&
 							(this.#externalSteerAdmissionSeq.get(message) ?? 0) > (abortSteeringSnapshot ?? -1),
 					);
-			// Capture the preserved post-snapshot steers' ownership hooks BEFORE
-			// the continuation is scheduled: onRunAccepted runs after
-			// continueQueuedMessages has already claimed and removed the
-			// accepted messages, so the queue no longer contains them at accept
-			// time (review thread P1).
-			const preservedSteerHooks: Array<() => void> = [];
-			for (const message of this.agent.snapshotSteering()) {
-				if (
-					this.#externalSteerMessages.has(message) &&
-					(this.#externalSteerAdmissionSeq.get(message) ?? 0) > (abortSteeringSnapshot ?? -1)
-				) {
-					const hook = this.#steerPromotionHooks.get(message);
-					if (hook) {
-						this.#steerPromotionHooks.delete(message);
-						preservedSteerHooks.push(hook);
-					}
-				}
-			}
 			if (hasPreservedFollowUp() || hasPreservedSteering()) {
 				// ANY preserved follow-up or steer — an owned-completion resume,
 				// an independently requested external follow-up, or a
@@ -11556,15 +11538,14 @@ export class AgentSession {
 					delayMs: 1,
 					generation: this.#promptGeneration,
 					shouldContinue: () => hasPreservedFollowUp() || hasPreservedSteering(),
-					// The rearmed continuation accepts the preserved post-snapshot
-					// steers under a fresh lineage: fire the hooks captured above
-					// so the new turn is associated with the submitting
-					// connection — without them a later terminal abort from that
-					// client is rejected as non-owner even though its accepted
-					// prompt is running (review thread P1).
-					onRunAccepted: () => {
-						for (const hook of preservedSteerHooks) hook();
-					},
+					// The rearmed continuation's run acceptance fires the SDK
+					// requester-ownership hooks for the messages it ACTUALLY
+					// consumed (#fireQueuedPromotionHooks over
+					// acceptance.consumedQueuedMessages inside
+					// #scheduleAgentContinue): no frozen snapshot is taken at
+					// schedule time, so a steer removed during the delay never
+					// fires a stale hook and a post-snapshot steer admitted
+					// during the delay is not missed (review thread P1).
 					rescheduleOnBusy: true,
 				});
 			}

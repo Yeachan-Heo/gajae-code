@@ -514,3 +514,63 @@ test("cancel intent survives a failing second attempt while the first is still p
 		fixture.dispose();
 	}
 });
+
+test("any successful cancel resolves the waiter immediately while an earlier attempt is pending", async () => {
+	// Review thread P2: when two cancels overlap and the LATER attempt is
+	// acknowledged while the earlier one is still unanswered, the shared
+	// waiter promise must resolve immediately — aggregating, not serializing
+	// in request order — or a prompt rejection awaiting cancelAttempt can
+	// hang past the cancellation grace bound.
+	let promptFrameArrived: () => void = () => {};
+	const promptFrameSeen = new Promise<void>(resolve => {
+		promptFrameArrived = resolve;
+	});
+	const promptGate = Promise.withResolvers<void>();
+	let releaseAbortA: () => void = () => {};
+	const abortAGate = new Promise<void>(resolve => {
+		releaseAbortA = resolve;
+	});
+	const fixture = await createFixture({
+		promptResponse: async () => {
+			promptFrameArrived();
+			await promptGate.promise;
+			return { ok: false, error: { code: "busy", message: "preflight busy" } };
+		},
+		abortResponses: [
+			// First cancel: still unanswered while the second acknowledges.
+			async () => {
+				await abortAGate;
+				return { ok: true, result: { aborted: true } };
+			},
+			// Second cancel: acknowledged immediately.
+			{ ok: true, result: { aborted: true } },
+		],
+		cancelSettlementGraceMs: 60_000,
+	});
+	try {
+		const pending = fixture.agent.prompt({
+			sessionId: fixture.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000001",
+			prompt: [{ type: "text", text: "hold the turn" }],
+		} as PromptRequest) as Promise<{ stopReason: StoppedReason }>;
+		const settled = pending.then(
+			resolved => ({ resolved }),
+			(error: unknown) => ({ rejected: error as { code?: string } }),
+		);
+		await bounded(promptFrameSeen, "prompt frame arrival");
+		// First cancel: pending.
+		const cancelAPromise = fixture.agent.cancel({ sessionId: fixture.sessionId } as CancelNotification);
+		// Second cancel acknowledges while the first is still unanswered.
+		await fixture.agent.cancel({ sessionId: fixture.sessionId } as CancelNotification);
+		// The prompt-preflight rejection settles as cancelled immediately —
+		// it must not wait for the unanswered first attempt.
+		promptGate.resolve();
+		const outcome = await bounded(settled, "prompt settlement after the later success");
+		expect("resolved" in outcome ? outcome.resolved?.stopReason : outcome.rejected?.code).toBe("cancelled");
+		// The first attempt's late acknowledgement resolves cleanly afterwards.
+		releaseAbortA();
+		await cancelAPromise;
+	} finally {
+		fixture.dispose();
+	}
+});

@@ -130,6 +130,10 @@ interface PromptWaiter {
 	 *  set while any attempt can still acknowledge, so a failure only clears
 	 *  the shared flag when no attempt remains pending (review thread P2). */
 	pendingCancelAttempts?: number;
+	/** Shared resolver for cancelAttempt: ANY successful attempt resolves it
+	 *  immediately (no request-order serialization), and the LAST failing
+	 *  attempt resolves false (review thread P2). */
+	cancelAttemptResolve?: (acknowledged: boolean) => void;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -1674,18 +1678,22 @@ export class AcpAgent implements Agent {
 		// `_meta.gjc.abortScope: "turn"` (or `GJC_ACP_ABORT_SCOPE=turn`).
 		const scope = resolveAcpAbortScope(params._meta, process.env);
 		const waiter = record.activePrompt;
-		const cancelAttempt = waiter ? Promise.withResolvers<boolean>() : undefined;
-		if (waiter && cancelAttempt) {
+		if (waiter) {
 			// Overlapping cancels must not lose an earlier successful
-			// acknowledgement: keep the waiter's attempt promise CUMULATIVE —
-			// it resolves true when ANY attempt acknowledged, so the second
-			// attempt's failure cannot rewrite the first's success (review
-			// thread P2). Count in-flight attempts so a failure only clears the
-			// shared intent when no earlier attempt can still acknowledge.
+			// acknowledgement: ANY successful attempt resolves the shared
+			// waiter promise IMMEDIATELY (aggregation, not request-order
+			// serialization — an unanswered first attempt must not delay the
+			// second attempt's acknowledged success, or a prompt rejection
+			// awaiting cancelAttempt could hang past the grace bound; review
+			// thread P2). The LAST failing attempt resolves false. In-flight
+			// attempts are counted so a failure only clears the shared intent
+			// when no earlier attempt can still acknowledge.
 			waiter.pendingCancelAttempts = (waiter.pendingCancelAttempts ?? 0) + 1;
-			waiter.cancelAttempt = waiter.cancelAttempt
-				? waiter.cancelAttempt.then(prior => prior || cancelAttempt.promise)
-				: cancelAttempt.promise;
+			if (!waiter.cancelAttemptResolve) {
+				waiter.cancelAttempt = new Promise<boolean>(resolve => {
+					waiter.cancelAttemptResolve = resolve;
+				});
+			}
 		}
 		try {
 			const acknowledgement = await record.adapter.cancel(scope);
@@ -1697,7 +1705,7 @@ export class AcpAgent implements Agent {
 				);
 			if (waiter) waiter.cancelAcknowledged = true;
 			if (waiter && record.activePrompt !== waiter) {
-				cancelAttempt?.resolve(true);
+				waiter.cancelAttemptResolve?.(true);
 				return;
 			}
 			if (
@@ -1717,10 +1725,12 @@ export class AcpAgent implements Agent {
 				// published. Arm the bounded settlement so the turn cannot outlive the cancel.
 				this.#scheduleCancelSettlement(params.sessionId, record);
 			}
-			cancelAttempt?.resolve(true);
+			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
 			if (!waiter) record.cancelRequested = false;
-			cancelAttempt?.resolve(false);
+			// Only the LAST in-flight attempt resolves the shared promise false;
+			// an earlier attempt may still acknowledge (review thread P2).
+			if (waiter && (waiter.pendingCancelAttempts ?? 0) <= 1) waiter.cancelAttemptResolve?.(false);
 			throw error;
 		} finally {
 			if (waiter) {
