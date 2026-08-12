@@ -1,7 +1,7 @@
-# Epic #4283 Reconciliation Ledger — 2026-08-12 11:15Z (refresh 2)
+# Epic #4283 Reconciliation Ledger — 2026-08-12 11:15Z (refresh 2; gen-2 correction 11:50Z; gen-3 precision pass 12:05Z)
 
 **Coordination lane:** `owner/issue-4283-customization-epic` (epic-owner worktree, no child implementation)
-**Reference dev head:** `ef3bd5c2276be1e50e59b026d36deb5c0255ccc1` (`origin/dev` at capture time)
+**Reference dev head:** `ef3bd5c2276be1e50e59b026d36deb5c0255ccc1` (`origin/dev` at initial capture 11:08Z; dev advanced to `bc2492af38` by ~11:45Z and `6102c6333f` by ~11:55Z during QA review — rows note the dev ref each verification ran against)
 **Prior ledger:** `artifacts/epic-4283-reconciliation-2026-08-12.md` (2/7 terminal at ~10:00Z)
 
 ## Child-state ledger (freshly derived)
@@ -12,7 +12,7 @@
 | #4285 | Zero-config conventional SKILL.md discovery | **CLOSED 11:13:28Z by epic-owner reconciliation** (keyword auto-close does not fire for non-default base `dev`) | PR #4349 **MERGED** 11:07:45Z, merge commit `ef3bd5c227` (REST-verified) | merge commit is the `origin/dev` head at capture; close evidence comment `issuecomment-5265933569` | ✅ **Terminal** |
 | #4286 | Hook convention normalization (IR + adapters) | CLOSED 02:50:15Z | PR #4289 → `77ce3f7b99`, PR #4307 → `eef03e4617` | both `--is-ancestor origin/dev` → YES (re-verified 11:15Z) | ✅ Terminal |
 | #4287 | Loose customization vs distributable bundles | CLOSED 00:47:11Z | PR #4290 → `364cbfe610` | `--is-ancestor origin/dev` → YES (re-verified 11:15Z) | ✅ Terminal |
-| #4288 | Provenance-aware customization doctor | OPEN (upd 09:44Z) | PR #4350 OPEN; was mergeState CLEAN at 10:20Z, **now `mergeable=false`/`dirty` after #4349 merge** (REST-verified ~11:45Z), head `15a73c5f4d`, branch 6 behind | `git merge-tree` vs `origin/dev` `bc2492af38`: conflicts in `README.md`, `packages/coding-agent/src/discovery/claude.ts`, `packages/coding-agent/src/discovery/codex.ts`; rebase coordination posted `issuecomment-5266385808` | **Nonterminal** (rebase required; caught by QA red-team falsification, gen-1→gen-2 correction) |
+| #4288 | Provenance-aware customization doctor | OPEN (upd 09:44Z) | PR #4350 OPEN, head `15a73c5f4d`, branch 6 behind. Mergeability snapshots are time-scoped: GitHub REST read `mergeable=false`/`mergeable_state=dirty` at ~11:45Z (lazily-computed field; repeat reads at ~11:55Z transiently reported `unknown` — API drift, not a clean state). Durable proof independent of API state: `git merge-tree` vs `origin/dev` reports the three-path conflict at both dev `bc2492af38` (leader run) and `6102c6333f` (QA run). | Conflicts: `README.md`, `packages/coding-agent/src/discovery/claude.ts`, `packages/coding-agent/src/discovery/codex.ts`; rebase coordination posted `issuecomment-5266385808`; epic addendum `issuecomment-5266388593` | **Nonterminal** (rebase required; gen-1 CLEAN row falsified by QA red-team, gen-2 corrected, gen-3 time-scoped) |
 | #4291 | `/extensions` UI + Claude/Codex import into `.gjc` | OPEN (upd 06:08Z) | No PR. Lane comment claims branch `feat/issue-4291-extensions-ui-import` ff'd to `e8af95c833` | **remote branch does not exist on origin** (`git ls-remote` zero matches for `4291`/`extensions-ui`); coordination comment `issuecomment-5265942195` posted requesting pushed evidence | **Nonterminal** (unverifiable local-only claims) |
 | #4292 | MCP 2026-07-28 stateless protocol (v2) | OPEN (upd 06:02Z) | No PR. Lane comment claims branch `feat/issue-4292-mcp-v2` ff'd to `2067b93976`, spec verified against primary sources, plan defined | **remote branch does not exist on origin**; coordination comment `issuecomment-5265942334` posted requesting pushed evidence | **Nonterminal** (unverifiable local-only claims) |
 
@@ -31,7 +31,7 @@ Local reproduction (biome from repo `node_modules`, PR head worktree):
 - Diagnostics in files outside the PR diff (`src/sdk/host/session-runtime.test.ts` ×5 `captureCalls`, `src/config/settings.ts`:276, `src/sdk/bus/telegram-daemon.ts`:3103, `src/tools/bash.ts`:1084 ×2, `test/sdk-daemon-cli-e2e.test.ts`:359) are **warnings, exit=0**, identical content on `origin/dev` → pre-existing noise, not the failure.
 - Sibling PR #4350's `check:@gajae-code/coding-agent` shard is SUCCESS on a similarly current base → consistent with PR-owned failure.
 
-Required lane fix: `biome check --write packages/coding-agent/test/runtime-mcp/mcp-autoload-redteam.test.ts` (or manual equivalent), push, re-verify shard.
+Required lane fix: `biome check --write packages/coding-agent/test/runtime-mcp/mcp-autoload-redteam.test.ts` (or manual equivalent), push, re-verify shard. Durable CI excerpt preserved at `artifacts/epic-4283-pr4335-ci-failure-excerpt.txt` (shard run `31585850513`, head `005ed04c76`).
 
 ## Epic acceptance gaps (beyond child merges)
 

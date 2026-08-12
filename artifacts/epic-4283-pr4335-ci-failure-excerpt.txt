@@ -1,0 +1,17 @@
+# PR #4335 CI failure excerpt — captured 2026-08-12 ~10:20Z from shard run 31585850513 (head 005ed04c7617c1592ca4ed12ea21632841430893)
+# Preserved by epic-owner lane as durable read-only evidence for the #4284 root-cause claim.
+
+## Failed jobs
+- Affected path validation / check:@gajae-code/coding-agent -> FAILURE
+- Affected path validation / evidence producer -> FAILURE (aggregate: required affected shards did not succeed)
+- Affected path validation -> FAILURE (aggregate)
+
+## Blocking diagnostics (PR-owned file, biome exit=1, locally reproduced)
+packages/coding-agent/test/runtime-mcp/mcp-autoload-redteam.test.ts:186:11 lint/suspicious/noPrototypeBuiltins  FIXABLE  ━━━━━━━━━━
+packages/coding-agent/test/runtime-mcp/mcp-autoload-redteam.test.ts:9:1 assist/source/organizeImports  FIXABLE  ━━━━━━━━━━
+
+## Local reproduction (epic worktree, biome from repo node_modules)
+$ biome check packages/coding-agent/test/runtime-mcp/mcp-autoload-redteam.test.ts  # at PR head worktree
+exit=1 (Some errors were emitted while running checks.)
+$ biome check packages/coding-agent/src/sdk/host/session-runtime.test.ts      # at origin/dev
+exit=0 (Found 6 warnings. captureCalls noUnusedVariables are warnings, identical content on dev)
