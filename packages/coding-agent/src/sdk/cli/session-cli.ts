@@ -443,21 +443,61 @@ async function requestQuery(
 	return response;
 }
 
-async function waitForTerminalStatus(
+/** Exported for tests: each status poll must stay inside the caller's wait window. */
+export async function waitForTerminalStatus(
 	router: SessionRouter,
 	sessionId: string,
 	clientRef: string,
 	timeoutMs: number | undefined,
 ): Promise<{ terminal: boolean; status: string; detail: unknown }> {
 	const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+	let status = "unknown";
+	let detail: unknown = {};
 	for (;;) {
-		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef }, {});
+		// Each poll is bounded by what is left of the caller's wait window, twice over.
+		// The request budget bounds the reply, and `bounded` bounds the whole poll: a
+		// disconnected transport reconnects before the reply timer is even installed,
+		// so without the outer bound the router's independent reconnect budget could
+		// still dispatch the query after the caller's window closed.
+		const remainingMs = deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
+		const poll = requestQuery(
+			router,
+			sessionId,
+			"turn.result",
+			{ kind: "prompt", clientRef },
+			remainingMs === undefined ? {} : { timeoutMs: remainingMs },
+		);
+		let response: JsonRecord;
+		try {
+			response =
+				remainingMs === undefined
+					? await poll
+					: await bounded(poll, remainingMs, `Prompt ${clientRef} status poll exceeded the wait window.`);
+		} catch (error) {
+			// An elapsed wait window is the documented `wait_timeout` outcome with the
+			// last observed status, not a transport failure. Anything else — and any
+			// failure with window left — is a real error the caller must see.
+			if (deadline !== undefined && Date.now() >= deadline && isWaitWindowFailure(error))
+				return { terminal: false, status, detail };
+			throw error;
+		}
 		const result = resultObject(response) ?? {};
-		const status = typeof result.status === "string" ? result.status : "unknown";
+		status = typeof result.status === "string" ? result.status : "unknown";
+		detail = result;
 		if (status === "terminal_ok" || status === "failed") return { terminal: true, status, detail: result };
 		if (deadline !== undefined && Date.now() >= deadline) return { terminal: false, status, detail: result };
 		await Bun.sleep(TAIL_STATUS_POLL_MS);
 	}
+}
+
+/**
+ * True for the failures a poll produces when the wait window itself ends it:
+ * the outer bound, the request reply timer, and the uncertain send the transport
+ * reports when a request that was already on the wire is abandoned.
+ */
+function isWaitWindowFailure(error: unknown): boolean {
+	if (error instanceof SdkClientError) return error.code === "timeout" || error.code === "uncertain_after_send";
+	return error instanceof SdkSessionCliError && error.code === "timeout";
 }
 
 async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliArgs): Promise<unknown> {

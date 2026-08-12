@@ -112,10 +112,6 @@ async function createFixture(
 	const sendAssistantMessage = (text: string): void => {
 		send({
 			type: "event",
-			kind: "message_end",
-			sessionId,
-			commandId,
-			turnId,
 			payload: {
 				event_type: "message_end",
 				event: {

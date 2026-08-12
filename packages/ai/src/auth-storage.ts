@@ -1436,6 +1436,62 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Force a running session's OAuth credential for a provider to a specific
+	 * stored row, independent of quota/rate-limit state. Used for a mid-session
+	 * `/credential <selector>` switch that has nothing to do with exhaustion —
+	 * the user just wants a different account for the rest of the session.
+	 *
+	 * This mutates ONLY the session-scoped sticky pointer
+	 * ({@link AuthStorage.#recordSessionCredential}), never a provider-wide
+	 * runtime override, so it cannot bleed into other sessions in the same
+	 * process whose credential identity differs. The sticky pointer is keyed by
+	 * `sessionId`, and subagents/team workers inherit their parent's
+	 * `credentialSessionId` by design so they keep using the same account as
+	 * the parent — a switch therefore applies to the whole session family
+	 * sharing that identity, not to unrelated sessions.
+	 *
+	 * Fails closed rather than silently no-op when a stronger override already
+	 * decides this provider's credential every call: a hard pin
+	 * ({@link AuthStorage.setRuntimeCredentialSelector}, `--credential`), a
+	 * runtime API-key override (`--api-key`), or a config-sourced API key
+	 * (`models.yml` `apiKey`) would each re-decide the credential on the very
+	 * next {@link AuthStorage.getApiKey} call and make this switch appear to
+	 * silently do nothing.
+	 *
+	 * Deliberately does not touch credential-blocked state: if the target row
+	 * is still backoff-blocked from a prior quota failure, the existing
+	 * `#resolveOAuthSelection` ranking safely ignores this sticky pointer and
+	 * falls back to a usable account instead of re-issuing a request that would
+	 * just draw another 429/quota error.
+	 */
+	switchSessionCredential(provider: string, sessionId: string, selector: AuthCredentialSelector): void {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeOverrides.has(storageProvider)) {
+			throw new Error(
+				`Cannot switch credential for ${provider}: a runtime API key override (--api-key) is active and always wins`,
+			);
+		}
+		if (this.#configOverrides.has(storageProvider)) {
+			throw new Error(
+				`Cannot switch credential for ${provider}: a config API key override (models.yml) is active and always wins`,
+			);
+		}
+		if (this.#runtimeCredentialSelectors.has(storageProvider)) {
+			throw new Error(
+				`Cannot switch credential for ${provider}: --credential already pins this session to one stored row`,
+			);
+		}
+		const matched = this.#findCredentialBySelector(storageProvider, selector);
+		if (matched?.credential.type !== "oauth") {
+			throw new Error(
+				`No active OAuth credential found for ${provider} matching ${this.#formatCredentialSelector(selector)}`,
+			);
+		}
+		this.#recordSessionCredential(storageProvider, sessionId, "oauth", matched.index);
+		this.#bumpGeneration("switch-session-credential");
+	}
+
+	/**
 	 * Register a per-provider API key sourced from user configuration
 	 * (e.g. `models.yml` `providers.<name>.apiKey`). Higher priority than
 	 * stored credentials and OAuth tokens — when the user pins a key in

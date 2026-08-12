@@ -83,6 +83,21 @@ gjc --prefer-credential email:name@example.com
 
 Unlike `--credential` (a hard pin that never rotates and fails the session on exhaustion), `--prefer-credential` is soft: it wins the initial pick, and a content-free quota/rate-limit failure switches to another active credential immediately and keeps the fallback sticky for the rest of the session. See [`non-compaction-retry-policy.md` → Preferred credential quota fallback](./non-compaction-retry-policy.md#preferred-credential-quota-fallback) for the full failure-mode contract.
 
+### Switch accounts mid-session
+
+`/credential` (alias `/account`) switches a *running* session's active stored OAuth account for a provider, independent of quota state — unlike the automatic quota-triggered fallback above, this is a manual switch for when nothing is exhausted and you just want a different account:
+
+```
+/credential                          # list every provider's stored accounts and which is active
+/credential id:15                    # switch to a specific stored row
+/credential email:me@example.com     # switch by email (current model's provider, or the one unique OAuth-pool match)
+/credential anthropic/id:15          # switch, naming the provider explicitly
+```
+
+With no argument, it lists every provider's stored OAuth rows and marks which one this session is currently using. A bare (unqualified) selector targets the current model's provider when that provider has a matching row, otherwise the single OAuth-pool provider it uniquely matches; an ambiguous match across providers asks for an explicit `provider/<selector>` prefix.
+
+The switch only affects this session's credential identity — the session and its subagents/team workers share one credential identity (`credentialSessionId`) by design, and it never changes another session's identity or a provider-wide override. It takes effect on the next request to that provider, and refuses outright when a stronger override already owns the provider's credential selection every call: `--credential` (hard pin), a runtime `--api-key` override, or a config-sourced `models.yml` `apiKey`. Switching to a row that is currently backoff-blocked from a prior quota failure does not force it through — the existing session-start ranking still skips a blocked row and falls back to a usable account instead of drawing another 429.
+
 ### Provider order across vendors
 
 Which *provider* serves a bare model alias is a separate ladder:

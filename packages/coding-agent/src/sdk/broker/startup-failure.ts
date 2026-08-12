@@ -7,6 +7,15 @@ export interface BrokerStartupFailureMarker {
 	exitCode: number | null;
 	signal: string | null;
 	writtenAt: number;
+	/**
+	 * pid of the exact broker process that wrote this marker. `ensureBroker`
+	 * only trusts a marker whose pid matches the exact spawned child it just
+	 * reaped -- a marker left behind by a stale or foreign broker process (for
+	 * example a losing racer from a concurrent spawn, or a marker predating the
+	 * pre-spawn clear) must never be misattributed to a different spawn's
+	 * failure.
+	 */
+	pid: number;
 }
 
 const BROKER_STARTUP_FAILURE_FILE = "broker.startup-failure.json";
@@ -16,26 +25,37 @@ export function brokerStartupFailurePath(agentDir: string): string {
 	return path.join(agentDir, "sdk", BROKER_STARTUP_FAILURE_FILE);
 }
 
-function boundedMarker(reason: string, exitCode: number | null, signal: string | null): BrokerStartupFailureMarker {
+function boundedMarker(
+	reason: string,
+	exitCode: number | null,
+	signal: string | null,
+	pid: number,
+): BrokerStartupFailureMarker {
 	return {
 		version: 1,
 		reason: reason.slice(0, MAX_BROKER_STARTUP_FAILURE_REASON),
 		exitCode,
 		signal,
 		writtenAt: Date.now(),
+		pid,
 	};
 }
 
-/** Best-effort durable marker write; never throws (diagnostics must not mask the exit itself). */
+/**
+ * Best-effort durable marker write; never throws (diagnostics must not mask the
+ * exit itself). `pid` must be the writing broker process's own pid
+ * (`process.pid`) so a later reader can bind the marker to the exact spawned
+ * child it is attributing the failure to.
+ */
 export async function writeBrokerStartupFailureMarker(
 	agentDir: string,
-	failure: { reason: string; exitCode: number | null; signal: string | null },
+	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number },
 ): Promise<void> {
 	try {
 		await fs.mkdir(path.dirname(brokerStartupFailurePath(agentDir)), { recursive: true, mode: 0o700 });
 		await Bun.write(
 			brokerStartupFailurePath(agentDir),
-			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal)),
+			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal, failure.pid)),
 		);
 	} catch {
 		// Best-effort only.
@@ -59,7 +79,10 @@ export async function readBrokerStartupFailureMarker(
 			marker.reason.length === 0 ||
 			(marker.exitCode !== null && typeof marker.exitCode !== "number") ||
 			(marker.signal !== null && typeof marker.signal !== "string") ||
-			typeof marker.writtenAt !== "number"
+			typeof marker.writtenAt !== "number" ||
+			typeof marker.pid !== "number" ||
+			!Number.isInteger(marker.pid) ||
+			marker.pid <= 0
 		)
 			return undefined;
 		return marker as BrokerStartupFailureMarker;

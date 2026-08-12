@@ -336,7 +336,13 @@ const UNOBSERVED_COMPENSATION_CODE = "broker_compensation_unobserved";
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
-/** Wall-clock bound `readCompleteQ12Snapshot` promises its callers, pages included. */
+/**
+ * Pagination window for `readCompleteQ12Snapshot`: it stops starting pages once
+ * this much time has passed and gives each page only the remainder as its reply
+ * budget. It bounds pagination, not the whole call — attachment resolution runs
+ * before the window opens, and a page's budget is a post-connect reply deadline,
+ * so transport reconnect time sits outside it.
+ */
 const Q12_SNAPSHOT_BUDGET_MS = 5_000;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);

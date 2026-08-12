@@ -21,6 +21,7 @@ test("write creates the marker at the expected path and read round-trips it", as
 			reason: "no discovery within deadline",
 			exitCode: 3,
 			signal: "SIGTERM",
+			pid: process.pid,
 		});
 
 		const stat = await fs.stat(brokerStartupFailurePath(agentDir));
@@ -33,6 +34,7 @@ test("write creates the marker at the expected path and read round-trips it", as
 		expect(marker?.reason).toBe("no discovery within deadline");
 		expect(marker?.exitCode).toBe(3);
 		expect(marker?.signal).toBe("SIGTERM");
+		expect(marker?.pid).toBe(process.pid);
 		expect(typeof marker?.writtenAt).toBe("number");
 		expect(Number.isFinite(marker?.writtenAt)).toBe(true);
 	} finally {
@@ -43,7 +45,12 @@ test("write creates the marker at the expected path and read round-trips it", as
 test("write truncates a reason longer than 512 characters to exactly 512", async () => {
 	const agentDir = await makeAgentDir();
 	try {
-		await writeBrokerStartupFailureMarker(agentDir, { reason: "x".repeat(600), exitCode: 1, signal: null });
+		await writeBrokerStartupFailureMarker(agentDir, {
+			reason: "x".repeat(600),
+			exitCode: 1,
+			signal: null,
+			pid: process.pid,
+		});
 
 		const marker = await readBrokerStartupFailureMarker(agentDir);
 		expect(marker?.reason?.length).toBe(512);
@@ -77,7 +84,7 @@ test("read returns undefined for a marker with an unsupported version", async ()
 	try {
 		await Bun.write(
 			brokerStartupFailurePath(agentDir),
-			JSON.stringify({ version: 2, reason: "old shape", exitCode: 1, signal: null, writtenAt: 123 }),
+			JSON.stringify({ version: 2, reason: "old shape", exitCode: 1, signal: null, writtenAt: 123, pid: 1 }),
 		);
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 	} finally {
@@ -91,11 +98,11 @@ test("read returns undefined when a marker field has an invalid type", async () 
 		const markerPath = brokerStartupFailurePath(agentDir);
 		await Bun.write(
 			markerPath,
-			JSON.stringify({ version: 1, reason: "r", exitCode: "1", signal: null, writtenAt: 123 }),
+			JSON.stringify({ version: 1, reason: "r", exitCode: "1", signal: null, writtenAt: 123, pid: 1 }),
 		);
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 
-		await Bun.write(markerPath, JSON.stringify({ version: 1, exitCode: 1, signal: null, writtenAt: 123 }));
+		await Bun.write(markerPath, JSON.stringify({ version: 1, exitCode: 1, signal: null, writtenAt: 123, pid: 1 }));
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
@@ -105,7 +112,7 @@ test("read returns undefined when a marker field has an invalid type", async () 
 test("clear removes the marker and tolerates an already-absent marker", async () => {
 	const agentDir = await makeAgentDir();
 	try {
-		await writeBrokerStartupFailureMarker(agentDir, { reason: "stale", exitCode: 0, signal: null });
+		await writeBrokerStartupFailureMarker(agentDir, { reason: "stale", exitCode: 0, signal: null, pid: process.pid });
 		await clearBrokerStartupFailureMarker(agentDir);
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 
@@ -146,7 +153,7 @@ test("write is best-effort when the sdk directory cannot be created", async () =
 		await Bun.write(agentDir, "not a directory");
 
 		await expect(
-			writeBrokerStartupFailureMarker(agentDir, { reason: "boom", exitCode: 1, signal: null }),
+			writeBrokerStartupFailureMarker(agentDir, { reason: "boom", exitCode: 1, signal: null, pid: process.pid }),
 		).resolves.toBeUndefined();
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 	} finally {
@@ -157,11 +164,17 @@ test("write is best-effort when the sdk directory cannot be created", async () =
 test("null exitCode and signal round-trip as null, not undefined", async () => {
 	const agentDir = await makeAgentDir();
 	try {
-		await writeBrokerStartupFailureMarker(agentDir, { reason: "no exit", exitCode: null, signal: null });
+		await writeBrokerStartupFailureMarker(agentDir, {
+			reason: "no exit",
+			exitCode: null,
+			signal: null,
+			pid: process.pid,
+		});
 
 		const marker = await readBrokerStartupFailureMarker(agentDir);
 		expect(marker?.exitCode).toBeNull();
 		expect(marker?.signal).toBeNull();
+		expect(marker?.pid).toBe(process.pid);
 	} finally {
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
@@ -171,18 +184,36 @@ test("read returns undefined for an empty reason, a non-string signal, or a miss
 	try {
 		const markerPath = brokerStartupFailurePath(agentDir);
 
-		await Bun.write(markerPath, JSON.stringify({ version: 1, reason: "", exitCode: 1, signal: null, writtenAt: 1 }));
-		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
-
-		await Bun.write(markerPath, JSON.stringify({ version: 1, reason: "r", exitCode: 1, signal: 7, writtenAt: 1 }));
-		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
-
-		await Bun.write(markerPath, JSON.stringify({ version: 1, reason: "r", exitCode: 1, signal: null }));
+		await Bun.write(
+			markerPath,
+			JSON.stringify({ version: 1, reason: "", exitCode: 1, signal: null, writtenAt: 1, pid: 1 }),
+		);
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 
 		await Bun.write(
 			markerPath,
-			JSON.stringify({ version: 1, reason: "r", exitCode: 1, signal: null, writtenAt: "now" }),
+			JSON.stringify({ version: 1, reason: "r", exitCode: 1, signal: 7, writtenAt: 1, pid: 1 }),
+		);
+		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
+
+		await Bun.write(markerPath, JSON.stringify({ version: 1, reason: "r", exitCode: 1, signal: null, pid: 1 }));
+		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
+
+		await Bun.write(
+			markerPath,
+			JSON.stringify({ version: 1, reason: "r", exitCode: 1, signal: null, writtenAt: "now", pid: 1 }),
+		);
+		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
+
+		await Bun.write(
+			markerPath,
+			JSON.stringify({ version: 1, reason: "r", exitCode: 1, signal: null, writtenAt: 1, pid: "1" }),
+		);
+		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
+
+		await Bun.write(
+			markerPath,
+			JSON.stringify({ version: 1, reason: "r", exitCode: 1, signal: null, writtenAt: 1, pid: 0 }),
 		);
 		await expect(readBrokerStartupFailureMarker(agentDir)).resolves.toBeUndefined();
 	} finally {

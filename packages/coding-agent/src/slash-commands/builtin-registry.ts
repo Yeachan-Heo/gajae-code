@@ -43,6 +43,7 @@ import {
 import { parseThinkingLevel } from "../thinking";
 import { getDisplayChangelogEntries } from "../utils/changelog";
 import { buildContextReportText } from "./helpers/context-report";
+import { switchSessionCredentialCommand } from "./helpers/credential-switch";
 import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
@@ -1261,6 +1262,25 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: async (_command, runtime) => {
 			await runtime.ctx.handleUsageCommand();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "credential",
+		aliases: ["account"],
+		description: "Switch this session's active stored account, or list accounts",
+		acpDescription: "Switch or list stored credentials for this session",
+		inlineHint: "[email:<addr>|id:<n>|account:<id>|project:<id>|provider/<selector>]",
+		acpInputHint: "[selector]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			await runtime.output(await switchSessionCredentialCommand(runtime, command.args));
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			const result = await switchSessionCredentialCommand(toSlashCommandRuntime(runtime), command.args);
+			refreshStatusLine(runtime.ctx);
+			runtime.ctx.showStatus(result);
 			runtime.ctx.editor.setText("");
 		},
 	},
