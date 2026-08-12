@@ -61,6 +61,7 @@ describe("SDK WebSocket transport lifecycle", () => {
 				mkdir: fs.mkdir,
 				writeFile: fs.writeFile,
 				chmod: fs.chmod,
+				stat: fs.stat,
 				rename: async (from, to) => {
 					expect(to).toBe(endpointPath);
 					expect((await fs.stat(from)).mode & 0o777).toBe(0o600);
@@ -72,7 +73,6 @@ describe("SDK WebSocket transport lifecycle", () => {
 					await releaseRename.promise;
 					await fs.rename(from, to);
 				},
-				readFile: fs.readFile,
 				rm: fs.rm,
 			},
 		});
@@ -227,8 +227,8 @@ describe("SDK WebSocket transport lifecycle", () => {
 				chmod: async () => {
 					throw Object.assign(new Error("chmod injected failure"), { code: "EACCES" });
 				},
+				stat: real.stat,
 				rename: real.rename,
-				readFile: real.readFile,
 				rm: real.rm,
 			},
 		};
@@ -268,8 +268,8 @@ describe("SDK WebSocket transport lifecycle", () => {
 					throw Object.assign(new Error("duplicate startup failed"), { code: "EIO" });
 				},
 				chmod: fs.chmod,
+				stat: fs.stat,
 				rename: fs.rename,
-				readFile: fs.readFile,
 				rm: fs.rm,
 			},
 		});
@@ -282,76 +282,48 @@ describe("SDK WebSocket transport lifecycle", () => {
 		}
 	});
 
-	test("serializes a successor publication behind an owner endpoint cleanup", async () => {
+	test("retains a replacement endpoint while concurrent readers finish", async () => {
 		const stateRoot = await tempStateRoot();
-		const sessionId = "serialized-cleanup";
-		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
-		const readEntered = Promise.withResolvers<void>();
-		const releaseRead = Promise.withResolvers<void>();
-		const owner = await createSdkWebSocketTransport({
-			sessionId,
+		const endpointPath = path.join(stateRoot, "sdk", "replacement.json");
+		const transport = await createSdkWebSocketTransport({
+			sessionId: "replacement",
 			stateRoot,
-			token: "owner-token",
-			filesystem: {
-				mkdir: fs.mkdir,
-				writeFile: fs.writeFile,
-				chmod: fs.chmod,
-				rename: fs.rename,
-				readFile: (async (...args: Parameters<typeof fs.readFile>) => {
-					readEntered.resolve();
-					await releaseRead.promise;
-					return await fs.readFile(...args);
-				}) as typeof fs.readFile,
-				rm: fs.rm,
-			},
+			token: "token",
 		});
-		const successor = await createSdkWebSocketTransport({ sessionId, stateRoot, token: "successor-token" });
 		try {
-			await owner.start();
-			const stop = owner.stop();
-			await readEntered.promise;
-			const start = successor.start();
-			await Bun.sleep(20);
-			expect(JSON.parse(await fs.readFile(endpointPath, "utf8"))).toMatchObject({ token: "owner-token" });
-			releaseRead.resolve();
-			await stop;
-			await start;
-			expect(JSON.parse(await fs.readFile(endpointPath, "utf8"))).toMatchObject({ token: "successor-token" });
+			await transport.start();
+			const replacement = JSON.stringify({ sessionId: "replacement", url: "ws://127.0.0.1:1", token: "successor" });
+			const displaced = `${endpointPath}.displaced`;
+			await fs.rename(endpointPath, displaced);
+			await fs.writeFile(endpointPath, replacement, { mode: 0o600 });
+			const readers = Promise.all(Array.from({ length: 16 }, async () => await fs.readFile(endpointPath, "utf8")));
+			await transport.stop();
+			expect(await readers).toEqual(Array(16).fill(replacement));
+			expect(await fs.readFile(endpointPath, "utf8")).toBe(replacement);
+			await fs.rm(displaced, { force: true });
 		} finally {
-			releaseRead.resolve();
-			await owner.stop().catch(() => undefined);
-			await successor.stop().catch(() => undefined);
+			await transport.stop().catch(() => undefined);
 			await fs.rm(stateRoot, { recursive: true, force: true });
 		}
 	});
 
-	test("endpoint removal failures are typed and do not prevent server release", async () => {
+	test("endpoint identity uncertainty is typed and retains the endpoint", async () => {
 		const stateRoot = await tempStateRoot();
-		let rmCalls = 0;
-		const real = fs;
-		const dependencies: SdkWebSocketTransportDependencies = {
-			filesystem: {
-				mkdir: real.mkdir,
-				writeFile: real.writeFile,
-				chmod: real.chmod,
-				rename: real.rename,
-				readFile: real.readFile,
-				rm: async (...args: Parameters<typeof real.rm>) => {
-					rmCalls += 1;
-					if (rmCalls === 1) throw Object.assign(new Error("rm injected failure"), { code: "EIO" });
-					return await real.rm(...args);
-				},
-			},
-		};
+		const endpointPath = path.join(stateRoot, "sdk", "identity-uncertain.json");
 		const transport = await createSdkWebSocketTransport({
-			sessionId: "rm-failure",
+			sessionId: "identity-uncertain",
 			stateRoot,
 			token: "token",
-			...dependencies,
 		});
-		await transport.start();
-		await expect(transport.stop()).rejects.toMatchObject({ code: "endpoint_remove_failed" });
-		await fs.rm(stateRoot, { recursive: true, force: true });
+		try {
+			await transport.start();
+			await fs.rm(endpointPath);
+			await fs.mkdir(endpointPath);
+			await expect(transport.stop()).rejects.toMatchObject({ code: "endpoint_remove_failed" });
+			await expect(fs.stat(endpointPath)).resolves.toBeDefined();
+		} finally {
+			await fs.rm(stateRoot, { recursive: true, force: true });
+		}
 	});
 
 	test("runtime stop releases the transport even when host stop fails", async () => {

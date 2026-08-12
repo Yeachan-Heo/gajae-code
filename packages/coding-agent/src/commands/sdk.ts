@@ -613,9 +613,43 @@ export async function runSessionHost(
 		})();
 		return failureRollback;
 	};
+	const sessionEndpointPath = path.join(request.stateRoot, "sdk", `${request.sessionId}.json`);
+	const exitAfterSessionDisposal = async (): Promise<void> => {
+		await disposeSession();
+		let failure: SdkStartupFailure | undefined;
+		try {
+			const endpoint = JSON.parse(await fs.readFile(sessionEndpointPath, "utf8")) as {
+				pid?: unknown;
+				sessionId?: unknown;
+			};
+			if (endpoint.pid === process.pid && endpoint.sessionId === request.sessionId)
+				failure = {
+					phase: "startup",
+					reason: "failed",
+					message: `SDK host endpoint remained after graceful shutdown: ${request.sessionId}`,
+				};
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				failure = {
+					phase: "startup",
+					reason: "failed",
+					message: `SDK host endpoint cleanup could not be verified: ${request.sessionId}`,
+				};
+			}
+		}
+		if (failure) {
+			process.exitCode = 1;
+			process.stderr.write(`${failure.message}\n`);
+			await writeFailure(failure, rollback.result).catch(() => {});
+		}
+		process.exit(process.exitCode ?? 0);
+	};
+	let stopping = false;
 	const stop = () => {
 		if (capability.result?.status === "started") {
-			void disposeSession().finally(() => process.exit(0));
+			if (stopping) return;
+			stopping = true;
+			void exitAfterSessionDisposal();
 			return;
 		}
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
