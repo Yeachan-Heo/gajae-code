@@ -1818,6 +1818,11 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			expect(timeoutMs).toBeLessThanOrEqual(5_000);
 		}
 		expect(q12Budgets.length).toBeGreaterThanOrEqual(2);
+		// Each page gets the remainder, not a fresh 5s: a later page can never be
+		// granted more time than an earlier one, which a fixed per-page budget would
+		// allow. Pages resolve in the same millisecond here, so equality is legal.
+		for (let index = 1; index < q12Budgets.length; index++)
+			expect(q12Budgets[index]!).toBeLessThanOrEqual(q12Budgets[index - 1]!);
 	});
 
 	it("diagnoses malformed gate rows without misclassifying legal Q12 pagination", async () => {

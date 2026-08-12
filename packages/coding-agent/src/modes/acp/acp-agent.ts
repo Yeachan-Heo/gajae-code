@@ -1642,6 +1642,14 @@ export class AcpAgent implements Agent {
 			waiter.terminal = undefined;
 			waiter.settled = true;
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
+			// Keep a late terminal for this (cancelled) turn closed, exactly like the
+			// other settlement paths, so an aborted run's trailing frame can never
+			// publish over a later prompt that reuses the identity.
+			if (hasCompleteCorrelation(waiter.correlation)) {
+				record.settledPromptCorrelations.push(waiter.correlation);
+				while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
+					record.settledPromptCorrelations.shift();
+			}
 			// A prompt cancelled before the SDK acknowledged it still ends this turn by
 			// client request, and ACP is explicit: "Agents MUST catch these errors and
 			// return the semantically meaningful `cancelled` stop reason, so that Clients
@@ -1649,6 +1657,10 @@ export class AcpAgent implements Agent {
 			// rejection instead would show the user a spurious error for their own cancel.
 			if (record.cancelRequested) {
 				record.cancelRequested = false;
+				// The client's turn is settled by the return; the advisory idle publication
+				// must not gate it and must still be attempted so the running phase is
+				// released (gjcRunning:false) instead of spinning behind a settled cancel.
+				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 				return { stopReason: "cancelled" };
 			}
 			throw error;
@@ -1689,6 +1701,9 @@ export class AcpAgent implements Agent {
 				waiter.deferredFrames.length = 0;
 				waiter.terminal = undefined;
 				waiter.resolve({ stopReason: "cancelled" });
+				// Release the running phase for consistency with the resolved cancel; the
+				// publication is advisory and must never gate the settlement above.
+				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 			} else {
 				// The acknowledgement proves the run was aborted, not that its terminal was
 				// published. Arm the bounded settlement so the turn cannot outlive the cancel.
@@ -1734,8 +1749,14 @@ export class AcpAgent implements Agent {
 			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
 				record.settledPromptCorrelations.shift();
 		}
-		await this.#publishPromptPhaseIdle(id, record.adapter);
+		// The client's turn ends with the resolution, not with the advisory idle update.
+		// Publishing the phase transition first made a backpressured ACP transport hold
+		// the settlement hostage: `sessionUpdate` awaits the stream write, a client that
+		// stops reading (force-cancel in progress) blocks it, and `waiter.resolve` never
+		// ran — the acknowledged cancel left the prompt pending forever, the client
+		// force-cancelled, and the next prompt collided with the stale foreground turn.
 		waiter.resolve({ stopReason: "cancelled" });
+		void this.#publishPromptPhaseIdle(id, record.adapter);
 	}
 
 	async extMethod(method: string, params: JsonObject): Promise<JsonObject> {
@@ -2390,6 +2411,9 @@ export class AcpAgent implements Agent {
 							"The prompt owner connection was lost before completion.",
 						),
 					);
+					// The turn is settled by the rejection; release the running phase
+					// best-effort so a cancelled prompt is not left reporting working.
+					void this.#publishPromptPhaseIdle(id, record.adapter);
 				}
 			}
 			return;
@@ -2573,17 +2597,22 @@ export class AcpAgent implements Agent {
 				record.settledPromptCorrelations.shift();
 		}
 		// The turn is over even though it ended badly, so the client's running phase has
-		// to be released. Skipping it here is what leaves a client composer spinning on a
-		// turn that will never produce another frame.
-		await this.#publishPromptPhaseIdle(id, record.adapter);
+		// to be released. Rejection is the settlement; the advisory idle publication must
+		// never gate it (a backpressured transport would otherwise hold the rejection
+		// forever). Skipping the idle publish entirely is what left a client composer
+		// spinning on a turn that already produced its terminal.
 		waiter.reject(error);
+		void this.#publishPromptPhaseIdle(id, record.adapter);
 	}
 
 	/**
 	 * Publishes only the phase transition — no `context.get`/`session.metadata` queries —
 	 * because an abnormal settlement has no trustworthy usage or title to report. Publish
 	 * failures are swallowed: the turn is already settled, and escalating to session
-	 * failure here would tear down a session the client can still use.
+	 * failure here would tear down a session the client can still use. Callers must
+	 * settle the prompt BEFORE invoking this (or detach it with `void`): `sessionUpdate`
+	 * awaits the transport write, so awaiting it ahead of resolution lets a backpressured
+	 * client hold the settlement hostage.
 	 */
 	async #publishPromptPhaseIdle(id: string, adapter: AcpSdkAdapter): Promise<void> {
 		const record = this.#sessions.get(id);

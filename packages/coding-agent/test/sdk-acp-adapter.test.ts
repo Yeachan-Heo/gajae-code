@@ -134,22 +134,34 @@ test("ACP abort keeps the one-shot reply deadline while other session commands t
 		sessionId: harness.attachment.sessionId,
 	});
 	await adapter.start();
-	await adapter.cancel();
-	await adapter.prompt({ prompt: "hello" });
-	await adapter.query("models.list/current");
+	try {
+		await adapter.cancel();
+		await adapter.control("turn.abort", { mode: "terminal", idempotencyKey: "abort-budget-direct" });
+		await adapter.prompt({ prompt: "hello" });
+		await adapter.query("models.list/current");
 
-	const budgetFor = (predicate: (frame: Record<string, unknown>) => boolean): number | undefined => {
-		const index = harness.requests.findIndex(predicate);
-		if (index < 0) throw new Error("expected frame was never dispatched");
-		return harness.requestOptions[index]?.timeoutMs;
-	};
+		const budgetsFor = (predicate: (frame: Record<string, unknown>) => boolean): (number | undefined)[] => {
+			const budgets = harness.requests
+				.map((frame, index) => (predicate(frame) ? harness.requestOptions[index]?.timeoutMs : undefined))
+				.filter((_value, index) => predicate(harness.requests[index]!));
+			if (budgets.length === 0) throw new Error("expected frame was never dispatched");
+			return budgets;
+		};
 
-	// A cancel is awaited before ACP can arm any settlement path, so it must not
-	// inherit the wide session reply budget the cold catalog query needs (#4258).
-	expect(budgetFor(frame => frame.operation === "turn.abort")).toBe(SESSION_ABORT_TIMEOUT_MS);
-	expect(SESSION_ABORT_TIMEOUT_MS).toBeLessThan(SESSION_REQUEST_TIMEOUT_MS);
-	expect(budgetFor(frame => frame.operation === "turn.prompt")).toBeUndefined();
-	expect(budgetFor(frame => frame.query === "models.list/current")).toBeUndefined();
+		// A cancel is awaited before ACP can arm any settlement path, so it must not
+		// inherit the wide session reply budget the cold catalog query needs (#4258).
+		// Both ACP abort ingresses -- cancel() and a raw turn.abort control -- go
+		// through control(), so both must carry the cancellation budget.
+		expect(budgetsFor(frame => frame.operation === "turn.abort")).toEqual([
+			SESSION_ABORT_TIMEOUT_MS,
+			SESSION_ABORT_TIMEOUT_MS,
+		]);
+		expect(SESSION_ABORT_TIMEOUT_MS).toBeLessThan(SESSION_REQUEST_TIMEOUT_MS);
+		expect(budgetsFor(frame => frame.operation === "turn.prompt")).toEqual([undefined]);
+		expect(budgetsFor(frame => frame.query === "models.list/current")).toEqual([undefined]);
+	} finally {
+		await adapter.close();
+	}
 });
 
 test("ACP SDK adapter maps native and extension methods and keeps endpoint credentials machine-only", async () => {
