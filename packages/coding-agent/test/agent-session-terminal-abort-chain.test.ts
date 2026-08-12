@@ -791,6 +791,40 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await promptPromise;
 	}, 30_000);
 
+	it("removed steers never fire their ownership hook into a later rearm", async () => {
+		// Review thread P1: promotion hooks must bind to the messages a run
+		// actually consumes — a steer removed from the queue before the abort
+		// (or during the rearm delay) must never fire its requester-ownership
+		// callback for a run that did not consume it.
+		const promoted: string[] = [];
+		scriptedResponses = [bashCall("sleep 2", "hold-removal"), stopReply("accepted")];
+		const promptPromise = session.prompt("hold removal window").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active removal window");
+		await session.sendUserMessage("removed steer", {
+			deliverAs: "steer",
+			onQueuedPromoted: () => promoted.push("removed"),
+		});
+		await session.sendUserMessage("accepted steer", {
+			deliverAs: "steer",
+			onQueuedPromoted: () => promoted.push("accepted"),
+		});
+		const removedEntry = session.getQueuedMessageEntries().find(entry => entry.text === "removed steer");
+		if (!removedEntry) throw new Error("Expected removable steer entry");
+		const removed = session.removeQueuedMessageForEditing(removedEntry.id);
+		expect(removed).toBe("removed steer");
+		expect(promoted).toEqual([]);
+		// The abort's rearm consumes the remaining steer; the removed steer's
+		// hook must never fire (the run-acceptance path only fires hooks for
+		// the messages actually consumed).
+		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
+			graceMs: 2_000,
+			terminal: { scope: "turn" },
+		});
+		await waitFor(() => !session.agent.hasQueuedSteering(), "remaining steer consumed");
+		expect(promoted).not.toContain("removed");
+		await promptPromise;
+	}, 30_000);
+
 	it("fires the queued steer's SDK ownership hook exactly once when its run accepts", async () => {
 		// Review thread P1: a streaming-diverted SDK turn.prompt accepted while
 		// the old turn is still streaming queues a steer without scheduling its
