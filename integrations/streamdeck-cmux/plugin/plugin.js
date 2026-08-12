@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { ANSWER_SLOT_COUNT, optionIndexForSlot, pageAction, pageCount, pendingAsk, sdkMessages, usesPagedLayout } from "./sdk-ask-state.js";
 import { nextSelectedSessionId } from "./focus-state.js";
+import { contextEntriesForActions, contextEntriesForControls } from "./render-lanes.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -39,7 +40,8 @@ let sessions = [];
 let selectedSessionId = null;
 const sdkClients = new Map();
 let topologyState = { windows: [], workspaces: [], panes: [], allSurfaces: [], surfaces: [], selectedTty: null };
-let refreshInFlight = null;
+let sessionRefreshInFlight = null;
+let projectRefreshInFlight = null;
 let focusRefreshInFlight = null;
 let socket;
 const imageCache = new Map();
@@ -134,11 +136,16 @@ function canonicalProjectPath(value) {
 }
 
 async function discoverFrequentProjects() {
-  const result = await run(GJC, ["sdk", "session", "list"], homedir(), 30000);
-  if (result.exitCode !== 0) { log(`frequent project list failed exit=${result.exitCode} ${result.stderr}`); return []; }
+  const result = await run(GJC, ["sdk", "session", "list"], homedir(), 10000);
+  let listed = [];
+  if (result.exitCode !== 0) log(`frequent project list failed exit=${result.exitCode} ${result.stderr}`);
+  else {
+    try {
+      const payload = JSON.parse(result.stdout);
+      listed = payload?.result?.sessions ?? payload?.sessions ?? [];
+    } catch (error) { log(`frequent project list parse failed ${error}`); }
+  }
   try {
-    const payload = JSON.parse(result.stdout);
-    const listed = payload?.result?.sessions ?? payload?.sessions ?? [];
     const counts = new Map();
     for (const session of listed) {
       const projectPath = canonicalProjectPath(session?.locator?.repo);
@@ -212,13 +219,13 @@ function connectSdkEndpoint(endpoint) {
           log(`ask reply rejected ${message.reason || "unknown"}`);
         }
       }
-      if (changed) renderAll().catch(error => log(`ask render error ${error}`));
+      if (changed) renderAskControls().catch(error => log(`ask render error ${error}`));
     } catch (error) { log(`sdk message error ${error}`); }
   });
   ws.addEventListener("close", () => {
     if (sdkClients.get(endpoint.sessionId) === client) {
       client.pending = null;
-      renderAll().catch(() => {});
+      renderAskControls().catch(() => {});
     }
   });
   ws.addEventListener("error", () => log(`sdk websocket error session=${endpoint.sessionId}`));
@@ -256,7 +263,7 @@ async function answerFocusedAsk(index, context) {
   if (index === ANSWER_SLOT_COUNT - 1 && page?.kind === "page") {
     pending.page = page.page;
     log(`sdk ask page session=${session.sessionId} id=${pending.id} page=${pending.page + 1}/${pageCount(pending)}`);
-    await renderAll();
+    await renderAskControls();
     ok(context);
     return;
   }
@@ -372,32 +379,25 @@ async function refreshFocus() {
     const next = nextSelectedSessionId(sessions, topology.selectedTty, selectedSessionId, sessionKey);
     if (next === selectedSessionId) return;
     selectedSessionId = next;
-    await renderAll();
+    await renderFocusState();
     log(`focus refresh selected=${selectedSessionId ?? "none"} focusedTty=${topology.selectedTty ?? "none"}`);
   })().finally(() => { focusRefreshInFlight = null; });
   return focusRefreshInFlight;
 }
-async function refresh() {
-  if (refreshInFlight) return refreshInFlight;
-  refreshInFlight = (async () => {
-    const [endpoints, ttys, projects] = await Promise.all([discoverEndpoints(), processTtys(), discoverFrequentProjects()]);
+async function refreshSessions() {
+  if (sessionRefreshInFlight) return sessionRefreshInFlight;
+  sessionRefreshInFlight = (async () => {
+    const [endpoints, ttys] = await Promise.all([discoverEndpoints(), processTtys()]);
     const topology = await cmuxTopology();
     syncSdkEndpoints(endpoints);
     topologyState = topology;
-    frequentProjects = projects;
     const endpointRows = endpoints.map(endpoint => ({ ...endpoint, tty: ttys.get(endpoint.pid) }));
     const endpointByTty = new Map(endpointRows.filter(row => row.tty).map(row => [row.tty, row]));
     const matchedSessionIds = new Set();
     const rows = topology.surfaces.map(surface => {
       const endpoint = endpointByTty.get(surface.tty);
       if (endpoint?.sessionId) matchedSessionIds.add(endpoint.sessionId);
-      return {
-        ...(endpoint ?? {}),
-        tty: surface.tty,
-        surface,
-        name: surface.title,
-        updatedAt: Number(endpoint?.updatedAt ?? endpoint?.startedAt ?? 0),
-      };
+      return { ...(endpoint ?? {}), tty: surface.tty, surface, name: surface.title, updatedAt: Number(endpoint?.updatedAt ?? endpoint?.startedAt ?? 0) };
     });
     rows.push(...endpointRows.filter(endpoint => !matchedSessionIds.has(endpoint.sessionId)).map(endpoint => ({
       ...endpoint,
@@ -419,10 +419,24 @@ async function refresh() {
     const focusedRow = rows.find(row => row.tty === topology.selectedTty);
     sessions = focusedRow ? [focusedRow, ...rows.filter(row => row !== focusedRow)].slice(0, 11) : rows.slice(0, 11);
     selectedSessionId = nextSelectedSessionId(sessions, topology.selectedTty, selectedSessionId, sessionKey);
-    await renderAll();
-    log(`refresh sessions=${sessions.length} contexts=${contexts.size} selected=${selectedSessionId ?? "none"} focusedTty=${topology.selectedTty ?? "none"} focusedEndpoint=${endpointByTty.get(topology.selectedTty)?.sessionId ?? "none"} endpoints=${endpoints.length} projects=${projects.map(project => `${project.label}:${project.sessionCount}`).join(",") || "none"}`);
-  })().finally(() => { refreshInFlight = null; });
-  return refreshInFlight;
+    await renderSessionState();
+    log(`session refresh sessions=${sessions.length} selected=${selectedSessionId ?? "none"} focusedTty=${topology.selectedTty ?? "none"} focusedEndpoint=${endpointByTty.get(topology.selectedTty)?.sessionId ?? "none"} endpoints=${endpoints.length}`);
+  })().finally(() => { sessionRefreshInFlight = null; });
+  return sessionRefreshInFlight;
+}
+
+async function refreshProjects() {
+  if (projectRefreshInFlight) return projectRefreshInFlight;
+  projectRefreshInFlight = (async () => {
+    frequentProjects = await discoverFrequentProjects();
+    await renderProjectControls();
+    log(`project refresh projects=${frequentProjects.map(project => `${project.label}:${project.sessionCount}`).join(",") || "none"}`);
+  })().finally(() => { projectRefreshInFlight = null; });
+  return projectRefreshInFlight;
+}
+
+async function refresh() {
+  await Promise.all([refreshSessions(), refreshProjects()]);
 }
 
 function sessionTitle(session) {
@@ -546,8 +560,31 @@ async function renderContext(context, state) {
   if (action === ABORT_ACTION) { title(context, ""); await image(context, "abort-esc2"); }
 }
 
+async function renderEntries(entries) {
+  await Promise.all(entries.map(([context, state]) => renderContext(context, state)));
+}
+
 async function renderAll() {
-  await Promise.all([...contexts].map(([context, state]) => renderContext(context, state)));
+  await renderEntries([...contexts]);
+}
+
+async function renderFocusState() {
+  await Promise.all([
+    renderEntries(contextEntriesForActions(contexts, new Set([SESSION_ACTION, STATUS_ACTION, SKILL_ACTION]))),
+    renderAskControls(),
+  ]);
+}
+
+async function renderSessionState() {
+  await renderFocusState();
+}
+
+async function renderProjectControls() {
+  await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "frequentProject"));
+}
+
+async function renderAskControls() {
+  await renderEntries(contextEntriesForControls(contexts, settings => settings.answerSlot !== undefined));
 }
 
 function focusedGjcSurface(topology) {
@@ -791,12 +828,13 @@ async function keyUp(context, state, heldMs) {
 }
 
 const focusPeriodic = setInterval(() => refreshFocus().catch(error => log(`focus refresh error ${error}`)), 500);
-const periodic = setInterval(() => refresh().catch(error => log(`refresh error ${error}`)), 10000);
+const sessionPeriodic = setInterval(() => refreshSessions().catch(error => log(`session refresh error ${error}`)), 5000);
+const projectPeriodic = setInterval(() => refreshProjects().catch(error => log(`project refresh error ${error}`)), 60000);
 
 socket = new WebSocket(`ws://127.0.0.1:${port}`);
 socket.addEventListener("open", () => {
   socket.send(JSON.stringify({ event: registerEvent, uuid: pluginUUID }));
-  refresh().catch(error => log(`initial refresh error ${error}`));
+  Promise.all([refreshSessions(), refreshProjects()]).catch(error => log(`initial refresh error ${error}`));
 });
 socket.addEventListener("message", async event => {
   try {
@@ -821,5 +859,5 @@ socket.addEventListener("message", async event => {
     }
   } catch (error) { log(`message error ${error}`); }
 });
-socket.addEventListener("close", () => { clearInterval(focusPeriodic); clearInterval(periodic); process.exit(0); });
+socket.addEventListener("close", () => { clearInterval(focusPeriodic); clearInterval(sessionPeriodic); clearInterval(projectPeriodic); process.exit(0); });
 socket.addEventListener("error", error => log(`socket error ${error}`));
