@@ -3830,3 +3830,50 @@ it("keeps parallel pending questions isolated when one answer is submitted", asy
 		fs.access(path.join(rootB, ".gjc", "coordinator-state", "local", "repo", "codex-wake-events")),
 	).rejects.toThrow();
 });
+
+it("issue-4351: completed coordinator session reports ready_for_input false and ended_at", async () => {
+	const root = await tempRoot();
+	const controls: SdkControl[] = [];
+	const server = await createSdkControlServer(root, controls);
+	await registerSdkSession(server, root);
+	const sent = await server.callTool("gjc_coordinator_send_prompt", {
+		session_id: "visible-session",
+		prompt: "terminal transition for issue-4351",
+		idempotency_key: "issue-4351-completed",
+		allow_mutation: true,
+	});
+	const turnId = (sent as { turn_id?: unknown }).turn_id;
+	if (typeof turnId !== "string") throw new Error("expected turn id");
+	await server.callTool("gjc_coordinator_report_status", {
+		session_id: "visible-session",
+		turn_id: turnId,
+		status: "completed",
+		summary: "completed session must not be ready_for_input",
+		idempotency_key: "issue-4351-terminal",
+		allow_mutation: true,
+	});
+	const statePath = path.join(
+		root,
+		".gjc",
+		"coordinator-state",
+		"local",
+		"repo",
+		"session-states",
+		"visible-session.json",
+	);
+	const durable = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+	expect(durable.state).toBe("completed");
+	expect(durable.ready_for_input).toBe(false);
+	expect(typeof durable.ended_at).toBe("string");
+	expect(Number.isFinite(Date.parse(durable.ended_at as string))).toBe(true);
+
+	const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
+	expect(status).toMatchObject({
+		session_state: {
+			state: "completed",
+			ready_for_input: false,
+		},
+	});
+	const publicState = (status as { session_state?: Record<string, unknown> }).session_state;
+	expect(typeof publicState?.ended_at).toBe("string");
+});
