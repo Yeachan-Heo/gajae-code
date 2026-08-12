@@ -406,6 +406,31 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences.map(parseKey)).toEqual(["escape", "alt+up"]);
 		});
 
+		it("preserves a Meta-wrapped arrow when the chunk splits after the third Escape", () => {
+			// Same ESC ESC ESC [ A bytes as above, but the read boundary falls after
+			// the Escape run. The ambiguous odd trailing run must stay buffered so the
+			// continuation still forms the Meta wrapper instead of a plain Up after a
+			// destructive double-Escape gesture.
+			vi.useFakeTimers();
+			processInput("\x1b\x1b\x1b");
+			expect(emittedSequences).toEqual([]);
+
+			vi.advanceTimersByTime(9);
+			processInput("[A");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b\x1b[A"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["escape", "alt+up"]);
+		});
+
+		it("emits three Escapes when the split continuation arrives after the flush boundary", () => {
+			vi.useFakeTimers();
+			processInput("\x1b\x1b\x1b");
+			vi.advanceTimersByTime(10);
+			processInput("[A");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b", "[", "A"]);
+		});
+
 		it("preserves a Meta-wrapped SS3 key after a preceding bare Escape", () => {
 			processInput("\x1b\x1b\x1bOP");
 			expect(emittedSequences).toEqual(["\x1b", "\x1b\x1bOP"]);

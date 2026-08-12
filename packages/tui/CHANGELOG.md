@@ -5,6 +5,7 @@
 ### Fixed
 
 - A fast double-Esc (or triple-Esc) whose ESC bytes coalesce into one stdin chunk — which tmux always produces within its escape-time window, and SSH batching produces routinely — is now emitted as individual Escape key presses instead of a single `"\x1b\x1b"` sequence that parsed as the unbound `alt+escape` and silently swallowed both presses. This restores the double-Esc draft-clear and double-Esc selector gestures under tmux/SSH. Option-as-Meta sequences with a real continuation (e.g. Option+Up as `ESC ESC [ A`) remain atomic, and an ESC-cancelled incomplete sequence is still emitted whole.
+- An ambiguous trailing run of Escape bytes now stays buffered until a continuation or the flush timeout resolves it, so `ESC ESC ESC` followed by `[A` in the next chunk still decodes as Escape then `alt+up` instead of two Escapes plus a plain Up that fired the destructive double-Escape gesture.
 - Apple Terminal.app now retains its default keyboard mode when it does not support the Kitty keyboard protocol, avoiding the modifyOtherKeys fallback that breaks Korean/Hangul IME composition.
 
 ## [0.13.1] - 2026-08-11

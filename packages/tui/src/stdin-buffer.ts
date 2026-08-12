@@ -299,6 +299,15 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 				pos += 2;
 				continue;
 			}
+			// A trailing run of nothing but ESC bytes is ambiguous: the next chunk
+			// may still deliver the continuation that turns its last ESC into a Meta
+			// prefix (ESC ESC ESC + "[A" is bare Escape then Option+Up). Splitting it
+			// now would emit an extra Escape and downgrade the wrapped key to a plain
+			// one, firing the destructive double-Escape gesture. Keep the whole run
+			// buffered; the flush timeout emits it as individual Escape presses.
+			if (/^\x1b+$/.test(remaining)) {
+				return { sequences, remainder: remaining };
+			}
 			// Find the end of this escape sequence
 			let seqEnd = 1;
 			while (seqEnd <= remaining.length) {
