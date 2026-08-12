@@ -461,6 +461,51 @@ describe("StdinBuffer", () => {
 			expect(buffer.flush()).toEqual(["\x1b\x1b[1;"]);
 		});
 
+		it("resolves an Escape run into individual presses when a bracketed paste follows", () => {
+			// A paste start proves no Meta continuation is coming for the buffered
+			// Escape run. Emitting the run as one sequence parses as the unbound
+			// alt+escape and swallows every press.
+			const pastes: string[] = [];
+			buffer.on("paste", text => pastes.push(text));
+
+			processInput("\x1b\x1b\x1b\x1b[200~hi\x1b[201~");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["escape", "escape", "escape"]);
+			expect(pastes).toEqual(["hi"]);
+		});
+
+		it("resolves an even Escape run before a bracketed paste", () => {
+			const pastes: string[] = [];
+			buffer.on("paste", text => pastes.push(text));
+
+			processInput("\x1b\x1b\x1b\x1b\x1b[200~hi\x1b[201~");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b", "\x1b"]);
+			expect(pastes).toEqual(["hi"]);
+		});
+
+		it("decodes an Escape run before a paste identically when the chunk splits", () => {
+			const pastes: string[] = [];
+			buffer.on("paste", text => pastes.push(text));
+
+			processInput("\x1b\x1b\x1b");
+			processInput("\x1b[200~hi\x1b[201~");
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b"]);
+			expect(pastes).toEqual(["hi"]);
+		});
+
+		it("decodes an Escape run before a paste identically byte by byte", () => {
+			const pastes: string[] = [];
+			buffer.on("paste", text => pastes.push(text));
+
+			for (const byte of "\x1b\x1b\x1b\x1b[200~hi\x1b[201~") processInput(byte);
+
+			expect(emittedSequences).toEqual(["\x1b", "\x1b", "\x1b"]);
+			expect(pastes).toEqual(["hi"]);
+		});
+
 		it("still cuts an ESC-cancelled incomplete sequence without splitting it", async () => {
 			// An incomplete alt-CSI prefix cancelled by a new ESC is not a pure
 			// ESC run and must be emitted whole, exactly as before.

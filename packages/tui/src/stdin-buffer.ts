@@ -278,6 +278,16 @@ function continuesAsStringTerminator(remaining: string, index: number): boolean 
 	return afterEsc === undefined || afterEsc === "\\";
 }
 
+/**
+ * A buffered run of nothing but ESC bytes is N real Escape key presses, not an
+ * Option-as-Meta prefix. Emitting the run as one sequence parses as the unbound
+ * `alt+escape` and silently swallows every press, so any path that gives up on a
+ * continuation must split the run first.
+ */
+function splitResolvedEscapeRun(buffer: string): string[] {
+	return /^\x1b{2,}$/.test(buffer) ? buffer.split("") : [buffer];
+}
+
 function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {
 	const sequences: string[] = [];
 	let pos = 0;
@@ -538,8 +548,12 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				for (const sequence of result.sequences) {
 					this.#emitDataSequence(sequence);
 				}
+				// A bracketed paste start proves no Meta continuation is coming for a
+				// buffered Escape run, so resolve it into individual presses here too.
 				if (result.remainder.length > 0) {
-					this.#emitDataSequence(result.remainder);
+					for (const sequence of splitResolvedEscapeRun(result.remainder)) {
+						this.#emitDataSequence(sequence);
+					}
 				}
 			}
 
@@ -746,7 +760,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		// fires, no continuation is coming, and emitting the pair as one
 		// sequence parses as the unbound "alt+escape" — silently swallowing
 		// both presses and breaking the double-Esc draft-clear gesture.
-		const flushedBuffer = /^\x1b{2,}$/.test(this.#buffer) ? this.#buffer.split("") : [this.#buffer];
+		const flushedBuffer = splitResolvedEscapeRun(this.#buffer);
 		const sequences = pendingMeta === undefined ? flushedBuffer : [pendingMeta, ...flushedBuffer];
 		this.#buffer = "";
 		this.#pendingKittyPrintableCodepoint = undefined;
