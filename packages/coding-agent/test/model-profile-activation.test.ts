@@ -330,7 +330,8 @@ describe("model profile activation", () => {
 		try {
 			authStorage.setRuntimeApiKey("anthropic", "test-anthropic-key");
 			using _hook = hookFetch(input => {
-				switch (String(input)) {
+				const url = String(input);
+				switch (url) {
 					case "https://models.dev/api.json":
 						return new Response(JSON.stringify({ anthropic: { models: {} } }), {
 							headers: { "Content-Type": "application/json" },
