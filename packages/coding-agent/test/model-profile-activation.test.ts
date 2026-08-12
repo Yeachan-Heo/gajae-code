@@ -403,6 +403,31 @@ describe("model profile activation", () => {
 					.getAvailableForProfileActivation()
 					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
 			).toBe(true);
+
+			registry.registerProvider("anthropic", {
+				baseUrl: "https://runtime-anthropic.example.test/v1",
+				api: "anthropic-messages",
+				apiKey: "TEST_RUNTIME_ANTHROPIC_KEY",
+				models: [
+					{
+						id: "claude-opus-5",
+						name: "Runtime Opus 5",
+						reasoning: true,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 200_000,
+						maxTokens: 8_000,
+					},
+				],
+			});
+			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe(
+				"https://runtime-anthropic.example.test/v1",
+			);
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+			).toBe(true);
 		} finally {
 			authStorage.close();
 			tempDir.removeSync();
