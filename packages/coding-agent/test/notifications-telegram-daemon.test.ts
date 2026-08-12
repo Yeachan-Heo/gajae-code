@@ -311,7 +311,7 @@ describe("Telegram provider supervisor ownership", () => {
 		const botApi: BotApi = {
 			call: async method => {
 				calls.push(method);
-				if (method === "closeForumTopic") return { ok: true, result: true };
+				if (method === "closeForumTopic" || method === "deleteForumTopic") return { ok: true, result: true };
 				return { ok: true, result: { id: 42, type: "private", message_thread_id: 100 } };
 			},
 		};
@@ -411,8 +411,225 @@ describe("Telegram provider supervisor ownership", () => {
 					topics: { ordinary: { authorityState: string } };
 				};
 			} while (archived.topics.ordinary.authorityState !== "inactive" && Date.now() < deadline);
-			expect(calls).toContain("closeForumTopic");
+			// A private paired chat has no closeForumTopic; the archive must use
+			// deleteForumTopic (closeForumTopic is supergroup-forum-only).
+			expect(calls).toContain("deleteForumTopic");
+			expect(calls).not.toContain("closeForumTopic");
 			expect(archived.topics.ordinary.authorityState).toBe("inactive");
+		} finally {
+			daemon.requestStop();
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("the archive retry sweep drains a durable archive job through deleteForumTopic in a private chat", async () => {
+		const agentDir = tempAgentDir();
+		const now = 1_000;
+		const calls: string[] = [];
+		const botApi: BotApi = {
+			call: async method => {
+				calls.push(method);
+				if (method === "deleteForumTopic" || method === "closeForumTopic") return { ok: true, result: true };
+				return { ok: true, result: { id: 42, type: "private" } };
+			},
+		};
+		const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi,
+			now: () => now,
+			installationHostId: "provider-owner",
+		});
+		try {
+			fs.mkdirSync(path.dirname(statePath), { recursive: true });
+			fs.writeFileSync(
+				statePath,
+				`${JSON.stringify({
+					version: 2,
+					installationHostId: "provider-owner",
+					topics: {
+						stuck: {
+							topicId: "100",
+							topicOrigin: "daemon_created",
+							sessionUuid: "stuck-topic",
+							identitySent: true,
+							createdAt: now,
+							authorityState: "archive_pending",
+							authorityEpoch: 1,
+							archiveLeaseEpoch: 1,
+							archiveHostId: "provider-owner",
+							chatId: "42",
+						},
+					},
+					fences: { stuck: 1 },
+					archiveJobs: {
+						stuck: {
+							sessionId: "stuck",
+							topicId: "100",
+							attempt: 1,
+							firstAttemptAt: now - 1_000,
+							backoffMs: 500,
+							nextAttemptAt: now - 500,
+						},
+					},
+				})}\n`,
+			);
+			await daemon.loadTopics();
+			await daemon.archiveReconciliationHarnessForTest().reconcilePendingTopicDeletes();
+			expect(calls).toContain("deleteForumTopic");
+			expect(calls).not.toContain("closeForumTopic");
+			const persisted = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+				topics: { stuck: { authorityState: string } };
+				archiveJobs?: Record<string, unknown>;
+			};
+			expect(persisted.topics.stuck.authorityState).toBe("inactive");
+			expect(persisted.archiveJobs?.stuck).toBeUndefined();
+		} finally {
+			daemon.requestStop();
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("a private-chat archive settles when Telegram reports the topic id as already invalid", async () => {
+		const agentDir = tempAgentDir();
+		const now = 1_000;
+		const calls: string[] = [];
+		const botApi: BotApi = {
+			call: async method => {
+				calls.push(method);
+				if (method === "deleteForumTopic")
+					return { ok: false, error_code: 400, description: "Bad Request: TOPIC_ID_INVALID" };
+				if (method === "closeForumTopic") return { ok: true, result: true };
+				return { ok: true, result: { id: 42, type: "private" } };
+			},
+		};
+		const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi,
+			now: () => now,
+			installationHostId: "provider-owner",
+		});
+		try {
+			fs.mkdirSync(path.dirname(statePath), { recursive: true });
+			fs.writeFileSync(
+				statePath,
+				`${JSON.stringify({
+					version: 2,
+					installationHostId: "provider-owner",
+					topics: {
+						gone: {
+							topicId: "100",
+							topicOrigin: "daemon_created",
+							sessionUuid: "gone-topic",
+							identitySent: true,
+							createdAt: now,
+							authorityState: "archive_pending",
+							authorityEpoch: 1,
+							archiveLeaseEpoch: 1,
+							archiveHostId: "provider-owner",
+							chatId: "42",
+						},
+					},
+					fences: { gone: 1 },
+					archiveJobs: {
+						gone: {
+							sessionId: "gone",
+							topicId: "100",
+							attempt: 1,
+							firstAttemptAt: now - 1_000,
+							backoffMs: 500,
+							nextAttemptAt: now - 500,
+						},
+					},
+				})}\n`,
+			);
+			await daemon.loadTopics();
+			await daemon.archiveReconciliationHarnessForTest().reconcilePendingTopicDeletes();
+			expect(calls).toContain("deleteForumTopic");
+			const persisted = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+				topics: { gone: { authorityState: string } };
+				archiveJobs?: Record<string, unknown>;
+			};
+			expect(persisted.topics.gone.authorityState).toBe("inactive");
+			expect(persisted.archiveJobs?.gone).toBeUndefined();
+		} finally {
+			daemon.requestStop();
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	test("the archive retry sweep never dispatches a destructive archive to a non-private paired chat", async () => {
+		const agentDir = tempAgentDir();
+		const now = 1_000;
+		const calls: string[] = [];
+		const botApi: BotApi = {
+			call: async method => {
+				calls.push(method);
+				if (method === "deleteForumTopic" || method === "closeForumTopic") return { ok: true, result: true };
+				return { ok: true, result: { id: 42, type: "supergroup", is_forum: true } };
+			},
+		};
+		const statePath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi,
+			now: () => now,
+			installationHostId: "provider-owner",
+		});
+		try {
+			fs.mkdirSync(path.dirname(statePath), { recursive: true });
+			fs.writeFileSync(
+				statePath,
+				`${JSON.stringify({
+					version: 2,
+					installationHostId: "provider-owner",
+					topics: {
+						stuck: {
+							topicId: "100",
+							topicOrigin: "daemon_created",
+							sessionUuid: "stuck-topic",
+							identitySent: true,
+							createdAt: now,
+							authorityState: "archive_pending",
+							authorityEpoch: 1,
+							archiveLeaseEpoch: 1,
+							archiveHostId: "provider-owner",
+							chatId: "42",
+						},
+					},
+					fences: { stuck: 1 },
+					archiveJobs: {
+						stuck: {
+							sessionId: "stuck",
+							topicId: "100",
+							attempt: 1,
+							firstAttemptAt: now - 1_000,
+							backoffMs: 500,
+							nextAttemptAt: now - 500,
+						},
+					},
+				})}\n`,
+			);
+			await daemon.loadTopics();
+			await daemon.archiveReconciliationHarnessForTest().reconcilePendingTopicDeletes();
+			// A non-private, non-validation chat never allows topics, so the sweep
+			// must cancel before any remote archive dispatch.
+			expect(calls).not.toContain("deleteForumTopic");
+			expect(calls).not.toContain("closeForumTopic");
+			const persisted = JSON.parse(fs.readFileSync(statePath, "utf8")) as {
+				topics: { stuck: { authorityState: string } };
+			};
+			expect(persisted.topics.stuck.authorityState).toBe("archive_pending");
 		} finally {
 			daemon.requestStop();
 			fs.rmSync(agentDir, { recursive: true, force: true });
