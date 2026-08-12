@@ -3722,6 +3722,7 @@ export class ModelRegistry {
 		return this.getAvailable().filter(model => {
 			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
 			if (!evidence?.profileFresh || evidence.profileModelIds === undefined) return true;
+			if (this.#hasCustomModelOverlay(model.provider, model.id)) return true;
 			const bundledModelIds = new Set(
 				(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
 					candidate => candidate.id,
@@ -3736,6 +3737,12 @@ export class ModelRegistry {
 				return true;
 			return evidence.profileModelIds.has(model.id);
 		});
+	}
+
+	#hasCustomModelOverlay(provider: string, id: string): boolean {
+		return [...this.#customModelOverlays, ...this.#runtimeModelOverlays].some(
+			overlay => overlay.provider === provider && overlay.id === id,
+		);
 	}
 
 	#hasFreshOrStaticModelEvidence(model: Model<Api>): boolean {

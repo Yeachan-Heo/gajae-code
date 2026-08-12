@@ -360,6 +360,55 @@ describe("model profile activation", () => {
 		}
 	});
 
+	test("fresh catalog omission does not exclude a same-id custom Anthropic replacement", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-custom-overlay-");
+		const modelsPath = `${tempDir.path()}/models.yml`;
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		try {
+			await Bun.write(
+				modelsPath,
+				JSON.stringify({
+					providers: {
+						anthropic: {
+							baseUrl: "https://custom-anthropic.example.test/v1",
+							api: "anthropic-messages",
+							apiKey: "TEST_ANTHROPIC_KEY",
+							models: [{ id: "claude-opus-5" }],
+						},
+					},
+				}),
+			);
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://custom-anthropic.example.test/models") {
+					return new Response(JSON.stringify({ data: [{ id: "claude-opus-4-6" }] }), {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected model discovery request: ${input}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			await registry.refreshProvider("anthropic", "online");
+
+			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe(
+				"https://custom-anthropic.example.test/v1",
+			);
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+			).toBe(true);
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
 	test("rejects a mixed provider-agnostic profile before mutation when a role alias is unavailable", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "open-weights-glm-deepseek",
