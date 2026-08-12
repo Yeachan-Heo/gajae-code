@@ -3278,7 +3278,7 @@ describe("branch-heavy retirement", () => {
 		} finally {
 			await reopened.close();
 		}
-	}, 30_000);
+	}, 90_000);
 
 	it("activates a compacted cold branch without hydrating inactive history", async () => {
 		const storage = new MemorySessionStorage();

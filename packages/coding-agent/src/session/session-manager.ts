@@ -1776,11 +1776,11 @@ function collectCheckpointBlobRefs(value: unknown, refs: Set<string> = new Set()
 
 const FORK_BLOB_VERIFY_MAX_BYTES = 16 * 1024 * 1024;
 
-function verifyForkBlobRefsBounded(value: unknown): boolean {
+function verifyForkBlobRefsBounded(value: unknown, blobDir: string = getBlobsDir()): boolean {
 	for (const ref of collectCheckpointBlobRefs(value)) {
 		const hash = parseBlobRef(ref);
 		if (!hash) return false;
-		const blobPath = path.join(getBlobsDir(), hash);
+		const blobPath = path.join(blobDir, hash);
 		let fd: number | undefined;
 		try {
 			fd = fs.openSync(blobPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -2999,6 +2999,61 @@ function computeDefaultSessionDir(
 	);
 	if (prepared.kind === "error") throw managedScopeStartupError("prepare", prepared);
 	return prepared.scope.directoryPath;
+}
+
+/** A session directory's authority is distinct from its string path. */
+export interface SessionPersistenceRoots {
+	readonly blobDir?: string;
+	readonly residentCacheRootDir?: string;
+	readonly terminalBreadcrumbs?: boolean;
+}
+
+/**
+ * Persistence roots accepted by SessionManager construction. The manager normalizes
+ * omitted roots to the ordinary GJC locations and treats breadcrumbs as enabled by
+ * default, preserving the historical profile for ordinary sessions.
+ */
+export interface SessionStorageProfile extends SessionPersistenceRoots {}
+
+interface SessionManagerOptions {
+	readonly persistenceProfile?: SessionStorageProfile;
+}
+
+type NormalizedSessionStorageProfile = {
+	readonly blobDir: string;
+	readonly residentCacheRootDir: string;
+	readonly terminalBreadcrumbs: boolean;
+};
+
+function normalizeSessionStorageProfile(
+	profile: SessionStorageProfile | undefined,
+	destination: SessionDestination,
+	sessionDir?: string,
+): NormalizedSessionStorageProfile {
+	const profileAgentDir =
+		destination.kind === "managed"
+			? destination.securityContext.profileAgentDir
+			: (explicitProfileAgentDirs.get(destination) ?? getAgentDir());
+	const blobDir =
+		profile?.blobDir === undefined
+			? path.resolve(getBlobsDir())
+			: canonicalizeThroughExistingAncestor(profile.blobDir);
+	const residentCacheRootDir =
+		profile?.residentCacheRootDir === undefined
+			? path.resolve(getResidentCacheRootDir(profileAgentDir))
+			: canonicalizeThroughExistingAncestor(profile.residentCacheRootDir);
+	if (sessionDir && profile && (profile.blobDir !== undefined || profile.residentCacheRootDir !== undefined)) {
+		const canonicalSessionDir = canonicalizeThroughExistingAncestor(sessionDir);
+		if (profile.blobDir !== undefined && !pathIsWithin(canonicalSessionDir, blobDir))
+			throw new Error("Session blob root escapes the session destination.");
+		if (profile.residentCacheRootDir !== undefined && !pathIsWithin(canonicalSessionDir, residentCacheRootDir))
+			throw new Error("Session resident cache root escapes the session destination.");
+	}
+	return Object.freeze({
+		blobDir,
+		residentCacheRootDir,
+		terminalBreadcrumbs: profile?.terminalBreadcrumbs ?? true,
+	});
 }
 
 /** A session directory's authority is distinct from its string path. */
@@ -6915,6 +6970,9 @@ export class SessionManager {
 	#ephemeralArtifactInit: Promise<ArtifactManager | null> | null = null;
 	#ephemeralArtifactCleanups = new Set<Promise<void>>();
 	readonly #blobStore: BlobStore;
+	readonly #storageProfile: NormalizedSessionStorageProfile;
+	readonly #storageProfileCustom: boolean;
+
 	#residentTextBlobStore: BlobStore = new MemoryBlobStore();
 	#residentImageBlobStore: BlobStore;
 	#memoryGuardCheckpointBlobs: Map<string, Buffer> | undefined;
@@ -6964,6 +7022,7 @@ export class SessionManager {
 		storage: SessionStorage,
 		private destination: SessionDestination = explicitDestination(sessionDir),
 		skipEnsureSessionDir = false,
+		persistenceProfile?: SessionStorageProfile,
 	) {
 		this.#storage = new Proxy(storage, {
 			get: (target, property, receiver) => {
@@ -7063,8 +7122,6 @@ export class SessionManager {
 				};
 			},
 		});
-		this.#blobStore = persist ? new BlobStore(getBlobsDir()) : this.#residentTextBlobStore;
-		this.#residentImageBlobStore = this.#blobStore;
 		if (persist && sessionDir) {
 			if (!skipEnsureSessionDir) this.#storage.ensureDirSync(sessionDir);
 			// Canonicalize the trusted session directory (single choke point for every
@@ -7075,7 +7132,23 @@ export class SessionManager {
 				this.sessionDir = canonicalizeTrustedPath(sessionDir);
 			}
 		}
+		this.#storageProfile = normalizeSessionStorageProfile(persistenceProfile, destination, this.sessionDir);
+		this.#storageProfileCustom = persistenceProfile !== undefined;
+		this.#blobStore = persist ? new BlobStore(this.#storageProfile.blobDir) : this.#residentTextBlobStore;
+		this.#residentImageBlobStore = this.#blobStore;
 		// Note: call _initSession() or _initSessionFile() after construction
+	}
+	#writeTerminalBreadcrumb(cwd: string, sessionFile: string): void {
+		if (!this.#storageProfile.terminalBreadcrumbs) return;
+		writeTerminalBreadcrumb(cwd, sessionFile);
+	}
+	#sidecarCacheRootDir(): string {
+		if (this.#storageProfileCustom) return path.join(this.#storageProfile.residentCacheRootDir, "sidecar-cache");
+		const profileAgentDir =
+			this.destination.kind === "managed"
+				? this.destination.securityContext.profileAgentDir
+				: (explicitProfileAgentDirs.get(this.destination) ?? getAgentDir());
+		return getSidecarCacheRootDir(profileAgentDir);
 	}
 
 	#residentBlobStores(): ResidentBlobStores {
@@ -7138,12 +7211,6 @@ export class SessionManager {
 		return this.#memoryGuardCheckpointBlobs ? this.#residentImageBlobStore : this.#blobStore;
 	}
 
-	#residentCacheProfileAgentDir(): string {
-		return this.destination.kind === "managed"
-			? this.destination.securityContext.profileAgentDir
-			: (explicitProfileAgentDirs.get(this.destination) ?? getAgentDir());
-	}
-
 	#newCanonicalResidentTextStore(): MemoryBlobStore {
 		return new MemoryBlobStore({ ownership: "canonical" });
 	}
@@ -7156,9 +7223,7 @@ export class SessionManager {
 			this.#residentCacheWin32FallbackCount++;
 			return { store: this.#newCanonicalResidentTextStore(), ownsStore: false };
 		}
-		const instanceDir = openVerifiedResidentCacheInstanceDir(
-			getResidentCacheRootDir(this.#residentCacheProfileAgentDir()),
-		);
+		const instanceDir = openVerifiedResidentCacheInstanceDir(this.#storageProfile.residentCacheRootDir);
 		return { store: EphemeralBlobStore.adoptVerifiedDir(instanceDir), ownsStore: true };
 	}
 
@@ -7615,7 +7680,7 @@ export class SessionManager {
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
 		this.#commitResidentTextStoreTransition(prepared);
-		if (this.#sessionFile) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+		if (this.#sessionFile) this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 	}
 
 	#freshSessionState(options?: NewSessionOptions, sessionFileOverride?: string): FreshSessionState {
@@ -8803,7 +8868,7 @@ export class SessionManager {
 			this.#effectiveSessionMemoryMode(transcriptSize) === "enabled" &&
 			this.#storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
 		if (boundedTranscriptAdmitted && (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile))) {
-			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			revalidateStrictResume();
 			return;
 		}
@@ -8813,7 +8878,7 @@ export class SessionManager {
 				this.#sessionMemoryMode = "shadow";
 				this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
 			}
-			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			revalidateStrictResume();
 			return;
 		}
@@ -8829,7 +8894,7 @@ export class SessionManager {
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
 			this.#retireEphemeralArtifacts();
-			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
@@ -8857,7 +8922,7 @@ export class SessionManager {
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
 			this.#retireEphemeralArtifacts();
-			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
@@ -8890,7 +8955,7 @@ export class SessionManager {
 		this.#titleSource = header?.titleSource;
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
 		this.#commitResidentTextStoreTransition(prepared);
-		writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+		this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
@@ -9058,7 +9123,7 @@ export class SessionManager {
 				this.#needsFullRewriteOnNextPersist = migrationApplied;
 				try {
 					managedTransition?.adopt();
-					writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+					this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 					await SessionManagerTestHooks.beforeManagedSwitchIdentity?.(resolvedSessionFile, this.#storage);
 					this.#adoptManagedPersistIdentity(resolvedSessionFile);
 					this.#commitResidentTextStoreTransition(prepared);
@@ -9110,7 +9175,7 @@ export class SessionManager {
 			this.#applyFreshSessionMetadata(fresh);
 			try {
 				managedTransition?.adopt();
-				writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+				this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 				this.#commitResidentTextStoreTransition(prepared);
 				if (!options?.deferEphemeralArtifactRetirement) this.#retireEphemeralArtifacts();
 			} catch (error) {
@@ -9559,7 +9624,7 @@ export class SessionManager {
 			"install-staged",
 		);
 		try {
-			if (stage.sessionFile) writeTerminalBreadcrumb(this.cwd, stage.sessionFile);
+			if (stage.sessionFile) this.#writeTerminalBreadcrumb(this.cwd, stage.sessionFile);
 		} catch (error) {
 			transition.dispose();
 			throw error;
@@ -10124,8 +10189,9 @@ export class SessionManager {
 		const previousSessionFile = this.#sessionFile;
 		const previousDestination = this.destination;
 
-		const nextDestination =
-			this.#storage instanceof FileSessionStorage
+		const nextDestination = this.#storageProfileCustom
+			? this.destination
+			: this.#storage instanceof FileSessionStorage
 				? managedDestination(
 						resolvedCwd,
 						this.#storage,
@@ -10431,7 +10497,7 @@ export class SessionManager {
 
 		// Update terminal breadcrumb only after the durable cwd transition succeeds.
 		if (this.#sessionFile) {
-			writeTerminalBreadcrumb(resolvedCwd, this.#sessionFile);
+			this.#writeTerminalBreadcrumb(resolvedCwd, this.#sessionFile);
 		}
 	}
 
@@ -10442,7 +10508,7 @@ export class SessionManager {
 		this.#applyFreshSessionMetadata(fresh);
 		this.#commitResidentTextStoreTransition(prepared);
 		this.#retireEphemeralArtifacts();
-		if (writeBreadcrumb && fresh.sessionFile) writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+		if (writeBreadcrumb && fresh.sessionFile) this.#writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 		return fresh.sessionFile;
 	}
 
@@ -10938,12 +11004,9 @@ export class SessionManager {
 		this.#releaseManagedSidecarCache();
 		// Sweep abandoned pre-namespace sidecars from the resident root. The sweep
 		// only reaps stale owner leases, so the canonical resident store is untouched.
-		void sweepResidentCacheRoot(getResidentCacheRootDir(this.#residentCacheProfileAgentDir()));
+		void sweepResidentCacheRoot(this.#storageProfile.residentCacheRootDir);
 		const sessionHash = crypto.createHash("sha256").update(sessionFile).digest("hex").slice(0, 32);
-		const instanceDir = openVerifiedSidecarCacheInstanceDir(
-			getSidecarCacheRootDir(this.#residentCacheProfileAgentDir()),
-			sessionHash,
-		);
+		const instanceDir = openVerifiedSidecarCacheInstanceDir(this.#sidecarCacheRootDir(), sessionHash);
 		const cacheParent = path.dirname(instanceDir);
 		let retainedAuthority: native.RecoveryFsRoot | undefined;
 		try {
@@ -14679,7 +14742,7 @@ export class SessionManager {
 		this.#flushed = stage.persistsToExistingFile;
 		this.#ensuredOnDisk = stage.persistsToExistingFile;
 		if (stage.persistsToExistingFile && this.#readOnlyResume && this.#sessionFile) {
-			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 			this.#readOnlyResume = false;
 		}
 		if (!stage.boundedCold) {
@@ -15738,7 +15801,7 @@ export class SessionManager {
 				if (!store) return;
 				const removedDraft = await store.consume("draft.txt");
 				if (this.#readOnlyResume && this.#sessionFile && (removedDraft !== null || this.#resumedDraftConsumed)) {
-					writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+					this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 					this.#readOnlyResume = false;
 					this.#resumedDraftConsumed = false;
 				}
@@ -15753,7 +15816,7 @@ export class SessionManager {
 			if (!store) return;
 			await store.replace("draft.txt", Buffer.from(text, "utf8"));
 			if (this.#readOnlyResume && this.#sessionFile) {
-				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 				this.#readOnlyResume = false;
 			}
 			return;
@@ -15769,7 +15832,7 @@ export class SessionManager {
 				if (!isEnoent(err)) throw err;
 			}
 			if (this.#readOnlyResume && this.#sessionFile && (removedDraft || this.#resumedDraftConsumed)) {
-				writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 				this.#readOnlyResume = false;
 				this.#resumedDraftConsumed = false;
 			}
@@ -15784,7 +15847,7 @@ export class SessionManager {
 		if (!artifactManager) return;
 		await artifactManager.replaceNamed("draft.txt", text);
 		if (this.#readOnlyResume && this.#sessionFile) {
-			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 			this.#readOnlyResume = false;
 		}
 	}
@@ -15901,7 +15964,7 @@ export class SessionManager {
 					(header?.version ?? 1) < CURRENT_SESSION_VERSION
 				) {
 					await this.#rewriteFileContents();
-					if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
+					if (publishResumeBreadcrumb) this.#writeTerminalBreadcrumb(this.cwd, sessionFile);
 					this.#readOnlyResume = false;
 					return;
 				}
@@ -15930,7 +15993,7 @@ export class SessionManager {
 					if (!writer) {
 						void this.#rewriteFile()
 							.then(() => {
-								if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
+								if (publishResumeBreadcrumb) this.#writeTerminalBreadcrumb(this.cwd, sessionFile);
 								this.#readOnlyResume = false;
 							})
 							.catch(() => {});
@@ -15941,7 +16004,7 @@ export class SessionManager {
 					return true;
 				});
 				if (written) {
-					if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, sessionFile);
+					if (publishResumeBreadcrumb && persisted) this.#writeTerminalBreadcrumb(this.cwd, sessionFile);
 					if (persisted) this.#readOnlyResume = false;
 					return;
 				}
@@ -15976,7 +16039,7 @@ export class SessionManager {
 			// test-level tempDir cleanup.
 			try {
 				this.#rewriteFileSync();
-				if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				if (publishResumeBreadcrumb) this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 				this.#readOnlyResume = false;
 			} catch (err) {
 				this.#recordPersistError(err);
@@ -16022,7 +16085,7 @@ export class SessionManager {
 				writer.writeSync(persistedEntry);
 				persisted = true;
 			});
-			if (publishResumeBreadcrumb && persisted) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			if (publishResumeBreadcrumb && persisted) this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 			if (persisted) this.#readOnlyResume = false;
 		} catch (err) {
 			this.#recordPersistError(err);
@@ -16510,7 +16573,7 @@ export class SessionManager {
 		if (!this.persist || !this.#sessionFile) return;
 		await this.#rewriteFile();
 		if (this.#readOnlyResume) {
-			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 			this.#readOnlyResume = false;
 		}
 	}
@@ -17786,9 +17849,18 @@ export class SessionManager {
 		cwd: string,
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
+		options?: SessionManagerOptions,
 	): SessionManager {
 		const destination = destinationFor(cwd, destinationInput, storage);
-		const manager = new SessionManager(cwd, destination.directory, true, storage, destination);
+		const manager = new SessionManager(
+			cwd,
+			destination.directory,
+			true,
+			storage,
+			destination,
+			false,
+			options?.persistenceProfile,
+		);
 		manager.#initNewSession();
 		return manager;
 	}
@@ -17983,7 +18055,7 @@ export class SessionManager {
 						if (record.type === "header_patch" && isHeaderPatchRecord(record))
 							Object.assign(headerPatch, record.patch);
 						else if (record.type === "entry_patch" && isEntryPatchRecord(record)) {
-							if (!verifyForkBlobRefsBounded(record.patch)) {
+							if (!verifyForkBlobRefsBounded(record.patch, this.#storageProfile.blobDir)) {
 								preflightRejected = true;
 								return false;
 							}
@@ -17999,7 +18071,7 @@ export class SessionManager {
 						typeof record.id !== "string" ||
 						record.id === previousId ||
 						record.parentId !== previousId ||
-						!verifyForkBlobRefsBounded(record)
+						!verifyForkBlobRefsBounded(record, this.#storageProfile.blobDir)
 					) {
 						preflightRejected = true;
 						return false;
@@ -18119,7 +18191,7 @@ export class SessionManager {
 				}
 			}
 			await this.#initSessionFile(fresh.sessionFile);
-			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return true;
 		} catch (error) {
 			try {
@@ -18211,7 +18283,7 @@ export class SessionManager {
 					if (record.type === "header_patch" && isHeaderPatchRecord(record))
 						Object.assign(headerPatch, record.patch);
 					else if (record.type === "entry_patch" && isEntryPatchRecord(record)) {
-						if (!verifyForkBlobRefsBounded(record.patch)) {
+						if (!verifyForkBlobRefsBounded(record.patch, this.#storageProfile.blobDir)) {
 							rejected = true;
 							return;
 						}
@@ -18224,7 +18296,7 @@ export class SessionManager {
 					typeof record.id !== "string" ||
 					record.id === previousId ||
 					record.parentId !== previousId ||
-					!verifyForkBlobRefsBounded(record)
+					!verifyForkBlobRefsBounded(record, this.#storageProfile.blobDir)
 				) {
 					rejected = true;
 					return;
@@ -18299,7 +18371,7 @@ export class SessionManager {
 				}
 			}
 			await this.#initSessionFile(fresh.sessionFile);
-			writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, fresh.sessionFile);
 			return { kind: "forked", manager: this };
 		} catch (error) {
 			try {
@@ -18323,10 +18395,11 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		options?: SessionManagerOptions,
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
-		const manager = new SessionManager(cwd, dir, true, storage, destination);
+		const manager = new SessionManager(cwd, dir, true, storage, destination, false, options?.persistenceProfile);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		let managedSourcePath = sourcePath;
 		if (destination.kind === "managed" && storage instanceof FileSessionStorage) {
@@ -18434,7 +18507,7 @@ export class SessionManager {
 		manager.#applyFreshSessionMetadata(fresh);
 		manager.#commitResidentTextStoreTransition(transition);
 		manager.#retireEphemeralArtifacts();
-		if (fresh.sessionFile) writeTerminalBreadcrumb(manager.cwd, fresh.sessionFile);
+		if (fresh.sessionFile) manager.#writeTerminalBreadcrumb(manager.cwd, fresh.sessionFile);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		await manager.#rewriteFile();
 		return manager;
@@ -18451,6 +18524,7 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		options?: SessionManagerOptions,
 	): Promise<SessionManager> {
 		const destination =
 			destinationInput === undefined
@@ -18490,6 +18564,8 @@ export class SessionManager {
 							true,
 							storage,
 							destination,
+							false,
+							options?.persistenceProfile,
 						);
 						manager.#sessionMemoryMode = sessionMemoryMode;
 						await manager.#initSessionFile(filePath, true);
@@ -18505,6 +18581,8 @@ export class SessionManager {
 					true,
 					storage,
 					destination,
+					false,
+					options?.persistenceProfile,
 				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
 				await manager.#hydrateExistingSession(filePath, inspected.entries, inspected.migrationApplied);
@@ -18517,7 +18595,16 @@ export class SessionManager {
 				: inspectTranscriptHeaderBounded(filePath, storage, BOUNDED_RESUME_TRANSCRIPT_MAX_BYTES);
 			if (!inspected.ok) {
 				if (inspected.error.reason === "missing") {
-					const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+					const manager = new SessionManager(
+						getProjectDir(),
+						destination.directory,
+						true,
+						storage,
+						destination,
+						false,
+						options?.persistenceProfile,
+					);
+
 					manager.#sessionMemoryMode = sessionMemoryMode;
 					await manager.#initSessionFile(filePath, true);
 					return manager;
@@ -18532,7 +18619,10 @@ export class SessionManager {
 				true,
 				storage,
 				destination,
+				false,
+				options?.persistenceProfile,
 			);
+
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			try {
 				await manager.#initSessionFile(
@@ -18602,6 +18692,7 @@ export class SessionManager {
 					storage,
 					destination,
 					true,
+					options?.persistenceProfile,
 				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
 				try {
@@ -18629,7 +18720,9 @@ export class SessionManager {
 					if (!returnTranscript || !managedFileSnapshotEquals(returnTranscript, publishedTranscript))
 						throw new Error("Could not open session: unstable");
 					manager.#managedPersistExpectedIdentity = returnTranscript.identity;
-					writeTerminalBreadcrumb(manager.cwd, filePath);
+					// Profile-gated: a master-profile session must not write an ordinary
+					// global terminal breadcrumb outside its confined root.
+					manager.#writeTerminalBreadcrumb(manager.cwd, filePath);
 					return manager;
 				} catch (createError) {
 					await manager.#discardRejectedOpenState();
@@ -18672,7 +18765,15 @@ export class SessionManager {
 		}
 
 		if (managedResumeBounded && sameManagedDirectory) {
-			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+			const manager = new SessionManager(
+				getProjectDir(),
+				destination.directory,
+				true,
+				storage,
+				destination,
+				false,
+				options?.persistenceProfile,
+			);
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			try {
 				await manager.#initSessionFile(
@@ -18744,7 +18845,16 @@ export class SessionManager {
 		const inspected = inspectResumeSessionFile(filePath, storage);
 		if ("kind" in inspected) {
 			if (inspected.reason === "missing") {
-				const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+				const manager = new SessionManager(
+					getProjectDir(),
+					destination.directory,
+					true,
+					storage,
+					destination,
+					false,
+					options?.persistenceProfile,
+				);
+
 				manager.#sessionMemoryMode = sessionMemoryMode;
 				await manager.#initSessionFile(filePath, true);
 				return manager;
@@ -18759,6 +18869,7 @@ export class SessionManager {
 			storage,
 			migrationPolicy,
 			sessionMemoryMode,
+			options,
 		);
 		if (opened.kind === "error") {
 			if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
@@ -18781,6 +18892,7 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		cwdOverride?: string,
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		options?: SessionManagerOptions,
 	): Promise<SessionManager> {
 		if (destination.kind !== "managed" || !trustedSessionDestinations.has(destination))
 			throw new Error("Nested managed session authority is unavailable");
@@ -18807,6 +18919,8 @@ export class SessionManager {
 				true,
 				storage,
 				destination,
+				false,
+				options?.persistenceProfile,
 			);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
 			try {
@@ -18878,7 +18992,15 @@ export class SessionManager {
 			header && cwdOverride && resolveEquivalentPath(header.cwd) !== resolveEquivalentPath(sessionCwd),
 		);
 		if (header && cwdChanged) header.cwd = sessionCwd;
-		const manager = new SessionManager(sessionCwd, destination.directory, true, storage, destination);
+		const manager = new SessionManager(
+			sessionCwd,
+			destination.directory,
+			true,
+			storage,
+			destination,
+			false,
+			options?.persistenceProfile,
+		);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		try {
 			let transcriptChanged = false;
@@ -18892,7 +19014,7 @@ export class SessionManager {
 					manager.#ensuredOnDisk = true;
 				}
 				if (cwdChanged) transcriptChanged = true;
-				writeTerminalBreadcrumb(manager.cwd, resolved);
+				manager.#writeTerminalBreadcrumb(manager.cwd, resolved);
 				if (await manager.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist()) transcriptChanged = true;
 			} else {
 				const fresh = manager.#freshSessionState(undefined, resolved);
@@ -18900,7 +19022,7 @@ export class SessionManager {
 				manager.#applyFreshSessionMetadata(fresh);
 				manager.#commitResidentTextStoreTransition(transition);
 				manager.#retireEphemeralArtifacts();
-				writeTerminalBreadcrumb(manager.cwd, resolved);
+				manager.#writeTerminalBreadcrumb(manager.cwd, resolved);
 				await manager.#rewriteFile();
 				manager.#flushed = true;
 				manager.#ensuredOnDisk = true;
@@ -19034,13 +19156,22 @@ export class SessionManager {
 		destinationInput?: SessionDestinationInput,
 		_migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		options?: SessionManagerOptions,
 	): Promise<StrictSessionForkResult> {
 		const destination = destinationFor(cwd, destinationInput, snapshot.storage);
 		if (
 			sessionMemoryMode === "enabled" ||
 			(sessionMemoryMode === "auto" && snapshot.identity.size > eagerHydrationMaxBytes())
 		) {
-			const boundedManager = new SessionManager(cwd, destination.directory, true, snapshot.storage, destination);
+			const boundedManager = new SessionManager(
+				cwd,
+				destination.directory,
+				true,
+				snapshot.storage,
+				destination,
+				false,
+				options?.persistenceProfile,
+			);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
 			if (
 				destination.kind === "managed" &&
@@ -19145,7 +19276,15 @@ export class SessionManager {
 		let privateStagingPublished = false;
 
 		try {
-			manager = new SessionManager(cwd, privateStagingDir ?? dir, true, snapshot.storage, forkDestination);
+			manager = new SessionManager(
+				cwd,
+				privateStagingDir ?? dir,
+				true,
+				snapshot.storage,
+				forkDestination,
+				false,
+				options?.persistenceProfile,
+			);
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
 			const sourceHeader = forkEntries[0] as SessionHeader | undefined;
@@ -19283,7 +19422,7 @@ export class SessionManager {
 					manager.#buildDisposableSidecars(manager.#fileEntries);
 				if (manager.#effectiveSessionMemoryMode() === "enabled") manager.#retireColdEntries();
 			}
-			if (manager.#sessionFile) writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
+			if (manager.#sessionFile) manager.#writeTerminalBreadcrumb(manager.cwd, manager.#sessionFile);
 			return { kind: "forked", manager };
 		} catch (error) {
 			if (manager) {
@@ -19312,7 +19451,10 @@ export class SessionManager {
 		}
 	}
 
-	static async restoreMemoryGuardCheckpoint(input: MemoryGuardRestoreInput): Promise<MemoryGuardRestoreResult> {
+	static async restoreMemoryGuardCheckpoint(
+		input: MemoryGuardRestoreInput,
+		options?: SessionManagerOptions,
+	): Promise<MemoryGuardRestoreResult> {
 		try {
 			assertMemoryGuardSessionId(input.checkpoint.session_id);
 		} catch {
@@ -19458,6 +19600,7 @@ export class SessionManager {
 				transcriptIdentity,
 				input.destination,
 				storage,
+				options,
 			);
 		} catch {
 			await cleanupTranscript();
@@ -19522,6 +19665,7 @@ export class SessionManager {
 		identity: ResumeSessionIdentity,
 		destinationInput?: SessionDestinationInput,
 		storage: SessionStorage = new FileSessionStorage(),
+		options?: SessionManagerOptions,
 	): Promise<RecoveryHydrationOpenResult> {
 		const destination =
 			destinationInput === undefined
@@ -19539,6 +19683,8 @@ export class SessionManager {
 			true,
 			storage,
 			destination,
+			false,
+			options?.persistenceProfile,
 		);
 		await manager.#hydrateExistingSession(identity.canonicalPath, inspected.entries, false, "memory-only");
 		const revalidated = inspectResumeSessionFile(identity.canonicalPath, storage);
@@ -19617,7 +19763,7 @@ export class SessionManager {
 		this.#recoveryPromotionTranscriptPath = undefined;
 		this.#commitResidentTextStoreTransition(transition);
 		this.#adoptManagedPersistIdentity(promotionPath);
-		writeTerminalBreadcrumb(this.cwd, promotionPath);
+		this.#writeTerminalBreadcrumb(this.cwd, promotionPath);
 		this.#recoveryHydrationContext = undefined;
 	}
 
@@ -19632,6 +19778,7 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		options?: SessionManagerOptions,
 	): Promise<StrictSessionOpenResult> {
 		const destination =
 			destinationInput === undefined
@@ -19669,7 +19816,15 @@ export class SessionManager {
 		const entries = inspected.entries;
 		const header = entries[0] as SessionHeader;
 		const dir = destination.directory;
-		const manager = new SessionManager(header.cwd || getProjectDir(), dir, true, storage, destination);
+		const manager = new SessionManager(
+			header.cwd || getProjectDir(),
+			dir,
+			true,
+			storage,
+			destination,
+			false,
+			options?.persistenceProfile,
+		);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		await manager.#hydrateExistingSession(sessionPath, entries, inspected.migrationApplied);
 		manager.#readOnlyResume = true;
@@ -19693,6 +19848,7 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		migrationPolicy: SessionDirectoryMigrationPolicy = "copy-retain",
 		sessionMemoryMode: SessionMemoryMode = "shadow",
+		options?: SessionManagerOptions,
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
@@ -19729,6 +19885,7 @@ export class SessionManager {
 					storage,
 					migrationPolicy,
 					sessionMemoryMode,
+					options,
 				);
 				if (canContinuePersistedHistory(manager.buildSessionContext().messages)) return manager;
 				await manager.close();
@@ -19746,6 +19903,7 @@ export class SessionManager {
 				storage,
 				migrationPolicy,
 				sessionMemoryMode,
+				options,
 			);
 			if (opened.kind === "error") {
 				if (opened.reason === "legacy_migration_disabled") throw new SessionMigrationPolicyError();
@@ -19771,7 +19929,8 @@ export class SessionManager {
 						storage,
 					);
 
-		const terminalSession = await readTerminalBreadcrumb(cwd);
+		const terminalSession =
+			options?.persistenceProfile?.terminalBreadcrumbs === false ? null : await readTerminalBreadcrumb(cwd);
 		const terminalSessionIsInExplicitRoot = (() => {
 			if (destination.kind === "managed" || !terminalSession) return destination.kind === "managed";
 			const canonicalRoot = canonicalizeTrustedPath(destination.directory);
@@ -19791,7 +19950,7 @@ export class SessionManager {
 			const opened = await openSelectedStrictly(mostRecent);
 			if (opened) return opened;
 		}
-		const manager = new SessionManager(cwd, dir, true, storage, destination);
+		const manager = new SessionManager(cwd, dir, true, storage, destination, false, options?.persistenceProfile);
 		manager.#initNewSession();
 		return manager;
 	}

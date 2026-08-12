@@ -20,6 +20,7 @@ export function getExtraHelpText(): string {
   ${APP_NAME} stats                - View AI usage statistics (tokens, cost, requests)
   ${APP_NAME} notify               - Send or test notifications
   ${APP_NAME} daemon               - Manage background daemon helpers
+  ${APP_NAME} master               - Manage global orchestration masters
   ${APP_NAME} mcp                  - Manage MCP server registrations
   ${APP_NAME} mcp-serve            - Serve the MCP integration endpoint
   ${APP_NAME} contribute-pr        - Prepare contribution/PR workflow artifacts

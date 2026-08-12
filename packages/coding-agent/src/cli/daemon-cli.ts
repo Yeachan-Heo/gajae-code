@@ -2,7 +2,8 @@
  * `gjc daemon` command handler.
  *
  * Generic over the static built-in daemon controller map: lists/inspects
- * daemons and drives cooperative stop/reload. Telegram is the only kind today.
+ * daemons and drives cooperative stop/reload. Telegram remains the default
+ * kind; the static inventory also includes Discord, Slack, and master.
  */
 
 import { Settings } from "../config/settings";

@@ -234,8 +234,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * settled as definitive, and the unsupported-method fallback closes when
  * deleteForumTopic is unavailable on older Bot API deployments.
  * Generation 158 updates terminal-abort notification admission and cleanup semantics.
+ * Generation 158 fences the master-worker lifecycle: older daemons cannot
+ * continue serving while this daemon adds or removes master-channel delivery
+ * authority.
  */
-export const DAEMON_GENERATION = 158;
+export const DAEMON_GENERATION = 159;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

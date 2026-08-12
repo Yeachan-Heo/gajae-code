@@ -2,11 +2,11 @@
  * Public types for the `gjc daemon` control plane.
  *
  * Deliberately compact: a small result/status surface plus a built-in
- * controller contract. There is exactly one daemon kind today (`telegram`);
- * a richer registry is intentionally deferred until a second kind exists.
+ * controller contract. Static kinds are kept in the built-in map; `master` is
+ * owned by the dedicated master daemon module.
  */
 
-export type DaemonKind = "telegram" | "discord" | "slack";
+export type DaemonKind = "telegram" | "discord" | "slack" | "master";
 
 /** `reload` remains the controller result verb; `restart` is the CLI canonical action. */
 export type DaemonAction = "list" | "status" | "stop" | "restart" | "reload";

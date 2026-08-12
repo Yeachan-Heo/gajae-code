@@ -700,7 +700,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 158 at serving epoch 87", () => {
+test("publishes exact durable authority generation 159 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -712,8 +712,11 @@ test("publishes exact durable authority generation 158 at serving epoch 87", () 
 	// mode always uses threads instead of refusing a session's own declaration.
 	// Generation 157: orphan-topic reconciliation with FORUM_TOPIC_NOT_FOUND
 	// settlement and unsupported-method fallback.
-	// Generation 158: terminal-abort notification admission and cleanup semantics.
-	expect(DAEMON_GENERATION).toBe(158);
+	// Generation 158: fences the master-worker lifecycle: older daemons cannot
+	// continue serving while this daemon adds or removes master-channel delivery
+	// authority.
+	// Generation 159: terminal-abort notification admission and cleanup semantics.
+	expect(DAEMON_GENERATION).toBe(159);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {

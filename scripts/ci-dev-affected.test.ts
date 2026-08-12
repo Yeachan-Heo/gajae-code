@@ -1070,14 +1070,15 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		]) {
 			const tasks = targeted([changedPath]);
 			const keys = tasks.map(task => task.key);
-			expect(keys).toContain(shardOne);
-			expect(tasks.find(task => task.key === shardOne)?.command).toEqual([
-				"bun",
-				"test",
-				"packages/coding-agent",
-				"--isolate",
-				"--shard=1/8",
-			]);
+		expect(keys).toContain(shardOne);
+		expect(tasks.find(task => task.key === shardOne)?.command).toEqual([
+			"bun",
+			"test",
+			"packages/coding-agent",
+			"--isolate",
+			"--timeout=30000",
+			"--shard=1/8",
+		]);
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([shardOne]);
 			expect(keys).toContain(isolated);
 			expect(tasks.find(task => task.key === isolated)?.command).toEqual([
@@ -1096,6 +1097,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"test",
 			"packages/coding-agent",
 			"--isolate",
+			"--timeout=30000",
 			"--shard=1/8",
 		]);
 		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated")?.command).toEqual([
@@ -1450,6 +1452,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"test",
 			"packages/coding-agent",
 			"--isolate",
+			"--timeout=30000",
 			"--shard=1/8",
 		]);
 		expect(testShards[0]?.cwd).toBeUndefined();

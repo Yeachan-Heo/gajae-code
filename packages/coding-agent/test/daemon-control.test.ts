@@ -9,13 +9,20 @@ import { createBuiltInDaemonControllers, selectDaemonControllers } from "../src/
 import type { BuiltInDaemonController, DaemonOperationResult, DaemonStatus } from "../src/daemon/control-types";
 import {
 	DAEMON_ACTION_ALIASES,
+	DAEMON_ACTION_TOKENS,
 	formatDaemonResult,
 	formatDaemonStatus,
+	MASTER_OWNER_INTERNAL_ACTION,
 	OWNERSHIP_MISMATCH_MESSAGE,
 	ownershipMismatchRecovery,
 	resolveDaemonAction,
 } from "../src/daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../src/daemon/runtime";
+import {
+	MasterDaemonController,
+	type MasterDaemonOperationResult,
+	type MasterDaemonStatus,
+} from "../src/master/daemon-control";
 import {
 	isProcessIncarnation,
 	parseDarwinProcessIncarnation,
@@ -219,22 +226,74 @@ describe("static built-in controller map", () => {
 	test("createBuiltInDaemonControllers exposes every built-in kind", () => {
 		const s = settings(tempAgentDir());
 		const map = createBuiltInDaemonControllers(s);
-		expect(Object.keys(map)).toEqual(["telegram", "discord", "slack"]);
+		expect(Object.keys(map)).toEqual(["telegram", "discord", "slack", "master"]);
 		expect(map.telegram).toBeInstanceOf(TelegramDaemonController);
 		expect(map.discord).toBeInstanceOf(ChatDaemonController);
 		expect(map.slack).toBeInstanceOf(ChatDaemonController);
+		expect(map.master).toBeInstanceOf(MasterDaemonController);
 	});
 
 	test("selectDaemonControllers defaults to Telegram, selects all kinds, and rejects unknown kinds", () => {
 		const s = settings(tempAgentDir());
-		expect(selectDaemonControllers(s, undefined, false)).toHaveLength(1);
-		expect(selectDaemonControllers(s, ["telegram"], false)).toHaveLength(1);
+		expect(selectDaemonControllers(s, undefined, false).map(controller => controller.kind)).toEqual(["telegram"]);
+		expect(selectDaemonControllers(s, ["telegram"], false).map(controller => controller.kind)).toEqual(["telegram"]);
+		expect(selectDaemonControllers(s, ["master"], false).map(controller => controller.kind)).toEqual(["master"]);
 		expect(selectDaemonControllers(s, undefined, true).map(controller => controller.kind)).toEqual([
 			"telegram",
 			"discord",
 			"slack",
+			"master",
 		]);
 		expect(() => selectDaemonControllers(s, ["mystery" as never], false)).toThrow(/unknown daemon kind/);
+	});
+
+	test("master status, stop, and reload use the injected controller contract", async () => {
+		const s = settings(tempAgentDir());
+		const calls: string[] = [];
+		const status: MasterDaemonStatus = {
+			kind: "master",
+			configured: true,
+			health: "running",
+			runtime: {
+				mode: "compiled",
+				execPath: "/opt/gjc/gjc",
+				reloadPicksUpSourceEdits: false,
+				warning: "Rebuild the compiled binary before reload can pick up source edits.",
+			},
+		};
+		const stop: MasterDaemonOperationResult = { ok: true, warnings: ["stopped"], message: "master stopped" };
+		const reload: MasterDaemonOperationResult = { ok: true, warnings: [], message: "master reloaded" };
+		const map = createBuiltInDaemonControllers(s, {
+			master: {
+				status: () => {
+					calls.push("status");
+					return status;
+				},
+				stop: () => {
+					calls.push("stop");
+					return stop;
+				},
+				reload: () => {
+					calls.push("reload");
+					return reload;
+				},
+			},
+		});
+
+		expect((await map.master.status()).runtime).toEqual(status.runtime);
+		expect(await map.master.stop()).toMatchObject({
+			kind: "master",
+			action: "stop",
+			ok: true,
+			message: "master stopped",
+		});
+		expect(await map.master.reload()).toMatchObject({
+			kind: "master",
+			action: "reload",
+			ok: true,
+			message: "master reloaded",
+		});
+		expect(calls).toEqual(["status", "stop", "reload"]);
 	});
 });
 
@@ -246,6 +305,7 @@ describe("parseDaemonArgs", () => {
 			"telegram",
 			"discord",
 			"slack",
+			"master",
 			"--all",
 			"--json",
 			"--force",
@@ -254,7 +314,7 @@ describe("parseDaemonArgs", () => {
 		]);
 		expect(parsed).toMatchObject({
 			action: "restart",
-			kinds: ["telegram", "discord", "slack"],
+			kinds: ["telegram", "discord", "slack", "master"],
 			all: true,
 			json: true,
 			force: true,
@@ -274,6 +334,17 @@ describe("parseDaemonArgs", () => {
 	test("defaults to status and ignores non-daemon argv", () => {
 		expect(parseDaemonArgs(["notify", "status"])).toBeUndefined();
 		expect(parseDaemonArgs(["daemon"])?.action).toBe("status");
+	});
+
+	test("does not expose the internal master owner action on the operator surface", () => {
+		expect(DAEMON_ACTION_TOKENS).not.toContain(MASTER_OWNER_INTERNAL_ACTION);
+		expect(resolveDaemonAction(MASTER_OWNER_INTERNAL_ACTION)).toBeUndefined();
+		// The internal token is claimed by the cli.ts fast path, so the operator
+		// parser must treat it as a (rejected) kind rather than an action.
+		expect(parseDaemonArgs(["daemon", MASTER_OWNER_INTERNAL_ACTION])).toMatchObject({
+			action: "status",
+			kinds: [MASTER_OWNER_INTERNAL_ACTION],
+		});
 	});
 
 	test("unknown kinds throw a typed error before settings initialization", async () => {
@@ -847,9 +918,9 @@ describe("TelegramDaemonController.reload", () => {
 				{ controllers: undefined },
 			),
 		).rejects.toMatchObject({
-			message: "Unknown daemon kind(s): bogus. Known kinds: telegram, discord, slack.",
+			message: "Unknown daemon kind(s): bogus. Known kinds: telegram, discord, slack, master.",
 			kinds: ["bogus"],
-			knownKinds: ["telegram", "discord", "slack"],
+			knownKinds: ["telegram", "discord", "slack", "master"],
 		});
 	});
 
@@ -2824,6 +2895,37 @@ describe("cli registration", () => {
 		expect(cliSource).toContain('{ name: "daemon"');
 		expect(cliSource).toContain('import("./commands/daemon")');
 	});
+
+	test("public daemon actions do not include a master owner action", () => {
+		const commandSource = fs.readFileSync(path.join(import.meta.dir, "../src/commands/daemon.ts"), "utf8");
+		expect(commandSource).not.toContain(MASTER_OWNER_INTERNAL_ACTION);
+	});
+
+	test("the detached master owner is spawned on the internal cli fast path, not `daemon session`", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-master-spawn-argv-"));
+		try {
+			const spawned: Array<{ command: string; args: string[] }> = [];
+			const result = await new MasterDaemonController({
+				masterRootDir: root,
+				spawn: (command, args) => {
+					spawned.push({ command, args });
+					// Report immediate child exit so the readiness loop terminates.
+					return { unref() {}, exitCode: 1 };
+				},
+			}).reload();
+
+			expect(result.ok).toBe(false);
+			expect(spawned).toHaveLength(1);
+			const args = spawned[0]!.args;
+			expect(args.slice(-4)).toEqual(["daemon", MASTER_OWNER_INTERNAL_ACTION, "--agent-dir", path.resolve(root)]);
+			// `gjc daemon session` was removed from the operator surface; the owner
+			// must not depend on it.
+			expect(args).not.toContain("session");
+			expect(args).not.toContain("--op");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}, 20_000);
 });
 
 describe("topic registry reload persistence", () => {

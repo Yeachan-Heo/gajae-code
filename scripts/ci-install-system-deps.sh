@@ -45,7 +45,13 @@ fi
 
 echo "system-deps: missing dependencies detected; installing."
 if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-   sudo apt-get update
+   # Hosted runners preinstall third-party repos (e.g. packages.microsoft.com
+   # for azure-cli) that we never use. When one of those goes stale/403s,
+   # `apt-get update` exits non-zero even though the Ubuntu archive indices
+   # we actually depend on refreshed fine. Don't let that unrelated repo
+   # abort our install; a genuinely broken/missing required package still
+   # fails loudly at the `apt-get install` step below.
+   sudo apt-get update || echo "system-deps: apt-get update reported errors (possibly from unrelated third-party repos); continuing with refreshed indices."
    sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
    sudo ln -sf $(which fdfind) /usr/local/bin/fd
    sudo ln -sf /usr/bin/convert /usr/local/bin/magick

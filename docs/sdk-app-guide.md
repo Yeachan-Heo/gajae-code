@@ -38,6 +38,141 @@ Gajae-Code packages the runtime as a reusable component:
   data-analysis products — any vertical.
 
 
+## Managed masters for application orchestration
+
+Use the managed **master** daemon when your application needs a durable
+orchestrator that can own several workers, keep decisions and provider effects
+across restarts, and expose one aggregate control surface. A master is not a
+normal top-level session with fewer prompt options, and its endpoint is not the
+ordinary SDK v3 endpoint described in the table below.
+
+### Create and configure masters
+
+```sh
+gjc master create <name> [--workdir <path>] [--max-concurrent-workers <n>]
+gjc master list [--json]
+gjc master configure <name> --max-concurrent-workers <n>
+```
+
+Names use `[a-z][a-z0-9-]{0,62}`. A create workdir must be a real canonical
+directory admitted by the frozen Coordinator authority. Each master defaults to
+`maxConcurrentWorkers: 3`; configured capacity is a positive safe integer
+(`>= 1`). `configure` changes only capacity. The command persists the record
+before reloading the managed daemon, so a reload failure leaves a stopped,
+recoverable record.
+
+Master state is private and global to GJC under `$GJC_HOME/master` (normally
+`~/.gjc/master`), not under an app repository's `.gjc` directory. The root
+contains daemon ownership/heartbeat, aggregate events, per-master queue,
+workers, ownership, claims, decisions, channels, presentation outbox, and the
+master's transcript/blob/resident-cache storage. Provider workers execute leased
+side effects and never write this root.
+
+### Master SDK v1 versus ordinary SDK v3
+
+A master-aware app reads `$GJC_HOME/master/sdk/master-daemon.json`:
+
+```json
+{
+  "version": 1,
+  "protocolVersion": 1,
+  "url": "ws://127.0.0.1:<port>/master",
+  "token": "<private token>",
+  "pid": 12345,
+  "startedAt": "<UTC ISO timestamp>",
+  "heartbeatAt": "<UTC ISO timestamp>"
+}
+```
+
+The v1 server binds to `127.0.0.1` and requires the discovery token in the
+query string; a missing or wrong token returns HTTP `401`. Its `hello` frame
+advertises `master-sdk-v1`. This is a different discovery/protocol contract
+from the ordinary per-session v3 file `<repo>/.gjc/state/sdk/<sessionId>.json`.
+Use v1 frames (`subscribe`, `get_snapshot`, `get_queue_page`,
+`master_user_message`, claim operations, provider-effect operations, and
+`ping`) rather than v3 `turn.*` or `session.*` operations. The v1 event sequence
+is globally contiguous: snapshot subscriptions establish a cut, cursor
+subscriptions replay retained events in order, and a replay gap requires a
+fresh resync. Queue pagination uses a null first cursor and explicit page
+resync for stale cursors.
+
+### What a master can do
+
+The master AgentSession has exactly these orchestration tools:
+
+```text
+master_queue_list
+master_queue_enqueue
+master_queue_assign
+master_worker_create
+master_worker_observe
+master_worker_follow_up
+master_record_decision
+master_escalate
+master_claim_request
+master_memory_read
+master_memory_write
+```
+
+There is no filesystem, edit, write, bash, image, web, goal, LSP, generic
+provider, MCP, extension, skill, rule, or workspace-discovery capability. There
+is no bundled/default skill or agent. Doctrine is loaded from the master state
+as evidence; the model cannot edit doctrine or repository/product code.
+
+Worker lifecycle uses only the frozen Coordinator operations
+`gjc_coordinator_start_session`, `gjc_coordinator_send_prompt`,
+`gjc_coordinator_await_turn`, and `gjc_coordinator_register_session`. The
+Coordinator's roots, mutation classes, explicit state root, namespace, and
+session command are frozen and fingerprinted; a changed authority blocks
+rather than widening access. Master-created workers are started without a
+prompt, receive master ownership before prompt delivery, quarantine pre-active
+observations, and become active only after the idempotent prompt is proven.
+Worker leases and observations are independent. Snapshots expose worker
+session/task/owner/lifecycle identity; user-owned workers remain in the direct
+user path.
+
+Ownership claims are two-step. Provider ingress mints an opaque expiring
+authorization, the model consumes it once with `master_claim_request`, and a
+distinct second authenticated interaction from the same actor approves it via
+the endpoint. Models cannot mint or approve claims.
+
+### Capacity and provider semantics
+
+Admission requires `capacityState: "within_limit"` and
+`activeWorkerCount < maxConcurrentWorkers`. Reducing capacity never revokes a
+worker. Counts above the new limit persist as `draining_over_capacity`; no new
+lease is admitted while draining, equality is still not enough for admission,
+and independent terminal releases must bring the count strictly below the new
+limit. The state survives restart.
+
+Master v1 currently has Telegram and Discord provider bindings. At least one
+configured provider with an active reconciled binding is enough for turns. Zero
+active providers is `channel_blocked` with `no_active_provider`. A binding can
+remain active while its provider is degraded because a presentation is pending;
+that provider is represented as both active and degraded, while a healthy second
+provider keeps the master available.
+
+Availability does not waive eventual delivery. Every presentation event has a
+per-provider durable outbox row with stable effect identity, nonce, fence, and
+lease. Receipt cursors advance only after exact reconciliation. On provider
+recovery, pending rows replay in that provider's original event order and the
+provider is marked recovered only when the backlog is zero. Telegram uses
+`Master · <name>` topics and Discord uses `master-<name>` threads. Chat daemons
+perform leased provider I/O and return receipts; they do not write master state.
+
+### Memory boundary
+
+The master profile disables ordinary product memory. An injected v1
+`MemoryContract` with global-scope `read`, `write`, and `subscribe` is the sole
+memory path. Read/write activity is emitted as `memory_activity`; an unavailable
+contract records unavailable evidence without making durable queue or worker
+state non-authoritative.
+
+For a normal application session, continue with the embedding or WebSocket SDK
+v3 surfaces below. For a durable orchestrator, use the master v1 discovery,
+strict frames, snapshot/event replay, and provider-effect leases above; do not
+mix the two endpoint contracts.
+
 ## The two supported integration surfaces
 
 | | Embedding SDK (in-process) | Managed external control |

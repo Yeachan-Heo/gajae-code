@@ -10,6 +10,7 @@ import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gaja
 import { runFixtureReport } from "./cli/fixture-report";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
 import QuickLane from "./commands/quick-lane";
+import { MASTER_OWNER_INTERNAL_ACTION } from "./daemon/operator-contract";
 import { smokeTestTabWorker } from "./tools/browser/tab-worker-smoke";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -51,6 +52,7 @@ export const commands: CommandEntry[] = [
 	{ name: "notify", load: () => import("./commands/notify").then(m => m.default) },
 	{ name: "sdk", load: () => import("./commands/sdk").then(m => m.default) },
 	{ name: "daemon", load: () => import("./commands/daemon").then(m => m.default) },
+	{ name: "master", load: () => import("./commands/master").then(m => m.default) },
 	{ name: "web-search", aliases: ["q"], load: () => import("./commands/web-search").then(m => m.default) },
 	{ name: "local-provider", load: () => import("./commands/local-provider").then(m => m.default) },
 	{ name: "mcp-serve", load: () => import("./commands/mcp-serve").then(m => m.default) },
@@ -175,6 +177,17 @@ async function runChatDaemonInternalFastPath(argv: string[]): Promise<void> {
 	}
 	const { runChatDaemonInternal } = await import("./sdk/bus/chat-daemon-cli");
 	await runChatDaemonInternal(action === "discord-internal" ? "discord" : "slack", argv.slice(2));
+}
+
+function isMasterOwnerInternalFastPath(argv: string[]): boolean {
+	return argv[0] === "daemon" && argv[1] === MASTER_OWNER_INTERNAL_ACTION;
+}
+
+async function runMasterOwnerInternalFastPath(argv: string[]): Promise<void> {
+	const agentDirIndex = argv.indexOf("--agent-dir");
+	const masterRootDir = agentDirIndex >= 0 ? argv[agentDirIndex + 1] : undefined;
+	const { runMasterDaemonInternal } = await import("./master/daemon");
+	await runMasterDaemonInternal(masterRootDir);
 }
 
 type MemoryGuardNativeSmokeLoad = () => Record<string, unknown>;
@@ -459,6 +472,10 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (isChatDaemonInternalFastPath(argv)) {
 		await runChatDaemonInternalFastPath(argv);
+		return;
+	}
+	if (isMasterOwnerInternalFastPath(argv)) {
+		await runMasterOwnerInternalFastPath(argv);
 		return;
 	}
 	if (argv[0] === "--smoke-test") {

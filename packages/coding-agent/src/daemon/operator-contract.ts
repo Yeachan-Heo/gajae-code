@@ -26,6 +26,13 @@ export const DAEMON_ACTION_ALIASES: Readonly<Record<string, DaemonAction>> = {
 	reload: "restart",
 };
 
+/**
+ * Internal-only `gjc daemon` action that hosts the detached master owner
+ * process. It is deliberately absent from {@link DAEMON_ACTION_TOKENS} so it
+ * never appears in the operator surface; only the master controller spawns it.
+ */
+export const MASTER_OWNER_INTERNAL_ACTION = "master-owner-internal";
+
 /** Every token accepted in the leading action position (canonical + aliases). */
 export const DAEMON_ACTION_TOKENS: readonly string[] = [
 	...DAEMON_CANONICAL_ACTIONS,

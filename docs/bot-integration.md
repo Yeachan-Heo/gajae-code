@@ -4,6 +4,147 @@ This guide is for authors of bots and orchestrators that want to drive Gajae-Cod
 
 GJC is an external runner. Your controller owns queueing, identity, policy, and credentials; GJC owns the coding-agent session, workflows, tools, artifacts, and evidence inside the selected repository or worktree.
 
+## Managed master orchestration
+
+The managed `master` daemon is a separate orchestration surface. Use it when a
+controller needs durable named masters, queue/worker ownership, provider
+bindings, and replay across restarts. It is not an ordinary SDK v3 session and
+it is not the Coordinator MCP surface for a single session.
+
+### Register and configure a master
+
+```sh
+gjc master create <name> [--workdir <path>] [--max-concurrent-workers <n>]
+gjc master list [--json]
+gjc master configure <name> --max-concurrent-workers <n>
+```
+
+Names are canonical (`[a-z][a-z0-9-]{0,62}`). A create workdir must be a real
+canonical directory admitted by the frozen Coordinator authority. The default
+`maxConcurrentWorkers` is **3**; every configured value is a positive safe
+integer (`>= 1`). `list` reports the workdir, limit, active count, capacity
+state, and update time; `--json` emits the same records as JSON. `configure`
+changes only capacity. Persistence happens before daemon reload, so a failed
+reload leaves a stopped, recoverable record rather than silently discarding the
+configuration.
+
+All master state lives under `$GJC_HOME/master` (normally `~/.gjc/master`), not
+under a selected repository's `.gjc` tree. That root contains the daemon owner
+and heartbeat, the aggregate event journal, the per-master queue/worker/
+ownership/claim/decision/channel/outbox files, and each master's transcript,
+blobs, and resident cache. Master directories/files are private (`0700`/`0600`)
+and provider workers have no write authority there.
+
+### Choose the right endpoint
+
+Ordinary bots that drive one live session use the SDK v3 discovery file
+`<repo>/.gjc/state/sdk/<sessionId>.json` or Coordinator MCP. Master-aware
+clients instead read `$GJC_HOME/master/sdk/master-daemon.json` and connect to
+its private loopback URL with its token:
+
+```json
+{
+  "version": 1,
+  "protocolVersion": 1,
+  "url": "ws://127.0.0.1:<port>/master",
+  "token": "<private token>",
+  "pid": 12345,
+  "startedAt": "<UTC ISO timestamp>",
+  "heartbeatAt": "<UTC ISO timestamp>"
+}
+```
+
+The master endpoint binds only to `127.0.0.1`; a missing or wrong query token
+gets HTTP `401`. Its first frame advertises `master-sdk-v1`. Do not use the v3
+`SdkClient` or infer v3 control/query operations from this endpoint.
+
+The v1 client sends `subscribe`, `get_snapshot`, `get_queue_page`,
+`master_user_message`, `claim_request`, `approve_claim`, provider-worker hello
+or effect-result frames, and `ping`. Server frames include correlated ACKs,
+snapshots, queue pages, provider effects, `pong`, strict errors, and sequenced
+`queue_updated`, `ownership_updated`, `decision_logged`, `memory_activity`,
+`master_status`, and `channel_updated` events. `subscribe` without a cursor
+returns a coherent snapshot cut and then live events; `afterSeq` replays retained
+events in ascending order. A replay gap returns `resync_required` instead of a
+partial stream. Queue pages start with `cursor: null`; stale cursors return a
+page-specific resync response.
+
+### Closed authority and worker ownership
+
+A master has exactly the orchestration tools
+`master_queue_list`, `master_queue_enqueue`, `master_queue_assign`,
+`master_worker_create`, `master_worker_observe`, `master_worker_follow_up`,
+`master_record_decision`, `master_escalate`, `master_claim_request`,
+`master_memory_read`, and `master_memory_write`. It has no filesystem/edit/
+bash/implementation capability, no ambient MCP/extensions/skills/rules/context
+discovery, and no bundled/default skill or agent. The model cannot edit the
+repository or product code.
+
+Worker lifecycle is delegated only through the frozen Coordinator gateway:
+`gjc_coordinator_start_session`, `gjc_coordinator_send_prompt`,
+`gjc_coordinator_await_turn`, and `gjc_coordinator_register_session`. The
+frozen authority includes Coordinator roots, mutation classes, explicit state
+root, namespace, and session-command fingerprint. Each call revalidates it and
+rejects workdirs outside its canonical roots. A master-created worker is
+started without a prompt, assigned `{kind: "master", masterName}` before its
+prompt, and becomes active only after the idempotent prompt delivery is proven;
+pre-active events are quarantined for that worker. Multiple workers are
+independent up to capacity. Snapshots/events retain worker session, task,
+ownership, and lifecycle visibility. User-owned workers stay in the direct user
+flow and do not become master decisions.
+
+Claims require two distinct authenticated steps. Bound Telegram or Discord
+ingress mints an opaque expiring authorization. The model may consume it once
+with `master_claim_request`; a distinct second authenticated interaction from
+the same actor approves it through the endpoint's `approve_claim` operation.
+Models cannot mint or approve claims, and forged, expired, reused, mismatched,
+or same-interaction approvals fail closed.
+
+### Capacity, availability, and delivery
+
+Capacity admission requires `within_limit` and a strict
+`activeWorkerCount < maxConcurrentWorkers`. Lowering the limit never revokes
+workers. If active workers exceed the new limit, durable state becomes
+`draining_over_capacity`; no new lease is admitted while draining, and equality
+still does not admit a lease. Independent terminal releases must reduce the
+count strictly below the limit. Drain state survives restart.
+
+Only Telegram and Discord are master providers. A master can run turns when at
+least one configured provider has an active reconciled binding. Zero active
+providers is `channel_blocked`/`no_active_provider`; a provider with an
+unavailable binding is degraded but not active. A provider may also be active
+and degraded when its binding is healthy but a presentation is pending
+(`reason: "presentation_pending"`). In that case another active provider keeps
+the master available.
+
+Availability and delivery are separate guarantees. Each presentation event has
+one durable outbox row per configured provider. Stable effect identity, nonce,
+binding fence, and lease are retained through retry, ambiguity, outage, and
+restart. The provider receipt cursor advances only after exact reconciliation.
+Recovery replays every pending row for that provider in original provider event
+order and emits `provider_recovered` only when the backlog is zero. A provider
+that never receives its required presentation is not an acceptable eventual
+state even if another provider remained available.
+
+Telegram master bindings render `Master · <name>` topics; Discord bindings
+render `master-<name>` threads. Telegram and Discord daemons are leased effect
+workers that perform provider I/O and return fenced receipts; they do not write
+master state. Existing ordinary worker topics/threads remain separate and
+visible.
+
+### Memory boundary
+
+Master memory is an injected v1 `MemoryContract` over global scope with only
+`read`, `write`, and `subscribe`. Ordinary product memory is disabled for the
+master profile. Read/write activity is visible as `memory_activity`; an
+unavailable contract reports unavailable evidence without blocking durable
+queue/worker state. Use the master SDK snapshot/events for this evidence rather
+than reading provider or workspace files.
+
+See [`docs/sdk.md`](./sdk.md#master-daemon-and-sdk-v1) for the complete v1 frame
+union, storage layout, exact catalog, capacity state, provider-health overlap,
+and recovery rules.
+
 ## Integration surfaces
 
 Use the smallest surface that fits your bot:

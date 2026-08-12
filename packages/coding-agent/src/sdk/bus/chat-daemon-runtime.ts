@@ -21,6 +21,7 @@ import { DiscordNotificationDaemon } from "./discord-daemon";
 import { DiscordLiveProvider } from "./discord-live-provider";
 import type { DiscordProvider } from "./discord-provider";
 import { type NotificationEvent, NotificationPresentationEngine } from "./engine";
+import type { MasterDaemonClient } from "./master-daemon-client";
 import { SlackNotificationDaemon } from "./slack-daemon";
 import { SlackLiveProvider } from "./slack-live-provider";
 import { SlackProvider, type SlackProviderClient } from "./slack-provider";
@@ -73,6 +74,7 @@ export interface ChatDaemonRuntimeDeps {
 		config: NonNullable<ChatDaemonRuntimeConfig["notifications"]["slack"]>,
 	) => SlackProviderClient;
 	routerDeps?: SessionRouterDeps;
+	createMasterClient?: (provider: "discord" | "telegram") => MasterDaemonClient | Promise<MasterDaemonClient>;
 }
 
 /** The lifecycle signals that decide whether a chat root exists at all. */
@@ -318,6 +320,8 @@ export class ChatDaemonRuntime {
 				guildId: config.guildId,
 				parentChannelId: config.parentChannelId,
 				provider,
+				createMasterClient:
+					this.deps.createMasterClient === undefined ? undefined : () => this.deps.createMasterClient!("discord"),
 				resolveAttachment: (sessionId, expectedGeneration) =>
 					this.#router.attachment(sessionId, expectedGeneration),
 				onCommand: async (sessionId, content, attachment, idempotencyKey) =>

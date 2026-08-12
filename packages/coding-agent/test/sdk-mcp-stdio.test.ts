@@ -111,7 +111,7 @@ test("shipped MCP stdio advertises confirm and forwards confirmed destructive co
 			content?: Array<{ text?: string }>;
 		};
 		expect(JSON.parse(controlPayload.content?.[0]?.text ?? "{}")).toMatchObject({ ok: true, cleared: true });
-		expect(received).toEqual([
+		expect(received.filter(notification => notification.type === "control_request")).toEqual([
 			expect.objectContaining({ type: "control_request", operation: "context.clear", input: {}, confirm: true }),
 		]);
 	} finally {

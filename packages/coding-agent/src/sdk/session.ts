@@ -63,6 +63,7 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
+import type { MemoryBackend } from "../memory-backend/types";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
@@ -108,9 +109,11 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
+import { assertMasterOrchestrationToolCatalog, type MasterOrchestrationTool } from "../master/tools";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { LazyService } from "../runtime/lazy-service";
 import { createLazyService } from "../runtime/lazy-service";
 import {
 	createOptionalRuntimeServices,
@@ -391,6 +394,30 @@ function resolveAgentRosterLabel(label: string | undefined, agentId: string, dis
 		sanitizeRosterLabel(displayName)
 	);
 }
+export interface MasterDoctrineDocument {
+	readonly revision: string;
+	readonly content: string;
+	readonly sha256: string;
+}
+
+export interface MasterSessionCapabilityProfile {
+	readonly masterName: string;
+	readonly model: Model;
+	readonly modelRegistry: ModelRegistry;
+	readonly authStorage: AuthStorage;
+	readonly sessionManager: SessionManager;
+	readonly agentRegistry: AgentRegistry;
+	readonly eventBus: EventBus;
+	readonly tools: readonly MasterOrchestrationTool[];
+	readonly systemPrompt: readonly string[];
+	readonly settings: Settings;
+	readonly providerSessionId: string;
+	readonly credentialSessionId: string;
+	readonly doctrineProvider?: () => MasterDoctrineDocument | Promise<MasterDoctrineDocument>;
+	readonly initialDoctrineRevision?: string;
+	readonly thinkingLevel?: ThinkingLevel;
+}
+
 // Types
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: getProjectDir() */
@@ -578,6 +605,8 @@ export interface CreateAgentSessionOptions {
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Cooperative pause checkpoint passed through to Agent. */
 	shouldPause?: () => boolean;
+	/** @internal Closed capability profile used only by MasterSessionFactory. */
+	masterProfile?: MasterSessionCapabilityProfile;
 }
 
 /** Result from createAgentSession */
@@ -1239,7 +1268,141 @@ function findDeferredExactMcpToolNameCollisions(
 	return [...collisions];
 }
 
+function createMasterMemoryService(
+	doctrineProvider: MasterSessionCapabilityProfile["doctrineProvider"],
+	initialDoctrineRevision: string | undefined,
+): LazyService<MemoryBackend> {
+	let appliedDoctrineRevision = initialDoctrineRevision;
+	const backend: MemoryBackend = {
+		id: "off",
+		start: async () => {},
+		buildDeveloperInstructions: async () => undefined,
+		clear: async () => {},
+		enqueue: async () => {},
+		beforeAgentStartPrompt: async () => {
+			if (doctrineProvider === undefined) return undefined;
+			const doctrine = await doctrineProvider();
+			if (doctrine.revision === appliedDoctrineRevision) return undefined;
+			appliedDoctrineRevision = doctrine.revision;
+			return `## Current master doctrine (${doctrine.revision})\n\n${doctrine.content}`;
+		},
+	};
+	return {
+		status: () => ({ id: "master.memory.disabled", state: "ready" }),
+		peek: () => backend,
+		get: async () => backend,
+		prewarm: async () => {},
+		dispose: async () => {},
+	};
+}
+
+async function createMasterAgentSession(profile: MasterSessionCapabilityProfile): Promise<CreateAgentSessionResult> {
+	if (!/^[a-z][a-z0-9-]{0,62}$/.test(profile.masterName)) {
+		throw new Error("Master names must match [a-z][a-z0-9-]{0,62}.");
+	}
+	if (profile.modelRegistry.authStorage !== profile.authStorage) {
+		throw new Error("Master modelRegistry.authStorage must be the injected authStorage instance.");
+	}
+	assertMasterOrchestrationToolCatalog(profile.tools.map(tool => tool.name));
+	const agentId = `master:${profile.masterName}`;
+	const expectedNames = profile.tools.map(tool => tool.name);
+	const sessionManager = profile.sessionManager;
+	const settings = profile.settings;
+	let session!: AgentSession;
+	let registered = false;
+	const customToolContext = (): CustomToolContext => ({
+		sessionManager: createReadonlySessionManager(sessionManager),
+		modelRegistry: profile.modelRegistry,
+		credentialSessionId: profile.credentialSessionId,
+		model: profile.model,
+		isIdle: () => !session?.isStreaming,
+		hasQueuedMessages: () => session?.queuedMessageCount > 0,
+		abort: () => {
+			session?.abort();
+		},
+		settings,
+	});
+	const wrappedTools = profile.tools.map(tool => CustomToolAdapter.wrap(tool, customToolContext) as AgentTool);
+	const toolRegistry = new Map<string, Tool>();
+	for (const tool of wrappedTools) toolRegistry.set(tool.name, tool);
+	const agent = new Agent({
+		initialState: {
+			systemPrompt: [...profile.systemPrompt],
+			model: profile.model,
+			thinkingLevel: profile.thinkingLevel === undefined ? undefined : toReasoningEffort(profile.thinkingLevel),
+			tools: wrappedTools,
+		},
+		sessionId: sessionManager.getSessionId(),
+		providerSessionId: profile.providerSessionId,
+		streamFn: streamSimple,
+		getApiKey: provider => profile.modelRegistry.getApiKeyForProvider(provider, profile.credentialSessionId),
+		getAuthCredentialType: provider =>
+			profile.modelRegistry.getSessionCredentialType(provider, profile.credentialSessionId),
+	});
+	try {
+		sessionManager.appendModelChange(`${profile.model.provider}/${profile.model.id}`);
+		sessionManager.appendThinkingLevelChange(profile.thinkingLevel ?? ThinkingLevel.Inherit);
+		profile.agentRegistry.register({
+			id: agentId,
+			displayName: agentId,
+			rosterLabel: agentId,
+			kind: "main",
+			session: null,
+			sessionFile: sessionManager.getSessionFile() ?? null,
+			status: "running",
+		});
+		registered = true;
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			memoryBackend: createMasterMemoryService(profile.doctrineProvider, profile.initialDoctrineRevision),
+			modelRegistry: profile.modelRegistry,
+			skills: [],
+			skillWarnings: [],
+			promptTemplates: [],
+			slashCommands: [],
+			customCommands: [],
+			toolRegistry,
+			requestedToolNames: new Set(expectedNames),
+			mcpDiscoveryEnabled: false,
+			discoveryMode: "off",
+			workflowGatePublication: "local",
+			rebuildSystemPrompt: async () => ({ systemPrompt: [...profile.systemPrompt] }),
+			agentId,
+			agentRegistry: profile.agentRegistry,
+			providerSessionId: profile.providerSessionId,
+			credentialSessionId: profile.credentialSessionId,
+			providerCacheSessionId: profile.providerSessionId,
+		});
+		profile.agentRegistry.attachSession(agentId, session, sessionManager.getSessionFile() ?? null);
+		const originalDispose = session.dispose.bind(session);
+		session.dispose = async () => {
+			try {
+				await originalDispose();
+			} finally {
+				profile.agentRegistry.unregister(agentId);
+			}
+		};
+		assertMasterOrchestrationToolCatalog(session.getActiveToolNames().slice().sort());
+		return {
+			session,
+			extensionsResult: { extensions: [], errors: [], runtime: new ExtensionRuntime() },
+			setToolUIContext: () => {},
+			eventBus: profile.eventBus,
+		};
+	} catch (error) {
+		if (session) {
+			await session.dispose().catch(() => undefined);
+		} else if (registered) {
+			profile.agentRegistry.unregister(agentId);
+		}
+		throw error;
+	}
+}
+
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	if (options.masterProfile !== undefined) return await createMasterAgentSession(options.masterProfile);
 	const lifecycleStartupCapability = (
 		options as CreateAgentSessionOptions & { [lifecycleStartupCapabilityOption]?: SdkStartupCapability }
 	)[lifecycleStartupCapabilityOption];

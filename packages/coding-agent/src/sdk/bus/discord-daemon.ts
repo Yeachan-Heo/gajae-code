@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { SdkClientError } from "../client/client";
 import { type SessionAttachment, SessionRouterError } from "../router";
 import type { ChatDeliveryError } from "./chat-daemon-runtime";
-
 import {
 	type ChatEffect,
 	ChatEffectJournal,
@@ -11,14 +12,15 @@ import {
 	type ChatEffectReceipt,
 } from "./chat-effect-journal";
 import { ConversationStore } from "./conversation-store";
-
 import {
 	type DiscordConversation,
 	type DiscordInboundDispatchReceipt,
 	discordConversationKey,
 	normalizeDiscordConversation,
 } from "./discord-conversation";
+import { DiscordMasterChannelWorker } from "./discord-master-channel-worker";
 import type { DiscordInboundEvent, DiscordMessageComponent, DiscordProvider, DiscordThread } from "./discord-provider";
+import { MasterDaemonClient } from "./master-daemon-client";
 
 const FAILURE = "This conversation is no longer available.";
 
@@ -79,6 +81,10 @@ export interface DiscordLeaseRecoveryScheduler {
 }
 
 export interface DiscordNotificationDaemonOptions {
+	/** Optional aggregate master endpoint; absent discovery is a no-op. */
+	master?: DiscordMasterClientOptions;
+	masterClient?: MasterDaemonClient;
+	createMasterClient?: () => MasterDaemonClient | Promise<MasterDaemonClient>;
 	agentDir: string;
 	guildId: string;
 	parentChannelId: string;
@@ -95,6 +101,12 @@ export interface DiscordNotificationDaemonOptions {
 		attachment: SessionAttachment,
 		idempotencyKey: string,
 	) => Promise<boolean>;
+}
+
+export interface DiscordMasterClientOptions {
+	enabled?: boolean;
+	client?: MasterDaemonClient;
+	createClient?: () => MasterDaemonClient | Promise<MasterDaemonClient>;
 }
 
 export interface DiscordNotificationInput {
@@ -187,9 +199,24 @@ export class DiscordNotificationDaemon {
 	readonly #dispatchLeaseMs = 60_000;
 	readonly #providerOwner = randomUUID();
 	readonly #providerLeaseMs = 60_000;
+
+	#masterClient: MasterDaemonClient | undefined;
+	#masterWorker: DiscordMasterChannelWorker | undefined;
+	#masterBindings = new Map<string, { masterName: string; bindingId: string; remoteChannelId: string }>();
+	readonly #masterAmbiguousBindings = new Set<string>();
+	readonly #masterIngressSeen = new Set<string>();
+	readonly #masterIngressRetries = new Map<string, { event: DiscordInboundEvent; attempt: number; timer: unknown }>();
+	readonly #masterIngressRetryPath: string;
+	#masterIngressPersistTask: Promise<void> = Promise.resolve();
+	#masterBindingDisposer: (() => void) | undefined;
+	#masterStartTask: Promise<void> | undefined;
+	#masterStopRequested = false;
+	#masterDiscoveryTimer: Timer | undefined;
+	#masterDiscoveryAttempts = 0;
 	constructor(private readonly options: DiscordNotificationDaemonOptions) {
 		this.#store = new ConversationStore({ agentDir: options.agentDir, kind: "discord", now: options.now });
 		this.#effects = new ChatEffectJournal({ agentDir: options.agentDir, transport: "discord", now: options.now });
+		this.#masterIngressRetryPath = path.join(options.agentDir, "sdk", "discord-master-ingress-retries.json");
 		this.#now = options.now ?? Date.now;
 		this.#leaseRecoveryScheduler = options.leaseRecoveryScheduler ?? {
 			setTimeout: (callback, delayMs) => setTimeout(() => void callback(), delayMs),
@@ -199,6 +226,301 @@ export class DiscordNotificationDaemon {
 	}
 	restartBlocked(): boolean {
 		return this.#providerLifecycleTail !== undefined || this.#providerLifecycleErrorSet;
+	}
+
+	async #ensureMasterWorker(): Promise<void> {
+		if (
+			this.options.master?.enabled === false ||
+			this.#masterWorker ||
+			this.#masterStartTask ||
+			this.#masterStopRequested ||
+			!this.#started
+		)
+			return;
+		const task = this.#startMasterWorker();
+		this.#masterStartTask = task;
+		try {
+			await task;
+		} finally {
+			if (this.#masterStartTask === task) this.#masterStartTask = undefined;
+		}
+		// Discovery can legitimately be absent when this daemon starts before the
+		// master daemon, or before any master exists. Without a lifecycle-owned retry
+		// a master created later would never get a Discord provider, because inbound
+		// handling consults the (still empty) binding map first.
+		if (!this.#masterWorker) this.#scheduleMasterDiscoveryRetry();
+	}
+
+	#scheduleMasterDiscoveryRetry(): void {
+		if (
+			this.#masterDiscoveryTimer !== undefined ||
+			this.options.master?.enabled === false ||
+			this.#masterStopRequested ||
+			!this.#started
+		)
+			return;
+		const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(this.#masterDiscoveryAttempts, 5));
+		this.#masterDiscoveryAttempts += 1;
+		// Deliberately NOT the lease-recovery scheduler: master discovery retry is an
+		// independent lifecycle concern and must not perturb effect-lease recovery.
+		const timer = setTimeout(() => {
+			this.#masterDiscoveryTimer = undefined;
+			if (this.#masterStopRequested || !this.#started || this.#masterWorker) return;
+			void this.#ensureMasterWorker().catch(() => undefined);
+		}, delayMs);
+		timer.unref?.();
+		this.#masterDiscoveryTimer = timer;
+	}
+
+	async #startMasterWorker(): Promise<void> {
+		let client: MasterDaemonClient | undefined;
+		try {
+			client =
+				this.options.masterClient ??
+				this.options.master?.client ??
+				(await (this.options.createMasterClient ?? this.options.master?.createClient)?.()) ??
+				new MasterDaemonClient();
+			const worker = new DiscordMasterChannelWorker({
+				client,
+				provider: this.options.provider,
+				guildId: this.options.guildId,
+				parentChannelId: this.options.parentChannelId,
+				resolveRemoteChannelId: input => client!.resolveRemoteChannelId?.(input),
+			});
+			this.#masterClient = client;
+			this.#masterWorker = worker;
+			this.#masterBindingDisposer = client.onFrame(frame => {
+				if (frame.type === "master_snapshot") {
+					this.#setMasterBindings(frame.masters);
+					return;
+				}
+				if (frame.type === "channel_updated") void this.#refreshMasterBindings(client!).catch(() => undefined);
+			});
+			await worker.start();
+			await this.#loadMasterIngressRetries();
+			if (this.#masterStopRequested || !this.#started) {
+				await worker.stop();
+				return;
+			}
+			try {
+				await this.#refreshMasterBindings(client);
+			} catch (error) {
+				this.#masterBindings.clear();
+				this.#masterAmbiguousBindings.clear();
+				if (
+					this.options.masterClient ||
+					this.options.master?.client ||
+					this.options.createMasterClient ||
+					this.options.master?.createClient
+				)
+					logger.warn(
+						`notifications: Discord master bindings unavailable: ${error instanceof Error ? error.message : String(error)}`,
+					);
+			}
+		} catch (error) {
+			this.#masterBindings.clear();
+			this.#masterAmbiguousBindings.clear();
+			this.#masterBindingDisposer?.();
+			this.#masterBindingDisposer = undefined;
+			if (this.#masterWorker) await this.#masterWorker.stop().catch(() => undefined);
+			this.#masterWorker = undefined;
+			if (client && !this.options.masterClient && !this.options.master?.client)
+				await client.close().catch(() => undefined);
+			this.#masterClient = undefined;
+			// Discovery is optional. A failed master worker must never prevent ordinary
+			// Discord routing from starting or continuing.
+			if (
+				this.options.masterClient ||
+				this.options.master?.client ||
+				this.options.createMasterClient ||
+				this.options.master?.createClient
+			)
+				logger.warn(
+					`notifications: Discord master worker unavailable: ${error instanceof Error ? error.message : String(error)}`,
+				);
+		}
+	}
+
+	async #refreshMasterBindings(client: MasterDaemonClient): Promise<void> {
+		const frame = await client.request({
+			type: "get_snapshot",
+			requestId: `discord-master-snapshot-${randomUUID()}`,
+		});
+		if (frame.type !== "master_snapshot") throw new Error("master daemon returned an invalid snapshot");
+		this.#setMasterBindings(frame.masters);
+	}
+
+	#setMasterBindings(masters: readonly unknown[]): void {
+		this.#masterBindings.clear();
+		this.#masterAmbiguousBindings.clear();
+		for (const master of masters) {
+			if (!master || typeof master !== "object" || Array.isArray(master)) continue;
+			const candidate = master as { masterName?: unknown; channels?: unknown };
+			if (
+				typeof candidate.masterName !== "string" ||
+				candidate.masterName.length === 0 ||
+				!Array.isArray(candidate.channels)
+			)
+				continue;
+			for (const channel of candidate.channels) {
+				if (!channel || typeof channel !== "object" || Array.isArray(channel)) continue;
+				const value = channel as {
+					provider?: unknown;
+					state?: unknown;
+					bindingId?: unknown;
+					remoteChannelId?: unknown;
+				};
+				if (
+					value.provider !== "discord" ||
+					value.state !== "active" ||
+					typeof value.bindingId !== "string" ||
+					typeof value.remoteChannelId !== "string" ||
+					value.bindingId.length === 0 ||
+					value.remoteChannelId.length === 0
+				)
+					continue;
+				if (this.#masterAmbiguousBindings.has(value.remoteChannelId)) continue;
+				const existing = this.#masterBindings.get(value.remoteChannelId);
+				if (existing && (existing.masterName !== candidate.masterName || existing.bindingId !== value.bindingId)) {
+					this.#masterBindings.delete(value.remoteChannelId);
+					this.#masterAmbiguousBindings.add(value.remoteChannelId);
+					continue;
+				}
+				this.#masterBindings.set(value.remoteChannelId, {
+					masterName: candidate.masterName,
+					bindingId: value.bindingId,
+					remoteChannelId: value.remoteChannelId,
+				});
+			}
+		}
+	}
+
+	async #scheduleMasterIngressRetry(event: DiscordInboundEvent, attempt = 0): Promise<void> {
+		const key = `discord:${event.threadId}:${event.id}`;
+		if (this.#masterIngressRetries.has(key) || this.#masterIngressSeen.has(key)) return;
+		const delayMs = Math.min(30_000, 500 * 2 ** Math.min(attempt, 6));
+		const timer = this.#leaseRecoveryScheduler.setTimeout(async () => {
+			this.#masterIngressRetries.delete(key);
+			try {
+				const handled = await this.#forwardMasterIngress(event);
+				if (!handled) await this.#scheduleMasterIngressRetry(event, attempt + 1);
+			} catch {
+				await this.#scheduleMasterIngressRetry(event, attempt + 1);
+			}
+		}, delayMs);
+		this.#masterIngressRetries.set(key, { event, attempt: attempt + 1, timer });
+		await this.#persistMasterIngressRetries();
+	}
+	async #loadMasterIngressRetries(): Promise<void> {
+		let rows: Array<{ event: DiscordInboundEvent; attempt: number }> = [];
+		try {
+			const value = await Bun.file(this.#masterIngressRetryPath).json();
+			if (Array.isArray(value))
+				rows = value.filter(
+					(row): row is { event: DiscordInboundEvent; attempt: number } =>
+						typeof row === "object" &&
+						row !== null &&
+						typeof (row as { attempt?: unknown }).attempt === "number" &&
+						typeof (row as { event?: { id?: unknown } }).event?.id === "string",
+				);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		for (const row of rows) await this.#scheduleMasterIngressRetry(row.event, row.attempt);
+	}
+
+	async #persistMasterIngressRetries(): Promise<void> {
+		const rows = [...this.#masterIngressRetries.values()].map(({ event, attempt }) => ({ event, attempt }));
+		this.#masterIngressPersistTask = this.#masterIngressPersistTask.then(async () => {
+			await fs.mkdir(path.dirname(this.#masterIngressRetryPath), { recursive: true, mode: 0o700 });
+			const temporaryPath = `${this.#masterIngressRetryPath}.${process.pid}.${Date.now()}.tmp`;
+			await Bun.write(temporaryPath, `${JSON.stringify(rows, null, 2)}\n`, { mode: 0o600 });
+			await fs.chmod(temporaryPath, 0o600);
+			await fs.rename(temporaryPath, this.#masterIngressRetryPath);
+			await fs.chmod(this.#masterIngressRetryPath, 0o600);
+		});
+		await this.#masterIngressPersistTask;
+	}
+
+	async #forwardMasterIngress(event: DiscordInboundEvent): Promise<boolean> {
+		if (event.guildId !== this.options.guildId || event.parentId !== this.options.parentChannelId) return false;
+		const key = `discord:${event.threadId}:${event.id}`;
+		if (this.#masterIngressSeen.has(key)) return true;
+		if (this.#masterAmbiguousBindings.has(event.threadId)) return false;
+		// Bootstrap discovery before consulting the binding map: an empty map is the
+		// exact state a startup-ordering failure leaves behind.
+		if (!this.#masterWorker) await this.#ensureMasterWorker();
+		const binding = this.#masterBindings.get(event.threadId);
+		if (!binding || binding.remoteChannelId !== event.threadId || !event.authorId.trim()) return false;
+		const content = event.content?.trim();
+		if (!content) return false;
+		await this.#ensureMasterWorker();
+		const client = this.#masterClient;
+		if (!client) {
+			await this.#scheduleMasterIngressRetry(event);
+			return true;
+		}
+		const idempotencyKey = `discord:${event.threadId}:${event.id}`;
+		try {
+			const response = await client.request({
+				type: "master_user_message",
+				requestId: `discord-master-ingress-${randomUUID()}`,
+				idempotencyKey,
+				masterName: binding.masterName,
+				text: content,
+				workdir: null,
+				urgency: "user",
+				ingress: {
+					kind: "provider",
+					provider: "discord",
+					channelId: binding.remoteChannelId,
+					messageId: event.id,
+					actorId: event.authorId,
+				},
+			});
+			if (
+				response.type !== "ack" ||
+				response.operation !== "master_user_message" ||
+				response.idempotencyKey !== idempotencyKey ||
+				response.result.kind !== "task" ||
+				response.result.state !== "queued"
+			)
+				throw new Error("master ingress was not durably acknowledged");
+			this.#masterIngressSeen.add(key);
+			this.#masterIngressRetries.delete(key);
+			await this.#persistMasterIngressRetries();
+			while (this.#masterIngressSeen.size > 1_024)
+				this.#masterIngressSeen.delete(this.#masterIngressSeen.values().next().value!);
+			return true;
+		} catch (error) {
+			logger.warn(
+				`notifications: Discord master ingress degraded: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			await this.#scheduleMasterIngressRetry(event);
+			return true;
+		}
+	}
+
+	async #stopMasterWorker(): Promise<void> {
+		this.#masterStopRequested = true;
+		if (this.#masterDiscoveryTimer !== undefined) clearTimeout(this.#masterDiscoveryTimer);
+		this.#masterDiscoveryTimer = undefined;
+		try {
+			await this.#masterStartTask;
+		} catch {}
+		this.#masterBindingDisposer?.();
+		this.#masterBindingDisposer = undefined;
+		await this.#masterWorker?.stop().catch(() => undefined);
+		this.#masterWorker = undefined;
+		this.#masterBindings.clear();
+		this.#masterAmbiguousBindings.clear();
+		for (const retry of this.#masterIngressRetries.values()) this.#leaseRecoveryScheduler.clearTimeout(retry.timer);
+		this.#masterIngressRetries.clear();
+		this.#masterIngressSeen.clear();
+		const client = this.#masterClient;
+		this.#masterClient = undefined;
+		if (client && !this.options.masterClient && !this.options.master?.client)
+			await client.close().catch(() => undefined);
 	}
 
 	async start(): Promise<void> {
@@ -236,6 +558,8 @@ export class DiscordNotificationDaemon {
 	}
 
 	async #start(lifecycleGeneration: number): Promise<void> {
+		this.#masterStopRequested = false;
+		this.#masterDiscoveryAttempts = 0;
 		try {
 			// Provider start is the delivery boundary; complete crash recovery first.
 			await this.#reconcileTerminalInboundReceipts();
@@ -268,6 +592,7 @@ export class DiscordNotificationDaemon {
 					},
 					() => {},
 				);
+				await this.#ensureMasterWorker();
 			} finally {
 				this.#providerStarting = false;
 			}
@@ -313,6 +638,7 @@ export class DiscordNotificationDaemon {
 	}
 
 	async #stop(starting: Promise<void> | undefined, stopProvider: boolean): Promise<void> {
+		await this.#stopMasterWorker();
 		const drainDeadline = this.#now() + 5_000;
 		let providerStopError: unknown;
 		let providerStopRejected = false;
@@ -635,6 +961,7 @@ export class DiscordNotificationDaemon {
 
 	async handleInbound(event: DiscordInboundEvent): Promise<void> {
 		if (event.bot || event.authorId === this.options.provider.botUserId) return;
+		if (await this.#forwardMasterIngress(event)) return;
 		await this.#reconcileTerminalInboundReceipts();
 		const record = await this.#byThread(event.guildId, event.parentId, event.threadId);
 		if (!record?.sessionId) {

@@ -85,6 +85,7 @@ import {
 	parseLifecycleCommand,
 	validateLifecycleTarget,
 } from "./lifecycle-commands";
+import { MasterDaemonClient } from "./master-daemon-client";
 import { NotificationOperatorRuntime, OperatorBackoffPolicy, OperatorEventRouter } from "./operator-runtime";
 import { type RateLimitDisposition, RateLimitPool } from "./rate-limit-pool";
 import { ReplySentStore } from "./reply-sent-store";
@@ -102,6 +103,7 @@ import {
 	TelegramAdoptionIntentStore,
 	type TelegramAdoptionTarget,
 } from "./telegram-adoption-intent";
+import { TelegramMasterChannelWorker } from "./telegram-master-channel-worker";
 import {
 	type AliasTable,
 	buildActionMarkdown,
@@ -3919,6 +3921,12 @@ export interface TelegramDaemonOptions {
 	/** TTL for durable topic-adoption intents (default 10 minutes). Observed, not a fixed contract. */
 	adoptionIntentTtlMs?: number;
 	pid?: number;
+	/** Liveness probe for skipping dead-PID endpoint records during root scanning. */
+	pidAlive?: (pid: number) => boolean;
+	/** Optional aggregate master endpoint; absent discovery is a no-op. */
+	master?: TelegramMasterClientOptions;
+	masterClient?: MasterDaemonClient;
+	createMasterClient?: () => MasterDaemonClient | Promise<MasterDaemonClient>;
 	pidIncarnation?: (pid: number) => string | undefined;
 	botApi?: BotApi;
 	control?: DaemonControlHooks;
@@ -3954,6 +3962,12 @@ export interface TelegramDaemonOptions {
 	topicRegistryAuthority?: TopicRegistryCasAuthority;
 	/** Stable host-local identity. Required whenever a shared authority is configured. */
 	installationHostId?: string;
+}
+
+export interface TelegramMasterClientOptions {
+	enabled?: boolean;
+	client?: MasterDaemonClient;
+	createClient?: () => MasterDaemonClient | Promise<MasterDaemonClient>;
 }
 
 interface StagedCallbackActivation {
@@ -4363,6 +4377,14 @@ export class TelegramNotificationDaemon {
 	readonly #deliveryAbort = new AbortController();
 	private readonly botApi: BotApi;
 	private readonly effects = new TelegramEffectSupervisor(this.#deliveryAbort.signal);
+
+	private masterClient: MasterDaemonClient | undefined;
+	private masterWorker: TelegramMasterChannelWorker | undefined;
+	private masterBindings = new Map<string, { masterName: string; bindingId: string; remoteChannelId: string }>();
+	private masterAmbiguousBindings = new Set<string>();
+	private masterBindingDisposer: (() => void) | undefined;
+	private masterStartTask: Promise<void> | undefined;
+	private masterStopRequested = false;
 	private readonly topics = new TopicRegistry();
 	#topicRegistryLoaded = false;
 	/** Stable host-local identity; never persisted in shared topic authority. */
@@ -4988,6 +5010,244 @@ export class TelegramNotificationDaemon {
 			publicationSettlement: (publicationId: string) => this.#publicationSettlement(publicationId),
 			settlePublication: (publicationId: string) => this.#settlePublication(publicationId),
 		};
+	}
+
+	private async ensureMasterWorker(): Promise<void> {
+		if (
+			this.opts.master?.enabled === false ||
+			this.masterWorker ||
+			this.masterStartTask ||
+			this.masterStopRequested ||
+			!this.running
+		)
+			return;
+		const task = this.startMasterWorker();
+		this.masterStartTask = task;
+		try {
+			await task;
+		} finally {
+			if (this.masterStartTask === task) this.masterStartTask = undefined;
+		}
+	}
+
+	private async startMasterWorker(): Promise<void> {
+		let client: MasterDaemonClient | undefined;
+		try {
+			client =
+				this.opts.masterClient ??
+				this.opts.master?.client ??
+				(await (this.opts.createMasterClient ?? this.opts.master?.createClient)?.()) ??
+				new MasterDaemonClient();
+			const worker = new TelegramMasterChannelWorker({
+				client,
+				provider: {
+					chatId: this.opts.chatId,
+					// Leased master effects are non-idempotent provider mutations with no
+					// nonce Telegram can echo back. A blind transport retry after a lost
+					// response would create a second topic or post a duplicate message that
+					// the durable receipt can never correlate, so a single attempt is the
+					// only safe contract: ambiguity is reported, never retried underneath.
+					call: (method: string, body: unknown, callOpts?: { signal?: AbortSignal; noRetry?: boolean }) =>
+						this.botApi.call(method, body, { ...callOpts, noRetry: true }),
+				},
+				chatId: this.opts.chatId,
+				resolveRemoteChannelId: input => client!.resolveRemoteChannelId?.(input),
+			});
+			this.masterClient = client;
+			this.masterWorker = worker;
+			this.masterBindingDisposer = client.onFrame(frame => {
+				if (frame.type === "master_snapshot") {
+					this.setMasterBindings(frame.masters);
+					return;
+				}
+				if (frame.type === "channel_updated") void this.refreshMasterBindings(client!).catch(() => undefined);
+			});
+			await worker.start();
+			if (this.masterStopRequested || !this.running) {
+				await worker.stop();
+				return;
+			}
+			try {
+				await this.refreshMasterBindings(client);
+			} catch (error) {
+				this.masterBindings.clear();
+				this.masterAmbiguousBindings.clear();
+				if (
+					this.opts.masterClient ||
+					this.opts.master?.client ||
+					this.opts.createMasterClient ||
+					this.opts.master?.createClient
+				)
+					logger.warn(
+						`notifications: Telegram master bindings unavailable: ${error instanceof Error ? error.message : String(error)}`,
+					);
+			}
+		} catch (error) {
+			this.masterBindings.clear();
+			this.masterAmbiguousBindings.clear();
+			this.masterBindingDisposer?.();
+			this.masterBindingDisposer = undefined;
+			if (this.masterWorker) await this.masterWorker.stop().catch(() => undefined);
+			this.masterWorker = undefined;
+			if (client && !this.opts.masterClient && !this.opts.master?.client)
+				await client.close().catch(() => undefined);
+			this.masterClient = undefined;
+			if (
+				this.opts.masterClient ||
+				this.opts.master?.client ||
+				this.opts.createMasterClient ||
+				this.opts.master?.createClient
+			)
+				logger.warn(
+					`notifications: Telegram master worker unavailable: ${error instanceof Error ? error.message : String(error)}`,
+				);
+		}
+	}
+
+	private async refreshMasterBindings(client: MasterDaemonClient): Promise<void> {
+		const frame = await client.request({
+			type: "get_snapshot",
+			requestId: `telegram-master-snapshot-${crypto.randomUUID()}`,
+		});
+		if (frame.type !== "master_snapshot") throw new Error("master daemon returned an invalid snapshot");
+		this.setMasterBindings(frame.masters);
+	}
+
+	private setMasterBindings(masters: readonly unknown[]): void {
+		this.masterBindings.clear();
+		this.masterAmbiguousBindings.clear();
+		for (const master of masters) {
+			if (!master || typeof master !== "object" || Array.isArray(master)) continue;
+			const candidate = master as { masterName?: unknown; channels?: unknown };
+			if (
+				typeof candidate.masterName !== "string" ||
+				candidate.masterName.length === 0 ||
+				!Array.isArray(candidate.channels)
+			)
+				continue;
+			for (const channel of candidate.channels) {
+				if (!channel || typeof channel !== "object" || Array.isArray(channel)) continue;
+				const value = channel as {
+					provider?: unknown;
+					state?: unknown;
+					bindingId?: unknown;
+					remoteChannelId?: unknown;
+				};
+				if (
+					value.provider !== "telegram" ||
+					value.state !== "active" ||
+					typeof value.bindingId !== "string" ||
+					typeof value.remoteChannelId !== "string" ||
+					value.bindingId.length === 0 ||
+					value.remoteChannelId.length === 0
+				)
+					continue;
+				if (this.masterAmbiguousBindings.has(value.remoteChannelId)) continue;
+				const existing = this.masterBindings.get(value.remoteChannelId);
+				if (existing && (existing.masterName !== candidate.masterName || existing.bindingId !== value.bindingId)) {
+					this.masterBindings.delete(value.remoteChannelId);
+					this.masterAmbiguousBindings.add(value.remoteChannelId);
+					continue;
+				}
+				this.masterBindings.set(value.remoteChannelId, {
+					masterName: candidate.masterName,
+					bindingId: value.bindingId,
+					remoteChannelId: value.remoteChannelId,
+				});
+			}
+		}
+	}
+
+	private async forwardMasterIngress(update: unknown): Promise<"handled" | "retry" | "not_bound"> {
+		const raw = update as {
+			update_id?: unknown;
+			message?: {
+				chat?: { id?: unknown };
+				message_thread_id?: unknown;
+				message_id?: unknown;
+				text?: unknown;
+				caption?: unknown;
+				from?: { id?: unknown; is_bot?: unknown };
+			};
+		};
+		const message = raw.message;
+		const updateId =
+			Number.isSafeInteger(raw.update_id) && Number(raw.update_id) >= 0 ? Number(raw.update_id) : undefined;
+		if (updateId !== undefined && this.dispatchState.seenUpdateIds.has(updateId)) return "handled";
+		if (!message || String(message.chat?.id) !== String(this.opts.chatId) || message.from?.is_bot === true)
+			return "not_bound";
+		if (!Number.isSafeInteger(message.message_thread_id) || Number(message.message_thread_id) <= 0)
+			return "not_bound";
+		const channelId = String(message.message_thread_id);
+		if (this.masterAmbiguousBindings.has(channelId)) return "not_bound";
+		const binding = this.masterBindings.get(channelId);
+		if (!binding || binding.remoteChannelId !== channelId) return "not_bound";
+		const messageId = message.message_id;
+		const actorId = message.from?.id;
+		if (
+			!Number.isSafeInteger(messageId) ||
+			Number(messageId) <= 0 ||
+			!Number.isSafeInteger(actorId) ||
+			Number(actorId) <= 0
+		)
+			return "not_bound";
+		const content = (
+			typeof message.text === "string" ? message.text : typeof message.caption === "string" ? message.caption : ""
+		).trim();
+		if (!content) return "not_bound";
+		await this.ensureMasterWorker();
+		const client = this.masterClient;
+		if (!client) return "retry";
+		const idempotencyKey = `telegram:${channelId}:${messageId}`;
+		try {
+			const response = await client.request({
+				type: "master_user_message",
+				requestId: `telegram-master-ingress-${crypto.randomUUID()}`,
+				idempotencyKey,
+				masterName: binding.masterName,
+				text: content,
+				workdir: null,
+				urgency: "user",
+				ingress: {
+					kind: "provider",
+					provider: "telegram",
+					channelId: binding.remoteChannelId,
+					messageId: String(messageId),
+					actorId: String(actorId),
+				},
+			});
+			if (
+				response.type !== "ack" ||
+				response.operation !== "master_user_message" ||
+				response.idempotencyKey !== idempotencyKey ||
+				response.result.kind !== "task" ||
+				response.result.state !== "queued"
+			)
+				throw new Error("master ingress was not durably acknowledged");
+			if (updateId !== undefined) await this.rememberSeenUpdateId(updateId);
+			return "handled";
+		} catch (error) {
+			logger.warn(
+				`notifications: Telegram master ingress degraded: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return "retry";
+		}
+	}
+
+	private async stopMasterWorker(): Promise<void> {
+		this.masterStopRequested = true;
+		try {
+			await this.masterStartTask;
+		} catch {}
+		this.masterBindingDisposer?.();
+		this.masterBindingDisposer = undefined;
+		await this.masterWorker?.stop().catch(() => undefined);
+		this.masterWorker = undefined;
+		this.masterBindings.clear();
+		this.masterAmbiguousBindings.clear();
+		const client = this.masterClient;
+		this.masterClient = undefined;
+		if (client && !this.opts.masterClient && !this.opts.master?.client) await client.close().catch(() => undefined);
 	}
 
 	/** @internal Test-only access to attachment routing lifecycle transitions. */
@@ -11653,6 +11913,9 @@ export class TelegramNotificationDaemon {
 
 	async handleTelegramUpdate(update: unknown): Promise<void> {
 		if (this.validationMode() || !this.#topicRegistryMutationAllowed()) return;
+		const masterIngress = await this.forwardMasterIngress(update);
+		if (masterIngress === "handled") return;
+		if (masterIngress === "retry") throw new Error("master ingress must be retried");
 		if ((await this.handleForumTopicCreatedUpdate(update)) !== "not-topic") return;
 		if ((await this.handleForumTopicEdited(update)) !== "not-topic") return;
 		// A raw path is accepted only after the explicit direct-entry choice. The exact
@@ -12481,6 +12744,7 @@ export class TelegramNotificationDaemon {
 			if (!renewed) return;
 			ownershipProved = true;
 			this.running = !this.stopRequested;
+			this.masterStopRequested = false;
 			if (!this.running) return;
 			await this.loadAliases();
 			if (!this.running) return;
@@ -12518,6 +12782,7 @@ export class TelegramNotificationDaemon {
 				await this.#loadPresentationState();
 			}
 			await this.#attachmentRouter.start();
+			await this.ensureMasterWorker();
 			await this.archiveUnownedTopicsAfterReconcile();
 			let idleSince = this.runtime.now();
 			while (this.running) {
@@ -12547,6 +12812,7 @@ export class TelegramNotificationDaemon {
 					);
 				}
 				if (!ownerHeld) break;
+				await this.ensureMasterWorker();
 				if (await this.controlStopRequested()) break;
 				const idleElapsed = this.runtime.now() - idleSince >= (this.opts.idleTimeoutMs ?? 60_000);
 				if (this.sessions.size > 0) {
@@ -12604,6 +12870,7 @@ export class TelegramNotificationDaemon {
 					toolShutdownError = error;
 				}
 				this.effects.beginShutdown();
+				await this.stopMasterWorker();
 				this.#deliveryAbort.abort();
 				this.stopFlushTimer();
 				this.stopTypingTimer();

@@ -25,6 +25,265 @@ For terminal-side session operation, use the broker-bound [SDK session CLI](./sd
 `control|query|global` hatch. The CLI resolves the exact attachment through SDK
 core and emits credential-free JSON.
 
+## Master daemon and SDK v1
+
+The managed **master** daemon is a separate product surface from the ordinary
+per-session SDK v3 described below. It hosts named, isolated headless masters
+and owns their durable queue, worker ownership, decisions, channel bindings,
+provider-effect outboxes, memory activity, and session persistence. Do not point
+a v3 `SdkClient` at the master endpoint, and do not treat a master as an
+ordinary top-level session with a narrowed prompt.
+
+### Master CLI and durable storage
+
+The root command is registered as `gjc master`:
+
+```sh
+gjc master create <name> [--workdir <path>] [--max-concurrent-workers <n>]
+gjc master list [--json]
+gjc master configure <name> --max-concurrent-workers <n>
+```
+
+- `create` requires a canonical name matching `[a-z][a-z0-9-]{0,62}`. Its
+  workdir must be an existing real directory at its canonical realpath and must
+  be admitted by the frozen Coordinator authority. `--workdir` defaults to the
+  current directory when omitted.
+- `list` prints a tab-separated table with `master`, `workdir`,
+  `max-concurrent-workers`, `active-workers`, `capacity-state`, and `updated-at`;
+  `--json` returns the same list as JSON. It accepts no master name or other
+  flags.
+- `configure` changes only `--max-concurrent-workers`; it does not accept
+  `--workdir` or `--json`.
+- Capacity is a positive safe integer (`>= 1`) and defaults to **3**. The
+  command validates authority, name, workdir, and capacity before persistence.
+  The durable record is written before the managed master daemon reload is
+  attempted. If reload fails, the record remains stopped and recoverable rather
+  than being rolled back.
+
+`$GJC_HOME` is the configured GJC home (normally `~/.gjc`). All master state is
+confined to `$GJC_HOME/master` and is private-written (directories `0700`, files
+`0600`):
+
+```text
+$GJC_HOME/master/
+  daemon/{owner.json,heartbeat.json,state.json}
+  sdk/master-daemon.json
+  events.jsonl
+  masters/<canonical-name>/
+    record.json
+    doctrine.md
+    queue.json
+    workers.json
+    ownership.json
+    claims.json
+    decisions.jsonl
+    channels.json
+    presentation-outbox.json
+    session/{<master-transcript>.jsonl,blobs/,resident-cache/}
+```
+
+The master store is the sole writer for this domain state. Chat/provider workers
+never write this tree, and master transcripts, blobs, resident caches, and
+recovery state do not fall back to a workspace `.gjc` directory or ordinary
+session breadcrumbs.
+
+### Private master SDK v1 discovery and protocol
+
+The master daemon publishes one aggregate discovery record at
+`$GJC_HOME/master/sdk/master-daemon.json`:
+
+```json
+{
+  "version": 1,
+  "protocolVersion": 1,
+  "url": "ws://127.0.0.1:<port>/master",
+  "token": "<private token>",
+  "pid": 12345,
+  "startedAt": "<UTC ISO timestamp>",
+  "heartbeatAt": "<UTC ISO timestamp>"
+}
+```
+
+The discovery directory is private and the record is private. The server binds
+only to `127.0.0.1`; the client appends the token as the `token` query parameter.
+A missing or wrong token is rejected with HTTP `401` before WebSocket upgrade.
+The first server frame is `hello` with `protocolVersion: 1` and capability
+`["master-sdk-v1"]`. Shutdown closes sockets and removes the discovery record.
+This endpoint, its token, and its wire contract are not the ordinary SDK v3
+endpoint at `<repo>/.gjc/state/sdk/<sessionId>.json`.
+
+Master v1 uses strict JSON frames (maximum 262,144 UTF-8 bytes) and a global
+contiguous event sequence. The client operations are:
+
+- `subscribe` (initial snapshot or replay after `afterSeq`),
+  `get_snapshot`, and `get_queue_page`;
+- `master_user_message` (durably enqueue user work);
+- `claim_request` and `approve_claim` (the latter is an authenticated provider
+  ingress operation, not a model tool);
+- `provider_worker_hello` and `provider_effect_result` for leased Telegram and
+  Discord effect workers; and
+- `ping`.
+
+Server frames include `hello`, `subscription_ready`, `master_snapshot`,
+`queue_page`, correlated `ack`, `pong`, `provider_effect`, strict `error`, and
+these sequenced event types: `queue_updated`, `ownership_updated`,
+`decision_logged`, `memory_activity`, `master_status`, and `channel_updated`.
+All request/response pairs are correlated by `requestId`; malformed or unknown
+fields fail strict validation instead of being ignored.
+
+A cursorless `subscribe` takes a coherent snapshot cut, sends `subscription_ready`
+and the snapshot, then sends events after that cut. A cursor-bearing subscribe
+replays retained events in ascending `seq` order and then attaches live. If the
+requested sequence has fallen out of retention, the server returns
+`resync_required` (`replay_gap`) and does not attach the stream. Queue pages use
+`cursor: null` for the first page; a stale or invalid subsequent cursor returns
+`queue_page_resync_required`, so the client discards the page and starts again
+from a fresh snapshot/first page. This is SDK event replay; provider delivery
+replay is a separate, durable obligation described below.
+
+### Closed master capability and Coordinator authority
+
+A master session admits exactly this orchestration catalog, with no ambient
+capability discovery or catalog growth:
+
+```text
+master_queue_list
+master_queue_enqueue
+master_queue_assign
+master_worker_create
+master_worker_observe
+master_worker_follow_up
+master_record_decision
+master_escalate
+master_claim_request
+master_memory_read
+master_memory_write
+```
+
+This is an orchestration-only profile. It has no filesystem or implementation
+capability (including read/write/edit/bash, image, web, goal, LSP, or generic
+provider tools), no MCP/extensions/skills/rules/context/slash/prompt discovery,
+and no bundled/default skill or agent. The master cannot edit repository or
+product code, and its `doctrine.md` is loaded as evidence rather than edited by
+the model. Ordinary product memory is hard-disabled; the injected v1
+`MemoryContract` is the only memory boundary.
+
+Worker lifecycle goes through a frozen `MasterCoordinatorGateway` and exactly
+these Coordinator operations:
+
+```text
+gjc_coordinator_start_session
+gjc_coordinator_send_prompt
+gjc_coordinator_await_turn
+gjc_coordinator_register_session
+```
+
+At master creation/daemon boot, Coordinator roots, mutation classes, explicit
+state root, namespace, and session-command form one frozen authority fingerprint.
+Every operation rechecks that authority and admits only canonical real workdirs
+inside its frozen roots. A missing or changed authority fails closed as
+`authority_blocked`; it never widens roots or moves state.
+
+Each master-owned worker is independent and follows this durable sequence:
+
+1. reserve its own queue slot and create intent with a stable idempotency key;
+2. call `gjc_coordinator_start_session` without a prompt;
+3. commit `{kind: "master", masterName}` ownership and quarantine pre-active
+   observations for that worker;
+4. persist a prompt-pending key and call
+   `gjc_coordinator_send_prompt`; and
+5. mark the worker active only after prompt delivery is proven, then route its
+   observations through the worker's own task/session identity.
+
+A master can run several such workers up to its capacity. Worker leases, intents,
+quarantines, and terminal releases are independent; one worker never rolls back
+or couples another worker's lifecycle. The snapshot exposes worker ownership,
+lifecycle, task, and session identifiers. Master-owned `action_needed`,
+`context_update`, and `turn_stream` observations are visible to the master;
+user-owned registered workers remain in the direct user/session flow and do not
+become master decisions.
+
+Claims are deliberately two-step. A bound Telegram or Discord ingress mints an
+opaque, actor-attributed, expiring authorization. The model may consume that
+authorization once through `master_claim_request`, which creates a pending
+claim; a distinct second authenticated interaction from the same bound actor
+approves it through `approve_claim`. Models cannot mint authorizations or approve
+claims, and forged, reused, expired, mismatched, or non-distinct interactions do
+not change ownership.
+
+### Concurrency, capacity, and drain-down
+
+Each master has an independent `maxConcurrentWorkers` and durable
+`capacityState`:
+
+```text
+capacityState = within_limit | draining_over_capacity
+```
+
+Admission requires both `capacityState: "within_limit"` and
+`activeWorkerCount < maxConcurrentWorkers`. Lowering the limit never revokes,
+stops, reassigns, or rolls back an existing worker. If the current count is now
+over the new limit, the store persists `draining_over_capacity`; no new lease is
+admitted while draining. Independent terminal releases reduce the exact active
+count. At equality the state may return to `within_limit`, but admission remains
+closed because the strict `<` test is still false; a new lease is admitted only
+after the count is strictly below the limit. The drain state and all leases
+survive restart. Queue priority remains `urgent_user`, `user`, then
+`autonomous`, with durable FIFO within each band and the existing three-user-
+dispatch fairness rule.
+
+### Provider availability versus eventual delivery
+
+Master v1 configures only Telegram and Discord provider bindings. A provider is
+**active** only after its binding is reconciled. `ProviderHealth.operational` is
+true exactly when at least one configured provider is active. Therefore:
+
+- zero active providers is `channel_blocked` with reason `no_active_provider`,
+  and the master does not start new turns;
+- one active provider is sufficient for productive master turns;
+- a provider with an unavailable/blocked binding is degraded but not active; and
+- an active binding with an unreconciled presentation backlog is both active and
+  degraded (`provider_degraded`, `state: "active"`,
+  `deliveryHealth: "degraded"`, reason `presentation_pending`). A healthy
+  second provider still keeps the master operational.
+
+Availability is not a promise that every provider has already received every
+presentation. Every presentation-required event creates one durable outbox row
+per configured provider keyed by `(provider, eventId)`. The effect identity
+`present:<provider>:<eventId>`, nonce, binding fence, and lease are retained
+across retry, ambiguity, restart, and provider outages. A provider receipt cursor
+advances only after the exact effect reconciles. On recovery, all pending rows
+for that provider replay in original per-provider event order; only when the
+backlog reaches zero does the channel emit `provider_recovered` with
+`deliveryHealth: "healthy"` and `replayPendingCount: 0`. Missing a provider's
+presentation forever is a correctness bug even when another provider kept the
+master available.
+
+`MasterDomainStore` commits binding intent, binding state, effect leases,
+receipts, outbox rows, and channel events. Chat daemons are leased provider-effect
+workers: they perform provider I/O and return fenced outcomes, but cannot write
+master state. Telegram master channels use topic names `Master · <name>` and a
+leased forum-topic effect; uncertain creation is reconciled explicitly rather
+than creating an uncorrelated second topic. Discord master channels use thread
+names `master-<name>`; workers find by nonce, unarchive retained threads, and
+relocate only after confirmed deletion. Existing ordinary worker conversations
+remain separate and routable.
+
+### MemoryContract boundary
+
+A master does not construct the ordinary product memory backend. Its injected
+`MemoryContract` v1 is the sole path and has `read`, `write`, and `subscribe`
+operations over global scope, with master/task/worker provenance. Read and write
+produce `memory_activity` evidence; no other memory operation is part of the
+master protocol. When the contract is unavailable, reads/writes fail with
+`memory_unavailable`, the master records memory evidence as unavailable, and
+queue/worker state remains authoritative and non-blocked. A completion lesson
+write uses a stable idempotency key when a contract is available.
+
+For ordinary sessions, continue with SDK v3 and its per-session discovery and
+control/query protocol. For master orchestration, use the v1 discovery record,
+strict master frames, snapshots, event replay, and provider-effect leases above.
+
 ## Migration from removed external transports
 
 The retired `--mode rpc`, `rpc-ui`, `bridge`, and `gjc sdk serve` transports
