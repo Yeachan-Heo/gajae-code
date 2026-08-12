@@ -43,6 +43,8 @@ export interface ModelManagerOptions<TApi extends Api = Api, TModelsDevPayload =
 	now?: () => number;
 	/** Optional guard that must permit cache publication. Default: writes are permitted. */
 	canPublishCache?: () => boolean;
+	/** Credential-and-endpoint identity required to reuse dynamic catalog IDs. */
+	cacheDynamicModelProvenance?: string;
 }
 
 /**
@@ -130,14 +132,17 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const cache = readModelCache<TApi>(options.providerId, ttlMs, now, dbPath);
 	const dynamicFetcher = options.fetchDynamicModels;
 	const hasDynamicFetcher = typeof dynamicFetcher === "function";
+	const cacheDynamicModelIdsCurrent =
+		cache?.dynamicModelIds !== undefined &&
+		cache.dynamicModelProvenance !== undefined &&
+		cache.dynamicModelProvenance === options.cacheDynamicModelProvenance;
+	const cacheProvenanceMismatch = cache?.dynamicModelIds !== undefined && !cacheDynamicModelIdsCurrent;
 	const hasAuthoritativeCache = (cache?.authoritative ?? false) || !hasDynamicFetcher;
 	const cacheAgeMs = cache ? now() - cache.updatedAt : Number.POSITIVE_INFINITY;
-	const shouldFetchFromNetwork = shouldFetchRemoteSources(
-		strategy,
-		cache?.fresh ?? false,
-		hasAuthoritativeCache,
-		cacheAgeMs,
-	);
+	const shouldFetchFromNetwork =
+		cacheProvenanceMismatch && strategy !== "offline"
+			? true
+			: shouldFetchRemoteSources(strategy, cache?.fresh ?? false, hasAuthoritativeCache, cacheAgeMs);
 	const staticFingerprint = fingerprintStatic(staticModels);
 
 	// Cold-start fast path: when a fresh, authoritative cache exists, the network
@@ -154,7 +159,12 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	) {
 		const cachedModels = passModelList<TApi>(cache.models);
 		if (!hasStaticTransportDrift(staticModels, cachedModels)) {
-			return { models: cachedModels, stale: false, fetched: false, dynamicModelIds: cache.dynamicModelIds };
+			return {
+				models: cachedModels,
+				stale: false,
+				fetched: false,
+				dynamicModelIds: cacheDynamicModelIdsCurrent ? cache.dynamicModelIds : undefined,
+			};
 		}
 		const repairedModels = mergeDynamicModels(staticModels, cachedModels);
 		if (options.canPublishCache?.() ?? true) {
@@ -166,9 +176,15 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				staticFingerprint,
 				dbPath,
 				cache.dynamicModelIds,
+				cache.dynamicModelProvenance,
 			);
 		}
-		return { models: repairedModels, stale: false, fetched: false, dynamicModelIds: cache.dynamicModelIds };
+		return {
+			models: repairedModels,
+			stale: false,
+			fetched: false,
+			dynamicModelIds: cacheDynamicModelIdsCurrent ? cache.dynamicModelIds : undefined,
+		};
 	}
 
 	const [fetchedModelsDevModels, fetchedDynamicModels] = shouldFetchFromNetwork
@@ -197,6 +213,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 					staticFingerprint,
 					dbPath,
 					dynamicModels.map(model => model.id),
+					options.cacheDynamicModelProvenance,
 				);
 			}
 		} else {
@@ -227,7 +244,9 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		dynamicModelIds: dynamicFetchSucceeded
 			? dynamicModels.map(model => model.id)
 			: shouldUseFreshCacheAsAuthoritative
-				? cache?.dynamicModelIds
+				? cacheDynamicModelIdsCurrent
+					? cache?.dynamicModelIds
+					: undefined
 				: undefined,
 	};
 }

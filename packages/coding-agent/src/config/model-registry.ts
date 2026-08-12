@@ -1250,6 +1250,8 @@ export class ModelRegistry {
 			fresh: boolean;
 			modelIds: ReadonlySet<string>;
 			profileModelIds?: ReadonlySet<string>;
+			profileFresh?: boolean;
+			profileEndpoint?: string;
 			authGeneration: string;
 			endpoint: string;
 		}
@@ -2601,6 +2603,7 @@ export class ModelRegistry {
 			const manager = createModelManager({
 				...options,
 				cacheDbPath: this.#cacheDbPath,
+				cacheDynamicModelProvenance: Bun.hash(`${authGeneration}\u0000${endpoint}`).toString(36),
 				canPublishCache: isCurrentDiscovery,
 				...(options.fetchDynamicModels
 					? {
@@ -2648,11 +2651,17 @@ export class ModelRegistry {
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint)
 			) {
 				this.#descriptorDiscoveryEvidence.set(options.providerId, {
-					fresh: !result.stale,
+					fresh: result.fetched,
 					modelIds: new Set(models.map(model => model.id)),
-					...(result.dynamicModelIds === undefined ? {} : { profileModelIds: new Set(result.dynamicModelIds) }),
+					...(result.dynamicModelIds === undefined
+						? {}
+						: {
+							profileModelIds: new Set(result.dynamicModelIds),
+							profileFresh: !result.stale,
+							profileEndpoint: endpoint,
+						}),
 					authGeneration,
-					endpoint,
+					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(models[0]?.baseUrl ?? endpoint),
 				});
 			}
 			if (!isCurrentDiscovery()) {
@@ -3712,7 +3721,7 @@ export class ModelRegistry {
 	getAvailableForProfileActivation(): Model<Api>[] {
 		return this.getAvailable().filter(model => {
 			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
-			if (!evidence?.fresh || evidence.profileModelIds === undefined) return true;
+			if (!evidence?.profileFresh || evidence.profileModelIds === undefined) return true;
 			const bundledModelIds = new Set(
 				(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
 					candidate => candidate.id,
@@ -3721,7 +3730,7 @@ export class ModelRegistry {
 			if (!bundledModelIds.has(model.id)) return true;
 			if (
 				evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
-				evidence.endpoint !==
+				evidence.profileEndpoint !==
 					this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "")
 			)
 				return true;
