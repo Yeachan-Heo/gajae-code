@@ -1,4 +1,5 @@
-import { Container, getKeybindings, matchesKey, Spacer, Text } from "@gajae-code/tui";
+import { Container, getKeybindings, matchesKey, replaceTabs, Spacer, Text, truncateToWidth } from "@gajae-code/tui";
+import { sanitizeText } from "@gajae-code/utils";
 import type {
 	AutoroutingProvenance,
 	AutoroutingSetup,
@@ -7,6 +8,9 @@ import type {
 } from "../../config/autorouting-contract";
 import type { AutoroutingSourceIdentity } from "../../config/autorouting-generator";
 import { theme } from "../theme/theme";
+
+/** Longest rendered panel line before truncation. */
+export const MAX_PANEL_LINE_WIDTH = 200;
 
 export type SmartRoutingPreview = {
 	readonly setup: AutoroutingSetup;
@@ -67,9 +71,21 @@ function isBackspace(data: string): boolean {
 	return data === "\x7f" || data === "\b";
 }
 
+/**
+ * Provider names, allowlist entries, generated selectors, and error text all
+ * originate in hand-editable config or catalog data, so any of them can carry
+ * tabs, control bytes, or terminal escape sequences. Strip them and bound the
+ * width before the value reaches a renderer.
+ */
+function displaySafe(text: string): string {
+	return truncateToWidth(replaceTabs(sanitizeText(text)), MAX_PANEL_LINE_WIDTH);
+}
+
 function formatTier(tier: AutoroutingTier, tiers: TierMap | undefined): string {
 	const selectors = tiers?.[tier];
-	return `${tier}: ${selectors && selectors.length > 0 ? selectors.join(", ") : "(empty; manual fallback)"}`;
+	return displaySafe(
+		`${tier}: ${selectors && selectors.length > 0 ? selectors.join(", ") : "(empty; manual fallback)"}`,
+	);
 }
 
 /**
@@ -188,7 +204,9 @@ export class SmartRoutingPanelComponent extends Container {
 				new Text(
 					theme.fg(
 						"warning",
-						`Preset ${this.#preset} is shadowed by generated tiers. Clear generated setup to restore preset routing.`,
+						displaySafe(
+							`Preset ${this.#preset} is shadowed by generated tiers. Clear generated setup to restore preset routing.`,
+						),
 					),
 					0,
 					0,
@@ -203,12 +221,14 @@ export class SmartRoutingPanelComponent extends Container {
 		for (let index = 0; index < this.#draft.providers.length; index++) {
 			const provider = this.#draft.providers[index] ?? "";
 			const prefix = index === this.#providerCursor ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
-			this.addChild(new Text(`${prefix}${provider}`, 0, 0));
+			this.addChild(new Text(`${prefix}${displaySafe(provider)}`, 0, 0));
 		}
 		if (this.#draft.providers.length === 0)
 			this.addChild(new Text(theme.fg("error", "  No providers declared."), 0, 0));
 		if (this.#allowlistEditing) {
-			this.addChild(new Text(theme.fg("accent", `Allowlist: ${this.#allowlistBuffer || "(all models)"}`), 0, 0));
+			this.addChild(
+				new Text(theme.fg("accent", displaySafe(`Allowlist: ${this.#allowlistBuffer || "(all models)"}`)), 0, 0),
+			);
 			this.addChild(
 				new Text(theme.fg("muted", "  Type provider/model values separated by commas, then Enter."), 0, 0),
 			);
@@ -217,7 +237,9 @@ export class SmartRoutingPanelComponent extends Container {
 				new Text(
 					theme.fg(
 						"dim",
-						`Allowlist: ${this.#draft.models && this.#draft.models.length > 0 ? this.#draft.models.join(", ") : "(all labeled models)"}`,
+						displaySafe(
+							`Allowlist: ${this.#draft.models && this.#draft.models.length > 0 ? this.#draft.models.join(", ") : "(all labeled models)"}`,
+						),
 					),
 					0,
 					0,
@@ -229,8 +251,8 @@ export class SmartRoutingPanelComponent extends Container {
 		for (const tier of ["fast", "balanced", "strong"] as const) {
 			this.addChild(new Text(`  ${formatTier(tier, this.#preview.tiers)}`, 0, 0));
 		}
-		if (this.#status) this.addChild(new Text(theme.fg("success", this.#status), 0, 0));
-		if (this.#error) this.addChild(new Text(theme.fg("error", this.#error), 0, 0));
+		if (this.#status) this.addChild(new Text(theme.fg("success", displaySafe(this.#status)), 0, 0));
+		if (this.#error) this.addChild(new Text(theme.fg("error", displaySafe(this.#error)), 0, 0));
 		if (this.#confirmation === "clear") {
 			this.addChild(
 				new Text(

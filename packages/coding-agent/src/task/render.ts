@@ -915,7 +915,12 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 	}
 	if (result.routing) {
 		const model = result.routing.effectiveModel ?? "not-executed";
-		lines.push(`${continuePrefix}${theme.fg("dim", `Routing: ${model} ${result.routing.note ?? ""}`)}`);
+		const note = result.routing.note ? ` ${result.routing.note}` : "";
+		// effectiveModel is provider-reported and note is free-form diagnostic text;
+		// neither is bounded by receipt validation, so sanitize before display.
+		lines.push(
+			`${continuePrefix}${theme.fg("dim", truncateToWidth(replaceTabs(sanitizeText(`Routing: ${model}${note}`)), 90))}`,
+		);
 	}
 	if (result.roi?.lowRoi) {
 		lines.push(`${continuePrefix}${theme.fg("warning", "low ROI: produced no material contribution")}`);

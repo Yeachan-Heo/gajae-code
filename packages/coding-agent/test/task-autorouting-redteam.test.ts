@@ -13,11 +13,14 @@ import {
 	validateAutoroutingLocal,
 } from "../src/config/autorouting-contract";
 import { Settings } from "../src/config/settings";
+import type { RenderResultOptions } from "../src/extensibility/custom-tools/types";
+import { getThemeByName } from "../src/modes/theme/theme";
 import taskSummaryTemplate from "../src/prompts/tools/task-summary.md" with { type: "text" };
 import { projectRoutingForSummary, TaskTool } from "../src/task";
 import * as discoveryModule from "../src/task/discovery";
 import type { runSubprocess } from "../src/task/executor";
-import type { SingleResult } from "../src/task/types";
+import { renderResult } from "../src/task/render";
+import type { SingleResult, TaskToolDetails } from "../src/task/types";
 import { assertRoutingEvidenceInvariant, type TaskRoutingEvidence } from "../src/task/types";
 import type { ToolSession } from "../src/tools";
 
@@ -351,6 +354,53 @@ describe("autorouting red-team adversarial suite", () => {
 		const routingLine = rendered.split("\n").find(line => line.includes("<routing "));
 		expect(routingLine).toBeDefined();
 		expect(routingLine).toMatch(/^<routing tier="[^"<>]*" model="[^"<>]*" note="[^"<>]*" \/>$/);
+	});
+
+	it("strips control sequences and bounds width when the TUI renders routing evidence", async () => {
+		const theme = await getThemeByName("red-claw");
+		if (!theme) throw new Error("Failed to load test theme");
+		const hostile = "\x1b]0;pwned\x07\x1b[2Jprovider/model\x07\tx";
+		const evidence: TaskRoutingEvidence = {
+			tier: "fast",
+			source: "tiers",
+			requestedSelector: "anthropic/claude-opus-5",
+			effectiveModel: hostile,
+			substitutions: [],
+			note: `${hostile} ${"z".repeat(400)}`,
+		};
+		assertRoutingEvidenceInvariant(evidence);
+		const component = renderResult(
+			{
+				content: [{ type: "text", text: "done" }],
+				details: {
+					results: [
+						{
+							id: "hostile",
+							agent: "task",
+							status: "completed",
+							task: "hostile routing render",
+							preview: "done",
+							routing: evidence,
+						},
+					],
+				} as unknown as TaskToolDetails,
+			},
+			{ expanded: true } as RenderResultOptions,
+			theme,
+		);
+		const rendered = component.render(120).join("\n");
+		const routing = rendered.split("\n").find(line => line.includes("Routing:"));
+		expect(routing).toBeDefined();
+		expect(rendered).not.toContain("\x1b]0;");
+		expect(rendered).not.toContain("\x1b[2J");
+		expect(rendered).not.toContain("\x07");
+		expect(rendered).not.toContain("\t");
+		// Sanitizing must not blank the evidence, and the note must stay bounded.
+		expect(rendered).toContain("provider/model");
+		const plain = rendered.replace(/\x1b\[[0-9;]*m/g, "").replace(/\s+/g, "");
+		const longestRun = Math.max(0, ...(plain.match(/z+/g) ?? []).map(run => run.length));
+		expect(longestRun).toBeGreaterThan(0);
+		expect(longestRun).toBeLessThanOrEqual(90);
 	});
 });
 it("preserves synthetic cancellation evidence and fresh resume markers", () => {

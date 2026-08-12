@@ -1,9 +1,17 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import type { Model } from "@gajae-code/ai";
+import type { AutoroutingSetup, TierMap } from "@gajae-code/coding-agent/config/autorouting-contract";
 import { canonicalJsonBytes } from "@gajae-code/coding-agent/config/autorouting-generator";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
-import type { SmartRoutingPanelComponent } from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
+import type {
+	SmartRoutingPanelComponent,
+	SmartRoutingPreview,
+} from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
+import {
+	MAX_PANEL_LINE_WIDTH,
+	SmartRoutingPanelComponent as SmartRoutingPanelClass,
+} from "@gajae-code/coding-agent/modes/components/smart-routing-panel";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 
@@ -278,5 +286,112 @@ describe("/model smart-routing panel integration", () => {
 		panel.handleInput("\x1b");
 		expect(ctx.restoreComposer).not.toHaveBeenCalled();
 		expect(selector.__testViewMode()).toBe("presets");
+	});
+});
+
+describe("smart-routing panel hostile render boundary", () => {
+	beforeAll(() => {
+		installTheme();
+	});
+
+	/** Raw render: keep escapes so the assertions can prove they were stripped. */
+	function rawRender(panel: SmartRoutingPanelComponent): string {
+		return panel.render(120).join("\n");
+	}
+
+	const HOSTILE = "\x1b]0;pwned\x07\x1b[2Jbad\x07\tname";
+
+	function hostilePanel(): SmartRoutingPanelComponent {
+		const setup: AutoroutingSetup = {
+			schema: 1,
+			providers: [HOSTILE, "anthropic"],
+			models: [`${HOSTILE}/model`, "x".repeat(400)],
+		};
+		const tiers: TierMap = {
+			fast: [`${HOSTILE}/fast-model`],
+			balanced: ["y".repeat(400)],
+			strong: ["anthropic/claude-opus-5"],
+		};
+		const preview = {
+			setup,
+			tiers,
+			provenance: {
+				schema: 1 as const,
+				source: { catalogFingerprint: "c", mapFingerprint: "m", generatorVersion: 1 },
+				declarationFingerprint: "d",
+				tiersFingerprint: "t",
+			},
+			sourceIdentity: { catalogFingerprint: "c", mapFingerprint: "m", generatorVersion: 1 },
+		} as unknown as SmartRoutingPreview;
+		return new SmartRoutingPanelClass({
+			setup,
+			tiers,
+			enabled: true,
+			preset: HOSTILE,
+			readOnly: false,
+			stale: false,
+			preview,
+			generatePreview: () => preview,
+			onSelect: () => undefined,
+			onCancel: () => undefined,
+		});
+	}
+
+	test("strips control sequences from provider, allowlist, preset, and tier rows", () => {
+		const rendered = rawRender(hostilePanel());
+		// Only SGR color codes may survive; OSC/CSI-erase/BEL/tab data must not.
+		expect(rendered).not.toContain("\x1b]0;");
+		expect(rendered).not.toContain("\x1b[2J");
+		expect(rendered).not.toContain("\x07");
+		expect(rendered).not.toContain("\t");
+		expect(rendered.replace(/\x1b\[[0-9;]*m/g, "")).not.toContain("\x1b");
+		// The surrounding literal text still renders, so sanitizing did not blank the row.
+		expect(rendered).toContain("bad");
+		expect(rendered).toContain("anthropic");
+	});
+
+	test("bounds oversized catalog selectors to the panel width budget", () => {
+		// Wrapping alone would hide an unbounded value, so measure the longest
+		// contiguous run of the oversized selector across the whole render.
+		const plain = rawRender(hostilePanel())
+			.replace(/\x1b\[[0-9;]*m/g, "")
+			.replace(/\s+/g, "");
+		const longestRun = Math.max(0, ...(plain.match(/y+/g) ?? []).map(run => run.length));
+		expect(longestRun).toBeGreaterThan(0);
+		expect(longestRun).toBeLessThanOrEqual(MAX_PANEL_LINE_WIDTH);
+	});
+
+	test("sanitizes error text raised by a failing preview regeneration", () => {
+		const baseSetup: AutoroutingSetup = { schema: 1, providers: ["anthropic", "openai-codex"] };
+		const preview = {
+			setup: baseSetup,
+			tiers: {},
+			provenance: {
+				schema: 1 as const,
+				source: { catalogFingerprint: "c", mapFingerprint: "m", generatorVersion: 1 },
+				declarationFingerprint: "d",
+				tiersFingerprint: "t",
+			},
+			sourceIdentity: { catalogFingerprint: "c", mapFingerprint: "m", generatorVersion: 1 },
+		} as unknown as SmartRoutingPreview;
+		const panel = new SmartRoutingPanelClass({
+			setup: baseSetup,
+			enabled: false,
+			readOnly: false,
+			stale: false,
+			preview,
+			generatePreview: () => {
+				throw new Error(HOSTILE);
+			},
+			onSelect: () => undefined,
+			onCancel: () => undefined,
+		});
+		// Removing a provider regenerates the preview, so the thrown message reaches #error.
+		panel.handleInput("x");
+		const rendered = rawRender(panel);
+		expect(rendered.replace(/\x1b\[[0-9;]*m/g, "")).toContain("bad");
+		expect(rendered).not.toContain("\x1b]0;");
+		expect(rendered).not.toContain("\x1b[2J");
+		expect(rendered).not.toContain("\x07");
 	});
 });
