@@ -572,7 +572,7 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 	}
 }, 60_000);
 
-test("Telegram ownership races publish safe siblings only in broker-authorized chat scope", async () => {
+test("a blocked Telegram ownership race preserves the canonical endpoint and withholds adapters", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
 	dirs.push(cwd);
 	const agentDir = path.join(cwd, "agent");
@@ -613,14 +613,19 @@ test("Telegram ownership races publish safe siblings only in broker-authorized c
 	const defaultEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	const chatStateRoot = path.join(cwd, ".gjc", "state", "chat");
 	const chatEndpoint = path.join(chatStateRoot, "sdk", `${sessionId}.json`);
-	expect(fs.existsSync(defaultEndpoint)).toBe(false);
-	expect(fs.existsSync(chatEndpoint)).toBe(true);
+	// No durable foreign-owner state exists up front, so the session publishes
+	// its canonical endpoint immediately; the ownership race discovered by the
+	// background ensure degrades to withheld notification adapters and never
+	// republishes or blocks the session (fail-closed daemon isolation).
+	expect(fs.existsSync(defaultEndpoint)).toBe(true);
+	expect(fs.existsSync(chatEndpoint)).toBe(false);
+	const stateRoot = path.join(cwd, ".gjc", "state");
 	const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
 	expect(sessions).toContainEqual(
 		expect.objectContaining({
 			sessionId,
-			locator: { repo: path.resolve(cwd), stateRoot: chatStateRoot },
-			endpointMtimeMs: fs.statSync(chatEndpoint).mtimeMs,
+			locator: { repo: path.resolve(cwd), stateRoot },
+			endpointMtimeMs: fs.statSync(defaultEndpoint).mtimeMs,
 		}),
 	);
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);

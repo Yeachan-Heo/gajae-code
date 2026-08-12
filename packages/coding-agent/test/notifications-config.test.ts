@@ -1914,9 +1914,14 @@ describe("notifications config", () => {
 			const chatEndpoint = path.join(cwd, ".gjc", "state", "chat", "sdk", `${sessionId}.json`);
 			try {
 				await sessionStart({}, context);
-				expect(providerEnsures).toBe(2);
+				// Isolation is decided up front from the durable foreign owner state
+				// (proposedTelegramIdentity); daemon ownership itself is acquired in
+				// the background and must not gate publication.
 				expect(fs.existsSync(standardEndpoint)).toBe(false);
 				expect(fs.existsSync(chatEndpoint)).toBe(true);
+				const deadline = Date.now() + 8_000;
+				while (providerEnsures < 1 && Date.now() < deadline) await new Promise(r => setTimeout(r, 25));
+				expect(providerEnsures).toBeGreaterThanOrEqual(1);
 			} finally {
 				await sessionShutdown({}, context);
 				expect(fs.existsSync(chatEndpoint)).toBe(false);
@@ -1924,7 +1929,7 @@ describe("notifications config", () => {
 			}
 		}, 30_000);
 
-		test("rejects ordinary session_start after provider readiness fails without publishing an endpoint", async () => {
+		test("publishes the endpoint even when provider readiness fails (fail-closed to delivery only)", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-failure-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");
 			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
@@ -1961,8 +1966,10 @@ describe("notifications config", () => {
 				const unsubscribe = runner.onError(error => errors.push(error.error));
 				await runner.emit({ type: "session_start" });
 				unsubscribe();
-				expect(errors).toContain("notifications: SDK startup failed: provider readiness denied");
-				expect(fs.existsSync(endpoint)).toBe(false);
+				// Provider daemon failure degrades notification delivery only; the
+				// core SDK endpoint is published and startup emits no error.
+				expect(errors).toEqual([]);
+				expect(fs.existsSync(endpoint)).toBe(true);
 			} finally {
 				await session?.extensionRunner?.emit({ type: "session_shutdown" });
 				session?.dispose();
@@ -1971,7 +1978,7 @@ describe("notifications config", () => {
 			}
 		}, 30000);
 
-		test("removes a readiness-failed runtime with rollback proof so /notify on retries a real startup", async () => {
+		test("settles lifecycle startup despite a failing provider so /notify on can retry delivery", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-retry-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");
 			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
@@ -2014,16 +2021,12 @@ describe("notifications config", () => {
 				throw new Error("notifications extension did not register its command handlers");
 			try {
 				await sessionStart({}, context);
-				expect(await capability.promise).toMatchObject({
-					status: "failed",
-					failure: { message: "provider readiness denied" },
-				});
-				expect(fs.existsSync(endpoint)).toBe(false);
-				expect(rollback.result).toMatchObject({
-					runtimeRemoved: true,
-					hostStopped: true,
-					brokerRegistrationReleased: true,
-				});
+				// A failing provider daemon no longer fails lifecycle startup or
+				// rolls the runtime back: the core SDK endpoint is published and
+				// the owner state stays retryable for a later reconcile.
+				expect(await capability.promise).toMatchObject({ status: "started" });
+				expect(fs.existsSync(endpoint)).toBe(true);
+				expect(rollback.result).toMatchObject({ runtimeRemoved: false, hostStopped: false });
 
 				providerReady = true;
 				await notify.handler("on", context);
@@ -2035,13 +2038,14 @@ describe("notifications config", () => {
 			}
 		}, 30000);
 
-		test("waits for provider readiness before publishing the embedded session endpoint", async () => {
+		test("publishes the embedded session endpoint before background provider readiness settles", async () => {
 			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-provider-readiness-success-"));
 			const agentDir = path.join(cwd, ".gjc", "agent");
 			const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 			const settings = providerSettings(agentDir);
 			let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
 			let endpoint = "";
+			let providerSawPublishedEndpoint: boolean | undefined;
 			try {
 				resetSettingsForTest();
 				await Settings.init({ inMemory: true, cwd, agentDir });
@@ -2054,7 +2058,10 @@ describe("notifications config", () => {
 						model: getBundledModel("openai", "gpt-4o-mini"),
 						disableExtensionDiscovery: true,
 						ensureNotificationProviderDaemon: async () => {
-							expect(fs.existsSync(endpoint)).toBe(false);
+							// Daemon readiness runs strictly AFTER core publication; the
+							// endpoint must already exist when the provider is ensured.
+							// (`endpoint` is assigned before session_start fires.)
+							if (endpoint) providerSawPublishedEndpoint = fs.existsSync(endpoint);
 						},
 						extensions: [],
 						skills: [],
@@ -2071,6 +2078,10 @@ describe("notifications config", () => {
 
 				await runner.emit({ type: "session_start" });
 				expect(fs.existsSync(endpoint)).toBe(true);
+				const deadline = Date.now() + 8_000;
+				while (providerSawPublishedEndpoint === undefined && Date.now() < deadline)
+					await new Promise(r => setTimeout(r, 25));
+				expect(providerSawPublishedEndpoint).toBe(true);
 			} finally {
 				await session?.extensionRunner?.emit({ type: "session_shutdown" });
 				session?.dispose();

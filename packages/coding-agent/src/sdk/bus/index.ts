@@ -7074,68 +7074,55 @@ export function createNotificationsExtension(
 				await cleanupAbandonedStartup();
 				return { status: "failed" };
 			}
-			if (notificationsEnabledForSession && settingsAvailable && settings) {
-				try {
-					const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
-					if (ownership === "blocked_identity") {
-						const result = failLifecycleStartup("failed", "Telegram daemon ownership is blocked.");
-						finishStartup(result);
-						await cleanupAbandonedStartup();
-						return result;
-					}
-					if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
-						await cleanupAbandonedStartup();
-						if (sessionStartPromises.get(id) === startSettled.promise) sessionStartPromises.delete(id);
-						forceIsolatedChatSessions.add(id);
-						const result = await startSession(ctx);
-						finishStartup(result);
-						return result;
-					}
-				} catch (error) {
-					const result = failLifecycleStartup("failed", error);
-					finishStartup(result);
-					await cleanupAbandonedStartup();
-					return result;
-				}
-			}
 
-			// Startup contract: configured notification daemon ownership must be ready
-			// before identity or endpoint publication. Native frames are ephemeral, so
-			// publish identity only after readiness; late SDK consumers recover it from
-			// event_replay.
+			// Fail-closed daemon isolation: the chat daemons (Telegram, Discord,
+			// Slack) are optional notification adapters, never session authority.
+			// No daemon ownership is acquired, awaited, or verified before core
+			// publication — a slow, wedged, blocked, or crashed daemon must degrade
+			// ONLY notification delivery, never an ACP/MCP session open. Native
+			// frames are ephemeral, so publish identity first; late SDK consumers
+			// recover it from event_replay.
 			const identityHeader = {
 				type: "identity_header",
 				sessionId: id,
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
-			// Core SDK authority is published before optional notification adapters acquire
-			// daemon ownership. A blocked adapter must not make an interactive session
-			// undiscoverable or uncontrollable.
 			const endpoint = await sdkRuntime.startTransport();
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
+				// Daemon ownership is acquired in the background AFTER the core SDK
+				// endpoint is published. Until it settles, the owner state stays
+				// "retry": activate() withholds notification adapters, and the
+				// controller's reconcile retries ensure later. Startup never awaits
+				// this task.
 				initializedRuntime.notificationOwnerState = "retry";
-				try {
-					const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
-					initializedRuntime.notificationOwnerState =
-						ownership === "ready" || (ownership === "blocked_identity_with_sibling" && isolateChatEndpoint)
-							? "ready"
-							: "blocked";
-					if (ownership === "blocked_identity") {
-						logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
-					}
-					if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
+				const ownershipRuntime = initializedRuntime;
+				const ownershipTask = (async () => {
+					try {
+						const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
+						if (runtimes.get(id) !== ownershipRuntime || ownershipRuntime.stopping) return;
+						ownershipRuntime.notificationOwnerState =
+							ownership === "ready" || (ownership === "blocked_identity_with_sibling" && isolateChatEndpoint)
+								? "ready"
+								: "blocked";
+						if (ownership === "blocked_identity") {
+							logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
+						}
+						if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
+							logger.warn(
+								"notifications: Telegram ownership changed after core publication; preserving the canonical endpoint and withholding adapters.",
+							);
+						}
+					} catch (error) {
+						// Owner state stays "retry" so a later reconcile can re-attempt.
 						logger.warn(
-							"notifications: Telegram ownership changed after core publication; preserving the canonical endpoint and withholding adapters.",
+							`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
 						);
 					}
-				} catch (error) {
-					initializedRuntime.notificationOwnerState = "retry";
-					logger.warn(
-						`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
-					);
-				}
+				})();
+				sessionLifecycleTasks.add(ownershipTask);
+				void ownershipTask.finally(() => sessionLifecycleTasks.delete(ownershipTask));
 			}
 
 			// The native server owns the only authoritative view of this host's live
