@@ -42,21 +42,8 @@ claiming stopped work.
 
 Owned termination is an explicit opt-in: `_meta.gjc.abortScope: "owned"` on the
 `session/cancel` notification, or `GJC_ACP_ABORT_SCOPE=owned` in the agent environment as
-the process-wide fallback. Paseo keeps owned cancels through its provider config without
-source changes:
-
-```json
-{
-  "agents": {
-    "providers": {
-      "gjc": {
-        "extends": "acp",
-        "env": { "GJC_ACP_ABORT_SCOPE": "owned" }
-      }
-    }
-  }
-}
-```
+the process-wide fallback. Paseo keeps owned cancels through its provider config `env`
+(see [Paseo custom agent](#paseo-custom-agent)).
 
 #### Evidence promotion policy
 
@@ -117,12 +104,17 @@ See [Environment Variables](./environment-variables.md#11-acp-permission-handlin
       "gjc": {
         "extends": "acp",
         "label": "Gajae Code",
-        "command": ["gjc", "acp"]
+        "command": ["gjc", "acp"],
+        "env": {
+          "GJC_ACP_ABORT_SCOPE": "owned"
+        }
       }
     }
   }
 }
 ```
+
+The `env` entry keeps Paseo's `stop` (an ACP `session/cancel`) terminating owned subagents and background jobs as well as the turn; without it, a cancel stops only the current turn and leaves owned work running (see [Turn-end termination of owned work](#turn-end-termination-of-owned-work)). Restart the Paseo daemon (`paseo daemon restart`) after editing the config.
 
 GJC's ACP session configuration carries the spec-defined `category` on the Mode, Model, and Thinking select options (`mode`, `model`, `thought_level`), which lets ACP clients such as Paseo discover models and thinking levels without provider-specific metadata. The model catalog is filtered to providers with usable stored credentials (`providers.list/active`), falling back to the full catalog on session hosts that do not expose that query.
 
