@@ -119,7 +119,7 @@ async function discoverEndpoints() {
     let files = [];
     try { files = await readdir(dir, { withFileTypes: true }); } catch { continue; }
     for (const file of files) {
-      if (!file.isFile() || !file.name.endsWith(".json")) continue;
+      if (!file.isFile() || !/^[0-9a-f-]+\.json$/i.test(file.name)) continue;
       try {
         const endpoint = JSON.parse(await readFile(join(dir, file.name), "utf8"));
         if (!endpoint.stale && Number.isInteger(endpoint.pid) && alive(endpoint.pid)) endpoints.set(endpoint.sessionId, { ...endpoint, repo: dirname(dirname(dirname(dir))), endpointPath: join(dir, file.name) });
