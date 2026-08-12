@@ -1521,4 +1521,17 @@ describe("wave 5 — adapters and polish", () => {
 		expect(result).toBe(false);
 		expect(output).toEqual([]);
 	});
+
+	it("/routing on|off refuses to mutate autorouting in a --models-scoped session", async () => {
+		const { output, runtime } = createRuntime();
+		(
+			runtime.session as unknown as { scopedModels: Array<{ model: { provider: string; id: string } }> }
+		).scopedModels = [{ model: { provider: "anthropic", id: "claude-haiku-4-5" } }];
+
+		const result = await executeAcpBuiltinSlashCommand("/routing on", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("read-only in a --models-scoped session");
+		expect(runtime.settings.get("task.autorouting.enabled")).not.toBe(true);
+	});
 });

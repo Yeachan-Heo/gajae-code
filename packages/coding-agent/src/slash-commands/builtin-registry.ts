@@ -1109,6 +1109,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			const arg = command.args.trim().toLowerCase();
 			if (arg === "on" || arg === "off") {
 				try {
+					// Mirror SelectorController#assertSmartRoutingWritable: the non-TUI (ACP/SDK)
+					// dispatch path must honor the same scoped-session guard as the TUI controller,
+					// otherwise a --models-scoped session can toggle routing through /routing on|off.
+					if ((runtime.session.scopedModels?.length ?? 0) > 0) {
+						throw new Error("Smart-routing settings are read-only in a --models-scoped session.");
+					}
 					runtime.settings.set("task.autorouting.enabled", arg === "on");
 				} catch (err) {
 					return usage(`Failed to change autorouting: ${errorMessage(err)}`, runtime);
