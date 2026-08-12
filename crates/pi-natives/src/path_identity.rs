@@ -579,6 +579,14 @@ const fn is_retryable_exact_replace_status(status: i32) -> bool {
 	status == STATUS_SHARING_VIOLATION
 }
 
+#[cfg(any(windows, test))]
+/// STATUS_INVALID_PARAMETER: the synthetic NTSTATUS used for early,
+/// pre-syscall name validation rejections in the status-returning open path
+/// (e.g. an embedded NUL or an oversized name), which never reach
+/// `NtCreateFile` and so have no real NTSTATUS to report. Distinct from
+/// `STATUS_SHARING_VIOLATION` and never retried.
+const STATUS_INVALID_PARAMETER: i32 = 0xc000_000du32 as i32;
+
 /// Bound on transient retries for the exact-replace destination open on
 /// Windows, matching the reporter's controlled 30 x 100 ms reproduction window
 /// (~1.2 s of contention) with margin. The delay keeps the retry hot loop from
@@ -5508,9 +5516,12 @@ mod platform {
 	};
 
 	use super::{
+		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, sha256,
+		NativeOwnerOnlySecurityResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
+		is_retryable_exact_replace_status, native_windows_error_code, open_with_transient_retry,
+		sha256,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -5881,7 +5892,11 @@ mod platform {
 			|| name.iter().any(|unit| *unit == 0)
 			|| name.len() > (u16::MAX as usize / 2)
 		{
-			return Err("io_error");
+			// This never reaches NtCreateFile, so there is no real NTSTATUS to report;
+			// STATUS_INVALID_PARAMETER is the synthetic status for this rejection, and
+			// [`ntstatus_code`] maps it back to "io_error" for callers of the
+			// string-returning wrapper.
+			return Err(STATUS_INVALID_PARAMETER);
 		}
 		let mut object_name = UnicodeString {
 			length:         (name.len() * size_of::<u16>()) as u16,
