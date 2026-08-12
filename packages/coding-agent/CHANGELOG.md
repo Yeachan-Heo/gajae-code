@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- When gjc runs inside a Herdr pane (`HERDR_ENV=1`), lifecycle state is now reported through Herdr's custom-integration API (`pane report-agent --source custom:gjc`): the pane shows up as the `gjc` agent in Herdr's sidebar and workspace rollups with `idle`, `working`, and `blocked` (ask tool) states, and the authority is released on exit. Outside Herdr the reporter is a no-op. The herdr binary is resolved via `HERDR_BIN_PATH`, PATH, or the known install layouts so the integration works even on Windows servers that omit `HERDR_BIN_PATH`.
+
 ## [0.13.1] - 2026-08-11
 
 ### Added
