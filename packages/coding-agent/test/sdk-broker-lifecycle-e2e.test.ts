@@ -830,6 +830,28 @@ test("broker reads Windows process incarnations as canonical FILETIME ticks with
 		}),
 	).toBe("windows:133830291061234568");
 });
+test("broker reads Windows process incarnations without surfacing a console window", () => {
+	// The PowerShell fallback runs whenever the native reader cannot bind the pid. Without
+	// windowsHide the broker's liveness polling flashes a console window on every probe.
+	const fromPid = vi.spyOn(native.Process, "fromPid").mockReturnValue(null);
+	const spawnSync = vi.spyOn(Bun, "spawnSync").mockReturnValue({
+		exitCode: 0,
+		stdout: Buffer.from("4242\t133830291061234567\r\n", "utf8"),
+		stderr: Buffer.alloc(0),
+		success: true,
+		signalCode: null,
+		resourceUsage: undefined,
+	} as unknown as Bun.SyncSubprocess<"pipe", "ignore">);
+	try {
+		expect(processIncarnation(4_242, { platform: "win32" })).toBe("windows:133830291061234567");
+		expect(spawnSync).toHaveBeenCalledTimes(1);
+		const options = spawnSync.mock.calls[0]?.[1] as { windowsHide?: boolean } | undefined;
+		expect(options?.windowsHide).toBe(true);
+	} finally {
+		spawnSync.mockRestore();
+		fromPid.mockRestore();
+	}
+});
 
 test("broker fails closed for failed or malformed Windows FILETIME process-incarnation output", () => {
 	const options = {
