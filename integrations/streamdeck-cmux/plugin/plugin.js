@@ -2,6 +2,7 @@
 import { readdir, readFile, appendFile, stat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { ANSWER_SLOT_COUNT, optionIndexForSlot, pageAction, pageCount, pendingAsk, sdkMessages, usesPagedLayout } from "./sdk-ask-state.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -116,7 +117,7 @@ async function discoverEndpoints() {
     let files = [];
     try { files = await readdir(dir, { withFileTypes: true }); } catch { continue; }
     for (const file of files) {
-      if (!file.isFile() || !/^[0-9a-f-]+\.json$/i.test(file.name)) continue;
+      if (!file.isFile() || !file.name.endsWith(".json")) continue;
       try {
         const endpoint = JSON.parse(await readFile(join(dir, file.name), "utf8"));
         if (!endpoint.stale && Number.isInteger(endpoint.pid) && alive(endpoint.pid)) endpoints.set(endpoint.sessionId, { ...endpoint, repo: dirname(dirname(dirname(dir))), endpointPath: join(dir, file.name) });
@@ -194,23 +195,14 @@ function connectSdkEndpoint(endpoint) {
   ws.addEventListener("message", event => {
     try {
       const envelope = JSON.parse(String(event.data));
-      const messages = envelope.type === "event_replay_result" && envelope.id === replayId && Array.isArray(envelope.events) ? envelope.events : [envelope];
+      const messages = sdkMessages(envelope, replayId);
       let changed = false;
       for (const message of messages) {
-        if (message.type === "action_needed" && message.kind === "ask") {
-          const selectedOptionIndices = Array.isArray(message.selectedOptionIndices) ? message.selectedOptionIndices.filter(index => Number.isInteger(index) && index >= 0) : null;
-          const controls = Array.isArray(message.controls) ? message.controls.filter(control => control && control.id === "navigation_forward" && control.kind === "navigation") : [];
-          client.pending = {
-            id: message.id,
-            question: String(message.question || "Question"),
-            options: Array.isArray(message.options) ? message.options.map(String) : [],
-            recommendedIndex: Number.isInteger(message.recommendedIndex) ? message.recommendedIndex : null,
-            selectedOptionIndices,
-            controls,
-            multi: selectedOptionIndices !== null,
-          };
+        const pending = pendingAsk(message);
+        if (pending) {
+          client.pending = pending;
           changed = true;
-          log(`sdk ask session=${endpoint.sessionId} options=${client.pending.options.length} id=${message.id}`);
+          log(`sdk ask session=${endpoint.sessionId} options=${client.pending.options.length} pages=${pageCount(client.pending)} id=${message.id}`);
         } else if (message.type === "action_resolved" && client.pending?.id === message.id) {
           client.pending = null;
           changed = true;
@@ -246,9 +238,9 @@ function focusedPendingAsk() {
   if (!pending || pending.options.length === 0) return null;
   if (pending.multi) {
     const navigation = pending.controls.find(control => control.id === "navigation_forward");
-    return pending.options.length <= 4 && navigation ? pending : null;
+    return navigation ? pending : null;
   }
-  return pending.controls.length === 0 && pending.options.length <= 5 ? pending : null;
+  return pending;
 }
 
 async function answerFocusedAsk(index, context) {
@@ -258,15 +250,22 @@ async function answerFocusedAsk(index, context) {
   if (!client || !pending || client.ws.readyState !== WebSocket.OPEN) { alert(context); return; }
   let answer;
   let suffix;
-  if (pending.multi && index === 4) {
-    const control = pending.controls.find(candidate => candidate.id === "navigation_forward");
-    if (!control?.enabled) { alert(context); return; }
-    answer = { controlId: control.id };
-    suffix = `control-${control.id}`;
+  const page = pageAction(pending, context?.heldMs ?? 0);
+  if (index === ANSWER_SLOT_COUNT - 1 && page?.kind === "page") {
+    pending.page = page.page;
+    log(`sdk ask page session=${session.sessionId} id=${pending.id} page=${pending.page + 1}/${pageCount(pending)}`);
+    await renderAll();
+    ok(context);
+    return;
+  }
+  if (index === ANSWER_SLOT_COUNT - 1 && page?.kind === "control") {
+    answer = { controlId: page.control.id };
+    suffix = `control-${page.control.id}`;
   } else {
-    if (index < 0 || index >= pending.options.length) { alert(context); return; }
-    answer = index;
-    suffix = String(index);
+    const optionIndex = optionIndexForSlot(pending, index);
+    if (optionIndex === null) { alert(context); return; }
+    answer = optionIndex;
+    suffix = String(optionIndex);
   }
   client.ws.send(JSON.stringify({ type: "reply", id: pending.id, answer, token: client.token, idempotencyKey: `streamdeck-${pending.id}-${suffix}` }));
   ok(context);
@@ -480,22 +479,32 @@ async function renderContext(context, state) {
       const pending = focusedPendingAsk();
       const index = Number(settings.answerSlot);
       if (pending) {
-        if (pending.multi && index === 4) {
-          const control = pending.controls.find(candidate => candidate.id === "navigation_forward");
-          const selectedCount = pending.selectedOptionIndices.length;
-          title(context, control?.enabled ? `${String(control.label || "DONE").toUpperCase()}\n${selectedCount} SELECTED` : "SELECT\nOPTION");
-          await image(context, `answer-control${control?.enabled ? "" : "-disabled"}`);
+        if (usesPagedLayout(pending) && index === ANSWER_SLOT_COUNT - 1) {
+          const action = pageAction(pending);
+          const pages = pageCount(pending);
+          if (action?.kind === "page") {
+            title(context, `MORE OPTIONS\n${pending.page + 1}/${pages}`);
+            await image(context, "answer-control");
+          } else if (action?.kind === "control") {
+            const selectedCount = pending.selectedOptionIndices.length;
+            title(context, `${String(action.control.label || "DONE").toUpperCase()}\n${selectedCount} SELECTED`);
+            await image(context, "answer-control");
+          } else {
+            title(context, pages > 1 ? `BACK TO START\n${pending.page + 1}/${pages}` : "SELECT\nOPTION");
+            await image(context, "answer-control-disabled");
+          }
           return;
         }
-        const option = pending.options[index];
+        const optionIndex = optionIndexForSlot(pending, index);
+        const option = optionIndex === null ? undefined : pending.options[optionIndex];
         if (pending.multi) {
-          const selected = pending.selectedOptionIndices.includes(index);
-          title(context, option ? `${selected ? "☑" : "☐"} OPTION ${index + 1}\n${wrapKeyText(option, 11, 2)}` : `NO OPTION\n${index + 1}`);
-          await image(context, option ? `answer-${index}${selected ? "-selected" : pending.recommendedIndex === index ? "-recommended" : ""}` : `answer-${index}`);
+          const selected = optionIndex !== null && pending.selectedOptionIndices.includes(optionIndex);
+          title(context, option ? `${selected ? "☑" : "☐"} OPTION ${optionIndex + 1}\n${wrapKeyText(option, 11, 2)}` : `NO OPTION\n${index + 1}`);
+          await image(context, option ? `answer-${index}${selected ? "-selected" : pending.recommendedIndex === optionIndex ? "-recommended" : ""}` : `answer-${index}`);
           return;
         }
-        title(context, option ? `ANSWER ${index + 1}\n${wrapKeyText(option, 11, 2)}` : `NO OPTION\n${index + 1}`);
-        await image(context, `answer-${index}${pending.recommendedIndex === index ? "-recommended" : ""}`);
+        title(context, option ? `ANSWER ${optionIndex + 1}\n${wrapKeyText(option, 11, 2)}` : `NO OPTION\n${index + 1}`);
+        await image(context, `answer-${index}${pending.recommendedIndex === optionIndex ? "-recommended" : ""}`);
         return;
       }
     }
@@ -733,7 +742,7 @@ async function keyUp(context, state, heldMs) {
   if (action === LAUNCH_ACTION) { await launchPreset(settings.preset, context); return; }
   if (action === SKILL_ACTION) { await sendFocusedGjcText(`/skill:${settings.skill}`, context, false); return; }
   if (action === CONTROL_ACTION) {
-    if (settings.answerSlot !== undefined && focusedPendingAsk()) { await answerFocusedAsk(Number(settings.answerSlot), context); return; }
+    if (settings.answerSlot !== undefined && focusedPendingAsk()) { await answerFocusedAsk(Number(settings.answerSlot), { ...context, heldMs }); return; }
     if (settings.type === "cmuxClose") { await closeFocusedCmuxTab(context); return; }
     if (settings.type === "fixedFolder") { await openFixedFolder(settings, context); return; }
     if (settings.type === "frequentProject") { await openFrequentProject(settings, context); return; }
