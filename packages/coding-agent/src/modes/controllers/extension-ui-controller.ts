@@ -1491,6 +1491,20 @@ export class ExtensionUiController {
 
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {
 		if (this.#isStopped()) return Promise.resolve();
+		// Validate at the owning boundary BEFORE session delivery and UI bookkeeping:
+		// applyInjectedUserSubmission → normalizeInjectedUserContent iterates content
+		// synchronously and throws an untyped TypeError on absent/null content, which
+		// happens before the send.catch handler below is attached, leaving the typed
+		// invalid_input rejection from AgentSession unobserved (unhandled rejection) and
+		// crashing the resident process. Reject as a typed nonfatal control error so
+		// callers can surface it without losing session continuity.
+		if (typeof content !== "string" && !Array.isArray(content)) {
+			return Promise.reject(
+				Object.assign(new Error("sendUserMessage requires string or content-array content."), {
+					code: "invalid_input",
+				}),
+			);
+		}
 		// Compute queued BEFORE send: prompt() may flip session.isStreaming synchronously.
 		const queued = Boolean(options?.deliverAs) || this.ctx.session.isStreaming;
 		// Call send first so the busy/queued path finds the session queue populated
