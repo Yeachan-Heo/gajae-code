@@ -722,9 +722,10 @@ export interface ClipboardImage {
 /**
  * Capture the primary display for JS callers (macOS).
  *
- * Requires the Screen Recording permission. This is the read-only `screenshot`
- * primitive of the computer-use tool; input primitives land behind the same
- * surface once the Accessibility gate is satisfied in a granted `gjc` process.
+ * Requires the Screen & System Audio Recording permission. This is the
+ * read-only `screenshot` primitive of the computer-use tool; input primitives
+ * land behind the same surface once the Accessibility gate is satisfied in a
+ * granted `gjc` process.
  *
  * # Errors
  * Returns an error when capture fails (e.g. Screen Recording not granted).
@@ -1750,6 +1751,13 @@ export interface NativeExactUnlinkResult {
    * neither a stale detached object nor a publisher successor.
    */
   retainedUnknownPath?: string
+  /**
+   * Hex-formatted Windows NTSTATUS of the underlying pre-mutation failure
+   * (e.g. `0xC0000043` for `STATUS_SHARING_VIOLATION`). Path-free by design;
+   * always absent on success, on non-Windows platforms, and after any
+   * namespace mutation.
+   */
+  windowsErrorCode?: string
 }
 
 /** Dedicated result for an atomic no-replace namespace publication. */
