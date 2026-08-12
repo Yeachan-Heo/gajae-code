@@ -275,6 +275,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		name: "Vercel AI Gateway",
 		available: true,
 	},
+	{
+		id: "kiro",
+		name: "Kiro (Amazon Q Developer / CodeWhisperer)",
+		available: true,
+	},
 ];
 
 const customOAuthProviders = new Map<string, OAuthProviderInterface>();
@@ -373,6 +378,11 @@ export async function refreshOAuthToken(
 		case "glm-zcode": {
 			const { refreshGlmZcodeToken } = await import("./glm-zcode");
 			newCredentials = await refreshGlmZcodeToken(credentials);
+			break;
+		}
+		case "kiro": {
+			const { refreshKiroToken } = await import("./kiro");
+			newCredentials = await refreshKiroToken(credentials);
 			break;
 		}
 		case "kilo":
@@ -487,7 +497,10 @@ export async function getOAuthApiKey(
 	}
 	// For providers that need request-time credential metadata, return JSON.
 	const needsStructuredApiKey =
-		provider === "github-copilot" || provider === "google-gemini-cli" || provider === "google-antigravity";
+		provider === "github-copilot" ||
+		provider === "google-gemini-cli" ||
+		provider === "google-antigravity" ||
+		provider === "kiro";
 	const apiKey = needsStructuredApiKey
 		? JSON.stringify({
 				token: creds.access,

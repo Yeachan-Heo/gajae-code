@@ -9,6 +9,7 @@ export type OAuthCredentials = {
 };
 
 export type OAuthProvider =
+	| "kiro"
 	| "alibaba-token-plan"
 	| "anthropic"
 	| "bizrouter"

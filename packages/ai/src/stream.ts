@@ -32,6 +32,7 @@ import type { CursorOptions } from "./providers/cursor";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
+import type { KiroCodeWhispererOptions } from "./providers/kiro-codewhisperer";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
 // Heavy provider stream functions are imported lazily via register-builtins,
@@ -46,6 +47,7 @@ import {
 	streamGoogle,
 	streamGoogleGeminiCli,
 	streamGoogleVertex,
+	streamKiroCodeWhisperer,
 	streamOllama,
 	streamOpenAICodexResponses,
 	streamOpenAICompletions,
@@ -119,6 +121,11 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	tavily: "TAVILY_API_KEY",
 	parallel: "PARALLEL_API_KEY",
 	kagi: "KAGI_API_KEY",
+	// Kiro uses AWS SSO OIDC OAuth flow; bearer token is stored as the OAuth access token.
+	kiro: () => {
+		const bearerToken = $credentialEnv("AWS_BEARER_TOKEN_KIRO");
+		if (bearerToken) return bearerToken;
+	},
 	// GitHub Copilot uses GitHub personal access token
 	"github-copilot": () => $pickCredentialEnv("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"),
 	// Foundry mode optionally switches Anthropic auth to enterprise gateway credentials.
@@ -330,6 +337,12 @@ export function stream<TApi extends Api>(
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		return streamBedrock(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
+	} else if (model.api === "kiro-codewhisperer-stream") {
+		return streamKiroCodeWhisperer(
+			model as Model<"kiro-codewhisperer-stream">,
+			context,
+			(options || {}) as KiroCodeWhispererOptions,
+		);
 	}
 
 	const apiKey = options?.apiKey || (model.provider === "opencodex" ? "local" : getEnvApiKey(model.provider));
