@@ -71,7 +71,7 @@ Troubleshooting:
 
 - **`gjc` reports an old Bun runtime.** Re-run the Bun installer above, restart the terminal, and confirm `bun --version` matches what `gjc --version` expects. If an older Bun still wins, make sure `%USERPROFILE%\.bun\bin` is first on `PATH` and remove any stale Bun installs shadowing it.
 - **`gjc.exe` exists but `gjc` is "not recognized".** The launcher is installed but not on `PATH`. Confirm `%USERPROFILE%\.bun\bin` is listed in `echo $env:Path`, then restart the terminal.
-- **`gjc --tmux` starts without a tmux-backed session.** Native Windows needs a tmux-compatible executable on `PATH`. For GJC-managed session guarantees, use WSL with real tmux, or another provider that round-trips tmux user options such as `@gjc-profile`. Native psmux can provide `tmux`/`pmux`/`psmux` commands, but that path is not fully supported for GJC ownership tags and team guarantees yet; see [`environment-variables.md`](./environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile).
+- **`gjc --tmux` starts without a tmux-backed session.** Native Windows needs a tmux-compatible executable on `PATH`. For GJC-managed session guarantees, use WSL with real tmux, or another provider that round-trips tmux user options such as `@gjc-profile`. Native psmux can provide `tmux`/`pmux`/`psmux` commands, but that path is not fully supported for GJC ownership tags and session guarantees yet; see [`environment-variables.md`](./environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile).
 
 ## Shell completion
 
