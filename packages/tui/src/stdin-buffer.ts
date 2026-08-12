@@ -315,6 +315,16 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 					// here keeps an unterminated sequence from swallowing the next key.
 					// seqEnd === 1 is excluded so Meta sequences (ESC ESC) still parse.
 					if (remaining[seqEnd] === ESC && seqEnd >= 2 && !continuesAsStringTerminator(remaining, seqEnd)) {
+						// A bare Escape may be followed in the same read by a Meta-wrapped
+						// sequence (ESC ESC ESC [ A). Keep the final Meta prefix intact;
+						// splitting all three ESC bytes would turn the wrapped arrow into a
+						// plain arrow after a destructive double-Escape gesture.
+						const trailing = remaining.slice(seqEnd);
+						if (/^\x1b+$/.test(candidate) && /^\x1b[^\x1b]/.test(trailing)) {
+							sequences.push(...candidate.slice(0, -1).split(""));
+							pos += seqEnd - 1;
+							break;
+						}
 						// A cut candidate of nothing but ESC bytes is real Escape key
 						// presses, not an Option-as-Meta prefix: a following ESC proves
 						// no continuation (like "[A") belongs to it. Emitting the pair

@@ -397,6 +397,21 @@ describe("StdinBuffer", () => {
 			expect(emittedSequences).toEqual(["\x1b\x1b[A"]);
 		});
 
+		it("preserves a Meta-wrapped arrow after a preceding bare Escape", () => {
+			// macOS Terminal can batch bare Escape then Option+Up as ESC ESC ESC [ A.
+			// The bare Escape must not consume the Meta wrapper and turn this into
+			// a destructive double-Escape gesture followed by plain Up.
+			processInput("\x1b\x1b\x1b[A");
+			expect(emittedSequences).toEqual(["\x1b", "\x1b\x1b[A"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["escape", "alt+up"]);
+		});
+
+		it("preserves a Meta-wrapped SS3 key after a preceding bare Escape", () => {
+			processInput("\x1b\x1b\x1bOP");
+			expect(emittedSequences).toEqual(["\x1b", "\x1b\x1bOP"]);
+			expect(emittedSequences.map(parseKey)).toEqual(["escape", "alt+f1"]);
+		});
+
 		it("keeps a delayed Option continuation atomic when it arrives before the flush boundary", () => {
 			vi.useFakeTimers();
 			processInput("\x1b\x1b");
