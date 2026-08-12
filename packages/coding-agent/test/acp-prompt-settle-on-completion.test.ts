@@ -111,7 +111,7 @@ async function createFixture(
 		/** Deferred per-turn.prompt response (default: accepted); awaited before answering. */
 		promptResponse?: () => unknown | Promise<unknown>;
 		/** Queue of per-turn.abort responses; falls back to { aborted: true }. */
-		abortResponses?: unknown[];
+		abortResponses?: Array<unknown | (() => unknown | Promise<unknown>)>;
 		/** Overrides the post-acknowledgement cancel settlement grace. */
 		cancelSettlementGraceMs?: number;
 	} = {},
@@ -253,6 +253,8 @@ async function createFixture(
 							? await options.promptResponse()
 							: { ok: true, result: { commandId, turnId, accepted: true } }
 						: undefined;
+				const queuedAbortReply = frame.operation === "turn.abort" ? abortResponseQueue.shift() : undefined;
+				const abortReply = await resolveAbortResponse(queuedAbortReply ?? { aborted: true });
 				socket.send(
 					JSON.stringify({
 						type: "control_response",
@@ -262,7 +264,7 @@ async function createFixture(
 							promptReply !== undefined
 								? (promptReply as { result?: unknown }).result
 								: frame.operation === "turn.abort"
-									? await resolveAbortResponse(abortResponseQueue.shift() ?? { aborted: true })
+									? abortReply
 									: {},
 					}),
 				);

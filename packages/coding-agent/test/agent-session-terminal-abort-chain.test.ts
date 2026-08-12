@@ -30,6 +30,8 @@ import { SubagentTool } from "@gajae-code/coding-agent/tools/subagent";
 import { Snowflake } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
 
+const TEST_ABORT_GRACE_MS = 50;
+
 /** Scripted assistant turn that issues a single `bash` tool call. */
 function bashCall(command: string, callId: string, background = false): MockResponse {
 	return {
@@ -38,7 +40,7 @@ function bashCall(command: string, callId: string, background = false): MockResp
 				type: "toolCall",
 				id: callId,
 				name: "bash",
-				arguments: { command, timeout: 10, ...(background ? { background: true } : {}) },
+				arguments: { command, timeout: 10, ...(background ? { async: true } : {}) },
 			},
 		],
 		stopReason: "toolUse",
@@ -179,7 +181,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 
 		const handle = session.agent.activeResourceRunId;
 		const proof = await session.abortPromptAndWait(handle ?? job.id, {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		// The abort may or may not fence (run handle availability varies), but the
@@ -357,7 +359,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		const job = manager.getAllJobs()[0]!;
 
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? job.id, {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "owned" },
 		});
 
@@ -378,7 +380,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await firstPrompt;
 		const firstJob = manager.getAllJobs()[0]!;
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? firstJob.id, {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		expect(classifyOwnedCompletion(firstJob.id, firstJob.generation)).toBeDefined();
@@ -413,7 +415,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// Terminal owned abort of the CURRENT turn (B): its scope captures only
 		// B's exact registered work; turn A's left-running job stays foreign.
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? jobB.id, {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "owned" },
 		});
 		expect(classifyOwnedCompletion(jobA.id, jobA.generation)).toBeUndefined();
@@ -461,7 +463,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			true,
 		);
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		expect(session.getPendingNextTurnMessagesForTests()).toHaveLength(0);
@@ -488,7 +490,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		);
 		// Terminal abort closes the first turn's fence.
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		// A NEW prompt advances the generation: the explicit-prompt admission
@@ -512,7 +514,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			timestamp: Date.now(),
 		});
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		// The queued steering is purged so it cannot alter the next user turn;
@@ -526,11 +528,11 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// whose acceptance was already acknowledged, so the abort must preserve
 		// it instead of purging every steering message — clearing it would
 		// leave its reconciliation record accepted indefinitely.
-		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const abortPromise = session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		// Queue the client steer AFTER the abort began (past its snapshot): it
@@ -550,13 +552,13 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// ADMISSION (before its durable marker transaction) — a steer admitted
 		// while the abort is in flight classifies as post-snapshot even though
 		// the later abortPromptAndWait purge has not run yet.
-		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		session.captureTerminalAbortSteeringSnapshot();
 		await session.sendUserMessage("admission-window steer", { deliverAs: "steer" });
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		// The steer admitted after the admission snapshot is preserved and
@@ -576,7 +578,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await session.sendUserMessage("pre-abort steer", { deliverAs: "steer" });
 		expect(session.agent.hasQueuedSteering()).toBe(true);
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		expect(session.agent.hasQueuedSteering()).toBe(false);
@@ -587,33 +589,35 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// with their OWN admission's snapshot — a later admission capturing a
 		// higher sequence must not overwrite the earlier admission's snapshot
 		// and purge an already-accepted steer.
-		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId;
 		// Settle the hold turn's abort first: the loop's teardown is done, so a
 		// steer queued afterwards stays in the queue (the terminal fence blocks
 		// any idle auto-continue from draining it).
-		await session.abortPromptAndWait(handle ?? "run", { graceMs: 2_000, terminal: { scope: "turn" } });
+		await session.abortPromptAndWait(handle ?? "run", { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
 		// Abort A admitted: captures the snapshot (sequence 0).
-		session.captureTerminalAbortSteeringSnapshot();
+		const tokenA = session.captureTerminalAbortSteeringSnapshot();
+		expect(tokenA).toBeDefined();
 		// A client steer is accepted at sequence 1 while A awaits its durable
 		// transaction.
 		await session.sendUserMessage("accepted steer", { deliverAs: "steer" });
 		// Abort B admitted (same turn, distinct admission): captures sequence 1.
-		session.captureTerminalAbortSteeringSnapshot();
-		// A settles: its purge uses A's OWN snapshot (0) and preserves the
-		// already-accepted steer.
+		const tokenB = session.captureTerminalAbortSteeringSnapshot();
+		expect(tokenB).toBeDefined();
+		// B settles FIRST: token-addressed consumption must use B's snapshot (1),
+		// not shift A's older FIFO entry. The pre-B steer is blocked.
 		await session.abortPromptAndWait(handle ?? "run", {
-			graceMs: 2_000,
-			terminal: { scope: "turn" },
+			graceMs: TEST_ABORT_GRACE_MS,
+			terminal: { scope: "turn", steeringSnapshotToken: tokenB },
 		});
-		expect(session.agent.hasQueuedSteering()).toBe(true);
-		// B settles with its own snapshot (1): the pre-B steer is an
-		// aborted-attempt continuation and is blocked.
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		// A settles later with its own token. It must not consume another
+		// admission's slot or resurrect/preserve stale steering.
 		await session.abortPromptAndWait(handle ?? "run", {
-			graceMs: 2_000,
-			terminal: { scope: "turn" },
+			graceMs: TEST_ABORT_GRACE_MS,
+			terminal: { scope: "turn", steeringSnapshotToken: tokenA },
 		});
 		expect(session.agent.hasQueuedSteering()).toBe(false);
 		await promptPromise;
@@ -623,23 +627,20 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// messages were actually purged — preserved post-snapshot external
 		// steers stay visible and purged internal steers disappear, so the
 		// positional editing APIs never remove a different preserved steer.
-		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId;
 		// Settle the hold turn's abort first so the queue state is stable (no
 		// live loop to poll, and the terminal fence blocks idle auto-continues).
-		await session.abortPromptAndWait(handle ?? "run", { graceMs: 2_000, terminal: { scope: "turn" } });
+		await session.abortPromptAndWait(handle ?? "run", { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
 		// An internal steer queued just before the abort wins: purged with the
 		// aborted turn's other continuations.
 		await session.steer("stale internal steer");
 		// A client steer admitted after the abort admission snapshot: preserved.
 		session.captureTerminalAbortSteeringSnapshot();
 		await session.sendUserMessage("client steer", { deliverAs: "steer" });
-		await session.abortPromptAndWait(handle ?? "run", {
-			graceMs: 2_000,
-			terminal: { scope: "turn" },
-		});
+		await session.abortPromptAndWait(handle ?? "run", { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
 		const queued = session.getQueuedMessages();
 		expect(queued.steering).toEqual(["client steer"]);
 		expect(session.agent.snapshotSteering()).toHaveLength(1);
@@ -662,7 +663,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// lineage — otherwise the scheduled continue runs under the aborted
 		// lineage+epoch, the terminal fence skips it as terminal_turn, and the
 		// preserved user follow-up stays stranded until unrelated activity.
-		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("follow-up answered")];
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("follow-up answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		// Queue the external follow-up while the turn is active (the idle
@@ -671,7 +672,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 		const handle = session.agent.activeResourceRunId;
 		const proof = await session.abortPromptAndWait(handle ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		expect(proof).toBeDefined();
@@ -686,11 +687,11 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// never settles — its captured snapshot must be discarded, or a later
 		// real abort would consume the stale entry and treat steering admitted
 		// since the replay as post-abort.
-		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("steer answered")];
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		// A replay-only admission captures a snapshot for the (still fenced)
@@ -703,7 +704,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// would have made it post-snapshot (survive) and leak into the next turn.
 		await session.sendUserMessage("steer after replay", { deliverAs: "steer" });
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		expect(session.agent.hasQueuedSteering()).toBe(false);
@@ -718,12 +719,12 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// The hidden-next-turn fence purge must not delete it solely by origin —
 		// it is a promised resume of the root worker (classified fresh), and
 		// dropping it also bypasses the registration-settlement path.
-		scriptedResponses = [bashCall("sleep 30", "call_hold_turn")];
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		// Terminal abort closes the current turn's continuation fence.
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		// A left-running owned job completes: its envelope references the
@@ -813,6 +814,26 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(promoted).toBe(1);
 	}, 30_000);
 
+	it("rejects a steering snapshot token captured for an earlier turn", async () => {
+		scriptedResponses = [stopReply("first turn done"), bashCall("sleep 2", "call_second_turn")];
+		await session.prompt("first turn");
+		const staleToken = session.captureTerminalAbortSteeringSnapshot();
+		expect(staleToken).toBeDefined();
+		const secondPrompt = session.prompt("second turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "second run handle");
+		const handle = session.agent.activeResourceRunId ?? "run";
+		await expect(
+			session.abortPromptAndWait(handle, {
+				graceMs: TEST_ABORT_GRACE_MS,
+				terminal: { scope: "turn", steeringSnapshotToken: staleToken },
+			}),
+		).resolves.toMatchObject({ status: "unfenced", reason: "unknown_run" });
+		// The stale token is retired and cannot affect cleanup of the live turn.
+		session.discardTerminalAbortSteeringSnapshot(staleToken ?? 0);
+		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
+		await secondPrompt;
+	}, 30_000);
+
 	it("terminal abort preserves a queued external follow-up through the purge and rearms it", async () => {
 		// Delta-review P1 regression: the steering purge must NOT
 		// collateral-purge the follow-up queue. An independently requested
@@ -820,14 +841,14 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// independent next-root-turn request and must survive the abort
 		// (alongside authorized owned-completion envelopes), then be rearmed
 		// under a fresh lineage.
-		scriptedResponses = [bashCall("sleep 30", "call_hold_turn"), stopReply("follow-up answered")];
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("follow-up answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		await session.followUp("external follow-up");
 		expect(session.agent.snapshotQueues().followUp.length).toBe(1);
 		const handle = session.agent.activeResourceRunId;
 		const proof = await session.abortPromptAndWait(handle ?? "run", {
-			graceMs: 2_000,
+			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
 		expect(proof).toBeDefined();

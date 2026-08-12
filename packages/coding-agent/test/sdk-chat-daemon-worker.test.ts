@@ -1359,7 +1359,7 @@ describe("chat daemon worker", () => {
 					sessionId: host.sessionId,
 					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
 					endpointGeneration: 1,
-					pid: process.pid,
+					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,
 				});
 				const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
@@ -1378,8 +1378,12 @@ describe("chat daemon worker", () => {
 							JSON.stringify({
 								sessionId: host.sessionId,
 								generation: 1,
-								pid: process.pid,
+								pid: host.endpoint.pid,
 								endpointMtimeMs: host.endpointMtimeMs,
+								endpointAuthorityDigest: crypto
+									.createHash("sha256")
+									.update(JSON.stringify({ url: host.endpoint.url, token: host.endpoint.token }))
+									.digest("hex"),
 							}),
 						)
 						.digest("hex"),

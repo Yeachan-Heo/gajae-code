@@ -3897,7 +3897,10 @@ export function createNotificationsExtension(
 			discardTerminalAbortSteeringSnapshot?: (token: number) => void;
 			abortPromptAndWaitWithTerminal: (
 				handle: string,
-				options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
+				options: {
+					graceMs: number;
+					terminal?: { scope: "turn" | "owned"; expectedEpoch?: number; steeringSnapshotToken?: number };
+				},
 			) => Promise<RunSettlementProof>;
 		};
 	} = {},
@@ -4735,7 +4738,7 @@ export function createNotificationsExtension(
 			// Cleanup-initiated claims (cancel, deadline, owner disconnect) must abort the
 			// run and prove settlement. A natural `agent_end`/`agent_failed` already unwound,
 			// so aborting there would cancel the next turn instead of fencing this one.
-			options: { fence?: boolean; terminal?: { scope: AbortScope } } = {},
+			options: { fence?: boolean; terminal?: { scope: AbortScope; steeringSnapshotToken?: number } } = {},
 			extra?: PromptTerminalExtra,
 			capture?: {
 				proof?: RunSettlementProof & {
@@ -5801,7 +5804,7 @@ export function createNotificationsExtension(
 					await terminalizePrompt(
 						{ commandId, turnId },
 						{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-						{ fence: true, terminal: { scope } },
+						{ fence: true, terminal: { scope, steeringSnapshotToken } },
 						undefined,
 						captured,
 					);

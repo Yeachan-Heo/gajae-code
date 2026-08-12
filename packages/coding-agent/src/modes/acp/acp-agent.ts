@@ -1696,6 +1696,10 @@ export class AcpAgent implements Agent {
 					"SDK did not acknowledge cancellation of the active prompt.",
 				);
 			if (waiter) waiter.cancelAcknowledged = true;
+			if (waiter && record.activePrompt !== waiter) {
+				cancelAttempt?.resolve(true);
+				return;
+			}
 			if (
 				result?.disposition === "preflight_cancelled" &&
 				waiter &&
@@ -1715,17 +1719,20 @@ export class AcpAgent implements Agent {
 			}
 			cancelAttempt?.resolve(true);
 		} catch (error) {
-			// A failing attempt must not erase a cancellation the client already
-			// requested when an overlapping attempt already acknowledged OR is
-			// still pending and can still acknowledge (e.g. the second abort
-			// failed while the first was in flight and then stopped the turn):
-			// the prompt-rejection path still settles as cancelled (review
-			// thread P2).
-			if (!waiter?.cancelAcknowledged && (waiter?.pendingCancelAttempts ?? 0) <= 1) record.cancelRequested = false;
+			if (!waiter) record.cancelRequested = false;
 			cancelAttempt?.resolve(false);
 			throw error;
 		} finally {
-			if (waiter) waiter.pendingCancelAttempts = Math.max(0, (waiter.pendingCancelAttempts ?? 1) - 1);
+			if (waiter) {
+				waiter.pendingCancelAttempts = Math.max(0, (waiter.pendingCancelAttempts ?? 1) - 1);
+				if (
+					waiter.pendingCancelAttempts === 0 &&
+					!waiter.cancelAcknowledged &&
+					record.activePrompt === waiter
+				) {
+					record.cancelRequested = false;
+				}
+			}
 		}
 	}
 

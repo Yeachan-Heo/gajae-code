@@ -219,7 +219,10 @@ export interface SdkOnlyTerminalAbortSeams {
 	discardTerminalAbortSteeringSnapshot?: (token: number) => void;
 	abortPromptAndWaitWithTerminal: (
 		handle: string,
-		options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
+		options: {
+			graceMs: number;
+			terminal?: { scope: "turn" | "owned"; expectedEpoch?: number; steeringSnapshotToken?: number };
+		},
 	) => Promise<{ status: string; terminalScope?: unknown }>;
 }
 
@@ -2109,7 +2112,7 @@ function createControlSurface(
 			try {
 				proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(handle, {
 					graceMs: 10_000,
-					terminal: { scope, expectedEpoch: epoch },
+					terminal: { scope, expectedEpoch: epoch, steeringSnapshotToken },
 				});
 			} catch {
 				proof = { status: "unfenced" };

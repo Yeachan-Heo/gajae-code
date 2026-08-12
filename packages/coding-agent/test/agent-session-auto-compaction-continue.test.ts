@@ -595,7 +595,7 @@ describe("AgentSession auto-compaction continuation", () => {
 		const continueQueuedMessagesSpy = vi
 			.spyOn(session.agent, "continueQueuedMessages")
 			.mockImplementation(async options => {
-				options?.onRunAccepted?.();
+				options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
 			});
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		const events: string[] = [];
@@ -721,7 +721,7 @@ describe("AgentSession auto-compaction continuation", () => {
 				throw new AgentBusyError();
 			});
 		continueQueuedMessagesSpy.mockImplementationOnce(async options => {
-			options?.onRunAccepted?.();
+			options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
 		});
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
 		const events: string[] = [];

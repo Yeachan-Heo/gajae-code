@@ -3,6 +3,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import {
+	runSdkProductionHostIsolated,
+	sdkProductionHostIsolatedSuites,
+} from "./run-sdk-production-host-isolated";
 
 // Matrix planning validates live workspace and Cargo manifests in subprocesses.
 // Hosted runners can need more than Bun's 5s default during their first cold scan.
@@ -17,6 +21,23 @@ const packages: WorkspacePackage[] = [
 ];
 
 const EMBEDDED_DOCS_GATE_KEY = "test:packages/coding-agent/test/docs-index-lazy.test.ts";
+
+test("the production SDK host suites run sequentially and stop after a failure", async () => {
+	const started: string[] = [];
+	let active = 0;
+	let maxActive = 0;
+	const exitCode = await runSdkProductionHostIsolated(async suite => {
+		active += 1;
+		maxActive = Math.max(maxActive, active);
+		started.push(suite.file);
+		await Bun.sleep(1);
+		active -= 1;
+		return suite.file === sdkProductionHostIsolatedSuites[0].file ? 0 : 17;
+	});
+	expect(started).toEqual(sdkProductionHostIsolatedSuites.map(suite => suite.file));
+	expect(maxActive).toBe(1);
+	expect(exitCode).toBe(17);
+});
 
 function planForPaths(paths: readonly string[]) {
 	return planTasks(paths, packages);

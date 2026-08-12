@@ -324,8 +324,7 @@ export interface AgentPromptOptions {
 	/** Continue a cooperative maintenance checkpoint under its existing logical run and cancellation domain. */
 	maintenanceContinuation?: boolean;
 	/** Called synchronously after this invocation claims the agent run, before asynchronous provider work. */
-	/** Receives the immutable run handle as the first callback argument. */
-	onRunAccepted?: (...args: any[]) => void;
+	onRunAccepted?: (handle: AttemptRunHandle, acceptance: { consumedQueuedMessages: readonly AgentMessage[] }) => void;
 	/** Called once immediately before every managed upstream request. */
 	nextFallbackAttempt?: AgentLoopConfig["nextFallbackAttempt"];
 	/** Called after a managed upstream request is accepted and committed. */
@@ -1437,7 +1436,11 @@ export class Agent {
 		if (messages[messages.length - 1].role === "assistant") {
 			const queuedSteering = this.#dequeueSteeringMessages();
 			if (queuedSteering.length > 0) {
-				await this.#runLoop(queuedSteering, { ...options, skipInitialSteeringPoll: true });
+				await this.#runLoop(queuedSteering, {
+					...options,
+					skipInitialSteeringPoll: true,
+					consumedQueuedMessages: queuedSteering,
+				});
 				return;
 			}
 
@@ -1454,7 +1457,7 @@ export class Agent {
 				// violate the zero-final-call guarantee, so return without
 				// running the loop (review thread P1).
 				if (queuedFollowUp.length === 0) return;
-				await this.#runLoop(queuedFollowUp, options);
+				await this.#runLoop(queuedFollowUp, { ...options, consumedQueuedMessages: queuedFollowUp });
 				return;
 			}
 
@@ -1477,7 +1480,11 @@ export class Agent {
 		}
 		const queuedSteering = this.#dequeueSteeringMessages();
 		if (queuedSteering.length > 0) {
-			await this.#runLoop(queuedSteering, { ...options, skipInitialSteeringPoll: true });
+			await this.#runLoop(queuedSteering, {
+				...options,
+				skipInitialSteeringPoll: true,
+				consumedQueuedMessages: queuedSteering,
+			});
 			return;
 		}
 		const queuedFollowUp = this.#dequeueFollowUpMessages();
@@ -1497,7 +1504,7 @@ export class Agent {
 			// the zero-final-call guarantee, so return without running the loop
 			// (review thread P2).
 			if (queuedFollowUp.length === 0) return;
-			await this.#runLoop(queuedFollowUp, options);
+			await this.#runLoop(queuedFollowUp, { ...options, consumedQueuedMessages: queuedFollowUp });
 			return;
 		}
 		throw new Error("No queued messages to continue");
@@ -1508,7 +1515,13 @@ export class Agent {
 	 * If messages are provided, starts a new conversation turn with those messages.
 	 * Otherwise, continues from existing context.
 	 */
-	async #runLoop(messages?: AgentMessage[], options?: AgentPromptOptions & { skipInitialSteeringPoll?: boolean }) {
+	async #runLoop(
+		messages?: AgentMessage[],
+		options?: AgentPromptOptions & {
+			skipInitialSteeringPoll?: boolean;
+			consumedQueuedMessages?: readonly AgentMessage[];
+		},
+	) {
 		const model = this.#state.model;
 		if (!model) throw new Error("No model configured");
 
@@ -1557,7 +1570,9 @@ export class Agent {
 		this.#observeMainAttemptScope(scope);
 		const handle: AttemptRunHandle = { logicalRunId, scope };
 		this.#runHandles.set(logicalRunId, handle);
-		options?.onRunAccepted?.(handle);
+		options?.onRunAccepted?.(handle, {
+			consumedQueuedMessages: options.consumedQueuedMessages ?? [],
+		});
 		if (startsManagedLogicalRun) {
 			this.#managedLogicalRunOwner = logicalRunId;
 			this.#emit({ type: "agent_start", scope });
