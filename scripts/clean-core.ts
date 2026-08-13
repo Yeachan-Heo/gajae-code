@@ -19,7 +19,8 @@ export interface CleanOptions {
  *
  * `artifacts/` is deliberately absent: red-team/QA tests write evidence there and
  * read it back (`packages/coding-agent/src/tools/computer.enforcement.test.ts`,
- * `packages/tui/test/g0*-redteam.test.ts`), and part of the tree is committed.
+ * `packages/tui/test/g0*-redteam.test.ts`). The directory is untracked (issue #4420);
+ * test fixtures belong in packages/ test/ fixtures/.
  */
 export const cleanPatterns: readonly CleanPattern[] = [
 	{ glob: "packages/*/dist", scope: "default" },

@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="bun test" tests="1" assertions="14" failures="0" skipped="0" time="2.523722">
-  <testsuite name="packages/coding-agent/test/session/session-memory-latency.test.ts" file="packages/coding-agent/test/session/session-memory-latency.test.ts" tests="1" assertions="14" failures="0" skipped="0" time="0" hostname="MacBook-Pro.local">
-    <testsuite name="session memory latency / I-O (AC11)" file="packages/coding-agent/test/session/session-memory-latency.test.ts" line="20" tests="1" assertions="14" failures="0" skipped="0" time="2.496" hostname="MacBook-Pro.local">
-      <testcase name="serves cold random, warm cached, parent-children, and 10k branch-switch operations within approved p95 budgets" classname="session memory latency / I-O (AC11)" time="2.496239" file="packages/coding-agent/test/session/session-memory-latency.test.ts" line="21" assertions="14" />
-    </testsuite>
-  </testsuite>
-</testsuites>

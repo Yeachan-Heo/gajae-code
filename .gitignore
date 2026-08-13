@@ -88,6 +88,10 @@ packages/coding-agent/src/internal-urls/docs-index.generated.ts
 CPU*.md
 packages/coding-agent/binaries/
 
+# Root artifacts/ is untracked test working space (issue #4420).
+# Tests write evidence there and read it back within the same run;
+# test fixtures belong in packages/*/test/fixtures/ instead.
+/artifacts/
 .release-040-artifacts/
 
 # Python SDK build output

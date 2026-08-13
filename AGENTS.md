@@ -48,7 +48,7 @@ bun run dev:doctor          # verify PATH resolution of `gjc` points at this wor
 bun run install:defaults    # (re)install bundled default definitions
 ```
 
-Removing build output (never touches sources, `node_modules/`, `.gjc/` state, or `artifacts/` evidence):
+Removing build output (never touches sources, `node_modules/`, `.gjc/` state, or `artifacts/` test working space):
 
 ```sh
 bun run clean                # dist/, binaries/, coverage/, stray *.bun-build, *.tsbuildinfo
@@ -57,6 +57,8 @@ bun scripts/clean.ts --dry-run  # list targets without deleting
 ```
 
 `clean` removes `packages/coding-agent/dist/`, so a `--binary`-linked `gjc` (see `dev:doctor`) stops resolving until you run `bun run --cwd=packages/coding-agent build` again. Source-linked setups are unaffected.
+
+`artifacts/` policy (issue #4420): The root `artifacts/` directory is untracked test working space. Red-team and QA tests write evidence there and read it back within the same run (`g011`/`g014`/`g015`/`vb001-gen5`). The directory is gitignored at root and is not committed. Deterministic test fixtures that must be tracked belong in `packages/*/test/fixtures/`. The `clean` command deliberately does not touch `artifacts/`.
 
 Verification (never run `tsc`/`npx tsc` directly at repo root; use these):
 

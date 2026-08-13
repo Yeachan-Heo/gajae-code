@@ -1262,8 +1262,8 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("test:scripts/clean.test.ts");
 		expect(keys).toContain("root-check");
 	});
-	test("cache-eval evidence artifact adds its focused AI test without bypassing root fallback coverage", () => {
-		const tasks = targeted(["artifacts/architecture-2383-eval.json"]);
+	test("cache-eval fixture adds its focused AI test without bypassing root fallback coverage", () => {
+		const tasks = targeted(["packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json"]);
 		expect(tasks.map(task => task.key)).toEqual([
 			"test:packages/ai/test/anthropic-cache-eval.integration.test.ts",
 			"root-check",

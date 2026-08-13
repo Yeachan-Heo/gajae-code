@@ -33,7 +33,7 @@ type EvalArtifact = {
 	testCommand: string;
 };
 
-const artifactPath = new URL("../../../artifacts/issue-3670-anthropic-cache-eval.json", import.meta.url);
+const artifactPath = new URL("./fixtures/issue-3670-anthropic-cache-eval.json", import.meta.url);
 const repoRoot = path.resolve(import.meta.dir, "../../..");
 const packageRoot = path.resolve(import.meta.dir, "..");
 const providerSourceGitPath = "packages/ai/src/providers/anthropic.ts";
