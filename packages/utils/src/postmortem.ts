@@ -654,10 +654,54 @@ export function cleanup(): Promise<void> {
 	return runCleanup(Reason.MANUAL);
 }
 
+interface ProcessOutputDrain {
+	promise: Promise<void>;
+	cancel: () => void;
+}
+
+function waitForProcessOutput(stream: NodeJS.WriteStream): ProcessOutputDrain | undefined {
+	if (!stream.writable || stream.destroyed || stream.writableFinished) return undefined;
+
+	const { promise, resolve } = Promise.withResolvers<void>();
+	let settled = false;
+	const finish = (): void => {
+		if (settled) return;
+		settled = true;
+		stream.off("close", finish);
+		stream.off("error", finish);
+		resolve();
+	};
+
+	stream.once("close", finish);
+	stream.once("error", finish);
+	try {
+		stream.end(finish);
+	} catch {
+		finish();
+	}
+	return { promise, cancel: finish };
+}
+
+async function waitForProcessOutputDrain(): Promise<void> {
+	const drains = [waitForProcessOutput(process.stdout), waitForProcessOutput(process.stderr)].filter(
+		(drain): drain is ProcessOutputDrain => drain !== undefined,
+	);
+	if (drains.length === 0) return;
+
+	const { promise: deadline, resolve: resolveDeadline } = Promise.withResolvers<void>();
+	const timer = setTimeout(resolveDeadline, 5_000);
+	try {
+		await Promise.race([Promise.all(drains.map(drain => drain.promise)), deadline]);
+	} finally {
+		clearTimeout(timer);
+		for (const drain of drains) drain.cancel();
+	}
+}
+
 /**
  * Runs all cleanup callbacks and exits.
  *
- * In main thread: waits for stdout drain, then calls process.exit().
+ * In main thread: waits for stdout and stderr drain, then calls process.exit().
  * In workers: runs cleanup only (process.exit would kill entire process).
  */
 export async function quit(code: number = 0): Promise<void> {
@@ -672,11 +716,7 @@ export async function quit(code: number = 0): Promise<void> {
 
 	const exitAfterCleanup = async (): Promise<void> => {
 		await awaitCleanupWithDeadline(Reason.MANUAL);
-		if (process.stdout.writableLength > 0) {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			process.stdout.once("drain", resolve);
-			await Promise.race([promise, Bun.sleep(5000)]);
-		}
+		await waitForProcessOutputDrain();
 		process.exit(code);
 	};
 
