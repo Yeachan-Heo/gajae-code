@@ -17477,6 +17477,7 @@ export class AgentSession {
 		const classification = this.#classifyErrorForRetry(message);
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
+		const providerRetryMaxAttempts = firstEventTimeout ? transportFailure?.retryMaxAttempts : undefined;
 		// Content-free message-only watchdog prose (wrapped canonical or bare
 		// per-provider variants) is admitted like the typed path: it is
 		// replay-safe, so a bare-default retry may re-issue the request even
@@ -17572,6 +17573,9 @@ export class AgentSession {
 			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
 				? "retry"
 				: "exhausted";
+		if (providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts) {
+			outcome = "exhausted";
+		}
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
 		// exhaustion and forces an immediate same-model retry.
@@ -17668,7 +17672,7 @@ export class AgentSession {
 					maxAttempts: managedFallback
 						? controller.maxAttempts
 						: firstEventTimeout
-							? retrySettings.maxRetries + 1
+							? Math.min(retrySettings.maxRetries + 1, providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY)
 							: retrySettings.maxRetries,
 					delayMs,
 					errorMessage,

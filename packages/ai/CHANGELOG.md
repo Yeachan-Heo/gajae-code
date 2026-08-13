@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Anthropic first-event timeouts now report safe elapsed time, serialized request bytes, canonical-vs-custom endpoint class, and the `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` override without exposing URL credentials, query tokens, or body content. Custom endpoints receive one bounded two-minute observation grace so a slightly later proxy 529 can surface, while full-window multi-megabyte requests are never automatically re-uploaded and small requests get at most one provider replay. Credit: @probepark (#4464).
 - Defense-in-depth: a completed Anthropic stream whose assembled assistant content carries directly adjacent `thinking`/`redacted_thinking` blocks now emits a bounded diagnostic per stream invocation naming only the envelope shape (block count, adjacency presence, model, provider), never raw thinking text, signatures, or redacted payloads. The send-boundary collapse remains the wire source of truth; this is a read-only observation that helps surface upstream producers of the rejected shape (#4443).
 
 - The adjacent-thinking-block collapse now treats `thinking` and `redacted_thinking` as one adjacency class at the final Anthropic send boundary, matching the maintainer-approved send-time invariant (#4425). The earlier replay-phase collapse (#4418) and its test asserted that a `redacted_thinking` block following a `thinking` block survived; the final send-boundary pass (#4425) correctly collapses that pair, and the replay-phase test and doc comment are reconciled to that authoritative behavior (#4382).
