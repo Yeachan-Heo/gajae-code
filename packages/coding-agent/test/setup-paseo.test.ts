@@ -190,20 +190,19 @@ describe("byte preservation (AC-3)", () => {
 		["4-space indentation", (o: unknown) => `${JSON.stringify(o, null, 4)}\n`],
 		["tab indentation", (o: unknown) => `${JSON.stringify(o, null, "\t")}\n`],
 		["no trailing newline", (o: unknown) => JSON.stringify(o, null, 2)],
-	])(
-		"%s is refused as format-drift and nothing is written",
-		async (_label: string, encode: (o: unknown) => string) => {
-			const { paths } = await makeFixture();
-			await fs.writeFile(paths.configJson, encode({ agents: { providers: {} } }));
-			const before = await fs.readFile(paths.configJson, "utf8");
+	])("%s is refused as format-drift and nothing is written", async (_label: string, encode: (
+		o: unknown,
+	) => string) => {
+		const { paths } = await makeFixture();
+		await fs.writeFile(paths.configJson, encode({ agents: { providers: {} } }));
+		const before = await fs.readFile(paths.configJson, "utf8");
 
-			await expect(readTarget(paths.configJson)).rejects.toMatchObject({
-				name: "PaseoPublishError",
-				refusal: { reason: "format-drift" },
-			});
-			expect(await fs.readFile(paths.configJson, "utf8")).toBe(before);
-		},
-	);
+		await expect(readTarget(paths.configJson)).rejects.toMatchObject({
+			name: "PaseoPublishError",
+			refusal: { reason: "format-drift" },
+		});
+		expect(await fs.readFile(paths.configJson, "utf8")).toBe(before);
+	});
 
 	test("unparseable JSON is refused as parse-refusal and nothing is written", async () => {
 		const { paths } = await makeFixture();
@@ -884,10 +883,11 @@ describe("provider probe parsing", () => {
 		if (outcome.kind === "ok") expect([...outcome.providerIds]).toEqual(expected);
 	});
 
-	test.each(["not json", '{"providers":{}}', '{"providers":[{"nope":1}]}'])(
-		"rejects %s as malformed",
-		(input: string) => {
-			expect(parseProviderLs(input).kind).toBe("malformed");
-		},
-	);
+	test.each([
+		"not json",
+		'{"providers":{}}',
+		'{"providers":[{"nope":1}]}',
+	])("rejects %s as malformed", (input: string) => {
+		expect(parseProviderLs(input).kind).toBe("malformed");
+	});
 });

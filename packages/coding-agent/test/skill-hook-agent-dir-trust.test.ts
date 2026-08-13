@@ -41,7 +41,17 @@ function scenario(dotenv: string | undefined, configs: Record<string, string>): 
 async function customDirectoriesIn(dir: string, home: string): Promise<string[]> {
 	const proc = Bun.spawn([process.execPath, PROBE], {
 		cwd: path.join(dir, "repo"),
-		env: { ...process.env, HOME: home, GJC_CODING_AGENT_DIR: undefined, GJC_CONFIG_DIR: undefined },
+		// Both agent-dir spellings must be cleared: this probe pins its own HOME
+		// and asserts the agent dir is derived from it, and the test preload
+		// isolates every test process by setting both.
+		env: {
+			...process.env,
+			HOME: home,
+			GJC_CODING_AGENT_DIR: undefined,
+			PI_CODING_AGENT_DIR: undefined,
+			GJC_CONFIG_DIR: undefined,
+			PI_CONFIG_DIR: undefined,
+		},
 		stdout: "pipe",
 		stderr: "pipe",
 	});
