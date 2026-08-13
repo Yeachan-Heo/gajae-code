@@ -81,15 +81,8 @@ export function createProviderSelectionPolicy(input: ProviderSelectionPolicyInpu
 		}
 	}
 
-	const orderedProviders = [...explicitProviders];
-	const seen = new Set(explicitSet);
-	for (const provider of input.catalogProviders) {
-		if (seen.has(provider)) {
-			continue;
-		}
-		seen.add(provider);
-		orderedProviders.push(provider);
-	}
+	// One shared implementation with the standalone accessor; see projectProviderOrder.
+	const orderedProviders = projectProviderOrder(explicitProviders, input.catalogProviders);
 
 	return {
 		rank(provider: string): number {
@@ -111,6 +104,35 @@ export function createProviderSelectionPolicy(input: ProviderSelectionPolicyInpu
 			return modelCatalogIndex.get(selector.trim().toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
 		},
 	};
+}
+
+/**
+ * Project the deterministic provider order: normalized explicit order first, then
+ * first-wins catalog order for everything else.
+ *
+ * This is the single implementation of that ordering. It reads no credentials and
+ * takes no auth input at all, so any consumer that only needs "which providers, in
+ * what priority" cannot accidentally acquire auth sensitivity. Auth-aware banding
+ * lives exclusively in {@link ProviderSelectionPolicy.rank}.
+ */
+export function projectProviderOrder(
+	explicitProviderOrder: readonly string[],
+	catalogProviders: readonly string[],
+): string[] {
+	const ordered: string[] = [];
+	const seen = new Set<string>();
+	for (const raw of explicitProviderOrder) {
+		const normalized = raw.trim().toLowerCase();
+		if (!normalized || seen.has(normalized)) continue;
+		seen.add(normalized);
+		ordered.push(normalized);
+	}
+	for (const provider of catalogProviders) {
+		if (!provider || seen.has(provider)) continue;
+		seen.add(provider);
+		ordered.push(provider);
+	}
+	return ordered;
 }
 
 export interface ProviderSelectionCatalog {

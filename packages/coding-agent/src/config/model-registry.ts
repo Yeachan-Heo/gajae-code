@@ -85,6 +85,7 @@ import {
 	createProviderSelectionPolicy,
 	type EffectiveProviderAuth,
 	type ProviderSelectionPolicy,
+	projectProviderOrder,
 } from "./provider-selection-policy";
 import { type Settings, settings } from "./settings";
 
@@ -3453,6 +3454,35 @@ export class ModelRegistry {
 		});
 	}
 
+	/**
+	 * Deterministic provider priority for autorouting tier generation: configured
+	 * `modelProviderOrder` first, then first-wins catalog order.
+	 *
+	 * Deliberately takes no session and never touches `authStorage`. It bypasses
+	 * `#buildProviderSelectionPolicy` entirely so no `effectiveAuth` map is even
+	 * assembled — auth-independence is structural here, not a convention. Ranking
+	 * that *is* auth-aware stays private to the policy.
+	 *
+	 * Providers absent from the catalog are dropped so a dead declaration cannot
+	 * pollute the generated setup's `declarationFingerprint`. Returned ids use the
+	 * catalog's original spelling because the generator matches provider prefixes
+	 * with case-sensitive exact strings.
+	 */
+	autoroutingProviderOrder(): readonly string[] {
+		const { catalogProviders } = buildProviderSelectionCatalog(this.#models);
+		const catalogSpelling = new Map<string, string>();
+		for (const model of this.#models) {
+			const normalized = model.provider.trim().toLowerCase();
+			if (normalized && !catalogSpelling.has(normalized)) catalogSpelling.set(normalized, model.provider);
+		}
+		const ordered = projectProviderOrder(getConfiguredProviderOrderFromSettings(), catalogProviders);
+		const restored: string[] = [];
+		for (const provider of ordered) {
+			const spelled = catalogSpelling.get(provider);
+			if (spelled !== undefined) restored.push(spelled);
+		}
+		return restored;
+	}
 	#providerRankMap(policy: ProviderSelectionPolicy): Map<string, number> {
 		const providerRank = new Map<string, number>();
 		for (const provider of policy.orderedProviders()) {

@@ -7,6 +7,7 @@ import {
 	AUTOROUTING_SELECTOR_PATTERN,
 	type AutoroutingProvenance,
 	type AutoroutingSetup,
+	autoroutingProviderOrderHint,
 	buildAutoroutingClearPatches,
 	buildAutoroutingEnabledPatch,
 	buildAutoroutingSettingsBatch,
@@ -275,3 +276,47 @@ describe("autorouting typed settings contract", () => {
 // Keep the generic type in the test source so tsc verifies the public contract.
 const optionalObjectDef: OptionalObjectDef<AutoroutingSetup> = SETTINGS_SCHEMA["task.autorouting.setup"];
 void optionalObjectDef;
+
+describe("autoroutingProviderOrderHint", () => {
+	it("reports no drift when the declaration matches the current priority", () => {
+		expect(autoroutingProviderOrderHint(["anthropic", "google"], ["anthropic", "google", "xai"])).toEqual({
+			reordered: false,
+			missing: [],
+		});
+	});
+
+	it("treats an order-preserving subset as unchanged", () => {
+		expect(autoroutingProviderOrderHint(["anthropic", "xai"], ["anthropic", "google", "xai"])).toEqual({
+			reordered: false,
+			missing: [],
+		});
+	});
+
+	it("flags a swap of two declared providers", () => {
+		expect(autoroutingProviderOrderHint(["google", "anthropic"], ["anthropic", "google"])).toEqual({
+			reordered: true,
+			missing: [],
+		});
+	});
+
+	it("lists declared providers the catalog no longer offers, preserving their spelling", () => {
+		expect(autoroutingProviderOrderHint(["anthropic", "CustomRouter"], ["anthropic"])).toEqual({
+			reordered: false,
+			missing: ["CustomRouter"],
+		});
+	});
+
+	it("normalizes case and whitespace the way provider selection does", () => {
+		expect(autoroutingProviderOrderHint([" Anthropic ", "GOOGLE"], ["anthropic", "google"])).toEqual({
+			reordered: false,
+			missing: [],
+		});
+	});
+
+	it("ignores duplicate declarations rather than reporting false drift", () => {
+		expect(autoroutingProviderOrderHint(["anthropic", "anthropic", "google"], ["anthropic", "google"])).toEqual({
+			reordered: false,
+			missing: [],
+		});
+	});
+});

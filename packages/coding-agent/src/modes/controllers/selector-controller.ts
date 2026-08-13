@@ -2322,6 +2322,19 @@ export class SelectorController {
 		});
 	}
 
+	/**
+	 * Reorder a recorded declaration into current provider priority and drop entries
+	 * the catalog no longer offers. Comparison uses normalized ids while the result
+	 * keeps the catalog's spelling, because the generator matches provider prefixes
+	 * case-sensitively.
+	 */
+	#reseedProvidersFromPolicy(setup: AutoroutingSetup): AutoroutingSetup {
+		const order = this.ctx.session.modelRegistry.autoroutingProviderOrder();
+		const declared = new Set(setup.providers.map(provider => provider.trim().toLowerCase()));
+		const providers = order.filter(provider => declared.has(provider.trim().toLowerCase()));
+		return { ...structuredClone(setup), providers };
+	}
+
 	async refreshSmartRouting(options?: { confirmHandEdit?: boolean }): Promise<SmartRoutingPreview> {
 		let preview: SmartRoutingPreview;
 		try {
@@ -2331,7 +2344,14 @@ export class SelectorController {
 			if (issues.length > 0 || setup === undefined) {
 				throw new Error("Cannot refresh smart routing without a valid recorded setup.");
 			}
-			preview = this.previewSmartRouting(setup);
+			// Reseed the recorded declaration against the current provider priority:
+			// reorder to policy order and drop providers the catalog no longer offers.
+			// Refusing an empty result keeps a dead declaration from being persisted.
+			const reseeded = this.#reseedProvidersFromPolicy(setup);
+			if (reseeded.providers.length === 0) {
+				throw new Error("No declared providers remain in the catalog; smart routing was not updated.");
+			}
+			preview = this.previewSmartRouting(reseeded);
 			this.#assertSmartRoutingNotHandEdited(preview, options?.confirmHandEdit === true);
 		} catch (error) {
 			return this.#reportSmartRoutingValidationError(error);

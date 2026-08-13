@@ -390,6 +390,47 @@ export function evaluateAutoroutingProvenanceState(
 	};
 }
 
+/** Advisory comparison between a recorded declaration and the current provider priority. */
+export type AutoroutingProviderOrderHint = {
+	/** The declaration lists the same providers in a different relative order. */
+	reordered: boolean;
+	/** Declared providers that the current catalog no longer offers, in declaration order. */
+	missing: string[];
+};
+
+/**
+ * Compare a recorded `setup.providers` declaration against the current provider
+ * priority, for an advisory panel hint only.
+ *
+ * Pure string comparison over two arrays, normalized exactly the way provider
+ * selection normalizes ids (trim + lowercase). It deliberately never reaches
+ * provenance, effective state, routing, preflight, or evidence: a changed priority
+ * is a new suggestion, not proof that persisted tiers went stale.
+ */
+export function autoroutingProviderOrderHint(
+	setupProviders: readonly string[],
+	currentOrder: readonly string[],
+): AutoroutingProviderOrderHint {
+	const normalize = (value: string): string => value.trim().toLowerCase();
+	const current = currentOrder.map(normalize).filter(id => id.length > 0);
+	const currentSet = new Set(current);
+	const declared: string[] = [];
+	const missing: string[] = [];
+	const seen = new Set<string>();
+	for (const raw of setupProviders) {
+		const id = normalize(raw);
+		if (!id || seen.has(id)) continue;
+		seen.add(id);
+		if (currentSet.has(id)) declared.push(id);
+		else missing.push(raw);
+	}
+	// Only the providers common to both sides can disagree about order, so a
+	// declaration that is a subset in the same relative order is not reordered.
+	const expected = current.filter(id => seen.has(id));
+	const reordered = declared.length === expected.length && declared.some((id, index) => id !== expected[index]);
+	return { reordered, missing };
+}
+
 export type AutoroutingSettingsBatchPatch =
 	| { path: "task.autorouting.tiers"; op: "set"; value: TierMap }
 	| { path: "task.autorouting.setup"; op: "set"; value: AutoroutingSetup }

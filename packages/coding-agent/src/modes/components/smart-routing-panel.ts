@@ -2,6 +2,7 @@ import { Container, getKeybindings, matchesKey, replaceTabs, Spacer, Text, trunc
 import { sanitizeDisplayLine } from "@gajae-code/utils";
 import type {
 	AutoroutingProvenance,
+	AutoroutingProviderOrderHint,
 	AutoroutingSetup,
 	AutoroutingTier,
 	TierMap,
@@ -45,6 +46,8 @@ export interface SmartRoutingPanelOptions {
 	setup: AutoroutingSetup;
 	tiers?: TierMap;
 	provenance?: AutoroutingProvenance;
+	/** Advisory drift between the recorded declaration and current provider priority. */
+	providerOrderHint?: AutoroutingProviderOrderHint;
 	enabled: boolean;
 	preset?: string;
 	readOnly: boolean;
@@ -112,6 +115,7 @@ export class SmartRoutingPanelComponent extends Container {
 	#providerCursor = 0;
 	#allowlistEditing = false;
 	#allowlistBuffer = "";
+	#providerOrderHint: AutoroutingProviderOrderHint | undefined;
 	#status = "";
 	#error = "";
 
@@ -126,6 +130,7 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
 		this.#provenance = options.provenance ? structuredClone(options.provenance) : undefined;
 		this.#enabled = options.enabled;
+		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
 		this.#stale = options.stale;
 		this.#preview = clonePreview(options.preview);
 		this.#render();
@@ -151,6 +156,20 @@ export class SmartRoutingPanelComponent extends Container {
 		return [...this.#draft.providers];
 	}
 
+	/**
+	 * Advisory-only, non-destructive hint update.
+	 *
+	 * `refreshState` deliberately replaces the draft and clears editor state, so it
+	 * must never be used for a background settings change: an external
+	 * `modelProviderOrder` edit would then discard the user's unsaved reordering,
+	 * allowlist buffer, cursor, and confirmation. This replaces the hint and nothing
+	 * else.
+	 */
+	updateProviderOrderHint(hint: AutoroutingProviderOrderHint | undefined): void {
+		this.#providerOrderHint = hint ? structuredClone(hint) : undefined;
+		this.#render();
+	}
+
 	/** Replace the panel's persisted snapshot after a controller mutation. */
 	refreshState(options: {
 		setup: AutoroutingSetup;
@@ -158,6 +177,7 @@ export class SmartRoutingPanelComponent extends Container {
 		provenance?: AutoroutingProvenance;
 		enabled: boolean;
 		preset?: string;
+		providerOrderHint?: AutoroutingProviderOrderHint;
 		stale: boolean;
 		preview: SmartRoutingPreview;
 	}): void {
@@ -167,6 +187,7 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#enabled = options.enabled;
 		this.#stale = options.stale;
 		this.#preset = options.preset;
+		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
 		this.#preview = clonePreview(options.preview);
 		this.#providerCursor = Math.min(this.#providerCursor, Math.max(0, this.#draft.providers.length - 1));
 		this.#mode = "editing";
@@ -195,6 +216,31 @@ export class SmartRoutingPanelComponent extends Container {
 			this.addChild(
 				new Text(
 					theme.fg("warning", "Stale generated setup: catalog/map or hand-edited tiers differ from provenance."),
+					0,
+					0,
+				),
+			);
+		}
+		// Advisory only: a changed provider priority is a new suggestion, never proof
+		// that the persisted tiers went stale.
+		if (this.#providerOrderHint?.reordered) {
+			this.addChild(
+				new Text(
+					theme.fg("muted", "Provider priority changed since this setup was generated. Press r to refresh."),
+					0,
+					0,
+				),
+			);
+		}
+		if (this.#providerOrderHint && this.#providerOrderHint.missing.length > 0) {
+			this.addChild(
+				new Text(
+					theme.fg(
+						"muted",
+						displaySafe(
+							`Declared providers missing from the catalog: ${this.#providerOrderHint.missing.join(", ")}`,
+						),
+					),
 					0,
 					0,
 				),

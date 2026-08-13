@@ -55,7 +55,14 @@ function installTheme(): void {
 	setThemeInstance(themeInstance);
 }
 
-function createContext(options: { scopedModels?: unknown[]; settings?: Settings; noProfiles?: boolean } = {}) {
+function createContext(
+	options: {
+		scopedModels?: unknown[];
+		settings?: Settings;
+		noProfiles?: boolean;
+		providerOrder?: readonly string[];
+	} = {},
+) {
 	const settings = options.settings ?? Settings.isolated();
 	const ui = { setFocus: vi.fn(), requestRender: vi.fn(), terminal: { rows: 40, columns: 120 } };
 	const editorContainer = { clear: vi.fn(), addChild: vi.fn() };
@@ -67,6 +74,7 @@ function createContext(options: { scopedModels?: unknown[]; settings?: Settings;
 		getCanonicalModels: () => [],
 		resolveCanonicalModel: () => undefined,
 		getDiscoverableProviders: () => [],
+		autoroutingProviderOrder: () => options.providerOrder ?? [...new Set(catalog.map(model => model.provider))],
 		getModelProfiles: () => (options.noProfiles ? new Map() : new Map([[smartProfile.name, smartProfile]])),
 		getModelProfile: (name: string) => (name === smartProfile.name ? smartProfile : undefined),
 		getAvailableModelProfileNames: () => [smartProfile.name],
@@ -286,6 +294,57 @@ describe("/model smart-routing panel integration", () => {
 		panel.handleInput("\x1b");
 		expect(ctx.restoreComposer).not.toHaveBeenCalled();
 		expect(selector.__testViewMode()).toBe("presets");
+	});
+});
+
+describe("provider-order derived seeding (Steps 3-4)", () => {
+	beforeAll(() => {
+		installTheme();
+	});
+
+	test("seeds the draft from the derived provider priority, not raw catalog iteration", async () => {
+		const { panel } = await openPanel({ providerOrder: ["openai-codex", "anthropic"] });
+		expect(panel.getProviderOrder()).toEqual(["openai-codex", "anthropic"]);
+	});
+
+	test("a recorded declaration still wins over the derived seed", async () => {
+		const settings = Settings.isolated();
+		await settings.set("task.autorouting.setup", { schema: 1, providers: ["anthropic"] });
+		const { panel } = await openPanel({ settings, providerOrder: ["openai-codex", "anthropic"] });
+		expect(panel.getProviderOrder()).toEqual(["anthropic"]);
+	});
+
+	test("refuses to open the panel when no providers are available", async () => {
+		const { ctx, editorContainer } = createContext({ providerOrder: [] });
+		const controller = new SelectorController(ctx as never);
+		controller.showModelSelector();
+		const selector = editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		await settle();
+		installTheme();
+		for (let index = 0; index < 20 && selector.__testSelectedPresetRowIdentity() !== "smartRouting"; index++) {
+			selector.handleInput("\x1b[B");
+		}
+		selector.handleInput("\n");
+		await settle();
+		expect(selector.__testGetSmartRoutingPanel()).toBeUndefined();
+		expect(selector.__testViewMode()).toBe("presets");
+	});
+
+	test("an external provider-order change updates the hint without discarding an unsaved draft", async () => {
+		const settings = Settings.isolated();
+		const { panel } = await openPanel({ settings, providerOrder: ["anthropic", "openai-codex"] });
+		const before = panel.getProviderOrder();
+		expect(before.length).toBeGreaterThan(1);
+		// Reorder in the panel without applying, then let an external settings change land.
+		panel.handleInput("\x1b[B");
+		panel.handleInput("J");
+		const edited = panel.getProviderOrder();
+		// Guard against a tautology: the edit must actually have changed the draft.
+		expect(edited).not.toEqual(before);
+		await settings.set("modelProviderOrder", ["openai-codex"]);
+		await settle();
+		// The unsaved draft must survive the advisory refresh.
+		expect(panel.getProviderOrder()).toEqual(edited);
 	});
 });
 

@@ -15,7 +15,9 @@ import {
 } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
 import {
+	type AutoroutingProviderOrderHint,
 	type AutoroutingSetup,
+	autoroutingProviderOrderHint,
 	evaluateAutoroutingProvenanceState,
 	resolveTierMap,
 	validateAutoroutingSetup,
@@ -395,6 +397,7 @@ export class ModelSelectorComponent extends Container {
 	#assignmentState: "idle" | "assigning" = "idle";
 	#closeAfterAssignment = false;
 	#unsubscribeCatalogChanged: () => void = () => {};
+	#unsubscribeProviderOrderChanged: () => void = () => {};
 	#disposed = false;
 	/** Standalone smart-routing entry: cancel closes the selector instead of falling back to the preset landing. */
 	#smartRoutingOnly = false;
@@ -524,6 +527,17 @@ export class ModelSelectorComponent extends Container {
 			});
 		}
 
+		// Advisory drift only, and only while the smart-routing panel is mounted. This
+		// must not call refreshState: that would discard the user's unsaved draft.
+		this.#unsubscribeProviderOrderChanged = this.#settings.onChanged(path => {
+			if (this.#disposed || path !== "modelProviderOrder") return;
+			if (this.#viewMode !== "smart-routing") return;
+			const panel = this.#smartRoutingPanel;
+			if (!panel) return;
+			panel.updateProviderOrderHint(this.#providerOrderHintFor(panel.getProviderOrder()));
+			this.#tui.requestRender();
+		});
+
 		// Load models and do initial render
 		this.#loadModels().then(() => {
 			this.#buildProviderTabs();
@@ -558,6 +572,7 @@ export class ModelSelectorComponent extends Container {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		this.#unsubscribeCatalogChanged();
+		this.#unsubscribeProviderOrderChanged();
 		super.dispose();
 	}
 
@@ -1558,11 +1573,24 @@ export class ModelSelectorComponent extends Container {
 		return truncateToWidth(label, ROLE_BINDING_MAX_WIDTH);
 	}
 
+	/**
+	 * A recorded declaration always wins; otherwise seed from the deterministic
+	 * provider priority so the draft reflects the user's configured order instead of
+	 * raw catalog iteration. No hardcoded provider fallback: an empty catalog means
+	 * there is nothing to generate tiers from, and the caller refuses entry.
+	 */
 	#smartRoutingSetup(): AutoroutingSetup {
 		const stored = this.#settings.get("task.autorouting.setup");
 		if (validateAutoroutingSetup(stored).length === 0 && stored !== undefined) return structuredClone(stored);
-		const providers = [...new Set(this.#modelRegistry.getAll().map(model => model.provider))];
-		return { schema: 1, providers: providers.length > 0 ? providers : ["anthropic"] };
+		return { schema: 1, providers: [...this.#modelRegistry.autoroutingProviderOrder()] };
+	}
+
+	/**
+	 * Advisory hint input is the panel's *current draft*, not the persisted setup, so
+	 * a user mid-reorder sees drift for what they are actually editing.
+	 */
+	#providerOrderHintFor(declared: readonly string[]): AutoroutingProviderOrderHint {
+		return autoroutingProviderOrderHint(declared, this.#modelRegistry.autoroutingProviderOrder());
 	}
 
 	#smartRoutingPreview(setup: AutoroutingSetup): SmartRoutingPreview {
@@ -1602,7 +1630,18 @@ export class ModelSelectorComponent extends Container {
 			this.#renderPresetLanding();
 			return;
 		}
+
 		const setup = this.#smartRoutingSetup();
+		if (setup.providers.length === 0) {
+			// Nothing to generate tiers from; refuse entry instead of seeding a guess.
+			if (this.#smartRoutingOnly) {
+				this.#onCancelCallback();
+				return;
+			}
+			this.#presetLoginHint = "No providers are available to generate routing tiers.";
+			this.#renderPresetLanding();
+			return;
+		}
 		const preview = this.#smartRoutingPreview(setup);
 		const tiers = resolveTierMap({ tiers: this.#settings.get("task.autorouting.tiers") });
 		const provenance = this.#settings.get("task.autorouting.provenance");
@@ -1613,6 +1652,7 @@ export class ModelSelectorComponent extends Container {
 			provenance,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
 			preset: this.#settings.get("task.autorouting.preset"),
+			providerOrderHint: this.#providerOrderHintFor(setup.providers),
 			readOnly: this.#smartRoutingReadOnly(),
 			stale: this.#smartRoutingIsStale(),
 			preview,
@@ -1650,6 +1690,7 @@ export class ModelSelectorComponent extends Container {
 			provenance: this.#settings.get("task.autorouting.provenance"),
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
 			preset: this.#settings.get("task.autorouting.preset"),
+			providerOrderHint: this.#providerOrderHintFor(setup.providers),
 			stale: this.#smartRoutingIsStale(),
 			preview,
 		});
