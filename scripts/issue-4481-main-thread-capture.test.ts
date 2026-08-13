@@ -91,4 +91,36 @@ describe.skipIf(process.platform !== "linux")("issue #4481 PTY capture harness",
 		expect(exitCode).toBe(0);
 		expect(summary).toMatchObject({ pty_closed: true, wedge_detected: false, alive_after_cleanup: false });
 	});
+
+	test("instruments the actual CLI process behind the repository dev command", async () => {
+		const dir = await tempDir();
+		const child = Bun.spawn(
+			[
+				"python3",
+				script,
+				"--artifact-dir",
+				dir,
+				"--duration",
+				"2",
+				"--sample-seconds",
+				"0.25",
+				"--pty-loss-after",
+				"0.75",
+				"--",
+				process.execPath,
+				"run",
+				"dev",
+				"--",
+				"--version",
+			],
+			{ cwd: path.resolve(import.meta.dir, ".."), stdout: "ignore", stderr: "pipe" },
+		);
+		const exitCode = await child.exited;
+		const stderr = await new Response(child.stderr).text();
+		if (exitCode !== 0) throw new Error(stderr);
+		const summary = (await Bun.file(path.join(dir, "summary.json")).json()) as { command: string[] };
+		expect(summary.command).toContain("--cwd=packages/coding-agent");
+		expect(summary.command).toContain("src/cli.ts");
+		expect((await Bun.file(path.join(dir, "heartbeat.txt")).text()).trim()).not.toBe("");
+	});
 });

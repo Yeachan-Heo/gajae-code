@@ -122,6 +122,24 @@ def terminate(pid: int, grace: float) -> dict[str, object]:
     return result
 
 
+def instrumented_command(command: list[str], preload: pathlib.Path, repo: pathlib.Path) -> list[str]:
+    executable_name = pathlib.Path(command[0]).name
+    if executable_name not in {"bun", "bunx"}:
+        return command
+    if executable_name == "bun" and command[1:3] == ["run", "dev"]:
+        remaining = command[3:]
+        if remaining[:1] == ["--"]:
+            remaining = remaining[1:]
+        return [
+            command[0],
+            f"--preload={preload}",
+            "--cwd=packages/coding-agent",
+            "src/cli.ts",
+            *remaining,
+        ]
+    return [command[0], f"--preload={preload}", *command[1:]]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--duration", type=float, default=120.0)
@@ -159,10 +177,7 @@ def main() -> int:
             "GJC_ISSUE4481_HEARTBEAT_PATH": str(heartbeat_path),
         }
     )
-    command = args.command
-    executable_name = pathlib.Path(command[0]).name
-    if executable_name in {"bun", "bunx"}:
-        command = [command[0], f"--preload={preload}", *command[1:]]
+    command = instrumented_command(args.command, preload, repo)
     pid, master = pty.fork()
     if pid == 0:
         os.chdir(repo)
