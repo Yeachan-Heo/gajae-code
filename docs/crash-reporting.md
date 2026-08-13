@@ -73,8 +73,29 @@ attempted and pre-feature records are not reportable through this flow.
   or dismissed entries; when nothing is evictable the compactor stops adding new entries
   and records an overflow marker that `gjc crash report` surfaces.
 - `lifetimeCount` (from the journal, monotonic) and `retainedCount` (recomputed from the
-  identity markers still present in the capped crash log) are tracked separately, so the
-  512 KiB crash-log cap reset cannot silently deflate a signature's history.
+  identity-bearing records still present in the capped crash log) are tracked separately,
+  so the 512 KiB crash-log cap reset cannot silently deflate a signature's history. A
+  retained count is capped at the lifetime count, because an index whose retained count
+  exceeds its lifetime count is rejected by the reader and quarantined whole. Both numbers
+  are therefore counted occurrences and matched records — not a census of the log file, in
+  which a signature whose journal events were lost can hold more records than were counted.
+- **Adoption from the log.** A journal event can be missing while its record is not: the
+  append can fail, the fatal latch spends its one append on the first fatal of a process,
+  and a quarantined index is rebuilt from a journal the previous compaction already
+  drained. For a fingerprint the index has never seen, compaction adopts the last usable
+  identity-bearing log record so the crash is reportable at all. Adoption creates a
+  signature; it is not a second counter. The adopted record counts as the one occurrence
+  it is and every later occurrence is counted by the journal, so a recovered signature's
+  count is a lower bound, never inflated. The adopted record is remembered on its own
+  entry, so the journal line it never got is recognised as the same crash whenever it
+  arrives — which keeps the bounded dedupe window free for journal ids. Adoption refuses a
+  fingerprint that was evicted after being reported or dismissed, which must not come back
+  unreported, and refuses a record whose identity line is not where the crash writer puts
+  it, since throwable text can contain a line that looks like one. That placement rule is
+  not authentication: a local crash message that reproduces the whole record framing can
+  still name a signature, and nothing in this file is a capability. Records with no
+  identity line stay unmatchable, and bare identity lines that no record header frames are
+  ignored entirely.
 - Multi-account installs that symlink one agent dir **share this state deliberately**:
   the scope is the agent dir, exactly like the crash log itself.
 

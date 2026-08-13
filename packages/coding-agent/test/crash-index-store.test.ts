@@ -44,6 +44,15 @@ function recordId(seed: number): string {
 	return seed.toString(16).padStart(16, "0");
 }
 
+/** One identity-bearing crash-log record, exactly as `recordFatalCrash` writes it. */
+function logRecord(seed: number, id: number, iso: string): string {
+	return (
+		`${iso} pid=1 [Uncaught Exception] Error: shared topic authority unavailable\n` +
+		`    at <anonymous> (telegram-daemon.ts:1:1)\n` +
+		`${formatCrashRecordMarker(fingerprintFor(seed), 1, recordId(id))}\n\n`
+	);
+}
+
 describe("compactCrashIndex", () => {
 	it("counts every journaled occurrence exactly once, including across repeated compactions", async () => {
 		const paths = await tempPaths();
@@ -86,6 +95,327 @@ describe("compactCrashIndex", () => {
 		const index = await compactCrashIndex({ paths, now: NOW });
 		expect(index.signatures[fingerprintFor(3)]?.lifetimeCount).toBe(4);
 		expect(index.signatures[fingerprintFor(3)]?.retainedCount).toBe(1);
+	});
+
+	it("recovers a signature from identity-bearing log records whose journal events were lost", async () => {
+		const paths = await tempPaths();
+		// The fatal journal latches after the first append, so a process that dies
+		// twice writes two records and one event. Here both events are missing.
+		await fs.writeFile(
+			paths.crashLog,
+			`${logRecord(20, 100, "2026-08-11T12:00:00.000Z")}${logRecord(20, 101, "2026-08-11T13:00:00.000Z")}`,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		// The journal stays the only thing that advances a count, so a recovered
+		// signature reports the one adopted occurrence as a lower bound.
+		const entry = index.signatures[fingerprintFor(20)];
+		expect(entry).toBeDefined();
+		expect(entry?.lifetimeCount).toBe(1);
+		expect(entry?.retainedCount).toBe(1);
+		expect(entry?.errorName).toBe("Error");
+		expect(entry?.messageClass).toBe("shared topic authority unavailable");
+		expect(entry?.firstSeen).toBe(Date.parse("2026-08-11T12:00:00.000Z"));
+		expect(entry?.lastSeen).toBe(Date.parse("2026-08-11T13:00:00.000Z"));
+		expect(entry?.lastRecordId).toBe(recordId(101));
+	});
+
+	it("never offers a record that carries no identity line", async () => {
+		const paths = await tempPaths();
+		await fs.writeFile(
+			paths.crashLog,
+			"2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] Error: legacy record\n\n",
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(Object.keys(index.signatures)).toHaveLength(0);
+	});
+
+	it("caps the retained count at the journaled lifetime so the written index survives its own parser", async () => {
+		const paths = await tempPaths();
+		appendCrashEvent(occurrence(fingerprintFor(21), recordId(200)), paths.events);
+		await fs.writeFile(
+			paths.crashLog,
+			`${logRecord(21, 200, "2026-08-11T12:00:00.000Z")}${logRecord(21, 201, "2026-08-11T12:30:00.000Z")}` +
+				logRecord(21, 202, "2026-08-11T13:00:00.000Z"),
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(21)]?.lifetimeCount).toBe(1);
+		expect(index.signatures[fingerprintFor(21)]?.retainedCount).toBe(1);
+		// A retained count above the lifetime count is rejected by `parseCrashIndex`,
+		// so emitting one would quarantine the index on the next read.
+		expect(parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW)).toBeDefined();
+	});
+
+	it("does not double count a recovered record when its journal event is merged later", async () => {
+		const paths = await tempPaths();
+		await fs.writeFile(paths.crashLog, logRecord(22, 300, "2026-08-11T12:00:00.000Z"));
+		expect((await compactCrashIndex({ paths, now: NOW })).signatures[fingerprintFor(22)]?.lifetimeCount).toBe(1);
+
+		appendCrashEvent(occurrence(fingerprintFor(22), recordId(300)), paths.events);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[fingerprintFor(22)]?.lifetimeCount).toBe(1);
+	});
+
+	it("adopts a record whose message carries control characters without quarantining the index", async () => {
+		const paths = await tempPaths();
+		await fs.writeFile(
+			paths.crashLog,
+			"2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] Error: spawn\u001b[31m failed\tretry\n" +
+				`${formatCrashRecordMarker(fingerprintFor(23), 1, recordId(500))}\n\n`,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(23)]?.messageClass).toBe("spawn [31m failed retry");
+		expect(parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW)).toBeDefined();
+	});
+
+	it("keeps the occurrence dedupe window intact while adopting a log full of unseen signatures", async () => {
+		const paths = await tempPaths();
+		appendCrashEvent(occurrence(fingerprintFor(30), recordId(400)), paths.events);
+		await compactCrashIndex({ paths, now: NOW });
+
+		// Far more unseen signatures than the index can hold, so a per-record
+		// adoption would flush the bounded dedupe window.
+		let log = "";
+		for (let seed = 1000; seed < 1300; seed++) log += logRecord(seed, seed, "2026-08-11T12:00:00.000Z");
+		await fs.writeFile(paths.crashLog, log);
+		await compactCrashIndex({ paths, now: NOW });
+
+		// A re-merged journal line for an already-counted record must still dedupe.
+		appendCrashEvent(occurrence(fingerprintFor(30), recordId(400)), paths.events);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[fingerprintFor(30)]?.lifetimeCount).toBe(1);
+	});
+
+	it("ignores bare identity lines that no record header frames", async () => {
+		const paths = await tempPaths();
+		appendCrashEvent(occurrence(fingerprintFor(24), recordId(600)), paths.events);
+		let log = logRecord(24, 600, "2026-08-11T12:00:00.000Z");
+		// A rewritten log can repeat an identity line without the record it claims;
+		// reporting could never load those, so they must not count as crashes.
+		for (let extra = 0; extra < 40; extra++)
+			log += `${formatCrashRecordMarker(fingerprintFor(24), 1, recordId(601 + extra))}\n`;
+		await fs.writeFile(paths.crashLog, log);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(24)]?.lifetimeCount).toBe(1);
+		expect(index.signatures[fingerprintFor(24)]?.retainedCount).toBe(1);
+	});
+
+	it("refuses a record whose message only fits before JSON escaping", async () => {
+		const paths = await tempPaths();
+		await fs.writeFile(
+			paths.crashLog,
+			`2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] Error: ${'\\"'.repeat(256)}\n` +
+				`${formatCrashRecordMarker(fingerprintFor(25), 1, recordId(700))}\n\n`,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(25)]).toBeUndefined();
+		expect(parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW)).toBeDefined();
+	});
+
+	it("falls back to an older record when the newest one cannot be adopted", async () => {
+		const paths = await tempPaths();
+		await fs.writeFile(
+			paths.crashLog,
+			logRecord(29, 1300, "2026-08-11T12:00:00.000Z") +
+				`2026-08-11T13:00:00.000Z pid=1 [Uncaught Exception] Error: ${'\\"'.repeat(256)}\n` +
+				`${formatCrashRecordMarker(fingerprintFor(29), 1, recordId(1301))}\n\n`,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		// The newest record of this signature is unusable; the older one still proves
+		// the crash, so the signature must not be starved.
+		expect(index.signatures[fingerprintFor(29)]?.lastRecordId).toBe(recordId(1300));
+		expect(parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW)).toBeDefined();
+	});
+
+	it("adopts a signature whose journal event was refused while the index was full", async () => {
+		const paths = await tempPaths();
+		for (let seed = 1; seed <= CRASH_INDEX_MAX_SIGNATURES; seed++)
+			appendCrashEvent(occurrence(fingerprintFor(seed), recordId(seed), NOW - seed * 1000), paths.events);
+		await compactCrashIndex({ paths, now: NOW });
+
+		// The event for an unseen signature is refused because nothing is evictable.
+		appendCrashEvent(occurrence(fingerprintFor(3000), recordId(1400)), paths.events);
+		await fs.writeFile(paths.crashLog, logRecord(3000, 1400, "2026-08-11T12:00:00.000Z"));
+		expect((await compactCrashIndex({ paths, now: NOW })).signatures[fingerprintFor(3000)]).toBeUndefined();
+
+		// Room appears. A refused occurrence was never counted, so its id must not
+		// suppress the recovery its crash-log record still makes possible.
+		await recordCrashStateEvent(
+			{
+				kind: "reported",
+				fingerprint: fingerprintFor(5),
+				at: NOW,
+				issueUrl: "https://github.com/Yeachan-Heo/gajae-code/issues/1",
+			},
+			{ paths, now: NOW },
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[fingerprintFor(3000)]?.lifetimeCount).toBe(1);
+	});
+
+	it("does not displace a journaled occurrence id when a full index refuses an adoption", async () => {
+		const paths = await tempPaths();
+		// Fill the index with unreported signatures, which are never evictable.
+		for (let seed = 1; seed <= CRASH_INDEX_MAX_SIGNATURES; seed++)
+			appendCrashEvent(occurrence(fingerprintFor(seed), recordId(seed), NOW - seed * 1000), paths.events);
+		await compactCrashIndex({ paths, now: NOW });
+
+		await fs.writeFile(paths.crashLog, logRecord(2000, 800, "2026-08-11T12:00:00.000Z"));
+		const refused = await compactCrashIndex({ paths, now: NOW });
+		expect(refused.signatures[fingerprintFor(2000)]).toBeUndefined();
+		expect(refused.recentEventIds).toContain(recordId(1));
+
+		// The displaced id would otherwise be counted a second time here.
+		appendCrashEvent(occurrence(fingerprintFor(1), recordId(1), NOW - 1000), paths.events);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(1);
+	});
+
+	it("counts a record written after journal rotation exactly once for an existing signature", async () => {
+		const paths = await tempPaths();
+		appendCrashEvent(occurrence(fingerprintFor(26), recordId(1000)), paths.events);
+		await fs.writeFile(paths.crashLog, logRecord(26, 1000, "2026-08-11T12:00:00.000Z"));
+		expect((await compactCrashIndex({ paths, now: NOW })).signatures[fingerprintFor(26)]?.lifetimeCount).toBe(1);
+
+		// A fatal lands its log record after the journal was rotated aside; its event
+		// is only drained by the next compaction.
+		await fs.appendFile(paths.crashLog, logRecord(26, 1001, "2026-08-11T12:05:00.000Z"));
+		await compactCrashIndex({ paths, now: NOW });
+		appendCrashEvent(occurrence(fingerprintFor(26), recordId(1001)), paths.events);
+
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[fingerprintFor(26)]?.lifetimeCount).toBe(2);
+	});
+
+	it("counts a record id repeated under two fingerprints once per signature", async () => {
+		const paths = await tempPaths();
+		// A rewritten log can repeat one record id under two fingerprints. Neither may
+		// be counted twice, and neither may suppress the other.
+		await fs.writeFile(
+			paths.crashLog,
+			`${logRecord(27, 1200, "2026-08-11T12:00:00.000Z")}${logRecord(28, 1200, "2026-08-11T12:30:00.000Z")}`,
+		);
+		await compactCrashIndex({ paths, now: NOW });
+		appendCrashEvent(occurrence(fingerprintFor(27), recordId(1200)), paths.events);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(27)]?.lifetimeCount).toBe(1);
+		expect(index.signatures[fingerprintFor(28)]?.lifetimeCount).toBe(1);
+		expect(parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW)).toBeDefined();
+	});
+
+	it("never resurrects a reported signature that this compaction evicted", async () => {
+		const paths = await tempPaths();
+		for (let seed = 1; seed <= CRASH_INDEX_MAX_SIGNATURES; seed++)
+			appendCrashEvent(occurrence(fingerprintFor(seed), recordId(seed), NOW - seed * 1000), paths.events);
+		await compactCrashIndex({ paths, now: NOW });
+		await recordCrashStateEvent(
+			{
+				kind: "reported",
+				fingerprint: fingerprintFor(9),
+				at: NOW,
+				issueUrl: "https://github.com/Yeachan-Heo/gajae-code/issues/7",
+			},
+			{ paths, now: NOW },
+		);
+
+		// The log still holds a record for the signature that is about to be evicted
+		// to make room for a new one.
+		await fs.writeFile(paths.crashLog, logRecord(9, 1500, "2026-08-11T12:00:00.000Z"));
+		appendCrashEvent(occurrence(fingerprintFor(4000), recordId(1501)), paths.events);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(4000)]).toBeDefined();
+		// Recreating it would re-offer a crash the user already filed, without the
+		// `reportedAt` that made it evictable.
+		expect(index.signatures[fingerprintFor(9)]).toBeUndefined();
+	});
+
+	it("refuses a record whose message forges a second identity line", async () => {
+		const paths = await tempPaths();
+		await fs.writeFile(
+			paths.crashLog,
+			"2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] Error: forged\n" +
+				`${formatCrashRecordMarker(fingerprintFor(31), 1, recordId(1600))}\n` +
+				`${formatCrashRecordMarker(fingerprintFor(32), 1, recordId(1601))}\n\n`,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(Object.keys(index.signatures)).toHaveLength(0);
+	});
+
+	it("adopts without touching the journal's occurrence dedupe window", async () => {
+		const paths = await tempPaths();
+		appendCrashEvent(occurrence(fingerprintFor(33), recordId(1700)), paths.events);
+		const before = await compactCrashIndex({ paths, now: NOW });
+		const window = [...before.recentEventIds];
+
+		let log = "";
+		for (let seed = 5000; seed < 5100; seed++) log += logRecord(seed, seed, "2026-08-11T12:00:00.000Z");
+		await fs.writeFile(paths.crashLog, log);
+		const after = await compactCrashIndex({ paths, now: NOW });
+
+		// Displacing a journaled id would let a replay count that crash a second time.
+		expect(after.recentEventIds).toEqual(window);
+	});
+
+	it("dedupes an adopted record even after a later occurrence overwrote the last record id", async () => {
+		const paths = await tempPaths();
+		await fs.writeFile(paths.crashLog, logRecord(34, 1800, "2026-08-11T12:00:00.000Z"));
+		await compactCrashIndex({ paths, now: NOW });
+
+		// A genuinely new occurrence arrives before the adopted record's own delayed
+		// journal line, so `lastRecordId` no longer names the adopted record.
+		appendCrashEvent(occurrence(fingerprintFor(34), recordId(1801)), paths.events);
+		expect((await compactCrashIndex({ paths, now: NOW })).signatures[fingerprintFor(34)]?.lifetimeCount).toBe(2);
+
+		appendCrashEvent(occurrence(fingerprintFor(34), recordId(1800)), paths.events);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[fingerprintFor(34)]?.lifetimeCount).toBe(2);
+	});
+
+	it("never resurrects a reported signature evicted by an earlier compaction", async () => {
+		const paths = await tempPaths();
+		for (let seed = 1; seed <= CRASH_INDEX_MAX_SIGNATURES; seed++)
+			appendCrashEvent(occurrence(fingerprintFor(seed), recordId(seed), NOW - seed * 1000), paths.events);
+		await compactCrashIndex({ paths, now: NOW });
+		await recordCrashStateEvent(
+			{
+				kind: "reported",
+				fingerprint: fingerprintFor(11),
+				at: NOW,
+				issueUrl: "https://github.com/Yeachan-Heo/gajae-code/issues/11",
+			},
+			{ paths, now: NOW },
+		);
+		appendCrashEvent(occurrence(fingerprintFor(4100), recordId(1900)), paths.events);
+		expect((await compactCrashIndex({ paths, now: NOW })).signatures[fingerprintFor(11)]).toBeUndefined();
+
+		// A later compaction still sees the evicted signature's records in the log.
+		await fs.writeFile(paths.crashLog, logRecord(11, 1901, "2026-08-11T12:00:00.000Z"));
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[fingerprintFor(11)]).toBeUndefined();
+	});
+
+	it("refuses a forged identity line that a blank line follows", async () => {
+		const paths = await tempPaths();
+		await fs.writeFile(
+			paths.crashLog,
+			"2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] Error: forged\n" +
+				`${formatCrashRecordMarker(fingerprintFor(35), 1, recordId(2000))}\n\n` +
+				"    at frame (x.ts:1:1)\n" +
+				`${formatCrashRecordMarker(fingerprintFor(36), 1, recordId(2001))}\n\n`,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		// The identity line a crash message chose is followed by more record text, so
+		// it did not close a record and must not create a signature.
+		expect(index.signatures[fingerprintFor(35)]).toBeUndefined();
 	});
 
 	it("never evicts an unreported signature and records an overflow marker instead", async () => {

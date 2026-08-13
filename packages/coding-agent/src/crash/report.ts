@@ -120,7 +120,7 @@ export function buildCrashReportBody(input: BuildCrashReportBodyInput): Sanitize
 		`Crash-derived text below is sanitized (paths, URLs, credentials and control characters removed) ` +
 		`and carries no pid or exact timestamps.\n\n` +
 		`- Signature: \`${CRASH_ISSUE_MARKER_PREFIX}${signature.fingerprint}\` (algorithm v${signature.fpv})\n` +
-		`- Occurrences: ${signature.lifetimeCount} lifetime, ${signature.retainedCount} still in the local crash log\n` +
+		`- Occurrences: ${signature.lifetimeCount} counted, ${signature.retainedCount} matched in the local crash log\n` +
 		`- First seen: ${coarseDate(signature.firstSeen)} — last seen: ${coarseDate(signature.lastSeen)}\n` +
 		`- Error class: \`${fenceCrashText(errorName.value)}\`\n` +
 		`- Normalized message class:\n\n\`\`\`\n${fenceCrashText(messageClass.value)}\n\`\`\``;
@@ -315,7 +315,7 @@ function describeSignature(signature: CrashSignatureView): string {
 	const acknowledged = signature.acknowledgedAt !== undefined ? ", dismissed" : "";
 	return (
 		`${signature.fingerprint}  ${signature.errorName}: ${signature.messageClass.slice(0, 80)}\n` +
-		`    ${signature.lifetimeCount}x (${signature.retainedCount} retained), ` +
+		`    ${signature.lifetimeCount}x (${signature.retainedCount} matched), ` +
 		`${coarseDate(signature.firstSeen)} → ${coarseDate(signature.lastSeen)}, fpv:${signature.fpv}, ${reported}${acknowledged}`
 	);
 }

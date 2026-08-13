@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { formatCrashRecordMarker } from "@gajae-code/utils";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { formatCrashRecordMarker, postmortem } from "@gajae-code/utils";
 import { findLatestRecord, parseCrashRecords } from "../src/crash/record-loader";
 
 const FP_A = "a".repeat(32);
@@ -60,5 +63,32 @@ describe("parseCrashRecords", () => {
 	it("ignores a forged marker that has no record header before it", () => {
 		const log = `${formatCrashRecordMarker(FP_A, 1, "0123456789abcdef")}\n`;
 		expect(parseCrashRecords(log)).toHaveLength(0);
+	});
+
+	it("marks a record whose identity line is not where the writer puts it", () => {
+		// Throwable text can contain a line that looks like an identity line, and the
+		// first one ends the record — so the identity of an unterminated record is one
+		// the crash message chose.
+		const forged =
+			"2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] Error: forged\n" +
+			`${formatCrashRecordMarker(FP_A, 1, "0123456789abcdef")}\n` +
+			`${formatCrashRecordMarker(FP_B, 1, "fedcba9876543210")}\n\n`;
+		expect(parseCrashRecords(forged).map(entry => entry.wellTerminated)).toEqual([false]);
+	});
+
+	it("treats records the crash writer produced as well terminated", () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-crash-loader-"));
+		const target = path.join(directory, "gjc-crash.log");
+		try {
+			postmortem.recordFatalCrash("Uncaught Exception", new Error("first failure\nwith a second line"), {
+				path: target,
+			});
+			postmortem.recordFatalCrash("Unhandled Rejection", new Error("second failure"), { path: target });
+			const records = parseCrashRecords(fs.readFileSync(target, "utf8"));
+			expect(records).toHaveLength(2);
+			expect(records.every(entry => entry.wellTerminated)).toBe(true);
+		} finally {
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });

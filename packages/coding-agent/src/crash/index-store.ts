@@ -9,7 +9,10 @@
  *
  * Increments come from the append-only journal, not from this file, so a lost,
  * hostile or concurrently-rewritten index can never silently deflate counts —
- * it is rebuilt from the journal instead.
+ * it is rebuilt from the journal instead. A signature the journal never recorded
+ * is adopted from the crash log's own identity-bearing records so the crash stays
+ * reportable, but adoption creates the signature and counts the one record it
+ * adopts; it never becomes a second source of increments.
  */
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -23,9 +26,9 @@ import {
 	getCrashLogPath,
 	isEnoent,
 	parseCrashEventLine,
-	parseCrashRecordMarker,
 } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
+import { type LoadedCrashRecord, parseCrashRecords } from "./record-loader";
 
 export const CRASH_INDEX_VERSION = 1;
 /** Per-entry message preview cap. */
@@ -40,6 +43,8 @@ export const CRASH_INDEX_MAX_SIGNATURES = 128;
 export const CRASH_INDEX_MAX_QUARANTINE = 3;
 /** Dedupe window for occurrence ids, so a re-merged journal cannot double-count. */
 const RECENT_EVENT_ID_LIMIT = 256;
+/** Newest log records kept per unseen signature as adoption fallbacks. */
+const ADOPTION_CANDIDATES_PER_SIGNATURE = 4;
 /** Timestamps outside this window are hostile-but-valid JSON and are rejected. */
 const MIN_TIMESTAMP_MS = Date.UTC(2020, 0, 1);
 const MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
@@ -63,6 +68,12 @@ export interface CrashSignatureEntry {
 	firstSeen: number;
 	lastSeen: number;
 	lastRecordId: string;
+	/**
+	 * The crash-log record this signature was recovered from, when the journal
+	 * never recorded it. Unlike `lastRecordId` it is never overwritten, so the
+	 * adopted occurrence stays deduped even after later occurrences arrive.
+	 */
+	adoptedRecordId?: string;
 	reportedAt?: number;
 	reportedIssueUrl?: string;
 	acknowledgedAt?: number;
@@ -78,6 +89,12 @@ export interface CrashIndex {
 	/** True when a new signature could not be stored because nothing was evictable. */
 	overflow: boolean;
 	recentEventIds: string[];
+	/**
+	 * Fingerprints of reported or dismissed signatures that were evicted for
+	 * capacity. Their crash-log records outlive them, and adoption must not turn
+	 * one back into an unreported signature and re-offer a filed crash.
+	 */
+	dismissed: string[];
 	signatures: Record<string, CrashSignatureEntry>;
 }
 
@@ -102,6 +119,7 @@ export function emptyCrashIndex(): CrashIndex {
 		lastNudgedAt: 0,
 		overflow: false,
 		recentEventIds: [],
+		dismissed: [],
 		signatures: Object.create(null) as Record<string, CrashSignatureEntry>,
 	};
 }
@@ -119,14 +137,27 @@ const ENTRY_KEYS = new Set([
 	"firstSeen",
 	"lastSeen",
 	"lastRecordId",
+	"adoptedRecordId",
 	"reportedAt",
 	"reportedIssueUrl",
 	"acknowledgedAt",
 	"commentedIssues",
 ]);
-const INDEX_KEYS = new Set(["version", "updatedAt", "lastNudgedAt", "overflow", "recentEventIds", "signatures"]);
+const INDEX_KEYS = new Set([
+	"version",
+	"updatedAt",
+	"lastNudgedAt",
+	"overflow",
+	"recentEventIds",
+	"dismissed",
+	"signatures",
+]);
+/** Fingerprints remembered as evicted-after-report, so adoption cannot undo a filing. */
+const DISMISSED_FINGERPRINT_LIMIT = 64;
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
+const RECORD_ID_PATTERN = /^[0-9a-f]{8,32}$/;
+const CONTROL_CHARS_GLOBAL = /[\u0000-\u001f\u007f-\u009f]/g;
 
 function isCleanString(value: unknown, maxBytes: number): value is string {
 	return typeof value === "string" && !CONTROL_CHARS.test(value) && Buffer.byteLength(value, "utf8") <= maxBytes;
@@ -166,6 +197,11 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 	if (!isTimestamp(raw.firstSeen, now) || !isTimestamp(raw.lastSeen, now)) return undefined;
 	if (raw.lastSeen < raw.firstSeen) return undefined;
 	if (typeof raw.lastRecordId !== "string" || !/^[0-9a-f]{8,32}$/.test(raw.lastRecordId)) return undefined;
+	if (
+		raw.adoptedRecordId !== undefined &&
+		(typeof raw.adoptedRecordId !== "string" || !RECORD_ID_PATTERN.test(raw.adoptedRecordId))
+	)
+		return undefined;
 	if (raw.reportedAt !== undefined && !isTimestamp(raw.reportedAt, now)) return undefined;
 	if (raw.acknowledgedAt !== undefined && !isTimestamp(raw.acknowledgedAt, now)) return undefined;
 	if (raw.reportedIssueUrl !== undefined && !isCleanString(raw.reportedIssueUrl, 256)) return undefined;
@@ -183,6 +219,7 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 		lastSeen: raw.lastSeen,
 		lastRecordId: raw.lastRecordId,
 	};
+	if (raw.adoptedRecordId !== undefined) entry.adoptedRecordId = raw.adoptedRecordId;
 	if (raw.reportedAt !== undefined) entry.reportedAt = raw.reportedAt;
 	if (raw.reportedIssueUrl !== undefined) entry.reportedIssueUrl = raw.reportedIssueUrl;
 	if (raw.acknowledgedAt !== undefined) entry.acknowledgedAt = raw.acknowledgedAt;
@@ -212,7 +249,13 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 	if (body.lastNudgedAt !== 0 && !isTimestamp(body.lastNudgedAt, now)) return undefined;
 	if (typeof body.overflow !== "boolean") return undefined;
 	if (!Array.isArray(body.recentEventIds) || body.recentEventIds.length > RECENT_EVENT_ID_LIMIT) return undefined;
-	if (!body.recentEventIds.every(id => typeof id === "string" && /^[0-9a-f]{8,32}$/.test(id))) return undefined;
+	if (!body.recentEventIds.every(id => typeof id === "string" && RECORD_ID_PATTERN.test(id))) return undefined;
+	// Absent in an index written before adoption existed: an upgrade must not
+	// quarantine a valid file and lose its history.
+	const dismissed = body.dismissed ?? [];
+	if (!Array.isArray(dismissed) || dismissed.length > DISMISSED_FINGERPRINT_LIMIT) return undefined;
+	if (!dismissed.every(fingerprint => typeof fingerprint === "string" && CRASH_FINGERPRINT_PATTERN.test(fingerprint)))
+		return undefined;
 	if (!body.signatures || typeof body.signatures !== "object" || Array.isArray(body.signatures)) return undefined;
 
 	const signatures = Object.create(null) as Record<string, CrashSignatureEntry>;
@@ -231,6 +274,7 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 		lastNudgedAt: body.lastNudgedAt as number,
 		overflow: body.overflow,
 		recentEventIds: [...(body.recentEventIds as string[])],
+		dismissed: [...(dismissed as string[])],
 		signatures,
 	};
 }
@@ -316,6 +360,13 @@ function evictOne(index: CrashIndex): boolean {
 	}
 	if (!victim) return false;
 	delete index.signatures[victim];
+	// An evicted signature is still named by the records the crash log holds, and
+	// only a reported or dismissed signature is ever evictable. The eviction has to
+	// outlive this compaction, or adoption would later recreate the signature
+	// without the `reportedAt` that made it evictable — re-offering a filed crash.
+	if (!index.dismissed.includes(victim)) index.dismissed.push(victim);
+	if (index.dismissed.length > DISMISSED_FINGERPRINT_LIMIT)
+		index.dismissed.splice(0, index.dismissed.length - DISMISSED_FINGERPRINT_LIMIT);
 	return true;
 }
 
@@ -350,20 +401,26 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 
 	// occurrence
 	if (index.recentEventIds.includes(event.recordId)) return false;
-	index.recentEventIds.push(event.recordId);
-	if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
-		index.recentEventIds.splice(0, index.recentEventIds.length - RECENT_EVENT_ID_LIMIT);
 	if (existing) {
+		// A record id names exactly one crash record. The record an entry was built
+		// from is therefore never a second occurrence, and an adopted record stays
+		// deduped for the entry's whole life — the bounded window cannot, and
+		// `lastRecordId` is overwritten by every later occurrence.
+		if (existing.lastRecordId === event.recordId || existing.adoptedRecordId === event.recordId) return false;
 		existing.lifetimeCount += 1;
 		existing.lastSeen = Math.max(existing.lastSeen, event.at);
 		existing.firstSeen = Math.min(existing.firstSeen, event.at);
 		existing.lastRecordId = event.recordId;
 		if (event.messageClass) existing.messageClass = boundMessageClass(event.messageClass);
+		rememberOccurrenceId(index, event.recordId);
 		return true;
 	}
 	if (Object.keys(index.signatures).length >= CRASH_INDEX_MAX_SIGNATURES && !evictOne(index)) {
 		// Nothing evictable: stop adding new entries and surface the overflow in
-		// `gjc crash report` rather than dropping an unreported signature.
+		// `gjc crash report` rather than dropping an unreported signature. The id is
+		// deliberately not remembered: an occurrence that was refused was not counted,
+		// and remembering it would suppress the same crash's later recovery from the
+		// crash log once the index has room again.
 		index.overflow = true;
 		return false;
 	}
@@ -377,7 +434,15 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 		lastSeen: event.at,
 		lastRecordId: event.recordId,
 	};
+	rememberOccurrenceId(index, event.recordId);
 	return true;
+}
+
+/** Record a counted occurrence id in the bounded dedupe window. */
+function rememberOccurrenceId(index: CrashIndex, recordId: string): void {
+	index.recentEventIds.push(recordId);
+	if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
+		index.recentEventIds.splice(0, index.recentEventIds.length - RECENT_EVENT_ID_LIMIT);
 }
 
 /**
@@ -387,16 +452,126 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
  * log is capped and reset, so retained counts are re-derived from what the log
  * actually still holds. That separation keeps a log reset from deflating a
  * signature's history.
+ *
+ * Only structurally framed records count. A bare marker line — an identity line
+ * with no record header above it — names a record that reporting could never
+ * load, so counting it would let a rewritten log inflate a signature's history.
+ * Record ids are deduped for the same reason.
+ *
+ * The count is capped at `lifetimeCount`, which the journal alone advances. The
+ * cap is not cosmetic: `parseEntry` rejects `retainedCount > lifetimeCount`, so
+ * a log that still holds more records than the journal ever counted would make
+ * compaction write a file it must quarantine on the next read.
  */
-async function recomputeRetainedCounts(index: CrashIndex, crashLogPath: string): Promise<void> {
+function recomputeRetainedCounts(index: CrashIndex, records: readonly LoadedCrashRecord[]): void {
 	for (const entry of Object.values(index.signatures)) entry.retainedCount = 0;
-	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
-	if (contents === undefined) return;
-	for (const line of contents.split("\n")) {
-		const marker = parseCrashRecordMarker(line);
-		if (!marker) continue;
-		const entry = index.signatures[marker.fingerprint];
+	const counted = new Set<string>();
+	for (const record of records) {
+		if (counted.has(record.recordId)) continue;
+		counted.add(record.recordId);
+		const entry = index.signatures[record.fingerprint];
 		if (entry) entry.retainedCount += 1;
+	}
+	for (const entry of Object.values(index.signatures))
+		entry.retainedCount = Math.min(entry.retainedCount, entry.lifetimeCount);
+}
+
+/**
+ * Adopt signatures for identity-bearing log records the index has never seen.
+ *
+ * The journal is the counter, but it is not the only witness: an append can
+ * fail, the fatal path latches after one event per process, and a quarantined
+ * index is rebuilt from a journal that compaction already consumed. In each
+ * case a `gjc-crash-record.v1` record still names its own fingerprint, and
+ * dropping it means the crash can never be reported at all.
+ *
+ * Only marker-bearing records are adopted — records written before that line
+ * existed stay `unmatchable`, exactly as the loader promises.
+ *
+ * Adoption creates a signature; it does not become a second counter. Exactly
+ * one record per newly seen fingerprint is adopted, the newest, and it counts
+ * as the one occurrence it is. Every later occurrence of that signature is
+ * counted by the journal as usual, and the adopted record's id enters the
+ * occurrence dedupe window so a journal line merged after adoption — the record
+ * written between this compaction's journal rotation and its log read — is
+ * recognised as the same crash instead of being counted twice.
+ *
+ * Consequently a signature whose journal events were lost is reported with a
+ * count that is a lower bound rather than the log's record count. Undercounting
+ * a recovered signature is the deliberate trade: the journal stays the only
+ * thing that advances a count, and the crash becomes reportable at all.
+ */
+function adoptLogOnlySignatures(index: CrashIndex, records: readonly LoadedCrashRecord[], now: number): void {
+	// Fingerprints the journal already accounts for keep the journal as their only
+	// counter; adoption applies to signatures the index has no record of at all.
+	const journaled = new Set(Object.keys(index.signatures));
+	const dismissed = new Set(index.dismissed);
+	const candidates = new Map<string, { newest: LoadedCrashRecord[]; firstSeen: number }>();
+	for (const record of records) {
+		if (journaled.has(record.fingerprint) || dismissed.has(record.fingerprint)) continue;
+		if (record.at === undefined || record.at < MIN_TIMESTAMP_MS || record.at > now + MAX_FUTURE_SKEW_MS) continue;
+		if (!Number.isSafeInteger(record.fpv) || record.fpv < 1 || record.fpv > 999) continue;
+		const previous = candidates.get(record.fingerprint);
+		if (!previous) {
+			candidates.set(record.fingerprint, { newest: [record], firstSeen: record.at });
+			continue;
+		}
+		previous.firstSeen = Math.min(previous.firstSeen, record.at);
+		// The last records in log order, so one unusable record — a message that only
+		// fits before escaping, an unusable error name — cannot starve a signature
+		// that another record of the same crash could still recover. Log order, not
+		// header timestamps: `findLatestRecord` picks the record that renders the
+		// report the same way, and a skewed header must not make the two disagree.
+		previous.newest.unshift(record);
+		if (previous.newest.length > ADOPTION_CANDIDATES_PER_SIGNATURE)
+			previous.newest.length = ADOPTION_CANDIDATES_PER_SIGNATURE;
+	}
+	// Newest first: when the index cannot hold every unseen signature, the recent
+	// crashes are the ones worth keeping.
+	const ordered = [...candidates.values()].sort((a, b) => (b.newest[0]?.at ?? 0) - (a.newest[0]?.at ?? 0));
+	for (const { newest, firstSeen } of ordered) {
+		for (const record of newest) {
+			if (index.recentEventIds.includes(record.recordId)) continue;
+			// Throwable text can contain a line that looks like an identity line, and the
+			// loader ends a record at the first one. A record whose identity line is not
+			// where the writer puts it therefore has an identity a crash message could
+			// have chosen; refuse to create a signature from it.
+			if (!record.wellTerminated) continue;
+			// The log is arbitrary throwable text, but the index is written under a parser
+			// that rejects control characters in any field: an escape sequence or tab in a
+			// crash message would quarantine the whole file on the next read.
+			const headline = record.headline.replace(CONTROL_CHARS_GLOBAL, " ");
+			const separator = headline.indexOf(": ");
+			const errorName = separator > 0 ? headline.slice(0, separator) : headline;
+			if (errorName.length === 0 || Buffer.byteLength(errorName, "utf8") > 128) continue;
+			const entry: CrashSignatureEntry = {
+				fpv: record.fpv,
+				errorName,
+				messageClass: boundMessageClass(separator > 0 ? headline.slice(separator + 2) : ""),
+				lifetimeCount: 1,
+				retainedCount: 0,
+				firstSeen: Math.min(firstSeen, record.at ?? firstSeen),
+				lastSeen: record.at ?? firstSeen,
+				lastRecordId: record.recordId,
+				adoptedRecordId: record.recordId,
+			};
+			// The entry has to survive the strict parser that reads it back. A message of
+			// quotes or backslashes stays under the raw byte cap but doubles when it is
+			// serialized, and an index one byte over the entry cap is quarantined whole.
+			if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) continue;
+			// Capacity is proved before the dedupe window is touched: a refused adoption
+			// must not displace the occurrence id of a journaled record.
+			if (Object.keys(index.signatures).length >= CRASH_INDEX_MAX_SIGNATURES && !evictOne(index)) {
+				index.overflow = true;
+				return;
+			}
+			// The bounded dedupe window is deliberately not touched: displacing a
+			// journaled id there would let a replay count that crash twice. The adopted
+			// id lives in `adoptedRecordId`, which `applyCrashEvent` checks, so this
+			// record stays deduped for as long as the entry exists.
+			index.signatures[record.fingerprint] = entry;
+			break;
+		}
 	}
 }
 
@@ -453,7 +628,12 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 			}
 		}
 
-		await recomputeRetainedCounts(index, paths.crashLog);
+		// One bounded read and one parse serve both passes: adoption and the retained
+		// recount must agree on exactly which records the log still holds.
+		const crashLog = await readNoFollow(paths.crashLog, CRASH_LOG_SCAN_MAX_BYTES);
+		const records = crashLog === undefined ? [] : parseCrashRecords(crashLog);
+		adoptLogOnlySignatures(index, records, now);
+		recomputeRetainedCounts(index, records);
 		index.updatedAt = now;
 		let serialized = `${JSON.stringify(index)}\n`;
 		while (Buffer.byteLength(serialized, "utf8") > CRASH_INDEX_MAX_BYTES && evictOne(index)) {
