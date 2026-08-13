@@ -549,6 +549,11 @@ async function renderContext(context, state) {
       await image(context, `control-${settings.name}`);
       return;
     }
+    if (settings.type === "sshTab") {
+      title(context, wrapKeyText(settings.label || "SSH", 10, 3));
+      await image(context, "control-ssh");
+      return;
+    }
     title(context, "");
     await image(context, `control-${settings.name}`);
     return;
@@ -732,6 +737,15 @@ async function openFixedFolder(settings, context) {
   await createTerminalTab(path, null, context, null);
 }
 
+async function openSshTab(settings, context) {
+  const port = Number(settings.port);
+  const host = String(settings.host || "");
+  const user = String(settings.user || "");
+  const label = String(settings.label || host);
+  if (!host || !user || !Number.isInteger(port) || port < 1 || port > 65535) { alert(context); return; }
+  await createTerminalTab(homedir(), `ssh -p ${port} ${shellQuote(`${user}@${host}`)}`, context, label);
+}
+
 async function openFrequentProject(settings, context) {
   const slot = Number(settings.slot ?? 0);
   const project = slot === 2 ? { path: homedir() } : frequentProjects[slot];
@@ -796,6 +810,7 @@ async function keyUp(context, state, heldMs) {
   if (action === CONTROL_ACTION) {
     if (settings.answerSlot !== undefined && focusedPendingAsk()) { await answerFocusedAsk(Number(settings.answerSlot), { ...context, heldMs }); return; }
     if (settings.type === "cmuxClose") { await closeFocusedCmuxTab(context); return; }
+    if (settings.type === "sshTab") { await openSshTab(settings, context); return; }
     if (settings.type === "fixedFolder") { await openFixedFolder(settings, context); return; }
     if (settings.type === "frequentProject") { await openFrequentProject(settings, context); return; }
     if (settings.type === "newGjcTab") { await openNewGjcSession(context); return; }

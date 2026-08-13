@@ -23,10 +23,11 @@ chmod +x "$plugin_target/bin/plugin" "$plugin_target/bin/worktree-session"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/Profiles"
+cp -R "$profile_source/page-1" "$work/Profiles/D9A7B3B2-7EC5-4A05-AF4D-5F7B8FE99042"
 cp -R "$profile_source/page-2" "$work/Profiles/C8F6A2A1-6DB4-49F4-9E3C-4E6A7ED88931"
 cp -R "$profile_source/page-3" "$work/Profiles/E1C9D4C3-8FD6-4B16-B05E-607C9FAAB153"
 cat > "$work/manifest.json" <<'JSON'
-{"Name":"GJC cmux Control","Pages":{"Current":"c8f6a2a1-6db4-49f4-9e3c-4e6a7ed88931","Default":"c8f6a2a1-6db4-49f4-9e3c-4e6a7ed88931","Pages":["c8f6a2a1-6db4-49f4-9e3c-4e6a7ed88931","e1c9d4c3-8fd6-4b16-b05e-607c9faab153"]},"Version":"3.0"}
+{"Name":"GJC cmux Control","Pages":{"Current":"d9a7b3b2-7ec5-4a05-af4d-5f7b8fe99042","Default":"d9a7b3b2-7ec5-4a05-af4d-5f7b8fe99042","Pages":["d9a7b3b2-7ec5-4a05-af4d-5f7b8fe99042","c8f6a2a1-6db4-49f4-9e3c-4e6a7ed88931","e1c9d4c3-8fd6-4b16-b05e-607c9faab153"]},"Version":"3.0"}
 JSON
 /usr/bin/ditto -c -k --sequesterRsrc "$work" "$HOME/Desktop/$profile_name"
 
