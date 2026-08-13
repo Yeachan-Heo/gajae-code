@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	parseLinuxProcStartTime,
+	parseLinuxProcState,
 	parseLinuxProcTtyDevice,
 	probeLinuxProcPid,
 	probeLinuxProcPidSync,
@@ -74,6 +75,17 @@ describe("parseLinuxProcStartTime", () => {
 	});
 });
 
+describe("parseLinuxProcState", () => {
+	it("returns the exact single-letter process state", () => {
+		expect(parseLinuxProcState(procStat("running", "1234", "0", "", "R"))).toBe("R");
+		expect(parseLinuxProcState(procStat("zombie", "1234", "0", "", "Z"))).toBe("Z");
+	});
+
+	it("rejects malformed process states", () => {
+		expect(parseLinuxProcState(procStat("owner", "1234").replace(") S", ") ZZ"))).toBeNull();
+	});
+});
+
 describe("parseLinuxProcTtyDevice", () => {
 	it("parses field 7 from a valid stat string", () => {
 		expect(parseLinuxProcTtyDevice(procStat("owner", "1234", "2049"))).toBe("2049");
@@ -91,6 +103,7 @@ describe("probeLinuxProcPidSync", () => {
 		const probe = probeLinuxProcPidSync(process.pid);
 		expect(probe.kind).toBe("live");
 		if (probe.kind !== "live") return;
+		expect(probe.state).toMatch(/^[A-Za-z]$/);
 		expect(probe.startTime).toMatch(/^\d+$/);
 		expect(probe.ttyDevice).toMatch(/^-?\d+$/);
 	});

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed ACP `session/delete` retries so a durable artifact `cleanup_pending` result remains authoritative instead of re-closing the already-terminated session and misclassifying an unreaped Linux zombie as unverifiable SIGKILL uncertainty. Broker close now recognizes an identity-matching zombie as exited without weakening PID-reuse checks, and repeated deletes resume the authorized cleanup receipt idempotently.
+
 - Added `/extensions`, an interactive project/global `.gjc` manager for skills, hooks, MCPs, and explicit Claude Code/Codex imports with redacted previews and atomic rollback.
 
 ### Added

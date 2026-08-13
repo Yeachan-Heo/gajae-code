@@ -12,6 +12,7 @@ import * as nodeFsSync from "node:fs";
 import * as nodeFs from "node:fs/promises";
 
 export interface LinuxProcStatIdentity {
+	state?: string;
 	startTime: string;
 	ttyDevice: string;
 }
@@ -40,7 +41,7 @@ function parseLinuxProcIdentity(stat: string | null | undefined): LinuxProcStatI
 	const ttyDevice = fields[4];
 	const startTime = fields[19];
 	if (!ttyDevice || !/^-?\d+$/.test(ttyDevice) || !/^\d+$/.test(startTime)) return null;
-	return { startTime, ttyDevice };
+	return { state: fields[0], startTime, ttyDevice };
 }
 
 function classifyProcReadError(error: unknown): Extract<LinuxProcPidProbeResult, { kind: "absent" | "unverifiable" }> {
@@ -58,6 +59,11 @@ export function parseLinuxProcStartTime(stat: string | null | undefined): string
 /** Parse field 7 (`tty_nr`) from a `/proc/<pid>/stat` record. */
 export function parseLinuxProcTtyDevice(stat: string | null | undefined): string | null {
 	return parseLinuxProcIdentity(stat)?.ttyDevice ?? null;
+}
+
+/** Parse field 3 (single-letter process state) from a `/proc/<pid>/stat` record. */
+export function parseLinuxProcState(stat: string | null | undefined): string | null {
+	return parseLinuxProcIdentity(stat)?.state ?? null;
 }
 
 export function probeLinuxProcPidSync(pid: number): LinuxProcPidProbeResult {

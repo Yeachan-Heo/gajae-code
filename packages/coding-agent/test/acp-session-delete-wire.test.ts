@@ -336,7 +336,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			await fs.promises.writeFile(path.join(artifactsDir, ".oracle.txt"), "artifact");
 
 			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Exact detached artifact removal rejected: cleanup_pending",
+				"Saved session cleanup is pending in artifacts: Exact detached artifact removal rejected: cleanup_pending",
 			);
 			expect(fs.existsSync(sessionPath)).toBe(true);
 			expect(fs.existsSync(artifactsDir)).toBe(false);
@@ -349,7 +349,7 @@ describe("ACP session/delete wire oracle (real subprocess stdio)", () => {
 			);
 
 			await expect(connection.deleteSession({ sessionId })).rejects.toThrow(
-				"Exact detached artifact removal rejected: cleanup_pending",
+				"Saved session cleanup is pending in artifacts: Exact detached artifact removal rejected: cleanup_pending",
 			);
 			expect(fs.existsSync(sessionPath)).toBe(true);
 			const payloadsAfterRetry = (await fs.promises.readdir(path.dirname(sessionPath), { recursive: true })).filter(

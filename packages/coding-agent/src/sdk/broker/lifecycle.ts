@@ -28,6 +28,7 @@ import {
 	type GjcLaunchWorktreePlan,
 	planLaunchWorktree,
 } from "../../gjc-runtime/launch-worktree";
+import { probeLinuxProcPidSync } from "../../gjc-runtime/linux-proc";
 import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -831,6 +832,10 @@ function observeProcess(
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
 	}
+	if (process.platform === "linux") {
+		const probe = probeLinuxProcPidSync(pid);
+		if (probe.kind === "live" && probe.state === "Z") return "exited";
+	}
 	if (!expectedIncarnation) return "uncertain";
 	const actualIncarnation = readIncarnation(pid);
 	if (!actualIncarnation) return "uncertain";
@@ -844,6 +849,41 @@ function hasObservedProcessExit(pid: number): boolean {
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ESRCH";
 	}
+}
+
+type StableProcessExitObserver = {
+	hasExited(): boolean;
+};
+
+/**
+ * Pin the indexed process before shutdown so exit remains observable after it
+ * becomes a zombie. `kill(pid, 0)` and `/proc/<pid>/stat` continue to describe
+ * an unreaped zombie as present, which otherwise makes a timely SIGTERM exit
+ * look unverifiable and incorrectly escalates the close to terminal uncertainty.
+ */
+function stableProcessExitObserver(record: CloseRecord): StableProcessExitObserver | undefined {
+	if (!record.processIncarnation) return undefined;
+	try {
+		const reference = nativeLifecycle().Process.fromPid(record.pid);
+		if (!reference || reference.incarnation !== record.processIncarnation) return undefined;
+		return { hasExited: () => reference.status() === "exited" };
+	} catch {
+		return undefined;
+	}
+}
+
+function observedProcessExited(
+	pid: number,
+	expectedIncarnation: string | undefined,
+	observer: StableProcessExitObserver | undefined,
+): boolean {
+	try {
+		if (observer?.hasExited()) return true;
+	} catch {}
+	if (hasObservedProcessExit(pid)) return true;
+	if (process.platform !== "linux" || !expectedIncarnation?.startsWith("linux:")) return false;
+	const probe = probeLinuxProcPidSync(pid);
+	return probe.kind === "live" && probe.state === "Z" && `linux:${probe.startTime}` === expectedIncarnation;
 }
 
 function isEffectMarker(value: unknown): value is EffectMarker {
@@ -2112,7 +2152,7 @@ async function removeOwnedLifecycleArtifacts(
 		} catch {
 			return false;
 		}
-		if (parsed.pid !== expected.pid || !hasObservedProcessExit(expected.pid)) return false;
+		if (parsed.pid !== expected.pid || observeProcess(expected.pid, expected.incarnation) !== "exited") return false;
 		if (createHash("sha256").update(endpoint.bytes).digest("hex") !== endpoint.digest) return false;
 		const endpointRemoval = exactUnlinkLifecycleFile(
 			endpointSource,
@@ -2513,7 +2553,13 @@ async function hasOwnedEndpointPayload(
 	}
 	return false;
 }
-async function waitForClose(broker: Broker, id: string, record: CloseRecord, timeoutMs: number): Promise<boolean> {
+async function waitForClose(
+	broker: Broker,
+	id: string,
+	record: CloseRecord,
+	timeoutMs: number,
+	processExitObserver?: StableProcessExitObserver,
+): Promise<boolean> {
 	const timing = lifecycleTiming(broker);
 	const deadline = timing.now() + timeoutMs;
 	const durablePlaceholders = new Set<string>();
@@ -2529,7 +2575,7 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 			registration &&
 			broker.index.hostUnregisteredAfter(registration) &&
 			(await endpointRemoved(record.locator.stateRoot, id)) &&
-			hasObservedProcessExit(record.pid) &&
+			observedProcessExited(record.pid, record.processIncarnation, processExitObserver) &&
 			(!record.lifecycleRequestId ||
 				!(await hasOwnedEndpointPayload(
 					record.locator.stateRoot,
@@ -2545,7 +2591,7 @@ async function waitForClose(broker: Broker, id: string, record: CloseRecord, tim
 		// That is exactly the evidence the dead-registration sweep retires records
 		// on, so retire it here too instead of escalating signals at a pid that no
 		// longer exists and then reporting the teardown as unfinished.
-		if (registration && hasObservedProcessExit(record.pid)) {
+		if (registration && observedProcessExited(record.pid, record.processIncarnation, processExitObserver)) {
 			const expected =
 				typeof record.lifecycleRequestId === "string" && typeof record.processIncarnation === "string"
 					? {
@@ -3771,6 +3817,7 @@ async function executeLifecycleResponse(
 			typeof record.lifecycleRequestId === "string" && typeof record.processIncarnation === "string"
 				? { pid: record.pid, effectMarker: record.lifecycleRequestId, incarnation: record.processIncarnation }
 				: undefined;
+		let processExitObserver = stableProcessExitObserver(record);
 
 		let usedSignalFallback = false;
 		let note: string | undefined;
@@ -3844,6 +3891,7 @@ async function executeLifecycleResponse(
 				if (record.lifecycleRequestId === undefined) {
 					usedSignalFallback = true;
 				} else {
+					processExitObserver ??= stableProcessExitObserver(record);
 					const response = await client.control("session.close", {
 						[BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: record.lifecycleRequestId,
 					});
@@ -3877,6 +3925,7 @@ async function executeLifecycleResponse(
 		if (usedSignalFallback) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
+			processExitObserver ??= stableProcessExitObserver(record);
 			const exited =
 				typeof record.processIncarnation === "string" &&
 				observeProcess(record.pid, record.processIncarnation, value =>
@@ -3892,7 +3941,7 @@ async function executeLifecycleResponse(
 			}
 		}
 
-		let closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
+		let closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS, processExitObserver);
 		if (!closed && !usedSignalFallback) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
@@ -3905,7 +3954,7 @@ async function executeLifecycleResponse(
 			}
 			note =
 				"Session acknowledged session.close but graceful teardown did not complete within the bounded deadline; sent SIGTERM to the durably identified session process.";
-			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
+			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS, processExitObserver);
 		}
 		if (!closed) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
@@ -3919,7 +3968,7 @@ async function executeLifecycleResponse(
 			}
 			note =
 				"Session teardown did not complete after SIGTERM within the bounded deadline; sent SIGKILL to the durably identified session process.";
-			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
+			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS, processExitObserver);
 		}
 		if (!closed) {
 			await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);

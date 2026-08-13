@@ -1412,7 +1412,11 @@ export class AcpAgent implements Agent {
 		}
 		this.#beginTeardown(params.sessionId);
 		try {
-			await this.#teardownSession(params.sessionId, "deleted", true);
+			// A retained delete locator proves the prior attempt already completed
+			// connection/process teardown and reached durable artifact cleanup. Re-closing
+			// that terminal session can only replace the authoritative cleanup_pending
+			// result with unrelated close uncertainty, so retries resume deletion directly.
+			await this.#teardownSession(params.sessionId, "deleted", pendingLocator === undefined);
 			let saved = pendingLocator?.cwd === cwd ? pendingLocator.path : undefined;
 			if (!saved) {
 				try {
