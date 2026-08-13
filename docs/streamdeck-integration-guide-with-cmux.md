@@ -247,20 +247,25 @@ open-weights-spark-luna
 
 #### Frequent prompt selector
 
-`PROMPT NAV` taps forward and holds backward through ten repeated operator actions mined from top-level session messages:
+`PROMPT NAV` taps forward and holds backward through twenty concise presets designed around the operator's common implementation, verification, delivery, and workflow lifecycle:
 
 ```text
-CONTINUE
-PR TO DEV
-REVIEW & MERGE
-COMMIT PUSH / PR DEV
-REBASE DEV
-RUN TESTS
-FIX TESTS
-AUDIT DIFF
-CLEANUP
-UPDATE DOCS
+CONTINUE         IMPLEMENT NEXT   ROOT CAUSE
+FIX & VERIFY     FOCUSED TESTS    FULL VERIFY
+AUDIT DIFF       ARCH REVIEW      RED TEAM QA
+CLEANUP          UPDATE DOCS      FIX CI
+REBASE DEV       COMMIT PUSH / PR DEV
+PR TO DEV        REVIEW & MERGE
+FOLLOW-UP DEEP   FOLLOW-UP RALPLAN
+EXECUTE PLAN     HANDOFF SUMMARY
 ```
+
+The workflow follow-up presets deliberately continue existing artifacts instead of creating parallel workflow runs:
+
+- `FOLLOW-UP DEEP`: continue from the latest deep-interview specification and final receipt, addressing unresolved requirements without reopening settled decisions.
+- `FOLLOW-UP RALPLAN`: continue from the latest ralplan final receipt and obey its recorded runtime disposition without producing another plan.
+- `EXECUTE PLAN`: perform the next incomplete step from the approved current plan and record verification evidence.
+- `HANDOFF SUMMARY`: summarize state, decisions, changed files, evidence, blockers, and the exact next action.
 
 `PROMPT SUBMIT` uses three gestures:
 

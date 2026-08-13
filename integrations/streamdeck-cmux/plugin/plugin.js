@@ -9,6 +9,7 @@ import { moveNavigation, recentPaths, selectedNavigationPath } from "./path-navi
 import { moveOption, selectedOption } from "./option-selector.js";
 import { focusedStatusAction } from "./focused-status.js";
 import { DOUBLE_TAP_MS, isDoubleTap, pressGesture, supportsDoubleTap } from "./key-gestures.js";
+import { PROMPT_OPTIONS } from "./prompt-options.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -42,18 +43,6 @@ const SKILL_OPTIONS = [
   { id: "team", label: "TEAM", image: "skill-team" },
 ];
 const THEME_OPTIONS = ["red-claw", "blue-crab", "claude-code", "codex", "gruvbox-dark", "opencode"];
-const PROMPT_OPTIONS = [
-  { id: "continue", label: "CONTINUE", prompt: "continue" },
-  { id: "pr-dev", label: "PR TO DEV", prompt: "make a PR targeting dev and make it LGTM" },
-  { id: "review-merge", label: "REVIEW &\nMERGE", prompt: "review and make it LGTM and merge" },
-  { id: "commit-push-pr", label: "COMMIT PUSH\nPR DEV", prompt: "review the changes, fix any issues, then commit, push, and create or update the PR targeting dev" },
-  { id: "rebase-dev", label: "REBASE DEV", prompt: "rebase onto latest origin/dev, resolve conflicts correctly, run focused verification, and update the PR" },
-  { id: "run-tests", label: "RUN TESTS", prompt: "run the relevant focused tests and fix any failures without suppressing warnings" },
-  { id: "fix-tests", label: "FIX TESTS", prompt: "investigate the failing tests, fix the root cause, and rerun focused verification" },
-  { id: "audit-diff", label: "AUDIT DIFF", prompt: "review the current diff for correctness, regressions, architecture issues, and missing tests; fix concrete findings" },
-  { id: "cleanup", label: "CLEANUP", prompt: "clean up the current implementation by removing obsolete code and unnecessary complexity, then verify behavior" },
-  { id: "update-docs", label: "UPDATE DOCS", prompt: "update the directly affected documentation and runtime guidance to match the implemented behavior" },
-];
 const GJC = process.env.GJC_STREAMDECK_GJC || join(homedir(), ".local", "bin", "gjc");
 const WORKTREE_LAUNCHER = process.env.GJC_STREAMDECK_WORKTREE || join(import.meta.dir, "bin", "worktree-session");
 const KEYBINDINGS_PATH = process.env.GJC_AGENT_DIR ? join(process.env.GJC_AGENT_DIR, "keybindings.json") : join(homedir(), ".gjc", "agent", "keybindings.json");
