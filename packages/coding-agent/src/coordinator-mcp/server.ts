@@ -1937,12 +1937,6 @@ async function writeSessionStateUnlocked(
  * base runtime did use a directory at this path, so the shared implementation reclaims
  * that shape too. Live owners are waited for; dead and malformed ones are reclaimed by
  * that implementation's own liveness and staleness checks.
-/**
- * Lock artifacts (owner records, transition markers, quarantine placeholders) are
- * created as siblings of the locked file by {@link withSessionStateFileLock}.
- * The idempotency record directory must enumerate as parseable records only, so
- * the lock path is kept in a dedicated subdirectory that never participates in
- * record enumeration.
  */
 async function withSessionStateLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
 	try {
