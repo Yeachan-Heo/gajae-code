@@ -50,6 +50,7 @@ export const commands: CommandEntry[] = [
 	{ name: "stats", load: () => import("./commands/stats").then(m => m.default) },
 	{ name: "notify", load: () => import("./commands/notify").then(m => m.default) },
 	{ name: "sdk", load: () => import("./commands/sdk").then(m => m.default) },
+	{ name: "master", load: () => import("./commands/master").then(m => m.default) },
 	{ name: "daemon", load: () => import("./commands/daemon").then(m => m.default) },
 	{ name: "web-search", aliases: ["q"], load: () => import("./commands/web-search").then(m => m.default) },
 	{ name: "local-provider", load: () => import("./commands/local-provider").then(m => m.default) },

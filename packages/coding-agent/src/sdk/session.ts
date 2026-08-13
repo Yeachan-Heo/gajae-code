@@ -108,6 +108,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
+import { createMasterModeExtension } from "../master/extension";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -421,6 +422,10 @@ export interface CreateAgentSessionOptions {
 
 	/** System prompt blocks. Array replaces default, function receives default blocks and returns final blocks. */
 	systemPrompt?: string[] | ((defaultPrompt: string[]) => string[]);
+	/** Master session (`gjc master` / `--master`): appends the master-mode system-prompt
+	 *  section and registers the session-start hook that injects SDK supervision
+	 *  guidance plus the authoritative resident-session inventory. Default: false. */
+	masterMode?: boolean;
 	/** Optional provider-facing session identifier for prompt caches and sticky auth selection.
 	 * Keeps persisted session files isolated while reusing provider-side caches. */
 	providerSessionId?: string;
@@ -2360,6 +2365,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
+		if (options.masterMode === true) {
+			inlineExtensions.push(createMasterModeExtension({ agentDir }));
+		}
 		if (!options.disableExtensionDiscovery) {
 			try {
 				const hookExtensions = await discoverAndLoadHookExtensions(cwd);
@@ -2983,6 +2991,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
 				subagent: options.parentTaskPrefix !== undefined,
+				masterMode: options.masterMode === true,
 			});
 
 			for (const warning of defaultPrompt.warnings) {

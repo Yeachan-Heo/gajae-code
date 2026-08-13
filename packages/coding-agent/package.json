@@ -459,6 +459,14 @@
 			"types": "./src/hindsight/*.ts",
 			"import": "./src/hindsight/*.ts"
 		},
+		"./master": {
+			"types": "./src/master/index.ts",
+			"import": "./src/master/index.ts"
+		},
+		"./master/*": {
+			"types": "./src/master/*.ts",
+			"import": "./src/master/*.ts"
+		},
 		"./modes/shared/agent-wire/*": null,
 		"./modes": {
 			"types": "./src/modes/index.ts",

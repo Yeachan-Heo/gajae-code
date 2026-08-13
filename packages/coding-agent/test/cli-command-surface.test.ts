@@ -167,6 +167,7 @@ process.exitCode = await child.exited;`;
 			"stats",
 			"notify",
 			"sdk",
+			"master",
 			"daemon",
 			"web-search",
 			"local-provider",
