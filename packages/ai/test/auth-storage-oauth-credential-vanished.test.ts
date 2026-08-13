@@ -27,6 +27,11 @@ describe("AuthStorage OAuth credential vanished from the store", () => {
 		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
 		events = [];
 		authStorage = new AuthStorage(store, {
+			// Multiple OAuth credentials for the same provider normally trigger
+			// usage-based ranking, which dials the upstream usage endpoint.
+			// These tests assert vanished-row / sibling-fallback resolution, not
+			// ranking, so disable the resolver to keep them hermetic.
+			rankingStrategyResolver: () => undefined,
 			onCredentialDisabled: event => {
 				events.push(event);
 			},
