@@ -167,6 +167,7 @@ const DISMISSED_FINGERPRINT_LIMIT = 4 * CRASH_INDEX_MAX_SIGNATURES;
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
 const RECORD_ID_PATTERN = /^[0-9a-f]{8,32}$/;
+const SCOPED_RECORD_ID_PATTERN = /^[0-9a-f]{32}:[0-9a-f]{8,32}$/;
 const CONTROL_CHARS_GLOBAL = /[\u0000-\u001f\u007f-\u009f]/g;
 
 function isCleanString(value: unknown, maxBytes: number): value is string {
@@ -259,7 +260,12 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 	if (body.lastNudgedAt !== 0 && !isTimestamp(body.lastNudgedAt, now)) return undefined;
 	if (typeof body.overflow !== "boolean") return undefined;
 	if (!Array.isArray(body.recentEventIds) || body.recentEventIds.length > RECENT_EVENT_ID_LIMIT) return undefined;
-	if (!body.recentEventIds.every(id => typeof id === "string" && RECORD_ID_PATTERN.test(id))) return undefined;
+	if (
+		!body.recentEventIds.every(
+			id => typeof id === "string" && (RECORD_ID_PATTERN.test(id) || SCOPED_RECORD_ID_PATTERN.test(id)),
+		)
+	)
+		return undefined;
 	// Absent in an index written before adoption existed: an upgrade must not
 	// quarantine a valid file and lose its history.
 	const dismissed = body.dismissed ?? [];
@@ -425,7 +431,7 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	}
 
 	// occurrence
-	if (index.recentEventIds.includes(event.recordId)) return false;
+	if (hasScopedOccurrenceId(index, event.fingerprint, event.recordId)) return false;
 	if (existing) {
 		// A record id names exactly one crash record. The record an entry was built
 		// from is therefore never a second occurrence, and an adopted record stays
@@ -437,7 +443,7 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 		existing.firstSeen = Math.min(existing.firstSeen, event.at);
 		existing.lastRecordId = event.recordId;
 		if (event.messageClass) existing.messageClass = boundMessageClass(event.messageClass);
-		rememberOccurrenceId(index, event.recordId);
+		rememberOccurrenceId(index, event.fingerprint, event.recordId);
 		return true;
 	}
 	if (Object.keys(index.signatures).length >= CRASH_INDEX_MAX_SIGNATURES && !evictOne(index)) {
@@ -459,15 +465,19 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 		lastSeen: event.at,
 		lastRecordId: event.recordId,
 	};
-	rememberOccurrenceId(index, event.recordId);
+	rememberOccurrenceId(index, event.fingerprint, event.recordId);
 	return true;
 }
 
 /** Record a counted occurrence id in the bounded dedupe window. */
-function rememberOccurrenceId(index: CrashIndex, recordId: string): void {
-	index.recentEventIds.push(recordId);
+function rememberOccurrenceId(index: CrashIndex, fingerprint: string, recordId: string): void {
+	index.recentEventIds.push(`${fingerprint}:${recordId}`);
 	if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
 		index.recentEventIds.splice(0, index.recentEventIds.length - RECENT_EVENT_ID_LIMIT);
+}
+
+function hasScopedOccurrenceId(index: CrashIndex, fingerprint: string, recordId: string): boolean {
+	return index.recentEventIds.includes(`${fingerprint}:${recordId}`);
 }
 
 /**
@@ -492,8 +502,9 @@ function recomputeRetainedCounts(index: CrashIndex, records: readonly LoadedCras
 	for (const entry of Object.values(index.signatures)) entry.retainedCount = 0;
 	const counted = new Set<string>();
 	for (const record of records) {
-		if (counted.has(record.recordId)) continue;
-		counted.add(record.recordId);
+		const identity = `${record.fingerprint}:${record.recordId}`;
+		if (counted.has(identity)) continue;
+		counted.add(identity);
 		const entry = index.signatures[record.fingerprint];
 		if (entry) entry.retainedCount += 1;
 	}
@@ -586,7 +597,7 @@ function adoptLogOnlySignatures(index: CrashIndex, records: readonly LoadedCrash
 	const ordered = [...candidates.values()].sort((a, b) => (b.newest[0]?.at ?? 0) - (a.newest[0]?.at ?? 0));
 	for (const { newest, firstSeen } of ordered) {
 		for (const record of newest) {
-			if (index.recentEventIds.includes(record.recordId)) continue;
+			if (hasScopedOccurrenceId(index, record.fingerprint, record.recordId)) continue;
 			// Throwable text can contain a line that looks like an identity line, and the
 			// loader ends a record at the first one. A record whose identity line is not
 			// where the writer puts it therefore has an identity a crash message could

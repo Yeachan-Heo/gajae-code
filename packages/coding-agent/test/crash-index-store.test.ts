@@ -268,7 +268,7 @@ describe("compactCrashIndex", () => {
 		await fs.writeFile(paths.crashLog, logRecord(2000, 800, "2026-08-11T12:00:00.000Z"));
 		const refused = await compactCrashIndex({ paths, now: NOW });
 		expect(refused.signatures[fingerprintFor(2000)]).toBeUndefined();
-		expect(refused.recentEventIds).toContain(recordId(1));
+		expect(refused.recentEventIds).toContain(`${fingerprintFor(1)}:${recordId(1)}`);
 
 		// The displaced id would otherwise be counted a second time here.
 		appendCrashEvent(occurrence(fingerprintFor(1), recordId(1), NOW - 1000), paths.events);
@@ -307,6 +307,34 @@ describe("compactCrashIndex", () => {
 		expect(index.signatures[fingerprintFor(27)]?.lifetimeCount).toBe(1);
 		expect(index.signatures[fingerprintFor(28)]?.lifetimeCount).toBe(1);
 		expect(parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW)).toBeDefined();
+	});
+
+	it("does not let a journaled id under one fingerprint suppress adoption under another", async () => {
+		const paths = await tempPaths();
+		const sharedId = recordId(1250);
+		appendCrashEvent(occurrence(fingerprintFor(27), sharedId), paths.events);
+		await fs.writeFile(paths.crashLog, logRecord(28, 1250, "2026-08-11T12:30:00.000Z"));
+
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(27)]?.lifetimeCount).toBe(1);
+		expect(index.signatures[fingerprintFor(28)]?.lifetimeCount).toBe(1);
+	});
+
+	it("dedupes retained record ids per fingerprint", async () => {
+		const paths = await tempPaths();
+		const sharedId = recordId(1251);
+		appendCrashEvent(occurrence(fingerprintFor(27), sharedId), paths.events);
+		appendCrashEvent(occurrence(fingerprintFor(28), recordId(1252)), paths.events);
+		await fs.writeFile(
+			paths.crashLog,
+			logRecord(27, 1251, "2026-08-11T12:00:00.000Z") + logRecord(28, 1251, "2026-08-11T12:30:00.000Z"),
+		);
+
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(27)]?.retainedCount).toBe(1);
+		expect(index.signatures[fingerprintFor(28)]?.retainedCount).toBe(1);
 	});
 
 	it("never resurrects a reported signature that this compaction evicted", async () => {
@@ -554,6 +582,55 @@ describe("parseCrashIndex", () => {
 
 	it("accepts a well-formed index", () => {
 		expect(parseCrashIndex(JSON.stringify(valid), NOW)?.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(2);
+	});
+
+	it("accepts fingerprint-scoped occurrence ids while preserving legacy ids", () => {
+		const scoped = {
+			...valid,
+			recentEventIds: [recordId(1), `${fingerprintFor(1)}:${recordId(2)}`],
+		};
+		expect(parseCrashIndex(JSON.stringify(scoped), NOW)?.recentEventIds).toEqual(scoped.recentEventIds);
+	});
+
+	it("does not let a legacy unscoped id suppress a different fingerprint", async () => {
+		const paths = await tempPaths();
+		const sharedId = recordId(3);
+		await fs.writeFile(
+			paths.index,
+			JSON.stringify({
+				...valid,
+				recentEventIds: [sharedId],
+			}),
+		);
+		await fs.writeFile(paths.crashLog, logRecord(2, 3, "2026-08-11T12:00:00.000Z"));
+
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(2)]?.lifetimeCount).toBe(1);
+	});
+
+	it("does not let a legacy unscoped id suppress an existing different fingerprint", async () => {
+		const paths = await tempPaths();
+		const sharedId = recordId(4);
+		await fs.writeFile(
+			paths.index,
+			JSON.stringify({
+				...valid,
+				recentEventIds: [sharedId],
+				signatures: {
+					...valid.signatures,
+					[fingerprintFor(2)]: {
+						...valid.signatures[fingerprintFor(1)],
+						lastRecordId: recordId(5),
+					},
+				},
+			}),
+		);
+		appendCrashEvent(occurrence(fingerprintFor(2), sharedId), paths.events);
+
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(2)]?.lifetimeCount).toBe(3);
 	});
 
 	it.each([
