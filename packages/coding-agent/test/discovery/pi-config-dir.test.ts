@@ -7,15 +7,22 @@ import { getUserPath } from "@gajae-code/coding-agent/discovery/helpers";
 
 describe("PI_CONFIG_DIR", () => {
 	const original = process.env.PI_CONFIG_DIR;
+	const originalGjc = process.env.GJC_CONFIG_DIR;
 	afterEach(() => {
 		if (original === undefined) {
 			delete process.env.PI_CONFIG_DIR;
 		} else {
 			process.env.PI_CONFIG_DIR = original;
 		}
+		if (originalGjc === undefined) {
+			delete process.env.GJC_CONFIG_DIR;
+		} else {
+			process.env.GJC_CONFIG_DIR = originalGjc;
+		}
 	});
 
 	test("getUserPath uses PI_CONFIG_DIR for native userAgent", () => {
+		delete process.env.GJC_CONFIG_DIR;
 		process.env.PI_CONFIG_DIR = ".config/gjc";
 		const ctx: LoadContext = {
 			cwd: "/work/project",
@@ -28,6 +35,7 @@ describe("PI_CONFIG_DIR", () => {
 	});
 
 	test("getConfigDirs respects PI_CONFIG_DIR for user base", () => {
+		delete process.env.GJC_CONFIG_DIR;
 		process.env.PI_CONFIG_DIR = ".config/gjc";
 		const result = getConfigDirs("commands", { project: false });
 		const expected = path.resolve(path.join(os.homedir(), ".config/gjc", "agent", "commands"));
