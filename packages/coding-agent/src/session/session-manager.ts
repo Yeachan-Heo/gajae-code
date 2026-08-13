@@ -89,6 +89,7 @@ import {
 	captureManagedFileNoFollow,
 	fsyncManagedArtifactTree,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	type ManagedAppendReceipt,
 	type ManagedBoundedAppendExpectation,
 	ManagedCommittedMutationError,
 	type ManagedDirectoryRoot,
@@ -15959,7 +15960,7 @@ export class SessionManager {
 			const store = this.#managedTranscriptStore(sessionFile);
 			const relativePath = path.basename(sessionFile);
 			const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
-			let receipt;
+			let receipt: ManagedAppendReceipt;
 			if (this.#managedPersistExpectedIdentity) {
 				try {
 					receipt = store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
