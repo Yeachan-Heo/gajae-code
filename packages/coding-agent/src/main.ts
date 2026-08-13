@@ -1262,6 +1262,7 @@ export interface RunRootCommandDependencies {
 	getChangelogForDisplay?: typeof getChangelogForDisplay;
 	createInteractiveMode?: CreateInteractiveMode;
 	runPrintMode?: RunPrintMode;
+	quit?: (code: number) => Promise<void>;
 	isResumePickerTerminal?: ResumePickerTerminalCheck;
 	listForResumePickerReadOnly?: ListForResumePickerReadOnly;
 	listManagedForResumePickerReadOnly?: ListManagedForResumePickerReadOnly;
@@ -1987,6 +1988,9 @@ export async function runRootCommand(
 				stopThemeWatcher();
 				authStorage.close();
 				if (!deps.suppressProcessExit) await postmortem.cleanup();
+			}
+			if (!deps.suppressProcessExit) {
+				await (deps.quit ?? postmortem.quit)(typeof process.exitCode === "number" ? process.exitCode : 0);
 			}
 		}
 	}

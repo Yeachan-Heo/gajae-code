@@ -140,6 +140,29 @@ describe("postmortem cleanup deadline contract (issue #2556)", () => {
 		expect(result.stderr).toContain("fixture: fatal with hung cleanup");
 		expect(result.stderr).toContain("cleanup deadline (300ms) expired for uncaught_exception");
 	});
+
+	it("quit drains backpressured stderr before preserving the requested exit code", async () => {
+		const proc = Bun.spawn([process.execPath, fixturePath, "quit-drains-backpressured-stderr"], {
+			cwd: utilsDirectory,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		// Hold the read side briefly so the fixture's diagnostics exceed the pipe
+		// capacity and must be drained by quit() rather than merely queued.
+		await Bun.sleep(250);
+		const stderrPromise = new Response(proc.stderr).text();
+		const exitCode = await Promise.race([proc.exited, Bun.sleep(5_000).then(() => "timeout" as const)]);
+		if (exitCode === "timeout") proc.kill();
+		const stderr = await stderrPromise;
+
+		const diagnosticLine = "timing-diagnostic\n";
+		const terminalMarker = "TIMING_DIAGNOSTICS_COMPLETE\n";
+		expect(exitCode).not.toBe("timeout");
+		expect(exitCode).toBe(23);
+		expect(stderr.length).toBe(diagnosticLine.length * 131_072 + terminalMarker.length);
+		expect(stderr.endsWith(terminalMarker)).toBe(true);
+	}, 15_000);
 });
 
 describe("known-sink peer closure classification", () => {
