@@ -24,7 +24,7 @@ import {
 } from "../config/model-resolver";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers.js";
 import { DynamicBorder } from "../modes/components/dynamic-border";
-import { theme } from "../modes/theme/theme";
+import { getAvailableThemes, getDetectedThemeSettingsPath, setTheme, theme } from "../modes/theme/theme";
 import {
 	type ComposerSubmissionOptions,
 	canApplyComposerSubmission,
@@ -716,10 +716,48 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "theme",
-		description: "Open theme selector",
-		handleTui: (_command, runtime) => {
-			runtime.ctx.showThemeSelector();
-			runtime.ctx.editor.setText("");
+		description: "Change theme immediately, or open the theme selector without args",
+		inlineHint: "[theme]",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			const ctx = runtime.ctx;
+			const name = command.args?.trim();
+			if (!name) {
+				ctx.showThemeSelector();
+				ctx.editor.setText("");
+				return;
+			}
+			const available = await getAvailableThemes();
+			if (!available.includes(name)) {
+				ctx.showError(`Unknown theme "${name}". Available themes: ${available.join(", ")}`);
+				ctx.editor.setText("");
+				return;
+			}
+			if (!ctx.settings.canWriteDurableConfig()) {
+				ctx.showError(
+					"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+				);
+				ctx.editor.setText("");
+				return;
+			}
+			try {
+				ctx.settings.set(getDetectedThemeSettingsPath(), name);
+			} catch (error) {
+				ctx.showError(error instanceof Error ? error.message : String(error));
+				ctx.editor.setText("");
+				return;
+			}
+			const result = await setTheme(name, true, { shouldApply: () => !ctx.isStopped?.() });
+			if (ctx.isStopped?.()) return;
+			ctx.statusLine.invalidate();
+			ctx.updateEditorTopBorder();
+			ctx.ui.invalidate();
+			if (result.success) {
+				ctx.showStatus(`Theme changed to ${name}`);
+			} else {
+				ctx.showError(`Failed to load theme "${name}": ${result.error}\nFell back to dark theme.`);
+			}
+			ctx.editor.setText("");
 		},
 	},
 	{

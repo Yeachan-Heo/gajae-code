@@ -172,6 +172,11 @@ Current defaults from settings schema:
 - `symbolPreset = "unicode"`
 - `colorBlindMode = false`
 
+### Interactive switching (`/theme`)
+
+- `/theme` with no arguments opens the interactive theme selector with live preview.
+- `/theme <name>` switches immediately: the name is validated against built-in and custom themes, persisted to the detected slot (`theme.dark` or `theme.light`), and applied to the running session (status line, editor border, and chat re-render at once). An unknown name is rejected with the list of available themes and changes nothing.
+
 ### Explicit switching (`setTheme`)
 
 - loads selected theme

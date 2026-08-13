@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/extensibility/slash-commands";
-import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { getCurrentThemeName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
@@ -369,5 +369,69 @@ describe("builtin /handoff slash command", () => {
 		expect(result).toBe(true);
 		expect(handleHandoffCommand).toHaveBeenCalledWith("preserve failing test name");
 		expect(setText).toHaveBeenCalledWith("");
+	});
+});
+
+function createThemeTuiRuntime() {
+	const showThemeSelector = vi.fn();
+	const showStatus = vi.fn();
+	const showError = vi.fn();
+	const setText = vi.fn();
+	const settingsSet = vi.fn();
+	const ctx = {
+		showThemeSelector,
+		showStatus,
+		showError,
+		editor: { setText },
+		settings: { canWriteDurableConfig: () => true, set: settingsSet },
+		statusLine: { invalidate: vi.fn() },
+		updateEditorTopBorder: vi.fn(),
+		ui: { invalidate: vi.fn() },
+	} as unknown as InteractiveModeContext;
+
+	return {
+		runtime: { ctx, handleBackgroundCommand: () => undefined },
+		showThemeSelector,
+		showStatus,
+		showError,
+		setText,
+		settingsSet,
+	};
+}
+
+describe("builtin /theme slash command", () => {
+	it("opens the theme selector when no theme name is given", async () => {
+		const { runtime, showThemeSelector, setText, settingsSet } = createThemeTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/theme", runtime);
+
+		expect(result).toBe(true);
+		expect(showThemeSelector).toHaveBeenCalledTimes(1);
+		expect(settingsSet).not.toHaveBeenCalled();
+		expect(setText).toHaveBeenCalledWith("");
+	});
+
+	it("changes the theme immediately when a valid theme name is given", async () => {
+		const { runtime, showThemeSelector, showStatus, settingsSet } = createThemeTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/theme blue-crab", runtime);
+
+		expect(result).toBe(true);
+		expect(showThemeSelector).not.toHaveBeenCalled();
+		expect(settingsSet).toHaveBeenCalledTimes(1);
+		expect(settingsSet.mock.calls[0]?.[1]).toBe("blue-crab");
+		expect(getCurrentThemeName()).toBe("blue-crab");
+		expect(showStatus).toHaveBeenCalledWith("Theme changed to blue-crab");
+	});
+
+	it("rejects an unknown theme name without touching settings", async () => {
+		const { runtime, showError, settingsSet } = createThemeTuiRuntime();
+
+		const result = await executeBuiltinSlashCommand("/theme not-a-theme", runtime);
+
+		expect(result).toBe(true);
+		expect(settingsSet).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledTimes(1);
+		expect(String(showError.mock.calls[0]?.[0])).toContain('Unknown theme "not-a-theme"');
 	});
 });
