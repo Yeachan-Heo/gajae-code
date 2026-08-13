@@ -27,6 +27,38 @@ const enum ToolCallStatus {
  * - Injects synthetic "aborted" tool results
  * - Adds a <turn-aborted> guidance marker for the model
  */
+/**
+ * Collapse a run of directly adjacent `thinking` blocks inside one assistant message down
+ * to its first block.
+ *
+ * Anthropic accepts a replayed assistant turn carrying a single thinking block, and accepts
+ * thinking blocks separated by a `tool_use` (ordinary interleaved-thinking shape), but
+ * rejects two directly adjacent `thinking` blocks with
+ * `messages.N.content.M: thinking or redacted_thinking blocks in the latest assistant
+ * message cannot be modified`, citing the *second* block of the pair. Because the offending
+ * message keeps its index as history grows, a single such turn makes every later request in
+ * that session fail, and the mutation repair - scoped to the latest assistant message -
+ * can never reach it (#4416).
+ *
+ * `redactedThinking` is deliberately not folded: a redacted blob following a thinking block
+ * is a shape the API itself emits and replays cleanly.
+ */
+function collapseAdjacentThinking<T extends { type: string }>(content: T[]): T[] {
+	let previousWasThinking = false;
+	let dropped = false;
+	const collapsed: T[] = [];
+	for (const block of content) {
+		const thinking = block.type === "thinking";
+		if (thinking && previousWasThinking) {
+			dropped = true;
+			continue;
+		}
+		previousWasThinking = thinking;
+		collapsed.push(block);
+	}
+	return dropped ? collapsed : content;
+}
+
 export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,
@@ -160,9 +192,14 @@ export function transformMessages<TApi extends Api>(
 				return block;
 			});
 
+			// Only the Anthropic wire shape rejects adjacent private blocks; other targets
+			// either degrade reasoning to text above or carry their own encoding rules.
+			const replayableContent =
+				model.api === "anthropic-messages" ? collapseAdjacentThinking(transformedContent) : transformedContent;
+
 			return {
 				...assistantMsg,
-				content: transformedContent,
+				content: replayableContent,
 			};
 		}
 		return msg;

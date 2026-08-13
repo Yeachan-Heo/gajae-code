@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Assistant turns that carry two directly adjacent `thinking` blocks are now collapsed to the first block before replay on `anthropic-messages`. Anthropic rejects that shape with `messages.N.content.M: thinking or redacted_thinking blocks in the latest assistant message cannot be modified`, citing the second block of the pair, and because the offending message keeps its index as the transcript grows, one such turn made every later request in the session fail - observed on two live sessions stuck for 9+ hours, each turn spending two rejected ~1.5 MB uploads, with the cited index frozen (`messages.5.content.118`) while the history grew from 103 to 430 messages. Verified against the captured transcript: the unmodified 430-message replay returns 400 and the collapsed replay returns 200. Thinking blocks separated by a `tool_use` are ordinary interleaved-thinking shape and are preserved, and a `redacted_thinking` blob following a thinking block is untouched (#4416).
 - Dev CI now runs each AI test file in a fresh process instead of sharing one Bun test runtime across the package. This prevents leaked fetch spies, fake timers, environment overrides, auth-broker state, and module caches from contaminating later files while using the same bounded, root-preloaded harness as coding-agent shards (#4378).
 - Anthropic thinking-replay repair now fingerprints the exact serialized outbound body before any application-level resend. A no-op latest-assistant transform is skipped in favor of a safe all-assistant transform, and if neither changes the body the turn fails without uploading the same large request again. The rejected request, transform disposition, hashes, sizes, and cited `messages.N.content.M` mismatch are recorded through the existing redacted HTTP-400 capture and warn path; thinking mode and the `context-management-2025-06-27` beta remain unchanged (#4382).
 - Anthropic 400 errors that name a `clear_thinking_*` context-management strategy now explain when GJC's captured outgoing body contains neither `thinking` nor `context_management`: an intermediary at the redacted configured base URL likely injected the strategy. The diagnostic recommends explicitly enabling thinking or fixing/replacing the intermediary, never silently enables thinking or retries, and annotates the sanitized raw-request capture without changing its body. Credit: @probepark (#4380).
@@ -87,7 +88,6 @@
 
 ### Fixed
 
-
 - `todo_write` raw argument rejections now carry bounded, authority-controlled correction codes for each rejected shape: unknown root keys, unknown operation-entry keys, done/drop entries missing a task or phase target, and unknown init list-entry keys. Each code maps to a fixed correction message naming the accepted shape (never echoing the offending input), so invalid calls surface specific guidance while valid payloads keep the existing passthrough/coercion path (#3916).
 - Anthropic Sonnet 5 now exposes Anthropic's real `xhigh` and `max` thinking efforts on the Messages API (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), matching official support. The previous generic `kind === opus` gate excluded it from the full preset range; the capability predicate is now an explicit version-scoped list (Opus 4.7+, Sonnet 5+), so older Sonnet generations and Bedrock Converse routes stay fail-closed at their previously advertised levels (issue #3913).
 - Alibaba Token Plan now exposes Qwen 3.8 Max under the provider-supported `qwen3.8-max` wire id instead of the rejected `qwen-3.8-max` spelling; catalog regeneration canonicalizes a legacy discovered alias rather than retaining a broken duplicate (#3909).
@@ -151,7 +151,6 @@
 ### Added
 
 - Reproducible Alibaba Token Plan header-parity A/B latency benchmark (`packages/ai/scripts/alibaba-token-plan-latency-ab.ts`): a fixed-seed interleaved A/B comparison of legacy vs Qwen-identical headers against a deterministic local HTTP server, reporting n/success/error/timeout and TTFT/total latency median/p90/p95/mean/stddev. No live credentials are required; a public-safe blocked-live-data receipt is included (`packages/ai/test/fixtures/alibaba-token-plan-latency-blocked-receipt.md`) (#3557).
-
 
 ## [0.12.4] - 2026-07-30
 

@@ -328,6 +328,80 @@ describe("Anthropic thinking replay immutability", () => {
 	});
 });
 
+describe("Anthropic adjacent thinking collapse", () => {
+	const usage = {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	const user: UserMessage = { role: "user", content: "continue", timestamp: Date.now() };
+	const assistantWith = (content: AssistantMessage["content"]): AssistantMessage => ({
+		role: "assistant",
+		content,
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: model.id,
+		usage,
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	});
+
+	it("keeps only the first of two directly adjacent thinking blocks", () => {
+		const assistant = assistantWith([
+			{ type: "thinking", thinking: "first", thinkingSignature: "sig_first" },
+			{ type: "thinking", thinking: "second", thinkingSignature: "sig_second" },
+			{ type: "toolCall", id: "toolu_1", name: "read", arguments: { path: "README.md" } },
+		]);
+
+		const params = convertAnthropicMessages([user, assistant], model, false);
+		const assistantParam = params.find(message => message.role === "assistant");
+
+		expect(assistantParam?.content).toEqual([
+			{ type: "thinking", thinking: "first", signature: "sig_first" },
+			{ type: "tool_use", id: "toolu_1", name: "read", input: { path: "README.md" } },
+		]);
+	});
+
+	it("preserves thinking blocks separated by a tool call", () => {
+		const assistant = assistantWith([
+			{ type: "thinking", thinking: "first", thinkingSignature: "sig_first" },
+			{ type: "toolCall", id: "toolu_1", name: "read", arguments: { path: "a.md" } },
+			{ type: "thinking", thinking: "second", thinkingSignature: "sig_second" },
+			{ type: "toolCall", id: "toolu_2", name: "read", arguments: { path: "b.md" } },
+		]);
+
+		const params = convertAnthropicMessages([user, assistant], model, false);
+		const assistantParam = params.find(message => message.role === "assistant");
+
+		expect(assistantParam?.content).toEqual([
+			{ type: "thinking", thinking: "first", signature: "sig_first" },
+			{ type: "tool_use", id: "toolu_1", name: "read", input: { path: "a.md" } },
+			{ type: "thinking", thinking: "second", signature: "sig_second" },
+			{ type: "tool_use", id: "toolu_2", name: "read", input: { path: "b.md" } },
+		]);
+	});
+
+	it("keeps a redacted block that directly follows a thinking block", () => {
+		const assistant = assistantWith([
+			{ type: "thinking", thinking: "first", thinkingSignature: "sig_first" },
+			{ type: "redactedThinking", data: "redacted-blob" },
+			{ type: "toolCall", id: "toolu_1", name: "read", arguments: { path: "README.md" } },
+		]);
+
+		const params = convertAnthropicMessages([user, assistant], model, false);
+		const assistantParam = params.find(message => message.role === "assistant");
+
+		expect(assistantParam?.content).toEqual([
+			{ type: "thinking", thinking: "first", signature: "sig_first" },
+			{ type: "redacted_thinking", data: "redacted-blob" },
+			{ type: "tool_use", id: "toolu_1", name: "read", input: { path: "README.md" } },
+		]);
+	});
+});
+
 describe("Anthropic thinking replay 400 classification", () => {
 	const status400 = (message: string): Error => Object.assign(new Error(message), { status: 400 });
 	// Captured from a real session failure (2026-07-23): a historical thinking block
