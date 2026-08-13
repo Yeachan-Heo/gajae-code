@@ -1087,19 +1087,228 @@ export async function run(baseInput: string | undefined, headInput: string | und
 		throw new Error(`telegram-daemon-generation-guard: v${GUARD_CONTRACT_VERSION} protected declaration is missing or malformed: ${decision.malformedDeclarations.join(", ")}`);
 	const telegramChanges = decision.protectedChanges.filter(change => change.startsWith("telegram:"));
 	if (telegramChanges.length > 0 && !decision.telegramGenerationBumped)
-		throw new Error(`telegram-daemon-generation-guard: protected Telegram lifecycle change requires a strictly higher DAEMON_GENERATION: ${telegramChanges.join(", ")}`);
+		throw new Error(`telegram-daemon-generation-guard: protected Telegram lifecycle change requires a strictly higher DAEMON_GENERATION: ${telegramChanges.join(", ")}\n${FIX_GENERATIONS_REMEDIATION}`);
 	for (const kind of ["discord", "slack"] as const) {
 		const changes = decision.protectedChanges.filter(change => change.startsWith(`${kind}:`));
 		if (changes.length > 0 && !decision.chatGenerationBumped[kind])
-			throw new Error(`telegram-daemon-generation-guard: protected ${kind} lifecycle change requires a strictly higher CHAT_DAEMON_GENERATIONS.${kind}: ${changes.join(", ")}`);
+			throw new Error(`telegram-daemon-generation-guard: protected ${kind} lifecycle change requires a strictly higher CHAT_DAEMON_GENERATIONS.${kind}: ${changes.join(", ")}\n${FIX_GENERATIONS_REMEDIATION}`);
 	}
 	console.log(`telegram-daemon-generation-guard: v${GUARD_CONTRACT_VERSION} ${decision.protectedChanges.length === 0 ? "no protected changes" : "required generation bump verified"}`);
 }
 
+/** Bounded remediation hint appended to normal guard failures. */
+export const FIX_GENERATIONS_REMEDIATION =
+	"telegram-daemon-generation-guard: run `bun scripts/telegram-daemon-generation-guard.ts --fix-generations <base-sha>` to apply all required generation bumps atomically";
+
+/**
+ * Locate the source span of a unique numeric literal declaration by name, using
+ * the same AST resolution as the guard's declaration extractor. Returns undefined
+ * for missing, ambiguous (duplicate), or non-numeric declarations — the caller
+ * must treat that as a hard failure rather than guessing.
+ */
+function numericLiteralLocation(source: string, name: string, kind?: "discord" | "slack"): { start: number; end: number } | undefined {
+	try {
+		const ast = parse(source, { sourceType: "module", plugins: ["typescript"] });
+		const variable = declarationNode(ast.program, kind ? `${name}.${kind}` : name);
+		if (!variable) return undefined;
+		const literal = kind ? variable.value : variable.declarations?.find((item: any) => item.id?.name === name)?.init;
+		if (literal?.type !== "NumericLiteral" || typeof literal.start !== "number" || typeof literal.end !== "number") return undefined;
+		return { start: literal.start, end: literal.end };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Replace the numeric literal at a unique declaration site with a new integer,
+ * preserving all surrounding source formatting. Throws if the target is missing,
+ * ambiguous, or non-numeric — never silently writes a malformed edit.
+ */
+export function replaceNumericLiteral(source: string, name: string, newValue: number, kind?: "discord" | "slack"): string {
+	const location = numericLiteralLocation(source, name, kind);
+	if (!location) throw new Error(`telegram-daemon-generation-guard: ${kind ? `${name}.${kind}` : name} must be a unique numeric literal to bump`);
+	return `${source.slice(0, location.start)}${String(newValue)}${source.slice(location.end)}`;
+}
+
+/** A single generation-constant repair edit. */
+export type GenerationEdit = { kind: "telegram" | "discord" | "slack"; file: string; from: number; to: number };
+
+/** The complete repair plan for one `--fix-generations` invocation. */
+export type RepairPlan = {
+	generationEdits: GenerationEdit[];
+	needsGuardPolicyAuthority: boolean;
+	guardContractEdit: { from: number; to: number } | undefined;
+	malformedDeclarations: string[];
+	noProtectedChanges: boolean;
+};
+
+/**
+ * Compute the complete set of generation bumps required to clear the guard for
+ * the given base→head transition, in one pass. Pure: does not touch the
+ * filesystem. Returns malformed declarations without throwing so the caller can
+ * present a clear diagnostic; throws only for non-numeric generation constants.
+ */
+export function computeRepairPlan(
+	base: ReadonlyMap<string, string | undefined>,
+	head: ReadonlyMap<string, string | undefined>,
+	inventory: Inventory = protectedInventory,
+	baseInventory: Inventory = inventory,
+): RepairPlan {
+	const decision = evaluate(base, head, inventory, baseInventory);
+	if (decision.malformedDeclarations.length > 0)
+		return { generationEdits: [], needsGuardPolicyAuthority: false, guardContractEdit: undefined, malformedDeclarations: decision.malformedDeclarations, noProtectedChanges: false };
+	const generationEdits: GenerationEdit[] = [];
+	const telegramAffected = decision.protectedChanges.some(change => change.startsWith("telegram:"));
+	if (telegramAffected) {
+		const baseGen = generation(base.get(telegramContract));
+		const headGen = generation(head.get(telegramContract));
+		if (baseGen === undefined || headGen === undefined)
+			throw new Error("telegram-daemon-generation-guard: DAEMON_GENERATION is missing or non-numeric in base or head");
+		if (headGen <= baseGen) generationEdits.push({ kind: "telegram", file: telegramContract, from: headGen, to: baseGen + 1 });
+	}
+	for (const kind of ["discord", "slack"] as const) {
+		const affected = decision.protectedChanges.some(change => change.startsWith(`${kind}:`));
+		if (!affected) continue;
+		const baseGen = generation(base.get(chatControl), kind);
+		const headGen = generation(head.get(chatControl), kind);
+		if (baseGen === undefined || headGen === undefined)
+			throw new Error(`telegram-daemon-generation-guard: CHAT_DAEMON_GENERATIONS.${kind} is missing or non-numeric in base or head`);
+		if (headGen <= baseGen) generationEdits.push({ kind, file: chatControl, from: headGen, to: baseGen + 1 });
+	}
+	const needsGuardPolicyAuthority = decision.guardPolicyChanged && !decision.guardContractBumped;
+	let guardContractEdit: { from: number; to: number } | undefined;
+	if (needsGuardPolicyAuthority) {
+		const baseVersion = guardContractVersion(base.get(guardScript));
+		if (baseVersion === undefined)
+			throw new Error("telegram-daemon-generation-guard: GUARD_CONTRACT_VERSION is missing or non-numeric in base");
+		guardContractEdit = { from: baseVersion, to: baseVersion + 1 };
+	}
+	return { generationEdits, needsGuardPolicyAuthority, guardContractEdit, malformedDeclarations: [], noProtectedChanges: decision.protectedChanges.length === 0 };
+}
+
+/**
+ * Explicit local command: compute and apply all required generation bumps
+ * atomically. Never runs under CI or guard-event environments. Snapshots all
+ * target files and rolls back every edit (source constants + manifest) if any
+ * step — manifest regeneration, current-tree validation, or post-fix evaluation
+ * — fails.
+ */
+export async function fixGenerations(baseInput: string | undefined, options: { fixGuardPolicy?: boolean } = {}): Promise<void> {
+	if (process.env.CI || process.env.GUARD_EVENT_NAME)
+		throw new Error("telegram-daemon-generation-guard: --fix-generations is an explicit local developer command and must not run under CI or guard-event environments");
+	bootstrapGuardContract();
+	const base = validateSha("base SHA", baseInput);
+	await verifyObject("base", base);
+	const baseManifestSource = await blob(base, manifestScript);
+	const baseInventory = inventoryFromManifestSource(baseManifestSource) ?? protectedInventory;
+	const filePaths = [
+		guardScript,
+		manifestScript,
+		...new Set([
+			...Object.values(baseInventory).flatMap(inv => Object.keys(inv)),
+			...Object.values(protectedInventory).flatMap(inv => Object.keys(inv)),
+			...nativeAuthoritySources,
+		]),
+	];
+	const baseFiles: Array<readonly [string, string | undefined]> = [];
+	const headFiles: Array<readonly [string, string | undefined]> = [];
+	for (const file of filePaths) {
+		baseFiles.push([file, file === manifestScript ? baseManifestSource : await blob(base, file)]);
+		headFiles.push([file, await Bun.file(path.join(root, file)).text().catch(() => undefined)]);
+	}
+	const plan = computeRepairPlan(new Map(baseFiles), new Map(headFiles), protectedInventory, baseInventory);
+	if (plan.malformedDeclarations.length > 0)
+		throw new Error(`telegram-daemon-generation-guard: v${GUARD_CONTRACT_VERSION} protected declaration is missing or malformed: ${plan.malformedDeclarations.join(", ")}`);
+	if (plan.needsGuardPolicyAuthority && !options.fixGuardPolicy)
+		throw new Error("telegram-daemon-generation-guard: guard policy change requires a strictly higher GUARD_CONTRACT_VERSION; rerun with --fix-guard-policy to bump it automatically");
+	const hasGuardContractBump = plan.needsGuardPolicyAuthority && options.fixGuardPolicy === true && plan.guardContractEdit !== undefined;
+	if (plan.generationEdits.length === 0 && !hasGuardContractBump) {
+		console.log(`telegram-daemon-generation-guard: v${GUARD_CONTRACT_VERSION} no generation bumps required`);
+		return;
+	}
+	// Snapshot every file that may be mutated so rollback restores the exact prior state.
+	const editFiles = new Set<string>();
+	for (const edit of plan.generationEdits) editFiles.add(edit.file);
+	if (hasGuardContractBump) editFiles.add(guardScript);
+	editFiles.add(manifestScript);
+	const snapshots = new Map<string, string | undefined>();
+	for (const file of editFiles) snapshots.set(file, await Bun.file(path.join(root, file)).text().catch(() => undefined));
+	try {
+		for (const edit of plan.generationEdits) {
+			const filePath = path.join(root, edit.file);
+			const current = await Bun.file(filePath).text();
+			const updated = edit.kind === "telegram"
+				? replaceNumericLiteral(current, "DAEMON_GENERATION", edit.to)
+				: replaceNumericLiteral(current, "CHAT_DAEMON_GENERATIONS", edit.to, edit.kind);
+			await Bun.write(filePath, updated);
+		}
+		if (hasGuardContractBump && plan.guardContractEdit) {
+			const guardPath = path.join(root, guardScript);
+			const current = await Bun.file(guardPath).text();
+			await Bun.write(guardPath, replaceNumericLiteral(current, "GUARD_CONTRACT_VERSION", plan.guardContractEdit.to));
+		}
+		// Regenerate the semantic manifest. manifestForCurrentTree() uses the
+		// in-memory GUARD_CONTRACT_VERSION import, so when the guard contract was
+		// bumped on disk, override the contract version to match the disk state.
+		const manifestObj = await manifestForCurrentTree();
+		if (hasGuardContractBump && plan.guardContractEdit) manifestObj.contractVersion = plan.guardContractEdit.to;
+		const manifestTarget = path.join(root, manifestScript);
+		const manifestTemp = `${manifestTarget}.${process.pid}.${crypto.randomUUID()}.tmp`;
+		try {
+			await Bun.write(manifestTemp, `${JSON.stringify(manifestObj, null, 2)}\n`);
+			await fs.rename(manifestTemp, manifestTarget);
+		} finally {
+			await fs.rm(manifestTemp, { force: true });
+		}
+		// Validate the current-tree manifest byte-matches the updated tree.
+		if (hasGuardContractBump && plan.guardContractEdit) {
+			// The in-memory validateCurrentTreeManifest uses the pre-bump
+			// GUARD_CONTRACT_VERSION import, so validate the disk manifest directly.
+			const diskManifest = JSON.parse(await Bun.file(manifestTarget).text()) as GuardManifest;
+			const diskGuardVersion = guardContractVersion(await Bun.file(path.join(root, guardScript)).text());
+			if (diskGuardVersion === undefined || diskManifest.contractVersion !== diskGuardVersion)
+				throw new Error("telegram-daemon-generation-guard: post-fix manifest contract version does not match the guard script");
+			const expected = JSON.stringify(Object.entries(await currentTreeDigests()).sort());
+			const actual = JSON.stringify(Object.entries(diskManifest.digests).sort());
+			if (expected !== actual) throw new Error("telegram-daemon-generation-guard: post-fix manifest digests do not byte-match the current tree");
+		} else {
+			await validateCurrentTreeManifest();
+		}
+		// Re-evaluate base→updated-tree to confirm the normal guard would pass.
+		const updatedHead: Array<readonly [string, string | undefined]> = [];
+		for (const file of filePaths) updatedHead.push([file, await Bun.file(path.join(root, file)).text().catch(() => undefined)]);
+		const reDecision = evaluate(new Map(baseFiles), new Map(updatedHead), protectedInventory, baseInventory);
+		if (reDecision.malformedDeclarations.length > 0)
+			throw new Error(`telegram-daemon-generation-guard: post-fix evaluation found malformed declarations: ${reDecision.malformedDeclarations.join(", ")}`);
+		const reTelegram = reDecision.protectedChanges.filter(change => change.startsWith("telegram:"));
+		if (reTelegram.length > 0 && !reDecision.telegramGenerationBumped)
+			throw new Error("telegram-daemon-generation-guard: post-fix evaluation still requires a Telegram generation bump");
+		for (const kind of ["discord", "slack"] as const) {
+			const reKind = reDecision.protectedChanges.filter(change => change.startsWith(`${kind}:`));
+			if (reKind.length > 0 && !reDecision.chatGenerationBumped[kind])
+				throw new Error(`telegram-daemon-generation-guard: post-fix evaluation still requires a ${kind} generation bump`);
+		}
+		// Print a bounded, secret-free summary.
+		const parts: string[] = plan.generationEdits.map(edit => `${edit.kind} ${edit.from}→${edit.to}`);
+		if (hasGuardContractBump && plan.guardContractEdit) parts.push(`guard-contract ${plan.guardContractEdit.from}→${plan.guardContractEdit.to}`);
+		console.log(`telegram-daemon-generation-guard: v${GUARD_CONTRACT_VERSION} applied ${parts.join(", ")}`);
+	} catch (error) {
+		for (const [file, content] of snapshots) {
+			const filePath = path.join(root, file);
+			if (content !== undefined) await Bun.write(filePath, content);
+			else await fs.rm(filePath, { force: true });
+		}
+		throw error;
+	}
+}
 if (import.meta.main) {
 	try {
 		if (process.argv.includes("--validate-current-tree")) await validateCurrentTreeManifest();
 		else if (process.argv.includes("--write-manifest")) await writeManifest();
+		else if (process.argv.includes("--fix-generations")) {
+			const baseArg = process.argv[process.argv.indexOf("--fix-generations") + 1];
+			await fixGenerations(baseArg, { fixGuardPolicy: process.argv.includes("--fix-guard-policy") });
+		}
 		else if (process.argv.includes("--check-authority"))
 			assertGuardAuthority({
 				eventName: process.env.GUARD_EVENT_NAME,

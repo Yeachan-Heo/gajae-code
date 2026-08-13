@@ -5,13 +5,16 @@ import { describe, expect, test } from "bun:test";
 import manifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
 import {
 	assertGuardAuthority,
+	computeRepairPlan,
 	currentTreeDigests,
 	declaration,
 	evaluate,
+	FIX_GENERATIONS_REMEDIATION,
 	GUARD_CONTRACT_VERSION,
 	isLegacyBootstrapBase,
 	manifestForCurrentTree,
 	protectedInventory,
+	replaceNumericLiteral,
 	TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS,
 	TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS,
 	validateCiInputs,
@@ -1117,4 +1120,150 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(() => assertGuardAuthority({ ...pr, eventName: "schedule" })).toThrow("unsupported CI event");
 	});
 
+});
+
+describe("fix-generations auto-repair", () => {
+	const contractFile = telegramContract;
+	const telegramOwnershipFn = "export function acquireDaemonOwnership() { return true; }";
+
+	function repairFiles(input: {
+		telegramGeneration: number;
+		discordGeneration: number;
+		slackGeneration: number;
+		telegramOwnership?: string;
+		chatLifecycle?: string;
+	}): Map<string, string> {
+		return files({
+			telegramGeneration: input.telegramGeneration,
+			discordGeneration: input.discordGeneration,
+			slackGeneration: input.slackGeneration,
+			telegramOwnership: input.telegramOwnership,
+			chatLifecycle: input.chatLifecycle,
+		});
+	}
+
+	test("replaceNumericLiteral bumps a unique numeric declaration preserving formatting", () => {
+		const source = "export const DAEMON_GENERATION = 160;\n";
+		expect(replaceNumericLiteral(source, "DAEMON_GENERATION", 161)).toBe("export const DAEMON_GENERATION = 161;\n");
+		const chat = "export const CHAT_DAEMON_GENERATIONS = { discord: 63, slack: 66 } as const;";
+		expect(replaceNumericLiteral(chat, "CHAT_DAEMON_GENERATIONS", 64, "discord")).toBe("export const CHAT_DAEMON_GENERATIONS = { discord: 64, slack: 66 } as const;");
+		expect(replaceNumericLiteral(chat, "CHAT_DAEMON_GENERATIONS", 67, "slack")).toBe("export const CHAT_DAEMON_GENERATIONS = { discord: 63, slack: 67 } as const;");
+	});
+
+	test("replaceNumericLiteral rejects non-numeric, missing, and duplicate declarations", () => {
+		expect(() => replaceNumericLiteral("export const DAEMON_GENERATION = getCurrent();", "DAEMON_GENERATION", 5)).toThrow("must be a unique numeric literal");
+		expect(() => replaceNumericLiteral("export const unrelated = 1;", "DAEMON_GENERATION", 5)).toThrow("must be a unique numeric literal");
+		expect(() => replaceNumericLiteral("export const DAEMON_GENERATION = 1;\nexport const DAEMON_GENERATION = 2;", "DAEMON_GENERATION", 5)).toThrow("must be a unique numeric literal");
+	});
+
+	test("computeRepairPlan produces a Telegram-only bump for a Telegram-only change", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return false;" });
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.generationEdits).toEqual([{ kind: "telegram", file: contractFile, from: 160, to: 161 }]);
+		expect(plan.needsGuardPolicyAuthority).toBe(false);
+		expect(plan.guardContractEdit).toBeUndefined();
+	});
+
+	test("computeRepairPlan bumps Discord and Slack together for a shared chat-daemon-control change", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		head.set(chatControl, (head.get(chatControl) ?? "").replace("return value !== null", "return Boolean(value)"));
+		const plan = computeRepairPlan(base, head, inventory);
+		const kinds = plan.generationEdits.map(edit => edit.kind);
+		expect(kinds).toContain("discord");
+		expect(kinds).toContain("slack");
+		expect(kinds).not.toContain("telegram");
+		expect(plan.generationEdits).toEqual(
+			expect.arrayContaining([
+				{ kind: "discord", file: chatControl, from: 63, to: 64 },
+				{ kind: "slack", file: chatControl, from: 66, to: 67 },
+			]),
+		);
+	});
+
+	test("computeRepairPlan repairs all three families in one pass", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return false;" });
+		head.set(chatControl, (head.get(chatControl) ?? "").replace("return value !== null", "return Boolean(value)"));
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.generationEdits).toEqual(
+			expect.arrayContaining([
+				{ kind: "telegram", file: contractFile, from: 160, to: 161 },
+				{ kind: "discord", file: chatControl, from: 63, to: 64 },
+				{ kind: "slack", file: chatControl, from: 66, to: 67 },
+			]),
+		);
+		expect(plan.generationEdits).toHaveLength(3);
+	});
+
+	test("computeRepairPlan preserves an already-higher generation and never decrements", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 165, discordGeneration: 70, slackGeneration: 66, telegramOwnership: "return false;" });
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.generationEdits).toEqual([{ kind: "slack", file: chatControl, from: 66, to: 67 }]);
+	});
+
+	test("computeRepairPlan produces no edits when generations are already bumped", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 161, discordGeneration: 64, slackGeneration: 67, telegramOwnership: "return false;" });
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.generationEdits).toEqual([]);
+		expect(plan.noProtectedChanges).toBe(false);
+	});
+
+	test("computeRepairPlan returns no edits and noProtectedChanges for a no-op tree", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.generationEdits).toEqual([]);
+		expect(plan.noProtectedChanges).toBe(true);
+	});
+
+	test("computeRepairPlan surfaces malformed declarations without partial computation", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		head.set(telegramDaemon, "export function acquireDaemonOwnership( {");
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.malformedDeclarations.length).toBeGreaterThan(0);
+		expect(plan.generationEdits).toEqual([]);
+	});
+
+	test("computeRepairPlan throws for a non-numeric Telegram generation constant", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return false;" });
+		head.set(contractFile, "export const DAEMON_GENERATION = getGeneration();");
+		expect(() => computeRepairPlan(base, head, inventory)).toThrow("DAEMON_GENERATION is missing or non-numeric");
+	});
+
+	test("computeRepairPlan throws for a non-numeric Discord generation constant", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		head.set(chatControl, (head.get(chatControl) ?? "").replace("return value !== null", "return Boolean(value)").replace("discord: 63", "discord: getGen()"));
+		expect(() => computeRepairPlan(base, head, inventory)).toThrow("CHAT_DAEMON_GENERATIONS.discord is missing or non-numeric");
+	});
+
+	test("computeRepairPlan refuses guard policy changes without explicit authority", () => {
+		const guard = `export const GUARD_CONTRACT_VERSION = ${GUARD_CONTRACT_VERSION};`;
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		base.set(guardScript, `${guard}\nexport const policy = true;`);
+		head.set(guardScript, `${guard}\nexport const policy = false;`);
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.needsGuardPolicyAuthority).toBe(true);
+		expect(plan.guardContractEdit).toEqual({ from: GUARD_CONTRACT_VERSION, to: GUARD_CONTRACT_VERSION + 1 });
+		expect(plan.generationEdits).toEqual([]);
+	});
+
+	test("guard failure messages include the fix-generations remediation hint", () => {
+		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return false;" });
+		const decision = evaluate(base, head, inventory);
+		expect(decision.telegramGenerationBumped).toBe(false);
+		const telegramChanges = decision.protectedChanges.filter(change => change.startsWith("telegram:"));
+		expect(telegramChanges.length).toBeGreaterThan(0);
+		const remediationMessage = `protected Telegram lifecycle change requires a strictly higher DAEMON_GENERATION: ${telegramChanges.join(", ")}\n${FIX_GENERATIONS_REMEDIATION}`;
+		expect(remediationMessage).toContain("--fix-generations");
+		expect(FIX_GENERATIONS_REMEDIATION).toContain("base-sha");
+	});
 });

@@ -160,7 +160,8 @@
     "generate-docs-index": "bun --cwd=packages/coding-agent run generate-docs-index",
     "generate-template": "bun --cwd=packages/coding-agent run generate-template",
     "check-spoofed-versions": "bun scripts/check-spoofed-versions.ts",
-    "check:gjc-ui": "bun scripts/verify-gjc-ui-redesign.ts && bun scripts/rebrand-inventory.ts --strict"
+    "check:gjc-ui": "bun scripts/verify-gjc-ui-redesign.ts && bun scripts/rebrand-inventory.ts --strict",
+    "fix:daemon-generations": "bun scripts/telegram-daemon-generation-guard.ts --fix-generations"
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
