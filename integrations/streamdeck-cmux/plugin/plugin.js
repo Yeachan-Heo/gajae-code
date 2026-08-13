@@ -7,6 +7,7 @@ import { nextSelectedSessionId } from "./focus-state.js";
 import { contextEntriesForActions, contextEntriesForControls } from "./render-lanes.js";
 import { moveNavigation, recentPaths, selectedNavigationPath } from "./path-navigation.js";
 import { moveOption, selectedOption } from "./option-selector.js";
+import { focusedStatusAction } from "./focused-status.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -962,14 +963,18 @@ async function duplicateFocusedTab(context) {
 }
 
 
-async function launchGjcInFocusedTab(context) {
-  const topology = await cmuxTopology();
+async function launchGjcInFocusedTab(context, topology = null) {
+  topology ??= await cmuxTopology();
   const surface = topology.allSurfaces.find(row => row.surface === topology.currentSurface);
-  if (!surface || surface.type !== "terminal") { alert(context); return; }
+  if (!surface || surface.type !== "terminal") { alert(context); log(`gjc launch unavailable surface=${topology.currentSurface ?? "none"}`); return; }
   const target = ["--surface", surface.surface, "--workspace", surface.workspace, "--window", surface.window];
-  const sent = await run(CMUX, ["send", ...target, "gjc"], homedir());
-  const submitted = sent.exitCode === 0 ? await run(CMUX, ["send-key", ...target, "enter"], homedir()) : sent;
-  if (submitted.exitCode === 0) ok(context); else { alert(context); log(`gjc launch failed ${submitted.stderr || submitted.stdout}`); }
+  const sent = await run(CMUX, ["send", ...target, shellQuote(GJC)], homedir());
+  if (sent.exitCode !== 0) { alert(context); log(`gjc launch send failed surface=${surface.surface} ${sent.stderr || sent.stdout}`); return; }
+  const submitted = await run(CMUX, ["send-key", ...target, "enter"], homedir());
+  if (submitted.exitCode === 0) {
+    log(`gjc launch submitted surface=${surface.surface} tty=${surface.tty ?? "none"}`);
+    ok(context);
+  } else { alert(context); log(`gjc launch enter failed surface=${surface.surface} ${submitted.stderr || submitted.stdout}`); }
 }
 
 async function closeFocusedCmuxTab(context) {
@@ -1020,8 +1025,13 @@ async function keyUp(context, state, heldMs) {
   }
   if (action === CMUX_NAV_ACTION) { await performCmuxNav(settings.op, context); return; }
   if (action === STATUS_ACTION) {
-    if (focusedGjcSurface(topologyState)) await sendFocusedGjcText("proceed", context, true);
-    else await launchGjcInFocusedTab(context);
+    const topology = await cmuxTopology();
+    topologyState = topology;
+    const surface = topology.allSurfaces.find(row => row.surface === topology.currentSurface);
+    const statusAction = focusedStatusAction(surface);
+    if (statusAction === "proceed") await sendFocusedGjcText("proceed", context, true);
+    else if (statusAction === "launch") await launchGjcInFocusedTab(context, topology);
+    else alert(context);
     return;
   }
   if (action === LAUNCH_ACTION) { await launchPreset(settings.preset, context); return; }
