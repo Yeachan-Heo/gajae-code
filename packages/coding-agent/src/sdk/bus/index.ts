@@ -7079,36 +7079,6 @@ export function createNotificationsExtension(
 				const notificationOrigin = hostCapCache
 					.get(authenticatedInbound.connectionId)
 					?.has(ASK_SELECTED_ACK_CAPABILITY);
-				// Ownership fence for inbound arriving on the NATIVE notification
-				// transport (the Telegram daemon's channel; identified by the
-				// ask-ack capability on its connection).
-				//
-				// That daemon stays connected across an ownership-identity change
-				// (credential, destination, actor) AND across a last-provider
-				// disable, so the OLD principal could otherwise inject a user
-				// message or SDK control through its still-live connection. Local
-				// adapter teardown does not revoke it, so admission itself requires
-				// BOTH proved ownership and actually-serving adapters: a disable
-				// tears adapters down without demoting owner state, and a re-proof
-				// demotes owner state before tearing adapters down.
-				//
-				// SCOPE: Discord and Slack do NOT arrive here. Their daemons hold a
-				// SessionRouter attachment and issue v3 `control_request`s, which
-				// reach the host control dispatch without any chat-origin marker.
-				// Fencing that path needs an authenticated chat-daemon
-				// classification at the Router/host boundary — the same Router
-				// surface as the deferred attachment revocation, recorded together
-				// as a follow-up rather than changed blind while that surface is red.
-				if (
-					notificationOrigin &&
-					runtime &&
-					(runtime.notificationOwnerState !== "ready" || !runtime.notificationsActive)
-				) {
-					logger.warn(
-						`notifications: refused chat-originated ${inbound.kind} (ownership ${runtime.notificationOwnerState}, adapters ${runtime.notificationsActive ? "active" : "withheld"})`,
-					);
-					return;
-				}
 				if (runtime?.policySuspended && notificationOrigin) {
 					if (inbound.kind === "control_command") {
 						const frame = sdkInboundFrame(inbound.commandJson);
@@ -7657,20 +7627,9 @@ export function createNotificationsExtension(
 		reproveOwnership: async binding => {
 			// PROVIDER-NEUTRAL ownership re-proof. Reconciliation calls this for any
 			// effective chat provider, not just Telegram: a Discord-only or
-			// Slack-only credential/destination/actor change must re-prove exactly
-			// like a Telegram one, or the old identity keeps authority indefinitely.
-			//
-			// What this enforces while the new identity is unproved: local
-			// notification adapters are torn down, activate() withholds them, and
-			// chat-originated inbound (user messages, SDK controls) is refused at
-			// admission — so the previous principal cannot inject anything.
-			//
-			// What it does NOT do: revoke an already-attached external chat
-			// daemon's SessionRouter attachment. A still-running Discord/Slack
-			// daemon can therefore still observe core host events during the
-			// re-proof window. Revocation belongs to the Router attachment surface;
-			// until then this narrows a previously unbounded window (before this
-			// change nothing re-proved at all) rather than closing it completely.
+			// Slack-only credential/destination/actor change must withhold adapters
+			// exactly like a Telegram one, or the old identity keeps delivery and
+			// (for Slack) inbound command authority through a stale outcome.
 			//
 			// Never awaits the ensure itself — only the adapter teardown, which is
 			// local. Lifecycle paths must not block on daemon ownership.
@@ -7684,11 +7643,21 @@ export function createNotificationsExtension(
 			const runtime = runtimes.get(sessionIdForOwnership);
 			if (!runtime || runtime.notificationOwnerKey === key) return;
 			// The ownership-relevant configuration changed under a runtime whose
-			// adapters were authorized for the OLD configuration. Withhold delivery
-			// first (`stop` with reason "notifications" tears down adapters and
-			// answer sources while leaving the core SDK host untouched), then
-			// re-prove. Delivery must never continue under a configuration
-			// ownership has not proved.
+			// LOCAL adapters were authorized for the OLD configuration. Withhold
+			// them first (`stop` with reason "notifications" tears down adapters
+			// and answer sources while leaving the core SDK host untouched), then
+			// re-prove.
+			//
+			// SCOPE: this does NOT revoke an already-attached external Discord or
+			// Slack daemon's SessionRouter attachment. Such a daemon can still
+			// observe host events and reach the host's inbound/control paths until
+			// it notices the change itself. Closing that requires one coherent
+			// authenticated chat-attachment authority boundary at the Router layer
+			// (provenance per connection, revocation on re-proof and on
+			// last-provider disable, covering replies and raw v3 frames uniformly).
+			// That is tracked as a follow-up; per-callback heuristics here were
+			// tried and reverted because they were bypassable and, on a blocked
+			// identity, silently refused legitimate Telegram inbound forever.
 			runtime.notificationOwnerKey = key;
 			runtime.notificationOwnerState = "retry";
 			if (runtime.notificationsActive) await stopSession(sessionIdForOwnership, "notifications");

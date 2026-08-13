@@ -51,10 +51,12 @@ export interface NotificationSessionRuntime<Context extends NotificationSessionC
 	 *
 	 * A credential, destination, or actor-authorization change invalidates the
 	 * ownership proof that authorized this runtime's adapters. The runtime must
-	 * withhold its local adapters and refuse chat-originated inbound until the
-	 * new identity is proved, so the previous principal cannot deliver through
-	 * this session or inject messages and controls into it. Implementations must
-	 * not await the daemon ensure itself.
+	 * withhold its LOCAL adapters until the new identity is proved. It does NOT
+	 * revoke an already-attached external chat daemon's SessionRouter
+	 * attachment, so such a daemon can still observe host events and reach the
+	 * host's inbound/control paths during the window; closing that requires an
+	 * authenticated chat-attachment authority boundary at the Router layer.
+	 * Implementations must not await the daemon ensure itself.
 	 */
 	reproveOwnership?(binding: BoundNotificationSession<Context>): Promise<void>;
 	/**
