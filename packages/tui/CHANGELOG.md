@@ -5,6 +5,7 @@
 ## [0.13.2] - 2026-08-13
 
 ### Fixed
+- Kitty inline images are no longer deleted when live output moves their anchor above the viewport, so terminal-native scrollback keeps previously rendered images visible.
 
 - Fast double-Esc and triple-Esc sequences coalesced into one stdin chunk by tmux or SSH are now emitted as individual Escape presses, restoring draft-clear and selector gestures while preserving atomic Option-as-Meta sequences (#4312 by @Yeachan-Heo).
 - Ambiguous trailing Escape bytes now remain buffered until a continuation or flush timeout resolves them, preventing a split `ESC ESC ESC [A` sequence from firing the destructive double-Escape gesture (#4312 by @Yeachan-Heo).

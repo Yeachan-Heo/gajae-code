@@ -1614,7 +1614,7 @@ describe("registered viewport anchor", () => {
 			tui.requestRender();
 			await settle(term);
 			const grownOutput = term.getWriteLog().join("");
-			expect(grownOutput).toContain(encodeKittyPlacementDelete(replacementPlacement!));
+			expect(grownOutput).not.toContain(encodeKittyPlacementDelete(replacementPlacement!));
 			expect(extractKittyPlacementReferences(grownOutput)).toEqual([]);
 		} finally {
 			tui.stop();
