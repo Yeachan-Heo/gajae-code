@@ -1374,6 +1374,60 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents.every(event => event.maxAttempts === 3 && event.unbounded === false)).toBe(true);
 		expect(lastAssistant(session).errorMessage).toMatch(/exhausted after 3 attempts; waited \d+ms total/);
 	});
+	it("honors the provider first-event retry ceiling for a large request", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage:
+				"Anthropic stream timed out while waiting for the first event (elapsed=300000ms request_bytes=1750732 endpoint=custom configured_timeout=300000ms; override with PI_STREAM_FIRST_EVENT_TIMEOUT_MS)",
+			transportFailure: {
+				kind: "transport",
+				providerCode: "stream_first_event_timeout",
+				requestBytes: 1_750_732,
+				firstEventElapsedMs: 300_000,
+				firstEventTimeoutMs: 300_000,
+				endpointClass: "custom",
+				retryMaxAttempts: 1,
+			},
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 3 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("large timeout must not amplify");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(1);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).errorMessage).toContain("exhausted after 1 attempts");
+	});
+	it("honors the provider first-event retry ceiling for a small request", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "Anthropic stream timed out while waiting for the first event",
+			transportFailure: {
+				kind: "transport",
+				providerCode: "stream_first_event_timeout",
+				requestBytes: 4096,
+				firstEventElapsedMs: 100_000,
+				firstEventTimeoutMs: 100_000,
+				endpointClass: "canonical",
+				retryMaxAttempts: 2,
+			},
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 3 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("small timeout gets one replay");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]?.maxAttempts).toBe(2);
+		expect(lastAssistant(session).errorMessage).toContain("exhausted after 2 attempts");
+	});
 	it("replays a typed first-event timeout before progress and never after progress", async () => {
 		const noProgressModels: string[] = [];
 		session = buildStatusErrorSession({

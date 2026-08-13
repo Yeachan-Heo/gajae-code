@@ -106,12 +106,30 @@ export function resolveOpenAISdkRequestTimeoutMs(
 }
 
 export type Watchdog = NodeJS.Timeout | undefined;
+export interface FirstEventTimeoutFacts {
+	requestBytes?: number;
+	firstEventElapsedMs?: number;
+	firstEventTimeoutMs?: number;
+	endpointClass?: "canonical" | "custom";
+	retryMaxAttempts?: number;
+}
+
 export class FirstEventTimeoutError extends Error {
 	readonly providerCode = STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;
+	readonly requestBytes?: number;
+	readonly firstEventElapsedMs?: number;
+	readonly firstEventTimeoutMs?: number;
+	readonly endpointClass?: "canonical" | "custom";
+	readonly retryMaxAttempts?: number;
 
-	constructor(message: string) {
+	constructor(message: string, facts: FirstEventTimeoutFacts = {}) {
 		super(message);
 		this.name = "FirstEventTimeoutError";
+		this.requestBytes = facts.requestBytes;
+		this.firstEventElapsedMs = facts.firstEventElapsedMs;
+		this.firstEventTimeoutMs = facts.firstEventTimeoutMs;
+		this.endpointClass = facts.endpointClass;
+		this.retryMaxAttempts = facts.retryMaxAttempts;
 	}
 }
 

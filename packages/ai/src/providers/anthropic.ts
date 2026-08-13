@@ -1481,6 +1481,48 @@ function getAnthropicCompat(
 
 const PROVIDER_MAX_RETRIES = 3;
 const PROVIDER_BASE_DELAY_MS = 2000;
+const ANTHROPIC_CUSTOM_ENDPOINT_FIRST_EVENT_GRACE_MS = 120_000;
+const ANTHROPIC_LARGE_REQUEST_BYTES = 1_000_000;
+const ANTHROPIC_LARGE_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS = 1;
+const ANTHROPIC_SMALL_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS = 2;
+
+function classifyAnthropicEndpoint(baseUrl: string): "canonical" | "custom" {
+	return isAnthropicApiBaseUrl(baseUrl) ? "canonical" : "custom";
+}
+
+function resolveAnthropicFirstEventWatchdogMs(
+	firstEventTimeoutMs: number | undefined,
+	endpointClass: "canonical" | "custom",
+): number | undefined {
+	if (firstEventTimeoutMs === undefined || endpointClass === "canonical") return firstEventTimeoutMs;
+	return firstEventTimeoutMs + ANTHROPIC_CUSTOM_ENDPOINT_FIRST_EVENT_GRACE_MS;
+}
+
+function resolveAnthropicFirstEventTimeoutMaxAttempts(requestBytes: number): number {
+	return requestBytes >= ANTHROPIC_LARGE_REQUEST_BYTES
+		? ANTHROPIC_LARGE_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS
+		: ANTHROPIC_SMALL_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS;
+}
+
+function createAnthropicFirstEventTimeoutError(args: {
+	elapsedMs: number;
+	requestBytes: number;
+	firstEventTimeoutMs: number | undefined;
+	endpointClass: "canonical" | "custom";
+}): FirstEventTimeoutError {
+	const retryMaxAttempts = resolveAnthropicFirstEventTimeoutMaxAttempts(args.requestBytes);
+	const timeoutLabel = args.firstEventTimeoutMs === undefined ? "disabled" : `${args.firstEventTimeoutMs}ms`;
+	return new FirstEventTimeoutError(
+		`Anthropic stream timed out while waiting for the first event (elapsed=${args.elapsedMs}ms request_bytes=${args.requestBytes} endpoint=${args.endpointClass} configured_timeout=${timeoutLabel}; override with PI_STREAM_FIRST_EVENT_TIMEOUT_MS)`,
+		{
+			requestBytes: args.requestBytes,
+			firstEventElapsedMs: args.elapsedMs,
+			firstEventTimeoutMs: args.firstEventTimeoutMs,
+			endpointClass: args.endpointClass,
+			retryMaxAttempts,
+		},
+	);
+}
 
 /**
  * Check if an error from the Anthropic SDK is a rate-limit/transient error that
@@ -1947,20 +1989,22 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
+			const endpointClass = classifyAnthropicEndpoint(baseUrl);
+			const firstEventWatchdogMs = resolveAnthropicFirstEventWatchdogMs(firstEventTimeoutMs, endpointClass);
 			stream.push({ type: "start", partial: output });
 			// Retry loop for transient errors from the stream.
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
 			// Malformed envelopes/JSON: only before replay-unsafe text/tool events are visible on this stream.
 			let providerRetryAttempt = 0;
 			while (true) {
+				const requestStartedAt = Date.now();
+				const requestBytes = fingerprintAnthropicPayload(params).bytes;
 				// Retries reset output.content; drop stale block correlations from the aborted attempt.
 				blocksByAnthropicIndex.clear();
 				truncatedToolCalls.clear();
 				sawTerminalStopReason = false;
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
-				const firstEventTimeoutAbortError = new FirstEventTimeoutError(
-					"Anthropic stream timed out while waiting for the first event",
-				);
+				let firstEventTimeoutAbortError: FirstEventTimeoutError | undefined;
 				const idleTimeoutAbortError = new Error("Anthropic stream stalled while waiting for the next event");
 				const { requestSignal } = activeAbortTracker;
 				setRawRequestDump(params);
@@ -1987,11 +2031,19 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 
 					for await (const event of iterateWithIdleTimeout(anthropicStream, {
 						idleTimeoutMs,
-						firstItemTimeoutMs: firstEventTimeoutMs,
+						firstItemTimeoutMs: firstEventWatchdogMs,
 						errorMessage: idleTimeoutAbortError.message,
-						firstItemErrorMessage: firstEventTimeoutAbortError.message,
+						firstItemErrorMessage: "Anthropic stream timed out while waiting for the first event",
 						onIdle: () => activeAbortTracker.abortLocally(idleTimeoutAbortError),
-						onFirstItemTimeout: () => activeAbortTracker.abortLocally(firstEventTimeoutAbortError),
+						onFirstItemTimeout: () => {
+							firstEventTimeoutAbortError = createAnthropicFirstEventTimeoutError({
+								elapsedMs: Date.now() - requestStartedAt,
+								requestBytes,
+								firstEventTimeoutMs,
+								endpointClass,
+							});
+							activeAbortTracker.abortLocally(firstEventTimeoutAbortError);
+						},
 						abortSignal: options?.signal,
 						isProgressItem: isProgressEvent,
 					})) {
@@ -2307,7 +2359,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				} catch (streamError) {
 					const localAbortReason = activeAbortTracker.getLocalAbortReason();
 					const streamFailure = localAbortReason ?? streamError;
-					if (localAbortReason || sawProviderSafetyStop) {
+					if (
+						(localAbortReason && !(localAbortReason instanceof FirstEventTimeoutError)) ||
+						sawProviderSafetyStop
+					) {
 						throw streamFailure;
 					}
 					if (
@@ -2615,8 +2670,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					const canRetryTransientEnvelopeFailure = isTransientEnvelopeFailure && !streamedReplayUnsafeContent;
 					const canRetryProviderFailure =
 						firstTokenTime === undefined && isProviderRetryableError(streamFailure, model.provider);
+					const firstEventRetryMaxAttempts =
+						streamFailure instanceof FirstEventTimeoutError ? streamFailure.retryMaxAttempts : undefined;
 					if (
 						activeAbortTracker.wasCallerAbort() ||
+						(firstEventRetryMaxAttempts !== undefined &&
+							providerRetryAttempt + 1 >= firstEventRetryMaxAttempts) ||
 						providerRetryAttempt >= resolveRetryBudget(options?.streamMaxRetries, PROVIDER_MAX_RETRIES) ||
 						(!canRetryTransientEnvelopeFailure && !canRetryProviderFailure)
 					) {

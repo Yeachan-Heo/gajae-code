@@ -21,6 +21,16 @@ const context: Context = {
 	messages: [{ role: "user", content: "Say hi", timestamp: Date.now() }],
 };
 
+function contextWithBytes(bytes: number): Context {
+	return {
+		messages: [{ role: "user", content: "x".repeat(bytes), timestamp: Date.now() }],
+	};
+}
+
+function customModel(baseUrl: string): Model<"anthropic-messages"> {
+	return { ...model, baseUrl };
+}
+
 type MockAnthropicEvent = Record<string, unknown>;
 type MockAnthropicStream = AsyncIterable<MockAnthropicEvent>;
 
@@ -90,11 +100,13 @@ function createSuccessfulAnthropicEvents(text: string): MockAnthropicEvent[] {
 function createAnthropicMockStream({
 	signal,
 	connectDelayMs = 0,
+	eventDelayMs = 0,
 	events,
 	hangAfterEvents = false,
 }: {
 	signal: AbortSignal | undefined;
 	connectDelayMs?: number;
+	eventDelayMs?: number;
 	events?: MockAnthropicEvent[];
 	hangAfterEvents?: boolean;
 }): MockAnthropicRequest {
@@ -108,6 +120,9 @@ function createAnthropicMockStream({
 			if (!events) {
 				await waitForAbortAndThrowAbortError(signal);
 				return;
+			}
+			if (eventDelayMs > 0) {
+				await waitForDelayOrAbort(eventDelayMs, signal);
 			}
 			for (const event of events) {
 				yield event;
@@ -152,14 +167,139 @@ describe("anthropic first-event timeouts", () => {
 		const result = await streamAnthropic(model, context, {
 			client,
 			streamFirstEventTimeoutMs: 1,
+			streamMaxRetries: 0,
 			providerRetryWait,
 		}).result();
 
 		expect(attempt).toBe(1);
 		expect(providerRetryWait).not.toHaveBeenCalled();
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("Anthropic stream timed out while waiting for the first event");
+		expect(result.errorMessage).toContain("Anthropic stream timed out while waiting for the first event");
+		expect(result.errorMessage).toContain("elapsed=");
+		expect(result.errorMessage).toContain("request_bytes=");
+		expect(result.errorMessage).toContain("endpoint=canonical");
+		expect(result.errorMessage).toContain("PI_STREAM_FIRST_EVENT_TIMEOUT_MS");
 		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		expect(result.transportFailure?.endpointClass).toBe("canonical");
+		expect(result.transportFailure?.retryMaxAttempts).toBe(2);
+		expect(result.transportFailure?.requestBytes).toBeGreaterThan(0);
+	});
+
+	it("does not upload a multi-megabyte body again after a full-window first-event timeout", async () => {
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			return createAnthropicMockStream({ signal: requestOptions?.signal }) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const providerRetryWait = vi.fn(async () => {});
+
+		const result = await streamAnthropic(model, contextWithBytes(1_670_000), {
+			client: { messages: { create } } as Anthropic,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(result.transportFailure).toMatchObject({
+			providerCode: "stream_first_event_timeout",
+			endpointClass: "canonical",
+			retryMaxAttempts: 1,
+		});
+		expect(result.transportFailure?.requestBytes).toBeGreaterThan(1_000_000);
+		expect(result.usage.totalTokens).toBe(0);
+		expect(result.duration).toBeGreaterThanOrEqual(result.transportFailure?.firstEventElapsedMs ?? 0);
+	});
+
+	it("allows one bounded replay for a small first-event timeout", async () => {
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			return createAnthropicMockStream({
+				signal: requestOptions?.signal,
+				events: attempts === 1 ? undefined : createSuccessfulAnthropicEvents("recovered once"),
+			}) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const providerRetryWait = vi.fn(async () => {});
+
+		const result = await streamAnthropic(model, context, {
+			client: { messages: { create } } as Anthropic,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
+		}).result();
+
+		expect(attempts).toBe(2);
+		expect(providerRetryWait).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "recovered once" }]);
+		expect(result.usage.totalTokens).toBe(16);
+	});
+
+	it("gives custom endpoints bounded grace so a late 529 surfaces instead of a timeout", async () => {
+		let attempts = 0;
+		const create = ((_body: unknown) => {
+			attempts += 1;
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				[Symbol.asyncIterator]() {
+					return {
+						async next(): Promise<IteratorResult<MockAnthropicEvent>> {
+							await Bun.sleep(5);
+							const error = new Error(
+								'529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+							);
+							(error as Error & { status: number; error: { type: string } }).status = 529;
+							(error as Error & { status: number; error: { type: string } }).error = {
+								type: "overloaded_error",
+							};
+							throw error;
+						},
+					};
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+
+		const result = await streamAnthropic(
+			customModel("https://user:password@proxy.example/v1?token=secret"),
+			context,
+			{
+				client: { messages: { create } } as Anthropic,
+				streamFirstEventTimeoutMs: 1,
+				streamMaxRetries: 0,
+			},
+		).result();
+
+		expect(attempts).toBe(1);
+		expect(result.errorStatus).toBe(529);
+		expect(result.errorMessage).toContain("overloaded_error");
+		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
+		expect(result.errorMessage).not.toContain("password");
+		expect(result.errorMessage).not.toContain("token=secret");
+	});
+
+	it("honors caller abort while a custom endpoint is inside its bounded grace", async () => {
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			return createAnthropicMockStream({ signal: requestOptions?.signal }) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 5);
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), context, {
+			client: { messages: { create } } as Anthropic,
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 1,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
 	});
 
 	it("surfaces large retry-after Anthropic 429s instead of first-event timeouts", async () => {
@@ -225,6 +365,24 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.content).toEqual([{ type: "text", text: "delayed connect" }]);
 	});
 
+	it("accepts an eventual first event inside the configured window", async () => {
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			return createAnthropicMockStream({
+				signal: requestOptions?.signal,
+				eventDelayMs: 2,
+				events: createSuccessfulAnthropicEvents("eventual first byte"),
+			}) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+
+		const result = await streamAnthropic(model, context, {
+			client: { messages: { create } } as Anthropic,
+			streamFirstEventTimeoutMs: 20,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "eventual first byte" }]);
+	});
+
 	it("keeps caller aborts as aborted instead of retrying them as first-event timeouts", async () => {
 		let attempt = 0;
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
@@ -246,6 +404,30 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).not.toBe("Anthropic stream timed out while waiting for the first event");
 		expect((result.errorMessage ?? "").toLowerCase()).toContain("abort");
+	});
+
+	it("stops a small-body timeout retry when the caller aborts during backoff", async () => {
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			return createAnthropicMockStream({ signal: requestOptions?.signal }) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const controller = new AbortController();
+		const providerRetryWait = vi.fn(async (_delayMs: number, signal?: AbortSignal) => {
+			controller.abort();
+			await waitForDelayOrAbort(1, signal);
+		});
+
+		const result = await streamAnthropic(model, context, {
+			client: { messages: { create } } as Anthropic,
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(providerRetryWait).toHaveBeenCalledTimes(1);
+		expect(result.stopReason).toBe("aborted");
 	});
 	it("fails hung Anthropic streams between tool-call events instead of waiting forever", async () => {
 		let attempt = 0;
