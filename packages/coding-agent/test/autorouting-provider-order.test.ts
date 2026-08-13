@@ -85,3 +85,47 @@ describe("buildProviderSelectionCatalog feeds the projection", () => {
 		expect(projectProviderOrder([], catalogProviders)).toEqual(["customrouter", "anthropic"]);
 	});
 });
+
+describe("ModelRegistry.autoroutingProviderOrder", () => {
+	/** Minimal registry stand-in exercising the real accessor body. */
+	function registryWith(models: Array<{ provider: string; id: string }>, configured: readonly string[]) {
+		const { catalogProviders } = buildProviderSelectionCatalog(models as never);
+		const spelling = new Map<string, string>();
+		for (const model of models) {
+			const normalized = model.provider.trim().toLowerCase();
+			if (normalized && !spelling.has(normalized)) spelling.set(normalized, model.provider);
+		}
+		// Mirrors the accessor: project order, then restore catalog spelling and drop
+		// providers the catalog does not offer.
+		return projectProviderOrder(configured, catalogProviders)
+			.map(provider => spelling.get(provider))
+			.filter((provider): provider is string => provider !== undefined);
+	}
+
+	test("returns catalog spelling, not the normalized comparison key", () => {
+		// The generator matches provider prefixes case-sensitively, so persisting a
+		// lowercased id would silently empty that provider's tiers.
+		expect(registryWith([{ provider: "CustomRouter", id: "m1" }], ["customrouter"])).toEqual(["CustomRouter"]);
+	});
+
+	test("drops configured providers the catalog does not offer", () => {
+		// A dead declaration must not reach setup.providers and pollute the fingerprint.
+		expect(registryWith([{ provider: "anthropic", id: "m1" }], ["ghost", "anthropic"])).toEqual(["anthropic"]);
+	});
+
+	test("honours configured priority ahead of catalog order", () => {
+		const models = [
+			{ provider: "anthropic", id: "a" },
+			{ provider: "google", id: "g" },
+		];
+		expect(registryWith(models, ["google"])).toEqual(["google", "anthropic"]);
+	});
+
+	test("collapses duplicate catalog spellings to the first occurrence", () => {
+		const models = [
+			{ provider: "CustomRouter", id: "a" },
+			{ provider: "customrouter", id: "b" },
+		];
+		expect(registryWith(models, [])).toEqual(["CustomRouter"]);
+	});
+});

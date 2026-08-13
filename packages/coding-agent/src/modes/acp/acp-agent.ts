@@ -3320,9 +3320,12 @@ export class AcpAgent implements Agent {
 						record.adapter,
 					);
 				}
+				// Not consumed on publish: this mirrors authFailure's lifecycle, where a
+				// later load/resume legitimately re-announces the condition. Clearing here
+				// would also lose the warning outright if the publish below rejected, since
+				// the enclosing bootstrap task swallows failures.
 				if (record.routingInactiveNotice) {
 					const message = record.routingInactiveNotice;
-					record.routingInactiveNotice = undefined;
 					await this.#publishSessionUpdate(
 						id,
 						{
