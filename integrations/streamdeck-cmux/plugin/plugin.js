@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { ANSWER_SLOT_COUNT, optionIndexForSlot, pageAction, pageCount, pendingAsk, sdkMessages, usesPagedLayout } from "./sdk-ask-state.js";
 import { nextSelectedSessionId } from "./focus-state.js";
 import { contextEntriesForActions, contextEntriesForControls } from "./render-lanes.js";
+import { moveNavigation, recentPaths, selectedNavigationPath } from "./path-navigation.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -46,6 +47,8 @@ let focusRefreshInFlight = null;
 let socket;
 const imageCache = new Map();
 let frequentProjects = [];
+let navigationPaths = [];
+let navigationIndex = 0;
 
 function log(message) {
   appendFile(LOG, `${new Date().toISOString()} ${message}\n`).catch(() => {});
@@ -166,11 +169,11 @@ async function discoverFrequentProjects() {
   }
 }
 
-async function savedSessionProjectCounts() {
+async function savedSessionRecords() {
   const root = join(process.env.GJC_AGENT_DIR || join(homedir(), ".gjc", "agent"), "sessions");
-  const counts = new Map();
+  const records = [];
   let buckets = [];
-  try { buckets = await readdir(root, { withFileTypes: true }); } catch { return counts; }
+  try { buckets = await readdir(root, { withFileTypes: true }); } catch { return records; }
   for (const bucket of buckets) {
     if (!bucket.isDirectory()) continue;
     let files = [];
@@ -178,13 +181,21 @@ async function savedSessionProjectCounts() {
     for (const file of files) {
       if (!file.isFile() || !file.name.endsWith(".jsonl")) continue;
       try {
-        const firstLine = (await readFile(join(root, bucket.name, file.name), "utf8")).split("\n", 1)[0];
+        const filePath = join(root, bucket.name, file.name);
+        const firstLine = (await readFile(filePath, "utf8")).split("\n", 1)[0];
         const record = JSON.parse(firstLine);
-        const projectPath = canonicalProjectPath(record.cwd ?? record.path ?? record.repo);
-        if (projectPath) counts.set(projectPath, (counts.get(projectPath) ?? 0) + 1);
+        const projectPath = String(record.cwd ?? record.path ?? record.repo ?? "");
+        const workspaceRoot = join(homedir(), "Documents", "Workspace");
+        if (projectPath === workspaceRoot || projectPath.startsWith(`${workspaceRoot}/`)) records.push({ path: projectPath, updatedAt: Number((await stat(filePath)).mtimeMs) });
       } catch {}
     }
   }
+  return records;
+}
+
+async function savedSessionProjectCounts() {
+  const counts = new Map();
+  for (const record of await savedSessionRecords()) counts.set(record.path, (counts.get(record.path) ?? 0) + 1);
   return counts;
 }
 
@@ -428,9 +439,14 @@ async function refreshSessions() {
 async function refreshProjects() {
   if (projectRefreshInFlight) return projectRefreshInFlight;
   projectRefreshInFlight = (async () => {
-    frequentProjects = await discoverFrequentProjects();
-    await renderProjectControls();
-    log(`project refresh projects=${frequentProjects.map(project => `${project.label}:${project.sessionCount}`).join(",") || "none"}`);
+    const [projects, records] = await Promise.all([discoverFrequentProjects(), savedSessionRecords()]);
+    frequentProjects = projects;
+    const currentPath = selectedNavigationPath(navigationPaths, navigationIndex);
+    navigationPaths = recentPaths(records);
+    navigationIndex = currentPath ? navigationPaths.indexOf(currentPath) : 0;
+    if (navigationIndex < 0) navigationIndex = 0;
+    await Promise.all([renderProjectControls(), renderNavigationControls()]);
+    log(`project refresh projects=${frequentProjects.map(project => `${project.label}:${project.sessionCount}`).join(",") || "none"} navigation=${navigationPaths.length}`);
   })().finally(() => { projectRefreshInFlight = null; });
   return projectRefreshInFlight;
 }
@@ -443,6 +459,22 @@ function sessionTitle(session) {
   const mode = session.surface ? (session.sessionId ? "SDK+CMUX" : "CMUX") : "SDK";
   const name = String(session.name || "GJC").replace(/^GJC:\s*/i, "").replace(/\s+/g, " ").trim();
   return `${mode}\n${name.slice(0, 14)}`;
+}
+
+function navigationPath() {
+  return selectedNavigationPath(navigationPaths, navigationIndex) ?? join(homedir(), "Documents", "Workspace");
+}
+
+function navigationLabel(path = navigationPath()) {
+  const root = join(homedir(), "Documents", "Workspace");
+  const relative = path.startsWith(`${root}/`) ? path.slice(root.length + 1) : path === root ? "." : path.replace(`${homedir()}/`, "~/");
+  const worktree = relative.match(/^(.+)\.gajae-code-worktrees\/([^/]+)(?:\/.*)?$/);
+  return worktree ? `${worktree[1]}\n${worktree[2]}` : wrapKeyText(relative, 12, 3);
+}
+
+function navigationPathAt(offset) {
+  if (navigationPaths.length === 0) return navigationPath();
+  return selectedNavigationPath(navigationPaths, navigationIndex + offset) ?? navigationPath();
 }
 
 function wrapKeyText(value, maxUnits = 12, maxLines = 3) {
@@ -488,8 +520,8 @@ async function renderContext(context, state) {
   }
   if (action === STATUS_ACTION) {
     const focused = focusedGjcSurface(topologyState);
-    title(context, focused ? `GJC FOCUS\n${wrapKeyText(focused.title)}` : "NOT GJC\nFOCUSED\nTAB");
-    await image(context, "focused-text");
+    title(context, focused ? `GJC FOCUS\n${wrapKeyText(focused.title)}` : "LAUNCH GJC\nIN THIS TAB");
+    await image(context, focused ? "focused-text" : "control-launch-gjc");
     return;
   }
   if (action === LAUNCH_ACTION) {
@@ -554,6 +586,17 @@ async function renderContext(context, state) {
       await image(context, settings.image || "ssh-vq-batch");
       return;
     }
+    if (settings.type === "pathNavigation") {
+      const delta = Number(settings.delta) < 0 ? -1 : 1;
+      title(context, `${delta < 0 ? "PREV" : "NEXT"}\n${navigationLabel(navigationPathAt(delta))}`);
+      await image(context, delta < 0 ? "directory-prev" : "directory-next");
+      return;
+    }
+    if (settings.type === "newPathTab") {
+      title(context, `NEW TAB\n${navigationLabel()}`);
+      await image(context, "directory-new-tab");
+      return;
+    }
     title(context, "");
     await image(context, `control-${settings.name}`);
     return;
@@ -586,6 +629,10 @@ async function renderSessionState() {
 
 async function renderProjectControls() {
   await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "frequentProject"));
+}
+
+async function renderNavigationControls() {
+  await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "pathNavigation" || settings.type === "newPathTab"));
 }
 
 async function renderAskControls() {
@@ -756,8 +803,25 @@ async function openFrequentProject(settings, context) {
   await createTerminalTab(project.path, null, context, null);
 }
 
-async function openNewGjcSession(context) {
-  await createTerminalTab(null, shellQuote(WORKTREE_LAUNCHER), context, null);
+async function openNewPathTab(context) {
+  await createTerminalTab(navigationPath(), null, context, null);
+}
+
+async function movePathNavigation(delta, context) {
+  const moved = moveNavigation(navigationPaths, navigationIndex, delta);
+  navigationIndex = moved.index;
+  await renderNavigationControls();
+  ok(context);
+}
+
+async function launchGjcInFocusedTab(context) {
+  const topology = await cmuxTopology();
+  const surface = topology.allSurfaces.find(row => row.surface === topology.currentSurface);
+  if (!surface || surface.type !== "terminal") { alert(context); return; }
+  const target = ["--surface", surface.surface, "--workspace", surface.workspace, "--window", surface.window];
+  const sent = await run(CMUX, ["send", ...target, "gjc"], homedir());
+  const submitted = sent.exitCode === 0 ? await run(CMUX, ["send-key", ...target, "enter"], homedir()) : sent;
+  if (submitted.exitCode === 0) ok(context); else { alert(context); log(`gjc launch failed ${submitted.stderr || submitted.stdout}`); }
 }
 
 async function closeFocusedCmuxTab(context) {
@@ -807,7 +871,11 @@ async function keyUp(context, state, heldMs) {
     return;
   }
   if (action === CMUX_NAV_ACTION) { await performCmuxNav(settings.op, context); return; }
-  if (action === STATUS_ACTION) { await sendFocusedGjcText("proceed", context, true); return; }
+  if (action === STATUS_ACTION) {
+    if (focusedGjcSurface(topologyState)) await sendFocusedGjcText("proceed", context, true);
+    else await launchGjcInFocusedTab(context);
+    return;
+  }
   if (action === LAUNCH_ACTION) { await launchPreset(settings.preset, context); return; }
   if (action === SKILL_ACTION) { await sendFocusedGjcText(`/skill:${settings.skill}`, context, false); return; }
   if (action === CONTROL_ACTION) {
@@ -816,8 +884,8 @@ async function keyUp(context, state, heldMs) {
     if (settings.type === "sshTab") { await openSshTab(settings, context); return; }
     if (settings.type === "fixedFolder") { await openFixedFolder(settings, context); return; }
     if (settings.type === "frequentProject") { await openFrequentProject(settings, context); return; }
-    if (settings.type === "newGjcTab") { await openNewGjcSession(context); return; }
-    if (settings.type === "voice") { await toggleFocusedGjcVoice(context); return; }
+    if (settings.type === "newPathTab") { await openNewPathTab(context); return; }
+    if (settings.type === "pathNavigation") { await movePathNavigation(Number(settings.delta) || 1, context); return; }
     if (settings.type === "command") { await sendFocusedGjcText(settings.value, context, settings.submit !== false); return; }
     if (settings.type === "worktree") { await launchProgram(WORKTREE_LAUNCHER, [], context, "worktree"); return; }
     if (settings.type === "launch" && Array.isArray(settings.value)) { await launchProgram(GJC, settings.value, context, settings.name || "GJC"); return; }
