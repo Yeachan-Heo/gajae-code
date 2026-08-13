@@ -7,7 +7,11 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { localBackend } from "@gajae-code/coding-agent/memory-backend/local-backend";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
-import { SessionContextTooLargeError, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	SessionContextTooLargeError,
+	SessionManager,
+	SessionManagerTestHooks,
+} from "@gajae-code/coding-agent/session/session-manager";
 
 const createdDirs = new Set<string>();
 
@@ -20,6 +24,7 @@ describe("createAgentSession memory startup", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		delete SessionManagerTestHooks.sessionContextBudgetBytesOverride;
 		authStorage.close();
 		for (const dir of createdDirs) {
 			await fs.promises.rm(dir, { recursive: true, force: true });
@@ -68,6 +73,12 @@ describe("createAgentSession memory startup", () => {
 	}, 30_000);
 
 	test("propagates typed session-context overflow during SDK startup", async () => {
+		// Pin the budget in-process, exactly as session-context-overflow.test.ts
+		// does. The shared preload no longer exports
+		// GJC_SESSION_CONTEXT_BUDGET_BYTES, so a 34 MiB fixture sized against the
+		// old pin no longer exceeds the production default and this assertion had
+		// silently stopped exercising the overflow path.
+		SessionManagerTestHooks.sessionContextBudgetBytesOverride = 32 * 1024 * 1024;
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-context-overflow-"));
 		createdDirs.add(cwd);
 		const modelRegistry = new ModelRegistry(authStorage);
