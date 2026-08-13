@@ -15,6 +15,7 @@ import {
 	recordMasterSession,
 	renderInventoryMarkdown,
 	resolveMasterResume,
+	syncMasterRegistryDirectory,
 } from "@gajae-code/coding-agent/master";
 import { masterModeSystemPromptSection } from "@gajae-code/coding-agent/master/prompt";
 import type { SdkSessionRowV1 } from "@gajae-code/coding-agent/sdk/cli/rows";
@@ -301,6 +302,35 @@ describe("durable master identity registry", () => {
 		expect((await resolveMasterResume(dir, repo, "../ordinary.jsonl")).ok).toBe(false);
 		fs.rmSync(dir, { recursive: true, force: true });
 		fs.rmSync(repo, { recursive: true, force: true });
+	});
+
+	it("tolerates only expected Windows directory-sync errors", async () => {
+		for (const code of ["EPERM", "EACCES"]) {
+			await expect(
+				syncMasterRegistryDirectory("C:\\registry", {
+					platform: "win32",
+					open: async () => {
+						throw Object.assign(new Error(code), { code });
+					},
+				}),
+			).resolves.toBeUndefined();
+		}
+		await expect(
+			syncMasterRegistryDirectory("C:\\registry", {
+				platform: "win32",
+				open: async () => {
+					throw Object.assign(new Error("EIO"), { code: "EIO" });
+				},
+			}),
+		).rejects.toThrow("EIO");
+		await expect(
+			syncMasterRegistryDirectory("/registry", {
+				platform: "linux",
+				open: async () => {
+					throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+				},
+			}),
+		).rejects.toThrow("EPERM");
 	});
 });
 

@@ -18,6 +18,37 @@ interface MasterRegistryDocument {
 	projects: Record<string, MasterProjectRecord>;
 }
 
+interface DirectorySyncHandle {
+	sync(): Promise<void>;
+	close(): Promise<void>;
+}
+
+/**
+ * Directory fsync is required on POSIX for rename durability. Windows does not
+ * permit opening/syncing directories; tolerate only that platform's expected
+ * EPERM/EACCES, matching the broker/session-index durability policy.
+ */
+export async function syncMasterRegistryDirectory(
+	directoryPath: string,
+	options: {
+		platform?: NodeJS.Platform;
+		open?: (path: string) => Promise<DirectorySyncHandle>;
+	} = {},
+): Promise<void> {
+	const platform = options.platform ?? process.platform;
+	const open = options.open ?? (async value => await fs.open(value, "r"));
+	let directory: DirectorySyncHandle | undefined;
+	try {
+		directory = await open(directoryPath);
+		await directory.sync();
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (platform !== "win32" || (code !== "EPERM" && code !== "EACCES")) throw error;
+	} finally {
+		await directory?.close().catch(() => {});
+	}
+}
+
 export type MasterResumeResolution =
 	| { ok: true; sessionId: string }
 	| { ok: false; reason: "no_master_session" | "not_a_master_session"; message: string };
@@ -85,12 +116,7 @@ async function writeAtomic(file: string, value: MasterRegistryDocument): Promise
 		await fs.rm(temporary, { force: true }).catch(() => {});
 		throw error;
 	}
-	const directory = await fs.open(path.dirname(file), "r");
-	try {
-		await directory.sync();
-	} finally {
-		await directory.close();
-	}
+	await syncMasterRegistryDirectory(path.dirname(file));
 }
 
 /** Required durable admission. Throws on corruption or publication failure. */
