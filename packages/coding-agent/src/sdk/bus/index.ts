@@ -7081,13 +7081,21 @@ export function createNotificationsExtension(
 					?.has(ASK_SELECTED_ACK_CAPABILITY);
 				// Ownership fence for chat-originated inbound. A chat daemon stays
 				// connected across an ownership-identity change (credential,
-				// destination, or Slack authorized actor), so the OLD principal can
-				// otherwise inject a user message or SDK control during the re-proof
-				// window. Local adapter teardown does not revoke that external
-				// attachment, so admission itself must require proved ownership.
-				if (notificationOrigin && runtime && runtime.notificationOwnerState !== "ready") {
+				// destination, or Slack authorized actor) AND across a
+				// last-provider disable, so the OLD principal can otherwise inject a
+				// user message or SDK control through its still-live attachment.
+				// Local adapter teardown does not revoke that external attachment,
+				// so admission itself must require BOTH proved ownership and
+				// actually-serving adapters: a disable path tears adapters down
+				// without demoting owner state, and a re-proof demotes owner state
+				// before tearing adapters down.
+				if (
+					notificationOrigin &&
+					runtime &&
+					(runtime.notificationOwnerState !== "ready" || !runtime.notificationsActive)
+				) {
 					logger.warn(
-						`notifications: refused chat-originated ${inbound.kind} while provider ownership is ${runtime.notificationOwnerState}`,
+						`notifications: refused chat-originated ${inbound.kind} (ownership ${runtime.notificationOwnerState}, adapters ${runtime.notificationsActive ? "active" : "withheld"})`,
 					);
 					return;
 				}
