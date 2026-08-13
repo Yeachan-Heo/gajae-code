@@ -31,6 +31,14 @@ import {
 } from "../setup/hermes-setup";
 import { buildHostPluginSetup, formatHostPluginSetup, type HostPluginKind } from "../setup/host-plugin-setup";
 import {
+	type PaseoSetupFlags,
+	type PaseoSetupOutcome,
+	PaseoSetupUsageError,
+	runPaseoSetup,
+} from "../setup/paseo/paseo-setup";
+import { checkExitCode } from "../setup/paseo/result-types";
+import { createDefaultPaseoSetupDependencies } from "../setup/paseo/setup-deps";
+import {
 	addApiCompatibleProvider,
 	formatProviderPresetList,
 	formatProviderSetupResult,
@@ -44,6 +52,7 @@ export type SetupComponent =
 	| "defaults"
 	| "hermes"
 	| "hooks"
+	| "paseo"
 	| "provider"
 	| "python"
 	| "stt";
@@ -67,6 +76,8 @@ export interface SetupCommandArgs {
 		repo?: string;
 		profile?: string;
 		sessionCommand?: string;
+		remove?: boolean;
+		mpreset?: string;
 		noWorktree?: boolean;
 		worktreeName?: string;
 		stateRoot?: string;
@@ -89,10 +100,30 @@ const VALID_COMPONENTS: SetupComponent[] = [
 	"defaults",
 	"hermes",
 	"hooks",
+	"paseo",
 	"provider",
 	"python",
 	"stt",
 ];
+
+/**
+ * Flags introduced by the `paseo` component.
+ *
+ * Deliberately narrow: `--check`, `--json`, and `--force` are pre-existing
+ * shared setup flags and are NOT relabeled here, so no other component's
+ * behavior changes.
+ */
+const PASEO_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = ["remove", "mpreset"];
+
+function rejectPaseoFlagsOutsidePaseo(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
+	if (component === "paseo") return;
+	const offending = PASEO_ONLY_FLAGS.filter(flag => flags[flag] !== undefined);
+	if (offending.length === 0) return;
+	const flagList = offending.map(flag => `--${flag}`);
+	process.stderr.write(`${chalk.red(`${flagList.join(", ")} require the explicit \`paseo\` component.`)}\n`);
+	process.stderr.write(`${chalk.dim(`Run: ${APP_NAME} setup paseo ${flagList.join(" ")}`)}\n`);
+	process.exit(1);
+}
 
 function hasProviderSetupFlags(flags: SetupCommandArgs["flags"]): boolean {
 	return (
@@ -194,6 +225,10 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.model = [...(flags.model ?? []), args[++i] ?? ""];
 		} else if (arg === "--models-path") {
 			flags.modelsPath = args[++i];
+		} else if (arg === "--remove") {
+			flags.remove = true;
+		} else if (arg === "--mpreset") {
+			flags.mpreset = args[++i];
 		} else if (!componentSeen && VALID_COMPONENTS.includes(arg as SetupComponent)) {
 			component = arg as SetupComponent;
 			componentSeen = true;
@@ -205,6 +240,7 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 	}
 
 	rejectProviderFlagsOutsideProvider(component, flags);
+	rejectPaseoFlagsOutsidePaseo(component, flags);
 
 	return {
 		component,
@@ -262,6 +298,7 @@ async function checkPythonSetup(): Promise<PythonCheckResult> {
  */
 export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 	rejectProviderFlagsOutsideProvider(cmd.component, cmd.flags);
+	rejectPaseoFlagsOutsidePaseo(cmd.component, cmd.flags);
 	switch (cmd.component) {
 		case "claude":
 			handleHostPluginSetup("claude", cmd.flags);
@@ -277,6 +314,9 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 			break;
 		case "hooks":
 			await handleHooksSetup(cmd.flags);
+			break;
+		case "paseo":
+			await handlePaseoSetup(cmd.flags);
 			break;
 		case "provider":
 			await handleProviderSetup(cmd.flags);
@@ -379,6 +419,105 @@ async function handleProviderSetup(flags: {
 			process.stderr.write(`${chalk.dim(message)}\n`);
 		}
 		process.exit(1);
+	}
+}
+
+/**
+ * Register GJC with Paseo, diagnose that registration, or roll it back.
+ *
+ * Every write target belongs to another application, so failures are reported
+ * rather than worked around: a refusal here means the user's files were left
+ * exactly as they were.
+ */
+async function handlePaseoSetup(flags: SetupCommandArgs["flags"]): Promise<void> {
+	const paseoFlags: PaseoSetupFlags = {
+		check: flags.check,
+		json: flags.json,
+		force: flags.force,
+		remove: flags.remove,
+		mpreset: flags.mpreset,
+	};
+	try {
+		const outcome = await runPaseoSetup(paseoFlags, createDefaultPaseoSetupDependencies());
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify(outcome.result, null, 2)}\n`);
+			process.exitCode = paseoExitCode(outcome);
+			return;
+		}
+		writePaseoHumanOutput(outcome);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify({ ok: false, error: message }, null, 2)}\n`);
+		} else {
+			process.stderr.write(`${chalk.red(`${theme.status.error} Paseo setup failed`)}\n`);
+			process.stderr.write(`${chalk.dim(message)}\n`);
+		}
+		process.exit(error instanceof PaseoSetupUsageError ? 2 : 1);
+	}
+}
+
+function paseoExitCode(outcome: PaseoSetupOutcome): number {
+	if (outcome.kind === "check") return checkExitCode(outcome.result);
+	if (outcome.kind === "install") return outcome.result.outcome === "installed" ? 0 : 1;
+	return outcome.result.outcome === "partial-removal" ? 1 : 0;
+}
+
+function writePaseoHumanOutput(outcome: PaseoSetupOutcome): void {
+	if (outcome.kind === "check") {
+		const result = outcome.result;
+		switch (result.status) {
+			case "drift":
+				process.stderr.write(`${chalk.red(`${theme.status.error} Paseo setup has drifted`)}\n`);
+				for (const reason of result.reasons) {
+					process.stderr.write(`${chalk.dim(`  ${reason.code}: ${reason.subject} -- ${reason.detail}`)}\n`);
+				}
+				process.exitCode = 1;
+				return;
+			case "stale":
+				process.stdout.write(`${chalk.yellow(`${theme.status.warning} Paseo has not picked up the change yet`)}\n`);
+				if (result.guidance) process.stdout.write(`${chalk.dim(result.guidance)}\n`);
+				return;
+			case "skipped":
+				process.stdout.write(`${chalk.green(`${theme.status.success} Paseo setup files are correct`)}\n`);
+				process.stdout.write(
+					`${chalk.dim("The Paseo daemon did not respond, so its live provider list was not verified.")}\n`,
+				);
+				return;
+			case "pass":
+				process.stdout.write(`${chalk.green(`${theme.status.success} GJC is registered with Paseo`)}\n`);
+				return;
+		}
+	}
+
+	if (outcome.kind === "install") {
+		if (outcome.result.outcome === "installed") {
+			process.stdout.write(`${chalk.green(`${theme.status.success} GJC registered with Paseo`)}\n`);
+			for (const entry of outcome.result.changed) process.stdout.write(`${chalk.dim(`  updated ${entry}`)}\n`);
+			process.stdout.write(
+				`${chalk.dim("Restart the Paseo daemon when convenient so it picks up the new provider.")}\n`,
+			);
+			return;
+		}
+		process.stderr.write(`${chalk.red(`${theme.status.error} Paseo setup did not complete`)}\n`);
+		process.stderr.write(`${chalk.dim(outcome.result.evidence.detail)}\n`);
+		process.exitCode = 1;
+		return;
+	}
+
+	switch (outcome.result.outcome) {
+		case "removed":
+			process.stdout.write(`${chalk.green(`${theme.status.success} GJC unregistered from Paseo`)}\n`);
+			for (const entry of outcome.result.removed) process.stdout.write(`${chalk.dim(`  reverted ${entry}`)}\n`);
+			return;
+		case "nothing-to-remove":
+			process.stdout.write(`${chalk.dim("GJC has nothing recorded to remove from Paseo.")}\n`);
+			return;
+		case "partial-removal":
+			process.stderr.write(`${chalk.red(`${theme.status.error} Paseo removal did not complete`)}\n`);
+			process.stderr.write(`${chalk.dim(outcome.result.evidence.detail)}\n`);
+			process.exitCode = 1;
+			return;
 	}
 }
 
@@ -724,6 +863,7 @@ ${chalk.bold("Components:")}
   defaults  Install bundled GJC default workflow skills (default)
   hermes   Optional: render/install a Hermes MCP bridge setup package
   hooks     Optional: install GJC native Codex UserPromptSubmit/Stop skill-state hooks
+  paseo     Optional: register GJC as a Paseo ACP provider and bridge Paseo's skills
   provider  Optional: add a preset, OpenAI-compatible, or Anthropic-compatible API provider
   python    Optional: verify a Python 3 interpreter is reachable for code execution
   stt       Optional: install speech-to-text dependencies (openai-whisper, recording tools)
@@ -770,6 +910,8 @@ ${chalk.bold("Options:")}
   --dry-run         Preview discovered credentials without importing (credentials)
   -y, --yes         Import discovered credentials without an interactive prompt (credentials)
   --keychain        Include Claude macOS Keychain when discovering credentials
+  --remove          Roll back the Paseo registration GJC created (paseo)
+  --mpreset         Register an additional gjc-<preset> Paseo provider (paseo)
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} setup                  Install bundled GJC default workflow skills
@@ -785,5 +927,8 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} setup credentials      Discover & import existing Claude/Codex credentials
   ${APP_NAME} setup credentials --dry-run  Preview importable credentials (redacted)
   ${APP_NAME} setup credentials --yes      Import without an interactive prompt
+  ${APP_NAME} setup paseo            Register GJC as a Paseo ACP provider
+  ${APP_NAME} setup paseo --check    Diagnose the Paseo registration
+  ${APP_NAME} setup paseo --remove   Roll back the Paseo registration
 `);
 }
