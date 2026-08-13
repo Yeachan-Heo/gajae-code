@@ -344,6 +344,13 @@ async function runCleanupDeadlineFatal(): Promise<void> {
 	await throwFromTimer(new Error("fixture: fatal with hung cleanup"));
 }
 
+async function runQuitDrainsBackpressuredStderr(): Promise<void> {
+	setInterval(() => {}, 1_000);
+	const diagnosticLine = "timing-diagnostic\n";
+	process.stderr.write(`${diagnosticLine.repeat(131_072)}TIMING_DIAGNOSTICS_COMPLETE\n`);
+	await postmortem.quit(23);
+}
+
 const scenario = process.argv[2];
 switch (scenario) {
 	case "exit-reentry-while-running":
@@ -363,6 +370,9 @@ switch (scenario) {
 		break;
 	case "cleanup-deadline-fatal":
 		await runCleanupDeadlineFatal();
+		break;
+	case "quit-drains-backpressured-stderr":
+		await runQuitDrainsBackpressuredStderr();
 		break;
 	case "quit-reentry-waits-for-cleanup":
 		await runQuitReentryWaitsForCleanup();
