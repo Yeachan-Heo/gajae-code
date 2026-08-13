@@ -1388,15 +1388,17 @@ function annotateForeignShadowing(
  * Build the full doctor report for a project directory.
  *
  * @param cwd Project directory; defaults to getProjectDir().
- * @param activeSettings Session-equivalent settings; when omitted, Settings.init
- *   is called for the given cwd (CLI path). Tests pass an in-memory instance.
+ * @param activeSettings Session-equivalent settings; when omitted,
+ *   Settings.loadReadonly is called for the given cwd (CLI path). The
+ *   read-only load never opens the DB, runs migrations, or writes files.
+ *   Tests pass an in-memory instance.
  */
 export async function runCustomizeDoctor(
 	cwd?: string,
 	activeSettings?: SettingsInstance,
 ): Promise<CustomizeDoctorReport> {
 	const projectDir = cwd ?? getProjectDir();
-	const settings = activeSettings ?? (await Settings.init({ cwd: projectDir }));
+	const settings = activeSettings ?? (await Settings.loadReadonly({ cwd: projectDir }));
 	// Mirror session startup: the capability system and the downstream startup
 	// consumers (loadAllMCPConfigs, loadSlashCommands) resolve provider policy
 	// from the initialized session settings, so the doctor must initialize with

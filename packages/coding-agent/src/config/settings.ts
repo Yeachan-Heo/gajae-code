@@ -220,6 +220,13 @@ export interface SettingsOptions {
 	inMemory?: boolean;
 	/** Initial overrides */
 	overrides?: Partial<Record<SettingPath, unknown>>;
+	/**
+	 * Read the canonical config.yml from disk but never persist: no DB open,
+	 * no legacy/config-root/project migrations, no file writes, renames, locks,
+	 * or mtime changes. Used by read-only inspection surfaces (`gjc customize
+	 * doctor`). When true, inMemory must be false so config.yml is still read.
+	 */
+	readonly?: boolean;
 }
 
 function summarizeSettingsOptions(options: SettingsOptions | null): {
@@ -536,12 +543,15 @@ export class Settings implements NotificationSettingsReader {
 
 	/** Whether to persist changes */
 	#persist: boolean;
+	/** Read-only inspection mode: config.yml is read but never written/migrated. */
+	#readonly: boolean;
 
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.resolve(this.#agentDir, "config.yml");
-		this.#persist = !options.inMemory;
+		this.#persist = !options.inMemory && !options.readonly;
+		this.#readonly = options.readonly === true;
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
@@ -595,6 +605,19 @@ export class Settings implements NotificationSettingsReader {
 	 */
 	static loadForScope(options: { cwd: string; agentDir?: string }): Promise<Settings> {
 		const instance = new Settings(options);
+		return instance.#load();
+	}
+	/**
+	 * Load settings for read-only inspection without any persistence side-effects:
+	 * no DB open, no legacy/config-root/project migrations, no file writes,
+	 * renames, locks, or mtime changes. Reads the canonical config.yml and
+	 * discovers/merges project settings exactly like the durable path, but the
+	 * result is a transient snapshot. Does not affect the global singleton.
+	 *
+	 * Used by `gjc customize doctor` to honor the read-only product contract.
+	 */
+	static loadReadonly(options: { cwd?: string; agentDir?: string }): Promise<Settings> {
+		const instance = new Settings({ ...options, readonly: true });
 		return instance.#load();
 	}
 
@@ -1344,6 +1367,14 @@ export class Settings implements NotificationSettingsReader {
 					await this.#migrateAgentDirAndDatabaseLegacy();
 				}
 				this.#global = await this.#loadYaml(this.#configPath!);
+			} else if (this.#readonly && this.#configPath) {
+				// Read-only inspection path (e.g. `gjc customize doctor`): read
+				// config.yml from disk without opening the DB, running legacy/
+				// config-root/project migrations, or writing/renaming anything.
+				// The effective configuration semantics are otherwise identical:
+				// the same YAML parse, schema reconciliation, in-memory migration,
+				// and project-layer discovery/merge are applied.
+				this.#global = await this.#loadYaml(this.#configPath);
 			}
 			if (this.#schemaMigrationPending)
 				this.#recordLegacyFallbackMigrationPatch("configSchemaVersion", CONFIG_SCHEMA_VERSION);
