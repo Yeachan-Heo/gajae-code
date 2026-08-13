@@ -550,8 +550,8 @@ async function renderContext(context, state) {
       return;
     }
     if (settings.type === "sshTab") {
-      title(context, wrapKeyText(settings.label || "SSH", 10, 3));
-      await image(context, "control-ssh");
+      title(context, String(settings.label || "SSH"));
+      await image(context, settings.image || "ssh-vq-batch");
       return;
     }
     title(context, "");
@@ -741,9 +741,12 @@ async function openSshTab(settings, context) {
   const port = Number(settings.port);
   const host = String(settings.host || "");
   const user = String(settings.user || "");
-  const label = String(settings.label || host);
+  const label = String(settings.label || host).replaceAll("\n", " ");
+  const remoteCwd = String(settings.cwd || "");
   if (!host || !user || !Number.isInteger(port) || port < 1 || port > 65535) { alert(context); return; }
-  await createTerminalTab(homedir(), `ssh -p ${port} ${shellQuote(`${user}@${host}`)}`, context, label);
+  const destination = shellQuote(`${user}@${host}`);
+  const remoteCommand = remoteCwd ? ` -t ${destination} ${shellQuote(`cd -- ${remoteCwd} && exec $SHELL -l`)}` : ` ${destination}`;
+  await createTerminalTab(homedir(), `ssh -p ${port}${remoteCommand}`, context, label);
 }
 
 async function openFrequentProject(settings, context) {
