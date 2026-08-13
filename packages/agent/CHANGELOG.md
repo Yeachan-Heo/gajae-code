@@ -4,7 +4,8 @@
 
 ### Fixed
 
-- The agent loop rejects a tool call flagged `escapedNonAsciiArguments` before execution, with a retryable error telling the model to re-issue the call writing non-ASCII characters literally. Hand-spelled `\uXXXX` arguments decode into valid-looking but silently wrong text (observed as garbled Hangul in `ask` prompts), and no post-parse repair can recover the intended characters.
+- A turn whose tool arguments arrive flagged `escapedNonAsciiArguments` is now resampled instead of being reported as a tool failure: the defective assistant turn is dropped from history and the request is re-issued, up to twice per turn, before the terminal per-call rejection takes over. Hand-spelled `\uXXXX` arguments decode into valid-looking but silently wrong text (observed as garbled Hangul in `ask` prompts) and no post-parse repair can recover them, but the defect is a wire-format accident that resampling clears - surfacing it as a tool error instead burned the whole turn and fed the literal escape syntax back into the context the model samples from next. Scoped to the non-managed session path, matching the existing `invalid_prompt` and reasoning-content repairs; managed fallback keeps owning its own retry policy.
+- The agent loop still rejects a tool call flagged `escapedNonAsciiArguments` before execution once the resample budget is spent, with a retryable error telling the model to re-issue the call writing non-ASCII characters literally.
 - The emergency compaction system now includes a `transcriptFileBytes` floor (48 MiB, 75% of the managed-storage per-file cap) so a long-running session compacts before its append-only transcript reaches the 64 MiB limit. `CompactionTriggerReason` adds `"transcriptFile"`, `EmergencyCompactionSample` adds `transcriptFileBytes`, and `EmergencyCompactionLimits` adds `transcriptFileBytes`.
 
 ### Added

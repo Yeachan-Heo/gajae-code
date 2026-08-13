@@ -144,6 +144,21 @@ const standaloneOwnershipStates = new WeakMap<StandaloneRunOwnership, Standalone
  */
 const MAX_CONSECUTIVE_MALFORMED_TURNS = 5;
 
+/**
+ * How many times a single turn may be re-requested because its tool arguments
+ * arrived as `\uXXXX` escapes instead of literal UTF-8.
+ *
+ * The defect is a wire-format accident that resampling clears, so a small
+ * budget recovers the overwhelming majority of turns; past it the terminal
+ * per-call rejection takes over rather than spending the run on retries.
+ */
+const MAX_ESCAPED_NONASCII_RESAMPLES = 2;
+
+/** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
+function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
+	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
+}
+
 function isComposerBashPolicyBlockedToolResult(result: ToolResultMessage): boolean {
 	return (
 		result.isError &&
@@ -1491,6 +1506,10 @@ async function runLoopBody(
 	// Fires at most one repaired resend per run for the reasoning-content replay
 	// breaker below (DeepSeek "reasoning_content ... must be passed back").
 	let reasoningContentRepairAttempted = false;
+	// Consecutive resamples spent on the current turn because its tool arguments
+	// arrived `\uXXXX`-escaped. Reset once a turn gets past the check, so every
+	// turn is judged on its own wire bytes.
+	let escapedNonAsciiResampleAttempt = 0;
 	let previousMalformedToolSignatures = new Set<string>();
 	type SyntheticRecoveryKind = "malformed-tool-call" | "composer-bash-policy" | "provider";
 	let pendingRecovery:
@@ -1794,6 +1813,38 @@ async function runLoopBody(
 					continue;
 				}
 			}
+
+			// Escaped-non-ASCII tool arguments: bounded turn resample.
+			//
+			// Arguments that spell a printable non-ASCII character as `\uXXXX`
+			// instead of literal UTF-8 are a wire-format defect, not a decision the
+			// model needs to be told about. The payload parses cleanly, but one
+			// mistyped nibble decodes to a different, equally valid character, so it
+			// can never be verified or repaired after the fact. Reporting it as a
+			// tool error spends the whole turn and writes the literal escape syntax
+			// back into the context the model samples from next. Drop the defective
+			// turn and re-request instead; the per-call rejection in
+			// `executeToolCalls` stays as the terminal answer once this budget is
+			// spent. Managed fallback owns its own retry policy, so this is scoped
+			// to the non-managed session path, matching the repairs above.
+			if (
+				!config.fallbackManaged &&
+				message.stopReason !== "error" &&
+				message.stopReason !== "aborted" &&
+				escapedNonAsciiResampleAttempt < MAX_ESCAPED_NONASCII_RESAMPLES &&
+				hasEscapedNonAsciiToolCall(message)
+			) {
+				escapedNonAsciiResampleAttempt++;
+				// The defective turn was already committed to the context by the
+				// streaming path. Drop it so the resample neither replays the escaped
+				// arguments as history nor leaves a second assistant tail behind.
+				const escapedIndex = currentContext.messages.length - 1;
+				if (escapedIndex >= 0 && currentContext.messages[escapedIndex]?.role === "assistant") {
+					currentContext.messages.splice(escapedIndex, 1);
+				}
+				continue;
+			}
+			escapedNonAsciiResampleAttempt = 0;
 
 			const overflow = managedContextOverflow(message, config);
 			if (config.fallbackManaged && overflow) {
