@@ -4,6 +4,7 @@ import { TEMPLATE } from "../src/export/html/template.generated";
 import { STATUS_LINE_PRESETS } from "../src/modes/components/status-line/presets";
 import { defaultThemes } from "../src/modes/theme/defaults";
 import blueCrabTheme from "../src/modes/theme/defaults/blue-crab.json" with { type: "json" };
+import ouroborosTheme from "../src/modes/theme/defaults/ouroboros.json" with { type: "json" };
 import redClawTheme from "../src/modes/theme/defaults/red-claw.json" with { type: "json" };
 import * as themeModule from "../src/modes/theme/theme";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../src/slash-commands/acp-builtins";
@@ -51,17 +52,39 @@ describe("GJC red-claw redesign defaults", () => {
 	it("exposes bundled selectable themes while preserving red-claw and blue-crab defaults", async () => {
 		const themes = await themeModule.getAvailableThemes();
 
-		expect(themes).toEqual(["blue-crab", "claude-code", "codex", "gruvbox-dark", "opencode", "red-claw"]);
+		expect(themes).toEqual([
+			"blue-crab",
+			"claude-code",
+			"codex",
+			"gruvbox-dark",
+			"opencode",
+			"ouroboros",
+			"red-claw",
+		]);
 		expect(Object.keys(defaultThemes).sort()).toEqual([
 			"blue-crab",
 			"claude-code",
 			"codex",
 			"gruvbox-dark",
 			"opencode",
+			"ouroboros",
 			"red-claw",
 		]);
 		expect(SETTINGS_SCHEMA["theme.dark"].default).toBe("red-claw");
 		expect(SETTINGS_SCHEMA["theme.light"].default).toBe("blue-crab");
+	});
+
+	it("keeps Ouroboros brand colors distinct from semantic state colors", async () => {
+		const colors = await themeModule.getResolvedThemeColors("ouroboros");
+		const vars = ouroborosTheme.vars;
+
+		expect(colors.accent).toBe(vars.petLime);
+		expect(colors.border).toBe(vars.ouroTeal);
+		expect(colors.borderAccent).toBe(vars.ritualGold);
+		expect(colors.statusLineBg).toBe(vars.deepNavy);
+		expect(colors.error).toBe(vars.dangerRed);
+		expect(colors.toolDiffRemoved).toBe(vars.diffRemovalRed);
+		expect(new Set([colors.accent, colors.warning, colors.error, colors.toolDiffRemoved]).size).toBe(4);
 	});
 
 	it("validates every bundled built-in theme against the schema-required token set", async () => {

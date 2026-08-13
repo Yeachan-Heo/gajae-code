@@ -39,6 +39,8 @@ export interface SelectListTheme {
 	symbols: SymbolTheme;
 }
 
+export type SelectListThemeSource = SelectListTheme | (() => SelectListTheme);
+
 export interface SelectListTruncatePrimaryContext {
 	text: string;
 	maxWidth: number;
@@ -67,7 +69,7 @@ export class SelectList implements Component {
 	constructor(
 		private readonly items: ReadonlyArray<SelectItem>,
 		private readonly maxVisible: number,
-		private readonly theme: SelectListTheme,
+		private readonly themeSource: SelectListThemeSource,
 		private readonly layout: SelectListLayoutOptions = {},
 	) {
 		this.#filteredItems = items;
@@ -114,11 +116,12 @@ export class SelectList implements Component {
 	}
 
 	render(width: number): string[] {
+		const theme = this.#theme();
 		const lines: string[] = [];
 
 		// If no items match filter, show message
 		if (this.#filteredItems.length === 0) {
-			lines.push(truncateToWidth(this.theme.noMatch("  No matching commands"), Math.max(0, width), Ellipsis.Omit));
+			lines.push(truncateToWidth(theme.noMatch("  No matching commands"), Math.max(0, width), Ellipsis.Omit));
 			return lines;
 		}
 
@@ -146,10 +149,14 @@ export class SelectList implements Component {
 			const position = this.#selectedIndex >= 0 ? `${this.#selectedIndex + 1}` : "-";
 			const scrollText = `  (${position}/${this.#filteredItems.length})`;
 			// Truncate if too long for terminal
-			lines.push(this.theme.scrollInfo(truncateToWidth(scrollText, width - 2, Ellipsis.Omit)));
+			lines.push(theme.scrollInfo(truncateToWidth(scrollText, width - 2, Ellipsis.Omit)));
 		}
 
 		return lines;
+	}
+
+	#theme(): SelectListTheme {
+		return typeof this.themeSource === "function" ? this.themeSource() : this.themeSource;
 	}
 
 	handleInput(keyData: string): void {
@@ -193,9 +200,8 @@ export class SelectList implements Component {
 		descriptionSingleLine: string | undefined,
 		primaryColumnWidth: number,
 	): string {
-		const prefix = isSelected
-			? `${this.theme.symbols.cursor} `
-			: padding(visibleWidth(this.theme.symbols.cursor) + 1);
+		const theme = this.#theme();
+		const prefix = isSelected ? `${theme.symbols.cursor} ` : padding(visibleWidth(theme.symbols.cursor) + 1);
 		const prefixWidth = visibleWidth(prefix);
 
 		if (descriptionSingleLine && width > 40) {
@@ -210,13 +216,13 @@ export class SelectList implements Component {
 			if (remainingWidth > MIN_DESCRIPTION_WIDTH) {
 				const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, Ellipsis.Omit);
 				if (item.disabled) {
-					return this.theme.description(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
+					return theme.description(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
 				}
 				if (isSelected) {
-					return this.theme.selectedText(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
+					return theme.selectedText(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
 				}
 
-				const descText = this.theme.description(spacing + truncatedDesc);
+				const descText = theme.description(spacing + truncatedDesc);
 				return prefix + truncatedValue + descText;
 			}
 		}
@@ -224,10 +230,10 @@ export class SelectList implements Component {
 		const maxWidth = width - prefixWidth - 2;
 		const truncatedValue = this.#truncatePrimary(item, isSelected, maxWidth, maxWidth);
 		if (item.disabled) {
-			return this.theme.description(`${prefix}${truncatedValue}`);
+			return theme.description(`${prefix}${truncatedValue}`);
 		}
 		if (isSelected) {
-			return this.theme.selectedText(`${prefix}${truncatedValue}`);
+			return theme.selectedText(`${prefix}${truncatedValue}`);
 		}
 
 		return prefix + truncatedValue;

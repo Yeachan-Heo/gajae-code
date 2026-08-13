@@ -1,6 +1,7 @@
-import { Container, type SelectItem, SelectList, Text } from "@gajae-code/tui";
+import { Container, type SelectItem, SelectList } from "@gajae-code/tui";
 import { getSelectListTheme, theme } from "../../modes/theme/theme";
 import { DynamicBorder } from "./dynamic-border";
+import { DynamicThemeText } from "./dynamic-theme-text";
 
 export interface FramedSelectOptions {
 	maxVisible?: number;
@@ -24,10 +25,10 @@ export function FramedSelect(
 	const container = new Container();
 	container.addChild(new DynamicBorder());
 	if (title) {
-		container.addChild(new Text(theme.bold(theme.fg("accent", title)), 0, 0));
+		container.addChild(new DynamicThemeText(() => theme.bold(theme.fg("accent", title))));
 	}
 
-	const selectList = new SelectList(items, opts.maxVisible ?? Math.min(items.length, 10), getSelectListTheme());
+	const selectList = new SelectList(items, opts.maxVisible ?? Math.min(items.length, 10), () => getSelectListTheme());
 	const selectedIndex =
 		opts.selectedValue === undefined ? -1 : items.findIndex(item => item.value === opts.selectedValue);
 	if (selectedIndex !== -1) selectList.setSelectedIndex(selectedIndex);

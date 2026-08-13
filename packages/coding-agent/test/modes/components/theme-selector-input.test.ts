@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { ThemeSelectorComponent } from "@gajae-code/coding-agent/modes/components/theme-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
-import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { initTheme, previewTheme, restoreThemePreview, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 
 const THEMES = ["red-claw", "blue-crab"];
@@ -74,6 +74,26 @@ describe("ThemeSelectorComponent input handling", () => {
 		expect(previewedThemes).toEqual(["blue-crab"]);
 	});
 
+	it("recolors the open /theme selector when previewing", async () => {
+		const component = new ThemeSelectorComponent(
+			"red-claw",
+			THEMES,
+			() => {},
+			() => {},
+			themeName => {
+				void previewTheme(themeName);
+			},
+		);
+
+		component.getSelectList().handleInput("\x1b[B");
+		await Bun.sleep(1);
+
+		const title = component.render(160).find(line => Bun.stripANSI(line).includes("Select theme"));
+		expect(title).toContain(theme.getFgAnsi("accent"));
+		expect(theme.getFgAnsi("accent")).toBe("\u001b[38;2;94;200;255m");
+		await restoreThemePreview("red-claw");
+	});
+
 	it("cancels on Escape from the focused theme list", () => {
 		const { component, cancellations } = createSelector();
 
@@ -125,6 +145,7 @@ describe("ThemeSelectorComponent input handling", () => {
 
 		selector.getSelectList().handleInput("\x1b[B");
 		selector.getSelectList().handleInput("\n");
+		await Bun.sleep(1);
 
 		expect(settings.get("theme.dark")).toBe("blue-crab");
 		expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(ctx.editor);

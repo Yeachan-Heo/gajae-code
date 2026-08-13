@@ -2,7 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:
 import type { SettingPath } from "@gajae-code/coding-agent/config/settings";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
-import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { initTheme, previewTheme, restoreThemePreview, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 
 const THEMES = ["red-claw", "blue-crab"];
 
@@ -74,6 +74,34 @@ describe("SettingsSelectorComponent theme selection", () => {
 		expect(restoredThemes).toEqual([]);
 		expect(changedSettings).toEqual([]);
 		expect(settings.get("theme.dark")).toBe("red-claw");
+	});
+
+	it("recolors the open Settings theme submenu while previewing", async () => {
+		const component = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [],
+				thinkingLevel: undefined,
+				availableThemes: THEMES,
+				availableModelProfiles: [],
+				cwd: process.cwd(),
+			},
+			{
+				onChange: () => {},
+				onThemePreview: themeName => previewTheme(themeName).then(() => {}),
+				onThemePreviewCancel: themeName => restoreThemePreview(themeName).then(() => {}),
+				onCancel: () => {},
+				getStatusLinePreview: () => "status-preview",
+			},
+		);
+
+		component.handleInput("\n");
+		component.handleInput("\x1b[B");
+		await Bun.sleep(1);
+
+		const title = component.render(120).find(line => Bun.stripANSI(line).includes("Dark Theme"));
+		expect(title).toContain(theme.getFgAnsi("accent"));
+		expect(theme.getFgAnsi("accent")).toBe("\u001b[38;2;94;200;255m");
+		await restoreThemePreview("red-claw");
 	});
 
 	it("restores the pre-preview rendered theme on cancel and leaves dark settings unchanged", () => {

@@ -77,6 +77,18 @@ describe("SelectList", () => {
 		expect(rendered[0]).toContain("Line one Line two Line three");
 	});
 
+	it("resolves a live theme source on every render", () => {
+		let marker = "first";
+		const list = new SelectList([{ value: "test", label: "test" }], 1, () => ({
+			...testTheme,
+			selectedText: text => `${marker}:${text}`,
+		}));
+
+		expect(list.render(80)[0]).toStartWith("first:");
+		marker = "second";
+		expect(list.render(80)[0]).toStartWith("second:");
+	});
+
 	it("keeps descriptions aligned when the primary text is truncated", () => {
 		const items = [
 			{ value: "short", label: "short", description: "short description" },
