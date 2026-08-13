@@ -17,6 +17,7 @@ import { disposeKernelSessionsByOwner, executePython } from "../eval/py/executor
 import { RLM_MANAGED_PYTHON_PACKAGES } from "../eval/py/runtime";
 import type { ToolDefinition } from "../extensibility/extensions/types";
 import { applyToolProxy } from "../extensibility/tool-proxy";
+import pythonToolDescription from "../prompts/tools/python.md" with { type: "text" };
 import type { RlmNotebookWriter } from "../rlm/notebook";
 import type { RlmCellResult } from "../rlm/types";
 
@@ -137,8 +138,7 @@ export function createAutoresearchPythonTool(
 	return {
 		name: AUTORESEARCH_PYTHON_TOOL_NAME,
 		label: "Python",
-		description:
-			'Execute Python in the persistent mission kernel. Variables, imports, and loaded data persist across calls like notebook cells; every call is recorded as a cell in the mission notebook. Use action "clear" to dispose the kernel subprocess when the mission is done.',
+		description: pythonToolDescription,
 		parameters: paramsSchema,
 		defaultInactive: true,
 		concurrency: "exclusive",
