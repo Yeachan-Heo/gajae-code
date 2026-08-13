@@ -7079,16 +7079,26 @@ export function createNotificationsExtension(
 				const notificationOrigin = hostCapCache
 					.get(authenticatedInbound.connectionId)
 					?.has(ASK_SELECTED_ACK_CAPABILITY);
-				// Ownership fence for chat-originated inbound. A chat daemon stays
-				// connected across an ownership-identity change (credential,
-				// destination, or Slack authorized actor) AND across a
-				// last-provider disable, so the OLD principal can otherwise inject a
-				// user message or SDK control through its still-live attachment.
-				// Local adapter teardown does not revoke that external attachment,
-				// so admission itself must require BOTH proved ownership and
-				// actually-serving adapters: a disable path tears adapters down
-				// without demoting owner state, and a re-proof demotes owner state
-				// before tearing adapters down.
+				// Ownership fence for inbound arriving on the NATIVE notification
+				// transport (the Telegram daemon's channel; identified by the
+				// ask-ack capability on its connection).
+				//
+				// That daemon stays connected across an ownership-identity change
+				// (credential, destination, actor) AND across a last-provider
+				// disable, so the OLD principal could otherwise inject a user
+				// message or SDK control through its still-live connection. Local
+				// adapter teardown does not revoke it, so admission itself requires
+				// BOTH proved ownership and actually-serving adapters: a disable
+				// tears adapters down without demoting owner state, and a re-proof
+				// demotes owner state before tearing adapters down.
+				//
+				// SCOPE: Discord and Slack do NOT arrive here. Their daemons hold a
+				// SessionRouter attachment and issue v3 `control_request`s, which
+				// reach the host control dispatch without any chat-origin marker.
+				// Fencing that path needs an authenticated chat-daemon
+				// classification at the Router/host boundary — the same Router
+				// surface as the deferred attachment revocation, recorded together
+				// as a follow-up rather than changed blind while that surface is red.
 				if (
 					notificationOrigin &&
 					runtime &&
