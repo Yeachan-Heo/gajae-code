@@ -630,12 +630,8 @@ describe("Telegram topic admission", () => {
 				telegramTopicsEnabled: true,
 			});
 			bot.calls.length = 0;
-			await (
-				daemon as unknown as {
-					archiveUnownedTopicsAfterReconcile(): Promise<void>;
-				}
-			).archiveUnownedTopicsAfterReconcile();
-			// Private-chat archival deletes the orphaned topic.
+			daemon.archiveReconciliationHarnessForTest().authorizeArchive(session.sessionId, "session_closed");
+			await daemon.archiveReconciliationHarnessForTest().archiveUnownedTopics();
 			expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
@@ -670,11 +666,8 @@ describe("Telegram topic admission", () => {
 					telegramTopicsEnabled: true,
 				});
 				bot.calls.length = 0;
-				await (
-					daemon as unknown as {
-						archiveUnownedTopicsAfterReconcile(): Promise<void>;
-					}
-				).archiveUnownedTopicsAfterReconcile();
+				daemon.archiveReconciliationHarnessForTest().authorizeArchive(session.sessionId, "session_closed");
+				await daemon.archiveReconciliationHarnessForTest().archiveUnownedTopics();
 				expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
 				const state = JSON.parse(
 					fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"),
@@ -711,11 +704,7 @@ describe("Telegram topic admission", () => {
 				installationHostId: "local-host",
 			});
 			await daemon.loadTopics();
-			await (
-				daemon as unknown as {
-					archiveUnownedTopicsAfterReconcile(): Promise<void>;
-				}
-			).archiveUnownedTopicsAfterReconcile();
+			await daemon.archiveReconciliationHarnessForTest().archiveUnownedTopics();
 			expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(0);
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });

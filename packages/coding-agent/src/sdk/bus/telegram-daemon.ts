@@ -5266,27 +5266,37 @@ export class TelegramNotificationDaemon {
 
 	/** @internal Test-only access to attachment routing lifecycle transitions. */
 	attachmentRoutingHarnessForTest() {
+		const subscriptions = new Map<string, NotificationSubscription>();
 		const asSubscription = (
 			value:
 				| NotificationSubscription
 				| {
 						sessionId: string;
 						generation?: number;
+						authorityId?: string;
 						isCurrent?: () => boolean;
 						send: (frame: Record<string, unknown>) => unknown;
 				  },
 		): NotificationSubscription => {
 			if ("subscriptionId" in value) return value;
+			const cacheKey = `${value.sessionId}\0${(value as { authorityId?: string }).authorityId ?? ""}`;
+			const existing = subscriptions.get(cacheKey);
+			if (existing) return existing;
 			const legacy = value;
-			return {
+			const subscription: NotificationSubscription = {
 				sessionId: legacy.sessionId,
-				subscriptionId: `test:${legacy.sessionId}`,
+				subscriptionId:
+					legacy.authorityId !== undefined
+						? `test:${legacy.sessionId}:${legacy.authorityId}`
+						: `test:${legacy.sessionId}`,
 				cursor: { generation: legacy.generation ?? 0, seq: 0 },
 				isActive: () => legacy.isCurrent?.() ?? true,
 				send: legacy.send,
 				advanceCursor: () => undefined,
 				cancel: () => undefined,
 			};
+			subscriptions.set(cacheKey, subscription);
+			return subscription;
 		};
 		return {
 			attach: (
@@ -5295,6 +5305,7 @@ export class TelegramNotificationDaemon {
 					| {
 							sessionId: string;
 							generation?: number;
+							authorityId?: string;
 							isCurrent?: () => boolean;
 							send: (frame: Record<string, unknown>) => unknown;
 					  },
@@ -5305,6 +5316,7 @@ export class TelegramNotificationDaemon {
 					| {
 							sessionId: string;
 							generation?: number;
+							authorityId?: string;
 							isCurrent?: () => boolean;
 							send: (frame: Record<string, unknown>) => unknown;
 					  },
@@ -5318,6 +5330,11 @@ export class TelegramNotificationDaemon {
 	archiveReconciliationHarnessForTest() {
 		return {
 			reconcilePendingTopicDeletes: () => this.reconcilePendingTopicDeletes(),
+			authorizeArchive: (
+				sessionId: string,
+				reason: "session_closed" | "notification_subscription_removed" | "create_compensation",
+			) => this.topics.beginArchive(sessionId, this.installationHostId, this.runtime.now(), reason),
+			archiveUnownedTopics: () => this.archiveUnownedTopicsAfterReconcile(),
 		};
 	}
 	#attachmentIsCurrent(session: AttachmentSession): boolean {
@@ -6913,19 +6930,6 @@ export class TelegramNotificationDaemon {
 		if (timer !== undefined) (this.opts.clearTimeoutImpl ?? clearTimeout)(timer);
 		this.#rejectedTopicCleanupTimers.delete(sessionId);
 	}
-	#scheduleRejectedTopicCleanup(sessionId: string, endpointKey: string): void {
-		const existing = this.#rejectedTopicCleanupTimers.get(sessionId);
-		if (existing !== undefined) (this.opts.clearTimeoutImpl ?? clearTimeout)(existing);
-		const timer = (this.opts.setTimeoutImpl ?? setTimeout)(() => {
-			if (this.#rejectedTopicCleanupTimers.get(sessionId) !== timer) return;
-			this.#rejectedTopicCleanupTimers.delete(sessionId);
-			if (this.stopRequested || this.#rejectedTopicEndpointKeys.get(sessionId) !== endpointKey) return;
-			// Subscription rejection is transport-local. It cannot authorize topic
-			// archive or mutate durable session ownership.
-		}, ORPHAN_TOPIC_GRACE_MS);
-		timer.unref?.();
-		this.#rejectedTopicCleanupTimers.set(sessionId, timer);
-	}
 
 	#leaseAllows(session: AttachmentSession, logicalSessionId = this.#logicalSessionId(session)): boolean {
 		if (this.#droppedSessions.has(session)) return false;
@@ -6933,8 +6937,7 @@ export class TelegramNotificationDaemon {
 		const closedBinding = this.closedEndpointKeys.get(session.sessionId);
 		if (
 			closedBinding &&
-			typeof session.attachmentKey === "string" &&
-			closedBinding.endpointKey === session.attachmentKey &&
+			closedBinding.endpointKey === session.sessionId &&
 			closedBinding.endpointGeneration === session.hostGeneration
 		)
 			return false;
@@ -6946,7 +6949,7 @@ export class TelegramNotificationDaemon {
 		if (this.#logicalSessionOwners.get(logicalSessionId) !== session) return false;
 		const record = this.topics.get(logicalSessionId);
 		return (
-			lease.binding.endpointKey === session.attachmentKey &&
+			lease.binding.endpointKey === session.sessionId &&
 			lease.binding.endpointGeneration === session.hostGeneration &&
 			(!record ||
 				(record.authorityState === "active" &&
@@ -7003,7 +7006,7 @@ export class TelegramNotificationDaemon {
 			lease.logicalSessionId === logicalSessionId &&
 			this.#logicalSessionOwners.get(logicalSessionId) === session &&
 			lease.binding.chatId === String(this.opts.chatId) &&
-			lease.binding.endpointKey === session.attachmentKey &&
+			lease.binding.endpointKey === session.sessionId &&
 			lease.binding.endpointGeneration === session.hostGeneration
 		);
 	}
@@ -7223,6 +7226,7 @@ export class TelegramNotificationDaemon {
 			chatId: String(this.opts.chatId),
 			endpointKey: session.sessionId,
 			endpointDigest: session.sessionId,
+			endpointGeneration: session.hostGeneration,
 		};
 	}
 
@@ -7233,7 +7237,7 @@ export class TelegramNotificationDaemon {
 		if (tombstoned) return { state: "ambiguous" as const };
 		const authority = this.topics.endpointAuthority(binding, excludedSession);
 		const competingLiveClaim = [...this.sessions.values()].some(
-			session => session !== excludedSession && session.attachmentKey === binding.endpointKey,
+			session => session !== excludedSession && session.sessionId === binding.endpointKey,
 		);
 		const competingRecoveryClaim = [...this.sessions.values()].some(
 			session =>
@@ -7249,7 +7253,7 @@ export class TelegramNotificationDaemon {
 		return (
 			this.sessions.get(session.sessionId) === session &&
 			session.subscription.isActive() &&
-			binding.endpointKey === session.attachmentKey &&
+			binding.endpointKey === session.sessionId &&
 			binding.endpointGeneration === session.hostGeneration
 		);
 	}
@@ -7262,7 +7266,7 @@ export class TelegramNotificationDaemon {
 				this.#logicalSessionId(session) === logicalSessionId &&
 				this.#leaseAllows(session, logicalSessionId)
 			)
-				keys.add(session.attachmentKey);
+				keys.add(session.sessionId);
 		}
 		return keys;
 	}
