@@ -39,6 +39,7 @@ import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
+import { recordMasterSession } from "./master/registry";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
 import type { SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
@@ -1793,6 +1794,19 @@ export async function runRootCommand(
 		// before activation so project-scoped defaults can resolve freshly discovered models.
 		if (!context?.skipPostCreateModelRefresh) {
 			modelRegistry.refreshInBackground();
+		}
+		if (options.masterMode === true) {
+			// Durable master identity: `gjc master --continue` resolves only recorded
+			// masters. Never let a registry failure break session startup.
+			try {
+				await recordMasterSession(
+					options.agentDir ?? getAgentDir(),
+					options.cwd ?? getProjectDir(),
+					result.session.sessionManager.getSessionId(),
+				);
+			} catch (error) {
+				logger.warn("Failed to record master session identity", { error: String(error) });
+			}
 		}
 		return result;
 	};

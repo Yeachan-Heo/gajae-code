@@ -22,8 +22,6 @@ export interface MasterModeExtensionDeps {
 	agentDir: string;
 	/** Test seam: overrides the broker-backed inventory loader. */
 	loadInventory?: (agentDir: string) => Promise<ResidentSessionInventory>;
-	/** Test seam: clock used for classification and rendering. */
-	now?: () => number;
 }
 
 /** Compose the session-start injection body (guidance + bounded inventory). */
@@ -33,11 +31,10 @@ export async function composeMasterSessionStartContent(
 ): Promise<string> {
 	const guidance = sdkSupervisionGuidance.trim();
 	const load = deps.loadInventory ?? loadResidentSessionInventory;
-	const now = deps.now ?? Date.now;
 	let inventorySection: string;
 	try {
 		const inventory = await load(deps.agentDir);
-		inventorySection = renderInventoryMarkdown(inventory, selfSessionId, now());
+		inventorySection = renderInventoryMarkdown(inventory, selfSessionId);
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : String(error);
 		inventorySection = [
