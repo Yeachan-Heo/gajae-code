@@ -4,7 +4,8 @@ GJC currently has three execution surfaces that are all called hooks. The canoni
 
 | Surface | Runtime authority | Distribution | Runtime owner |
 |---|---|---|---|
-| Native/Claude/Codex hook directories | In-process `HookAPI` module adapted to `ExtensionRunner` | User/project files | GJC `ExtensionRunner` |
+| Native GJC hook directories | In-process `HookAPI` module adapted to `ExtensionRunner` | Canonical user/project `.gjc` files | GJC `ExtensionRunner` |
+| Claude/Codex hook directories | Import and diagnostic sources only | Foreign user/project convention files | No ordinary GJC runtime authority |
 | Codex managed `hooks.json` | External command | User Codex configuration | Codex invokes `gjc codex-native-hook` |
 | Distributable plugin hooks | Constrained GJC API; ambient host-process authority | Installed plugin bundle | GJC `ExtensionRunner` adapter |
 
@@ -27,13 +28,13 @@ Unknown names and unsupported convention/event pairs produce bounded diagnostics
 
 The authoritative per-convention table is `CONVENTION_EVENT_CONTRACTS`. A single global timeout/error table would be false because the runtimes differ.
 
-### Native, Claude, and Codex hook directories
+### Native GJC hook directories
 
-Discovery paths:
+Runtime discovery paths:
 
 - native GJC: `~/.gjc/hooks/{pre,post}/` and `.gjc/hooks/{pre,post}/`;
-- Claude: `.claude/hooks/{pre,post}/`;
-- Codex: `.codex/hooks/pre-<tool>.{ts,js}` and `post-<tool>.{ts,js}`.
+
+Claude `.claude/hooks/{pre,post}/` and Codex `.codex/hooks/pre-<tool>.{ts,js}` / `post-<tool>.{ts,js}` layouts remain registered discovery providers for explicit import and diagnostics. Ordinary sessions do not import or execute them directly; importing an accepted hook writes the canonical `.gjc/hooks/` copy that becomes runtime authority.
 
 These files are loaded with Bun `import()` and must export a hook factory. They receive the full in-process `HookAPI`, including `exec`, messages, renderers, and command registration. They are **not command/shell-script hooks** merely because some legacy discovery comments use that terminology.
 
@@ -110,7 +111,7 @@ Batch normalization accepts already-bounded adapter results, preserves input ord
 
 ## Runtime integration boundary
 
-Native/Claude/Codex discovery is validated through `normalizeDirectoryHook` before discovered modules are imported, then accepted hook factories are adapted into the session's `ExtensionRunner`. Tool-scoped directory handlers receive exact matcher filtering at that adapter boundary. Constrained plugin execution uses the same plugin normalization rules when selecting its runtime registration event and validates the complete batch before the first registration. The canonical layer therefore participates in startup/runtime adaptation without becoming a second dispatcher.
+Native GJC discovery is validated through `normalizeDirectoryHook` before discovered modules are imported, then accepted hook factories are adapted into the session's `ExtensionRunner`. Claude/Codex providers remain available to the explicit import and diagnostic surfaces but are excluded from ordinary runtime discovery. Tool-scoped native directory handlers receive exact matcher filtering at the adapter boundary. Constrained plugin execution uses the same plugin normalization rules when selecting its runtime registration event and validates the complete batch before the first registration. The canonical layer therefore participates in startup/runtime adaptation without becoming a second dispatcher.
 
 It does **not**:
 
