@@ -24,6 +24,43 @@ afterEach(async () => {
 function namespaceDir(root: string): string {
 	return path.join(root, ".gjc", "coordinator-state", "local", "repo");
 }
+/**
+ * Asserts that every file in the idempotency record directory is a complete,
+ * parseable JSON record (#4473). Lock artifacts, transition markers, quarantine
+ * placeholders, and torn writes must never appear alongside records.
+ */
+async function assertIdempotencyDirectoryClean(root: string): Promise<void> {
+	const dir = path.join(namespaceDir(root), "idempotency");
+	const entries = await fs.readdir(dir);
+	for (const name of entries) {
+		const content = await fs.readFile(path.join(dir, name), "utf8");
+		expect(() => JSON.parse(content)).not.toThrow(`idempotency entry ${name} is not parseable JSON`);
+		const record = JSON.parse(content) as { schema_version: number; state: string };
+		expect(record.schema_version).toBe(1);
+		expect(["in_progress", "completed"]).toContain(record.state);
+	}
+}
+
+/**
+ * Reads and parses every record file in the idempotency directory, failing on any
+ * non-record entry (lock artifact, torn write, etc.).
+ */
+async function readIdempotencyRecords(
+	root: string,
+): Promise<Array<{ schema_version: 1; state: string; key_digest: string }>> {
+	const dir = path.join(namespaceDir(root), "idempotency");
+	const entries = await fs.readdir(dir);
+	return Promise.all(
+		entries.map(
+			async name =>
+				JSON.parse(await fs.readFile(path.join(dir, name), "utf8")) as {
+					schema_version: 1;
+					state: string;
+					key_digest: string;
+				},
+		),
+	);
+}
 
 type CodexTransportControl = {
 	status: "idle" | "running";
@@ -189,6 +226,120 @@ describe("Coordinator Codex resume bridge", () => {
 		};
 		expect(persisted.response.handoff.token_file).toBe(tokenFile);
 		expect(persisted.response.handoff.endpoint).not.toHaveProperty("ignored");
+	});
+	it("leaves a parseable atomic idempotency state after a rejected nonterminal operation and replays it exactly", async () => {
+		const root = await tempRoot();
+		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+		const server = createServer(root, "idle", requests);
+		await createSession(root);
+
+		const rejection = await server.callTool("gjc_coordinator_register_codex_handoff", {
+			session_id: "session-1",
+			thread_id: "thread-1",
+			endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
+			token_file: path.join(root, `token-${"x".repeat(5000)}`),
+			idempotency_key: "rejected-nonterminal",
+			allow_mutation: true,
+		});
+		expect(rejection).toEqual({ ok: false, error: { code: "token_material_not_allowed" } });
+
+		// Every entry in the idempotency record directory must be a parseable record
+		// after a rejection: no lock owner files, transition markers, quarantine
+		// placeholders, or torn writes may leak into the record set (#4473).
+		await assertIdempotencyDirectoryClean(root);
+
+		// Exact same-key retry replays the sealed rejection instead of re-running it.
+		const replay = await server.callTool("gjc_coordinator_register_codex_handoff", {
+			session_id: "session-1",
+			thread_id: "thread-1",
+			endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
+			token_file: path.join(root, `token-${"x".repeat(5000)}`),
+			idempotency_key: "rejected-nonterminal",
+			allow_mutation: true,
+		});
+		expect(replay).toEqual(rejection);
+
+		// A restart (fresh server over the same state root) still replays it.
+		const restarted = createServer(root, "idle", requests);
+		await expect(
+			restarted.callTool("gjc_coordinator_register_codex_handoff", {
+				session_id: "session-1",
+				thread_id: "thread-1",
+				endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
+				token_file: path.join(root, `token-${"x".repeat(5000)}`),
+				idempotency_key: "rejected-nonterminal",
+				allow_mutation: true,
+			}),
+		).resolves.toEqual(rejection);
+		await assertIdempotencyDirectoryClean(root);
+
+		// Reusing the rejected key with a different request conflicts, never re-runs.
+		await expect(
+			server.callTool("gjc_coordinator_register_codex_handoff", {
+				session_id: "session-1",
+				thread_id: "thread-1",
+				endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
+				token_file: path.join(root, "codex-token"),
+				idempotency_key: "rejected-nonterminal",
+				allow_mutation: true,
+			}),
+		).resolves.toEqual({ ok: false, error: { code: "idempotency_conflict", message: expect.any(String) } });
+	});
+
+	it("keeps the idempotency record directory clean under concurrent same-key and distinct-key mutations", async () => {
+		const root = await tempRoot();
+		const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+		const server = createServer(root, "idle", requests);
+		await createSession(root);
+		// Additional sessions so distinct-key mutations do not race on the same
+		// handoff record file — that shared-file race is independent of #4473.
+		for (const session of ["session-2", "session-3", "session-4"])
+			await Bun.write(
+				path.join(namespaceDir(root), "sessions", `${session}.json`),
+				JSON.stringify({ session_id: session }),
+			);
+		await Bun.write(path.join(root, "codex-token"), "test-token");
+
+		const attempt = (sessionId: string, idempotencyKey: string) =>
+			server.callTool("gjc_coordinator_register_codex_handoff", {
+				session_id: sessionId,
+				thread_id: `thread-${sessionId}`,
+				endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
+				token_file: path.join(root, "codex-token"),
+				idempotency_key: idempotencyKey,
+				allow_mutation: true,
+			});
+
+		// Six concurrent mutations: three racing on one key, three on distinct keys.
+		const settled = await Promise.allSettled([
+			attempt("session-1", "concurrent-shared"),
+			attempt("session-1", "concurrent-shared"),
+			attempt("session-1", "concurrent-shared"),
+			attempt("session-2", "concurrent-a"),
+			attempt("session-3", "concurrent-b"),
+			attempt("session-4", "concurrent-c"),
+		]);
+		expect(settled.every(result => result.status === "fulfilled")).toBe(true);
+		for (const result of settled)
+			expect((result as PromiseFulfilledResult<Record<string, unknown>>).value).toMatchObject({ ok: true });
+
+		await assertIdempotencyDirectoryClean(root);
+
+		// Exactly one sealed record per distinct key, replayable across a restart.
+		const records = await readIdempotencyRecords(root);
+		expect(records.map(record => record.key_digest).sort()).toHaveLength(4);
+		const restarted = createServer(root, "idle", requests);
+		await expect(
+			restarted.callTool("gjc_coordinator_register_codex_handoff", {
+				session_id: "session-1",
+				thread_id: "thread-session-1",
+				endpoint: { kind: "unix", path: "/tmp/codex-app-server.sock" },
+				token_file: path.join(root, "codex-token"),
+				idempotency_key: "concurrent-shared",
+				allow_mutation: true,
+			}),
+		).resolves.toMatchObject({ ok: true });
+		await assertIdempotencyDirectoryClean(root);
 	});
 
 	it("records and publishes terminal wakes without including final responses, preserving registrations across restart", async () => {
