@@ -393,6 +393,89 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
 	});
 
+	it("writes a clarified cold mission, reads it through the CLI, and clears it through the CLI", async () => {
+		const root = await tempDir();
+		const write = await runNativeAutoresearchCommand(
+			[
+				"write",
+				"--goal",
+				"Measure parser throughput",
+				"--mode",
+				"data",
+				"--slug",
+				"parser-throughput",
+				"--deliverable",
+				"Verdict",
+				"--constraint",
+				"No source edits",
+				"--json",
+			],
+			root,
+		);
+		expect(write.status).toBe(0);
+		const written = JSON.parse(write.stdout!) as { mission: { slug: string; mode: string; objective: string } };
+		expect(written.mission.slug).toBe("parser-throughput");
+		expect(written.mission.mode).toBe("data");
+		expect(written.mission.objective).toBe("Measure parser throughput");
+		const read = await runNativeAutoresearchCommand(["read", "--json"], root);
+		expect(read.status).toBe(0);
+		const readPayload = JSON.parse(read.stdout!) as {
+			exists: boolean;
+			mission: { slug: string };
+			ledger: Array<{ event: string }>;
+		};
+		expect(readPayload.exists).toBe(true);
+		expect(readPayload.mission.slug).toBe("parser-throughput");
+		expect(readPayload.ledger.map(entry => entry.event)).toEqual(["mission_created"]);
+		const cleared = await runNativeAutoresearchCommand(["clear", "--json"], root);
+		expect(cleared.status).toBe(0);
+		expect(JSON.parse(cleared.stdout!)).toMatchObject({ cleared: true, ledger_event: "kernel_cleared" });
+		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
+	});
+
+	it("rejects unsafe cold mission slugs", async () => {
+		const root = await tempDir();
+		const result = await runNativeAutoresearchCommand(
+			["write", "--goal", "Measure parser throughput", "--mode", "data", "--slug", "!!!"],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("invalid path component");
+	});
+
+	it("records run, critic, verdict, and report through public CLI verbs", async () => {
+		const root = await tempDir();
+		await runNativeAutoresearchCommand(
+			["write", "--goal", "Measure parser throughput", "--mode", "data", "--slug", "parser-throughput"],
+			root,
+		);
+		const run = await runNativeAutoresearchCommand(
+			["log-run", "--run-id", "run-1", "--status", "keep", "--description", "baseline", "--metric", "42"],
+			root,
+		);
+		expect(run.status).toBe(0);
+		const critic = await runNativeAutoresearchCommand(
+			["critic", "--status-json", '{"verdict":"OKAY"}', "--evidence", "reviewed", "--evaluator", "critic"],
+			root,
+		);
+		expect(critic.status).toBe(0);
+		const verdict = await runNativeAutoresearchCommand(
+			["verdict", "--status-json", '{"verdict":"best_effort"}', "--evidence", "measured", "--evaluator", "agent"],
+			root,
+		);
+		expect(verdict.status).toBe(0);
+		const report = await runNativeAutoresearchCommand(["report", "--summary", "Measured parser throughput"], root);
+		expect(report.status).toBe(0);
+		expect(report.stdout).toContain("report_path=");
+		const ledger = (await autoresearchRead(root, TEST_SESSION_ID)).ledger;
+		expect(ledger.map(entry => entry.event)).toEqual([
+			"mission_created",
+			"run_logged",
+			"critic_recorded",
+			"verdict_issued",
+		]);
+	});
+
 	it("rejects unknown flags", async () => {
 		const root = await tempDir();
 		const result = await runNativeAutoresearchCommand(["--bogus"], root);

@@ -9,7 +9,7 @@ You are a **read-only detector and reporter**. You never edit code, write files,
 - Inspect ONLY the active Ultragoal story's changed-files list. No broad rewrites, no inspection outside that scope, no new dependencies.
 - Allow only narrow supporting reads needed to understand the contracts of changed files; if you need broader context, report that need to the leader instead of expanding scope.
 - If there are no relevant edits, emit a passed/no-op report (`Gate Result: PASS`, `Changed Files Reviewed` listing the files as "no relevant edits").
-- Recursion guard: you are already inside an Ultragoal workflow. Do NOT spawn nested `ralplan`, `team`, `deep-interview`, or `ultragoal` workflows. Broad, ambiguous, cross-layer, or architectural findings are handed to the leader as review blockers, not resolved here.
+- Recursion guard: you are already inside an Ultragoal workflow. Do NOT spawn nested `autoresearch`, `ralplan`, `deep-interview`, or `ultragoal` workflows. Broad, ambiguous, cross-layer, or architectural findings are handed to the leader as review blockers, not resolved here.
 
 ## Taxonomy
 
@@ -46,7 +46,7 @@ Advisory Findings: [none, or numbered findings with file, category, evidence, wh
 Fallback Findings: [none, or finding -> masking fallback slop / grounded compatibility/fail-safe fallback -> blocking/advisory]
 UI/Design Findings: [none/N/A, or signal -> blocking/advisory -> rationale]
 Missing Test Findings: [none, or gap -> blocking/advisory -> required coverage]
-Recursion Guard: [confirmed no nested ralplan/team/deep-interview/ultragoal spawned; broad findings handed to leader]
+Recursion Guard: [confirmed no nested autoresearch/ralplan/deep-interview/ultragoal spawned; broad findings handed to leader]
 Changed Files Reviewed:
 - [path] - [reviewed / no relevant edits]
 

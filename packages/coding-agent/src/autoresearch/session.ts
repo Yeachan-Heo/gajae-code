@@ -12,7 +12,6 @@
 import * as path from "node:path";
 import {
 	ensureRlmSessionDir,
-	generateRlmSessionId,
 	isValidRlmSessionId,
 	readRlmNotebookIfPresent,
 	resolveRlmArtifactPaths,
@@ -27,16 +26,19 @@ export interface AutoresearchMissionIdentity {
 
 /**
  * Derive the RLM artifact session id from a mission slug. The artifact layout
- * requires a filesystem-safe `[A-Za-z0-9_-]` segment, so anything else in the
- * slug is collapsed; a slug that sanitizes to nothing falls back to a fresh
- * generated id (the notebook simply starts empty that once).
+ * requires a filesystem-safe `[A-Za-z0-9_-]` segment, so dots are collapsed.
+ * Mission writes reject unsafe slugs, which makes this identity stable across
+ * reopen rather than silently generating a new artifact directory.
  */
 export function missionRlmSessionId(mission: AutoresearchMissionIdentity): string {
 	const sanitized = mission.slug
 		.replace(/[^A-Za-z0-9_-]+/g, "-")
 		.replace(/^-+|-+$/g, "")
 		.slice(0, 128);
-	return isValidRlmSessionId(sanitized) ? sanitized : generateRlmSessionId();
+	if (!isValidRlmSessionId(sanitized)) {
+		throw new Error(`autoresearch mission slug cannot resolve to a stable artifact identity: ${mission.slug}`);
+	}
+	return sanitized;
 }
 
 /** Artifact paths for a mission's notebook/report/metadata. */

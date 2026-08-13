@@ -27,12 +27,12 @@ Write `./autoresearch.sh` at the working directory. It is the canonical benchmar
 - print any secondary metrics as additional `METRIC <name>=<value>` lines;
 - run the same workload deterministically every time (no live network, no time-of-day dependencies, fixed seeds where applicable).
 
-You **may** edit anything else needed to make `autoresearch.sh` work — benchmark binaries, `Cargo.toml`, `package.json`, helper scripts, fixtures. All those edits are part of the harness baseline and are committed for you when the mission starts on an autoresearch branch.
+Do not edit product source, manifests, or dependencies. The harness must use existing checked-in commands and fixtures, or report that the mission requires the normal approval-gated implementation path before benchmarking can proceed.
 
 ### Steps
 
 1. Inspect the target. Read source, identify what to measure, decide on the workload.
-2. Write `autoresearch.sh` plus any supporting files (benchmark binaries, fixtures, etc.).
+2. Write `autoresearch.sh` only when it is an explicitly approved research artifact; otherwise use an existing benchmark command.
 3. Validate it: invoke `bash autoresearch.sh` through the regular `bash` tool. Confirm it exits 0 and emits at least one `METRIC` line. Iterate on the harness until it does.
 4. Start the mission with `gjc autoresearch` (cold intake: goal, constraints, deliverables, and an explicit mode) or `gjc autoresearch --spec <spec>` (handoff intake). Record the primary metric name and its direction (lower/higher is better) with the mission. The harness baseline is snapshotted at mission start and Phase 2 (the iteration loop) begins.
 

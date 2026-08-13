@@ -9,6 +9,9 @@ export default class Autoresearch extends Command {
 		"$ gjc autoresearch --spec <deep-interview-spec.md> --json",
 		'$ gjc autoresearch "<goal>"',
 		"$ gjc autoresearch",
+		"$ gjc autoresearch read --json",
+		"$ gjc autoresearch clear --json",
+		"$ gjc autoresearch write --goal <goal> --mode web --slug <slug> --json",
 	];
 	static delegateHelp = true;
 

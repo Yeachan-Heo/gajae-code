@@ -77,17 +77,17 @@ The mission runs in two phases.
 
 ### Phase 1 — build the harness
 
-Write `./autoresearch.sh` at the working directory. It is the canonical benchmark entrypoint and must:
+Use an existing benchmark command or a research-only harness artifact explicitly approved for the mission. It must:
 
 - exit 0 on success and non-zero on failure;
 - print the primary metric as a single line `METRIC <name>=<value>`, and any secondary metrics as additional `METRIC <name>=<value>` lines;
 - run the same workload deterministically (no live network, no time-of-day dependencies, fixed seeds where applicable).
 
-Supporting edits needed to make the harness work (benchmark binaries, fixtures, config) are part of the harness baseline. Validate the harness by running `bash autoresearch.sh` and confirming it exits 0 and emits at least one `METRIC` line before the mission starts. Harness output may also carry `ASI key=value` learning lines.
+Do not edit product source, manifests, dependencies, or benchmark binaries. When a useful benchmark requires a code or harness change, record that limitation as a caveat and route the change through the normal approval-gated implementation path. Validate the existing command by running it and confirming it exits 0 and emits at least one `METRIC` line. Output may also carry `ASI key=value` learning lines.
 
 ### Phase 2 — iterate
 
-Iterate experiments on an `autoresearch/*` branch with baseline/keep/discard discipline. Log every run: `keep` when the primary metric improves, `discard` when it regresses or stays flat, `crash` when the run fails, `checks_failed` when validation fails. A `keep` commits the run only on the dedicated branch; `discard`/`crash`/`checks_failed` revert it. Flag suspect runs (reward-hacked, invalid, unjustified) so they are excluded from baseline and best-metric math. When the worktree is too dirty to branch, the loop degrades to off-branch mode: keeps stay in the worktree, and discards revert only run-modified paths so pre-existing user dirt survives.
+Iterate existing experiments with baseline/keep/discard discipline. Log every run: `keep` when the primary metric improves, `discard` when it regresses or stays flat, `crash` when the run fails, `checks_failed` when validation fails. Flag suspect runs (reward-hacked or invalid) so they are excluded from baseline and best-metric math. This workflow does not create branches, commit changes, or revert files because it never changes product code.
 
 ## Persistent Python
 

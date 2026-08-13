@@ -11,7 +11,7 @@ export default class State extends Command {
 		"$ gjc state clear --mode deep-interview",
 		"$ gjc state deep-interview read --json",
 		'$ gjc state ralplan write --input \'{"phase":"planner","active":true}\' --json',
-		"$ gjc state team contract",
+		"$ gjc state autoresearch read --json",
 		"$ gjc state deep-interview handoff --to ralplan --json",
 		"$ gjc state doctor --skill ralplan --json",
 	];

@@ -73,7 +73,7 @@ describe("autoresearch mission session wiring (kernel + notebook)", () => {
 	it("derives a filesystem-safe rlm session id from the mission slug", () => {
 		expect(missionRlmSessionId({ slug: "tokenizer-mission" })).toBe("tokenizer-mission");
 		expect(missionRlmSessionId({ slug: "Mission.With.Dots" })).toBe("Mission-With-Dots");
-		expect(missionRlmSessionId({ slug: "!!! " })).not.toBe("");
+		expect(() => missionRlmSessionId({ slug: "!!! " })).toThrow("stable artifact identity");
 	});
 
 	it("opens the mission notebook under the session autoresearch runs dir and persists cells", async () => {

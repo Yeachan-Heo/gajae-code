@@ -271,7 +271,8 @@ function renderSecondarySummary(
 function findBestResult(state: AutoresearchExperimentState): AutoresearchExperimentResult | null {
 	let best: AutoresearchExperimentResult | null = null;
 	for (const result of state.results) {
-		if (result.segment !== state.currentSegment || result.status !== "keep" || result.metric <= 0) continue;
+		if (result.segment !== state.currentSegment || result.status !== "keep" || result.flagged || result.metric <= 0)
+			continue;
 		if (!best || isBetter(result.metric, best.metric, state.bestDirection)) {
 			best = result;
 		}

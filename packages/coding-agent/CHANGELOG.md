@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Changed
+- Breaking: replaced the bundled `team` workflow and `gjc team` command with the research-only `autoresearch` workflow and its session-scoped mission ledger. `gjc rlm` is removed; existing Team/RLM automation must move to the supported workflow and approval-gated execution surfaces.
 - Defense-in-depth: when an Anthropic-origin assistant transcript message carrying directly adjacent `thinking`/`redacted_thinking` blocks is persisted, a single bounded warn is emitted per session manager instance — but only in development/test builds, never in production. The diagnostic names only the envelope shape (block count, adjacency presence, provider), never raw thinking text, signatures, redacted payloads, or transcript-path metadata. Storage is never mutated — the send-boundary collapse remains the wire source of truth; this is a read-only observation that helps surface upstream producers of the rejected shape (#4443).
 ### Fixed
 - Print mode now requests a governed process exit after successful session teardown, so completed one-shot runs cannot be pinned by residual runtime handles; both stdout and stderr are drained first and the recorded exit code is preserved.

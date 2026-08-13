@@ -167,6 +167,25 @@ describe("autoresearch TUI dashboard", () => {
 		expect(lines.join("\n")).toContain("run and log the baseline experiment");
 	});
 
+	it("excludes flagged keep runs from the rendered best result", () => {
+		const config = createAutoresearchExperimentConfig({
+			name: "flagged",
+			primaryMetric: "latency_ms",
+			direction: "lower",
+		});
+		for (const [baseline, candidate] of [
+			[10, 1],
+			[1, 10],
+		] as const) {
+			const direction = baseline < candidate ? "higher" : "lower";
+			const state = buildAutoresearchExperimentState({ ...config, direction }, [
+				runRecord({ runNumber: 1, metric: baseline, status: "keep", description: "baseline" }),
+				runRecord({ runNumber: 2, metric: candidate, status: "keep", flagged: true, description: "flagged" }),
+			]);
+			expect(renderDashboardLines({ state }, 120).join("\n")).toContain(`Best: ${baseline}`);
+		}
+	});
+
 	it("renderExpandedDashboard combines header and body", () => {
 		const text = renderExpandedDashboard({ state: sampleState() }, 120, 0);
 		expect(text).toContain("autoresearch: tokenizer bench");

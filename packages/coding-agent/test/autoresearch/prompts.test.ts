@@ -15,7 +15,7 @@ describe("autoresearch two-phase prompts", () => {
 		expect(setupPromptTemplate).toContain("## Autoresearch Mode");
 		expect(setupPromptTemplate).toContain("Phase 1");
 		expect(iteratePromptTemplate).toContain("## Autoresearch Mode");
-		expect(iteratePromptTemplate).toContain("autonomous experiment loop");
+		expect(iteratePromptTemplate).toContain("research-only evidence loop");
 	});
 
 	it("phase 1 (harness setup) renders the harness contract", () => {
