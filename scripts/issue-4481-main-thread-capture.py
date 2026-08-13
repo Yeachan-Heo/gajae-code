@@ -156,14 +156,17 @@ def main() -> int:
     env.update(
         {
             "TERM": env.get("TERM", "xterm-256color"),
-            "BUN_OPTIONS": f"--preload={preload} {env.get('BUN_OPTIONS', '')}".strip(),
             "GJC_ISSUE4481_HEARTBEAT_PATH": str(heartbeat_path),
         }
     )
+    command = args.command
+    executable_name = pathlib.Path(command[0]).name
+    if executable_name in {"bun", "bunx"}:
+        command = [command[0], f"--preload={preload}", *command[1:]]
     pid, master = pty.fork()
     if pid == 0:
         os.chdir(repo)
-        os.execvpe(args.command[0], args.command, env)
+        os.execvpe(command[0], command, env)
         os._exit(127)
 
     start = time.monotonic()
@@ -171,7 +174,7 @@ def main() -> int:
     hot_stale_samples = 0
     wedge_detected = False
     pty_closed = False
-    summary: dict[str, object] = {"pid": pid, "command": args.command, "artifact_dir": str(artifact_dir)}
+    summary: dict[str, object] = {"pid": pid, "command": command, "artifact_dir": str(artifact_dir)}
     with pty_path.open("wb") as pty_out, samples_path.open("w") as samples:
         try:
             while proc_exists(pid) and time.monotonic() - start < args.duration:
