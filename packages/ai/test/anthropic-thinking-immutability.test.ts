@@ -384,7 +384,10 @@ describe("Anthropic adjacent thinking collapse", () => {
 		]);
 	});
 
-	it("keeps a redacted block that directly follows a thinking block", () => {
+	it("collapses a redacted block that directly follows a thinking block", () => {
+		// #4425 treats thinking and redacted_thinking as one adjacency class
+		// per the API contract, so [thinking, redactedThinking] collapses to
+		// [thinking] at the final Anthropic send boundary.
 		const assistant = assistantWith([
 			{ type: "thinking", thinking: "first", thinkingSignature: "sig_first" },
 			{ type: "redactedThinking", data: "redacted-blob" },
@@ -396,7 +399,6 @@ describe("Anthropic adjacent thinking collapse", () => {
 
 		expect(assistantParam?.content).toEqual([
 			{ type: "thinking", thinking: "first", signature: "sig_first" },
-			{ type: "redacted_thinking", data: "redacted-blob" },
 			{ type: "tool_use", id: "toolu_1", name: "read", input: { path: "README.md" } },
 		]);
 	});

@@ -40,8 +40,9 @@ const enum ToolCallStatus {
  * that session fail, and the mutation repair - scoped to the latest assistant message -
  * can never reach it (#4416).
  *
- * `redactedThinking` is deliberately not folded: a redacted blob following a thinking block
- * is a shape the API itself emits and replays cleanly.
+ * `redactedThinking` is not folded in this phase, but the final send-boundary
+ * collapse in `convertAnthropicMessages` (#4425) treats `thinking` and
+ * `redacted_thinking` as one adjacency class per the API contract.
  */
 function collapseAdjacentThinking<T extends { type: string }>(content: T[]): T[] {
 	let previousWasThinking = false;
