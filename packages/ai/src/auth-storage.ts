@@ -4264,6 +4264,23 @@ export class AuthStorage {
 			if (attemptedCredentialId !== undefined) {
 				const latestRow = this.#store.listAuthCredentials(provider).find(row => row.id === attemptedCredentialId);
 				const latestCredential = latestRow?.credential;
+				if (!latestRow) {
+					// The row we just tried is no longer active: a peer disabled it after a
+					// definitive refresh failure, the user removed it, or a re-login replaced
+					// it with a new row. Our in-memory snapshot is stale, and the refresh
+					// helper can only answer "credential disappeared" for it — an error that
+					// classifies as transient and would temp-block a row that will never come
+					// back. Long-lived processes (resumed sessions) would then keep replaying
+					// the vanished credential until restart while a valid re-login row sits
+					// unused in the store. Reload and re-resolve against the persisted truth.
+					logger.debug("OAuth credential vanished from the store; reloading snapshot", {
+						provider,
+						index: selection.index,
+						credentialId: attemptedCredentialId,
+					});
+					await this.reload();
+					return this.#resolveOAuthSelection(provider, sessionId, options, reloadsUsed + 1);
+				}
 				if (latestCredential?.type === "oauth" && latestCredential.refresh !== attemptedRefreshToken) {
 					logger.debug("OAuth refresh race detected; another process rotated token first", {
 						provider,
