@@ -50,6 +50,8 @@ const TODO_OP_KEYS = new Set(["op", "list", "task", "phase", "items", "text"]);
 const TODO_INIT_ENTRY_KEYS = new Set(["phase", "items"]);
 /** `content` is accepted only as a synonym the schema rewrites to `task`. */
 const TODO_OP_KEYS_WITH_ALIASES = new Set([...TODO_OP_KEYS, "content"]);
+const MAX_REJECTED_KEYS = 8;
+const POSITIONAL_HANDLE_KEYS = new Set(["id", "ids", "index", "taskId", "task_id"]);
 
 /**
  * Exact key corrections. `note` is the one repeatable confusion: it is an `op`
@@ -60,11 +62,27 @@ const TODO_OP_KEYS_WITH_ALIASES = new Set([...TODO_OP_KEYS, "content"]);
  * an entry here when the replacement is unambiguous — never from fuzzy or
  * edit-distance matching, because a wrong suggestion costs more turns than no
  * suggestion.
+ *
+ * The positional-handle family (`id`, `index`, and spellings of them) is the
+ * other repeatable confusion: the tool result renders tasks as a list, so a
+ * caller assumes the list is addressable by ordinal. No op has ever taken a
+ * handle - a task is addressed by its verbatim content - and the executor
+ * already says so, but on the validated model-facing path this validator
+ * rejects the key first, so that message never gets its turn. One shared
+ * correction keeps both layers telling the same story.
  */
+const POSITIONAL_HANDLE_CORRECTION =
+	'tasks have no id or index; target a task with "task" set to its exact content, or a whole phase with "phase"';
+
 const TODO_KEY_CORRECTIONS = new Map<string, string>([
 	["note", 'note is an op, not a key; note operations require both "task" and "text"'],
 	["newTask", "there is no rename op; re-run init with the corrected list to rename a task"],
 	["tasks", 'tasks is not a key; append operations take "items"'],
+	["id", POSITIONAL_HANDLE_CORRECTION],
+	["ids", POSITIONAL_HANDLE_CORRECTION],
+	["index", POSITIONAL_HANDLE_CORRECTION],
+	["taskId", POSITIONAL_HANDLE_CORRECTION],
+	["task_id", POSITIONAL_HANDLE_CORRECTION],
 ]);
 
 function unknownKeys(value: object, allowed: Set<string>): string[] {
@@ -72,13 +90,40 @@ function unknownKeys(value: object, allowed: Set<string>): string[] {
 }
 
 function keyRejectionDetail(keys: readonly string[], location?: string): RawArgumentRejectionDetail {
-	const hints = keys.map(key => TODO_KEY_CORRECTIONS.get(key)).filter((hint): hint is string => hint !== undefined);
-	const parts = location === undefined ? hints : [location, ...hints];
-	return parts.length > 0 ? { rejectedKeys: keys, hint: parts.join("; ") } : { rejectedKeys: keys };
+	const rejectedKeys = keys.slice(0, MAX_REJECTED_KEYS);
+	// Distinct corrections only. A family that shares one correction (every
+	// positional handle) would otherwise repeat it once per rejected key and blow
+	// past the caller's hint clamp, which truncates the advice mid-sentence.
+	const hints = [
+		...new Set(
+			keys
+				.map(key => TODO_KEY_CORRECTIONS.get(key) ?? TODO_KEY_CORRECTIONS.get(key.split(".").at(-1) ?? ""))
+				.filter((hint): hint is string => hint !== undefined),
+		),
+	];
+	const omitted = keys.length - rejectedKeys.length;
+	const parts = [
+		...(location === undefined ? [] : [location]),
+		...hints,
+		...(omitted > 0 ? [`${omitted} additional rejected keys omitted`] : []),
+	];
+	return parts.length > 0 ? { rejectedKeys, hint: parts.join("; ") } : { rejectedKeys };
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function nestedPositionalHandleKeys(entry: Record<string, unknown>): string[] {
+	const keys: string[] = [];
+	for (const alias of ["task", "content"] as const) {
+		const value = entry[alias];
+		if (!isPlainRecord(value)) continue;
+		for (const key of Object.keys(value)) {
+			if (POSITIONAL_HANDLE_KEYS.has(key)) keys.push(`${alias}.${key}`);
+		}
+	}
+	return keys;
 }
 
 /**
@@ -118,6 +163,13 @@ export function validateRawTodoArguments(arguments_: Record<string, unknown>): R
 				outcome: "reject",
 				code: "todo-write-unknown-op-entry-key",
 				detail: keyRejectionDetail(unknownEntryKeys, location),
+			};
+		const nestedHandles = nestedPositionalHandleKeys(entry);
+		if (nestedHandles.length > 0)
+			return {
+				outcome: "reject",
+				code: "todo-write-unknown-op-entry-key",
+				detail: keyRejectionDetail(nestedHandles, location),
 			};
 		const target = entry.task ?? entry.content;
 		if ((op === "done" || op === "drop") && !target && !entry.phase) {
