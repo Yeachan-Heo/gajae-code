@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "kind": "pr-terminal-disposition-reconstruction",
+  "repository": "Yeachan-Heo/gajae-code",
+  "pr": 4440,
+  "issue": 4426,
+  "capturedAt": "2026-08-13T08:43:00Z",
+  "exactBase": "dcdeb0e5fb37d6a750bd8c8951897e453f89183f",
+  "exactHead": "058e077dff9970ca338a33e8ff6e9776160efb6a",
+  "exactDiffSha256": "4381d729fd126a1c9ad1ad39a503025f931de58be5bdff6f63f23442272227df",
+  "prBase": "dev",
+  "defaultBranch": "main",
+  "workflow": ".github/workflows/pr-validation.yml",
+  "workflowActivation": "pull_request_target workflows execute from the default branch; main does not contain this workflow.",
+  "ownerAuthorization": "none for main/default-branch/settings/ruleset mutation or advisory-only scope reduction",
+  "decision": "close_without_merge",
+  "issueDisposition": "OWNER_CONFIRMATION_REQUIRED",
+  "prohibitedMutations": ["main", "default-branch", "repository-settings", "rulesets", "release", "tag", "publish"],
+  "evidence": [
+    "PR mergeable CLEAN at exact head; implementation CI check runs are green.",
+    "origin/main 5666472818b71a1c37615408d9b4d3b5a77b7fa3 has no .github/workflows/pr-validation.yml.",
+    "A dev-only merge cannot activate the advertised unbypassable pull_request_target enforcement.",
+    "No explicit owner authorization or scope-reduction decision exists."
+  ]
+}
