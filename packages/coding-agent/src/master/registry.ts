@@ -38,15 +38,25 @@ export async function syncMasterRegistryDirectory(
 	const platform = options.platform ?? process.platform;
 	const open = options.open ?? (async value => await fs.open(value, "r"));
 	let directory: DirectorySyncHandle | undefined;
+	let operationError: unknown;
 	try {
 		directory = await open(directoryPath);
 		await directory.sync();
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
-		if (platform !== "win32" || (code !== "EPERM" && code !== "EACCES")) throw error;
-	} finally {
-		await directory?.close().catch(() => {});
+		if (platform !== "win32" || (code !== "EPERM" && code !== "EACCES")) operationError = error;
 	}
+	let closeError: unknown;
+	try {
+		await directory?.close();
+	} catch (error) {
+		closeError = error;
+	}
+	if (operationError !== undefined && closeError !== undefined) {
+		throw new AggregateError([operationError, closeError], "Master registry directory sync and close failed.");
+	}
+	if (operationError !== undefined) throw operationError;
+	if (closeError !== undefined) throw closeError;
 }
 
 export type MasterResumeResolution =

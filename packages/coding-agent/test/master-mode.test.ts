@@ -331,6 +331,32 @@ describe("durable master identity registry", () => {
 				},
 			}),
 		).rejects.toThrow("EPERM");
+		await expect(
+			syncMasterRegistryDirectory("C:\\registry", {
+				platform: "win32",
+				open: async () => ({
+					sync: async () => {
+						throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+					},
+					close: async () => {
+						throw new Error("close-failed");
+					},
+				}),
+			}),
+		).rejects.toThrow("close-failed");
+		await expect(
+			syncMasterRegistryDirectory("/registry", {
+				platform: "linux",
+				open: async () => ({
+					sync: async () => {
+						throw Object.assign(new Error("sync-failed"), { code: "EIO" });
+					},
+					close: async () => {
+						throw new Error("close-failed");
+					},
+				}),
+			}),
+		).rejects.toBeInstanceOf(AggregateError);
 	});
 });
 
