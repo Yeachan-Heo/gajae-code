@@ -43,7 +43,16 @@ function scenario(
 }
 
 async function resolveIn(home: string, repo: string, configDir: string | undefined): Promise<Record<string, unknown>> {
-	const env: Record<string, string | undefined> = { ...process.env, HOME: home, GJC_CONFIG_DIR: configDir };
+	// This probe asserts the agent dir is DERIVED from its pinned HOME, so the
+	// ambient agent-dir override (the test preload isolates every test process
+	// into a temp agent dir) must not leak into it.
+	const env: Record<string, string | undefined> = {
+		...process.env,
+		HOME: home,
+		GJC_CONFIG_DIR: configDir,
+		GJC_CODING_AGENT_DIR: undefined,
+		PI_CODING_AGENT_DIR: undefined,
+	};
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd: repo, env, stdout: "pipe", stderr: "pipe" });
 	const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 	if ((await proc.exited) !== 0) throw new Error(`probe failed: ${err}`);
