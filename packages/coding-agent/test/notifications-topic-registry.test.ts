@@ -699,7 +699,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 165 at serving epoch 87", () => {
+test("publishes exact durable authority generation 166 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -720,7 +720,9 @@ test("publishes exact durable authority generation 165 at serving epoch 87", () 
 	// Generation 162: detached chat-provider daemon ownership from session lifecycle.
 	// Generation 164: auto-reap superseded Telegram daemon owners (#4403).
 	// Generation 165: bounded lean settlement windows preserve user receipts.
-	expect(DAEMON_GENERATION).toBe(165);
+	// Generation 166: complete owned process-group cleanup, fail-closed watchdog,
+	// and daemon-internal orphan-owner reconciliation (#4403).
+	expect(DAEMON_GENERATION).toBe(166);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {
