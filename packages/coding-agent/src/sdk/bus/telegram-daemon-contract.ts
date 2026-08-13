@@ -250,8 +250,11 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * binding fallback no longer spawns powershell.exe when it cannot bind a pid,
  * so older daemons that may still flash a console window during liveness polling
  * are fenced off (#4362).
+ * Generation 160 introduces provider-local Telegram subscriptions, detached
+ * cleanup, stable topic bindings, and explicit archive authority. Older daemons
+ * retain attachment-level lifecycle coupling and may not serve this contract.
  */
-export const DAEMON_GENERATION = 159;
+export const DAEMON_GENERATION = 160;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
