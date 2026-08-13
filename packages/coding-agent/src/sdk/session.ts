@@ -48,6 +48,7 @@ import {
 import { loadCapability } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
+import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
@@ -3547,6 +3548,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		session.setActiveModelProfile(startupActiveModelProfile);
 		session.configWarnings.push(...contextFileWarnings);
+		if (settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active) {
+			session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
+			session.emitNotice("warning", AUTOROUTING_INACTIVE_WARNING, "autorouting");
+		}
 		hasSession = true;
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {

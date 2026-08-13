@@ -20,7 +20,7 @@ export const DEFAULT_AUTOROUTING_TIER: AutoroutingTier = "balanced";
  * of interpolation so it is always safe to render.
  */
 export const AUTOROUTING_INACTIVE_WARNING =
-	"Autorouting is enabled but has no usable tiers, so every Task item falls back to manual model resolution. Generate tiers from the /model smart-routing panel.";
+	"Autorouting is enabled but has no usable tier chains; Task items fall back to manual model resolution. Run /routing to inspect, or /model \u2192 smart routing to generate tiers.";
 
 /** The normalized tier map consumed by routing policy. */
 export type TierMap = Partial<Record<AutoroutingTier, string[]>>;
