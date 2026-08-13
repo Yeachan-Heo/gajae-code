@@ -423,6 +423,56 @@ async function registerSdkSession(server: ReturnType<typeof createCoordinatorMcp
 }
 
 describe("Coordinator MCP canonical SDK controls", () => {
+	async function pingServer(root: string) {
+		const server = createCoordinatorMcpServer({
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			services: { getAgentDir: () => path.join(root, "agent-global") },
+		});
+		return server;
+	}
+
+	it("answers the MCP ping keepalive with an empty result instead of method-not-found", async () => {
+		const root = await tempRoot();
+		const server = await pingServer(root);
+		const response = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "ping" });
+		expect(response).toEqual({ jsonrpc: "2.0", id: 1, result: {} });
+	});
+
+	it("preserves a string request id in the ping response", async () => {
+		const root = await tempRoot();
+		const server = await pingServer(root);
+		const response = await server.handleJsonRpc({ jsonrpc: "2.0", id: "keepalive-1", method: "ping" });
+		expect(response).toEqual({ jsonrpc: "2.0", id: "keepalive-1", result: {} });
+	});
+
+	it("answers ping with extra params by ignoring them (params carry no payload)", async () => {
+		const root = await tempRoot();
+		const server = await pingServer(root);
+		const response = await server.handleJsonRpc({
+			jsonrpc: "2.0",
+			id: 42,
+			method: "ping",
+			params: { unexpected: "ignored" },
+		});
+		expect(response).toEqual({ jsonrpc: "2.0", id: 42, result: {} });
+	});
+
+	it("does not write any coordinator state files for a ping keepalive", async () => {
+		const root = await tempRoot();
+		const stateRoot = path.join(root, ".gjc", "coordinator-state");
+		const server = await pingServer(root);
+		await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "ping" });
+		const exists = await fs
+			.stat(stateRoot)
+			.then(() => true)
+			.catch(() => false);
+		expect(exists).toBe(false);
+	});
 	it("uses agent-global SDK discovery and returns credential-free broker status", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

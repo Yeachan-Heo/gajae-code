@@ -352,4 +352,14 @@ describe("pumpCoordinatorMcpStream — frame handling", () => {
 		await pumpCoordinatorMcpStream(handler as never, ch, l => void writes.push(JSON.parse(l)));
 		expect(writes.map(w => w.id)).toEqual([7]);
 	});
+	it("answers a ping request but emits nothing for a ping notification (no id)", async () => {
+		const handler = async (req: Rpc): Promise<Rpc> => ({ jsonrpc: "2.0", id: req.id ?? null, result: {} });
+		const writes: Rpc[] = [];
+		const ch = channel();
+		ch.push(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" })}\n`); // request → answered
+		ch.push(`${JSON.stringify({ jsonrpc: "2.0", method: "ping" })}\n`); // notification (no id) → no response
+		ch.close();
+		await pumpCoordinatorMcpStream(handler as never, ch, l => void writes.push(JSON.parse(l)));
+		expect(writes.map(w => w.id)).toEqual([1]); // only the request id gets a response
+	});
 });
