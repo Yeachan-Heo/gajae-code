@@ -7079,6 +7079,18 @@ export function createNotificationsExtension(
 				const notificationOrigin = hostCapCache
 					.get(authenticatedInbound.connectionId)
 					?.has(ASK_SELECTED_ACK_CAPABILITY);
+				// Ownership fence for chat-originated inbound. A chat daemon stays
+				// connected across an ownership-identity change (credential,
+				// destination, or Slack authorized actor), so the OLD principal can
+				// otherwise inject a user message or SDK control during the re-proof
+				// window. Local adapter teardown does not revoke that external
+				// attachment, so admission itself must require proved ownership.
+				if (notificationOrigin && runtime && runtime.notificationOwnerState !== "ready") {
+					logger.warn(
+						`notifications: refused chat-originated ${inbound.kind} while provider ownership is ${runtime.notificationOwnerState}`,
+					);
+					return;
+				}
 				if (runtime?.policySuspended && notificationOrigin) {
 					if (inbound.kind === "control_command") {
 						const frame = sdkInboundFrame(inbound.commandJson);
@@ -7627,9 +7639,20 @@ export function createNotificationsExtension(
 		reproveOwnership: async binding => {
 			// PROVIDER-NEUTRAL ownership re-proof. Reconciliation calls this for any
 			// effective chat provider, not just Telegram: a Discord-only or
-			// Slack-only credential/destination/actor change must withhold adapters
-			// exactly like a Telegram one, or the old identity keeps delivery and
-			// (for Slack) inbound command authority through a stale outcome.
+			// Slack-only credential/destination/actor change must re-prove exactly
+			// like a Telegram one, or the old identity keeps authority indefinitely.
+			//
+			// What this enforces while the new identity is unproved: local
+			// notification adapters are torn down, activate() withholds them, and
+			// chat-originated inbound (user messages, SDK controls) is refused at
+			// admission — so the previous principal cannot inject anything.
+			//
+			// What it does NOT do: revoke an already-attached external chat
+			// daemon's SessionRouter attachment. A still-running Discord/Slack
+			// daemon can therefore still observe core host events during the
+			// re-proof window. Revocation belongs to the Router attachment surface;
+			// until then this narrows a previously unbounded window (before this
+			// change nothing re-proved at all) rather than closing it completely.
 			//
 			// Never awaits the ensure itself — only the adapter teardown, which is
 			// local. Lifecycle paths must not block on daemon ownership.

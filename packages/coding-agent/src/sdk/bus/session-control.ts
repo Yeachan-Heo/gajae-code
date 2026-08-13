@@ -51,9 +51,10 @@ export interface NotificationSessionRuntime<Context extends NotificationSessionC
 	 *
 	 * A credential, destination, or actor-authorization change invalidates the
 	 * ownership proof that authorized this runtime's adapters. The runtime must
-	 * withhold delivery until the new identity is proved, or the previous
-	 * identity keeps delivery — and, for Slack, inbound command authority.
-	 * Implementations must not await the daemon ensure itself.
+	 * withhold its local adapters and refuse chat-originated inbound until the
+	 * new identity is proved, so the previous principal cannot deliver through
+	 * this session or inject messages and controls into it. Implementations must
+	 * not await the daemon ensure itself.
 	 */
 	reproveOwnership?(binding: BoundNotificationSession<Context>): Promise<void>;
 	/**
