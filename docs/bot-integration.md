@@ -340,9 +340,9 @@ Key SDK workflow-gate facts:
 The prior documented invariant `action_needed.id == gate_id` is incorrect for
 v3 and must not be implemented by controllers. See [the SDK session CLI guide](./sdk-session-cli.md)
 for broker-bound controls and [the SDK guide](./sdk.md) for Router and lifecycle
-ownership. Retired RPC and bridge transports have no compatibility shim; migrate
-controllers to Coordinator MCP, `gjc sdk session`, or a managed Telegram,
-Discord, or Slack adapter.
+ownership. `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed
+and have no compatibility shim; migrate controllers to Coordinator MCP,
+`gjc sdk session`, or a managed Telegram, Discord, or Slack adapter.
 
 ## Error handling playbook
 
