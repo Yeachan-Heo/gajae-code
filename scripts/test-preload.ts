@@ -42,7 +42,12 @@ try {
 // the exact destructive regression this preload exists to prevent.
 const isolation = decideAgentDirIsolation({
 	home: os.homedir(),
-	env: process.env,
+	env: {
+		GJC_CODING_AGENT_DIR: process.env.GJC_CODING_AGENT_DIR,
+		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+		GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
+		PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
+	},
 	projectEnv: readProjectEnvFile(process.cwd()),
 });
 if (isolation.action === "isolate") {

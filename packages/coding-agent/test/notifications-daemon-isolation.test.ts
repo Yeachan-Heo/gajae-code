@@ -27,17 +27,6 @@ import {
 } from "./helpers/notification-settings";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
-const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
-
-async function waitFor(pred: () => boolean, ms = 8_000, label = "condition"): Promise<void> {
-	const deadline = Date.now() + ms;
-	while (Date.now() < deadline) {
-		if (pred()) return;
-		await sleep(25);
-	}
-	throw new Error(`timed out waiting for ${label}`);
-}
-
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
 const cleanups: FixtureRootCleanup[] = [];
