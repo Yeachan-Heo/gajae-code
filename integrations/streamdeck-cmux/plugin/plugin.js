@@ -10,6 +10,7 @@ import { moveOption, selectedOption } from "./option-selector.js";
 import { focusedStatusAction } from "./focused-status.js";
 import { DOUBLE_TAP_MS, isDoubleTap, pressGesture, supportsDoubleTap } from "./key-gestures.js";
 import { PROMPT_OPTIONS } from "./prompt-options.js";
+import { BROWSER_TARGETS, SSH_TARGETS, USAGE_TARGETS } from "./daily-selectors.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -78,6 +79,9 @@ let modelOptionIndex = 0;
 let skillOptionIndex = 0;
 let themeOptionIndex = 0;
 let promptOptionIndex = 0;
+let browserTargetIndex = 0;
+let sshTargetIndex = 0;
+let usageTargetIndex = 0;
 const thinkingLevelBySession = new Map();
 
 function log(message) {
@@ -660,6 +664,14 @@ async function renderContext(context, state) {
       await image(context, `control-${settings.name}`);
       return;
     }
+    if (settings.type === "dailySelector") {
+      const targets = settings.group === "ssh" ? SSH_TARGETS : settings.group === "usage" ? USAGE_TARGETS : BROWSER_TARGETS;
+      const index = settings.group === "ssh" ? sshTargetIndex : settings.group === "usage" ? usageTargetIndex : browserTargetIndex;
+      const target = selectedOption(targets, index);
+      title(context, target ? `${String(settings.group).toUpperCase()} ${index + 1}/${targets.length}\n${target.label}` : "NO TARGET");
+      await image(context, target?.image || `selector-${settings.group}`);
+      return;
+    }
     if (settings.type === "sshTab") {
       title(context, String(settings.label || "SSH"));
       await image(context, settings.image || "ssh-vq-batch");
@@ -927,6 +939,76 @@ async function openFixedFolder(settings, context) {
   await createTerminalTab(path, null, context, null);
 }
 
+async function openWebTarget(target, context) {
+  const script = `on run argv
+set matchText to item 1 of argv
+set targetURL to item 2 of argv
+if application "Google Chrome" is running then
+ tell application "Google Chrome"
+  repeat with w in windows
+   repeat with tabIndex from 1 to count of tabs of w
+    set t to tab tabIndex of w
+    try
+     if URL of t contains matchText then
+      set active tab index of w to tabIndex
+      set index of w to 1
+      activate
+      return
+     end if
+    end try
+   end repeat
+  end repeat
+ end tell
+end if
+if application "Safari" is running then
+ tell application "Safari"
+  repeat with w in windows
+   repeat with t in tabs of w
+    try
+     if URL of t contains matchText then
+      set current tab of w to t
+      set index of w to 1
+      activate
+      return
+     end if
+    end try
+   end repeat
+  end repeat
+ end tell
+end if
+tell application "Google Chrome"
+ activate
+ if count of windows is 0 then make new window
+ tell front window to make new tab with properties {URL:targetURL}
+end tell
+end run`;
+  const result = await run("/usr/bin/osascript", ["-e", script, target.match, target.url], homedir(), 15000);
+  if (result.exitCode === 0) ok(context); else { alert(context); log(`web target failed ${result.stderr || result.stdout}`); }
+}
+
+async function moveDailySelector(group, context) {
+  const targets = group === "ssh" ? SSH_TARGETS : group === "usage" ? USAGE_TARGETS : BROWSER_TARGETS;
+  const index = group === "ssh" ? sshTargetIndex : group === "usage" ? usageTargetIndex : browserTargetIndex;
+  const moved = moveOption(targets, index, 1);
+  if (group === "ssh") sshTargetIndex = moved.index;
+  else if (group === "usage") usageTargetIndex = moved.index;
+  else browserTargetIndex = moved.index;
+  await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "dailySelector" && settings.group === group));
+  ok(context);
+}
+
+async function launchDailySelector(group, context) {
+  const targets = group === "ssh" ? SSH_TARGETS : group === "usage" ? USAGE_TARGETS : BROWSER_TARGETS;
+  const index = group === "ssh" ? sshTargetIndex : group === "usage" ? usageTargetIndex : browserTargetIndex;
+  const target = selectedOption(targets, index);
+  if (!target) { alert(context); return; }
+  if (group === "ssh") await openSshTab(target, context);
+  else if (group === "usage") await openWebTarget(target, context);
+  else {
+    const result = await run("/usr/bin/open", [target.app], homedir());
+    if (result.exitCode === 0) ok(context); else { alert(context); log(`browser launch failed ${result.stderr || result.stdout}`); }
+  }
+}
 async function openSshTab(settings, context) {
   const port = Number(settings.port);
   const host = String(settings.host || "");
@@ -1121,6 +1203,7 @@ async function keyUp(context, state, heldMs, gesture = pressGesture(heldMs)) {
   if (action === SKILL_ACTION) { await sendFocusedGjcText(`/skill:${settings.skill}`, context, false); return; }
   if (action === CONTROL_ACTION) {
     if (settings.answerSlot !== undefined && focusedPendingAsk()) { await answerFocusedAsk(Number(settings.answerSlot), { ...context, heldMs }); return; }
+    if (settings.type === "dailySelector") { if (gesture === "hold") await launchDailySelector(settings.group, context); else await moveDailySelector(settings.group, context); return; }
     if (settings.type === "cmuxClose") { await closeFocusedCmuxTab(context); return; }
     if (settings.type === "sshTab") { await openSshTab(settings, context); return; }
     if (settings.type === "fixedFolder") { await openFixedFolder(settings, context); return; }

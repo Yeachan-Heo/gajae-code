@@ -165,16 +165,21 @@ It contains the pre-gesture plugin, page-three profile, source commit `1423f2a43
 
 ## Three-page operating model
 
-### Page 1: daily web shortcuts
+### Page 1: daily applications and target selectors
 
-Use ordinary daily shortcuts here. Browser actions should:
+```text
+CMUX       | VS CODE | BROWSER SELECT | SSH SELECT | USAGE SELECT
+KAKAOTALK  | DISCORD | CHATGPT        | GMAIL      | GITHUB
+FINDER     | GHOSTTY | ACTIVITY       | PREVIEW    | NEXT
+```
 
-1. search every Chrome window and tab;
-2. search every Safari window and tab;
-3. focus an existing matching tab;
-4. create a Chrome tab only when neither browser contains a match.
+The three selector controls use a consistent gesture contract: tap changes the displayed target and hold launches the selected target.
 
-Compiled AppleScript applications are suitable when Stream Deck's built-in website action cannot enforce tab reuse. Match stable URL fragments rather than volatile titles.
+- `BROWSER SELECT`: cycles Google Chrome and Safari; hold opens the selected browser application.
+- `SSH SELECT`: cycles VQ Batch (`:22`), Gajae (`:24`), and VQ Lab (`:25`); hold creates a cmux terminal and connects to the selected host and working directory.
+- `USAGE SELECT`: cycles the legacy usage dashboard at `management.html#/usage` and Keeper at `/keeper/`; hold searches all Chrome and Safari windows for the target before creating a Chrome tab.
+
+Consolidating Safari/Chrome, three SSH keys, and the Usage launcher frees three daily-operation slots. Based on the operator's active desktop and existing profile usage, those slots open Finder, Ghostty, and Activity Monitor. Preview and page navigation remain in place.
 
 ### Page 2: cmux navigation and session entry
 
