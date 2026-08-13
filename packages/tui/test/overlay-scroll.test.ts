@@ -116,6 +116,28 @@ describe("TUI overlays", () => {
 		Bun.env.TERM = "xterm-256color";
 	});
 
+	it("bounds non-finite overlay geometry without stalling the render loop", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			tui.showOverlay(new LineComponent("overlay-", 2), {
+				margin: { top: Number.POSITIVE_INFINITY, right: Number.NaN },
+				row: Number.POSITIVE_INFINITY,
+				col: Number.NaN,
+				offsetX: Number.POSITIVE_INFINITY,
+				offsetY: Number.NEGATIVE_INFINITY,
+				minWidth: Number.POSITIVE_INFINITY,
+			});
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-0");
+		} finally {
+			tui.stop();
+		}
+	});
+
 	afterEach(() => {
 		if (previousTmux === undefined) {
 			delete Bun.env.TMUX;

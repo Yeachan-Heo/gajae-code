@@ -355,13 +355,22 @@ export type SizeValue = number | `${number}%`;
 /** Parse a SizeValue into absolute value given a reference size */
 function parseSizeValue(value: SizeValue | undefined, referenceSize: number): number | undefined {
 	if (value === undefined) return undefined;
-	if (typeof value === "number") return value;
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
 	// Parse percentage string like "50%"
 	const match = value.match(/^(\d+(?:\.\d+)?)%$/);
 	if (match) {
-		return Math.floor((referenceSize * parseFloat(match[1])) / 100);
+		const parsed = Math.floor((referenceSize * parseFloat(match[1])) / 100);
+		return Number.isFinite(parsed) ? parsed : undefined;
 	}
 	return undefined;
+}
+
+function finiteNumber(value: number | undefined, fallback: number): number {
+	return value !== undefined && Number.isFinite(value) ? value : fallback;
+}
+
+function finiteNonNegative(value: number | undefined, fallback = 0): number {
+	return Math.max(0, finiteNumber(value, fallback));
 }
 
 const DISABLED_ENV_VALUES = new Set(["0", "false", "off", "no"]);
@@ -2539,10 +2548,10 @@ export class TUI extends Container {
 			typeof opt.margin === "number"
 				? { top: opt.margin, right: opt.margin, bottom: opt.margin, left: opt.margin }
 				: (opt.margin ?? {});
-		const marginTop = Math.max(0, margin.top ?? 0);
-		const marginRight = Math.max(0, margin.right ?? 0);
-		const marginBottom = Math.max(0, margin.bottom ?? 0);
-		const marginLeft = Math.max(0, margin.left ?? 0);
+		const marginTop = finiteNonNegative(margin.top);
+		const marginRight = finiteNonNegative(margin.right);
+		const marginBottom = finiteNonNegative(margin.bottom);
+		const marginLeft = finiteNonNegative(margin.left);
 
 		// Available space after margins
 		const availWidth = Math.max(1, termWidth - marginLeft - marginRight);
@@ -2551,7 +2560,7 @@ export class TUI extends Container {
 		// === Resolve width ===
 		let width = parseSizeValue(opt.width, termWidth) ?? Math.min(80, availWidth);
 		// Apply minWidth
-		if (opt.minWidth !== undefined) {
+		if (opt.minWidth !== undefined && Number.isFinite(opt.minWidth)) {
 			width = Math.max(width, opt.minWidth);
 		}
 		// Clamp to available space
@@ -2583,9 +2592,11 @@ export class TUI extends Container {
 					// Invalid format, fall back to center
 					row = this.#resolveAnchorRow("center", effectiveHeight, availHeight, marginTop);
 				}
-			} else {
+			} else if (Number.isFinite(opt.row)) {
 				// Absolute row position
 				row = opt.row;
+			} else {
+				row = this.#resolveAnchorRow(opt.anchor ?? "center", effectiveHeight, availHeight, marginTop);
 			}
 		} else {
 			// Anchor-based (default: center)
@@ -2605,9 +2616,11 @@ export class TUI extends Container {
 					// Invalid format, fall back to center
 					col = this.#resolveAnchorCol("center", width, availWidth, marginLeft);
 				}
-			} else {
+			} else if (Number.isFinite(opt.col)) {
 				// Absolute column position
 				col = opt.col;
+			} else {
+				col = this.#resolveAnchorCol(opt.anchor ?? "center", width, availWidth, marginLeft);
 			}
 		} else {
 			// Anchor-based (default: center)
@@ -2616,8 +2629,8 @@ export class TUI extends Container {
 		}
 
 		// Apply offsets
-		if (opt.offsetY !== undefined) row += opt.offsetY;
-		if (opt.offsetX !== undefined) col += opt.offsetX;
+		row += finiteNumber(opt.offsetY, 0);
+		col += finiteNumber(opt.offsetX, 0);
 
 		// Clamp to terminal bounds (respecting margins)
 		row = Math.max(marginTop, Math.min(row, termHeight - marginBottom - effectiveHeight));
@@ -2707,6 +2720,9 @@ export class TUI extends Container {
 		// than the current content. Padding to it can cause the renderer to output hundreds/thousands of blank
 		// lines, effectively scrolling the terminal when an overlay is shown.
 		const workingHeight = Math.max(result.length, minLinesNeeded);
+		if (!Number.isFinite(workingHeight)) {
+			throw new Error("Overlay layout produced a non-finite working height");
+		}
 
 		// Extend result with empty lines if content is too short for overlay placement
 		while (result.length < workingHeight) {
