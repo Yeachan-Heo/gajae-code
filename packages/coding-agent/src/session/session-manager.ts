@@ -15078,6 +15078,20 @@ export class SessionManager {
 	getSessionFile(): string | undefined {
 		return this.#sessionFile;
 	}
+	/**
+	 * On-disk transcript file size in bytes. Returns 0 when the file is
+	 * unavailable, unreadable, or no session file is set. The managed-storage
+	 * path reads through the descriptor (no full-file scan); the plain-file
+	 * path uses statSync.
+	 */
+	getTranscriptFileBytes(): number {
+		if (!this.#sessionFile) return 0;
+		try {
+			return this.#statSync(this.#sessionFile).size;
+		} catch {
+			return 0;
+		}
+	}
 
 	getSessionMemoryStats(): SessionMemoryStats {
 		const runtime = this.#sidecarRuntime;
@@ -16088,6 +16102,20 @@ export class SessionManager {
 			if (publishResumeBreadcrumb && persisted) this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 			if (persisted) this.#readOnlyResume = false;
 		} catch (err) {
+			// content_too_large on the managed append hot path means the append-only
+			// transcript file has reached the per-file storage limit (64 MiB). The
+			// on-disk file is append-only and grew past the limit even though the
+			// in-memory entry list may be much smaller (compaction evicts old
+			// content but the append-only file never shrinks until a full rewrite).
+			// Fall back to a full rewrite (replaceSync) which writes only the live
+			// in-memory entries, shrinking the file below the limit. The entry has
+			// already been added to #fileEntries by #appendEntryWithinPersistenceFence.
+			if (err instanceof Error && err.message === "content_too_large") {
+				this.#rewriteFileSync();
+				if (publishResumeBreadcrumb) this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				this.#readOnlyResume = false;
+				return;
+			}
 			this.#recordPersistError(err);
 			throw this.#persistError ?? toError(err);
 		}

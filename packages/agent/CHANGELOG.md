@@ -5,6 +5,7 @@
 ### Fixed
 
 - The agent loop rejects a tool call flagged `escapedNonAsciiArguments` before execution, with a retryable error telling the model to re-issue the call writing non-ASCII characters literally. Hand-spelled `\uXXXX` arguments decode into valid-looking but silently wrong text (observed as garbled Hangul in `ask` prompts), and no post-parse repair can recover the intended characters.
+- The emergency compaction system now includes a `transcriptFileBytes` floor (48 MiB, 75% of the managed-storage per-file cap) so a long-running session compacts before its append-only transcript reaches the 64 MiB limit. `CompactionTriggerReason` adds `"transcriptFile"`, `EmergencyCompactionSample` adds `transcriptFileBytes`, and `EmergencyCompactionLimits` adds `transcriptFileBytes`.
 
 ### Added
 

@@ -253,6 +253,7 @@ export type CompactionTriggerReason =
 	| "token"
 	| "heap"
 	| "retainedMemory"
+	| "transcriptFile"
 	| "providerBytes"
 	| "messageCount"
 	| "imageBytes";
@@ -275,6 +276,8 @@ export interface EmergencyCompactionSample {
 	tuiChatChildren?: number;
 	/** Bytes retained by TUI render caches. */
 	tuiCachedRenderBytes?: number;
+	/** On-disk JSONL transcript file size in bytes; 0/undefined when unknown. */
+	transcriptFileBytes?: number;
 }
 
 export interface EmergencyCompactionLimits {
@@ -286,6 +289,7 @@ export interface EmergencyCompactionLimits {
 	retainedMemoryDiagnosticBytes?: number;
 	tuiChatChildren?: number;
 	tuiChatChildrenDiagnostic?: number;
+	transcriptFileBytes?: number;
 }
 
 const MAX_EMERGENCY_HEAP_FLOOR_BYTES = 1_536 * 1024 * 1024; // 1.5 GiB resident heap
@@ -293,6 +297,7 @@ const EMERGENCY_RETAINED_MEMORY_BYTES = 128 * 1024 * 1024;
 const DIAGNOSTIC_RETAINED_MEMORY_BYTES = 64 * 1024 * 1024;
 const EMERGENCY_TUI_CHAT_CHILDREN = 1000;
 const DIAGNOSTIC_TUI_CHAT_CHILDREN = 700;
+const EMERGENCY_TRANSCRIPT_FILE_BYTES = 48 * 1024 * 1024; // 48 MiB (75% of the 64 MiB managed cap)
 let retainedMemoryDiagnosticActive = false;
 let tuiChatChildrenDiagnosticActive = false;
 
@@ -315,6 +320,7 @@ export function resolveEmergencyCompactionLimits(totalMemoryBytes: number = os.t
 		retainedMemoryDiagnosticBytes: DIAGNOSTIC_RETAINED_MEMORY_BYTES,
 		tuiChatChildren: EMERGENCY_TUI_CHAT_CHILDREN,
 		tuiChatChildrenDiagnostic: DIAGNOSTIC_TUI_CHAT_CHILDREN,
+		transcriptFileBytes: EMERGENCY_TRANSCRIPT_FILE_BYTES,
 	};
 }
 
@@ -326,7 +332,7 @@ export function resolveEmergencyCompactionLimits(totalMemoryBytes: number = os.t
 export const DEFAULT_EMERGENCY_COMPACTION_LIMITS: EmergencyCompactionLimits = resolveEmergencyCompactionLimits();
 
 /**
- * Returns the first emergency limit exceeded (heap > retainedMemory > providerBytes > imageBytes > messageCount),
+ * Returns the first emergency limit exceeded (heap > retainedMemory > transcriptFile > providerBytes > imageBytes > messageCount),
  * or null when none is. Pure apart from retained-memory diagnostics; the caller routes the result through the
  * normal pair-safe `compact()` cut logic so a tool_use/tool_result pair is never split.
  */
@@ -360,6 +366,11 @@ export function emergencyCompactionReason(
 		tuiChatChildren >= (limits.tuiChatChildren ?? EMERGENCY_TUI_CHAT_CHILDREN)
 	)
 		return "retainedMemory";
+	if (
+		sample.transcriptFileBytes &&
+		sample.transcriptFileBytes > (limits.transcriptFileBytes ?? EMERGENCY_TRANSCRIPT_FILE_BYTES)
+	)
+		return "transcriptFile";
 	if (sample.providerBytes > limits.providerBytes) return "providerBytes";
 	if (sample.imageBytes > limits.imageBytes) return "imageBytes";
 	if (sample.messageCount > limits.messageCount) return "messageCount";

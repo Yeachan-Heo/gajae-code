@@ -94,4 +94,33 @@ describe("emergencyCompactionReason (W4 / F6)", () => {
 		expect(resolveEmergencyCompactionLimits(Number.NaN).heapUsedBytes).toBe(fullFloor);
 		expect(resolveEmergencyCompactionLimits(Number.POSITIVE_INFINITY).heapUsedBytes).toBe(fullFloor);
 	});
+
+	it("exposes a 48 MiB transcript-file floor by default", () => {
+		expect(LIM.transcriptFileBytes).toBe(48 * 1024 * 1024);
+	});
+
+	it("flags transcriptFile when the transcript exceeds its floor", () => {
+		expect(
+			emergencyCompactionReason({
+				...under,
+				transcriptFileBytes: LIM.transcriptFileBytes! + 1,
+			}),
+		).toBe("transcriptFile");
+		expect(emergencyCompactionReason({ ...under, transcriptFileBytes: LIM.transcriptFileBytes })).toBeNull();
+	});
+
+	it("does not flag transcriptFile when the value is 0 or undefined", () => {
+		expect(emergencyCompactionReason({ ...under, transcriptFileBytes: 0 })).toBeNull();
+		expect(emergencyCompactionReason({ ...under, transcriptFileBytes: undefined })).toBeNull();
+	});
+
+	it("prioritizes transcriptFile above providerBytes", () => {
+		expect(
+			emergencyCompactionReason({
+				...under,
+				transcriptFileBytes: LIM.transcriptFileBytes! + 1,
+				providerBytes: LIM.providerBytes + 1,
+			}),
+		).toBe("transcriptFile");
+	});
 });

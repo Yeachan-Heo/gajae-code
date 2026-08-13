@@ -15139,6 +15139,7 @@ export class AgentSession {
 				sessionMemory.metadataResidentBytes,
 			tuiChatChildren: retainedMemory.tuiChatChildren ?? 0,
 			tuiCachedRenderBytes: retainedMemory.tuiCachedRenderBytes ?? 0,
+			transcriptFileBytes: this.sessionManager.getTranscriptFileBytes(),
 		};
 	}
 
