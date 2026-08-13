@@ -132,6 +132,37 @@ ditto -c -k --sequesterRsrc --keepParent \
 
 Restore from a known backup instead of reverse-engineering a damaged default profile.
 
+### Freeze and rollback the working integration
+
+Before adding gesture mappings or changing page structure, freeze the exact installed plugin and affected page profile together with the source commit:
+
+```sh
+stamp="$(date +%Y%m%d-%H%M%S)"
+base="$HOME/Library/Application Support/com.elgato.StreamDeck"
+tmp="$(mktemp -d)"
+mkdir -p "$tmp/frozen" "$base/ManualBackups"
+
+ditto "$base/Plugins/dev.gajae.streamdeck.sdPlugin" \
+  "$tmp/frozen/plugin"
+ditto "$base/ProfilesV3/<profile>.sdProfile/Profiles/<page-3>" \
+  "$tmp/frozen/page-3"
+git rev-parse HEAD > "$tmp/frozen/commit.txt"
+git status --short --branch > "$tmp/frozen/git-status.txt"
+
+ditto -c -k --sequesterRsrc --keepParent "$tmp/frozen" \
+  "$base/ManualBackups/gjc-before-change-$stamp.zip"
+rm -rf "$tmp"
+```
+
+The gesture-control rollout used this frozen rollback archive:
+
+```text
+~/Library/Application Support/com.elgato.StreamDeck/ManualBackups/
+gjc-before-gesture-controls-20260813-144957.zip
+```
+
+It contains the pre-gesture plugin, page-three profile, source commit `1423f2a435`, and repository status. Restore the archived plugin and page directory, preserve executable bits on `bin/plugin` and `bin/worktree-session`, then hard-restart Stream Deck.
+
 ## Three-page operating model
 
 ### Page 1: daily web shortcuts
@@ -148,46 +179,30 @@ Compiled AppleScript applications are suitable when Stream Deck's built-in websi
 ### Page 2: cmux navigation and session entry
 
 ```text
-TAB PREV | TAB NEXT | NEW SESSION | CLOSE TAB | GJC FOCUS
-PANE PREV | PANE NEXT | VOICE | STEER | ESC X2
-BACK | PROJECT 1 | PROJECT 2 | HOME | NEXT
+TAB PREV | TAB NEXT | DUPLICATE TAB | CLOSE TAB | GJC FOCUS
+PANE PREV | PANE NEXT | HOME TAB      | STEER NOW | ESC X2
+BACK      | DIR PREV  | DIRECTORY TAB | DIR NEXT  | NEXT
 ```
 
 #### Navigation controls
 
 - `PANE PREV` / `PANE NEXT`: select the previous or next pane in the current workspace.
 - `TAB PREV` / `TAB NEXT`: select the previous or next surface in the focused pane.
-- `GJC FOCUS`: keep the text-focused visual style; when pressed, submit `proceed` plus `Enter` only to a focused `GJC:` surface.
+- `GJC FOCUS`: sample fresh cmux topology once on key release. On a focused `GJC:` surface it submits `proceed`; on a normal terminal it launches the canonical GJC binary in that same surface.
+- `DIR PREV` / `DIR NEXT`: browse the ten most recent GJC working directories. A hold reverses the configured direction.
+- `DIRECTORY TAB`: tap opens a shell at the selected path; hold opens the path and starts GJC.
 
 #### Session and surface controls
 
-- `NEW SESSION`: create a terminal surface and ask for a worktree name; a blank answer starts a plain `gjc` session, while a name starts `gjc --worktree <name>`. Do not select a profile here.
+- `DUPLICATE TAB`: tap opens a shell at the focused terminal's current working directory; hold starts GJC there.
 - `CLOSE TAB`: close the focused cmux surface.
-- `VOICE`: invoke GJC's local Whisper speech-to-text action with a user remap to `Ctrl+H` on the focused `GJC:` surface.
-- `STEER`: send `Esc`, wait 100 ms, then send `Enter`.
+- `HOME TAB`: create a terminal surface in `$HOME`.
+- `STEER NOW`: send `Esc`, wait 100 ms, then send `Enter`.
 - `ESC X2`: send `Esc`, wait 100 ms, then send `Esc` again.
 
-A session-only launcher can be implemented as:
+Recent paths are displayed relative to `~/Documents/Workspace`. Managed worktrees display the canonical repository and branch on separate lines.
 
-```zsh
-#!/bin/zsh
-set -u
-
-printf 'GJC worktree name (blank = plain session): '
-IFS= read -r worktree_name
-args=()
-[[ -n "$worktree_name" ]] && args+=(--worktree "$worktree_name")
-exec "$HOME/.local/bin/gjc" "${args[@]}"
-```
-
-Do not prompt for a model profile here. Apply the profile after the GJC session starts.
-
-#### Frequent GJC project controls
-
-Bind the first two project keys from GJC session history, not operator-specific absolute paths. Merge `gjc sdk session list` with saved top-level session headers under the agent session store, canonicalize managed worktree paths such as `<repo>.gajae-code-worktrees/<name>` back to `<repo>`, discard non-existent and non-Git directories outside the user's home, count sessions per canonical repository, and display the top two repositories. The third key always opens `$HOME`.
-
-Each project key shows the repository basename and session count. Pressing it creates a terminal surface in that repository. The `HOME` key creates a terminal surface in the user's home directory. Leave the cmux tab name automatic so a later `gjc` launch can publish its authoritative `GJC:` title.
-
+The launch path must use the configured canonical GJC executable rather than depending on an interactive shell alias. The local default is `~/.local/bin/gjc`, with `GJC_STREAMDECK_GJC` available as an override.
 ### Bundled source and assets
 
 The repository-owned implementation lives at `integrations/streamdeck-cmux/`:
@@ -201,46 +216,69 @@ Runtime paths are derived from `$HOME`, `import.meta.dir`, `PATH`, and optional 
 ### Page 3: focused GJC operations
 
 ```text
-SET FRONTIER | SET GPT | SET GLM DS | KIMI GPT | BTW EXPLAIN
-RESUME | EXIT | PR TO DEV | THINK LEVEL | CLEAR CTX
-BACK | DEEP INTERVIEW | RALPLAN | ULTRAGOAL | NEXT
+MODEL NAV  | MODEL SET     | SKILL NAV | SKILL RUN | BTW
+PROMPT NAV | PROMPT SUBMIT | CLEAR CTX | THINK     | THEME
+BACK       | NEW SESSION   | RESUME    | EXIT      | NEXT
 ```
 
-#### Model profile controls
+#### Model selector
 
-Model profile keys submit commands to the focused GJC editor:
+`MODEL NAV` cycles the configured model catalog; hold moves backward. `MODEL SET` submits `/model gajae-code/<selected-id>`. The navigation image remains fixed, while the Set control composites the selected model artwork into its base image.
+
+The current catalog contains:
 
 ```text
-/model gajae-code/frontier-heavy
-/model gajae-code/gpt-heavy
-/model gajae-code/glm-deepseek
-/model gajae-code/kimi-gpt
+frontier-heavy
+frontier-default
+gpt-heavy
+gpt-default
+kimi-gpt
+kimi-deepseek-glm
+glm-deepseek
+deepseek-glm
+lunamaxxing-local
+open-weights-spark-deepseek
+open-weights-spark-luna
 ```
 
-A profile must exist and be available to the current session. The names shown above (`frontier-heavy`, `gpt-heavy`, `glm-deepseek`, `kimi-gpt`) are operator-defined examples, not bundled defaults; none of them ships with GJC. Provide matching definitions in `~/.gjc/agent/models.yml` or replace them with bundled profile names before the keys will work.
+#### Skill selector
 
-#### Session controls
+`SKILL NAV` taps forward and holds backward through `deep-interview`, `ralplan`, `ultragoal`, and `team`. `SKILL RUN` taps to insert `/skill:<id>` without submitting and holds to submit immediately.
 
-- `RESUME`: submit `/resume` and open the saved-session selector.
-- `EXIT`: submit `/exit` for a clean GJC shutdown.
-- `PR TO DEV`: submit the operator macro `make a PR targeting dev and make it LGTM` plus `Enter`.
-- `THINK LEVEL`: send atomic `Shift+Tab` through `cmux send-key`.
-- `CLEAR CTX`: submit `/clear`, preserving the session ID while clearing context.
-- `BTW EXPLAIN`: submit `/btw 설명해봐 이거` for an ephemeral side question.
+#### Frequent prompt selector
 
-The PR macro is an operator convenience, not a policy bypass. GJC must still inspect repository rules, run required verification, use an isolated branch or worktree when appropriate, create a focused commit, and open a PR against `dev` only when that branch exists and is the repository's intended integration branch.
-
-#### Skill controls
-
-Skill keys type but do not submit:
+`PROMPT NAV` taps forward and holds backward through ten repeated operator actions mined from top-level session messages:
 
 ```text
-/skill:deep-interview
-/skill:ralplan
-/skill:ultragoal
+CONTINUE
+PR TO DEV
+REVIEW & MERGE
+COMMIT PUSH / PR DEV
+REBASE DEV
+RUN TESTS
+FIX TESTS
+AUDIT DIFF
+CLEANUP
+UPDATE DOCS
 ```
 
-Leaving the command in the editor allows the operator to add arguments before pressing `Enter`.
+`PROMPT SUBMIT` uses three gestures:
+
+- tap: submit the selected prompt;
+- hold: insert the selected prompt without `Enter` so it can be edited;
+- double tap: submit `/clear`, wait 250 ms, then submit the selected prompt to the same captured GJC surface.
+
+#### Context, thinking, theme, and session controls
+
+- `CLEAR CTX`: tap submits `/clear`; hold asks for a concise summary of state, decisions, remaining work, and verification evidence; double tap submits `/new`.
+- `THINK`: displays the focused session's persisted thinking level and taps `Shift+Tab` to cycle it.
+- `THEME`: tap cycles forward, hold cycles backward, and double tap restores `red-claw`.
+- `NEW SESSION`: submits `/new`. The `NEW SESSION` label is baked into its artwork, matching Resume and Exit rather than using Stream Deck title overlay.
+- `RESUME`: submits `/resume`.
+- `EXIT`: submits `/exit`.
+- `BTW`: inserts the configured `/btw` side-question prompt.
+
+PR and merge prompts are operator conveniences, not policy bypasses. GJC must still inspect repository rules, verify changes, and perform only actions authorized by the active runtime context.
 
 ## cmux command patterns
 
@@ -278,17 +316,11 @@ cmux send-key \
   enter
 ```
 
-### Voice (`Ctrl+H`)
+### Gesture delivery
 
-Remap local Whisper speech-to-text in `~/.gjc/agent/keybindings.json`:
+The plugin measures `keyDown` to `keyUp` duration. A hold begins at 600 ms. Double-tap recognition uses a 280 ms window and is enabled only for Prompt Submit, Clear Context, and Theme; other controls execute immediately on release.
 
-```json
-{
-  "app.stt.toggle": "Ctrl+H"
-}
-```
-
-The Stream Deck plugin sends atomic `ctrl+h` through `cmux send-key`. New GJC sessions load the remap; already-running sessions keep the keybindings they started with and should not be modified in place.
+Do not enable double-tap globally. Delaying tab, pane, escape, close, or navigation controls makes the deck feel unresponsive and increases accidental destructive actions.
 
 ### Shift+Tab
 
@@ -448,13 +480,15 @@ Use temporary surfaces and restore the original focus after each test:
 - pane previous/next;
 - tab previous/next;
 - terminal creation in the requested pane;
-- voice sends atomic `Ctrl+H` to a session that loaded the remap without inserting text;
-- fixed-folder `cd` behavior;
+- fixed-folder and recent-directory `cd` behavior;
 - focused tab closure;
-- same-tab worktree prompting when required;
+- tap-versus-hold directory and duplicate-tab launches;
 - exact `Shift+Tab` bytes;
 - exact `Esc`, delay, and `Esc` sequence;
-- exact macro text plus carriage return.
+- selector reversal at the 600 ms hold boundary;
+- Prompt Submit tap, hold-to-insert, and double-tap `/clear` plus prompt on one surface;
+- Clear Context tap, summary hold, and `/new` double tap;
+- Theme forward, backward, and `red-claw` reset.
 
 ### SDK behavior
 
@@ -487,9 +521,9 @@ Confirm the plugin reconnects, contexts render, and the active profile remains c
 
 Check the focused cmux surface title. GJC-only commands intentionally fail closed unless the raw title starts with `GJC:`.
 
-### Worktree prompting does not appear
+### Hold or double tap does not trigger
 
-Confirm the helper is executable. A blank name must invoke plain `gjc`; a non-empty name must invoke `gjc --worktree <name>` from a Git repository. Do not pass a filesystem path as the worktree name.
+Confirm the hardware emits a complete `keyDown` and `keyUp` pair. Holds require at least 600 ms. Double taps require the second release within 280 ms and are intentionally supported only by Prompt Submit, Clear Context, and Theme. Navigation controls use hold only and should never wait for a possible second tap.
 
 ### Think level aborts the operation
 
