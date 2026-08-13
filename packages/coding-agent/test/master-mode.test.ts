@@ -63,6 +63,11 @@ describe("gjc master launch surface", () => {
 		expect(() => parseArgs(["--master", "--mode", "acp"], "local")).toThrow(/--master.*acp/);
 	});
 
+	it("rejects the bare resume picker before it can select an ordinary session", () => {
+		expect(() => parseArgs(["--master", "--resume"], "local")).toThrow(/session picker is disabled/);
+		expect(() => parseArgs(["--master", "-r"], "local")).toThrow(/session picker is disabled/);
+	});
+
 	it("exposes the gjc master command with a supervision description", () => {
 		expect(Master.description).toContain("master session");
 		expect(Master.description).toContain("SDK");

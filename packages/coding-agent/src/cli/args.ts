@@ -396,6 +396,11 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 	if (result.master === true && result.mode === "acp") {
 		throw new CliParseError("--master is only supported for local interactive/print launches, not --mode acp.");
 	}
+	if (result.master === true && result.resume === true) {
+		throw new CliParseError(
+			"Master mode requires --resume <recorded-master-id> or --continue; the session picker is disabled.",
+		);
+	}
 
 	CONSUMER_FLAGS_BY_ARGS.set(result, consumerFlags);
 	if (authority === "local") assertLocalLaunchArgs(result);

@@ -85,6 +85,12 @@ async function writeAtomic(file: string, value: MasterRegistryDocument): Promise
 		await fs.rm(temporary, { force: true }).catch(() => {});
 		throw error;
 	}
+	const directory = await fs.open(path.dirname(file), "r");
+	try {
+		await directory.sync();
+	} finally {
+		await directory.close();
+	}
 }
 
 /** Required durable admission. Throws on corruption or publication failure. */
