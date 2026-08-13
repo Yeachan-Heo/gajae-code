@@ -4040,21 +4040,6 @@ export class TUI extends Container {
 			viewportRepaint(`content contraction changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
 			return;
 		}
-		if (
-			appendedLines &&
-			nextLiveViewportTop > prevViewportTop &&
-			previousKittyPlacementSpans.some(placement =>
-				this.#kittyPlacementIntersectsRegion(placement, {
-					top: prevViewportTop,
-					bottom: prevViewportTop + height,
-				}),
-			)
-		) {
-			viewportRepaint(
-				`content append moved a Kitty placement viewport (${prevViewportTop} -> ${nextLiveViewportTop})`,
-			);
-			return;
-		}
 		if (distinctPostContractionRows) this.#scrollbackResumeViewportTop = undefined;
 		if (
 			appendedLines &&

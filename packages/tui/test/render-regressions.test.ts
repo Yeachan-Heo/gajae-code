@@ -556,7 +556,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
-		it("removes a Kitty placement when sticky live viewport repaint moves its anchor into scrollback", async () => {
+		it("preserves a Kitty placement when sticky live output moves its anchor into native scrollback", async () => {
 			const originalProtocol = TERMINAL.imageProtocol;
 			const originalCellDimensions = getCellDimensions();
 			setCellDimensions({ widthPx: 10, heightPx: 10 });
@@ -591,7 +591,7 @@ describe("TUI terminal-state regressions", () => {
 				tui.requestRender();
 				await settle(term);
 				const liveOutput = term.getWriteLog().join("");
-				expect(liveOutput).toContain(encodeKittyPlacementDelete(placement!));
+				expect(liveOutput).not.toContain(encodeKittyPlacementDelete(placement!));
 				expect(extractKittyPlacementReferences(liveOutput)).toEqual([]);
 
 				term.clearWriteLog();
