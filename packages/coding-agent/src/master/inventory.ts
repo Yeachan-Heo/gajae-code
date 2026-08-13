@@ -13,6 +13,8 @@
  *    The broker row proves liveness only; turn state requires an authoritative
  *    per-session SDK query, modeled here as an explicit SupervisionProbe.
  */
+
+import { randomUUID } from "node:crypto";
 import { ensureBroker } from "../sdk/broker/ensure";
 import { type SdkSessionRowV1, toSessionRowV1 } from "../sdk/cli/rows";
 import { SessionRouter } from "../sdk/router";
@@ -97,19 +99,15 @@ export interface ResidentSessionInventory {
 	truncated: boolean;
 }
 
-const ROUTER_START_TIMEOUT_MS = 10_000;
-const ROUTER_STOP_TIMEOUT_MS = 5_000;
+const BROKER_REQUEST_TIMEOUT_MS = 10_000;
 const MASTER_INVENTORY_ACTOR_KEY = "gjc-master:session.list";
 
 async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
+	const deferred = Promise.withResolvers<never>();
+	let timer: NodeJS.Timeout | undefined;
 	try {
-		return await Promise.race([
-			promise,
-			new Promise<never>((_resolve, reject) => {
-				timer = setTimeout(() => reject(new MasterInventoryError("timeout", message)), timeoutMs);
-			}),
-		]);
+		timer = setTimeout(() => deferred.reject(new MasterInventoryError("timeout", message)), timeoutMs);
+		return await Promise.race([promise, deferred.promise]);
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);
 	}
@@ -127,15 +125,16 @@ export async function loadResidentSessionInventory(
 	agentDir: string,
 	now: () => number = Date.now,
 ): Promise<ResidentSessionInventory> {
-	await bounded(ensureBroker({ agentDir }), ROUTER_START_TIMEOUT_MS, "SDK broker startup timed out.");
+	await bounded(ensureBroker({ agentDir }), BROKER_REQUEST_TIMEOUT_MS, "SDK broker startup timed out.");
 	const router = new SessionRouter({ agentDir });
-	let actionError: unknown;
-	let inventory: ResidentSessionInventory | undefined;
 	try {
-		await bounded(router.start(), ROUTER_START_TIMEOUT_MS, "SDK session Router startup timed out.");
-		const response = await router.listBrokerSessions(
-			{ limit: MASTER_INVENTORY_ROW_LIMIT + 1 },
-			MASTER_INVENTORY_ACTOR_KEY,
+		const response = await bounded(
+			router.listBrokerSessions(
+				{ limit: MASTER_INVENTORY_ROW_LIMIT },
+				`${MASTER_INVENTORY_ACTOR_KEY}:${randomUUID()}`,
+			),
+			BROKER_REQUEST_TIMEOUT_MS,
+			"SDK broker session.list timed out.",
 		);
 		if (response?.ok === false) {
 			const failure = response.error as { code?: unknown; message?: unknown } | undefined;
@@ -152,24 +151,14 @@ export async function loadResidentSessionInventory(
 		} catch {
 			throw new MasterInventoryError("protocol_error", "session.list returned a malformed session row.");
 		}
-		const truncated = rows.length > MASTER_INVENTORY_ROW_LIMIT || page.continuationCursor !== undefined;
-		inventory = { fetchedAt: now(), sessions: rows.slice(0, MASTER_INVENTORY_ROW_LIMIT), truncated };
+		return { fetchedAt: now(), sessions: rows, truncated: page.continuationCursor !== undefined };
 	} catch (error) {
-		actionError = error;
-	}
-	try {
-		await bounded(router.stop(), ROUTER_STOP_TIMEOUT_MS, "SDK session Router shutdown timed out.");
-	} catch {
-		// Router cleanup failure must not mask the inventory result or its error.
-	}
-	if (actionError !== undefined) {
-		if (actionError instanceof MasterInventoryError) throw actionError;
+		if (error instanceof MasterInventoryError) throw error;
 		throw new MasterInventoryError(
 			"unavailable",
-			actionError instanceof Error ? actionError.message : "Failed to load the resident-session inventory.",
+			error instanceof Error ? error.message : "Failed to load the resident-session inventory.",
 		);
 	}
-	return inventory as ResidentSessionInventory;
 }
 
 /** Neutralize broker-controlled strings before they enter LLM context. */

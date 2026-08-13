@@ -3,14 +3,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "@gajae-code/coding-agent/cli/args";
-import Master, { rewriteMasterContinuationArgs } from "@gajae-code/coding-agent/commands/master";
+import Master from "@gajae-code/coding-agent/commands/master";
 import {
 	classifyResidentSession,
 	classifySupervisionTarget,
 	createMasterModeExtension,
 	MASTER_INVENTORY_FIELD_MAX_CHARS,
 	MASTER_INVENTORY_ROW_LIMIT,
-	MASTER_SESSION_CONTEXT_CUSTOM_TYPE,
 	type MasterModeExtensionDeps,
 	type ResidentSessionInventory,
 	recordMasterSession,
@@ -263,53 +262,38 @@ describe("durable master identity registry", () => {
 		expect((await resolveMasterResume(dir, "/repo-b")).ok).toBe(false);
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
-});
 
-describe("master continuation argv rewriting", () => {
-	it("rewrites bare --continue to the exact verified master id", () => {
-		expect(rewriteMasterContinuationArgs(["--master", "--continue"], "m-1")).toEqual(["--master", "--resume", "m-1"]);
+	it("serializes concurrent writers without losing either project record", async () => {
+		const dir = tempDir("gjc-master-registry-");
+		const repoA = tempDir("gjc-master-repo-a-");
+		const repoB = tempDir("gjc-master-repo-b-");
+		await Promise.all([recordMasterSession(dir, repoA, "master-a"), recordMasterSession(dir, repoB, "master-b")]);
+		expect(await resolveMasterResume(dir, repoA)).toEqual({ ok: true, sessionId: "master-a" });
+		expect(await resolveMasterResume(dir, repoB)).toEqual({ ok: true, sessionId: "master-b" });
+		fs.rmSync(dir, { recursive: true, force: true });
+		fs.rmSync(repoA, { recursive: true, force: true });
+		fs.rmSync(repoB, { recursive: true, force: true });
 	});
 
-	it("replaces every continue/resume token shape", () => {
-		for (const token of ["-c", "--continue"]) {
-			expect(rewriteMasterContinuationArgs(["--master", token], "m-1")).toEqual(["--master", "--resume", "m-1"]);
-		}
-		expect(rewriteMasterContinuationArgs(["--master", "--resume", "m-1"], "m-1")).toEqual([
-			"--master",
-			"--resume",
-			"m-1",
-		]);
-		expect(rewriteMasterContinuationArgs(["--master", "--resume=m-1"], "m-1")).toEqual([
-			"--master",
-			"--resume",
-			"m-1",
-		]);
-		expect(rewriteMasterContinuationArgs(["--master", "-r", "m-1"], "m-1")).toEqual(["--master", "--resume", "m-1"]);
-		expect(rewriteMasterContinuationArgs(["--master", "--session", "m-1"], "m-1")).toEqual([
-			"--master",
-			"--resume",
-			"m-1",
-		]);
-	});
-
-	it("preserves unrelated flags through the tmux/worktree relaunch argv", () => {
-		const rewritten = rewriteMasterContinuationArgs(["--master", "--model", "opus", "-c"], "m-1");
-		expect(rewritten).toEqual(["--master", "--model", "opus", "--resume", "m-1"]);
-		expect(rewritten).not.toContain("-c");
-		const reparsed = parseArgs([...rewritten], "local");
-		expect(reparsed.master).toBe(true);
-		expect(reparsed.resume).toBe("m-1");
-		expect(reparsed.continue).toBeUndefined();
+	it("canonicalizes project aliases and rejects path-shaped resume ids", async () => {
+		const dir = tempDir("gjc-master-registry-");
+		const repo = tempDir("gjc-master-repo-");
+		const alias = `${repo}/.`;
+		await recordMasterSession(dir, repo, "master-a");
+		expect(await resolveMasterResume(dir, alias)).toEqual({ ok: true, sessionId: "master-a" });
+		expect((await resolveMasterResume(dir, repo, "../ordinary.jsonl")).ok).toBe(false);
+		fs.rmSync(dir, { recursive: true, force: true });
+		fs.rmSync(repo, { recursive: true, force: true });
 	});
 });
 
 describe("master session-start hook", () => {
 	function fakeApi(sent: Array<{ message: Record<string, unknown>; options: unknown }>) {
-		const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
+		const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
 		return {
 			handlers,
 			api: {
-				on: (event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) => {
+				on: (event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => {
 					handlers.set(event, handler);
 				},
 				sendMessage: (message: Record<string, unknown>, options: unknown) => {
@@ -332,12 +316,11 @@ describe("master session-start hook", () => {
 		const handler = handlers.get("session_start");
 		expect(handler).toBeDefined();
 		await handler?.({}, ctx);
-		expect(sent).toHaveLength(1);
-		const [{ message, options }] = sent;
-		expect(message.customType).toBe(MASTER_SESSION_CONTEXT_CUSTOM_TYPE);
-		expect(message.display).toBe(false);
-		expect(options).toEqual({ triggerTurn: false });
-		const content = String(message.content);
+		expect(sent).toHaveLength(0);
+		const result = (await handlers.get("before_agent_start")?.({ systemPrompt: ["base"] }, ctx)) as
+			| { systemPrompt?: string[] }
+			| undefined;
+		const content = result?.systemPrompt?.at(-1) ?? "";
 		expect(content).toContain("SDK supervision quick reference");
 		expect(content).toContain("session=worker-1");
 		expect(content).toContain("this master session");
@@ -353,10 +336,22 @@ describe("master session-start hook", () => {
 			},
 		})(api as never);
 		await handlers.get("session_start")?.({}, ctx);
-		expect(sent).toHaveLength(1);
-		const content = String(sent[0]?.message.content);
+		expect(sent).toHaveLength(0);
+		const result = (await handlers.get("before_agent_start")?.({ systemPrompt: ["base"] }, ctx)) as
+			| { systemPrompt?: string[] }
+			| undefined;
+		const content = result?.systemPrompt?.at(-1) ?? "";
 		expect(content).toContain("SDK supervision quick reference");
 		expect(content).toContain("UNAVAILABLE");
 		expect(content).toContain("Fail closed");
+		expect(content).not.toContain("broker gone");
+	});
+
+	it("rejects session switches so ordinary sessions cannot inherit master authority", async () => {
+		const sent: Array<{ message: Record<string, unknown>; options: unknown }> = [];
+		const { handlers, api } = fakeApi(sent);
+		createMasterModeExtension({ agentDir: "/unused", loadInventory: async () => inventory([]) })(api as never);
+		const result = await handlers.get("session_before_switch")?.({}, ctx);
+		expect(result).toEqual({ cancel: true });
 	});
 });

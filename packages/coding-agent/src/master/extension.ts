@@ -9,13 +9,9 @@
  * the injection fails closed — the guidelines are still delivered alongside an
  * explicit "inventory unavailable" notice, and no session action is taken.
  */
-import { logger } from "@gajae-code/utils";
 import type { ExtensionFactory } from "../extensibility/extensions/types";
 import { loadResidentSessionInventory, type ResidentSessionInventory, renderInventoryMarkdown } from "./inventory";
 import sdkSupervisionGuidance from "./sdk-supervision-guidance.md" with { type: "text" };
-
-/** Custom-message type used for the master-mode session-start injection. */
-export const MASTER_SESSION_CONTEXT_CUSTOM_TYPE = "master-supervision-context";
 
 export interface MasterModeExtensionDeps {
 	/** SDK broker state directory the inventory is read from. */
@@ -35,11 +31,10 @@ export async function composeMasterSessionStartContent(
 	try {
 		const inventory = await load(deps.agentDir);
 		inventorySection = renderInventoryMarkdown(inventory, selfSessionId);
-	} catch (error) {
-		const reason = error instanceof Error ? error.message : String(error);
+	} catch {
 		inventorySection = [
 			"Resident-session inventory is UNAVAILABLE: the SDK broker snapshot could not be loaded",
-			`(${reason}). Fail closed: do not prompt, steer, answer, or retire any session until`,
+			"(typed broker failure hidden). Fail closed: do not prompt, steer, answer, or retire any session until",
 			"`gjc sdk session list` succeeds and you hold a fresh authoritative inventory.",
 		].join(" ");
 	}
@@ -61,25 +56,15 @@ export async function composeMasterSessionStartContent(
  */
 export function createMasterModeExtension(deps: MasterModeExtensionDeps): ExtensionFactory {
 	return api => {
+		let sessionStartContext: string | undefined;
+		api.on("session_before_switch", async () => ({ cancel: true }));
 		api.on("session_start", async (_event, ctx) => {
-			try {
-				const selfSessionId = ctx.sessionManager.getSessionId() || undefined;
-				const content = await composeMasterSessionStartContent(deps, selfSessionId);
-				api.sendMessage(
-					{
-						customType: MASTER_SESSION_CONTEXT_CUSTOM_TYPE,
-						content,
-						display: false,
-						attribution: "agent",
-					},
-					{ triggerTurn: false },
-				);
-			} catch (error) {
-				// The session-start hook must never break session startup.
-				logger.warn("Master-mode session-start injection failed", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
+			const selfSessionId = ctx.sessionManager.getSessionId() || undefined;
+			sessionStartContext = await composeMasterSessionStartContent(deps, selfSessionId);
+		});
+		api.on("before_agent_start", async event => {
+			if (!sessionStartContext) return;
+			return { systemPrompt: [...event.systemPrompt, sessionStartContext] };
 		});
 	};
 }

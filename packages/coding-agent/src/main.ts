@@ -39,7 +39,7 @@ import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
-import { recordMasterSession } from "./master/registry";
+import { recordMasterSession, resolveMasterResume } from "./master/registry";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
 import type { SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
@@ -1004,7 +1004,7 @@ export async function createSessionManager(
 	// session exists. When a prior session is resumed, mark parsed.continue so
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
-	if (activeSettings.get("autoResume")) {
+	if (parsed.master !== true && activeSettings.get("autoResume")) {
 		const manager = await SessionManager.continueRecent(
 			cwd,
 			sessionDestination(),
@@ -1508,6 +1508,26 @@ export async function runRootCommand(
 	);
 	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";
+	if (parsedArgs.master === true) {
+		if (!isInteractive || parsedArgs.noSession === true) {
+			process.stderr.write("Master mode requires a persistent interactive terminal session.\n");
+			if (!deps.suppressProcessExit) process.exitCode = 2;
+			authStorage.close();
+			return;
+		}
+		if (parsedArgs.continue === true || parsedArgs.resume !== undefined) {
+			const requestedId = typeof parsedArgs.resume === "string" ? parsedArgs.resume : undefined;
+			const resolution = await resolveMasterResume(settingsInstance.getAgentDir(), cwd, requestedId);
+			if (!resolution.ok) {
+				process.stderr.write(`${resolution.message}\n`);
+				if (!deps.suppressProcessExit) process.exitCode = 1;
+				authStorage.close();
+				return;
+			}
+			parsedArgs.continue = false;
+			parsedArgs.resume = resolution.sessionId;
+		}
+	}
 
 	// Initialize discovery system with settings for provider persistence
 	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
@@ -1796,17 +1816,12 @@ export async function runRootCommand(
 			modelRegistry.refreshInBackground();
 		}
 		if (options.masterMode === true) {
-			// Durable master identity: `gjc master --continue` resolves only recorded
-			// masters. Never let a registry failure break session startup.
-			try {
-				await recordMasterSession(
-					options.agentDir ?? getAgentDir(),
-					options.cwd ?? getProjectDir(),
-					result.session.sessionManager.getSessionId(),
-				);
-			} catch (error) {
-				logger.warn("Failed to record master session identity", { error: String(error) });
-			}
+			await result.session.sessionManager.ensureOnDisk();
+			await recordMasterSession(
+				options.agentDir ?? getAgentDir(),
+				result.session.sessionManager.getCwd(),
+				result.session.sessionManager.getSessionId(),
+			);
 		}
 		return result;
 	};
