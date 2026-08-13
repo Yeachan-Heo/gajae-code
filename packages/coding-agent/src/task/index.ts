@@ -35,6 +35,7 @@ import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" wit
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
+import { splitSelectorThinkingSuffix } from "../thinking";
 import { formatBytes, formatDuration } from "../tools/render-utils";
 import { escapeXmlAttribute } from "../utils/xml-escape";
 import {
@@ -2032,13 +2033,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						continue;
 					}
 					candidates.push(normalized.pinned);
-					const literal = routingSnapshot.find(candidate => formatModelString(candidate) === selector);
+					const exact = routingSnapshot.find(candidate => formatModelString(candidate) === normalized.pinned);
+					const suffix = splitSelectorThinkingSuffix(normalized.pinned.slice(normalized.pinned.indexOf("/") + 1));
+					const selectorWithoutEffort =
+						suffix.thinkingLevel === undefined
+							? undefined
+							: `${normalized.pinned.slice(0, normalized.pinned.indexOf("/") + 1)}${suffix.selector}`;
 					const model =
-						literal ??
-						routingSnapshot.find(candidate => {
-							const singleton = normalizeTierSelector(selector, [candidate]);
-							return "pinned" in singleton && singleton.pinned === normalized.pinned;
-						});
+						exact ??
+						(selectorWithoutEffort === undefined
+							? undefined
+							: routingSnapshot.find(candidate => formatModelString(candidate) === selectorWithoutEffort));
 					if (model) candidateModels.set(normalized.pinned, model);
 				}
 				routingCandidatesByIndex.set(i, candidates);
