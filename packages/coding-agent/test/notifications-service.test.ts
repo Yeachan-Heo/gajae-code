@@ -1301,6 +1301,65 @@ describe("notification-service stale debris sweep", () => {
 		expect(report.kept).toBe(1);
 	});
 
+	test("a candidate replaced between the staleness check and deletion is retained as a failure", async () => {
+		// Identity-bound deletion: the successor's bytes differ, so exactUnlink
+		// reports identity_mismatch and the live replacement survives.
+		const debris = path.join(dir, "transition-005aa822-3f0b-45c9-bd39-e7047b1d3be4");
+		const { fs, store, unlinked } = mockFs(
+			{ [debris]: "stale-quarantine" },
+			{
+				mtimes: { [debris]: OLD },
+				onExactUnlink: (file, files) => {
+					if (file === debris) files.set(file, "live-successor-content");
+				},
+			},
+		);
+		const report = await sweepNotificationDebris({
+			dir,
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.removed).toEqual([]);
+		expect(report.failures).toBe(1);
+		expect(unlinked).toEqual([]);
+		expect(store.get(debris)).toBe("live-successor-content");
+	});
+
+	test("an unlink failure is reported as a failure, not silently kept", async () => {
+		const debris = path.join(dir, ".gjc-exact-unlink-placeholder-locked.json");
+		const { fs } = mockFs({ [debris]: "" }, { mtimes: { [debris]: OLD }, failUnlink: new Set([debris]) });
+		const report = await sweepNotificationDebris({
+			dir,
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.removed).toEqual([]);
+		expect(report.failures).toBe(1);
+		expect(report.kept).toBe(0);
+	});
+
+	test("a failed directory listing is reported instead of looking like a clean sweep", async () => {
+		const { fs } = mockFs({});
+		const report = await sweepNotificationDebris({
+			dir: "/tmp/gjc-debris-missing-dir",
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report).toMatchObject({ removed: [], kept: 0, failures: 0, scanFailed: true });
+	});
+
+	test("an unreadable candidate is a failure and is never pathname-unlinked", async () => {
+		const debris = path.join(dir, "transition-11111111-2222-4333-8444-555555555555");
+		const { fs, unlinked } = mockFs(
+			{ [debris]: "" },
+			{ mtimes: { [debris]: OLD }, rejectEndpointFiles: new Set([debris]) },
+		);
+		const report = await sweepNotificationDebris({
+			dir,
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.removed).toEqual([]);
+		expect(report.failures).toBe(1);
+		expect(unlinked).toEqual([]);
+	});
+
 	test("recovery sweeps debris in both the endpoint and daemon dirs and reports it", async () => {
 		const settings = Settings.isolated({
 			"notifications.enabled": true,

@@ -1,3 +1,4 @@
+import { decideAgentDirIsolation, readProjectEnvFile } from "./test-agent-dir-isolation";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,7 +24,6 @@ try {
 	// Leave the environment untouched if the temp root cannot be resolved.
 }
 
-
 // Isolate the agent directory for every test process. `getAgentDir()` (and
 // therefore `Settings.isolated()` and every daemon-path helper) resolves the
 // REAL `~/.gjc/agent` unless GJC_CODING_AGENT_DIR overrides it, so any test
@@ -33,31 +33,27 @@ try {
 // corrupted the running Telegram daemon: leaked `transition-*` markers made
 // dead-owner lock recovery report `left-contended` and give up.
 //
-// A fresh per-process mkdtemp keeps every such write inside the (already
-// canonicalized) temp root. An ambient override that merely restates the
-// DEFAULT agent dir gets no deference: a gjc parent process exports
-// GJC_CODING_AGENT_DIR=<home>/<config>/agent into every child it spawns, so
-// equality with the default carries no test intent — only an override that
-// points somewhere else is an intentional pin and is honored.
-const configuredAgentDir = process.env.GJC_CODING_AGENT_DIR || process.env.PI_CODING_AGENT_DIR;
-const configDirName = process.env.GJC_CONFIG_DIR?.trim() || process.env.PI_CONFIG_DIR?.trim() || ".gjc";
-const defaultAgentDir = path.join(os.homedir(), configDirName, "agent");
-const resolvesToDefaultAgentDir = (dir: string): boolean => {
-	const resolved = path.resolve(dir);
-	if (resolved === defaultAgentDir) return true;
+// The decision (including the project-`.env` distrust rule production applies)
+// lives in ./test-agent-dir-isolation.ts so it is unit-testable without
+// importing this preload's side effects.
+//
+// FAIL CLOSED: if the isolated directory cannot be created, throw. Continuing
+// would silently run the suite against the operator's live agent dir, which is
+// the exact destructive regression this preload exists to prevent.
+const isolation = decideAgentDirIsolation({
+	home: os.homedir(),
+	env: process.env,
+	projectEnv: readProjectEnvFile(process.cwd()),
+});
+if (isolation.action === "isolate") {
+	let agentDir: string;
 	try {
-		return fs.realpathSync(resolved) === fs.realpathSync(defaultAgentDir);
-	} catch {
-		return false;
+		agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-agent-"));
+	} catch (error) {
+		throw new Error(
+			`Test agent-directory isolation failed (${isolation.reason}); refusing to run tests against the live agent dir: ${String(error)}`,
+		);
 	}
-};
-if (!configuredAgentDir || resolvesToDefaultAgentDir(configuredAgentDir)) {
-	try {
-		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-agent-"));
-		process.env.GJC_CODING_AGENT_DIR = agentDir;
-		process.env.PI_CODING_AGENT_DIR = agentDir;
-	} catch {
-		// Leave the environment untouched if the temp root cannot be created;
-		// the suite then runs against the operator's real agent dir as before.
-	}
+	process.env.GJC_CODING_AGENT_DIR = agentDir;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 }

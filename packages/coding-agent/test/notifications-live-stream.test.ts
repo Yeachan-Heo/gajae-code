@@ -320,7 +320,7 @@ test("rapid live updates are throttled to a single frame within the interval", a
 	expect(live().length).toBe(1); // later updates fall inside the throttle window
 }, 15_000);
 
-test("defers a finalized turn during ownership preflight and flushes it once with the live message reference", async () => {
+test("a deferred ownership preflight never holds reconciliation and the turn finalizes once on the live ref", async () => {
 	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
 	let deferEnsure = false;
 	const ensureEntered = Promise.withResolvers<void>();
@@ -346,7 +346,11 @@ test("defers a finalized turn during ownership preflight and flushes it once wit
 	await waitFor(() => streams().some(frame => frame.phase === "live"), 3000, "live frame");
 	const liveRef = streams().find(frame => frame.phase === "live")?.messageRef;
 
+	// An ownership-relevant change keeps a genuinely deferred ensure in flight;
+	// reconciliation must settle without it, because chat daemons are optional
+	// adapters and never session authority.
 	settings.set("notifications.telegram.streaming.enabled", false);
+	settings.set("notifications.telegram.chatId", "43");
 	const reconciliation = controller.reconcileCurrentSession(ctx);
 	await Promise.race([
 		ensureEntered.promise,
@@ -354,21 +358,18 @@ test("defers a finalized turn during ownership preflight and flushes it once wit
 			throw new Error("deferred ensure was not entered");
 		}),
 	]);
+	const settled = await Promise.race([
+		reconciliation.then(() => "settled" as const),
+		Bun.sleep(5000).then(() => "hung" as const),
+	]);
+	expect(settled).toBe("settled");
+
 	await handlers.get("turn_end")!(
 		{ type: "turn_end", message: { role: "assistant", content: "authoritative final during preflight" } },
 		ctx,
 	);
-	await sleep(50);
-	expect(streams().some(frame => frame.phase === "finalized")).toBe(false);
-
 	releaseEnsure.resolve();
-	await Promise.race([
-		reconciliation,
-		Bun.sleep(3000).then(() => {
-			throw new Error("reconciliation did not settle after ensure release");
-		}),
-	]);
-	await waitFor(() => streams().some(frame => frame.phase === "finalized"), 3000, "deferred finalized frame");
+	await waitFor(() => streams().some(frame => frame.phase === "finalized"), 3000, "finalized frame");
 	const finalized = streams().filter(frame => frame.phase === "finalized");
 	expect(finalized).toHaveLength(1);
 	expect(finalized[0]?.messageRef).toBe(liveRef);

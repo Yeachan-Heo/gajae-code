@@ -2345,11 +2345,17 @@ describe("notifications config", () => {
 			await notify.handler("on", context);
 			expect(fs.existsSync(endpoint)).toBe(true);
 			expect(fs.existsSync(roots)).toBe(false);
+			// `/notify on` triggers daemon ownership but never awaits it (a wedged
+			// daemon must not hold the command), so the spawn is observed
+			// asynchronously. It must still happen exactly once.
+			const spawnDeadline = Date.now() + 8_000;
+			while (spawns < 1 && Date.now() < spawnDeadline) await Bun.sleep(25);
 			expect(spawns).toBe(1);
 
 			await notify.handler("on", context);
 			expect(fs.existsSync(endpoint)).toBe(true);
 			expect(fs.existsSync(roots)).toBe(false);
+			await Bun.sleep(100);
 			expect(spawns).toBe(1);
 
 			await sessionShutdown({}, context);

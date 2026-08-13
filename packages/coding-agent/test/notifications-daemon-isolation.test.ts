@@ -103,31 +103,45 @@ async function createIsolationHarness(input: {
 	};
 }
 
-test("a wedged telegram daemon never delays SDK endpoint publication", async () => {
+test("an awaited session_start settles while the telegram daemon ensure stays wedged", async () => {
 	enableNotificationsEnv();
 	let ensureCalls = 0;
+	// A daemon whose lock recovery is wedged: this ensure NEVER settles, for the
+	// whole lifetime of the test. Nothing on a session-lifecycle path may await
+	// it — not publication, not the awaited handler, not shutdown.
 	const wedge = Promise.withResolvers<"attached">();
 	const harness = await createIsolationHarness({
 		prefix: "gjc-daemon-wedge-",
 		ensureTelegramDaemon: () => {
 			ensureCalls += 1;
-			// Simulates a daemon whose lock recovery is wedged: the ensure call
-			// never settles for the lifetime of the assertion window.
 			return wedge.promise;
 		},
 	});
-	// Fire session_start WITHOUT awaiting it: the handler's post-start
-	// reconcile legitimately waits on daemon ensure, but core publication
-	// (what broker session.new consumes) must not.
-	const startTask = Promise.resolve(
-		harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx),
-	).catch(() => {});
-	await waitFor(() => fs.existsSync(harness.endpoint), 8_000, "endpoint publication under a wedged daemon");
+
+	// The handler is AWAITED here, exactly as the lifecycle command awaits it.
+	const started = await Promise.race([
+		Promise.resolve(harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx)).then(
+			() => "settled" as const,
+			() => "settled" as const,
+		),
+		Bun.sleep(15_000).then(() => "hung" as const),
+	]);
+	expect(started).toBe("settled");
+	expect(fs.existsSync(harness.endpoint)).toBe(true);
 	expect(ensureCalls).toBeGreaterThan(0);
-	// Release the wedge so shutdown can join the tracked lifecycle tasks.
+
+	// Shutdown must not join the detached ownership ensure either.
+	const shutdown = await Promise.race([
+		Promise.resolve(harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx)).then(
+			() => "settled" as const,
+			() => "settled" as const,
+		),
+		Bun.sleep(15_000).then(() => "hung" as const),
+	]);
+	expect(shutdown).toBe("settled");
+	// The wedge is still unresolved: nothing ever waited on it.
 	wedge.resolve("attached");
-	await startTask;
-});
+}, 60_000);
 
 test("a blocked telegram daemon identity degrades delivery only, never session startup", async () => {
 	enableNotificationsEnv();

@@ -452,7 +452,12 @@ test("tool ending during Telegram owner preflight is cancelled once when redacti
 		);
 		await waitFor(() => activityFrames(result.frames).length === 1, "started tool frame");
 
+		// A deferred daemon ensure must NOT hold reconciliation: chat daemons are
+		// optional adapters, never session authority. Change an ownership-relevant
+		// setting so a fresh (deferred) ensure is genuinely in flight — if
+		// reconciliation ever awaits it again, this test hangs.
 		deferEnsure = true;
+		result.settings.set("notifications.telegram.chatId", "43");
 		result.settings.set("notifications.redact", true);
 		const reconciliation = result.controller.reconcileCurrentSession(result.ctx);
 		await Promise.race([
@@ -461,6 +466,21 @@ test("tool ending during Telegram owner preflight is cancelled once when redacti
 				throw new Error("Telegram owner preflight was not entered");
 			}),
 		]);
+		const settled = await Promise.race([
+			reconciliation.then(() => "settled" as const),
+			sleep(5000).then(() => "hung" as const),
+		]);
+		expect(settled).toBe("settled");
+
+		// The redaction commit terminalizes the in-flight tool exactly once; the
+		// later end event must not add a second terminal frame.
+		await waitFor(
+			() =>
+				activityFrames(result.frames).some(
+					frame => frame.toolCallId === "preflight-redaction" && frame.phase === "cancelled",
+				),
+			"committed redaction terminal frame",
+		);
 		await result.handlers.get("tool_execution_end")!(
 			{
 				type: "tool_execution_end",
@@ -472,17 +492,7 @@ test("tool ending during Telegram owner preflight is cancelled once when redacti
 			result.ctx,
 		);
 		await sleep(50);
-		expect(activityFrames(result.frames)).toHaveLength(1);
-
 		releaseEnsure.resolve();
-		await reconciliation;
-		await waitFor(
-			() =>
-				activityFrames(result.frames).some(
-					frame => frame.toolCallId === "preflight-redaction" && frame.phase === "cancelled",
-				),
-			"committed redaction terminal frame",
-		);
 
 		const toolFrames = activityFrames(result.frames).filter(frame => frame.toolCallId === "preflight-redaction");
 		expect(toolFrames).toEqual([
@@ -506,7 +516,7 @@ test("tool ending during Telegram owner preflight is cancelled once when redacti
 	});
 }, 30000);
 
-test("tool ending during Telegram owner preflight completes once when non-redaction remains committed", async () => {
+test("a deferred Telegram owner preflight never holds reconciliation or duplicates a tool terminal", async () => {
 	await withNotifications(async () => {
 		let deferEnsure = false;
 		const ensureEntered = Promise.withResolvers<void>();
@@ -542,7 +552,11 @@ test("tool ending during Telegram owner preflight completes once when non-redact
 		);
 		await waitFor(() => activityFrames(result.frames).length === 1, "started tool frame");
 
+		// A deferred daemon ensure must NOT hold reconciliation. An
+		// ownership-relevant change keeps a real deferred ensure in flight, so a
+		// reintroduced await would hang this test.
 		deferEnsure = true;
+		result.settings?.set("notifications.telegram.chatId", "43");
 		const reconciliation = result.controller.reconcileCurrentSession(result.ctx);
 		await Promise.race([
 			ensureEntered.promise,
@@ -550,6 +564,12 @@ test("tool ending during Telegram owner preflight completes once when non-redact
 				throw new Error("Telegram owner preflight was not entered");
 			}),
 		]);
+		const settled = await Promise.race([
+			reconciliation.then(() => "settled" as const),
+			sleep(5000).then(() => "hung" as const),
+		]);
+		expect(settled).toBe("settled");
+
 		await result.handlers.get("tool_execution_end")!(
 			{
 				type: "tool_execution_end",
@@ -560,11 +580,7 @@ test("tool ending during Telegram owner preflight completes once when non-redact
 			} as never,
 			result.ctx,
 		);
-		await sleep(50);
-		expect(activityFrames(result.frames)).toHaveLength(1);
-
 		releaseEnsure.resolve();
-		await reconciliation;
 		await waitFor(
 			() =>
 				activityFrames(result.frames).some(
@@ -578,11 +594,11 @@ test("tool ending during Telegram owner preflight completes once when non-redact
 			expect.objectContaining({ phase: "started" }),
 			expect.objectContaining({ phase: "completed" }),
 		]);
-		for (const frame of toolFrames) {
-			expect(frame.argsSummary).toBeUndefined();
-			expect(frame.resultSummary).toBeUndefined();
-		}
-		expect(JSON.stringify(toolFrames)).not.toContain("sentinel");
+		// Policy is committed and non-redacted by the time the tool ends, so
+		// summaries are correctly present; the contract under test is that a
+		// deferred daemon ensure neither held reconciliation nor produced a
+		// duplicate terminal frame.
+		expect(toolFrames.at(-1)?.resultSummary).toContain("sentinel");
 
 		await result.handlers.get("agent_end")!({ type: "agent_end" } as never, result.ctx);
 		await result.handlers.get("session_shutdown")!({ type: "session_shutdown" } as never, result.ctx);

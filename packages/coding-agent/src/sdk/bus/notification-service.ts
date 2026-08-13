@@ -1249,8 +1249,12 @@ export interface NotificationRecoveryReport {
 	endpointsRetainedUnknown?: string[];
 	/** Stale quarantine/staging debris removed from the endpoint and daemon dirs. */
 	debrisRemoved?: string[];
-	/** Debris candidates retained (young, live writer, or unlink failure). */
+	/** Debris candidates retained by policy (young, live writer). */
 	debrisKept?: number;
+	/** Debris removals attempted without conclusive success (identity/unlink). */
+	debrisFailures?: number;
+	/** At least one debris directory listing failed; the sweep was not exhaustive. */
+	debrisScanFailed?: boolean;
 	daemon: {
 		action: DaemonRecoveryAction;
 		detail: string;
@@ -1504,8 +1508,16 @@ const DEBRIS_STAGING_TMP = /\.([0-9]{1,10})\.[0-9]{1,16}\.[a-z0-9]{1,24}\.tmp$/;
 export interface NotificationDebrisSweepReport {
 	/** Basenames removed from the swept directory. */
 	removed: string[];
-	/** Debris candidates retained (young, live writer, or unlink failure). */
+	/** Debris candidates retained (young, live writer, or identity/unlink refusal). */
 	kept: number;
+	/**
+	 * Candidates whose removal was ATTEMPTED and did not conclusively succeed
+	 * (identity mismatch, unreadable candidate, unlink error). Distinct from
+	 * `kept`-by-policy so a caller can see that a sweep was not fully effective.
+	 */
+	failures: number;
+	/** The directory listing itself failed; nothing could be inspected. */
+	scanFailed?: boolean;
 }
 
 /**
@@ -1516,9 +1528,16 @@ export interface NotificationDebrisSweepReport {
  * Removal requires positive staleness proof — a dead recorded writer pid for
  * staging files, or an mtime older than {@link NOTIFICATION_DEBRIS_MIN_AGE_MS}
  * for everything else. Canonical files can never match the debris patterns, a
- * young staging file with a live writer is kept, and any stat/unlink failure
- * keeps the file. Without a `stat` capability only dead-pid staging files are
- * swept.
+ * young staging file with a live writer is kept, and without a `stat`
+ * capability only dead-pid staging files are swept.
+ *
+ * Deletion is IDENTITY-BOUND, never a bare pathname unlink: the candidate is
+ * re-read through the no-follow endpoint reader and removed through
+ * `exactUnlink` with that exact identity. A candidate replaced between the
+ * staleness check and the delete fails the identity match and is retained, and
+ * a symlinked candidate is refused by the reader — so a live successor can
+ * never be deleted by a stale decision. Every inconclusive attempt is counted
+ * in `failures` rather than silently folded into `kept`.
  */
 export async function sweepNotificationDebris(input: {
 	dir: string;
@@ -1532,11 +1551,12 @@ export async function sweepNotificationDebris(input: {
 	const minAgeMs = input.minAgeMs ?? NOTIFICATION_DEBRIS_MIN_AGE_MS;
 	const removed: string[] = [];
 	let kept = 0;
+	let failures = 0;
 	let names: string[] = [];
 	try {
 		names = await fs.readdir(input.dir);
 	} catch {
-		return { removed, kept };
+		return { removed, kept, failures, scanFailed: true };
 	}
 	const olderThanMinAge = async (file: string): Promise<boolean> => {
 		if (!fs.stat) return false;
@@ -1564,14 +1584,33 @@ export async function sweepNotificationDebris(input: {
 			kept += 1;
 			continue;
 		}
+		// Identity-bound removal: bind to exactly the bytes inspected here. A
+		// replacement, a symlink, or an unreadable candidate is refused.
+		const candidate = await fs.readEndpointFile(file).catch(() => undefined);
+		if (!candidate) {
+			failures += 1;
+			continue;
+		}
 		try {
-			await fs.unlink(file);
-			removed.push(name);
+			const result = await fs.exactUnlink(file, candidate.identity);
+			if (result.ok) {
+				removed.push(name);
+				continue;
+			}
+			// A typed retained cleanup with the canonical path proven absent is a
+			// completed removal; anything else keeps the file.
+			const retainedRemoved =
+				result.code === "cleanup_pending" &&
+				typeof result.detachedPath === "string" &&
+				result.detachedPath.length > 0 &&
+				(await fs.readFile(file, "utf8").catch(() => undefined)) === undefined;
+			if (retainedRemoved) removed.push(name);
+			else failures += 1;
 		} catch {
-			kept += 1;
+			failures += 1;
 		}
 	}
-	return { removed, kept };
+	return { removed, kept, failures };
 }
 
 /**
@@ -1847,10 +1886,14 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 	// slows every later scan; sweep it with positive staleness proof only.
 	const debrisRemoved: string[] = [];
 	let debrisKept = 0;
+	let debrisFailures = 0;
+	let debrisScanFailed = false;
 	for (const sweepDir of new Set([dir, paths.dir])) {
 		const swept = await sweepNotificationDebris({ dir: sweepDir, deps });
 		debrisRemoved.push(...swept.removed);
 		debrisKept += swept.kept;
+		debrisFailures += swept.failures;
+		debrisScanFailed ||= swept.scanFailed === true;
 	}
 
 	return {
@@ -1864,6 +1907,8 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		endpointsRetainedUnknown: retainedUnknown,
 		debrisRemoved,
 		debrisKept,
+		debrisFailures,
+		...(debrisScanFailed ? { debrisScanFailed } : {}),
 		daemon,
 	};
 }
@@ -1885,7 +1930,9 @@ export function formatNotificationRecoveryReport(report: NotificationRecoveryRep
 	for (const unknown of report.endpointsRetainedUnknown ?? [])
 		lines.push(`    - retained unverified cleanup path ${unknown}`);
 	if (report.debrisRemoved !== undefined || report.debrisKept !== undefined)
-		lines.push(`  debris: removed ${report.debrisRemoved?.length ?? 0}, kept ${report.debrisKept ?? 0}`);
+		lines.push(
+			`  debris: removed ${report.debrisRemoved?.length ?? 0}, kept ${report.debrisKept ?? 0}, failed ${report.debrisFailures ?? 0}${report.debrisScanFailed ? ", scan failed" : ""}`,
+		);
 	lines.push(`  daemon: ${report.daemon.action} — ${report.daemon.detail}`);
 	if (report.daemon.blockingReason) lines.push(`    - blocking reason: ${report.daemon.blockingReason}`);
 	if (report.daemon.markerAgeMs !== undefined)

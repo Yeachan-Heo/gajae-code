@@ -24,7 +24,17 @@ export interface BoundNotificationSession<Context extends NotificationSessionCon
 }
 
 export type NotificationEndpointStartResult = "started" | "already" | "disabled" | "failed";
-export type TelegramDaemonPreflightResult = "ready" | "blocked_identity" | "failed";
+/**
+ * Outcome of the Telegram daemon preflight.
+ *
+ * `pending` means ownership acquisition is in flight and was deliberately NOT
+ * awaited: chat daemons are optional notification adapters, never session
+ * authority, so reconciliation on an awaited session-lifecycle path must never
+ * block on one. A pending preflight neither stops the runtime nor marks it
+ * blocked — the runtime starts, adapters stay withheld while the owner state is
+ * not ready, and the ensure's settle callback re-reconciles.
+ */
+export type TelegramDaemonPreflightResult = "ready" | "pending" | "blocked_identity" | "failed";
 
 /**
  * The endpoint implementation is deliberately injected. The controller owns
@@ -329,7 +339,13 @@ export class NotificationSessionController {
 					ensured = "failed";
 				}
 				if (!this.#isCurrentConfig(cfg)) continue;
-				if (ensured !== "ready" && !nonTelegramEffectiveForTelegram) {
+				// Only a SETTLED non-ready preflight gates the runtime. `pending`
+				// falls through to the normal start path: the session is never held
+				// or stopped by an in-flight daemon ensure, and adapters stay
+				// withheld by the runtime's own owner-state check until it settles.
+				// A missing hook keeps its prior gating semantics; only `pending` is exempt.
+				const settledNotReady = ensured !== "ready" && ensured !== "pending";
+				if (settledNotReady && !nonTelegramEffectiveForTelegram) {
 					if (runtime.isRunning(binding)) await runtime.stop(binding);
 					this.#blockedRuntimeSessions.add(binding.sessionId);
 					return {
@@ -337,7 +353,7 @@ export class NotificationSessionController {
 						status: this.#status(binding, cfg, runtime),
 					};
 				}
-				if (ensured !== "ready" && nonTelegramEffectiveForTelegram) {
+				if (settledNotReady && nonTelegramEffectiveForTelegram) {
 					const isolated = await runtime.isolateTelegram?.(binding);
 					if (isolated !== "started" && isolated !== "already") {
 						if (runtime.isRunning(binding)) await runtime.stop(binding);

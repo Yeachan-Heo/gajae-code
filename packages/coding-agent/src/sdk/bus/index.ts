@@ -3980,6 +3980,113 @@ export function createNotificationsExtension(
 		return "ready";
 	}
 
+	/**
+	 * Single-flight chat-daemon ownership acquisition.
+	 *
+	 * Chat daemons are optional notification adapters, never session authority,
+	 * so NO session-lifecycle path (startSession, reconcile, authority rotation)
+	 * may await ownership — a wedged ensure would hold `session/new` open. This
+	 * coordinator keeps at most one ensure in flight and exposes it as a
+	 * settle-or-pending read: {@link peekDaemonOwnership} answers `undefined`
+	 * while an ensure is still running, and callers proceed without it. Exactly
+	 * one ensure runs at a time, so two callers can never race two outcomes onto
+	 * the same runtime.
+	 */
+	type DaemonOwnershipOutcome = ConfiguredDaemonOwnerResult | "failed";
+	let daemonOwnershipInFlight: Promise<DaemonOwnershipOutcome> | undefined;
+	let daemonOwnershipSettled: DaemonOwnershipOutcome | undefined;
+	let daemonOwnershipSettledKey: string | undefined;
+
+	/**
+	 * Identity of the ownership-relevant configuration. A settled outcome is
+	 * only reusable while this is unchanged: toggling enablement, credentials,
+	 * destination, or the activation marker must force a fresh ensure, while a
+	 * delivery-only change (redaction, verbosity) must not.
+	 */
+	function daemonOwnershipKey(cfg: NotificationConfig): string {
+		return JSON.stringify([
+			isProviderEffectivelyEnabled(cfg, "telegram"),
+			isProviderEffectivelyEnabled(cfg, "discord"),
+			isProviderEffectivelyEnabled(cfg, "slack"),
+			cfg.botToken === undefined ? null : cfg.botToken.length,
+			cfg.chatId ?? null,
+			cfg.discord.parentChannelId ?? null,
+			cfg.slack.channelId ?? null,
+			getCurrentTelegramActivationMarker(cfg) ?? null,
+		]);
+	}
+
+	function peekDaemonOwnership(cfg: NotificationConfig): DaemonOwnershipOutcome | undefined {
+		if (daemonOwnershipInFlight) return undefined;
+		return daemonOwnershipSettledKey === daemonOwnershipKey(cfg) ? daemonOwnershipSettled : undefined;
+	}
+
+	function kickDaemonOwnership(
+		settings: Settings,
+		cfg: NotificationConfig,
+		onSettled?: (outcome: DaemonOwnershipOutcome) => void,
+	): void {
+		const existing = daemonOwnershipInFlight;
+		if (existing) {
+			if (onSettled) void existing.then(onSettled, () => {});
+			return;
+		}
+		daemonOwnershipSettled = undefined;
+		daemonOwnershipSettledKey = undefined;
+		const key = daemonOwnershipKey(cfg);
+		const task = (async (): Promise<DaemonOwnershipOutcome> => {
+			try {
+				return await ensureConfiguredDaemonOwners(settings, cfg);
+			} catch (error) {
+				logger.warn(
+					`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
+				);
+				return "failed";
+			}
+		})();
+		daemonOwnershipInFlight = task;
+		void task.then(outcome => {
+			if (daemonOwnershipInFlight === task) {
+				daemonOwnershipInFlight = undefined;
+				daemonOwnershipSettled = outcome;
+				daemonOwnershipSettledKey = key;
+			}
+			onSettled?.(outcome);
+		});
+	}
+
+	/**
+	 * Apply one settled ownership outcome to exactly one runtime.
+	 *
+	 * Three guards keep a late outcome harmless: the runtime must still be the
+	 * registered one for its id and not be stopping (a replacement session never
+	 * inherits a predecessor's outcome), and the state must still be `retry` — an
+	 * outcome that lost a race must never downgrade a runtime whose adapters are
+	 * already active. A `failed` ensure leaves the state retryable.
+	 */
+	function applyDaemonOwnership(
+		id: string,
+		runtime: SessionRuntime,
+		outcome: DaemonOwnershipOutcome,
+		isolateChatEndpoint: boolean,
+	): void {
+		if (runtimes.get(id) !== runtime || runtime.stopping) return;
+		if (runtime.notificationOwnerState !== "retry") return;
+		if (outcome === "failed") return;
+		runtime.notificationOwnerState =
+			outcome === "ready" || (outcome === "blocked_identity_with_sibling" && isolateChatEndpoint)
+				? "ready"
+				: "blocked";
+		if (outcome === "blocked_identity") {
+			logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
+		}
+		if (outcome === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
+			logger.warn(
+				"notifications: Telegram ownership changed after core publication; preserving the canonical endpoint and withholding adapters.",
+			);
+		}
+	}
+
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -7091,38 +7198,24 @@ export function createNotificationsExtension(
 			const endpoint = await sdkRuntime.startTransport();
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
-				// Daemon ownership is acquired in the background AFTER the core SDK
-				// endpoint is published. Until it settles, the owner state stays
-				// "retry": activate() withholds notification adapters, and the
-				// controller's reconcile retries ensure later. Startup never awaits
-				// this task.
+				// Daemon ownership is acquired AFTER the core SDK endpoint is
+				// published, and is deliberately NOT tracked in
+				// `sessionLifecycleTasks`: shutdown joins that set, so a wedged
+				// ensure tracked there would hang teardown. Every write the settled
+				// outcome performs is identity-guarded instead. Until it settles the
+				// owner state stays "retry", so activate() withholds notification
+				// adapters and a later reconcile re-attempts.
 				initializedRuntime.notificationOwnerState = "retry";
 				const ownershipRuntime = initializedRuntime;
-				const ownershipTask = (async () => {
-					try {
-						const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
-						if (runtimes.get(id) !== ownershipRuntime || ownershipRuntime.stopping) return;
-						ownershipRuntime.notificationOwnerState =
-							ownership === "ready" || (ownership === "blocked_identity_with_sibling" && isolateChatEndpoint)
-								? "ready"
-								: "blocked";
-						if (ownership === "blocked_identity") {
-							logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
-						}
-						if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
-							logger.warn(
-								"notifications: Telegram ownership changed after core publication; preserving the canonical endpoint and withholding adapters.",
-							);
-						}
-					} catch (error) {
-						// Owner state stays "retry" so a later reconcile can re-attempt.
-						logger.warn(
-							`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
-						);
-					}
-				})();
-				sessionLifecycleTasks.add(ownershipTask);
-				void ownershipTask.finally(() => sessionLifecycleTasks.delete(ownershipTask));
+				kickDaemonOwnership(settings, cfg, outcome => {
+					applyDaemonOwnership(id, ownershipRuntime, outcome, isolateChatEndpoint);
+					// Adapters activate only through reconciliation, so re-run it once
+					// ownership is known. Detached: no lifecycle path awaits this.
+					if (runtimes.get(id) !== ownershipRuntime || ownershipRuntime.stopping || extensionShuttingDown) return;
+					void controller
+						.reconcileCurrentSession(ctx)
+						.catch(error => logger.warn(`notifications: post-ownership reconciliation failed: ${String(error)}`));
+				});
 			}
 
 			// The native server owns the only authoritative view of this host's live
@@ -7405,15 +7498,17 @@ export function createNotificationsExtension(
 				if (runtime.notificationOwnerState === "retry") {
 					const { cfg, settings, settingsAvailable } = resolveSettings(options.settings);
 					if (!settingsAvailable || !settings) return "failed";
-					try {
-						const ownership = await ensureConfiguredDaemonOwners(settings, cfg);
-						runtime.notificationOwnerState =
-							ownership === "ready" ||
-							(ownership === "blocked_identity_with_sibling" && runtime.endpointScope === "chat")
-								? "ready"
-								: "blocked";
-					} catch {
-						return "failed";
+					// Settle-or-pending: never await ownership on this path. A pending
+					// ensure leaves the state retryable and adapters withheld; its
+					// settle callback applies the outcome and re-reconciles.
+					const settled = peekDaemonOwnership(cfg);
+					const isolated = runtime.endpointScope === "chat";
+					if (settled === undefined) {
+						kickDaemonOwnership(settings, cfg, outcome =>
+							applyDaemonOwnership(binding.sessionId, runtime, outcome, isolated),
+						);
+					} else {
+						applyDaemonOwnership(binding.sessionId, runtime, settled, isolated);
 					}
 				}
 				return "started";
@@ -7481,13 +7576,20 @@ export function createNotificationsExtension(
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
 		ensureTelegramDaemon: async _binding => {
-			const { settings, settingsAvailable } = resolveSettings(options.settings);
+			const { settings, settingsAvailable, cfg } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
-			try {
-				return await ensureTelegramOwner(settings);
-			} catch {
-				return "failed";
+			// Reconciliation runs on awaited session-lifecycle paths (session_start,
+			// switch, branch, fork, resume), so this preflight must NEVER await a
+			// daemon ensure. A pending ensure answers "pending": reconciliation
+			// proceeds without activating adapters, and the settle callback
+			// re-reconciles once ownership is known.
+			const settled = peekDaemonOwnership(cfg);
+			if (settled === undefined) {
+				kickDaemonOwnership(settings, cfg);
+				return "pending";
 			}
+			if (settled === "failed") return "failed";
+			return settled === "ready" ? "ready" : "blocked_identity";
 		},
 	};
 	controller.attachRuntime(sessionRuntime);
