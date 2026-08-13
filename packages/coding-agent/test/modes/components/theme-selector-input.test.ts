@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { ThemeSelectorComponent } from "@gajae-code/coding-agent/modes/components/theme-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
@@ -6,6 +6,7 @@ import { initTheme, previewTheme, restoreThemePreview, theme } from "@gajae-code
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 
 const THEMES = ["red-claw", "blue-crab"];
+const ORIGINAL_COLORTERM = Bun.env.COLORTERM;
 
 type ThemeSelectorHarness = {
 	component: ThemeSelectorComponent;
@@ -15,7 +16,16 @@ type ThemeSelectorHarness = {
 };
 
 beforeAll(async () => {
+	Bun.env.COLORTERM = "truecolor";
 	await initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+});
+
+afterAll(() => {
+	if (ORIGINAL_COLORTERM === undefined) {
+		delete Bun.env.COLORTERM;
+	} else {
+		Bun.env.COLORTERM = ORIGINAL_COLORTERM;
+	}
 });
 
 beforeEach(async () => {
