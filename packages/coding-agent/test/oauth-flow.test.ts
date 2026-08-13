@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { hookFetch } from "../../utils/src/hook-fetch";
-import { MCPOAuthFlow } from "../src/runtime-mcp/oauth-flow";
+import { canonicalMCPResourceUri, MCPOAuthFlow } from "../src/runtime-mcp/oauth-flow";
 
 const originalFetch = global.fetch;
 
@@ -439,5 +439,133 @@ describe("mcp oauth flow", () => {
 		expect(flow.resolvedClientId).toBe("configured-client-id");
 		expect(flow.registeredClientSecret).toBeUndefined();
 		expect(registrationCalled).toBe(false);
+	});
+});
+
+describe("MCP 2026-07-28 authorization conformance", () => {
+	const baseConfig = {
+		authorizationUrl: "https://provider.example/authorize",
+		tokenUrl: "https://provider.example/token",
+		clientId: "client-id",
+	};
+
+	function mockTokenEndpoint(onBody: (body: string) => void) {
+		return hookFetch((input, init) => {
+			const url = String(input);
+			if (url === "https://provider.example/token") {
+				onBody(String(init?.body ?? ""));
+				return new Response(
+					JSON.stringify({ access_token: "access-token", refresh_token: "refresh-token", expires_in: 3600 }),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			return new Response("not found", { status: 404 });
+		});
+	}
+
+	function driveCallback(onAuthUrl: (authUrl: URL) => Record<string, string>) {
+		return (info: { url: string; instructions?: string }) => {
+			const authUrl = new URL(info.url);
+			const redirectUri = authUrl.searchParams.get("redirect_uri") ?? "";
+			const state = authUrl.searchParams.get("state") ?? "";
+			const extra = onAuthUrl(authUrl);
+			const params = new URLSearchParams({ code: "test-code", state, ...extra });
+			queueMicrotask(() => {
+				void dispatchLocalCallback(`${redirectUri}?${params.toString()}`);
+			});
+		};
+	}
+
+	it("sends the RFC 8707 canonical resource on authorization and token requests", async () => {
+		let tokenRequestBody = "";
+		let observedAuthUrl: URL | undefined;
+		using _hook = mockTokenEndpoint(body => {
+			tokenRequestBody = body;
+		});
+		const flow = new MCPOAuthFlow(
+			{ ...baseConfig, callbackPort: allocateCallbackPort(), resource: "https://mcp.example/mcp" },
+			{
+				onAuth: info => {
+					observedAuthUrl = new URL(info.url);
+					driveCallback(() => ({}))(info);
+				},
+				signal: AbortSignal.timeout(5_000),
+			},
+		);
+		const credentials = await flow.login();
+		expect(credentials.access).toBe("access-token");
+		expect(observedAuthUrl?.searchParams.get("resource")).toBe("https://mcp.example/mcp");
+		expect(new URLSearchParams(tokenRequestBody).get("resource")).toBe("https://mcp.example/mcp");
+	});
+
+	it("rejects a mismatched authorization-response issuer fail-closed (RFC 9207)", async () => {
+		let tokenCalled = false;
+		using _hook = mockTokenEndpoint(() => {
+			tokenCalled = true;
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				...baseConfig,
+				callbackPort: allocateCallbackPort(),
+				resource: "https://mcp.example/mcp",
+				issuer: "https://provider.example",
+				issuerResponseIssSupported: true,
+			},
+			{ onAuth: driveCallback(() => ({ iss: "https://attacker.example" })), signal: AbortSignal.timeout(5_000) },
+		);
+		await expect(flow.login()).rejects.toThrow(/issuer mismatch/);
+		expect(tokenCalled).toBe(false);
+	});
+
+	it("rejects an iss-less response when metadata advertises iss support", async () => {
+		using _hook = mockTokenEndpoint(() => {});
+		const flow = new MCPOAuthFlow(
+			{
+				...baseConfig,
+				callbackPort: allocateCallbackPort(),
+				issuer: "https://provider.example",
+				issuerResponseIssSupported: true,
+			},
+			{ onAuth: driveCallback(() => ({})), signal: AbortSignal.timeout(5_000) },
+		);
+		await expect(flow.login()).rejects.toThrow(/missing required issuer/);
+	});
+
+	it("accepts a response whose iss matches the recorded issuer", async () => {
+		let tokenRequestBody = "";
+		using _hook = mockTokenEndpoint(body => {
+			tokenRequestBody = body;
+		});
+		const flow = new MCPOAuthFlow(
+			{
+				...baseConfig,
+				callbackPort: allocateCallbackPort(),
+				issuer: "https://provider.example",
+				issuerResponseIssSupported: true,
+			},
+			{ onAuth: driveCallback(() => ({ iss: "https://provider.example" })), signal: AbortSignal.timeout(5_000) },
+		);
+		const credentials = await flow.login();
+		expect(credentials.access).toBe("access-token");
+		expect(new URLSearchParams(tokenRequestBody).get("code")).toBe("test-code");
+	});
+
+	it("proceeds without iss validation when no issuer was recorded", async () => {
+		using _hook = mockTokenEndpoint(() => {});
+		const flow = new MCPOAuthFlow(
+			{ ...baseConfig, callbackPort: allocateCallbackPort() },
+			{ onAuth: driveCallback(() => ({ iss: "https://anything.example" })), signal: AbortSignal.timeout(5_000) },
+		);
+		const credentials = await flow.login();
+		expect(credentials.access).toBe("access-token");
+	});
+
+	it("canonicalizes MCP resource URIs per RFC 8707", () => {
+		expect(canonicalMCPResourceUri("https://mcp.example.com/")).toBe("https://mcp.example.com");
+		expect(canonicalMCPResourceUri("https://mcp.example.com/mcp#frag")).toBe("https://mcp.example.com/mcp");
+		expect(canonicalMCPResourceUri("https://mcp.example.com:8443/server/mcp")).toBe(
+			"https://mcp.example.com:8443/server/mcp",
+		);
+		expect(canonicalMCPResourceUri("not a url")).toBeUndefined();
 	});
 });

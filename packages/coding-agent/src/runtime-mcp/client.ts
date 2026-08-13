@@ -9,9 +9,9 @@ import * as path from "node:path";
 import * as url from "node:url";
 import { getProjectDir, logger, withTimeout } from "@gajae-code/utils";
 import {
+	buildXMcpParamHeaders,
 	classifyMcpProbeFailure,
 	collectXMcpHeaderBindings,
-	createMCPProtocolObservation,
 	extractMcpInputRequired,
 	isModernProtocolVersion,
 	JSONRPC_ERROR_METHOD_NOT_FOUND,
@@ -20,7 +20,6 @@ import {
 	MCP_PROTOCOL_VERSION_2026_07_28,
 	type MCPDowngradeReason,
 	type MCPModernClientContext,
-	type MCPProtocolObservation,
 	modernEraObservation,
 	normalizeMcpCacheHints,
 	resolveMCPProtocolPreference,
@@ -277,9 +276,7 @@ function decodeDiscoverResult(value: unknown): MCPDiscoverResultLite {
 	const meta = isRecord(value._meta) ? value._meta : undefined;
 	const serverInfoRaw = meta?.["io.modelcontextprotocol/serverInfo"];
 	const serverInfo =
-		isRecord(serverInfoRaw) &&
-		typeof serverInfoRaw.name === "string" &&
-		typeof serverInfoRaw.version === "string"
+		isRecord(serverInfoRaw) && typeof serverInfoRaw.name === "string" && typeof serverInfoRaw.version === "string"
 			? { name: serverInfoRaw.name, version: serverInfoRaw.version }
 			: undefined;
 	const hints = normalizeMcpCacheHints(value);
@@ -366,7 +363,9 @@ async function negotiateModernEra(
 						// rejecting our request context — a defect or policy failure, never
 						// a downgrade signal.
 						throw new MCPExpectedFailure(
-							new Error(`MCP modern server rejected the request context (code ${classification.modernErrorCode})`),
+							new Error(
+								`MCP modern server rejected the request context (code ${classification.modernErrorCode})`,
+							),
 						);
 					}
 				}
@@ -392,7 +391,8 @@ async function negotiateModernEra(
 			);
 		}
 		if (discovery.supportedVersions.length > 0) {
-			if (strict) failStrict(`server advertises only legacy-era versions (${discovery.supportedVersions.join(", ")})`);
+			if (strict)
+				failStrict(`server advertises only legacy-era versions (${discovery.supportedVersions.join(", ")})`);
 			return { outcome: "legacy-fallback", reason: "server-advertised-legacy-only" };
 		}
 		throw new MCPExpectedFailure(new Error("MCP server/discover returned no supported versions"));
@@ -671,22 +671,14 @@ export async function listTools(
 	let cacheScope: "public" | "private" | undefined;
 	const allTools: MCPToolDefinition[] = [];
 	try {
-		await collectPaginated(
-			connection,
-			options,
-			"tools/list",
-			"tools",
-			allTools,
-			decodeToolsListResult,
-			page => {
-				const hints = normalizeMcpCacheHints(page);
-				if (hints?.ttlMs !== undefined) {
-					const deadline = Date.now() + hints.ttlMs;
-					freshUntil = freshUntil === undefined ? deadline : Math.min(freshUntil, deadline);
-				}
-				if (hints?.cacheScope !== undefined) cacheScope = hints.cacheScope;
-			},
-		);
+		await collectPaginated(connection, options, "tools/list", "tools", allTools, decodeToolsListResult, page => {
+			const hints = normalizeMcpCacheHints(page);
+			if (hints?.ttlMs !== undefined) {
+				const deadline = Date.now() + hints.ttlMs;
+				freshUntil = freshUntil === undefined ? deadline : Math.min(freshUntil, deadline);
+			}
+			if (hints?.cacheScope !== undefined) cacheScope = hints.cacheScope;
+		});
 	} catch (error) {
 		if (modern && isModernMethodNotFound(error)) return [];
 		throw error;
@@ -727,6 +719,20 @@ export async function callTool(
 		name: toolName,
 		arguments: args,
 	};
+
+	// Modern era: mirror validated x-mcp-header bindings into Mcp-Param-* headers.
+	if (connection.protocol.era === "modern" && !options?.mcpParamHeaders) {
+		const tool = connection.tools?.find(candidate => candidate.name === toolName);
+		if (tool) {
+			const { bindings } = collectXMcpHeaderBindings(tool.inputSchema);
+			if (bindings.length > 0) {
+				const mcpParamHeaders = buildXMcpParamHeaders(bindings, args);
+				if (Object.keys(mcpParamHeaders).length > 0) {
+					options = { ...options, mcpParamHeaders };
+				}
+			}
+		}
+	}
 
 	return requestWithInputHandling<MCPToolCallResult>(
 		connection,

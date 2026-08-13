@@ -18,7 +18,7 @@ import {
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
-import { MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
+import { canonicalMCPResourceUri, MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
 import {
 	clearSmitheryApiKey,
 	createSmitheryCliAuthSession,
@@ -434,6 +434,7 @@ export class MCPCommandController {
 								finalConfig.oauth?.callbackPort,
 								finalConfig.oauth?.callbackPath,
 								finalConfig.oauth?.redirectUri,
+								{ issuer: oauth.issuer, issuerResponseIssSupported: oauth.authorizationResponseIssSupported },
 							);
 							const persistedClientId = oauthResult.clientId ?? oauth.clientId ?? finalConfig.oauth?.clientId;
 							const persistedClientSecret = oauthResult.clientSecret ?? finalConfig.oauth?.clientSecret;
@@ -522,6 +523,7 @@ export class MCPCommandController {
 		callbackPort?: number,
 		callbackPath?: string,
 		redirectUri?: string,
+		oauthMeta?: { issuer?: string; issuerResponseIssSupported?: boolean },
 	): Promise<OAuthFlowResult> {
 		const authStorage = this.ctx.session.modelRegistry.authStorage;
 		let parsedAuthUrl: URL;
@@ -553,6 +555,13 @@ export class MCPCommandController {
 					redirectUri,
 					callbackPort,
 					callbackPath,
+					// RFC 8707 canonical MCP server resource on auth + token requests.
+					...(canonicalMCPResourceUri(endpointUrl) ? { resource: canonicalMCPResourceUri(endpointUrl) } : {}),
+					// RFC 9207 issuer validation (recorded from validated discovery metadata).
+					...(oauthMeta?.issuer ? { issuer: oauthMeta.issuer } : {}),
+					...(oauthMeta?.issuerResponseIssSupported !== undefined
+						? { issuerResponseIssSupported: oauthMeta.issuerResponseIssSupported }
+						: {}),
 				},
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
@@ -738,6 +747,8 @@ export class MCPCommandController {
 		tokenUrl: string;
 		clientId?: string;
 		scopes?: string;
+		issuer?: string;
+		authorizationResponseIssSupported?: boolean;
 	}> {
 		// First test if server actually needs auth by connecting without OAuth
 		let connectionSucceeded = false;
@@ -1358,6 +1369,7 @@ export class MCPCommandController {
 				found.config.oauth?.callbackPort,
 				found.config.oauth?.callbackPath,
 				found.config.oauth?.redirectUri,
+				{ issuer: oauth.issuer, issuerResponseIssSupported: oauth.authorizationResponseIssSupported },
 			);
 
 			const persistedClientId = oauthResult.clientId ?? oauth.clientId ?? found.config.oauth?.clientId;

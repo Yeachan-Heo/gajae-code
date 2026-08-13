@@ -12,6 +12,10 @@ export interface OAuthEndpoints {
 	tokenUrl: string;
 	clientId?: string;
 	scopes?: string;
+	/** Issuer recorded from the validated metadata document (RFC 9207). */
+	issuer?: string;
+	/** `authorization_response_iss_parameter_supported` from the same metadata. */
+	authorizationResponseIssSupported?: boolean;
 }
 
 export interface AuthDetectionResult {
@@ -413,6 +417,15 @@ export async function discoverOAuthEndpoints(
 								...endpoints,
 								authorizationUrl: authorization.url.toString(),
 								tokenUrl: token.url.toString(),
+								// RFC 9207 (MCP 2026-07-28): record the issuer from this validated
+								// metadata document so the authorization response can be checked.
+								...(issuer ? { issuer } : {}),
+								...(typeof metadata.authorization_response_iss_parameter_supported === "boolean"
+									? {
+											authorizationResponseIssSupported:
+												metadata.authorization_response_iss_parameter_supported,
+										}
+									: {}),
 							};
 						}
 					}

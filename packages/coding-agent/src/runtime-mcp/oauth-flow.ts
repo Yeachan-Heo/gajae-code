@@ -95,7 +95,26 @@ function resolveCallbackOptions(config: MCPOAuthConfig): OAuthCallbackFlowOption
 		callbackHostname: resolveCallbackHostname(redirectUri),
 		callbackBindHostname: CALLBACK_BIND_HOSTNAME,
 		redirectUri,
+		...(config.issuer ? { expectedIssuer: config.issuer } : {}),
+		...(config.issuerResponseIssSupported !== undefined
+			? { issuerResponseIssSupported: config.issuerResponseIssSupported }
+			: {}),
 	};
+}
+
+/**
+ * Canonical MCP server resource URI per RFC 8707 §2: absolute URI, lowercase
+ * scheme/host, no fragment, no trailing slash on an empty path.
+ */
+export function canonicalMCPResourceUri(raw: string): string | undefined {
+	try {
+		const url = new URL(raw);
+		if (url.hash) url.hash = "";
+		const serialized = url.toString();
+		return url.pathname === "/" && serialized.endsWith("/") ? serialized.slice(0, -1) : serialized;
+	} catch {
+		return undefined;
+	}
 }
 
 export interface MCPOAuthConfig {
@@ -103,7 +122,12 @@ export interface MCPOAuthConfig {
 	authorizationUrl: string;
 	/** Token endpoint URL */
 	tokenUrl: string;
-	/** Client ID (optional when already embedded in authorization URL) */
+	/**
+	 * Client ID (optional when already embedded in authorization URL). An
+	 * HTTPS URL here is a Client ID Metadata Document (CIMD) reference per
+	 * MCP 2026-07-28 and is used as-is; Dynamic Client Registration is only a
+	 * deprecated backwards-compatibility fallback when no client id exists.
+	 */
 	clientId?: string;
 	/** Client secret (optional for PKCE flows) */
 	clientSecret?: string;
@@ -115,6 +139,19 @@ export interface MCPOAuthConfig {
 	callbackPort?: number;
 	/** Custom callback path (default: /callback or redirectUri pathname) */
 	callbackPath?: string;
+	/**
+	 * Canonical URI of the target MCP server (RFC 8707). Sent as the `resource`
+	 * parameter on BOTH the authorization and token requests, regardless of
+	 * authorization-server support.
+	 */
+	resource?: string;
+	/**
+	 * Expected authorization-server issuer recorded from validated discovery
+	 * metadata (RFC 9207 / MCP 2026-07-28). Validation fails closed on mismatch.
+	 */
+	issuer?: string;
+	/** `authorization_response_iss_parameter_supported` from the same metadata. */
+	issuerResponseIssSupported?: boolean;
 }
 
 /**
@@ -174,6 +211,10 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		}
 		params.set("redirect_uri", redirectUri);
 		params.set("state", state);
+		// RFC 8707: the canonical MCP server resource MUST be on the authorization request.
+		if (this.config.resource && !params.get("resource")) {
+			params.set("resource", this.config.resource);
+		}
 
 		// Add PKCE challenge (some providers require it)
 		const codeVerifier = this.#generateCodeVerifier();
@@ -199,6 +240,10 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		});
 		if (this.#resolvedClientId) {
 			params.set("client_id", this.#resolvedClientId);
+		}
+		// RFC 8707: the canonical MCP server resource MUST be on the token request.
+		if (this.config.resource) {
+			params.set("resource", this.config.resource);
 		}
 
 		// Add code verifier for PKCE

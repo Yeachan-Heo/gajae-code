@@ -36,6 +36,17 @@ export interface OAuthCallbackFlowOptions {
 	 * `onManualCodeInput` handler on the controller.
 	 */
 	skipCallbackServer?: boolean;
+	/**
+	 * Expected authorization-server issuer recorded from validated metadata
+	 * (RFC 9207 / MCP 2026-07-28). When set, a present `iss` that differs
+	 * rejects the response before any other parameter is acted on.
+	 */
+	expectedIssuer?: string;
+	/**
+	 * `authorization_response_iss_parameter_supported` from the same metadata.
+	 * When true, a response WITHOUT `iss` is rejected.
+	 */
+	issuerResponseIssSupported?: boolean;
 }
 
 /**
@@ -48,6 +59,8 @@ export abstract class OAuthCallbackFlow {
 	callbackHostname: string;
 	callbackBindHostname: string;
 	redirectUri?: string;
+	expectedIssuer?: string;
+	issuerResponseIssSupported?: boolean;
 	readonly #skipCallbackServer: boolean;
 	#callbackResolve?: (result: CallbackResult) => void;
 	#callbackReject?: (error: string) => void;
@@ -72,6 +85,8 @@ export abstract class OAuthCallbackFlow {
 		this.callbackHostname = preferredPortOrOptions.callbackHostname ?? DEFAULT_HOSTNAME;
 		this.callbackBindHostname = preferredPortOrOptions.callbackBindHostname ?? this.callbackHostname;
 		this.redirectUri = preferredPortOrOptions.redirectUri;
+		this.expectedIssuer = preferredPortOrOptions.expectedIssuer;
+		this.issuerResponseIssSupported = preferredPortOrOptions.issuerResponseIssSupported;
 		this.#skipCallbackServer = preferredPortOrOptions.skipCallbackServer === true;
 	}
 
@@ -202,12 +217,27 @@ export abstract class OAuthCallbackFlow {
 		const state = url.searchParams.get("state") || "";
 		const error = url.searchParams.get("error") || "";
 		const errorDescription = url.searchParams.get("error_description") || error;
+		const iss = url.searchParams.get("iss");
 
 		type OkState = { ok: true; code: string; state: string };
 		type ErrorState = { ok?: false; error?: string };
 		let resultState: OkState | ErrorState;
 
-		if (error) {
+		// RFC 9207 §2.4 (MCP 2026-07-28): validate the response issuer before acting
+		// on any other parameter; on mismatch, server-supplied error details must not
+		// be acted on or displayed, so the failure message is generic by design.
+		let issuerFailure: string | null = null;
+		if (this.expectedIssuer) {
+			if (iss !== null && iss !== this.expectedIssuer) {
+				issuerFailure = "Authorization response issuer mismatch";
+			} else if (iss === null && this.issuerResponseIssSupported === true) {
+				issuerFailure = "Authorization response missing required issuer (iss)";
+			}
+		}
+
+		if (issuerFailure) {
+			resultState = { ok: false, error: issuerFailure };
+		} else if (error) {
 			resultState = { ok: false, error: `Authorization failed: ${errorDescription}` };
 		} else if (!code) {
 			resultState = { ok: false, error: "Missing authorization code" };

@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import * as path from "node:path";
+import { resolveMCPProtocolPreference } from "./protocol";
 import type { MCPServerConfig } from "./types";
 
 export type MCPPoolSharingMode = "per-session" | "shared";
@@ -67,6 +68,8 @@ export interface MCPPoolKeyIdentity {
 	authScopeId: string;
 	pluginNetworkPolicyId: string;
 	capabilityProfile: MCPPoolCapabilityProfile;
+	/** Resolved protocol preference (auto | 2026-07-28 | legacy); partitions protocol generations. */
+	protocolPreference: string;
 	sessionId?: string;
 }
 
@@ -262,10 +265,11 @@ export function buildMCPPoolKeyIdentity(
 	}
 	const headers = headerIdentity(source, options, auth.kind, auth.scope);
 	const identity: MCPPoolKeyIdentity = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		serverName,
 		sharingMode,
 		transport,
+		protocolPreference: resolveMCPProtocolPreference(source.protocol),
 		command: source.type === "http" || source.type === "sse" ? "" : source.command,
 		argsNormalized: source.type === "http" || source.type === "sse" ? [] : [...(source.args ?? [])],
 		effectiveCwdRealpath: effectiveCwd(config, options),

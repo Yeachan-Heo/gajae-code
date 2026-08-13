@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { MCPConnectionPool, MCPPoolAcquireAbortError, MCPPoolLeaseInvalidatedError } from "./pool";
-import { legacyEraObservation } from "./protocol";
 import { MCPPoolConfigError } from "./pool-key";
+import { legacyEraObservation } from "./protocol";
 import type { MCPRequestOptions, MCPServerConfig, MCPServerConnection, MCPTransport } from "./types";
 import { MCPExpectedFailure, MCPNotificationMethods } from "./types";
 

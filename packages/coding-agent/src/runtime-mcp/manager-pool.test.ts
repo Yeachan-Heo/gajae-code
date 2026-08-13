@@ -5,8 +5,8 @@ import * as configValue from "../config/resolve-config-value";
 import { MCPManager } from "./manager";
 import { MCPConnectionPool } from "./pool";
 import { computeMCPPoolKey } from "./pool-key";
-import { legacyEraObservation } from "./protocol";
 import type { MCPProtocolObservation } from "./protocol";
+import { legacyEraObservation } from "./protocol";
 import type { MCPRequestOptions, MCPServerConfig, MCPServerConnection, MCPTransport } from "./types";
 
 /** Fake connections model pre-v2 stdio servers: legacy era, forced by transport. */

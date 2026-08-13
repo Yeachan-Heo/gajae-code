@@ -8,12 +8,6 @@
  * no sessions, no standalone stream, no replay. See ../protocol.ts.
  */
 import { logger, readSseJson, Snowflake } from "@gajae-code/utils";
-import {
-	buildModernMcpHeaders,
-	type MCPModernClientContext,
-	type MCPProtocolEra,
-	withModernMeta,
-} from "../protocol";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
@@ -34,6 +28,7 @@ import {
 	readMCPResponseText,
 } from "../content-limits";
 import { fetchPluginMcpRequest, isPluginMcpPublicNetworkBound } from "../plugin-network-boundary";
+import { buildModernMcpHeaders, type MCPModernClientContext, type MCPProtocolEra, withModernMeta } from "../protocol";
 
 /** Best-effort JSON parse of an error body for structured era classification. */
 function tryParseJsonBody(text: string): unknown {
@@ -272,9 +267,10 @@ export class HttpTransport implements MCPTransport {
 			jsonrpc: "2.0" as const,
 			id,
 			method,
-			params: this.#era === "modern" && this.#modernContext
-				? withModernMeta(params ?? {}, this.#modernContext)
-				: (params ?? {}),
+			params:
+				this.#era === "modern" && this.#modernContext
+					? withModernMeta(params ?? {}, this.#modernContext)
+					: (params ?? {}),
 		};
 
 		const headers: Record<string, string> = {
@@ -370,7 +366,9 @@ export class HttpTransport implements MCPTransport {
 				if (!result.error) {
 					throw new MCPExpectedFailure();
 				}
-				throw new MCPExpectedFailure(new MCPJsonRpcError(result.error.code, result.error.message, result.error.data));
+				throw new MCPExpectedFailure(
+					new MCPJsonRpcError(result.error.code, result.error.message, result.error.data),
+				);
 			}
 
 			return result.result as T;

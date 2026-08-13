@@ -60,6 +60,8 @@ describe("mcp oauth discovery", () => {
 			authorizationUrl: "https://login.example/authorize",
 			tokenUrl: "https://tokens.example/token",
 			scopes: "read write",
+			// Recorded from the validated metadata document for RFC 9207 response checks.
+			issuer: "https://auth.example/",
 		});
 	});
 

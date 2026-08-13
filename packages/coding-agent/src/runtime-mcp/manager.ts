@@ -1261,7 +1261,10 @@ export class MCPManager {
 									() => this.#waitForConnection(name).then(connection => this.#connectionForLease(connection)),
 									source,
 									reconnect,
-									{ noReplay: task.config.sharing === "shared", inputHandler: () => this.#inputRequestHandler ?? undefined },
+									{
+										noReplay: task.config.sharing === "shared",
+										inputHandler: () => this.#inputRequestHandler ?? undefined,
+									},
 								),
 							);
 						} catch (error) {
@@ -2046,8 +2049,10 @@ export class MCPManager {
 		const globalEpoch = this.#epoch;
 		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
 
-		// Clear cached tools
+		// Clear cached tools and any server-supplied freshness hints
 		connection.tools = undefined;
+		connection.toolsFreshUntil = undefined;
+		connection.toolsCacheScope = undefined;
 
 		// Reload tools
 		const facade = this.#connectionForLease(connection);
