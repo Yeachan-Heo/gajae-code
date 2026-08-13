@@ -359,7 +359,9 @@ function parseSizeValue(value: SizeValue | undefined, referenceSize: number): nu
 	// Parse percentage string like "50%"
 	const match = value.match(/^(\d+(?:\.\d+)?)%$/);
 	if (match) {
-		const parsed = Math.floor((referenceSize * parseFloat(match[1])) / 100);
+		const percent = Number.parseFloat(match[1]);
+		if (!Number.isFinite(percent)) return undefined;
+		const parsed = Math.floor((referenceSize * percent) / 100);
 		return Number.isFinite(parsed) ? parsed : undefined;
 	}
 	return undefined;
@@ -2587,7 +2589,9 @@ export class TUI extends Container {
 				if (match) {
 					const maxRow = Math.max(0, availHeight - effectiveHeight);
 					const percent = parseFloat(match[1]) / 100;
-					row = marginTop + Math.floor(maxRow * percent);
+					row = Number.isFinite(percent)
+						? marginTop + Math.floor(maxRow * percent)
+						: this.#resolveAnchorRow(opt.anchor ?? "center", effectiveHeight, availHeight, marginTop);
 				} else {
 					// Invalid format, fall back to center
 					row = this.#resolveAnchorRow("center", effectiveHeight, availHeight, marginTop);
@@ -2611,7 +2615,9 @@ export class TUI extends Container {
 				if (match) {
 					const maxCol = Math.max(0, availWidth - width);
 					const percent = parseFloat(match[1]) / 100;
-					col = marginLeft + Math.floor(maxCol * percent);
+					col = Number.isFinite(percent)
+						? marginLeft + Math.floor(maxCol * percent)
+						: this.#resolveAnchorCol(opt.anchor ?? "center", width, availWidth, marginLeft);
 				} else {
 					// Invalid format, fall back to center
 					col = this.#resolveAnchorCol("center", width, availWidth, marginLeft);
