@@ -37,6 +37,14 @@ A signed lifecycle coordination comment was posted and read back:
 
 Keep #3709 open only while #3731 remains open and actively remediates the complete acceptance contract. Verify merged `dev` against the full contract before closing #3709. If #3731 is terminally closed or rejected without satisfying it, immediately create a narrowly scoped successor with a dedicated owner only where the standing acceptance still requires delivery; otherwise close #3709 as superseded or non-deliverable with evidence. No parallel implementation lane is authorized.
 
+## Candidate handoff monitored after #4447
+
+`origin/dev` advanced through #4447 to `b5ef23f52208e3eaf0a25c1eaf0056b8f6b191c5`. A retiring lane published `handoff/issue-3709-session-import-reconstruction` at `669ad15970cd3498682a32dc23c78be4365735c8`; its implementation parent is `9ce7d47f32fff0c58f422c10f2a87a3e5557af18`.
+
+The handoff documents a provider-neutral Codex-and-Claude file-import candidate and its own 28 non-skipped focused-test receipt. It is **not** #3731 evidence: the PR remote remains at `5ca3abd09eb50aee2b02bafdcfc989d570c8321b`; the candidate is not an ancestor of current `dev`; and the retiring worktree has an unrelated uncommitted native declaration formatting change. The active PR owner must reconstruct/rebase the candidate cleanly, retain broker-endpoint fixtures instead of unconditional test skips, push the result, then produce exact-head test, CI, and review evidence.
+
+The lifecycle monitor posted this bounded handoff notice to [PR #3731](https://github.com/Yeachan-Heo/gajae-code/pull/3731#issuecomment-5278191081) and validated its required footer and evidence predicates. The issue is intentionally not updated until a new PR remote head exists.
+
 ## Validation performed
 
 ```text
