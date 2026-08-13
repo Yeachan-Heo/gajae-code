@@ -6898,7 +6898,8 @@ export class TelegramNotificationDaemon {
 	#topicAdmissionEndpointKey(subscription: NotificationSubscription): string {
 		return subscription.subscriptionId;
 	}
-	#isRejectedTopicEndpointKey(subscription: NotificationSubscription): boolean {
+	#isRejectedTopicEndpointKey(subscription: NotificationSubscription | undefined): boolean {
+		if (!subscription) return false;
 		return (
 			this.#rejectedTopicEndpointKeys.get(subscription.sessionId) === this.#topicAdmissionEndpointKey(subscription)
 		);
@@ -10089,6 +10090,9 @@ export class TelegramNotificationDaemon {
 	}
 
 	async handleSessionMessage(session: AttachmentSession, msg: any, publicationId?: string): Promise<void> {
+		// Direct embedded/test presentation frames may arrive before Router creates
+		// a notification subscription. They remain provider-local: they can render
+		// flat/live output, but cannot claim topic admission or lifecycle authority.
 		if (this.#isRejectedTopicEndpoint(session)) return;
 		if (msg?.type === "identity_header" && !session.replayPending) {
 			session.telegramTopicsEnabled = msg.telegramTopicsEnabled === true;
