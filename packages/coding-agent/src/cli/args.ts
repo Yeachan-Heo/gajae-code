@@ -90,6 +90,8 @@ export interface Args {
 	unknownFlags: Map<string, boolean | string>;
 	/** Exact interactive startup login intent, recognized before model-profile activation. */
 	authBootstrap?: true;
+	/** Launch the session in master mode (resident session supervisor; `gjc master`). */
+	master?: boolean;
 }
 
 const CONSUMER_FLAGS_BY_ARGS = new WeakMap<Args, Map<ConsumerLaunchFlagName, string>>();
@@ -355,6 +357,8 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 			result.noRules = true;
 		} else if (arg === "--no-title") {
 			result.noTitle = true;
+		} else if (arg === "--master") {
+			result.master = true;
 		} else if (arg === "--list-models") {
 			// Check if next arg is a search pattern (not a flag or file arg)
 			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {

@@ -73,6 +73,9 @@ export const ROOT_LAUNCH_FLAGS = {
 		optionalValue: true,
 	}),
 	"no-title": Flags.boolean({ description: "Disable title auto-generation" }),
+	master: Flags.boolean({
+		description: "Master mode: resident supervisor session for other GJC sessions (same as `gjc master`)",
+	}),
 };
 
 export type ConsumerLaunchFlagName = "hook" | "extension" | "no-extensions" | "no-skills" | "skills";

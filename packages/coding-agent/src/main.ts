@@ -1092,6 +1092,7 @@ async function buildSessionOptions(
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
 	};
+	if (parsed.master === true) options.masterMode = true;
 	if (parsed.mcpConfig !== undefined) options.mcpConfigPath = parsed.mcpConfig;
 	if (parsed.noMcp === true) options.enableMcpAutoload = false;
 
