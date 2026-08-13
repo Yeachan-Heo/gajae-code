@@ -123,4 +123,35 @@ describe.skipIf(process.platform !== "linux")("issue #4481 PTY capture harness",
 		expect(summary.command).toContain("src/cli.ts");
 		expect((await Bun.file(path.join(dir, "heartbeat.txt")).text()).trim()).not.toBe("");
 	});
+
+	test("does not classify CPU as a wedge when no heartbeat was established", async () => {
+		const dir = await tempDir();
+		const child = Bun.spawn(
+			[
+				"python3",
+				script,
+				"--artifact-dir",
+				dir,
+				"--duration",
+				"1",
+				"--sample-seconds",
+				"0.25",
+				"--stale-seconds",
+				"0.25",
+				"--consecutive",
+				"2",
+				"--",
+				"python3",
+				"-c",
+				"while True: object()",
+			],
+			{ stdout: "ignore", stderr: "pipe" },
+		);
+		const exitCode = await child.exited;
+		const stderr = await new Response(child.stderr).text();
+		if (exitCode !== 0) throw new Error(stderr);
+		const summary = (await Bun.file(path.join(dir, "summary.json")).json()) as { wedge_detected: boolean };
+		expect(summary.wedge_detected).toBe(false);
+		expect(await Bun.file(path.join(dir, "heartbeat.txt")).exists()).toBe(false);
+	});
 });

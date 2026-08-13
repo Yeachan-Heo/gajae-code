@@ -124,7 +124,7 @@ def terminate(pid: int, grace: float) -> dict[str, object]:
 
 def instrumented_command(command: list[str], preload: pathlib.Path, repo: pathlib.Path) -> list[str]:
     executable_name = pathlib.Path(command[0]).name
-    if executable_name not in {"bun", "bunx"}:
+    if executable_name != "bun":
         return command
     if executable_name == "bun" and command[1:3] == ["run", "dev"]:
         remaining = command[3:]
@@ -244,7 +244,7 @@ def main() -> int:
                 }
                 samples.write(json.dumps(record) + "\n")
                 samples.flush()
-                stale = heartbeat_age is None or heartbeat_age >= args.stale_seconds
+                stale = heartbeat_age is not None and heartbeat_age >= args.stale_seconds
                 hot_stale_samples = hot_stale_samples + 1 if main_percent >= args.hot_percent and stale else 0
                 if hot_stale_samples >= args.consecutive:
                     wedge_detected = True
