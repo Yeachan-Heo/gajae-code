@@ -13107,29 +13107,31 @@ export class AgentSession {
 			onAfterMutation?: () => void;
 		},
 	): Promise<DefaultModelSelectionResult> {
-		// Scheduled continuations share this admission queue, so idle settlement
-		// must happen before selection acquires its lease. But a reentrant
-		// selection from inside an active admission (e.g. before_agent_start)
-		// must reject immediately instead of deadlocking on waitForIdle.
+		// Fail-fast reentrancy/inherit checks before any wait. Credential
+		// probe and idle wait stay outside the selection admission so they do
+		// not hold the lease while auto-compaction's post-prompt continuation
+		// (needing prompt admission via #postPromptTasksPromise) is pending.
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		if (thinkingLevel === ThinkingLevel.Inherit) {
+			throw new Error("Default model selection cannot inherit a thinking level");
+		}
+		const speculativeApiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+		if (!speculativeApiKey) {
+			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
+		const resolvedLevel = resolveThinkingLevelForModel(model, thinkingLevel);
+		const effectiveLevel =
+			resolvedLevel ??
+			resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
+			ThinkingLevel.Off;
+		const expectedSessionId = this.sessionId;
 		await this.waitForIdle();
 		return this.#withSessionAdmission("selection", async () => {
 			options?.onBeforeMutation?.();
-			const expectedSessionId = this.sessionId;
-
-			if (thinkingLevel === ThinkingLevel.Inherit) {
-				throw new Error("Default model selection cannot inherit a thinking level");
+			if (this.sessionId !== expectedSessionId) {
+				throw new Error("Session changed while selecting model");
 			}
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
-			if (!apiKey) {
-				throw new Error(`No API key for ${model.provider}/${model.id}`);
-			}
-			const resolvedLevel = resolveThinkingLevelForModel(model, thinkingLevel);
-			const effectiveLevel =
-				resolvedLevel ??
-				resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
-				ThinkingLevel.Off;
 			await this.sessionManager.flush();
 			await this.#waitForAdmittedBaseSystemPromptRebuilds();
 			if (this.sessionId !== expectedSessionId) {

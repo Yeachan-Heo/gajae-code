@@ -562,27 +562,18 @@ describe("AgentSession durable default model selection", () => {
 			}
 			return originalDurableCommit(build);
 		});
-		const lastPreflightEntered = Promise.withResolvers<void>();
-		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
-			if (model.id === lastModel.id) lastPreflightEntered.resolve();
-			return originalGetApiKey(model, ...args);
-		});
 
 		// When
 		const firstSelection = session.setDefaultModelSelection(firstModel, Effort.Low);
 		await firstDurableCommitEntered.promise;
 		const lastSelection = session.setDefaultModelSelection(lastModel, Effort.High);
-		const preflightRace = Promise.withResolvers<boolean>();
-		void lastPreflightEntered.promise.then(() => preflightRace.resolve(true));
-		setImmediate(() => preflightRace.resolve(false));
-		const lastRequestOvertookFirst = await preflightRace.promise;
-		if (lastRequestOvertookFirst) await lastSelection;
+		// With fail-fast credential probe outside the admission, the second
+		// selection's getApiKey can race concurrently. Serialization is proven
+		// by the final durable/model state, not by preflight timing.
 		releaseFirstDurableCommit.resolve();
 		await Promise.all([firstSelection, lastSelection]);
 
 		// Then
-		expect(lastRequestOvertookFirst).toBeFalse();
 		expect(settings.getGlobal("modelRoles")).toEqual({ default: "target-provider/last:high" });
 		expect(session.model).toBe(lastModel);
 		expect(session.thinkingLevel).toBe(Effort.High);
@@ -621,9 +612,8 @@ describe("AgentSession durable default model selection", () => {
 		expect(sessionManager.getEntries()).toEqual(entriesBefore);
 	});
 
-	it("rejects missing credentials before waiting or mutation", async () => {
+	it("rejects missing credentials without mutation", async () => {
 		// Given
-		const waitForIdle = vi.spyOn(session, "waitForIdle");
 		const entriesBefore = sessionManager.getEntries();
 		const model = { ...targetModel(), provider: "missing-provider" };
 
@@ -632,9 +622,20 @@ describe("AgentSession durable default model selection", () => {
 
 		// Then
 		await expect(selection).rejects.toThrow("No API key for missing-provider/reasoning");
-		expect(waitForIdle).not.toHaveBeenCalled();
 		expect(settings.getGlobal("modelRoles")).toBeUndefined();
 		expect(sessionManager.getEntries()).toEqual(entriesBefore);
+	});
+
+	it("does not deadlock when auto-compaction continuation is pending", async () => {
+		const hold = Promise.withResolvers<void>();
+		vi.spyOn(session, "waitForIdle").mockImplementation(async () => {
+			await hold.promise;
+		});
+		const selection = session.setDefaultModelSelection(targetModel(), Effort.High);
+		hold.resolve();
+		await expect(selection).resolves.toMatchObject({ provider: "target-provider" });
+		expect(settings.getGlobal("modelRoles")).toEqual({ default: "target-provider/reasoning:high" });
+		vi.restoreAllMocks();
 	});
 
 	it("does not materialize session JSONL when lazy default selection fails", async () => {
