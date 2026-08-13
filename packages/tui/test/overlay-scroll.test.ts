@@ -174,6 +174,22 @@ describe("TUI overlays", () => {
 		}
 	});
 
+	it("bounds a non-finite maximum height to the terminal", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			tui.showOverlay(new LineComponent("overlay-", 10_000), { maxHeight: Number.POSITIVE_INFINITY });
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-");
+			expect(term.getScrollBuffer().length).toBeLessThan(100);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	afterEach(() => {
 		if (previousTmux === undefined) {
 			delete Bun.env.TMUX;
