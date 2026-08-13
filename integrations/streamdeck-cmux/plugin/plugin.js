@@ -41,6 +41,18 @@ const SKILL_OPTIONS = [
   { id: "team", label: "TEAM", image: "skill-team" },
 ];
 const THEME_OPTIONS = ["red-claw", "blue-crab", "claude-code", "codex", "gruvbox-dark", "opencode"];
+const PROMPT_OPTIONS = [
+  { id: "continue", label: "CONTINUE", prompt: "continue" },
+  { id: "pr-dev", label: "PR TO DEV", prompt: "make a PR targeting dev and make it LGTM" },
+  { id: "review-merge", label: "REVIEW &\nMERGE", prompt: "review and make it LGTM and merge" },
+  { id: "commit-push-pr", label: "COMMIT PUSH\nPR DEV", prompt: "review the changes, fix any issues, then commit, push, and create or update the PR targeting dev" },
+  { id: "rebase-dev", label: "REBASE DEV", prompt: "rebase onto latest origin/dev, resolve conflicts correctly, run focused verification, and update the PR" },
+  { id: "run-tests", label: "RUN TESTS", prompt: "run the relevant focused tests and fix any failures without suppressing warnings" },
+  { id: "fix-tests", label: "FIX TESTS", prompt: "investigate the failing tests, fix the root cause, and rerun focused verification" },
+  { id: "audit-diff", label: "AUDIT DIFF", prompt: "review the current diff for correctness, regressions, architecture issues, and missing tests; fix concrete findings" },
+  { id: "cleanup", label: "CLEANUP", prompt: "clean up the current implementation by removing obsolete code and unnecessary complexity, then verify behavior" },
+  { id: "update-docs", label: "UPDATE DOCS", prompt: "update the directly affected documentation and runtime guidance to match the implemented behavior" },
+];
 const GJC = process.env.GJC_STREAMDECK_GJC || join(homedir(), ".local", "bin", "gjc");
 const WORKTREE_LAUNCHER = process.env.GJC_STREAMDECK_WORKTREE || join(import.meta.dir, "bin", "worktree-session");
 const KEYBINDINGS_PATH = process.env.GJC_AGENT_DIR ? join(process.env.GJC_AGENT_DIR, "keybindings.json") : join(homedir(), ".gjc", "agent", "keybindings.json");
@@ -74,6 +86,7 @@ let navigationIndex = 0;
 let modelOptionIndex = 0;
 let skillOptionIndex = 0;
 let themeOptionIndex = 0;
+let promptOptionIndex = 0;
 const thinkingLevelBySession = new Map();
 
 function log(message) {
@@ -700,6 +713,13 @@ async function renderContext(context, state) {
       await image(context, "control-duplicate-tab");
       return;
     }
+    if (settings.type === "promptSelector" || settings.type === "promptSubmit") {
+      const option = selectedOption(PROMPT_OPTIONS, promptOptionIndex);
+      const verb = settings.type === "promptSelector" ? `PROMPT ${promptOptionIndex + 1}/${PROMPT_OPTIONS.length}` : "SUBMIT";
+      title(context, option ? `${verb}\n${option.label}` : "NO PROMPT");
+      await image(context, settings.type === "promptSelector" ? "selector-prompt-nav" : "selector-prompt-set");
+      return;
+    }
     title(context, "");
     await image(context, `control-${settings.name}`);
     return;
@@ -744,6 +764,10 @@ async function renderOptionControls(group) {
 
 async function renderThinkingControls() {
   await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "thinkingCycle"));
+}
+
+async function renderPromptControls() {
+  await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "promptSelector" || settings.type === "promptSubmit"));
 }
 
 async function renderAskControls() {
@@ -943,6 +967,19 @@ async function applySelectedOption(group, context) {
   else await sendFocusedGjcText(`/model gajae-code/${option.id}`, context, true);
 }
 
+async function movePromptSelector(delta, context) {
+  const moved = moveOption(PROMPT_OPTIONS, promptOptionIndex, delta);
+  promptOptionIndex = moved.index;
+  await renderPromptControls();
+  ok(context);
+}
+
+async function submitSelectedPrompt(context) {
+  const option = selectedOption(PROMPT_OPTIONS, promptOptionIndex);
+  if (!option) { alert(context); return; }
+  await sendFocusedGjcText(option.prompt, context, true);
+}
+
 async function cycleTheme(context) {
   const theme = THEME_OPTIONS[themeOptionIndex];
   await sendFocusedGjcText(`/theme ${theme}`, context, true);
@@ -1058,6 +1095,8 @@ async function keyUp(context, state, heldMs) {
       return;
     }
     if (settings.type === "duplicateTab") { await duplicateFocusedTab(context); return; }
+    if (settings.type === "promptSelector") { await movePromptSelector(Number(settings.delta) || 1, context); return; }
+    if (settings.type === "promptSubmit") { await submitSelectedPrompt(context); return; }
     if (settings.type === "command") { await sendFocusedGjcText(settings.value, context, settings.submit !== false); return; }
     if (settings.type === "worktree") { await launchProgram(WORKTREE_LAUNCHER, [], context, "worktree"); return; }
     if (settings.type === "launch" && Array.isArray(settings.value)) { await launchProgram(GJC, settings.value, context, settings.name || "GJC"); return; }
