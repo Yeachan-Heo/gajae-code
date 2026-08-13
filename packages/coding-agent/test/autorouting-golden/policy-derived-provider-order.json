@@ -1,0 +1,48 @@
+{
+  "catalog": [
+    {
+      "provider": "google",
+      "id": "gemini-3-pro",
+      "reasoning": true
+    },
+    {
+      "provider": "anthropic",
+      "id": "claude-opus-5",
+      "reasoning": true
+    },
+    {
+      "provider": "anthropic",
+      "id": "claude-haiku-5",
+      "reasoning": false
+    },
+    {
+      "provider": "openai-codex",
+      "id": "gpt-5.6-codex",
+      "reasoning": true
+    }
+  ],
+  "configuredProviderOrder": [
+    "openai-codex",
+    "ghost-provider",
+    "anthropic"
+  ],
+  "expectedProviderOrder": [
+    "openai-codex",
+    "anthropic",
+    "google"
+  ],
+  "setup": {
+    "schema": 1,
+    "providers": [
+      "openai-codex",
+      "anthropic",
+      "google"
+    ]
+  },
+  "expectedTiers": {
+    "strong": [
+      "anthropic/claude-opus-5:high"
+    ]
+  },
+  "expectedCanonicalBytes": "{\"strong\":[\"anthropic/claude-opus-5:high\"]}"
+}

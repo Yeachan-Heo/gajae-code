@@ -4,6 +4,7 @@ import { resolveTaskRouting } from "../src/config/autorouting";
 import { validateAutoroutingEffective } from "../src/config/autorouting-contract";
 import { canonicalJsonBytes, generateTierChains } from "../src/config/autorouting-generator";
 import type { CuratedTierLabels } from "../src/config/autorouting-tier-map";
+import { buildProviderSelectionCatalog, projectProviderOrder } from "../src/config/provider-selection-policy";
 
 function model(provider: string, id: string, reasoning = true): Model {
 	return {
@@ -113,5 +114,40 @@ describe("autorouting generator", () => {
 			expect(bytes(result.tiers)).toBe(fixture.expectedCanonicalBytes);
 			expect(result.tiers).toEqual(fixture.expectedTiers);
 		}
+	});
+
+	it("derives the declaration from provider priority before generating tiers", async () => {
+		// The other fixtures hand the generator an already-sorted setup, so they never
+		// exercise the derivation. This one starts from configured order plus catalog
+		// and runs the real projection end to end.
+		const fixture = (await Bun.file(
+			new URL("./autorouting-golden/policy-derived-provider-order.json", import.meta.url),
+		).json()) as {
+			catalog: Array<{ provider: string; id: string; reasoning: boolean }>;
+			configuredProviderOrder: string[];
+			expectedProviderOrder: string[];
+			setup: { schema: 1; providers: string[] };
+			expectedTiers: Record<string, string[]>;
+			expectedCanonicalBytes: string;
+		};
+		const catalog = fixture.catalog.map(entry => model(entry.provider, entry.id, entry.reasoning));
+		const { catalogProviders } = buildProviderSelectionCatalog(catalog);
+		const spelling = new Map<string, string>();
+		for (const entry of fixture.catalog) {
+			const normalized = entry.provider.trim().toLowerCase();
+			if (!spelling.has(normalized)) spelling.set(normalized, entry.provider);
+		}
+		const derived = projectProviderOrder(fixture.configuredProviderOrder, catalogProviders)
+			.map(provider => spelling.get(provider))
+			.filter((provider): provider is string => provider !== undefined);
+
+		// A configured provider absent from the catalog must not survive into the setup.
+		expect(fixture.configuredProviderOrder).toContain("ghost-provider");
+		expect(derived).toEqual(fixture.expectedProviderOrder);
+		expect(derived).toEqual(fixture.setup.providers);
+
+		const result = generateTierChains({ schema: 1, providers: derived }, undefined, catalog);
+		expect(bytes(result.tiers)).toBe(fixture.expectedCanonicalBytes);
+		expect(result.tiers).toEqual(fixture.expectedTiers);
 	});
 });
