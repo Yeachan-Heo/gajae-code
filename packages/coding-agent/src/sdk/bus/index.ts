@@ -4033,6 +4033,10 @@ export function createNotificationsExtension(
 			fingerprint(cfg.slack.appToken),
 			cfg.slack.workspaceId ?? null,
 			cfg.slack.channelId ?? null,
+			// Slack's inbound actor authorization is part of the daemon's durable
+			// identity: rotating the paired user must re-prove ownership, or the
+			// previous user keeps command authority through a stale outcome.
+			cfg.slack.authorizedUserId ?? null,
 			getCurrentTelegramActivationMarker(cfg) ?? null,
 		]);
 	}
@@ -7610,6 +7614,45 @@ export function createNotificationsExtension(
 			flushPendingFinal(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
+		reproveOwnership: async binding => {
+			// PROVIDER-NEUTRAL ownership re-proof. Reconciliation calls this for any
+			// effective chat provider, not just Telegram: a Discord-only or
+			// Slack-only credential/destination/actor change must withhold adapters
+			// exactly like a Telegram one, or the old identity keeps delivery and
+			// (for Slack) inbound command authority through a stale outcome.
+			//
+			// Never awaits the ensure itself — only the adapter teardown, which is
+			// local. Lifecycle paths must not block on daemon ownership.
+			const { settings, settingsAvailable, cfg } = resolveSettings(options.settings);
+			if (!settingsAvailable || !settings) return;
+			const key = daemonOwnershipKey(cfg);
+			const sessionIdForOwnership = binding.sessionId;
+			// The binding is released when reconciliation returns, so capture the
+			// context eagerly: the settle callback runs strictly later.
+			const ownershipCtx = binding.context;
+			const runtime = runtimes.get(sessionIdForOwnership);
+			if (!runtime || runtime.notificationOwnerKey === key) return;
+			// The ownership-relevant configuration changed under a runtime whose
+			// adapters were authorized for the OLD configuration. Withhold delivery
+			// first (`stop` with reason "notifications" tears down adapters and
+			// answer sources while leaving the core SDK host untouched), then
+			// re-prove. Delivery must never continue under a configuration
+			// ownership has not proved.
+			runtime.notificationOwnerKey = key;
+			runtime.notificationOwnerState = "retry";
+			if (runtime.notificationsActive) await stopSession(sessionIdForOwnership, "notifications");
+			kickDaemonOwnership(settings, cfg, (outcome, outcomeKey) => {
+				const current = runtimes.get(sessionIdForOwnership);
+				if (!current) return;
+				applyDaemonOwnership(sessionIdForOwnership, current, outcome, current.endpointScope === "chat", outcomeKey);
+				if (current.stopping || extensionShuttingDown) return;
+				// One detached reconciliation so adapters activate once the new
+				// configuration is proved. No lifecycle path awaits this.
+				void controller
+					.reconcileCurrentSession(ownershipCtx)
+					.catch(error => logger.warn(`notifications: post-ownership reconciliation failed: ${String(error)}`));
+			});
+		},
 		ensureTelegramDaemon: async binding => {
 			const { settings, settingsAvailable, cfg } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
@@ -7618,23 +7661,8 @@ export function createNotificationsExtension(
 			// daemon ensure. A pending ensure answers "pending": reconciliation
 			// proceeds without activating adapters, and the settle callback
 			// re-reconciles once ownership is known.
-			const key = daemonOwnershipKey(cfg);
 			const sessionIdForOwnership = binding.sessionId;
-			// The binding is released when reconciliation returns, so capture the
-			// context eagerly: the settle callback runs strictly later.
 			const ownershipCtx = binding.context;
-			const runtime = runtimes.get(sessionIdForOwnership);
-			if (runtime && runtime.notificationOwnerKey !== key) {
-				// The ownership-relevant configuration changed under a runtime whose
-				// adapters were authorized for the OLD configuration. Withhold
-				// delivery first (`stop` with reason "notifications" tears down
-				// adapters and answer sources while leaving the core SDK host
-				// untouched), then re-prove. Delivery must never continue under a
-				// configuration ownership has not proved.
-				runtime.notificationOwnerKey = key;
-				runtime.notificationOwnerState = "retry";
-				if (runtime.notificationsActive) await stopSession(sessionIdForOwnership, "notifications");
-			}
 			const settled = peekDaemonOwnership(cfg);
 			if (settled === undefined) {
 				kickDaemonOwnership(settings, cfg, (outcome, outcomeKey) => {
@@ -7648,8 +7676,6 @@ export function createNotificationsExtension(
 						outcomeKey,
 					);
 					if (current.stopping || extensionShuttingDown) return;
-					// One detached reconciliation so adapters activate once the new
-					// configuration is proved. No lifecycle path awaits this.
 					void controller
 						.reconcileCurrentSession(ownershipCtx)
 						.catch(error => logger.warn(`notifications: post-ownership reconciliation failed: ${String(error)}`));

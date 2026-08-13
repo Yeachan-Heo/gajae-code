@@ -59,19 +59,24 @@ function enableNotificationsEnv(): void {
 
 async function createIsolationHarness(input: {
 	prefix: string;
-	ensureTelegramDaemon: (input: {
+	ensureTelegramDaemon?: (input: {
 		settings: unknown;
 	}) => Promise<"owner_spawned" | "attached" | "disabled" | "blocked">;
+	ensureProviderDaemon?: (provider: "discord" | "slack", settings: unknown) => Promise<unknown>;
+	settingsOverrides?: Record<string, unknown>;
 }) {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), input.prefix));
 	const agentDir = path.join(cwd, ".gjc", "agent");
 	const cleanup = await createNotificationFixtureRoot(cwd, agentDir);
 	cleanups.push(cleanup);
-	const settings = isolatedNotificationSettings(agentDir, {
-		"notifications.enabled": true,
-		"notifications.telegram.botToken": TOKEN,
-		"notifications.telegram.chatId": "12345",
-	});
+	const settings = isolatedNotificationSettings(
+		agentDir,
+		input.settingsOverrides ?? {
+			"notifications.enabled": true,
+			"notifications.telegram.botToken": TOKEN,
+			"notifications.telegram.chatId": "12345",
+		},
+	);
 	const handlers = new Map<string, Handler>();
 	const api = {
 		on: (event: string, handler: Handler) => handlers.set(event, handler),
@@ -85,7 +90,8 @@ async function createIsolationHarness(input: {
 	createNotificationsExtension(api, {
 		settings,
 		controller,
-		ensureTelegramDaemon: input.ensureTelegramDaemon as never,
+		...(input.ensureTelegramDaemon ? { ensureTelegramDaemon: input.ensureTelegramDaemon as never } : {}),
+		...(input.ensureProviderDaemon ? { ensureProviderDaemon: input.ensureProviderDaemon as never } : {}),
 	});
 	const sid = `${input.prefix}${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
@@ -263,3 +269,77 @@ test("an ownership-identity change withholds active adapters until the new confi
 	while (!harness.controller.query(harness.ctx).running && Date.now() < restoreDeadline) await Bun.sleep(25);
 	expect(harness.controller.query(harness.ctx).running).toBe(true);
 }, 60_000);
+
+/**
+ * Ownership identity is provider-neutral. A Discord-only or Slack-only
+ * configuration has no Telegram preflight at all, so a credential, destination,
+ * or actor-authorization rotation there must still withhold adapters until the
+ * new identity is proved — otherwise the previous identity keeps delivery and,
+ * for Slack, inbound command authority.
+ */
+for (const scenario of [
+	{
+		name: "a Discord-only credential rotation",
+		prefix: "gjc-daemon-discord-rotate-",
+		overrides: {
+			"notifications.enabled": true,
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.applicationId": "app",
+			"notifications.discord.guildId": "guild",
+			"notifications.discord.parentChannelId": "parent",
+		},
+		rotate: "notifications.discord.botToken",
+		rotated: "discord-token-rotated",
+	},
+	{
+		name: "a Slack-only credential rotation",
+		prefix: "gjc-daemon-slack-rotate-",
+		overrides: {
+			"notifications.enabled": true,
+			"notifications.slack.botToken": "slack-bot-token",
+			"notifications.slack.appToken": "slack-app-token",
+			"notifications.slack.workspaceId": "workspace",
+			"notifications.slack.channelId": "channel",
+		},
+		rotate: "notifications.slack.botToken",
+		rotated: "slack-bot-token-rotated",
+	},
+	{
+		name: "a Slack authorized-actor rotation",
+		prefix: "gjc-daemon-slack-actor-",
+		overrides: {
+			"notifications.enabled": true,
+			"notifications.slack.botToken": "slack-bot-token",
+			"notifications.slack.appToken": "slack-app-token",
+			"notifications.slack.workspaceId": "workspace",
+			"notifications.slack.channelId": "channel",
+			"notifications.slack.authorizedUserId": "U-original",
+		},
+		rotate: "notifications.slack.authorizedUserId",
+		rotated: "U-rotated",
+	},
+] as const) {
+	test(`${scenario.name} re-proves ownership without a Telegram preflight`, async () => {
+		enableNotificationsEnv();
+		let ensureCalls = 0;
+		const harness = await createIsolationHarness({
+			prefix: scenario.prefix,
+			settingsOverrides: { ...scenario.overrides },
+			ensureProviderDaemon: async () => {
+				ensureCalls += 1;
+				return "attached";
+			},
+		});
+		await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+		const deadline = Date.now() + 8_000;
+		while (ensureCalls < 1 && Date.now() < deadline) await Bun.sleep(25);
+		const afterStart = ensureCalls;
+		expect(afterStart).toBeGreaterThanOrEqual(1);
+
+		harness.settings.set(scenario.rotate, scenario.rotated);
+		await harness.controller.reconcileCurrentSession(harness.ctx);
+		const rotateDeadline = Date.now() + 8_000;
+		while (ensureCalls <= afterStart && Date.now() < rotateDeadline) await Bun.sleep(25);
+		expect(ensureCalls).toBeGreaterThan(afterStart);
+	}, 60_000);
+}

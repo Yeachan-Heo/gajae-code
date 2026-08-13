@@ -46,6 +46,17 @@ export interface NotificationSessionRuntime<Context extends NotificationSessionC
 	start(binding: BoundNotificationSession<Context>): Promise<NotificationEndpointStartResult>;
 	stop(binding: BoundNotificationSession<Context>): Promise<boolean>;
 	/**
+	 * Provider-neutral ownership re-proof, called for ANY effective chat
+	 * provider before the Telegram-specific preflight.
+	 *
+	 * A credential, destination, or actor-authorization change invalidates the
+	 * ownership proof that authorized this runtime's adapters. The runtime must
+	 * withhold delivery until the new identity is proved, or the previous
+	 * identity keeps delivery — and, for Slack, inbound command authority.
+	 * Implementations must not await the daemon ensure itself.
+	 */
+	reproveOwnership?(binding: BoundNotificationSession<Context>): Promise<void>;
+	/**
 	 * Proves the complete Telegram owner identity before a generic endpoint can
 	 * emit a frame. `blocked_identity` is fail-closed and starts nothing.
 	 */
@@ -326,6 +337,22 @@ export class NotificationSessionController {
 			const telegramEffective = isProviderEffectivelyEnabled(cfg, "telegram");
 			const nonTelegramEffectiveForTelegram =
 				isProviderEffectivelyEnabled(cfg, "discord") || isProviderEffectivelyEnabled(cfg, "slack");
+			// Ownership identity is provider-neutral: re-prove for ANY effective
+			// chat provider before the Telegram-specific preflight, so a
+			// Discord-only or Slack-only credential/destination/actor change also
+			// withholds adapters until the new identity is proved.
+			if (telegramEffective || nonTelegramEffectiveForTelegram) {
+				try {
+					// Idempotent and keyed: a config change racing this call is caught
+					// by the next attempt's key comparison, so no extra
+					// current-config check is needed here (adding one would
+					// short-circuit the bounded churn loop before its preflight).
+					await runtime.reproveOwnership?.(binding);
+				} catch {
+					// Re-proof is best-effort withholding; a failure must not gate the
+					// session. The runtime stays in whatever state it already had.
+				}
+			}
 			if (telegramEffective && telegramMarker && !nonTelegramEffectiveForTelegram) {
 				if (runtime.isRunning(binding)) await runtime.stop(binding);
 				if (!this.#isCurrentConfig(cfg)) continue;
