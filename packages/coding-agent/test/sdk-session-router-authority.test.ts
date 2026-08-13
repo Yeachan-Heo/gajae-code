@@ -883,7 +883,7 @@ describe("SessionRouter dispatch authority", () => {
 		await fixture.router.stop();
 	});
 
-	test("holds reconnect successor attachment behind predecessor provider retirement", async () => {
+	test("publishes reconnect successor without awaiting predecessor provider retirement", async () => {
 		const entered = Promise.withResolvers<"replaced_same_generation">();
 		const release = Promise.withResolvers<void>();
 		const fixture = await routerFixture({
@@ -909,7 +909,8 @@ describe("SessionRouter dispatch authority", () => {
 			await entered.promise;
 			const reconciliation = fixture.router.reconcile();
 			await Bun.sleep(25);
-			expect(fixture.clients).toHaveLength(1);
+			expect(fixture.clients).toHaveLength(2);
+			expect(fixture.router.attachment(fixture.sessionId)).not.toBeNull();
 			release.resolve();
 			await reconciliation;
 			expect(fixture.clients).toHaveLength(2);
@@ -1335,7 +1336,7 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
-	test("waits for retirement installed while successor endpoint validation is in flight", async () => {
+	test("does not hold successor endpoint validation behind provider retirement", async () => {
 		const endpointValidationEntered = Promise.withResolvers<void>();
 		const releaseEndpointValidation = Promise.withResolvers<void>();
 		const retirementEntered = Promise.withResolvers<void>();
@@ -1376,7 +1377,8 @@ describe("SessionRouter dispatch authority", () => {
 			await retirementEntered.promise;
 			releaseEndpointValidation.resolve();
 			await Bun.sleep(25);
-			expect(fixture.clients).toHaveLength(1);
+			expect(fixture.clients).toHaveLength(2);
+			expect(fixture.router.attachment(fixture.sessionId)).not.toBeNull();
 			releaseRetirement.resolve();
 			await reconciliation;
 			expect(fixture.clients).toHaveLength(2);

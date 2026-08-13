@@ -6,6 +6,15 @@
 /** Protocol version the daemon advertises in its ClientHello. */
 export const NOTIFICATION_PROTOCOL_VERSION = 3;
 
+/** Telegram transport generation; independent from SDK lifecycle protocol changes. */
+export const TELEGRAM_TRANSPORT_GENERATION = 1;
+
+/** Notification event schema version; payload compatibility is versioned separately. */
+export const NOTIFICATION_EVENT_SCHEMA_VERSION = 1;
+
+/** SDK Router/lifecycle protocol negotiated by core, not by Telegram transport. */
+export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
+
 /**
  * Guarded behavior-inventory version for the current daemon build. Bump this
  * on every guarded daemon-behavior change independent of the wire version; it

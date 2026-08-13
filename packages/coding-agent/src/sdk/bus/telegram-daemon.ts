@@ -32,7 +32,14 @@ import {
 	releaseDaemonTransitionLock,
 	sanitizeDiagnostic,
 } from "./notification-service";
-import { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION, SERVING_EPOCH } from "./telegram-daemon-contract";
+import {
+	DAEMON_GENERATION,
+	NOTIFICATION_EVENT_SCHEMA_VERSION,
+	NOTIFICATION_PROTOCOL_VERSION,
+	SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION,
+	SERVING_EPOCH,
+	TELEGRAM_TRANSPORT_GENERATION,
+} from "./telegram-daemon-contract";
 import {
 	type DaemonProcessReference,
 	type TelegramDaemonControlDeps,
@@ -40,7 +47,14 @@ import {
 } from "./telegram-daemon-control";
 import { type TelegramSetupPreflight, withTelegramSetupLease } from "./telegram-setup";
 
-export { DAEMON_GENERATION, NOTIFICATION_PROTOCOL_VERSION, SERVING_EPOCH } from "./telegram-daemon-contract";
+export {
+	DAEMON_GENERATION,
+	NOTIFICATION_EVENT_SCHEMA_VERSION,
+	NOTIFICATION_PROTOCOL_VERSION,
+	SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION,
+	SERVING_EPOCH,
+	TELEGRAM_TRANSPORT_GENERATION,
+} from "./telegram-daemon-contract";
 
 import {
 	type AgentDirSessionLifecycleService,
@@ -57,7 +71,7 @@ import type {
 	SessionResumeOutcome,
 } from "../lifecycle/service";
 import {
-	type SessionAttachment,
+	type NotificationSubscription,
 	SessionRouter,
 	type SessionRouterDeps,
 	type SessionRouterFrame,
@@ -3978,7 +3992,7 @@ interface StagedCallbackActivation {
 }
 
 interface AttachmentSession {
-	/** Provider presentation metadata bound to one opaque SDK attachment. */
+	/** Provider presentation metadata bound to one provider-local subscription. */
 	sessionId: string;
 	logicalSessionId: string;
 	/**
@@ -3987,7 +4001,7 @@ interface AttachmentSession {
 	 */
 	telegramTopicsEnabled: boolean;
 	logicalSessionIdTrusted: boolean;
-	readonly attachment: SessionAttachment;
+	readonly subscription: NotificationSubscription;
 	readonly transport: { readyState: number; send(data: string): Promise<void>; close(): void };
 	/** Opaque local identity used only to fence presentation state. */
 	attachmentKey: string;
@@ -4983,10 +4997,10 @@ export class TelegramNotificationDaemon {
 			agentDir: opts.settings.getAgentDir(),
 			deps: {
 				...opts.routerDeps,
-				onAttachment: attachment => this.#onAttachment(attachment),
-				onAttachmentReady: attachment => this.#onAttachmentReady(attachment),
-				onFrame: (attachment, frame) => this.#onRouterFrame(attachment, frame),
-				onSessionRemoved: (attachment, reason) => this.#onSessionRemoved(attachment, reason),
+				onNotificationSubscription: subscription => this.#onAttachment(subscription),
+				onNotificationSubscriptionReady: subscription => this.#onAttachmentReady(subscription),
+				onNotificationFrame: (subscription, frame) => this.#onRouterFrame(subscription, frame),
+				onNotificationSubscriptionRemoved: (subscription, reason) => this.#onSessionRemoved(subscription, reason),
 			},
 		});
 		this.pool = new RateLimitPool<TelegramQueuePayload>({ now: opts.now });
@@ -5252,10 +5266,50 @@ export class TelegramNotificationDaemon {
 
 	/** @internal Test-only access to attachment routing lifecycle transitions. */
 	attachmentRoutingHarnessForTest() {
+		const asSubscription = (
+			value:
+				| NotificationSubscription
+				| {
+						sessionId: string;
+						generation?: number;
+						isCurrent?: () => boolean;
+						send: (frame: Record<string, unknown>) => unknown;
+				  },
+		): NotificationSubscription => {
+			if ("subscriptionId" in value) return value;
+			const legacy = value;
+			return {
+				sessionId: legacy.sessionId,
+				subscriptionId: `test:${legacy.sessionId}`,
+				cursor: { generation: legacy.generation ?? 0, seq: 0 },
+				isActive: () => legacy.isCurrent?.() ?? true,
+				send: legacy.send,
+				advanceCursor: () => undefined,
+				cancel: () => undefined,
+			};
+		};
 		return {
-			attach: (attachment: SessionAttachment) => this.#onAttachment(attachment),
-			remove: async (attachment: SessionAttachment, reason: "removed" | "replaced" | "replaced_same_generation") =>
-				await this.#onSessionRemoved(attachment, reason),
+			attach: (
+				attachment:
+					| NotificationSubscription
+					| {
+							sessionId: string;
+							generation?: number;
+							isCurrent?: () => boolean;
+							send: (frame: Record<string, unknown>) => unknown;
+					  },
+			) => this.#onAttachment(asSubscription(attachment)),
+			remove: async (
+				attachment:
+					| NotificationSubscription
+					| {
+							sessionId: string;
+							generation?: number;
+							isCurrent?: () => boolean;
+							send: (frame: Record<string, unknown>) => unknown;
+					  },
+				reason: "removed" | "replaced" | "replaced_same_generation",
+			) => await this.#onSessionRemoved(asSubscription(attachment), reason),
 			ownsLogicalSession: (sessionId: string) => this.#logicalSessionOwners.has(sessionId),
 		};
 	}
@@ -5267,39 +5321,39 @@ export class TelegramNotificationDaemon {
 		};
 	}
 	#attachmentIsCurrent(session: AttachmentSession): boolean {
-		return this.sessions.get(session.sessionId) === session && session.attachment.isCurrent();
+		return this.sessions.get(session.sessionId) === session && session.subscription.isActive();
 	}
 
 	async #sendAttachment(session: AttachmentSession, frame: Record<string, unknown>): Promise<void> {
 		if (!this.#attachmentIsCurrent(session)) throw new Error("SDK session attachment is stale.");
-		await Promise.resolve(session.attachment.send(frame));
+		await Promise.resolve(session.subscription.send(frame));
 	}
 
-	#onAttachment(attachment: SessionAttachment): void {
-		const rejectedEndpointKey = this.#rejectedTopicEndpointKeys.get(attachment.sessionId);
-		if (rejectedEndpointKey !== undefined && rejectedEndpointKey !== this.#topicAdmissionEndpointKey(attachment))
-			this.#clearRejectedTopicEndpoint(attachment.sessionId);
+	#onAttachment(subscription: NotificationSubscription): void {
+		const rejectedEndpointKey = this.#rejectedTopicEndpointKeys.get(subscription.sessionId);
+		if (rejectedEndpointKey !== undefined && rejectedEndpointKey !== subscription.subscriptionId)
+			this.#clearRejectedTopicEndpoint(subscription.sessionId);
 		const transport = {
 			get readyState(): number {
-				return attachment.isCurrent() ? 1 : 3;
+				return subscription.isActive() ? 1 : 3;
 			},
 			send: async (data: string): Promise<void> => {
-				if (!attachment.isCurrent()) throw new Error("SDK session attachment is stale.");
-				await Promise.resolve(attachment.send(JSON.parse(data) as Record<string, unknown>));
+				if (!subscription.isActive()) throw new Error("Telegram notification subscription is stale.");
+				await Promise.resolve(subscription.send(JSON.parse(data) as Record<string, unknown>));
 			},
 			close: (): void => {
-				void attachment.retire?.();
+				subscription.cancel("telegram transport closed");
 			},
 		};
 		const session: AttachmentSession = {
-			sessionId: attachment.sessionId,
-			logicalSessionId: attachment.sessionId,
+			sessionId: subscription.sessionId,
+			logicalSessionId: subscription.sessionId,
 			logicalSessionIdTrusted: false,
 			telegramTopicsEnabled: false,
-			attachment,
+			subscription,
 			transport,
-			attachmentKey: crypto.randomUUID(),
-			hostGeneration: attachment.generation,
+			attachmentKey: subscription.subscriptionId,
+			hostGeneration: subscription.cursor.generation,
 			pending: new Map(),
 			capable: true,
 			ephemeralCapable: true,
@@ -5307,8 +5361,8 @@ export class TelegramNotificationDaemon {
 			lastPongAt: this.runtime.now(),
 			awaitingNonce: undefined,
 			pingTimer: undefined,
-			replayId: `telegram-router-replay:${attachment.sessionId}:${attachment.generation}`,
-			replayPending: !this.#isRejectedTopicEndpointKey(attachment),
+			replayId: `telegram-router-replay:${subscription.sessionId}:${subscription.subscriptionId}`,
+			replayPending: !this.#isRejectedTopicEndpointKey(subscription),
 			replayQueue: [],
 		};
 		const previous = this.sessions.get(session.sessionId);
@@ -5319,9 +5373,9 @@ export class TelegramNotificationDaemon {
 			this.preservedInitiatorTopics.add(session.sessionId);
 	}
 
-	async #onAttachmentReady(attachment: SessionAttachment): Promise<void> {
-		const session = this.sessions.get(attachment.sessionId);
-		if (!session || session.attachment !== attachment) return;
+	async #onAttachmentReady(subscription: NotificationSubscription): Promise<void> {
+		const session = this.sessions.get(subscription.sessionId);
+		if (!session || session.subscription !== subscription) return;
 		if (this.#isRejectedTopicEndpoint(session)) {
 			session.replayPending = false;
 			session.replayQueue = [];
@@ -5341,6 +5395,9 @@ export class TelegramNotificationDaemon {
 			await this.#sendAttachment(session, {
 				type: "hello",
 				protocolVersion: NOTIFICATION_PROTOCOL_VERSION,
+				transportGeneration: TELEGRAM_TRANSPORT_GENERATION,
+				eventSchemaVersion: NOTIFICATION_EVENT_SCHEMA_VERSION,
+				sdkLifecycleProtocolVersion: SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION,
 				capabilities: [
 					CLIENT_PING_PONG_CAPABILITY,
 					ASK_CONTROLS_CAPABILITY,
@@ -5374,11 +5431,11 @@ export class TelegramNotificationDaemon {
 		if (lease?.topicId === topic.topicId) await this.flushPendingThreadedFrames(session.sessionId, lease);
 	}
 
-	async #onRouterFrame(attachment: SessionAttachment, frame: SessionRouterFrame): Promise<void> {
+	async #onRouterFrame(subscription: NotificationSubscription, frame: SessionRouterFrame): Promise<void> {
 		if (frame.publicationId && this.#failedPublicationSettlements.delete(frame.publicationId))
 			this.#publicationSettlements.delete(frame.publicationId);
-		const session = this.sessions.get(attachment.sessionId);
-		if (!session || session.attachment !== attachment || !attachment.isCurrent()) return;
+		const session = this.sessions.get(subscription.sessionId);
+		if (!session || session.subscription !== subscription || !subscription.isActive()) return;
 		if (await this.#publicationSuppressed(frame.publicationId)) return;
 		await this.#claimPublication(frame.publicationId);
 		const replayPending = session.replayPending;
@@ -5402,11 +5459,15 @@ export class TelegramNotificationDaemon {
 	}
 
 	async #onSessionRemoved(
-		attachment: SessionAttachment,
-		reason: "removed" | "replaced" | "replaced_same_generation" = "removed",
+		subscription: NotificationSubscription,
+		reason: "removed" | "replaced" | "replaced_same_generation" | "cancelled" = "removed",
 	): Promise<void> {
-		const session = this.sessions.get(attachment.sessionId);
-		if (!session || session.attachment !== attachment) return;
+		const session = this.sessions.get(subscription.sessionId);
+		if (!session || session.subscription !== subscription) return;
+		if (reason === "removed" && !session.logicalSessionIdTrusted) {
+			// Router disappearance alone is not durable archive authority.
+			return;
+		}
 		if (reason === "replaced" || reason === "replaced_same_generation") {
 			const callbackLease = {
 				session,
@@ -5418,7 +5479,7 @@ export class TelegramNotificationDaemon {
 			this.#droppedSessions.add(session);
 			this.cancelLegacyToolStartsForSession(session);
 			this.#clearModelChoiceAliasesForSocket(session);
-			this.sessions.delete(attachment.sessionId);
+			this.sessions.delete(subscription.sessionId);
 			for (const [logicalSessionId, owner] of this.#logicalSessionOwners) {
 				if (owner === session) this.#logicalSessionOwners.delete(logicalSessionId);
 			}
@@ -5690,7 +5751,12 @@ export class TelegramNotificationDaemon {
 						await this.#persistTopicMutation(
 							() => {
 								this.closedEndpointKeys.set(session.sessionId, closedBinding);
-								this.topics.beginArchive(logicalSessionId, this.installationHostId, this.runtime.now());
+								this.topics.beginArchive(
+									logicalSessionId,
+									this.installationHostId,
+									this.runtime.now(),
+									"session_closed",
+								);
 							},
 							() => {
 								this.topics.restoreArchiveAuthority(closeTopicAuthority);
@@ -6407,6 +6473,8 @@ export class TelegramNotificationDaemon {
 						this.#rejectPublicationSettlement(publicationId, error),
 					);
 		if (isCurrentSession) this.cancelLegacyToolStartsForSession(session);
+		// Telegram teardown is provider-local; never retire the SDK attachment.
+		session.subscription.cancel(reason);
 		if (isCurrentSession) this.#scheduleVisibleToolTerminalization(session.attachmentKey).catch(() => undefined);
 		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
 		if (session.pingTimer) {
@@ -6440,11 +6508,8 @@ export class TelegramNotificationDaemon {
 			else item.controller?.abort();
 			this.finishSelectedAck(item, { status: "unknown", reason: "transport_ambiguous" });
 		}
-		if (session.transport.readyState !== 3) {
-			try {
-				session.transport.close();
-			} catch {}
-		}
+		// Subscription cancellation is the only authority operation Telegram may
+		// perform; the Router owns SDK transport closure and core revocation.
 	}
 
 	#purgeBtwTombstones(): void {
@@ -6830,14 +6895,16 @@ export class TelegramNotificationDaemon {
 	#topicAdmissionAllows(_session?: AttachmentSession): boolean {
 		return this.opts.requireTelegramTopicEligibility !== true || this.#topicRegistryLoaded;
 	}
-	#topicAdmissionEndpointKey(attachment: SessionAttachment): string {
-		return attachment.authorityId ?? `${attachment.generation}\0${attachment.connectionId ?? "unknown"}`;
+	#topicAdmissionEndpointKey(subscription: NotificationSubscription): string {
+		return subscription.subscriptionId;
 	}
-	#isRejectedTopicEndpointKey(attachment: SessionAttachment): boolean {
-		return this.#rejectedTopicEndpointKeys.get(attachment.sessionId) === this.#topicAdmissionEndpointKey(attachment);
+	#isRejectedTopicEndpointKey(subscription: NotificationSubscription): boolean {
+		return (
+			this.#rejectedTopicEndpointKeys.get(subscription.sessionId) === this.#topicAdmissionEndpointKey(subscription)
+		);
 	}
 	#isRejectedTopicEndpoint(session: AttachmentSession): boolean {
-		return session.attachment !== undefined && this.#isRejectedTopicEndpointKey(session.attachment);
+		return this.#isRejectedTopicEndpointKey(session.subscription);
 	}
 	#clearRejectedTopicEndpoint(sessionId: string): void {
 		this.#rejectedTopicEndpointKeys.delete(sessionId);
@@ -6852,11 +6919,8 @@ export class TelegramNotificationDaemon {
 			if (this.#rejectedTopicCleanupTimers.get(sessionId) !== timer) return;
 			this.#rejectedTopicCleanupTimers.delete(sessionId);
 			if (this.stopRequested || this.#rejectedTopicEndpointKeys.get(sessionId) !== endpointKey) return;
-			void this.#observeOrphanedTopic(sessionId).catch(error => {
-				logger.warn(
-					`notifications: rejected topic orphan cleanup failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
-				);
-			});
+			// Subscription rejection is transport-local. It cannot authorize topic
+			// archive or mutate durable session ownership.
 		}, ORPHAN_TOPIC_GRACE_MS);
 		timer.unref?.();
 		this.#rejectedTopicCleanupTimers.set(sessionId, timer);
@@ -7156,9 +7220,8 @@ export class TelegramNotificationDaemon {
 	#endpointBinding(session: AttachmentSession): TopicEndpointBinding {
 		return {
 			chatId: String(this.opts.chatId),
-			endpointKey: session.attachmentKey,
-			endpointDigest: session.attachmentKey,
-			endpointGeneration: session.hostGeneration,
+			endpointKey: session.sessionId,
+			endpointDigest: session.sessionId,
 		};
 	}
 
@@ -7184,7 +7247,7 @@ export class TelegramNotificationDaemon {
 	#ownsLiveOpenEndpoint(session: AttachmentSession, binding: TopicEndpointBinding): boolean {
 		return (
 			this.sessions.get(session.sessionId) === session &&
-			session.attachment.isCurrent() &&
+			session.subscription.isActive() &&
 			binding.endpointKey === session.attachmentKey &&
 			binding.endpointGeneration === session.hostGeneration
 		);
@@ -7211,38 +7274,9 @@ export class TelegramNotificationDaemon {
 		);
 		return pending;
 	}
-	#topicPastOrphanGrace(sessionId: string): boolean {
-		const orphanedAt = this.topics.get(sessionId)?.orphanedAt;
-		return orphanedAt !== undefined && this.runtime.now() - orphanedAt >= ORPHAN_TOPIC_GRACE_MS;
-	}
-	async #observeOrphanedTopic(sessionId: string): Promise<void> {
-		await this.#withRecoveryBindingClaim(async () => {
-			const owner = this.#logicalSessionOwners.get(sessionId);
-			if (owner && this.#topicAdmissionAllows(owner) && this.#leaseAllows(owner, sessionId)) {
-				if (this.topics.clearOrphaned(sessionId)) await this.persistTopics();
-				return;
-			}
-			if (this.topics.markOrphaned(sessionId, this.runtime.now())) await this.persistTopics();
-			if (!this.#topicPastOrphanGrace(sessionId)) return;
-			const currentOwner = this.#logicalSessionOwners.get(sessionId);
-			if (currentOwner && this.#topicAdmissionAllows(currentOwner) && this.#leaseAllows(currentOwner, sessionId))
-				return;
-			await this.archiveTopic(sessionId);
-		});
-	}
 	async #rejectTopicAdmission(session: AttachmentSession): Promise<void> {
-		if (session.attachment === undefined) {
-			this.#dropSession(session, "topic_admission_rejected");
-			return;
-		}
-		const endpointKey = this.#topicAdmissionEndpointKey(session.attachment);
+		const endpointKey = this.#topicAdmissionEndpointKey(session.subscription);
 		this.#rejectedTopicEndpointKeys.set(session.sessionId, endpointKey);
-		this.#scheduleRejectedTopicCleanup(session.sessionId, endpointKey);
-		await this.#observeOrphanedTopic(session.sessionId).catch(error => {
-			logger.warn(
-				`notifications: rejected topic orphan observation failed: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
-			);
-		});
 		this.#dropSession(session, "topic_admission_rejected");
 	}
 
@@ -8092,7 +8126,7 @@ export class TelegramNotificationDaemon {
 					revokedAcceptedRecord.endpointKey === undefined
 				)
 					revokedAcceptedRecord.chatId = String(this.opts.chatId);
-				this.topics.beginArchive(sessionId, this.installationHostId, this.runtime.now());
+				this.topics.beginArchive(sessionId, this.installationHostId, this.runtime.now(), "create_compensation");
 				await this.persistTopics();
 			}
 			if (
@@ -8205,7 +8239,9 @@ export class TelegramNotificationDaemon {
 		const archiveSnapshot = this.topics.captureArchiveAuthority(sessionId);
 		let record = archiveFenceAlreadyPublished
 			? existing
-			: this.topics.beginArchive(sessionId, this.installationHostId, this.runtime.now());
+			: existing?.archiveReason === undefined
+				? undefined
+				: this.topics.beginArchive(sessionId, this.installationHostId, this.runtime.now(), existing.archiveReason);
 		if (socketLease && !this.#deleteLeaseAllows(socketLease)) return "pre_dispatch_cancelled";
 		if (
 			record &&
@@ -8386,8 +8422,6 @@ export class TelegramNotificationDaemon {
 					if (state) {
 						this.topics.replace(state);
 						this.closedEndpointKeys.clear();
-						for (const [sessionId, binding] of Object.entries(state.closedEndpoints ?? {}))
-							if (binding) this.closedEndpointKeys.set(sessionId, binding);
 					}
 				} else if (latestWinner) {
 					this.#replaceTopicAuthority(latestWinner);
@@ -8523,14 +8557,11 @@ export class TelegramNotificationDaemon {
 	#replaceTopicAuthority(state: TopicRegistryState): void {
 		this.topics.replace(state);
 		this.closedEndpointKeys.clear();
-		for (const [sessionId, binding] of Object.entries(state.closedEndpoints ?? {}))
-			if (binding) this.closedEndpointKeys.set(sessionId, binding);
 	}
 
 	#topicStateForPersistence(): TopicRegistryState {
 		return {
 			...this.topics.serialize(),
-			closedEndpoints: Object.fromEntries(this.closedEndpointKeys),
 			...(this.opts.topicRegistryAuthority ? {} : { installationHostId: this.installationHostId }),
 		};
 	}
@@ -8581,16 +8612,9 @@ export class TelegramNotificationDaemon {
 				const topic = this.topics.get(claim.sessionId);
 				reconciledCreateClaim = this.topics.reconcileCreateClaim(claim.sessionId, topic) || reconciledCreateClaim;
 			}
-			for (const [sessionId, binding] of Object.entries(state.closedEndpoints ?? {})) {
-				if (
-					binding &&
-					typeof binding.chatId === "string" &&
-					typeof binding.endpointKey === "string" &&
-					(binding.endpointGeneration === undefined ||
-						(Number.isSafeInteger(binding.endpointGeneration) && binding.endpointGeneration >= 0))
-				)
-					this.closedEndpointKeys.set(sessionId, binding);
-			}
+			// Closed endpoint tombstones are legacy SDK authority metadata. They are
+			// intentionally not restored into Telegram state; explicit terminal events
+			// are the only archive authority after the v2 migration.
 			persistMigration = legacySnapshot || missingHostId || missingSessionUuid || reconciledCreateClaim;
 		}
 		this.#topicRegistryLoaded = true;
@@ -9905,19 +9929,8 @@ export class TelegramNotificationDaemon {
 	}
 
 	private startTopicReconcileTimer(): void {
-		this.runtime.startInterval("telegram-topic-reconcile", HEARTBEAT_INTERVAL_MS, () => {
-			if (!this.running) return;
-			void this.runtime
-				.runExclusive("telegram-topic-reconcile", () => this.archiveUnownedTopicsAfterReconcile())
-				.catch(error => {
-					logger.warn(
-						`notifications: Telegram topic reconciliation failed: ${sanitizeDiagnostic(
-							String(error),
-							this.opts.botToken,
-						)}`,
-					);
-				});
-		});
+		// Topic absence is not archive authority. Only explicit terminal events
+		// create archive fences; retain this lifecycle hook as a no-op.
 	}
 
 	private stopTopicReconcileTimer(): void {
@@ -12672,35 +12685,19 @@ export class TelegramNotificationDaemon {
 		}
 	}
 
-	/**
-	 * Reconcile durable presentation topics after the Router has proved which
-	 * session endpoints are live. A daemon can outlive every session process, so
-	 * no `session_closed` frame is guaranteed for a crashed or force-killed
-	 * session. Only daemon-created topics are eligible; user-created topics are
-	 * never deleted by GJC.
-	 */
+	/** Retry archive jobs that were authorized by an explicit terminal event. */
 	private async archiveUnownedTopicsAfterReconcile(): Promise<void> {
 		if (!this.#topicRegistryMutationAllowed()) return;
-		const liveTopicSessionIds = new Set(
-			[...this.sessions.values()]
-				.filter(session => this.#topicAdmissionAllows(session))
-				.map(session => this.#logicalSessionId(session)),
-		);
 		const retryableSessionIds = new Set(this.topics.archivePendingSessionIds(this.runtime.now()));
-		for (const sessionId of this.topics.sessionIds()) {
+		for (const sessionId of retryableSessionIds) {
 			const topic = this.topics.get(sessionId);
-			if (liveTopicSessionIds.has(sessionId)) continue;
 			if (topic?.topicOrigin !== "daemon_created") continue;
+			if (topic.archiveReason === undefined) continue;
 			const foreignOwner = topic.leaseOwner ?? topic.archiveHostId;
 			if (
 				foreignOwner !== undefined &&
 				foreignOwner !== this.installationHostId &&
 				(topic.leaseExpiresAt ?? 0) > this.runtime.now()
-			)
-				continue;
-			if (
-				(topic.authorityState === "archive_pending" || topic.authorityState === "archive_exhausted") &&
-				!retryableSessionIds.has(sessionId)
 			)
 				continue;
 			try {
@@ -12783,7 +12780,6 @@ export class TelegramNotificationDaemon {
 			}
 			await this.#attachmentRouter.start();
 			await this.ensureMasterWorker();
-			await this.archiveUnownedTopicsAfterReconcile();
 			let idleSince = this.runtime.now();
 			while (this.running) {
 				if (await this.controlStopRequested()) break;
@@ -12820,7 +12816,6 @@ export class TelegramNotificationDaemon {
 				} else if (idleElapsed) {
 					// Zero sessions past the idle window: exit so the owner does not run
 					// forever. An active session resets the idle window above.
-					await this.archiveUnownedTopicsAfterReconcile();
 					break;
 				}
 				// Poll getUpdates whenever the daemon owns the token — even with zero
@@ -12847,8 +12842,6 @@ export class TelegramNotificationDaemon {
 				await this.runtime.sleep(10);
 			}
 		} finally {
-			const noLiveSessionsAtShutdown = this.sessions.size === 0;
-			if (noLiveSessionsAtShutdown) await this.archiveUnownedTopicsAfterReconcile();
 			this.requestStop("stop");
 			this.running = false;
 			await this.#attachmentRouter

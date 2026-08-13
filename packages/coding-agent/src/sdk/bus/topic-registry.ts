@@ -61,6 +61,10 @@ export interface TopicRecord {
 	authorityState?: TopicLifecycleState;
 	/** Telegram chat and endpoint authority last proven to use this topic. */
 	chatId?: string;
+	/** Stable provider binding; never contains SDK endpoint or attachment identity. */
+	telegramBinding?: TelegramTopicBinding;
+	/** Why this record is archive-fenced; absence means no remote archive is authorized. */
+	archiveReason?: "session_closed" | "notification_subscription_removed" | "create_compensation";
 	/** Canonical endpoint tuple (URL + token) that currently holds the lease. */
 	endpointKey?: string;
 	/** Authenticated endpoint authority digest, excluding transport presentation. */
@@ -88,6 +92,8 @@ export interface TopicCreateClaim {
 	leaseOwner?: string;
 	authorityEpoch: number;
 	createdAt: number;
+	telegramBinding?: TelegramTopicBinding;
+	/** Legacy v2 input only; never emitted by serialize(). */
 	binding?: TopicEndpointBinding;
 }
 
@@ -115,8 +121,8 @@ export interface TopicRegistryState {
 	topics: Record<string, TopicRecord>;
 	/** Durable lifecycle epochs retained after an archive starts. */
 	fences?: Record<string, number>;
-	/** Closed transport endpoint leases; unchanged endpoint discovery remains fenced across restart. */
-	closedEndpoints?: Record<string, TopicEndpointBinding>;
+	/** Closed durable Telegram bindings; values intentionally contain no SDK endpoint identity. */
+	closedEndpoints?: Record<string, TelegramTopicBinding>;
 	/** Persistent host identity used to distinguish concurrent installations. */
 	installationHostId?: string;
 	/** Bounded durable archive work; no topic record is physically deleted. */
@@ -135,9 +141,20 @@ export interface TopicRegistryCasAuthority {
 	compareAndSet(expectedGeneration: number, next: TopicRegistryState): Promise<boolean>;
 }
 
+/** Durable Telegram authority. This is the only binding shape writers persist. */
+export interface TelegramTopicBinding {
+	chatId: string;
+	transport: "telegram";
+}
+
+export type TopicArchiveReason = NonNullable<TopicRecord["archiveReason"]>;
+
 /** Authenticated runtime binding for a durable topic lease. */
 export interface TopicEndpointBinding {
 	chatId: string;
+	/** Stable subscription binding used by new writers. */
+	transport?: "telegram";
+	/** Legacy transient endpoint fields accepted only while migrating v2 state. */
 	endpointKey: string;
 	endpointDigest: string;
 	endpointGeneration?: number;
@@ -169,6 +186,7 @@ function isValidBindingGeneration(value: unknown): value is number {
 }
 function hasAnyBinding(record: TopicRecord): boolean {
 	return (
+		record.telegramBinding !== undefined ||
 		record.chatId !== undefined ||
 		record.endpointKey !== undefined ||
 		record.endpointDigest !== undefined ||
@@ -177,7 +195,16 @@ function hasAnyBinding(record: TopicRecord): boolean {
 	);
 }
 
+function hasStableTelegramBinding(record: TopicRecord): boolean {
+	return (
+		record.telegramBinding !== undefined &&
+		isValidBindingString(record.telegramBinding.chatId) &&
+		record.telegramBinding.transport === "telegram"
+	);
+}
+
 function hasCompleteBinding(record: TopicRecord): boolean {
+	if (hasStableTelegramBinding(record)) return true;
 	return (
 		isValidBindingString(record.chatId) &&
 		isValidBindingString(record.endpointKey) &&
@@ -208,6 +235,27 @@ function nextAuthorityEpoch(current: number): number {
 export function emptyTopicRegistryState(): TopicRegistryState {
 	return { version: 2, topics: {} };
 }
+
+/** Strip SDK endpoint authority from legacy v2 records without archiving them. */
+function migrateLegacyTopicBinding(record: Record<string, unknown>): Record<string, unknown> {
+	const migrated = { ...record };
+	const chatId =
+		isObjectLike(migrated.telegramBinding) && isValidBindingString(migrated.telegramBinding.chatId)
+			? migrated.telegramBinding.chatId
+			: migrated.chatId;
+	if (isValidBindingString(chatId)) {
+		migrated.telegramBinding = { chatId, transport: "telegram" };
+		delete migrated.endpointKey;
+		delete migrated.endpointDigest;
+		delete migrated.endpointGeneration;
+		delete migrated.endpointIncarnation;
+	}
+	return migrated;
+}
+
+function isObjectLike(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
 /**
  * Reject snapshots written by a newer daemon. Missing versions are preserved as
  * evidence but quarantined: legacy records must never route or mutate remotely.
@@ -231,6 +279,7 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 					record && typeof record === "object"
 						? {
 								...record,
+								...migrateLegacyTopicBinding(record as unknown as Record<string, unknown>),
 								topicOrigin: (record as TopicRecord).topicOrigin ?? "daemon_created",
 								authorityState: "legacy_quarantined",
 							}
@@ -262,6 +311,12 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 						]),
 					),
 	};
+	state.topics = Object.fromEntries(
+		Object.entries(state.topics).map(([sessionId, record]) => [
+			sessionId,
+			isObject(record) ? (migrateLegacyTopicBinding(record) as unknown as TopicRecord) : record,
+		]),
+	);
 	const validTimestamp = (candidate: unknown): candidate is number =>
 		typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0;
 	const validEpoch = (candidate: unknown): candidate is number =>
@@ -277,6 +332,8 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 	const malformed = (): never => {
 		throw new Error("malformed Telegram topic state");
 	};
+	const validTelegramBinding = (candidate: unknown): candidate is TelegramTopicBinding =>
+		isObject(candidate) && isValidBindingString(candidate.chatId) && candidate.transport === "telegram";
 
 	if (
 		(state.registryGeneration !== undefined && !validEpoch(state.registryGeneration)) ||
@@ -289,6 +346,13 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 	for (const [sessionId, raw] of Object.entries(state.topics)) {
 		if (!isValidBindingString(sessionId) || !isObject(raw) || !isValidTopicId(raw.topicId)) malformed();
 		if (typeof raw.identitySent !== "boolean" || !validTimestamp(raw.createdAt)) malformed();
+		if (
+			raw.telegramBinding !== undefined &&
+			(!isObject(raw.telegramBinding) ||
+				!isValidBindingString(raw.telegramBinding.chatId) ||
+				raw.telegramBinding.transport !== "telegram")
+		)
+			malformed();
 		if (
 			!validOptionalString(raw.sessionUuid) ||
 			(raw.orphanedAt !== undefined && !validTimestamp(raw.orphanedAt)) ||
@@ -354,8 +418,14 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 			raw.endpointDigest === undefined &&
 			raw.endpointGeneration === undefined &&
 			raw.endpointIncarnation === undefined;
+		const hasStableTelegramBinding =
+			raw.telegramBinding !== undefined &&
+			isObjectLike(raw.telegramBinding) &&
+			isValidBindingString(raw.telegramBinding.chatId) &&
+			raw.telegramBinding.transport === "telegram";
 		if (
 			hasBinding &&
+			!hasStableTelegramBinding &&
 			!hasArchiveOnlyChatIdentity &&
 			(!isValidBindingString(raw.chatId) ||
 				!isValidBindingString(raw.endpointKey) ||
@@ -388,7 +458,11 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 			!validTimestamp(claim.createdAt) ||
 			!validOptionalString(claim.hostId) ||
 			!validOptionalString(claim.leaseOwner) ||
-			(claim.binding !== undefined && !validBinding(claim.binding))
+			(claim.binding !== undefined && !validBinding(claim.binding)) ||
+			(claim.telegramBinding !== undefined &&
+				(!isObject(claim.telegramBinding) ||
+					!isValidBindingString(claim.telegramBinding.chatId) ||
+					claim.telegramBinding.transport !== "telegram"))
 		)
 			malformed();
 	}
@@ -408,7 +482,7 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 			malformed();
 	}
 	for (const [sessionId, binding] of Object.entries(state.closedEndpoints ?? {}))
-		if (!isValidBindingString(sessionId) || !validBinding(binding)) malformed();
+		if (!isValidBindingString(sessionId) || !validTelegramBinding(binding)) malformed();
 	return state;
 }
 
@@ -521,6 +595,9 @@ export class TopicRegistry {
 					...(isValidBindingString(claim.hostId) ? { hostId: claim.hostId } : {}),
 					...(isValidBindingString(claim.leaseOwner) ? { leaseOwner: claim.leaseOwner } : {}),
 					...(claim.binding ? { binding: claim.binding } : {}),
+					...(isObjectLike(claim.telegramBinding) && isValidBindingString(claim.telegramBinding.chatId)
+						? { telegramBinding: { chatId: claim.telegramBinding.chatId, transport: "telegram" } }
+						: {}),
 				});
 		}
 
@@ -562,6 +639,9 @@ export class TopicRegistry {
 					typeof raw.sessionUuid === "string" && raw.sessionUuid.length > 0 ? raw.sessionUuid : randomUUID(),
 				identitySent: raw.identitySent === true,
 				createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
+				...(isObjectLike(raw.telegramBinding) && isValidBindingString(raw.telegramBinding.chatId)
+					? { telegramBinding: { chatId: raw.telegramBinding.chatId, transport: "telegram" as const } }
+					: {}),
 				...(typeof raw.name === "string" ? { name: raw.name } : {}),
 				...(typeof raw.orphanedAt === "number" && Number.isFinite(raw.orphanedAt) && raw.orphanedAt >= 0
 					? { orphanedAt: raw.orphanedAt }
@@ -572,6 +652,11 @@ export class TopicRegistry {
 					? { userNameUpdateId: raw.userNameUpdateId }
 					: {}),
 				...(typeof raw.identityKey === "string" ? { identityKey: raw.identityKey } : {}),
+				...(raw.archiveReason === "session_closed" ||
+				raw.archiveReason === "notification_subscription_removed" ||
+				raw.archiveReason === "create_compensation"
+					? { archiveReason: raw.archiveReason }
+					: {}),
 				...(typeof raw.creationLeaseEpoch === "number" &&
 				Number.isSafeInteger(raw.creationLeaseEpoch) &&
 				raw.creationLeaseEpoch >= 0
@@ -600,8 +685,16 @@ export class TopicRegistry {
 						}
 					: { authorityState: "active" as const }),
 				...(isValidBindingString(raw.chatId) ? { chatId: raw.chatId } : {}),
-				...(isValidBindingString(raw.endpointKey) ? { endpointKey: raw.endpointKey } : {}),
-				...(isValidBindingString(raw.endpointDigest) ? { endpointDigest: raw.endpointDigest } : {}),
+				...(isValidBindingString(raw.endpointKey)
+					? { endpointKey: raw.endpointKey }
+					: hasStableTelegramBinding(raw)
+						? { endpointKey: sessionId }
+						: {}),
+				...(isValidBindingString(raw.endpointDigest)
+					? { endpointDigest: raw.endpointDigest }
+					: hasStableTelegramBinding(raw)
+						? { endpointDigest: "telegram" }
+						: {}),
 				...(isValidBindingGeneration(raw.endpointGeneration) ? { endpointGeneration: raw.endpointGeneration } : {}),
 				...(isValidBindingGeneration(raw.endpointIncarnation)
 					? { endpointIncarnation: raw.endpointIncarnation }
@@ -1260,7 +1353,12 @@ export class TopicRegistry {
 	}
 
 	/** Fence new work before the remote archive starts, including an absent in-flight create. */
-	beginArchive(sessionId: string, hostId?: string, now = Date.now()): TopicRecord | undefined {
+	beginArchive(
+		sessionId: string,
+		hostId?: string,
+		now = Date.now(),
+		reason?: TopicArchiveReason,
+	): TopicRecord | undefined {
 		const record = this.topics.get(sessionId);
 		if (
 			record?.topicOrigin === "user_created" ||
@@ -1286,6 +1384,7 @@ export class TopicRegistry {
 		if (!record) return undefined;
 		record.authorityEpoch = epoch;
 		record.authorityState = "archive_pending";
+		if (reason) record.archiveReason = reason;
 		delete record.disconnectGraceExpiresAt;
 		if (hostId) record.archiveHostId = hostId;
 		record.archiveLeaseEpoch = epoch;
@@ -1480,14 +1579,43 @@ export class TopicRegistry {
 
 	/** Serialise active records plus unpublished staged creates for atomic commit. */
 	serialize(): TopicRegistryState {
+		const stripSdkAuthority = (record: TopicRecord): TopicRecord => {
+			const next = { ...record };
+			if (next.chatId) next.telegramBinding = { chatId: next.chatId, transport: "telegram" };
+			if (!next.chatId && next.telegramBinding) next.chatId = next.telegramBinding.chatId;
+			delete next.endpointKey;
+			delete next.endpointDigest;
+			delete next.endpointGeneration;
+			delete next.endpointIncarnation;
+			return next;
+		};
+		const topics = Object.fromEntries(
+			[...this.topics, ...this.staged].map(([id, record]) => [id, stripSdkAuthority(record)]),
+		);
+		const claims = Object.fromEntries(
+			[...this.createClaims].map(([id, claim]) => [
+				id,
+				{
+					...claim,
+					...(claim.binding
+						? { telegramBinding: { chatId: claim.binding.chatId, transport: "telegram" as const } }
+						: {}),
+					binding: undefined,
+				},
+			]),
+		);
+		const closedEndpoints: Record<string, TelegramTopicBinding> = {};
 		return {
 			version: 2,
 			registryGeneration: this.registryGeneration,
-			topics: Object.fromEntries([...this.topics, ...this.staged]),
+			topics,
 			fences: Object.fromEntries(this.epochs),
+			closedEndpoints,
 			archiveJobs: Object.fromEntries(this.archiveJobs),
-			createClaims: Object.fromEntries(this.createClaims),
-			retiredTopics: Object.fromEntries(this.retiredTopics),
+			createClaims: claims,
+			retiredTopics: Object.fromEntries(
+				[...this.retiredTopics].map(([id, records]) => [id, records.map(stripSdkAuthority)]),
+			),
 		};
 	}
 }

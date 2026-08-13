@@ -1,0 +1,210 @@
+{
+  "kind": "api-package-test-report",
+  "schemaVersion": 1,
+  "issue": "#4399",
+  "verdict": "BLOCK",
+  "status": "failed",
+  "e2eStatus": "failed",
+  "redTeamStatus": "failed",
+  "sourceHash": "sha256:753dcd3f0347666d58690a523e1249292fde47b985737bd90c7be319b53204cd",
+  "base": {
+    "commit": "178fc2624803c76ee4fc5bc6ce89e7ed8f906373",
+    "originDev": "178fc2624803c76ee4fc5bc6ce89e7ed8f906373",
+    "branch": "refactor/issue-4399-telegram-fault-containment"
+  },
+  "commands": [
+    {
+      "command": "bun --cwd=packages/coding-agent run check:types",
+      "status": "passed",
+      "result": "tsc -p tsconfig.json --noEmit exited 0"
+    },
+    {
+      "command": "bun --cwd=packages/coding-agent run check",
+      "status": "failed",
+      "result": "Biome exited non-zero on 7 pre-existing warnings and 2 infos; no files were modified. Typecheck phase then exited 0. Findings include unused private Telegram methods introduced by this diff and unrelated baseline warnings."
+    },
+    {
+      "command": "bun test packages/coding-agent/test/sdk-telegram-fault-containment.test.ts packages/coding-agent/test/notifications-topic-registry.test.ts packages/coding-agent/test/sdk-session-router-authority.test.ts",
+      "status": "passed",
+      "result": "101 pass, 0 fail, 375 expectations across 3 files"
+    },
+    {
+      "command": "bun test packages/coding-agent/test/sdk-acp-provider-reconnect.test.ts packages/coding-agent/test/sdk-mcp-server.test.ts packages/coding-agent/test/sdk-acp-adapter.test.ts",
+      "status": "failed",
+      "result": "3 pass, 1 fail, 1 unhandled native-addon error; ACP/MCP coverage is environment-blocked by absent or mismatched pi_natives and one broker-dependent failure"
+    },
+    {
+      "command": "bun test packages/coding-agent/test/sdk-telegram-fault-containment.test.ts packages/coding-agent/test/notifications-topic-registry.test.ts packages/coding-agent/test/sdk-session-router-authority.test.ts packages/coding-agent/test/sdk-acp-adapter.test.ts packages/coding-agent/test/coordinator-mcp-server.test.ts",
+      "status": "failed",
+      "result": "198 pass, 10 fail, 1 error, 809 expectations; focused Router/topic/fault tests pass, coordinator/ACP broker lifecycle cases are blocked by pi_natives mismatch and broker bootstrap failures"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed",
+      "result": "no whitespace errors"
+    },
+    {
+      "command": "git fetch origin dev",
+      "status": "passed",
+      "result": "origin/dev remained 178fc2624803c76ee4fc5bc6ce89e7ed8f906373"
+    }
+  ],
+  "contractCoverage": [
+    {
+      "id": "C1",
+      "contractRef": "immutable-provider-authority",
+      "obligation": "Telegram cannot retire or mutate SDK authority",
+      "status": "blocked",
+      "evidence": "NotificationSubscription omits retire and endpoint fields, but legacy SessionAttachment remains injectable through attachmentRoutingHarnessForTest and the generic provider callback surface remains in SessionRouter. Telegram no longer calls attachment.retire in its main path, yet the provider-facing boundary is not fully removed."
+    },
+    {
+      "id": "C2",
+      "contractRef": "independent-consumer-subscriptions",
+      "obligation": "Telegram failure cannot revoke ACP/MCP/other consumers",
+      "status": "partial",
+      "evidence": "Production Router fault tests preserve SessionAttachment authority after subscription cancellation and hung callback; no test composes a real Telegram daemon with live ACP and MCP consumers, so sibling availability is not directly proven."
+    },
+    {
+      "id": "C3",
+      "contractRef": "replayable-subscription-reconnect",
+      "obligation": "Reconnect preserves cursor and avoids duplicate effects",
+      "status": "partial",
+      "evidence": "Focused fault test exercises cursor generation mutation and poisoned/replacement cancellation, but does not drive Telegram Bot API effects or a real reconnect with duplicate-effect assertions."
+    },
+    {
+      "id": "C4",
+      "contractRef": "stable-telegram-topic-authority",
+      "obligation": "Durable topic binds only stable session plus Telegram binding",
+      "status": "blocked",
+      "evidence": "serialize strips endpoint fields, but TopicRegistry.load reconstructs endpointKey=sessionId and endpointDigest=telegram for stable bindings; live Telegram lease and admission logic still uses endpointKey, endpointGeneration, attachmentKey, and hostGeneration."
+    },
+    {
+      "id": "C5",
+      "contractRef": "explicit-archive-authority",
+      "obligation": "Attachment disappearance alone cannot archive",
+      "status": "blocked",
+      "evidence": "Removal without trusted logical identity returns without archive, but #dropSession performs Telegram-local terminalization/cleanup and releaseTopicLease; archive retry drains records only when archiveReason exists, while create-compensation and session_closed remain explicit paths. Full daemon-level archive poison/hang test is absent."
+    },
+    {
+      "id": "C6",
+      "contractRef": "detached-router-stop",
+      "obligation": "Core revocation and stop never await provider cleanup",
+      "status": "partial",
+      "evidence": "Router detach invokes bounded notification cleanup and records pending/failed/completed in memory; stop uses detached callback. However Telegram removal callback is still an async provider hook and the implementation retains legacy onSessionRemoved wiring for non-Telegram providers."
+    },
+    {
+      "id": "C7",
+      "contractRef": "protocol-generation-split",
+      "obligation": "Transport/event/lifecycle versions are separate",
+      "status": "covered",
+      "evidence": "telegram-daemon-contract.ts exports TELEGRAM_TRANSPORT_GENERATION, NOTIFICATION_EVENT_SCHEMA_VERSION, and SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION; Telegram hello advertises all three."
+    },
+    {
+      "id": "C8",
+      "contractRef": "registry-fault-containment",
+      "obligation": "Corrupt/migrated registry remains Telegram-local",
+      "status": "partial",
+      "evidence": "Focused registry tests pass corrupt input rejection, v2 migration, endpoint-field serialization stripping, and explicit archive transition. No real SDK discovery/active-turn plus corrupt Telegram registry integration exists."
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "A1",
+      "scenario": "permanently hung Telegram sendMessage",
+      "expectedBehavior": "SDK authority, active turn, ACP and MCP remain available",
+      "verdict": "not_proven",
+      "evidence": "No live Bot API harness or ACP/MCP sibling fixture; only generic Router callback-hang coverage passed."
+    },
+    {
+      "id": "A2",
+      "scenario": "permanently hung topic archive",
+      "expectedBehavior": "SDK switch/stop completes and siblings remain available",
+      "verdict": "not_proven",
+      "evidence": "No Telegram daemon archive hang fixture; architect review reports recovery still awaits Telegram terminalization in paths."
+    },
+    {
+      "id": "A3",
+      "scenario": "corrupt Telegram registry",
+      "expectedBehavior": "SDK discovery and active turn continue",
+      "verdict": "partial",
+      "evidence": "Corrupt parse rejection is covered; sibling continuity is not composed."
+    },
+    {
+      "id": "A4",
+      "scenario": "daemon crash/restart",
+      "expectedBehavior": "Exact SDK authority and active turn remain unchanged",
+      "verdict": "not_proven",
+      "evidence": "No daemon lifecycle crash/restart scenario in the added fault test."
+    },
+    {
+      "id": "A5",
+      "scenario": "Telegram attachment/subscription replacement failure",
+      "expectedBehavior": "Another consumer is not revoked",
+      "verdict": "partial",
+      "evidence": "Cancellation preserves Router authority in a synthetic production Router harness; real Telegram replacement failure is not driven."
+    },
+    {
+      "id": "A6",
+      "scenario": "poisoned replay",
+      "expectedBehavior": "Replay poison cannot terminalize SDK session",
+      "verdict": "partial",
+      "evidence": "Synthetic subscription cancellation preserves core authority; actual Telegram replay proof/poison path is not exercised."
+    },
+    {
+      "id": "A7",
+      "scenario": "Telegram generation skew",
+      "expectedBehavior": "ACP/MCP are unaffected",
+      "verdict": "partial",
+      "evidence": "Cursor generation mutation preserves core authority in a Router harness; ACP/MCP sibling consumers are absent."
+    },
+    {
+      "id": "A8",
+      "scenario": "provider cleanup failure",
+      "expectedBehavior": "Only Telegram-local pending/failed receipt",
+      "verdict": "partial",
+      "evidence": "Router has bounded cleanup receipt code, but added tests do not assert a failed receipt from a rejecting/hung removal callback and receipts are not durable Telegram receipts."
+    },
+    {
+      "id": "A9",
+      "scenario": "topic survives endpoint reconnect/replacement",
+      "expectedBehavior": "Cursor continuity and no duplicate Bot API effect",
+      "verdict": "not_proven",
+      "evidence": "Registry cursor monotonicity is indirectly covered, but no reconnect plus Bot API effect/idempotency fixture exists."
+    },
+    {
+      "id": "A10",
+      "scenario": "attachment disappearance without explicit terminal/removal event",
+      "expectedBehavior": "No archive",
+      "verdict": "partial",
+      "evidence": "Synthetic removal guard and registry archiveReason behavior exist, but no end-to-end daemon disappearance/archive assertion."
+    }
+  ],
+  "architectureReview": {
+    "verdict": "BLOCK",
+    "summary": "Independent architect review found reasonless archive fencing/retry paths, endpoint-derived authority remaining in live Telegram/TopicRegistry state, Router-memory-only cleanup receipts, a legacy callback seam, Telegram-local teardown capable of terminalizing turn state, recovery awaiting Telegram Bot API terminalization, and no real Telegram+ACP/MCP sibling containment fixture.",
+    "evidence": "Read-only review by architect agent 4-Issue4399ArchitectReview against frozen source; no source changes made."
+  },
+  "blockers": [
+    "Plan/code mismatch: mandatory matrix requires real provider-local Telegram failure alongside unaffected ACP, MCP, SDK authority, and active turn; added tests are a synthetic Router/TopicRegistry harness and do not exercise real Telegram daemon plus siblings.",
+    "Provider boundary remains incomplete: SessionAttachment with retire/isCurrent/endpoint identity is still a generic provider-facing capability, Telegram retains a legacy test adapter accepting it, and generic onSessionRemoved/onFrame hooks remain injectable.",
+    "Durable authority mismatch: TopicRegistry.load recreates endpointKey/sessionId and endpointDigest/telegram for Telegram bindings, while live Telegram lease/replay/admission logic still compares endpointKey, endpointGeneration, attachmentKey, and hostGeneration.",
+    "Telegram-local teardown still runs turn-affecting cleanup (cancelLegacyToolStartsForSession, terminalize Btw/tool activity, revoke callback aliases, release topic lease) in #dropSession; this violates the absolute Telegram-only failure invariant.",
+    "Router cleanup receipts are process-memory only; the contract requires provider-local durable pending/failed receipts. No artifact or test proves persistence/recovery of these receipts.",
+    "Archive authority remains coupled to provider lifecycle and remote Bot API: explicit session_closed/create compensation paths still perform archive work, and architect review reports recovery can await Telegram terminalization."
+  ],
+  "artifactPath": "artifacts/issue-4399-adversarial-report.json",
+  "artifactRefs": [
+    {
+      "id": "issue4399-adversarial-report",
+      "kind": "api-package-test-report",
+      "path": "artifacts/issue-4399-adversarial-report.json",
+      "description": "Read-only focused red-team report bound to exact frozen source hash"
+    }
+  ],
+  "notes": [
+    "No source, test, config, .gjc, installed gjc binary, or native addon was modified.",
+    "The repository package check is non-green because Biome reports warnings; the focused typecheck is green.",
+    "ACP/MCP and daemon lifecycle suites are environment-blocked by absent or mismatched pi_natives in this clean worktree; they were not skipped as green.",
+    "origin/dev was fetched immediately before audit and remained exactly at the declared base."
+  ]
+}

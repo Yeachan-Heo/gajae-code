@@ -238,10 +238,11 @@ describe("TopicRegistry", () => {
 			}),
 		).toBe("rejected");
 		expect(reg.serialize().topics.s1).toMatchObject({
-			endpointGeneration: 9,
-			endpointKey: "endpoint",
-			endpointDigest: "digest",
+			telegramBinding: { chatId: "42", transport: "telegram" },
 		});
+		expect(reg.serialize().topics.s1).not.toHaveProperty("endpointGeneration");
+		expect(reg.serialize().topics.s1).not.toHaveProperty("endpointKey");
+		expect(reg.serialize().topics.s1).not.toHaveProperty("endpointDigest");
 	});
 
 	test("resolves session for a topic id (inbound routing)", async () => {

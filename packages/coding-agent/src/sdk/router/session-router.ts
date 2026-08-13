@@ -64,6 +64,30 @@ export interface SessionAttachment {
 	retire?(): Promise<void>;
 }
 
+/**
+ * Provider-local notification capability. This is deliberately not an
+ * attachment lease: it carries no endpoint, connection, generation, or
+ * authority identity and its cancellation can only stop this subscription.
+ */
+export interface NotificationSubscription {
+	readonly sessionId: string;
+	readonly subscriptionId: string;
+	readonly cursor: { readonly generation: number; readonly seq: number };
+	readonly isActive: () => boolean;
+	readonly send: (frame: Record<string, unknown>) => unknown;
+	readonly advanceCursor: (generation: number, seq: number) => void;
+	readonly cancel: (reason?: string) => void;
+}
+
+export type NotificationCleanupState = "pending" | "failed" | "completed";
+
+export interface NotificationCleanupReceipt {
+	readonly subscriptionId: string;
+	readonly sessionId: string;
+	readonly state: NotificationCleanupState;
+	readonly reason?: string;
+}
+
 /** The transport surface Router keeps private behind its attachment capabilities. */
 export interface SessionRouterClient {
 	onFrame(handler: (frame: Record<string, unknown>) => void): () => void;
@@ -86,6 +110,7 @@ export interface SessionRouterFrame {
 	readonly commandId?: string;
 	readonly turnId?: string;
 	readonly publicationId?: string;
+	readonly seq?: number;
 }
 
 export type SessionRouterFrameCorrelator = (frame: Record<string, unknown>) => SessionRouterFrame | undefined;
@@ -108,6 +133,14 @@ export interface SessionRouterDeps {
 	onSessionRemoved?: (
 		attachment: SessionAttachment,
 		reason?: "removed" | "replaced" | "replaced_same_generation",
+	) => Promise<void> | void;
+	/** Narrow provider surface for notification consumers such as Telegram. */
+	onNotificationSubscription?: (subscription: NotificationSubscription) => Promise<void> | void;
+	onNotificationSubscriptionReady?: (subscription: NotificationSubscription) => Promise<void> | void;
+	onNotificationFrame?: (subscription: NotificationSubscription, frame: SessionRouterFrame) => Promise<void> | void;
+	onNotificationSubscriptionRemoved?: (
+		subscription: NotificationSubscription,
+		reason?: "removed" | "replaced" | "replaced_same_generation" | "cancelled",
 	) => Promise<void> | void;
 	onReconciled?: () => void;
 	setInterval?: typeof setInterval;
@@ -156,6 +189,9 @@ type AttachedSession = {
 	readonly cursor: { seq: number };
 	readonly barrier: ReplayBarrier;
 	readonly capability: SessionAttachment;
+	readonly notificationSubscription: NotificationSubscription;
+	notificationCancelled: boolean;
+	readonly notificationCursor: { generation: number; seq: number };
 	published: boolean;
 	initializingPublication: boolean;
 	readyTail: Promise<void>;
@@ -169,6 +205,8 @@ const REPLAY_RETRY_BACKOFF_MS = 100;
 const DELIVERY_ATTEMPT_LIMIT = 3;
 const ATTACH_CONCURRENCY = 4;
 const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
+const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
+const NOTIFICATION_WORK_TIMEOUT = Symbol("notification_work_timeout");
 
 function readGeneration(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
@@ -228,6 +266,7 @@ function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame
 		generation,
 		commandId,
 		turnId,
+		seq: readSequence(frame.seq) ?? readSequence(payload?.seq),
 	};
 }
 
@@ -290,6 +329,7 @@ export class SessionRouter {
 		{ generation: number; frames: Array<{ seq: number; frame: Record<string, unknown> }> }
 	>();
 	readonly #reviving = new Set<string>();
+	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
 	#reconcilePending: { readonly runEpoch: number } | undefined;
@@ -303,6 +343,11 @@ export class SessionRouter {
 		this.#deps = options.deps ?? {};
 		this.#correlateFrame = options.correlateFrame ?? fallbackCorrelation;
 		this.#index = this.#deps.createIndex?.(options.agentDir) ?? new DefaultSessionIndex(options.agentDir);
+	}
+
+	/** Provider-local cleanup outcomes; core authority never depends on these. */
+	notificationCleanupReceipts(): NotificationCleanupReceipt[] {
+		return [...this.#notificationReceipts.values()].map(receipt => ({ ...receipt }));
 	}
 
 	isReady(): boolean {
@@ -416,9 +461,10 @@ export class SessionRouter {
 		for (const [sessionId, attached] of this.#sessions) {
 			this.#sessions.delete(sessionId);
 			attached.dispose();
-			shutdownTasks.push(
-				(async () => await attached.client.close())(),
-				(async () => await this.#deps.onSessionRemoved?.(attached.capability))(),
+			this.#detachNotification(attached, "removed");
+			shutdownTasks.push((async () => await attached.client.close())());
+			void Promise.resolve(this.#deps.onSessionRemoved?.(attached.capability)).catch(error =>
+				logger.warn(`SDK provider cleanup failed during router stop: ${String(error)}`),
 			);
 		}
 		this.#adopted.clear();
@@ -869,6 +915,10 @@ export class SessionRouter {
 
 			this.#sessions.delete(indexed.sessionId);
 			existing.dispose();
+			this.#detachNotification(
+				existing,
+				existing.generation === indexed.endpointGeneration ? "replaced_same_generation" : "replaced",
+			);
 			try {
 				await existing.client.close();
 			} catch (error) {
@@ -876,16 +926,18 @@ export class SessionRouter {
 					`SDK session replacement transport cleanup failed for ${indexed.sessionId}; authority remains revoked (${String(error)}).`,
 				);
 			}
-			await this.#deps.onSessionRemoved?.(
-				existing.capability,
-				existing.generation === indexed.endpointGeneration &&
-					(existing.endpoint.url !== endpoint.url ||
-						existing.endpoint.token !== endpoint.token ||
-						existing.pid !== indexed.pid ||
-						existing.endpointMtimeMs !== indexed.endpointMtimeMs)
-					? "replaced_same_generation"
-					: "replaced",
-			);
+			void Promise.resolve(
+				this.#deps.onSessionRemoved?.(
+					existing.capability,
+					existing.generation === indexed.endpointGeneration &&
+						(existing.endpoint.url !== endpoint.url ||
+							existing.endpoint.token !== endpoint.token ||
+							existing.pid !== indexed.pid ||
+							existing.endpointMtimeMs !== indexed.endpointMtimeMs)
+						? "replaced_same_generation"
+						: "replaced",
+				),
+			).catch(error => logger.warn(`SDK provider cleanup failed after replacement: ${String(error)}`));
 			if (!resumable) {
 				this.#undelivered.delete(indexed.sessionId);
 				this.#recoveredFrames.delete(indexed.sessionId);
@@ -946,6 +998,32 @@ export class SessionRouter {
 				if (attached) await this.#retireAttachment(attached);
 			},
 		});
+		const notificationCursor = { generation: indexed.endpointGeneration, seq: resumeSeq };
+		const notificationSubscription: NotificationSubscription = Object.freeze({
+			sessionId: indexed.sessionId,
+			subscriptionId: `notification:${indexed.sessionId}:${crypto.randomUUID()}`,
+			cursor: notificationCursor,
+			isActive: () => attached !== undefined && !attached.notificationCancelled && this.#attachmentLive(attached),
+			send: (frame: Record<string, unknown>) => {
+				if (!attached || attached.notificationCancelled || !this.#attachmentLive(attached))
+					throw new SessionRouterError("pre_send", "Notification subscription is cancelled.");
+				attached.client.send(this.#prepareFrame(attached, frame));
+			},
+			advanceCursor: (generation: number, seq: number) => {
+				if (!Number.isSafeInteger(generation) || generation < 0 || !Number.isSafeInteger(seq) || seq < 0) return;
+				if (
+					generation > notificationCursor.generation ||
+					(generation === notificationCursor.generation && seq > notificationCursor.seq)
+				) {
+					notificationCursor.generation = generation;
+					notificationCursor.seq = seq;
+				}
+			},
+			cancel: (reason?: string) => {
+				if (attached) this.#detachNotification(attached, "cancelled");
+				if (reason) this.#recordNotificationReceipt(notificationSubscription, "pending", reason);
+			},
+		});
 		const disposeFrames = client.onFrame(frame => {
 			if (!attached) return;
 			const task =
@@ -975,6 +1053,9 @@ export class SessionRouter {
 			cursor: { seq: resumeSeq },
 			barrier,
 			capability,
+			notificationSubscription,
+			notificationCancelled: false,
+			notificationCursor,
 			published: false,
 			publication,
 			dispose: () => {
@@ -998,6 +1079,11 @@ export class SessionRouter {
 			});
 		try {
 			await this.#deps.onAttachment?.(capability);
+			this.#recordNotificationReceipt(notificationSubscription, "pending");
+			void Promise.resolve(this.#deps.onNotificationSubscription?.(notificationSubscription)).catch(error => {
+				this.#detachNotification(attached!, "cancelled");
+				logger.warn(`SDK notification subscription admission failed: ${String(error)}`);
+			});
 		} catch (error) {
 			const failedStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
 			this.#adopted.delete(indexed.sessionId);
@@ -1035,6 +1121,12 @@ export class SessionRouter {
 		attached.publication.resolve();
 		attached.initializingPublication = true;
 		try {
+			void Promise.resolve(this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription)).catch(
+				error => {
+					this.#detachNotification(attached, "cancelled");
+					logger.warn(`SDK notification subscription ready hook failed locally: ${String(error)}`);
+				},
+			);
 			await this.#deps.onAttachmentReady?.(attached.capability);
 		} catch (error) {
 			const stillCurrent = this.#sessions.get(attached.sessionId) === attached;
@@ -1077,6 +1169,12 @@ export class SessionRouter {
 				}
 				attached.initializingPublication = true;
 				try {
+					void Promise.resolve(
+						this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription),
+					).catch(error => {
+						this.#detachNotification(attached, "cancelled");
+						logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
+					});
 					await this.#deps.onAttachmentReady?.(attached.capability);
 				} catch {
 					await this.#retireAttachment(attached);
@@ -1115,6 +1213,82 @@ export class SessionRouter {
 		return attached.published && this.#attachmentLive(attached);
 	}
 
+	#recordNotificationReceipt(
+		subscription: NotificationSubscription,
+		state: NotificationCleanupState,
+		reason?: string,
+	): void {
+		this.#notificationReceipts.set(subscription.subscriptionId, {
+			subscriptionId: subscription.subscriptionId,
+			sessionId: subscription.sessionId,
+			state,
+			...(reason ? { reason: reason.slice(0, 256) } : {}),
+		});
+	}
+
+	async #boundedNotificationWork<T>(work: () => Promise<T> | T): Promise<T | typeof NOTIFICATION_WORK_TIMEOUT> {
+		const timeout: Promise<typeof NOTIFICATION_WORK_TIMEOUT> = Bun.sleep(NOTIFICATION_WORK_TIMEOUT_MS).then(
+			() => NOTIFICATION_WORK_TIMEOUT,
+		);
+		return await Promise.race([Promise.resolve().then(work), timeout]);
+	}
+
+	#detachNotification(
+		attached: AttachedSession,
+		reason: "removed" | "replaced" | "replaced_same_generation" | "cancelled",
+	): void {
+		if (attached.notificationCancelled) return;
+		attached.notificationCancelled = true;
+		this.#recordNotificationReceipt(attached.notificationSubscription, "pending", reason);
+		const work = this.#boundedNotificationWork(() =>
+			this.#deps.onNotificationSubscriptionRemoved?.(attached.notificationSubscription, reason),
+		)
+			.then(
+				result =>
+					this.#recordNotificationReceipt(
+						attached.notificationSubscription,
+						result === NOTIFICATION_WORK_TIMEOUT ? "failed" : "completed",
+						reason,
+					),
+				(error: unknown) =>
+					this.#recordNotificationReceipt(
+						attached.notificationSubscription,
+						"failed",
+						error instanceof Error ? error.message : String(error),
+					),
+			)
+			.catch(() => undefined);
+		void work;
+	}
+
+	#dispatchNotificationFrame(attached: AttachedSession, frame: SessionRouterFrame): void {
+		if (attached.notificationCancelled || !this.#attachmentLive(attached)) return;
+		const callback = this.#deps.onNotificationFrame;
+		if (!callback) return;
+		const work = this.#boundedNotificationWork(async () => {
+			await callback(attached.notificationSubscription, frame);
+			return true;
+		}).then(
+			result => {
+				if (result === NOTIFICATION_WORK_TIMEOUT) {
+					this.#detachNotification(attached, "cancelled");
+					return;
+				}
+				if (frame.seq !== undefined)
+					attached.notificationSubscription.advanceCursor(frame.generation ?? attached.generation, frame.seq);
+			},
+			(error: unknown) => {
+				this.#detachNotification(attached, "cancelled");
+				logger.warn(
+					`SDK notification subscription ${attached.notificationSubscription.subscriptionId} failed locally: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			},
+		);
+		void work;
+	}
+
 	async #retireAttachment(
 		attached: AttachedSession,
 		explicitReason?: "removed" | "replaced" | "replaced_same_generation",
@@ -1146,11 +1320,10 @@ export class SessionRouter {
 				}
 			}
 			reason ??= "removed";
-			try {
-				await this.#deps.onSessionRemoved?.(attached.capability, reason);
-			} catch {
-				// Exact authority is already revoked; provider cleanup remains best effort.
-			}
+			void Promise.resolve(this.#deps.onSessionRemoved?.(attached.capability, reason)).catch(error =>
+				logger.warn(`SDK provider cleanup failed after authority revocation: ${String(error)}`),
+			);
+			this.#detachNotification(attached, reason);
 			await attached.client.close().catch(() => undefined);
 		} finally {
 			gate.resolve();
@@ -1236,7 +1409,10 @@ export class SessionRouter {
 		if (!correlated) return;
 		if (correlated.sessionId !== undefined && correlated.sessionId !== attached.sessionId) return;
 		if (correlated.generation !== undefined && correlated.generation !== attached.generation) return;
-		await this.#deps.onFrame?.(attached.capability, correlated);
+		this.#dispatchNotificationFrame(attached, correlated);
+		void Promise.resolve(this.#deps.onFrame?.(attached.capability, correlated)).catch(error =>
+			logger.warn(`SDK provider frame hook failed: ${String(error)}`),
+		);
 	}
 	#enqueueFrame(attached: AttachedSession, frame: Record<string, unknown>, origin: FrameOrigin): Promise<void> {
 		const previous = this.#frameTails.get(attached.id) ?? Promise.resolve();
@@ -1272,10 +1448,9 @@ export class SessionRouter {
 				const publicationId =
 					seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
 				try {
-					await this.#deps.onFrame?.(
-						attached.capability,
-						publicationId === undefined ? correlated : { ...correlated, publicationId },
-					);
+					const notificationFrame = publicationId === undefined ? correlated : { ...correlated, publicationId };
+					this.#dispatchNotificationFrame(attached, notificationFrame);
+					await this.#deps.onFrame?.(attached.capability, notificationFrame);
 				} catch (error) {
 					if (!this.#attachmentLive(attached)) return;
 					if (seq === undefined || !ownsSequence) throw error;
