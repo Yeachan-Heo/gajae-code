@@ -713,15 +713,23 @@ fn break_long_word(
 	let mut i = 0usize;
 
 	while i < word.len() {
-		if word[i] == ESC
-			&& let Some(seq_len) = ansi_seq_len_u16(word, i)
-		{
-			let seq = &word[i..i + seq_len];
-			current_line.extend_from_slice(seq);
-			if is_sgr_u16(seq) {
-				state.apply_sgr_u16(&seq[2..seq_len - 1]);
+		if word[i] == ESC {
+			if let Some(seq_len) = ansi_seq_len_u16(word, i) {
+				let seq = &word[i..i + seq_len];
+				current_line.extend_from_slice(seq);
+				if is_sgr_u16(seq) {
+					state.apply_sgr_u16(&seq[2..seq_len - 1]);
+				}
+				i += seq_len;
+				continue;
 			}
-			i += seq_len;
+			// A lone ESC that does not start a recognizable ANSI sequence
+			// (e.g. binary tool output persisted into a session). Consume it
+			// as a zero-width scalar like truncate/slice do; without this the
+			// segment scan below stops at the ESC without advancing `i` and
+			// the outer loop never terminates.
+			current_line.push(ESC);
+			i += 1;
 			continue;
 		}
 
@@ -1599,6 +1607,44 @@ mod tests {
 		assert!(first.starts_with("\x1b[38;2;156;163;176m"));
 		assert!(second.starts_with("\x1b[38;2;156;163;176m"));
 		assert!(second.contains("world"));
+	}
+
+	#[test]
+	fn test_wrap_text_with_ansi_terminates_on_lone_esc_in_long_word() {
+		// Regression: a word wider than the wrap width containing an ESC that
+		// does not start a recognizable ANSI sequence (binary tool output,
+		// e.g. `head` on a compiled binary persisted into a session) made
+		// `break_long_word` loop forever: the segment scan stops at ESC
+		// without consuming it. Interactive session resume then spun at 100%
+		// CPU while wrapping history.
+		let cases: &[Vec<u16>] = &[
+			// lone ESC followed by NUL inside an over-width word
+			to_u16(&format!("{}\u{1b}\0{}", "x".repeat(85), "y".repeat(85))),
+			// lone ESC at the very end of an over-width word
+			to_u16(&format!("{}\u{1b}", "x".repeat(85))),
+			// ESC followed by a byte outside every recognized sequence class
+			to_u16(&format!("{}\u{1b}5{}", "x".repeat(85), "y".repeat(85))),
+			// Mach-O-flavored soup: NUL runs, replacement chars, trailing ESC
+			to_u16(&format!(
+				"__TEXT{}\u{fffd}F{}__literals{}\u{fffd}\u{fffd}\u{1b}",
+				"\0".repeat(20),
+				"\0".repeat(40),
+				"\0".repeat(30),
+			)),
+		];
+		for data in cases {
+			let lines = wrap_text_with_ansi_impl(data, 80, DEFAULT_TAB_WIDTH);
+			assert!(!lines.is_empty());
+			// Zero-width scalars must not be dropped by the wrap.
+			let total: usize = lines.iter().map(Vec::len).sum();
+			let esc_in: usize = data.iter().filter(|&&u| u == ESC).count();
+			let esc_out: usize = lines
+				.iter()
+				.map(|l| l.iter().filter(|&&u| u == ESC).count())
+				.sum();
+			assert!(esc_out >= esc_in, "lone ESC dropped: {esc_in} in, {esc_out} out");
+			assert!(total > 0);
+		}
 	}
 
 	#[test]
