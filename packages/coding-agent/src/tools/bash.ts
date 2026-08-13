@@ -47,6 +47,7 @@ import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-intera
 import { checkBashInterception } from "./bash-interceptor";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
+import { longSleepAdvisory } from "./bash-sleep-advisory";
 import { checkComposerBashPolicy } from "./composer-bash-policy";
 import {
 	formatArtifactReference,
@@ -1118,6 +1119,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const notices: string[] = [];
 		const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec);
 		if (timeoutClampNotice) notices.push(timeoutClampNotice);
+		const sleepAdvisory = longSleepAdvisory(command, timeoutSec);
+		if (sleepAdvisory) notices.push(sleepAdvisory);
 
 		return { command, commandCwd, resolvedEnv, requestedTimeoutSec, timeoutSec, timeoutMs, notices };
 	}
@@ -1662,20 +1665,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
 				});
 		if (result.cancelled) {
-			const failureText = formatBashFailureMessage(
-				result,
-				normalizeResultOutput(result) || "Command aborted",
-				signal?.aborted ? "Command aborted" : undefined,
-			);
+			const noticeSuffix = pendingNotices.length > 0 ? `\n\n${pendingNotices.join("\n")}` : "";
+			const baseCancelledText = normalizeResultOutput(result) || "Command aborted";
 			if (signal?.aborted) {
-				throw new ToolAbortError(failureText);
+				throw new ToolAbortError(formatBashFailureMessage(result, baseCancelledText, "Command aborted"));
 			}
-			throw new ToolError(failureText);
+			const failureText = `${baseCancelledText}${noticeSuffix}`;
+			throw new ToolError(formatBashFailureMessage(result, failureText));
 		}
 		if (isInteractiveResult(result) && result.timedOut) {
 			const timeoutMessage = `Command timed out after ${timeoutSec} seconds`;
 			const output = normalizeResultOutput(result);
-			const failureText = output ? `${output}\n\n${timeoutMessage}` : timeoutMessage;
+			const noticeSuffix = pendingNotices.length > 0 ? `\n\n${pendingNotices.join("\n")}` : "";
+			const baseText = output ? `${output}\n\n${timeoutMessage}` : timeoutMessage;
+			const failureText = `${baseText}${noticeSuffix}`;
 			throw new ToolError(formatBashFailureMessage(result, failureText, timeoutMessage));
 		}
 		return this.#buildCompletedResult(result, timeoutSec, {

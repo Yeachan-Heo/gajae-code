@@ -61,6 +61,12 @@ Use it only for sanctioned GJC workflow CLI persistence or state read/write/cont
 - `async: true` only defers **reporting** of the result — it does NOT disable, extend, or detach the timeout. A daemon started with `async: true` is still killed when `timeout` elapses, regardless of how long the agent waits before reading the result.
 - For long-running daemons (dev servers, watchers): either pass an explicit large `timeout` (up to `3600`), or fully detach the process from this shell using `nohup …  &` / `setsid … &` / `disown` so it survives independent of the bash call's lifecycle.
 {{/if}}
+# Waiting for background work
+
+- A long blocking `sleep N` (or `sleep N && …`) emits nothing for the entire duration and is indistinguishable from a hung session. Never use it to wait for subagents or background jobs.
+- To wait for detached task subagents, use `subagent await` — it emits periodic liveness while waiting.
+- To wait for background bash jobs, use `job poll` — it reports status on each tick.
+- Short sleeps for rate-limiting or pacing (e.g. `sleep 2` between retries) are fine.
 
 # Output minimizer
 

@@ -1371,3 +1371,189 @@ describe("SubagentTool", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 });
+
+describe("await liveness (#4465)", () => {
+	it("force-re-emits an update when the liveness interval elapses even if the signature is stable", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const gate = Promise.withResolvers<string>();
+		manager.register("task", "long silent subagent", async () => gate.promise, {
+			id: "job-liveness",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-Liveness",
+					agent: "executor",
+					agentSource: "bundled",
+					description: "stable",
+				},
+			},
+		});
+
+		// Virtual clock: starts at 0, advances manually between ticks.
+		let clock = 0;
+		const restore = tool.withLivenessClock(() => clock);
+
+		const updates: unknown[] = [];
+		// heartbeat_ms=100 → liveness interval = max(15000, 100*30) = 15000.
+		// The real timer ticks every 100ms; the virtual clock controls the
+		// liveness decision, so a 15s liveness interval is exercised in ~200ms.
+		const awaiting = tool.execute(
+			"await-liveness",
+			{ action: "await", ids: ["0-Liveness"], heartbeat_ms: 100, timeout_ms: 500 },
+			undefined,
+			update => updates.push(update),
+		);
+
+		// Wait for the initial forced emit + at least one non-liveness tick.
+		await Bun.sleep(60);
+		const updatesAfterWarmup = updates.length;
+
+		// Advance the virtual clock past the liveness interval.
+		clock = 16_000;
+		await Bun.sleep(120);
+		const updatesAfterLiveness = updates.length;
+		expect(updatesAfterLiveness).toBeGreaterThan(updatesAfterWarmup);
+
+		// Advance again and confirm another liveness re-emit.
+		clock = 31_000;
+		await Bun.sleep(120);
+		expect(updates.length).toBeGreaterThan(updatesAfterLiveness);
+
+		gate.resolve("done");
+		await awaiting;
+		restore();
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("does not re-emit more than once per liveness interval when the signature is stable", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const gate = Promise.withResolvers<string>();
+		manager.register("task", "stable subagent", async () => gate.promise, {
+			id: "job-liveness-bounded",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-LivenessBounded",
+					agent: "executor",
+					agentSource: "bundled",
+					description: "stable",
+				},
+			},
+		});
+
+		let clock = 0;
+		const restore = tool.withLivenessClock(() => clock);
+
+		const updates: unknown[] = [];
+		const awaiting = tool.execute(
+			"await-liveness-bounded",
+			{ action: "await", ids: ["0-LivenessBounded"], heartbeat_ms: 100, timeout_ms: 500 },
+			undefined,
+			update => updates.push(update),
+		);
+
+		// Initial emit.
+		await Bun.sleep(60);
+		const initial = updates.length;
+
+		// Advance clock by only 5s (below the 15s interval) and wait for ticks.
+		clock = 5_000;
+		await Bun.sleep(150);
+		// No liveness re-emit should have fired (no signature change either).
+		expect(updates.length).toBe(initial);
+
+		gate.resolve("done");
+		await awaiting;
+		restore();
+		await manager.dispose({ timeoutMs: 100 });
+	});
+	it("does not emit liveness after the await resolves (no timer leak)", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const gate = Promise.withResolvers<string>();
+		manager.register("task", "race subagent", async () => gate.promise, {
+			id: "job-race",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-Race",
+					agent: "executor",
+					agentSource: "bundled",
+					description: "stable",
+				},
+			},
+		});
+
+		let clock = 0;
+		const restore = tool.withLivenessClock(() => clock);
+		const updates: unknown[] = [];
+		const awaiting = tool.execute(
+			"await-race",
+			{ action: "await", ids: ["0-Race"], heartbeat_ms: 100, timeout_ms: 500 },
+			undefined,
+			update => updates.push(update),
+		);
+
+		await Bun.sleep(200);
+		const warmup = updates.length;
+		expect(warmup).toBeGreaterThan(0);
+
+		// Resolve the subagent; the await should complete promptly (same
+		// macrotask turn), and clearInterval runs in the finally.
+		gate.resolve("done");
+		await awaiting;
+		const countAtCompletion = updates.length;
+
+		// Keep ticking the real 100ms timer for 300ms with the virtual clock
+		// far past the liveness interval. Any surviving progressTimer would
+		// fire a liveness re-emit here — proving a leak/race.
+		clock = 100_000;
+		await Bun.sleep(300);
+		// No additional updates after completion — the timer was cleared.
+		expect(updates.length).toBe(countAtCompletion);
+
+		restore();
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("heartbeat_ms=0 disables both progress timer and liveness", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const gate = Promise.withResolvers<string>();
+		manager.register("task", "silent subagent", async () => gate.promise, {
+			id: "job-hb0",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-Hb0",
+					agent: "executor",
+					agentSource: "bundled",
+					description: "silent",
+				},
+			},
+		});
+
+		let clock = 0;
+		const restore = tool.withLivenessClock(() => clock);
+		const updates: unknown[] = [];
+		const awaiting = tool.execute(
+			"await-hb0",
+			{ action: "await", ids: ["0-Hb0"], heartbeat_ms: 0, timeout_ms: 120 },
+			undefined,
+			update => updates.push(update),
+		);
+
+		await Bun.sleep(200);
+		const initial = updates.length;
+		clock = 100_000;
+		await Bun.sleep(100);
+		expect(updates.length).toBe(initial);
+
+		gate.resolve("done");
+		await awaiting;
+		restore();
+		await manager.dispose({ timeoutMs: 100 });
+	});
+});
