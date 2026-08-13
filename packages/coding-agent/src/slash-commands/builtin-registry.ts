@@ -1119,11 +1119,25 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				} catch (err) {
 					return usage(`Failed to change autorouting: ${errorMessage(err)}`, runtime);
 				}
-				await runtime.output(buildAutoroutingStatusReport(runtime.settings.getEffectiveAutorouting()));
+				await runtime.output(
+					buildAutoroutingStatusReport({
+						effective: runtime.settings.getEffectiveAutorouting(),
+						tiers: runtime.settings.get("task.autorouting.tiers"),
+						provenance: runtime.settings.get("task.autorouting.provenance"),
+					}),
+				);
+
 				return commandConsumed();
 			}
 			if (arg === "" || arg === "status") {
-				await runtime.output(buildAutoroutingStatusReport(runtime.settings.getEffectiveAutorouting()));
+				await runtime.output(
+					buildAutoroutingStatusReport({
+						effective: runtime.settings.getEffectiveAutorouting(),
+						tiers: runtime.settings.get("task.autorouting.tiers"),
+						provenance: runtime.settings.get("task.autorouting.provenance"),
+					}),
+				);
+
 				return commandConsumed();
 			}
 			return usage("Usage: /routing [on|off|status]", runtime);
@@ -1143,7 +1157,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.showStatus("Usage: /routing [on|off|status]");
 				return;
 			}
-			const report = buildAutoroutingStatusReport(runtime.ctx.settings.getEffectiveAutorouting());
+			const report = buildAutoroutingStatusReport({
+				effective: runtime.ctx.settings.getEffectiveAutorouting(),
+				tiers: runtime.ctx.settings.get("task.autorouting.tiers"),
+				provenance: runtime.ctx.settings.get("task.autorouting.provenance"),
+			});
 			runtime.ctx.chatContainer.addChild(new Spacer(1));
 			runtime.ctx.chatContainer.addChild(new DynamicBorder());
 			runtime.ctx.chatContainer.addChild(new Text(report, 1, 0));

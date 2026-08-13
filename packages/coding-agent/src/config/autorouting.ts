@@ -15,7 +15,6 @@ export type RoutingOutcome =
 			tier: AutoroutingTier;
 			requestedTier?: AutoroutingTier;
 			defaultTierApplied?: true;
-			source: "tiers" | { preset: string };
 			pinnedSelector: string;
 	  }
 	| {
@@ -23,7 +22,6 @@ export type RoutingOutcome =
 			tier: AutoroutingTier;
 			requestedTier?: AutoroutingTier;
 			defaultTierApplied?: true;
-			source: "tiers" | { preset: string };
 			attemptedSelectorCount: number;
 			reason: "tier_unmatched" | "tier_missing_in_map";
 	  };
@@ -65,10 +63,6 @@ export function normalizeTierSelector(selector: string, snapshot: readonly Model
 	return { pinned: `${formatModelString(model)}:${suffix.thinkingLevel}` };
 }
 
-function sourceOf(effective: Extract<AutoroutingEffective, { active: true }>): "tiers" | { preset: string } {
-	return effective.source === "tiers" ? "tiers" : { preset: effective.source.preset };
-}
-
 export function resolveTaskRouting(input: {
 	effectiveAutorouting: AutoroutingEffective;
 	requestedTier?: AutoroutingTier;
@@ -79,7 +73,6 @@ export function resolveTaskRouting(input: {
 
 	const tier = requestedTier ?? DEFAULT_AUTOROUTING_TIER;
 	const defaultTierApplied = requestedTier === undefined ? true : undefined;
-	const source = sourceOf(effectiveAutorouting);
 	const selectors = effectiveAutorouting.map[tier];
 	if (!selectors || selectors.length === 0) {
 		return {
@@ -87,7 +80,6 @@ export function resolveTaskRouting(input: {
 			tier,
 			requestedTier,
 			...(defaultTierApplied ? { defaultTierApplied } : {}),
-			source,
 			attemptedSelectorCount: 0,
 			reason: "tier_missing_in_map",
 		};
@@ -98,7 +90,6 @@ export function resolveTaskRouting(input: {
 			tier,
 			requestedTier,
 			...(defaultTierApplied ? { defaultTierApplied } : {}),
-			source,
 			attemptedSelectorCount: selectors.length,
 			reason: "tier_unmatched",
 		};
@@ -114,7 +105,6 @@ export function resolveTaskRouting(input: {
 				tier,
 				requestedTier,
 				...(defaultTierApplied ? { defaultTierApplied } : {}),
-				source,
 				pinnedSelector: normalized.pinned,
 			};
 		}
@@ -124,7 +114,6 @@ export function resolveTaskRouting(input: {
 		tier,
 		requestedTier,
 		...(defaultTierApplied ? { defaultTierApplied } : {}),
-		source,
 		attemptedSelectorCount,
 		reason: "tier_unmatched",
 	};

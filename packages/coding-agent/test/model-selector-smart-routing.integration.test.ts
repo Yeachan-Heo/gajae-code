@@ -234,10 +234,9 @@ describe("/model smart-routing panel integration", () => {
 		expect(panel.getPreviewPayload().tiers).toEqual(editedPreview.tiers);
 	});
 
-	test("clear unsets generated keys while preserving preset and enabled (AC5)", async () => {
+	test("clear unsets generated keys while preserving enabled", async () => {
 		const settings = Settings.isolated({
 			"task.autorouting.enabled": true,
-			"task.autorouting.preset": "anthropic",
 		});
 		const { panel, selector } = await openPanel({ settings });
 		await panel.__testApply();
@@ -252,7 +251,6 @@ describe("/model smart-routing panel integration", () => {
 		expect(settings.get("task.autorouting.tiers")).toEqual({});
 		expect(settings.get("task.autorouting.setup")).toBeUndefined();
 		expect(settings.get("task.autorouting.provenance")).toBeUndefined();
-		expect(settings.get("task.autorouting.preset")).toBe("anthropic");
 		expect(settings.get("task.autorouting.enabled")).toBe(true);
 	});
 
@@ -386,7 +384,6 @@ describe("smart-routing panel hostile render boundary", () => {
 			setup,
 			tiers,
 			enabled: true,
-			preset: HOSTILE,
 			readOnly: false,
 			stale: false,
 			preview,

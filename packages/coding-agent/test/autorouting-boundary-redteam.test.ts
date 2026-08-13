@@ -790,7 +790,6 @@ describe("autorouting boundary red-team: routing evidence, retries, and residue"
 			})),
 			routing: {
 				tier: "fast",
-				source: "tiers",
 				requestedSelector: "enabled/present",
 				substitutions: [],
 			},
@@ -870,7 +869,6 @@ describe("autorouting boundary red-team: routing evidence, retries, and residue"
 		});
 		const valid: TaskRoutingEvidence = {
 			tier: "fast",
-			source: "tiers",
 			requestedSelector: "provider/model",
 			notExecuted: true,
 			substitutions: [],
@@ -1064,7 +1062,6 @@ describe("autorouting boundary red-team: malformed evidence and hostile selector
 				autoroutingSkips: [{ selector: "\u0000\u0001", code: "snapshot_missing" }],
 				routing: {
 					tier: "fast",
-					source: "tiers",
 					requestedSelector: "provider/model",
 					substitutions: [],
 				},
@@ -1093,7 +1090,6 @@ describe("autorouting boundary red-team: malformed evidence and hostile selector
 	it("does not accept unbounded auth-resolved model evidence", () => {
 		const evidence: TaskRoutingEvidence = {
 			tier: "fast",
-			source: "tiers",
 			requestedSelector: "provider/model",
 			effectiveModel: "provider/model",
 			authResolvedModel: `provider/${"x".repeat(10_000)}`,
@@ -1407,7 +1403,7 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 				autoroutingPreflight: true,
 				autoroutingCandidates: [],
 				autoroutingSkips: inputs.map(selector => ({ selector, code: "snapshot_missing" as const })),
-				routing: { tier: "fast", source: "tiers", requestedSelector: "provider/model", substitutions: [] },
+				routing: { tier: "fast", requestedSelector: "provider/model", substitutions: [] },
 			});
 		} catch (caught) {
 			error = caught instanceof Error ? caught.message : String(caught);
@@ -1435,7 +1431,6 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 	it("B5 varied: exact 256 bounds, 257 rejection, multibyte lengths, and impossible phase/code pairs are enforced", () => {
 		const makeEvidence = (authResolvedModel: string): TaskRoutingEvidence => ({
 			tier: "fast",
-			source: "tiers",
 			requestedSelector: "provider/model",
 			effectiveModel: "provider/effective",
 			authResolvedModel,
@@ -1505,7 +1500,6 @@ describe("autorouting boundary red-team generation 2 delta re-attacks", () => {
 		const projection = buildBoundedRoutingSkips(skips);
 		const evidence: TaskRoutingEvidence = {
 			tier: "fast",
-			source: "tiers",
 			requestedSelector: "manual-model-chain",
 			effectiveModel: "manual-model-chain",
 			substitutions: [],
@@ -2292,7 +2286,6 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 				autoroutingSkips: [],
 				routing: {
 					tier: "fast",
-					source: "tiers",
 					requestedSelector: "test/first",
 					effectiveModel: "test/first",
 					substitutions: [],
@@ -2410,7 +2403,6 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 				autoroutingSkips: [],
 				routing: {
 					tier: "fast",
-					source: "tiers",
 					requestedSelector: "test/first",
 					effectiveModel: "test/first",
 					substitutions: [],
@@ -2492,7 +2484,6 @@ describe("autorouting boundary red-team generation 5 delta re-attacks", () => {
 			autoroutingSkips: [],
 			routing: {
 				tier: "fast",
-				source: "tiers",
 				requestedSelector: candidates[0] ?? "test/one",
 				substitutions: [],
 			},
@@ -2592,7 +2583,6 @@ describe("autorouting boundary red-team generation 5 delta re-attacks", () => {
 				autoroutingSkips: [],
 				routing: {
 					tier: "fast",
-					source: "tiers",
 					requestedSelector: "test/diagnostic",
 					substitutions: [],
 				},
@@ -2799,7 +2789,7 @@ describe("autorouting boundary red-team generation 6 varied delta re-attacks", (
 				autoroutingPreflight: true,
 				autoroutingCandidates: ["test/diagnostic"],
 				autoroutingSkips: [],
-				routing: { tier: "fast", source: "tiers", requestedSelector: "test/diagnostic", substitutions: [] },
+				routing: { tier: "fast", requestedSelector: "test/diagnostic", substitutions: [] },
 				sessionFile: path.join(root, "diagnostic.jsonl"),
 			});
 		} finally {
@@ -3190,7 +3180,6 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 				autoroutingSkips: [],
 				routing: {
 					tier: "fast",
-					source: "tiers",
 					// The evidence-side requestedSelector/effectiveModel are legitimately bounded to
 					// <=256 chars by assertRoutingEvidenceInvariant; that bounding is correct and not
 					// under test here. Only the *live* selector must reach execution untransformed.

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 /**
- * Dependency-free autorouting vocabulary, presets, and settings validators.
+ * Dependency-free autorouting vocabulary and settings validators.
  *
  * This module deliberately does not import Settings, task code, or model
  * profiles.  It is the shared contract used by settings and (later) routing
@@ -46,33 +46,6 @@ export type AutoroutingProvenance = {
 	tiersFingerprint: string;
 };
 
-export type AutoroutingPresetId = "anthropic" | "openai-codex" | "google" | "xai";
-
-export const AUTOROUTING_PRESETS: Readonly<Record<AutoroutingPresetId, TierMap>> = {
-	anthropic: {
-		fast: ["anthropic/claude-haiku-4-5"],
-		balanced: ["anthropic/claude-sonnet-5", "anthropic/claude-sonnet-4-6"],
-		strong: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-8:high"],
-	},
-	"openai-codex": {
-		fast: ["openai-codex/gpt-5.6-terra:low"],
-		balanced: ["openai-codex/gpt-5.6-terra:medium"],
-		strong: ["openai-codex/gpt-5.6-sol:high"],
-	},
-	google: {
-		fast: ["google/gemini-3.5-flash-lite", "google/gemini-2.5-flash-lite"],
-		balanced: ["google/gemini-3.5-flash", "google/gemini-2.5-flash"],
-		strong: ["google/gemini-3.1-pro-preview", "google/gemini-2.5-pro"],
-	},
-	xai: {
-		fast: ["xai/grok-4.5:low", "xai/grok-4.3:low"],
-		balanced: ["xai/grok-4.5:medium", "xai/grok-4.3:medium"],
-		strong: ["xai/grok-4.5:high", "xai/grok-4.3:high"],
-	},
-};
-
-export const AUTOROUTING_PRESET_IDS = Object.freeze(Object.keys(AUTOROUTING_PRESETS)) as readonly AutoroutingPresetId[];
-
 /** The exact selector grammar published by the generated config schema. */
 export const AUTOROUTING_SELECTOR_PATTERN = "^[^/\\s*?\\[]+\\/[^\\s*?\\[]+(?::(?:minimal|low|medium|high|xhigh))?$";
 
@@ -109,7 +82,7 @@ export type AutoroutingEffectiveIssue = {
 };
 
 export type AutoroutingEffective =
-	| { active: true; map: TierMap; source: "tiers" | { preset: AutoroutingPresetId } }
+	| { active: true; map: TierMap }
 	| { active: false; issue?: AutoroutingEffectiveIssue };
 
 function issue(path: string, code: AutoroutingReasonCode, detail: string): AutoroutingLocalIssue {
@@ -143,7 +116,7 @@ export function isValidAutoroutingSelector(value: unknown): value is string {
 	return provider.toLowerCase() !== "pi";
 }
 
-function normalizeTierMap(value: unknown): TierMap {
+export function normalizeTierMap(value: unknown): TierMap {
 	if (!isRecord(value)) return {};
 	const normalized: TierMap = {};
 	for (const tier of AUTOROUTING_TIERS) {
@@ -158,21 +131,6 @@ function normalizeTierMap(value: unknown): TierMap {
 /** True when at least one known tier contains one grammatically valid selector. */
 export function isMeaningfulTierMap(value: unknown): value is TierMap {
 	return Object.values(normalizeTierMap(value)).some(selectors => selectors.length > 0);
-}
-
-/**
- * Resolve an explicit tier map before a preset.  An empty/default tiers object
- * does not mask a selected preset; a meaningful explicit map always wins.
- */
-export function resolveTierMap(input: { tiers?: unknown; preset?: unknown }): TierMap {
-	if (isMeaningfulTierMap(input.tiers)) return normalizeTierMap(input.tiers);
-	if (typeof input.preset === "string" && Object.hasOwn(AUTOROUTING_PRESETS, input.preset)) {
-		const preset = AUTOROUTING_PRESETS[input.preset as AutoroutingPresetId];
-		return Object.fromEntries(
-			AUTOROUTING_TIERS.filter(tier => preset[tier] !== undefined).map(tier => [tier, [...preset[tier]!]]),
-		) as TierMap;
-	}
-	return {};
 }
 
 function validateSelectorValue(path: string, value: unknown, issues: AutoroutingLocalIssue[]): void {
@@ -301,16 +259,14 @@ export function validateAutoroutingLocal(fragment: unknown): AutoroutingLocalIss
 	}
 
 	for (const key of Object.keys(fragment)) {
-		if (!new Set(["enabled", "preset", "tiers", "setup", "provenance"]).has(key)) {
+		if (!new Set(["enabled", "tiers", "setup", "provenance"]).has(key)) {
 			issues.push(issue(key, "config_invalid", "Unknown autorouting setting key."));
 		}
 	}
 	if (fragment.enabled !== undefined && typeof fragment.enabled !== "boolean") {
 		issues.push(issue("enabled", "config_invalid", "Expected a boolean."));
 	}
-	if (fragment.preset !== undefined && typeof fragment.preset !== "string") {
-		issues.push(issue("preset", "config_invalid", "Expected a string."));
-	}
+
 	if (fragment.setup !== undefined) {
 		for (const setupIssue of validateAutoroutingSetup(fragment.setup)) {
 			issues.push({ ...setupIssue, path: setupIssue.path ? `setup.${setupIssue.path}` : "setup" });
@@ -400,6 +356,14 @@ export function evaluateAutoroutingProvenanceState(
 	};
 }
 
+/** Compare a recorded tier fingerprint with the current raw tier map. */
+export function matchesRecordedTiersFingerprint(
+	provenance: AutoroutingProvenance | undefined,
+	tiers: unknown,
+): boolean {
+	return provenance !== undefined && provenance.tiersFingerprint === autoroutingSha256(tiers);
+}
+
 /** Advisory comparison between a recorded declaration and the current provider priority. */
 export type AutoroutingProviderOrderHint = {
 	/** The declaration lists the same providers in a different relative order. */
@@ -479,9 +443,8 @@ export function buildAutoroutingEnabledPatch(enabled: boolean): {
 	return { path: "task.autorouting.enabled", op: "set", value: enabled };
 }
 
-/** Validate effective enablement and map/preset cross-field semantics. */
+/** Validate effective enablement and map cross-field semantics. */
 export function validateAutoroutingEffective(fragment: unknown): AutoroutingEffective {
-	const availablePresetIds = [...AUTOROUTING_PRESET_IDS].sort();
 	if (fragment === undefined || !isRecord(fragment)) return { active: false };
 	if (fragment.enabled === undefined || fragment.enabled === false) return { active: false };
 	if (fragment.enabled !== true) {
@@ -493,40 +456,14 @@ export function validateAutoroutingEffective(fragment: unknown): AutoroutingEffe
 			),
 		};
 	}
-	const explicitMap = isMeaningfulTierMap(fragment.tiers);
-	if (explicitMap) {
-		return { active: true, map: resolveTierMap({ tiers: fragment.tiers }), source: "tiers" };
-	}
-	if (fragment.preset !== undefined && typeof fragment.preset !== "string") {
-		return {
-			active: false,
-			issue: effectiveIssue(
-				"config_invalid",
-				`Autorouting preset must be one of: ${availablePresetIds.join(", ")}.`,
-			),
-		};
-	}
-	if (typeof fragment.preset === "string" && fragment.preset !== "") {
-		if (Object.hasOwn(AUTOROUTING_PRESETS, fragment.preset)) {
-			return {
-				active: true,
-				map: resolveTierMap({ preset: fragment.preset }),
-				source: { preset: fragment.preset as AutoroutingPresetId },
-			};
-		}
-		return {
-			active: false,
-			issue: effectiveIssue(
-				"config_invalid",
-				`Autorouting preset must be one of: ${availablePresetIds.join(", ")}.`,
-			),
-		};
+	if (isMeaningfulTierMap(fragment.tiers)) {
+		return { active: true, map: normalizeTierMap(fragment.tiers) };
 	}
 	return {
 		active: false,
 		issue: effectiveIssue(
 			"map_absent",
-			`Autorouting is enabled but has no usable tiers or preset. Available presets: ${availablePresetIds.join(", ")}.`,
+			"Autorouting is enabled but has no usable tiers. Generate them from the /model smart-routing panel.",
 		),
 	};
 }

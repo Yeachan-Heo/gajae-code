@@ -182,7 +182,6 @@ describe("autorouting typed settings contract", () => {
 			validateAutoroutingEffective({ enabled: true, tiers: { fast: ["anthropic/model"] }, setup, provenance }),
 		).toMatchObject({
 			active: true,
-			source: "tiers",
 		});
 	});
 

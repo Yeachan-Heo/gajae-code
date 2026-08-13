@@ -4,8 +4,6 @@ import { prompt } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
 import { normalizeTierSelector, resolveTaskRouting } from "../src/config/autorouting";
 import {
-	AUTOROUTING_PRESET_IDS,
-	AUTOROUTING_PRESETS,
 	AUTOROUTING_SELECTOR_PATTERN,
 	AUTOROUTING_TIERS,
 	isMeaningfulTierMap,
@@ -100,7 +98,6 @@ describe("autorouting red-team adversarial suite", () => {
 		const enabled = validateAutoroutingEffective({
 			enabled: true,
 			tiers: { fast: ["anthropic/claude-opus-5"] },
-			preset: "google",
 		});
 		expect(
 			resolveTaskRouting({ effectiveAutorouting: enabled, requestedTier: "fast", availableModels: snapshot }),
@@ -123,17 +120,23 @@ describe("autorouting red-team adversarial suite", () => {
 			{ enabled: true, tiers: {} },
 			{ enabled: true, tiers: { fast: [] } },
 			{ enabled: true, tiers: { fast: ["  "] } },
-			{ enabled: true, preset: "unknown-preset" },
 		]) {
 			const effective = validateAutoroutingEffective(fragment);
 			expect(effective.active).toBe(false);
 			const settings = Settings.isolated({
 				"task.autorouting.enabled": true,
 				...(fragment.tiers ? { "task.autorouting.tiers": fragment.tiers } : {}),
-				...(fragment.preset ? { "task.autorouting.preset": fragment.preset } : {}),
 			});
 			expect(settings.getSchemaReport().valid).toBe(false);
-			expect(settings.getSchemaReport().issues.some(issue => issue.detail.includes("anthropic"))).toBe(true);
+			expect(
+				settings
+					.getSchemaReport()
+					.issues.some(
+						issue =>
+							issue.detail.includes("Unknown autorouting setting key") ||
+							issue.detail.includes("Generate them from the /model smart-routing panel."),
+					),
+			).toBe(true);
 			expect(resolveTaskRouting({ effectiveAutorouting: effective, availableModels: snapshot })).toEqual({
 				kind: "disabled",
 			});
@@ -163,14 +166,12 @@ describe("autorouting red-team adversarial suite", () => {
 		const cases: TaskRoutingEvidence[] = [
 			{
 				tier: "fast",
-				source: "tiers",
 				requestedSelector: "anthropic/claude-opus-5",
 				effectiveModel: "anthropic/claude-opus-5",
 				substitutions: [],
 			},
 			{
 				tier: "fast",
-				source: "tiers",
 				requestedSelector: "anthropic/claude-opus-5",
 				authResolvedModel: "anthropic/claude-sonnet-5",
 				effectiveModel: "xai/grok-4.5",
@@ -178,7 +179,6 @@ describe("autorouting red-team adversarial suite", () => {
 			},
 			{
 				tier: "fast",
-				source: "tiers",
 				requestedSelector: "anthropic/claude-opus-5",
 				authResolvedModel: "anthropic/claude-sonnet-5",
 				effectiveModel: "xai/grok-4.5",
@@ -220,7 +220,6 @@ describe("autorouting red-team adversarial suite", () => {
 	it("applies omitted-tier balanced default and keeps tiers above preset", () => {
 		const effective = validateAutoroutingEffective({
 			enabled: true,
-			preset: "anthropic",
 			tiers: { balanced: ["xai/grok-4.5"] },
 		});
 		expect(
@@ -233,19 +232,17 @@ describe("autorouting red-team adversarial suite", () => {
 		});
 	});
 
-	it("validates every locked preset selector against the published schema pattern", async () => {
+	it("validates every generated tier selector against the published schema pattern", async () => {
 		const schema = (await Bun.file(
 			new URL("../../../schemas/config.schema.json", import.meta.url).pathname,
-		).json()) as any;
+		).json()) as Record<string, any>;
 		const tierSchema = schema.properties.task.properties.autorouting.properties.tiers;
 		expect(Object.keys(tierSchema.properties)).toEqual([...AUTOROUTING_TIERS]);
 		expect(tierSchema.additionalProperties).toBe(false);
 		const pattern = new RegExp(AUTOROUTING_SELECTOR_PATTERN);
-		for (const presetId of AUTOROUTING_PRESET_IDS) {
-			for (const selectors of Object.values(AUTOROUTING_PRESETS[presetId])) {
-				for (const selector of selectors ?? []) expect(pattern.test(selector)).toBe(true);
-			}
-		}
+		const generated = { fast: ["alpha/fast"], balanced: ["beta/balanced"], strong: ["gamma/strong"] };
+		for (const selectors of Object.values(generated))
+			for (const selector of selectors) expect(pattern.test(selector)).toBe(true);
 	});
 
 	it("exercises the subprocess seam with terminal-model evidence", async () => {
@@ -269,7 +266,6 @@ describe("autorouting red-team adversarial suite", () => {
 				modelOverride: options.modelOverride,
 				routing: {
 					tier: "fast",
-					source: "tiers",
 					requestedSelector: "anthropic/claude-opus-5",
 					authResolvedModel: "anthropic/claude-sonnet-5",
 					effectiveModel: "xai/grok-4.5",
@@ -323,7 +319,6 @@ describe("autorouting red-team adversarial suite", () => {
 		const hostileModel = `provider/" <model attr='x'>&`;
 		const evidence: TaskRoutingEvidence = {
 			tier: "fast",
-			source: "tiers",
 			requestedSelector: "anthropic/claude-opus-5",
 			effectiveModel: hostileModel,
 			substitutions: ["assistant_model_mismatch"],
@@ -362,7 +357,6 @@ describe("autorouting red-team adversarial suite", () => {
 		const hostile = "\x1b]0;pwned\x07\x1b[2Jprovider/model\x07\tx\nINJECTED-RESULT-ROW\r\nINJECTED-CRLF-ROW";
 		const evidence: TaskRoutingEvidence = {
 			tier: "fast",
-			source: "tiers",
 			requestedSelector: "anthropic/claude-opus-5",
 			effectiveModel: hostile,
 			substitutions: [],
@@ -411,7 +405,6 @@ describe("autorouting red-team adversarial suite", () => {
 it("preserves synthetic cancellation evidence and fresh resume markers", () => {
 	const cancelled: TaskRoutingEvidence = {
 		tier: "fast",
-		source: "tiers",
 		requestedSelector: "anthropic/claude-haiku-4-5",
 		notExecuted: true,
 		substitutions: [],
@@ -422,12 +415,11 @@ it("preserves synthetic cancellation evidence and fresh resume markers", () => {
 	expect(cancelled.notExecuted).toBe(true);
 	const resumed: TaskRoutingEvidence = {
 		tier: "fast",
-		source: "tiers",
 		requestedSelector: "anthropic/claude-opus-5",
 		effectiveModel: "anthropic/claude-opus-5",
 		substitutions: [],
 		freshOnResume: true,
-		note: "fast; tiers; freshOnResume",
+		note: "balanced; freshOnResume",
 	};
 	expect(() => assertRoutingEvidenceInvariant(resumed)).not.toThrow();
 	expect(resumed.freshOnResume).toBe(true);
@@ -438,7 +430,6 @@ describe("autorouting preflight red-team evidence", () => {
 	it("rejects invalid phase pairing and oversized selectors fail closed", () => {
 		const base = {
 			tier: "fast" as const,
-			source: "tiers" as const,
 			requestedSelector: "anthropic/model",
 			substitutions: [],
 			notExecuted: true as const,

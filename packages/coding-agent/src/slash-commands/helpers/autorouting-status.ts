@@ -1,5 +1,11 @@
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
-import { AUTOROUTING_TIERS, type AutoroutingEffective } from "../../config/autorouting-contract";
+import {
+	AUTOROUTING_TIERS,
+	type AutoroutingEffective,
+	type AutoroutingProvenance,
+	matchesRecordedTiersFingerprint,
+	validateAutoroutingProvenance,
+} from "../../config/autorouting-contract";
 import { validateDisplayLine } from "../../modes/components/ansi-display-validator";
 
 /** Longest rendered chain/diagnostic before truncation. */
@@ -14,21 +20,32 @@ function displaySafe(text: string): string {
 	return truncateToWidth(validateDisplayLine(replaceTabs(text)), MAX_STATUS_LINE_WIDTH);
 }
 
-/**
- * Render the durable autorouting state as plain text.
- *
- * Only settings-derived facts are reported; catalog freshness and generated
- * provenance belong to the interactive smart-routing panel.
- */
-export function buildAutoroutingStatusReport(effective: AutoroutingEffective): string {
+export type AutoroutingStatusSnapshot = {
+	effective: AutoroutingEffective;
+	tiers: unknown;
+	provenance: AutoroutingProvenance | undefined;
+};
+
+/** Render settings-derived autorouting state without consulting registry/auth. */
+export function buildAutoroutingStatusReport(snapshot: AutoroutingStatusSnapshot): string {
+	const { effective, tiers, provenance } = snapshot;
 	if (!effective.active) {
 		const detail =
 			effective.issue?.detail ?? "Autorouting is disabled; every Task item uses manual model resolution.";
 		return `Autorouting: off\n${displaySafe(detail)}`;
 	}
-	const source =
-		effective.source === "tiers" ? "generated/explicit tiers" : `preset ${displaySafe(effective.source.preset)}`;
-	const lines = [`Autorouting: on (${source})`];
+	const provenanceIssues = provenance === undefined ? [] : validateAutoroutingProvenance(provenance);
+	const malformed = provenanceIssues.length > 0;
+	const generated = !malformed && provenance !== undefined && matchesRecordedTiersFingerprint(provenance, tiers);
+	const label = malformed
+		? "hand-authored tiers"
+		: generated
+			? "generated"
+			: provenance === undefined
+				? "hand-authored tiers"
+				: "generated, hand-edited";
+	const lines = [`Autorouting: on (${label})`];
+	if (malformed) lines.push("Recorded generation provenance is invalid; treating tiers as hand-authored.");
 	for (const tier of AUTOROUTING_TIERS) {
 		const chain = effective.map[tier];
 		const rendered = chain && chain.length > 0 ? displaySafe(chain.join(" -> ")) : "(unmapped, falls back to manual)";

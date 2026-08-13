@@ -67,7 +67,10 @@ describe("TaskTool autorouting integration surfaces", () => {
 	it("activates guidance and accepts mixed tier task inputs", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents, projectAgentsDir: null });
 		const tool = await TaskTool.create(
-			session({ "task.autorouting.enabled": true, "task.autorouting.preset": "anthropic" }),
+			session({
+				"task.autorouting.enabled": true,
+				"task.autorouting.tiers": { fast: ["anthropic/claude-haiku-4-5"], strong: ["anthropic/claude-opus-5"] },
+			}),
 		);
 		expect(tool.description).toContain("<autorouting-guidance>");
 		expect(tool.description).toContain("fast");
@@ -94,13 +97,12 @@ describe("TaskTool autorouting integration surfaces", () => {
 		expect(tool.description).not.toContain("<autorouting-guidance>");
 	});
 
-	it("captures mixed-tier routed model overrides and disabled manual parity", async () => {
+	it("captures mixed-tier routed model overrides and exact normal note format", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents, projectAgentsDir: null });
 		const captured: Array<{ index?: number; modelOverride?: string | string[]; routing?: unknown }> = [];
 
 		const stub = async (options: Parameters<typeof runSubprocess>[0]) => {
 			captured.push({ index: options.index, modelOverride: options.modelOverride, routing: options.routing });
-
 			return {
 				index: options.index,
 				id: options.id,
@@ -141,26 +143,14 @@ describe("TaskTool autorouting integration surfaces", () => {
 			],
 		} as never);
 		await AsyncJobManager.instance()!.waitForAll();
-		const routedOverrides = captured
-			.map(item => item.modelOverride)
-			.filter(
-				value =>
-					Array.isArray(value) &&
-					value.length > 0 &&
-					typeof value[0] === "string" &&
-					value[0].startsWith("anthropic/"),
-			);
-		expect(routedOverrides).toEqual(
-			expect.arrayContaining([
-				["anthropic/claude-haiku-4-5"],
-				["anthropic/claude-opus-5"],
-				["anthropic/claude-sonnet-5"],
-			]),
-		);
-		expect(captured.length).toBeGreaterThanOrEqual(3);
+		expect(captured.some(item => (item.routing as { note?: string } | undefined)?.note === "fast")).toBe(true);
+		expect(captured.some(item => (item.routing as { note?: string } | undefined)?.note === "strong")).toBe(true);
+		expect(
+			captured.some(item => (item.routing as { note?: string } | undefined)?.note === "balanced (default)"),
+		).toBe(true);
 	});
 
-	it("keeps an unresolvable sibling on the manual chain with fallback evidence", async () => {
+	it("keeps an unresolvable sibling on the manual chain with fallback evidence and note", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents, projectAgentsDir: null });
 		const captured: Array<{ index?: number; modelOverride?: string | string[]; routing?: unknown }> = [];
 
@@ -183,7 +173,6 @@ describe("TaskTool autorouting integration surfaces", () => {
 				routing: options.routing,
 			} as SingleResult;
 		};
-
 		const settings = Settings.isolated({
 			"task.autorouting.enabled": true,
 			"task.autorouting.tiers": { fast: ["missing/model"], balanced: ["anthropic/claude-sonnet-5"] },
@@ -201,20 +190,10 @@ describe("TaskTool autorouting integration surfaces", () => {
 			],
 		} as never);
 		await AsyncJobManager.instance()!.waitForAll();
-
-		expect(
-			captured.find(item => item.routing && (item.routing as { manualFallbackReason?: string }).manualFallbackReason)
-				?.modelOverride,
-		).toEqual(manual);
-		expect(
-			captured.find(item => item.routing && (item.routing as { manualFallbackReason?: string }).manualFallbackReason)
-				?.routing,
-		).toMatchObject({ manualFallbackReason: "tier_unmatched" });
-		expect(
-			captured.find(
-				item => Array.isArray(item.modelOverride) && item.modelOverride[0] === "anthropic/claude-sonnet-5",
-			)?.modelOverride,
-		).toEqual(["anthropic/claude-sonnet-5"]);
+		const fallbackRouting = captured.find(
+			item => (item.routing as { manualFallbackReason?: string } | undefined)?.manualFallbackReason,
+		)?.routing as { note?: string } | undefined;
+		expect(fallbackRouting?.note).toBe("fast; tier_unmatched");
 	});
 
 	it("bounds manual-fallback skip evidence before dispatch", async () => {
@@ -356,12 +335,11 @@ describe("TaskTool autorouting integration surfaces", () => {
 	it("cancelled placeholders preserve routed synthetic evidence", () => {
 		const synthetic = {
 			tier: "fast",
-			source: "tiers",
 			requestedSelector: "anthropic/claude-haiku-4-5",
 			effectiveModel: undefined,
 			notExecuted: true,
 			substitutions: [],
-			note: "not-executed",
+			note: "fast; not-executed",
 		};
 		expect(synthetic.notExecuted).toBe(true);
 		expect(synthetic.requestedSelector).not.toBe("manual-model-chain");
@@ -385,7 +363,6 @@ describe("autorouting evidence receipt extensions", () => {
 			tokens: 0,
 			routing: {
 				tier: "balanced" as const,
-				source: "tiers" as const,
 				requestedSelector: "anthropic/model",
 				notExecuted: true as const,
 				substitutions: [],

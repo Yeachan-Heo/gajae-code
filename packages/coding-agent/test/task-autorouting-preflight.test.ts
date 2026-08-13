@@ -37,7 +37,6 @@ const agent = {
 
 const routing: TaskRoutingEvidence = {
 	tier: "balanced",
-	source: "tiers",
 	requestedSelector: "anthropic/model",
 	effectiveModel: "anthropic/model",
 	substitutions: [],

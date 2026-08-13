@@ -1995,14 +1995,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								tier: task.tier ?? "balanced",
 								requestedTier: task.tier,
 								...(task.tier === undefined ? { defaultTierApplied: true as const } : {}),
-								source:
-									effectiveAutorouting.source === "tiers"
-										? ("tiers" as const)
-										: { preset: effectiveAutorouting.source.preset },
 								attemptedSelectorCount: 0,
 								reason: "tier_unmatched" as const,
 							}
 						: { kind: "disabled" as const };
+
 				routingByIndex.set(i, outcome);
 				if (outcome.kind === "disabled" || !routingSnapshot || !effectiveAutorouting.active) continue;
 
@@ -2079,12 +2076,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					tier: outcome.tier,
 					requestedTier: outcome.requestedTier,
 					defaultTierApplied: outcome.defaultTierApplied,
-					source: outcome.source,
 					requestedSelector: outcome.kind === "routed" ? outcome.pinnedSelector : "manual-model-chain",
 					notExecuted: true,
 					substitutions: [],
 					manualFallbackReason: outcome.kind === "manual-fallback" ? outcome.reason : undefined,
-					note: `${outcome.tier}; ${outcome.source === "tiers" ? "tiers" : `preset:${outcome.source.preset}`}; ${outcome.kind === "manual-fallback" ? outcome.reason : "not-executed"}`,
+					note: `${outcome.tier}; ${outcome.kind === "manual-fallback" ? outcome.reason : "not-executed"}`,
 				};
 			};
 
@@ -2189,18 +2185,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					freshOnResume = false,
 				): TaskRoutingEvidence | undefined => {
 					if (!outcome || outcome.kind === "disabled") return undefined;
-					const sourceNote = outcome.source === "tiers" ? "tiers" : `preset:${outcome.source.preset}`;
 					const noteParts = [
 						`${outcome.tier}${outcome.defaultTierApplied ? " (default)" : ""}`,
-						sourceNote,
 						outcome.kind === "manual-fallback" ? outcome.reason : undefined,
 						freshOnResume ? "freshOnResume" : undefined,
-					].filter(Boolean);
+					].filter((part): part is string => part !== undefined);
 					return {
 						tier: outcome.tier,
 						requestedTier: outcome.requestedTier,
 						defaultTierApplied: outcome.defaultTierApplied,
-						source: outcome.source,
 						requestedSelector: outcome.kind === "routed" ? outcome.pinnedSelector : "manual-model-chain",
 						effectiveModel: outcome.kind === "routed" ? outcome.pinnedSelector : "manual-model-chain",
 						substitutions: [],

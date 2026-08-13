@@ -2,15 +2,14 @@ import { describe, expect, it } from "bun:test";
 import type { Model } from "@gajae-code/ai";
 import { normalizeTierSelector, resolveTaskRouting } from "../src/config/autorouting";
 import {
-	AUTOROUTING_PRESET_IDS,
-	AUTOROUTING_PRESETS,
 	AUTOROUTING_SELECTOR_DESCRIPTION,
 	AUTOROUTING_TIERS,
 	isMeaningfulTierMap,
-	resolveTierMap,
+	normalizeTierMap,
 	validateAutoroutingEffective,
 	validateAutoroutingLocal,
 } from "../src/config/autorouting-contract";
+
 import { Settings } from "../src/config/settings";
 import { reconcileSettingsSchema } from "../src/config/settings-schema";
 import { finalizeRoutingEvidence } from "../src/task/executor";
@@ -38,21 +37,18 @@ const snapshot = [
 	model("openrouter", "route:model:free"),
 ];
 
-function active(tiers: Record<string, string[]>, preset?: string) {
-	return validateAutoroutingEffective({ enabled: true, tiers, preset });
+function active(tiers: Record<string, string[]>) {
+	return validateAutoroutingEffective({ enabled: true, tiers });
 }
 
 describe("G001 foundation contract", () => {
-	it("keeps boundary semantics and tiers-over-preset precedence", () => {
+	it("keeps boundary semantics and the generated tier map entry point", () => {
 		expect(AUTOROUTING_TIERS).toEqual(["fast", "balanced", "strong"]);
-		expect(AUTOROUTING_PRESET_IDS).toEqual(["anthropic", "openai-codex", "google", "xai"]);
 		expect(isMeaningfulTierMap({})).toBe(false);
 		expect(isMeaningfulTierMap({ fast: [] })).toBe(false);
 		expect(isMeaningfulTierMap({ fast: ["  "] })).toBe(false);
 		expect(isMeaningfulTierMap({ fast: ["vllm/model"] })).toBe(true);
-		expect(resolveTierMap({ tiers: { fast: ["vllm/model"] }, preset: "anthropic" })).toEqual({
-			fast: ["vllm/model"],
-		});
+		expect(normalizeTierMap({ fast: ["vllm/model"], unknown: ["bad/model"] })).toEqual({ fast: ["vllm/model"] });
 	});
 
 	it("reports local diagnostics and publishes fixed schema keys", async () => {
@@ -70,52 +66,43 @@ describe("G001 foundation contract", () => {
 		).toBe(true);
 		expect(reconcileSettingsSchema({ task: { autorouting: { enabled: true } } }).report.valid).toBe(true);
 		const schema = await Bun.file(new URL("../../../schemas/config.schema.json", import.meta.url).pathname).json();
-		const tiers = schema.properties.task.properties.autorouting.properties.tiers;
+		const autorouting = schema.properties.task.properties.autorouting;
+		const tiers = autorouting.properties.tiers;
 		expect(Object.keys(tiers.properties)).toEqual(["fast", "balanced", "strong"]);
 		expect(tiers.additionalProperties).toBe(false);
 		expect(JSON.stringify(tiers)).toContain('"pattern":"^\\\\s*[pP][iI]/"');
 		expect(JSON.stringify(tiers)).toContain("no pi/<role> role aliases");
+		expect(autorouting.properties.preset).toBeUndefined();
 		const main = await Bun.file(new URL("../src/main.ts", import.meta.url).pathname).text();
-		for (const path of ["task.autorouting.enabled", "task.autorouting.preset", "task.autorouting.tiers"])
-			expect(main).toContain(`"${path}"`);
+		expect(main).toContain('"task.autorouting.enabled"');
+		expect(main).not.toContain('"task.autorouting.preset"');
+		expect(main).toContain('"task.autorouting.tiers"');
 	});
 
-	it("covers locked presets and local vllm behavior", () => {
-		for (const [id, preset] of Object.entries(AUTOROUTING_PRESETS)) {
-			for (const tier of AUTOROUTING_TIERS) {
-				const full = preset[tier]!.map(selector =>
-					model(selector.split("/")[0]!, selector.split("/")[1]!.split(":")[0]!),
-				);
-				expect(
-					resolveTaskRouting({
-						effectiveAutorouting: validateAutoroutingEffective({ enabled: true, preset: id }),
-						requestedTier: tier,
-						availableModels: full,
-					}).kind,
-				).toBe("routed");
-				expect(
-					resolveTaskRouting({
-						effectiveAutorouting: validateAutoroutingEffective({ enabled: true, preset: id }),
-						requestedTier: tier,
-						availableModels: full.slice(-1),
-					}).kind,
-				).toBe("routed");
-				expect(
-					resolveTaskRouting({
-						effectiveAutorouting: validateAutoroutingEffective({ enabled: true, preset: id }),
-						requestedTier: tier,
-						availableModels: [],
-					}),
-				).toMatchObject({ kind: "manual-fallback", reason: "tier_unmatched" });
-			}
+	it("covers generated tier selectors and local vllm behavior", () => {
+		const generated = {
+			fast: ["anthropic/claude-opus-5"],
+			balanced: ["xai/grok-4.5"],
+			strong: ["openrouter/route:model:free"],
+		};
+		for (const tier of AUTOROUTING_TIERS) {
+			const selectors = generated[tier];
+			const full = selectors.map(selector => model(selector.split("/")[0]!, selector.split("/")[1]!));
+			expect(
+				resolveTaskRouting({
+					effectiveAutorouting: validateAutoroutingEffective({ enabled: true, tiers: generated }),
+					requestedTier: tier,
+					availableModels: full,
+				}).kind,
+			).toBe("routed");
+			expect(
+				resolveTaskRouting({
+					effectiveAutorouting: validateAutoroutingEffective({ enabled: true, tiers: generated }),
+					requestedTier: tier,
+					availableModels: [],
+				}),
+			).toMatchObject({ kind: "manual-fallback", reason: "tier_unmatched" });
 		}
-		expect(
-			resolveTaskRouting({
-				effectiveAutorouting: validateAutoroutingEffective({ enabled: true, preset: "anthropic" }),
-				requestedTier: "fast",
-				availableModels: [model("vllm", "local")],
-			}).kind,
-		).toBe("manual-fallback");
 		expect(
 			resolveTaskRouting({
 				effectiveAutorouting: validateAutoroutingEffective({ enabled: true, tiers: { fast: ["vllm/local"] } }),
@@ -156,7 +143,6 @@ describe("T9 precedence and evidence parity", () => {
 	it("keeps evidence model parity and ordered substitutions", () => {
 		const evidence: TaskRoutingEvidence = {
 			tier: "balanced",
-			source: "tiers",
 			requestedSelector: "anthropic/claude-opus-5",
 			effectiveModel: "anthropic/claude-opus-5",
 			substitutions: [],
@@ -226,26 +212,24 @@ describe("G003 routing engine", () => {
 		}
 	});
 
-	it("supports locked preset selectors and disabled/refusal outcomes", () => {
+	it("returns disabled outcomes when no generated tier is materialized", () => {
 		expect(
 			resolveTaskRouting({
-				effectiveAutorouting: active({}, "anthropic"),
+				effectiveAutorouting: active({}),
 				requestedTier: "strong",
 				availableModels: snapshot,
 			}),
-		).toMatchObject({ kind: "routed" });
-		expect(resolveTaskRouting({ effectiveAutorouting: { active: false }, availableModels: snapshot })).toEqual({
-			kind: "disabled",
-		});
+		).toEqual({ kind: "disabled" });
 		const settings = Settings.isolated({ "task.autorouting.enabled": true });
 		expect(settings.getSchemaReport().valid).toBe(false);
-		expect(settings.getSchemaReport().issues[0]?.detail).toContain("anthropic");
+		expect(settings.getSchemaReport().issues[0]?.detail).toContain(
+			"Generate them from the /model smart-routing panel.",
+		);
 	});
 
 	it("asserts routing evidence invariants and substitution order", () => {
 		const evidence: TaskRoutingEvidence = {
 			tier: "strong",
-			source: "tiers",
 			requestedSelector: "anthropic/claude-opus-5:high",
 			authResolvedModel: "anthropic/claude-opus-4-8",
 			effectiveModel: "anthropic/claude-opus-4-8:high",
@@ -279,7 +263,6 @@ describe("G003 routing engine", () => {
 	it("executor finalizer covers direct, auth-substituted, mismatch, and combined ordered substitutions", () => {
 		const routing: TaskRoutingEvidence = {
 			tier: "strong",
-			source: "tiers",
 			requestedSelector: "anthropic/claude-opus-5:high",
 			substitutions: [],
 		};

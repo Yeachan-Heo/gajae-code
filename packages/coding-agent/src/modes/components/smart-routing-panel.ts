@@ -49,7 +49,6 @@ export interface SmartRoutingPanelOptions {
 	/** Advisory drift between the recorded declaration and current provider priority. */
 	providerOrderHint?: AutoroutingProviderOrderHint;
 	enabled: boolean;
-	preset?: string;
 	readOnly: boolean;
 	stale: boolean;
 	preview: SmartRoutingPreview;
@@ -101,8 +100,8 @@ export class SmartRoutingPanelComponent extends Container {
 	readonly #onCancel: () => void;
 	readonly #generatePreview: (draft: AutoroutingSetup) => SmartRoutingPreview;
 	readonly #readOnly: boolean;
-	#preset?: string;
 	#draft: AutoroutingSetup;
+
 	#tiers?: TierMap;
 	#provenance?: AutoroutingProvenance;
 	#enabled: boolean;
@@ -125,8 +124,8 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#onCancel = options.onCancel;
 		this.#generatePreview = options.generatePreview;
 		this.#readOnly = options.readOnly;
-		this.#preset = options.preset;
 		this.#draft = cloneSetup(options.setup);
+
 		this.#tiers = options.tiers ? structuredClone(options.tiers) : undefined;
 		this.#provenance = options.provenance ? structuredClone(options.provenance) : undefined;
 		this.#enabled = options.enabled;
@@ -176,7 +175,6 @@ export class SmartRoutingPanelComponent extends Container {
 		tiers?: TierMap;
 		provenance?: AutoroutingProvenance;
 		enabled: boolean;
-		preset?: string;
 		providerOrderHint?: AutoroutingProviderOrderHint;
 		stale: boolean;
 		preview: SmartRoutingPreview;
@@ -186,7 +184,6 @@ export class SmartRoutingPanelComponent extends Container {
 		this.#provenance = options.provenance ? structuredClone(options.provenance) : undefined;
 		this.#enabled = options.enabled;
 		this.#stale = options.stale;
-		this.#preset = options.preset;
 		this.#providerOrderHint = options.providerOrderHint ? structuredClone(options.providerOrderHint) : undefined;
 		this.#preview = clonePreview(options.preview);
 		this.#providerCursor = Math.min(this.#providerCursor, Math.max(0, this.#draft.providers.length - 1));
@@ -239,20 +236,6 @@ export class SmartRoutingPanelComponent extends Container {
 						"muted",
 						displaySafe(
 							`Declared providers missing from the catalog: ${this.#providerOrderHint.missing.join(", ")}`,
-						),
-					),
-					0,
-					0,
-				),
-			);
-		}
-		if (this.#preset && this.#preset.length > 0 && this.#tiers && Object.keys(this.#tiers).length > 0) {
-			this.addChild(
-				new Text(
-					theme.fg(
-						"warning",
-						displaySafe(
-							`Preset ${this.#preset} is shadowed by generated tiers. Clear generated setup to restore preset routing.`,
 						),
 					),
 					0,

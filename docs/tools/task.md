@@ -157,7 +157,7 @@ Artifacts and side channels:
 
 Off by default. When `task.autorouting.enabled` is `true`, each task item is routed by its `tier` instead of the manual model chain.
 
-- Tier map source: `task.autorouting.tiers` (explicit or generated) wins over `task.autorouting.preset` (`anthropic`, `openai-codex`, `google`, `xai`). Contract in `packages/coding-agent/src/config/autorouting-contract.ts`.
+- Tier map source: `task.autorouting.tiers` (generated from `task.autorouting.setup`; provider order is seeded from `modelProviderOrder` and the model catalog). The removed `task.autorouting.preset` setting no longer participates in routing; enablement without usable tiers falls back to manual model resolution and reports a diagnostic. Contract in `packages/coding-agent/src/config/autorouting-contract.ts`.
 - Selectors are exact `provider/modelId` strings with an optional `:minimal|low|medium|high|xhigh` suffix. Globs, bare model ids, and `pi/<role>` aliases are rejected by the generated config schema.
 - An omitted `tier` routes as `balanced`. A tier with no usable chain falls back to manual resolution for that item alone, with a bounded reason recorded.
 - Preflight tries at most three unique candidates and only advances on transient failures observed before the run starts; there is no mid-run failover. Failed attempts run in staged sessions and attempt-scoped artifacts, so they leave no durable residue.
