@@ -85,7 +85,7 @@ import {
 	createProviderSelectionPolicy,
 	type EffectiveProviderAuth,
 	type ProviderSelectionPolicy,
-	projectProviderOrder,
+	projectCatalogProviderOrder,
 } from "./provider-selection-policy";
 import { type Settings, settings } from "./settings";
 
@@ -3469,19 +3469,7 @@ export class ModelRegistry {
 	 * with case-sensitive exact strings.
 	 */
 	autoroutingProviderOrder(): readonly string[] {
-		const { catalogProviders } = buildProviderSelectionCatalog(this.#models);
-		const catalogSpelling = new Map<string, string>();
-		for (const model of this.#models) {
-			const normalized = model.provider.trim().toLowerCase();
-			if (normalized && !catalogSpelling.has(normalized)) catalogSpelling.set(normalized, model.provider);
-		}
-		const ordered = projectProviderOrder(getConfiguredProviderOrderFromSettings(), catalogProviders);
-		const restored: string[] = [];
-		for (const provider of ordered) {
-			const spelled = catalogSpelling.get(provider);
-			if (spelled !== undefined) restored.push(spelled);
-		}
-		return restored;
+		return projectCatalogProviderOrder(getConfiguredProviderOrderFromSettings(), this.#models);
 	}
 	#providerRankMap(policy: ProviderSelectionPolicy): Map<string, number> {
 		const providerRank = new Map<string, number>();

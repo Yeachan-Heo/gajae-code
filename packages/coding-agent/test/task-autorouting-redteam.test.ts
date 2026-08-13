@@ -10,6 +10,8 @@ import {
 	validateAutoroutingEffective,
 	validateAutoroutingLocal,
 } from "../src/config/autorouting-contract";
+import { generateTierChains } from "../src/config/autorouting-generator";
+import { CURATED_TIER_LABELS } from "../src/config/autorouting-tier-map";
 import { Settings } from "../src/config/settings";
 import type { RenderResultOptions } from "../src/extensibility/custom-tools/types";
 import { getThemeByName } from "../src/modes/theme/theme";
@@ -240,9 +242,34 @@ describe("autorouting red-team adversarial suite", () => {
 		expect(Object.keys(tierSchema.properties)).toEqual([...AUTOROUTING_TIERS]);
 		expect(tierSchema.additionalProperties).toBe(false);
 		const pattern = new RegExp(AUTOROUTING_SELECTOR_PATTERN);
-		const generated = { fast: ["alpha/fast"], balanced: ["beta/balanced"], strong: ["gamma/strong"] };
-		for (const selectors of Object.values(generated))
-			for (const selector of selectors) expect(pattern.test(selector)).toBe(true);
+
+		// Exhaustive, not sampled: the deleted preset loop checked every shipped
+		// selector, so both boundaries it spanned must stay covered here.
+		const curatedKeys = Object.keys(CURATED_TIER_LABELS);
+		// Guards against an empty-map vacuous pass rather than pinning a churn-prone count.
+		expect(curatedKeys.length).toBeGreaterThan(10);
+		for (const key of curatedKeys) expect(pattern.test(key)).toBe(true);
+
+		// Every selector the generator actually emits from the curated catalog.
+		const catalog = curatedKeys.map(key => {
+			const separator = key.indexOf("/");
+			return model(key.slice(0, separator), key.slice(separator + 1));
+		});
+		const providers = [...new Set(catalog.map(entry => entry.provider))];
+		const emitted = generateTierChains({ schema: 1, providers }, undefined, catalog).tiers;
+		const emittedSelectors = Object.values(emitted).flat();
+		expect(emittedSelectors.length).toBeGreaterThan(0);
+		for (const selector of emittedSelectors) {
+			expect(pattern.test(selector)).toBe(true);
+			expect(selector.length).toBeLessThanOrEqual(256);
+		}
+
+		// Negative control: an unfit selector in the same position must be rejected.
+		for (const unfit of ["no-slash", "has space/model", "wild*/card", "trailing/", "/leading", "a/b?c", "a/b[0]"])
+			expect(pattern.test(unfit)).toBe(false);
+		// A colon is legal inside a model id, so only the effort suffix is constrained.
+		expect(pattern.test("anthropic/claude-sonnet-5:high")).toBe(true);
+		expect(pattern.test("anthropic/claude-sonnet-5:medium")).toBe(true);
 	});
 
 	it("exercises the subprocess seam with terminal-model evidence", async () => {

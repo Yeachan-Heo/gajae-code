@@ -166,3 +166,32 @@ export function buildProviderSelectionCatalog(models: readonly Model<Api>[]): Pr
 	}
 	return { catalogProviders, catalogModels };
 }
+/**
+ * Deterministic provider priority for a catalog, returned in the catalog's own
+ * spelling.
+ *
+ * Ordering and de-duplication run on normalized ids, but the result restores each
+ * provider's first-seen catalog spelling because the autorouting generator matches
+ * provider prefixes with case-sensitive exact strings — a lowercased id would
+ * silently empty that provider's tiers. Providers absent from the catalog are
+ * dropped so a dead declaration cannot pollute a generated declarationFingerprint.
+ *
+ * Reads no credentials: it takes a catalog and an explicit order, nothing else.
+ */
+export function projectCatalogProviderOrder(
+	explicitProviderOrder: readonly string[],
+	models: readonly Model<Api>[],
+): string[] {
+	const { catalogProviders } = buildProviderSelectionCatalog(models);
+	const spelling = new Map<string, string>();
+	for (const model of models) {
+		const normalized = model.provider.trim().toLowerCase();
+		if (normalized && !spelling.has(normalized)) spelling.set(normalized, model.provider);
+	}
+	const restored: string[] = [];
+	for (const provider of projectProviderOrder(explicitProviderOrder, catalogProviders)) {
+		const spelled = spelling.get(provider);
+		if (spelled !== undefined) restored.push(spelled);
+	}
+	return restored;
+}
