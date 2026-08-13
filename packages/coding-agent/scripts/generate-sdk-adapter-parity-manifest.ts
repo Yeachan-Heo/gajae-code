@@ -6,36 +6,38 @@ import { type Manifest, type ManifestAdapterRow, validateManifest } from "./mani
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const manifestPath = path.join(repoRoot, "packages/coding-agent/test/manifests/sdk-adapter-parity-v1.json");
+const chatDispositionFile = "packages/coding-agent/test/sdk-adapter-dispositions.test.ts";
+const mcpDispositionFile = "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts";
+const acpDispositionFile = "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts";
+const daemonCliDispositionFile = "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts";
 const adapterTests: Record<Adapter, string[]> = {
-	telegram: ["packages/coding-agent/test/sdk-adapter-dispositions.test.ts"],
-	discord: ["packages/coding-agent/test/sdk-adapter-dispositions.test.ts"],
-	slack: ["packages/coding-agent/test/sdk-adapter-dispositions.test.ts"],
+	telegram: [chatDispositionFile],
+	discord: [chatDispositionFile],
+	slack: [chatDispositionFile],
 	mcp: [
 		"packages/coding-agent/test/sdk-mcp-adapter.test.ts",
 		"packages/coding-agent/test/sdk-mcp-entrypoint-e2e.test.ts",
-		"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+		mcpDispositionFile,
 	],
 	acp: [
 		"packages/coding-agent/test/sdk-acp-adapter.test.ts",
 		"packages/coding-agent/test/sdk-acp-two-client-race.test.ts",
 		"packages/coding-agent/test/sdk-acp-provider-reconnect.test.ts",
-		"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+		acpDispositionFile,
 	],
 	daemonCli: [
 		"packages/coding-agent/test/sdk-daemon-cli-e2e.test.ts",
 		"packages/coding-agent/test/sdk-client.test.ts",
-		"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+		daemonCliDispositionFile,
 	],
 };
-const dispositionTestFile = "packages/coding-agent/test/sdk-adapter-dispositions.test.ts";
+const dispositionChatFile = chatDispositionFile;
 const commandFiles = [
 	...new Set([...Object.values(adapterTests).flat(), "packages/coding-agent/test/sdk-host-wiring.test.ts"]),
 ].sort();
 const commands: Manifest["commands"] = commandFiles.flatMap(file =>
-	file === dispositionTestFile
-		? ["^AD-M-", "^AD-A-", "^AD-L-", "^AD-(T|D|S)-"].map(pattern => ({
-				argv: ["bun", "test", file, "--test-name-pattern", pattern],
-			}))
+	file === dispositionChatFile
+		? [{ argv: ["bun", "test", file, "--test-name-pattern", "^AD-(T|D|S)-"] }]
 		: [{ argv: ["bun", "test", file] }],
 );
 const required = [...commandFiles];
@@ -63,19 +65,26 @@ function adapterTestPrefix(adapter: Adapter): string {
 						? "M"
 						: "A";
 }
+function dispositionFileFor(adapter: Adapter): string {
+	if (adapter === "mcp") return mcpDispositionFile;
+	if (adapter === "acp") return acpDispositionFile;
+	if (adapter === "daemonCli") return daemonCliDispositionFile;
+	return chatDispositionFile;
+}
 function row(adapter: Adapter, operation: (typeof OPERATIONS)[number], secret = false): ManifestAdapterRow {
 	const suffix = secret ? "-secret" : "";
+	const testFile = dispositionFileFor(adapter);
 	return {
 		adapterTestId: `AD-${adapterTestPrefix(adapter)}-${operation.id}${suffix}`,
 		sdkId: operation.sdkId,
 		adapter,
 		disposition: operation.adapterDispositions[adapter],
-		testFile: dispositionTestFile,
+		testFile,
 		testNamePattern: `AD-${adapterTestPrefix(adapter)}-${operation.id}${suffix}`,
 		argv: [
 			"bun",
 			"test",
-			dispositionTestFile,
+			testFile,
 			"--test-name-pattern",
 			`^AD-${adapterTestPrefix(adapter)}-${operation.id}${suffix}:`,
 		],
@@ -127,11 +136,17 @@ async function checkCoverage(manifest: Manifest): Promise<void> {
 			throw new Error(`${row.adapterTestId} must execute its exact test-name pattern.`);
 		const testPath = path.join(repoRoot, row.testFile);
 		const testFile = Bun.file(testPath);
-		if (!(await testFile.exists())) throw new Error(`${row.adapterTestId} test file does not exist: ${row.testFile}`);
+		if (!(await testFile.exists()))
+			throw new Error(`${row.adapterTestId} test file does not exist: ${row.testFile}.`);
 		const testText = await testFile.text();
 		// The disposition suite deliberately generates names from registry IDs. This source check
-		// confirms its name template and the concrete row ID are both present in the registry.
-		if (!testText.includes("AD-$" + "{adapterPrefix[adapter]}-$" + "{operation.id}"))
+		// confirms its name template and the concrete row ID are both present in the test source.
+		// Chat adapters use chatPrefix; machine adapters use adapterPrefix (issue #4475 split).
+		const isChat = row.adapter === "telegram" || row.adapter === "discord" || row.adapter === "slack";
+		const nameTemplate = isChat
+			? "AD-$" + "{chatPrefix[adapter]}-$" + "{operation.id}"
+			: "AD-$" + "{adapterPrefix[adapter]}-$" + "{operation.id}";
+		if (!testText.includes(nameTemplate))
 			throw new Error(`${row.adapterTestId} test name template was not found in ${row.testFile}.`);
 		if (!OPERATIONS.some(operation => row.sdkId === operation.sdkId))
 			throw new Error(`${row.adapterTestId} references an unknown SDK ID.`);

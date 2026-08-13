@@ -295,12 +295,13 @@ describe("test manifest runner", () => {
 	it("rejects incomplete anchored partitions for a required parity file", async () => {
 		const directory = await tempDir();
 		const manifest = await sdkAdapterParityManifest();
-		manifest.commands = manifest.commands.filter(command => command.argv[4] !== "^AD-L-");
+		const daemonCliFile = "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts";
+		manifest.commands = manifest.commands.filter(command => command.argv[2] !== daemonCliFile);
 		const manifestPath = await writeManifest(directory, manifest);
 		const result = run(runner, [manifestPath]);
 		expect(result.exitCode, output(result)).toBe(1);
 		expect(output(result)).toContain(
-			"Manifest required file is not covered by executable commands: packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			`Manifest required file is not covered by executable commands: ${daemonCliFile}`,
 		);
 	});
 	it("does not run parity rows after a behavioral command fails", async () => {
