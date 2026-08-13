@@ -33,7 +33,13 @@ function endpointIncarnation(sessionId: string): string {
 
 async function createServer(
 	root: string,
-	options: { forceStop?: boolean; closeFails?: boolean; closeFailures?: number } = {},
+	options: {
+		forceStop?: boolean;
+		closeFails?: boolean;
+		closeFailures?: number;
+		brokerSessionsOverride?: () => Promise<Array<Record<string, unknown>>>;
+		closeHandler?: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
+	} = {},
 ) {
 	const stateRoot = path.join(root, ".gjc", "coordinator-state");
 	const agentDir = path.join(root, "agent-global");
@@ -96,8 +102,13 @@ async function createServer(
 						opts: { idempotencyKey?: string } = {},
 					) => {
 						controls.push({ operation, input, idempotencyKey: opts.idempotencyKey });
-						if (operation === "session.list") return { ok: true, result: { sessions: await brokerSessions() } };
+						if (operation === "session.list") {
+							if (options.brokerSessionsOverride)
+								return { ok: true, result: { sessions: await options.brokerSessionsOverride() } };
+							return { ok: true, result: { sessions: await brokerSessions() } };
+						}
 						if (operation === "session.close") {
+							if (options.closeHandler) return await options.closeHandler(input);
 							closeAttempts += 1;
 							if (options.closeFails || closeAttempts <= (options.closeFailures ?? 0))
 								return { ok: false, error: { code: "close_refused", message: "SDK refused close" } };
@@ -245,6 +256,318 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		]);
 		expect(await Bun.file(sessionFile("idle")).exists()).toBe(false);
 		expect(await Bun.file(sessionFile("registered")).exists()).toBe(true);
+	});
+
+	describe("DR-1 narrow reap proves exact terminal row after incarnation-bound close", () => {
+		it("reaps when DR-1 retains the exact terminal/non-live incarnation (the bug)", async () => {
+			const root = await tempRoot();
+			const liveRow: Record<string, unknown> = {
+				sessionId: "dr1-ok",
+				locator: { repo: root },
+				live: true,
+				terminal: false,
+				ambiguous: false,
+				endpointGeneration: ENDPOINT_GENERATION,
+				pid: process.pid,
+				endpointMtimeMs: ENDPOINT_MTIME_MS,
+			};
+			const terminalRow: Record<string, unknown> = {
+				sessionId: "dr1-ok",
+				locator: { repo: root },
+				live: false,
+				terminal: true,
+				ambiguous: false,
+				endpointGeneration: ENDPOINT_GENERATION,
+				pid: process.pid,
+				endpointMtimeMs: ENDPOINT_MTIME_MS,
+			};
+			let afterClose = false;
+			const agentDir = `${root}/agent-global`;
+			// need writeBrokerDiscovery manually because createServer does it internally but we need custom rows
+			// create server with override plumbing
+			const server2 = await createServer(root, {
+				brokerSessionsOverride: async () => (afterClose ? [terminalRow] : [liveRow]),
+				closeHandler: async () => {
+					afterClose = true;
+					return { ok: true, result: {} } as any;
+				},
+			});
+			await writeSession(server2.sessionFile("dr1-ok"), root, "dr1-ok", { ephemeral: true });
+			// patch: recreate with afterClose-aware override (createServer already captured root stateRoot; reuse but replace brokerSessionsOverride closure)
+			// Instead construct a fresh server directly to avoid stale liveRow reference mismatch: rebuild here
+			const stateRoot = `${root}/.gjc/coordinator-state`;
+			await writeBrokerDiscovery(agentDir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "test",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://sdk.example.test",
+				token: "test-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			let sawClose2 = false;
+			const controls2: Array<{ operation: string }> = [];
+			const srv = createCoordinatorMcpServer({
+				env: {
+					GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+					GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+					GJC_COORDINATOR_MCP_PROFILE: "local",
+					GJC_COORDINATOR_MCP_REPO: "repo",
+				},
+				services: {
+					getAgentDir: () => agentDir,
+					connectBroker: async () =>
+						({
+							global: async (op: string, input: Record<string, unknown>, _opts: any = {}) => {
+								controls2.push({ operation: op });
+								if (op === "session.list")
+									return { ok: true, result: { sessions: sawClose2 ? [terminalRow] : [liveRow] } };
+								if (op === "session.close") {
+									sawClose2 = true;
+									return { ok: true, result: { sessionId: input.sessionId } };
+								}
+								return { ok: true, result: {} };
+							},
+							close: async () => {},
+						}) as unknown as import("../../src/sdk/client/client").SdkClient,
+				},
+			});
+			const res = await srv.callTool("gjc_coordinator_stop_session", { session_id: "dr1-ok", allow_mutation: true });
+			expect(res).toMatchObject({ ok: true, closed: true });
+			expect(await Bun.file(`${stateRoot}/local/repo/sessions/dr1-ok.json`).exists()).toBe(false);
+			// idempotent completed deletion receipt
+			const res2 = await srv.callTool("gjc_coordinator_stop_session", {
+				session_id: "dr1-ok",
+				allow_mutation: true,
+			});
+			expect(res2).toMatchObject({ ok: true, closed: true });
+			// WAL completed via idempotent second call already verified; no hard-coded registry path
+		});
+
+		it("fails closed on rotated generation", async () => {
+			const root = await tempRoot();
+			const liveRow: Record<string, unknown> = {
+				sessionId: "rotated",
+				locator: { repo: root },
+				live: true,
+				terminal: false,
+				ambiguous: false,
+				endpointGeneration: ENDPOINT_GENERATION,
+				pid: process.pid,
+				endpointMtimeMs: ENDPOINT_MTIME_MS,
+			};
+			const rotatedRow: Record<string, unknown> = {
+				sessionId: "rotated",
+				locator: { repo: root },
+				live: false,
+				terminal: true,
+				ambiguous: false,
+				endpointGeneration: ENDPOINT_GENERATION + 1,
+				pid: process.pid,
+				endpointMtimeMs: ENDPOINT_MTIME_MS,
+			};
+			let sawClose = false;
+			const stateRoot = `${root}/.gjc/coordinator-state`;
+			const agentDir = `${root}/agent-global`;
+			await writeBrokerDiscovery(agentDir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "test",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://sdk.example.test",
+				token: "test-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			await Bun.write(
+				`${stateRoot}/local/repo/sessions/rotated.json`,
+				JSON.stringify({
+					session_id: "rotated",
+					cwd: root,
+					created_at: new Date().toISOString(),
+					broker_workspace: await fs.realpath(root),
+					endpoint_generation: ENDPOINT_GENERATION,
+					endpoint_incarnation: endpointIncarnation("rotated"),
+					ephemeral: true,
+				}),
+			);
+			await fs.mkdir(`${stateRoot}/local/repo/sessions`, { recursive: true }).catch(() => {});
+			const srv = createCoordinatorMcpServer({
+				env: {
+					GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+					GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+					GJC_COORDINATOR_MCP_PROFILE: "local",
+					GJC_COORDINATOR_MCP_REPO: "repo",
+				},
+				services: {
+					getAgentDir: () => agentDir,
+					connectBroker: async () =>
+						({
+							global: async (op: string, _input: Record<string, unknown>) => {
+								if (op === "session.list")
+									return { ok: true, result: { sessions: sawClose ? [rotatedRow] : [liveRow] } };
+								if (op === "session.close") {
+									sawClose = true;
+									return { ok: true, result: {} };
+								}
+								return { ok: true, result: {} };
+							},
+							close: async () => {},
+						}) as unknown as import("../../src/sdk/client/client").SdkClient,
+				},
+			});
+			// ensure session file exists (createServer path would have created it)
+			await writeSession(`${stateRoot}/local/repo/sessions/rotated.json`, root, "rotated", { ephemeral: true });
+			const res = await srv.callTool("gjc_coordinator_stop_session", {
+				session_id: "rotated",
+				allow_mutation: true,
+			});
+			expect(res.ok).toBe(false);
+			expect((res as any).reason === "endpoint_stale" || (res as any).detail === "endpoint_stale").toBe(true);
+			expect(await Bun.file(`${stateRoot}/local/repo/sessions/rotated.json`).exists()).toBe(true);
+		});
+
+		it("fails closed on ambiguous retained row", async () => {
+			const root = await tempRoot();
+			const liveRow: Record<string, unknown> = {
+				sessionId: "amb",
+				locator: { repo: root },
+				live: true,
+				terminal: false,
+				ambiguous: false,
+				endpointGeneration: ENDPOINT_GENERATION,
+				pid: process.pid,
+				endpointMtimeMs: ENDPOINT_MTIME_MS,
+			};
+			const ambRow: Record<string, unknown> = {
+				sessionId: "amb",
+				locator: { repo: root },
+				live: false,
+				terminal: true,
+				ambiguous: true,
+				endpointGeneration: ENDPOINT_GENERATION,
+				pid: process.pid,
+				endpointMtimeMs: ENDPOINT_MTIME_MS,
+			};
+			let sawClose = false;
+			const stateRoot = `${root}/.gjc/coordinator-state`;
+			const agentDir = `${root}/agent-global`;
+			await writeBrokerDiscovery(agentDir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "test",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://sdk.example.test",
+				token: "test-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			const srv = createCoordinatorMcpServer({
+				env: {
+					GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+					GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+					GJC_COORDINATOR_MCP_PROFILE: "local",
+					GJC_COORDINATOR_MCP_REPO: "repo",
+				},
+				services: {
+					getAgentDir: () => agentDir,
+					connectBroker: async () =>
+						({
+							global: async (op: string) => {
+								if (op === "session.list")
+									return { ok: true, result: { sessions: sawClose ? [ambRow] : [liveRow] } };
+								if (op === "session.close") {
+									sawClose = true;
+									return { ok: true, result: {} };
+								}
+								return { ok: true, result: {} };
+							},
+							close: async () => {},
+						}) as unknown as import("../../src/sdk/client/client").SdkClient,
+				},
+			});
+			await writeSession(`${stateRoot}/local/repo/sessions/amb.json`, root, "amb", { ephemeral: true });
+			const res = await srv.callTool("gjc_coordinator_stop_session", { session_id: "amb", allow_mutation: true });
+			expect(res.ok).toBe(false);
+			expect(await Bun.file(`${stateRoot}/local/repo/sessions/amb.json`).exists()).toBe(true);
+		});
+
+		it("fails closed when retained row is still live", async () => {
+			const root = await tempRoot();
+			const liveRow: Record<string, unknown> = {
+				sessionId: "still-live",
+				locator: { repo: root },
+				live: true,
+				terminal: false,
+				ambiguous: false,
+				endpointGeneration: ENDPOINT_GENERATION,
+				pid: process.pid,
+				endpointMtimeMs: ENDPOINT_MTIME_MS,
+			};
+			let sawClose = false;
+			const stateRoot = `${root}/.gjc/coordinator-state`;
+			const agentDir = `${root}/agent-global`;
+			await writeBrokerDiscovery(agentDir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "test",
+				ownerId: "test",
+				pid: process.pid,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://sdk.example.test",
+				token: "test-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			const srv = createCoordinatorMcpServer({
+				env: {
+					GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+					GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+					GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+					GJC_COORDINATOR_MCP_PROFILE: "local",
+					GJC_COORDINATOR_MCP_REPO: "repo",
+				},
+				services: {
+					getAgentDir: () => agentDir,
+					connectBroker: async () =>
+						({
+							global: async (op: string) => {
+								if (op === "session.list")
+									return { ok: true, result: { sessions: sawClose ? [liveRow] : [liveRow] } };
+								if (op === "session.close") {
+									sawClose = true;
+									return { ok: true, result: {} };
+								}
+								return { ok: true, result: {} };
+							},
+							close: async () => {},
+						}) as unknown as import("../../src/sdk/client/client").SdkClient,
+				},
+			});
+			await writeSession(`${stateRoot}/local/repo/sessions/still-live.json`, root, "still-live", {
+				ephemeral: true,
+			});
+			const res = await srv.callTool("gjc_coordinator_stop_session", {
+				session_id: "still-live",
+				allow_mutation: true,
+			});
+			expect(res.ok).toBe(false);
+			expect(await Bun.file(`${stateRoot}/local/repo/sessions/still-live.json`).exists()).toBe(true);
+		});
 	});
 
 	it("reuses the close idempotency key when the idle reaper retries", async () => {

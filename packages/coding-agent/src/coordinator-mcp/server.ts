@@ -3529,16 +3529,49 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			await advanceDeletion(questionPaths, deletionId, "broker_closed");
 
 			try {
-				await exactBrokerSessionAuthority(id, workspace);
-				return { ok: false, reason: "endpoint_stale", closed: false };
+				const listing = await paginatedBrokerSessionList(workspace, { cwd: workspace });
+				const rows = jsonRecords(
+					Array.isArray((listing as Record<string, unknown>).sessions)
+						? ((listing as Record<string, unknown>).sessions as unknown[])
+						: [],
+				);
+				const candidates: Array<Record<string, unknown>> = [];
+				for (const row of rows) {
+					if (brokerSessionId(row) !== id) continue;
+					const declaredWorkspace = brokerSessionScope(row);
+					if (!declaredWorkspace) continue;
+					let canonicalDeclared: string;
+					try {
+						canonicalDeclared = await canonicalBrokerWorkspace(declaredWorkspace);
+					} catch {
+						continue;
+					}
+					if (sameCanonicalPath(canonicalDeclared, workspace, platform)) candidates.push(row);
+				}
+				if (candidates.length === 0) {
+					// No retained row: proven deletion (session_deleted) after successful close.
+				} else if (candidates.length !== 1) {
+					return { ok: false, reason: "close_failed", detail: "endpoint_stale", closed: false };
+				} else {
+					const row = candidates[0]!;
+					const gen = brokerEndpointGeneration(row);
+					const inc = brokerEndpointIncarnation(row, id);
+					const genMatches = gen === persistedGeneration;
+					const incMatches = inc === persistedIncarnation;
+					if (!genMatches || !incMatches) return { ok: false, reason: "endpoint_stale", closed: false };
+					const isAmbiguous = row.ambiguous === true;
+					const isTerminalUncertain =
+						row.terminalUncertain === true || (row as Record<string, unknown>).terminal_uncertain === true;
+					const isTerminal = row.terminal === true;
+					const isLive = row.live === true;
+					if (isAmbiguous || isTerminalUncertain)
+						return { ok: false, reason: "close_failed", detail: "endpoint_stale", closed: false };
+					if (!isTerminal || isLive) return { ok: false, reason: "endpoint_stale", closed: false };
+				}
 			} catch (error) {
-				if (!(error instanceof SdkClientError) || error.code !== "not_found")
-					return {
-						ok: false,
-						reason: "close_failed",
-						detail: error instanceof SdkClientError ? error.code : "unavailable",
-						closed: false,
-					};
+				if (error instanceof SdkClientError)
+					return { ok: false, reason: "close_failed", detail: error.code, closed: false };
+				return { ok: false, reason: "close_failed", detail: "unavailable", closed: false };
 			}
 			await fs.rm(sessionFile(id), { force: true });
 			await fs.rm(sessionStateFile(namespaceDir, id), { force: true });
