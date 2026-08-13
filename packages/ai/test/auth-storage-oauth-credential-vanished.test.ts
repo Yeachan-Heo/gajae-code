@@ -118,4 +118,78 @@ describe("AuthStorage OAuth credential vanished from the store", () => {
 		expect(refreshAttempts).toBe(0);
 		expect(authStorage.hasOAuth("anthropic")).toBe(false);
 	});
+
+	test("falls through to a healthy sibling credential without disabling it", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "vanishing-access",
+				refresh: "vanishing-refresh",
+				expires: Date.now() - 60_000,
+				accountId: "account-vanishing",
+			},
+			{
+				type: "oauth",
+				access: "healthy-access",
+				refresh: "healthy-refresh",
+				expires: Date.now() + 60 * 60_000,
+				accountId: "account-healthy",
+			},
+		]);
+		const rows = store.listAuthCredentials("anthropic");
+		expect(rows).toHaveLength(2);
+		store.deleteAuthCredential(rows[0]!.id, "oauth refresh failed: invalid_grant");
+
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, creds) => {
+			const credential = creds[provider];
+			if (!credential) throw new Error("missing credential");
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			expect(await authStorage!.getApiKey("anthropic", "session-sibling")).toBe("healthy-access");
+		});
+
+		// The surviving row must stay active: a vanished sibling is a store-state
+		// change, not an auth failure attributable to the credential we fell back to.
+		expect(events).toHaveLength(0);
+		const active = store.listAuthCredentials("anthropic");
+		expect(active).toHaveLength(1);
+		expect(active[0]!.credential).toMatchObject({ type: "oauth", access: "healthy-access" });
+	});
+
+	test("bounds store reloads when the row stays absent", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "expired-access",
+				refresh: "revoked-refresh",
+				expires: Date.now() - 60_000,
+			},
+		]);
+		const staleId = store.listAuthCredentials("anthropic")[0]!.id;
+
+		// A peer keeps re-inserting and re-disabling the provider's row, so every
+		// reload observes a fresh id that is gone again by the time it is tried.
+		let snapshotReloads = 0;
+		const realList = store.listAuthCredentials.bind(store);
+		vi.spyOn(store, "listAuthCredentials").mockImplementation((provider?: string) => {
+			if (provider === undefined) snapshotReloads += 1;
+			return realList(provider);
+		});
+		store.deleteAuthCredential(staleId, "oauth refresh failed: invalid_grant");
+
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			expect(await authStorage!.getApiKey("anthropic", "session-absent")).toBeUndefined();
+		});
+
+		// Recovery has to terminate: one reload settles this case, and the shared
+		// budget caps any pathological peer at a small constant.
+		expect(snapshotReloads).toBeGreaterThan(0);
+		expect(snapshotReloads).toBeLessThanOrEqual(4);
+	});
 });
