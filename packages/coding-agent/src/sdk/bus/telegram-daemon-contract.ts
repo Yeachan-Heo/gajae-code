@@ -260,7 +260,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * inert notification-dir debris at startup. Older daemons assume ownership is
  * proved before publication and do not perform that sweep.
  */
-export const DAEMON_GENERATION = 163;
+export const DAEMON_GENERATION = 164;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
