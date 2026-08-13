@@ -3548,9 +3548,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		session.setActiveModelProfile(startupActiveModelProfile);
 		session.configWarnings.push(...contextFileWarnings);
+		// Determined once, here, where settings are already available. Recorded as a
+		// durable config warning rather than an event: session events are emitted into
+		// #eventListenerSnapshot synchronously with no buffering, and this factory has
+		// not returned yet, so nothing can be subscribed. An event emitted here would
+		// be dropped unconditionally. Interactive and print read configWarnings; ACP
+		// delivery needs a host-owned read that does not exist yet.
 		if (settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active) {
 			session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
-			session.emitNotice("warning", AUTOROUTING_INACTIVE_WARNING, "autorouting");
 		}
 		hasSession = true;
 		const sessionAsyncJobManager = asyncJobManager;
