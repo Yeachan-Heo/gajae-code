@@ -1809,6 +1809,8 @@ export class SelectorController {
 	showThemeSelector(): void {
 		getAvailableThemes().then(availableThemes => {
 			const initialTheme = getCurrentThemeName() ?? "red-claw";
+			const settingsPath = getDetectedThemeSettingsPath();
+			const savedTheme = settings.get(settingsPath);
 			this.showSelector(done => {
 				const restoreAndClose = () => {
 					void restoreThemePreview(initialTheme).then(result => {
@@ -1831,7 +1833,7 @@ export class SelectorController {
 							return;
 						}
 						try {
-							settings.set(getDetectedThemeSettingsPath(), themeName);
+							settings.set(settingsPath, themeName);
 						} catch (error) {
 							if (!settings.canWriteDurableConfig()) {
 								this.ctx.showError(error instanceof Error ? error.message : String(error));
@@ -1843,6 +1845,14 @@ export class SelectorController {
 						void restoreThemePreview(themeName).then(result => {
 							if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
 								this.ctx.showError(`Failed to apply theme: ${result.error}`);
+								settings.set(settingsPath, savedTheme);
+								void restoreThemePreview(initialTheme).then(recovery => {
+									if (!recovery.success && recovery.error && !isThemePreviewSuperseded(recovery)) {
+										this.ctx.showError(`Failed to restore theme preview: ${recovery.error}`);
+									}
+									this.#refreshThemeUi();
+								});
+								return;
 							}
 							this.#refreshThemeUi();
 							done();

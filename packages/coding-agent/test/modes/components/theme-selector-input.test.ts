@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { ThemeSelectorComponent } from "@gajae-code/coding-agent/modes/components/theme-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
+import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
 import { initTheme, previewTheme, restoreThemePreview, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 
@@ -161,5 +162,46 @@ describe("ThemeSelectorComponent input handling", () => {
 		expect(ctx.ui.setFocus).toHaveBeenLastCalledWith(ctx.editor);
 		expect(ctx.statusLine.invalidate).toHaveBeenCalled();
 		expect(ctx.updateEditorTopBorder).toHaveBeenCalled();
+	});
+
+	it("keeps /theme open and restores its persisted mapping when confirmation fails", async () => {
+		const editorContainer = {
+			children: [] as unknown[],
+			clear() {
+				this.children = [];
+			},
+			addChild(child: unknown) {
+				this.children.push(child);
+			},
+		};
+		const ctx = {
+			editorContainer,
+			editor: {},
+			ui: { setFocus: vi.fn(), requestRender: vi.fn(), terminal: { columns: 120 } },
+			statusLine: { invalidate: vi.fn() },
+			updateEditorTopBorder: vi.fn(),
+			showError: vi.fn(),
+		} as unknown as InteractiveModeContext;
+		const restore = vi.spyOn(themeModule, "restoreThemePreview");
+		restore.mockResolvedValueOnce({ success: false, error: "missing selected theme" });
+		restore.mockResolvedValueOnce({ success: true });
+
+		const controller = new SelectorController(ctx);
+		controller.showThemeSelector();
+		for (let i = 0; i < 10 && editorContainer.children.length === 0; i++) {
+			await Bun.sleep(1);
+		}
+		const selector = editorContainer.children[0];
+		if (!(selector instanceof ThemeSelectorComponent)) {
+			throw new Error("Expected /theme to mount ThemeSelectorComponent");
+		}
+
+		selector.getSelectList().handleInput("\x1b[B");
+		selector.getSelectList().handleInput("\n");
+		await Bun.sleep(1);
+
+		expect(settings.get("theme.dark")).toBe("red-claw");
+		expect(editorContainer.children[0]).toBe(selector);
+		expect(ctx.showError).toHaveBeenCalledWith("Failed to apply theme: missing selected theme");
 	});
 });
