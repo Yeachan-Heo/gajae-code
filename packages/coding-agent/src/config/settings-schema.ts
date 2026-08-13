@@ -323,7 +323,11 @@ const AUTOROUTING_SETUP_JSON_SCHEMA: JsonSchemaObject = {
 		},
 		models: {
 			type: "array",
-			items: { type: "string", pattern: AUTOROUTING_SELECTOR_PATTERN },
+			items: {
+				type: "string",
+				pattern: "^(?![Pp][Ii]/)[^/\\s*?\\[]+/[^\\s*?\\[]+(?::(?:minimal|low|medium|high|xhigh))?$",
+				description: AUTOROUTING_SELECTOR_DESCRIPTION,
+			},
 		},
 	},
 	additionalProperties: false,
@@ -4077,6 +4081,20 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 	const issues: Array<{ path: string; detail: string }> = [];
 	const knownPaths = new Set(Object.keys(SETTINGS_SCHEMA));
 	for (const [path, value] of Object.entries(patch)) {
+		if (path === "task.autorouting" || path.startsWith("task.autorouting.")) {
+			const suffix = path.slice("task.autorouting".length).replace(/^\./u, "");
+			if (suffix === "enabled") {
+				if (typeof value !== "boolean") issues.push({ path, detail: "Expected boolean." });
+				continue;
+			}
+			if (suffix === "tiers" || suffix === "setup" || suffix === "provenance") {
+				const local = validateAutoroutingLocal({ [suffix]: value });
+				for (const issue of local) issues.push({ path: `task.autorouting.${issue.path}`, detail: issue.detail });
+				continue;
+			}
+			issues.push({ path, detail: "Setting is not a valid autorouting sub-path." });
+			continue;
+		}
 		const definition = SETTINGS_SCHEMA[path as SettingPath];
 		if (!definition) {
 			const recordParent = [...knownPaths].find(known => known !== path && path.startsWith(`${known}.`));

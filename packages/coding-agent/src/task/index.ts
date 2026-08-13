@@ -2064,8 +2064,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						skips.push({ selector, code: "snapshot_missing" });
 						continue;
 					}
-					if (await registry.getApiKey(model, credentialSessionId)) authenticated.push(selector);
-					else skips.push({ selector, code: "credential_unavailable" });
+					try {
+						if (await registry.getApiKey(model, credentialSessionId)) authenticated.push(selector);
+						else skips.push({ selector, code: "credential_unavailable" });
+					} catch {
+						// The durable preflight owns classification and terminal evidence for
+						// lookup failures; only a definite missing key is a prefilter skip.
+						authenticated.push(selector);
+					}
 				}
 				return { candidates: authenticated, skips };
 			};

@@ -1138,7 +1138,8 @@
 									"type": "array",
 									"items": {
 										"type": "string",
-										"pattern": "^[^/\\s*?\\[]+\\/[^\\s*?\\[]+(?::(?:minimal|low|medium|high|xhigh))?$"
+										"pattern": "^(?![Pp][Ii]/)[^/\\s*?\\[]+/[^\\s*?\\[]+(?::(?:minimal|low|medium|high|xhigh))?$",
+										"description": "provider/modelId with an optional valid thinking suffix (:minimal|low|medium|high|xhigh), no globs, no bare model ids, no pi/<role> role aliases."
 									}
 								}
 							},

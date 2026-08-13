@@ -128,9 +128,17 @@ function splitAllowlistSelector(selector: string): string {
 	return suffixMatch ? selector.slice(0, -suffixMatch[0].length) : selector;
 }
 
-function buildAllowlist(setup: AutoroutingSetup): Set<string> | undefined {
+function buildAllowlist(setup: AutoroutingSetup, catalog: readonly Model<Api>[]): Set<string> | undefined {
 	if (setup.models === undefined) return undefined;
-	return new Set(setup.models.map(splitAllowlistSelector));
+	const catalogKeys = new Set(catalog.map(catalogKey));
+	return new Set(
+		setup.models.map(selector => {
+			// Preserve a literal colon-bearing catalog id before interpreting the
+			// trailing token as a thinking suffix.
+			if (catalogKeys.has(selector)) return selector;
+			return splitAllowlistSelector(selector);
+		}),
+	);
 }
 
 function selectorWithEffort(model: Model<Api>, effort: TierEffort | undefined): string {
@@ -172,7 +180,7 @@ function assignmentsForProvider(
 function materializeTiers(setup: AutoroutingSetup, labels: CuratedTierLabels, catalog: readonly Model<Api>[]): TierMap {
 	const catalogByKey = new Map<string, Model<Api>>();
 	for (const model of catalog) catalogByKey.set(catalogKey(model), model);
-	const allowlist = buildAllowlist(setup);
+	const allowlist = buildAllowlist(setup, catalog);
 	const tierCandidates = new Map<AutoroutingTier, Candidate[]>();
 	for (const [providerIndex, provider] of providerOrder(setup).entries()) {
 		const providerTiers = assignmentsForProvider(labels, provider, providerIndex, catalogByKey, allowlist);

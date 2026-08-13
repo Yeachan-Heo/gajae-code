@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { Model } from "@gajae-code/ai";
 import { AUTOROUTING_SELECTOR_PATTERN, type AutoroutingTier } from "../src/config/autorouting-contract";
+import { generateTierChains } from "../src/config/autorouting-generator";
 import {
 	CURATED_TIER_LABELS,
 	CURATED_TIER_MAP,
@@ -54,6 +55,17 @@ describe("autorouting tier map", () => {
 			],
 		} satisfies CuratedTierLabels;
 		expect(() => validateTierMap(mapWith(labels), [model("example", "model")])).not.toThrow();
+	});
+
+	it("keeps a literal colon-bearing model id in the setup allowlist", () => {
+		const catalog = [model("example", "model"), model("example", "model:high")];
+		const generated = generateTierChains(
+			{ schema: 1, providers: ["example"], models: ["example/model:high"] },
+			mapWith({ "example/model:high": [{ tier: "fast", rank: 1 }] }),
+			catalog,
+		);
+
+		expect(generated.tiers.fast).toEqual(["example/model:high"]);
 	});
 
 	it("rejects duplicate tier assignments and cross-model provider/tier rank collisions", () => {

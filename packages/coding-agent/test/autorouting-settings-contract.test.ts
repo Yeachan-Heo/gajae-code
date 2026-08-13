@@ -4,7 +4,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	AUTOROUTING_SELECTOR_PATTERN,
 	type AutoroutingProvenance,
 	type AutoroutingSetup,
 	autoroutingProviderOrderHint,
@@ -150,7 +149,9 @@ describe("autorouting typed settings contract", () => {
 		expect(setupSchema.additionalProperties).toBe(false);
 		expect(setupSchema.required).toEqual(["schema", "providers"]);
 		expect(setupSchema.properties.providers).toMatchObject({ type: "array", minItems: 1, uniqueItems: true });
-		expect(setupSchema.properties.models.items.pattern).toBe(AUTOROUTING_SELECTOR_PATTERN);
+		expect(setupSchema.properties.models.items.pattern).toBe(
+			"^(?![Pp][Ii]/)[^/\\s*?\\[]+/[^\\s*?\\[]+(?::(?:minimal|low|medium|high|xhigh))?$",
+		);
 		expect(provenanceSchema.additionalProperties).toBe(false);
 		expect(provenanceSchema.properties.source.additionalProperties).toBe(false);
 		expect(provenanceSchema.properties.source.properties.generatorVersion).toMatchObject({
