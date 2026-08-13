@@ -52,10 +52,21 @@ export class MasterInventoryError extends Error {
  * `unknown` (hands-off), never to a fabricated `terminal`/`stuck` verdict.
  */
 export function classifyResidentSession(
-	row: Pick<SdkSessionRowV1, "live" | "ambiguous" | "terminalUncertain" | "deleted">,
+	row: Pick<SdkSessionRowV1, "live" | "ambiguous" | "terminalUncertain" | "deleted"> & { activity?: unknown },
 ): ResidentSessionClass {
 	if (row.ambiguous === true || row.terminalUncertain === true) return "blocked";
 	if (row.deleted === true) return "terminal";
+	if (
+		row.activity !== undefined &&
+		(typeof row.activity !== "object" ||
+			row.activity === null ||
+			!("state" in row.activity) ||
+			!(["active", "idle"] as unknown[]).includes(row.activity.state) ||
+			!("at" in row.activity) ||
+			typeof row.activity.at !== "number" ||
+			!Number.isFinite(row.activity.at))
+	)
+		return "unknown";
 	if (row.live === true) return "live";
 	return "unknown";
 }

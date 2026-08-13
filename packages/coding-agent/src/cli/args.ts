@@ -138,6 +138,7 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 		unknownFlags: new Map(),
 	};
 	const consumerFlags = new Map<ConsumerLaunchFlagName, string>();
+	let masterSeen = false;
 
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
@@ -358,6 +359,9 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 		} else if (arg === "--no-title") {
 			result.noTitle = true;
 		} else if (arg === "--master") {
+			if (hasInlineValue) throw new CliParseError("--master does not accept a value");
+			if (masterSeen) throw new CliParseError("--master can only be specified once");
+			masterSeen = true;
 			result.master = true;
 		} else if (arg === "--list-models") {
 			// Check if next arg is a search pattern (not a flag or file arg)

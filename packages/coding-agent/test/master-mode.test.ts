@@ -53,6 +53,12 @@ describe("gjc master launch surface", () => {
 		expect(parseArgs([], "local").master).toBeUndefined();
 	});
 
+	it("rejects value-bearing and repeated master flags", () => {
+		expect(() => parseArgs(["--master=value"], "local")).toThrow(/does not accept a value/);
+		expect(() => parseArgs(["--master="], "local")).toThrow(/does not accept a value/);
+		expect(() => parseArgs(["--master", "--master"], "local")).toThrow(/only be specified once/);
+	});
+
 	it("rejects --master with --mode acp instead of silently no-opping the hook", () => {
 		expect(() => parseArgs(["--master", "--mode", "acp"], "local")).toThrow(/--master.*acp/);
 	});
@@ -122,6 +128,12 @@ describe("resident-session classification", () => {
 		// An idle-looking heartbeat is also only liveness.
 		expect(classifyResidentSession(row({ sessionId: "b", activity: { state: "idle", at: NOW - 1_000 } }))).toBe(
 			"live",
+		);
+	});
+
+	it("hostile: malformed activity metadata fails closed", () => {
+		expect(classifyResidentSession({ ...row({ sessionId: "bad" }), activity: { state: "active", at: "bad" } })).toBe(
+			"unknown",
 		);
 	});
 });
