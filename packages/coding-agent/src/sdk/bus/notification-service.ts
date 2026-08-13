@@ -1558,27 +1558,63 @@ export async function sweepNotificationDebris(input: {
 	} catch {
 		return { removed, kept, failures, scanFailed: true };
 	}
-	const olderThanMinAge = async (file: string): Promise<boolean> => {
-		if (!fs.stat) return false;
-		const st = await fs.stat(file).catch(() => undefined);
-		if (!st || !Number.isFinite(st.mtimeMs)) return false;
-		return now() - st.mtimeMs > minAgeMs;
+	/**
+	 * Tri-state staleness. An ABSENT `stat` capability is a policy limitation
+	 * (retain, counted as `kept`); a stat that throws or reports a nonsense
+	 * mtime is an operational failure and must surface as `failures`, never be
+	 * laundered into ordinary retention.
+	 */
+	const ageState = async (file: string): Promise<"stale" | "fresh" | "unknown" | "unavailable"> => {
+		if (!fs.stat) return "unavailable";
+		let st: { mtimeMs: number } | undefined;
+		try {
+			st = await fs.stat(file);
+		} catch {
+			return "unknown";
+		}
+		if (!st || !Number.isFinite(st.mtimeMs)) return "unknown";
+		return now() - st.mtimeMs > minAgeMs ? "stale" : "fresh";
 	};
 	for (const name of names) {
 		const staging = DEBRIS_STAGING_TMP.exec(name);
+		const placeholder = DEBRIS_UNLINK_PLACEHOLDER.test(name);
 		const quarantineLike =
-			DEBRIS_TRANSITION_QUARANTINE.test(name) ||
-			DEBRIS_ENDPOINT_QUARANTINE.test(name) ||
-			DEBRIS_UNLINK_PLACEHOLDER.test(name);
+			DEBRIS_TRANSITION_QUARANTINE.test(name) || DEBRIS_ENDPOINT_QUARANTINE.test(name) || placeholder;
 		if (!staging && !quarantineLike) continue;
 		const file = path.join(input.dir, name);
-		let stale = false;
-		if (staging) {
-			const writerPid = Number.parseInt(staging[1] ?? "", 10);
-			stale =
-				(Number.isSafeInteger(writerPid) && writerPid > 0 && !pidAlive(writerPid)) || (await olderThanMinAge(file));
-		} else {
-			stale = await olderThanMinAge(file);
+		const deadWriter =
+			staging !== null &&
+			(() => {
+				const writerPid = Number.parseInt(staging[1] ?? "", 10);
+				return Number.isSafeInteger(writerPid) && writerPid > 0 && !pidAlive(writerPid);
+			})();
+		let stale = deadWriter;
+		if (!stale) {
+			const age = await ageState(file);
+			if (age === "unknown") {
+				// Operational stat failure: retain the file AND report it.
+				failures += 1;
+				continue;
+			}
+			stale = age === "stale";
+		}
+		if (stale && placeholder) {
+			// A native exchange placeholder is only inert once it is the terminal
+			// scrubbed remnant. A NONEMPTY placeholder may still carry the retained
+			// cleanup evidence for an endpoint whose verified removal failed, so it
+			// is never age-reclaimed.
+			const size = await fs
+				.readEndpointFile(file)
+				.then(candidate => candidate.bytes.length)
+				.catch(() => undefined);
+			if (size === undefined) {
+				failures += 1;
+				continue;
+			}
+			if (size > 0) {
+				kept += 1;
+				continue;
+			}
 		}
 		if (!stale) {
 			kept += 1;

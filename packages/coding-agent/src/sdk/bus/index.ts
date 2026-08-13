@@ -3850,9 +3850,13 @@ function sdkInboundFrame(commandJson: string | undefined): Record<string, unknow
 	}
 }
 /**
- * Ensures every configured chat-provider daemon is ready before the SDK
- * publishes session identity. A rejected ensure is startup-fatal: presenting
- * an identity for a transport that never became available is false success.
+ * Ensures every configured chat-provider daemon is ready.
+ *
+ * This runs strictly AFTER the SDK publishes session identity and its core
+ * endpoint, through the detached ownership coordinator: chat providers are
+ * optional notification adapters, never session authority. A rejected ensure
+ * therefore degrades notification delivery only — the coordinator records it
+ * as `failed`, adapters stay withheld, and a later reconcile re-attempts.
  */
 export async function ensureConfiguredProviderDaemons(
 	settings: Settings,

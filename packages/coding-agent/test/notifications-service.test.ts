@@ -208,7 +208,7 @@ describe("notification-service status", () => {
 });
 
 describe("configured chat daemon readiness", () => {
-	test("awaits every configured provider before startup can publish identity", async () => {
+	test("awaits every configured provider before the ownership ensure can settle", async () => {
 		const settings = Settings.isolated({
 			"notifications.enabled": true,
 			"notifications.discord.botToken": "discord-token",
@@ -229,7 +229,7 @@ describe("configured chat daemon readiness", () => {
 		expect(calls).toEqual(["discord", "slack"]);
 	});
 
-	test("propagates configured provider readiness failures instead of reporting startup success", async () => {
+	test("propagates configured provider readiness failures to the ownership ensure", async () => {
 		const settings = Settings.isolated({
 			"notifications.enabled": true,
 			"notifications.discord.botToken": "discord-token",
@@ -1358,6 +1358,58 @@ describe("notification-service stale debris sweep", () => {
 		expect(report.removed).toEqual([]);
 		expect(report.failures).toBe(1);
 		expect(unlinked).toEqual([]);
+	});
+
+	test("an operational stat failure is reported as a failure, not laundered into kept", async () => {
+		const debris = path.join(dir, "transition-22222222-3333-4444-8555-666666666666");
+		const { fs, unlinked } = mockFs({ [debris]: "" });
+		const throwingStat: NotificationServiceFs = {
+			...fs,
+			stat: async () => {
+				throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+			},
+		};
+		const report = await sweepNotificationDebris({
+			dir,
+			deps: { fs: throwingStat, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.failures).toBe(1);
+		expect(report.kept).toBe(0);
+		expect(unlinked).toEqual([]);
+	});
+
+	test("a nonempty exchange placeholder is retained even when old", async () => {
+		// A nonempty placeholder can still carry retained cleanup evidence for an
+		// endpoint whose verified removal failed; only the terminal scrubbed
+		// (zero-length) remnant is inert.
+		const evidence = path.join(dir, ".gjc-exact-unlink-placeholder-with-evidence.json");
+		const scrubbed = path.join(dir, ".gjc-exact-unlink-placeholder-scrubbed");
+		const { fs, unlinked } = mockFs(
+			{ [evidence]: '{"retained":"cleanup-evidence"}', [scrubbed]: "" },
+			{ mtimes: { [evidence]: OLD, [scrubbed]: OLD } },
+		);
+		const report = await sweepNotificationDebris({
+			dir,
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.removed).toEqual([path.basename(scrubbed)]);
+		expect(report.kept).toBe(1);
+		expect(unlinked).not.toContain(evidence);
+	});
+
+	test("the recovery report renders debris failures and a failed scan", () => {
+		const rendered = formatNotificationRecoveryReport({
+			endpointsScanned: 0,
+			endpointsRemoved: [],
+			endpointsKept: 0,
+			endpointsUnreadable: 0,
+			debrisRemoved: [],
+			debrisKept: 2,
+			debrisFailures: 3,
+			debrisScanFailed: true,
+			daemon: { action: "none", detail: "no daemon ownership record", ownerId: undefined, pid: undefined },
+		});
+		expect(rendered).toContain("debris: removed 0, kept 2, failed 3, scan failed");
 	});
 
 	test("recovery sweeps debris in both the endpoint and daemon dirs and reports it", async () => {

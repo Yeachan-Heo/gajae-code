@@ -1879,7 +1879,7 @@ describe("notify daemon-internal lightweight startup", () => {
 		);
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {
-			for (const mode of ["never-settles", "rejects"] as const) {
+			for (const mode of ["never-settles", "rejects", "resolves-with-failures"] as const) {
 				let sweptDir: string | undefined;
 				let daemonRan = false;
 				const rejection = new Error("sweep exploded");
@@ -1890,6 +1890,7 @@ describe("notify daemon-internal lightweight startup", () => {
 					sweepNotificationDebris: async input => {
 						sweptDir = input.dir;
 						if (mode === "rejects") throw rejection;
+						if (mode === "resolves-with-failures") return { removed: [], kept: 0, failures: 2, scanFailed: true };
 						return await new Promise(() => {});
 					},
 					DaemonImpl: class {
@@ -1905,6 +1906,9 @@ describe("notify daemon-internal lightweight startup", () => {
 			}
 			await Bun.sleep(10);
 			expect(warning.mock.calls.flat().join("\n")).toContain("startup debris sweep failed");
+			// A RESOLVED report carrying operational failures must not disappear.
+			expect(warning.mock.calls.flat().join("\n")).toContain("startup debris sweep incomplete");
+			expect(warning.mock.calls.flat().join("\n")).toContain("failed 2, scan failed");
 		} finally {
 			warning.mockRestore();
 		}

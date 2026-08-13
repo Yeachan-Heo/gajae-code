@@ -142,3 +142,68 @@ describe("project .env reader", () => {
 		}
 	});
 });
+
+describe("preload fail-closed behavior (real preload path)", () => {
+	const preload = path.resolve(import.meta.dir, "../../../scripts/test-preload.ts");
+
+	test("throws and never falls back to the live agent dir when the temp dir cannot be created", async () => {
+		// Point the temp root at a path that cannot hold a new directory, so
+		// mkdtempSync fails inside the real preload. Continuing would silently run
+		// a suite against the operator's live ~/.gjc/agent.
+		const blocker = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-failclosed-"));
+		const notADir = path.join(blocker, "not-a-directory");
+		await fs.promises.writeFile(notADir, "");
+		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "--preload", preload, "-e", "console.log(process.env.GJC_CODING_AGENT_DIR)"],
+				env: {
+					...process.env,
+					TMPDIR: notADir,
+					TMP: notADir,
+					TEMP: notADir,
+					GJC_CODING_AGENT_DIR: "",
+					PI_CODING_AGENT_DIR: "",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(probe.exitCode).not.toBe(0);
+			expect(probe.stderr.toString()).toContain("Test agent-directory isolation failed");
+			// It must not have adopted (or printed) any agent dir at all.
+			expect(probe.stdout.toString().trim()).toBe("");
+		} finally {
+			await fs.promises.rm(blocker, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("an explicit trusted non-default pin survives the real preload", async () => {
+		const pinned = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-preload-pinned-"));
+		try {
+			const probe = Bun.spawnSync({
+				cmd: [process.execPath, "--preload", preload, "-e", "console.log(process.env.GJC_CODING_AGENT_DIR)"],
+				env: { ...process.env, GJC_CODING_AGENT_DIR: pinned, PI_CODING_AGENT_DIR: "" },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(probe.exitCode).toBe(0);
+			expect(probe.stdout.toString().trim()).toBe(pinned);
+		} finally {
+			await fs.promises.rm(pinned, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("an ambient default agent dir is replaced by a fresh isolated dir in the real preload", async () => {
+		const defaultAgentDir = path.join(os.homedir(), ".gjc", "agent");
+		const probe = Bun.spawnSync({
+			cmd: [process.execPath, "--preload", preload, "-e", "console.log(process.env.GJC_CODING_AGENT_DIR)"],
+			env: { ...process.env, GJC_CODING_AGENT_DIR: defaultAgentDir, PI_CODING_AGENT_DIR: "" },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const adopted = probe.stdout.toString().trim();
+		expect(probe.exitCode).toBe(0);
+		expect(adopted).not.toBe(defaultAgentDir);
+		expect(path.basename(adopted).startsWith("gjc-test-agent-")).toBe(true);
+		await fs.promises.rm(adopted, { recursive: true, force: true });
+	}, 30_000);
+});
