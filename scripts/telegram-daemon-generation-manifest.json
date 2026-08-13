@@ -1,5 +1,5 @@
 {
-  "contractVersion": 48,
+  "contractVersion": 49,
   "inventory": {
     "telegram": {
       "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts": [
