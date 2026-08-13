@@ -109,6 +109,22 @@ async function imageData(name) {
 }
 async function image(context, name) { send("setImage", context, { image: await imageData(name), target: 0 }); }
 
+async function optionSetImageData(group, option) {
+  const cacheKey = `option-set:${group}:${option?.id ?? "none"}`;
+  if (imageCache.has(cacheKey)) return imageCache.get(cacheKey);
+  const base = await imageData(`selector-${group}-set`);
+  const selected = option ? await imageData(option.image) : base;
+  const accent = group === "skill" ? "#b36cff" : "#42d8ff";
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144"><image href="${base}" width="144" height="144"/><rect x="82" y="8" width="54" height="54" rx="12" fill="#02070bcc" stroke="${accent}" stroke-width="3"/><image href="${selected}" x="86" y="12" width="46" height="46" preserveAspectRatio="xMidYMid slice"/><circle cx="127" cy="52" r="8" fill="#06110b" stroke="#39f59f" stroke-width="2"/><path d="M123 52l3 3 5-7" fill="none" stroke="#39f59f" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  const data = `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+  imageCache.set(cacheKey, data);
+  return data;
+}
+
+async function optionSetImage(context, group, option) {
+  send("setImage", context, { image: await optionSetImageData(group, option), target: 0 });
+}
+
 function alive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
@@ -661,7 +677,8 @@ async function renderContext(context, state) {
       const option = selectedOption(options, index);
       const verb = settings.type === "optionSet" ? (settings.group === "skill" ? "RUN" : "SET") : (settings.group === "skill" ? "SKILL" : "MODEL");
       title(context, option ? `${verb} ${settings.type === "optionSelector" ? `${index + 1}/${options.length}\n${option.label}` : `\n${option.label}`}` : "NO OPTION");
-      await image(context, settings.type === "optionSelector" ? `selector-${settings.group}` : option?.image || "category");
+      if (settings.type === "optionSet") await optionSetImage(context, settings.group, option);
+      else await image(context, `selector-${settings.group}-nav`);
       return;
     }
     if (settings.type === "thinkingCycle") {
