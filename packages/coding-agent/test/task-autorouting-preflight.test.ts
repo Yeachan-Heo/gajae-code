@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, stat, writeFile } from "node:fs/prom
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { FallbackTriggerClass } from "@gajae-code/ai/utils/fallback-transport";
+import * as native from "@gajae-code/natives";
 import { getTerminalId } from "@gajae-code/tui";
 import { getTerminalSessionsDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
@@ -50,6 +51,7 @@ type DurablePhase =
 	| { kind: "prepare_throw"; failure: AutoroutingPreflightFailure }
 	| { kind: "post_fence"; class: FallbackTriggerClass }
 	| { kind: "rename_failure" }
+	| { kind: "direct_uncertain_publish" }
 	| { kind: "uncertain_publish" }
 	| { kind: "reservation_failure" };
 
@@ -368,6 +370,35 @@ async function runScriptedLedger(scripts: CandidateScript[], managed = false): P
 		}
 		if (durable.kind === "rename_failure") {
 			await expect(manager.commitStaged()).rejects.toThrow();
+			await manager.discardStaged();
+			attempts.push({ selector: script.selector, phase: "durable", code: "post_acceptance_failure" });
+			const after = await residueSnapshot(ctx);
+			failedSnapshots.push({ before, after });
+			terminal = "post_acceptance_failure";
+			break;
+		}
+		if (durable.kind === "direct_uncertain_publish") {
+			await manager.flush();
+			const realRename = native.renameNoReplacePath;
+			const rename = spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+				const outcome = realRename(source, destination);
+				if (outcome.ok && String(destination) === ctx.finalPath) {
+					return {
+						...outcome,
+						ok: false,
+						code: "fsync_failed",
+						mutationState: "committed",
+						durabilityState: "not_provable",
+						reason: "durability_not_provable",
+					};
+				}
+				return outcome;
+			});
+			try {
+				await expect(manager.commitStaged()).rejects.toThrow(/committed without proof/);
+			} finally {
+				rename.mockRestore();
+			}
 			await manager.discardStaged();
 			attempts.push({ selector: script.selector, phase: "durable", code: "post_acceptance_failure" });
 			const after = await residueSnapshot(ctx);
@@ -862,6 +893,27 @@ describe("autorouting preflight contract", () => {
 		expect(await snapshotTree(parent.dir, true)).toBe(before.tree);
 		expect(parent.getAllocatedIds()).toEqual(before.ids);
 		expect(await parent.exists("0")).toBe(true);
+	});
+
+	it("T2 direct uncertain publication preserves the published transcript, staging, and artifacts without acceptance", async () => {
+		const run = await runScriptedLedger([
+			{
+				selector: "provider/direct-uncertain",
+				probe: { kind: "pass" },
+				durable: { kind: "direct_uncertain_publish" },
+			},
+		]);
+
+		expect(run.terminal).toBe("post_acceptance_failure");
+		expect(run.finalExists).toBe(true);
+		expect(run.finalText).toContain("artifact://");
+		expect(run.artifactTree).toContain("Y2FuZGlkYXRlLXByb3ZpZGVyL2RpcmVjdC11bmNlcnRhaW4=");
+		// The rename committed, so the transcript legitimately moved out of staging;
+		// preservation prevents reclamation of its now-final artifact references.
+		expect(run.stagingTree).toBe("[]");
+		expect(run.liveHandles).toBe(0);
+		expect(run.lifecycleStarts).toBe(0);
+		expect(run.resumeVisible).toBe(true);
 	});
 
 	it("T2m managed adoption-failure and reservation-failure rollback preserve managed inventory and sibling artifacts", async () => {
