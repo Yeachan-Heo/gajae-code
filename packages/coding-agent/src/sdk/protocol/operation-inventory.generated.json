@@ -2058,6 +2058,17 @@
 		}
 	},
 	{
+		"sourceId": "slash_command:extensions",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "exclude",
+		"rationale": "interactive local customization dashboard mutates trusted local skill, hook, and MCP configuration (including filesystem import/removal); ACP and local headless cannot dispatch it, while SDK extension list/enable operations do not expose this dashboard authority",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "slash_command:monitors",
 		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
 		"sourceKind": "slash_command",

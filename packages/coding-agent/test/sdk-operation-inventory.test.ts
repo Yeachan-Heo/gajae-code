@@ -126,6 +126,36 @@ describe("SDK operation inventory", () => {
 		}
 	});
 
+	it("locks the interactive extensions dashboard out of the SDK inventory exactly once", async () => {
+		const records = (await Bun.file(inventory).json()) as Array<{
+			sourceId: string;
+			sdkId?: string;
+			sourceFile: string;
+			sourceKind: string;
+			decision: string;
+			rationale?: string;
+			exclusionMetadata?: { adapterMappings: string; testIds: string };
+		}>;
+		const extensions = records.filter(record => record.sourceId === "slash_command:extensions");
+		expect(extensions).toEqual([
+			expect.objectContaining({
+				sourceId: "slash_command:extensions",
+				sourceFile: "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+				sourceKind: "slash_command",
+				decision: "exclude",
+				rationale:
+					"interactive local customization dashboard mutates trusted local skill, hook, and MCP configuration (including filesystem import/removal); ACP and local headless cannot dispatch it, while SDK extension list/enable operations do not expose this dashboard authority",
+				exclusionMetadata: { adapterMappings: "not_applicable", testIds: "not_applicable" },
+			}),
+		]);
+		for (const [sourceId, sdkId] of [
+			["registry:Q22", "extensions.list"],
+			["registry:C46", "extension.set_enabled"],
+		]) {
+			expect(records).toContainEqual(expect.objectContaining({ sourceId, sdkId, decision: "include" }));
+		}
+	});
+
 	it("rejects a generated matrix with a dropped row", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-inventory-"));
 		tempDirs.push(directory);

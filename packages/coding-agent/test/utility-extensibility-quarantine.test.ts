@@ -25,10 +25,9 @@ describe("GJC utility extensibility quarantine", () => {
 		expect(registry).toContain("BUILTIN_SLASH_COMMAND_LOOKUP.set(command.name, command)");
 	});
 
-	it("deletes approved non-critical slash command implementations", async () => {
+	it("keeps the explicitly contracted local customization dashboard out of utility surfaces", async () => {
 		const registry = await source("slash-commands", "builtin-registry.ts");
 		for (const removedCommand of [
-			"extensions",
 			"marketplace",
 			"plugins",
 			"reload-plugins",
@@ -45,6 +44,10 @@ describe("GJC utility extensibility quarantine", () => {
 		]) {
 			expect(registry).not.toContain(`name: "${removedCommand}"`);
 		}
+		const extensions = registry.match(/\{\s*name: "extensions",([\s\S]*?)\n\t\},/);
+		expect(extensions?.[1]).toContain("handleTui:");
+		expect(extensions?.[1]).not.toContain("handle:");
+		expect(extensions?.[1]).not.toContain("localHeadless:");
 		// `/changelog` was restored as a first-class built-in (see CHANGELOG
 		// Unreleased), so it is intentionally no longer in the removed set above.
 		expect(registry).toContain(`name: "changelog"`);

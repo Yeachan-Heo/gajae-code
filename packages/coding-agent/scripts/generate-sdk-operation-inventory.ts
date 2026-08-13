@@ -39,6 +39,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:exit": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:notify":
 		"interactive diagnostics command; session on/off delegate to the notifications extension, not an SDK ingress seam",
+	"slash_command:extensions":
+		"interactive local customization dashboard mutates trusted local skill, hook, and MCP configuration (including filesystem import/removal); ACP and local headless cannot dispatch it, while SDK extension list/enable operations do not expose this dashboard authority",
 	"slash_command:credential":
 		"interactive session credential selector; not a credential-free public SDK operation or independent control seam",
 	"slash_command:pet": "visual/local-only command, not a user-facing SDK control seam",

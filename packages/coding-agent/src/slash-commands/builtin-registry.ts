@@ -1431,12 +1431,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "extensions",
 		description: "Configure skills, hooks, and MCPs.",
-		handle: async (_command, runtime) => {
-			await runtime.output(
-				"/extensions is an interactive surface for configuring skills, hooks, and MCPs. Run gjc in an interactive terminal to use it. Non-interactive alternatives: gjc mcp (MCP servers) and gjc migrate (Claude Code/Codex import).",
-			);
-			return commandConsumed();
-		},
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showCustomizationDashboard();
 			runtime.ctx.editor.setText("");

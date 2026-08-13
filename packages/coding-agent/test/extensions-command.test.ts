@@ -1,14 +1,16 @@
 /**
  * Issue #4291 acceptance: `/extensions` is registered, discoverable, and
- * described exactly as "Configure skills, hooks, and MCPs."; non-interactive
- * (ACP/text) mode gets an explicit rejection instead of silence.
+ * described exactly as "Configure skills, hooks, and MCPs."; it is strictly
+ * local and interactive because its dashboard mutates trusted configuration.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
+	executeBuiltinSlashCommand,
+	executeLocalHeadlessBuiltinSlashCommand,
 	lookupBuiltinSlashCommand,
 } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
-import type { ParsedSlashCommand, SlashCommandRuntime } from "@gajae-code/coding-agent/slash-commands/types";
+import type { SlashCommandRuntime } from "@gajae-code/coding-agent/slash-commands/types";
 
 describe("/extensions slash command registration", () => {
 	test("is registered with the exact owner-contract description", () => {
@@ -28,21 +30,30 @@ describe("/extensions slash command registration", () => {
 		expect(typeof spec?.handleTui).toBe("function");
 	});
 
-	test("non-interactive dispatch outputs an explicit rejection", async () => {
-		const spec = lookupBuiltinSlashCommand("extensions");
-		expect(typeof spec?.handle).toBe("function");
-		const outputs: string[] = [];
+	test("opens the local dashboard but has no headless dispatch authority", async () => {
+		const showCustomizationDashboard = () => {};
+		const setText = () => {};
+		const command = "/extensions";
 		const runtime = {
-			output: async (text: string) => {
-				outputs.push(text);
-			},
-		} as unknown as SlashCommandRuntime;
-		const command = { name: "extensions", args: "" } as unknown as ParsedSlashCommand;
-		const result = await spec!.handle!(command, runtime);
-		expect(result).toEqual({ consumed: true });
-		expect(outputs).toHaveLength(1);
-		expect(outputs[0]).toContain("/extensions");
-		expect(outputs[0]).toContain("interactive");
-		expect(outputs[0]).toContain("skills, hooks, and MCPs");
+			ctx: { showCustomizationDashboard, editor: { setText } },
+		};
+		const dashboard = spyOn(runtime.ctx, "showCustomizationDashboard");
+		const editor = spyOn(runtime.ctx.editor, "setText");
+
+		expect(await executeBuiltinSlashCommand(command, runtime as never)).toBe(true);
+		expect(dashboard).toHaveBeenCalledTimes(1);
+		expect(editor).toHaveBeenCalledWith("");
+		expect(
+			await executeLocalHeadlessBuiltinSlashCommand(command, {
+				output: async () => {},
+			} as unknown as SlashCommandRuntime),
+		).toBe(false);
+	});
+
+	test("has no text or ACP handler", () => {
+		const spec = lookupBuiltinSlashCommand("extensions");
+		expect(spec?.handle).toBeUndefined();
+		expect(spec?.localHeadless).not.toBe(true);
+		expect(spec?.acp).not.toBe(true);
 	});
 });

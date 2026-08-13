@@ -981,6 +981,9 @@ describe("ACP builtin slash commands", () => {
 	it("does not advertise /copy to ACP clients", () => {
 		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "copy")).toBe(false);
 	});
+	it("does not advertise /extensions to ACP clients", () => {
+		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "extensions")).toBe(false);
+	});
 	// TUI-only and dropped commands fall through as false
 	it("TUI-only and dropped commands return false (fall through to model)", async () => {
 		const fallthroughCommands = [
