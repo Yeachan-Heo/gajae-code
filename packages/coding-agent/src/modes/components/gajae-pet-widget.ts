@@ -324,9 +324,9 @@ export class GajaePetWidget {
 			sixelTopPaddingPx: protocol === "sixel" ? PET_SIXEL_DROP_PX : 0,
 			kittyCellYOffsetPx: protocol === "kitty" ? petKittyDropPx(cell.heightPx) : 0,
 			kittyImageId: protocol === "kitty" ? this.#kittyImageId : undefined,
-			// Keep the 36px sprite size and move the visible art slightly farther
-			// row downward within the inline image canvas.
-			iterm2TopPaddingPx: protocol === "iterm2" ? Math.floor((cell.heightPx * 17) / 20) : 0,
+			// iTerm2 receives an explicit 1:1 pixel size; keep its raster inside the
+			// same two-row footprint reserved for Kitty and Sixel.
+			iterm2TopPaddingPx: 0,
 			iterm2BottomPaddingPx: 0,
 		});
 		this.#framedEditor.setReserve(this.#pixel.columns + PET_SIDE_MARGIN);

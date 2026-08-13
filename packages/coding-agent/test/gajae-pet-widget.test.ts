@@ -3,11 +3,14 @@ import {
 	__animationSchedulerTestHooks,
 	Container,
 	getCellDimensions,
+	ImageProtocol,
 	setCellDimensions,
+	TERMINAL,
 	type TUI,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "../src/modes/components/custom-editor";
 import { GajaePetWidget, PetFramedEditor } from "../src/modes/components/gajae-pet-widget";
+import { getPetPixelProtocol } from "../src/modes/components/pet-capability";
 
 function makeStubs(columns = 80, rows = 30) {
 	const written: string[] = [];
@@ -118,6 +121,24 @@ describe("GajaePetWidget", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("selects iTerm2 directly but blocks raw graphics under multiplexers", () => {
+		const terminal = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
+		const originalProtocol = terminal.imageProtocol;
+		try {
+			terminal.imageProtocol = ImageProtocol.Iterm2;
+			expect(getPetPixelProtocol({})).toBe("iterm2");
+			expect(getPetPixelProtocol({ TMUX: "/tmp/tmux-1/default,1,0" })).toBeNull();
+			expect(getPetPixelProtocol({ STY: "screen.1" })).toBeNull();
+			expect(getPetPixelProtocol({ ZELLIJ: "1" })).toBeNull();
+
+			terminal.imageProtocol = ImageProtocol.Sixel;
+			expect(getPetPixelProtocol({ TMUX: "1", PI_FORCE_IMAGE_PROTOCOL: "sixel" })).toBe("sixel");
+			expect(getPetPixelProtocol({ TMUX: "1" })).toBeNull();
+		} finally {
+			terminal.imageProtocol = originalProtocol;
+		}
+	});
+
 	it("on: reserves a side area and registers the overlay emitter", () => {
 		const { widget, editorContainer, getEmitter, getRenderedWidth } = makeWidget();
 		try {
@@ -157,8 +178,44 @@ describe("GajaePetWidget", () => {
 			const payload = getEmitter()?.();
 			expect(payload).toContain("\x1b[28;76H");
 			expect(payload).toContain("\x1b]1337;File=");
-			expect(payload).toContain("width=36px;height=51px;preserveAspectRatio=0");
+			expect(payload).toContain("width=36px;height=36px;preserveAspectRatio=0");
+			expect(payload).toEndWith("\x1b\\");
 		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("clears iTerm2 frames on animation, resize, disable, and dispose", () => {
+		vi.useFakeTimers();
+		const original = getCellDimensions();
+		const { widget, written, getEmitter, setTerminalSize } = makeWidget(80, 30, {
+			protocol: "iterm2",
+			autoFlexGapMs: null,
+		});
+		try {
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1b]1337;File=");
+			written.length = 0;
+
+			vi.advanceTimersByTime(1200);
+			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X") && chunk.includes("\x1b]1337;File="))).toBe(
+				true,
+			);
+
+			setCellDimensions({ widthPx: 12, heightPx: 24 });
+			vi.advanceTimersByTime(100);
+			expect(getEmitter()?.()).toContain("width=48px;height=48px");
+
+			setTerminalSize(12, 30);
+			expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
+			setTerminalSize(80, 30);
+			expect(getEmitter()?.()).toContain("\x1b]1337;File=");
+
+			written.length = 0;
+			widget.setMode("off");
+			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+		} finally {
+			setCellDimensions(original);
 			widget.dispose();
 		}
 	});

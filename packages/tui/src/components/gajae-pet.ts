@@ -1,4 +1,4 @@
-import { deflateSync } from "node:zlib";
+import * as zlib from "node:zlib";
 
 import {
 	OUROBOROS_HEART_STEPS,
@@ -419,6 +419,11 @@ export function encodeGridSixel(
 	return `${out}\x1b\\`;
 }
 
+const MAX_PET_PNG_DIMENSION = 16_384;
+const MAX_PET_PNG_RAW_BYTES = 64 * 1024 * 1024;
+const MAX_PET_FRAME_DIMENSION = 4_096;
+const MAX_PET_FRAME_RGBA_BYTES = 16 * 1024 * 1024;
+
 function pngChunk(type: string, data: Uint8Array): Uint8Array {
 	const typeBytes = Buffer.from(type, "ascii");
 	const payload = Buffer.concat([typeBytes, Buffer.from(data)]);
@@ -435,29 +440,80 @@ function pngChunk(type: string, data: Uint8Array): Uint8Array {
 	return out;
 }
 
+function validatePngGrid(
+	grid: string[],
+	scale: number,
+	topPaddingPx: number,
+	bottomPaddingPx: number,
+): {
+	gridWidth: number;
+	gridHeight: number;
+	width: number;
+	spriteHeight: number;
+	height: number;
+} {
+	const gridHeight = grid.length;
+	const gridWidth = grid[0]?.length ?? 0;
+	if (gridHeight === 0 || gridWidth === 0 || grid.some(row => row.length !== gridWidth)) {
+		throw new Error("iTerm2 pet grid must be non-empty and rectangular");
+	}
+	if (!Number.isFinite(scale) || scale <= 0) throw new Error("iTerm2 pet scale must be finite and positive");
+	for (const [name, value] of [
+		["top padding", topPaddingPx],
+		["bottom padding", bottomPaddingPx],
+	] as const) {
+		if (!Number.isSafeInteger(value) || value < 0)
+			throw new Error(`iTerm2 pet ${name} must be a non-negative integer`);
+	}
+	const width = Math.round(gridWidth * scale);
+	const spriteHeight = Math.round(gridHeight * scale);
+	const height = spriteHeight + topPaddingPx + bottomPaddingPx;
+	if (
+		!Number.isSafeInteger(width) ||
+		!Number.isSafeInteger(spriteHeight) ||
+		!Number.isSafeInteger(height) ||
+		width <= 0 ||
+		spriteHeight <= 0 ||
+		height <= 0 ||
+		width > MAX_PET_PNG_DIMENSION ||
+		height > MAX_PET_PNG_DIMENSION
+	) {
+		throw new Error("iTerm2 pet PNG dimensions are out of bounds");
+	}
+	const stride = width * 4 + 1;
+	const rawBytes = stride * height;
+	if (!Number.isSafeInteger(rawBytes) || rawBytes > MAX_PET_PNG_RAW_BYTES) {
+		throw new Error("iTerm2 pet PNG allocation is out of bounds");
+	}
+	return { gridWidth, gridHeight, width, spriteHeight, height };
+}
+
 /** Encode a grid as an iTerm2 inline PNG. */
 export function encodeGridIterm2(
 	grid: string[],
 	scale: number,
-	_cellWidthPx: number,
-	_cellHeightPx: number,
 	topPaddingPx = 0,
 	bottomPaddingPx = 0,
 	palette: Palette = RED_PALETTE,
 ): string {
-	const gw = grid[0].length;
-	const gh = grid.length;
-	const width = Math.round(gw * scale);
-	const spriteHeight = Math.round(gh * scale);
-	const height = spriteHeight + topPaddingPx + bottomPaddingPx;
+	const { gridWidth, gridHeight, width, spriteHeight, height } = validatePngGrid(
+		grid,
+		scale,
+		topPaddingPx,
+		bottomPaddingPx,
+	);
 	const raw = Buffer.alloc((width * 4 + 1) * height);
 	for (let y = 0; y < height; y++) {
 		for (let x = 0; x < width; x++) {
 			const sourceY = y - topPaddingPx;
 			const rgb =
-				sourceY < 0
+				sourceY < 0 || sourceY >= spriteHeight
 					? null
-					: palette[grid[Math.min(gh - 1, Math.floor(sourceY / scale))][Math.min(gw - 1, Math.floor(x / scale))]];
+					: palette[
+							grid[Math.min(gridHeight - 1, Math.floor(sourceY / scale))][
+								Math.min(gridWidth - 1, Math.floor(x / scale))
+							]
+						];
 			const offset = y * (width * 4 + 1) + 1 + x * 4;
 			if (!rgb) continue;
 			raw[offset] = rgb[0];
@@ -466,7 +522,7 @@ export function encodeGridIterm2(
 			raw[offset + 3] = 255;
 		}
 	}
-	const compressed = deflateSync(raw);
+	const compressed = zlib.deflateSync(raw);
 	const header = Buffer.alloc(13);
 	header.writeUInt32BE(width, 0);
 	header.writeUInt32BE(height, 4);
@@ -482,7 +538,7 @@ export function encodeGridIterm2(
 	// the surrounding TUI; asking iTerm2 to fit a small PNG into a cell box makes
 	// it stretch or shrink differently from Kitty/Ghostty.
 	const params = `width=${width}px;height=${height}px;preserveAspectRatio=0;inline=1`;
-	return `\x1b]1337;File=${params}:${png.toString("base64")}\x07`;
+	return `\x1b]1337;File=${params}:${png.toString("base64")}\x1b\\`;
 }
 
 /** Encode a bottom-aligned grid as kitty raw RGBA at `scale`. */
@@ -577,6 +633,13 @@ export function buildGajaePixelFrames(options: {
 	skin?: PetSkinId;
 }): GajaePixelFrames {
 	const targetRows = options.targetRows ?? 2;
+	if (!Number.isFinite(options.cellWidthPx) || options.cellWidthPx <= 0) {
+		throw new Error("Pet cell width must be finite and positive");
+	}
+	if (!Number.isFinite(options.cellHeightPx) || options.cellHeightPx <= 0) {
+		throw new Error("Pet cell height must be finite and positive");
+	}
+	if (!Number.isFinite(targetRows) || targetRows <= 0) throw new Error("Pet target rows must be finite and positive");
 	const skin = PET_SKINS[options.skin ?? "red"];
 	const grids = Object.entries(skin.frames);
 	const firstGrid = grids[0]?.[1];
@@ -597,12 +660,21 @@ export function buildGajaePixelFrames(options: {
 	const topPaddingPx =
 		allocatedHeightPx - visibleHeightPx + (options.protocol === "sixel" ? (options.sixelTopPaddingPx ?? 0) : 0);
 	const heightPx = visibleHeightPx + topPaddingPx;
-	const rasterRows = Math.ceil(heightPx / options.cellHeightPx);
 	// Center the square sprite in its (cols * cellWidth) block, which the ceil()
 	// column rounding can make wider than the sprite itself.
 	const horizontalPaddingPx = Math.max(0, columns * options.cellWidthPx - widthPx);
 	const leftPaddingPx = Math.floor(horizontalPaddingPx / 2);
 	const rightPaddingPx = horizontalPaddingPx - leftPaddingPx;
+	const canvasWidthPx = widthPx + leftPaddingPx + rightPaddingPx;
+	if (
+		widthPx > MAX_PET_FRAME_DIMENSION ||
+		heightPx > MAX_PET_FRAME_DIMENSION ||
+		canvasWidthPx > MAX_PET_FRAME_DIMENSION ||
+		!Number.isSafeInteger(canvasWidthPx * heightPx * 4) ||
+		canvasWidthPx * heightPx * 4 > MAX_PET_FRAME_RGBA_BYTES
+	) {
+		throw new Error("Pet frame dimensions are out of bounds");
+	}
 	const imageId = options.kittyImageId ?? 0xc0de;
 	const frames: Record<string, string> = {};
 	for (const [name, grid] of grids) {
@@ -613,8 +685,6 @@ export function buildGajaePixelFrames(options: {
 					? encodeGridIterm2(
 							grid,
 							scale,
-							options.cellWidthPx,
-							options.cellHeightPx,
 							options.iterm2TopPaddingPx ?? 0,
 							options.iterm2BottomPaddingPx ?? 0,
 							skin.palette,
@@ -633,5 +703,17 @@ export function buildGajaePixelFrames(options: {
 						);
 	}
 
-	return { frames, protocol: options.protocol, widthPx, heightPx, columns, rows, rasterRows };
+	const protocolHeightPx =
+		options.protocol === "iterm2"
+			? visibleHeightPx + (options.iterm2TopPaddingPx ?? 0) + (options.iterm2BottomPaddingPx ?? 0)
+			: heightPx;
+	return {
+		frames,
+		protocol: options.protocol,
+		widthPx,
+		heightPx: protocolHeightPx,
+		columns,
+		rows,
+		rasterRows: Math.ceil(protocolHeightPx / options.cellHeightPx),
+	};
 }
