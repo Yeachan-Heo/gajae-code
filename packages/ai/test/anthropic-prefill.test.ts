@@ -104,6 +104,7 @@ it("preserves redacted thinking blocks in assistant replay payloads", () => {
 		role: "assistant",
 		content: [
 			{ type: "thinking", thinking: "internal", thinkingSignature: "sig_1" },
+			{ type: "text", text: "intermediate" },
 			{ type: "redactedThinking", data: "encrypted_payload" },
 			{ type: "text", text: "Final answer" },
 		],
@@ -127,9 +128,11 @@ it("preserves redacted thinking blocks in assistant replay payloads", () => {
 	expect(assistantParam).toBeDefined();
 	expect(Array.isArray(assistantParam?.content)).toBe(true);
 	const blocks = assistantParam?.content as unknown as Array<Record<string, unknown>>;
-	expect(blocks.map(block => block.type)).toEqual(["thinking", "redacted_thinking", "text"]);
+	// The text block separates thinking from redactedThinking so the adjacency
+	// collapse (#4416) does not merge them; both survive as distinct blocks.
+	expect(blocks.map(block => block.type)).toEqual(["thinking", "text", "redacted_thinking", "text"]);
 	expect(blocks[0]?.signature).toBe("sig_1");
-	expect(blocks[1]?.data).toBe("encrypted_payload");
+	expect(blocks[2]?.data).toBe("encrypted_payload");
 });
 
 it("preserves latest Anthropic thinking blocks even when model id changes", () => {
