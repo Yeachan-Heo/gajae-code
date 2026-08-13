@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,6 +13,25 @@ import { readNotebookDocument } from "../../src/edit/notebook";
 import * as pyExecutor from "../../src/eval/py/executor";
 
 const tempRoots: string[] = [];
+const TEST_SESSION_ID = "test-session";
+let previousGjcSessionId: string | undefined;
+
+// State writes require an explicit session id. Pin one instead of inheriting the
+// ambient GJC_SESSION_ID, which is set when the suite runs inside a live GJC
+// session and absent on a clean runner -- that difference made these tests pass
+// locally while failing in CI.
+beforeAll(() => {
+	previousGjcSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
+
+afterAll(() => {
+	if (previousGjcSessionId === undefined) {
+		delete process.env.GJC_SESSION_ID;
+	} else {
+		process.env.GJC_SESSION_ID = previousGjcSessionId;
+	}
+});
 
 afterEach(async () => {
 	vi.restoreAllMocks();

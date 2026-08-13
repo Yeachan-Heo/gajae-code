@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentTool, type AgentToolResult } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai/core";
@@ -18,6 +18,25 @@ import { autoresearchWrite } from "../../src/gjc-runtime/autoresearch-runtime";
 import { BUILTIN_TOOL_DESCRIPTORS, BUILTIN_TOOLS, createTools, type ToolSession } from "../../src/tools";
 
 const TEST_SESSION_ID = "test-session";
+let previousGjcSessionId: string | undefined;
+
+// The mission resolver writes and reads state, which requires an explicit
+// session id. Pin one rather than inheriting the ambient GJC_SESSION_ID, which
+// is present when this suite runs inside a live GJC session and absent on a
+// clean runner -- that difference made these tests pass locally while failing
+// in CI with SessionResolutionError.
+beforeAll(() => {
+	previousGjcSessionId = process.env.GJC_SESSION_ID;
+	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+});
+
+afterAll(() => {
+	if (previousGjcSessionId === undefined) {
+		delete process.env.GJC_SESSION_ID;
+	} else {
+		process.env.GJC_SESSION_ID = previousGjcSessionId;
+	}
+});
 
 function textOf(result: AgentToolResult): string {
 	return result.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
