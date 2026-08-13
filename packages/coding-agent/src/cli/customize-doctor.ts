@@ -31,6 +31,7 @@ import { type Skill, skillCapability } from "../capability/skill";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { Capability, LoadContext, LoadResult, SourceMeta } from "../capability/types";
+import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { Settings, type Settings as SettingsInstance } from "../config/settings";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { initializeWithSettings, loadCapability } from "../discovery";
@@ -46,6 +47,7 @@ import { loadAllMCPConfigs } from "../runtime-mcp/config";
 import { readDisabledServers } from "../runtime-mcp/config-writer";
 import { canonicalizeMCPEndpoint } from "../runtime-mcp/pool-key";
 import { redactMCPEndpoint } from "../runtime-mcp/redaction";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 
 // =============================================================================
@@ -197,6 +199,8 @@ export interface CustomizeDoctorCommandOptions {
 // =============================================================================
 
 const REDACTED = "<redacted>";
+
+const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 
 const SENSITIVE_KEY_PATTERN =
 	/(?:token|secret|key|credential|password|passwd|pwd|authorization|auth|bearer|cookie|session|apikey)/i;
@@ -387,7 +391,11 @@ async function discoverCapability<T extends { _source: SourceMeta }>(
 			if (winner) {
 				shadowed = true;
 				shadowedBy = winner;
-			} else {
+			} else if (!disabledProviders.has(item._source.provider)) {
+				// Only enabled providers can own a dedup key; a disabled
+				// higher-priority provider must never shadow an enabled
+				// lower-priority source (includeDisabledProviders reports it
+				// as a listed item without giving it effective precedence).
 				winners.set(key, { provider: item._source.provider, scope });
 			}
 		}
@@ -656,14 +664,14 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 			"skills.enabled is false: sessions load only the four bundled workflow skills. Enable discovery with `gjc config set skills.enabled true`.",
 		);
 	}
-	if (skillsEnabled && !(activeSettings.get("skills.enablePiProject") === true)) {
+	if (skillsEnabled && !resolveSkillScopeTrust(activeSettings.getGroup("skills"), "project")) {
 		skillScopeNotes.push(
-			"skills.enablePiProject is false: project .gjc/skills are not loaded even with skills.enabled true.",
+			"Project skills are not trusted (skills.trustProjectSkills is false, or legacy skills.enablePiProject is false): project .gjc/skills are not loaded even with skills.enabled true.",
 		);
 	}
-	if (skillsEnabled && !(activeSettings.get("skills.enablePiUser") === true)) {
+	if (skillsEnabled && !resolveSkillScopeTrust(activeSettings.getGroup("skills"), "user")) {
 		skillScopeNotes.push(
-			"skills.enablePiUser is false: user-level skills are not loaded even with skills.enabled true.",
+			"User skills are not trusted (skills.trustUserSkills is false, or legacy skills.enablePiUser is false): user-level skills are not loaded even with skills.enabled true.",
 		);
 	}
 
@@ -722,6 +730,16 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				[`Move the skill under .gjc/skills/<name>/SKILL.md to make it loadable`],
 			);
 		}
+		if (BUILT_IN_SKILL_NAMES.has(entry.name)) {
+			return finalizeItem(
+				base,
+				"shadowed",
+				"shadowed-by-precedence",
+				`"${entry.name}" is a bundled GJC workflow skill; the bundled definition takes precedence in sessions and this discovered copy is never used (sdk/session.ts withEmbeddedDefaultGjcSkills).`,
+				[`Rename ${entry.path} to make it loadable`],
+				{ precedence: { priority: entry.priority, shadowedBy: { provider: "bundled", scope: "native" } } },
+			);
+		}
 		if (loadedNames.has(entry.name)) {
 			return finalizeItem(base, "loaded", "loaded", "Loaded by session startup.", []);
 		}
@@ -738,8 +756,8 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 			base,
 			"stored-only",
 			"policy-blocked",
-			"Discovered but not present in the session skill list (name collision, disabled scope, or include/ignore pattern).",
-			["Check skills.ignoredSkills, skills.includeSkills, skills.enablePiUser, and skills.enablePiProject"],
+			"Discovered but not present in the session skill list (name collision, untrusted scope, or include/ignore pattern).",
+			["Check skills.ignoredSkills, skills.includeSkills, skills.trustUserSkills, and skills.trustProjectSkills"],
 		);
 	});
 
@@ -791,12 +809,25 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				);
 				continue;
 			}
-			if (loadedNames.has(skill.name)) {
+			if (BUILT_IN_SKILL_NAMES.has(skill.name)) {
 				items.push(
-					finalizeItem(base, "loaded", "loaded", "Loaded by session startup from skills.customDirectories.", []),
+					finalizeItem(
+						base,
+						"shadowed",
+						"shadowed-by-precedence",
+						`"${skill.name}" is a bundled GJC workflow skill; the bundled definition takes precedence in sessions and this custom-directory copy is never used (sdk/session.ts withEmbeddedDefaultGjcSkills).`,
+						[`Rename ${skill.path} to make it loadable`],
+						{ precedence: { priority: 0, shadowedBy: { provider: "bundled", scope: "native" } } },
+					),
 				);
 				continue;
 			}
+			// Check for an already-loaded effective winner (native/convention
+			// skill of the same name) BEFORE the loadedNames shortcut: when
+			// loadSkills also scans customDirectories, a custom copy can appear
+			// in loadedNames even though it loses the name collision to an
+			// earlier-priority source. The collision must report shadowed-by-
+			// precedence, not a second "loaded" item.
 			const collisionWinner = items.find(i => i.name === skill.name && i.status === "loaded");
 			if (collisionWinner) {
 				items.push(
@@ -816,6 +847,12 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 				);
 				continue;
 			}
+			if (loadedNames.has(skill.name)) {
+				items.push(
+					finalizeItem(base, "loaded", "loaded", "Loaded by session startup from skills.customDirectories.", []),
+				);
+				continue;
+			}
 			items.push(
 				finalizeItem(
 					base,
@@ -829,8 +866,10 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 	}
 
 	// Bundled GJC workflow skills are a product invariant: sessions always
-	// include them, and a discovered same-name skill takes precedence when
-	// skills.enabled is true (sdk/session.ts withEmbeddedDefaultGjcSkills).
+	// include them, and the bundled definition always wins over any discovered
+	// same-name filesystem skill (sdk/session.ts withEmbeddedDefaultGjcSkills,
+	// extensibility/skills.ts collision warning). Discovered same-name copies
+	// are marked shadowed by the bundled entry above.
 	for (const embedded of getEmbeddedDefaultGjcSkills()) {
 		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
 			name: embedded.name,
@@ -845,29 +884,15 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 			restartRequired: restartRequiredFor("skill"),
 			precedence: { priority: 0 },
 		};
-		const winner = items.find(i => i.name === embedded.name && i.status === "loaded");
-		if (winner) {
-			items.push(
-				finalizeItem(
-					base,
-					"shadowed",
-					"shadowed-by-precedence",
-					`Bundled workflow skill; the discovered ${winner.convention}/${winner.scope} skill with the same name takes precedence at session startup.`,
-					[],
-					{ precedence: { priority: 0, shadowedBy: { provider: winner.provider, scope: winner.scope } } },
-				),
-			);
-		} else {
-			items.push(
-				finalizeItem(
-					base,
-					"loaded",
-					"loaded",
-					"Bundled GJC workflow skill — always available to sessions (product invariant), even when skills.enabled is false.",
-					[],
-				),
-			);
-		}
+		items.push(
+			finalizeItem(
+				base,
+				"loaded",
+				"loaded",
+				"Bundled GJC workflow skill — always available to sessions (product invariant), even when skills.enabled is false, and always takes precedence over any discovered same-name filesystem skill.",
+				[],
+			),
+		);
 	}
 
 	return {

@@ -301,4 +301,83 @@ describe("customize doctor (#4288)", () => {
 		expect(fixture?.mcp?.connectable).toBe(true);
 		expect(fixture?.status).toBe("stored-only");
 	});
+	it("disabled native provider does not shadow an enabled lower-priority source (bug A)", async () => {
+		const cwd = await makeTempProject();
+		// Same skill name from two providers: native (.gjc, priority 100) and
+		// agents (.agent, priority 70). When the native provider is disabled,
+		// the disabled native must never own the dedup key in the winner map,
+		// so the agents item is NOT incorrectly marked shadowed-by-precedence.
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "fixture-collision", "Native project skill");
+		await makeSkill(path.join(cwd, ".agent", "skills"), "fixture-collision", "Agent project skill");
+
+		const settings = Settings.isolated({
+			"skills.enabled": true,
+			disabledProviders: ["native"],
+		});
+
+		const report = await runCustomizeDoctor(cwd, settings);
+		const items = surface(report, "skill").items.filter(i => i.name === "fixture-collision");
+
+		// The native item is listed/reported as disabled-provider.
+		const nativeItem = items.find(i => i.provider === "native");
+		expect(nativeItem).toMatchObject({
+			status: "disabled",
+			reason: "disabled-provider",
+		});
+
+		// The agents item must NOT be shadowed by the disabled native provider.
+		// Without the fix it would report "shadowed-by-precedence" with
+		// shadowedBy.provider === "native", which is incorrect: a disabled
+		// provider has no effective precedence. With the fix, the agents item
+		// reaches its natural classification (source-ignored) instead.
+		const agentItem = items.find(i => i.provider === "agents");
+		expect(agentItem?.status).not.toBe("shadowed");
+		expect(agentItem?.reason).not.toBe("shadowed-by-precedence");
+		expect(agentItem?.precedence?.shadowedBy).toBeUndefined();
+	});
+
+	it("custom-directory skill collision reports shadowed-by-precedence, not double-loaded (bug B)", async () => {
+		const cwd = await makeTempProject();
+		// A native skill owns the name first.
+		await makeSkill(path.join(cwd, ".gjc", "skills"), "fixture-custom-collision", "Native project skill");
+		// A custom directory has a skill of the same name.
+		const customDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-custom-skills-"));
+		tempDirs.push(customDir);
+		await makeSkill(customDir, "fixture-custom-collision", "Custom directory skill");
+
+		const settings = Settings.isolated({
+			"skills.enabled": true,
+			"skills.customDirectories": [customDir],
+		});
+
+		const report = await runCustomizeDoctor(cwd, settings);
+		const items = surface(report, "skill").items.filter(i => i.name === "fixture-custom-collision");
+
+		// Exactly one item should be "loaded" (the native one). The custom-
+		// directory copy must report shadowed-by-precedence, not a second
+		// "loaded" item.
+		const loadedItems = items.filter(i => i.status === "loaded");
+		expect(loadedItems).toHaveLength(1);
+		expect(loadedItems[0]).toMatchObject({ provider: "native", convention: "gjc" });
+
+		const customItem = items.find(i => i.provider === "custom");
+		expect(customItem).toMatchObject({
+			status: "shadowed",
+			reason: "shadowed-by-precedence",
+		});
+		expect(customItem?.precedence?.shadowedBy).toMatchObject({
+			provider: "native",
+			scope: "project",
+		});
+
+		// Startup agreement: loadSkills only keeps the native copy.
+		const startup = await loadSkills({
+			...settings.getGroup("skills"),
+			cwd,
+			disabledExtensions: settings.get("disabledExtensions"),
+		});
+		const startupSkills = startup.skills.filter(s => s.name === "fixture-custom-collision");
+		expect(startupSkills).toHaveLength(1);
+		expect(startupSkills[0]?.source).toContain("native");
+	});
 });

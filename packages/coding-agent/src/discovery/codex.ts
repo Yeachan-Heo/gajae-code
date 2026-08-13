@@ -1,31 +1,25 @@
 /**
- * OpenAI code provider project provider.
+ * OpenAI Codex project/global skill layout adapter (import source).
  *
- * Supports project-local `.OpenAI code backend/` compatibility only. User-home OpenAI code backend
- * directories are intentionally ignored so `~/.OpenAI code backend` content is never injected
- * into GJC sessions.
+ * The `.codex/skills` layout is an explicit import source into the canonical
+ * `.gjc` skill locations — it is never loaded as an ordinary runtime authority.
+ * These helpers enumerate the layout for import/inspection consumers (#4291
+ * import UI, #4288 provenance diagnostics) and are deliberately NOT registered
+ * as capability providers: activating Codex's other surfaces (MCP servers,
+ * hooks, commands, tools, prompts, settings) is owned by sibling issues.
+ *
+ * User-home `~/.codex/skills` is enumerated as an explicit import candidate
+ * only; it is never loaded into sessions without an explicit import action.
  */
 import * as path from "node:path";
 import { logger, parseFrontmatter } from "@gajae-code/utils";
-import { registerProvider } from "../capability";
-import type { ContextFile } from "../capability/context-file";
-import { contextFileCapability } from "../capability/context-file";
-import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
+import type { ExtensionModule } from "../capability/extension-module";
 import { readFile } from "../capability/fs";
 import type { Hook } from "../capability/hook";
-import { hookCapability } from "../capability/hook";
 import type { MCPServer } from "../capability/mcp";
-import { mcpCapability } from "../capability/mcp";
-import type { Prompt } from "../capability/prompt";
-import { promptCapability } from "../capability/prompt";
-import type { Settings } from "../capability/settings";
-import { settingsCapability } from "../capability/settings";
 import type { Skill } from "../capability/skill";
-import { skillCapability } from "../capability/skill";
 import type { SlashCommand } from "../capability/slash-command";
-import { slashCommandCapability } from "../capability/slash-command";
 import type { CustomTool } from "../capability/tool";
-import { toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import {
 	buildExtensionModuleItems,
@@ -35,57 +29,53 @@ import {
 	scanSkillsFromDir,
 } from "./helpers";
 
-const PROVIDER_ID = "codex";
-const DISPLAY_NAME = "OpenAI Codex";
-const PRIORITY = 70;
+export const CODEX_PROVIDER_ID = "codex";
+export const CODEX_DISPLAY_NAME = "OpenAI Codex";
+export const CODEX_CONFIG_DIR = ".codex";
+
+/**
+ * Enumerate the project-local `.codex/skills` layout (cwd only), mirroring the
+ * OpenAI Codex project convention.
+ */
+export async function scanCodexProjectSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
+	return await scanSkillsFromDir(ctx, {
+		dir: path.join(ctx.cwd, CODEX_CONFIG_DIR, "skills"),
+		providerId: CODEX_PROVIDER_ID,
+		level: "project",
+		requireDescription: true,
+	});
+}
+
+/**
+ * Enumerate the user-global `~/.codex/skills` layout. This is an explicit
+ * import candidate only; GJC never loads it without an explicit import action.
+ */
+export async function scanCodexUserSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
+	return await scanSkillsFromDir(ctx, {
+		dir: path.join(ctx.home, CODEX_CONFIG_DIR, "skills"),
+		providerId: CODEX_PROVIDER_ID,
+		level: "user",
+		requireDescription: true,
+	});
+}
+
+export function codexSkillSourceMeta(filePath: string, level: "user" | "project") {
+	return createSourceMeta(CODEX_PROVIDER_ID, filePath, level);
+}
+
+// =============================================================================
+// Provenance inspection (#4288)
+//
+// The scans below enumerate the remaining `.codex/` project surfaces (MCP
+// servers, hooks, tools, extensions, commands) for the `gjc customize doctor`
+// provenance report. They reuse the shared discovery helpers but are
+// deliberately NOT registered as capability providers: none of these surfaces
+// are part of the session load path, and inspection must not change runtime
+// behavior.
+// =============================================================================
 
 function getProjectCodexDir(ctx: LoadContext): string {
-	return path.join(ctx.cwd, ".codex");
-}
-
-async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFile>> {
-	const items: ContextFile[] = [];
-	const agentsMd = path.join(getProjectCodexDir(ctx), "AGENTS.md");
-	const agentsContent = await readFile(agentsMd);
-	if (agentsContent) {
-		items.push({
-			path: agentsMd,
-			content: agentsContent,
-			level: "project",
-			depth: 0,
-			_source: createSourceMeta(PROVIDER_ID, agentsMd, "project"),
-		});
-	}
-	return { items, warnings: [] };
-}
-
-async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> {
-	const warnings: string[] = [];
-	const projectConfigPath = path.join(getProjectCodexDir(ctx), "config.toml");
-	const projectConfig = await loadTomlConfig(projectConfigPath);
-	const items: MCPServer[] = [];
-	if (projectConfig) {
-		const servers = extractMCPServersFromToml(projectConfig);
-		for (const [name, config] of Object.entries(servers)) {
-			items.push({
-				name,
-				...config,
-				_source: createSourceMeta(PROVIDER_ID, projectConfigPath, "project"),
-			});
-		}
-	}
-	return { items, warnings };
-}
-
-async function loadTomlConfig(filePath: string): Promise<Record<string, unknown> | null> {
-	const content = await readFile(filePath);
-	if (!content) return null;
-	try {
-		return Bun.TOML.parse(content) as Record<string, unknown>;
-	} catch (error) {
-		logger.warn("Failed to parse TOML config", { path: filePath, error: String(error) });
-		return null;
-	}
+	return path.join(ctx.cwd, CODEX_CONFIG_DIR);
 }
 
 interface CodexMCPConfig {
@@ -102,6 +92,17 @@ interface CodexMCPConfig {
 	tool_timeout_sec?: number;
 	enabled_tools?: string[];
 	disabled_tools?: string[];
+}
+
+async function loadTomlConfig(filePath: string): Promise<Record<string, unknown> | null> {
+	const content = await readFile(filePath);
+	if (!content) return null;
+	try {
+		return Bun.TOML.parse(content) as Record<string, unknown>;
+	} catch (error) {
+		logger.warn("Failed to parse TOML config", { path: filePath, error: String(error) });
+		return null;
+	}
 }
 
 function extractMCPServersFromToml(toml: Record<string, unknown>): Record<string, Partial<MCPServer>> {
@@ -153,59 +154,25 @@ function extractMCPServersFromToml(toml: Record<string, unknown>): Record<string
 	return result;
 }
 
-async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	return await scanSkillsFromDir(ctx, {
-		dir: path.join(getProjectCodexDir(ctx), "skills"),
-		providerId: PROVIDER_ID,
-		level: "project",
-	});
+async function inspectMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> {
+	const warnings: string[] = [];
+	const projectConfigPath = path.join(getProjectCodexDir(ctx), "config.toml");
+	const projectConfig = await loadTomlConfig(projectConfigPath);
+	const items: MCPServer[] = [];
+	if (projectConfig) {
+		const servers = extractMCPServersFromToml(projectConfig);
+		for (const [name, config] of Object.entries(servers)) {
+			items.push({
+				name,
+				...config,
+				_source: createSourceMeta(CODEX_PROVIDER_ID, projectConfigPath, "project"),
+			});
+		}
+	}
+	return { items, warnings };
 }
 
-async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<ExtensionModule>> {
-	const projectExtensionsDir = path.join(getProjectCodexDir(ctx), "extensions");
-	const projectPaths = await discoverExtensionModulePaths(ctx, projectExtensionsDir);
-	return { items: buildExtensionModuleItems(PROVIDER_ID, [], projectPaths), warnings: [] };
-}
-
-async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashCommand>> {
-	const projectCommandsDir = path.join(getProjectCodexDir(ctx), "commands");
-	const transformCommand = (name: string, content: string, filePath: string, source: SourceMeta) => {
-		const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
-		const commandName = frontmatter.name || name.replace(/\.md$/, "");
-		return {
-			name: String(commandName),
-			path: filePath,
-			content: body,
-			level: "project" as const,
-			_source: source,
-		};
-	};
-	return await loadFilesFromDir(ctx, projectCommandsDir, PROVIDER_ID, "project", {
-		extensions: ["md"],
-		transform: transformCommand,
-	});
-}
-
-async function loadPrompts(ctx: LoadContext): Promise<LoadResult<Prompt>> {
-	const projectPromptsDir = path.join(getProjectCodexDir(ctx), "prompts");
-	const transformPrompt = (name: string, content: string, filePath: string, source: SourceMeta) => {
-		const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
-		const promptName = frontmatter.name || name.replace(/\.md$/, "");
-		return {
-			name: String(promptName),
-			path: filePath,
-			content: body,
-			description: frontmatter.description ? String(frontmatter.description) : undefined,
-			_source: source,
-		};
-	};
-	return await loadFilesFromDir(ctx, projectPromptsDir, PROVIDER_ID, "project", {
-		extensions: ["md"],
-		transform: transformPrompt,
-	});
-}
-
-async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
+async function inspectHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 	const projectHooksDir = path.join(getProjectCodexDir(ctx), "hooks");
 	const transformHook = (name: string, _content: string, filePath: string, source: SourceMeta) => {
 		const baseName = name.replace(/\.(ts|js)$/, "");
@@ -220,13 +187,13 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 			_source: source,
 		};
 	};
-	return await loadFilesFromDir(ctx, projectHooksDir, PROVIDER_ID, "project", {
+	return await loadFilesFromDir(ctx, projectHooksDir, CODEX_PROVIDER_ID, "project", {
 		extensions: ["ts", "js"],
 		transform: transformHook,
 	});
 }
 
-async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
+async function inspectTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 	const projectToolsDir = path.join(getProjectCodexDir(ctx), "tools");
 	const transformTool = (name: string, _content: string, filePath: string, source: SourceMeta) =>
 		({
@@ -235,26 +202,35 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 			level: "project" as const,
 			_source: source,
 		}) as CustomTool;
-	return await loadFilesFromDir(ctx, projectToolsDir, PROVIDER_ID, "project", {
+	return await loadFilesFromDir(ctx, projectToolsDir, CODEX_PROVIDER_ID, "project", {
 		extensions: ["ts", "js"],
 		transform: transformTool,
 	});
 }
 
-async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
-	const projectConfigPath = path.join(getProjectCodexDir(ctx), "config.toml");
-	const projectConfig = await loadTomlConfig(projectConfigPath);
-	return {
-		items: projectConfig
-			? [
-					{
-						...projectConfig,
-						_source: createSourceMeta(PROVIDER_ID, projectConfigPath, "project"),
-					} as Settings,
-				]
-			: [],
-		warnings: [],
+async function inspectExtensionModules(ctx: LoadContext): Promise<LoadResult<ExtensionModule>> {
+	const projectExtensionsDir = path.join(getProjectCodexDir(ctx), "extensions");
+	const projectPaths = await discoverExtensionModulePaths(ctx, projectExtensionsDir);
+	return { items: buildExtensionModuleItems(CODEX_PROVIDER_ID, [], projectPaths), warnings: [] };
+}
+
+async function inspectSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashCommand>> {
+	const projectCommandsDir = path.join(getProjectCodexDir(ctx), "commands");
+	const transformCommand = (name: string, content: string, filePath: string, source: SourceMeta) => {
+		const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
+		const commandName = frontmatter.name || name.replace(/\.md$/, "");
+		return {
+			name: String(commandName),
+			path: filePath,
+			content: body,
+			level: "project" as const,
+			_source: source,
+		};
 	};
+	return await loadFilesFromDir(ctx, projectCommandsDir, CODEX_PROVIDER_ID, "project", {
+		extensions: ["md"],
+		transform: transformCommand,
+	});
 }
 
 export interface CodexConventionInspection {
@@ -269,97 +245,20 @@ export interface CodexConventionInspection {
 /**
  * Inspect what the Codex project convention (.codex/) would surface.
  *
- * Reuses the canonical provider load functions without registering the provider,
+ * Reuses the shared discovery scan helpers without registering any provider,
  * so diagnostics can report the convention's files while keeping the runtime
- * load path exactly as configured (this provider is not registered by default).
+ * load path exactly as configured (none of these surfaces are registered for
+ * session loading; hooks are covered by the separate registered codex-hooks
+ * provider).
  */
 export async function inspectCodexConvention(ctx: LoadContext): Promise<CodexConventionInspection> {
 	const [mcps, skills, hooks, tools, extensions, commands] = await Promise.all([
-		loadMCPServers(ctx),
-		loadSkills(ctx),
-		loadHooks(ctx),
-		loadTools(ctx),
-		loadExtensionModules(ctx),
-		loadSlashCommands(ctx),
+		inspectMCPServers(ctx),
+		scanCodexProjectSkills(ctx),
+		inspectHooks(ctx),
+		inspectTools(ctx),
+		inspectExtensionModules(ctx),
+		inspectSlashCommands(ctx),
 	]);
 	return { mcps, skills, hooks, tools, extensions, commands };
-}
-
-/**
- * Opt back into Codex convention discovery. Not called by default: importing
- * this module is side-effect free, and sessions only load the conventions
- * registered in discovery/index.ts.
- */
-export function registerCodexProviders(): void {
-	registerProvider<ContextFile>(contextFileCapability.id, {
-		id: PROVIDER_ID,
-		displayName: DISPLAY_NAME,
-		description: "Load context files from project .codex/AGENTS.md",
-		priority: PRIORITY,
-		load: loadContextFiles,
-	});
-
-	registerProvider<MCPServer>(mcpCapability.id, {
-		id: PROVIDER_ID,
-		displayName: DISPLAY_NAME,
-		description: "Load MCP servers from project .codex/config.toml [mcp_servers.*] sections",
-		priority: PRIORITY,
-		load: loadMCPServers,
-	});
-
-	registerProvider<Skill>(skillCapability.id, {
-		id: PROVIDER_ID,
-		displayName: DISPLAY_NAME,
-		description: "Load skills from project .codex/skills/",
-		priority: PRIORITY,
-		load: loadSkills,
-	});
-
-	registerProvider<ExtensionModule>(extensionModuleCapability.id, {
-		id: PROVIDER_ID,
-		displayName: DISPLAY_NAME,
-		description: "Load extension modules from project .codex/extensions/",
-		priority: PRIORITY,
-		load: loadExtensionModules,
-	});
-
-	registerProvider<SlashCommand>(slashCommandCapability.id, {
-		id: PROVIDER_ID,
-		displayName: DISPLAY_NAME,
-		description: "Load slash commands from project .codex/commands/",
-		priority: PRIORITY,
-		load: loadSlashCommands,
-	});
-
-	registerProvider<Prompt>(promptCapability.id, {
-		id: PROVIDER_ID,
-		displayName: DISPLAY_NAME,
-		description: "Load prompts from project .codex/prompts/",
-		priority: PRIORITY,
-		load: loadPrompts,
-	});
-
-	registerProvider<Hook>(hookCapability.id, {
-		id: PROVIDER_ID,
-		displayName: DISPLAY_NAME,
-		description: "Load hooks from project .codex/hooks/",
-		priority: PRIORITY,
-		load: loadHooks,
-	});
-
-	registerProvider<CustomTool>(toolCapability.id, {
-		id: PROVIDER_ID,
-		displayName: DISPLAY_NAME,
-		description: "Load custom tools from project .codex/tools/",
-		priority: PRIORITY,
-		load: loadTools,
-	});
-
-	registerProvider<Settings>(settingsCapability.id, {
-		id: PROVIDER_ID,
-		displayName: DISPLAY_NAME,
-		description: "Load settings from project .codex/config.toml",
-		priority: PRIORITY,
-		load: loadSettings,
-	});
 }
