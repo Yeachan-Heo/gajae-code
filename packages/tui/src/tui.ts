@@ -2569,10 +2569,8 @@ export class TUI extends Container {
 		width = Math.max(1, Math.min(width, availWidth));
 
 		// === Resolve maxHeight ===
-		let maxHeight =
-			typeof opt.maxHeight === "number" && !Number.isFinite(opt.maxHeight)
-				? availHeight
-				: parseSizeValue(opt.maxHeight, termHeight);
+		const parsedMaxHeight = parseSizeValue(opt.maxHeight, termHeight);
+		let maxHeight = opt.maxHeight !== undefined && parsedMaxHeight === undefined ? availHeight : parsedMaxHeight;
 		// Clamp to available space
 		if (maxHeight !== undefined) {
 			maxHeight = Math.max(1, Math.min(maxHeight, availHeight));
