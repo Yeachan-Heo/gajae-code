@@ -58,8 +58,13 @@ describe("builtin /pet slash command", () => {
 	it("exposes the named Gajae choices", () => {
 		const petCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "pet");
 
-		expect(petCommand?.subcommands?.map(command => command.name)).toEqual(["off", "RedGajae", "BlueGajae"]);
-		expect(petCommand?.inlineHint).toBe("[off|RedGajae|BlueGajae]");
+		expect(petCommand?.subcommands?.map(command => command.name)).toEqual([
+			"off",
+			"RedGajae",
+			"BlueGajae",
+			"Ouroboros",
+		]);
+		expect(petCommand?.inlineHint).toBe("[off|RedGajae|BlueGajae|Ouroboros]");
 	});
 
 	it("maps named Gajae commands to their internal modes", async () => {
@@ -72,8 +77,9 @@ describe("builtin /pet slash command", () => {
 
 		expect(await executeBuiltinSlashCommand("/pet redgajae", runtime)).toBe(true);
 		expect(await executeBuiltinSlashCommand("/pet BlueGajae", runtime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/pet Ouroboros", runtime)).toBe(true);
 
-		expect(setPetMode.mock.calls.map(call => call[0])).toEqual(["red", "blue"]);
+		expect(setPetMode.mock.calls.map(call => call[0])).toEqual(["red", "blue", "ouroboros"]);
 	});
 
 	it("keeps deprecated on/red/blue inputs accepted while display stays canonical", async () => {
@@ -92,13 +98,18 @@ describe("builtin /pet slash command", () => {
 		expect(setPetMode.mock.calls.map(call => call[0])).toEqual(["red", "blue", "red"]);
 		// The public surface stays canonical: no deprecated names in subcommands.
 		const petCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "pet");
-		expect(petCommand?.subcommands?.map(command => command.name)).toEqual(["off", "RedGajae", "BlueGajae"]);
+		expect(petCommand?.subcommands?.map(command => command.name)).toEqual([
+			"off",
+			"RedGajae",
+			"BlueGajae",
+			"Ouroboros",
+		]);
 
 		// Unknown tokens still fall through to usage guidance.
 		expect(await executeBuiltinSlashCommand("/pet purple", { ctx, handleBackgroundCommand: () => undefined })).toBe(
 			true,
 		);
-		expect(showStatus).toHaveBeenLastCalledWith("Usage: /pet [off|RedGajae|BlueGajae]", { dim: true });
+		expect(showStatus).toHaveBeenLastCalledWith("Usage: /pet [off|RedGajae|BlueGajae|Ouroboros]", { dim: true });
 		expect(setPetMode).toHaveBeenCalledTimes(3);
 	});
 

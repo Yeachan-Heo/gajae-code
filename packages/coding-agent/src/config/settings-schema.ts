@@ -763,7 +763,7 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "appearance",
 			label: "Gajae Pet",
-			description: "16x16 real-pixel gajae living beside the composer (sixel/kitty terminals)",
+			description: "Real-pixel pet living beside the composer (sixel/kitty terminals)",
 			options: [
 				{ value: "off", label: "Off", description: "No pet" },
 				...PET_SKIN_IDS.map(id => ({

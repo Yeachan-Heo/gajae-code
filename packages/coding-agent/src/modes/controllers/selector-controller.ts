@@ -4,7 +4,7 @@ import type { Api, Model } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
-import { Input, isPetMode, Loader, Spacer, Text } from "@gajae-code/tui";
+import { Input, Loader, resolvePetMode, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
 import type { AppKeybinding } from "../../config/keybindings";
 import {
@@ -1840,8 +1840,13 @@ export class SelectorController {
 							}
 							throw error;
 						}
-						this.#refreshThemeUi();
-						done();
+						void restoreThemePreview(themeName).then(result => {
+							if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
+								this.ctx.showError(`Failed to apply theme: ${result.error}`);
+							}
+							this.#refreshThemeUi();
+							done();
+						});
 					},
 					restoreAndClose,
 					themeName => {
@@ -1860,7 +1865,7 @@ export class SelectorController {
 
 	showPetSelector(): void {
 		const stored = settings.get("pet.mode");
-		const initial: PetMode = isPetMode(stored) ? stored : "off";
+		const initial: PetMode = resolvePetMode(stored);
 		this.showSelector(done => {
 			// Live-preview via previewMode (no editor re-mount, so the overlay stays);
 			// Enter commits + persists, Esc restores the initial skin.
@@ -2043,6 +2048,17 @@ export class SelectorController {
 					this.ctx.ui.invalidate();
 					if (!result.success) {
 						this.ctx.showError(`Failed to load theme "${value}": ${result.error}\nFell back to dark theme.`);
+					}
+				});
+				break;
+			}
+			case "theme.dark":
+			case "theme.light": {
+				restoreThemePreview(value as string).then(result => {
+					if (this.ctx.isStopped?.()) return;
+					this.#refreshThemeUi();
+					if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
+						this.ctx.showError(`Failed to apply theme "${value}": ${result.error}`);
 					}
 				});
 				break;

@@ -1,11 +1,23 @@
+import {
+	OUROBOROS_HEART_STEPS,
+	OUROBOROS_IDLE_STEPS,
+	OUROBOROS_PIXEL_GRIDS,
+	OUROBOROS_WORK_CRY_STEPS,
+	OUROBOROS_WORK_ENTER_STEPS,
+	OUROBOROS_WORK_EXIT_STEPS,
+	OUROBOROS_WORK_HEART_STEPS,
+	OUROBOROS_WORK_STEPS,
+	type OuroborosFrameName,
+} from "./ouroboros-pet";
+
 /**
  * ┌─ GAJAE PET SPRITE SPEC ────────────────────────────────────────────────┐
- * The pet is a 16×16 pixel sprite drawn beside the composer. Everything here is
- * data: no PNGs, no assets — each frame is 16 strings of 16 chars, encoded to a
- * sixel or kitty escape at runtime. Author a new frame by drawing a grid.
+ * Pets are square pixel sprites drawn beside the composer. Everything here is
+ * data: no PNGs or binary assets. Current pet frames are 16×16 and render into
+ * the same terminal footprint.
  *
  * GRID RULES
- * - Exactly 16 rows × 16 columns. Only PALETTE keys below are valid chars.
+ * - Every frame within a skin has the same square dimensions.
  * - `.` = transparent. Keep the outer columns transparent so the sprite sits
  *   snug beside the input box (the widget reserves +1 column of slack).
  *
@@ -34,17 +46,15 @@
  * ADD A FRAME: draw the grid → add its name to GajaePixelFrameName → register it in
  * PIXEL_GRIDS → reference it from an idle/work loop or a skin burst.
  *
- * ADD A PET (skin): append one entry to PET_SKINS below — { id, label, description,
- * palette, burst }. The id flows into PetSkinId/PetMode automatically, the settings
- * enum, `/pet` command and both selectors derive their options from PET_SKINS, and the
- * widget reads `burst` to animate — no other file needs editing. Recolor with a palette
- * spread (see BLUE_PALETTE); add frames only for poses the catalog lacks.
+ * ADD A PET (skin): append one PET_SKINS entry with its palette, frame registry,
+ * base/idle/work animations and burst. The id flows into PetSkinId/PetMode
+ * automatically; settings, `/pet`, and both selectors derive from PET_SKINS.
  * └────────────────────────────────────────────────────────────────────────┘
  */
 type Rgb = readonly [number, number, number];
 
 export type Palette = Record<string, Rgb | null>;
-export const PET_SKIN_IDS = ["red", "blue"] as const;
+export const PET_SKIN_IDS = ["red", "blue", "ouroboros"] as const;
 export type PetSkinId = (typeof PET_SKIN_IDS)[number];
 /** Every pet mode: "off" plus each skin id, in menu order. */
 export const PET_MODE_IDS = ["off", ...PET_SKIN_IDS] as const;
@@ -52,6 +62,11 @@ export type PetMode = (typeof PET_MODE_IDS)[number];
 /** Narrow an arbitrary string to a PetMode. */
 export function isPetMode(value: string): value is PetMode {
 	return (PET_MODE_IDS as readonly string[]).includes(value);
+}
+
+/** Resolve a persisted mode after a skin has been removed. Explicit "off" remains off. */
+export function resolvePetMode(value: string): PetMode {
+	return isPetMode(value) ? value : "red";
 }
 
 const RED_PALETTE: Palette = {
@@ -78,6 +93,15 @@ const BLUE_PALETTE: Palette = {
 	b: [125, 211, 252], // azure (belly)
 	A: [37, 120, 200], // muted blue (antenna)
 	w: [230, 247, 255], // foam (tear)
+};
+const OUROBOROS_PALETTE: Palette = {
+	".": null,
+	D: [20, 100, 48], // closed / crying eye
+	R: [174, 232, 14], // vivid lime body
+	r: [112, 146, 190], // cool blue underside (#7092BE)
+	G: [255, 231, 134], // pale-yellow eye
+	A: [255, 137, 180], // pink tongue and heart accent
+	w: [190, 231, 255], // tear
 };
 
 // ------------------------------------------------------------------------
@@ -188,6 +212,7 @@ export type GajaePixelFrameName =
 	| "cry1"
 	| "cry2"
 	| "cry3";
+export type PetFrameName = GajaePixelFrameName | OuroborosFrameName;
 
 const PIXEL_GRIDS: Record<GajaePixelFrameName, string[]> = {
 	base: F0,
@@ -210,6 +235,14 @@ export const PARA_PARA_STEPS: ReadonlyArray<readonly [GajaePixelFrameName, numbe
 	["flex", 480],
 	["base", 260],
 ];
+export const GAJAE_IDLE_STEPS: ReadonlyArray<readonly [GajaePixelFrameName, number]> = [
+	["base", 1100],
+	["gazeL", 350],
+	["base", 500],
+	["gazeR", 350],
+	["base", 800],
+	["flicker", 150],
+];
 
 /**
  * A skin's idle burst: a short intro sequence, then an optional looping tail. It drives
@@ -218,9 +251,9 @@ export const PARA_PARA_STEPS: ReadonlyArray<readonly [GajaePixelFrameName, numbe
  */
 export interface PetBurst {
 	/** Frames played once, in order, at the start of the burst. */
-	intro: ReadonlyArray<readonly [GajaePixelFrameName, number]>;
+	intro: ReadonlyArray<readonly [PetFrameName, number]>;
 	/** Frames cycled every `stepMs` for `ms` after the intro (a held or looping finish). */
-	tail?: { frames: readonly GajaePixelFrameName[]; stepMs: number; ms: number };
+	tail?: { frames: readonly PetFrameName[]; stepMs: number; ms: number };
 }
 
 /** Everything that defines a pet skin: identity, UI copy, colors and behavior. */
@@ -231,8 +264,16 @@ export interface PetSkin {
 	/** One-line selector/settings description. */
 	description: string;
 	palette: Palette;
+	frames: Readonly<Record<string, string[]>>;
+	baseFrame: PetFrameName;
+	idle: ReadonlyArray<readonly [PetFrameName, number]>;
+	workEnter?: ReadonlyArray<readonly [PetFrameName, number]>;
+	work: ReadonlyArray<readonly [PetFrameName, number]>;
+	workExit?: ReadonlyArray<readonly [PetFrameName, number]>;
 	/** Idle burst animation played between quiet idle loops. */
 	burst: PetBurst;
+	/** Optional variants that interrupt and then resume the work loop. */
+	workBursts?: readonly PetBurst[];
 }
 
 /** Skin registry — the single source for palettes, behavior and selector/command copy. */
@@ -242,6 +283,10 @@ export const PET_SKINS: Record<PetSkinId, PetSkin> = {
 		label: "RedGajae",
 		description: "The Red Crab, who likes to work-out.",
 		palette: RED_PALETTE,
+		frames: PIXEL_GRIDS,
+		baseFrame: "base",
+		idle: GAJAE_IDLE_STEPS,
+		work: PARA_PARA_STEPS,
 		burst: {
 			intro: PARA_PARA_STEPS,
 			tail: { frames: ["flex", "base"], stepMs: 200, ms: 1000 },
@@ -252,10 +297,30 @@ export const PET_SKINS: Record<PetSkinId, PetSkin> = {
 		label: "BlueGajae",
 		description: "The Blue Crab, who wants to rest.",
 		palette: BLUE_PALETTE,
+		frames: PIXEL_GRIDS,
+		baseFrame: "base",
+		idle: GAJAE_IDLE_STEPS,
+		work: PARA_PARA_STEPS,
 		burst: {
 			intro: PARA_PARA_STEPS,
 			tail: { frames: ["cry1", "cry2", "cry3"], stepMs: 110, ms: 990 },
 		},
+	},
+	ouroboros: {
+		id: "ouroboros",
+		label: "Ouroboros",
+		description: "The little snake who keeps going.",
+		palette: OUROBOROS_PALETTE,
+		frames: OUROBOROS_PIXEL_GRIDS,
+		baseFrame: "idle",
+		idle: OUROBOROS_IDLE_STEPS,
+		workEnter: OUROBOROS_WORK_ENTER_STEPS,
+		work: OUROBOROS_WORK_STEPS,
+		workExit: OUROBOROS_WORK_EXIT_STEPS,
+		burst: {
+			intro: OUROBOROS_HEART_STEPS,
+		},
+		workBursts: [{ intro: OUROBOROS_WORK_HEART_STEPS }, { intro: OUROBOROS_WORK_CRY_STEPS }],
 	},
 };
 
@@ -266,7 +331,7 @@ export function petBurstDurationMs(burst: PetBurst): number {
 }
 
 /** The frame to show `elapsed` ms into a burst (`now` cycles the looping tail). */
-export function petBurstFrame(burst: PetBurst, elapsed: number, now: number): GajaePixelFrameName {
+export function petBurstFrame(burst: PetBurst, elapsed: number, now: number): PetFrameName {
 	let t = elapsed;
 	for (const [frame, ms] of burst.intro) {
 		if (t < ms) return frame;
@@ -279,8 +344,10 @@ export function petBurstFrame(burst: PetBurst, elapsed: number, now: number): Ga
 
 /** Test-only access to logical art; production rendering still uses encoded frames. */
 export const __gajaePetTestHooks = {
-	getPixelGrid(name: GajaePixelFrameName): string[] {
-		return [...PIXEL_GRIDS[name]];
+	getPixelGrid(name: PetFrameName, skin: PetSkinId = "red"): string[] {
+		const grid = PET_SKINS[skin].frames[name];
+		if (!grid) throw new Error(`Unknown ${skin} pet frame: ${name}`);
+		return [...grid];
 	},
 };
 
@@ -407,7 +474,7 @@ export function encodeGridKitty(
 
 export interface GajaePixelFrames {
 	/** escape payload per logical frame (drawn at the current cursor cell) */
-	frames: Record<GajaePixelFrameName, string>;
+	frames: Record<string, string>;
 	/** protocol the frames were encoded for */
 	protocol: "sixel" | "kitty";
 	widthPx: number;
@@ -420,8 +487,8 @@ export interface GajaePixelFrames {
 
 /**
  * Build overlay pixel frames exactly `targetRows` terminal rows tall when the
- * terminal cells permit it. Nearest-neighbor sampling preserves the 16x16 art
- * while allowing fractional scale factors such as 36px / 16px.
+ * terminal cells permit it. Each skin owns its source resolution so future
+ * additions can opt into denser art without changing the terminal footprint.
  */
 export function buildGajaePixelFrames(options: {
 	protocol: "sixel" | "kitty";
@@ -437,10 +504,20 @@ export function buildGajaePixelFrames(options: {
 	skin?: PetSkinId;
 }): GajaePixelFrames {
 	const targetRows = options.targetRows ?? 2;
-	const gridSize = 16;
-	const scale = Math.max(1, (targetRows * options.cellHeightPx) / gridSize);
-	const widthPx = Math.round(gridSize * scale);
-	const visibleHeightPx = Math.round(gridSize * scale);
+	const skin = PET_SKINS[options.skin ?? "red"];
+	const grids = Object.entries(skin.frames);
+	const firstGrid = grids[0]?.[1];
+	if (!firstGrid?.[0]) throw new Error(`Pet skin ${skin.id} has no pixel frames`);
+	const gridHeight = firstGrid.length;
+	const gridWidth = firstGrid[0].length;
+	for (const [name, grid] of grids) {
+		if (grid.length !== gridHeight || grid.some(row => row.length !== gridWidth)) {
+			throw new Error(`Pet frame ${skin.id}/${name} does not match ${gridWidth}x${gridHeight}`);
+		}
+	}
+	const scale = Math.max(1, (targetRows * options.cellHeightPx) / gridHeight);
+	const widthPx = Math.round(gridWidth * scale);
+	const visibleHeightPx = Math.round(gridHeight * scale);
 	const columns = Math.ceil(widthPx / options.cellWidthPx);
 	const rows = Math.ceil(visibleHeightPx / options.cellHeightPx);
 	const allocatedHeightPx = rows * options.cellHeightPx;
@@ -454,14 +531,13 @@ export function buildGajaePixelFrames(options: {
 	const leftPaddingPx = Math.floor(horizontalPaddingPx / 2);
 	const rightPaddingPx = horizontalPaddingPx - leftPaddingPx;
 	const imageId = options.kittyImageId ?? 0xc0de;
-	const palette = PET_SKINS[options.skin ?? "red"].palette;
-	const frames = {} as Record<GajaePixelFrameName, string>;
-	for (const name of Object.keys(PIXEL_GRIDS) as GajaePixelFrameName[]) {
+	const frames: Record<string, string> = {};
+	for (const [name, grid] of grids) {
 		frames[name] =
 			options.protocol === "sixel"
-				? encodeGridSixel(PIXEL_GRIDS[name], scale, topPaddingPx, palette)
+				? encodeGridSixel(grid, scale, topPaddingPx, skin.palette)
 				: encodeGridKitty(
-						PIXEL_GRIDS[name],
+						grid,
 						scale,
 						imageId,
 						columns,
@@ -470,7 +546,7 @@ export function buildGajaePixelFrames(options: {
 						options.kittyCellYOffsetPx ?? 0,
 						leftPaddingPx,
 						rightPaddingPx,
-						palette,
+						skin.palette,
 					);
 	}
 

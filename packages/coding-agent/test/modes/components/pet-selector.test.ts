@@ -24,6 +24,7 @@ describe("PetSelectorComponent", () => {
 
 		expect(rendered).toContain("RedGajae (saved)");
 		expect(rendered).toContain("BlueGajae");
+		expect(rendered).toContain("Ouroboros");
 		expect(rendered).toContain("Saved, unavailable");
 		expect(stripAnsi(component.render(40).join("\n"))).toContain("RedGajae (saved)");
 		expect(component.getSelectList().getSelectedItem()?.value).toBe("off");

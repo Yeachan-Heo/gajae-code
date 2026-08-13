@@ -136,6 +136,18 @@ describe("GajaePetWidget", () => {
 		}
 	});
 
+	it("falls back an unavailable saved skin to RedGajae", () => {
+		const { widget, getEmitter } = makeWidget();
+		try {
+			widget.setMode("removed-skin");
+
+			expect(widget.mode).toBe("red");
+			expect(getEmitter()).toBeDefined();
+		} finally {
+			widget.dispose();
+		}
+	});
+
 	it("owns and deletes a distinct Kitty image ID per widget", () => {
 		const first = makeWidget(80, 30, { protocol: "kitty" });
 		const second = makeWidget(80, 30, { protocol: "kitty" });
@@ -609,6 +621,78 @@ describe("GajaePetWidget", () => {
 			vi.advanceTimersByTime(1500);
 			const danceFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
 			expect(danceFrames.size).toBeGreaterThanOrEqual(3);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("runs the Ouroboros infinity chase while working", () => {
+		vi.useFakeTimers();
+		const { widget, written } = makeWidget(80, 30, { isWorking: () => true, autoFlexGapMs: null });
+		try {
+			widget.setMode("ouroboros");
+			written.length = 0;
+
+			// One full retouched orbit is 8 × 220ms.
+			vi.advanceTimersByTime(2000);
+
+			const spinFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
+			expect(spinFrames.size).toBeGreaterThanOrEqual(8);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("occasionally leaves the Ouroboros work loop for heart and three-drop cry bursts", () => {
+		vi.useFakeTimers();
+		vi.spyOn(Math, "random").mockReturnValue(0);
+		const { widget, written } = makeWidget(80, 30, {
+			isWorking: () => true,
+			autoFlexGapMs: [500, 500],
+		});
+		try {
+			widget.setMode("ouroboros");
+			written.length = 0;
+
+			vi.advanceTimersByTime(15_000);
+			expect(widget.isFlexing).toBe(true);
+			const heartWrites = written.length;
+			vi.advanceTimersByTime(5_000);
+			expect(widget.isFlexing).toBe(false);
+
+			vi.advanceTimersByTime(12_500);
+			expect(widget.isFlexing).toBe(true);
+			expect(written.length).toBeGreaterThan(heartWrites);
+			vi.advanceTimersByTime(3_500);
+			expect(widget.isFlexing).toBe(false);
+
+			written.length = 0;
+			vi.advanceTimersByTime(1000);
+			const resumedSpinFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
+			expect(resumedSpinFrames.size).toBeGreaterThanOrEqual(4);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("enters and exits the Ouroboros work loop through its authored transition", () => {
+		vi.useFakeTimers();
+		let working = false;
+		const { widget, written } = makeWidget(80, 30, { isWorking: () => working, autoFlexGapMs: null });
+		try {
+			widget.setMode("ouroboros");
+			written.length = 0;
+
+			working = true;
+			vi.advanceTimersByTime(400);
+			const enterFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
+			expect(enterFrames.size).toBeGreaterThanOrEqual(3);
+
+			written.length = 0;
+			working = false;
+			vi.advanceTimersByTime(520);
+			const exitFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
+			expect(exitFrames.size).toBeGreaterThanOrEqual(3);
 		} finally {
 			widget.dispose();
 		}

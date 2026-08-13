@@ -39,7 +39,7 @@ function makeComponent(
 function openPetSetting(component: SettingsSelectorComponent): void {
 	for (let attempt = 0; attempt < 100; attempt++) {
 		const rendered = stripVTControlCharacters(component.render(160).join("\n"));
-		if (rendered.includes("16x16 real-pixel gajae living beside the composer")) {
+		if (rendered.includes("Real-pixel pet living beside the composer")) {
 			component.handleInput("\n");
 			return;
 		}
@@ -64,6 +64,7 @@ describe("SettingsSelectorComponent pet capability", () => {
 		const submenu = stripVTControlCharacters(component.render(80).join("\n"));
 		expect(submenu).toContain("RedGajae (saved)");
 		expect(submenu).toContain("BlueGajae");
+		expect(submenu).toContain("Ouroboros");
 		expect(submenu).toContain("Saved, unavailable");
 		expect(stripVTControlCharacters(component.render(40).join("\n"))).toContain("RedGajae (saved)");
 

@@ -1,7 +1,20 @@
 import { describe, expect, it } from "bun:test";
-import { __gajaePetTestHooks, buildGajaePixelFrames, encodeGridSixel } from "@gajae-code/tui";
+import {
+	__gajaePetTestHooks,
+	buildGajaePixelFrames,
+	encodeGridSixel,
+	PET_SKIN_IDS,
+	PET_SKINS,
+	resolvePetMode,
+} from "@gajae-code/tui";
 
 describe("gajae pixel frames", () => {
+	it("falls back removed persisted skins to RedGajae without overriding explicit off", () => {
+		expect(resolvePetMode("removed-skin")).toBe("red");
+		expect(resolvePetMode("off")).toBe("off");
+		expect(resolvePetMode("blue")).toBe("blue");
+	});
+
 	it("encodes bottom-aligned sixel frames with a transparent background", () => {
 		const built = buildGajaePixelFrames({ protocol: "sixel", cellWidthPx: 9, cellHeightPx: 18, targetRows: 2 });
 		expect(built.widthPx).toBe(36);
@@ -67,5 +80,100 @@ describe("gajae pixel frames", () => {
 	it("keeps a minimum 1x scale for tiny cells", () => {
 		const sixel = encodeGridSixel(["RK", ".G"], 1);
 		expect(sixel.startsWith('\x1bP0;1;0q"1;1;2;2')).toBe(true);
+	});
+
+	it("registers Ouroboros as a 16x16 skin with authored heart turns and work transitions", () => {
+		expect(PET_SKIN_IDS).toContain("ouroboros");
+		const skin = PET_SKINS.ouroboros;
+		expect(skin.baseFrame).toBe("idle");
+		expect(skin.work).toHaveLength(8);
+		expect(skin.workEnter).toHaveLength(2);
+		expect(skin.workExit?.map(([frame]) => frame)).toEqual(["enter-2", "enter-1", "idle"]);
+		expect(skin.idle.map(([frame]) => frame)).toContain("blink");
+		expect(skin.idle.map(([frame]) => frame)).toContain("tongue-2");
+		expect(skin.idle.map(([frame]) => frame)).toContain("cry-3");
+		expect(skin.idle.filter(([frame]) => frame === "tongue-2")).toHaveLength(3);
+		expect(skin.idle.map(([frame]) => frame).slice(-8, -1)).toEqual([
+			"cry-1",
+			"cry-2",
+			"cry-3",
+			"cry-2",
+			"cry-3",
+			"cry-2",
+			"cry-3",
+		]);
+		expect(skin.burst.intro.map(([frame]) => frame)).toContain("heart-accent");
+		expect(skin.workBursts?.map(burst => burst.intro.some(([frame]) => frame === "heart-accent"))).toEqual([
+			true,
+			false,
+		]);
+		expect(skin.workBursts?.[1]?.intro.map(([frame]) => frame).filter(frame => frame.startsWith("cry-"))).toEqual([
+			"cry-1",
+			"cry-2",
+			"cry-3",
+			"cry-2",
+			"cry-3",
+			"cry-2",
+			"cry-3",
+		]);
+
+		for (const frame of Object.values(skin.frames)) {
+			expect(frame).toHaveLength(16);
+			expect(frame.every(row => row.length === 16)).toBe(true);
+		}
+
+		const distinctWorkFrames = new Set(skin.work.map(([name]) => skin.frames[name]?.join("\n")));
+		expect(distinctWorkFrames.size).toBe(8);
+		for (const [name] of skin.work) {
+			const grid = skin.frames[name];
+			expect(grid?.join("").match(/G/g)).toHaveLength(1);
+			expect(grid?.join("")).toContain("r");
+		}
+		expect(skin.work.every(([, duration]) => duration === 220)).toBe(true);
+		expect(skin.frames["enter-2"]).toEqual(skin.frames["spin-1"]?.map(row => row.replaceAll("G", "D")));
+
+		const rotatedHeartStart = [...(skin.frames["heart-turn-0"] ?? [])]
+			.reverse()
+			.map(row => [...row].reverse().join(""));
+		expect(skin.frames.heart).toEqual(rotatedHeartStart);
+		for (const removedFrame of ["heart-turn-2", "heart-turn-7", "heart-turn-8", "heart-turn-9"]) {
+			expect(skin.frames).not.toHaveProperty(removedFrame);
+		}
+		expect(skin.burst.intro.map(([frame]) => frame).filter(frame => frame.startsWith("heart-turn-"))).toEqual([
+			"heart-turn-0",
+			"heart-turn-1",
+			"heart-turn-3",
+			"heart-turn-4",
+			"heart-turn-5",
+			"heart-turn-6",
+			"heart-turn-10",
+			"heart-turn-11",
+			"heart-turn-11",
+			"heart-turn-10",
+			"heart-turn-6",
+			"heart-turn-5",
+			"heart-turn-4",
+			"heart-turn-3",
+			"heart-turn-1",
+			"heart-turn-0",
+		]);
+	});
+
+	it("renders Ouroboros at the same terminal footprint as the crab skins", () => {
+		const built = buildGajaePixelFrames({
+			protocol: "sixel",
+			cellWidthPx: 9,
+			cellHeightPx: 18,
+			targetRows: 2,
+			skin: "ouroboros",
+		});
+
+		expect(built.widthPx).toBe(36);
+		expect(built.heightPx).toBe(36);
+		expect(built.columns).toBe(4);
+		expect(built.rows).toBe(2);
+		expect(Object.keys(built.frames)).toHaveLength(27);
+		expect(built.frames.idle.startsWith('\x1bP0;1;0q"1;1;36;36')).toBe(true);
+		expect(built.frames["spin-1"]).not.toBe(built.frames["spin-2"]);
 	});
 });
