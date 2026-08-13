@@ -8,6 +8,7 @@ import { contextEntriesForActions, contextEntriesForControls } from "./render-la
 import { moveNavigation, recentPaths, selectedNavigationPath } from "./path-navigation.js";
 import { moveOption, selectedOption } from "./option-selector.js";
 import { focusedStatusAction } from "./focused-status.js";
+import { DOUBLE_TAP_MS, isDoubleTap, pressGesture, supportsDoubleTap } from "./key-gestures.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -71,6 +72,7 @@ if (!port || !pluginUUID || !registerEvent) process.exit(64);
 
 const contexts = new Map();
 const keyDownAt = new Map();
+const pendingTaps = new Map();
 let sessions = [];
 let selectedSessionId = null;
 const sdkClients = new Map();
@@ -824,6 +826,23 @@ async function sendFocusedGjcText(text, context, submit = true) {
   if (submitted.exitCode === 0) ok(context); else { alert(context); log(`cmux enter failed ${submitted.stderr}`); }
 }
 
+async function sendFocusedGjcSequence(steps, context) {
+  const surface = await focusedGjcTarget(context);
+  if (!surface) return false;
+  const target = ["--surface", surface.surface, "--workspace", surface.workspace, "--window", surface.window];
+  for (const step of steps) {
+    const sent = await run(CMUX, ["send", ...target, step.text], homedir());
+    if (sent.exitCode !== 0) { alert(context); log(`cmux sequence send failed ${sent.stderr}`); return false; }
+    if (step.submit !== false) {
+      const submitted = await run(CMUX, ["send-key", ...target, "enter"], homedir());
+      if (submitted.exitCode !== 0) { alert(context); log(`cmux sequence enter failed ${submitted.stderr}`); return false; }
+    }
+    if (step.waitMs) await Bun.sleep(step.waitMs);
+  }
+  ok(context);
+  return true;
+}
+
 async function sendFocusedGjcKey(key, context) {
   const surface = await focusedGjcTarget(context);
   if (!surface) return false;
@@ -942,6 +961,10 @@ async function openNewPathTab(context) {
   await createTerminalTab(navigationPath(), null, context, null);
 }
 
+async function openNewPathGjcTab(context) {
+  await createTerminalTab(navigationPath(), shellQuote(GJC), context, "GJC");
+}
+
 async function movePathNavigation(delta, context) {
   const moved = moveNavigation(navigationPaths, navigationIndex, delta);
   navigationIndex = moved.index;
@@ -980,10 +1003,10 @@ async function submitSelectedPrompt(context) {
   await sendFocusedGjcText(option.prompt, context, true);
 }
 
-async function cycleTheme(context) {
-  const theme = THEME_OPTIONS[themeOptionIndex];
-  await sendFocusedGjcText(`/theme ${theme}`, context, true);
-  themeOptionIndex = (themeOptionIndex + 1) % THEME_OPTIONS.length;
+async function cycleTheme(context, delta = 1) {
+  const moved = moveOption(THEME_OPTIONS, themeOptionIndex, delta);
+  themeOptionIndex = moved.index;
+  await sendFocusedGjcText(`/theme ${moved.option}`, context, true);
   await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "themeCycle"));
 }
 
@@ -997,6 +1020,18 @@ async function duplicateFocusedTab(context) {
   const pid = shell ? Number(shell[1]) : null;
   const cwd = pid ? (await run("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], homedir())).stdout.split("\n").find(line => line.startsWith("n"))?.slice(1) : null;
   await createTerminalTab(cwd || homedir(), null, context, null);
+}
+
+async function duplicateFocusedGjcTab(context) {
+  const topology = await cmuxTopology();
+  const surface = topology.allSurfaces.find(row => row.surface === topology.currentSurface);
+  if (!surface || surface.type !== "terminal" || !surface.tty) { alert(context); return; }
+  const tty = surface.tty.replace(/^\/dev\//, "");
+  const result = await run("/bin/ps", ["-t", tty, "-o", "pid=,ppid=,command="], homedir());
+  const shell = result.stdout.split("\n").map(line => line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).filter(Boolean).sort((left, right) => Number(left[2]) - Number(right[2]))[0];
+  const pid = shell ? Number(shell[1]) : null;
+  const cwd = pid ? (await run("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], homedir())).stdout.split("\n").find(line => line.startsWith("n"))?.slice(1) : null;
+  await createTerminalTab(cwd || homedir(), shellQuote(GJC), context, "GJC");
 }
 
 
@@ -1053,7 +1088,29 @@ async function sdkControl(operation, input, context, confirm = false) {
   else { alert(context); log(`sdk ${operation} failed: ${result.stderr || result.stdout}`); }
 }
 
-async function keyUp(context, state, heldMs) {
+async function dispatchKeyGesture(context, state, heldMs, releasedAt = Date.now()) {
+  const gesture = pressGesture(heldMs);
+  if (gesture === "hold" || !supportsDoubleTap(state.settings)) {
+    const pending = pendingTaps.get(context);
+    if (pending) { clearTimeout(pending.timer); pendingTaps.delete(context); }
+    await keyUp(context, state, heldMs, gesture);
+    return;
+  }
+  const pending = pendingTaps.get(context);
+  if (pending && isDoubleTap(pending.releasedAt, releasedAt)) {
+    clearTimeout(pending.timer);
+    pendingTaps.delete(context);
+    await keyUp(context, state, heldMs, "double");
+    return;
+  }
+  const timer = setTimeout(() => {
+    pendingTaps.delete(context);
+    keyUp(context, state, heldMs, "tap").catch(error => log(`gesture tap error ${error}`));
+  }, DOUBLE_TAP_MS);
+  pendingTaps.set(context, { releasedAt, timer });
+}
+
+async function keyUp(context, state, heldMs, gesture = pressGesture(heldMs)) {
   const { action, settings = {} } = state;
   if (action === SESSION_ACTION) {
     const session = sessions[Number(settings.slot ?? 0)];
@@ -1079,11 +1136,24 @@ async function keyUp(context, state, heldMs) {
     if (settings.type === "sshTab") { await openSshTab(settings, context); return; }
     if (settings.type === "fixedFolder") { await openFixedFolder(settings, context); return; }
     if (settings.type === "frequentProject") { await openFrequentProject(settings, context); return; }
-    if (settings.type === "newPathTab") { await openNewPathTab(context); return; }
-    if (settings.type === "pathNavigation") { await movePathNavigation(Number(settings.delta) || 1, context); return; }
-    if (settings.type === "optionSelector") { await moveOptionSelector(settings.group, Number(settings.delta) || 1, context); return; }
-    if (settings.type === "optionSet") { await applySelectedOption(settings.group, context); return; }
-    if (settings.type === "themeCycle") { await cycleTheme(context); return; }
+    if (settings.type === "newPathTab") { if (gesture === "hold") await openNewPathGjcTab(context); else await openNewPathTab(context); return; }
+    if (settings.type === "pathNavigation") { await movePathNavigation(gesture === "hold" ? -(Number(settings.delta) || 1) : Number(settings.delta) || 1, context); return; }
+    if (settings.type === "optionSelector") { await moveOptionSelector(settings.group, gesture === "hold" ? -(Number(settings.delta) || 1) : Number(settings.delta) || 1, context); return; }
+    if (settings.type === "optionSet") {
+      if (gesture === "hold" && settings.group === "skill") {
+        const option = selectedOption(SKILL_OPTIONS, skillOptionIndex);
+        if (option) await sendFocusedGjcText(`/skill:${option.id}`, context, true); else alert(context);
+      } else await applySelectedOption(settings.group, context);
+      return;
+    }
+    if (settings.type === "themeCycle") {
+      if (gesture === "double") {
+        themeOptionIndex = 0;
+        await sendFocusedGjcText(`/theme ${THEME_OPTIONS[0]}`, context, true);
+        await renderEntries(contextEntriesForControls(contexts, candidate => candidate.type === "themeCycle"));
+      } else await cycleTheme(context, gesture === "hold" ? -1 : 1);
+      return;
+    }
     if (settings.type === "thinkingCycle") {
       const session = sessions.find(row => sessionKey(row) === selectedSessionId);
       if (await sendFocusedGjcShortcut("shift+tab", context)) {
@@ -1094,10 +1164,22 @@ async function keyUp(context, state, heldMs) {
       }
       return;
     }
-    if (settings.type === "duplicateTab") { await duplicateFocusedTab(context); return; }
-    if (settings.type === "promptSelector") { await movePromptSelector(Number(settings.delta) || 1, context); return; }
-    if (settings.type === "promptSubmit") { await submitSelectedPrompt(context); return; }
-    if (settings.type === "command") { await sendFocusedGjcText(settings.value, context, settings.submit !== false); return; }
+    if (settings.type === "duplicateTab") { if (gesture === "hold") await duplicateFocusedGjcTab(context); else await duplicateFocusedTab(context); return; }
+    if (settings.type === "promptSelector") { await movePromptSelector(gesture === "hold" ? -(Number(settings.delta) || 1) : Number(settings.delta) || 1, context); return; }
+    if (settings.type === "promptSubmit") {
+      const option = selectedOption(PROMPT_OPTIONS, promptOptionIndex);
+      if (!option) { alert(context); return; }
+      if (gesture === "hold") await sendFocusedGjcText(option.prompt, context, false);
+      else if (gesture === "double") await sendFocusedGjcSequence([{ text: "/clear", waitMs: 250 }, { text: option.prompt }], context);
+      else await submitSelectedPrompt(context);
+      return;
+    }
+    if (settings.type === "command") {
+      if (settings.name === "clear" && gesture === "hold") await sendFocusedGjcText("summarize the current state, decisions, remaining work, and verification evidence concisely", context, true);
+      else if (settings.name === "clear" && gesture === "double") await sendFocusedGjcText("/new", context, true);
+      else await sendFocusedGjcText(settings.value, context, settings.submit !== false);
+      return;
+    }
     if (settings.type === "worktree") { await launchProgram(WORKTREE_LAUNCHER, [], context, "worktree"); return; }
     if (settings.type === "launch" && Array.isArray(settings.value)) { await launchProgram(GJC, settings.value, context, settings.name || "GJC"); return; }
     if (settings.type === "key") { if (await sendFocusedGjcShortcut(settings.value, context)) ok(context); return; }
@@ -1143,6 +1225,9 @@ socket.addEventListener("message", async event => {
     } else if (message.event === "willDisappear") {
       contexts.delete(context);
       keyDownAt.delete(context);
+      const pending = pendingTaps.get(context);
+      if (pending) clearTimeout(pending.timer);
+      pendingTaps.delete(context);
     } else if (message.event === "didReceiveSettings") {
       const current = contexts.get(context);
       if (current) { current.settings = message.payload?.settings ?? {}; await renderContext(context, current); }
@@ -1150,9 +1235,10 @@ socket.addEventListener("message", async event => {
       keyDownAt.set(context, Date.now());
     } else if (message.event === "keyUp") {
       const state = contexts.get(context);
-      const heldMs = Date.now() - (keyDownAt.get(context) ?? Date.now());
+      const releasedAt = Date.now();
+      const heldMs = releasedAt - (keyDownAt.get(context) ?? releasedAt);
       keyDownAt.delete(context);
-      if (state) await keyUp(context, state, heldMs);
+      if (state) await dispatchKeyGesture(context, state, heldMs, releasedAt);
     }
   } catch (error) { log(`message error ${error}`); }
 });
