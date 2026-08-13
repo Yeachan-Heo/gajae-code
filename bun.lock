@@ -50,6 +50,7 @@
       "version": "0.13.1",
       "bin": {
         "gjc": "bin/gjc.js",
+        "가재씨": "bin/gajaessi.js",
       },
       "dependencies": {
         "@agentclientprotocol/sdk": "catalog:",
@@ -90,6 +91,7 @@
       "version": "0.13.1",
       "bin": {
         "gjc": "bin/gjc.js",
+        "가재씨": "bin/gajaessi.js",
       },
       "dependencies": {
         "@gajae-code/coding-agent": "catalog:",

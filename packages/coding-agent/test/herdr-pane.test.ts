@@ -433,4 +433,16 @@ describe("herdr pane title", () => {
 
 		expect(calls).toHaveLength(0);
 	});
+
+	it("truncates without splitting a surrogate pair", () => {
+		// 119 ASCII chars + one emoji (2 UTF-16 code units) = 121 code units.
+		// A naive slice(0, 120) would leave a lone high surrogate at the end.
+		const emoji = "🚀";
+		const title = "a".repeat(119) + emoji;
+		expect(title.length).toBe(121);
+		const sanitized = sanitizeHerdrPaneTitle(title);
+		expect(sanitized).toHaveLength(119);
+		const last = sanitized!.charCodeAt(sanitized!.length - 1);
+		expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+	});
 });

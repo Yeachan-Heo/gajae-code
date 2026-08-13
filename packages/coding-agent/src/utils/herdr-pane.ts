@@ -160,7 +160,14 @@ export function sanitizeHerdrPaneTitle(title: string | undefined): string | unde
 	if (!title) return undefined;
 	const sanitized = title.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim();
 	if (!sanitized) return undefined;
-	return sanitized.length > MAX_PANE_TITLE_CHARS ? sanitized.slice(0, MAX_PANE_TITLE_CHARS).trimEnd() : sanitized;
+	if (sanitized.length <= MAX_PANE_TITLE_CHARS) return sanitized;
+	// Truncate by UTF-16 code units (the Herdr argv is a string), then step back
+	// if the cut lands on the high surrogate of a pair so the title never ends
+	// with a lone surrogate.
+	let bound = MAX_PANE_TITLE_CHARS;
+	const last = sanitized.charCodeAt(bound - 1);
+	if (last >= 0xd800 && last <= 0xdbff) bound -= 1;
+	return sanitized.slice(0, bound).trimEnd();
 }
 
 /** Build the argv for a pane title report. Exported for tests. */
