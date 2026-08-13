@@ -6,6 +6,7 @@ import { ANSWER_SLOT_COUNT, optionIndexForSlot, pageAction, pageCount, pendingAs
 import { nextSelectedSessionId } from "./focus-state.js";
 import { contextEntriesForActions, contextEntriesForControls } from "./render-lanes.js";
 import { moveNavigation, recentPaths, selectedNavigationPath } from "./path-navigation.js";
+import { moveOption, selectedOption } from "./option-selector.js";
 
 const PLUGIN_UUID = "dev.gajae.streamdeck";
 const SESSION_ACTION = `${PLUGIN_UUID}.session`;
@@ -19,6 +20,26 @@ const LAUNCH_ACTION = `${PLUGIN_UUID}.launch-preset`;
 const STATUS_ACTION = `${PLUGIN_UUID}.focused-status`;
 const CONTROL_ACTION = `${PLUGIN_UUID}.control`;
 const ROOTS = [join(homedir(), "Documents", "Workspace"), join(homedir(), "tmp")];
+const MODEL_OPTIONS = [
+  { id: "frontier-heavy", label: "FRONTIER\nHEAVY", image: "control-set-frontier" },
+  { id: "frontier-default", label: "FRONTIER\nDEFAULT", image: "control-set-frontier" },
+  { id: "gpt-heavy", label: "GPT HEAVY", image: "control-set-gpt" },
+  { id: "gpt-default", label: "GPT DEFAULT", image: "control-set-gpt" },
+  { id: "kimi-gpt", label: "KIMI + GPT", image: "control-set-kimi-gpt" },
+  { id: "kimi-deepseek-glm", label: "KIMI + DS\n/ GLM", image: "control-set-kimi-gpt" },
+  { id: "glm-deepseek", label: "GLM +\nDEEPSEEK", image: "control-set-glm" },
+  { id: "deepseek-glm", label: "DEEPSEEK\n+ GLM", image: "control-set-glm" },
+  { id: "lunamaxxing-local", label: "LUNAMAXXING", image: "control-set-gpt" },
+  { id: "open-weights-spark-deepseek", label: "SPARK +\nDEEPSEEK", image: "control-set-glm" },
+  { id: "open-weights-spark-luna", label: "SPARK + LUNA", image: "control-set-frontier" },
+];
+const SKILL_OPTIONS = [
+  { id: "deep-interview", label: "DEEP\nINTERVIEW", image: "skill-deep-interview" },
+  { id: "ralplan", label: "RALPLAN", image: "skill-ralplan" },
+  { id: "ultragoal", label: "ULTRAGOAL", image: "skill-ultragoal" },
+  { id: "team", label: "TEAM", image: "skill-team" },
+];
+const THEME_OPTIONS = ["red-claw", "blue-crab", "claude-code", "codex", "gruvbox-dark", "opencode"];
 const GJC = process.env.GJC_STREAMDECK_GJC || join(homedir(), ".local", "bin", "gjc");
 const WORKTREE_LAUNCHER = process.env.GJC_STREAMDECK_WORKTREE || join(import.meta.dir, "bin", "worktree-session");
 const KEYBINDINGS_PATH = process.env.GJC_AGENT_DIR ? join(process.env.GJC_AGENT_DIR, "keybindings.json") : join(homedir(), ".gjc", "agent", "keybindings.json");
@@ -49,6 +70,10 @@ const imageCache = new Map();
 let frequentProjects = [];
 let navigationPaths = [];
 let navigationIndex = 0;
+let modelOptionIndex = 0;
+let skillOptionIndex = 0;
+let themeOptionIndex = 0;
+const thinkingLevelBySession = new Map();
 
 function log(message) {
   appendFile(LOG, `${new Date().toISOString()} ${message}\n`).catch(() => {});
@@ -217,6 +242,7 @@ function connectSdkEndpoint(endpoint) {
       const envelope = JSON.parse(String(event.data));
       const messages = sdkMessages(envelope, replayId);
       let changed = false;
+      let thinkingChanged = false;
       for (const message of messages) {
         const pending = pendingAsk(message);
         if (pending) {
@@ -228,9 +254,13 @@ function connectSdkEndpoint(endpoint) {
           changed = true;
         } else if (message.type === "reply_rejected" && client.pending?.id === message.id) {
           log(`ask reply rejected ${message.reason || "unknown"}`);
+        } else if (message.type === "thinking_level_changed" || message.type === "thinking_level_change") {
+          thinkingLevelBySession.set(endpoint.sessionId, String(message.thinkingLevel ?? message.level ?? "off"));
+          thinkingChanged = true;
         }
       }
       if (changed) renderAskControls().catch(error => log(`ask render error ${error}`));
+      if (thinkingChanged) renderThinkingControls().catch(error => log(`thinking render error ${error}`));
     } catch (error) { log(`sdk message error ${error}`); }
   });
   ws.addEventListener("close", () => {
@@ -367,6 +397,34 @@ async function cmuxTopology() {
   currentPane ??= panes.find(row => row.workspace === currentWorkspace)?.pane ?? null;
   currentSurface ??= allSurfaces.find(row => row.pane === currentPane)?.surface ?? null;
   return { byTty, windows, workspaces, panes, allSurfaces, surfaces, currentWindow, currentWorkspace, currentPane, currentSurface, selectedTty };
+}
+
+async function sessionThinkingLevel(session) {
+  if (!session?.sessionId) return "n/a";
+  const cached = thinkingLevelBySession.get(session.sessionId);
+  if (cached) return cached;
+  const root = join(process.env.GJC_AGENT_DIR || join(homedir(), ".gjc", "agent"), "sessions");
+  let buckets = [];
+  try { buckets = await readdir(root, { withFileTypes: true }); } catch { return "inherit"; }
+  for (const bucket of buckets) {
+    if (!bucket.isDirectory()) continue;
+    let files = [];
+    try { files = await readdir(join(root, bucket.name), { withFileTypes: true }); } catch { continue; }
+    const file = files.find(item => item.isFile() && item.name.endsWith(`_${session.sessionId}.jsonl`));
+    if (!file) continue;
+    try {
+      let level = "inherit";
+      for (const line of (await readFile(join(root, bucket.name, file.name), "utf8")).split("\n")) {
+        if (!line) continue;
+        const record = JSON.parse(line);
+        if (record.type === "thinking_level_change") level = String(record.thinkingLevel ?? "off");
+        else if (record.type === "model_change" && record.thinkingLevel !== undefined) level = String(record.thinkingLevel ?? "off");
+      }
+      thinkingLevelBySession.set(session.sessionId, level);
+      return level;
+    } catch { return "inherit"; }
+  }
+  return "inherit";
 }
 
 async function sdkMetadata(session) {
@@ -597,6 +655,33 @@ async function renderContext(context, state) {
       await image(context, "directory-new-tab");
       return;
     }
+    if (settings.type === "optionSelector" || settings.type === "optionSet") {
+      const options = settings.group === "skill" ? SKILL_OPTIONS : MODEL_OPTIONS;
+      const index = settings.group === "skill" ? skillOptionIndex : modelOptionIndex;
+      const option = selectedOption(options, index);
+      const verb = settings.type === "optionSet" ? (settings.group === "skill" ? "RUN" : "SET") : (settings.group === "skill" ? "SKILL" : "MODEL");
+      title(context, option ? `${verb} ${settings.type === "optionSelector" ? `${index + 1}/${options.length}\n${option.label}` : `\n${option.label}`}` : "NO OPTION");
+      await image(context, settings.type === "optionSelector" ? `selector-${settings.group}` : option?.image || "category");
+      return;
+    }
+    if (settings.type === "thinkingCycle") {
+      const session = sessions.find(row => sessionKey(row) === selectedSessionId);
+      const level = await sessionThinkingLevel(session);
+      title(context, `THINK LEVEL\n${String(level).toUpperCase()}`);
+      await image(context, "control-thinking-level");
+      return;
+    }
+    if (settings.type === "themeCycle") {
+      const theme = THEME_OPTIONS[themeOptionIndex];
+      title(context, `THEME ${themeOptionIndex + 1}/${THEME_OPTIONS.length}\n${wrapKeyText(theme, 11, 2)}`);
+      await image(context, "control-theme");
+      return;
+    }
+    if (settings.type === "duplicateTab") {
+      title(context, "DUPLICATE\nTHIS TAB");
+      await image(context, "control-duplicate-tab");
+      return;
+    }
     title(context, "");
     await image(context, `control-${settings.name}`);
     return;
@@ -624,7 +709,7 @@ async function renderFocusState() {
 }
 
 async function renderSessionState() {
-  await renderFocusState();
+  await Promise.all([renderFocusState(), renderThinkingControls()]);
 }
 
 async function renderProjectControls() {
@@ -633,6 +718,14 @@ async function renderProjectControls() {
 
 async function renderNavigationControls() {
   await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "pathNavigation" || settings.type === "newPathTab"));
+}
+
+async function renderOptionControls(group) {
+  await renderEntries(contextEntriesForControls(contexts, settings => (settings.type === "optionSelector" || settings.type === "optionSet") && settings.group === group));
+}
+
+async function renderThinkingControls() {
+  await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "thinkingCycle"));
 }
 
 async function renderAskControls() {
@@ -814,6 +907,44 @@ async function movePathNavigation(delta, context) {
   ok(context);
 }
 
+async function moveOptionSelector(group, delta, context) {
+  const options = group === "skill" ? SKILL_OPTIONS : MODEL_OPTIONS;
+  const index = group === "skill" ? skillOptionIndex : modelOptionIndex;
+  const moved = moveOption(options, index, delta);
+  if (group === "skill") skillOptionIndex = moved.index; else modelOptionIndex = moved.index;
+  await renderOptionControls(group);
+  ok(context);
+}
+
+async function applySelectedOption(group, context) {
+  const options = group === "skill" ? SKILL_OPTIONS : MODEL_OPTIONS;
+  const index = group === "skill" ? skillOptionIndex : modelOptionIndex;
+  const option = selectedOption(options, index);
+  if (!option) { alert(context); return; }
+  if (group === "skill") await sendFocusedGjcText(`/skill:${option.id}`, context, false);
+  else await sendFocusedGjcText(`/model gajae-code/${option.id}`, context, true);
+}
+
+async function cycleTheme(context) {
+  const theme = THEME_OPTIONS[themeOptionIndex];
+  await sendFocusedGjcText(`/theme ${theme}`, context, true);
+  themeOptionIndex = (themeOptionIndex + 1) % THEME_OPTIONS.length;
+  await renderEntries(contextEntriesForControls(contexts, settings => settings.type === "themeCycle"));
+}
+
+async function duplicateFocusedTab(context) {
+  const topology = await cmuxTopology();
+  const surface = topology.allSurfaces.find(row => row.surface === topology.currentSurface);
+  if (!surface || surface.type !== "terminal" || !surface.tty) { alert(context); return; }
+  const tty = surface.tty.replace(/^\/dev\//, "");
+  const result = await run("/bin/ps", ["-t", tty, "-o", "pid=,ppid=,command="], homedir());
+  const shell = result.stdout.split("\n").map(line => line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/)).filter(Boolean).sort((left, right) => Number(left[2]) - Number(right[2]))[0];
+  const pid = shell ? Number(shell[1]) : null;
+  const cwd = pid ? (await run("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], homedir())).stdout.split("\n").find(line => line.startsWith("n"))?.slice(1) : null;
+  await createTerminalTab(cwd || homedir(), null, context, null);
+}
+
+
 async function launchGjcInFocusedTab(context) {
   const topology = await cmuxTopology();
   const surface = topology.allSurfaces.find(row => row.surface === topology.currentSurface);
@@ -886,6 +1017,20 @@ async function keyUp(context, state, heldMs) {
     if (settings.type === "frequentProject") { await openFrequentProject(settings, context); return; }
     if (settings.type === "newPathTab") { await openNewPathTab(context); return; }
     if (settings.type === "pathNavigation") { await movePathNavigation(Number(settings.delta) || 1, context); return; }
+    if (settings.type === "optionSelector") { await moveOptionSelector(settings.group, Number(settings.delta) || 1, context); return; }
+    if (settings.type === "optionSet") { await applySelectedOption(settings.group, context); return; }
+    if (settings.type === "themeCycle") { await cycleTheme(context); return; }
+    if (settings.type === "thinkingCycle") {
+      const session = sessions.find(row => sessionKey(row) === selectedSessionId);
+      if (await sendFocusedGjcShortcut("shift+tab", context)) {
+        if (session?.sessionId) thinkingLevelBySession.delete(session.sessionId);
+        await Bun.sleep(250);
+        await renderThinkingControls();
+        ok(context);
+      }
+      return;
+    }
+    if (settings.type === "duplicateTab") { await duplicateFocusedTab(context); return; }
     if (settings.type === "command") { await sendFocusedGjcText(settings.value, context, settings.submit !== false); return; }
     if (settings.type === "worktree") { await launchProgram(WORKTREE_LAUNCHER, [], context, "worktree"); return; }
     if (settings.type === "launch" && Array.isArray(settings.value)) { await launchProgram(GJC, settings.value, context, settings.name || "GJC"); return; }
