@@ -48,6 +48,7 @@ function sdkBusNatives(): NativeSdkBusBindings {
 type NotificationServer = NativeNotificationServer;
 
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
+
 import { AsyncJobManager } from "../../async";
 import { Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
@@ -3888,6 +3889,7 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
+		autoroutingInactive?: boolean;
 		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
@@ -3895,7 +3897,6 @@ export function createNotificationsExtension(
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
-
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
@@ -6314,6 +6315,7 @@ export function createNotificationsExtension(
 		}
 
 		sdkRuntime = new SessionSdkSessionRuntime({
+			autoroutingInactive: options.autoroutingInactive,
 			transport: {
 				sessionId: id,
 				stateRoot,

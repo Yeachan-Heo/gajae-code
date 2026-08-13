@@ -165,6 +165,8 @@ type SessionRecord = {
 	/** Bounded set of correlations already settled; they stay closed for publication. */
 	settledPromptCorrelations: PromptCorrelation[];
 	authFailure?: string;
+	/** Replayable startup notice captured before ACP bootstrap; emitted once after the session id is known. */
+	routingInactiveNotice?: string;
 	activePrompt?: PromptWaiter;
 	/** Set by `session/cancel` so an in-flight prompt settles as `cancelled`, never as an error. */
 	cancelRequested?: boolean;
@@ -2510,6 +2512,10 @@ export class AcpAgent implements Agent {
 		if (!received) return;
 		const { event, wirePayload } = received;
 		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
+		if (event.type === "notice" && event.source === "autorouting" && typeof event.message === "string") {
+			record.routingInactiveNotice = event.message;
+			return;
+		}
 		const derivedCorrelation = sdkFrameCorrelation(frame, event);
 		const correlation = derivedCorrelation ?? {};
 		const activePrompt = record.activePrompt;
@@ -3309,6 +3315,21 @@ export class AcpAgent implements Agent {
 							update: {
 								sessionUpdate: "agent_thought_chunk",
 								content: { type: "text", text: `[error:auth] ${record.authFailure}\n` },
+							},
+						},
+						record.adapter,
+					);
+				}
+				if (record.routingInactiveNotice) {
+					const message = record.routingInactiveNotice;
+					record.routingInactiveNotice = undefined;
+					await this.#publishSessionUpdate(
+						id,
+						{
+							sessionId: id,
+							update: {
+								sessionUpdate: "agent_thought_chunk",
+								content: { type: "text", text: `[warning:autorouting] ${message}\n` },
 							},
 						},
 						record.adapter,

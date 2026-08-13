@@ -1365,6 +1365,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 		}
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
+		const autoroutingInactive =
+			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
+
 		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd });
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
@@ -2449,6 +2452,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
 						createNotificationsExtension(api, {
 							settings,
+							autoroutingInactive,
+
 							controller: notificationSessionController,
 							spawnedByGjc,
 							sdkHostModeSupported: options.sdkHostModeSupported,
@@ -2501,6 +2506,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
 							createTransport: input => createSdkWebSocketTransport(input),
 							settings,
+							autoroutingInactive,
 							configOverrides: new Map(),
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
@@ -3548,15 +3554,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		session.setActiveModelProfile(startupActiveModelProfile);
 		session.configWarnings.push(...contextFileWarnings);
-		// Determined once, here, where settings are already available. Recorded as a
-		// durable config warning rather than an event: session events are emitted into
-		// #eventListenerSnapshot synchronously with no buffering, and this factory has
-		// not returned yet, so nothing can be subscribed. An event emitted here would
-		// be dropped unconditionally. Interactive and print read configWarnings; ACP
-		// delivery needs a host-owned read that does not exist yet.
-		if (settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active) {
-			session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
-		}
+		// Determined once, here, where settings are already available. Keep the
+		// durable warning for interactive and print consumers; ACP delivery is
+		// carried by the host replay ring through the internal runtime seam above.
+		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {
