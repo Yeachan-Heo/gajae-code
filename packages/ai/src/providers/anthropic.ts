@@ -3393,6 +3393,49 @@ function buildToolResultBlock(model: Model<"anthropic-messages">, msg: ToolResul
 	return block;
 }
 
+/**
+ * Anthropic rejects a replayed assistant message containing adjacent
+ * `thinking`/`redacted_thinking` blocks — even when each block individually
+ * carries a valid signature — with a 400 citing the second block: "cannot be
+ * modified. These blocks must remain as in the original response." (issue #4416)
+ *
+ * The adjacency can originate from the provider stream (two `content_block_start`
+ * events for `thinking` in one message with no intervening `tool_use`), from a
+ * history mutation that removed a separating `tool_use`, or from an earlier
+ * conversion phase in `convertAnthropicMessages` that skipped an empty `text`
+ * block sitting between two thinking blocks. Because that last path exists, the
+ * invariant cannot be enforced in the shared `transformMessages` phase — it must
+ * run on the final wire output.
+ *
+ * This collapses each run of adjacent `thinking`/`redacted_thinking` blocks down
+ * to the first block, preserving its bytes, signature, and type verbatim (never
+ * concatenating, editing, synthesizing, or choosing the last). Blocks separated
+ * by any non-thinking block (`text`, `tool_use`, …) are legitimate
+ * interleaved-thinking shape and pass through unchanged. `thinking` and
+ * `redacted_thinking` are treated as one adjacency class per the API contract.
+ *
+ * The pass is O(n) per message and idempotent: an already-collapsed array is a
+ * no-op, so re-runs through `convertAnthropicMessages` (e.g. forced-tool-choice
+ * or unreplayable-thinking rebuilds) are safe.
+ */
+function collapseAdjacentThinkingBlocks(messages: MessageParam[]): void {
+	for (const message of messages) {
+		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+		const content = message.content;
+		let write = 0;
+		let inThinkingRun = false;
+		for (let read = 0; read < content.length; read++) {
+			const block = content[read];
+			if (block === undefined) continue;
+			const isThinkingBlock = block.type === "thinking" || block.type === "redacted_thinking";
+			if (isThinkingBlock && inThinkingRun) continue; // only the first block of a run survives
+			inThinkingRun = isThinkingBlock;
+			content[write++] = block;
+		}
+		if (write < content.length) content.length = write;
+	}
+}
+
 export function convertAnthropicMessages(
 	messages: Message[],
 	model: Model<"anthropic-messages">,
@@ -3530,6 +3573,11 @@ export function convertAnthropicMessages(
 		}
 	}
 
+	// Final send-time invariant (issue #4416): collapse any run of adjacent
+	// `thinking`/`redacted_thinking` blocks within one assistant message down to
+	// the first block. This runs on the wire output because earlier phases here
+	// (e.g. skipping empty text blocks) can themselves create the adjacency.
+	collapseAdjacentThinkingBlocks(params);
 	if (params.length > 0 && params[params.length - 1]?.role === "assistant") {
 		params.push({ role: "user", content: "Continue." });
 	}
