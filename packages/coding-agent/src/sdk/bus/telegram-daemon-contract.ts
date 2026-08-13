@@ -256,8 +256,14 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 161 completes that authority split: archive reasons and cleanup
  * receipts are durable, topic recovery no longer reconstructs SDK endpoint
  * authority, and replay generation cannot mutate lifecycle authority.
+ * Generation 162 removes chat-daemon ownership from the session-open critical
+ * path: the host acquires provider ownership only AFTER publishing its core
+ * endpoint, through a single-flight coordinator keyed to the full provider
+ * identity, and never awaits it on a lifecycle path. The daemon also sweeps
+ * inert notification-dir debris at startup. Older daemons assume ownership is
+ * proved before publication and do not perform that sweep.
  */
-export const DAEMON_GENERATION = 161;
+export const DAEMON_GENERATION = 162;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
