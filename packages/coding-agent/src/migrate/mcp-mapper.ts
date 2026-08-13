@@ -38,7 +38,18 @@ const SECRET_INDIRECTION_FIELDS: Record<MigrateSource, string[]> = {
 
 /** Fields recognized for a source (handled or intentionally omitted). Anything else is omitted-with-warning. */
 const RECOGNIZED_FIELDS: Record<MigrateSource, ReadonlySet<string>> = {
-	"claude-code": new Set(["type", "command", "args", "env", "url", "headers", "enabled", "timeout", "cwd", "protocol"]),
+	"claude-code": new Set([
+		"type",
+		"command",
+		"args",
+		"env",
+		"url",
+		"headers",
+		"enabled",
+		"timeout",
+		"cwd",
+		"protocol",
+	]),
 	codex: new Set([
 		"type",
 		"command",

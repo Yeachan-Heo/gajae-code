@@ -379,7 +379,7 @@ describe("MRTR input_required", () => {
 
 	it("gathers input and retries exactly once with verbatim requestState under a fresh id", async () => {
 		const fixture = startModernFixture({
-			onCall: (body, index) => {
+			onCall: (_body, index) => {
 				if (index === 1) return { result: inputRequiredResult };
 				return { result: { resultType: "complete", content: [{ type: "text", text: "answered" }] } };
 			},

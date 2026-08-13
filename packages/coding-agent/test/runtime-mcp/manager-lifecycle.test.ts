@@ -1340,7 +1340,13 @@ setInterval(() => {}, 1000);
 			expect(toolCallCount).toBe(1);
 			expect(initializeCapabilities).toEqual({});
 			// auto preference probes server/discover first; this stub answers like a real legacy server.
-			expect(requestMethods).toEqual(["server/discover", "initialize", "notifications/initialized", "tools/list", "tools/call"]);
+			expect(requestMethods).toEqual([
+				"server/discover",
+				"initialize",
+				"notifications/initialized",
+				"tools/list",
+				"tools/call",
+			]);
 			expect(result.errors.get("bad")).toBe("MCP server unavailable");
 			expect(manager.getConnectionStatus("exact")).toBe("connected");
 			expect(manager.getConnectedServers()).toEqual(["exact"]);
