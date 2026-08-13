@@ -8,7 +8,6 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
-import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { type ModelProfileDefinition, resolveProfileBindings } from "../../config/model-profiles";
 import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../config/model-resolver";
