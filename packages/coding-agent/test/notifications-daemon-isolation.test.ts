@@ -15,7 +15,9 @@ import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getNotificationConfig } from "../src/sdk/bus/config";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
+import { NotificationSessionController } from "../src/sdk/bus/session-control";
 import {
 	cleanupFixtureRoot,
 	createNotificationFixtureRoot,
@@ -76,8 +78,13 @@ async function createIsolationHarness(input: {
 		registerCommand: () => {},
 		sendUserMessage: async () => {},
 	} as never;
+	const controller = new NotificationSessionController({
+		eligible: true,
+		getConfig: () => getNotificationConfig(settings),
+	});
 	createNotificationsExtension(api, {
 		settings,
+		controller,
 		ensureTelegramDaemon: input.ensureTelegramDaemon as never,
 	});
 	const sid = `${input.prefix}${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -99,6 +106,8 @@ async function createIsolationHarness(input: {
 	return {
 		handlers,
 		ctx,
+		settings,
+		controller,
 		endpoint: path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`),
 	};
 }
@@ -155,3 +164,102 @@ test("a blocked telegram daemon identity degrades delivery only, never session s
 	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
 	expect(fs.existsSync(harness.endpoint)).toBe(true);
 });
+
+test("a same-length credential rotation re-proves ownership instead of reusing the settled outcome", async () => {
+	enableNotificationsEnv();
+	// Keying a secret by length (or omitting it) would let a rotation reuse a
+	// stale "ready" and authorize adapters for an unproved configuration.
+	const rotated = `9876543210:${"Z".repeat(TOKEN.length - "9876543210:".length)}`;
+	expect(rotated).toHaveLength(TOKEN.length);
+	let ensureCalls = 0;
+	const harness = await createIsolationHarness({
+		prefix: "gjc-daemon-rotate-",
+		ensureTelegramDaemon: async () => {
+			ensureCalls += 1;
+			return "attached";
+		},
+	});
+	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+	const deadline = Date.now() + 8_000;
+	while (ensureCalls < 1 && Date.now() < deadline) await Bun.sleep(25);
+	const afterStart = ensureCalls;
+	expect(afterStart).toBeGreaterThanOrEqual(1);
+
+	// Same-length rotation: a fresh ensure MUST run.
+	harness.settings.set("notifications.telegram.botToken", rotated);
+	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+	const rotateDeadline = Date.now() + 8_000;
+	while (ensureCalls <= afterStart && Date.now() < rotateDeadline) await Bun.sleep(25);
+	expect(ensureCalls).toBeGreaterThan(afterStart);
+}, 60_000);
+
+test("a delivery-only change reuses the settled ownership outcome instead of re-ensuring", async () => {
+	enableNotificationsEnv();
+	let ensureCalls = 0;
+	const harness = await createIsolationHarness({
+		prefix: "gjc-daemon-delivery-only-",
+		ensureTelegramDaemon: async () => {
+			ensureCalls += 1;
+			return "attached";
+		},
+	});
+	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+	const deadline = Date.now() + 8_000;
+	while (ensureCalls < 1 && Date.now() < deadline) await Bun.sleep(25);
+	const settledCalls = ensureCalls;
+
+	// Redaction/verbosity are delivery policy, not ownership identity.
+	harness.settings.set("notifications.redact", true);
+	harness.settings.set("notifications.verbosity", "verbose");
+	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+	await Bun.sleep(200);
+	expect(ensureCalls).toBe(settledCalls);
+}, 60_000);
+
+test("an ownership-identity change withholds active adapters until the new configuration is proved", async () => {
+	enableNotificationsEnv();
+	// Delivery must never continue under a configuration ownership has not
+	// proved: on an ownership-identity change the runtime is demoted and its
+	// adapters are torn down BEFORE the new ensure starts, then restored only
+	// after that ensure settles ready.
+	let defer = false;
+	const entered = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const harness = await createIsolationHarness({
+		prefix: "gjc-daemon-reproof-",
+		ensureTelegramDaemon: async () => {
+			if (!defer) return "attached";
+			entered.resolve();
+			await release.promise;
+			return "attached";
+		},
+	});
+	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+	const readyDeadline = Date.now() + 8_000;
+	while (!harness.controller.query(harness.ctx).running && Date.now() < readyDeadline) await Bun.sleep(25);
+	expect(harness.controller.query(harness.ctx).running).toBe(true);
+
+	// Rotate the destination: ownership identity changes.
+	defer = true;
+	harness.settings.set("notifications.telegram.chatId", "99999");
+	const settled = await Promise.race([
+		harness.controller.reconcileCurrentSession(harness.ctx).then(() => "settled" as const),
+		Bun.sleep(8_000).then(() => "hung" as const),
+	]);
+	// Reconciliation still must not block on the daemon...
+	expect(settled).toBe("settled");
+	await Promise.race([
+		entered.promise,
+		Bun.sleep(5_000).then(() => {
+			throw new Error("re-proof ensure was not entered");
+		}),
+	]);
+	// ...and delivery is withheld while the new configuration is unproved.
+	expect(harness.controller.query(harness.ctx).running).toBe(false);
+
+	// Once the new configuration is proved, adapters come back.
+	release.resolve();
+	const restoreDeadline = Date.now() + 8_000;
+	while (!harness.controller.query(harness.ctx).running && Date.now() < restoreDeadline) await Bun.sleep(25);
+	expect(harness.controller.query(harness.ctx).running).toBe(true);
+}, 60_000);

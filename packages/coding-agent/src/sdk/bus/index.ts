@@ -123,6 +123,7 @@ import {
 	type NotificationSettingsReader,
 	resolveGenericNotificationSessionEligibility,
 	sessionTag,
+	tokenFingerprint,
 } from "./config";
 import { telegramControlCommandUsage } from "./config-commands";
 import {
@@ -1131,6 +1132,12 @@ interface SessionRuntime {
 	notificationsActive: boolean;
 	/** Provider ownership state is independent from the already-published core SDK runtime. */
 	notificationOwnerState: "ready" | "retry" | "blocked";
+	/**
+	 * Ownership-relevant configuration identity this runtime's owner state was
+	 * proved under. A settled outcome may only be applied while it still matches,
+	 * so a credential/destination/enablement change forces a re-proof.
+	 */
+	notificationOwnerKey?: string;
 	/** Rejects new SDK frames while a leased terminal response drains. */
 	inboundFenced: boolean;
 	/** Set as soon as terminal teardown is requested, before startup settles. */
@@ -3993,7 +4000,7 @@ export function createNotificationsExtension(
 	 * the same runtime.
 	 */
 	type DaemonOwnershipOutcome = ConfiguredDaemonOwnerResult | "failed";
-	let daemonOwnershipInFlight: Promise<DaemonOwnershipOutcome> | undefined;
+	let daemonOwnershipInFlight: { key: string; task: Promise<DaemonOwnershipOutcome> } | undefined;
 	let daemonOwnershipSettled: DaemonOwnershipOutcome | undefined;
 	let daemonOwnershipSettledKey: string | undefined;
 
@@ -4004,13 +4011,23 @@ export function createNotificationsExtension(
 	 * delivery-only change (redaction, verbosity) must not.
 	 */
 	function daemonOwnershipKey(cfg: NotificationConfig): string {
+		// Secrets are keyed by non-reversible fingerprint, never by raw value or
+		// length: a same-length credential rotation MUST invalidate the outcome.
+		const fingerprint = (secret: string | undefined): string | null =>
+			secret === undefined || secret.length === 0 ? null : tokenFingerprint(secret);
 		return JSON.stringify([
 			isProviderEffectivelyEnabled(cfg, "telegram"),
 			isProviderEffectivelyEnabled(cfg, "discord"),
 			isProviderEffectivelyEnabled(cfg, "slack"),
-			cfg.botToken === undefined ? null : cfg.botToken.length,
+			fingerprint(cfg.botToken),
 			cfg.chatId ?? null,
+			fingerprint(cfg.discord.botToken),
+			cfg.discord.applicationId ?? null,
+			cfg.discord.guildId ?? null,
 			cfg.discord.parentChannelId ?? null,
+			fingerprint(cfg.slack.botToken),
+			fingerprint(cfg.slack.appToken),
+			cfg.slack.workspaceId ?? null,
 			cfg.slack.channelId ?? null,
 			getCurrentTelegramActivationMarker(cfg) ?? null,
 		]);
@@ -4024,16 +4041,23 @@ export function createNotificationsExtension(
 	function kickDaemonOwnership(
 		settings: Settings,
 		cfg: NotificationConfig,
-		onSettled?: (outcome: DaemonOwnershipOutcome) => void,
+		onSettled?: (outcome: DaemonOwnershipOutcome, key: string) => void,
 	): void {
+		const key = daemonOwnershipKey(cfg);
 		const existing = daemonOwnershipInFlight;
-		if (existing) {
-			if (onSettled) void existing.then(onSettled, () => {});
+		// Only an ensure for the SAME configuration can serve this caller. An
+		// in-flight ensure for a different key is superseded: its outcome proves
+		// nothing about this configuration, and its callbacks are key-checked.
+		if (existing && existing.key === key) {
+			if (onSettled)
+				void existing.task.then(
+					outcome => onSettled(outcome, key),
+					() => {},
+				);
 			return;
 		}
 		daemonOwnershipSettled = undefined;
 		daemonOwnershipSettledKey = undefined;
-		const key = daemonOwnershipKey(cfg);
 		const task = (async (): Promise<DaemonOwnershipOutcome> => {
 			try {
 				return await ensureConfiguredDaemonOwners(settings, cfg);
@@ -4044,34 +4068,39 @@ export function createNotificationsExtension(
 				return "failed";
 			}
 		})();
-		daemonOwnershipInFlight = task;
+		daemonOwnershipInFlight = { key, task };
 		void task.then(outcome => {
-			if (daemonOwnershipInFlight === task) {
+			if (daemonOwnershipInFlight?.task === task) {
 				daemonOwnershipInFlight = undefined;
 				daemonOwnershipSettled = outcome;
 				daemonOwnershipSettledKey = key;
 			}
-			onSettled?.(outcome);
+			onSettled?.(outcome, key);
 		});
 	}
 
 	/**
 	 * Apply one settled ownership outcome to exactly one runtime.
 	 *
-	 * Three guards keep a late outcome harmless: the runtime must still be the
-	 * registered one for its id and not be stopping (a replacement session never
-	 * inherits a predecessor's outcome), and the state must still be `retry` — an
-	 * outcome that lost a race must never downgrade a runtime whose adapters are
-	 * already active. A `failed` ensure leaves the state retryable.
+	 * Four guards keep a late or superseded outcome harmless: the runtime must
+	 * still be the registered one for its id and not be stopping (a replacement
+	 * session never inherits a predecessor's outcome), the state must still be
+	 * `retry` (an outcome that lost a race must never downgrade a runtime whose
+	 * adapters are already active), and the outcome must have been proved under
+	 * the exact configuration this runtime is waiting on — an outcome proved for
+	 * a superseded configuration can never authorize adapters. A `failed` ensure
+	 * leaves the state retryable.
 	 */
 	function applyDaemonOwnership(
 		id: string,
 		runtime: SessionRuntime,
 		outcome: DaemonOwnershipOutcome,
 		isolateChatEndpoint: boolean,
+		key: string,
 	): void {
 		if (runtimes.get(id) !== runtime || runtime.stopping) return;
 		if (runtime.notificationOwnerState !== "retry") return;
+		if (runtime.notificationOwnerKey !== key) return;
 		if (outcome === "failed") return;
 		runtime.notificationOwnerState =
 			outcome === "ready" || (outcome === "blocked_identity_with_sibling" && isolateChatEndpoint)
@@ -7206,9 +7235,10 @@ export function createNotificationsExtension(
 				// owner state stays "retry", so activate() withholds notification
 				// adapters and a later reconcile re-attempts.
 				initializedRuntime.notificationOwnerState = "retry";
+				initializedRuntime.notificationOwnerKey = daemonOwnershipKey(cfg);
 				const ownershipRuntime = initializedRuntime;
-				kickDaemonOwnership(settings, cfg, outcome => {
-					applyDaemonOwnership(id, ownershipRuntime, outcome, isolateChatEndpoint);
+				kickDaemonOwnership(settings, cfg, (outcome, key) => {
+					applyDaemonOwnership(id, ownershipRuntime, outcome, isolateChatEndpoint, key);
 					// Adapters activate only through reconciliation, so re-run it once
 					// ownership is known. Detached: no lifecycle path awaits this.
 					if (runtimes.get(id) !== ownershipRuntime || ownershipRuntime.stopping || extensionShuttingDown) return;
@@ -7503,12 +7533,13 @@ export function createNotificationsExtension(
 					// settle callback applies the outcome and re-reconciles.
 					const settled = peekDaemonOwnership(cfg);
 					const isolated = runtime.endpointScope === "chat";
+					runtime.notificationOwnerKey = daemonOwnershipKey(cfg);
 					if (settled === undefined) {
-						kickDaemonOwnership(settings, cfg, outcome =>
-							applyDaemonOwnership(binding.sessionId, runtime, outcome, isolated),
+						kickDaemonOwnership(settings, cfg, (outcome, key) =>
+							applyDaemonOwnership(binding.sessionId, runtime, outcome, isolated, key),
 						);
 					} else {
-						applyDaemonOwnership(binding.sessionId, runtime, settled, isolated);
+						applyDaemonOwnership(binding.sessionId, runtime, settled, isolated, runtime.notificationOwnerKey);
 					}
 				}
 				return "started";
@@ -7575,7 +7606,7 @@ export function createNotificationsExtension(
 			flushPendingFinal(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
-		ensureTelegramDaemon: async _binding => {
+		ensureTelegramDaemon: async binding => {
 			const { settings, settingsAvailable, cfg } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
 			// Reconciliation runs on awaited session-lifecycle paths (session_start,
@@ -7583,9 +7614,42 @@ export function createNotificationsExtension(
 			// daemon ensure. A pending ensure answers "pending": reconciliation
 			// proceeds without activating adapters, and the settle callback
 			// re-reconciles once ownership is known.
+			const key = daemonOwnershipKey(cfg);
+			const sessionIdForOwnership = binding.sessionId;
+			// The binding is released when reconciliation returns, so capture the
+			// context eagerly: the settle callback runs strictly later.
+			const ownershipCtx = binding.context;
+			const runtime = runtimes.get(sessionIdForOwnership);
+			if (runtime && runtime.notificationOwnerKey !== key) {
+				// The ownership-relevant configuration changed under a runtime whose
+				// adapters were authorized for the OLD configuration. Withhold
+				// delivery first (`stop` with reason "notifications" tears down
+				// adapters and answer sources while leaving the core SDK host
+				// untouched), then re-prove. Delivery must never continue under a
+				// configuration ownership has not proved.
+				runtime.notificationOwnerKey = key;
+				runtime.notificationOwnerState = "retry";
+				if (runtime.notificationsActive) await stopSession(sessionIdForOwnership, "notifications");
+			}
 			const settled = peekDaemonOwnership(cfg);
 			if (settled === undefined) {
-				kickDaemonOwnership(settings, cfg);
+				kickDaemonOwnership(settings, cfg, (outcome, outcomeKey) => {
+					const current = runtimes.get(sessionIdForOwnership);
+					if (!current) return;
+					applyDaemonOwnership(
+						sessionIdForOwnership,
+						current,
+						outcome,
+						current.endpointScope === "chat",
+						outcomeKey,
+					);
+					if (current.stopping || extensionShuttingDown) return;
+					// One detached reconciliation so adapters activate once the new
+					// configuration is proved. No lifecycle path awaits this.
+					void controller
+						.reconcileCurrentSession(ownershipCtx)
+						.catch(error => logger.warn(`notifications: post-ownership reconciliation failed: ${String(error)}`));
+				});
 				return "pending";
 			}
 			if (settled === "failed") return "failed";
