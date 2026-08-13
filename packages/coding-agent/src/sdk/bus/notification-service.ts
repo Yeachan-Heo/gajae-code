@@ -1527,17 +1527,17 @@ export interface NotificationDebrisSweepReport {
  *
  * Removal requires positive staleness proof — a dead recorded writer pid for
  * staging files, or an mtime older than {@link NOTIFICATION_DEBRIS_MIN_AGE_MS}
- * for everything else. Canonical files can never match the debris patterns, a
- * young staging file with a live writer is kept, and without a `stat`
- * capability only dead-pid staging files are swept.
+ * for everything else. Canonical files can never match the debris patterns, and
+ * a young staging file with a live writer is kept.
  *
- * Deletion is IDENTITY-BOUND, never a bare pathname unlink: the candidate is
- * re-read through the no-follow endpoint reader and removed through
- * `exactUnlink` with that exact identity. A candidate replaced between the
- * staleness check and the delete fails the identity match and is retained, and
- * a symlinked candidate is refused by the reader — so a live successor can
- * never be deleted by a stale decision. Every inconclusive attempt is counted
- * in `failures` rather than silently folded into `kept`.
+ * Age, terminal-scrub proof, and the delete identity all come from ONE
+ * no-follow snapshot of the candidate. Judging age from a separate `stat` would
+ * prove one pathname stale and then bind the delete to whatever occupied that
+ * pathname afterwards, so a live successor could be removed on a predecessor's
+ * staleness. A candidate replaced after the snapshot fails the identity match
+ * and is retained; a symlinked, non-regular, or unreadable candidate is refused
+ * outright. Every inconclusive attempt is counted in `failures` rather than
+ * silently folded into `kept`.
  */
 export async function sweepNotificationDebris(input: {
 	dir: string;
@@ -1558,23 +1558,6 @@ export async function sweepNotificationDebris(input: {
 	} catch {
 		return { removed, kept, failures, scanFailed: true };
 	}
-	/**
-	 * Tri-state staleness. An ABSENT `stat` capability is a policy limitation
-	 * (retain, counted as `kept`); a stat that throws or reports a nonsense
-	 * mtime is an operational failure and must surface as `failures`, never be
-	 * laundered into ordinary retention.
-	 */
-	const ageState = async (file: string): Promise<"stale" | "fresh" | "unknown" | "unavailable"> => {
-		if (!fs.stat) return "unavailable";
-		let st: { mtimeMs: number } | undefined;
-		try {
-			st = await fs.stat(file);
-		} catch {
-			return "unknown";
-		}
-		if (!st || !Number.isFinite(st.mtimeMs)) return "unknown";
-		return now() - st.mtimeMs > minAgeMs ? "stale" : "fresh";
-	};
 	for (const name of names) {
 		const staging = DEBRIS_STAGING_TMP.exec(name);
 		const placeholder = DEBRIS_UNLINK_PLACEHOLDER.test(name);
@@ -1582,49 +1565,35 @@ export async function sweepNotificationDebris(input: {
 			DEBRIS_TRANSITION_QUARANTINE.test(name) || DEBRIS_ENDPOINT_QUARANTINE.test(name) || placeholder;
 		if (!staging && !quarantineLike) continue;
 		const file = path.join(input.dir, name);
+		// ONE no-follow snapshot decides everything: age, terminal-scrub proof, and
+		// the identity the delete is bound to. Reading mtime separately (e.g. via
+		// `stat`) would judge the age of one pathname and then delete whatever
+		// occupied it afterwards — the exact-unlink identity would faithfully bind
+		// to a successor that was never proved stale.
+		const candidate = await fs.readEndpointFile(file).catch(() => undefined);
+		if (!candidate) {
+			// Unreadable, symlinked, or non-regular: never a pathname unlink, and
+			// an operational failure rather than silent policy retention.
+			failures += 1;
+			continue;
+		}
+		const mtimeMs = Number(candidate.identity.mtimeNs / 1_000_000n);
+		const olderThanMinAge = Number.isFinite(mtimeMs) && now() - mtimeMs > minAgeMs;
 		const deadWriter =
 			staging !== null &&
 			(() => {
 				const writerPid = Number.parseInt(staging[1] ?? "", 10);
 				return Number.isSafeInteger(writerPid) && writerPid > 0 && !pidAlive(writerPid);
 			})();
-		let stale = deadWriter;
-		if (!stale) {
-			const age = await ageState(file);
-			if (age === "unknown") {
-				// Operational stat failure: retain the file AND report it.
-				failures += 1;
-				continue;
-			}
-			stale = age === "stale";
-		}
-		if (stale && placeholder) {
-			// A native exchange placeholder is only inert once it is the terminal
-			// scrubbed remnant. A NONEMPTY placeholder may still carry the retained
-			// cleanup evidence for an endpoint whose verified removal failed, so it
-			// is never age-reclaimed.
-			const size = await fs
-				.readEndpointFile(file)
-				.then(candidate => candidate.bytes.length)
-				.catch(() => undefined);
-			if (size === undefined) {
-				failures += 1;
-				continue;
-			}
-			if (size > 0) {
-				kept += 1;
-				continue;
-			}
-		}
-		if (!stale) {
+		if (!deadWriter && !olderThanMinAge) {
 			kept += 1;
 			continue;
 		}
-		// Identity-bound removal: bind to exactly the bytes inspected here. A
-		// replacement, a symlink, or an unreadable candidate is refused.
-		const candidate = await fs.readEndpointFile(file).catch(() => undefined);
-		if (!candidate) {
-			failures += 1;
+		if (placeholder && candidate.bytes.length > 0) {
+			// A native exchange placeholder is inert only once it is the terminal
+			// scrubbed remnant. A NONEMPTY placeholder may still carry the retained
+			// cleanup evidence for an endpoint whose verified removal failed.
+			kept += 1;
 			continue;
 		}
 		try {

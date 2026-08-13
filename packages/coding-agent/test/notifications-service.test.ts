@@ -71,6 +71,15 @@ function mockFs(
 	const unlinked: string[] = [];
 	const created: string[] = [];
 	const enoent = (): NodeJS.ErrnoException => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+	// The sweep derives candidate age from the SAME no-follow snapshot it binds
+	// the delete to, so the mock's identity must carry the configured mtime.
+	// `ino`/`size`/`sha256` still change on replacement, so an identity mismatch
+	// is still detected when the mtime is pinned.
+	const mtimeNsFor = (file: string): bigint => {
+		const configured = opts.mtimes?.[file];
+		if (configured !== undefined) return BigInt(Math.round(configured * 1_000_000));
+		return BigInt(revisions.get(file) ?? 0);
+	};
 	const fs: NotificationServiceFs = {
 		async readdir(dir) {
 			const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
@@ -102,7 +111,7 @@ function mockFs(
 					dev: 1n,
 					ino: BigInt(revision),
 					size: BigInt(bytes.length),
-					mtimeNs: BigInt(revision),
+					mtimeNs: mtimeNsFor(file),
 					sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
 				},
 			};
@@ -120,7 +129,7 @@ function mockFs(
 				identity.dev === 1n &&
 				identity.ino === BigInt(revision) &&
 				identity.size === BigInt(bytes.length) &&
-				identity.mtimeNs === BigInt(revision) &&
+				identity.mtimeNs === mtimeNsFor(file) &&
 				identity.sha256 === crypto.createHash("sha256").update(bytes).digest("hex");
 			if (!matches) return { ok: false, code: "identity_mismatch" };
 			store.delete(file);
@@ -1288,14 +1297,18 @@ describe("notification-service stale debris sweep", () => {
 		expect(report.removed).toEqual([path.basename(oldLiveTmp)]);
 	});
 
-	test("without a stat capability only dead-writer staging files are swept", async () => {
+	test("a dead-writer staging file is swept on pid proof alone, without any age proof", async () => {
+		// Age and identity come from one snapshot; a dead recorded writer is
+		// independent positive proof and needs no mtime at all.
 		const transition = path.join(dir, "transition-005aa822-3f0b-45c9-bd39-e7047b1d3be4");
 		const deadTmp = path.join(dir, "telegram-seen-updates.json.777.1786000000000.abcdef.tmp");
-		const { fs } = mockFs({ [transition]: "", [deadTmp]: "{}" });
-		const noStatFs: NotificationServiceFs = { ...fs, stat: undefined };
+		const { fs } = mockFs(
+			{ [transition]: "", [deadTmp]: "{}" },
+			{ mtimes: { [transition]: YOUNG, [deadTmp]: YOUNG } },
+		);
 		const report = await sweepNotificationDebris({
 			dir,
-			deps: { fs: noStatFs, now: () => NOW, pidAlive: () => false },
+			deps: { fs, now: () => NOW, pidAlive: () => false },
 		});
 		expect(report.removed).toEqual([path.basename(deadTmp)]);
 		expect(report.kept).toBe(1);
@@ -1360,22 +1373,46 @@ describe("notification-service stale debris sweep", () => {
 		expect(unlinked).toEqual([]);
 	});
 
-	test("an operational stat failure is reported as a failure, not laundered into kept", async () => {
+	test("an unreadable candidate snapshot is reported as a failure, not laundered into kept", async () => {
+		// The snapshot read is the only source of age, scrub proof, and delete
+		// identity, so an operational read failure must surface as `failures`
+		// rather than as ordinary policy retention.
 		const debris = path.join(dir, "transition-22222222-3333-4444-8555-666666666666");
-		const { fs, unlinked } = mockFs({ [debris]: "" });
-		const throwingStat: NotificationServiceFs = {
-			...fs,
-			stat: async () => {
-				throw Object.assign(new Error("EACCES"), { code: "EACCES" });
-			},
-		};
+		const { fs, unlinked } = mockFs(
+			{ [debris]: "" },
+			{ mtimes: { [debris]: OLD }, rejectEndpointFiles: new Set([debris]) },
+		);
 		const report = await sweepNotificationDebris({
 			dir,
-			deps: { fs: throwingStat, now: () => NOW, pidAlive: () => false },
+			deps: { fs, now: () => NOW, pidAlive: () => false },
 		});
 		expect(report.failures).toBe(1);
 		expect(report.kept).toBe(0);
 		expect(unlinked).toEqual([]);
+	});
+
+	test("age and delete identity come from one snapshot, so a post-snapshot successor survives", async () => {
+		// Regression for the stat-then-read window: proving age on one pathname
+		// and then capturing identity separately would bind the delete to a
+		// successor that was never proved stale.
+		const debris = path.join(dir, "transition-33333333-4444-4555-8666-777777777777");
+		const { fs, store, unlinked } = mockFs(
+			{ [debris]: "aged-quarantine" },
+			{
+				mtimes: { [debris]: OLD },
+				onExactUnlink: (file, files) => {
+					if (file === debris) files.set(file, "fresh-live-successor");
+				},
+			},
+		);
+		const report = await sweepNotificationDebris({
+			dir,
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.removed).toEqual([]);
+		expect(report.failures).toBe(1);
+		expect(unlinked).toEqual([]);
+		expect(store.get(debris)).toBe("fresh-live-successor");
 	});
 
 	test("a nonempty exchange placeholder is retained even when old", async () => {

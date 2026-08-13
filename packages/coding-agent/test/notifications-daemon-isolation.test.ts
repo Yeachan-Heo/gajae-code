@@ -343,3 +343,62 @@ for (const scenario of [
 		expect(ensureCalls).toBeGreaterThan(afterStart);
 	}, 60_000);
 }
+
+test("a redaction transition re-proves ownership when a chat daemon is effective", async () => {
+	enableNotificationsEnv();
+	// Discord/Slack daemons snapshot redaction into their presentation engine at
+	// construction and carry it in their durable identity, so a false->true
+	// transition must re-prove ownership; otherwise a live presenter keeps
+	// rendering unredacted payloads.
+	let ensureCalls = 0;
+	const harness = await createIsolationHarness({
+		prefix: "gjc-daemon-redact-chat-",
+		settingsOverrides: {
+			"notifications.enabled": true,
+			"notifications.redact": false,
+			"notifications.discord.botToken": "discord-token",
+			"notifications.discord.applicationId": "app",
+			"notifications.discord.guildId": "guild",
+			"notifications.discord.parentChannelId": "parent",
+		},
+		ensureProviderDaemon: async () => {
+			ensureCalls += 1;
+			return "attached";
+		},
+	});
+	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+	const deadline = Date.now() + 8_000;
+	while (ensureCalls < 1 && Date.now() < deadline) await Bun.sleep(25);
+	const afterStart = ensureCalls;
+	expect(afterStart).toBeGreaterThanOrEqual(1);
+
+	harness.settings.set("notifications.redact", true);
+	await harness.controller.reconcileCurrentSession(harness.ctx);
+	const rotateDeadline = Date.now() + 8_000;
+	while (ensureCalls <= afterStart && Date.now() < rotateDeadline) await Bun.sleep(25);
+	expect(ensureCalls).toBeGreaterThan(afterStart);
+}, 60_000);
+
+test("a telegram-only redaction change is applied in-process without re-proving ownership", async () => {
+	enableNotificationsEnv();
+	// Telegram applies redaction through the in-process presentation policy, so
+	// keying it would churn ownership (and briefly withhold adapters) for the
+	// most common configuration with nothing to re-prove.
+	let ensureCalls = 0;
+	const harness = await createIsolationHarness({
+		prefix: "gjc-daemon-redact-tg-",
+		ensureTelegramDaemon: async () => {
+			ensureCalls += 1;
+			return "attached";
+		},
+	});
+	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+	const deadline = Date.now() + 8_000;
+	while (ensureCalls < 1 && Date.now() < deadline) await Bun.sleep(25);
+	const afterStart = ensureCalls;
+
+	harness.settings.set("notifications.redact", true);
+	await harness.controller.reconcileCurrentSession(harness.ctx);
+	await Bun.sleep(200);
+	expect(ensureCalls).toBe(afterStart);
+}, 60_000);

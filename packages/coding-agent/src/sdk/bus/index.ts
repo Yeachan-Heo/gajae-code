@@ -4038,6 +4038,16 @@ export function createNotificationsExtension(
 			// previous user keeps command authority through a stale outcome.
 			cfg.slack.authorizedUserId ?? null,
 			getCurrentTelegramActivationMarker(cfg) ?? null,
+			// Redaction and verbosity are ordinarily delivery policy, applied
+			// in-process. For Discord/Slack they are also part of the DAEMON's
+			// durable identity (chatDaemonIdentity) and are snapshotted into the
+			// provider's presentation engine at construction, so only a daemon
+			// re-proof can retire a presenter still rendering under the old policy.
+			// Key them exactly when such a provider is effective, so a Telegram-only
+			// session is not churned by an in-process policy change.
+			isProviderEffectivelyEnabled(cfg, "discord") || isProviderEffectivelyEnabled(cfg, "slack")
+				? `${String(cfg.redact)}:${cfg.verbosity}`
+				: null,
 		]);
 	}
 
