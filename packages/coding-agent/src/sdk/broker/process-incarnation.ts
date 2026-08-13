@@ -40,7 +40,12 @@ export interface ProcessIncarnationOptions {
 
 function runProcessIncarnationCommand(command: string, args: readonly string[]): ProcessIncarnationCommandResult {
 	try {
-		const result = Bun.spawnSync([command, ...args], { stdin: "ignore", stdout: "pipe", stderr: "ignore" });
+		const result = Bun.spawnSync([command, ...args], {
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "ignore",
+			windowsHide: true,
+		});
 		return { exitCode: result.exitCode, stdout: Buffer.from(result.stdout).toString("utf8") };
 	} catch {
 		return undefined;

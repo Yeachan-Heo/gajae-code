@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- On Windows, the SDK broker's process-liveness checks no longer flash a PowerShell console window on every heartbeat. When the native process-incarnation binding is unavailable, `processIncarnation()` falls back to spawning `powershell.exe`; that fallback now passes `windowsHide: true` (matching every other Windows spawn in the codebase), so repeated liveness polling stays invisible instead of opening and closing a terminal window in a loop.
+
 ## [0.13.1] - 2026-08-11
 
 ### Added
