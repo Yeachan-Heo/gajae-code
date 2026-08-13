@@ -29,7 +29,7 @@ import type { ToolSession } from "..";
 import { normalizeTierSelector, type RoutingOutcome, resolveTaskRouting } from "../config/autorouting";
 import type { AutoroutingReasonCode } from "../config/autorouting-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
-import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { formatModelString, resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
@@ -1980,6 +1980,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const routingSnapshot = registry?.getAll?.() ?? registry?.getAvailable?.();
 			const routingByIndex = new Map<number, RoutingOutcome>();
 			const routingCandidatesByIndex = new Map<number, string[]>();
+			const routingCandidateModelsByIndex = new Map<number, Map<string, Model>>();
 			const routingSkipsByIndex = new Map<number, Array<{ selector: string; code: AutoroutingReasonCode }>>();
 			for (let i = 0; i < tasksWithUniqueIds.length; i++) {
 				const task = tasksWithUniqueIds[i];
@@ -2008,6 +2009,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				// missing, malformed, or disabled.
 				const configured = effectiveAutorouting.map[outcome.tier] ?? [];
 				const candidates: string[] = [];
+				const candidateModels = new Map<string, Model>();
 				const skips: Array<{ selector: string; code: AutoroutingReasonCode }> = [];
 				const disabledProviders = new Set(
 					this.session.settings.get("disabledProviders").map(provider => provider.toLowerCase()),
@@ -2030,8 +2032,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						continue;
 					}
 					candidates.push(normalized.pinned);
+					const literal = routingSnapshot.find(candidate => formatModelString(candidate) === selector);
+					const model =
+						literal ??
+						routingSnapshot.find(candidate => {
+							const singleton = normalizeTierSelector(selector, [candidate]);
+							return "pinned" in singleton && singleton.pinned === normalized.pinned;
+						});
+					if (model) candidateModels.set(normalized.pinned, model);
 				}
 				routingCandidatesByIndex.set(i, candidates);
+				routingCandidateModelsByIndex.set(i, candidateModels);
 				routingSkipsByIndex.set(i, skips);
 			}
 			const resolveAutoroutingCandidates = async (
@@ -2041,16 +2052,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				skips: Array<{ selector: string; code: AutoroutingReasonCode }>;
 			}> => {
 				const candidates = [...(routingCandidatesByIndex.get(index) ?? [])];
+				const candidateModels = routingCandidateModelsByIndex.get(index);
 				const skips = [...(routingSkipsByIndex.get(index) ?? [])];
 				if (!registry?.getApiKey || !routingSnapshot) return { candidates, skips };
 				const authenticated: string[] = [];
 				const credentialSessionId =
 					this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined;
 				for (const selector of candidates) {
-					const model = routingSnapshot.find(candidate => {
-						const normalized = normalizeTierSelector(selector, [candidate]);
-						return "pinned" in normalized && normalized.pinned === selector;
-					});
+					const model = candidateModels?.get(selector);
 					if (!model) {
 						skips.push({ selector, code: "snapshot_missing" });
 						continue;
