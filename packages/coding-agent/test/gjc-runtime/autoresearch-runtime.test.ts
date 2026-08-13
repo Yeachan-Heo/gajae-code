@@ -6,6 +6,7 @@ import {
 	AUTORESEARCH_LEDGER_EVENT_KINDS,
 	type AutoresearchMode,
 	autoresearchClear,
+	autoresearchDashboardText,
 	autoresearchHandoff,
 	autoresearchIssueVerdict,
 	autoresearchLogRun,
@@ -474,6 +475,15 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 			"critic_recorded",
 			"verdict_issued",
 		]);
+		const dashboard = await autoresearchDashboardText(root, TEST_SESSION_ID);
+		expect(dashboard).toContain("baseline");
+		expect(dashboard).toContain("42");
+		expect(
+			(await Bun.file(path.join(getAutoresearchPaths(root, TEST_SESSION_ID).dir, "runs.jsonl")).text()).trim(),
+		).not.toBe("");
+		const reportPath = report.stdout!.match(/report_path=(.+)\n/)?.[1];
+		if (!reportPath) throw new Error("missing report path");
+		expect(await Bun.file(reportPath).text()).toContain("Critic review");
 	});
 
 	it("rejects unknown flags", async () => {

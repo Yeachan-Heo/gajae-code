@@ -1,6 +1,7 @@
 # External control readiness
 
-Process-isolated controllers use broker-bound or managed surfaces. Endpoint
+Process-isolated controllers use broker-bound or managed surfaces. The legacy SDK WebSocket endpoint is not a public controller interface.
+Endpoint
 records, transport credentials, and raw session transports remain inside SDK
 core; see [SDK machine interfaces](./sdk.md) for the ownership boundary.
 
@@ -13,7 +14,7 @@ core; see [SDK machine interfaces](./sdk.md) for the ownership boundary.
 | Managed adapter | Configured Telegram, Discord, or Slack integration | A provider renders session presentation through opaque Router attachments. |
 | ACP | `gjc --mode acp` or `gjc acp` | An editor or ACP-compatible client supplies the session frontend. |
 
-`--mode rpc`, `--mode rpc-ui`, `--mode bridge`, and `gjc sdk serve` are removed;
+`--mode rpc`, `--mode rpc-ui`, `--mode bridge`, and `gjc sdk serve` have been removed;
 they are not compatibility interfaces.
 
 ## SDK session CLI readiness

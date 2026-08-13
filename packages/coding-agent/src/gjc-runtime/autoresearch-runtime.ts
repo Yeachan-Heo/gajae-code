@@ -423,7 +423,7 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getAutoresearchPaths(cwd, resolvedSessionId);
 	const existing = await readAutoresearchMission(cwd, resolvedSessionId);
-	if (existing) await disposeKernelSessionsByOwner(`autoresearch:${existing.slug}`);
+	if (existing) await disposeKernelSessionsByOwner(`autoresearch:${resolvedSessionId}:${existing.slug}`);
 	const deleted = await removeFileAudited(paths.missionPath, {
 		cwd,
 		audit: {
@@ -624,7 +624,25 @@ export async function autoresearchLogRun(input: {
 	if (!status) throw new AutoresearchCommandError(2, "autoresearch run status is required");
 	const description = input.description.trim();
 	if (!description) throw new AutoresearchCommandError(2, "autoresearch run description is required");
-	return appendAutoresearchLedger(
+	if (status !== "keep" && status !== "discard" && status !== "crash" && status !== "checks_failed") {
+		throw new AutoresearchCommandError(2, "autoresearch run status must be keep, discard, crash, or checks_failed");
+	}
+	const sessionId =
+		input.sessionId?.trim() ||
+		resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const store = await autoresearchRunsStore(input.cwd, sessionId);
+	if (!store.config) throw new AutoresearchCommandError(2, "autoresearch run logging requires an active mission");
+	const started = await store.startRun({ command: "research observation" });
+	await store.completeRun(started.runId, {
+		exitCode: status === "crash" || status === "checks_failed" ? 1 : 0,
+		timedOut: false,
+	});
+	await store.logRun(started.runId, {
+		status,
+		description,
+		...(input.metric === undefined ? {} : { metric: input.metric }),
+	});
+	return await appendAutoresearchLedger(
 		input.cwd,
 		{
 			event: "run_logged",
@@ -634,7 +652,7 @@ export async function autoresearchLogRun(input: {
 			...(input.slug?.trim() ? { slug: input.slug.trim() } : {}),
 			...(typeof input.metric === "number" && Number.isFinite(input.metric) ? { metric: input.metric } : {}),
 		},
-		input.sessionId,
+		sessionId,
 	);
 }
 
@@ -689,6 +707,12 @@ export async function autoresearchIssueVerdict(input: {
 	const caveats = requireStringArray(input.caveats, "verdict caveats");
 	const evaluator = input.evaluator.trim();
 	if (!evaluator) throw new AutoresearchCommandError(2, "autoresearch verdict evaluator is required");
+	const sessionId =
+		input.sessionId?.trim() ||
+		resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const ledger = await readAutoresearchLedger(input.cwd, sessionId);
+	const latestCritic = [...ledger].reverse().find(event => event.event === "critic_recorded" && event.criticReceipt)
+		?.criticReceipt as AutoresearchCriticReceipt | undefined;
 	const receipt: AutoresearchVerdictReceipt = {
 		receiptId: crypto.randomUUID(),
 		status: input.status,
@@ -696,7 +720,7 @@ export async function autoresearchIssueVerdict(input: {
 		caveats,
 		evaluator,
 		issuedAt: new Date().toISOString(),
-		...(input.criticReceipt ? { criticReceipt: input.criticReceipt } : {}),
+		...((input.criticReceipt ?? latestCritic) ? { criticReceipt: input.criticReceipt ?? latestCritic } : {}),
 	};
 	await appendAutoresearchLedger(
 		input.cwd,
@@ -705,8 +729,10 @@ export async function autoresearchIssueVerdict(input: {
 			...(input.slug?.trim() ? { slug: input.slug.trim() } : {}),
 			verdictReceipt: receipt,
 		},
-		input.sessionId,
+		sessionId,
 	);
+	const mission = await readAutoresearchMission(input.cwd, sessionId);
+	if (mission) await reconcileAutoresearchState(input.cwd, mission, sessionId, { phase: "verdict" });
 	return receipt;
 }
 
@@ -845,7 +871,7 @@ async function reconcileAutoresearchState(
 	cwd: string,
 	mission: AutoresearchMission | null,
 	sessionId?: string,
-	options: { active?: boolean; phase?: "intake" | "research" | "complete" } = {},
+	options: { active?: boolean; phase?: "intake" | "research" | "verdict" | "complete" } = {},
 ): Promise<void> {
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
@@ -1079,15 +1105,12 @@ export async function autoresearchRunsStore(cwd: string, sessionId?: string | nu
 	if (store.config === null) {
 		const mission = await readAutoresearchMission(cwd, sessionId);
 		if (mission) {
-			const branch = await ensureAutoresearchBranch(cwd, mission.objective).then(result =>
-				result.ok ? result.branchName : null,
-			);
 			store.setInMemoryConfig(
 				createAutoresearchExperimentConfig({
 					name: mission.slug,
 					goal: mission.objective,
 					primaryMetric: "metric",
-					branch,
+					branch: null,
 				}),
 			);
 		}
@@ -1123,13 +1146,16 @@ export async function autoresearchDashboardText(cwd: string, sessionId?: string 
 export async function autoresearchMissionPythonTool(cwd: string, sessionId?: string | null) {
 	const mission = await readAutoresearchMission(cwd, sessionId);
 	if (!mission) return null;
-	const { writer, paths } = await openMissionNotebook(cwd, mission);
+	const resolvedSessionId =
+		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const { writer, paths } = await openMissionNotebook(cwd, mission, resolvedSessionId);
 	const tool = createMissionPythonTool({
 		cwd,
 		mission,
-		artifactsDir: missionArtifactsDir(cwd, mission),
+		artifactsDir: missionArtifactsDir(cwd, mission, resolvedSessionId),
 		notebook: writer,
 		registerSessionCleanup: () => {},
+		sessionId: resolvedSessionId,
 	});
 	return { tool, notebook: writer, paths, mission };
 }
@@ -1142,16 +1168,19 @@ export async function autoresearchMissionReport(
 ): Promise<string> {
 	const mission = await readAutoresearchMission(cwd, sessionId);
 	if (!mission) throw new AutoresearchCommandError(2, "autoresearch report requires an active mission");
-	const { writer, paths } = await openMissionNotebook(cwd, mission);
+	const resolvedSessionId =
+		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const { writer, paths } = await openMissionNotebook(cwd, mission, resolvedSessionId);
 	const ledger = await readAutoresearchLedger(cwd, sessionId);
 	const verdict = extractVerdictFromLedger(ledger);
-	return synthesizeAutoresearchReport({
+	await synthesizeAutoresearchReport({
 		paths,
 		notebook: writer,
 		mission,
 		summary,
 		verdict,
 	});
+	return paths.reportPath;
 }
 
 export async function autoresearchDataContext(

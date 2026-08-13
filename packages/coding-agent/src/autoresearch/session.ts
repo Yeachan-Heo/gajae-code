@@ -9,7 +9,10 @@
  * and the notebook survives mission restarts by resuming from the persisted
  * document.
  */
+
+import * as crypto from "node:crypto";
 import * as path from "node:path";
+import { resolveGjcSessionForWrite } from "../gjc-runtime/session-resolution";
 import {
 	ensureRlmSessionDir,
 	isValidRlmSessionId,
@@ -30,7 +33,7 @@ export interface AutoresearchMissionIdentity {
  * Mission writes reject unsafe slugs, which makes this identity stable across
  * reopen rather than silently generating a new artifact directory.
  */
-export function missionRlmSessionId(mission: AutoresearchMissionIdentity): string {
+export function missionRlmSessionId(mission: AutoresearchMissionIdentity, sessionId?: string): string {
 	const sanitized = mission.slug
 		.replace(/[^A-Za-z0-9_-]+/g, "-")
 		.replace(/^-+|-+$/g, "")
@@ -38,12 +41,23 @@ export function missionRlmSessionId(mission: AutoresearchMissionIdentity): strin
 	if (!isValidRlmSessionId(sanitized)) {
 		throw new Error(`autoresearch mission slug cannot resolve to a stable artifact identity: ${mission.slug}`);
 	}
-	return sanitized;
+	const sessionPrefix = sessionId ? crypto.createHash("sha256").update(sessionId).digest("hex").slice(0, 16) : "";
+	const scoped = sessionPrefix ? `${sessionPrefix}-${sanitized.slice(0, 111)}` : sanitized;
+	if (!isValidRlmSessionId(scoped)) {
+		throw new Error(`autoresearch mission session cannot resolve to a stable artifact identity: ${sessionId}`);
+	}
+	return scoped;
 }
 
 /** Artifact paths for a mission's notebook/report/metadata. */
-export function resolveMissionArtifactPaths(cwd: string, mission: AutoresearchMissionIdentity): RlmArtifactPaths {
-	return resolveRlmArtifactPaths(cwd, missionRlmSessionId(mission));
+export function resolveMissionArtifactPaths(
+	cwd: string,
+	mission: AutoresearchMissionIdentity,
+	sessionId?: string,
+): RlmArtifactPaths {
+	const resolvedSessionId =
+		sessionId ?? resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	return resolveRlmArtifactPaths(cwd, missionRlmSessionId(mission, resolvedSessionId), resolvedSessionId);
 }
 
 export interface MissionNotebookHandle {
@@ -55,10 +69,17 @@ export interface MissionNotebookHandle {
 export async function openMissionNotebook(
 	cwd: string,
 	mission: AutoresearchMissionIdentity,
+	sessionId?: string,
 ): Promise<MissionNotebookHandle> {
-	const paths = resolveMissionArtifactPaths(cwd, mission);
+	const resolvedSessionId =
+		sessionId ?? resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
+	const paths = resolveMissionArtifactPaths(cwd, mission, resolvedSessionId);
 	await ensureRlmSessionDir(paths);
-	const existing = await readRlmNotebookIfPresent(cwd, missionRlmSessionId(mission));
+	const existing = await readRlmNotebookIfPresent(
+		cwd,
+		missionRlmSessionId(mission, resolvedSessionId),
+		resolvedSessionId,
+	);
 	return {
 		writer: new RlmNotebookWriter(paths.notebookPath, existing),
 		paths,
@@ -76,6 +97,7 @@ export interface MissionPythonToolInput {
 	registerSessionCleanup: (cleanup: () => Promise<void> | void) => void;
 	/** Provision a managed workspace venv seeded with research packages. */
 	managedWorkspaceVenv?: boolean;
+	sessionId?: string;
 }
 
 /**
@@ -88,13 +110,14 @@ export function createMissionPythonTool(input: MissionPythonToolInput) {
 		cwd: input.cwd,
 		artifactsDir: input.artifactsDir,
 		notebook: input.notebook,
-		getMissionId: () => input.mission.slug,
+		getMissionId: () =>
+			`${input.sessionId ?? resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId}:${input.mission.slug}`,
 		registerSessionCleanup: input.registerSessionCleanup,
 		managedWorkspaceVenv: input.managedWorkspaceVenv,
 	});
 }
 
 /** Default artifacts directory used when a mission session has no explicit one. */
-export function missionArtifactsDir(cwd: string, mission: AutoresearchMissionIdentity): string {
-	return path.join(resolveMissionArtifactPaths(cwd, mission).dir, "artifacts");
+export function missionArtifactsDir(cwd: string, mission: AutoresearchMissionIdentity, sessionId?: string): string {
+	return path.join(resolveMissionArtifactPaths(cwd, mission, sessionId).dir, "artifacts");
 }

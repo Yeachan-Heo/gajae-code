@@ -119,11 +119,12 @@ describe("autoresearch capability surface reachable from the runtime", () => {
 		});
 
 		const report = await autoresearchMissionReport(root, "Final summary", TEST_SESSION_ID);
-		expect(report).toContain("# Autoresearch report: Optimize the tokenizer hot path");
-		expect(report).toContain("Final summary");
-		expect(report).toContain("## Verdict");
-		expect(report).toContain("- Evaluator: mission-agent");
-		expect(report).toContain("latency down 14%");
+		const content = await Bun.file(report).text();
+		expect(content).toContain("# Autoresearch report: Optimize the tokenizer hot path");
+		expect(content).toContain("Final summary");
+		expect(content).toContain("## Verdict");
+		expect(content).toContain("- Evaluator: mission-agent");
+		expect(content).toContain("latency down 14%");
 	});
 
 	it("7: data context is gated by mission mode through the runtime", async () => {

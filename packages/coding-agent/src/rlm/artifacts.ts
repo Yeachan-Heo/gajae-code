@@ -28,13 +28,13 @@ export function generateRlmSessionId(now: Date = new Date()): string {
 	return `${stamp}-${suffix}`;
 }
 
-export function resolveRlmArtifactPaths(cwd: string, sessionId: string): RlmArtifactPaths {
+export function resolveRlmArtifactPaths(cwd: string, sessionId: string, gjcSessionId?: string): RlmArtifactPaths {
 	if (!isValidRlmSessionId(sessionId)) {
 		throw new Error(`Invalid RLM session id: ${JSON.stringify(sessionId)}`);
 	}
 	const dir = autoresearchRlmArtifactRoot(
 		cwd,
-		resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId,
+		gjcSessionId ?? resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId,
 		sessionId,
 	);
 	return {
@@ -50,8 +50,8 @@ export async function ensureRlmSessionDir(paths: RlmArtifactPaths): Promise<void
 	await fs.mkdir(paths.dir, { recursive: true });
 }
 
-export async function rlmSessionExists(cwd: string, sessionId: string): Promise<boolean> {
-	const paths = resolveRlmArtifactPaths(cwd, sessionId);
+export async function rlmSessionExists(cwd: string, sessionId: string, gjcSessionId?: string): Promise<boolean> {
+	const paths = resolveRlmArtifactPaths(cwd, sessionId, gjcSessionId);
 	try {
 		const stat = await fs.stat(paths.dir);
 		return stat.isDirectory();
@@ -60,8 +60,8 @@ export async function rlmSessionExists(cwd: string, sessionId: string): Promise<
 	}
 }
 
-export async function readRlmNotebookIfPresent(cwd: string, sessionId: string) {
-	const paths = resolveRlmArtifactPaths(cwd, sessionId);
+export async function readRlmNotebookIfPresent(cwd: string, sessionId: string, gjcSessionId?: string) {
+	const paths = resolveRlmArtifactPaths(cwd, sessionId, gjcSessionId);
 	try {
 		return await readNotebookDocument(paths.notebookPath, paths.notebookPath);
 	} catch (error) {

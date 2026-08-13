@@ -128,6 +128,43 @@ describe("autoresearch mission session wiring (kernel + notebook)", () => {
 		expect(second.writer.cellCount).toBe(2);
 	});
 
+	it("keeps identical mission slugs isolated across GJC sessions", async () => {
+		const root = await tempDir();
+		const mission = { slug: "same-mission" };
+		const first = await openMissionNotebook(root, mission, "session-one");
+		const second = await openMissionNotebook(root, mission, "session-two");
+		expect(first.paths.dir).not.toBe(second.paths.dir);
+		expect(missionArtifactsDir(root, mission, "session-one")).not.toBe(
+			missionArtifactsDir(root, mission, "session-two"),
+		);
+		const executeSpy = vi.spyOn(pyExecutor, "executePython").mockResolvedValue(fakePythonResult());
+		try {
+			const firstTool = createMissionPythonTool({
+				cwd: root,
+				mission,
+				artifactsDir: missionArtifactsDir(root, mission, "session-one"),
+				notebook: first.writer,
+				registerSessionCleanup: () => {},
+				sessionId: "session-one",
+			});
+			const secondTool = createMissionPythonTool({
+				cwd: root,
+				mission,
+				artifactsDir: missionArtifactsDir(root, mission, "session-two"),
+				notebook: second.writer,
+				registerSessionCleanup: () => {},
+				sessionId: "session-two",
+			});
+			await executeTool(firstTool, "one = 1");
+			await executeTool(secondTool, "two = 2");
+			expect((executeSpy.mock.calls[0]![1] as pyExecutor.PythonExecutorOptions).kernelOwnerId).not.toBe(
+				(executeSpy.mock.calls[1]![1] as pyExecutor.PythonExecutorOptions).kernelOwnerId,
+			);
+		} finally {
+			executeSpy.mockRestore();
+		}
+	});
+
 	it("binds the mission python tool to the mission slug as kernel owner and records every call as a notebook cell", async () => {
 		const executeSpy = vi.spyOn(pyExecutor, "executePython").mockResolvedValue(fakePythonResult());
 		try {
@@ -146,11 +183,11 @@ describe("autoresearch mission session wiring (kernel + notebook)", () => {
 			await executeTool(tool, "print(answer)");
 			await writer.flush();
 
-			// Kernel owner id is the mission-scoped owner, not the session eval owner.
+			// Kernel owner id is scoped by both the mission and GJC session, never the eval owner.
 			expect(autoresearchKernelOwnerId(mission.slug)).toBe("autoresearch:cell-recording-mission");
 			const options = executeSpy.mock.calls[0]![1] as pyExecutor.PythonExecutorOptions;
-			expect(options.sessionId).toBe("autoresearch:cell-recording-mission");
-			expect(options.kernelOwnerId).toBe("autoresearch:cell-recording-mission");
+			expect(options.sessionId).toBe("autoresearch:test-session:cell-recording-mission");
+			expect(options.kernelOwnerId).toBe("autoresearch:test-session:cell-recording-mission");
 			expect(executeSpy).toHaveBeenCalledTimes(2);
 
 			// Every executed call is recorded as a notebook cell.
