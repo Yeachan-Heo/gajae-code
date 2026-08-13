@@ -45,6 +45,7 @@ import {
 import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "./control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "./control/runtime-gate";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
+import { isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
 import {
 	createSdkCapabilities,
@@ -120,8 +121,6 @@ export interface SessionSdkRuntimeOptions
 	transport: SessionSdkTransport;
 	/** Session settings; enables `config.patch` application on this runtime. */
 	settings?: Settings;
-	/** Determined once by the session factory; published by the host after start. */
-	autoroutingInactive?: boolean;
 	/** Mutable shadow of patched config values merged into query readback. */
 	configOverrides?: Map<string, unknown>;
 }
@@ -389,10 +388,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	}): SessionSdkTransport | Promise<SessionSdkTransport>;
 	/** Session settings; enables `config.patch` application on this runtime. */
 	settings?: Settings;
-	/** Determined once by the session factory; published by the host after start. */
 	/** Callback for diagnostics and lifecycle request observation. */
 	onSdkRequest?: SessionSdkHostOptions["onRequest"];
-	autoroutingInactive?: boolean;
 	/** Mutable shadow of patched config values merged into query readback. */
 	configOverrides?: Map<string, unknown>;
 	/** Private session-owned terminal-abort capabilities; never exposed on ExtensionContext. */
@@ -2681,13 +2678,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	);
 	api.on("tool_execution_start", async (_event, ctx) => {
 		const current = active;
-		if (current?.activeInvocation?.kind !== "prompt") return;
+		if (current === undefined) return;
+		if (current.activeInvocation?.kind !== "prompt") return;
 		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_start");
 		void ctx;
 	});
 	api.on("tool_execution_end", async (_event, ctx) => {
 		const current = active;
-		if (current?.activeInvocation?.kind !== "prompt") return;
+		if (current === undefined) return;
+		if (current.activeInvocation?.kind !== "prompt") return;
 		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_end");
 		void ctx;
 	});
@@ -2863,7 +2862,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
 		};
 		runtime = new SessionSdkSessionRuntime({
-			autoroutingInactive: options.autoroutingInactive,
 			transport,
 			control: async (connectionId, frame) => {
 				options.onFrameAdmitted?.();
@@ -2974,6 +2972,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (request.operation === "session.close" && response.ok === true) ctx.shutdown();
 			},
 		});
+		if (isAutoroutingInactive(api)) markAutoroutingInactive(runtime.host);
 		const disposeGate = ctx.workflowGate?.onGateEmitted?.(gate =>
 			runtime.emitEvent({ kind: "workflow_gate", payload: gate }),
 		);

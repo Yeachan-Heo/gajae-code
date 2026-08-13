@@ -150,6 +150,8 @@
 		"./sdk/host/control/runtime-gate.js": null,
 		"./sdk/host/control/runtime-gate": null,
 		"./sdk/host/control/runtime-gate/*": null,
+		"./sdk/host/internal-autorouting-state.js": null,
+		"./sdk/host/internal-autorouting-state": null,
 		"./sdk/lifecycle/broker-client.js": null,
 		"./sdk/lifecycle/broker-client": null,
 		"./sdk/lifecycle/broker-client/*": null,
