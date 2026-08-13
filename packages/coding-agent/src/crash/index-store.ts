@@ -153,7 +153,17 @@ const INDEX_KEYS = new Set([
 	"signatures",
 ]);
 /** Fingerprints remembered as evicted-after-report, so adoption cannot undo a filing. */
-const DISMISSED_FINGERPRINT_LIMIT = 64;
+/**
+ * Fingerprints remembered as evicted-after-report.
+ *
+ * `pruneDismissed` already drops a dismissal as soon as the crash log stops
+ * naming it, so this cap only binds when that many *distinct* signatures have
+ * been filed, evicted, and still have records in the log window at the same
+ * time. Four times the signature capacity costs about 17 KiB of the 256 KiB
+ * index budget. Past that the oldest dismissal is dropped and its crash can be
+ * re-offered once; see the note on `pruneDismissed`.
+ */
+const DISMISSED_FINGERPRINT_LIMIT = 4 * CRASH_INDEX_MAX_SIGNATURES;
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
 const RECORD_ID_PATTERN = /^[0-9a-f]{8,32}$/;
@@ -349,13 +359,23 @@ function boundMessageClass(value: string): string {
 function evictOne(index: CrashIndex): boolean {
 	let victim: string | undefined;
 	let victimSeen = Number.POSITIVE_INFINITY;
+	let victimRetained = Number.POSITIVE_INFINITY;
 	for (const [fingerprint, entry] of Object.entries(index.signatures)) {
 		// Unreported signatures are never evicted: losing them is exactly the
 		// failure this feature exists to prevent.
 		if (entry.reportedAt === undefined && entry.acknowledgedAt === undefined) continue;
-		if (entry.lastSeen < victimSeen) {
+		// A signature the crash log no longer names cannot be adopted back, so evicting
+		// it needs no dismissal that outlives this compaction. Taking those victims
+		// first keeps the bounded dismissal list for the signatures that actually need
+		// it. This is a preference, not a refusal: refusing to evict a retained
+		// signature would make the index reject a new — possibly unreported — one
+		// instead, which is the failure eviction exists to avoid.
+		const retained = entry.retainedCount > 0 ? 1 : 0;
+		if (retained > victimRetained) continue;
+		if (retained < victimRetained || entry.lastSeen < victimSeen) {
 			victim = fingerprint;
 			victimSeen = entry.lastSeen;
+			victimRetained = retained;
 		}
 	}
 	if (!victim) return false;
@@ -365,6 +385,11 @@ function evictOne(index: CrashIndex): boolean {
 	// outlive this compaction, or adoption would later recreate the signature
 	// without the `reportedAt` that made it evictable — re-offering a filed crash.
 	if (!index.dismissed.includes(victim)) index.dismissed.push(victim);
+	// A dismissal is only load-bearing while the crash log can still name the
+	// signature, and `pruneDismissed` drops it as soon as it cannot. This cap is the
+	// backstop for the one case pruning cannot cover — a log the compactor could not
+	// read — and is sized at the signature capacity because that is the most
+	// signatures that can be evicted without a single new record being written.
 	if (index.dismissed.length > DISMISSED_FINGERPRINT_LIMIT)
 		index.dismissed.splice(0, index.dismissed.length - DISMISSED_FINGERPRINT_LIMIT);
 	return true;
@@ -474,6 +499,36 @@ function recomputeRetainedCounts(index: CrashIndex, records: readonly LoadedCras
 	}
 	for (const entry of Object.values(index.signatures))
 		entry.retainedCount = Math.min(entry.retainedCount, entry.lifetimeCount);
+}
+
+/**
+ * Drop dismissals the crash log can no longer justify.
+ *
+ * A dismissal exists for exactly one reason: to stop adoption from recreating a
+ * signature that eviction removed after it was filed. Adoption can only act on
+ * records this same scan found, so once the log no longer names a fingerprint,
+ * its dismissal protects nothing and only consumes a bounded slot that a
+ * still-reachable signature may need.
+ *
+ * Tying the lifetime to the log rather than to a fixed count is what makes the
+ * bound sound: the count-only cap could age out a dismissal while the record it
+ * guarded was still in the log, and the next compaction would re-offer a crash
+ * the user had already filed.
+ *
+ * Only called with records from a log the compactor actually read. A log that
+ * could not be read is indistinguishable from an empty one here, and pruning on
+ * that would discard every dismissal on a transient read error.
+ *
+ * The residual bound: when more than `DISMISSED_FINGERPRINT_LIMIT` distinct
+ * signatures are filed, evicted, and still named by the log window at once, the
+ * oldest dismissal is dropped and that crash can be adopted again as a new
+ * signature — re-offering a report the user already filed. It is re-offered, not
+ * lost, and the alternative is an unbounded list inside a byte-capped file.
+ */
+function pruneDismissed(index: CrashIndex, records: readonly LoadedCrashRecord[]): void {
+	if (index.dismissed.length === 0) return;
+	const named = new Set(records.map(record => record.fingerprint));
+	index.dismissed = index.dismissed.filter(fingerprint => named.has(fingerprint));
 }
 
 /**
@@ -632,6 +687,7 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		// recount must agree on exactly which records the log still holds.
 		const crashLog = await readNoFollow(paths.crashLog, CRASH_LOG_SCAN_MAX_BYTES);
 		const records = crashLog === undefined ? [] : parseCrashRecords(crashLog);
+		if (crashLog !== undefined) pruneDismissed(index, records);
 		adoptLogOnlySignatures(index, records, now);
 		recomputeRetainedCounts(index, records);
 		index.updatedAt = now;
