@@ -834,7 +834,8 @@ function observeProcess(
 	}
 	if (process.platform === "linux") {
 		const probe = probeLinuxProcPidSync(pid);
-		if (probe.kind === "live" && probe.state === "Z") return "exited";
+		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
+			return "exited";
 	}
 	if (!expectedIncarnation) return "uncertain";
 	const actualIncarnation = readIncarnation(pid);
