@@ -9,6 +9,11 @@
  *   - `working` — agent turn in progress
  *   - `blocked` — waiting on a user decision (ask tool)
  *
+ * The session title is reported through the same API as display-only pane
+ * metadata, so a pane shows what it is working on instead of a bare agent
+ * label. Herdr renders that title on the pane border and exposes it to the
+ * sidebar as the `pane` token.
+ *
  * Reporting is strictly best-effort and never blocks or fails a turn. Outside
  * a Herdr pane every entry point is a no-op. Herdr also clears the authority
  * when the pane's foreground process exits, so a hard kill still recovers.
@@ -27,6 +32,23 @@ const SOURCE = "custom:gjc";
 const HERDR_REPORT_TIMEOUT_MS = 1500;
 /** Release runs on the shutdown path, so it is bounded even tighter. */
 const HERDR_RELEASE_TIMEOUT_MS = 1000;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+/** Herdr truncates to the pane width anyway; this only bounds the argv. */
+const MAX_PANE_TITLE_CHARS = 120;
+
+/**
+ * Metadata reports carry their own per-source sequence in Herdr, independent of
+ * the lifecycle-state sequence, so title updates need a counter of their own.
+ * Module scope because the title is a property of the process, not of one
+ * reporter instance: `setSessionTerminalTitle` is called from controllers that
+ * never see the reporter.
+ */
+let metadataSeq = 0;
+
+function nextMetadataSeq(): number {
+	metadataSeq += 1;
+	return metadataSeq;
+}
 
 export type HerdrAgentState = "idle" | "working" | "blocked";
 
@@ -130,6 +152,101 @@ export function buildHerdrReleaseArgs(paneId: string, seq: number): string[] {
 }
 
 /**
+ * Collapse a session name into a single-line pane title. Control characters are
+ * removed rather than escaped: the value reaches a terminal surface, and a
+ * model-generated session name must never be able to inject escapes.
+ */
+export function sanitizeHerdrPaneTitle(title: string | undefined): string | undefined {
+	if (!title) return undefined;
+	const sanitized = title.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim();
+	if (!sanitized) return undefined;
+	return sanitized.length > MAX_PANE_TITLE_CHARS ? sanitized.slice(0, MAX_PANE_TITLE_CHARS).trimEnd() : sanitized;
+}
+
+/** Build the argv for a pane title report. Exported for tests. */
+export function buildHerdrTitleArgs(paneId: string, title: string, seq: number): string[] {
+	return [
+		"pane",
+		"report-metadata",
+		paneId,
+		"--source",
+		SOURCE,
+		"--agent",
+		AGENT_LABEL,
+		"--title",
+		title,
+		"--seq",
+		String(seq),
+	];
+}
+
+/** Build the argv that retracts a previously reported pane title. Exported for tests. */
+export function buildHerdrClearTitleArgs(paneId: string, seq: number): string[] {
+	return ["pane", "report-metadata", paneId, "--source", SOURCE, "--clear-title", "--seq", String(seq)];
+}
+
+/**
+ * Spawn a detached, timeout-bounded herdr CLI invocation. Every failure mode is
+ * swallowed: a status ping must never surface in a session.
+ */
+function runHerdrCommand(binPath: string, args: string[], timeoutMs: number, options: HerdrReporterOptions): void {
+	const env = options.env ?? process.env;
+	const spawn = options.spawn ?? defaultSpawn;
+
+	let proc: HerdrReportProcess;
+	try {
+		proc = spawn([binPath, ...args], {
+			env,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+	} catch (error) {
+		// Missing/unexecutable binary: reporting is best-effort, never fatal.
+		logger.debug("herdr report failed to start", { error: String(error) });
+		return;
+	}
+	proc.unref();
+	const timer = setTimeout(() => {
+		try {
+			proc.kill();
+		} catch {}
+	}, timeoutMs);
+	timer.unref?.();
+	// Bun.spawn surfaces spawn failure through `exited` rejection, so this
+	// handler is what keeps an ENOENT from becoming an unhandled rejection.
+	void proc.exited
+		.then(exitCode => {
+			clearTimeout(timer);
+			if (exitCode !== 0) logger.debug("herdr report exited non-zero", { exitCode });
+		})
+		.catch(error => {
+			clearTimeout(timer);
+			logger.debug("herdr report failed", { error: String(error) });
+		});
+}
+
+/**
+ * Report the current session title for this pane. No-op outside a Herdr pane or
+ * when the session has no usable name, so a pane keeps the last real title
+ * instead of flickering to a placeholder during startup or a rename.
+ */
+export function syncHerdrPaneTitle(sessionName: string | undefined, options: HerdrReporterOptions = {}): void {
+	const title = sanitizeHerdrPaneTitle(sessionName);
+	if (!title) return;
+
+	const paneEnv = resolveHerdrPaneEnvironment(options);
+	if (!paneEnv) return;
+
+	runHerdrCommand(
+		paneEnv.binPath,
+		buildHerdrTitleArgs(paneEnv.paneId, title, nextMetadataSeq()),
+		HERDR_REPORT_TIMEOUT_MS,
+		options,
+	);
+}
+
+/**
  * Create a reporter bound to a pane. `subscribe` supplies the session event
  * stream and is parameterized so the state machine is testable without a live
  * session.
@@ -139,9 +256,6 @@ export function createHerdrReporter(
 	subscribe: (listener: (event: HerdrSessionEvent) => void) => () => void,
 	options: HerdrReporterOptions = {},
 ): HerdrReporter {
-	const env = options.env ?? process.env;
-	const spawn = options.spawn ?? defaultSpawn;
-
 	let seq = 0;
 	let currentState: HerdrAgentState | null = null;
 	let released = false;
@@ -149,37 +263,7 @@ export function createHerdrReporter(
 	let askDepth = 0;
 
 	const run = (args: string[], timeoutMs: number): void => {
-		let proc: HerdrReportProcess;
-		try {
-			proc = spawn([paneEnv.binPath, ...args], {
-				env,
-				stdin: "ignore",
-				stdout: "ignore",
-				stderr: "ignore",
-			});
-		} catch (error) {
-			// Missing/unexecutable binary: reporting is best-effort, never fatal.
-			logger.debug("herdr report failed to start", { error: String(error) });
-			return;
-		}
-		proc.unref();
-		const timer = setTimeout(() => {
-			try {
-				proc.kill();
-			} catch {}
-		}, timeoutMs);
-		timer.unref?.();
-		// Bun.spawn surfaces spawn failure through `exited` rejection, so this
-		// handler is what keeps an ENOENT from becoming an unhandled rejection.
-		void proc.exited
-			.then(exitCode => {
-				clearTimeout(timer);
-				if (exitCode !== 0) logger.debug("herdr report exited non-zero", { exitCode });
-			})
-			.catch(error => {
-				clearTimeout(timer);
-				logger.debug("herdr report failed", { error: String(error) });
-			});
+		runHerdrCommand(paneEnv.binPath, args, timeoutMs, options);
 	};
 
 	const report = (state: HerdrAgentState): void => {
@@ -226,6 +310,9 @@ export function createHerdrReporter(
 			unsubscribe = null;
 			seq += 1;
 			run(buildHerdrReleaseArgs(paneEnv.paneId, seq), HERDR_RELEASE_TIMEOUT_MS);
+			// The pane outlives gjc, so a session title left behind would label a
+			// plain shell with the work of a session that already ended.
+			run(buildHerdrClearTitleArgs(paneEnv.paneId, nextMetadataSeq()), HERDR_RELEASE_TIMEOUT_MS);
 		},
 		get state() {
 			return currentState;

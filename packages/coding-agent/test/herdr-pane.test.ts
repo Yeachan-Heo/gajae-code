@@ -1,11 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import {
+	buildHerdrClearTitleArgs,
 	buildHerdrReleaseArgs,
 	buildHerdrReportArgs,
+	buildHerdrTitleArgs,
 	createHerdrReporter,
 	type HerdrReportProcess,
 	type HerdrSessionEvent,
 	resolveHerdrPaneEnvironment,
+	sanitizeHerdrPaneTitle,
+	syncHerdrPaneTitle,
 } from "../src/utils/herdr-pane";
 
 function paneEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -236,7 +240,11 @@ describe("herdr reporter state machine", () => {
 		source.emit({ type: "agent_end" });
 		reporter.release();
 
-		const seqs = calls.map(call => Number(call.command.at(-1)));
+		// Metadata carries its own per-source sequence in Herdr, so only the
+		// lifecycle reports share this counter.
+		const seqs = calls
+			.filter(call => !call.command.includes("report-metadata"))
+			.map(call => Number(call.command.at(-1)));
 		expect(seqs).toEqual([1, 2, 3, 4]);
 	});
 
@@ -250,8 +258,12 @@ describe("herdr reporter state machine", () => {
 
 		expect(source.attached).toBe(false);
 		expect(source.unsubscribeCount).toBe(1);
-		expect(calls).toHaveLength(2);
+		expect(calls).toHaveLength(3);
 		expect(calls[1]?.command).toEqual(["/usr/bin/herdr", ...buildHerdrReleaseArgs("pane-7", 2)]);
+		expect(calls[2]?.command.slice(0, -1)).toEqual([
+			"/usr/bin/herdr",
+			...buildHerdrClearTitleArgs("pane-7", 0).slice(0, -1),
+		]);
 	});
 
 	it("ignores events and reports after release", () => {
@@ -263,7 +275,8 @@ describe("herdr reporter state machine", () => {
 		source.emit({ type: "agent_start" });
 		reporter.report("working");
 
-		expect(calls).toHaveLength(2);
+		// idle at startup, then release-agent and the title retraction.
+		expect(calls).toHaveLength(3);
 	});
 
 	it("keeps reporting after a spawn throws synchronously", () => {
@@ -319,4 +332,105 @@ describe("herdr reporter state machine", () => {
 		await Bun.sleep(1600);
 		expect(calls[0]?.killed).toBe(true);
 	}, 5000);
+});
+
+describe("herdr pane title", () => {
+	it("emits the documented metadata argv for a title and its retraction", () => {
+		expect(buildHerdrTitleArgs("pane-7", "Refactor auth middleware", 2)).toEqual([
+			"pane",
+			"report-metadata",
+			"pane-7",
+			"--source",
+			"custom:gjc",
+			"--agent",
+			"gjc",
+			"--title",
+			"Refactor auth middleware",
+			"--seq",
+			"2",
+		]);
+		expect(buildHerdrClearTitleArgs("pane-7", 3)).toEqual([
+			"pane",
+			"report-metadata",
+			"pane-7",
+			"--source",
+			"custom:gjc",
+			"--clear-title",
+			"--seq",
+			"3",
+		]);
+	});
+
+	it("collapses a session name into a single-line title", () => {
+		expect(sanitizeHerdrPaneTitle("  Fix   flaky\ttest  ")).toBe("Fix flaky test");
+		expect(sanitizeHerdrPaneTitle("Fix\r\nflaky test")).toBe("Fix flaky test");
+	});
+
+	it("drops a title that carries no visible text", () => {
+		expect(sanitizeHerdrPaneTitle(undefined)).toBeUndefined();
+		expect(sanitizeHerdrPaneTitle("")).toBeUndefined();
+		expect(sanitizeHerdrPaneTitle("   \n\t ")).toBeUndefined();
+		expect(sanitizeHerdrPaneTitle("\u001b]0;pwned\u0007")).toBe("]0;pwned");
+	});
+
+	it("bounds the reported title", () => {
+		const sanitized = sanitizeHerdrPaneTitle("x".repeat(500));
+		expect(sanitized).toHaveLength(120);
+	});
+
+	it("reports the sanitized session title for the pane", () => {
+		const { calls, spawn } = recordingSpawn();
+
+		syncHerdrPaneTitle("Ship  the\nrelease", { env: paneEnv(), which: () => "/usr/bin/herdr", spawn });
+
+		expect(calls).toHaveLength(1);
+		const command = calls[0]?.command ?? [];
+		expect(command.slice(0, -1)).toEqual([
+			"/usr/bin/herdr",
+			"pane",
+			"report-metadata",
+			"pane-7",
+			"--source",
+			"custom:gjc",
+			"--agent",
+			"gjc",
+			"--title",
+			"Ship the release",
+			"--seq",
+		]);
+		expect(Number(command.at(-1))).toBeGreaterThan(0);
+	});
+
+	it("advances the metadata sequence between title reports", () => {
+		const { calls, spawn } = recordingSpawn();
+		const options = { env: paneEnv(), which: () => "/usr/bin/herdr", spawn };
+
+		syncHerdrPaneTitle("first", options);
+		syncHerdrPaneTitle("second", options);
+
+		const [first, second] = calls.map(call => Number(call.command.at(-1)));
+		expect(second).toBeGreaterThan(first as number);
+	});
+
+	it("is a no-op outside a Herdr pane", () => {
+		const { calls, spawn } = recordingSpawn();
+
+		syncHerdrPaneTitle("Ship the release", {
+			env: {} as NodeJS.ProcessEnv,
+			which: () => "/usr/bin/herdr",
+			spawn,
+		});
+
+		expect(calls).toHaveLength(0);
+	});
+
+	it("keeps the previous title when the session has no usable name", () => {
+		const { calls, spawn } = recordingSpawn();
+		const options = { env: paneEnv(), which: () => "/usr/bin/herdr", spawn };
+
+		syncHerdrPaneTitle(undefined, options);
+		syncHerdrPaneTitle("   ", options);
+
+		expect(calls).toHaveLength(0);
+	});
 });
