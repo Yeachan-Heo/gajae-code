@@ -2548,10 +2548,10 @@ export class TUI extends Container {
 			typeof opt.margin === "number"
 				? { top: opt.margin, right: opt.margin, bottom: opt.margin, left: opt.margin }
 				: (opt.margin ?? {});
-		const marginTop = finiteNonNegative(margin.top);
-		const marginRight = finiteNonNegative(margin.right);
-		const marginBottom = finiteNonNegative(margin.bottom);
-		const marginLeft = finiteNonNegative(margin.left);
+		const marginTop = Math.min(finiteNonNegative(margin.top), Math.max(0, termHeight - 1));
+		const marginRight = Math.min(finiteNonNegative(margin.right), Math.max(0, termWidth - 1));
+		const marginBottom = Math.min(finiteNonNegative(margin.bottom), Math.max(0, termHeight - 1 - marginTop));
+		const marginLeft = Math.min(finiteNonNegative(margin.left), Math.max(0, termWidth - 1 - marginRight));
 
 		// Available space after margins
 		const availWidth = Math.max(1, termWidth - marginLeft - marginRight);

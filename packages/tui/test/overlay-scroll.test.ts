@@ -138,6 +138,22 @@ describe("TUI overlays", () => {
 		}
 	});
 
+	it("clamps enormous finite margins to the terminal bounds", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			tui.showOverlay(new LineComponent("overlay-", 2), { margin: Number.MAX_VALUE });
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("o");
+			expect(term.getScrollBuffer().length).toBeLessThan(100);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	afterEach(() => {
 		if (previousTmux === undefined) {
 			delete Bun.env.TMUX;
