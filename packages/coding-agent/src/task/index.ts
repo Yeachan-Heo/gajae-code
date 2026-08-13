@@ -1945,6 +1945,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				file => path.basename(file.path).toLowerCase() !== "agents.md",
 			);
 			const promptTemplates = this.session.promptTemplates;
+			const parentMcpManager = this.session.getMcpManager?.();
+			// Exact-config tools-only managers belong to the top-level ACP session and cannot be reused by sub-sessions.
+			const reusableParentMcpManager = parentMcpManager?.isToolsOnly() ? undefined : parentMcpManager;
 
 			// Initialize progress for all tasks
 			for (let i = 0; i < tasksWithUniqueIds.length; i++) {
@@ -2086,7 +2089,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 						parentTelemetry: this.session.getTelemetry?.(),
-						parentMcpManager: this.session.getMcpManager?.(),
+						parentMcpManager: reusableParentMcpManager,
 						forkContextSeed,
 					});
 					return {
@@ -2164,7 +2167,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						parentArtifactManager,
 						parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 						parentTelemetry: this.session.getTelemetry?.(),
-						parentMcpManager: this.session.getMcpManager?.(),
+						parentMcpManager: reusableParentMcpManager,
 						forkContextSeed,
 					});
 					let capturedResult = {
