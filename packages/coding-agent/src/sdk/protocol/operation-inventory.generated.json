@@ -2718,6 +2718,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:awaitSessionSettlement",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal agent-event settlement barrier, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:drainAsyncJobDeliveriesForAcp",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

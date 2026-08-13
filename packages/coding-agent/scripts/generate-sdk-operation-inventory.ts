@@ -98,6 +98,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal CLI startup-readiness fence composition, not a user-facing SDK control seam",
 	"agent_session:awaitPendingContextTransformations":
 		"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
+	"agent_session:awaitSessionSettlement":
+		"internal agent-event settlement barrier, not a user-facing SDK control seam",
 	"agent_session:drainAsyncJobDeliveriesForAcp": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getAsyncDeliveryStateForAcp":
 		"internal ACP lifecycle quiescence plumbing, not a user-facing control seam",

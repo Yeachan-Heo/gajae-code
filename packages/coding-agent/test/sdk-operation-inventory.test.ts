@@ -105,6 +105,10 @@ describe("SDK operation inventory", () => {
 				"internal context-transformation lifecycle barrier, not a user-facing SDK control seam",
 			],
 			[
+				"agent_session:awaitSessionSettlement",
+				"internal agent-event settlement barrier, not a user-facing SDK control seam",
+			],
+			[
 				"agent_session:abortPromptAndWait",
 				"internal SDK prompt-terminalization resource fence over a host-captured run handle, not an independent public SDK control seam",
 			],

@@ -7152,6 +7152,27 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Deterministically await every in-flight agent-event handler (including the
+	 * synchronous canonical persistence each one performs) plus the durable
+	 * transcript flush, without waiting for a prompt/turn lifecycle.
+	 *
+	 * This is the explicit signal replacement for real-time settle sleeps after
+	 * externally emitted events (`agent.emitExternalEvent`): the dispatcher
+	 * increments `#agentEventHandlersInFlight` synchronously before this call can
+	 * observe it, and each handler decrements it in its `finally`, so the
+	 * settlement promise below resolves exactly when the last handler — and
+	 * therefore its `sessionManager.appendMessage`/`_persist` work — has finished.
+	 * `flush()` then queues deterministically behind the SessionManager persist
+	 * queue, so every seeded entry is canonical AND on disk before the caller
+	 * proceeds.
+	 */
+	async awaitSessionSettlement(): Promise<void> {
+		await this.awaitPendingContextTransformations();
+		await this.#waitForSessionSettlement();
+		await this.sessionManager.flush();
+	}
+
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
 		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		if (!manager) return false;

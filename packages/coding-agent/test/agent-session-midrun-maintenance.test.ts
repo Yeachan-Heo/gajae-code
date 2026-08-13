@@ -136,7 +136,15 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		for (const message of messages) {
 			s.agent.emitExternalEvent({ type: "message_end", message: message as never });
 		}
-		await Bun.sleep(10);
+		// Deterministic settlement: wait for every in-flight agent-event handler
+		// (including synchronous canonical persistence) and the durable transcript
+		// flush, instead of a real-time sleep whose duration is ambiguous under
+		// stress. The dispatcher increments #agentEventHandlersInFlight
+		// synchronously before this await, and each handler decrements it in its
+		// finally, so the settlement promise resolves exactly when the last
+		// handler — and therefore its sessionManager.appendMessage/_persist — has
+		// finished.
+		await s.awaitSessionSettlement();
 	}
 
 	/**
@@ -238,10 +246,13 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 	}
 
 	async function waitFor(predicate: () => boolean): Promise<void> {
-		const deadline = Date.now() + 1_000;
+		const deadline = Date.now() + 5_000;
 		while (!predicate()) {
 			if (Date.now() >= deadline) throw new Error("Timed out waiting for test condition");
-			await Bun.sleep(1);
+			// Yield one event-loop tick so the concurrent maintenance task can
+			// progress. A bare microtask yield (Promise.resolve) would starve
+			// I/O-backed continuations; Bun.sleep(0) schedules a macrotask tick.
+			await Bun.sleep(0);
 		}
 	}
 
@@ -451,8 +462,11 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 		(globalThis as { __midrunCompactGate?: Promise<void> }).__midrunCompactGate = gate.promise;
 		try {
 			const inFlight = session.runIdleCompaction();
-			const deadline = Date.now() + 1_000;
-			while (!session.isCompacting && Date.now() < deadline) await Bun.sleep(5);
+			// Wait for the compaction to reach the controller-assignment point
+			// (isCompacting=true) using event-loop tick yields instead of fixed
+			// real-time sleeps. The deadline is a safety bound, not pacing.
+			const deadline = Date.now() + 5_000;
+			while (!session.isCompacting && Date.now() < deadline) await Bun.sleep(0);
 			expect(session.isCompacting).toBe(true);
 
 			const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
