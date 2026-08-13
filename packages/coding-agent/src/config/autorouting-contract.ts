@@ -12,6 +12,16 @@ export const AUTOROUTING_TIERS = ["fast", "balanced", "strong"] as const;
 export type AutoroutingTier = (typeof AUTOROUTING_TIERS)[number];
 export const DEFAULT_AUTOROUTING_TIER: AutoroutingTier = "balanced";
 
+/**
+ * The single wording for "autorouting is switched on but cannot route".
+ *
+ * One constant so every delivery surface (interactive, print, and the SDK/ACP
+ * host) reports the identical sentence and cannot drift apart. Bounded and free
+ * of interpolation so it is always safe to render.
+ */
+export const AUTOROUTING_INACTIVE_WARNING =
+	"Autorouting is enabled but has no usable tiers, so every Task item falls back to manual model resolution. Generate tiers from the /model smart-routing panel.";
+
 /** The normalized tier map consumed by routing policy. */
 export type TierMap = Partial<Record<AutoroutingTier, string[]>>;
 
