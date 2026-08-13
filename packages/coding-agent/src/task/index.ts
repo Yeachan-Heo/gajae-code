@@ -1974,7 +1974,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				| {
 						getAvailable?: () => Model[];
 						getAll?: () => Model[];
-						getApiKey?: (model: Model) => Promise<string | undefined>;
+						getApiKey?: (model: Model, sessionId?: string) => Promise<string | undefined>;
 				  }
 				| undefined;
 			const routingSnapshot = registry?.getAll?.() ?? registry?.getAvailable?.();
@@ -2044,25 +2044,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const skips = [...(routingSkipsByIndex.get(index) ?? [])];
 				if (!registry?.getApiKey || !routingSnapshot) return { candidates, skips };
 				const authenticated: string[] = [];
+				const credentialSessionId =
+					this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined;
 				for (const selector of candidates) {
-					const slash = selector.indexOf("/");
-					const provider = selector.slice(0, slash).toLowerCase();
-					const modelId = selector.slice(slash + 1);
-					const model = routingSnapshot.find(
-						candidate =>
-							candidate.provider.toLowerCase() === provider &&
-							(modelId === candidate.id || modelId.startsWith(`${candidate.id}:`)),
-					);
+					const model = routingSnapshot.find(candidate => {
+						const normalized = normalizeTierSelector(selector, [candidate]);
+						return "pinned" in normalized && normalized.pinned === selector;
+					});
 					if (!model) {
 						skips.push({ selector, code: "snapshot_missing" });
 						continue;
 					}
-					try {
-						if (await registry.getApiKey(model)) authenticated.push(selector);
-						else skips.push({ selector, code: "credential_unavailable" });
-					} catch {
-						skips.push({ selector, code: "credential_unavailable" });
-					}
+					if (await registry.getApiKey(model, credentialSessionId)) authenticated.push(selector);
+					else skips.push({ selector, code: "credential_unavailable" });
 				}
 				return { candidates: authenticated, skips };
 			};

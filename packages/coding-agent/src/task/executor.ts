@@ -1737,7 +1737,9 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 				typeof modelRegistry.getApiKey === "function"
 			) {
 				preflightOperation = "auth_resolve";
-				const exactKey = await awaitAbortable(modelRegistry.getApiKey(model, options.parentSessionId));
+				const exactKey = await awaitAbortable(
+					modelRegistry.getApiKey(model, options.parentCredentialSessionId ?? options.parentSessionId),
+				);
 				if (!exactKey)
 					throw Object.assign(new Error("autorouting credential unavailable"), {
 						transient: false,
@@ -2821,7 +2823,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		if (durable.preflightFenceCrossed) {
 			if (durable.exitCode === 0) {
 				attempts.push({ selector, phase: "durable", code: "accepted" });
-				return { ...durable, routing: evidenceWithAttempts(routedOptions, attempts) };
+				const routing = evidenceWithAttempts(routedOptions, attempts);
+				return {
+					...durable,
+					routing: routing ? { ...routing, effectiveModel: selector } : undefined,
+				};
 			}
 			attempts.push({ selector, phase: "durable", code: "post_acceptance_failure" });
 			return { ...durable, routing: evidenceWithAttempts(routedOptions, attempts) };

@@ -604,4 +604,4 @@ describe("builtin /routing slash command", () => {
 		expect(fastLine).toBeDefined();
 		expect(fastLine?.length).toBeLessThanOrEqual(220);
 	});
-}
+});

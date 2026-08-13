@@ -102,7 +102,12 @@ import {
 	mayCleanManagedTreeStaging,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
-import { classifyNativePublishOutcome, formatNativePublishDiagnostic } from "./internal/native-publish-outcome";
+import {
+	classifyNativePublishOutcome,
+	formatNativePublishDiagnostic,
+	mayCleanCurrentStaging,
+	type NativePublishOutcome,
+} from "./internal/native-publish-outcome";
 import {
 	applyReducerDelta,
 	type BaseAnchor,
@@ -7219,17 +7224,8 @@ export class SessionManager {
 	 * terminal's resume breadcrumb until it commits; `force` is the post-commit path.
 	 */
 	#writeTerminalBreadcrumb(cwd: string, sessionFile: string, force = false): void {
-		if (!this.#storageProfile.terminalBreadcrumbs) return;
 		if (this.#stagedPublication && !force && !this.#stagedPublication.committed) return;
 		writeTerminalBreadcrumb(cwd, sessionFile);
-	}
-	#sidecarCacheRootDir(): string {
-		if (this.#storageProfileCustom) return path.join(this.#storageProfile.residentCacheRootDir, "sidecar-cache");
-		const profileAgentDir =
-			this.destination.kind === "managed"
-				? this.destination.securityContext.profileAgentDir
-				: (explicitProfileAgentDirs.get(this.destination) ?? getAgentDir());
-		return getSidecarCacheRootDir(profileAgentDir);
 	}
 
 	#residentBlobStores(): ResidentBlobStores {
@@ -8957,7 +8953,7 @@ export class SessionManager {
 			this.#effectiveSessionMemoryMode(transcriptSize) === "enabled" &&
 			this.#storage.existsSync(`${sidecarRoot}/.session-memory.spill.commit`);
 		if (boundedTranscriptAdmitted && (await this.#tryInitSessionFileFromSidecar(resolvedSessionFile))) {
-			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			revalidateStrictResume();
 			return;
 		}
@@ -8967,7 +8963,7 @@ export class SessionManager {
 				this.#sessionMemoryMode = "shadow";
 				this.#sessionMemoryAutoDisabledReason = "sidecar_reload_failures";
 			}
-			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			revalidateStrictResume();
 			return;
 		}
@@ -8983,7 +8979,7 @@ export class SessionManager {
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
 			this.#retireEphemeralArtifacts();
-			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
@@ -9011,7 +9007,7 @@ export class SessionManager {
 			this.#applyFreshSessionMetadata(fresh);
 			this.#commitResidentTextStoreTransition(prepared);
 			this.#retireEphemeralArtifacts();
-			writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+			this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 			await this.#rewriteFile();
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
@@ -9044,7 +9040,7 @@ export class SessionManager {
 		this.#titleSource = header?.titleSource;
 		this.#needsFullRewriteOnNextPersist = migrationApplied;
 		this.#commitResidentTextStoreTransition(prepared);
-		writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+		this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		this.#adoptManagedPersistIdentity(resolvedSessionFile);
@@ -18829,6 +18825,7 @@ export class SessionManager {
 			);
 		this.#stagedCommitArtifactParent = parentArtifacts;
 		let published = false;
+		let directPublishOutcome: NativePublishOutcome | undefined;
 		try {
 			if (stagedManager?.getAttemptId() === staged.attemptId) {
 				const stagedArtifactFiles = await stagedManager.listFiles();
@@ -18848,10 +18845,10 @@ export class SessionManager {
 					sourceStoreRelativePath: stagedName,
 				});
 			} else {
-				const outcome = classifyNativePublishOutcome(
+				directPublishOutcome = classifyNativePublishOutcome(
 					nativeSessionManager().renameNoReplacePath(staged.stagedSessionFile, staged.finalSessionFile),
 				);
-				if (!outcome.ok) throw new Error(outcome.code ?? "staged_session_publish_failed");
+				if (!directPublishOutcome.ok) throw new Error(formatNativePublishDiagnostic(directPublishOutcome));
 			}
 			published = true;
 			if (staged.managedParentStore) {
@@ -18896,6 +18893,29 @@ export class SessionManager {
 					staged.publishedFinalSnapshot = destination ?? undefined;
 					// Latch the uncertainty so no later compensation reclaims what a possibly
 					// published transcript references.
+					staged.preservedUnproven = true;
+					throw new AggregateError(
+						[toError(error), ...probeErrors],
+						"Staged publication may have committed without proof; artifacts and staging were preserved for recovery.",
+					);
+				}
+			}
+			if (
+				!published &&
+				!staged.managedParentStore &&
+				directPublishOutcome &&
+				!mayCleanCurrentStaging(directPublishOutcome)
+			) {
+				const probeErrors: Error[] = [];
+				let destinationExists = false;
+				try {
+					await fs.promises.readFile(staged.finalSessionFile);
+					destinationExists = true;
+				} catch (probeError) {
+					const code = (probeError as NodeJS.ErrnoException).code;
+					if (code !== "ENOENT") probeErrors.push(toError(probeError));
+				}
+				if (destinationExists || probeErrors.length > 0) {
 					staged.preservedUnproven = true;
 					throw new AggregateError(
 						[toError(error), ...probeErrors],
