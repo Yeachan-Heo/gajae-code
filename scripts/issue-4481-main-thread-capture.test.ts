@@ -126,6 +126,7 @@ describe.skipIf(process.platform !== "linux")("issue #4481 PTY capture harness",
 
 	test("does not classify CPU as a wedge when no heartbeat was established", async () => {
 		const dir = await tempDir();
+		await Bun.write(path.join(dir, "heartbeat.txt"), `999999 8 ${Date.now() - 60_000}\n`);
 		const child = Bun.spawn(
 			[
 				"python3",

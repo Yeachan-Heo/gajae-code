@@ -59,9 +59,11 @@ def thread_ticks(pid: int) -> dict[str, tuple[str, int]]:
     return result
 
 
-def heartbeat(path: pathlib.Path) -> tuple[int, int] | None:
+def heartbeat(path: pathlib.Path, pid: int) -> tuple[int, int] | None:
     try:
         fields = path.read_text().split()
+        if int(fields[0]) != pid:
+            return None
         return int(fields[1]), int(fields[2])
     except (OSError, ValueError, IndexError):
         return None
@@ -169,6 +171,7 @@ def main() -> int:
     pty_path = artifact_dir / "pty.bin"
     summary_path = artifact_dir / "summary.json"
     preload = repo / "scripts/issue-4481-event-loop-heartbeat.ts"
+    heartbeat_path.unlink(missing_ok=True)
 
     env = os.environ.copy()
     env.update(
@@ -230,7 +233,7 @@ def main() -> int:
                         main_delta = delta
                         break
                 main_percent = main_delta / HZ / elapsed * 100.0
-                hb = heartbeat(heartbeat_path)
+                hb = heartbeat(heartbeat_path, pid)
                 heartbeat_age = None if hb is None else max(0.0, time.time() - hb[1] / 1000.0)
                 record = {
                     "elapsed": time.monotonic() - start,
