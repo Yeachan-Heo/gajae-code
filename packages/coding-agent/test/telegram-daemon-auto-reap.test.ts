@@ -165,9 +165,9 @@ describe("issue #4403 auto-reap", () => {
 				if (aliveSet.has(pid)) {
 					return {
 						incarnation: `linux:${pid}`,
-						termination: "cooperative" as const,
-						signalRoot: () => {
+						terminateTree: () => {
 							aliveSet.delete(pid);
+							return true;
 						},
 					};
 				}

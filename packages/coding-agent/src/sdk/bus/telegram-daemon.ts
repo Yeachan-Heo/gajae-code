@@ -358,6 +358,8 @@ const PICKER_CALLBACK_PREFIX = "p:";
 const ADOPTION_INTENT_SWEEP_INTERVAL_MS = 60_000;
 const ARCHIVE_RETRY_SWEEP_INTERVAL_MS = 15_000;
 const BTW_MAX_PENDING = 256;
+/** Periodic orphan-owner reconciliation cadence for the daemon watchdog. */
+const ORPHAN_REAP_INTERVAL_MS = 60_000;
 
 /** How long a compensation fence retries a failed topic-registry persist before giving up (40 × 250ms ≈ 10s). */
 const COMPENSATION_FENCE_MAX_ATTEMPTS = 40;
@@ -3551,7 +3553,7 @@ async function ensureTelegramDaemonRunningDetailedOnce(
 				const { nativeProcessBindings } = await import("@gajae-code/utils/native-process");
 				const pidForReap = cur.pid;
 				const incarnationForReap = cur.incarnation;
-				const { decisions: _decisions, receipt } = await reapTelegramDaemonOrphans({
+				const reapResult = await reapTelegramDaemonOrphans({
 					agentDir: input.settings.getAgentDir(),
 					currentOwnerId: cur.ownerId,
 					currentAcquisitionId: cur.acquisitionId ?? cur.ownerId,
@@ -3570,42 +3572,60 @@ async function ensureTelegramDaemonRunningDetailedOnce(
 								}
 							}),
 						pidIncarnation: deps.pidIncarnation ?? defaultPidIncarnation,
-						processReference:
-							deps.processReference ??
-							((pid: number) => {
-								try {
-									const r = nativeProcessBindings().Process.fromPid(pid) as {
-										incarnation?: unknown;
-										signalRoot?: (s: number) => boolean;
-									} | null;
-									if (!r || typeof r.incarnation !== "string" || !isProcessIncarnation(r.incarnation))
-										return undefined;
-									return {
-										incarnation: r.incarnation,
-										termination: process.platform === "win32" ? ("hard" as const) : ("cooperative" as const),
-										signalRoot: (sig: NodeJS.Signals) => {
-											const code = (require("node:os") as typeof import("node:os")).constants.signals[sig];
-											if (code !== undefined) {
-												const ok = (r as { signalRoot(s: number): boolean }).signalRoot(code);
-												if (!ok) throw new Error("signalRoot failed");
-											}
-										},
-									};
-								} catch {
+						// Native stable reference opened BEFORE the incarnation check.
+						// Uses killTree (process-group termination including descendants)
+						// rather than signalRoot (root-only, fails closed on macOS).
+						processReference: (pid: number) => {
+							try {
+								const r = nativeProcessBindings().Process.fromPid(pid) as {
+									incarnation?: unknown;
+									killTree?: (signal?: number) => number;
+								} | null;
+								if (!r || typeof r.incarnation !== "string" || !isProcessIncarnation(r.incarnation))
 									return undefined;
-								}
-							}),
+								return {
+									incarnation: r.incarnation,
+									terminateTree: (sig?: NodeJS.Signals) => {
+										const os = require("node:os") as typeof import("node:os");
+										const code =
+											sig === "SIGKILL" ? os.constants.signals.SIGKILL : os.constants.signals.SIGTERM;
+										// killTree signals the process AND its descendants / process group.
+										// On macOS it uses the start-time-pinned identity (works); on
+										// Linux it walks the tree + signals the group. Returns the count
+										// of signaled processes.
+										const count = (r as { killTree: (signal?: number) => number }).killTree(code);
+										return count > 0;
+									},
+								};
+							} catch {
+								return undefined;
+							}
+						},
 						platform: deps.platform,
 						now: deps.now,
 					},
 				});
+				const { receipt } = reapResult;
+				// Native signal failure including macOS must remain observable: log
+				// any refused (termination_failed) or incarnation_unavailable results
+				// instead of silently swallowing them.
+				if (receipt.refused > 0) {
+					logger.warn(
+						`notifications: orphan daemon reap had ${receipt.refused} refused candidate(s)${receipt.reasons.termination_failed ? ` (${receipt.reasons.termination_failed} termination_failed)` : ""}${receipt.reasons.incarnation_unavailable ? ` (${receipt.reasons.incarnation_unavailable} incarnation_unavailable)` : ""}`,
+					);
+				}
 				await writeTelegramOrphanRecoveryReceipt(
 					deps.fs ?? ((await import("node:fs")).promises as unknown as TelegramDaemonFs),
 					input.settings.getAgentDir(),
 					receipt,
-				).catch(() => undefined);
+				).catch(error =>
+					logger.warn(`notifications: orphan recovery receipt write failed: ${sanitizeDiagnostic(String(error))}`),
+				);
 			}
-		} catch {}
+		} catch (error) {
+			// Reap failure must be observable, not silently swallowed.
+			logger.warn(`notifications: orphan daemon reap failed: ${sanitizeDiagnostic(String(error))}`);
+		}
 		return "spawned";
 	}
 	throw new Error("Telegram daemon did not become ready after spawning");
@@ -4066,6 +4086,15 @@ export interface TelegramDaemonOptions {
 	topicRegistryAuthority?: TopicRegistryCasAuthority;
 	/** Stable host-local identity. Required whenever a shared authority is configured. */
 	installationHostId?: string;
+	/**
+	 * Orphan-owner reconciliation seam. Production wires the bounded orphan reap
+	 * (marker-registry-authorized process-group termination of superseded daemon
+	 * owners) so the daemon fences stale pollers before it becomes poll-capable
+	 * and re-runs reconciliation periodically. Injectable for deterministic tests.
+	 */
+	orphanReap?: () => Promise<void>;
+	/** Periodic reconciliation cadence; defaults to ORPHAN_REAP_INTERVAL_MS. */
+	orphanReapIntervalMs?: number;
 }
 
 interface StagedCallbackActivation {
@@ -4463,6 +4492,10 @@ export class TelegramNotificationDaemon {
 	#archiveRetrySweepInFlight = false;
 	/** In-flight submissions close the pre-sidecar race across picker and direct-path entry points. */
 	readonly #adoptionStartingTopics = new Set<number>();
+	/** Injected orphan reap seam; undefined when the daemon does not own reconciliation (e.g. validation mode). */
+	readonly #orphanReap: (() => Promise<void>) | undefined;
+	/** Reconciliation cadence; defaults to ORPHAN_REAP_INTERVAL_MS. */
+	readonly #orphanReapIntervalMs: number;
 
 	private readonly runtime: NotificationOperatorRuntime;
 	/** Provider-facing frame dispatcher; endpoint authority remains in SessionRouter. */
@@ -5090,6 +5123,8 @@ export class TelegramNotificationDaemon {
 			backoff: this.pollConflictBackoff,
 			processUpdate: update => this.processTelegramUpdate(update),
 		});
+		this.#orphanReap = opts.orphanReap;
+		this.#orphanReapIntervalMs = opts.orphanReapIntervalMs ?? ORPHAN_REAP_INTERVAL_MS;
 	}
 	/** @internal Test-only access to durable publication receipt transitions. */
 	publicationReceiptHarnessForTest() {
@@ -9793,6 +9828,42 @@ export class TelegramNotificationDaemon {
 		this.runtime.stopInterval("telegram-topic-reconcile");
 	}
 
+	/**
+	 * Periodic orphan-owner reconciliation. The daemon re-runs the bounded orphan
+	 * reap on a fixed cadence so a stale poller that survived the startup sweep
+	 * (or appeared after it) is eventually fenced. Failures are logged, never
+	 * fatal: reconciliation is convergence work, not a run precondition.
+	 */
+	private startOrphanReapTimer(): void {
+		if (!this.#orphanReap) return;
+		this.runtime.startInterval("telegram-orphan-reap", this.#orphanReapIntervalMs, () => {
+			if (!this.running) return;
+			void this.#runOrphanReap("periodic");
+		});
+	}
+
+	private stopOrphanReapTimer(): void {
+		this.runtime.stopInterval("telegram-orphan-reap");
+	}
+
+	/**
+	 * Run one bounded orphan-owner reconciliation. The `startup` phase runs
+	 * before the poll loop so stale pollers are fenced before this daemon
+	 * becomes poll-capable; the `periodic` phase converges late strays.
+	 */
+	async #runOrphanReap(phase: "startup" | "periodic"): Promise<void> {
+		if (!this.#orphanReap) return;
+		if (!this.running && phase === "periodic") return;
+		try {
+			await this.#orphanReap();
+		} catch (error) {
+			// Observable, never fatal: a failed reconciliation must not take down
+			// the authoritative owner. The next tick retries.
+			logger.warn(
+				`notifications: orphan-owner reconciliation (${phase}) failed: ${sanitizeDiagnostic(String(error))}`,
+			);
+		}
+	}
 	/** Send a single `typing` chat action into a busy session's topic (best-effort). */
 	private async sendTyping(
 		sessionId: string,
@@ -12576,6 +12647,13 @@ export class TelegramNotificationDaemon {
 			this.startFlushTimer();
 			this.startTypingTimer();
 			if (!this.validationMode()) {
+				// Pre-poll fencing: fence stale pollers before this daemon becomes
+				// poll-capable so Telegram never sees dual getUpdates pollers from
+				// the old and new owner. Then start the periodic reconciliation timer.
+				await this.#runOrphanReap("startup");
+				this.startOrphanReapTimer();
+			}
+			if (!this.validationMode()) {
 				await this.refreshBotIdentity();
 				await this.registerBotCommands();
 			}
@@ -12675,6 +12753,7 @@ export class TelegramNotificationDaemon {
 			this.runtime.stop();
 			this.stopOwnershipHeartbeatTimer();
 			this.stopTopicReconcileTimer();
+			this.stopOrphanReapTimer();
 			const heartbeatJoined = await this.runtime.joinExclusive("telegram-owner-heartbeat", BTW_SHUTDOWN_JOIN_MS);
 			if (!heartbeatJoined) logger.warn("heartbeat join timed out; retaining daemon ownership (release aborted)");
 			// A contender must not mutate durable owner state while unwinding startup.

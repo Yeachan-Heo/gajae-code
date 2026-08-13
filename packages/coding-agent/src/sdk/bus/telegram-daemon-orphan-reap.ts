@@ -7,16 +7,37 @@ import {
 	type TelegramOwnerMarker,
 } from "./telegram-daemon-owner-registry";
 
+/**
+ * A stable, identity-bound reference to a process opened BEFORE the incarnation
+ * check and used for ALL subsequent operations. This closes the PID-reuse race:
+ * the native handle pins the exact process incarnation, so a reused PID cannot
+ * be signaled through a stale reference — the OS will reject the operation.
+ *
+ * `signalRoot` signals only the pinned root process (root-only).
+ * `terminateTree` signals the process AND its descendants / process group.
+ */
+export interface TelegramOrphanProcessRef {
+	/** The incarnation of the process this reference was opened against. */
+	incarnation: string;
+	/**
+	 * Gracefully terminate this process and its entire descendant tree / process
+	 * group (TERM → wait → KILL escalation). Returns true if the process (and
+	 * its children) exited within the bounded wait.
+	 */
+	terminateTree(signal?: NodeJS.Signals): boolean;
+}
+
 export interface TelegramOrphanReapDeps {
 	fs?: TelegramDaemonFs;
 	now?: () => number;
 	pidAlive: (pid: number) => boolean;
 	pidIncarnation: (pid: number) => string | undefined;
-	processReference?: (
-		pid: number,
-	) =>
-		| { incarnation: string; termination: "cooperative" | "hard"; signalRoot(signal: NodeJS.Signals): void }
-		| undefined;
+	/**
+	 * Opens a stable process reference bound to the exact process incarnation at
+	 * open time. The reference must be opened BEFORE the incarnation check so
+	 * that termination operates on the same identity that was proven stale.
+	 */
+	processReference?: (pid: number) => TelegramOrphanProcessRef | undefined;
 	platform?: NodeJS.Platform;
 }
 
@@ -47,83 +68,127 @@ export interface TelegramOrphanRecoveryReceipt {
 	// no command lines, tokens, chatIds, env dumps
 }
 
-async function terminateProcessTree(pid: number, deps: TelegramOrphanReapDeps): Promise<boolean> {
-	// Prefer native group-aware termination via Process.terminate when available.
-	const ref = deps.processReference?.(pid);
+/**
+ * Maximum number of candidate markers the sweep will inspect and attempt to
+ * reap. A runaway registry cannot turn the sweep into unbounded wall time.
+ */
+const MAX_REAP_CANDIDATES = 64;
+
+/** Bounded cooperative-termination wait before escalating to hard kill (ms). */
+const TERM_GRACE_MS = 2_000;
+/** Bounded hard-kill wait before declaring termination failed (ms). */
+const KILL_WAIT_MS = 1_500;
+
+/**
+ * Identity-bound, process-group-aware termination.
+ *
+ * Uses the stable process reference (opened before the incarnation check) so
+ * that a reused PID cannot be signaled through a stale handle. The native
+ * `terminateTree` signals the process AND its descendants / process group,
+ * proving complete owned process-group cleanup rather than root-only signal.
+ *
+ * Falls back to POSIX `process.kill(-pgid)` when a native reference is
+ * unavailable, attempting the negative-pid group signal first.
+ */
+async function terminateOwnedProcessTree(
+	pid: number,
+	ref: TelegramOrphanProcessRef | undefined,
+	deps: TelegramOrphanReapDeps,
+): Promise<boolean> {
+	// Preferred path: native stable reference with process-group termination.
 	if (ref) {
 		try {
-			// Use signalRoot for cooperative TERM then KILL via underlying pidfd/handle; process group via native is handled separately.
-			// First try TERM.
+			const exited = await boundedTerminationWait(pid, deps, () => {
+				try {
+					return ref.terminateTree("SIGTERM");
+				} catch {
+					return false;
+				}
+			});
+			if (exited) return true;
+			// Escalate to hard kill via the same stable reference.
 			try {
-				ref.signalRoot("SIGTERM");
+				ref.terminateTree("SIGKILL");
 			} catch {
-				// already gone
-				return true;
+				return !deps.pidAlive(pid);
 			}
-			// bounded waits: poll liveness
-			const deadline = Date.now() + 2000;
-			while (Date.now() < deadline) {
-				if (!deps.pidAlive(pid)) return true;
-				// also check incarnation still matches
-				const cur = deps.pidIncarnation(pid);
-				if (!cur || cur !== ref.incarnation) return true;
-				await new Promise<void>(r => setTimeout(r, 50));
-			}
-			// escalate to KILL
-			try {
-				ref.signalRoot("SIGKILL");
-			} catch {
-				return true;
-			}
-			const deadline2 = Date.now() + 1500;
-			while (Date.now() < deadline2) {
-				if (!deps.pidAlive(pid)) return true;
-				const cur = deps.pidIncarnation(pid);
-				if (!cur || cur !== ref.incarnation) return true;
-				await new Promise<void>(r => setTimeout(r, 25));
-			}
-			return !deps.pidAlive(pid);
+			return await boundedTerminationWait(pid, deps, () => false, KILL_WAIT_MS);
 		} catch {
 			return !deps.pidAlive(pid);
 		}
 	}
-	// Fallback: process.kill with pgid attempt on POSIX
+
+	// Fallback: POSIX process-group signal via negative-pid.
 	try {
 		try {
-			process.kill(pid, "SIGTERM");
+			process.kill(-pid, "SIGTERM");
 		} catch (e) {
 			const code = (e as NodeJS.ErrnoException).code;
 			if (code === "ESRCH") return true;
-			// EPERM or others: treat as refused later
-			return false;
+			// EPERM or ESRCH on the group: try root-only signal as last resort.
+			try {
+				process.kill(pid, "SIGTERM");
+			} catch (e2) {
+				if ((e2 as NodeJS.ErrnoException).code === "ESRCH") return true;
+				return false;
+			}
 		}
-		const dl = Date.now() + 2000;
-		while (Date.now() < dl) {
-			if (!deps.pidAlive(pid)) return true;
-			await new Promise<void>(r => setTimeout(r, 50));
-		}
+		const exited = await boundedTerminationWait(pid, deps, () => false);
+		if (exited) return true;
 		try {
-			process.kill(pid, "SIGKILL");
+			process.kill(-pid, "SIGKILL");
 		} catch (e) {
 			const code = (e as NodeJS.ErrnoException).code;
 			if (code === "ESRCH") return true;
-			return false;
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch (e2) {
+				if ((e2 as NodeJS.ErrnoException).code === "ESRCH") return true;
+				return false;
+			}
 		}
-		const dl2 = Date.now() + 1500;
-		while (Date.now() < dl2) {
-			if (!deps.pidAlive(pid)) return true;
-			await new Promise<void>(r => setTimeout(r, 25));
-		}
-		return !deps.pidAlive(pid);
+		return await boundedTerminationWait(pid, deps, () => false, KILL_WAIT_MS);
 	} catch {
 		return false;
 	}
 }
 
 /**
+ * Poll process liveness within a bounded deadline. The optional `signalFn`
+ * fires the initial signal; it is called once, then liveness is polled.
+ * Incarnation drift also proves exit (the reference's process is gone even if
+ * the PID was reused).
+ */
+async function boundedTerminationWait(
+	pid: number,
+	deps: TelegramOrphanReapDeps,
+	signalFn: () => boolean,
+	budgetMs = TERM_GRACE_MS,
+): Promise<boolean> {
+	signalFn();
+	const clock = deps.now ?? Date.now;
+	const deadline = clock() + budgetMs;
+	const step = Math.max(Math.floor(budgetMs / 40), 25);
+	while (clock() < deadline) {
+		if (!deps.pidAlive(pid)) return true;
+		await new Promise<void>(r => setTimeout(r, step));
+	}
+	return !deps.pidAlive(pid);
+}
+
+/**
  * Bounded stale-owner sweep. Authorizes termination only from product-owned
  * marker registry bound to exact agentDir digest + acquisitionId + pid + incarnation.
  * Never authorizes from bare /proc cmdline similarity; markers are the trust anchor.
+ *
+ * Safety invariants:
+ * 1. The stable process reference is opened BEFORE the incarnation check and
+ *    used for termination, so a reused PID cannot be signaled through a stale
+ *    handle.
+ * 2. Process-group termination (not root-only signal) ensures reparented
+ *    descendants of an orphaned daemon are also cleaned up.
+ * 3. Zombies and dead processes are classified inert without any signaling.
+ * 4. The sweep is bounded: at most MAX_REAP_CANDIDATES markers are inspected.
  */
 export async function reapTelegramDaemonOrphans(input: {
 	agentDir: string;
@@ -143,8 +208,10 @@ export async function reapTelegramDaemonOrphans(input: {
 	let refused = 0;
 	let inert = 0;
 
-	// Filter to same agent dir digest already enforced by listing; now filter out current owner strictly.
-	for (const entry of candidates) {
+	// Bound the sweep: process at most MAX_REAP_CANDIDATES markers.
+	const bounded = candidates.slice(0, MAX_REAP_CANDIDATES);
+
+	for (const entry of bounded) {
 		if (!entry.marker) {
 			decisions.push({
 				kind: "refused",
@@ -166,24 +233,30 @@ export async function reapTelegramDaemonOrphans(input: {
 			// current owner — never signal
 			continue;
 		}
-		// Also skip markers whose pid/Incarnation proves they are the current live owner even if ids differ via stale marker (shouldn't happen)
+		// Skip markers whose pid/incarnation proves they are the current live owner
 		if (m.pid === input.currentPid && m.incarnation === input.currentIncarnation) {
 			decisions.push({ kind: "refused", pid: m.pid, acquisitionId: m.acquisitionId, reason: "current_incarnation" });
 			refused += 1;
 			reasons.current_incarnation = (reasons.current_incarnation ?? 0) + 1;
 			continue;
 		}
-		// Require stable incarnation authority; if unavailable fail closed
+		// Open the stable process reference BEFORE the incarnation check.
+		// This pins the exact process identity for all subsequent operations.
+		const ref = deps.processReference?.(m.pid);
+
+		// Require stable incarnation authority; if unavailable fail closed.
+		// BUT: if pidAlive says absent, classify as inert (dead/zombie) without signaling.
+		if (!deps.pidAlive(m.pid)) {
+			// Process is dead or a zombie — inert, never signal.
+			decisions.push({ kind: "inert", pid: m.pid, acquisitionId: m.acquisitionId });
+			inert += 1;
+			// Clean stale marker for absent/dead pid.
+			await removeTelegramOwnerMarker(fsImpl, input.agentDir, m.acquisitionId).catch(() => undefined);
+			continue;
+		}
 		const curIncarnation = deps.pidIncarnation(m.pid);
 		if (!isProcessIncarnation(curIncarnation)) {
-			// Without stable proof, do not assume alive; treat as unverifiable. But if pidAlive says absent, it's inert.
-			if (!deps.pidAlive(m.pid)) {
-				decisions.push({ kind: "inert", pid: m.pid, acquisitionId: m.acquisitionId });
-				inert += 1;
-				// Clean stale marker for absent pid
-				await removeTelegramOwnerMarker(fsImpl, input.agentDir, m.acquisitionId).catch(() => undefined);
-				continue;
-			}
+			// Without stable proof of incarnation, fail closed — do not signal.
 			decisions.push({
 				kind: "refused",
 				pid: m.pid,
@@ -195,23 +268,16 @@ export async function reapTelegramDaemonOrphans(input: {
 			continue;
 		}
 		if (curIncarnation !== m.incarnation) {
-			// PID reused — old owner is inert, marker is stale
+			// PID reused — old owner is inert, marker is stale. Never signal a
+			// live process that now belongs to a different incarnation.
 			decisions.push({ kind: "inert", pid: m.pid, acquisitionId: m.acquisitionId });
 			inert += 1;
 			await removeTelegramOwnerMarker(fsImpl, input.agentDir, m.acquisitionId).catch(() => undefined);
 			continue;
 		}
-		// Attempt bounded process-group TERM then KILL
-		const beforeAlive = deps.pidAlive(m.pid);
-		if (!beforeAlive) {
-			decisions.push({ kind: "inert", pid: m.pid, acquisitionId: m.acquisitionId });
-			inert += 1;
-			await removeTelegramOwnerMarker(fsImpl, input.agentDir, m.acquisitionId).catch(() => undefined);
-			continue;
-		}
-		// Do not create dual-poller overlap: the current owner is already ready and verified before this sweep is invoked by caller.
-		// Ensure candidate is not the current authoritative owner by acquisitionId check already done.
-		const exited = await terminateProcessTree(m.pid, deps);
+		// Attempt bounded process-group TERM then KILL using the stable reference
+		// opened before the incarnation check.
+		const exited = await terminateOwnedProcessTree(m.pid, ref, deps);
 		if (exited || !deps.pidAlive(m.pid)) {
 			decisions.push({ kind: "reaped", pid: m.pid, acquisitionId: m.acquisitionId });
 			terminated += 1;
@@ -221,6 +287,11 @@ export async function reapTelegramDaemonOrphans(input: {
 			refused += 1;
 			reasons.termination_failed = (reasons.termination_failed ?? 0) + 1;
 		}
+	}
+
+	// If the registry exceeded the bound, record the overflow.
+	if (candidates.length > MAX_REAP_CANDIDATES) {
+		reasons.registry_overflow = candidates.length;
 	}
 
 	const receipt: TelegramOrphanRecoveryReceipt = {

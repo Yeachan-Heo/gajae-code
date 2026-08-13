@@ -314,6 +314,71 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	);
 	const Daemon: TelegramDaemonConstructor = deps.DaemonImpl ?? TelegramNotificationDaemon;
 	const readState = deps.readDaemonState ?? readDaemonState;
+	// The daemon owns periodic orphan-owner reconciliation: it fences stale
+	// pollers before becoming poll-capable and re-runs the reap on a fixed
+	// cadence so late strays converge. The callback reads the current owner
+	// identity from the durable state (not from this process's volatile
+	// ownerId) so the reap targets only superseded owners, never itself.
+	const orphanReap = async (): Promise<void> => {
+		const { reapTelegramDaemonOrphans, writeTelegramOrphanRecoveryReceipt } = await import(
+			"./telegram-daemon-orphan-reap"
+		);
+		const snapshot = await readOwnerFreshnessSnapshot({ settings: settings as Settings });
+		const state = snapshot.state;
+		if (!state || !hasSafeDaemonStateShape(state) || state.ownershipPhase !== "ready") return;
+		const { nativeProcessBindings } = await import("@gajae-code/utils/native-process");
+		const incarnation = state.incarnation;
+		const { receipt } = await reapTelegramDaemonOrphans({
+			agentDir: resolvedAgentDir,
+			currentOwnerId: state.ownerId,
+			currentAcquisitionId: state.acquisitionId ?? state.ownerId,
+			currentPid: state.pid,
+			currentIncarnation: incarnation,
+			fsImpl: fs.promises as unknown as import("./telegram-daemon").TelegramDaemonFs,
+			deps: {
+				pidAlive:
+					deps.pidAlive ??
+					((pid: number) => {
+						try {
+							process.kill(pid, 0);
+							return true;
+						} catch (e) {
+							return (e as NodeJS.ErrnoException).code !== "ESRCH";
+						}
+					}),
+				pidIncarnation: deps.pidIncarnation ?? processIncarnation,
+				processReference: (pid: number) => {
+					try {
+						const r = nativeProcessBindings().Process.fromPid(pid) as {
+							incarnation?: unknown;
+							killTree?: (signal?: number) => number;
+						} | null;
+						if (!r || typeof r.incarnation !== "string" || !isProcessIncarnation(r.incarnation)) return undefined;
+						return {
+							incarnation: r.incarnation,
+							terminateTree: (sig?: NodeJS.Signals) => {
+								const os = require("node:os") as typeof import("node:os");
+								const code = sig === "SIGKILL" ? os.constants.signals.SIGKILL : os.constants.signals.SIGTERM;
+								const count = (r as { killTree: (signal?: number) => number }).killTree(code);
+								return count > 0;
+							},
+						};
+					} catch {
+						return undefined;
+					}
+				},
+				now: deps.now,
+			},
+		});
+		if (receipt.refused > 0) {
+			logger.warn(`notifications: daemon orphan reap had ${receipt.refused} refused candidate(s)`);
+		}
+		await writeTelegramOrphanRecoveryReceipt(
+			fs.promises as unknown as import("./telegram-daemon").TelegramDaemonFs,
+			resolvedAgentDir,
+			receipt,
+		).catch(() => undefined);
+	};
 	const daemon = new Daemon({
 		settings: settings as Settings,
 		ownerId,
@@ -331,6 +396,7 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		topicRegistryAuthority,
 		installationHostId,
 		requireTelegramTopicEligibility: true,
+		orphanReap,
 	});
 	// Signals are a process concern: install them at the daemon-internal boundary,
 	// not inside the embeddable daemon class. SIGTERM is the reload wakeup path.
@@ -401,12 +467,11 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 					daemon.requestStop("stop");
 					return;
 				}
-				if (!selfTuple && publishedOwner.ownerId !== ownerId) {
-					// No self incarnation proof available (Windows native unavailable) — fall back to ownerId only, but only when we cannot prove otherwise.
-					stopRequested = true;
-					daemon.requestStop("stop");
-					return;
-				}
+				// No stable self incarnation proof available (e.g. Windows native
+				// unavailable). Fail closed: do NOT self-terminate on ownerId alone.
+				// A bare ownerId equality is not sufficient authority to terminate a
+				// running daemon — a stale or reused PID could match, killing a
+				// foreign process. The stall watchdog below handles non-progress.
 			}
 			if (lastHeartbeatAt === undefined || heartbeatAt !== lastHeartbeatAt) {
 				lastHeartbeatAt = heartbeatAt;

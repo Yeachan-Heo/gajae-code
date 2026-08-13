@@ -261,8 +261,12 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * proved before publication and do not perform that sweep. Generation 165
  * preserves a bounded lean settlement window across autonomous continuations,
  * so the Telegram terminal receipt cannot lose a prior user-request result.
+ * Generation 166 introduces complete owned process-group cleanup (killTree
+ * instead of root-only signalRoot), identity-fenced orphan-owner reconciliation
+ * in the daemon run loop, pre-poll stale-poller fencing, and fail-closed
+ * watchdog behavior when stable identity authority is unavailable (#4403).
  */
-export const DAEMON_GENERATION = 165;
+export const DAEMON_GENERATION = 166;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
