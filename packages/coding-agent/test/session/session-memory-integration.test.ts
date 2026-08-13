@@ -4934,6 +4934,35 @@ describePosix("managed session memory authority", () => {
 		}
 	});
 
+	it("recreates a missing managed transcript from the full resident session", async () => {
+		const tempDir = TempDir.createSync("@pi-managed-missing-transcript-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const manager = SessionManager.create(cwd, destination, storage);
+		try {
+			await manager.ensureOnDisk();
+			const firstId = manager.appendCustomEntry("node", { payload: "first" });
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed session file");
+
+			storage.unlinkSync(sessionFile);
+			const secondId = manager.appendCustomEntry("node", { payload: "second" });
+
+			const persisted = await SessionManager.open(sessionFile, destination, storage);
+			try {
+				expect(persisted.getEntry(firstId)).toMatchObject({ id: firstId });
+				expect(persisted.getEntry(secondId)).toMatchObject({ id: secondId });
+			} finally {
+				await persisted.close();
+			}
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
 	it("discards managed failed successors through identity-bound transcript and tree removal", async () => {
 		class RejectRawDeleteStorage extends FileSessionStorage {
 			rawDeleteCalls = 0;
