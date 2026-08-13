@@ -4934,6 +4934,77 @@ describePosix("managed session memory authority", () => {
 		}
 	});
 
+	it("recreates a missing managed transcript from the full resident session", async () => {
+		const tempDir = TempDir.createSync("@pi-managed-missing-transcript-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const manager = SessionManager.create(cwd, destination, storage);
+		try {
+			await manager.ensureOnDisk();
+			const firstId = manager.appendCustomEntry("node", { payload: "first" });
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed session file");
+
+			storage.unlinkSync(sessionFile);
+			const secondId = manager.appendCustomEntry("node", { payload: "second" });
+
+			const persisted = await SessionManager.open(sessionFile, destination, storage);
+			try {
+				expect(persisted.getEntry(firstId)).toMatchObject({ id: firstId });
+				expect(persisted.getEntry(secondId)).toMatchObject({ id: secondId });
+			} finally {
+				await persisted.close();
+			}
+		} finally {
+			await manager.close();
+			tempDir.removeSync();
+		}
+	});
+	it("does not overwrite a concurrent successor during missing-transcript recovery", async () => {
+		const tempDir = TempDir.createSync("@pi-managed-missing-transcript-race-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const agentDir = path.join(tempDir.path(), "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const manager = SessionManager.create(cwd, destination, storage);
+		try {
+			await manager.ensureOnDisk();
+			const firstId = manager.appendCustomEntry("node", { payload: "first" });
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed session file");
+
+			// Simulate the expected transcript disappearing (the bug condition).
+			storage.unlinkSync(sessionFile);
+
+			// Simulate a concurrent successor published at the same pathname in
+			// the race window between the identity check and the recovery write.
+			const successorBytes = Buffer.from(
+				`${JSON.stringify({ type: "session", version: 5, id: "successor", timestamp: "1", cwd })}\n` +
+					`${JSON.stringify({ type: "custom", id: "succ-1", parentId: null, timestamp: "1", customType: "node", data: {} })}\n`,
+				"utf8",
+			);
+			fs.writeFileSync(sessionFile, successorBytes);
+			const successorIno = fs.statSync(sessionFile).ino;
+
+			// The append must fail rather than silently overwriting the successor.
+			expect(() => manager.appendCustomEntry("node", { payload: "second" })).toThrow();
+
+			// The successor file must be untouched.
+			const afterIno = fs.statSync(sessionFile).ino;
+			expect(afterIno).toBe(successorIno);
+			expect(fs.readFileSync(sessionFile, "utf8")).toBe(successorBytes.toString("utf8"));
+
+			// The resident entries are still intact in memory.
+			expect(manager.getEntry(firstId)).toMatchObject({ id: firstId });
+		} finally {
+			await manager.close().catch(() => {});
+			tempDir.removeSync();
+		}
+	});
 	it("discards managed failed successors through identity-bound transcript and tree removal", async () => {
 		class RejectRawDeleteStorage extends FileSessionStorage {
 			rawDeleteCalls = 0;

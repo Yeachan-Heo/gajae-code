@@ -89,6 +89,7 @@ import {
 	captureManagedFileNoFollow,
 	fsyncManagedArtifactTree,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	type ManagedAppendReceipt,
 	type ManagedBoundedAppendExpectation,
 	ManagedCommittedMutationError,
 	type ManagedDirectoryRoot,
@@ -3511,6 +3512,28 @@ function managedIdentityFromDescriptor(descriptor: DescriptorSnapshot): ManagedF
 		mtimeNs: descriptor.mtimeNs,
 		ctimeNs: descriptor.ctimeNs,
 	};
+}
+/**
+ * A managed predecessor is confirmed missing when either:
+ * - the non-authority path throws ENOENT (macOS), or
+ * - the retained RecoveryFsRoot authority reports `not_found` (Linux), or
+ * - the retained authority's identity stat returns `managed_replace_missing`
+ *   / `managed_append_missing` codes from ManagedSessionDescendantStore.
+ *
+ * Present-but-different-identity errors (mismatch) are intentionally excluded so
+ * they propagate as hard failures — a concurrent successor must never be
+ * silently overwritten.
+ */
+function isManagedMissingPredecessorError(err: unknown): boolean {
+	if (isEnoent(err)) return true;
+	if (err instanceof Error) {
+		return (
+			err.message === "not_found" ||
+			err.message === "managed_replace_missing" ||
+			err.message === "managed_append_missing"
+		);
+	}
+	return false;
 }
 
 function retainedManagedInspectionStorage(
@@ -14343,9 +14366,25 @@ export class SessionManager {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 				const store = this.#managedTranscriptStore(sessionFile);
 				const relativePath = path.basename(sessionFile);
-				if (this.#managedPersistExpectedIdentity)
-					store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
-				else store.replaceSync(relativePath, bytes);
+				if (this.#managedPersistExpectedIdentity) {
+					try {
+						store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+					} catch (err) {
+						// A confirmed missing predecessor can be recreated from the
+						// complete resident transcript. On macOS (no retained root
+						// authority) the identity capture throws ENOENT; on Linux
+						// (retained RecoveryFsRoot) the stat observation surfaces
+						// `not_found`. Any present-but-different identity still fails
+						// closed (the mismatch errors above) so a concurrent successor
+						// is never silently overwritten. Publishing with no-replace
+						// semantics ensures a successor that appeared in the window
+						// between the identity check and this write causes a conflict
+						// rather than being clobbered.
+						if (!isManagedMissingPredecessorError(err)) throw err;
+						this.#managedPersistExpectedIdentity = undefined;
+						store.publishNoReplaceSync(relativePath, bytes);
+					}
+				} else store.publishNoReplaceSync(relativePath, bytes);
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
 				this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(descriptor);
@@ -15950,9 +15989,25 @@ export class SessionManager {
 			const store = this.#managedTranscriptStore(sessionFile);
 			const relativePath = path.basename(sessionFile);
 			const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
-			const receipt = this.#managedPersistExpectedIdentity
-				? store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity)
-				: store.appendSync(relativePath, bytes);
+			let receipt: ManagedAppendReceipt | undefined;
+			if (this.#managedPersistExpectedIdentity) {
+				try {
+					receipt = store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+				} catch (err) {
+					const predecessorMissing = store.descriptorExpected(relativePath) === null;
+					if (
+						!isManagedMissingPredecessorError(err) &&
+						(!(err instanceof Error) || err.message !== "managed_append_identity_mismatch" || !predecessorMissing)
+					)
+						throw err;
+					// Appending only the new records would create a truncated transcript.
+					// Recreate the missing file from the complete resident entry set instead.
+					this.#managedPersistExpectedIdentity = undefined;
+					this.#rewriteFileSync();
+					return;
+				}
+			} else receipt = store.appendSync(relativePath, bytes);
+			if (!receipt) throw new Error("managed_append_receipt_unavailable");
 			this.#managedPersistExpectedIdentity = receipt.identity;
 			this.#publishSessionCommitMarkerSync(receipt.descriptor);
 		});
