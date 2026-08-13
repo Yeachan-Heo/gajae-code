@@ -29,6 +29,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:provider": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:logout": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:ssh": "visual/local-only command, not a user-facing SDK control seam",
+	"slash_command:import-session":
+		"local transcript-file import into a new session; no SDK operation counterpart, not a user-facing SDK control seam",
 	"slash_command:drop": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:contribute-pr": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:btw": "visual/local-only command, not a user-facing SDK control seam",

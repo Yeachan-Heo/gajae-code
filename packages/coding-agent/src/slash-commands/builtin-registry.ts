@@ -34,6 +34,7 @@ import {
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
+import { formatSessionImportSummary, runSessionImportCommand } from "../session-import";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
@@ -1080,6 +1081,50 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: async (command, runtime) => {
 			await runtime.ctx.handleExportCommand(command.text);
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "import-session",
+		priority: 51,
+		description: "Import a Codex or Claude session transcript into a new session",
+		acpDescription: "Import an external Codex or Claude transcript into a new session",
+		inlineHint: "<transcript-file> [--provider codex|claude]",
+		acpInputHint: "<transcript-file> [--provider codex|claude]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			if (runtime.session.isStreaming) {
+				return usage("Cannot import a session while a response is streaming; wait for it to finish.", runtime);
+			}
+			const outcome = await runSessionImportCommand(command.args, runtime.cwd);
+			if (outcome.kind === "error") return usage(outcome.message, runtime);
+			const switched = await runtime.session.switchSession(outcome.result.targetPath);
+			if (!switched) {
+				return usage(
+					`Import created ${outcome.result.targetPath}, but switching to it was cancelled. Resume it later from the session picker.`,
+					runtime,
+				);
+			}
+			await runtime.notifyTitleChanged?.();
+			await runtime.output(formatSessionImportSummary(outcome.result));
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			runtime.ctx.editor.setText("");
+			if (runtime.ctx.session.isStreaming) {
+				runtime.ctx.showError("Cannot import a session while a response is streaming; wait for it to finish.");
+				return;
+			}
+			const outcome = await runSessionImportCommand(command.args, runtime.ctx.sessionManager.getCwd());
+			if (outcome.kind === "error") {
+				runtime.ctx.showError(outcome.message);
+				return;
+			}
+			await runtime.ctx.handleResumeSession(outcome.result.targetPath);
+			const { prepared } = outcome.result;
+			const providerLabel = prepared.conversation.provider === "codex" ? "Codex" : "Claude";
+			runtime.ctx.showStatus(
+				`Imported ${providerLabel} session "${outcome.result.title}" (${prepared.conversation.messages.length} messages reconstructed${prepared.counts.redacted > 0 ? `, ${prepared.counts.redacted} secret values redacted` : ""}).`,
+			);
 		},
 	},
 	{
