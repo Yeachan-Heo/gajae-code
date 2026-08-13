@@ -15,6 +15,7 @@ import type {
 	TextContent,
 	Usage,
 } from "@gajae-code/ai/core";
+import { hasAdjacentPrivateThinkingBlocks } from "@gajae-code/ai/core";
 import type * as native from "@gajae-code/natives";
 
 function nativeSessionManager(): typeof import("@gajae-code/natives") {
@@ -6946,6 +6947,9 @@ export class SessionManager {
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
+	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
+	#warnedAdjacentThinkingPersist = false;
+	#closeRetryPending = false;
 	/** Depth of the non-yielding same-session persistence fence (reentrancy counter). */
 	#persistenceFenceDepth = 0;
 	/** Publication fence counter carried by the mutable `.spill.commit` marker. */
@@ -16013,6 +16017,43 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Defense-in-depth (#4443): detect directly adjacent thinking/redacted_thinking
+	 * blocks in a persisted assistant transcript message. Non-mutating read-only
+	 * diagnostic that fires at most once per session manager instance. Bounded to
+	 * development/test builds only via an explicit environment gate so normal
+	 * production never emits the diagnostic or transcript-path metadata.
+	 *
+	 * Only Anthropic-origin assistant messages are inspected: the adjacency class
+	 * is specific to the Anthropic wire contract (#4416), and a provider-neutral
+	 * check would false-positive on OpenAI Responses assemblies that emit one
+	 * internal `thinking` block per reasoning output item.
+	 *
+	 * Names only the envelope shape (content block count), never raw thinking
+	 * text, signatures, or redacted payloads.
+	 */
+	#warnAdjacentPrivateThinking(message: Parameters<typeof this.appendMessage>[0]): void {
+		if (this.#warnedAdjacentThinkingPersist) return;
+		// Explicit environment gate: production builds must not emit this
+		// diagnostic or transcript-path metadata. `NODE_ENV` is the canonical
+		// build-mode signal; the gate is robust to undefined (default: silent).
+		if (process.env.NODE_ENV !== "development" && process.env.NODE_ENV !== "test") return;
+		// Only assistant messages carry content block arrays with thinking blocks.
+		if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
+		// Restrict to Anthropic-origin: the adjacency rejection is specific to the
+		// Anthropic replay wire contract. Other providers tolerate adjacent
+		// reasoning blocks, so a provider-neutral check would be a false positive.
+		if (message.api !== "anthropic-messages") return;
+		if (!hasAdjacentPrivateThinkingBlocks(message.content)) return;
+		this.#warnedAdjacentThinkingPersist = true;
+		logger.warn("Session transcript: persisted assistant message has adjacent thinking blocks", {
+			role: "assistant",
+			provider: message.provider,
+			contentBlockCount: message.content.length,
+			hasAdjacentPrivateBlocks: true,
+		});
+	}
+
 	#appendEntry(entry: SessionEntry): void {
 		this.#withSessionPersistenceFenceSync(() => this.#appendEntryWithinPersistenceFence(entry));
 	}
@@ -16238,6 +16279,12 @@ export class SessionManager {
 			message,
 		};
 		associateSessionMessageEntryId(message, entry.id);
+		// Defense-in-depth (#4443): detect directly adjacent thinking/redacted_thinking
+		// blocks in a persisted assistant transcript message and warn once per session.
+		// This is a read-only observation — storage is NEVER mutated. The diagnostic is
+		// bounded to development/test to avoid production noise, and names only the
+		// envelope shape (block count), never raw thinking text, signatures, or payloads.
+		this.#warnAdjacentPrivateThinking(message);
 		this.#appendEntry(entry);
 		const residentEntry = this.#byId.get(entry.id);
 		if (residentEntry?.type === "message") transferSessionMessageIdentity([message], [residentEntry.message]);

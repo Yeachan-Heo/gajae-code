@@ -27,6 +27,30 @@ const enum ToolCallStatus {
  * - Injects synthetic "aborted" tool results
  * - Adds a <turn-aborted> guidance marker for the model
  */
+/**
+ * Detect directly adjacent private thinking blocks inside one assistant message's
+ * content. `thinking` and `redacted_thinking` are one adjacency class: the
+ * Anthropic wire contract rejects a replayed assistant turn where two such blocks
+ * sit next to each other with no intervening `tool_use`/`text` block (#4416).
+ *
+ * This is a pure, allocation-free predicate used by defense-in-depth diagnostics
+ * (issue #4443): the write-time transcript assertion (coding-agent persistence)
+ * and the stream-assembler SSE diagnostic (anthropic stream completion). It never
+ * inspects block payloads — only the block-type sequence — so it cannot leak
+ * thinking text, signatures, or credentials.
+ *
+ * Blocks separated by any non-private block (`tool_use`, `text`, …) are ordinary
+ * interleaved-thinking shape and return `false`.
+ */
+export function hasAdjacentPrivateThinkingBlocks(content: { type: string }[]): boolean {
+	let previousWasPrivate = false;
+	for (const block of content) {
+		const isPrivate = block.type === "thinking" || block.type === "redactedThinking";
+		if (isPrivate && previousWasPrivate) return true;
+		previousWasPrivate = isPrivate;
+	}
+	return false;
+}
 export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,

@@ -23,6 +23,7 @@ export {
 	PROVIDER_RUNTIME_DESCRIPTORS,
 	type ProviderRuntimeDescriptor,
 } from "./providers/register-builtins";
+export { hasAdjacentPrivateThinkingBlocks } from "./providers/transform-messages";
 export * from "./rate-limit-utils";
 export * from "./stream";
 export * from "./types";

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+### Changed
+- Defense-in-depth: when an Anthropic-origin assistant transcript message carrying directly adjacent `thinking`/`redacted_thinking` blocks is persisted, a single bounded warn is emitted per session manager instance — but only in development/test builds, never in production. The diagnostic names only the envelope shape (block count, adjacency presence, provider), never raw thinking text, signatures, redacted payloads, or transcript-path metadata. Storage is never mutated — the send-boundary collapse remains the wire source of truth; this is a read-only observation that helps surface upstream producers of the rejected shape (#4443).
 ### Fixed
 - Bound `apply_patch` transcript metadata so oversized patch payloads cannot bloat managed session transcripts (#4573).
 

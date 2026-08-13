@@ -104,7 +104,7 @@ import {
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
-import { transformMessages } from "./transform-messages";
+import { hasAdjacentPrivateThinkingBlocks, transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
 export type AnthropicHeaderOptions = {
@@ -2652,6 +2652,23 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			if (dropFastMode && resolveServiceTier(options?.serviceTier, model.provider) === "priority") {
 				output.disabledFeatures = [...(output.disabledFeatures ?? []), "priority"];
+			}
+			// Defense-in-depth (#4443): when the provider stream assembles an
+			// assistant message whose content carries directly adjacent private
+			// blocks, emit a bounded diagnostic naming only the envelope shape —
+			// block count and adjacent-pair presence — never raw thinking text,
+			// signatures, or redacted payloads. The send-boundary collapse
+			// remains the wire source of truth; this is a read-only observation.
+			// Scoped to this stream invocation: each completed turn with the
+			// defect is a distinct upstream producer worth surfacing, so the
+			// diagnostic is not latched across invocations.
+			if (hasAdjacentPrivateThinkingBlocks(output.content)) {
+				logger.warn("anthropic: stream assembled assistant content with adjacent thinking blocks", {
+					model: model.id,
+					provider: model.provider,
+					contentBlockCount: output.content.length,
+					hasAdjacentPrivateBlocks: true,
+				});
 			}
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();

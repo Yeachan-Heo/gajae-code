@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Defense-in-depth: a completed Anthropic stream whose assembled assistant content carries directly adjacent `thinking`/`redacted_thinking` blocks now emits a bounded diagnostic per stream invocation naming only the envelope shape (block count, adjacency presence, model, provider), never raw thinking text, signatures, or redacted payloads. The send-boundary collapse remains the wire source of truth; this is a read-only observation that helps surface upstream producers of the rejected shape (#4443).
 
 ### Fixed
 - Release the Codex websocket when the consumer aborts, preventing leaked connections after cancelled turns (#4556).
