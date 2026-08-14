@@ -606,6 +606,28 @@ const expectedProfiles: Array<{
 			architect: "openai-codex/gpt-5.6-sol:xhigh",
 		},
 	},
+	{
+		name: "omlx-qwen36-35b-moe",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/qwen3.6-35b-a3b:medium",
+			executor: "omlx/qwen3.6-35b-a3b:low",
+			planner: "omlx/qwen3.6-35b-a3b:high",
+			critic: "omlx/qwen3.6-35b-a3b:high",
+			architect: "omlx/qwen3.6-35b-a3b:high",
+		},
+	},
+	{
+		name: "omlx-qwen36-27b-dense",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/qwen3.6-27b:medium",
+			executor: "omlx/qwen3.6-27b:low",
+			planner: "omlx/qwen3.6-27b:xhigh",
+			critic: "omlx/qwen3.6-27b:high",
+			architect: "omlx/qwen3.6-27b:xhigh",
+		},
+	},
 ];
 
 const oldNames = [
@@ -811,6 +833,9 @@ describe("built-in model profile catalog", () => {
 
 	test("every selector parses with schema validation and exists in models.json", () => {
 		const missing: string[] = [];
+		// Providers whose models are discovered dynamically at runtime from local servers.
+		// Their selectors reference runtime-discovered model IDs, not bundled catalog entries.
+		const dynamicProviders = new Set(["omlx"]);
 		for (const profile of BUILTIN_MODEL_PROFILES) {
 			for (const role of roles) {
 				const selectorValue = profile.modelMapping[role];
@@ -818,6 +843,8 @@ describe("built-in model profile catalog", () => {
 				for (const selector of normalizeModelSelectorValue(selectorValue)) {
 					expect(ProfileModelSelectorSchema.safeParse(selector).success).toBe(true);
 					if (selector.includes("/")) expect(parseModelString(selector)).toBeDefined();
+					const provider = selector.split("/")[0];
+					if (dynamicProviders.has(provider)) continue;
 					if (!selectorExists(selector)) missing.push(`${profile.name}.${role}=${selector}`);
 				}
 			}
@@ -870,6 +897,7 @@ describe("built-in model profile catalog", () => {
 			"OPENCODEGO",
 			"COMMAND CODE GOAT",
 			"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+			"OMLX LOCAL",
 			"CLAUDE",
 			"GLM",
 			"KIMI CODING PLAN",

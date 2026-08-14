@@ -1399,6 +1399,45 @@ export function lmStudioModelManagerOptions(
 }
 
 // ---------------------------------------------------------------------------
+// 12.6. oMLX
+// ---------------------------------------------------------------------------
+
+export interface OmlxModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function omlxModelManagerOptions(
+	config?: OmlxModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? Bun.env.OMLX_BASE_URL ?? "http://127.0.0.1:8080";
+	const references = createBundledReferenceMap<"openai-completions">("omlx" as any);
+	return {
+		providerId: "omlx",
+		fetchDynamicModels: () =>
+			fetchOpenAICompatibleModels({
+				api: "openai-completions",
+				provider: "omlx",
+				baseUrl,
+				apiKey,
+				mapModel: (entry, defaults) => {
+					const reference = references.get(defaults.id);
+					return {
+						...defaults,
+						id: entry.id as string,
+						name: entry.name as string,
+						reasoning: entry.supports_reasoning === true,
+						input: entry.supports_vision === true ? ["text", "image"] : ["text"],
+						contextWindow: toPositiveNumber(entry.context_length, defaults.contextWindow),
+						maxTokens: toPositiveNumber(entry.max_tokens, defaults.maxTokens),
+					};
+				},
+			}),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // 13. Synthetic
 // ---------------------------------------------------------------------------
 
