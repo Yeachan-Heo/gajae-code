@@ -4762,6 +4762,14 @@ export class AgentSession {
 			this.#silentAbortPending = false;
 		}
 
+		// Track the terminal assistant synchronously, before any admission wait:
+		// the agent_end handler for an externally emitted terminal can otherwise
+		// read a stale #lastAssistantMessage (missing the just-emitted stop) and
+		// run post-turn continuation logic against the previous turn.
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#lastAssistantMessage = event.message;
+		}
+
 		// Canonical persistence follows synchronous message_end reservation order.
 		// Only the admission predecessor and this event's own pre-admission work are
 		// inside the lane; release before extension delivery and unrelated post-work.
@@ -5082,9 +5090,9 @@ export class AgentSession {
 				this.#markTtsrInjected(this.#extractTtsrRuleNames(event.message.details));
 			}
 
-			// Track assistant message for auto-compaction (checked on agent_end)
+			// (#lastAssistantMessage is captured synchronously before the
+			// admission wait above.)
 			if (event.message.role === "assistant") {
-				this.#lastAssistantMessage = event.message;
 				const assistantMsg = event.message as AssistantMessage;
 				const currentGrantsAnthropicPriority =
 					this.serviceTier === "priority" || this.serviceTier === "claude-only";

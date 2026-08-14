@@ -521,13 +521,16 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 			{ role: "user", content: "second distinct steering", timestamp: Date.now() },
 		]);
 
-		// With protectRecentTurns: 2 (default), the session manager's canonical
-		// entry ordering places the large orphan tool results inside the fence
-		// window, so they are not eligible for pruning — maintenance falls
-		// through to compaction. The short-circuit extension produces a
-		// compaction entry that preserves the recent paired result and steering.
+		// Canonical message admission is chronological, so the branch persists
+		// exactly the seeded order: the three orphan tool results land BEFORE the
+		// two trailing steering turns. With protectRecentTurns: 2 (default) the
+		// fence starts at the first steering message, so the oldest orphan output
+		// falls outside the 40k-token protect window and is prunable — maintenance
+		// prunes instead of compacting. The rewrite must still preserve the recent
+		// paired result, both steering messages, and replace the pruned output with
+		// a canonical truncate notice.
 		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
-		expect(outcome).toBe("compacted");
+		expect(outcome).toBe("pruned");
 		const persisted = session.sessionManager
 			.getBranch()
 			.flatMap(entry =>
@@ -543,6 +546,10 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 			persisted.filter(message => message.role === "user" && message.content === "second distinct steering"),
 		).toHaveLength(1);
 		expect(closed).toBeGreaterThanOrEqual(1);
+		const prunedOldest = persisted.find(message => message.toolCallId === "old-output-1");
+		expect(prunedOldest).toBeDefined();
+		expect(JSON.stringify(prunedOldest?.content)).toContain("[Output truncated");
+		expect(getLatestCompactionEntry(session.sessionManager.getBranch())).toBeNull();
 	});
 
 	it("fails closed when tool-output artifact persistence is unavailable", async () => {
