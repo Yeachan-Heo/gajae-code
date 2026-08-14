@@ -2048,7 +2048,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			// Malformed envelopes/JSON: only before replay-unsafe text/tool events are visible on this stream.
 			let providerRetryAttempt = 0;
 			while (true) {
-				const requestStartedAt = Date.now();
+				let firstEventWaitStartedAt: number | undefined;
 				const requestBytes = fingerprintAnthropicPayload(params).bytes;
 				const firstEventWatchdogMs = resolveAnthropicFirstEventWatchdogMs(
 					firstEventTimeoutMs,
@@ -2091,6 +2091,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						options?.client ? event => options?.onSseEvent?.(event, model, options?.attemptScope) : undefined,
 					);
 					await notifyProviderResponse(options, response, model, requestId);
+					firstEventWaitStartedAt = Date.now();
 					let sawEvent = false;
 					let sawMessageStart = false;
 					let sawTerminalEnvelope = false;
@@ -2105,7 +2106,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						onIdle: () => activeAbortTracker.abortLocally(idleTimeoutAbortError),
 						onFirstItemTimeout: () => {
 							firstEventTimeoutAbortError = createAnthropicFirstEventTimeoutError({
-								elapsedMs: Date.now() - requestStartedAt,
+								elapsedMs: Date.now() - (firstEventWaitStartedAt ?? Date.now()),
 								requestBytes,
 								firstEventTimeoutMs,
 								endpointClass,
@@ -2433,7 +2434,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					const localAbortReason = activeAbortTracker.getLocalAbortReason();
 					const streamFailure = localAbortReason ?? streamError;
 					attachAnthropicGraceFailureFacts(streamFailure, {
-						elapsedMs: Date.now() - requestStartedAt,
+						elapsedMs: Date.now() - (firstEventWaitStartedAt ?? Date.now()),
 						requestBytes,
 						firstEventTimeoutMs,
 						endpointClass,

@@ -647,6 +647,40 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.content).toEqual([{ type: "text", text: "delayed connect" }]);
 	});
 
+	it("does not count delayed response setup as first-event grace elapsed", async () => {
+		const create = ((_body: unknown) => {
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				[Symbol.asyncIterator]() {
+					return {
+						async next(): Promise<IteratorResult<MockAnthropicEvent>> {
+							const error = new Error("529 immediately after delayed response setup");
+							(error as Error & { status: number }).status = 529;
+							throw error;
+						},
+					};
+				},
+			};
+			return {
+				async withResponse() {
+					await Bun.sleep(5);
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+
+		const result = await streamAnthropic(model, contextWithBytes(1_670_000), {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 1,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(result.errorStatus).toBe(529);
+		expect(result.transportFailure?.retryMaxAttempts).toBeUndefined();
+		expect(result.transportFailure?.firstEventElapsedMs).toBeUndefined();
+	});
+
 	it("accepts an eventual first event inside the configured window", async () => {
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
 			return createAnthropicMockStream({
