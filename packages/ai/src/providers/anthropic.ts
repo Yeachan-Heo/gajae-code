@@ -2078,6 +2078,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
 			// Malformed envelopes/JSON: only before replay-unsafe text/tool events are visible on this stream.
 			let providerRetryAttempt = 0;
+			// Total uploads this invocation has spent, including corrective-policy
+			// replays (strict-tool/forced-tool/fast-mode/thinking/CPA) that reset
+			// providerRetryAttempt before `continue`. The timeout ceiling must bound
+			// TOTAL uploads, so it reads this counter, not the resettable one.
+			let providerUploadCount = 0;
 			while (true) {
 				let firstEventWaitStartedAt: number | undefined;
 				const requestBytes = fingerprintAnthropicPayload(params).bytes;
@@ -2141,7 +2146,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								requestBytes,
 								firstEventTimeoutMs,
 								endpointClass,
-								providerAttemptsConsumed: providerRetryAttempt,
+								providerAttemptsConsumed: providerUploadCount,
 							});
 							activeAbortTracker.abortLocally(firstEventTimeoutAbortError);
 						},
@@ -2515,6 +2520,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						disableStrictTools = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
+						providerUploadCount++;
 						resetOutputForRetry();
 						continue;
 					}
@@ -2544,6 +2550,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						droppedForcedToolChoice = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
+						providerUploadCount++;
 						resetOutputForRetry();
 						continue;
 					}
@@ -2701,6 +2708,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						dropFastMode = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
+						providerUploadCount++;
 						resetOutputForRetry();
 						continue;
 					}
@@ -2729,6 +2737,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						generatedCacheBudget = nextBudget;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
+						providerUploadCount++;
 						resetOutputForRetry();
 						continue;
 					}
@@ -2816,6 +2825,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						throw streamFailure;
 					}
 					providerRetryAttempt++;
+					providerUploadCount++;
 					const delayMs = PROVIDER_BASE_DELAY_MS * 2 ** (providerRetryAttempt - 1);
 					if (options?.providerRetryWait) {
 						await options.providerRetryWait(delayMs, options.signal);

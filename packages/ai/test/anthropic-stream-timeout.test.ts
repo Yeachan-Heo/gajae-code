@@ -499,6 +499,72 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.errorMessage).toContain("compiled grammar is too large");
 		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
 	});
+	it("counts corrective-policy replays when reporting the timeout attempt ceiling", async () => {
+		// A corrective replay (strict-tool fallback) resets providerRetryAttempt
+		// before `continue`, so the earlier providerRetryAttempt-based accounting
+		// reported the full two-attempt ceiling after two uploads had already
+		// happened — licensing a third upload of the corrected request.
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			if (attempts === 1) {
+				// Corrective path: strict-grammar-too-large 400.
+				return {
+					async withResponse(): Promise<never> {
+						const error = new Error("400 invalid_request_error: compiled grammar is too large");
+						(error as Error & { status: number }).status = 400;
+						throw error;
+					},
+				} as never;
+			}
+			// Corrected request then hangs until the first-event timeout.
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					await new Promise<void>(resolve => {
+						const timer = setTimeout(resolve, 10_000);
+						requestOptions?.signal?.addEventListener(
+							"abort",
+							() => {
+								clearTimeout(timer);
+								resolve();
+							},
+							{ once: true },
+						);
+					});
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+		const strictContext: Context = {
+			messages: [{ role: "user", content: "small strict request", timestamp: Date.now() }],
+			tools: [
+				{
+					name: "edit",
+					description: "Edit a value",
+					strict: true,
+					parameters: { type: "object", properties: {} },
+				},
+			],
+		};
+
+		const result = await streamAnthropic(model, strictContext, {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 30,
+		}).result();
+
+		expect(attempts).toBe(2);
+		expect(result.stopReason).toBe("error");
+		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		// Two uploads consumed (initial + corrective); small-request ceiling is 2,
+		// so the remaining ceiling must be 1 — not the full 2.
+		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
+	});
 
 	it("does not treat a delayed pre-message_start content block as semantic progress", async () => {
 		let attempts = 0;
