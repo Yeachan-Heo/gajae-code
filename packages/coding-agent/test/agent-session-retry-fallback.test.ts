@@ -55,6 +55,7 @@ function typedRateLimitStream(
 	model: Model,
 	retryAfterMs: number,
 	errorMessage = "Provider returned error: rate_limit_error: organization quota reached",
+	extraFailure: Partial<NonNullable<AssistantMessage["transportFailure"]>> = {},
 ): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
@@ -79,6 +80,7 @@ function typedRateLimitStream(
 				kind: "transport",
 				status: 429,
 				headers: { "retry-after-ms": String(retryAfterMs) },
+				...extraFailure,
 			},
 			timestamp: Date.now(),
 		};
@@ -657,6 +659,62 @@ describe("AgentSession retry fallback", () => {
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
 		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
+	});
+
+	it("does not rotate credentials after a large grace failure reaches its retry ceiling", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model");
+		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.set("anthropic", [
+			{ type: "api_key", key: "account-a-key" },
+			{ type: "api_key", key: "account-b-key" },
+		]);
+
+		const providerAffinitySessionId = "large-grace-pool";
+		const requestedKeys: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, providerAffinitySessionId);
+				if (key) requestedKeys.push(key);
+				return key;
+			},
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				calls++;
+				return typedRateLimitStream(requestedModel, 60_000, "429 Overloaded during grace", {
+					anthropicErrorType: "rate_limit_error",
+					requestBytes: 1_750_732,
+					firstEventElapsedMs: 305_000,
+					firstEventTimeoutMs: 300_000,
+					endpointClass: "custom",
+					retryMaxAttempts: 1,
+				});
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: "large-grace-logical",
+			providerCacheSessionId: providerAffinitySessionId,
+			credentialSessionId: providerAffinitySessionId,
+		});
+		const { retryStartEvents } = trackRetryEvents(session);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("do not rotate a bounded large grace request");
+		await session.waitForIdle();
+
+		expect(calls).toBe(1);
+		expect(requestedKeys).toHaveLength(1);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(getLastAssistantMessage(session).errorMessage).toContain(
+			"First-event/grace retry ceiling exhausted after 1 attempts",
+		);
 	});
 
 	it("rotates a single-model credential through an extension-loaded session (#3491 claim 1)", async () => {

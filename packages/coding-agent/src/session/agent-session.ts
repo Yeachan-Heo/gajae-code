@@ -18259,12 +18259,16 @@ export class AgentSession {
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
 				: false;
 		}
+		const attemptsUsed = managedFallback && !localSnapshot ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const providerRetryCeilingReached =
+			providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts;
 		// Credential rotation: a content-free quota/rate-limit failure has no
 		// observable state to corrupt, so it is replay-safe regardless of
 		// extension lifecycle participation. Mark the failed credential and
 		// retry with the next stored credential of the same provider.
 		let credentialRotated =
 			!managedFallback &&
+			!providerRetryCeilingReached &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit") &&
 			(await this.#markFailedCredential(trigger));
@@ -18272,7 +18276,9 @@ export class AgentSession {
 		// output, no tool calls, no extension-observable streaming state was produced
 		// before the failure. This bypasses #hasCleanRetryReplaySafety because the
 		// content-free check is the replay-safety guarantee for credential rotation.
-		const canReplayRotatedCredential = credentialRotated;
+		// A reached provider ceiling also continues through this gate only so the
+		// bounded exhaustion path can surface its exact diagnostic; it never replays.
+		const canReplayRotatedCredential = credentialRotated || providerRetryCeilingReached;
 		// Universal automatic replay-safety gate (#3791): once the failed attempt
 		// carries observable assistant text, thinking, or tool-call content,
 		// automatic session retry must not re-issue the request. This covers
@@ -18310,30 +18316,30 @@ export class AgentSession {
 			!managedFallback &&
 			classification === "transient" &&
 			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
-		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
 		if (managedFallback) {
 			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
-			if (
-				providerRetryMaxAttempts !== undefined &&
-				attemptsUsed >= providerRetryMaxAttempts &&
-				outcome === "retry"
-			) {
+			if (providerRetryCeilingReached && outcome === "retry") {
 				outcome = controller.advance() ? "advance" : "exhausted";
 			}
 		} else {
-			outcome =
-				providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts
-					? "exhausted"
-					: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
-						? "retry"
-						: "exhausted";
+			outcome = providerRetryCeilingReached
+				? "exhausted"
+				: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+					? "retry"
+					: "exhausted";
 		}
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
 		// exhaustion and forces an immediate same-model retry.
-		if (managedFallback && outcome === "advance" && (trigger.class === "quota" || trigger.class === "rate_limit")) {
+		if (
+			managedFallback &&
+			!providerRetryCeilingReached &&
+			outcome === "advance" &&
+			(trigger.class === "quota" || trigger.class === "rate_limit")
+		) {
 			credentialRotated = await this.#markFailedCredential(trigger);
 		}
 		if (credentialRotated) {
