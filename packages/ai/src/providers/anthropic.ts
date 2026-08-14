@@ -2440,6 +2440,20 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						endpointClass,
 						awaitingFirstEvent: !sawFirstSemanticEvent,
 					});
+					// A ceiling-bound upload failed before stream iteration began (for
+					// example an immediate 529 from withResponse()): the grace clock
+					// never started, so the facts above cannot apply, but the one-attempt
+					// upload ceiling must still bound the outer provider retry loop.
+					// Otherwise the multi-megabyte body is re-uploaded up to the default
+					// streamMaxRetries budget despite the ceiling. Once iteration has
+					// begun, only the grace-clock path above decides.
+					if (requestUploadCeilingBound && firstEventWaitStartedAt === undefined) {
+						Object.assign(streamFailure as Error, {
+							requestBytes,
+							endpointClass,
+							retryMaxAttempts: ANTHROPIC_LARGE_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS,
+						});
+					}
 					const firstEventRetryMaxAttempts =
 						typeof (streamFailure as { retryMaxAttempts?: unknown }).retryMaxAttempts === "number"
 							? (streamFailure as { retryMaxAttempts: number }).retryMaxAttempts
