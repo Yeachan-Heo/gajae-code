@@ -7091,7 +7091,18 @@ export function createNotificationsExtension(
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
 			server.onInbound((err, inbound) => {
 				if (err || !inbound) return;
-				if (initializedRuntime.inboundFenced) return;
+				if (initializedRuntime.inboundFenced) {
+					// A fenced predecessor keeps its native server alive for the terminal
+					// response, so the daemon can still deliver here after it has already
+					// ACKed the user's Telegram message. Dropping without a diagnostic
+					// made that loss undiscoverable (2026-08-14 incident).
+					logger.warn(
+						`notifications: inbound ${inbound.kind} dropped: runtime is inbound-fenced (updateId=${String(
+							(inbound as { updateId?: unknown }).updateId ?? "none",
+						)})`,
+					);
+					return;
+				}
 				const authenticatedInbound = inbound as typeof inbound & {
 					connectionId: string;
 					messageId?: number;
@@ -7115,6 +7126,12 @@ export function createNotificationsExtension(
 							});
 						}
 					}
+					if (inbound.kind !== "control_command")
+						logger.warn(
+							`notifications: inbound ${inbound.kind} dropped: notification policy is suspended (updateId=${String(
+								(inbound as { updateId?: unknown }).updateId ?? "none",
+							)})`,
+						);
 					return;
 				}
 				if (inbound.kind === "control_command") {
