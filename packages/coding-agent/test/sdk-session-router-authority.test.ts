@@ -1546,4 +1546,125 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.stop();
 		}
 	});
+
+	test("periodic reconcile converges while a rehosted attachment's replay is wedged (#4527)", async () => {
+		// Reproduces the production wedge: a session-host rehost bumps
+		// endpointGeneration, and the periodic reconcile replaces the attachment
+		// with one whose event_replay never settles. Before the fix, that replay
+		// was awaited inside the serialized reconcile tail, so every later tick
+		// froze until the replay budget expired; publications died while leases
+		// and inbound stayed green (#4527).
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4527-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "wedge";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://wedge.test", token: "v1", pid: 42 }));
+		let generation = 1;
+		let wedgeReplay = false;
+		const wedgedGate = Promise.withResolvers<void>();
+		let reconcileCount = 0;
+		let tick: (() => void) | undefined;
+
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			listSessions: () => ({
+				indexSeq: generation,
+				sessions: [
+					{
+						sessionId,
+						locator: { repo, stateRoot },
+						endpointGeneration: generation,
+						pid: 42,
+						endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+						live: true,
+						indexSeq: generation,
+						ambiguous: false,
+						terminal: false,
+					},
+				],
+				warnings: [],
+			}),
+		} as unknown as SessionIndex;
+
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => ({
+					onFrame: () => () => {},
+					request: async (frame: Record<string, unknown>) => {
+						if (wedgeReplay && frame.type === "event_replay") await wedgedGate.promise;
+						return { events: [] };
+					},
+					close: async () => {},
+					send: () => {},
+				}),
+				onReconciled: () => {
+					reconcileCount++;
+				},
+				setInterval: ((callback: () => void) => {
+					tick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+
+		try {
+			await router.start();
+			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+			const baseline = reconcileCount;
+
+			// Bump generation and rewrite the endpoint file: the periodic
+			// reconcile must replace the attachment. After the replacement,
+			// the new host's event_replay never settles.
+			generation = 2;
+			await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://wedge.test", token: "v2", pid: 42 }));
+			wedgeReplay = true;
+
+			// A publication-driven reconcile can observe the rehost before the
+			// periodic timer. It must publish and dispatch without awaiting the
+			// replacement attachment's wedged replay on the shared tail.
+			const requestSettled = await Promise.race([
+				Bun.sleep(500).then(() => false),
+				router.request(sessionId, { type: "test" }).then(() => true),
+			]);
+			expect(requestSettled).toBe(true);
+			expect(reconcileCount).toBeGreaterThan(baseline);
+
+			// A later periodic tick must also converge: the reconcile tail is not
+			// held by the wedged replay living on the attachment's ready tail.
+			const beforeSecond = reconcileCount;
+			tick!();
+			const secondSettled = await Promise.race([
+				Bun.sleep(500).then(() => false),
+				(async () => {
+					for (let i = 0; i < 500 && reconcileCount <= beforeSecond; i++) await Bun.sleep(1);
+					return reconcileCount > beforeSecond;
+				})(),
+			]);
+			expect(secondSettled).toBe(true);
+
+			// Explicit reconciliation preserves its synchronous replay contract,
+			// but joins the per-attachment tail outside the serialized reconcile
+			// tail so periodic fleet convergence remains independent.
+			let explicitSettled = false;
+			const explicitReconcile = router.reconcile().then(() => {
+				explicitSettled = true;
+			});
+			await Bun.sleep(10);
+			expect(explicitSettled).toBe(false);
+			wedgedGate.resolve();
+			await explicitReconcile;
+			expect(explicitSettled).toBe(true);
+		} finally {
+			wedgedGate.resolve();
+			await router.stop();
+		}
+	});
 });

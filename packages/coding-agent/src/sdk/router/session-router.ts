@@ -394,7 +394,7 @@ export class SessionRouter {
 			await this.#serialReconcile(runEpoch);
 			if (!this.#running(runEpoch)) return;
 			const timer = (this.#deps.setInterval ?? setInterval)(
-				() => this.#schedule(this.#serialReconcile(runEpoch)),
+				() => this.#schedule(this.#serialReconcile(runEpoch, true)),
 				2_000,
 			);
 			this.#stopTimer = () => (this.#deps.clearInterval ?? clearInterval)(timer);
@@ -405,8 +405,13 @@ export class SessionRouter {
 	}
 
 	/** Exposed for deterministic callers and reconciliation tests. */
-	reconcile(): Promise<void> {
-		return this.#serialReconcile(this.#runEpoch);
+	async reconcile(): Promise<void> {
+		await this.#serialReconcile(this.#runEpoch, true);
+		// Periodic reconciliation may have published an attachment while its
+		// initial replay continues on that attachment's isolated ready tail.
+		// Explicit callers retain the historical synchronous contract without
+		// putting any ready tail back onto the fleet-wide reconcile tail.
+		await Promise.all([...this.#sessions.values()].map(attached => attached.readyTail));
 	}
 	/** Ingests a credential-bearing Broker lifecycle result directly into Router custody. */
 	async adoptLifecycleResult(
@@ -471,7 +476,8 @@ export class SessionRouter {
 		const listing = this.#index.listSessions();
 		const indexedCurrent =
 			listing.warnings.length === 0 ? listing.sessions.find(item => item.sessionId === sessionId) : undefined;
-		if (indexedCurrent && sameIndexedAuthority(indexed, indexedCurrent)) await this.#serialReconcile(this.#runEpoch);
+		if (indexedCurrent && sameIndexedAuthority(indexed, indexedCurrent))
+			await this.#serialReconcile(this.#runEpoch, true);
 		return capability;
 	}
 
@@ -547,7 +553,7 @@ export class SessionRouter {
 	): Promise<Record<string, unknown>> {
 		const publishing = this.#sessions.get(sessionId);
 		if (!expectedAttachment || publishing?.capability !== expectedAttachment || !publishing.initializingPublication)
-			await this.#serialReconcile(this.#runEpoch);
+			await this.#serialReconcile(this.#runEpoch, true);
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentPublished(attached))
 			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not published.");
@@ -711,7 +717,7 @@ export class SessionRouter {
 		}
 	}
 
-	#serialReconcile(runEpoch: number): Promise<void> {
+	#serialReconcile(runEpoch: number, deferReplay = false): Promise<void> {
 		if (!this.#running(runEpoch)) return Promise.resolve();
 		const pending = this.#reconcilePending;
 		if (pending?.runEpoch === runEpoch) return this.#reconcileTail;
@@ -722,7 +728,7 @@ export class SessionRouter {
 			.then(async () => {
 				if (this.#reconcilePending === queued) this.#reconcilePending = undefined;
 				try {
-					await this.#reconcile(runEpoch);
+					await this.#reconcile(runEpoch, deferReplay);
 					if (!this.#running(runEpoch)) return;
 					this.#ready = true;
 					this.#deps.onReconciled?.();
@@ -735,7 +741,7 @@ export class SessionRouter {
 		return task;
 	}
 
-	async #reconcile(runEpoch: number): Promise<void> {
+	async #reconcile(runEpoch: number, deferReplay = false): Promise<void> {
 		if (!this.#running(runEpoch)) return;
 		await this.#index.open();
 		if (!this.#running(runEpoch)) return;
@@ -795,7 +801,8 @@ export class SessionRouter {
 				const session = live[nextAttachment++];
 				if (!session) return;
 				try {
-					if (await this.#attach(session, runEpoch)) attachedIds.add(session.sessionId);
+					if (await this.#attach(session, runEpoch, undefined, false, false, deferReplay))
+						attachedIds.add(session.sessionId);
 				} catch {
 					const failed = this.#sessions.get(session.sessionId);
 					if (failed?.runEpoch === runEpoch)
@@ -921,6 +928,7 @@ export class SessionRouter {
 		resolvedEndpoint?: SdkSessionEndpoint,
 		skipReplay = false,
 		deferPublication = false,
+		deferReplay = false,
 	): Promise<boolean> {
 		const retirementVersion = this.#retirementVersions.get(indexed.sessionId) ?? 0;
 		const retirement = this.#retirements.get(indexed.sessionId);
@@ -931,7 +939,7 @@ export class SessionRouter {
 		const retirementAfterValidation = this.#retirements.get(indexed.sessionId);
 		if (retirementAfterValidation) await retirementAfterValidation;
 		if ((this.#retirementVersions.get(indexed.sessionId) ?? 0) !== retirementVersion)
-			return await this.#attach(indexed, runEpoch, undefined, skipReplay, deferPublication);
+			return await this.#attach(indexed, runEpoch, undefined, skipReplay, deferPublication, deferReplay);
 		if (!this.#running(runEpoch)) return false;
 		if (!endpoint) return false;
 		const existing = this.#sessions.get(indexed.sessionId);
@@ -991,7 +999,7 @@ export class SessionRouter {
 			await client.close().catch(() => undefined);
 			const currentRetirement = this.#retirements.get(indexed.sessionId);
 			if (currentRetirement) await currentRetirement;
-			return await this.#attach(indexed, runEpoch, undefined, skipReplay, deferPublication);
+			return await this.#attach(indexed, runEpoch, undefined, skipReplay, deferPublication, deferReplay);
 		}
 		let attached: AttachedSession | undefined;
 		const barrier: ReplayBarrier = { held: undefined, detached: false, failed: false };
@@ -1026,7 +1034,7 @@ export class SessionRouter {
 						await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
 						throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 					}
-				} else await this.#serialReconcile(runEpoch);
+				} else await this.#serialReconcile(runEpoch, true);
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(this.#prepareFrame(attached, frame));
@@ -1138,10 +1146,10 @@ export class SessionRouter {
 			throw error;
 		}
 		if (deferPublication) return true;
-		return await this.#publishAttachment(attached, skipReplay);
+		return await this.#publishAttachment(attached, skipReplay, deferReplay);
 	}
 
-	async #publishAttachment(attached: AttachedSession, skipReplay: boolean): Promise<boolean> {
+	async #publishAttachment(attached: AttachedSession, skipReplay: boolean, deferReplay = false): Promise<boolean> {
 		if (attached.published) return this.#attachmentPublished(attached);
 		if (!this.#attachmentLive(attached)) return false;
 		const endpoint = await this.#readEndpoint(attached.indexed).catch(() => null);
@@ -1185,6 +1193,23 @@ export class SessionRouter {
 			attached.initializingPublication = false;
 		}
 		if (skipReplay) return true;
+		// When the caller drives the serialized reconcile tail (periodic
+		// re-attachment after a rehost), initial replay must not hold it: each
+		// replay owns its own retry budget, so awaiting it here wedges all later
+		// reconciles (and the sends that funnel through them) until the budget
+		// expires. The barrier still holds live frames, so ordering and
+		// generation fences are unchanged; replay just runs on the attachment's
+		// ready tail like the reconnect path (#4527).
+		if (deferReplay) {
+			attached.readyTail = attached.readyTail
+				.catch(() => undefined)
+				.then(async () => {
+					if (!this.#attachmentLive(attached)) return;
+					if (!(await this.#deliverRecoveredFrames(attached))) return;
+					await this.#replayAttachment(attached, attached.cursor.seq);
+				});
+			return true;
+		}
 		if (!(await this.#deliverRecoveredFrames(attached))) return false;
 		await this.#replayAttachment(attached, attached.cursor.seq);
 		return true;
