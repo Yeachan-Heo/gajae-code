@@ -219,6 +219,19 @@ const ATTACH_CONCURRENCY = 4;
 const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
 const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
 const NOTIFICATION_WORK_TIMEOUT = Symbol("notification_work_timeout");
+/**
+ * Client-message types the native session server authorizes with the
+ * per-session endpoint token (`tokens_match` in crates/gjc-sdk server.rs).
+ * Frames of these types without a matching `token` are dropped silently.
+ */
+const TOKEN_AUTHORIZED_FRAME_TYPES = new Set([
+	"user_message",
+	"reply",
+	"ephemeral_turn",
+	"ephemeral_turn_cancel",
+	"config_command",
+	"control_command",
+]);
 
 function readGeneration(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
@@ -507,11 +520,23 @@ export class SessionRouter {
 		return attached.capability;
 	}
 	#prepareFrame(attached: AttachedSession, frame: Record<string, unknown>): Record<string, unknown> {
+		// The native session server authorizes these client-message types with
+		// the per-session endpoint token and silently drops frames whose token
+		// is missing or wrong. Providers only hold opaque capabilities (the
+		// endpoint record lives here), so the router must stamp the token —
+		// omitting it made every daemon-origin injection (Telegram → session)
+		// vanish after the daemon had already ACKed the user's message.
+		const withToken =
+			typeof frame.type === "string" &&
+			TOKEN_AUTHORIZED_FRAME_TYPES.has(frame.type) &&
+			frame.token === undefined
+				? { ...frame, token: attached.endpoint.token }
+				: frame;
 		const connectionId = attached.client.connectionId;
-		if (connectionId === undefined) return frame;
-		if (frame.connectionId !== undefined && frame.connectionId !== connectionId)
+		if (connectionId === undefined) return withToken;
+		if (withToken.connectionId !== undefined && withToken.connectionId !== connectionId)
 			throw new SessionRouterError("pre_send", "SDK session transport identity changed before command dispatch.");
-		return { ...frame, connectionId };
+		return { ...withToken, connectionId };
 	}
 
 	/** Sends an SDK command through the current attachment without exposing its client. */

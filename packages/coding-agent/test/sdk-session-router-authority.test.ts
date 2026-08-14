@@ -1517,4 +1517,33 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.stop();
 		}
 	});
+	test("stamps the endpoint token onto token-authorized inbound frames", async () => {
+		// The native session server silently drops user_message/reply/control
+		// frames whose embedded token is missing or wrong; providers never see
+		// the endpoint record, so the router must stamp the token itself.
+		const subscriptions: NotificationSubscription[] = [];
+		const fixture = await routerFixture({
+			onNotificationSubscription: subscription => {
+				subscriptions.push(subscription);
+			},
+		});
+		try {
+			expect(subscriptions.length).toBe(1);
+			const [client] = fixture.clients;
+			const subscription = subscriptions[0]!;
+			subscription.send({ type: "user_message", sessionId: fixture.sessionId, text: "hi" });
+			subscription.send({ type: "reply", id: "a1", answer: "yes" });
+			subscription.send({ type: "user_message", sessionId: fixture.sessionId, text: "x", token: "preset" });
+			subscription.send({ type: "session_frame_ack", seq: 1 });
+			const byType = (type: string) => client!.sent.filter(frame => frame.type === type);
+			expect(byType("user_message")[0]?.token).toBe("secret");
+			expect(byType("reply")[0]?.token).toBe("secret");
+			// A caller-provided token is never overwritten.
+			expect(byType("user_message")[1]?.token).toBe("preset");
+			// Non-authorized frame types stay untouched.
+			expect(byType("session_frame_ack")[0]?.token).toBeUndefined();
+		} finally {
+			await fixture.router.stop();
+		}
+	});
 });
