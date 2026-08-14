@@ -79079,6 +79079,28 @@
 				"maxLevel": "xhigh"
 			}
 		},
+		"deepseek-v4-pro-0813": {
+			"id": "deepseek-v4-pro-0813",
+			"name": "deepseek-v4-pro-0813",
+			"api": "openai-completions",
+			"provider": "venice",
+			"baseUrl": "https://api.venice.ai/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888,
+			"compat": {
+				"supportsUsageInStreaming": false
+			}
+		},
 		"e2ee-deepseek-v4-flash": {
 			"id": "e2ee-deepseek-v4-flash",
 			"name": "e2ee-deepseek-v4-flash",
@@ -89136,9 +89158,15 @@
 			"contextWindow": 1000000,
 			"maxTokens": 131072,
 			"thinking": {
-				"mode": "budget",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"defaultLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
 			}
 		},
 		"glm-5v-turbo": {

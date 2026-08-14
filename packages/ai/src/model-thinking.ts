@@ -468,6 +468,17 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	if (model.provider === "zai" && model.id === "glm-5.2") {
 		model.contextWindow = 1_000_000;
 	}
+	// GLM-5.3 always thinks and exposes only low/high/max reasoning_effort.
+	// https://z.ai/blog/glm-5.3#api-changes-in-glm-5-3
+	if (model.provider === "zai" && model.id === "glm-5.3") {
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		};
+	}
 	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
 		model.contextWindow = 1_000_000;
 		model.maxTokens = 384_000;

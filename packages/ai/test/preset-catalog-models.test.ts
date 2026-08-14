@@ -24,7 +24,13 @@ describe("preset catalog model entries", () => {
 		expect(model.input).toContain("text");
 		expect(model.contextWindow).toBe(1_000_000);
 		expect(model.maxTokens).toBe(131_072);
-		expect(model.thinking).toEqual({ mode: "budget", minLevel: Effort.Minimal, maxLevel: Effort.XHigh });
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		});
 	});
 
 	test("bundles google-gemini-cli/gemini-3.5-flash", () => {
