@@ -66,6 +66,45 @@ describe("SDK session index lock contention (#4544)", () => {
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
+	it("reports a foreign lock owner with unknown liveness instead of probing a local pid", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-foreign-owner-"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		// A shared-volume lock record owned by another host: its pid is meaningful
+		// only there. The local pid space may contain a coincident (here: live and
+		// definitely local) process with the same number; the exhaustion diagnostic
+		// must not label it the holder.
+		const lockDir = path.join(sessionsDir, "index.jsonl.lock");
+		await fs.mkdir(lockDir, { recursive: true });
+		await Bun.write(
+			path.join(lockDir, "info"),
+			JSON.stringify({
+				pid: process.pid,
+				start_time: "unknown",
+				timestamp: Date.now(),
+				owner_host_id: "another-host",
+			}),
+		);
+		let failure: unknown;
+		try {
+			await lockModule.withFileLock(path.join(sessionsDir, "index.jsonl"), async () => {}, {
+				retries: 2,
+				retryDelayMs: 5,
+				ownerHostId: "this-host",
+			});
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(Error);
+		const message = (failure as Error).message;
+		expect(message).toContain(`pid ${process.pid} on host another-host`);
+		expect(message).toContain("liveness unknown from this host");
+		expect(message).not.toContain("(live)");
+		expect(message).not.toContain("dead but not reaped");
+		// The foreign owner's lock is never stolen from this host either.
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
 	it("keeps the append path's OS incarnation derivation outside the lock-held section", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-append-probe-"));
 		const index = await new SessionIndex(dir).open();
