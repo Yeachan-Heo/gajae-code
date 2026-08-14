@@ -432,7 +432,10 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts" ||
 		changedPath === "packages/coding-agent/test/session/managed-lock-lease.windows.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-session-directory.windows.test.ts" ||
-		changedPath === "packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts"
+		changedPath === "packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts" ||
+		changedPath === "packages/coding-agent/test/sdk-session-index-lock-contention.test.ts" ||
+		changedPath === "packages/coding-agent/src/sdk/broker/process-incarnation.ts" ||
+		changedPath === "packages/coding-agent/src/config/file-lock.ts"
 	);
 }
 

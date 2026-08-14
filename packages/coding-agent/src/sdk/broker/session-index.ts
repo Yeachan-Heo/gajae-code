@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { resolveEquivalentPath } from "@gajae-code/utils";
+import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
 import { processIncarnation } from "./process-incarnation";
 import {
@@ -347,7 +347,12 @@ function preferredIdentity(states: Iterable<SessionIdentityState>): SessionIdent
 	return preferred;
 }
 
-function projectIdentity(state: SessionIdentityState, ambiguous: boolean, now: number): IndexedSession {
+function projectIdentity(
+	state: SessionIdentityState,
+	ambiguous: boolean,
+	now: number,
+	probedIncarnations?: ReadonlyMap<string, string | undefined>,
+): IndexedSession {
 	const { latest, heartbeat } = state;
 	const terminal = isTerminalEvent(latest);
 	const terminalUncertain = latest.type === "lifecycle_terminal" || latest.terminalUncertain === true;
@@ -362,7 +367,17 @@ function projectIdentity(state: SessionIdentityState, ambiguous: boolean, now: n
 	const evidenceTs = Math.max(heartbeat?.ts ?? 0, latest.type === "host_registered" ? latest.ts : 0);
 	const heartbeatFresh = evidenceTs > 0 && now - evidenceTs < 2 * SESSION_HEARTBEAT_INTERVAL_MS;
 	const recordedIncarnation = effectiveIncarnation(latest);
-	const currentIncarnation = recordedIncarnation === undefined ? undefined : processIncarnation(latest.pid);
+	// OS incarnation probes are never taken while the machine-global index lock is
+	// held (#4544): callers that already probed pass the observation in, and
+	// unlocked callers probe directly. On Windows a probe can spawn powershell.exe
+	// — an unbounded OS operation a machine-global critical section must not await.
+	const probeKey = `${latest.sessionId}\u0000${latest.endpointGeneration}\u0000${latest.pid}`;
+	const currentIncarnation =
+		recordedIncarnation === undefined
+			? undefined
+			: probedIncarnations !== undefined
+				? probedIncarnations.get(probeKey)
+				: processIncarnation(latest.pid);
 	const incarnationMatches = currentIncarnation !== undefined && currentIncarnation === recordedIncarnation;
 	return {
 		sessionId: latest.sessionId,
@@ -400,7 +415,12 @@ function projectIdentity(state: SessionIdentityState, ambiguous: boolean, now: n
  * from another root has a higher generation. Heartbeats inherit
  * locator/endpoint metadata from their identity's prior event.
  */
-function reduceEvents(events: SessionIndexEvent[], now: number, agentDir: string): SessionIndexProjection {
+function reduceEvents(
+	events: SessionIndexEvent[],
+	now: number,
+	agentDir: string,
+	probedIncarnations?: ReadonlyMap<string, string | undefined>,
+): SessionIndexProjection {
 	// Resolved once: the fence-row check runs per root, and only this side of the
 	// comparison is ours to normalize.
 	const agentDirIdentity = resolveEquivalentPath(agentDir);
@@ -482,7 +502,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number, agentDir: string
 		const fencing = fencingRoots.get(sessionId);
 		const unresolved = unresolvedRoots.get(sessionId);
 		const ambiguous = (fencing?.size ?? 0) > 1;
-		for (const state of states) identities.push(projectIdentity(state, ambiguous, now));
+		for (const state of states) identities.push(projectIdentity(state, ambiguous, now, probedIncarnations));
 		const defaultAuthority = preferredIdentity(states);
 		if (defaultAuthority === undefined || defaultAuthority.latest.type === "session_deleted") continue;
 		let authority = defaultAuthority;
@@ -495,7 +515,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number, agentDir: string
 			const survivingAuthority = onlyRoot ? preferredIdentity(onlyRoot) : undefined;
 			if (survivingAuthority !== undefined) authority = survivingAuthority;
 		}
-		sessions.push(projectIdentity(authority, ambiguous, now));
+		sessions.push(projectIdentity(authority, ambiguous, now, probedIncarnations));
 	}
 	return { identities, sessions };
 }
@@ -504,8 +524,29 @@ function reduceEvents(events: SessionIndexEvent[], now: number, agentDir: string
 // this bounded at one minute while the shared lock's exact dead-owner recovery runs.
 const SESSION_INDEX_LOCK_OPTIONS = { retries: 600, retryDelayMs: 100 } as const;
 
-function withSessionIndexLock<T>(agentDir: string, callback: () => Promise<T>): Promise<T> {
-	return withFileLock(logFor(agentDir), callback, SESSION_INDEX_LOCK_OPTIONS);
+/**
+ * Observation window for one locked index transaction (#4544). This never times
+ * out or interrupts the holder — the machine-global lock's safety (never steal
+ * from a live owner) depends on holders finishing — it only names the operation
+ * still running once the window elapses, so a wedged Windows sync-family await
+ * is attributable from logs instead of surfacing as a bare 600-attempt
+ * lock-exhaustion crash on every later launch.
+ */
+const SESSION_INDEX_OP_SLOW_MS = 10_000;
+
+/**
+ * One locked session-index transaction (#4544): every critical section over the
+ * machine-global lock runs through this single choke point, so (a) the operation
+ * is named in a slow-operation warning when it holds the lock beyond the
+ * observation window and (b) the lock budget cannot silently drift per call
+ * site.
+ */
+function withSessionIndexLock<T>(operation: string, agentDir: string, callback: () => Promise<T>): Promise<T> {
+	const note = setTimeout(
+		() => logger.warn(`sdk broker: session index "${operation}" still holds the index lock after 10s`),
+		SESSION_INDEX_OP_SLOW_MS,
+	);
+	return withFileLock(logFor(agentDir), callback, SESSION_INDEX_LOCK_OPTIONS).finally(() => clearTimeout(note));
 }
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
 	if (!snapshot || typeof snapshot !== "object") return false;
@@ -713,7 +754,9 @@ export class SessionIndex {
 			group.promise = SessionIndex.#enqueue(indexPath, () => this.#prepareOpenGroup(indexPath, group!));
 		}
 		await group.promise;
-		await SessionIndex.#enqueue(indexPath, () => withSessionIndexLock(this.#agentDir, () => this.#replayUnderLock()));
+		await SessionIndex.#enqueue(indexPath, () =>
+			withSessionIndexLock("replay", this.#agentDir, () => this.#replayUnderLock()),
+		);
 		return this;
 	}
 	async #prepareOpenGroup(indexPath: string, group: SessionIndexOpenGroup): Promise<void> {
@@ -727,7 +770,9 @@ export class SessionIndex {
 	}
 	async replay(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
-		await SessionIndex.#enqueue(indexPath, () => withSessionIndexLock(this.#agentDir, () => this.#replayUnderLock()));
+		await SessionIndex.#enqueue(indexPath, () =>
+			withSessionIndexLock("replay", this.#agentDir, () => this.#replayUnderLock()),
+		);
 	}
 	async #replayUnderLock(): Promise<void> {
 		const scan = await this.#scan();
@@ -918,14 +963,14 @@ export class SessionIndex {
 				}),
 			);
 			if (!exists.some(Boolean)) return { status: "healthy", validPrefixSeq: 0, snapshotSeq: 0 };
-			return await withSessionIndexLock(this.#agentDir, async () => (await this.#scan()).diagnosis);
+			return await withSessionIndexLock("diagnose", this.#agentDir, async () => (await this.#scan()).diagnosis);
 		});
 	}
 	async repair(): Promise<SessionIndexRepairResult> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-			return await withSessionIndexLock(this.#agentDir, async () => {
+			return await withSessionIndexLock("repair", this.#agentDir, async () => {
 				const scan = await this.#scan();
 				if (scan.diagnosis.status === "unsupported") return { ...scan.diagnosis, repaired: false };
 				if (scan.diagnosis.status === "healthy") return { ...scan.diagnosis, repaired: false };
@@ -1018,7 +1063,7 @@ export class SessionIndex {
 	async refresh(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		await SessionIndex.#enqueue(indexPath, () =>
-			withSessionIndexLock(this.#agentDir, () => this.#refreshUnderLock()),
+			withSessionIndexLock("refresh", this.#agentDir, () => this.#refreshUnderLock()),
 		);
 	}
 	async #refreshUnderLock(): Promise<void> {
@@ -1035,7 +1080,19 @@ export class SessionIndex {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-			return await withSessionIndexLock(this.#agentDir, async () => {
+			// Own-pid incarnation derivation runs BEFORE the lock (#4544): on Windows
+			// the probe can spawn powershell.exe, and the machine-global index lock
+			// must not be held across an unbounded OS spawn. It cannot race anything —
+			// this process's own pid is fixed for its lifetime.
+			let ownIncarnation: string | undefined;
+			if (
+				input.hostIncarnation === undefined &&
+				input.pid === process.pid &&
+				Number.isSafeInteger(input.pid) &&
+				input.pid > 0
+			)
+				ownIncarnation = input.processIncarnation ?? processIncarnation(input.pid);
+			return await withSessionIndexLock("append", this.#agentDir, async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix)
 					throw new Error(
@@ -1047,16 +1104,11 @@ export class SessionIndex {
 					indexSeq: this.indexSeq + 1,
 					ts: input.ts ?? Date.now(),
 				};
-				// A host may derive its own OS identity; broker-authored events for another
-				// process must carry the registration's persisted binding instead.
-				if (
-					unsigned.hostIncarnation === undefined &&
-					unsigned.pid === process.pid &&
-					Number.isSafeInteger(unsigned.pid) &&
-					unsigned.pid > 0
-				) {
-					unsigned.hostIncarnation = unsigned.processIncarnation ?? processIncarnation(unsigned.pid);
-				}
+				// The host's own OS identity was derived before the lock above;
+				// broker-authored events for another process carry the registration's
+				// persisted binding instead.
+				if (ownIncarnation !== undefined && unsigned.hostIncarnation === undefined)
+					unsigned.hostIncarnation = ownIncarnation;
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
 				await this.#refreshUnderLock();
@@ -1148,7 +1200,7 @@ export class SessionIndex {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return await callback();
 				throw error;
 			}
-			return await withSessionIndexLock(this.#agentDir, async () => {
+			return await withSessionIndexLock("authority operation", this.#agentDir, async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) throw new Error("Cannot use corrupt session index for artifact reclamation");
 				return await callback();
@@ -1158,7 +1210,7 @@ export class SessionIndex {
 	async snapshot(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		await SessionIndex.#enqueue(indexPath, () =>
-			withSessionIndexLock(this.#agentDir, () => this.#snapshotUnderLock()),
+			withSessionIndexLock("snapshot", this.#agentDir, () => this.#snapshotUnderLock()),
 		);
 	}
 	async #snapshotUnderLock(): Promise<void> {
@@ -1187,7 +1239,7 @@ export class SessionIndex {
 	async compact(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		await SessionIndex.#enqueue(indexPath, () =>
-			withFileLock(logFor(this.#agentDir), async () => {
+			withSessionIndexLock("compact", this.#agentDir, async () => {
 				await this.#replayUnderLock();
 				await this.#rotate();
 			}),
@@ -1243,11 +1295,29 @@ export class SessionIndex {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
 				throw error;
 			}
-			return await withFileLock(logFor(this.#agentDir), async () => {
+			// OS incarnation probes run BEFORE the machine-global lock is taken
+			// (#4544): on Windows a probe can spawn powershell.exe, and holding the
+			// index lock across an unbounded OS spawn starves every later launch.
+			// The probe reads only the last replayed history to pick WHICH pids are
+			// worth observing; the locked section below re-validates every candidate
+			// against the fresh replay and the probed observation, so a stale probe
+			// set can only skip a heartbeat for one cycle, never checkpoint a wrong
+			// host (fail-closed).
+			const probed = new Map<string, string | undefined>();
+			for (const row of reduceEvents(this.#events, now, this.#agentDir).sessions) {
+				if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
+				if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
+					continue;
+				if (!alive(row.pid)) continue;
+				const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
+				if (recordedIncarnation === undefined) continue;
+				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
+			}
+			return await withSessionIndexLock("heartbeat checkpoint", this.#agentDir, async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) return 0;
 				const events: SessionIndexEvent[] = [];
-				const rows = reduceEvents(this.#events, now, this.#agentDir).sessions;
+				const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
 				for (const row of rows) {
 					if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
 					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
@@ -1255,7 +1325,7 @@ export class SessionIndex {
 					if (!alive(row.pid)) continue;
 					const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
 					if (recordedIncarnation === undefined) continue;
-					const current = processIncarnation(row.pid);
+					const current = probed.get(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`);
 					if (current === undefined || current !== recordedIncarnation) continue;
 					const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 						version: SDK_STATE_VERSION,

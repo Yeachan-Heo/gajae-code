@@ -38,6 +38,16 @@ export interface ProcessIncarnationOptions {
 	runCommand?: ProcessIncarnationCommandRunner;
 }
 
+/**
+ * Hard ceiling on the PowerShell incarnation probe (#4544). A wedged
+ * powershell.exe (profile policy, constrained language mode, AV interception)
+ * must never block its caller indefinitely — the broker probes liveness inside
+ * its heartbeat pass, and an unbounded synchronous spawn there starves the
+ * machine-global session-index lock every later launch contends for.
+ * `killSignal: "SIGKILL"` means even a TERM-ignoring process is reaped.
+ */
+const WIN32_INCARNATION_TIMEOUT_MS = 5_000;
+
 function runProcessIncarnationCommand(command: string, args: readonly string[]): ProcessIncarnationCommandResult {
 	try {
 		const result = Bun.spawnSync([command, ...args], {
@@ -45,6 +55,8 @@ function runProcessIncarnationCommand(command: string, args: readonly string[]):
 			stdout: "pipe",
 			stderr: "ignore",
 			windowsHide: true,
+			timeout: WIN32_INCARNATION_TIMEOUT_MS,
+			killSignal: "SIGKILL",
 		});
 		return { exitCode: result.exitCode, stdout: Buffer.from(result.stdout).toString("utf8") };
 	} catch {

@@ -61,6 +61,13 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-daemon-isolation.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-e2e.test.ts"
 			]
 		},
@@ -321,6 +328,34 @@
 				"bun",
 				"test",
 				"packages/coding-agent/test/telegram-baseline-manifest.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/telegram-daemon-auto-reap.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/telegram-daemon-cli-fail-closed.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/telegram-daemon-legacy-stray-reap.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/telegram-daemon-orphan-reap-acceptance.test.ts"
 			]
 		},
 		{
