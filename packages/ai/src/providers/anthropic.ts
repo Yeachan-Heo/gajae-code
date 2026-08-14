@@ -1528,9 +1528,23 @@ function resolveAnthropicFirstEventTimeoutMaxAttempts(requestBytes: number): num
 
 function normalizeStreamFailure(error: unknown): unknown {
 	if (error instanceof Error) return error;
-	// `null`/`undefined` rejections carry no message; keep them distinguishable
-	// from a real throw of those values by wrapping as an Error with the same
-	// string form downstream matchers already use (String(error)).
+	if (error !== null && typeof error === "object") {
+		// Structured rejections (e.g. `{ status, error, headers }` from an SDK or
+		// injected client) carry transport metadata downstream classification
+		// reads; wrap them in a mutable Error but copy every enumerable own
+		// property so status/provider-code/header extraction still works.
+		let message: string;
+		try {
+			message = JSON.stringify(error) || String(error);
+		} catch {
+			message = String(error);
+		}
+		const wrapper = new Error(message);
+		Object.assign(wrapper, error as object);
+		return wrapper;
+	}
+	// Primitive rejections (string/number/boolean/null/undefined): wrap with the
+	// same string form downstream matchers already use (String(error)).
 	return new Error(String(error));
 }
 

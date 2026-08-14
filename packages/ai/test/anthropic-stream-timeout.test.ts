@@ -416,6 +416,42 @@ describe("anthropic first-event timeouts", () => {
 			retryMaxAttempts: 1,
 		});
 	});
+	it("preserves transport metadata when normalizing a structured non-Error rejection", async () => {
+		// Structured rejections from an injected client (e.g. `{ status, error,
+		// headers }`) must keep their transport metadata through normalization so
+		// status/provider-code extraction and managed-fallback classification
+		// still work — the wrapper must not collapse them to "[object Object]".
+		let attempts = 0;
+		const create = ((_body: unknown) => {
+			attempts += 1;
+			return {
+				async withResponse(): Promise<never> {
+					throw {
+						status: 529,
+						error: { type: "overloaded_error", message: "Overloaded" },
+						headers: { "request-id": "req_structured" },
+					};
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), contextWithBytes(1_670_000), {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 100,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(529);
+		expect(result.transportFailure).toMatchObject({
+			status: 529,
+			anthropicErrorType: "overloaded_error",
+			requestBytes: expect.any(Number),
+			endpointClass: "custom",
+			retryMaxAttempts: 1,
+		});
+	});
 
 	it("does not run strict-tool corrective replay after a large grace ceiling is reached", async () => {
 		let attempts = 0;
