@@ -2114,6 +2114,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						},
 						abortSignal: options?.signal,
 						isProgressItem: event => {
+							if (!isRecord(event) || (!sawMessageStart && event.type !== "message_start")) return false;
 							const progress = isProgressEvent(event);
 							if (progress) sawFirstSemanticEvent = true;
 							return progress;

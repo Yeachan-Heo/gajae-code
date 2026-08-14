@@ -378,6 +378,40 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
 	});
 
+	it("does not treat a delayed pre-message_start content block as semantic progress", async () => {
+		let attempts = 0;
+		const create = ((_body: unknown) => {
+			attempts += 1;
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					await Bun.sleep(5);
+					yield {
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "text", text: "invalid preamble" },
+					};
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+
+		const result = await streamAnthropic(model, contextWithBytes(1_670_000), {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 1,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("received content_block_start before message_start");
+		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
+	});
+
 	it("does not attach first-event grace ceilings after message_start progress", async () => {
 		const create = ((_body: unknown) => {
 			const response = new Response(null, { status: 200 });
