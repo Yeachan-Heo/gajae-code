@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- break_long_word infinite loop on lone ESC in over-width word (#4437).
+
 ## [0.13.2] - 2026-08-13
 
 ### Added

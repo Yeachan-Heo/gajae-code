@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- Keep G013 large valid edit under shard-pressure deadline (#4353).
+- Resolve scratch roots at render time (#4452).
+- Give todo_write's positional-handle rejection an actual correction (#4453).
+- Keep isolated home paths non-scratch (#4455).
+- Add Grok 4.6 to the model catalog (#4462).
+
 ## [0.13.2] - 2026-08-13
 
 ### Added

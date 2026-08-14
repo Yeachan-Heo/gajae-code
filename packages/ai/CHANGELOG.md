@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- Preserve terminal Responses tool arguments (#4264).
+- Converge Anthropic thinking-replay rejections under managed fallback attempts (#4267).
+- Close fail-open Responses tool-call identity/lifecycle edge cases (#4274).
+- Repair CPA Claude-OAuth tool-alias restore 500 with one-shot steering (#4339).
+- Validate Synthetic API key via models endpoint, not retired Kimi probe (#4385).
+
 ## [0.13.2] - 2026-08-13
 
 ### Fixed

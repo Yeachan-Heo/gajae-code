@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Close fail-open Responses tool-call identity/lifecycle edge cases (#4274).
+
 ## [0.13.2] - 2026-08-13
 
 ## [0.13.1] - 2026-08-11
