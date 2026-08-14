@@ -527,9 +527,7 @@ export class SessionRouter {
 		// omitting it made every daemon-origin injection (Telegram → session)
 		// vanish after the daemon had already ACKed the user's message.
 		const withToken =
-			typeof frame.type === "string" &&
-			TOKEN_AUTHORIZED_FRAME_TYPES.has(frame.type) &&
-			frame.token === undefined
+			typeof frame.type === "string" && TOKEN_AUTHORIZED_FRAME_TYPES.has(frame.type) && frame.token === undefined
 				? { ...frame, token: attached.endpoint.token }
 				: frame;
 		const connectionId = attached.client.connectionId;
