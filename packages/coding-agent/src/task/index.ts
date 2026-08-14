@@ -33,6 +33,7 @@ import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" wit
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
+import { splitSelectorThinkingSuffix } from "../thinking";
 import { formatBytes, formatDuration } from "../tools/render-utils";
 import {
 	type AgentDefinition,
@@ -1717,7 +1718,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			activeModelPattern: parentActiveModelPattern,
 			fallbackModelPattern: this.session.getModelString?.(),
 		});
-		const thinkingLevelOverride = effectiveAgent.thinkingLevel;
+
+		// Agent frontmatter thinkingLevel takes priority; fall back to effort suffix
+		// from modelOverride (profile model_mapping) if not explicitly set in frontmatter.
+		const modelOverrideThinkingLevel =
+			modelOverride.length > 0 ? splitSelectorThinkingSuffix(modelOverride[0]).thinkingLevel : undefined;
+		const thinkingLevelOverride = effectiveAgent.thinkingLevel ?? modelOverrideThinkingLevel;
 
 		// Output schema priority: task call > agent frontmatter > inherited parent session.
 		// task.simple can disable the task-call override while leaving agent/session schemas intact.
