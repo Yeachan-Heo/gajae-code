@@ -31,7 +31,12 @@ import { HookEditorComponent } from "../../modes/components/hook-editor";
 import { HookInputComponent } from "../../modes/components/hook-input";
 import { HookSelectorComponent } from "../../modes/components/hook-selector";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "../../modes/theme/theme";
-import type { InteractiveModeContext } from "../../modes/types";
+import {
+	clearInteractiveActivityLoaders,
+	type InteractiveModeContext,
+	stopInteractiveActivityIndicator,
+	syncInteractiveActivityIndicator,
+} from "../../modes/types";
 import {
 	parseSyntheticModelId,
 	resolveSyntheticModelSelection,
@@ -43,8 +48,9 @@ import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
 import { setSessionTerminalTitle, setTerminalTitle } from "../../utils/title-generator";
 import { emitHostStatus } from "../utils/host-status";
-import { applyInjectedUserSubmission, extensionUserMessageContentError } from "../utils/injected-user-submission";
+import { applyInjectedUserSubmission } from "../utils/injected-user-submission";
 import { classifyHookSelectorBellEvent, ringTerminalBell } from "../utils/terminal-bell";
+import { prepareTranscriptRebuild } from "../utils/ui-helpers";
 
 const MAX_WIDGET_LINES = 10;
 const HOOK_SELECTOR_CHROME_ROWS = 7;
@@ -99,23 +105,6 @@ const EXTENSION_COMMAND_MUTATIONS: ReadonlySet<PropertyKey> = new Set([
 	"compact",
 	"switchSession",
 ]);
-
-const BROKER_LIFECYCLE_OPERATIONS = new Set([
-	"session.new",
-	"session.fork",
-	"session.resume",
-	"session.close",
-	"session.switch",
-	"session.branch",
-	"session.handoff",
-	"session.delete",
-]);
-
-function prohibitBrokerLifecycleOperation(operation: string): never {
-	throw Object.assign(new Error(`${operation} is available only through the Broker lifecycle service.`), {
-		code: "operation_prohibited",
-	});
-}
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
@@ -325,8 +314,52 @@ export class ExtensionUiController {
 			case "retry.abort":
 				session.abortRetry();
 				return { aborted: true };
+			case "session.new":
+				return { created: await session.newSession() };
+			case "session.fork":
+				return { session: await session.fork() };
+			case "session.resume":
+				return { resumed: await session.switchSession(String(input.id)) };
+			case "session.close":
+				await session.sessionManager.flush();
+				return { closed: true };
+			case "session.switch":
+				return { switched: await session.switchSession(String(input.id)) };
+			case "session.branch":
+				try {
+					return await session.branch(String(input.entryId));
+				} catch (error) {
+					throw Object.assign(new Error(error instanceof Error ? error.message : "Branch entry was not found."), {
+						code: "resource_gone",
+					});
+				}
 			case "session.rename":
 				return { renamed: await session.setSessionName(String(input.name), "user") };
+			case "session.handoff":
+				try {
+					return {
+						handoff: await session.handoff(
+							typeof input.target === "string"
+								? input.target
+								: typeof input.instructions === "string"
+									? input.instructions
+									: undefined,
+						),
+					};
+				} catch (error) {
+					const typed = error as { code?: unknown; handoffDocument?: unknown };
+					const handoffDocument =
+						typeof typed?.handoffDocument === "string" ? { handoffDocument: typed.handoffDocument } : undefined;
+					// Preserve a safe typed code (e.g. transient `busy`) so clients keep
+					// correct retry/backoff semantics; only synthesize invalid_request for
+					// otherwise-untyped failures.
+					const code = typed?.code === "busy" ? "busy" : "invalid_request";
+					throw Object.assign(
+						new Error(error instanceof Error ? error.message : "Handoff is unavailable for the current state."),
+						{ code },
+						handoffDocument,
+					);
+				}
 			case "session.export_html":
 				try {
 					return { path: await session.exportToHtml(typeof input.path === "string" ? input.path : undefined) };
@@ -393,11 +426,13 @@ export class ExtensionUiController {
 				}
 				return { changed: true, enabled: on };
 			}
+			case "session.delete":
+				await session.sessionManager.dropSession(String(input.id));
+				return { deleted: true };
 			case "session.cwd.move":
 				await session.sessionManager.moveTo(String(input.path));
 				return { moved: true, cwd: session.sessionManager.getCwd() };
 			default:
-				if (BROKER_LIFECYCLE_OPERATIONS.has(operation)) prohibitBrokerLifecycleOperation(operation);
 				throw Object.assign(new Error(`${operation} has no AgentSession implementation.`), { code: "unavailable" });
 		}
 	};
@@ -496,13 +531,7 @@ export class ExtensionUiController {
 			sendMessage: (message, options) => {
 				const wasStreaming = this.ctx.session.isStreaming;
 				this.ctx.session
-					// The extension seam is the trusted runtime boundary: extension
-					// producers are external to the turn's model/tool runtime, so
-					// nextTurn messages are classified "external" here (survive a
-					// terminal abort) instead of letting the extension label its
-					// own origin — caller-controlled origin defeats source-based
-					// continuation fencing (review thread P2).
-					.sendCustomMessage(message, { ...options, origin: "external" })
+					.sendCustomMessage(message, options)
 					.then(() => {
 						if (!this.#isStopped()) this.#applyCustomMessageDisplay(wasStreaming, message.display);
 					})
@@ -611,13 +640,6 @@ export class ExtensionUiController {
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			waitForIdle: () => this.ctx.session.agent.waitForIdle(),
-			newSession: async () => prohibitBrokerLifecycleOperation("session.new"),
-			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
-			navigateTree: async (targetId, navOptions) => {
-				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
-				return { cancelled: result.cancelled };
-			},
-			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
 			reload: async () => {
 				const previousSessionId = this.ctx.sessionManager.getSessionId();
 				await this.ctx.session.reload();
@@ -629,7 +651,105 @@ export class ExtensionUiController {
 				if (this.#isStopped()) return;
 				this.ctx.showStatus("Reloaded session");
 			},
+			newSession: async options => {
+				const cleanupPreviousSessionUi = this.captureSessionUiCleanup();
+				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				if (!success) {
+					return { cancelled: true };
+				}
+				if (this.#isStopped()) return { cancelled: true };
+				clearInteractiveActivityLoaders(this.ctx);
+				cleanupPreviousSessionUi();
+
+				stopInteractiveActivityIndicator(this.ctx);
+				this.ctx.resetIrcSidebarSession();
+				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+
+				if (options?.setup) {
+					await options.setup(this.ctx.sessionManager);
+					if (this.#isStopped()) return { cancelled: true };
+				}
+
+				this.ctx.statusLine.invalidate();
+				this.ctx.statusLine.setSessionStartTime(Date.now());
+				this.ctx.updateEditorTopBorder();
+				this.ctx.ui.requestRender();
+
+				prepareTranscriptRebuild(this.ctx.ui, "replace-identity");
+				this.ctx.chatContainer.clear();
+				this.ctx.pendingMessagesContainer.clear();
+				this.ctx.compactionQueuedMessages = [];
+				this.ctx.streamingComponent = undefined;
+				this.ctx.streamingMessage = undefined;
+				this.ctx.pendingTools.clear();
+
+				this.ctx.chatContainer.addChild(
+					new Text(`${theme.fg("accent", `${theme.status.success} New session started`)}`, 1, 0),
+				);
+				await this.ctx.reloadTodos();
+				if (this.#isStopped()) return { cancelled: true };
+				this.ctx.ui.requestRender();
+
+				return { cancelled: false };
+			},
+			branch: async entryId => {
+				const result = await this.ctx.session.branch(entryId);
+				if (this.#isStopped()) return { cancelled: true };
+				if (result.cancelled) {
+					return { cancelled: true };
+				}
+				this.ctx.resetIrcSidebarSession();
+
+				// Update UI
+				this.ctx.rebuildInitialMessages("replace-identity");
+				await this.ctx.reloadTodos();
+				if (this.#isStopped()) return { cancelled: true };
+				this.ctx.editor.setText(result.selectedText);
+				this.ctx.showStatus("Branched to new session");
+
+				return { cancelled: false };
+			},
+			navigateTree: async (targetId, options) => {
+				const result = await this.ctx.session.navigateTree(targetId, { summarize: options?.summarize });
+				if (this.#isStopped()) return { cancelled: true };
+				if (result.cancelled) {
+					return { cancelled: true };
+				}
+
+				// Update UI
+				this.ctx.rebuildInitialMessages("reconcile-same-transcript");
+				await this.ctx.reloadTodos();
+				if (this.#isStopped()) return { cancelled: true };
+				if (result.editorText && !this.ctx.editor.getText().trim()) {
+					this.ctx.editor.setText(result.editorText);
+				}
+				this.ctx.showStatus("Navigated to selected point");
+
+				return { cancelled: false };
+			},
 			compact: async instructionsOrOptions => this.#handleInteractiveCompact(instructionsOrOptions),
+			switchSession: async sessionPath => {
+				const previousSessionId = this.ctx.sessionManager.getSessionId();
+
+				this.clearHookWidgets();
+				const result = await this.ctx.session.switchSession(sessionPath);
+				if (this.#isStopped()) return { cancelled: true };
+				if (!result) {
+					return { cancelled: true };
+				}
+				clearInteractiveActivityLoaders(this.ctx);
+				const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
+				if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
+
+				setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+				this.ctx.rebuildInitialMessages(
+					switchingToDifferentSession ? "replace-identity" : "reconcile-same-transcript",
+				);
+				await this.ctx.reloadTodos();
+				if (this.#isStopped()) return { cancelled: true };
+				syncInteractiveActivityIndicator(this.ctx);
+				return { cancelled: false };
+			},
 		};
 
 		extensionRunner.initialize(
@@ -729,10 +849,7 @@ export class ExtensionUiController {
 			sendMessage: (message, options) => {
 				const wasStreaming = this.ctx.session.isStreaming;
 				this.ctx.session
-					// Trusted seam: extension producers are external to the turn
-					// runtime, so classify nextTurn messages "external" here
-					// instead of accepting a caller-supplied origin (review P2).
-					.sendCustomMessage(message, { ...options, origin: "external" })
+					.sendCustomMessage(message, options)
 					.then(() => this.#applyCustomMessageDisplay(wasStreaming, message.display))
 					.catch((err: unknown) => {
 						const errorText = `Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -838,13 +955,6 @@ export class ExtensionUiController {
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			waitForIdle: () => this.ctx.session.agent.waitForIdle(),
-			newSession: async () => prohibitBrokerLifecycleOperation("session.new"),
-			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
-			navigateTree: async (targetId, navOptions) => {
-				const result = await this.ctx.session.navigateTree(targetId, { summarize: navOptions?.summarize });
-				return { cancelled: result.cancelled };
-			},
-			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
 			reload: async () => {
 				if (this.ctx.isBackgrounded) {
 					return;
@@ -859,7 +969,109 @@ export class ExtensionUiController {
 				if (this.#isStopped()) return;
 				this.ctx.showStatus("Reloaded session");
 			},
+			newSession: async options => {
+				if (this.ctx.isBackgrounded) {
+					return { cancelled: true };
+				}
+				const cleanupPreviousSessionUi = this.captureSessionUiCleanup();
+				const success = await this.ctx.session.newSession({ parentSession: options?.parentSession });
+				if (!success) {
+					return { cancelled: true };
+				}
+				if (this.#isStopped()) return { cancelled: true };
+				clearInteractiveActivityLoaders(this.ctx);
+				cleanupPreviousSessionUi();
+
+				stopInteractiveActivityIndicator(this.ctx);
+				this.ctx.resetIrcSidebarSession();
+
+				if (options?.setup) {
+					await options.setup(this.ctx.sessionManager);
+					if (this.#isStopped()) return { cancelled: true };
+				}
+
+				prepareTranscriptRebuild(this.ctx.ui, "replace-identity");
+				this.ctx.chatContainer.clear();
+				this.ctx.pendingMessagesContainer.clear();
+				this.ctx.compactionQueuedMessages = [];
+				this.ctx.streamingComponent = undefined;
+				this.ctx.streamingMessage = undefined;
+				this.ctx.pendingTools.clear();
+
+				this.ctx.chatContainer.addChild(
+					new Text(`${theme.fg("accent", `${theme.status.success} New session started`)}`, 1, 0),
+				);
+				await this.ctx.reloadTodos();
+				if (this.#isStopped()) return { cancelled: true };
+				this.ctx.ui.requestRender();
+
+				return { cancelled: false };
+			},
+			branch: async entryId => {
+				if (this.ctx.isBackgrounded) {
+					return { cancelled: true };
+				}
+				const result = await this.ctx.session.branch(entryId);
+				if (this.#isStopped()) return { cancelled: true };
+				if (result.cancelled) {
+					return { cancelled: true };
+				}
+				this.ctx.resetIrcSidebarSession();
+
+				// Update UI
+				this.ctx.rebuildInitialMessages("replace-identity");
+				await this.ctx.reloadTodos();
+				if (this.#isStopped()) return { cancelled: true };
+				this.ctx.editor.setText(result.selectedText);
+				this.ctx.showStatus("Branched to new session");
+
+				return { cancelled: false };
+			},
+			navigateTree: async (targetId, options) => {
+				if (this.ctx.isBackgrounded) {
+					return { cancelled: true };
+				}
+				const result = await this.ctx.session.navigateTree(targetId, { summarize: options?.summarize });
+				if (this.#isStopped()) return { cancelled: true };
+				if (result.cancelled) {
+					return { cancelled: true };
+				}
+
+				// Update UI
+				this.ctx.rebuildInitialMessages("reconcile-same-transcript");
+				await this.ctx.reloadTodos();
+				if (this.#isStopped()) return { cancelled: true };
+				if (result.editorText && !this.ctx.editor.getText().trim()) {
+					this.ctx.editor.setText(result.editorText);
+				}
+				this.ctx.showStatus("Navigated to selected point");
+
+				return { cancelled: false };
+			},
 			compact: async instructionsOrOptions => this.#handleInteractiveCompact(instructionsOrOptions),
+			switchSession: async sessionPath => {
+				if (this.ctx.isBackgrounded) {
+					return { cancelled: true };
+				}
+				const previousSessionId = this.ctx.sessionManager.getSessionId();
+
+				this.clearHookWidgets();
+				const result = await this.ctx.session.switchSession(sessionPath);
+				if (this.#isStopped()) return { cancelled: true };
+				if (!result) {
+					return { cancelled: true };
+				}
+				clearInteractiveActivityLoaders(this.ctx);
+				const switchingToDifferentSession = previousSessionId !== this.ctx.sessionManager.getSessionId();
+				if (switchingToDifferentSession) this.ctx.resetIrcSidebarSession();
+				this.ctx.rebuildInitialMessages(
+					switchingToDifferentSession ? "replace-identity" : "reconcile-same-transcript",
+				);
+				await this.ctx.reloadTodos();
+				if (this.#isStopped()) return { cancelled: true };
+				syncInteractiveActivityIndicator(this.ctx);
+				return { cancelled: false };
+			},
 		};
 
 		extensionRunner.initialize(
@@ -1491,17 +1703,6 @@ export class ExtensionUiController {
 
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {
 		if (this.#isStopped()) return Promise.resolve();
-		// Validate at the owning boundary BEFORE session delivery and UI bookkeeping:
-		// applyInjectedUserSubmission → normalizeInjectedUserContent iterates content
-		// and dereferences part.type synchronously. Absent/null content (the
-		// container) OR null/undefined/non-object array elements throw an untyped
-		// TypeError synchronously — before the send.catch handler below is attached,
-		// leaving the typed invalid_input rejection from AgentSession unobserved
-		// (unhandled rejection) and crashing the resident process. Reject as a typed
-		// nonfatal control error so callers can surface it without losing session
-		// continuity.
-		const invalidContentError = extensionUserMessageContentError(content);
-		if (invalidContentError) return Promise.reject(invalidContentError);
 		// Compute queued BEFORE send: prompt() may flip session.isStreaming synchronously.
 		const queued = Boolean(options?.deliverAs) || this.ctx.session.isStreaming;
 		// Call send first so the busy/queued path finds the session queue populated
