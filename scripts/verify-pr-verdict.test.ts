@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as url from "node:url";
 import { canonicalDiffSha256, parseGhPrCreate, parsePrVerdict, validatePrContract } from "./verify-pr-verdict";
 
 const base = "a".repeat(40);
@@ -115,9 +116,16 @@ test("hook keeps repository root separate from nested invocation cwd", async () 
 });
 
 test("preflight preserves missing body-file diagnostics", async () => {
-	const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
-	expect(source).toContain("Could not read PR body file");
-	expect(source).not.toContain('.text().catch(() => "")');
+	const temp = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-pr-missing-body-"));
+	try {
+		const script = url.fileURLToPath(new URL("./verify-pr-verdict.ts", import.meta.url));
+		const child = Bun.spawn([process.execPath, script, "--preflight-command", "gh pr create --base dev --body-file missing.md", "--repo", temp, "--trusted-root", temp, "--invocation-cwd", temp], { stdout: "pipe", stderr: "pipe" });
+		const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+		expect(exitCode).toBe(1);
+		expect(stderr).toContain(`Could not read PR body file ${path.join(temp, "missing.md")}`);
+	} finally {
+		await fs.rm(temp, { recursive: true, force: true });
+	}
 });
 
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {

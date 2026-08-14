@@ -84,6 +84,10 @@ const GJC_REFERENCE_PATTERNS: readonly RegExp[] = [
 	/\bgetUltragoalPaths\b/u,
 ];
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
 interface Finding {
 	file: string;
 	line: number;
@@ -141,8 +145,9 @@ function dynamicMutationBindings(content: string): { aliases: Set<string>; names
 	for (const match of content.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*Bun\.write\b/gu)) aliases.add(match[1]!);
 	const namespaceNames = new Set([...importedFsNamespaces(content), ...namespaces]);
 	for (const namespace of namespaceNames) {
+		const escapedNamespace = escapeRegExp(namespace);
 		const member = `(?:${[...MUTATION_EXPORTS].join("|")})`;
-		for (const match of content.matchAll(new RegExp(`(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${namespace}(?:\\.promises)?(?:\\.${member}\\b|\\[['\"]${member}['\"]\\])`, "gu"))) {
+		for (const match of content.matchAll(new RegExp(`(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(?<![\\w$])${escapedNamespace}(?![\\w$])\\s*(?:\\.promises\\s*)?(?:\\.${member}\\b|\\[['\"]${member}['\"]\\])`, "gu"))) {
 			aliases.add(match[1]!);
 		}
 	}
@@ -155,11 +160,13 @@ function matchedApi(line: string, aliases: ReadonlySet<string>, namespaces: Read
 		if (m) return m[0].replace(/\s*\($/u, "");
 	}
 	for (const alias of aliases) {
-		if (new RegExp(`\\b${alias}\\s*\\(`, "u").test(line)) return alias;
+		const escapedAlias = escapeRegExp(alias);
+		if (new RegExp(`(?<![\\w$])${escapedAlias}(?![\\w$])\\s*\\(`, "u").test(line)) return alias;
 	}
 	for (const namespace of namespaces) {
+		const escapedNamespace = escapeRegExp(namespace);
 		const member = "(?:writeFile|appendFile|mkdir|rm|rmdir|unlink|rename|cp|copyFile|open|createWriteStream)";
-		const match = new RegExp(`\\b${namespace}(?:\\.promises)?(?:\\.${member}|\\[['\"]${member}['\"]\\])\\s*\\(`, "u").exec(line);
+		const match = new RegExp(`(?<![\\w$])${escapedNamespace}(?![\\w$])\\s*(?:\\.promises\\s*)?(?:\\.${member}|\\[['\"]${member}['\"]\\])\\s*\\(`, "u").exec(line);
 		if (match) return match[0].replace(/\s*\($/u, "");
 	}
 	return null;

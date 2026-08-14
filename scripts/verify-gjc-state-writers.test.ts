@@ -105,7 +105,7 @@ test("detects aliases assigned from computed namespace members", async () => {
 	try {
 		const file = path.join(root, "packages", "coding-agent", "src", "computed-alias.ts");
 		await fs.mkdir(path.dirname(file), { recursive: true });
-		await Bun.write(file, 'import * as io from "node:fs/promises";\nconst writer = io["writeFile"];\nawait writer(".gjc/x", "x");\n');
+		await Bun.write(file, 'import * as io$ from "node:fs/promises";\nconst writer$ = io$ ["writeFile"];\nawait writer$(".gjc/x", "x");\n');
 		const result = await run(root);
 		expect(result.exitCode).toBe(1);
 		expect(`${result.stdout}\n${result.stderr}`).toContain("computed-alias.ts");
