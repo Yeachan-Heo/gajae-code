@@ -122,8 +122,6 @@ Do not claim a web search, browser action, integration, or subagent ran without 
 Some tool output values are intentionally redacted as versioned `#GJC1_…#` tokens. Treat them as opaque sensitive strings.
 </redacted-content>
 {{/if}}
-
-
 {{#has tools "lsp"}}
 <lsp>
 Use language-server intelligence for symbol-aware operations whenever available:

@@ -55,7 +55,7 @@ export interface SessionSdkTransport {
 	readonly sessionId: string;
 	readonly stateRoot: string;
 	readonly token: string;
-	sendFrame(connectionId: string, frame: SdkFrame): void | Promise<void>;
+	sendFrame(connectionId: string, frame: SdkFrame): "written" | "dropped" | Promise<"written" | "dropped">;
 	onFrame(handler: (connectionId: string, frame: SdkFrame) => void): undefined | (() => void);
 	onMalformedFrame?(handler: (connectionId: string, message: string) => void): undefined | (() => void);
 	start(): Promise<{ url: string }>;

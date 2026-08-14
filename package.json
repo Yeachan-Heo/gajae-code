@@ -22,7 +22,7 @@
       "@gajae-code/stats": "0.13.2",
       "@gajae-code/agent-core": "0.13.2",
       "@gajae-code/ai": "0.13.2",
-      "@gajae-code/bridge-client": "workspace:*",
+      "@gajae-code/bridge-client": "0.13.2",
       "@gajae-code/coding-agent": "0.13.2",
       "@gajae-code/natives": "0.13.2",
       "@gajae-code/natives-darwin-arm64": "0.13.2",

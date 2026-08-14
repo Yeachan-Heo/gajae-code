@@ -18,7 +18,6 @@ import {
 	type Message,
 	type Model,
 	type ProviderSessionState,
-	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	streamSimple,
 	type ToolResultMessage,
@@ -39,16 +38,9 @@ import {
 	providerSupportsAppendOnlyAuto,
 	resolveAppendOnlyMode,
 } from "../append-only-mode";
-import {
-	type AsyncJob,
-	AsyncJobManager,
-	asyncJobEndpointId as deriveAsyncJobEndpointId,
-	isBackgroundJobSupportEnabled,
-	jobElapsedMs,
-} from "../async";
+import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
 import { loadCapability } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
-import type { SourceMeta } from "../capability/types";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
@@ -62,7 +54,6 @@ import {
 } from "../config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "../config/prompt-templates";
 import { Settings, type SkillsSettings } from "../config/settings";
-import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import "../discovery";
@@ -102,14 +93,11 @@ import {
 	gjcActivationGenerationFor,
 } from "../extensibility/gjc-plugins/runtime-quarantine";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
-import { discoverAndLoadHookExtensions } from "../extensibility/hooks/loader";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
-import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
-import { createMasterModeExtension } from "../master/extension";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -118,8 +106,7 @@ import {
 	createOptionalRuntimeServices,
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
-import { loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
-import type { MCPServerConfig } from "../runtime-mcp/types";
+import { MCPManager } from "../runtime-mcp";
 import {
 	getNotificationConfig,
 	isGenericNotificationHostEligible,
@@ -127,29 +114,15 @@ import {
 	SPAWN_PROVENANCE_ENV,
 	shouldRegisterGenericNotificationsExtension,
 } from "../sdk/bus/config";
-import { createReconciliationStore, type ReconciliationStore } from "../sdk/bus/reconciliation-store";
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
-import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
-import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
+import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
-import {
-	parsePersistedCredentialSelector,
-	resolveStartupAuthConfig,
-	type StartupAuthConfigSnapshot,
-} from "../session/startup-auth-config";
-import {
-	isOwnedCompletionEnvelopeAllowed,
-	lookupOwnedRegistration,
-	type OwnedCompletionEnvelope,
-	retireOwnedRegistrationsForEndpoint,
-	unregisterOwnedRegistration,
-} from "../session/terminal-abort";
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
 import {
 	type BuildSystemPromptResult,
@@ -190,8 +163,6 @@ type AsyncResultEntry = {
 	result: string;
 	job: AsyncJob | undefined;
 	durationMs: number | undefined;
-	/** Exact owned-completion origin when the job is registered left-running work of a terminal turn. */
-	ownedCompletion?: OwnedCompletionEnvelope;
 };
 
 type AsyncResultJobDetails = {
@@ -203,8 +174,6 @@ type AsyncResultJobDetails = {
 
 type AsyncResultDetails = {
 	jobs: AsyncResultJobDetails[];
-	/** Private origin envelope(s); absent = ordinary delivery. Never a public field. */
-	ownedCompletions?: OwnedCompletionEnvelope[];
 };
 
 type McpNotificationEntry = {
@@ -214,53 +183,13 @@ type McpNotificationEntry = {
 
 function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessage<AsyncResultDetails> | null {
 	if (entries.length === 0) return null;
-	// Partition denied owned-completion entries out ENTIRELY before batch
-	// construction (AC 36 zero final calls from stopped work): a denied entry —
-	// owned scope, forged tuple, or vanished scope — must never reach
-	// followUp/prompt, even inside a mixed batch. Allowed owned-completion and
-	// ordinary entries are delivered normally.
-	const survivors = entries.filter(
-		entry => entry.ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(entry.ownedCompletion),
-	);
-	// Denied entries never reach followUp/prompt (AC 36), so no later
-	// settlement boundary sees them — retire their terminal tuples HERE,
-	// otherwise an owned_unsettled abort's later completion keeps occupying
-	// the global registration and retained-policy capacities (review P2).
-	const denied = entries.filter(
-		(entry): entry is AsyncResultEntry & { ownedCompletion: OwnedCompletionEnvelope } =>
-			entry.ownedCompletion !== undefined && !isOwnedCompletionEnvelopeAllowed(entry.ownedCompletion),
-	);
-	if (denied.length > 0) {
-		// Resolve the manager from the registration's OWN endpoint: the
-		// process-global instance is the last-created session, so when B's
-		// manager is global with the same local job id still running, the
-		// terminality check would observe B's running job and refuse to
-		// unregister A's already-terminal tuple (review thread P2).
-		const manager =
-			AsyncJobManager.forEndpoint(denied[0]?.ownedCompletion.registration.endpointId) ?? AsyncJobManager.instance();
-		for (const entry of denied) {
-			const registration = entry.ownedCompletion.registration;
-			const job = manager?.getJob(registration.jobId);
-			const status = job?.generation === registration.jobGeneration ? job?.status : undefined;
-			if (job === undefined || status === "completed" || status === "cancelled" || status === "failed") {
-				unregisterOwnedRegistration(registration);
-			}
-		}
-	}
-	if (survivors.length === 0) return null;
-	const jobs = survivors.map(entry => ({
+	const jobs = entries.map(entry => ({
 		jobId: entry.jobId,
 		result: entry.result,
 		type: entry.job?.type,
 		label: entry.job?.label,
 		durationMs: entry.durationMs,
 	}));
-	const ownedCompletions = survivors
-		.filter(
-			(entry): entry is AsyncResultEntry & { ownedCompletion: OwnedCompletionEnvelope } =>
-				entry.ownedCompletion !== undefined,
-		)
-		.map(entry => entry.ownedCompletion);
 	const details: AsyncResultDetails = {
 		jobs: jobs.map(job => ({
 			jobId: job.jobId,
@@ -268,10 +197,6 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
 			label: job.label,
 			durationMs: job.durationMs,
 		})),
-		// Private origin envelope for the AgentSession injector; absent for
-		// ordinary deliveries. Only ALLOWED owned-completion entries survive
-		// partitioning, so the injector never sees a denied envelope here.
-		...(ownedCompletions.length > 0 ? { ownedCompletions } : {}),
 	};
 	return {
 		role: "custom",
@@ -299,20 +224,6 @@ function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessag
  * result for any such trailing unpaired tool call so a resumed session always
  * starts from a valid, paired history. No-op for well-formed transcripts.
  */
-/** Whether the cached SDK-only reconciliation store still matches the current
- *  session identity. session_switch/session_branch can move to a DIFFERENT
- *  transcript that retains the same copied session id, so the cache is keyed
- *  by BOTH the session id and the session-file path (including a null-to-file
- *  transition); a mismatch means the store must be recreated or the successor
- *  reads/writes the predecessor's reconciliation file (review thread P2). */
-export function sdkOnlyStoreMatches(
-	cached: { sessionId: string; sessionFile: string | undefined } | undefined,
-	sessionId: string,
-	sessionFile: string | undefined,
-): boolean {
-	return cached !== undefined && cached.sessionId === sessionId && cached.sessionFile === sessionFile;
-}
-
 export function reconcileTrailingToolCalls(messages: AgentMessage[]): AgentMessage[] {
 	let lastAssistantIdx = -1;
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -399,6 +310,12 @@ function resolveAgentRosterLabel(label: string | undefined, agentId: string, dis
 }
 // Types
 export interface CreateAgentSessionOptions {
+	/** Master orchestration mode for resident session supervision (#4448). */
+	masterMode?: boolean;
+	/** MCP autoload for native .gjc registrations (#4335). */
+	enableMcpAutoload?: boolean;
+	/** Preferred credential selector for multi-account pools (#4317). */
+	preferredCredentialSelector?: unknown;
 	/** Working directory for project-local discovery. Default: getProjectDir() */
 	cwd?: string;
 	/** Global config directory. Default: ~/.gjc/agent */
@@ -427,10 +344,6 @@ export interface CreateAgentSessionOptions {
 
 	/** System prompt blocks. Array replaces default, function receives default blocks and returns final blocks. */
 	systemPrompt?: string[] | ((defaultPrompt: string[]) => string[]);
-	/** Master session (`gjc master` / `--master`): appends the master-mode system-prompt
-	 *  section and registers the session-start hook that injects SDK supervision
-	 *  guidance plus the authoritative resident-session inventory. Default: false. */
-	masterMode?: boolean;
 	/** Optional provider-facing session identifier for prompt caches and sticky auth selection.
 	 * Keeps persisted session files isolated while reusing provider-side caches. */
 	providerSessionId?: string;
@@ -438,10 +351,6 @@ export interface CreateAgentSessionOptions {
 	credentialSessionId?: string;
 	/** Runtime credential selector for multi-account auth pools. */
 	credentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
-	/** Soft runtime credential preference; quota/rate-limit failures may rotate away from it. */
-	preferredCredentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
-	/** Durable global pin intent loaded from startup-auth config; session bootstrap resolves it without mutating shared storage. */
-	startupAuthConfig?: StartupAuthConfigSnapshot;
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -451,8 +360,6 @@ export interface CreateAgentSessionOptions {
 	extensions?: ExtensionFactory[];
 	/** Additional extension paths to load (merged with discovery). */
 	additionalExtensionPaths?: string[];
-	/** Explicit hook module paths to load in addition to native discovery. */
-	hookPaths?: string[];
 	/** Disable extension discovery (explicit paths still load). */
 	disableExtensionDiscovery?: boolean;
 	/**
@@ -485,14 +392,6 @@ export interface CreateAgentSessionOptions {
 	/** Load MCP tools for a top-level session only from this caller-owned absolute config file path.
 	 * Mutually exclusive with mcpManager. */
 	mcpConfigPath?: string;
-	/**
-	 * Whether conventional MCP autoload is enabled for a top-level standalone
-	 * session (default: true). When false, native user `~/.gjc/agent/mcp.json`
-	 * and project `.gjc/mcp.json` registrations are not discovered or connected
-	 * at startup. Plugin-bundle MCPs and `mcpConfigPath` exact-file sessions
-	 * are unaffected. CLI: `--no-mcp`.
-	 */
-	enableMcpAutoload?: boolean;
 	/**
 	 * Defer connecting an exact MCP config until the interactive UI is ready.
 	 * @internal CLI-only startup optimization; SDK callers retain synchronous loading by default.
@@ -546,8 +445,6 @@ export interface CreateAgentSessionOptions {
 	agentRegistry?: AgentRegistry;
 	/** Parent task ID prefix for nested artifact naming (e.g., "6-Extensions") */
 	parentTaskPrefix?: string;
-	/** Parent manager borrowed by a child session; never disposed by the child. */
-	inheritedAsyncJobManager?: AsyncJobManager;
 	/**
 	 * W6b: the parent's scope-held MCP facade, handed to a canonical sub-session so
 	 * it can inherit always-on MCP tools without owning the manager. Replaces the
@@ -665,11 +562,10 @@ function getDefaultAgentDir(): string {
  */
 export async function discoverAuthStorage(
 	agentDir: string = getDefaultAgentDir(),
-	startupAuth?: StartupAuthConfigSnapshot,
+	_startupAuth?: unknown,
 ): Promise<AuthStorage> {
-	const resolvedStartupAuth = startupAuth ?? (await resolveStartupAuthConfig(agentDir));
-	const brokerConfig = resolvedStartupAuth.broker;
-	const credentialRankingMode = resolvedStartupAuth.credentialRankingMode;
+	const brokerConfig = await resolveAuthBrokerConfig();
+	const credentialRankingMode = resolveCredentialRankingMode();
 	if (brokerConfig) {
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 		const initialResult = await client.fetchSnapshot();
@@ -713,7 +609,18 @@ export async function discoverAuthStorage(
 	return storage;
 }
 
-/** Ranking is resolved as part of the typed startup-auth snapshot. */
+/**
+ * Opt-in multi-account credential ranking mode, read from the
+ * `GJC_CREDENTIAL_RANKING_MODE` env var. Unset/unknown → `undefined`, leaving
+ * {@link AuthStorage}'s default (`balanced`) untouched. `earliest-reset`
+ * switches to earliest-expiry-first selection so soon-to-reset tumbling-window
+ * quota is drained before it is lost.
+ */
+function resolveCredentialRankingMode(): "balanced" | "earliest-reset" | undefined {
+	const raw = process.env.GJC_CREDENTIAL_RANKING_MODE?.trim();
+	if (raw === "balanced" || raw === "earliest-reset") return raw;
+	return undefined;
+}
 
 /**
  * Discover extensions from cwd.
@@ -949,26 +856,12 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 
 export function createPluginHooksExtension(hooks: ConstrainedPluginHook[]): ExtensionFactory {
 	return api => {
-		const normalizedHooks = hooks.map(hook => ({
-			hook,
-			result: normalizePluginHook({
-				declaredEvent: hook.event,
-				target: hook.target,
-				phase: hook.phase,
-				plugin: hook.plugin,
-				source: `plugin:${hook.plugin}`,
-			}),
-		}));
-		const diagnostics = normalizedHooks.flatMap(entry => entry.result.diagnostics);
-		if (normalizedHooks.some(entry => !entry.result.hook)) {
-			throw new Error(diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "));
-		}
-
-		for (const { hook, result } of normalizedHooks) {
-			const normalized = result.hook;
-			if (!normalized) throw new Error("Hook normalization invariant violated");
-			const registrationEvent = normalized.runtimeEvent;
-			const target = normalized.toolName === "*" ? undefined : normalized.toolName;
+		for (const hook of hooks) {
+			// Constrained hooks have one explicit execution phase. `tool_call` is
+			// pre-execution; an after-phase tool_call hook is registered on the
+			// post-execution tool_result event so it cannot block the tool.
+			const registrationEvent = hook.event === "tool_call" && hook.phase === "after" ? "tool_result" : hook.event;
+			const target = hook.target;
 			const handler = target
 				? (event: { toolName?: string; tool?: { name?: string }; name?: string }, ...rest: unknown[]) => {
 						const toolName = event?.toolName ?? event?.tool?.name ?? event?.name;
@@ -1065,11 +958,10 @@ function buildMCPPromptCommands(manager: MCPManager): LoadedCustomCommand[] {
 
 function withEmbeddedDefaultGjcSkills(skills: Skill[]): Skill[] {
 	const byName = new Map(skills.map(skill => [skill.name, skill]));
-	// The four public GJC workflow skills are a product invariant: even if a
-	// caller-supplied or filesystem skill shares a name, the bundled definition
-	// wins so workflow routing can never be silently hijacked.
 	for (const defaultSkill of getEmbeddedDefaultGjcSkills()) {
-		byName.set(defaultSkill.name, defaultSkill);
+		if (!byName.has(defaultSkill.name)) {
+			byName.set(defaultSkill.name, defaultSkill);
+		}
 	}
 	return [...byName.values()];
 }
@@ -1100,7 +992,6 @@ const MAX_EXACT_MCP_TOOL_COLLISION_NAMES = 10;
 const DEFERRED_MCP_CONFIG_STARTUP_ERROR = "MCP tools could not be loaded.";
 const MAX_EXACT_MCP_TOOL_NAME_LENGTH = 100;
 const pluginMcpManagerServers = new WeakMap<MCPManager, ReadonlySet<string>>();
-const conventionalMcpManagerServers = new WeakMap<MCPManager, ReadonlySet<string>>();
 
 class ExactMcpToolNameCollisionError extends Error {
 	constructor(toolNames: Iterable<string>) {
@@ -1193,11 +1084,6 @@ function safeErrorForLog(value: unknown): unknown {
 	return safeErrorDescription(value);
 }
 
-function sanitizeProviderForLog(provider: string): string {
-	const sanitized = provider.replace(/[^\x20-\x7e]/g, "?").slice(0, 128);
-	return sanitized.length > 0 ? sanitized : "<empty>";
-}
-
 function attachMcpCleanupDiagnostic(primary: unknown, cleanup: unknown): unknown {
 	const diagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED" as const, cause: cleanup };
 	if (primary && (typeof primary === "object" || typeof primary === "function")) {
@@ -1281,23 +1167,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
-	const hasInjectedAuth = options.authStorage !== undefined || options.modelRegistry !== undefined;
 
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
 	// / session would silently miss credential_disabled events.
-	// Injected auth is already the caller's authority; do not discover global
-	// startup auth or apply persistent pins while constructing this session.
-	const startupAuthConfig = hasInjectedAuth
-		? undefined
-		: (options.startupAuthConfig ?? (await resolveStartupAuthConfig(agentDir)));
 	const ownsAuthStorage = options.modelRegistry === undefined && options.authStorage === undefined;
 	const modelRegistry =
 		options.modelRegistry ??
-		new ModelRegistry(
-			options.authStorage ??
-				(await logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig))),
-		);
+		new ModelRegistry(options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir)));
 	const authStorage = modelRegistry.authStorage;
 	if (options.authStorage && options.authStorage !== authStorage) {
 		throw new Error(
@@ -1309,9 +1186,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let session!: AgentSession;
 	let hasSession = false;
 	let hasRegistered = false;
-	let asyncJobManager: AsyncJobManager | undefined;
-	let asyncJobManagerAdmitted = false;
-	let priorAsyncJobManager: AsyncJobManager | undefined;
 	let cleanupOwnedMcpManager: (() => Promise<void>) | undefined;
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
@@ -1331,13 +1205,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 	const enableLsp = options.enableLsp ?? true;
 	let authStorageClosed = false;
-	let credentialScopeId: string | undefined;
-	let credentialScopeLeased = false;
 	const closeOwnedAuthStorage = (): void => {
-		if (!hasSession && credentialScopeLeased && credentialScopeId) {
-			authStorage.releaseCredentialScope(credentialScopeId);
-			credentialScopeLeased = false;
-		}
 		if (!ownsAuthStorage || authStorageClosed) return;
 		authStorageClosed = true;
 		authStorage.close();
@@ -1364,14 +1232,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				startupCredentialDisabledEvents.push(event);
 			}
 		});
-		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
-			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
+		let runtimeCredentialSelectorInstalled = false;
+		const installRuntimeCredentialSelector = (provider: string): void => {
+			if (!options.credentialSelector || runtimeCredentialSelectorInstalled) return;
+			authStorage.setRuntimeCredentialSelector(provider, options.credentialSelector.selector);
+			runtimeCredentialSelectorInstalled = true;
 		};
+		const earlyCredentialSelectorProvider = options.credentialSelector?.provider ?? options.model?.provider;
+		if (earlyCredentialSelectorProvider) {
+			installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
+		}
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
 		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd });
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
-		if (!options.modelRegistry) {
+		const canRefreshModelsBeforeCredentialSelector =
+			!options.credentialSelector || runtimeCredentialSelectorInstalled || options.modelRegistry !== undefined;
+		if (!options.modelRegistry && canRefreshModelsBeforeCredentialSelector) {
 			modelRegistry.refreshInBackground();
 		}
 		// Resolve the workspace tree through its runtime service. The compatibility
@@ -1436,46 +1313,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session_id upstream, where session-owning transports reject the extra
 		// downstreams (owner_busy) and degrade those turns to uncached HTTP.
 		const providerSessionId = options.providerSessionId ?? logicalSessionId;
-		// AsyncJobManager ownership is distinct from both the persisted logical
-		// header and provider cache affinity. Managed child transcripts may share a
-		// logical header, while unrelated top-level sessions may intentionally share
-		// providerSessionId. Bind explicit provider scopes to the independently
-		// persisted transcript path so ownership is collision-free and stable across
-		// detached resume; ordinary sessions keep the transition-aware logical id.
-		const sessionFile = sessionManager.getSessionFile();
-		const asyncJobEndpointId = deriveAsyncJobEndpointId(
-			options.providerSessionId === undefined ? undefined : providerSessionId,
-			logicalSessionId,
-			sessionFile,
-		);
 		const credentialSessionId = options.credentialSessionId ?? providerSessionId;
-		credentialScopeId = credentialSessionId;
-
-		const scopeAlreadyLeased = authStorage.hasCredentialScopeLease(credentialSessionId);
-		authStorage.acquireCredentialScope(credentialSessionId);
-		credentialScopeLeased = true;
-		const configuredPins = hasInjectedAuth ? {} : (startupAuthConfig?.credentialPins ?? {});
-		const persistedPinStoreMatches =
-			startupAuthConfig?.credentialPinStoreIdentity === startupAuthConfig?.credentialStoreIdentity;
-		// AuthStorage has no scope-level "pinned but unavailable" marker. Keep the
-		// discarded durable pin identity local to this credential scope so startup
-		// config cannot immediately replace it with a different account; later
-		// request-time resolution for this provider remains ordinary AUTO ranking.
-		const staleDurableCredentialPins = new Set<string>();
-		if (options.credentialSelector) {
-			const provider = options.credentialSelector.provider ?? options.model?.provider;
-			if (provider) applyCredentialSelector(credentialSessionId, provider, options.credentialSelector.selector);
-		}
-		const preferredCredentialProvider = options.preferredCredentialSelector
-			? (options.preferredCredentialSelector.provider ??
-				authStorage.resolveRuntimePreferredCredentialSelectorProvider(options.preferredCredentialSelector.selector))
-			: undefined;
-		if (options.preferredCredentialSelector && preferredCredentialProvider) {
-			authStorage.setRuntimePreferredCredentialSelector(
-				preferredCredentialProvider,
-				options.preferredCredentialSelector.selector,
-			);
-		}
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
 			`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
@@ -1486,19 +1324,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return cached;
 			}
 
-			const credentialSelector = options.credentialSelector?.provider
-				? undefined
-				: options.credentialSelector?.selector;
+			const credentialSelector =
+				options.credentialSelector && !runtimeCredentialSelectorInstalled
+					? options.credentialSelector.provider === undefined ||
+						options.credentialSelector.provider === candidate.provider
+						? options.credentialSelector.selector
+						: undefined
+					: undefined;
 			if (options.credentialSelector?.provider && options.credentialSelector.provider !== candidate.provider) {
-				modelApiKeyAvailability.set(availabilityKey, false);
-				return false;
-			}
-			// A preferred (soft) credential is always installed synchronously above, so
-			// availability just needs to exclude candidates from a different provider —
-			// `--prefer-credential` names one provider's account, and letting a
-			// different-provider default model win here would silently strand the
-			// preference.
-			if (preferredCredentialProvider && preferredCredentialProvider !== candidate.provider) {
 				modelApiKeyAvailability.set(availabilityKey, false);
 				return false;
 			}
@@ -1548,83 +1381,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const hasExistingSession = existingBranch.length > 0;
 		const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
 		const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
-
-		for (const entry of existingBranch) {
-			if (entry.type !== "custom" || entry.customType !== "auth-credential-pin") continue;
-			const data = entry.data;
-			if (!data || typeof data !== "object") continue;
-			const record = data as {
-				v?: unknown;
-				scopeId?: unknown;
-				provider?: unknown;
-				pin?: unknown;
-				credentialStoreIdentity?: unknown;
-			};
-			if (record.v !== 1 || record.scopeId !== credentialSessionId || typeof record.provider !== "string") continue;
-			const pin = record.pin as { auto?: unknown; kind?: unknown; value?: unknown } | undefined;
-			// Durable replay must never abort session startup: a pinned account may
-			// have been removed, disabled, or deduplicated since the pin was written.
-			// Pin identity is preserved by leaving the provider unpinned on failure —
-			// never silently retarget to another account; the user re-pins or picks AUTO.
-			try {
-				if (pin?.auto === true) {
-					authStorage.setSessionCredentialAuto(record.provider, credentialSessionId);
-					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
-				} else if (
-					pin &&
-					(pin.kind === "id" || pin.kind === "email" || pin.kind === "account" || pin.kind === "project") &&
-					typeof pin.value === "string"
-				) {
-					if (
-						pin.kind === "id" &&
-						(!startupAuthConfig?.credentialStoreIdentity ||
-							record.credentialStoreIdentity !== startupAuthConfig.credentialStoreIdentity)
-					) {
-						throw new Error("Durable numeric credential pin authority changed");
-					}
-					authStorage.setSessionCredentialSelector(credentialSessionId, record.provider, {
-						kind: pin.kind,
-						value: pin.value,
-					});
-					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
-				}
-			} catch {
-				// A newer stale pin must not leave an earlier replayed selector active.
-				authStorage.clearSessionCredentialSelector(record.provider, credentialSessionId);
-				staleDurableCredentialPins.add(resolveOAuthStorageProvider(record.provider));
-			}
-		}
-		if (staleDurableCredentialPins.size > 0) {
-			logger.warn("Stale durable credential pin discarded; re-pin or select AUTO explicitly", {
-				providers: [...staleDurableCredentialPins].map(sanitizeProviderForLog),
-			});
-		}
-		if (!scopeAlreadyLeased) {
-			for (const [provider, rawSelector] of Object.entries(configuredPins)) {
-				if (staleDurableCredentialPins.has(resolveOAuthStorageProvider(provider))) continue;
-				if (
-					authStorage.hasSessionCredentialSelector(provider, credentialSessionId) ||
-					authStorage.hasSessionCredentialAuto(provider, credentialSessionId)
-				)
-					continue;
-				const selector = parsePersistedCredentialSelector(rawSelector);
-				if (!selector) continue;
-				if (selector.kind === "id" && !persistedPinStoreMatches) {
-					logger.warn("Numeric persistent credential pin discarded after credential-store authority changed", {
-						provider: sanitizeProviderForLog(provider),
-					});
-					continue;
-				}
-				applyCredentialSelector(credentialSessionId, provider, selector);
-			}
-		}
-		if (options.credentialSelector?.provider) {
-			applyCredentialSelector(
-				credentialSessionId,
-				options.credentialSelector.provider,
-				options.credentialSelector.selector,
-			);
-		}
 
 		const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
 		const modelMatchPreferences = {
@@ -1703,25 +1459,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					},
 				);
 				model = restoredDefaultResolution.model;
-				// A restored session model from a different provider than an active
-				// `--prefer-credential` preference is discarded rather than kept: the
-				// preference names one provider's account, and silently resuming on
-				// another provider would strand it without any error.
-				if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
-					model = undefined;
-				}
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
 			});
 		}
 
 		// If still no model, try settings default.
 		// Skip settings fallback when an explicit model was requested.
-		if (
-			!hasExplicitModel &&
-			!model &&
-			defaultRoleSpec.model &&
-			(!preferredCredentialProvider || defaultRoleSpec.model.provider === preferredCredentialProvider)
-		) {
+		if (!hasExplicitModel && !model && defaultRoleSpec.model) {
 			const settingsDefaultModel = defaultRoleSpec.model;
 			logger.time("resolveSettingsDefaultModel", () => {
 				// defaultRoleSpec.model already comes from modelRegistry.getAvailable(),
@@ -1801,9 +1545,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillWarnings = skillsResult.warnings;
 		} else {
 			// GJC's four public workflow skills are bundled into the binary so the
-			// default workflow surface survives accidental .gjc deletion. Filesystem
-			// skill discovery is enabled by default (`skills.enabled`), so this
-			// branch only runs when the user explicitly disabled it.
+			// default workflow surface survives accidental .gjc deletion. Arbitrary
+			// filesystem skill discovery remains gated by skills.enabled above.
 			skills = getEmbeddedDefaultGjcSkills();
 			skillWarnings = [];
 		}
@@ -1878,17 +1621,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
 		const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
 		const ASYNC_PREVIEW_MAX_CHARS = 4_000;
-		const formatAsyncResultForFollowUp = async (result: string, allowArtifact = true): Promise<string> => {
+		const formatAsyncResultForFollowUp = async (result: string): Promise<string> => {
 			if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) {
 				return result;
 			}
 
 			const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
-			// A delivery already denied by a scope:"owned" gate never reaches the
-			// model: allocating an artifact for it would leave the stopped job's
-			// output in an unreferenced artifact after the flush drops it (review
-			// thread P2). Only the inline preview is produced.
-			if (!allowArtifact) return preview;
 			try {
 				const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
 				if (artifactPath && artifactId) {
@@ -1907,49 +1645,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// parent's manager via `AsyncJobManager.instance()` (set below), so creating
 		// a second instance here just to leave it orphaned wastes a constructor and
 		// risks accidental disposal of the parent's manager on subagent teardown.
-		asyncJobManager =
+		const asyncJobManager =
 			backgroundJobsEnabled && !options.parentTaskPrefix
 				? new AsyncJobManager({
 						maxRunningJobs: asyncMaxJobs,
 						onJobComplete: async (jobId, result, job) => {
 							if (!session) return;
-							// Mandated boundary comment (corrected turn semantics):
-							// turn-scope abort blocks only deliveries whose origin is a
-							// continuation of the aborted turn. Owned-completion deliveries
-							// from work deliberately left running are intentionally allowed
-							// to resume the agent through the normal followUp/prompt path
-							// and receive a fresh turn attempt. Recover the immutable origin
-							// BEFORE formatting or artifact allocation; missing metadata
-							// fails closed to an ordinary delivery.
-							// Preserve ownership on the queued entry REGARDLESS of whether a
-							// terminal scope exists yet: the registration is determined at
-							// job-registration time, and the scope is determined at abort
-							// time (or later, at flush). A completion finished before the
-							// abort must not become an ordinary entry that owned cleanup
-							// cannot identify/purge (review thread P1).
-							// Owned tuples are keyed by the LOGICAL endpoint, not a
-							// provider-facing session id. providerSessionId may differ
-							// from sessionManager.getSessionId(), so session.sessionId
-							// would miss the tuple and turn a left-running completion
-							// into an ordinary follow-up (review thread P1).
-							const endpointId = AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId;
-							const registration = job ? lookupOwnedRegistration(jobId, job.generation, endpointId) : undefined;
-							const ownedCompletion = registration
-								? {
-										lineageIdHash: registration.lineageIdHash,
-										promptAttemptEpoch: registration.promptAttemptEpoch,
-										registration,
-									}
-								: undefined;
-							// Check suppression and classify the captured envelope BEFORE
-							// formatting/artifact allocation: a delivery already suppressed
-							// by the manager (owned-stop cancel/acknowledge) or already
-							// denied by a scope:"owned" gate must not allocate an
-							// unreferenced artifact (review thread P2).
+							const formattedResult = await formatAsyncResultForFollowUp(result);
 							if (asyncJobManager!.isDeliverySuppressed(jobId, job?.generation)) return;
-							const deniedOwnedDelivery =
-								ownedCompletion !== undefined && !isOwnedCompletionEnvelopeAllowed(ownedCompletion);
-							const formattedResult = await formatAsyncResultForFollowUp(result, !deniedOwnedDelivery);
 
 							const durationMs = job ? jobElapsedMs(job) : undefined;
 							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
@@ -1958,19 +1661,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								result: formattedResult,
 								job,
 								durationMs,
-								...(ownedCompletion
-									? {
-											ownedCompletion: {
-												lineageIdHash: ownedCompletion.lineageIdHash,
-												promptAttemptEpoch: ownedCompletion.promptAttemptEpoch,
-												registration: ownedCompletion.registration,
-											},
-										}
-									: {}),
 							});
 						},
 					})
-				: options.inheritedAsyncJobManager;
+				: undefined;
 
 		let promptMetadataModel: Model | undefined;
 		const getActiveModelString = (): string | undefined => {
@@ -2006,14 +1700,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
-			getAsyncJobManager: () => asyncJobManager,
-			// Subagents inherit the parent's manager; its registered endpoint is
-			// authoritative for owned-registration keying and endpoint-first
-			// manager lookup (the child's own id is never registered), so tools
-			// pass the same endpoint the manager's completion callback resolves
-			// (review thread P1). For a top-level session this equals the
-			// session id.
-			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
+			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
@@ -2121,26 +1808,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
 			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
-			if (asyncJobManager) {
-				// Register under the session endpoint so concurrent sessions'
-				// owned work settles in the correct manager (review thread P1).
-				// `session` is not yet constructed here; the provider identity is
-				// the endpoint identity. ADMIT THE ENDPOINT FIRST: a second
-				// top-level session constructed or resumed under an endpoint id
-				// already held by another LIVE manager must fail construction
-				// BEFORE the global instance is replaced — otherwise the
-				// rejected construction leaves this orphan manager as the
-				// process-global instance, redirecting global-manager
-				// consumers away from the live session (review thread P1).
-				if (!AsyncJobManager.registerForEndpoint(asyncJobEndpointId, asyncJobManager)) {
-					throw new Error(
-						`Cannot construct session "${asyncJobEndpointId}": the endpoint id is already held by another live async job manager`,
-					);
-				}
-				asyncJobManagerAdmitted = true;
-				priorAsyncJobManager = AsyncJobManager.instance();
-				AsyncJobManager.setInstance(asyncJobManager);
-			}
+			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
 		}
 		await initializeLocalRoot(localProtocolOptions);
 		if (options.localProtocolOptions) {
@@ -2164,18 +1832,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Create built-in tools (already wrapped with meta notice formatting)
 		const builtinTools = await logger.time("createAllTools", createTools, toolSession, options.toolNames);
 
-		// A top-level session loads MCP tools from three bounded surfaces: a
-		// caller-supplied exact config (`--mcp-config`), conventional native
-		// user/project registrations (`~/.gjc/agent/mcp.json` and `.gjc/mcp.json`
-		// written by `gjc mcp add`; disabled by `--no-mcp`), and plugin-bundle
-		// MCP servers (created below after `customTools` is populated). Existing
-		// caller-supplied managers remain available for legacy in-process callers.
+		// MCP runtime discovery is quarantined for the GJC surface. A top-level
+		// session may load only a caller-supplied exact config; project and user
+		// MCP configs are never discovered here. Existing managers remain available
+		// for legacy in-process callers, and plugin-bundle managers are created
+		// below after `customTools` is populated.
 		let mcpManager: MCPManager | undefined = options.mcpManager;
 		let ownsMcpManager = false;
 		const customTools: CustomTool[] = [];
 		const exactMcpToolNames: string[] = [];
 		const pluginMcpToolNames: string[] = [];
-		const conventionalMcpToolNames: string[] = [];
 		let deferredExactMcpConfig: { manager: MCPManager; configPath: string } | undefined;
 
 		// Add image tools when an image role model is configured.
@@ -2296,77 +1962,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 		} else if (!mcpManager && !isCanonicalSubSession) {
-			// Conventional MCP autoload: top-level standalone sessions consume
-			// enabled registrations from GJC's own native configs — project
-			// `.gjc/mcp.json` and user `~/.gjc/agent/mcp.json` (written by
-			// `gjc mcp add`). Native project scope wins over native user scope on
-			// name collisions (capability priority), and plugin-bundle MCPs below
-			// override conventional entries with the same name. Claude Code/Codex
-			// MCP files are explicit import sources into `.gjc` (#4291), never
-			// implicit runtime authorities here. `--no-mcp` opts a session out;
-			// `--mcp-config` exact-file sessions never reach here. The owned manager's
-			// tools are surfaced as always-on custom tools (like plugin MCPs), so an
-			// ordinary session exposes them without needing MCP discovery mode.
-			let conventionalConfigs: Record<string, MCPServerConfig> = {};
-			let conventionalSources: Record<string, SourceMeta> = {};
-			if (options.enableMcpAutoload !== false) {
-				try {
-					const loaded = await loadAllMCPConfigs(cwd, {
-						// Project-scope native config loads by default; only an
-						// explicitly configured `mcp.enableProjectConfig: false`
-						// disables it (the legacy schema default stays false for
-						// foreign-format discovery consumers of the capability system).
-						enableProjectConfig: settings.has("mcp.enableProjectConfig")
-							? settings.get("mcp.enableProjectConfig")
-							: true,
-						autoloadOnly: true,
-						// Runtime authority is GJC's native `.gjc` config in both scopes;
-						// Claude Code/Codex MCP files are explicit import sources into
-						// `.gjc`, not implicit competing runtime authorities.
-						nativeOnly: true,
-					});
-					conventionalConfigs = loaded.configs;
-					conventionalSources = loaded.sources;
-					for (const warning of loaded.warnings) {
-						logger.warn("MCP conventional discovery warning", { warning });
-					}
-					if (loaded.configurationWarning) {
-						logger.warn("MCP configuration unavailable.");
-					}
-				} catch (error) {
-					logger.warn("Failed to discover conventional MCP servers", { error: safeErrorForLog(error) });
-				}
-			}
-			// Always-on GJC plugin-bundle MCP servers, merged over conventional
-			// servers on name collisions. Top-level sessions own a manager and
-			// connect the validated servers; subagents inherit the parent's manager
+			// Always-on GJC plugin-bundle MCP servers. Top-level sessions own a manager
+			// and connect the validated servers; subagents inherit the parent's manager
 			// via options.mcpManager and never spawn their own (prevents duplicate
-			// processes and leaks). Per the plugin product contract, connected MCP
-			// tools are surfaced as always-on tools rather than gated behind MCP
-			// selection.
+			// processes and leaks). Per the plugin product contract, connected MCP tools
+			// are surfaced as always-on tools rather than gated behind MCP selection.
 			try {
 				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
 				for (const q of quarantine) {
 					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
 				}
-				const pluginNames = new Set(Object.keys(configs));
-				const mergedConfigs = { ...conventionalConfigs, ...configs };
-				const mergedSources = {
-					...conventionalSources,
-					...Object.fromEntries(
-						Object.keys(configs).map(name => [
-							name,
-							{ provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
-						]),
-					),
-				};
-				if (Object.keys(mergedConfigs).length > 0) {
+				if (Object.keys(configs).length > 0) {
 					const owned = new MCPManager(cwd, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
-					owned.setAuthStorage(authStorage);
 					cleanupOwnedMcpManager = () => owned.disconnectAll();
 					try {
-						const result = await owned.connectServers(mergedConfigs, mergedSources as never);
+						const sources = Object.fromEntries(
+							Object.keys(configs).map(name => [
+								name,
+								{ provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
+							]),
+						);
+						const result = await owned.connectServers(configs, sources as never);
 						for (const [server, err] of result.errors) {
 							// A server that failed to connect leaves this generation
 							// incomplete: its surfaces produced no evidence, so publishing
@@ -2381,22 +1998,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							mcpManager = owned;
 							ownsMcpManager = true;
 							customTools.push(...(result.tools as CustomTool[]));
-							const connectedPluginNames = new Set(
-								result.connectedServers.filter(name => pluginNames.has(name)),
-							);
-							pluginMcpManagerServers.set(owned, connectedPluginNames);
-							conventionalMcpManagerServers.set(owned, new Set(result.connectedServers));
-							for (const tool of result.tools) {
-								const serverName = tool.mcpServerName;
-								if (serverName === undefined) continue;
-								if (connectedPluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
-								else conventionalMcpToolNames.push(tool.name);
-							}
-							// Plugin-bundle connections are fixed for the session lifetime
-							// (existing plugin contract). Sessions without plugin MCPs keep
-							// a mutable connection set so `/mcp reload` can re-discover
-							// conventional registrations.
-							if (connectedPluginNames.size > 0) owned.sealConnectionSet();
+							pluginMcpManagerServers.set(owned, new Set(result.connectedServers));
+							owned.sealConnectionSet();
+							pluginMcpToolNames.push(...result.tools.map(tool => tool.name));
 						} else {
 							try {
 								await owned.disconnectAll();
@@ -2431,22 +2035,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				});
 			}
 		} else if (isCanonicalSubSession) {
-			// Subagents inherit the parent's always-on plugin and conventional MCP
-			// tools WITHOUT owning the manager (no connect, no callbacks, no
-			// disposal). The facade is carried explicitly by the parent session
-			// scope; process-global state is never consulted for MCP routing.
+			// Subagents inherit the parent's always-on plugin MCP tools WITHOUT
+			// owning the manager (no connect, no callbacks, no disposal). The facade
+			// is carried explicitly by the parent session scope; process-global state
+			// is never consulted for MCP routing.
 			const inherited = mcpManager ?? options.inheritedMcpManager;
 			if (inherited) {
 				try {
 					const inheritedTools = inherited.getTools();
 					if (inheritedTools.length > 0) customTools.push(...(inheritedTools as CustomTool[]));
 					const pluginServers = pluginMcpManagerServers.get(inherited);
-					const conventionalServers = conventionalMcpManagerServers.get(inherited);
-					for (const tool of inheritedTools) {
-						const serverName = tool.mcpServerName;
-						if (serverName === undefined) continue;
-						if (pluginServers?.has(serverName)) pluginMcpToolNames.push(tool.name);
-						else if (conventionalServers?.has(serverName)) conventionalMcpToolNames.push(tool.name);
+					if (pluginServers) {
+						pluginMcpToolNames.push(
+							...inheritedTools
+								.filter(tool => tool.mcpServerName !== undefined && pluginServers.has(tool.mcpServerName))
+								.map(tool => tool.name),
+						);
 					}
 				} catch (error) {
 					logger.warn("Failed to inherit MCP tools in subagent", { error: safeErrorForLog(error) });
@@ -2455,27 +2059,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		// MCP routing is scope-held; no process-global manager registration.
 
-		// General extension discovery is quarantined from the public SDK surface.
-		// Recognized hook conventions are the bounded exception: their descriptors
-		// normalize before import and then adapt into the authoritative ExtensionRunner.
+		// Custom tool and extension discovery is quarantined from the public GJC utility surface.
+		// Explicit SDK extension factories are still honored; callers use them to
+		// register in-process tools/providers without enabling filesystem discovery.
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
-		const discoveredHookExtensions: Array<{ factory: ExtensionFactory; name: string }> = [];
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
-		}
-		if (options.masterMode === true) {
-			inlineExtensions.push(createMasterModeExtension({ agentDir }));
-		}
-		if (!options.disableExtensionDiscovery) {
-			try {
-				const hookExtensions = await discoverAndLoadHookExtensions(options.hookPaths ?? [], cwd);
-				discoveredHookExtensions.push(...hookExtensions.factories);
-				for (const error of hookExtensions.errors) {
-					logger.warn("Rejected discovered hook", { path: error.path, error: error.error });
-				}
-			} catch (error) {
-				logger.warn("Failed to discover hook extensions", { error: safeErrorForLog(error) });
-			}
 		}
 
 		// Always-on constrained plugin hooks (validated registry surfaces). Additive
@@ -2550,41 +2139,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
-					if (notificationsExtensionEligible) {
+					if (notificationsExtensionEligible || sdkHostEligible) {
 						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
 						createNotificationsExtension(api, {
 							settings,
 							controller: notificationSessionController,
 							spawnedByGjc,
 							sdkHostModeSupported: options.sdkHostModeSupported,
-							// INTERNAL terminal-abort seams, threaded directly from the
-							// owning session (NOT on the public extension context).
-							terminalAbortSeams: {
-								getTerminalTurnEpoch: () => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									return session.getTerminalTurnEpoch();
-								},
-								cancelPendingPreflightForTerminalAbort: () => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									session.cancelPendingPreflightForTerminalAbort();
-								},
-								captureTerminalAbortSteeringSnapshot: () => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									return session.captureTerminalAbortSteeringSnapshot();
-								},
-								discardTerminalAbortSteeringSnapshot: (token: number) => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									session.discardTerminalAbortSteeringSnapshot(token);
-								},
-								rebindTerminalAbortSteeringSnapshot: (token: number) => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									session.rebindTerminalAbortSteeringSnapshot(token);
-								},
-								abortPromptAndWaitWithTerminal: (handle, seamOptions) => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									return session.abortPromptAndWait(handle, seamOptions);
-								},
-							},
 							ensureProviderDaemon: options.ensureNotificationProviderDaemon,
 							runBtwTurn: async (question, signal) => {
 								if (!session) throw new Error("Ephemeral turns are unavailable.");
@@ -2594,75 +2155,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									signal,
 								});
 								return { replyText };
-							},
-						});
-					} else if (sdkHostEligible) {
-						registerSdkOnlyNotificationCommand(api);
-						let sdkOnlyReconciliationStore:
-							| { sessionId: string; sessionFile: string | undefined; store: ReconciliationStore }
-							| undefined;
-						createSdkSessionRuntimeExtension(api, {
-							agentDir,
-							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
-							createTransport: input => createSdkWebSocketTransport(input),
-							settings,
-							configOverrides: new Map(),
-							// INTERNAL terminal-abort seams, threaded directly from the
-							// owning session (NOT on the public extension context).
-							terminalAbortSeams: {
-								getReconciliationStore: () => {
-									const sessionId = sessionManager.getSessionId();
-									const sessionFile = sessionManager.getSessionFile();
-									// session_switch/session_branch may move to a DIFFERENT transcript
-									// that retains the same copied session id: the store must be
-									// recreated (keyed by session id AND file path, including a
-									// null-to-file transition) or the successor reads/writes the
-									// predecessor's reconciliation file, spuriously replaying or
-									// conflicting with its keys and losing its own replay authority
-									// after restart (review thread P2).
-									if (
-										!sdkOnlyReconciliationStore ||
-										!sdkOnlyStoreMatches(sdkOnlyReconciliationStore, sessionId, sessionFile)
-									) {
-										sdkOnlyReconciliationStore = {
-											sessionId,
-											sessionFile,
-											store: createReconciliationStore({
-												sessionFile,
-												sessionId,
-											}),
-										};
-									}
-									return sdkOnlyReconciliationStore.store;
-								},
-								getTerminalTurnEpoch: () => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									return session.getTerminalTurnEpoch();
-								},
-								getActivePromptHandle: () => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									return session.activePromptHandle;
-								},
-								cancelPendingPreflightForTerminalAbort: () => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									session.cancelPendingPreflightForTerminalAbort();
-								},
-								captureTerminalAbortSteeringSnapshot: () => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									return session.captureTerminalAbortSteeringSnapshot();
-								},
-								discardTerminalAbortSteeringSnapshot: (token: number) => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									session.discardTerminalAbortSteeringSnapshot(token);
-								},
-								rebindTerminalAbortSteeringSnapshot: (token: number) => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									session.rebindTerminalAbortSteeringSnapshot(token);
-								},
-								abortPromptAndWaitWithTerminal: (handle, seamOptions) => {
-									if (!session) throw new Error("Terminal abort session is not initialized.");
-									return session.abortPromptAndWait(handle, seamOptions);
-								},
 							},
 						});
 					}
@@ -2709,16 +2201,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				);
 				extensionsResult.extensions.push(loaded);
 			}
-		}
-		for (const entry of discoveredHookExtensions) {
-			const loaded = await loadExtensionFromFactory(
-				entry.factory,
-				cwd,
-				eventBus,
-				extensionsResult.runtime,
-				entry.name,
-			);
-			extensionsResult.extensions.push(loaded);
 		}
 
 		// Process provider registrations queued during extension loading.
@@ -2785,25 +2267,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: formatNoModelsAvailableFallback();
 			}
 		}
-		if (options.credentialSelector && !options.credentialSelector.provider && model) {
-			applyCredentialSelector(credentialSessionId, model.provider, options.credentialSelector.selector);
-		}
 
-		if (options.credentialSelector && !options.credentialSelector.provider && !model?.provider) {
-			throw new Error(
-				`--credential ${options.credentialSelector.raw} requires a resolved model or an explicit provider prefix`,
-			);
-		}
-		// Safety net: every resolution branch above already filters candidates by
-		// `preferredCredentialProvider` (session restore, settings default, fallback
-		// scan via `hasModelApiKey`), but an explicit `--model`/`--models` request for
-		// a different provider takes priority earlier in resolution and would
-		// otherwise silently ignore the preference. Fail closed with a clear error
-		// instead.
-		if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
-			throw new Error(
-				`--prefer-credential ${options.preferredCredentialSelector?.raw ?? ""} matches ${preferredCredentialProvider}, but the resolved model uses ${model.provider}`,
-			);
+		if (options.credentialSelector && !runtimeCredentialSelectorInstalled) {
+			const credentialProvider = options.credentialSelector.provider ?? model?.provider;
+			if (!credentialProvider) {
+				throw new Error(
+					`--credential ${options.credentialSelector.raw} requires a resolved model or an explicit provider prefix`,
+				);
+			}
+			installRuntimeCredentialSelector(credentialProvider);
+			if (!options.modelRegistry && !canRefreshModelsBeforeCredentialSelector) {
+				modelRegistry.refreshInBackground();
+			}
 		}
 		const customCommandsResult: CustomCommandsLoadResult = { commands: [], errors: [] };
 
@@ -2888,20 +2363,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// All built-in tools are active (conditional tools like git/ask return null from factory if disabled)
 		const toolRegistry = new Map<string, Tool>();
-		/**
-		 * Identity — not name — provenance for the coordinator-visible tool label.
-		 *
-		 * Every tool object this builder constructs from a built-in descriptor is recorded
-		 * here as it is created, BEFORE extension, MCP, and custom tools overwrite registry
-		 * names below. An extension or custom tool that registers itself as `bash` replaces
-		 * the registry entry with an object that was never recorded, so the label resolves to
-		 * `custom` instead of impersonating the built-in.
-		 */
-		const builtinToolIdentities = new Set<object>();
 		let builtinCandidateTools = [...builtinTools];
 		for (const tool of builtinTools) {
 			toolRegistry.set(tool.name, tool);
-			builtinToolIdentities.add(tool);
 		}
 		const goalStateToolNames = ["goal"] as const;
 		if (settings.get("goal.enabled")) {
@@ -2916,7 +2380,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					const wrappedGoalStateTool = wrapToolWithMetaNotice(goalStateTool);
 					builtinCandidateTools.push(wrappedGoalStateTool);
 					toolRegistry.set(wrappedGoalStateTool.name, wrappedGoalStateTool);
-					builtinToolIdentities.add(wrappedGoalStateTool);
 				}
 			}
 		}
@@ -2925,11 +2388,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		if (extensionRunner) {
 			for (const tool of toolRegistry.values()) {
-				const wrapped = new ExtensionToolWrapper(tool, extensionRunner);
-				// A wrapper built from a proven built-in inherits that provenance; one built
-				// from an extension/custom tool does not.
-				if (builtinToolIdentities.has(tool)) builtinToolIdentities.add(wrapped);
-				toolRegistry.set(tool.name, wrapped);
+				toolRegistry.set(tool.name, new ExtensionToolWrapper(tool, extensionRunner));
 			}
 		}
 		if (model?.provider === "cursor") {
@@ -2946,7 +2405,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const wrappedResolveTool = wrapToolWithMetaNotice(resolveTool);
 				builtinCandidateTools.push(wrappedResolveTool);
 				toolRegistry.set(wrappedResolveTool.name, wrappedResolveTool);
-				builtinToolIdentities.add(wrappedResolveTool);
 			}
 		}
 		// Exact-config MCP tools cannot claim a name already represented by the final candidate catalog.
@@ -2985,18 +2443,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
-		// Re-resolved per prompt build so a profile activated after session start is
-		// reflected on the next refresh. Vendor-separated worker roles imply eager
-		// delegation unless `task.eager` is configured explicitly.
-		const resolveEagerTasks = (): boolean => {
-			const profileName = startupActiveModelProfile ?? settings.get("modelProfile.default");
-			const resolvedProfileName = profileName ? resolveModelProfileName(profileName, persistedProfiles) : undefined;
-			return resolveEagerTaskDelegation({
-				settings,
-				profile: resolvedProfileName ? persistedProfiles.get(resolvedProfileName) : undefined,
-			}).eagerTasks;
-		};
-		const eagerTasks = resolveEagerTasks();
+		const eagerTasks = settings.get("task.eager");
 		const intentTracingEnabled = resolveIntentTracingEnabled(settings.get("tools.intentTracing"), {
 			subSession: isCanonicalSubSession,
 		});
@@ -3081,11 +2528,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				repeatToolDescriptions,
 				intentField,
 				toolDiscoveryActive: effectiveDiscoveryMode === "all" || mcpDiscoveryEnabled,
-				eagerTasks: resolveEagerTasks(),
+				eagerTasks,
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
 				subagent: options.parentTaskPrefix !== undefined,
-				masterMode: options.masterMode === true,
 			});
 
 			for (const warning of defaultPrompt.warnings) {
@@ -3175,9 +2621,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				...new Set([
 					...discoveryDefaultServerToolNames,
 					...(explicitMcpConfigPath !== undefined ? exactMcpToolNames : []),
-					// Conventional autoload servers are selected by default so their
-					// tools are exposed in sessions that enable MCP discovery mode.
-					...conventionalMcpToolNames,
 				]),
 			];
 			hasExplicitMCPToolSelection =
@@ -3197,13 +2640,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Custom, extension-registered, and plugin-bundle MCP tools are always
 		// included regardless of the caller's built-in tool filter. Plugin MCPs
-		// and conventional autoload MCPs remain always-on even when generic MCP
-		// discovery is disabled.
+		// remain always-on even when generic MCP discovery is disabled.
 		const alwaysInclude: string[] = [
 			...(options.customTools?.map(t => (isCustomTool(t) ? t.name : t.name)) ?? []),
 			...registeredTools.filter(t => !t.definition.defaultInactive).map(t => t.definition.name),
 			...pluginMcpToolNames,
-			...conventionalMcpToolNames,
 		];
 		const pluginMcpToolNameSet = new Set(pluginMcpToolNames);
 		for (const name of alwaysInclude) {
@@ -3362,7 +2803,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						activeSkillState: session?.getActiveSkillState(),
 						sessionId: sessionManager.getSessionId?.() ?? null,
 					}),
-					() => session?.getSessionAgentDir(),
 				),
 			);
 
@@ -3441,13 +2881,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getApiKey: async provider => {
 				// Read agent.sessionId at call time so credential selection stays aligned
 				// with metadataResolver after /new, fork, resume, or branch switches.
-				const key = await modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
+				const key = await modelRegistry.getApiKeyForProvider(
+					provider,
+					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
+				);
 				if (!key) {
 					throw new Error(`No API key found for provider "${provider}"`);
 				}
 				return key;
 			},
-			getAuthCredentialType: provider => modelRegistry.getSessionCredentialType(provider, credentialSessionId),
+			getAuthCredentialType: provider =>
+				modelRegistry.getSessionCredentialType(
+					provider,
+					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
+				),
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
@@ -3455,6 +2902,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
 						onAuthError: async (provider, oldKey, error) => {
+							const credentialSessionId =
+								options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId;
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 								signal: streamOptions?.signal,
 								sessionId: credentialSessionId,
@@ -3562,12 +3011,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			sessionManager,
 			settings,
-			// The session's REQUESTED agent directory when the caller explicitly
-			// supplied it, independent of the reused global Settings singleton
-			// (which may belong to an earlier session). When the option is
-			// absent, the injected settings instance's own profile wins via the
-			// AgentSession fallback - never the process default.
-			agentDir: options.agentDir,
 			memoryBackend: runtimeServices.memoryBackend,
 			notificationSessionController,
 			evalKernelOwnerId,
@@ -3576,7 +3019,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// AsyncJobManager on teardown; subagents inherit the parent's and
 			// **MUST NOT** tear it down.
 			ownedAsyncJobManager: asyncJobManager,
-			disposeAsyncJobManager: !options.parentTaskPrefix,
 			// Only an MCP manager owned by this session is torn down on dispose;
 			// subagents and callers that merely observe a manager must not (see
 			// AgentSession.dispose).
@@ -3594,7 +3036,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			taskDepth,
 			workflowGatePublication: isCanonicalSubSession ? "local" : "endpoint",
 			toolRegistry,
-			builtinToolIdentities,
 			workflowGateToolSession: toolSession,
 			transformContext,
 			onPayload,
@@ -3632,10 +3073,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			obfuscator,
 			agentId: resolvedAgentId,
 			agentRegistry,
-			asyncJobProviderSessionId: options.providerSessionId,
 			providerSessionId: options.providerSessionId,
-			credentialSessionId,
-			credentialStoreIdentity: startupAuthConfig?.credentialStoreIdentity,
+			credentialSessionId: options.credentialSessionId,
 			providerCacheSessionId: providerSessionId,
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,
@@ -3643,17 +3082,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		session.setActiveModelProfile(startupActiveModelProfile);
 		session.configWarnings.push(...contextFileWarnings);
 		hasSession = true;
-		const sessionAsyncJobManager = asyncJobManager;
-		if (sessionAsyncJobManager) {
+		if (asyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
-				// Build one message per ownership origin so an owned-scope drop of
-				// one turn's message never suppresses other turns'/ordinary
-				// completions batched in the same flush (review thread P2).
-				groupKey: entry =>
-					entry.ownedCompletion
-						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
-						: "ordinary",
+				isStale: entry => asyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
 				build: buildAsyncResultBatchMessage,
 			});
 		}
@@ -3676,20 +3107,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						releaseCredentialDisabledSubscription();
 						releaseLocalProtocolOverride();
 					} finally {
-						// The endpoint is gone: its owned registrations can never
-						// reach a delivery settlement boundary, and foreign-endpoint
-						// tuples are deliberately never classified terminal by other
-						// managers — retire them before unregistering the manager so
-						// repeated session churn cannot saturate the registry
-						// (review thread P2). The endpoint is the manager's live
-						// registration key, which survives newSession/switchSession
-						// rekeying and may differ from the persisted logical session id.
-						if (!options.parentTaskPrefix) {
-							retireOwnedRegistrationsForEndpoint(
-								AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
-							);
-							AsyncJobManager.unregisterManager(asyncJobManager);
-						}
 						closeOwnedAuthStorage();
 					}
 				}
@@ -3908,19 +3325,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await session.dispose();
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
-				// Admission happens before session construction. Any later startup
-				// failure must remove THIS manager's endpoint mapping and restore
-				// the prior global only when this manager is still global: otherwise
-				// a retry under the same endpoint is falsely rejected and an orphan
-				// redirects global-manager consumers away from the live session
-				// (review thread P1).
-				if (asyncJobManagerAdmitted && asyncJobManager) {
-					AsyncJobManager.unregisterManager(asyncJobManager);
-					if (AsyncJobManager.instance() === asyncJobManager) {
-						AsyncJobManager.setInstance(priorAsyncJobManager);
-					}
-					await asyncJobManager.dispose({ timeoutMs: 100 });
-				}
 				await cleanupOwnedMcpManager?.();
 				const [{ disposeKernelSessionsByOwner }, { disposeVmContextsByOwner }] = await Promise.all([
 					import("../eval/py/executor"),

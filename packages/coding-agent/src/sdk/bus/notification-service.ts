@@ -1247,14 +1247,6 @@ export interface NotificationRecoveryReport {
 	endpointsRetainedPlaceholders?: string[];
 	/** Cleanup entries retained with unverified or mismatching identity. */
 	endpointsRetainedUnknown?: string[];
-	/** Stale quarantine/staging debris removed from the endpoint and daemon dirs. */
-	debrisRemoved?: string[];
-	/** Debris candidates retained by policy (young, live writer). */
-	debrisKept?: number;
-	/** Debris removals attempted without conclusive success (identity/unlink). */
-	debrisFailures?: number;
-	/** At least one debris directory listing failed; the sweep was not exhaustive. */
-	debrisScanFailed?: boolean;
 	daemon: {
 		action: DaemonRecoveryAction;
 		detail: string;
@@ -1486,168 +1478,6 @@ async function detachStaleTransitionMarker(input: {
 	return await detachTransitionMarker(input.fs, input.path, snapshot);
 }
 
-// --- stale debris sweep ---------------------------------------------------
-
-/**
- * Minimum age before age-based debris removal. Quarantine artifacts are inert
- * the moment they are detached, but the age bound keeps the sweep clear of any
- * recovery pass still holding a `detachedPath` reference in its report.
- */
-export const NOTIFICATION_DEBRIS_MIN_AGE_MS = 60 * 60 * 1_000;
-
-const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-/** Quarantine target of a detached daemon transition marker (telegram-daemon exact unlink). */
-const DEBRIS_TRANSITION_QUARANTINE = new RegExp(`^transition-${UUID_PATTERN}$`);
-/** Quarantine target of a detached notification endpoint file. */
-const DEBRIS_ENDPOINT_QUARANTINE = new RegExp(`^\\.gjc-delete-notification-endpoint-${UUID_PATTERN}\\.json$`);
-/** Native exact-unlink exchange placeholder left behind by a failed verified cleanup. */
-const DEBRIS_UNLINK_PLACEHOLDER = /^\.gjc-exact-unlink-placeholder-/;
-/** Atomic-write staging file: `<canonical>.<pid>.<epochMs>.<random>.tmp`. */
-const DEBRIS_STAGING_TMP = /\.([0-9]{1,10})\.[0-9]{1,16}\.[a-z0-9]{1,24}\.tmp$/;
-
-export interface NotificationDebrisSweepReport {
-	/** Basenames removed from the swept directory. */
-	removed: string[];
-	/** Debris candidates retained (young, live writer, or identity/unlink refusal). */
-	kept: number;
-	/**
-	 * Candidates whose removal was ATTEMPTED and did not conclusively succeed
-	 * (identity mismatch, unreadable candidate, unlink error). Distinct from
-	 * `kept`-by-policy so a caller can see that a sweep was not fully effective.
-	 */
-	failures: number;
-	/** The directory listing itself failed; nothing could be inspected. */
-	scanFailed?: boolean;
-}
-
-/**
- * Remove inert filesystem debris from a notification/state directory:
- * quarantine targets of already-detached markers and endpoints, exact-unlink
- * exchange placeholders, and leaked atomic-write staging files.
- *
- * Removal requires positive staleness proof — a dead recorded writer pid for
- * staging files, or an mtime older than {@link NOTIFICATION_DEBRIS_MIN_AGE_MS}
- * for everything else. Canonical files can never match the debris patterns, and
- * a young staging file with a live writer is kept.
- *
- * Age, terminal-scrub proof, and the delete identity all come from ONE
- * no-follow snapshot of the candidate. Judging age from a separate `stat` would
- * prove one pathname stale and then bind the delete to whatever occupied that
- * pathname afterwards, so a live successor could be removed on a predecessor's
- * staleness. A candidate replaced after the snapshot fails the identity match
- * and is retained; a symlinked, non-regular, or unreadable candidate is refused
- * outright. Every inconclusive attempt is counted in `failures` rather than
- * silently folded into `kept`.
- */
-export async function sweepNotificationDebris(input: {
-	dir: string;
-	deps?: NotificationServiceDeps;
-	minAgeMs?: number;
-}): Promise<NotificationDebrisSweepReport> {
-	const deps = input.deps ?? {};
-	const fs = deps.fs ?? nodeServiceFs;
-	const pidAlive = deps.pidAlive ?? defaultPidAlive;
-	const now = deps.now ?? Date.now;
-	const minAgeMs = input.minAgeMs ?? NOTIFICATION_DEBRIS_MIN_AGE_MS;
-	const removed: string[] = [];
-	let kept = 0;
-	let failures = 0;
-	let names: string[] = [];
-	try {
-		names = await fs.readdir(input.dir);
-	} catch {
-		return { removed, kept, failures, scanFailed: true };
-	}
-	for (const name of names) {
-		const staging = DEBRIS_STAGING_TMP.exec(name);
-		const placeholder = DEBRIS_UNLINK_PLACEHOLDER.test(name);
-		const quarantineLike =
-			DEBRIS_TRANSITION_QUARANTINE.test(name) || DEBRIS_ENDPOINT_QUARANTINE.test(name) || placeholder;
-		if (!staging && !quarantineLike) continue;
-		const file = path.join(input.dir, name);
-		// ONE no-follow snapshot decides everything: age, terminal-scrub proof, and
-		// the identity the delete is bound to. Reading mtime separately (e.g. via
-		// `stat`) would judge the age of one pathname and then delete whatever
-		// occupied it afterwards — the exact-unlink identity would faithfully bind
-		// to a successor that was never proved stale.
-		const candidate = await fs.readEndpointFile(file).catch(() => undefined);
-		if (!candidate) {
-			// Unreadable, symlinked, or non-regular: never a pathname unlink, and
-			// an operational failure rather than silent policy retention.
-			failures += 1;
-			continue;
-		}
-		const mtimeMs = Number(candidate.identity.mtimeNs / 1_000_000n);
-		const olderThanMinAge = Number.isFinite(mtimeMs) && now() - mtimeMs > minAgeMs;
-		const deadWriter =
-			staging !== null &&
-			(() => {
-				const writerPid = Number.parseInt(staging[1] ?? "", 10);
-				return Number.isSafeInteger(writerPid) && writerPid > 0 && !pidAlive(writerPid);
-			})();
-		if (!deadWriter && !olderThanMinAge) {
-			kept += 1;
-			continue;
-		}
-		if (placeholder && candidate.bytes.length > 0) {
-			// A native exchange placeholder is inert only once it is the terminal
-			// scrubbed remnant. A NONEMPTY placeholder may still carry the retained
-			// cleanup evidence for an endpoint whose verified removal failed.
-			kept += 1;
-			continue;
-		}
-		try {
-			const result = await fs.exactUnlink(file, candidate.identity);
-			if (result.ok) {
-				removed.push(name);
-				continue;
-			}
-			// A typed retained cleanup with the canonical path proven absent is a
-			// completed removal; anything else keeps the file.
-			const retainedRemoved =
-				result.code === "cleanup_pending" &&
-				typeof result.detachedPath === "string" &&
-				result.detachedPath.length > 0 &&
-				(await fs.readFile(file, "utf8").catch(() => undefined)) === undefined;
-			if (retainedRemoved) removed.push(name);
-			else failures += 1;
-		} catch {
-			failures += 1;
-		}
-	}
-	return { removed, kept, failures };
-}
-
-/**
- * Operator-authorized detach of a provenance-less blocking transition marker.
- *
- * The normal reclaim path (`detachStaleTransitionMarker`) refuses malformed and
- * empty markers because they carry no owner proof. `--force-daemon-lock` is the
- * documented operator confirmation that no legacy writer remains, so under that
- * flag a marker that is unparseable AND older than the transition grace window
- * may be detached through the identity-bound primitive. Valid markers are never
- * force-detached here — dead-owner reclaim already covers them, and a live
- * owner's marker must stay untouchable even under force.
- */
-async function forceDetachBlockedTransitionMarker(input: {
-	fs: TransitionMarkerFs;
-	path: string;
-	now: number;
-}): Promise<boolean> {
-	const snapshot = await readTransitionMarker(input.fs, input.path);
-	if (!snapshot) return false;
-	try {
-		if (isDaemonTransitionLock(JSON.parse(snapshot.raw))) return false;
-	} catch {
-		// Unparseable marker: exactly the class force is for.
-	}
-	if (!input.fs.stat) return false;
-	const st = await input.fs.stat(input.path).catch(() => undefined);
-	if (!st || !Number.isFinite(st.mtimeMs)) return false;
-	if (input.now - st.mtimeMs <= TRANSITION_MARKER_GRACE_MS) return false;
-	return await detachTransitionMarker(input.fs, input.path, snapshot);
-}
-
 /**
  * Owner-bound removal of a dead daemon's lock. Closes the classic
  * check-then-unlink TOCTOU: a naive `unlink(lock)` after observing a dead owner
@@ -1664,7 +1494,6 @@ async function removeDeadOwnerLock(
 	expected: NormalizedDaemonState,
 	now: () => number,
 	pidIncarnation: (pid: number) => string | undefined,
-	forceDaemonLock = false,
 ): Promise<"cleared" | "contended" | "superseded" | "now-alive" | "unlink-failed"> {
 	let transition = await acquireDaemonTransitionLock({
 		fs,
@@ -1681,7 +1510,6 @@ async function removeDeadOwnerLock(
 			pidAlive,
 			pidIncarnation,
 		});
-		if (forceDaemonLock) await forceDetachBlockedTransitionMarker({ fs, path: paths.steal, now: now() });
 		transition = await acquireDaemonTransitionLock({
 			fs,
 			path: paths.steal,
@@ -1828,7 +1656,6 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 			state,
 			now,
 			deps.pidIncarnation ?? defaultTransitionPidIncarnation,
-			opts.forceDaemonLock === true,
 		);
 		const action: DaemonRecoveryAction =
 			outcome === "cleared"
@@ -1886,21 +1713,6 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		};
 	}
 
-	// Stale debris (quarantine targets, exchange placeholders, leaked staging
-	// tmp files) accumulates in both the endpoint dir and the daemon dir and
-	// slows every later scan; sweep it with positive staleness proof only.
-	const debrisRemoved: string[] = [];
-	let debrisKept = 0;
-	let debrisFailures = 0;
-	let debrisScanFailed = false;
-	for (const sweepDir of new Set([dir, paths.dir])) {
-		const swept = await sweepNotificationDebris({ dir: sweepDir, deps });
-		debrisRemoved.push(...swept.removed);
-		debrisKept += swept.kept;
-		debrisFailures += swept.failures;
-		debrisScanFailed ||= swept.scanFailed === true;
-	}
-
 	return {
 		endpointsScanned: removed.length + kept + unreadable + recoveryFailures,
 		endpointsRemoved: removed,
@@ -1910,10 +1722,6 @@ export async function recoverNotifications(opts: RecoveryOptions): Promise<Notif
 		endpointsRetainedSuccessors: retainedSuccessors,
 		endpointsRetainedPlaceholders: retainedPlaceholders,
 		endpointsRetainedUnknown: retainedUnknown,
-		debrisRemoved,
-		debrisKept,
-		debrisFailures,
-		...(debrisScanFailed ? { debrisScanFailed } : {}),
 		daemon,
 	};
 }
@@ -1934,10 +1742,6 @@ export function formatNotificationRecoveryReport(report: NotificationRecoveryRep
 		lines.push(`    - retained exchange placeholder cleanup path ${placeholder}`);
 	for (const unknown of report.endpointsRetainedUnknown ?? [])
 		lines.push(`    - retained unverified cleanup path ${unknown}`);
-	if (report.debrisRemoved !== undefined || report.debrisKept !== undefined)
-		lines.push(
-			`  debris: removed ${report.debrisRemoved?.length ?? 0}, kept ${report.debrisKept ?? 0}, failed ${report.debrisFailures ?? 0}${report.debrisScanFailed ? ", scan failed" : ""}`,
-		);
 	lines.push(`  daemon: ${report.daemon.action} — ${report.daemon.detail}`);
 	if (report.daemon.blockingReason) lines.push(`    - blocking reason: ${report.daemon.blockingReason}`);
 	if (report.daemon.markerAgeMs !== undefined)

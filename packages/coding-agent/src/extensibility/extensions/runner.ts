@@ -69,17 +69,11 @@ interface BeforeAgentStartCombinedResult {
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
-/** Bounded timeout for session_shutdown handlers — generous but never infinite. */
-export const SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS = 60_000;
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
 let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
-let sessionShutdownHandlerTimeoutMs = SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS;
 
 export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
 	extensionHandlerTimeoutMs = timeoutMs;
-}
-export function testSetSessionShutdownHandlerTimeoutMs(timeoutMs: number): void {
-	sessionShutdownHandlerTimeoutMs = timeoutMs;
 }
 
 const EXTENSION_HANDLER_TIMEOUT = Symbol("extensionHandlerTimeout");
@@ -643,7 +637,7 @@ export class ExtensionRunner {
 			withSdkControlMutation: body => this.#withSdkControlMutationFn?.(body) ?? body(),
 			cycleThinkingLevel: () => this.#cycleThinkingLevelFn?.(),
 			setQueueMode: (kind, mode) => this.#setQueueModeFn?.(kind, mode) ?? false,
-			invokeSkill: async (name, args, options) => await this.#invokeSkillFn?.(name, args, options),
+			invokeSkill: async (name, args) => await this.#invokeSkillFn?.(name, args),
 
 			setPlanMode: on => this.#setPlanModeFn?.(on),
 			operateGoal: async (op, objective) => await this.#operateGoalFn?.(op, objective),
@@ -721,13 +715,12 @@ export class ExtensionRunner {
 		event: TEvent,
 		ctx: ExtensionContext,
 		ext: Extension,
-		timeoutMs: number | undefined,
+		timeoutMs: number,
 	): Promise<TResult | undefined> {
 		let timeout: NodeJS.Timeout | undefined;
 		const abortController = new AbortController();
 		const handlerContext = createHandlerContext(ctx, abortController.signal);
 		try {
-			if (timeoutMs === undefined) return await handler(event, handlerContext);
 			const timeoutPromise = new Promise<typeof EXTENSION_HANDLER_TIMEOUT>(resolve => {
 				timeout = setTimeout(() => resolve(EXTENSION_HANDLER_TIMEOUT), timeoutMs);
 			});
@@ -789,13 +782,7 @@ export class ExtensionRunner {
 				this.#markAttemptExecuted(scope);
 				marked = true;
 			}
-			const handlerResult = await this.#runHandlerWithTimeout(
-				handler,
-				event,
-				ctx,
-				ext,
-				event.type === "session_shutdown" ? sessionShutdownHandlerTimeoutMs : extensionHandlerTimeoutMs,
-			);
+			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
 			if (continueWhile && !continueWhile()) return result as RunnerEmitResult<TEvent>;
 
 			if (this.#isSessionBeforeEvent(event) && handlerResult) {

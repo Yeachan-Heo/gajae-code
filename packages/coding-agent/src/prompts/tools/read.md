@@ -10,8 +10,6 @@ Read files, directories, archives, SQLite databases, images, documents, internal
 
 - `path` — required. Local path, internal URI (`agent://`, `artifact://`, `rule://`, `local://`), or URL. Append `:<sel>` for line ranges, raw mode, or special modes (e.g. `src/foo.ts:50-200`, `src/foo.ts:raw`, `db.sqlite:users:42`).
 - `truncation` — optional `head` | `last` | `both`; selects which end of an over-budget result to retain. Configured default: {{TRUNCATION_DEFAULT}} (factory default: `last`); non-file routes such as URLs, directories and converted documents default to `head`. A line-range selector still bounds the selection — this only picks which end of that selection survives the byte/line cap. SQLite row queries page via their own `limit`/`offset` and ignore it.
-
-
 ## Selectors
 Append `:<sel>` to `path`. The bare path falls back to the default mode.
 

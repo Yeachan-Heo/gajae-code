@@ -12,15 +12,6 @@ import { ToolError } from "./tool-errors";
 
 const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
 const MAX_AWAIT_TIMEOUT_MS = 60 * 60 * 1000;
-/**
- * Bounded cadence for await liveness: even when the rendered-state signature is
- * stable (a running subagent emitting no new progress), the await panel re-emits
- * so a healthy wait never looks like a hung session (issue #4465). Derived from
- * `heartbeat_ms` so callers keep one knob, floor-bounded so a small heartbeat
- * cannot turn liveness into transcript spam, and injected for tests.
- */
-const AWAIT_LIVENESS_MULTIPLIER = 30;
-const AWAIT_LIVENESS_MIN_INTERVAL_MS = 15_000;
 const DEFAULT_LIST_LIMIT = 10;
 const MAX_LIST_LIMIT = 50;
 const RECEIPT_PREVIEW_WIDTH = 280;
@@ -132,22 +123,6 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 	readonly parameters = subagentSchema;
 	readonly strict = true;
 	readonly loadMode = "discoverable";
-	/**
-	 * Injected monotonic clock for await-liveness tests. Production callers leave
-	 * this undefined and the await falls back to `Date.now`; tests substitute a
-	 * virtual clock so a 15s+ liveness interval is exercised without any real
-	 * multi-minute sleep (#4465).
-	 */
-	#livenessNowMs?: () => number;
-
-	/** Test-only seam: substitute the liveness clock. Returns a restore function. */
-	withLivenessClock(nowMs: () => number): () => void {
-		const prior = this.#livenessNowMs;
-		this.#livenessNowMs = nowMs;
-		return () => {
-			this.#livenessNowMs = prior;
-		};
-	}
 
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(subagentDescription);
@@ -160,16 +135,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		onUpdate?: AgentToolUpdateCallback<SubagentToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SubagentToolDetails>> {
-		// The session's ENDPOINT-owned manager first: concurrent top-level
-		// sessions register their manager under their endpoint (sdk/session.ts),
-		// so list/pause/resume/message/cancel/await must inspect THIS session's
-		// manager — the process-global instance belongs to the last-created
-		// session, where this session's subagent records and jobs are absent
-		// or belong to a same-id subagent of another session (review thread P1).
-		const manager =
-			this.session.getAsyncJobManager?.() ??
-			AsyncJobManager.forEndpoint(this.session.getSessionId?.() ?? undefined) ??
-			AsyncJobManager.instance();
+		const manager = AsyncJobManager.instance();
 		if (!manager) {
 			return {
 				content: [{ type: "text", text: "No subagent manager is available in this session." }],
@@ -275,7 +241,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				records.push(record);
 				terminalGuidanceIds.add(record.subagentId);
 			} else {
-				const result = manager.resumeSubagent(record.subagentId, ownerFilter, params.message, _toolCallId);
+				const result = manager.resumeSubagent(record.subagentId, ownerFilter, params.message);
 				if (!result.ok && result.reason === "context_unavailable") throw new ToolError("context unavailable");
 				if (!result.ok && result.reason === "not_found") {
 					missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
@@ -327,7 +293,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 					records.push(manager.getSubagentRecord(record.subagentId, ownerFilter) ?? record);
 					steerStates.set(record.subagentId, "queued");
 				} else {
-					const result = manager.resumeSubagent(record.subagentId, ownerFilter, message, _toolCallId);
+					const result = manager.resumeSubagent(record.subagentId, ownerFilter, message);
 					if (!result.ok && result.reason === "not_found") {
 						missing.push(this.#missingSnapshot(id, "not_found", "No visible detached subagent matches this id."));
 					} else if (!result.ok) {
@@ -438,24 +404,13 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const watchedJobIds = targets.map(target => target.jobId).filter((jobId): jobId is string => jobId !== null);
 		manager.watchJobs(watchedJobIds);
 		const heartbeatMs = params.heartbeat_ms === undefined ? 500 : params.heartbeat_ms;
-		// Liveness interval: force a re-emit even when the rendered-state signature
-		// is stable so a healthy wait never looks like a hung session (#4465). The
-		// `#livenessNowMs` clock is injected for deterministic tests; `Date.now`
-		// is the production fallback. The interval is floor-bounded so a caller who
-		// sets a tiny `heartbeat_ms` cannot turn liveness into transcript spam.
-		const livenessIntervalMs = Math.max(AWAIT_LIVENESS_MIN_INTERVAL_MS, heartbeatMs * AWAIT_LIVENESS_MULTIPLIER);
-		const nowMs = this.#livenessNowMs ?? Date.now;
-		let lastEmitMs = nowMs();
 		let lastEmittedSignature: string | undefined;
 		const emitIfChanged = (force: boolean): void => {
 			if (!onUpdate) return;
 			const result = this.#progressResult(manager, records, true);
 			const signature = subagentAwaitRenderedStateSignature(result.details?.subagents ?? []);
-			const t = nowMs();
-			const livenessDue = force || t - lastEmitMs >= livenessIntervalMs;
-			if (!livenessDue && signature === lastEmittedSignature) return;
+			if (!force && signature === lastEmittedSignature) return;
 			lastEmittedSignature = signature;
-			lastEmitMs = t;
 			onUpdate(result);
 		};
 		const progressTimer =

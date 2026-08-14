@@ -1,10 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../../prompt-status.js";
-import { TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS } from "../../protocol/operation-registry.js";
-
 import type { ActiveProviderDescriptor } from "../../providers.js";
 import { ActiveProviderResolutionError } from "../../providers.js";
-
 import {
 	assertCursorSelector,
 	type CursorEnvelope,
@@ -64,7 +61,6 @@ export interface SessionSurface {
 		commandId?: string;
 		turnId?: string;
 	}): unknown | Promise<unknown>;
-	getSteerStatus?(selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown | Promise<unknown>;
 	/** Q27 effective model-profile catalog from the live session registry. */
 	getModelProfiles?(): unknown[] | Promise<unknown[]>;
 	/**
@@ -179,11 +175,9 @@ const names = [
 	"runtime.jobs.list",
 	"turn.result",
 	"models.profiles.list",
-	// Q28 was folded into Q26; retain the vacant slot so Q29/Q30 remain stable.
-	undefined,
+	"skill.invoke_status",
 	"providers.list/active",
 	"session.checkpoint",
-	"turn.steer_status",
 ];
 
 export class QueryHandlers {
@@ -205,9 +199,8 @@ export class QueryHandlers {
 					);
 				return await this.#turnResult(request);
 			}
-			if (request.query === TURN_RESULT_PROMPT_ALIAS) return await this.#promptTurnResult(request);
-
-			if (request.query === TURN_RESULT_SKILL_ALIAS) return await this.#skillTurnResult(request);
+			if (request.query === "turn.prompt_status") return await this.#promptTurnResult(request);
+			if (request.query === "skill.invoke_status") return await this.#skillTurnResult(request);
 
 			const query = request.query.startsWith("Q")
 				? request.query
@@ -224,7 +217,7 @@ export class QueryHandlers {
 					);
 				return await this.#turnResult(request);
 			}
-
+			if (query === "Q28") return await this.#skillTurnResult(request);
 			if (
 				this.surface.installedQueries instanceof Set &&
 				!this.surface.installedQueries.has(names[Number(query.slice(1)) - 1] ?? "")
@@ -259,7 +252,6 @@ export class QueryHandlers {
 			if (query === "Q23") return await this.#resourceBody(request);
 			if (query === "Q24") return await this.#artifact(request);
 			if (query === "Q30") return await this.#checkpoint(request);
-			if (query === "Q31") return await this.#steerStatus(request);
 			if (query === "Q27" && request.input && Object.keys(request.input).length > 0)
 				return this.#error(request, "invalid_request", false, "models.profiles.list does not accept input fields.");
 			if (query === "Q27" && typeof this.surface.getModelProfiles !== "function")
@@ -589,8 +581,7 @@ export class QueryHandlers {
 		// unreachable: the bounded content cap is well under both RESPONSE_CEILING_BYTES
 		// and TARGET_PAGE_BYTES, so no revision is ever created. Reject cursors
 		// upfront instead of advertising a continuation path that can never fire.
-		if (request.cursor !== undefined)
-			return this.#error(request, "invalid_request", false, "turn.result does not support cursors.");
+		if (request.cursor) return this.#error(request, "invalid_cursor", false, "turn.result does not support cursors.");
 		if (typeof this.surface.getTurnResult !== "function") return this.#error(request, "unavailable");
 		const result = await this.surface.getTurnResult({
 			kind,
@@ -646,12 +637,12 @@ export class QueryHandlers {
 		return await this.#turnResult({ ...request, input: { ...input, kind: "prompt" } });
 	}
 	async #skillTurnResult(request: QueryRequest): Promise<QueryResponse> {
-		if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("turn.result"))
+		if (this.surface.installedQueries instanceof Set && !this.surface.installedQueries.has("skill.invoke_status"))
 			return this.#error(
 				request,
 				"operation_not_session_owned",
 				false,
-				"turn.result is not installed for this session.",
+				"skill.invoke_status is not installed for this session.",
 			);
 		const input = request.input ?? {};
 		if (input.kind !== undefined && input.kind !== "skill")
@@ -786,56 +777,6 @@ export class QueryHandlers {
 			page.preview = true;
 		}
 		return { id: request.id, ok: true, page };
-	}
-
-	async #steerStatus(request: QueryRequest): Promise<QueryResponse> {
-		if (request.cursor)
-			return this.#error(request, "invalid_request", false, "turn.steer_status does not support cursors.");
-		const input = request.input ?? {};
-		for (const key of Object.keys(input))
-			if (key !== "commandId" && key !== "turnId" && key !== "clientRef")
-				return this.#error(
-					request,
-					"invalid_request",
-					false,
-					`turn.steer_status does not accept selector field "${key}".`,
-				);
-		const commandId = typeof input.commandId === "string" && input.commandId ? input.commandId : undefined;
-		const turnId = typeof input.turnId === "string" && input.turnId ? input.turnId : undefined;
-		const rawClientRef = typeof input.clientRef === "string" ? input.clientRef : undefined;
-		const clientRef = rawClientRef?.trim() || undefined;
-		if (rawClientRef !== undefined && (!clientRef || clientRef.length > PROMPT_CLIENT_REF_MAX_LENGTH))
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"clientRef must be a non-empty string of at most 128 characters.",
-			);
-		if ((commandId === undefined) !== (turnId === undefined))
-			return this.#error(request, "invalid_request", false, "commandId and turnId must be provided together.");
-		if (commandId !== undefined && clientRef !== undefined)
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"Provide exactly one selector: a commandId/turnId pair or a clientRef.",
-			);
-		if (commandId === undefined && clientRef === undefined)
-			return this.#error(
-				request,
-				"invalid_request",
-				false,
-				"turn.steer_status requires a commandId/turnId pair or a clientRef.",
-			);
-		if (typeof this.surface.getSteerStatus !== "function")
-			return this.#error(request, "unavailable", false, "turn.steer_status is unavailable for this session.");
-		return {
-			id: request.id,
-			ok: true,
-			result: await this.surface.getSteerStatus(
-				clientRef !== undefined ? { clientRef } : { commandId: commandId!, turnId: turnId! },
-			),
-		};
 	}
 
 	#error(request: QueryRequest, code: string, restartQuery = false, message = code, details?: unknown): QueryResponse {

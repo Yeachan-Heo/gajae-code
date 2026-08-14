@@ -15,22 +15,8 @@ function getBellSetting(key: Parameters<typeof settings.get>[0]): boolean {
 	}
 }
 
-function terminalBellEnabled(): boolean {
-	try {
-		// macOS terminals commonly use OSC notification protocols for background
-		// status, while an interactive completion does not send that notification.
-		// Make the local BEL audible by default on macOS; an explicit setting still
-		// wins so users can disable it.
-		return settings.has("notifications.terminalBell")
-			? Boolean(settings.get("notifications.terminalBell"))
-			: process.platform === "darwin";
-	} catch {
-		return false;
-	}
-}
-
 function enabledForEvent(event: TerminalBellEvent): boolean {
-	if (!terminalBellEnabled()) return false;
+	if (!getBellSetting("notifications.terminalBell")) return false;
 	switch (event) {
 		case "complete":
 			return getBellSetting("notifications.bellOnComplete");

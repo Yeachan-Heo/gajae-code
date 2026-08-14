@@ -1,7 +1,5 @@
-import { decideAgentDirIsolation, readProjectEnvFile } from "./test-agent-dir-isolation";
 import * as fs from "node:fs";
 import * as os from "node:os";
-import * as path from "node:path";
 
 // macOS `os.tmpdir()` resolves through the `/var -> /private/var` symlink, and the
 // native owner-only primitive plus the session-storage reparse guard intentionally
@@ -24,41 +22,18 @@ try {
 	// Leave the environment untouched if the temp root cannot be resolved.
 }
 
-// Isolate the agent directory for every test process. `getAgentDir()` (and
-// therefore `Settings.isolated()` and every daemon-path helper) resolves the
-// REAL `~/.gjc/agent` unless GJC_CODING_AGENT_DIR overrides it, so any test
-// with filesystem side effects — notification daemon diagnostics, transition
-// markers, unlink placeholders, the SDK session index — writes into the live
-// operator state of the machine running `bun test`. On dev machines this
-// corrupted the running Telegram daemon: leaked `transition-*` markers made
-// dead-owner lock recovery report `left-contended` and give up.
+// The session-context materialization budget defaults to 512 MiB in production
+// (overridable via GJC_SESSION_CONTEXT_BUDGET_BYTES). Test fixtures in
+// session-context-overflow.test.ts were authored against the former 64 MiB
+// default (BIG_TEXT = 40 MiB → ~80 MiB measured). Pin the budget to 64 MiB for
+// the test process so those fixtures keep triggering the overflow preflight
+// without inflating memory usage across every other test suite.
 //
-// The decision (including the project-`.env` distrust rule production applies)
-// lives in ./test-agent-dir-isolation.ts so it is unit-testable without
-// importing this preload's side effects.
-//
-// FAIL CLOSED: if the isolated directory cannot be created, throw. Continuing
-// would silently run the suite against the operator's live agent dir, which is
-// the exact destructive regression this preload exists to prevent.
-const isolation = decideAgentDirIsolation({
-	home: os.homedir(),
-	env: {
-		GJC_CODING_AGENT_DIR: process.env.GJC_CODING_AGENT_DIR,
-		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
-		GJC_CONFIG_DIR: process.env.GJC_CONFIG_DIR,
-		PI_CONFIG_DIR: process.env.PI_CONFIG_DIR,
-	},
-	projectEnv: readProjectEnvFile(process.cwd()),
-});
-if (isolation.action === "isolate") {
-	let agentDir: string;
-	try {
-		agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-test-agent-"));
-	} catch (error) {
-		throw new Error(
-			`Test agent-directory isolation failed (${isolation.reason}); refusing to run tests against the live agent dir: ${String(error)}`,
-		);
-	}
-	process.env.GJC_CODING_AGENT_DIR = agentDir;
-	process.env.PI_CODING_AGENT_DIR = agentDir;
-}
+// bun test runs every test file in a single shared process, so a per-file env
+// override would leak across files and make the 512 MiB production default
+// nondeterministic. The production default itself is exercised deterministically
+// by session-context-budget.test.ts, which spawns a clean subprocess (no
+// GJC_SESSION_CONTEXT_BUDGET_BYTES in the environment) and asserts the resolved
+// budget equals 512 MiB — so the test pin here cannot drift from production
+// semantics silently.
+process.env.GJC_SESSION_CONTEXT_BUDGET_BYTES = String(64 * 1024 * 1024);

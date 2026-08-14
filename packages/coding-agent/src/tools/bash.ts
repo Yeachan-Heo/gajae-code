@@ -30,11 +30,6 @@ import {
 	truncateHeadBytes,
 	truncateTailBytes,
 } from "../session/streaming-output";
-import {
-	lookupOwnedRegistration,
-	registerOwnedIfLineaged,
-	unregisterOwnedRegistration,
-} from "../session/terminal-abort";
 
 import { renderStatusLine } from "../tui";
 import { CachedOutputBlock, getOutputBlockContentWidth } from "../tui/output-block";
@@ -47,7 +42,6 @@ import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-intera
 import { checkBashInterception } from "./bash-interceptor";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-skill-urls";
-import { longSleepAdvisory } from "./bash-sleep-advisory";
 import { checkComposerBashPolicy } from "./composer-bash-policy";
 import {
 	formatArtifactReference,
@@ -604,23 +598,6 @@ function formatTimeoutClampNotice(requestedTimeoutSec: number, effectiveTimeoutS
  *
  * Executes bash commands with optional timeout and working directory.
  */
-/** Remove the owned registration of a FOREGROUND bash job whose delivery was
- *  synchronously acknowledged: the tuple is settled and must not occupy the
- *  registry, otherwise old retained policies are treated as occupied and the
- *  tombstone FIFO fallback can evict a genuinely live work's policy (review
- *  thread P2). */
-function unregisterForegroundOwnedBash(
-	manager: { getJob?(id: string): { generation?: string } | undefined },
-	jobId: string,
-	endpointId?: string,
-): void {
-	const generation = manager.getJob?.(jobId)?.generation;
-	if (!generation) return;
-	// The endpoint disambiguates concurrent sessions' same job ids (review P1).
-	const registration = lookupOwnedRegistration(jobId, generation, endpointId);
-	if (registration) unregisterOwnedRegistration(registration);
-}
-
 export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly name = "bash";
 	readonly label = "Bash";
@@ -774,10 +751,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		startBackgrounded: boolean;
-		/** Immutable attempt-scoped tool call id, when executed via a tool call. */
-		toolCallId?: string;
 	}): ManagedBashJobHandle {
-		const manager = this.#resolveOwnedJobManager();
+		const manager = AsyncJobManager.instance();
 		if (!manager) {
 			throw new ToolError("Background job manager unavailable for this session.");
 		}
@@ -865,7 +840,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				},
 			},
 		);
-		registerOwnedIfLineaged(manager, options.toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
 
 		return {
 			jobId,
@@ -878,24 +852,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		};
 	}
 
-	/**
-	 * The session's ENDPOINT-owned AsyncJobManager, falling back to the
-	 * process-global instance. Concurrent top-level sessions each register
-	 * their manager under their endpoint (sdk/session.ts), so a job created
-	 * by THIS session must be stored in THIS session's manager — otherwise a
-	 * Bash launched by session A lands in the last-created session B's
-	 * manager while registering as A-owned, an A scope:"owned" abort then
-	 * consults A's endpoint manager and cannot cancel the actual job, and a
-	 * later missing-job settlement can retire the tuple while the job keeps
-	 * running (review thread P1).
-	 */
-	#resolveOwnedJobManager(): AsyncJobManager | undefined {
-		const endpointId = this.session.getSessionId?.() ?? undefined;
-		return (
-			this.session.getAsyncJobManager?.() ?? AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance()
-		);
-	}
-
 	async #waitForManagedBashJob(
 		job: ManagedBashJobHandle,
 		thresholdMs: number,
@@ -906,28 +862,26 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			return { kind: "aborted" };
 		}
 
-		const threshold = Promise.withResolvers<{ kind: "running" }>();
-		const thresholdTimer = setTimeout(() => threshold.resolve({ kind: "running" }), Math.max(0, thresholdMs));
 		const waiters: Array<Promise<ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" }>> = [
 			job.completion,
-			threshold.promise,
+			Bun.sleep(thresholdMs).then(() => ({ kind: "running" as const })),
 		];
 		if (backgroundRequest) {
 			waiters.push(backgroundRequest.then(() => ({ kind: "running" as const })));
 		}
 
-		let onAbort: (() => void) | undefined;
-		if (signal) {
-			const aborted = Promise.withResolvers<{ kind: "aborted" }>();
-			onAbort = () => aborted.resolve({ kind: "aborted" });
-			signal.addEventListener("abort", onAbort, { once: true });
-			waiters.push(aborted.promise);
+		if (!signal) {
+			return await Promise.race(waiters);
 		}
+
+		const { promise: abortedPromise, resolve: resolveAborted } = Promise.withResolvers<{ kind: "aborted" }>();
+		const onAbort = () => resolveAborted({ kind: "aborted" });
+		signal.addEventListener("abort", onAbort, { once: true });
+		waiters.push(abortedPromise);
 		try {
 			return await Promise.race(waiters);
 		} finally {
-			clearTimeout(thresholdTimer);
-			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+			signal.removeEventListener("abort", onAbort);
 		}
 	}
 
@@ -1068,28 +1022,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					),
 				)
 			: undefined;
-		// Spawned workflow commands must resolve the SESSION's agent
-		// profile: the child's getAgentDir() reads GJC_CODING_AGENT_DIR at
-		// module load. Injected per-command (session-scoped), never
-		// mutating the host process; an explicit tool-call env wins. The
-		// session's REQUESTED directory (getSessionAgentDir) takes
-		// precedence over the global Settings singleton, which may belong
-		// to an earlier session.
-		const sessionAgentDir = this.session.getSessionAgentDir?.() ?? this.session.settings?.getAgentDir?.();
-		// An EXPLICIT tool-call env that supplies either supported spelling of
-		// the agent-directory override wins over the session injection: the
-		// child's getAgentDir() prefers GJC_CODING_AGENT_DIR, so injecting it
-		// while the caller only set the legacy PI_CODING_AGENT_DIR alias would
-		// silently ignore the caller's override.
-		const explicitAgentDirOverride =
-			expandedEnv?.GJC_CODING_AGENT_DIR !== undefined || expandedEnv?.PI_CODING_AGENT_DIR !== undefined;
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
 				sessionFile: null,
 				sessionId: this.session.getSessionId?.(),
 				cwd: this.session.cwd,
 			}),
-			...(sessionAgentDir && !explicitAgentDirOverride ? { GJC_CODING_AGENT_DIR: sessionAgentDir } : {}),
 			...expandedEnv,
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
@@ -1119,8 +1057,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const notices: string[] = [];
 		const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec);
 		if (timeoutClampNotice) notices.push(timeoutClampNotice);
-		const sleepAdvisory = longSleepAdvisory(command, timeoutSec);
-		if (sleepAdvisory) notices.push(sleepAdvisory);
 
 		return { command, commandCwd, resolvedEnv, requestedTimeoutSec, timeoutSec, timeoutMs, notices };
 	}
@@ -1140,13 +1076,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			ownerId?: string;
 			label?: string;
 			ctx?: AgentToolContext;
-			toolCallId?: string;
 			onRawLine?: (line: string, jobId: string) => void;
 			shouldAcceptRawLine?: (jobId: string) => boolean;
 			lifecycle?: import("../async").AsyncJobLifecycleCleanup;
 		} = {},
 	): Promise<{ jobId: string; label: string; commandCwd: string }> {
-		const manager = this.#resolveOwnedJobManager();
+		const manager = AsyncJobManager.instance();
 		if (!manager) {
 			throw new ToolError("Async job manager unavailable for this session.");
 		}
@@ -1244,16 +1179,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			},
 			{ ownerId, metadata: { monitor: true }, lifecycle: opts.lifecycle },
 		);
-		// Monitor jobs are exact owned background work of the turn that started
-		// them: register the five-tuple so scope:"owned" terminal abort stops the
-		// monitor too (review thread P2).
-		registerOwnedIfLineaged(manager, opts.toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
 		currentJobId = jobId;
 		return { jobId, label, commandCwd: prepared.commandCwd };
 	}
 
 	async execute(
-		toolCallId: string,
+		_toolCallId: string,
 		{
 			command: rawCommand,
 			env: rawEnv,
@@ -1289,11 +1220,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		} = prepared;
 
 		if (asyncRequested) {
-			// Availability is endpoint-first: a concurrent top-level session
-			// that was the process-global instance may have been disposed,
-			// clearing instance() while THIS session's manager stays
-			// registered by endpoint (review thread P1).
-			if (!this.#resolveOwnedJobManager()) {
+			if (!AsyncJobManager.instance()) {
 				throw new ToolError("Async job manager unavailable for this session.");
 			}
 			const job = this.#startManagedBashJob({
@@ -1307,7 +1234,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				resolvedEnv,
 				onUpdate,
 				startBackgrounded: true,
-				toolCallId,
 			});
 			return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1321,15 +1247,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			this.session.bashRestrictionProfile === "read-only" ? undefined : this.session.getClientBridge?.();
 		const clientTerminalActive = Boolean(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty);
 
+		const autoBgManager = AsyncJobManager.instance();
 		// Run non-PTY bash through the managed job path so Ctrl+B-twice fold-on-demand works
 		// even when auto-background is disabled. When a client terminal will handle the
 		// command, keep the existing bridge path unless auto-background is enabled.
-		// The manager is resolved ONCE from the session's endpoint (same instance the
-		// job was created in) and reused for creation, acknowledgement, cancellation,
-		// and unregistering — the process-global instance may belong to a different
-		// concurrent top-level session (review thread P1).
-		const ownedManager = this.#resolveOwnedJobManager();
-		if (!pty && ownedManager && (this.#autoBackgroundEnabled || !clientTerminalActive)) {
+		if (!pty && autoBgManager && (this.#autoBackgroundEnabled || !clientTerminalActive)) {
 			// With auto-background off, wait past the command's own timeout so the job only
 			// leaves the foreground on an explicit Ctrl+B fold, never on an auto-background timer.
 			const autoBackgroundWaitMs = this.#autoBackgroundEnabled
@@ -1347,7 +1269,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				resolvedEnv,
 				onUpdate,
 				startBackgrounded,
-				toolCallId,
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
@@ -1372,20 +1293,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				unregisterBackgroundRequest?.();
 			}
 			if (waitResult.kind === "completed") {
-				ownedManager.acknowledgeDeliveries([job.jobId]);
-				unregisterForegroundOwnedBash(ownedManager, job.jobId, this.session.getSessionId?.() ?? "local");
+				autoBgManager.acknowledgeDeliveries([job.jobId]);
 				return waitResult.result;
 			}
 			if (waitResult.kind === "failed") {
-				ownedManager.acknowledgeDeliveries([job.jobId]);
-				unregisterForegroundOwnedBash(ownedManager, job.jobId, this.session.getSessionId?.() ?? "local");
+				autoBgManager.acknowledgeDeliveries([job.jobId]);
 				throw waitResult.error;
 			}
 			if (waitResult.kind === "aborted") {
-				ownedManager.cancel(job.jobId);
+				autoBgManager.cancel(job.jobId);
 				const terminal = await job.completion;
-				ownedManager.acknowledgeDeliveries([job.jobId]);
-				unregisterForegroundOwnedBash(ownedManager, job.jobId, this.session.getSessionId?.() ?? "local");
+				autoBgManager.acknowledgeDeliveries([job.jobId]);
 				if (terminal.kind === "failed") {
 					throw new ToolAbortError(
 						formatManagedAbortFailure(terminal.error, terminal.result, job.getLatestText()),
@@ -1665,20 +1583,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
 				});
 		if (result.cancelled) {
-			const noticeSuffix = pendingNotices.length > 0 ? `\n\n${pendingNotices.join("\n")}` : "";
-			const baseCancelledText = normalizeResultOutput(result) || "Command aborted";
+			const failureText = formatBashFailureMessage(
+				result,
+				normalizeResultOutput(result) || "Command aborted",
+				signal?.aborted ? "Command aborted" : undefined,
+			);
 			if (signal?.aborted) {
-				throw new ToolAbortError(formatBashFailureMessage(result, baseCancelledText, "Command aborted"));
+				throw new ToolAbortError(failureText);
 			}
-			const failureText = `${baseCancelledText}${noticeSuffix}`;
-			throw new ToolError(formatBashFailureMessage(result, failureText));
+			throw new ToolError(failureText);
 		}
 		if (isInteractiveResult(result) && result.timedOut) {
 			const timeoutMessage = `Command timed out after ${timeoutSec} seconds`;
 			const output = normalizeResultOutput(result);
-			const noticeSuffix = pendingNotices.length > 0 ? `\n\n${pendingNotices.join("\n")}` : "";
-			const baseText = output ? `${output}\n\n${timeoutMessage}` : timeoutMessage;
-			const failureText = `${baseText}${noticeSuffix}`;
+			const failureText = output ? `${output}\n\n${timeoutMessage}` : timeoutMessage;
 			throw new ToolError(formatBashFailureMessage(result, failureText, timeoutMessage));
 		}
 		return this.#buildCompletedResult(result, timeoutSec, {

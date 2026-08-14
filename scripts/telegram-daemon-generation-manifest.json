@@ -344,7 +344,7 @@
     }
   },
   "digests": {
-    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:defaultPidAlive": "4b35a9534120b352539eb85c65099b9bc0adddd08ad53df7efae92ba98f35455",
+    "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:defaultPidAlive": "437658a2f14ac5daa2a3e84dcd637078566e71a88841cd750efab6d48fc94c3f",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "aff409ff6d08bfe19f5c39aac900ec6c8e898d988971bac029edb50459a84f5e",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:ownerPid": "31110dcdd6e0f5dbc8b4dce27383646b9c339739758623ab67dc40ddc36661e0",
     "discord:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:runChatDaemonInternal": "3865dd37ea7a6b92ef0e692a63fb9c084f06fa88b823d293b1e1e55d082dac86",
@@ -426,7 +426,7 @@
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:start": "947e8ba6e57e70b420665a9678c606b94751073716c046c40f14f3a6f2e306c3",
     "discord:packages/coding-agent/src/sdk/bus/discord-daemon.ts:stop": "c8bcd881cc0331fb0565a82d997805f939701b12a80e03177192dbd5935824ff",
     "discord:packages/coding-agent/src/sdk/client/discovery.ts:readSdkSessionEndpoint": "c0f42dcf4843e6c79516b11927150e0fe827f6f4cfff400f04ab113ae0574022",
-    "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:defaultPidAlive": "4b35a9534120b352539eb85c65099b9bc0adddd08ad53df7efae92ba98f35455",
+    "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:defaultPidAlive": "437658a2f14ac5daa2a3e84dcd637078566e71a88841cd750efab6d48fc94c3f",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:loadConfig": "aff409ff6d08bfe19f5c39aac900ec6c8e898d988971bac029edb50459a84f5e",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:ownerPid": "31110dcdd6e0f5dbc8b4dce27383646b9c339739758623ab67dc40ddc36661e0",
     "slack:packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts:runChatDaemonInternal": "3865dd37ea7a6b92ef0e692a63fb9c084f06fa88b823d293b1e1e55d082dac86",
@@ -510,9 +510,9 @@
     "slack:packages/coding-agent/src/sdk/bus/slack-daemon.ts:stop": "6a16592a1fb6afbb9f23f34c0612b6363aaa45c128fb288209720fd2217cab99",
     "slack:packages/coding-agent/src/sdk/client/discovery.ts:readSdkSessionEndpoint": "c0f42dcf4843e6c79516b11927150e0fe827f6f4cfff400f04ab113ae0574022",
     "telegram:packages/coding-agent/src/sdk/bus/config.ts:parseNotificationSettingsSnapshot": "a694158726a9a4f4df58d1b1a4cee54884ef2e4bab506b3c6cac981b3f41072e",
-    "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:DaemonPaths": "a0ff443307bd24f6613567f2a891180775065c27d333316b6541713f0dc4527e",
+    "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:DaemonPaths": "2a22d60aed8c778a8f4b7e2b2017b192977e3767b04572ca13d534980fa2f560",
     "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:HEARTBEAT_TTL_MS": "62255b5467995d21d3f929c863278ca3e815102001c51ca6d66840e1522ff990",
-    "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:daemonPaths": "7043b25a3b8ebefa4ea68ea136f0fc49a1b83e392b4eeb78305d1b3e96d0c9cc",
+    "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:daemonPaths": "1bd6ae51096fedb95d47149b977f8a40e7f814a774ecfce21e027aac268b0379",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:DaemonTransitionLock": "0fb018a6384bff312aab0345012936f7e0609e4691c841919426ad3d75841dcb",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:NATIVE_PATH_IDENTITY_CONTRACT_VERSION": "ec669ef396909ce429e08ce4fa9a78b5f0106d8cedf967e634c6ae6974830b8a",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:acquireDaemonTransitionLock": "0115500fcb5c5797008d607bd69694579c5b372420310f265d33a4759364decc",
@@ -637,10 +637,10 @@
     "telegram:packages/coding-agent/src/sdk/host/host.ts:TOOL_ACTIVITY_CAPABILITY": "547f80bd6b3bd1c615fc3d885e507aba4418e6c4c54c47d36938b8b2e5d2abd7"
   },
   "nativeAuthoritySha256": {
-    "crates/pi-natives/src/path_identity.rs": "c432ead23fdd22241bdff8b882d9d4556acfffcb94424d1c417162f948398690",
+    "crates/pi-natives/src/path_identity.rs": "7de823ead8bddf98be0e41b97b8ec0c2a23c3a114c3bf39515bb5724bed515f0",
     "crates/pi-natives/src/ps.rs": "7696078e123b9beecc7252371c71eab2cec590413be6e6ddf4692ff6fe8c41e1",
     "crates/pi-shell/src/process.rs": "45b222432a70eb056807507f8b4d28cf5fb73a7441ee9a0e28349ec85ef9b177",
-    "crates/pi-shell/src/shell.rs": "66cacfe63d495b23156d023f2f34f354b657534ee3cdaf01e30d6694af253982",
+    "crates/pi-shell/src/shell.rs": "cc0584dbd21a35838e464e6a10f2e974362a800a9a5747b7bac34cb9d2a1f9cd",
     "crates/brush-core-vendored/src/commands.rs": "55e9dceffad7d829051547e91592ca8e392a9073e2d4ee2f7546e3b6c1b75a9d",
     "packages/natives/native/index.d.ts": "c61e02fd4712c822d30fb4b1496f064097a38718c9443bef526711f828165c50",
     "packages/coding-agent/src/sdk/broker/process-incarnation.ts": "3846556b59c8850f584d13d2eec8a482f6a9b7f4ff66d126f8bd66cad4329a9c"

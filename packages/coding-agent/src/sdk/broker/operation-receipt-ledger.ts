@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { canonicalElevationJson } from "../elevation/digest";
 import type { BrokerResponse } from "./broker";
 
 interface PendingReceipt {
@@ -21,16 +22,6 @@ interface CompletedReceipt {
 }
 
 type OperationReceipt = PendingReceipt | CompletedReceipt;
-
-function canonicalJson(value: unknown): string {
-	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-	const record = value as Record<string, unknown>;
-	return `{${Object.keys(record)
-		.sort()
-		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-		.join(",")}}`;
-}
 
 export type OperationReserveResult =
 	| { status: "reserved" }
@@ -63,7 +54,7 @@ export function operationReceiptKey(sessionId: string, clientRef: string): strin
 
 export function operationReceiptDigest(operation: string, input: Record<string, unknown>, sessionId?: string): string {
 	return createHash("sha256")
-		.update(canonicalJson({ operation, input, ...(sessionId === undefined ? {} : { sessionId }) }))
+		.update(canonicalElevationJson({ operation, input, ...(sessionId === undefined ? {} : { sessionId }) }))
 		.digest("hex");
 }
 

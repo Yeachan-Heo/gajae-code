@@ -4683,10 +4683,10 @@ export function createNotificationsExtension(
 			abandonPrompt(submission);
 		};
 
-		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>) => {
+		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>): "written" | "dropped" => {
 			if (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime) {
 				abandonPromptResponse(connectionId, frame);
-				return;
+				return "dropped";
 			}
 			const json = JSON.stringify(frame);
 			if (connectionId.startsWith("seam:")) {
@@ -4703,7 +4703,7 @@ export function createNotificationsExtension(
 					abandonPromptResponse(connectionId, frame);
 					throw error;
 				}
-				return;
+				return "written";
 			}
 			try {
 				server.sendTo(connectionId, json);
@@ -4712,6 +4712,7 @@ export function createNotificationsExtension(
 				abandonPromptResponse(connectionId, frame);
 				throw error;
 			}
+			return "written";
 		};
 
 		/**

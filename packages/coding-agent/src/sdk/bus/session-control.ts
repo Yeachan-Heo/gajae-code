@@ -24,17 +24,7 @@ export interface BoundNotificationSession<Context extends NotificationSessionCon
 }
 
 export type NotificationEndpointStartResult = "started" | "already" | "disabled" | "failed";
-/**
- * Outcome of the Telegram daemon preflight.
- *
- * `pending` means ownership acquisition is in flight and was deliberately NOT
- * awaited: chat daemons are optional notification adapters, never session
- * authority, so reconciliation on an awaited session-lifecycle path must never
- * block on one. A pending preflight neither stops the runtime nor marks it
- * blocked — the runtime starts, adapters stay withheld while the owner state is
- * not ready, and the ensure's settle callback re-reconciles.
- */
-export type TelegramDaemonPreflightResult = "ready" | "pending" | "blocked_identity" | "failed";
+export type TelegramDaemonPreflightResult = "ready" | "blocked_identity" | "failed";
 
 /**
  * The endpoint implementation is deliberately injected. The controller owns
@@ -45,20 +35,6 @@ export interface NotificationSessionRuntime<Context extends NotificationSessionC
 	isRunning(binding: BoundNotificationSession<Context>): boolean;
 	start(binding: BoundNotificationSession<Context>): Promise<NotificationEndpointStartResult>;
 	stop(binding: BoundNotificationSession<Context>): Promise<boolean>;
-	/**
-	 * Provider-neutral ownership re-proof, called for ANY effective chat
-	 * provider before the Telegram-specific preflight.
-	 *
-	 * A credential, destination, or actor-authorization change invalidates the
-	 * ownership proof that authorized this runtime's adapters. The runtime must
-	 * withhold its LOCAL adapters until the new identity is proved. It does NOT
-	 * revoke an already-attached external chat daemon's SessionRouter
-	 * attachment, so such a daemon can still observe host events and reach the
-	 * host's inbound/control paths during the window; closing that requires an
-	 * authenticated chat-attachment authority boundary at the Router layer.
-	 * Implementations must not await the daemon ensure itself.
-	 */
-	reproveOwnership?(binding: BoundNotificationSession<Context>): Promise<void>;
 	/**
 	 * Proves the complete Telegram owner identity before a generic endpoint can
 	 * emit a frame. `blocked_identity` is fail-closed and starts nothing.
@@ -340,22 +316,6 @@ export class NotificationSessionController {
 			const telegramEffective = isProviderEffectivelyEnabled(cfg, "telegram");
 			const nonTelegramEffectiveForTelegram =
 				isProviderEffectivelyEnabled(cfg, "discord") || isProviderEffectivelyEnabled(cfg, "slack");
-			// Ownership identity is provider-neutral: re-prove for ANY effective
-			// chat provider before the Telegram-specific preflight, so a
-			// Discord-only or Slack-only credential/destination/actor change also
-			// withholds adapters until the new identity is proved.
-			if (telegramEffective || nonTelegramEffectiveForTelegram) {
-				try {
-					// Idempotent and keyed: a config change racing this call is caught
-					// by the next attempt's key comparison, so no extra
-					// current-config check is needed here (adding one would
-					// short-circuit the bounded churn loop before its preflight).
-					await runtime.reproveOwnership?.(binding);
-				} catch {
-					// Re-proof is best-effort withholding; a failure must not gate the
-					// session. The runtime stays in whatever state it already had.
-				}
-			}
 			if (telegramEffective && telegramMarker && !nonTelegramEffectiveForTelegram) {
 				if (runtime.isRunning(binding)) await runtime.stop(binding);
 				if (!this.#isCurrentConfig(cfg)) continue;
@@ -369,13 +329,7 @@ export class NotificationSessionController {
 					ensured = "failed";
 				}
 				if (!this.#isCurrentConfig(cfg)) continue;
-				// Only a SETTLED non-ready preflight gates the runtime. `pending`
-				// falls through to the normal start path: the session is never held
-				// or stopped by an in-flight daemon ensure, and adapters stay
-				// withheld by the runtime's own owner-state check until it settles.
-				// A missing hook keeps its prior gating semantics; only `pending` is exempt.
-				const settledNotReady = ensured !== "ready" && ensured !== "pending";
-				if (settledNotReady && !nonTelegramEffectiveForTelegram) {
+				if (ensured !== "ready" && !nonTelegramEffectiveForTelegram) {
 					if (runtime.isRunning(binding)) await runtime.stop(binding);
 					this.#blockedRuntimeSessions.add(binding.sessionId);
 					return {
@@ -383,7 +337,7 @@ export class NotificationSessionController {
 						status: this.#status(binding, cfg, runtime),
 					};
 				}
-				if (settledNotReady && nonTelegramEffectiveForTelegram) {
+				if (ensured !== "ready" && nonTelegramEffectiveForTelegram) {
 					const isolated = await runtime.isolateTelegram?.(binding);
 					if (isolated !== "started" && isolated !== "already") {
 						if (runtime.isRunning(binding)) await runtime.stop(binding);

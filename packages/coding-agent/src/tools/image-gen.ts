@@ -41,124 +41,6 @@ const IMAGE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_IMAGE_OUTPUT_FORMAT = "webp";
 const OPENAI_IMAGE_MIME_TYPE = "image/webp";
-const MAX_PROVIDER_TEXT_LENGTH = 4096;
-const REDACTED_PROVIDER_SECRET = "[redacted]";
-const MAX_PROVIDER_BODY_BYTES = 64 * 1024 * 1024;
-const MAX_PROVIDER_SSE_EVENT_BYTES = MAX_PROVIDER_BODY_BYTES;
-const PROVIDER_MALFORMED_RESPONSE = "Provider returned a malformed image response.";
-const PROVIDER_OVERSIZED_RESPONSE = "Provider image response exceeded the supported size.";
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-export function redactImageProviderText(value: unknown, activeApiKey?: string): string {
-	let text = typeof value === "string" ? value : value === undefined || value === null ? "" : String(value);
-	const key = activeApiKey?.trim();
-	if (key) {
-		text = text.replace(new RegExp(escapeRegExp(key), "g"), REDACTED_PROVIDER_SECRET);
-		const keyChars = [...key].filter(character => !/[\s\p{Cc}\p{Cf}]/u.test(character));
-		if (keyChars.length > 0) {
-			const separatorTolerantKey = keyChars.map(escapeRegExp).join("[\\s\\p{Cc}\\p{Cf}]*");
-			text = text.replace(new RegExp(separatorTolerantKey, "gu"), REDACTED_PROVIDER_SECRET);
-		}
-	}
-	text = text.replace(/[\p{Cc}\p{Cf}]/gu, " ");
-	text = text
-		.replace(/\b(?:bearer|basic)\s+[^\s,;]+/gi, match => `${match.split(/\s+/, 1)[0]} ${REDACTED_PROVIDER_SECRET}`)
-		.replace(
-			/(?:\b|["'])(?:authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
-			match => match.replace(/([:=]\s*).*/, `$1${REDACTED_PROVIDER_SECRET}`),
-		)
-		.replace(/\b(?:sk|rk|pk|sess|ghp|gho|github_pat|xox[baprs])-[-A-Za-z0-9._]{8,}\b/gi, REDACTED_PROVIDER_SECRET)
-		.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, REDACTED_PROVIDER_SECRET)
-		.replace(/\b[A-Za-z0-9+/_-]{40,}={0,2}\b/g, REDACTED_PROVIDER_SECRET);
-	return text.length > MAX_PROVIDER_TEXT_LENGTH ? `${text.slice(0, MAX_PROVIDER_TEXT_LENGTH - 1)}…` : text;
-}
-
-function tryParseProviderJson<T>(rawText: string): T | undefined {
-	if (Buffer.byteLength(rawText, "utf8") > MAX_PROVIDER_BODY_BYTES) return undefined;
-	try {
-		const parsed: unknown = JSON.parse(rawText);
-		return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as T) : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function parseProviderJson<T>(rawText: string, activeApiKey?: string): T {
-	const parsed = tryParseProviderJson<T>(rawText);
-	if (parsed !== undefined) return parsed;
-	const message =
-		Buffer.byteLength(rawText, "utf8") > MAX_PROVIDER_BODY_BYTES
-			? PROVIDER_OVERSIZED_RESPONSE
-			: PROVIDER_MALFORMED_RESPONSE;
-	throw new Error(redactImageProviderText(message, activeApiKey));
-}
-
-async function readProviderResponseText(
-	response: Response,
-	activeApiKey?: string,
-	signal?: AbortSignal,
-): Promise<string> {
-	const contentLength = response.headers.get("content-length");
-	if (contentLength !== null) {
-		const declaredLength = Number(contentLength);
-		if (Number.isFinite(declaredLength) && declaredLength > MAX_PROVIDER_BODY_BYTES) {
-			await response.body?.cancel().catch(() => undefined);
-			throw new Error(PROVIDER_OVERSIZED_RESPONSE);
-		}
-	}
-
-	if (!response.body) return "";
-
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder("utf-8");
-	const chunks: string[] = [];
-	let totalBytes = 0;
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			if (!value || value.byteLength === 0) continue;
-
-			if (totalBytes > MAX_PROVIDER_BODY_BYTES - value.byteLength) {
-				await reader.cancel().catch(() => undefined);
-				throw new Error(PROVIDER_OVERSIZED_RESPONSE);
-			}
-			totalBytes += value.byteLength;
-			const decoded = decoder.decode(value, { stream: true });
-			if (decoded.length > 0) chunks.push(decoded);
-		}
-
-		const trailingText = decoder.decode();
-		if (trailingText.length > 0) chunks.push(trailingText);
-		return chunks.join("");
-	} catch (error) {
-		if (signal?.aborted) throw signal.reason ?? error;
-		throw new Error(redactImageProviderText(error instanceof Error ? error.message : error, activeApiKey));
-	} finally {
-		reader.releaseLock();
-	}
-}
-
-const PROVIDER_SSE_READ_OPTIONS = {
-	maxEventBytes: MAX_PROVIDER_SSE_EVENT_BYTES,
-	maxTotalBytes: MAX_PROVIDER_BODY_BYTES,
-} as const;
-
-async function fetchImageProvider(
-	input: string | URL | Request,
-	init: RequestInit,
-	activeApiKey: string,
-): Promise<Response> {
-	try {
-		return await fetch(input, init);
-	} catch (error) {
-		if (init.signal?.aborted) throw init.signal.reason ?? error;
-		throw new Error(redactImageProviderText(error instanceof Error ? error.message : error, activeApiKey));
-	}
-}
 
 const ANTIGRAVITY_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const ALIBABA_TOKEN_PLAN_HOST = "https://token-plan.ap-southeast-1.maas.aliyuncs.com";
@@ -166,26 +48,13 @@ const ALIBABA_IMAGE_GENERATION_URL = `${ALIBABA_TOKEN_PLAN_HOST}/api/v1/services
 const IMAGE_SYSTEM_INSTRUCTION =
 	"You are an AI image generator. Generate images based on user descriptions. Focus on creating high-quality, visually appealing images that match the user's request.";
 
-type ImageProvider = "alibaba" | "antigravity" | "gemini" | "openai" | "openai-codex" | "openrouter";
+type ImageProvider = "alibaba" | "antigravity" | "gemini" | "openai" | "openai-codex" | "openrouter" | (string & {});
 interface ImageApiKey {
 	provider: ImageProvider;
 	apiKey: string;
 	projectId?: string;
 	model?: Model;
 	authCredentialType?: "api_key" | "oauth";
-}
-
-export class UnsupportedImageProviderError extends Error {
-	readonly code = "unsupported_image_provider" as const;
-
-	constructor(
-		readonly provider: string,
-		readonly modelId: string,
-		readonly api: Model["api"],
-	) {
-		super(`Image generation is not supported for provider "${provider}" with transport "${api}".`);
-		this.name = "UnsupportedImageProviderError";
-	}
 }
 
 const responseModalitySchema = z.enum(["IMAGE", "TEXT"] as const);
@@ -373,30 +242,6 @@ interface OpenAIHostedImageResult {
 	responseText?: string;
 	revisedPrompt?: string;
 	usage?: OpenAIResponsesUsage;
-}
-
-function redactOpenAIHostedImageResult(result: OpenAIHostedImageResult, activeApiKey: string): OpenAIHostedImageResult {
-	return {
-		...result,
-		responseText: result.responseText ? redactImageProviderText(result.responseText, activeApiKey) : undefined,
-		revisedPrompt: result.revisedPrompt ? redactImageProviderText(result.revisedPrompt, activeApiKey) : undefined,
-	};
-}
-
-function redactGeminiPromptFeedback(
-	promptFeedback: GeminiPromptFeedback | undefined,
-	activeApiKey: string,
-): GeminiPromptFeedback | undefined {
-	if (!promptFeedback) return undefined;
-	return {
-		blockReason: promptFeedback.blockReason
-			? redactImageProviderText(promptFeedback.blockReason, activeApiKey)
-			: undefined,
-		safetyRatings: promptFeedback.safetyRatings?.map(rating => ({
-			category: rating.category ? redactImageProviderText(rating.category, activeApiKey) : undefined,
-			probability: rating.probability ? redactImageProviderText(rating.probability, activeApiKey) : undefined,
-		})),
-	};
 }
 
 interface OpenRouterImageUrl {
@@ -721,11 +566,7 @@ async function readImageResponse(
 	}
 }
 
-async function loadImageFromUrl(
-	imageUrl: string,
-	signal?: AbortSignal,
-	activeApiKey?: string,
-): Promise<InlineImageData> {
+async function loadImageFromUrl(imageUrl: string, signal?: AbortSignal): Promise<InlineImageData> {
 	if (imageUrl.startsWith("data:")) {
 		const normalized = normalizeDataUrl(imageUrl.trim());
 		if (!normalized.mimeType) {
@@ -758,11 +599,8 @@ async function loadImageFromUrl(
 		}
 		validateImageResponseFraming(response);
 		if (status < 200 || status >= 300) {
-			const preview = redactImageProviderText(
-				(await readImageResponse(response, MAX_IMAGE_ERROR_PREVIEW_SIZE, signal)).toString("utf8"),
-				activeApiKey,
-			);
-			throw new Error(`Image download failed (${status}): ${preview || "provider returned an error"}`);
+			const preview = (await readImageResponse(response, MAX_IMAGE_ERROR_PREVIEW_SIZE, signal)).toString("utf8");
+			throw new Error(`Image download failed (${status}): ${preview}`);
 		}
 		const rawContentType = response.headers["content-type"];
 		const contentType =
@@ -948,9 +786,8 @@ async function findImageApiKey(
 }
 
 /**
- * Map a resolved image model to its provider credentials. Transport and image
- * capability are validated before any credential lookup; unsupported models
- * fail without forwarding their provider credential to another endpoint.
+ * Map a resolved image model to its provider credentials. Each provider
+ * branch mirrors the original credential-resolution path.
  */
 async function resolveCredentialsForImageModel(
 	model: Model,
@@ -972,23 +809,19 @@ async function resolveCredentialsForImageModel(
 		};
 	}
 
-	if (
-		(provider === "antigravity" || provider === "google-antigravity") &&
-		model.api === "google-gemini-cli" &&
-		model.output?.includes("image")
-	) {
+	if (provider === "antigravity" || provider === "google-antigravity") {
 		return await findAntigravityCredentials(modelRegistry, sessionId);
 	}
-	if ((provider === "alibaba" || provider === "alibaba-token-plan") && model.output?.includes("image")) {
+	if (provider === "alibaba" || provider === "alibaba-token-plan") {
 		return await findAlibabaImageCredentials(modelRegistry, sessionId);
 	}
-	if (provider === "openrouter" && model.output?.includes("image")) {
+	if (provider === "openrouter") {
 		const openRouterKey = await modelRegistry.getApiKey(model, sessionId);
 		if (isAuthenticated(openRouterKey)) return { provider: "openrouter", apiKey: openRouterKey };
 		const envKey = getEnvApiKey("openrouter");
 		return envKey ? { provider: "openrouter", apiKey: envKey } : null;
 	}
-	if (provider === "google" && model.api === "google-generative-ai" && model.output?.includes("image")) {
+	if (provider === "gemini" || provider === "google") {
 		const googleKey = await modelRegistry.getApiKey(model, sessionId);
 		if (isAuthenticated(googleKey)) return { provider: "gemini", apiKey: googleKey };
 		const envKey = getEnvApiKey("google");
@@ -997,7 +830,14 @@ async function resolveCredentialsForImageModel(
 		return fallbackKey ? { provider: "gemini", apiKey: fallbackKey } : null;
 	}
 
-	throw new UnsupportedImageProviderError(model.provider, model.id, model.api);
+	// Fallback: try the model's own API key via the registry.
+	const apiKey = await modelRegistry.getApiKey(model, sessionId);
+	if (!isAuthenticated(apiKey)) return null;
+	return {
+		provider: provider as ImageProvider,
+		apiKey,
+		model,
+	};
 }
 
 async function loadImageFromPath(imagePath: string, cwd: string): Promise<InlineImageData> {
@@ -1096,7 +936,7 @@ function collectInlineImages(parts: GeminiPart[]): InlineImageData[] {
 	return images;
 }
 
-export function isOpenAIHostedImageModel(model: Model | undefined): boolean {
+export function isOpenAIHostedImageModel(model: Model | undefined): model is Model {
 	if (!model) return false;
 	// The hosted image_generation tool is only available over the Responses API.
 	if (model.api !== "openai-responses" && model.api !== "openai-codex-responses") return false;
@@ -1209,9 +1049,13 @@ function collectOpenAIHostedImageResult(response: OpenAIHostedImageResponse): Op
 	};
 }
 
-function getOpenAIResponseErrorMessage(rawText: string, activeApiKey?: string): string {
-	const parsed = tryParseProviderJson<{ error?: { message?: string } }>(rawText);
-	return redactImageProviderText(parsed?.error?.message ?? "provider returned an error", activeApiKey);
+function getOpenAIResponseErrorMessage(rawText: string): string {
+	try {
+		const parsed = JSON.parse(rawText) as { error?: { message?: string } };
+		return parsed.error?.message ?? rawText;
+	} catch {
+		return rawText;
+	}
 }
 
 function getOpenAIBaseUrl(model: Model, authCredentialType?: "api_key" | "oauth"): string {
@@ -1269,11 +1113,7 @@ function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string
 	return headers;
 }
 
-async function parseOpenAIHostedImageSse(
-	response: Response,
-	signal: AbortSignal | undefined,
-	activeApiKey: string,
-): Promise<OpenAIHostedImageResult> {
+async function parseOpenAIHostedImageSse(response: Response, signal?: AbortSignal): Promise<OpenAIHostedImageResult> {
 	if (!response.body) {
 		throw new Error("No response body");
 	}
@@ -1281,33 +1121,21 @@ async function parseOpenAIHostedImageSse(
 	const fallbackOutput: OpenAIResponseOutput[] = [];
 	let completedResponse: OpenAIHostedImageResponse | undefined;
 
-	try {
-		for await (const event of readSseJson<OpenAISseEvent>(
-			response.body,
-			signal,
-			undefined,
-			PROVIDER_SSE_READ_OPTIONS,
-		)) {
-			if (!event || typeof event !== "object" || Array.isArray(event)) throw new Error(PROVIDER_MALFORMED_RESPONSE);
-			if (event.type === "error") {
-				const message = event.error?.message ?? event.message ?? "OpenAI image request failed";
-				throw new Error(redactImageProviderText(message, activeApiKey));
-			}
-			if (event.type === "response.failed") {
-				const message = event.response?.error?.message ?? "OpenAI image request failed";
-				throw new Error(redactImageProviderText(message, activeApiKey));
-			}
-			if (event.type === "response.output_item.done" && event.item) {
-				fallbackOutput.push(event.item);
-			}
-			if ((event.type === "response.completed" || event.type === "response.done") && event.response) {
-				completedResponse = event.response;
-			}
+	for await (const event of readSseJson<OpenAISseEvent>(response.body, signal)) {
+		if (event.type === "error") {
+			const message = event.error?.message ?? event.message ?? "OpenAI image request failed";
+			throw new Error(message);
 		}
-	} catch (error) {
-		if (signal?.aborted) throw signal.reason ?? error;
-		if (error instanceof Error && error.message !== PROVIDER_MALFORMED_RESPONSE) throw error;
-		throw new Error(redactImageProviderText(PROVIDER_MALFORMED_RESPONSE, activeApiKey));
+		if (event.type === "response.failed") {
+			const message = event.response?.error?.message ?? "OpenAI image request failed";
+			throw new Error(message);
+		}
+		if (event.type === "response.output_item.done" && event.item) {
+			fallbackOutput.push(event.item);
+		}
+		if ((event.type === "response.completed" || event.type === "response.done") && event.response) {
+			completedResponse = event.response;
+		}
 	}
 
 	return collectOpenAIHostedImageResult(
@@ -1329,32 +1157,25 @@ async function generateOpenAIHostedImage(
 	const promptText = assemblePrompt(params);
 	const stream = model.api === "openai-codex-responses" || model.provider === "openai-codex";
 	const requestBody = buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
-	const response = await fetchImageProvider(
-		getOpenAIResponsesUrl(model, options?.authCredentialType),
-		{
-			method: "POST",
-			headers: buildOpenAIImageHeaders(model, apiKey, sessionId),
-			body: JSON.stringify(requestBody),
-			signal,
-		},
-		apiKey,
-	);
+	const response = await fetch(getOpenAIResponsesUrl(model, options?.authCredentialType), {
+		method: "POST",
+		headers: buildOpenAIImageHeaders(model, apiKey, sessionId),
+		body: JSON.stringify(requestBody),
+		signal,
+	});
 
 	if (!response.ok) {
-		const errorText = await readProviderResponseText(response, apiKey, signal);
-		throw new Error(
-			`OpenAI image request failed (${response.status}): ${getOpenAIResponseErrorMessage(errorText, apiKey)}`,
-		);
+		const errorText = await response.text();
+		throw new Error(`OpenAI image request failed (${response.status}): ${getOpenAIResponseErrorMessage(errorText)}`);
 	}
 
 	const contentType = response.headers.get("content-type") ?? "";
 	if (stream || contentType.includes("text/event-stream")) {
-		return redactOpenAIHostedImageResult(await parseOpenAIHostedImageSse(response, signal, apiKey), apiKey);
+		return parseOpenAIHostedImageSse(response, signal);
 	}
 
-	const rawText = await readProviderResponseText(response, apiKey, signal);
-	const data = parseProviderJson<OpenAIHostedImageResponse>(rawText, apiKey);
-	return redactOpenAIHostedImageResult(collectOpenAIHostedImageResult(data), apiKey);
+	const data = (await response.json()) as OpenAIHostedImageResponse;
+	return collectOpenAIHostedImageResult(data);
 }
 
 function combineParts(response: GeminiGenerateContentResponse): GeminiPart[] {
@@ -1413,11 +1234,7 @@ interface AntigravitySseResult {
 	usage?: GeminiUsageMetadata;
 }
 
-async function parseAntigravitySseForImage(
-	response: Response,
-	signal: AbortSignal | undefined,
-	activeApiKey?: string,
-): Promise<AntigravitySseResult> {
+async function parseAntigravitySseForImage(response: Response, signal?: AbortSignal): Promise<AntigravitySseResult> {
 	if (!response.body) {
 		throw new Error("No response body");
 	}
@@ -1425,42 +1242,25 @@ async function parseAntigravitySseForImage(
 	const textParts: string[] = [];
 	const images: InlineImageData[] = [];
 	let usage: GeminiUsageMetadata | undefined;
-	let chunks: AntigravityResponseChunk[];
-	try {
-		chunks = [];
-		for await (const chunk of readSseJson<AntigravityResponseChunk>(
-			response.body,
-			signal,
-			undefined,
-			PROVIDER_SSE_READ_OPTIONS,
-		)) {
-			if (!chunk || typeof chunk !== "object" || Array.isArray(chunk)) throw new Error(PROVIDER_MALFORMED_RESPONSE);
-			chunks.push(chunk);
-		}
-	} catch (error) {
-		if (signal?.aborted) throw signal.reason ?? error;
-		throw new Error(redactImageProviderText(PROVIDER_MALFORMED_RESPONSE, activeApiKey));
-	}
 
-	for (const chunk of chunks) {
+	for await (const chunk of readSseJson<AntigravityResponseChunk>(response.body, signal)) {
 		const responseData = chunk.response;
-		if (!responseData || typeof responseData !== "object") continue;
-		const candidates = Array.isArray(responseData.candidates) ? responseData.candidates : [];
-		for (const candidate of candidates) {
-			if (!candidate || typeof candidate !== "object") continue;
-			const parts = Array.isArray(candidate.content?.parts) ? candidate.content.parts : [];
+		if (!responseData) continue;
+		if (!responseData.candidates) continue;
+		for (const candidate of responseData.candidates) {
+			const parts = candidate.content?.parts;
+			if (!parts) continue;
 			for (const part of parts) {
-				if (!part || typeof part !== "object") continue;
-				if (typeof part.text === "string" && part.text.length > 0) {
+				if (part.text) {
 					textParts.push(part.text);
 				}
 				const inlineData = part.inlineData;
-				if (inlineData && typeof inlineData === "object" && inlineData.data && inlineData.mimeType) {
+				if (inlineData?.data && inlineData.mimeType) {
 					images.push({ data: inlineData.data, mimeType: inlineData.mimeType });
 				}
 			}
 		}
-		if (responseData.usageMetadata && typeof responseData.usageMetadata === "object") {
+		if (responseData.usageMetadata) {
 			usage = responseData.usageMetadata;
 		}
 	}
@@ -1581,34 +1381,32 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 				const { getAntigravityUserAgent } =
 					require("@gajae-code/ai/providers/google-gemini-headers") as typeof import("@gajae-code/ai/providers/google-gemini-headers");
-				const response = await fetchImageProvider(
-					`${ANTIGRAVITY_ENDPOINT}/v1internal:streamGenerateContent?alt=sse`,
-					{
-						method: "POST",
-						headers: {
-							Authorization: `Bearer ${apiKey.apiKey}`,
-							"Content-Type": "application/json",
-							Accept: "text/event-stream",
-							"User-Agent": getAntigravityUserAgent(),
-						},
-						body: JSON.stringify(requestBody),
-						signal: requestSignal,
+				const response = await fetch(`${ANTIGRAVITY_ENDPOINT}/v1internal:streamGenerateContent?alt=sse`, {
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${apiKey.apiKey}`,
+						"Content-Type": "application/json",
+						Accept: "text/event-stream",
+						"User-Agent": getAntigravityUserAgent(),
 					},
-					apiKey.apiKey,
-				);
+					body: JSON.stringify(requestBody),
+					signal: requestSignal,
+				});
 
 				if (!response.ok) {
-					const errorText = await readProviderResponseText(response, apiKey.apiKey, requestSignal);
-					const parsed = tryParseProviderJson<{ error?: { message?: string } }>(errorText);
-					const message = parsed?.error?.message;
-					throw new Error(
-						`Antigravity image request failed (${response.status}): ${redactImageProviderText(message ?? "provider returned an error", apiKey.apiKey)}`,
-					);
+					const errorText = await response.text();
+					let message = errorText;
+					try {
+						const parsed = JSON.parse(errorText) as { error?: { message?: string } };
+						message = parsed.error?.message ?? message;
+					} catch {
+						// Keep raw text.
+					}
+					throw new Error(`Antigravity image request failed (${response.status}): ${message}`);
 				}
 
-				const parsed = await parseAntigravitySseForImage(response, requestSignal, apiKey.apiKey);
-				const responseText =
-					parsed.text.length > 0 ? redactImageProviderText(parsed.text.join(" "), apiKey.apiKey) : undefined;
+				const parsed = await parseAntigravitySseForImage(response, requestSignal);
+				const responseText = parsed.text.length > 0 ? parsed.text.join(" ") : undefined;
 
 				if (parsed.images.length === 0) {
 					const messageText = responseText ? `\n\n${responseText}` : "";
@@ -1654,40 +1452,38 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					messages: [{ role: "user" as const, content: contentParts }],
 				};
 
-				const response = await fetchImageProvider(
-					"https://openrouter.ai/api/v1/chat/completions",
-					{
-						method: "POST",
-						headers: {
-							"Content-Type": "application/json",
-							Authorization: `Bearer ${apiKey.apiKey}`,
-							"HTTP-Referer": "https://gaebal-gajae.dev/",
-							"X-OpenRouter-Title": "Gajae Code",
-							"X-OpenRouter-Categories": "cli-agent",
-						},
-						body: JSON.stringify(requestBody),
-						signal: requestSignal,
+				const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${apiKey.apiKey}`,
+						"HTTP-Referer": "https://gaebal-gajae.dev/",
+						"X-OpenRouter-Title": "Gajae Code",
+						"X-OpenRouter-Categories": "cli-agent",
 					},
-					apiKey.apiKey,
-				);
+					body: JSON.stringify(requestBody),
+					signal: requestSignal,
+				});
 
-				const rawText = await readProviderResponseText(response, apiKey.apiKey, requestSignal);
+				const rawText = await response.text();
 				if (!response.ok) {
-					const parsed = tryParseProviderJson<{ error?: { message?: string } }>(rawText);
-					const message = parsed?.error?.message;
-					throw new Error(
-						`OpenRouter image request failed (${response.status}): ${redactImageProviderText(message ?? "provider returned an error", apiKey.apiKey)}`,
-					);
+					let message = rawText;
+					try {
+						const parsed = JSON.parse(rawText) as { error?: { message?: string } };
+						message = parsed.error?.message ?? message;
+					} catch {
+						// Keep raw text.
+					}
+					throw new Error(`OpenRouter image request failed (${response.status}): ${message}`);
 				}
 
-				const data = parseProviderJson<OpenRouterResponse>(rawText, apiKey.apiKey);
+				const data = JSON.parse(rawText) as OpenRouterResponse;
 				const message = data.choices?.[0]?.message;
-				const rawResponseText = collectOpenRouterResponseText(message);
-				const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
+				const responseText = collectOpenRouterResponseText(message);
 				const imageUrls = extractOpenRouterImageUrls(message);
 				const inlineImages: InlineImageData[] = [];
 				for (const imageUrl of imageUrls) {
-					inlineImages.push(await loadImageFromUrl(imageUrl, requestSignal, apiKey.apiKey));
+					inlineImages.push(await loadImageFromUrl(imageUrl, requestSignal));
 				}
 
 				if (inlineImages.length === 0) {
@@ -1730,42 +1526,38 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					params.image_size,
 				);
 
-				const response = await fetchImageProvider(
-					ALIBABA_IMAGE_GENERATION_URL,
-					{
-						method: "POST",
-						headers: {
-							"Content-Type": "application/json",
-							Authorization: `Bearer ${apiKey.apiKey}`,
-						},
-						body: JSON.stringify(requestBody),
-						signal: requestSignal,
+				const response = await fetch(ALIBABA_IMAGE_GENERATION_URL, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${apiKey.apiKey}`,
 					},
-					apiKey.apiKey,
-				);
+					body: JSON.stringify(requestBody),
+					signal: requestSignal,
+				});
 
-				const rawText = await readProviderResponseText(response, apiKey.apiKey, requestSignal);
+				const rawText = await response.text();
 				if (!response.ok) {
-					const parsed = tryParseProviderJson<{ message?: string; error?: { message?: string } }>(rawText);
-					const message = parsed?.error?.message ?? parsed?.message;
-					throw new Error(
-						`Alibaba image request failed (${response.status}): ${redactImageProviderText(message ?? "provider returned an error", apiKey.apiKey)}`,
-					);
+					let message = rawText;
+					try {
+						const parsed = JSON.parse(rawText) as { message?: string; error?: { message?: string } };
+						message = parsed.error?.message ?? parsed.message ?? message;
+					} catch {
+						// Keep raw text.
+					}
+					throw new Error(`Alibaba image request failed (${response.status}): ${message}`);
 				}
 
-				const data = parseProviderJson<AlibabaImageResponse>(rawText, apiKey.apiKey);
+				const data = JSON.parse(rawText) as AlibabaImageResponse;
 				if (data.code) {
-					throw new Error(
-						`Alibaba image request failed: ${redactImageProviderText(`${data.code}: ${data.message ?? ""}`, apiKey.apiKey)}`,
-					);
+					throw new Error(`Alibaba image request failed: ${data.code}: ${data.message ?? ""}`.trim());
 				}
 
-				const { imageUrls, responseText: rawResponseText } = collectAlibabaImageResult(data);
-				const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
+				const { imageUrls, responseText } = collectAlibabaImageResult(data);
 				// Result URLs are short-lived OSS-signed URLs (24h); download immediately.
 				const inlineImages: InlineImageData[] = [];
 				for (const imageUrl of imageUrls) {
-					inlineImages.push(await loadImageFromUrl(imageUrl, requestSignal, apiKey.apiKey));
+					inlineImages.push(await loadImageFromUrl(imageUrl, requestSignal));
 				}
 
 				if (inlineImages.length === 0) {
@@ -1823,7 +1615,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				generationConfig,
 			};
 
-			const response = await fetchImageProvider(
+			const response = await fetch(
 				`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
 				{
 					method: "POST",
@@ -1834,27 +1626,28 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					body: JSON.stringify(requestBody),
 					signal: requestSignal,
 				},
-				apiKey.apiKey,
 			);
 
-			const rawText = await readProviderResponseText(response, apiKey.apiKey, requestSignal);
+			const rawText = await response.text();
 			if (!response.ok) {
-				const parsed = tryParseProviderJson<{ error?: { message?: string } }>(rawText);
-				const message = parsed?.error?.message;
-				throw new Error(
-					`Gemini image request failed (${response.status}): ${redactImageProviderText(message ?? "provider returned an error", apiKey.apiKey)}`,
-				);
+				let message = rawText;
+				try {
+					const parsed = JSON.parse(rawText) as { error?: { message?: string } };
+					message = parsed.error?.message ?? message;
+				} catch {
+					// Keep raw text.
+				}
+				throw new Error(`Gemini image request failed (${response.status}): ${message}`);
 			}
 
-			const data = parseProviderJson<GeminiGenerateContentResponse>(rawText, apiKey.apiKey);
+			const data = JSON.parse(rawText) as GeminiGenerateContentResponse;
 			const responseParts = combineParts(data);
-			const rawResponseText = collectResponseText(responseParts);
-			const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
+			const responseText = collectResponseText(responseParts);
 			const inlineImages = collectInlineImages(responseParts);
 
 			if (inlineImages.length === 0) {
 				const blocked = data.promptFeedback?.blockReason
-					? `Blocked: ${redactImageProviderText(data.promptFeedback.blockReason, apiKey.apiKey)}`
+					? `Blocked: ${data.promptFeedback.blockReason}`
 					: "No image data returned.";
 				return {
 					content: [{ type: "text", text: `${blocked}${responseText ? `\n\n${responseText}` : ""}` }],
@@ -1865,7 +1658,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 						imagePaths: [],
 						images: [],
 						responseText,
-						promptFeedback: redactGeminiPromptFeedback(data.promptFeedback, apiKey.apiKey),
+						promptFeedback: data.promptFeedback,
 						usage: data.usageMetadata,
 					},
 				};
@@ -1882,7 +1675,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					imagePaths,
 					images: inlineImages,
 					responseText,
-					promptFeedback: redactGeminiPromptFeedback(data.promptFeedback, apiKey.apiKey),
+					promptFeedback: data.promptFeedback,
 					usage: data.usageMetadata,
 				},
 			};

@@ -1,6 +1,6 @@
 export interface NotificationOperatorTimerDeps {
 	now?: () => number;
-	setTimeoutImpl?: (callback: () => void, ms?: number) => Timer | NodeJS.Timeout;
+	setTimeoutImpl?: typeof setTimeout;
 	clearTimeoutImpl?: typeof clearTimeout;
 	setIntervalImpl?: typeof setInterval;
 	clearIntervalImpl?: typeof clearInterval;

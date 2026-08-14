@@ -1,17 +1,4 @@
 export type ControlValue = unknown;
-export type AbortMode = "turn" | "terminal";
-export type AbortScope = "turn" | "owned";
-
-/**
- * Terminal-mode C04 `turn.abort` input. `scope` selects whether exact causal
- * owned work (background Bash/task jobs, detached subagents) is also stopped
- * (`"owned"`) or left running so its completion can resume the root worker
- * (`"turn"`, the default).
- */
-export interface TerminalAbortInput {
-	mode: "terminal";
-	scope?: AbortScope;
-}
 export type ControlInput = Record<string, unknown>;
 
 /**
@@ -19,12 +6,11 @@ export type ControlInput = Record<string, unknown>;
  * AgentSession and its controllers without exposing those concrete types here.
  */
 export interface ControlSurface {
+	authorizeElevationClaim?(sdkId: string, input: ControlInput, capability: string): boolean;
 	prompt(text: string, images?: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
-	steer(text: string, clientRef?: string): Promise<ControlValue> | ControlValue;
+	steer(text: string): Promise<ControlValue> | ControlValue;
 	followUp(text: string): Promise<ControlValue> | ControlValue;
 	abort(): Promise<ControlValue> | ControlValue;
-	/** Terminal abort: stop the current root turn (and optionally exact owned work). */
-	abortTerminal?(input: TerminalAbortInput, idempotencyKey?: string): Promise<ControlValue> | ControlValue;
 	abortAndPrompt(text: string): Promise<ControlValue> | ControlValue;
 	answerAsk(id: string, answer: ControlValue): Promise<ControlValue> | ControlValue;
 	answerGate(
@@ -32,8 +18,14 @@ export interface ControlSurface {
 		response: ControlValue,
 		expectedSessionId?: string,
 		idempotencyKey?: string,
+		elevationRequestId?: string,
 	): Promise<ControlValue> | ControlValue;
-	approvePlan(id: string, choice: ControlValue, expectedSessionId?: string): Promise<ControlValue> | ControlValue;
+	approvePlan(
+		id: string,
+		choice: ControlValue,
+		expectedSessionId?: string,
+		elevationRequestId?: string,
+	): Promise<ControlValue> | ControlValue;
 	invokeSkill(name: string, args: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
 	setPlanMode(on: boolean): Promise<ControlValue> | ControlValue;
 	operateGoal(op: string, objective?: string): Promise<ControlValue> | ControlValue;

@@ -26,6 +26,19 @@ export const SPAWN_PROVENANCE_ENV = "GJC_SPAWNED_BY_SESSION";
 export function isTelegramSessionEligible(cfg: NotificationConfig): boolean {
 	return isProviderEffectivelyEnabled(cfg, "telegram") && isTelegramComplete(cfg);
 }
+/**
+ * Telegram forum-topic ownership is reserved for sessions launched with
+ * coordinator or lifecycle provenance. A plain notification opt-in is not
+ * sufficient because it would turn every ordinary session into a topic.
+ */
+export function isTelegramOrchestrationSession(env: NodeJS.ProcessEnv = process.env): boolean {
+	return [
+		env.GJC_COORDINATOR_SESSION_ID,
+		env.GJC_COORDINATOR_SESSION_STATE_FILE,
+		env.GJC_LIFECYCLE_REQUEST_ID,
+		env.GJC_SDK_LIFECYCLE_REQUEST,
+	].some(value => typeof value === "string" && value.trim().length > 0);
+}
 
 export type TelegramActivationState = "inactive" | "blocked";
 export type TelegramActivationReason = "saved_inactive" | "identity_mismatch";
