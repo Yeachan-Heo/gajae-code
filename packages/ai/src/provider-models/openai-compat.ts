@@ -1409,7 +1409,7 @@ export interface OmlxModelManagerConfig {
 
 export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? Bun.env.OMLX_BASE_URL ?? "http://127.0.0.1:8080/v1";
+	const baseUrl = config?.baseUrl ?? Bun.env.OMLX_BASE_URL ?? "http://127.0.0.1:8000/v1";
 	return {
 		providerId: "omlx",
 		fetchDynamicModels: () =>
@@ -1419,13 +1419,14 @@ export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelM
 				baseUrl,
 				apiKey,
 				mapModel: (entry, defaults) => {
+					// oMLX /v1/models entries are {id, object, created, owned_by, max_model_len}
+					// (jundot/omlx ModelInfo). Only max_model_len is served; `name` is absent, so keep
+					// the defaults fallback (the id) instead of clobbering it with undefined.
 					return {
 						...defaults,
-						id: entry.id as string,
-						name: entry.name as string,
 						reasoning: entry.supports_reasoning === true,
 						input: entry.supports_vision === true ? ["text", "image"] : ["text"],
-						contextWindow: toPositiveNumber(entry.context_length, defaults.contextWindow),
+						contextWindow: toPositiveNumber(entry.max_model_len, defaults.contextWindow),
 						maxTokens: toPositiveNumber(entry.max_tokens, defaults.maxTokens),
 					};
 				},

@@ -34,9 +34,10 @@ import {
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
 
-// Sentinel for local-only OAuth token (LM Studio, vLLM) — declared inline to avoid loading
-// any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts.
-const DEFAULT_LOCAL_TOKEN = "lm-studio-local";
+// Sentinels for local-only OAuth tokens (LM Studio/vLLM, oMLX) — declared inline to avoid loading
+// any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts and
+// oauth/omlx.ts respectively.
+const LOCAL_TOKEN_SENTINELS = new Set(["lm-studio-local", "omlx-local"]);
 
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
@@ -1686,7 +1687,9 @@ export class ModelRegistry {
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
 		const liveBaseUrl =
-			providerConfig.discovery.type === "openai-models-list" || providerConfig.discovery.type === "lm-studio"
+			providerConfig.discovery.type === "openai-models-list" ||
+			providerConfig.discovery.type === "lm-studio" ||
+			providerConfig.discovery.type === "omlx"
 				? this.#normalizeOpenAIModelsListBaseUrl(
 						this.#getProviderBaseUrlForDiscovery(providerConfig.provider) ?? providerConfig.baseUrl,
 					)
@@ -1710,7 +1713,9 @@ export class ModelRegistry {
 		});
 	}
 	#sanitizeDiscoverableModelsForCache(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		return providerConfig.discovery.type === "openai-models-list" || providerConfig.discovery.type === "lm-studio"
+		return providerConfig.discovery.type === "openai-models-list" ||
+			providerConfig.discovery.type === "lm-studio" ||
+			providerConfig.discovery.type === "omlx"
 			? this.#stripModelBaseUrlQueries(models)
 			: models;
 	}
@@ -1763,11 +1768,19 @@ export class ModelRegistry {
 			this.#optionalAuthProviders.add("lm-studio");
 			this.#keylessProviders.add("lm-studio");
 		}
-		if (!configuredProviders.has("omlx") && !disabledProviders.has("omlx")) {
+		if (
+			!configuredProviders.has("omlx") &&
+			!disabledProviders.has("omlx") &&
+			// oMLX's documented default port is 8000 (jundot/omlx ServerConfig.port=8000). Probe
+			// implicitly only when the endpoint is explicit or oMLX actually lives on its own
+			// default — never silently duplicate llama.cpp's 127.0.0.1:8080 probe.
+			(Bun.env.OMLX_BASE_URL !== undefined ||
+				!this.#llamaCppOwnsImplicitEndpoint(configuredProviders, disabledProviders))
+		) {
 			this.#discoveryManager.addProvider({
 				provider: "omlx",
 				api: "openai-completions",
-				baseUrl: Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8080/v1",
+				baseUrl: Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8000/v1",
 				discovery: { type: "omlx" },
 				optional: true,
 			});
@@ -1775,6 +1788,21 @@ export class ModelRegistry {
 			this.#optionalAuthProviders.add("omlx");
 			this.#keylessProviders.add("omlx");
 		}
+	}
+
+	/**
+	 * True when llama.cpp's implicit endpoint would be the same URL oMLX would probe, so an
+	 * implicit oMLX registration would only duplicate llama.cpp traffic (and misattribute its
+	 * models). oMLX then requires an explicit OMLX_BASE_URL before it probes anything.
+	 */
+	#llamaCppOwnsImplicitEndpoint(
+		configuredProviders: ReadonlySet<string>,
+		disabledProviders: ReadonlySet<string>,
+	): boolean {
+		if (configuredProviders.has("llama.cpp") || disabledProviders.has("llama.cpp")) return false;
+		return (
+			(Bun.env.LLAMA_CPP_BASE_URL || "http://127.0.0.1:8080") === (Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8000")
+		);
 	}
 
 	#loadCustomModels(): CustomModelsResult {
@@ -2791,7 +2819,7 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (apiKey && !LOCAL_TOKEN_SENTINELS.has(apiKey) && apiKey !== kNoAuth) {
 			headers.Authorization = `Bearer ${apiKey}`;
 		}
 		const response = await fetch(tagsUrl, {
@@ -2871,7 +2899,7 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (apiKey && !LOCAL_TOKEN_SENTINELS.has(apiKey) && apiKey !== kNoAuth) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
@@ -2992,7 +3020,7 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider, undefined, { baseUrl }));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (apiKey && !LOCAL_TOKEN_SENTINELS.has(apiKey) && apiKey !== kNoAuth) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
@@ -3836,7 +3864,9 @@ export class ModelRegistry {
 					this.#normalizeDiscoveryEvidenceEndpoint(
 						discoveryType === "ollama"
 							? `${this.#normalizeOllamaBaseUrl(baseUrl)}/v1`
-							: discoveryType === "openai-models-list" || discoveryType === "lm-studio"
+							: discoveryType === "openai-models-list" ||
+									discoveryType === "lm-studio" ||
+									discoveryType === "omlx"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
 								: (baseUrl ?? ""),
 					);
