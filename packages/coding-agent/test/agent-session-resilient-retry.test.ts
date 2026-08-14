@@ -1477,6 +1477,77 @@ describe("AgentSession resilient retry", () => {
 			/^First-event stream timeout retry ceiling exhausted after 2 attempts; waited \d+ms total: 529 Overloaded$/,
 		);
 	});
+	it("clears the first-event ceiling after a successful retry before a tool continuation", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model");
+		const tool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo test tool",
+			parameters: z.object({}),
+			execute: async () => ({ content: [{ type: "text", text: "echoed" }] }),
+		};
+		const toolResponse = createMockModel({
+			responses: [{ content: [{ type: "toolCall", name: "echo", arguments: {} }] }],
+		});
+		const successResponse = createMockModel({ responses: [{ content: ["continuation recovered"] }] });
+		let calls = 0;
+		const failureStream = (
+			errorMessage: string,
+			transportFailure: NonNullable<AssistantMessage["transportFailure"]>,
+		): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const failure = assistantMessage(model, [], "error", errorMessage);
+				failure.transportFailure = transportFailure;
+				stream.push({ type: "start", partial: failure });
+				stream.push({ type: "error", reason: "error", error: failure });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls++;
+				if (calls === 1) {
+					return failureStream("Anthropic stream timed out while waiting for the first event", {
+						kind: "transport",
+						providerCode: "stream_first_event_timeout",
+						requestBytes: 4096,
+						firstEventElapsedMs: 100_000,
+						firstEventTimeoutMs: 100_000,
+						endpointClass: "canonical",
+						retryMaxAttempts: 2,
+					});
+				}
+				if (calls === 2) return toolResponse.stream(requestedModel, context, options);
+				if (calls === 3 || calls === 4) {
+					return failureStream("529 Overloaded", {
+						kind: "transport",
+						status: 529,
+						anthropicErrorType: "overloaded_error",
+					});
+				}
+				return successResponse.stream(requestedModel, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxDelayMs": 10,
+			"retry.maxRetries": 5,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("recover timeout then run a tool continuation");
+		await session.waitForIdle();
+
+		expect(calls).toBe(5);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "continuation recovered" }]);
+	});
 	it("replays a typed first-event timeout before progress and never after progress", async () => {
 		const noProgressModels: string[] = [];
 		session = buildStatusErrorSession({

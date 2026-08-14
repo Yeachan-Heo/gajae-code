@@ -237,6 +237,7 @@ describe("anthropic first-event timeouts", () => {
 
 	it("gives custom endpoints bounded grace so a late 529 surfaces instead of a timeout", async () => {
 		let attempts = 0;
+		const providerRetryWait = vi.fn(async () => {});
 		const create = ((_body: unknown) => {
 			attempts += 1;
 			const response = new Response(null, { status: 200 });
@@ -264,22 +265,28 @@ describe("anthropic first-event timeouts", () => {
 			} as never;
 		}) as unknown as Anthropic["messages"]["create"];
 
-		const result = await streamAnthropic(
-			customModel("https://user:password@api.anthropic.com:8443/v1?token=secret"),
-			contextWithBytes(1_670_000),
-			{
-				client: { messages: { create } } as Anthropic,
-				streamFirstEventTimeoutMs: 1,
-				streamMaxRetries: 0,
-			},
-		).result();
+		const injectedClient = {
+			baseURL: "https://user:password@api.anthropic.com:8443/v1?token=secret",
+			messages: { create },
+		} as Anthropic;
+		const result = await streamAnthropic(model, contextWithBytes(1_670_000), {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
+		}).result();
 
 		expect(attempts).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
 		expect(result.errorStatus).toBe(529);
 		expect(result.errorMessage).toContain("overloaded_error");
 		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
 		expect(result.errorMessage).not.toContain("password");
 		expect(result.errorMessage).not.toContain("token=secret");
+		expect(result.transportFailure).toMatchObject({
+			requestBytes: expect.any(Number),
+			endpointClass: "custom",
+			retryMaxAttempts: 1,
+		});
 	});
 
 	it("honors caller abort while a custom endpoint is inside its bounded grace", async () => {

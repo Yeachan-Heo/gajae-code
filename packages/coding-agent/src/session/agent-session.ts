@@ -5386,6 +5386,7 @@ export class AgentSession {
 						attempt: this.#retryAttempt,
 					});
 					this.#retryAttempt = 0;
+					this.#providerRetryMaxAttempts = undefined;
 					// Settle the retry gate here, colocated with the success event, rather
 					// than relying on the generic #resolveRetry() at the end of the
 					// agent_end branch. That tail resolver is bypassed by every early
@@ -18211,7 +18212,7 @@ export class AgentSession {
 		}
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
-		const reportedRetryMaxAttempts = firstEventTimeout ? transportFailure?.retryMaxAttempts : undefined;
+		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
 		if (reportedRetryMaxAttempts !== undefined) {
 			this.#providerRetryMaxAttempts = Math.min(
 				this.#providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY,

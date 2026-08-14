@@ -1526,6 +1526,34 @@ function resolveAnthropicFirstEventTimeoutMaxAttempts(requestBytes: number): num
 		: ANTHROPIC_SMALL_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS;
 }
 
+function attachAnthropicGraceFailureFacts(
+	error: unknown,
+	args: {
+		elapsedMs: number;
+		requestBytes: number;
+		firstEventTimeoutMs: number | undefined;
+		endpointClass: "canonical" | "custom";
+	},
+): void {
+	if (
+		!(error instanceof Error) ||
+		args.firstEventTimeoutMs === undefined ||
+		args.firstEventTimeoutMs <= 0 ||
+		args.elapsedMs < args.firstEventTimeoutMs ||
+		args.endpointClass !== "custom" ||
+		args.requestBytes < ANTHROPIC_LARGE_REQUEST_BYTES
+	) {
+		return;
+	}
+	Object.assign(error, {
+		requestBytes: args.requestBytes,
+		firstEventElapsedMs: args.elapsedMs,
+		firstEventTimeoutMs: args.firstEventTimeoutMs,
+		endpointClass: args.endpointClass,
+		retryMaxAttempts: ANTHROPIC_LARGE_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS,
+	});
+}
+
 function createAnthropicFirstEventTimeoutError(args: {
 	elapsedMs: number;
 	requestBytes: number;
@@ -2011,7 +2039,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
-			const endpointClass = classifyAnthropicEndpoint(baseUrl);
+			const endpointClass = classifyAnthropicEndpoint(options?.client?.baseURL ?? baseUrl);
 			stream.push({ type: "start", partial: output });
 			// Retry loop for transient errors from the stream.
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
@@ -2385,6 +2413,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				} catch (streamError) {
 					const localAbortReason = activeAbortTracker.getLocalAbortReason();
 					const streamFailure = localAbortReason ?? streamError;
+					attachAnthropicGraceFailureFacts(streamFailure, {
+						elapsedMs: Date.now() - requestStartedAt,
+						requestBytes,
+						firstEventTimeoutMs,
+						endpointClass,
+					});
 					if (localAbortReason || sawProviderSafetyStop) {
 						throw streamFailure;
 					}
@@ -2694,7 +2728,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					const canRetryProviderFailure =
 						firstTokenTime === undefined && isProviderRetryableError(streamFailure, model.provider);
 					const firstEventRetryMaxAttempts =
-						streamFailure instanceof FirstEventTimeoutError ? streamFailure.retryMaxAttempts : undefined;
+						typeof (streamFailure as { retryMaxAttempts?: unknown }).retryMaxAttempts === "number"
+							? (streamFailure as { retryMaxAttempts: number }).retryMaxAttempts
+							: undefined;
 					if (
 						activeAbortTracker.wasCallerAbort() ||
 						(firstEventRetryMaxAttempts !== undefined &&
