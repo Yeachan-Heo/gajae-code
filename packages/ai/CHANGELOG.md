@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Validate Synthetic API key via models endpoint, not retired Kimi probe (#4385).
+
 ## [0.13.2] - 2026-08-13
 
 ### Fixed
