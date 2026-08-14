@@ -905,6 +905,79 @@ describe("AgentSession retry fallback", () => {
 		expect(refreshSpy).toHaveBeenCalledTimes(2);
 	});
 
+	it("advances managed fallback without mutating credentials after a reached ceiling", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.set("anthropic", [
+			{ type: "api_key", key: "account-a-key" },
+			{ type: "api_key", key: "account-b-key" },
+		]);
+		const poolSessionId = "managed-large-grace-pool";
+		const requestedAnthropicKeys: string[] = [];
+		const requestedModels: string[] = [];
+		let primaryCalls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, poolSessionId);
+				if (provider === "anthropic" && key) requestedAnthropicKeys.push(key);
+				return key;
+			},
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				if (requestedModel.provider === primary.provider) {
+					primaryCalls++;
+					return typedRateLimitStream(requestedModel, 60_000, "429 Overloaded during grace", {
+						anthropicErrorType: "rate_limit_error",
+						requestBytes: 1_750_732,
+						firstEventElapsedMs: 305_000,
+						firstEventTimeoutMs: 300_000,
+						endpointClass: "custom",
+						retryMaxAttempts: 1,
+					});
+				}
+				return createMockModel({ responses: [{ content: ["Fallback recovered"] }] }).stream(
+					requestedModel,
+					context,
+					options,
+				);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 2,
+			"retry.maxRetries": 9,
+			"retry.baseDelayMs": 1,
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: "managed-large-grace-logical",
+			providerCacheSessionId: poolSessionId,
+			credentialSessionId: poolSessionId,
+		});
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("advance without rotating bounded credential");
+		await session.waitForIdle();
+
+		expect(primaryCalls).toBe(1);
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`]);
+		expect(requestedAnthropicKeys).toHaveLength(1);
+		expect(await modelRegistry.getApiKeyForProvider("anthropic", poolSessionId)).toBe(requestedAnthropicKeys[0]);
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
+	});
+
 	it("bounds all-provider canonical timeout exhaustion", async () => {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");

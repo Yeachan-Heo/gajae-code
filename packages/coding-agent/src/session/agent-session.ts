@@ -18393,7 +18393,9 @@ export class AgentSession {
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
-			if (managedFallback && !credentialRotated) await this.#markFailedCredential(trigger);
+			if (managedFallback && !credentialRotated && !providerRetryCeilingReached) {
+				await this.#markFailedCredential(trigger);
+			}
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
 			if (outcome === "advance") {
