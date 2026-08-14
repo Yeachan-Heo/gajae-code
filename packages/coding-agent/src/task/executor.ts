@@ -1527,7 +1527,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
-				explicitThinkingLevel,
 				authFallbackUsed,
 				requestedModel,
 				fallbackReason,
@@ -1583,9 +1582,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const forkContextSeed = options.forkContextSeed
 				? trimForkContextSeedForModel(options.forkContextSeed, model)
 				: undefined;
-			const effectiveThinkingLevel = explicitThinkingLevel
-				? resolvedThinkingLevel
-				: (thinkingLevel ?? resolvedThinkingLevel);
+			// Resolve effective thinking level: model resolution wins, but fall back to
+			// explicit override (from profile model_mapping :effort or frontmatter) when
+			// the resolution produced no level (e.g. omlx models lack `thinking` config).
+			const effectiveThinkingLevel = resolvedThinkingLevel ?? thinkingLevel;
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
 			const sessionManager = options.managedPersistence
