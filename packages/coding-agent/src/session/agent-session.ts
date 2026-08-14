@@ -18303,13 +18303,14 @@ export class AgentSession {
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		outcome = managedFallback
-			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
-				? "retry"
-				: "exhausted";
 		if (providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts) {
 			outcome = "exhausted";
+		} else {
+			outcome = managedFallback
+				? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
+				: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+					? "retry"
+					: "exhausted";
 		}
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
@@ -18406,7 +18407,9 @@ export class AgentSession {
 					attempt: this.#retryAttempt,
 					maxAttempts:
 						managedFallback && !localSnapshot
-							? controller.maxAttempts
+							? firstEventTimeout
+								? Math.min(controller.maxAttempts, providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY)
+								: controller.maxAttempts
 							: firstEventTimeout
 								? Math.min(retrySettings.maxRetries + 1, providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY)
 								: retrySettings.maxRetries,

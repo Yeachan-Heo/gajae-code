@@ -148,7 +148,7 @@ function createAnthropicMockStream({
 }
 
 afterEach(() => {
-	// No shared globals to restore; keep hook so the suite stays explicit.
+	vi.useRealTimers();
 });
 
 describe("anthropic first-event timeouts", () => {
@@ -266,7 +266,7 @@ describe("anthropic first-event timeouts", () => {
 
 		const result = await streamAnthropic(
 			customModel("https://user:password@proxy.example/v1?token=secret"),
-			context,
+			contextWithBytes(1_670_000),
 			{
 				client: { messages: { create } } as Anthropic,
 				streamFirstEventTimeoutMs: 1,
@@ -291,7 +291,7 @@ describe("anthropic first-event timeouts", () => {
 		const controller = new AbortController();
 		setTimeout(() => controller.abort(), 5);
 
-		const result = await streamAnthropic(customModel("https://proxy.example"), context, {
+		const result = await streamAnthropic(customModel("https://proxy.example"), contextWithBytes(1_670_000), {
 			client: { messages: { create } } as Anthropic,
 			signal: controller.signal,
 			streamFirstEventTimeoutMs: 1,
@@ -300,6 +300,71 @@ describe("anthropic first-event timeouts", () => {
 		expect(attempts).toBe(1);
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
+	});
+
+	it("surfaces redacted timeout facts after large custom-endpoint grace expires", async () => {
+		vi.useFakeTimers();
+		let attempts = 0;
+		const streamStarted = Promise.withResolvers<void>();
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			streamStarted.resolve();
+			return createAnthropicMockStream({ signal: requestOptions?.signal }) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+
+		const resultPromise = streamAnthropic(
+			customModel("https://user:password@proxy.example/v1?token=secret"),
+			contextWithBytes(1_670_000),
+			{
+				client: { messages: { create } } as Anthropic,
+				streamFirstEventTimeoutMs: 1,
+			},
+		).result();
+		await streamStarted.promise;
+		for (let index = 0; index < 20 && vi.getTimerCount() === 0; index++) {
+			await Promise.resolve();
+		}
+		expect(vi.getTimerCount()).toBeGreaterThan(0);
+		vi.advanceTimersByTime(120_001);
+		await Promise.resolve();
+		await Promise.resolve();
+		const result = await resultPromise;
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("elapsed=120001ms");
+		expect(result.errorMessage).toContain("endpoint=custom");
+		expect(result.errorMessage).toContain("configured_timeout=1ms");
+		expect(result.errorMessage).not.toContain("password");
+		expect(result.errorMessage).not.toContain("token=secret");
+		expect(result.transportFailure).toMatchObject({
+			endpointClass: "custom",
+			firstEventTimeoutMs: 1,
+			retryMaxAttempts: 1,
+		});
+		expect(result.transportFailure?.requestBytes).toBeGreaterThan(1_000_000);
+	});
+
+	it("does not extend the configured first-event window for a small custom-endpoint request", async () => {
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			return createAnthropicMockStream({ signal: requestOptions?.signal }) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), context, {
+			client: { messages: { create } } as Anthropic,
+			streamFirstEventTimeoutMs: 1,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.transportFailure).toMatchObject({
+			endpointClass: "custom",
+			retryMaxAttempts: 2,
+		});
+		expect(result.duration).toBeLessThan(1_000);
 	});
 
 	it("surfaces large retry-after Anthropic 429s instead of first-event timeouts", async () => {

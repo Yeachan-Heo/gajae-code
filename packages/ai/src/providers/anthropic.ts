@@ -1493,8 +1493,15 @@ function classifyAnthropicEndpoint(baseUrl: string): "canonical" | "custom" {
 function resolveAnthropicFirstEventWatchdogMs(
 	firstEventTimeoutMs: number | undefined,
 	endpointClass: "canonical" | "custom",
+	requestBytes: number,
 ): number | undefined {
-	if (firstEventTimeoutMs === undefined || endpointClass === "canonical") return firstEventTimeoutMs;
+	if (
+		firstEventTimeoutMs === undefined ||
+		endpointClass === "canonical" ||
+		requestBytes < ANTHROPIC_LARGE_REQUEST_BYTES
+	) {
+		return firstEventTimeoutMs;
+	}
 	return firstEventTimeoutMs + ANTHROPIC_CUSTOM_ENDPOINT_FIRST_EVENT_GRACE_MS;
 }
 
@@ -1990,7 +1997,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
 			const endpointClass = classifyAnthropicEndpoint(baseUrl);
-			const firstEventWatchdogMs = resolveAnthropicFirstEventWatchdogMs(firstEventTimeoutMs, endpointClass);
 			stream.push({ type: "start", partial: output });
 			// Retry loop for transient errors from the stream.
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
@@ -1999,6 +2005,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			while (true) {
 				const requestStartedAt = Date.now();
 				const requestBytes = fingerprintAnthropicPayload(params).bytes;
+				const firstEventWatchdogMs = resolveAnthropicFirstEventWatchdogMs(
+					firstEventTimeoutMs,
+					endpointClass,
+					requestBytes,
+				);
 				// Retries reset output.content; drop stale block correlations from the aborted attempt.
 				blocksByAnthropicIndex.clear();
 				truncatedToolCalls.clear();
