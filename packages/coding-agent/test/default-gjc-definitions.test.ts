@@ -698,6 +698,66 @@ Project executor override body.
 		).toBe(true);
 	});
 
+	it("quarantines a retired bundled skill left on disk instead of leaving it discoverable", async () => {
+		const targetRoot = await makeTempRoot();
+		const retiredSkill = path.join(targetRoot, "skills", "team", "SKILL.md");
+		await Bun.write(retiredSkill, "---\nname: team\n---\n\nstale bundled team skill\n");
+
+		const result = await installDefaultGjcDefinitions({ targetRoot });
+
+		// The retired directory is gone from the discoverable skills root...
+		expect(await Bun.file(retiredSkill).exists()).toBe(false);
+		const row = result.retired.find(entry => entry.name === "team");
+		expect(row?.status).toBe("quarantined");
+		// ...but the content survives under retired/, so a customized copy is not destroyed.
+		expect(row?.quarantinedTo).toBeDefined();
+		expect(await Bun.file(path.join(row!.quarantinedTo!, "SKILL.md")).text()).toContain("stale bundled team skill");
+		// Retiring team must not disturb the four current skills.
+		expect(await Bun.file(path.join(targetRoot, "skills", "autoresearch", "SKILL.md")).exists()).toBe(true);
+	});
+
+	it("reports a retired skill under check without touching the filesystem", async () => {
+		const targetRoot = await makeTempRoot();
+		const retiredSkill = path.join(targetRoot, "skills", "team", "SKILL.md");
+		await Bun.write(retiredSkill, "stale\n");
+
+		const checked = await installDefaultGjcDefinitions({ targetRoot, check: true });
+
+		expect(checked.retired.find(entry => entry.name === "team")?.status).toBe("quarantined");
+		// --check is read-only: the file is still exactly where it was.
+		expect(await Bun.file(retiredSkill).exists()).toBe(true);
+		expect(await Bun.file(retiredSkill).text()).toBe("stale\n");
+	});
+
+	it("reports retired definitions as absent when none are on disk and never creates retired/", async () => {
+		const targetRoot = await makeTempRoot();
+
+		const result = await installDefaultGjcDefinitions({ targetRoot });
+
+		expect(result.retired.map(entry => entry.name)).toEqual(["team"]);
+		expect(result.retired.every(entry => entry.status === "absent")).toBe(true);
+		expect(await Bun.file(path.join(targetRoot, "retired")).exists()).toBe(false);
+	});
+
+	it("does not collide when the same retired skill is quarantined twice", async () => {
+		const targetRoot = await makeTempRoot();
+		const retiredSkill = path.join(targetRoot, "skills", "team", "SKILL.md");
+
+		await Bun.write(retiredSkill, "first\n");
+		const first = await installDefaultGjcDefinitions({ targetRoot });
+		await Bun.write(retiredSkill, "second\n");
+		const second = await installDefaultGjcDefinitions({ targetRoot });
+
+		const firstTo = first.retired.find(entry => entry.name === "team")?.quarantinedTo;
+		const secondTo = second.retired.find(entry => entry.name === "team")?.quarantinedTo;
+		expect(firstTo).toBeDefined();
+		expect(secondTo).toBeDefined();
+		expect(secondTo).not.toBe(firstTo);
+		// Neither quarantine overwrote the other.
+		expect(await Bun.file(path.join(firstTo!, "SKILL.md")).text()).toBe("first\n");
+		expect(await Bun.file(path.join(secondTo!, "SKILL.md")).text()).toBe("second\n");
+	});
+
 	it("refreshOnly rewrites stale local copies but never materializes missing ones", async () => {
 		const targetRoot = await makeTempRoot();
 		const deepInterviewSkillPath = path.join(targetRoot, "skills", "deep-interview", "SKILL.md");

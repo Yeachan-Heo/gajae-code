@@ -596,6 +596,14 @@ async function handleDefaultsSetup(flags: { json?: boolean; check?: boolean; for
 	console.log(chalk.dim(`Target: ${result.targetRoot}`));
 	console.log(chalk.dim(`Written: ${result.written}; skipped: ${result.skipped}`));
 	console.log(chalk.dim(inspectGuidance));
+	const quarantined = result.retired.filter(entry => entry.status === "quarantined");
+	for (const entry of quarantined) {
+		console.log(
+			chalk.dim(
+				`Retired: \`${entry.name}\` is no longer a bundled workflow skill; moved to ${entry.quarantinedTo} so it is no longer discoverable.`,
+			),
+		);
+	}
 	if (result.skipped > 0 && !flags.force) {
 		console.log(
 			chalk.dim(
