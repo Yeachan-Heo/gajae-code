@@ -1507,6 +1507,73 @@ describe("AgentSession resilient retry", () => {
 			/^First-event\/grace retry ceiling exhausted after 2 attempts; waited \d+ms total: 529 Overloaded$/,
 		);
 	});
+	it("clears a stale provider ceiling when a manual retry begins", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model");
+		const recovered = createMockModel({ responses: [{ content: ["continuation recovered"] }] });
+		let calls = 0;
+		const failureStream = (
+			errorMessage: string,
+			transportFailure: NonNullable<AssistantMessage["transportFailure"]>,
+		): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const failure = assistantMessage(model, [], "error", errorMessage);
+				failure.transportFailure = transportFailure;
+				stream.push({ type: "start", partial: failure });
+				stream.push({ type: "error", reason: "error", error: failure });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls++;
+				if (calls === 1) {
+					return failureStream("Anthropic stream timed out while waiting for the first event", {
+						kind: "transport",
+						providerCode: "stream_first_event_timeout",
+						requestBytes: 4096,
+						firstEventElapsedMs: 100_000,
+						firstEventTimeoutMs: 100_000,
+						endpointClass: "canonical",
+						retryMaxAttempts: 1,
+					});
+				}
+				if (calls === 2) {
+					return failureStream("529 Overloaded", {
+						kind: "transport",
+						status: 529,
+						anthropicErrorType: "overloaded_error",
+					});
+				}
+				return recovered.stream(requestedModel, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxDelayMs": 10,
+			"retry.maxRetries": 5,
+		});
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		await session.prompt("timeout once then fail the turn");
+		await session.waitForIdle();
+		// The one-attempt provider ceiling exhausts the first turn immediately.
+		expect(calls).toBe(1);
+		expect(lastAssistant(session).errorMessage).toContain("exhausted after 1 attempts");
+
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		// Manual retry cleared the prior turn's one-attempt ceiling, so the 529 on
+		// the reissued turn consumes the ordinary retry budget and recovers; a
+		// retained stale ceiling would exhaust the 529 after a single attempt.
+		expect(calls).toBe(3);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "continuation recovered" }]);
+	});
 	it("clears the first-event ceiling after a successful retry before a tool continuation", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled Anthropic test model");
