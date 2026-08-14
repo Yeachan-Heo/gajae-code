@@ -792,6 +792,11 @@ describe("AgentSession retry fallback", () => {
 					return canonicalFirstEventTimeoutStream(requestedModel, [], {
 						kind: "transport",
 						providerCode: "stream_first_event_timeout",
+						requestBytes: 1_750_732,
+						firstEventElapsedMs: 420_000,
+						firstEventTimeoutMs: 300_000,
+						endpointClass: "custom",
+						retryMaxAttempts: 1,
 					});
 				}
 				return createMockModel({ responses: [{ content: ["Fallback recovered"] }] }).stream(
@@ -825,13 +830,9 @@ describe("AgentSession retry fallback", () => {
 		await session.prompt("recover canonical timeout through fallback");
 		await session.waitForIdle();
 
-		expect(primaryCalls).toBe(2);
-		expect(requestedModels).toEqual([
-			`${primary.provider}/${primary.id}`,
-			`${primary.provider}/${primary.id}`,
-			`${fallback.provider}/${fallback.id}`,
-		]);
-		expect(retryStartEvents).toHaveLength(2);
+		expect(primaryCalls).toBe(1);
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`]);
+		expect(retryStartEvents).toHaveLength(1);
 		expect(retryStartEvents.every(event => event.maxAttempts === 2 && event.unbounded === false)).toBe(true);
 		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 		expect(switches).toEqual([
@@ -839,7 +840,7 @@ describe("AgentSession retry fallback", () => {
 				from: `${primary.provider}/${primary.id}`,
 				to: `${fallback.provider}/${fallback.id}`,
 				reason: "server",
-				attemptsUsed: 2,
+				attemptsUsed: 1,
 			}),
 		]);
 		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });

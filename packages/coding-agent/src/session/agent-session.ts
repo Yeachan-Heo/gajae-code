@@ -2181,6 +2181,7 @@ export class AgentSession {
 		this.#retryReplayEpoch++;
 		this.#retryReplayUnsafeEpoch = undefined;
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
+		this.#providerRetryMaxAttempts = undefined;
 	}
 
 	#markRetryReplayUnsafe(): void {
@@ -2218,6 +2219,7 @@ export class AgentSession {
 	#retryAbortController: AbortController | undefined = undefined;
 	#retryNowRequested = false;
 	#firstEventTimeoutRetryStartedAt: number | undefined;
+	#providerRetryMaxAttempts: number | undefined;
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
@@ -18209,7 +18211,14 @@ export class AgentSession {
 		}
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
-		const providerRetryMaxAttempts = firstEventTimeout ? transportFailure?.retryMaxAttempts : undefined;
+		const reportedRetryMaxAttempts = firstEventTimeout ? transportFailure?.retryMaxAttempts : undefined;
+		if (reportedRetryMaxAttempts !== undefined) {
+			this.#providerRetryMaxAttempts = Math.min(
+				this.#providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY,
+				reportedRetryMaxAttempts,
+			);
+		}
+		const providerRetryMaxAttempts = this.#providerRetryMaxAttempts;
 		// Content-free message-only watchdog prose (wrapped canonical or bare
 		// per-provider variants) is admitted like the typed path: it is
 		// replay-safe, so a bare-default retry may re-issue the request even
@@ -18303,14 +18312,22 @@ export class AgentSession {
 		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts) {
-			outcome = "exhausted";
+		if (managedFallback) {
+			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+			if (
+				providerRetryMaxAttempts !== undefined &&
+				attemptsUsed >= providerRetryMaxAttempts &&
+				outcome === "retry"
+			) {
+				outcome = controller.advance() ? "advance" : "exhausted";
+			}
 		} else {
-			outcome = managedFallback
-				? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-				: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
-					? "retry"
-					: "exhausted";
+			outcome =
+				providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts
+					? "exhausted"
+					: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+						? "retry"
+						: "exhausted";
 		}
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
@@ -18329,6 +18346,9 @@ export class AgentSession {
 				outcome = "retry";
 			}
 		}
+		if (outcome === "advance") {
+			this.#providerRetryMaxAttempts = undefined;
+		}
 		if (outcome === "exhausted") {
 			if (managedFallback) {
 				const errorMessage = this.#fallbackExhaustionError(controller);
@@ -18337,9 +18357,13 @@ export class AgentSession {
 				controller.resetSticky();
 				return managedOutcome ? this.#managedFallbackExhaustionDecision(message, errorMessage) : false;
 			}
-			if (classification === "first_event_timeout") {
+			if (classification === "first_event_timeout" || providerRetryMaxAttempts !== undefined) {
 				const elapsedMs = Date.now() - (this.#firstEventTimeoutRetryStartedAt ?? Date.now());
-				message.errorMessage = `First-event stream timeout exhausted after ${attemptsUsed} attempts; waited ${elapsedMs}ms total: ${message.errorMessage ?? "Unknown error"}`;
+				const prefix =
+					classification === "first_event_timeout"
+						? "First-event stream timeout exhausted"
+						: "First-event stream timeout retry ceiling exhausted";
+				message.errorMessage = `${prefix} after ${attemptsUsed} attempts; waited ${elapsedMs}ms total: ${message.errorMessage ?? "Unknown error"}`;
 			}
 			return false;
 		}
@@ -18408,10 +18432,13 @@ export class AgentSession {
 					maxAttempts:
 						managedFallback && !localSnapshot
 							? firstEventTimeout
-								? Math.min(controller.maxAttempts, providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY)
+								? Math.min(controller.maxAttempts, this.#providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY)
 								: controller.maxAttempts
 							: firstEventTimeout
-								? Math.min(retrySettings.maxRetries + 1, providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY)
+								? Math.min(
+										retrySettings.maxRetries + 1,
+										this.#providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY,
+									)
 								: retrySettings.maxRetries,
 					delayMs,
 					errorMessage,

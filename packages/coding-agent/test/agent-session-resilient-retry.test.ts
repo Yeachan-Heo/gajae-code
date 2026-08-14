@@ -127,6 +127,11 @@ describe("AgentSession resilient retry", () => {
 		requestedModels?: string[];
 		settingsOverrides?: Record<string, unknown>;
 		onStreamStart?: () => void;
+		failureByCall?: (call: number) => {
+			errorMessage?: string;
+			errorStatus?: number;
+			transportFailure?: AssistantMessage["transportFailure"];
+		};
 	}): AgentSession {
 		const model = options.model ?? getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model to exist");
@@ -138,6 +143,7 @@ describe("AgentSession resilient retry", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, opts) => {
 				calls++;
+				const callFailure = options.failureByCall?.(calls);
 				options.onStreamStart?.();
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				if (calls > 1 && options.recoveredContent) {
@@ -164,10 +170,16 @@ describe("AgentSession resilient retry", () => {
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
 						stopReason: "error",
-						...(options.errorMessage === undefined ? {} : { errorMessage: options.errorMessage }),
-						...(options.errorStatus === undefined ? {} : { errorStatus: options.errorStatus }),
+						...(callFailure?.errorMessage === undefined && options.errorMessage === undefined
+							? {}
+							: { errorMessage: callFailure?.errorMessage ?? options.errorMessage }),
+						...(callFailure?.errorStatus === undefined && options.errorStatus === undefined
+							? {}
+							: { errorStatus: callFailure?.errorStatus ?? options.errorStatus }),
 						...(options.errorKind === undefined ? {} : { errorKind: options.errorKind }),
-						...(options.transportFailure === undefined ? {} : { transportFailure: options.transportFailure }),
+						...(callFailure?.transportFailure === undefined && options.transportFailure === undefined
+							? {}
+							: { transportFailure: callFailure?.transportFailure ?? options.transportFailure }),
 						timestamp: Date.now(),
 					};
 					stream.push({ type: "start", partial: message });
@@ -1427,6 +1439,43 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryStartEvents[0]?.maxAttempts).toBe(2);
 		expect(lastAssistant(session).errorMessage).toContain("exhausted after 2 attempts");
+	});
+	it("keeps the first-event attempt ceiling across a later transient failure", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 5 },
+			failureByCall: call =>
+				call === 1
+					? {
+							errorMessage: "Anthropic stream timed out while waiting for the first event",
+							transportFailure: {
+								kind: "transport",
+								providerCode: "stream_first_event_timeout",
+								requestBytes: 4096,
+								firstEventElapsedMs: 100_000,
+								firstEventTimeoutMs: 100_000,
+								endpointClass: "canonical",
+								retryMaxAttempts: 2,
+							},
+						}
+					: {
+							errorMessage: "529 Overloaded",
+							errorStatus: 529,
+							transportFailure: { kind: "transport", status: 529, anthropicErrorType: "overloaded_error" },
+						},
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("timeout then overload stays bounded");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(lastAssistant(session).errorMessage).toMatch(
+			/^First-event stream timeout retry ceiling exhausted after 2 attempts; waited \d+ms total: 529 Overloaded$/,
+		);
 	});
 	it("replays a typed first-event timeout before progress and never after progress", async () => {
 		const noProgressModels: string[] = [];
