@@ -64,6 +64,45 @@ describe("streamSimple auth retry", () => {
 		unregisterCustomApis(SOURCE_ID);
 	});
 
+	it("aborts the active auth-retry request when the public consumer returns early", async () => {
+		let providerSignal: AbortSignal | undefined;
+		let providerAborted = false;
+		registerCustomApi(
+			API,
+			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+				providerSignal = options?.signal;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const message = assistant(["partial"]);
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "text_delta", contentIndex: 0, delta: "partial", partial: message });
+				});
+				providerSignal?.addEventListener(
+					"abort",
+					() => {
+						providerAborted = true;
+						stream.fail(new Error("Request was aborted"));
+					},
+					{ once: true },
+				);
+				return stream;
+			},
+			SOURCE_ID,
+		);
+
+		const stream = streamSimple(model(), context, {
+			apiKey: "old-key",
+			onAuthError: async () => "new-key",
+		});
+		const iterator = stream[Symbol.asyncIterator]();
+		expect((await iterator.next()).done).toBe(false);
+		await iterator.return?.();
+		await Bun.sleep(0);
+
+		expect(providerSignal?.aborted).toBe(true);
+		expect(providerAborted).toBe(true);
+	});
+
 	it("retries once with a fresh key when 401 happens before the first event", async () => {
 		const keys: Array<string | undefined> = [];
 		let authCalls = 0;

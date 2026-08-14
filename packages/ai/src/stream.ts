@@ -493,7 +493,11 @@ export function streamSimple<TApi extends Api>(
 	}
 	const retryApiKey = options?.onAuthError ? (options.apiKey ?? getEnvApiKey(model.provider)) : undefined;
 	if (retryApiKey) {
-		const outer = new AssistantMessageEventStream();
+		const consumerAbortController = new AbortController();
+		const outer = new AssistantMessageEventStream(() => consumerAbortController.abort());
+		const requestSignal = options?.signal
+			? AbortSignal.any([options.signal, consumerAbortController.signal])
+			: consumerAbortController.signal;
 		const onAuthError = options!.onAuthError!;
 		const runAttempt = async (apiKey: string, captureAuthFailure: boolean): Promise<AuthRetryFailure | undefined> => {
 			const bufferedEvents: AssistantMessageEvent[] = [];
@@ -504,7 +508,12 @@ export function streamSimple<TApi extends Api>(
 			};
 
 			try {
-				const inner = streamSimple(model, context, { ...options, apiKey, onAuthError: undefined });
+				const inner = streamSimple(model, context, {
+					...options,
+					apiKey,
+					onAuthError: undefined,
+					signal: requestSignal,
+				});
 				for await (const event of inner) {
 					if (!emittedReplayUnsafeEvent && event.type === "start") {
 						bufferedEvents.push(event);
