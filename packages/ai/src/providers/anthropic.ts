@@ -1533,10 +1533,12 @@ function attachAnthropicGraceFailureFacts(
 		requestBytes: number;
 		firstEventTimeoutMs: number | undefined;
 		endpointClass: "canonical" | "custom";
+		awaitingFirstEvent: boolean;
 	},
 ): void {
 	if (
 		!(error instanceof Error) ||
+		!args.awaitingFirstEvent ||
 		args.firstEventTimeoutMs === undefined ||
 		args.firstEventTimeoutMs <= 0 ||
 		args.elapsedMs < args.firstEventTimeoutMs ||
@@ -2065,6 +2067,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				const anthropicRequest = client.messages.create({ ...params, stream: true }, { signal: requestSignal });
 				let streamedReplayUnsafeContent = false;
 				let sawProviderSafetyStop = false;
+				let sawFirstSemanticEvent = false;
 
 				try {
 					const {
@@ -2099,7 +2102,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							activeAbortTracker.abortLocally(firstEventTimeoutAbortError);
 						},
 						abortSignal: options?.signal,
-						isProgressItem: isProgressEvent,
+						isProgressItem: event => {
+							const progress = isProgressEvent(event);
+							if (progress) sawFirstSemanticEvent = true;
+							return progress;
+						},
 					})) {
 						sawEvent = true;
 						if (sawMessageStop) {
@@ -2418,6 +2425,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						requestBytes,
 						firstEventTimeoutMs,
 						endpointClass,
+						awaitingFirstEvent: !sawFirstSemanticEvent,
 					});
 					if (localAbortReason || sawProviderSafetyStop) {
 						throw streamFailure;

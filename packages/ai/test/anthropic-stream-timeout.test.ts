@@ -331,6 +331,49 @@ describe("anthropic first-event timeouts", () => {
 		});
 	});
 
+	it("does not attach first-event grace ceilings after message_start progress", async () => {
+		const create = ((_body: unknown) => {
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					yield {
+						type: "message_start",
+						message: {
+							id: "msg_progress_before_failure",
+							usage: {
+								input_tokens: 12,
+								output_tokens: 0,
+								cache_read_input_tokens: 0,
+								cache_creation_input_tokens: 0,
+							},
+						},
+					};
+					await Bun.sleep(5);
+					const error = new Error("529 Overloaded after message_start");
+					(error as Error & { status: number }).status = 529;
+					throw error;
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+
+		const result = await streamAnthropic(model, contextWithBytes(1_670_000), {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 1,
+			streamIdleTimeoutMs: 5000,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(result.errorStatus).toBe(529);
+		expect(result.transportFailure?.retryMaxAttempts).toBeUndefined();
+		expect(result.transportFailure?.requestBytes).toBeUndefined();
+	});
+
 	it("honors caller abort while a custom endpoint is inside its bounded grace", async () => {
 		let attempts = 0;
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {

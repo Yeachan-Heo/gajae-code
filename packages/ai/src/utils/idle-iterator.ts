@@ -301,6 +301,11 @@ export async function* iterateWithIdleTimeout<T>(
 			if (outcome.kind === "error") {
 				throw outcome.error;
 			}
+			if (awaitingFirstItem && firstItemDeadlineAt !== undefined && Date.now() >= firstItemDeadlineAt) {
+				options.onFirstItemTimeout?.();
+				closeIterator();
+				throw new FirstEventTimeoutError(options.firstItemErrorMessage ?? options.errorMessage);
+			}
 			if (outcome.result.done) {
 				markFirstItemReceived();
 				return;

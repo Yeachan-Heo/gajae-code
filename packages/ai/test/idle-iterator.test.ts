@@ -10,6 +10,7 @@ async function waitForTimerRegistration(): Promise<void> {
 describe("iterateWithIdleTimeout transport facts", () => {
 	afterEach(() => {
 		vi.useRealTimers();
+		vi.restoreAllMocks();
 	});
 
 	it("normalizes the typed first-event timeout fact idempotently", () => {
@@ -114,5 +115,31 @@ describe("iterateWithIdleTimeout transport facts", () => {
 			kind: "transport",
 			providerCode: STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 		});
+	});
+
+	it("rejects a synchronously buffered non-progress item after the absolute first-event deadline", async () => {
+		let now = 0;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const source: AsyncIterable<string> = {
+			[Symbol.asyncIterator]() {
+				return {
+					async next() {
+						return { done: false as const, value: "ping" };
+					},
+				};
+			},
+		};
+		const iterator = iterateWithIdleTimeout(source, {
+			firstItemTimeoutMs: 2,
+			idleTimeoutMs: 100,
+			errorMessage: "stream idle",
+			firstItemErrorMessage: "first event timed out",
+			isProgressItem: () => false,
+		});
+
+		expect((await iterator.next()).value).toBe("ping");
+		now = 2;
+
+		await expect(iterator.next()).rejects.toBeInstanceOf(FirstEventTimeoutError);
 	});
 });
