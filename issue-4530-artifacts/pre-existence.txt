@@ -1,0 +1,307 @@
+=== 0d1d94d3fa6abe10743e5958560368bf03143ea0 | fix(sdk): land the PR #4098 review-cohort fix generations 4-7 (#4281)
+  EXISTS_PRE: docs/bot-integration.md
+  EXISTS_PRE: docs/sdk-app-guide.md
+  EXISTS_PRE: docs/sdk.md
+  EXISTS_PRE: docs/telegram-onboarding.md
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/commands/daemon.ts
+  EXISTS_PRE: packages/coding-agent/src/commands/sdk.ts
+  EXISTS_PRE: packages/coding-agent/src/coordinator-mcp/server.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/broker.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/lifecycle.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/session-index.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/transport.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/index.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/cli/session-cli.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/client/client.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/control/dispatch.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/control/operations.ts
+  NEW_IN_4098(modified=yes): packages/coding-agent/src/sdk/lifecycle/service.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/protocol/operation-inventory.generated.json
+  EXISTS_PRE: packages/coding-agent/src/sdk/protocol/operation-registry.ts
+  NEW_IN_4098(modified=yes): packages/coding-agent/src/sdk/router/session-router.ts
+  EXISTS_PRE: packages/coding-agent/src/session/internal/managed-session-storage.ts
+  EXISTS_PRE: packages/coding-agent/test/chat-daemon-session-reconnect.test.ts
+  EXISTS_PRE: packages/coding-agent/test/coordinator-mcp-server.test.ts
+  EXISTS_PRE: packages/coding-agent/test/manifests/sdk-adapter-parity-v1.json
+  EXISTS_PRE: packages/coding-agent/test/notifications-config.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-live-stream.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-telegram-daemon.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-tool-activity.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-topic-registry.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-adapter-dispositions.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-client.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-control-dispatch.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-daemon-cli-e2e.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-host-wiring.test.ts
+  NEW_IN_4098(modified=yes): packages/coding-agent/test/sdk-lifecycle-service.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-operation-matrix.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-serve-transport.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-session-index.test.ts
+  NEW_IN_4098(modified=yes): packages/coding-agent/test/sdk-session-router-authority.test.ts
+  EXISTS_PRE: scripts/generate-gjc-sdk-skills.test.ts
+  EXISTS_PRE: scripts/generate-gjc-sdk-skills.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-guard.test.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-guard.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+  EXISTS_PRE: scripts/verify-gjc-sdk-skills.ts
+  EXISTS_PRE: sdk-skills/gjc-sdk-author/templates/direct-sdk.ts
+=== ef269a7ba51990f163a68795352fde4f170a0f89 | fix(sdk): close post-merge review threads on the C04 terminal abort (#4282)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/modes/acp/acp-agent.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/broker.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/index.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/host.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/session-runtime.ts
+  EXISTS_PRE: packages/coding-agent/test/acp-prompt-settle-on-completion.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-topic-registry.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-chat-daemon-worker.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-daemon-cli-e2e.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-host-wiring.test.ts
+  EXISTS_PRE: packages/coding-agent/test/session/session-context-overflow.test.ts
+  EXISTS_PRE: scripts/ci-dev-affected.test.ts
+  NEW_IN_4098(modified=yes): scripts/run-sdk-production-host-isolated.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== 00ca7798bcc18e6d916fd46d6c127feaae58739f | fix(sdk): make terminal receipts and steering durable (#4080)
+  EXISTS_PRE: docs/sdk.md
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/coordinator-mcp/server.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/index.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/control/dispatch.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/control/operations.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/session-runtime.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/protocol/operation-inventory.generated.json
+  EXISTS_PRE: packages/coding-agent/src/sdk/protocol/operation-registry.ts
+  EXISTS_PRE: packages/coding-agent/test/manifests/sdk-adapter-parity-v1.json
+  EXISTS_PRE: packages/coding-agent/test/sdk-adapter-dispositions.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-control-dispatch.test.ts
+=== e02f6c5be93dd1efe00360eb7d47be8451c0d5a2 | fix(sdk): detach chat-provider daemon ownership from session lifecycle (#4427)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/index.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-config.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-live-stream.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-tool-activity.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-topic-registry.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-host-wiring.test.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== 3cf0aa531abd8a42809e027ca9a1e773c930ec73 | fix(dev-ci): repair the 0.13.1-window regressions and the session-index lock storm (#4263) (#4272)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/lifecycle.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/session-index.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/chat-daemon-control.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/chat-daemon-runtime.ts
+  NEW_IN_4098(modified=yes): packages/coding-agent/src/sdk/router/session-router.ts
+  NEW_IN_4098(modified=yes): packages/coding-agent/test/helpers/sdk-exact-session-authority.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-chat-daemon-worker.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-session-index.test.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== 65631379e8a4ae69ae8bb249bbf6f851fe12db76 | fix(telegram): reconcile orphaned session topics (#4268)
+  EXISTS_PRE: docs/sdk.md
+  EXISTS_PRE: docs/telegram-onboarding.md
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-config.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-telegram-daemon.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-topic-registry.test.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== a17c8417d2e00d4a8918057cf037da8f484cabbb | fix(acp): restore turn as the default session/cancel abort scope (#4360)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/modes/acp/acp-agent.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/acp/adapter.ts
+  EXISTS_PRE: packages/coding-agent/test/acp-prompt-watchdog.test.ts
+  EXISTS_PRE: packages/coding-agent/test/acp/acp-fallback-cancel-completion.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-acp-adapter.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-acp-production-path.test.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-acp-prompt-terminal.test.ts
+=== 16b3616ba80b2e741ecd77618d772276dd6096d6 | refactor(notifications): isolate Telegram failure authority (#4401)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon.ts
+  NEW_IN_4098(modified=yes): packages/coding-agent/src/sdk/router/session-router.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-topic-registry.test.ts
+  NEW_IN_4098(modified=yes): packages/coding-agent/test/sdk-session-router-authority.test.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== 00d4318ef65b031fe08f43c46c616b72b1d14710 | fix(sdk): sync session-index snapshot through a writable handle (#4254)
+  EXISTS_PRE: .github/workflows/dev-ci.yml
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/session-index.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-session-index.test.ts
+  EXISTS_PRE: scripts/ci-dev-affected.test.ts
+  EXISTS_PRE: scripts/ci-dev-affected.ts
+  EXISTS_PRE: scripts/dev-ci-guard-topology.test.ts
+=== bc2492af38d8b159e632cbf2f658c183c880c206 | fix(notifications): settle Telegram topic archives in private chats (#4327)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-telegram-daemon.test.ts
+  EXISTS_PRE: packages/coding-agent/test/notifications-topic-registry.test.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== d314993007abfaeef1e593f1a64ee25b15658a5b | refactor(sdk): unify duplicated durable terminal-retention writes (#4329)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/index.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/session-runtime.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== b10c9c405d3645c8aeb87717568cf9a9ae697c3e | fix(sdk): skip PowerShell when native binding reports absent process (#4362, #4365)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/chat-daemon-control.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== 9d25e79b8fd13c5bdcf55497acb567e3dcddcee5 | feat(sdk): bounded progress-aware prompt deadline lease with hard cap and exact-turn isolation (#4397)
+  EXISTS_PRE: docs/bot-integration.md
+  EXISTS_PRE: docs/sdk.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/session-runtime.ts
+  EXISTS_PRE: scripts/generate-gjc-sdk-skills.ts
+  EXISTS_PRE: sdk-skills/gjc-sdk-author/templates/direct-sdk.ts
+=== a7b487e58773f5f35480ce7996e2bbb404898e96 | chore(repo): untrack artifacts/ and define test working space policy (#4420)
+  EXISTS_PRE: AGENTS.md
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: scripts/ci-dev-affected.test.ts
+  EXISTS_PRE: scripts/ci-dev-affected.ts
+  EXISTS_PRE: scripts/clean-core.ts
+=== cf07293f7404b35c085dde35013aa5a12d595ad5 | fix(notifications): #4403 acceptance successor — process-group reap, fail-closed CLI, watchdog reconciliation (#4480)
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/bus/telegram-daemon.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== bf441220a8501422db350077dd6819f899176174 | fix(natives): retry transient Windows destination sharing violations in exactReplacePath (#4345)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/session/internal/managed-session-storage.ts
+  EXISTS_PRE: packages/natives/CHANGELOG.md
+  EXISTS_PRE: packages/natives/native/index.d.ts
+=== 4e4f7ce84ca842753c223f8eaf880dc0d501de2e | feat(ci): auto-repair daemon generation bumps from semantic guard changes (#4410)
+  EXISTS_PRE: package.json
+  EXISTS_PRE: scripts/telegram-daemon-generation-guard.test.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-guard.ts
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== 099ca7ec19654b2863f0a113ed569c8e7e96b9f5 | chore: bump version to 0.13.2
+  EXISTS_PRE: bun.lock
+  EXISTS_PRE: package.json
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/natives/native/index.d.ts
+=== 54c92fbf9a65704a11788a1d240e5296964eb3b2 | fix(acp): prevent stale attachment from terminalizing ACP session (#4356) (#4371)
+  EXISTS_PRE: packages/coding-agent/src/modes/acp/acp-agent.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/acp/adapter.ts
+  NEW_IN_4098(modified=yes): packages/coding-agent/src/sdk/router/session-router.ts
+=== d1d28d6e4fbe503d4f1f6f5425788411bc436728 | fix(ci): remove --isolate from coding-agent shard command (#4378) (#4381)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: scripts/ci-dev-affected.test.ts
+  EXISTS_PRE: scripts/ci-dev-affected.ts
+=== 73eb359d4e39a153a08db219397f0ee5c61dd16f | fix(dev-ci): repair issue #4293 unowned shard regressions (#4298)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: scripts/ci-dev-affected.test.ts
+  EXISTS_PRE: scripts/ci-dev-affected.ts
+=== f0a44081afe3dbebeba3afb9ab380517ebd6c8d7 | fix(test): split sdk-adapter-dispositions to stay under CI file-timeout (#4475)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/test/manifests/sdk-adapter-parity-v1.json
+  EXISTS_PRE: packages/coding-agent/test/sdk-adapter-dispositions.test.ts
+=== ffcd048d50cd1dac32cdc2074109a42d73e62f06 | fix(sdk): preserve workflow gate recovery during shutdown (#4299)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/host/session-runtime.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-host-wiring.test.ts
+=== 36876355417bbb2353fb294ec268ea247af96ba4 | fix(sdk): attribute reconnect-cycle termination (#4253)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/client/client.ts
+  EXISTS_PRE: packages/coding-agent/test/sdk-client.test.ts
+=== 7121d19c72bacb1bcf3837a837622825bd895430 | fix(acp): preserve cleanup-pending delete authority (#4506)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/modes/acp/acp-agent.ts
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/lifecycle.ts
+=== 295d7801aa1b5c9c297f4ada48f370da8ea01735 | fix(coordinator-mcp): narrow DR-1 post-close proof for incarnation-bound reap (#4483)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/coordinator-mcp/server.ts
+  EXISTS_PRE: packages/coding-agent/test/coordinator-mcp/stop-session.test.ts
+=== 6543e608560c6001df469ce8d036d14d8bfcabd3 | fix(coordinator): terminal session must not report ready_for_input (#4351) (#4358)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/coordinator-mcp/server.ts
+  EXISTS_PRE: packages/coding-agent/test/coordinator-mcp-server.test.ts
+=== 5f78d769b17ce7dd11bf58fe9dadf7ce95c0a6b0 | feat(cli): support 가재씨 as a Korean launcher alias for gjc (#4364)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/package.json
+  EXISTS_PRE: scripts/release-publish-order.test.ts
+=== 3354698b5339fa6337731e734ee75b7324e027b0 | fix(coordinator-mcp): answer ping keepalive with empty result (#4412)
+  EXISTS_PRE: packages/coding-agent/src/coordinator-mcp/server.ts
+  EXISTS_PRE: packages/coding-agent/test/coordinator-mcp-server.test.ts
+=== ace25b5bd84a8e4bb4c0827295eb6427599a4f79 | fix(sdk): terminalize scrubbed transcript deletion and update retired CLI ingress (#4278)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/test/sdk-machine-lifecycle-topology.test.ts
+=== 32269d8eb42afdcea86e41a5ea3be1d1c90e2c23 | fix(session): replace real-time settle sleeps with deterministic session settlement (#4476) (#4486)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/sdk/protocol/operation-inventory.generated.json
+=== be92463bab085e216ef3b4c0c74e09717bf9cf05 | fix(subagent): observable await liveness + sleep smell warning (#4465)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/prompts/tools/bash.md
+=== 6102c6333f3dd30dc731c6b0e7f5a2d00b27e148 | fix(sdk): verify session endpoint removal after graceful shutdown (#4230)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/commands/sdk.ts
+=== 2d5180fb696b91ccdfae5c938b00f67ccfd51ace | fix(sdk): restore the broker startup-failure marker writer and bind it to the exact spawned child (#4344)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+  EXISTS_PRE: packages/coding-agent/src/commands/sdk.ts
+=== 4675bf072d45745edd1c62abf0548a12de5f4bc9 | feat(herdr): report the gjc session title to the containing pane (#4402)
+  EXISTS_PRE: bun.lock
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 67b65937617c44c21f489744ea4bb149f41fbf33 | fix(session): close retained-authority residuals (#4246)
+  EXISTS_PRE: bun.lock
+  EXISTS_PRE: package.json
+=== 4a038bc0774a73ea5e83c686cd701d775feafe73 | fix(ci): regenerate telegram closure manifest after merge (#4467)
+  EXISTS_PRE: scripts/telegram-daemon-generation-manifest.json
+=== e389ebc1b51149d5e783a1c23ba366e707e14f43 | fix(test): revert shared package-cwd preload; pin overflow budgets in-process (#4224) (#4306)
+  EXISTS_PRE: packages/coding-agent/test/session/session-context-overflow.test.ts
+=== 6c3854c52a825300473e866b54a9f34ad00b3d08 | fix(session): resolve shard-1-of-8 lifecycle cluster failures (#4359)
+  EXISTS_PRE: packages/coding-agent/test/sdk-machine-lifecycle-topology.test.ts
+=== 50a787116a498b93b6b2082b9fbb918a804b8e78 | fix(test): update stale DAEMON_GENERATION assertion 165→166 (#4403 postmerge) (#4493)
+  EXISTS_PRE: packages/coding-agent/test/notifications-topic-registry.test.ts
+=== f7b77e5785cc6a7919141b0353ef9e54fa7cb911 | fix(sdk): classify extensions dashboard inventory seam
+  EXISTS_PRE: packages/coding-agent/src/sdk/protocol/operation-inventory.generated.json
+=== eaed3aeca2730fab0d07b23b651d7bb1c598a32b | style(broker): drop the stray blank line that fails repo-pinned biome on dev (#4300)
+  EXISTS_PRE: packages/coding-agent/src/sdk/broker/broker.ts
+=== 178fc2624803c76ee4fc5bc6ce89e7ed8f906373 | fix(controller): reject malformed extension user messages (#4395)
+  EXISTS_PRE: packages/coding-agent/src/modes/controllers/extension-ui-controller.ts
+=== 7931cf6995a58cd02e5e43e65939af2656530715 | fix(coordinator): isolate idempotency lock artifacts from record directory (#4484)
+  EXISTS_PRE: packages/coding-agent/src/coordinator-mcp/server.ts
+=== f44f6fbe179d25b92aa245fe2096739e6be42e6e | fix(settings): follow-up to #4245 review threads — retirement ordering, marker fail-closed, probe robustness, Bun.write staging (#4277)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== b7e0dea98c07082830b2a3bf66ec933c89633ffd | feat(customization): add provenance-aware customization doctor (#4288)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== b5ef23f52208e3eaf0a25c1eaf0056b8f6b191c5 | fix(coding-agent): terminate completed print runs (#4446)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 8d6784cb374386367a9ddb1e8777645cb4c12723 | fix(session): recover from managed transcript content_too_large (#4408) (#4411)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 818896af4290c9a1673d9789527ec89f6baa318b | feat(auth): add --prefer-credential soft quota fallback for multi-account pools (#4317)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 7247cc755109ee5362ed176693980cdd5f38e4b7 | fix(settings): complete the retirement recovery and publication-proof follow-ups
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 71c6cdf5d7dd95d6b870ed41a3c15c737161abbf | docs(customization): align hook runtime authority
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 628604d5b67e8af376d31667a14b1c13f281e183 | feat(tui): support /theme <name> for immediate theme switching (#4429)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 515f1c7cb244f2cc5a1863af016f2a2e31ae22c5 | fix(session): recover missing managed transcripts (#4421)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 4a927889f3c138b0f2efd2e86024ae278f5ef9cc | feat(auth): add /credential slash command for mid-session account switching (#4321)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 429c7c54ce54f9505b8e43435ad5c2cb5e1718d7 | fix(notifications): bump chat daemon generations for shared Router lifecycle changes (#4401 postmerge) (#4405)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 41473691c5a97de8ce0c3b10ae03e358df90f489 | feat(mcp): activate conventional autoload for native .gjc MCP registrations (#4335)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 37ec2c5f87aac47c35a870b4969b53620a354d7c | fix(models): fall back from unavailable Opus 5 (#4301)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 2d39e6d6df66d87181384fb9232ce61bfc7d2bf8 | feat(setup): add gjc setup paseo to register GJC as a Paseo provider (replacement for #4417, credits @probepark)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 12e1df1724bec0b7b1a40988cdc2a0c7dcca29ec | feat(mcp): support MCP 2026-07-28 stateless protocol (MCP v2) (#4292)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 0ca33b8532ea4f5377d5d6c01143d89b8d85aab9 | fix(task): exclude exact MCP managers from subagents (#4419)
+  EXISTS_PRE: packages/coding-agent/CHANGELOG.md
+=== 01b370fba17638abd7d8cac866ceabb1f1e7ebab | fix(ci): add trusted PR contract bootstrap
+  EXISTS_PRE: .github/workflows/dev-ci.yml
+=== 61f443d9bff05ef24cc7f2e6380da1d23e6a863b | fix(docs): restore accurate removed-surface wording in bot integration docs (#4482)
+  EXISTS_PRE: docs/bot-integration.md

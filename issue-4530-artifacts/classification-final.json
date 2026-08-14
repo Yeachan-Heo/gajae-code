@@ -1,0 +1,226 @@
+{
+  "generated_at": "2026-08-13",
+  "issue": 4530,
+  "pr_being_reverted": 4098,
+  "merge_commit": "9bd1b642bc994bce880d961d2a4528d050551892",
+  "pre_merge_dev": "56450d2a05c5bce3af995b9a5c3398b76b7c8986",
+  "current_dev": "099ca7ec19654b2863f0a113ed569c8e7e96b9f5",
+  "pr_4098_branch_tip": "489c4ed43da4dd690b54da32d03e50a7b2f11104",
+  "total_first_parent_commits": 172,
+  "total_overlap_commits": 62,
+  "total_non_overlap_commits": 110,
+  "classification_counts": {
+    "MUST_REVERT": 24,
+    "RETAIN_INDEPENDENT": 37,
+    "REAPPLY_AFTER_REVERT": 1
+  },
+  "new_in_4098_files": [
+    "docs/sdk-owned-session-lifecycle-handoff.md",
+    "packages/coding-agent/src/sdk/host/control/runtime-gate.ts",
+    "packages/coding-agent/src/sdk/lifecycle/broker-client.ts",
+    "packages/coding-agent/src/sdk/lifecycle/client.ts",
+    "packages/coding-agent/src/sdk/lifecycle/index.ts",
+    "packages/coding-agent/src/sdk/lifecycle/recent-sessions.ts",
+    "packages/coding-agent/src/sdk/lifecycle/service.ts",
+    "packages/coding-agent/src/sdk/router/index.ts",
+    "packages/coding-agent/src/sdk/router/session-router.ts",
+    "packages/coding-agent/src/sdk/session-list.ts",
+    "packages/coding-agent/test/helpers/sdk-endpoint.ts",
+    "packages/coding-agent/test/helpers/sdk-exact-session-authority.ts",
+    "packages/coding-agent/test/sdk-lifecycle-service.test.ts",
+    "packages/coding-agent/test/sdk-lifecycle-telegram-integration.test.ts",
+    "packages/coding-agent/test/sdk-session-lifecycle-authority.test.ts",
+    "packages/coding-agent/test/sdk-session-list.test.ts",
+    "packages/coding-agent/test/sdk-session-router-authority.test.ts",
+    "scripts/run-sdk-production-host-isolated.ts"
+  ],
+  "must_revert": [
+    {
+      "sha": "0d1d94d3fa6abe10743e5958560368bf03143ea0",
+      "pr": "4098",
+      "subject": "fix(sdk): land the PR #4098 review-cohort fix generations 4-7 (#4281)",
+      "reason": "#4281: explicitly '#4098 review-cohort fix generations 4-7'. Touches lifecycle/service.ts (NEW), router/session-router.ts (NEW)"
+    },
+    {
+      "sha": "ef269a7ba51990f163a68795352fde4f170a0f89",
+      "pr": "4282",
+      "subject": "fix(sdk): close post-merge review threads on the C04 terminal abort (#4282)",
+      "reason": "#4282: close post-merge review threads on C04 terminal abort. Touches run-sdk-production-host-isolated.ts (NEW)"
+    },
+    {
+      "sha": "00ca7798bcc18e6d916fd46d6c127feaae58739f",
+      "pr": "4080",
+      "subject": "fix(sdk): make terminal receipts and steering durable (#4080)",
+      "reason": "#4080: durable terminal receipts and steering on #4098 SDK architecture. Touches host/control/dispatch.ts, operations.ts, session-runtime.ts (all substantially #4098 code)"
+    },
+    {
+      "sha": "e02f6c5be93dd1efe00360eb7d47be8451c0d5a2",
+      "pr": "4427",
+      "subject": "fix(sdk): detach chat-provider daemon ownership from session lifecycle (#4427)",
+      "reason": "#4427: detach chat-provider daemon ownership from #4098's session lifecycle. Touches bus/index.ts lifecycle wiring"
+    },
+    {
+      "sha": "3cf0aa531abd8a42809e027ca9a1e773c930ec73",
+      "pr": "4263",
+      "subject": "fix(dev-ci): repair the 0.13.1-window regressions and the session-index lock storm (#4263) (#4272)",
+      "reason": "#4272: repair #4098's session-index lock storm. Touches router/session-router.ts (NEW), broker/lifecycle.ts, broker/session-index.ts"
+    },
+    {
+      "sha": "65631379e8a4ae69ae8bb249bbf6f851fe12db76",
+      "pr": "4268",
+      "subject": "fix(telegram): reconcile orphaned session topics (#4268)",
+      "reason": "#4268: reconcile orphaned session topics via #4098's router. Touches router/session-router.ts (NEW)"
+    },
+    {
+      "sha": "a17c8417d2e00d4a8918057cf037da8f484cabbb",
+      "pr": "4360",
+      "subject": "fix(acp): restore turn as the default session/cancel abort scope (#4360)",
+      "reason": "#4360: restore turn abort scope. Touches ACP adapter/router integrated with #4098 lifecycle"
+    },
+    {
+      "sha": "16b3616ba80b2e741ecd77618d772276dd6096d6",
+      "pr": "4401",
+      "subject": "refactor(notifications): isolate Telegram failure authority (#4401)",
+      "reason": "#4401: isolate Telegram failure authority. Touches router/session-router.ts (NEW), sdk-session-router-authority.test.ts (NEW)"
+    },
+    {
+      "sha": "00d4318ef65b031fe08f43c46c616b72b1d14710",
+      "pr": "4254",
+      "subject": "fix(sdk): sync session-index snapshot through a writable handle (#4254)",
+      "reason": "#4254: sync session-index snapshot. Touches broker/session-index.ts (#4098-refactored)"
+    },
+    {
+      "sha": "bc2492af38d8b159e632cbf2f658c183c880c206",
+      "pr": "4327",
+      "subject": "fix(notifications): settle Telegram topic archives in private chats (#4327)",
+      "reason": "#4327: telegram topic archives via #4098 daemon lifecycle. Touches telegram-daemon-contract.ts/daemon.ts (#4098-refactored)"
+    },
+    {
+      "sha": "d314993007abfaeef1e593f1a64ee25b15658a5b",
+      "pr": "4329",
+      "subject": "refactor(sdk): unify duplicated durable terminal-retention writes (#4329)",
+      "reason": "#4329: unify #4098's durable terminal-retention writes. Touches host/session-runtime.ts (#4098-refactored)"
+    },
+    {
+      "sha": "b10c9c405d3645c8aeb87717568cf9a9ae697c3e",
+      "pr": "4362",
+      "subject": "fix(sdk): skip PowerShell when native binding reports absent process (#4362, #4365)",
+      "reason": "#4362/#4365: skip PowerShell via #4098's chat-daemon-control lifecycle. Touches chat-daemon-control.ts (#4098-introduced lifecycle)"
+    },
+    {
+      "sha": "9d25e79b8fd13c5bdcf55497acb567e3dcddcee5",
+      "pr": "4397",
+      "subject": "feat(sdk): bounded progress-aware prompt deadline lease with hard cap and exact-turn isolation (#4397)",
+      "reason": "#4397: prompt deadline lease on #4098's host/session-runtime. Touches host/session-runtime.ts (#4098-refactored)"
+    },
+    {
+      "sha": "cf07293f7404b35c085dde35013aa5a12d595ad5",
+      "pr": "4403",
+      "subject": "fix(notifications): #4403 acceptance successor \u2014 process-group reap, fail-closed CLI, watchdog reconciliation (#4480)",
+      "reason": "#4480: process-group reap. Touches telegram-daemon-cli/contract/daemon.ts (#4098-refactored daemon lifecycle)"
+    },
+    {
+      "sha": "54c92fbf9a65704a11788a1d240e5296964eb3b2",
+      "pr": "4356",
+      "subject": "fix(acp): prevent stale attachment from terminalizing ACP session (#4356) (#4371)",
+      "reason": "#4371: (already classified above)"
+    },
+    {
+      "sha": "ffcd048d50cd1dac32cdc2074109a42d73e62f06",
+      "pr": "4299",
+      "subject": "fix(sdk): preserve workflow gate recovery during shutdown (#4299)",
+      "reason": "#4299: workflow gate recovery during shutdown. Touches host/session-runtime.ts (#4098-refactored)"
+    },
+    {
+      "sha": "36876355417bbb2353fb294ec268ea247af96ba4",
+      "pr": "4253",
+      "subject": "fix(sdk): attribute reconnect-cycle termination (#4253)",
+      "reason": "#4253: attribute reconnect-cycle termination. Touches sdk/client/client.ts (#4098-refactored)"
+    },
+    {
+      "sha": "7121d19c72bacb1bcf3837a837622825bd895430",
+      "pr": "4506",
+      "subject": "fix(acp): preserve cleanup-pending delete authority (#4506)",
+      "reason": "#4506: cleanup-pending delete authority. Touches broker/lifecycle.ts (#4098-refactored)"
+    },
+    {
+      "sha": "32269d8eb42afdcea86e41a5ea3be1d1c90e2c23",
+      "pr": "4476",
+      "subject": "fix(session): replace real-time settle sleeps with deterministic session settlement (#4476) (#4486)",
+      "reason": "#4476: deterministic session settlement touching operation-inventory.generated.json (#4098-generated)"
+    },
+    {
+      "sha": "6102c6333f3dd30dc731c6b0e7f5a2d00b27e148",
+      "pr": "4230",
+      "subject": "fix(sdk): verify session endpoint removal after graceful shutdown (#4230)",
+      "reason": "#4230: verify session endpoint removal. Touches commands/sdk.ts (#4098-refactored session lifecycle)"
+    },
+    {
+      "sha": "2d5180fb696b91ccdfae5c938b00f67ccfd51ace",
+      "pr": "4344",
+      "subject": "fix(sdk): restore the broker startup-failure marker writer and bind it to the exact spawned child (#4344)",
+      "reason": "#4344: broker startup-failure marker. Touches commands/sdk.ts (#4098-refactored broker startup)"
+    },
+    {
+      "sha": "6c3854c52a825300473e866b54a9f34ad00b3d08",
+      "pr": "4359",
+      "subject": "fix(session): resolve shard-1-of-8 lifecycle cluster failures (#4359)",
+      "reason": "#4359: shard lifecycle cluster failures in sdk-machine-lifecycle-topology.test.ts (#4098-introduced test)"
+    },
+    {
+      "sha": "f7b77e5785cc6a7919141b0353ef9e54fa7cb911",
+      "pr": "",
+      "subject": "fix(sdk): classify extensions dashboard inventory seam",
+      "reason": "classify extensions dashboard inventory seam in operation-inventory.generated.json (#4098-generated)"
+    },
+    {
+      "sha": "eaed3aeca2730fab0d07b23b651d7bb1c598a32b",
+      "pr": "4300",
+      "subject": "style(broker): drop the stray blank line that fails repo-pinned biome on dev (#4300)",
+      "reason": "#4300: trivial style fix in broker.ts but broker.ts was substantially rewritten by #4098. Reverting #4098 reverts this too."
+    }
+  ],
+  "reapply_after_revert": [
+    {
+      "sha": "ace25b5bd84a8e4bb4c0827295eb6427599a4f79",
+      "pr": "4278",
+      "subject": "fix(sdk): terminalize scrubbed transcript deletion and update retired CLI ingress (#4278)",
+      "reason": "#4278: terminalize scrubbed transcript deletion. Fixes real issue but uses #4098 CLI ingress."
+    }
+  ],
+  "retain_independent_prs": [
+    "4245",
+    "4246",
+    "4288",
+    "4292",
+    "4293",
+    "4301",
+    "4317",
+    "4321",
+    "4335",
+    "4345",
+    "4351",
+    "4364",
+    "4378",
+    "4395",
+    "4401",
+    "4402",
+    "4403",
+    "4408",
+    "4410",
+    "4412",
+    "4417",
+    "4419",
+    "4420",
+    "4421",
+    "4429",
+    "4446",
+    "4465",
+    "4467",
+    "4475",
+    "4482",
+    "4483",
+    "4484",
+    "4224"
+  ]
+}

@@ -1,0 +1,173 @@
+commit_sha	subject	pr_number	overlap_count	overlap_files
+00ca7798bcc18e6d916fd46d6c127feaae58739f	fix(sdk): make terminal receipts and steering durable (#4080)	4080	12	docs/sdk.md;packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/coordinator-mcp/server.ts;packages/coding-agent/src/sdk/bus/index.ts;packages/coding-agent/src/sdk/host/control/dispatch.ts;packages/coding-agent/src/sdk/host/control/operations.ts;packages/coding-agent/src/sdk/host/session-runtime.ts;packages/coding-agent/src/sdk/protocol/operation-inventory.generated.json;packages/coding-agent/src/sdk/protocol/operation-registry.ts;packages/coding-agent/test/manifests/sdk-adapter-parity-v1.json;packages/coding-agent/test/sdk-adapter-dispositions.test.ts;packages/coding-agent/test/sdk-control-dispatch.test.ts
+67b65937617c44c21f489744ea4bb149f41fbf33	fix(session): close retained-authority residuals (#4246)	4246	2	bun.lock;package.json
+099a37fb4120e6c10be4f4d2f2b2f9f55cb57b46	Merge pull request #4260 from Yeachan-Heo/fix/issue-4257-version-catalog-drift	4260	0	
+75301116ec607947ea1580cae0c60da107c0eaba	fix(telegram): accept archive fences that retained a stray grace deadline (#4249)	4249	0	
+597e8e59530fb85ef16b8e25bb8dfaee476b19a3	fix(ai): converge Anthropic thinking-replay rejections under managed fallback attempts (#4267)	4267	0	
+db64d8d0842258414b5103bb93b0d4341e44f0a5	Merge pull request #4241 from Yeachan-Heo/fix/issue-4200-runloop-heartbeat-containment	4241	0	
+d50b4ff3ee7f9c6b12a96ec194c445cb0399cc65	fix(acp): restore canonical skill lifecycle (#4243)	4243	0	
+44f4e75b0e1ab658379cd0d68219470582d6a97c	Merge pull request #4256 from Yeachan-Heo/fix/4228-close-native-shell-sessions	4256	0	
+678e26c4cecec337d43b379b11c85dbbcd64aaa6	Merge pull request #4264 from itecob/agent/fix-bonsai-responses-tool-arguments	4264	0	
+36876355417bbb2353fb294ec268ea247af96ba4	fix(sdk): attribute reconnect-cycle termination (#4253)	4253	3	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/client/client.ts;packages/coding-agent/test/sdk-client.test.ts
+4396d52200b1072d4f76bb1c7e87bcbda1276bf6	Merge pull request #4245 from snowykr/feat/settings-unify	4245	0	
+948bcc5d8d845756a713e5ff29e6ec503ddc2f08	fix(ai,agent): close fail-open Responses tool-call identity/lifecycle edge cases (#4274) (#4276)	4274	0	
+259885288d0e682e215fb3c2df0a7bb76e927aa3	fix(macos): stabilize TCC permissions for GJC binaries (#4275)	4275	0	
+debe936960409e7f106f3f417cc4887deaea666f	Merge pull request #4265 from Yeachan-Heo/research/stress-test	4265	0	
+ace25b5bd84a8e4bb4c0827295eb6427599a4f79	fix(sdk): terminalize scrubbed transcript deletion and update retired CLI ingress (#4278)	4278	2	packages/coding-agent/CHANGELOG.md;packages/coding-agent/test/sdk-machine-lifecycle-topology.test.ts
+f44f6fbe179d25b92aa245fe2096739e6be42e6e	fix(settings): follow-up to #4245 review threads — retirement ordering, marker fail-closed, probe robustness, Bun.write staging (#4277)	4245	1	packages/coding-agent/CHANGELOG.md
+7247cc755109ee5362ed176693980cdd5f38e4b7	fix(settings): complete the retirement recovery and publication-proof follow-ups		1	packages/coding-agent/CHANGELOG.md
+290fe1c9f58c4da43da9a40941ff96278379c418	Merge pull request #4255 from snowykr/feat/abort-sdk-terminal	4255	0	
+0d1d94d3fa6abe10743e5958560368bf03143ea0	fix(sdk): land the PR #4098 review-cohort fix generations 4-7 (#4281)	4098	51	docs/bot-integration.md;docs/sdk-app-guide.md;docs/sdk.md;docs/telegram-onboarding.md;packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/commands/daemon.ts;packages/coding-agent/src/commands/sdk.ts;packages/coding-agent/src/coordinator-mcp/server.ts;packages/coding-agent/src/sdk/broker/broker.ts;packages/coding-agent/src/sdk/broker/lifecycle.ts;packages/coding-agent/src/sdk/broker/session-index.ts;packages/coding-agent/src/sdk/broker/transport.ts;packages/coding-agent/src/sdk/bus/index.ts;packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts;packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts;packages/coding-agent/src/sdk/bus/telegram-daemon.ts;packages/coding-agent/src/sdk/cli/session-cli.ts;packages/coding-agent/src/sdk/client/client.ts;packages/coding-agent/src/sdk/host/control/dispatch.ts;packages/coding-agent/src/sdk/host/control/operations.ts;packages/coding-agent/src/sdk/lifecycle/service.ts;packages/coding-agent/src/sdk/protocol/operation-inventory.generated.json;packages/coding-agent/src/sdk/protocol/operation-registry.ts;packages/coding-agent/src/sdk/router/session-router.ts;packages/coding-agent/src/session/internal/managed-session-storage.ts;packages/coding-agent/test/chat-daemon-session-reconnect.test.ts;packages/coding-agent/test/coordinator-mcp-server.test.ts;packages/coding-agent/test/manifests/sdk-adapter-parity-v1.json;packages/coding-agent/test/notifications-config.test.ts;packages/coding-agent/test/notifications-live-stream.test.ts;packages/coding-agent/test/notifications-telegram-daemon.test.ts;packages/coding-agent/test/notifications-tool-activity.test.ts;packages/coding-agent/test/notifications-topic-registry.test.ts;packages/coding-agent/test/sdk-adapter-dispositions.test.ts;packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts;packages/coding-agent/test/sdk-client.test.ts;packages/coding-agent/test/sdk-control-dispatch.test.ts;packages/coding-agent/test/sdk-daemon-cli-e2e.test.ts;packages/coding-agent/test/sdk-host-wiring.test.ts;packages/coding-agent/test/sdk-lifecycle-service.test.ts;packages/coding-agent/test/sdk-operation-matrix.test.ts;packages/coding-agent/test/sdk-serve-transport.test.ts;packages/coding-agent/test/sdk-session-index.test.ts;packages/coding-agent/test/sdk-session-router-authority.test.ts;scripts/generate-gjc-sdk-skills.test.ts;scripts/generate-gjc-sdk-skills.ts;scripts/telegram-daemon-generation-guard.test.ts;scripts/telegram-daemon-generation-guard.ts;scripts/telegram-daemon-generation-manifest.json;scripts/verify-gjc-sdk-skills.ts;sdk-skills/gjc-sdk-author/templates/direct-sdk.ts
+364cbfe6108d145daf9f55697ab83c4d0e84b314	Merge pull request #4290 from Yeachan-Heo/feat/issue-4287-plugin-loose-surface-separation	4290	0	
+8ed14208c43323a1c1deb799d804e4caf8a06db5	test(gjc-plugins): use named normalized bundle type (#4295)	4295	0	
+efbe4eef83839ff7860c7c11014b5b16e4928224	fix(tui): avoid modifyOtherKeys in Apple Terminal (#4297)	4297	0	
+eaed3aeca2730fab0d07b23b651d7bb1c598a32b	style(broker): drop the stray blank line that fails repo-pinned biome on dev (#4300)	4300	1	packages/coding-agent/src/sdk/broker/broker.ts
+8c709b286a178faf841678ce4588069860ba2ef6	fix(config): couple eager delegation to vendor-separated model profiles (#4269)	4269	0	
+77ce3f7b993cf329379afdad1447adf269a23972	Merge pull request #4289 from Yeachan-Heo/feat/issue-4286-hook-convention-normalization	4289	0	
+5f99c2dea89600f7bd60c5756ccca1626ed08089	feat(ai): add native TypeScript Kiro OAuth provider (#4304)	4304	0	
+e65397891713d9791941a714584378ddadfe2b3c	Merge pull request #4308 from Yeachan-Heo/docs/streamdeck-cmux-guide	4308	0	
+00d4318ef65b031fe08f43c46c616b72b1d14710	fix(sdk): sync session-index snapshot through a writable handle (#4254)	4254	7	.github/workflows/dev-ci.yml;packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/broker/session-index.ts;packages/coding-agent/test/sdk-session-index.test.ts;scripts/ci-dev-affected.test.ts;scripts/ci-dev-affected.ts;scripts/dev-ci-guard-topology.test.ts
+394cee75a8f6fc763cc352ff21e16417035c55d5	Merge pull request #4302 from Yeachan-Heo/salvage/pr-4296-image-gen-security	4302	0	
+3cf0aa531abd8a42809e027ca9a1e773c930ec73	fix(dev-ci): repair the 0.13.1-window regressions and the session-index lock storm (#4263) (#4272)	4263	10	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/broker/lifecycle.ts;packages/coding-agent/src/sdk/broker/session-index.ts;packages/coding-agent/src/sdk/bus/chat-daemon-control.ts;packages/coding-agent/src/sdk/bus/chat-daemon-runtime.ts;packages/coding-agent/src/sdk/router/session-router.ts;packages/coding-agent/test/helpers/sdk-exact-session-authority.ts;packages/coding-agent/test/sdk-chat-daemon-worker.test.ts;packages/coding-agent/test/sdk-session-index.test.ts;scripts/telegram-daemon-generation-manifest.json
+27a63180501e88a8d9d345b03118413e4eed4cba	Merge pull request #4271 from Yeachan-Heo/feat/issue-4259-crash-report	4271	0	
+e389ebc1b51149d5e783a1c23ba366e707e14f43	fix(test): revert shared package-cwd preload; pin overflow budgets in-process (#4224) (#4306)	4224	1	packages/coding-agent/test/session/session-context-overflow.test.ts
+37ec2c5f87aac47c35a870b4969b53620a354d7c	fix(models): fall back from unavailable Opus 5 (#4301)	4301	1	packages/coding-agent/CHANGELOG.md
+eef03e4617f645733dfddf63be7f79033d851ba5	fix(hooks): validate constrained metadata before import (#4307)	4307	0	
+56302cda4e92a163fbbf5b3648ac5e8db2c5003f	fix(session): heal over-limit scope before binding publication		0	
+08c527fd8ca30c418e8ceb75fc593e4ef586451e	fix(test): restore package-cwd TMPDIR preload without budget pin (#4224 follow-up) (#4314)	4224	0	
+bad55adb363a88488d6eec0740a8054cefa6aa76	Merge pull request #4294 from Yeachan-Heo/feat/muse-spark-presets	4294	0	
+f59e2ee56d19f50df4b9b23caaa8a2e126ef71e1	fix(update): recover managed notifications after verified install (#4310)	4310	0	
+ff1d4584cd034eb92520c8ef70ebb4cfa6c0beb2	Merge pull request #4270 from Yeachan-Heo/fix/issue-4258-acp-cold-timeout	4270	0	
+ff0a73635b36b354fa16f80cc2989bc42cc5a9eb	Merge pull request #4279 from Yeachan-Heo/research/stress-test	4279	0	
+73eb359d4e39a153a08db219397f0ee5c61dd16f	fix(dev-ci): repair issue #4293 unowned shard regressions (#4298)	4293	3	packages/coding-agent/CHANGELOG.md;scripts/ci-dev-affected.test.ts;scripts/ci-dev-affected.ts
+818896af4290c9a1673d9789527ec89f6baa318b	feat(auth): add --prefer-credential soft quota fallback for multi-account pools (#4317)	4317	1	packages/coding-agent/CHANGELOG.md
+0c97d3820aed01ac6572599676c238bf6d5614f4	feat(herdr): report gjc lifecycle state inside Herdr panes (salvage of #4318) (#4320)	4318	0	
+2067b93976f5bbbe996fd9ec70a997bb0668b527	Merge pull request #4322 from Yeachan-Heo/fix/issue-4319-persist-tool-choice-capability	4322	0	
+fd51adf874f84decd9436d061e69f9647ec2133f	Merge pull request #4323 from Yeachan-Heo/fix/telegram-daemon-session-ambiguity	4323	0	
+e8af95c8332e588eb878b470dc6543c8645be74e	fix(models): retain authoritative provider catalog IDs (#4313)	4313	0	
+cae0c20cb89509941ae859ffe39012c83daf3645	Merge pull request #4328 from nahyeongjin1/feat/worktree-bucket-env	4328	0	
+40def6aceffba9481f466b25b0d6a88c9fdae902	Merge pull request #4325 from Yeachan-Heo/fix/issue-4258-followup-deadlines	4325	0	
+759811d139bb524f2aa03aa8ff9e7fcdaa8ecd2e	Merge pull request #4337 from Yeachan-Heo/fix/issue-4324-acp-cancel-settlement	4337	0	
+4a927889f3c138b0f2efd2e86024ae278f5ef9cc	feat(auth): add /credential slash command for mid-session account switching (#4321)	4321	1	packages/coding-agent/CHANGELOG.md
+94f48b77586e6eb021163a94fa7158f002f26ed8	Merge pull request #4339 from Yeachan-Heo/fix/issue-4338-cpa-tool-alias-recovery	4339	0	
+2d5180fb696b91ccdfae5c938b00f67ccfd51ace	fix(sdk): restore the broker startup-failure marker writer and bind it to the exact spawned child (#4344)	4344	2	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/commands/sdk.ts
+55f12b8c5127b2eca8d60659a26fde5f71ad8abc	fix(session): defer managed identity adoption in moveTo when no destination transcript exists (#4343)	4343	0	
+723fc1a2572ac90d478ff22eb9b1659ffda9bb06	fix(tui): emit coalesced multi-Esc chunks as individual presses (#4312)	4312	0	
+3df33d0a2fdbd243181f79057c38dd1d8952211f	fix(streamdeck): page current SDK ask options (#4333)	4333	0	
+c63766cd28bc9ae59ab74e405b4ac519445f9387	fix(sdk): hide the Windows process-incarnation PowerShell console (#4346)	4346	0	
+a7f5ac7870e8246a584a1fa489228c4b3314c52a	Merge pull request #4326 from lotgood/fix/session-continuation-task-render	4326	0	
+7948d2e15615fe04bdabda43dff47fba41afa756	feat(coordinator): harden bounded current tool activity (#4248)	4248	0	
+39ef440912fd2433319d1f0cf3a2b7687346138f	fix: preserve prompt suggestions after cancelled actions (#4347)	4347	0	
+1cd83d3f88e1762e08a2b2168554b36fc622b7f6	Merge pull request #4353 from Yeachan-Heo/fix/issue-4342-g013-shard-pressure	4353	0	
+4b386a94810baebe1a360ff44193f48ea0206a0e	Merge pull request #4354 from Yeachan-Heo/fix/issue-4319-persist-tool-choice-capability	4354	0	
+ef3bd5c2276be1e50e59b026d36deb5c0255ccc1	Merge pull request #4349 from Yeachan-Heo/feat/issue-4285-skill-zero-config-discovery	4349	0	
+bf441220a8501422db350077dd6819f899176174	fix(natives): retry transient Windows destination sharing violations in exactReplacePath (#4345)	4345	4	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/session/internal/managed-session-storage.ts;packages/natives/CHANGELOG.md;packages/natives/native/index.d.ts
+bc2492af38d8b159e632cbf2f658c183c880c206	fix(notifications): settle Telegram topic archives in private chats (#4327)	4327	6	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts;packages/coding-agent/src/sdk/bus/telegram-daemon.ts;packages/coding-agent/test/notifications-telegram-daemon.test.ts;packages/coding-agent/test/notifications-topic-registry.test.ts;scripts/telegram-daemon-generation-manifest.json
+9fd5f5ab1146262c990fe092198fb8fcad499407	fix(status-line): deduplicate PR lookups across instances (#4332) (#4348)	4332	0	
+6102c6333f3dd30dc731c6b0e7f5a2d00b27e148	fix(sdk): verify session endpoint removal after graceful shutdown (#4230)	4230	2	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/commands/sdk.ts
+9cd9cdce2e1a164692888527bdc6b66d4be5ffe0	fix(ai): reject tool arguments that spell non-ASCII text as \uXXXX escapes (#4352)	4352	0	
+41473691c5a97de8ce0c3b10ae03e358df90f489	feat(mcp): activate conventional autoload for native .gjc MCP registrations (#4335)	4335	1	packages/coding-agent/CHANGELOG.md
+ffcd048d50cd1dac32cdc2074109a42d73e62f06	fix(sdk): preserve workflow gate recovery during shutdown (#4299)	4299	3	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/host/session-runtime.ts;packages/coding-agent/test/sdk-host-wiring.test.ts
+6c3854c52a825300473e866b54a9f34ad00b3d08	fix(session): resolve shard-1-of-8 lifecycle cluster failures (#4359)	4359	1	packages/coding-agent/test/sdk-machine-lifecycle-topology.test.ts
+d314993007abfaeef1e593f1a64ee25b15658a5b	refactor(sdk): unify duplicated durable terminal-retention writes (#4329)	4329	5	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/bus/index.ts;packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts;packages/coding-agent/src/sdk/host/session-runtime.ts;scripts/telegram-daemon-generation-manifest.json
+9eb997bb55a832d1e080f3bacd117fc9c1c4219b	Merge pull request #4336 from Yeachan-Heo/fix/telegram-threaded-eligibility	4336	0	
+6543e608560c6001df469ce8d036d14d8bfcabd3	fix(coordinator): terminal session must not report ready_for_input (#4351) (#4358)	4351	3	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/coordinator-mcp/server.ts;packages/coding-agent/test/coordinator-mcp-server.test.ts
+65631379e8a4ae69ae8bb249bbf6f851fe12db76	fix(telegram): reconcile orphaned session topics (#4268)	4268	10	docs/sdk.md;docs/telegram-onboarding.md;packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts;packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts;packages/coding-agent/src/sdk/bus/telegram-daemon.ts;packages/coding-agent/test/notifications-config.test.ts;packages/coding-agent/test/notifications-telegram-daemon.test.ts;packages/coding-agent/test/notifications-topic-registry.test.ts;scripts/telegram-daemon-generation-manifest.json
+a17c8417d2e00d4a8918057cf037da8f484cabbb	fix(acp): restore turn as the default session/cancel abort scope (#4360)	4360	8	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/modes/acp/acp-agent.ts;packages/coding-agent/src/sdk/acp/adapter.ts;packages/coding-agent/test/acp-prompt-watchdog.test.ts;packages/coding-agent/test/acp/acp-fallback-cancel-completion.test.ts;packages/coding-agent/test/sdk-acp-adapter.test.ts;packages/coding-agent/test/sdk-acp-production-path.test.ts;packages/coding-agent/test/sdk-acp-prompt-terminal.test.ts
+f46bdea89b2ccedb0810021a88675030e7831897	feat(master): add managed orchestration sessions (#4199)	4199	0	
+5f78d769b17ce7dd11bf58fe9dadf7ce95c0a6b0	feat(cli): support 가재씨 as a Korean launcher alias for gjc (#4364)	4364	3	packages/coding-agent/CHANGELOG.md;packages/coding-agent/package.json;scripts/release-publish-order.test.ts
+b10c9c405d3645c8aeb87717568cf9a9ae697c3e	fix(sdk): skip PowerShell when native binding reports absent process (#4362, #4365)	4362	5	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/bus/chat-daemon-control.ts;packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts;packages/coding-agent/test/sdk-broker-lifecycle-e2e.test.ts;scripts/telegram-daemon-generation-manifest.json
+ef269a7ba51990f163a68795352fde4f170a0f89	fix(sdk): close post-merge review threads on the C04 terminal abort (#4282)	4282	16	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/modes/acp/acp-agent.ts;packages/coding-agent/src/sdk/broker/broker.ts;packages/coding-agent/src/sdk/bus/index.ts;packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts;packages/coding-agent/src/sdk/host/host.ts;packages/coding-agent/src/sdk/host/session-runtime.ts;packages/coding-agent/test/acp-prompt-settle-on-completion.test.ts;packages/coding-agent/test/notifications-topic-registry.test.ts;packages/coding-agent/test/sdk-chat-daemon-worker.test.ts;packages/coding-agent/test/sdk-daemon-cli-e2e.test.ts;packages/coding-agent/test/sdk-host-wiring.test.ts;packages/coding-agent/test/session/session-context-overflow.test.ts;scripts/ci-dev-affected.test.ts;scripts/run-sdk-production-host-isolated.ts;scripts/telegram-daemon-generation-manifest.json
+99aa9db2b02fc0671f4b8c90779ff99712628588	docs(acp): move the owned-abort example to the Paseo section only		0	
+278f0a6b4745a8905248afc6c621088afaefe06d	fix(session): reconcile Windows replacement receipts safely (#4373)	4373	0	
+54c92fbf9a65704a11788a1d240e5296964eb3b2	fix(acp): prevent stale attachment from terminalizing ACP session (#4356) (#4371)	4356	3	packages/coding-agent/src/modes/acp/acp-agent.ts;packages/coding-agent/src/sdk/acp/adapter.ts;packages/coding-agent/src/sdk/router/session-router.ts
+547b4cfce337216de395be4e29ab9262f581c74b	fix(ci): repair coding-agent shard baseline (#4375)	4375	0	
+e614bc143b609558eff7b03285d209a8110e9c04	Merge pull request #4379 from Yeachan-Heo/owner/pr-4376-chat-daemon-probe	4379	0	
+caf1dae61b8c8d25cea07e97e2d2f6336c924fcf	Merge pull request #4377 from jason931225/feat/grok-4.6-presets	4377	0	
+d1d28d6e4fbe503d4f1f6f5425788411bc436728	fix(ci): remove --isolate from coding-agent shard command (#4378) (#4381)	4378	3	packages/coding-agent/CHANGELOG.md;scripts/ci-dev-affected.test.ts;scripts/ci-dev-affected.ts
+bbc9b04323816fc6cbb4ed96a6a82d6fcdad59cc	Merge pull request #4383 from Yeachan-Heo/fix/issue-4380-anthropic-proxy-diagnostic	4383	0	
+6add8ad611527a140bdd7028f575edfa872fbecb	fix(ai): validate Synthetic API key via models endpoint, not retired Kimi probe (#4385)	4385	0	
+8e5c0e8a63200dafaae9fde2b5826e030fe83cbd	Merge pull request #4388 from Yeachan-Heo/fix/issue-4382-thinking-repair-noop	4388	0	
+30628db609a99f3ae1f49cef6a10d2916e73ddf1	Merge pull request #4390 from Yeachan-Heo/owner/pr-4387-default-thinking	4390	0	
+020521fe03417cda9b1946174a3189263d15a594	Merge pull request #4386 from jason931225/fix/grok-usage-weekly-credits	4386	0	
+c81614fc7708637524e91eb253654a6c49d0d431	Merge pull request #4396 from Yeachan-Heo/fix/issue-4394-managed-output-publication-hang	4396	0	
+9d25e79b8fd13c5bdcf55497acb567e3dcddcee5	feat(sdk): bounded progress-aware prompt deadline lease with hard cap and exact-turn isolation (#4397)	4397	5	docs/bot-integration.md;docs/sdk.md;packages/coding-agent/src/sdk/host/session-runtime.ts;scripts/generate-gjc-sdk-skills.ts;sdk-skills/gjc-sdk-author/templates/direct-sdk.ts
+178fc2624803c76ee4fc5bc6ce89e7ed8f906373	fix(controller): reject malformed extension user messages (#4395)	4395	1	packages/coding-agent/src/modes/controllers/extension-ui-controller.ts
+16b3616ba80b2e741ecd77618d772276dd6096d6	refactor(notifications): isolate Telegram failure authority (#4401)	4401	7	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts;packages/coding-agent/src/sdk/bus/telegram-daemon.ts;packages/coding-agent/src/sdk/router/session-router.ts;packages/coding-agent/test/notifications-topic-registry.test.ts;packages/coding-agent/test/sdk-session-router-authority.test.ts;scripts/telegram-daemon-generation-manifest.json
+b7e0dea98c07082830b2a3bf66ec933c89633ffd	feat(customization): add provenance-aware customization doctor (#4288)	4288	1	packages/coding-agent/CHANGELOG.md
+4675bf072d45745edd1c62abf0548a12de5f4bc9	feat(herdr): report the gjc session title to the containing pane (#4402)	4402	2	bun.lock;packages/coding-agent/CHANGELOG.md
+8d6784cb374386367a9ddb1e8777645cb4c12723	fix(session): recover from managed transcript content_too_large (#4408) (#4411)	4408	1	packages/coding-agent/CHANGELOG.md
+86e86070f842604bbdb9449c27ec616b4741d0c3	fix(customize): keep doctor settings inspection read-only (#4406) (#4414)	4406	0	
+300e49dddf9d5ce77b7a991da0e8ae4460cf168e	Merge pull request #4407 from Yeachan-Heo/refactor/issue-4399-telegram-fault-containment	4407	0	
+18039fee5192af3f895b30717aa5d51f972c0fd4	Merge pull request #4400 from Yeachan-Heo/fix/issue-4378-shard-isolation-followup	4400	0	
+f1150c60378efa3caf83ce32418b24795f08733a	fix(ai): collapse adjacent thinking blocks before Anthropic replay (#4418)	4418	0	
+1f87cf04891e451ac601f228661d0b279faed8a1	fix(ai): reload the credential snapshot when an OAuth row vanishes (#4415)	4415	0	
+ef4ce20a23d7c8525e6e4f758a6a83d601b26ee7	fix(ai): collapse adjacent thinking blocks at Anthropic send boundary (#4416) (#4425)	4416	0	
+515f1c7cb244f2cc5a1863af016f2a2e31ae22c5	fix(session): recover missing managed transcripts (#4421)	4421	1	packages/coding-agent/CHANGELOG.md
+628604d5b67e8af376d31667a14b1c13f281e183	feat(tui): support /theme <name> for immediate theme switching (#4429)	4429	1	packages/coding-agent/CHANGELOG.md
+736302eac639944b7ce43a09bfda71fee5c750e6	Merge pull request #4428 from Yeachan-Heo/fix/issue-4378-shard-isolation-followup	4428	0	
+429c7c54ce54f9505b8e43435ad5c2cb5e1718d7	fix(notifications): bump chat daemon generations for shared Router lifecycle changes (#4401 postmerge) (#4405)	4401	1	packages/coding-agent/CHANGELOG.md
+4e4f7ce84ca842753c223f8eaf880dc0d501de2e	feat(ci): auto-repair daemon generation bumps from semantic guard changes (#4410)	4410	4	package.json;scripts/telegram-daemon-generation-guard.test.ts;scripts/telegram-daemon-generation-guard.ts;scripts/telegram-daemon-generation-manifest.json
+0ca33b8532ea4f5377d5d6c01143d89b8d85aab9	fix(task): exclude exact MCP managers from subagents (#4419)	4419	1	packages/coding-agent/CHANGELOG.md
+2d39e6d6df66d87181384fb9232ce61bfc7d2bf8	feat(setup): add gjc setup paseo to register GJC as a Paseo provider (replacement for #4417, credits @probepark)	4417	1	packages/coding-agent/CHANGELOG.md
+3354698b5339fa6337731e734ee75b7324e027b0	fix(coordinator-mcp): answer ping keepalive with empty result (#4412)	4412	2	packages/coding-agent/src/coordinator-mcp/server.ts;packages/coding-agent/test/coordinator-mcp-server.test.ts
+a7b487e58773f5f35480ce7996e2bbb404898e96	chore(repo): untrack artifacts/ and define test working space policy (#4420)	4420	5	AGENTS.md;packages/coding-agent/CHANGELOG.md;scripts/ci-dev-affected.test.ts;scripts/ci-dev-affected.ts;scripts/clean-core.ts
+8eb8127e608b2d549e1c3fb9c34753ff4d484f72	fix(tui): preserve images in terminal scrollback (#4424)	4424	0	
+e02f6c5be93dd1efe00360eb7d47be8451c0d5a2	fix(sdk): detach chat-provider daemon ownership from session lifecycle (#4427)	4427	10	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/bus/index.ts;packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts;packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts;packages/coding-agent/test/notifications-config.test.ts;packages/coding-agent/test/notifications-live-stream.test.ts;packages/coding-agent/test/notifications-tool-activity.test.ts;packages/coding-agent/test/notifications-topic-registry.test.ts;packages/coding-agent/test/sdk-host-wiring.test.ts;scripts/telegram-daemon-generation-manifest.json
+c063212ab56066f89ed7451c430d47a2278da69f	Merge pull request #4438 from Yeachan-Heo/revert/master-runtime-4199	4438	0	
+82593e8a51d8b2ce5a95dc95e6e6d9e5c7f1c19b	Merge pull request #4439 from Yeachan-Heo/fix/issue-4436-dev-baseline	4439	0	
+745b8ba18f768c03efe1d5d0b7440c34afd1a42b	Merge pull request #4441 from Yeachan-Heo/fix/issue-4436-dev-baseline-followup	4441	0	
+0bd4898d1845cd6a5a36f74c65dc0a6b0975affa	fix(natives): break_long_word infinite loop on lone ESC in over-width word (#4437)	4437	0	
+dcdeb0e5fb37d6a750bd8c8951897e453f89183f	fix(ai): reconcile #4418 test/doc with #4425 send-boundary adjacency class (#4382) (#4442)	4418	0	
+12e1df1724bec0b7b1a40988cdc2a0c7dcca29ec	feat(mcp): support MCP 2026-07-28 stateless protocol (MCP v2) (#4292)	4292	1	packages/coding-agent/CHANGELOG.md
+c8f60f988a0c9170ade316b3d7bd589be8091eea	Merge pull request #4447 from Yeachan-Heo/fix/issue-4436-dev-baseline-final	4447	0	
+b5ef23f52208e3eaf0a25c1eaf0056b8f6b191c5	fix(coding-agent): terminate completed print runs (#4446)	4446	1	packages/coding-agent/CHANGELOG.md
+d2ac02f3327279d26d3be499db1143dfa6721901	Merge pull request #4452 from Yeachan-Heo/fix/issue-4436-status-roots-runtime	4452	0	
+ffa07d6c9bf25c803bd3bd00cdb2deeefe66ec4e	Merge pull request #4450 from laerad777/fix/session-enoent-managed-predecessor	4450	0	
+c06f4f5e70e35dc79ae5527352a3d229ec0ce0e9	Merge pull request #4451 from Yeachan-Heo/research/cpu-rss-optimization	4451	0	
+91e98e678971b5565b79bafade1f25a079b2db6b	Merge pull request #4455 from Yeachan-Heo/fix/issue-4436-status-home-precedence	4455	0	
+a9481baf09b51507378ef441e30ae0bae3ca4b44	Merge pull request #4449 from Yeachan-Heo/feat/issue-4443-thinking-defense/worktree	4449	0	
+6080b98310038b963479fdc8a499dc326c81fe86	Merge pull request #4453 from Yeachan-Heo/fix/todo-write-positional-handle	4453	0	
+0cecbaf819727d2c519ccf33974768058548ab61	Merge pull request #4372 from Yeachan-Heo/fix/telegram-daemon-does-not-rename-topic-properly	4372	0	
+3d836d1686980afc2db40088a17321b96840abbe	Merge pull request #4456 from Yeachan-Heo/fix/dev-ci-31669328497	4456	0	
+4a038bc0774a73ea5e83c686cd701d775feafe73	fix(ci): regenerate telegram closure manifest after merge (#4467)	4467	1	scripts/telegram-daemon-generation-manifest.json
+e3fb0332054fffa4b20d0ded2590fdae01a5c6f2	Merge pull request #4409 from Yeachan-Heo/fix/issue-4403-telegram-daemon-auto-reap	4409	0	
+d2f6e8a4091a219f00d3ab304cc1b124e43cc0d3	Merge pull request #4468 from project-catsy/feat/pet-ouroboros	4468	0	
+d659a0abfa76d1c4e938265ebf9c63e2a2618973	fix(theme): guard Settings theme commit with invalid-config check		0	
+0a736b17ece3c277a586fb53cf9161f371f693dc	fix(crash): stop compaction writing an index its own reader quarantines (#4470)	4470	0	
+61f443d9bff05ef24cc7f2e6380da1d23e6a863b	fix(docs): restore accurate removed-surface wording in bot integration docs (#4482)	4482	1	docs/bot-integration.md
+f55c4d09390e104bb23756bb9d59370040d86b2e	Merge pull request #4460 from Yeachan-Heo/fix/issue-4458-lean-settlement	4460	0	
+7931cf6995a58cd02e5e43e65939af2656530715	fix(coordinator): isolate idempotency lock artifacts from record directory (#4484)	4484	1	packages/coding-agent/src/coordinator-mcp/server.ts
+295d7801aa1b5c9c297f4ada48f370da8ea01735	fix(coordinator-mcp): narrow DR-1 post-close proof for incarnation-bound reap (#4483)	4483	3	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/coordinator-mcp/server.ts;packages/coding-agent/test/coordinator-mcp/stop-session.test.ts
+32269d8eb42afdcea86e41a5ea3be1d1c90e2c23	fix(session): replace real-time settle sleeps with deterministic session settlement (#4476) (#4486)	4476	2	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/sdk/protocol/operation-inventory.generated.json
+bfde8643479cd4f3987d996777fa1d77548434c7	Merge pull request #3731 from Yeachan-Heo/feat/codex-session-import-redo	3731	0	
+be92463bab085e216ef3b4c0c74e09717bf9cf05	fix(subagent): observable await liveness + sleep smell warning (#4465)	4465	2	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/prompts/tools/bash.md
+cf07293f7404b35c085dde35013aa5a12d595ad5	fix(notifications): #4403 acceptance successor — process-group reap, fail-closed CLI, watchdog reconciliation (#4480)	4403	4	packages/coding-agent/src/sdk/bus/telegram-daemon-cli.ts;packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts;packages/coding-agent/src/sdk/bus/telegram-daemon.ts;scripts/telegram-daemon-generation-manifest.json
+f0a44081afe3dbebeba3afb9ab380517ebd6c8d7	fix(test): split sdk-adapter-dispositions to stay under CI file-timeout (#4475)	4475	3	packages/coding-agent/CHANGELOG.md;packages/coding-agent/test/manifests/sdk-adapter-parity-v1.json;packages/coding-agent/test/sdk-adapter-dispositions.test.ts
+65c6165937cbeb913070352db56a4c229fdcbba1	fix(test): isolate config-root probe env from harness and shadowed PI_CONFIG_DIR (#4474) (#4488)	4474	0	
+a6a3974dcbb9dd50c890e9e86d29310a0dd2b9ce	Merge pull request #4485 from Yeachan-Heo/feat/issue-4448-master-session-supervisor	4485	0	
+437d11d4a916dd2b83512aae888db14fd65be778	Merge pull request #4492 from Yeachan-Heo/feat/issue-4291-extensions-ui-import	4492	0	
+50a787116a498b93b6b2082b9fbb918a804b8e78	fix(test): update stale DAEMON_GENERATION assertion 165→166 (#4403 postmerge) (#4493)	4403	1	packages/coding-agent/test/notifications-topic-registry.test.ts
+f1f9e4c7095c466fa276596320ae1c0c465399da	Merge pull request #4494 from Yeachan-Heo/fix/pr-3731-postmerge-ci	4494	0	
+cf29e8dc82f8ec853541b5ce161c8b15fdd09513	Merge pull request #4491 from Yeachan-Heo/fix/issue-4489-escaped-nonascii-resample-successor	4491	0	
+e566cd2a1ee80d01c0676d813b6310ef664d0a30	Merge pull request #4462 from sskys18/feat/grok-build-4-6	4462	0	
+f7b77e5785cc6a7919141b0353ef9e54fa7cb911	fix(sdk): classify extensions dashboard inventory seam		1	packages/coding-agent/src/sdk/protocol/operation-inventory.generated.json
+dfb1081c53726fd4945ed4199583a8f00a49ccd0	Merge pull request #4499 from thegreatesthoneybee/feat/iterm2-gajae-pet	4499	0	
+e4f4281ac80dc2d7deb0ae31cbbe4e5570760308	fix(session): redesign default-model-selection admission to avoid post-prompt deadlock (#4496)	4496	0	
+7a6b0d1315a6b88493aedb53607335aabdd7b1f3	Merge pull request #4495 from Yeachan-Heo/fix/issue-4478-crash-log-recovery	4495	0	
+fb672eb1a8e45ff84dd15b76039f2de06053201b	docs(customization): unify trust and import authority (#4507) (#4513)	4507	0	
+ce6ba23bdd90928946b70823c4f9ac9ad7b6d4cd	test(session): coordinate Cursor split publication (#4510)	4510	0	
+d69ec3523bb98b91ec2676efb5ad35100a34f866	Merge pull request #4511 from Yeachan-Heo/fix/pr-4499-docs	4511	0	
+3be6cd0e4e2d83f2a4bcc8993ae3d1ae481eb134	Merge pull request #4500 from Yeachan-Heo/fix/issue-4489-escaped-nonascii-resample-successor	4500	0	
+cbb358d20a499ef18b0bdbb6150e4a69c4fd9050	Merge pull request #4503 from Yeachan-Heo/fix/issue-4498-tool-catalog-order	4503	0	
+7095fc894797b2a3655db6bf4664f26b79948d59	Merge pull request #4423 from Yeachan-Heo/feat/multi-account-setup	4423	0	
+96e8f23ea808844ea27a4dc59468bc9f111dc4fc	test(customization): add cross-convention consumption fixture (#4508)	4508	0	
+2c12aebc1365ff7fcbb7c1da725bf372bf878675	Merge pull request #4517 from Yeachan-Heo/fix/issue-4516-hook-authority	4517	0	
+71c6cdf5d7dd95d6b870ed41a3c15c737161abbf	docs(customization): align hook runtime authority		1	packages/coding-agent/CHANGELOG.md
+7121d19c72bacb1bcf3837a837622825bd895430	fix(acp): preserve cleanup-pending delete authority (#4506)	4506	3	packages/coding-agent/CHANGELOG.md;packages/coding-agent/src/modes/acp/acp-agent.ts;packages/coding-agent/src/sdk/broker/lifecycle.ts
+e0c8a35aabcdcd6fd811105fe643f895fc7e8c3b	fix(customization): wire explicit hook paths		0	
+01b370fba17638abd7d8cac866ceabb1f1e7ebab	fix(ci): add trusted PR contract bootstrap		1	.github/workflows/dev-ci.yml
+59ac14e7bd5af05d6ce38dfa80b0b2b2100051e3	Merge pull request #4520 from Yeachan-Heo/test/issue-4508-cross-convention-fixture	4520	0	
+38f3b4077c870e41d061f8f2aa7f5c873a30e25f	fix(tui): bound overlay geometry to stop main-thread spin (#4481)	4481	0	
+99efe0ad8466ae764ddde99fa886e82dc522f0ce	Merge branch 'main' into dev		0	
+099ca7ec19654b2863f0a113ed569c8e7e96b9f5	chore: bump version to 0.13.2		4	bun.lock;package.json;packages/coding-agent/CHANGELOG.md;packages/natives/native/index.d.ts
