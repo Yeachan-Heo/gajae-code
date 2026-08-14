@@ -265,7 +265,7 @@ describe("anthropic first-event timeouts", () => {
 		}) as unknown as Anthropic["messages"]["create"];
 
 		const result = await streamAnthropic(
-			customModel("https://user:password@proxy.example/v1?token=secret"),
+			customModel("https://user:password@api.anthropic.com:8443/v1?token=secret"),
 			contextWithBytes(1_670_000),
 			{
 				client: { messages: { create } } as Anthropic,

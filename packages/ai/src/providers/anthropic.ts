@@ -1487,7 +1487,21 @@ const ANTHROPIC_LARGE_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS = 1;
 const ANTHROPIC_SMALL_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS = 2;
 
 function classifyAnthropicEndpoint(baseUrl: string): "canonical" | "custom" {
-	return isAnthropicApiBaseUrl(baseUrl) ? "canonical" : "custom";
+	try {
+		const url = new URL(baseUrl);
+		return url.protocol.toLowerCase() === "https:" &&
+			url.hostname.toLowerCase() === "api.anthropic.com" &&
+			(url.port === "" || url.port === "443") &&
+			url.username === "" &&
+			url.password === "" &&
+			url.search === "" &&
+			url.hash === "" &&
+			(url.pathname === "" || url.pathname === "/")
+			? "canonical"
+			: "custom";
+	} catch {
+		return "custom";
+	}
 }
 
 function resolveAnthropicFirstEventWatchdogMs(
