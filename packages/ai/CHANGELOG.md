@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Refreshed the bundled ZAI catalog with GLM-5.3 and made it the provider's default model.
 - Defense-in-depth: a completed Anthropic stream whose assembled assistant content carries directly adjacent `thinking`/`redacted_thinking` blocks now emits a bounded diagnostic per stream invocation naming only the envelope shape (block count, adjacency presence, model, provider), never raw thinking text, signatures, or redacted payloads. The send-boundary collapse remains the wire source of truth; this is a read-only observation that helps surface upstream producers of the rejected shape (#4443).
 
 - The adjacent-thinking-block collapse now treats `thinking` and `redacted_thinking` as one adjacency class at the final Anthropic send boundary, matching the maintainer-approved send-time invariant (#4425). The earlier replay-phase collapse (#4418) and its test asserted that a `redacted_thinking` block following a `thinking` block survived; the final send-boundary pass (#4425) correctly collapses that pair, and the replay-phase test and doc comment are reconciled to that authoritative behavior (#4382).

@@ -341,7 +341,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		config => maraModelManagerOptions(config),
 		catalog("Mara Cloud", ["MARA_API_KEY"]),
 	),
-	catalogDescriptor("zai", "glm-5.2", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
+	catalogDescriptor("zai", "glm-5.3", config => zaiModelManagerOptions(config), catalog("zAI", ["ZAI_API_KEY"])),
 	catalogDescriptor(
 		"glm-zcode",
 		"glm-5.2",
