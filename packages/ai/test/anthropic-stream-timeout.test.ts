@@ -211,14 +211,11 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.duration).toBeGreaterThanOrEqual(result.transportFailure?.firstEventElapsedMs ?? 0);
 	});
 
-	it("allows one bounded replay for a small first-event timeout", async () => {
+	it("leaves a small first-event timeout replay to the session attempt ceiling", async () => {
 		let attempts = 0;
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
 			attempts += 1;
-			return createAnthropicMockStream({
-				signal: requestOptions?.signal,
-				events: attempts === 1 ? undefined : createSuccessfulAnthropicEvents("recovered once"),
-			}) as never;
+			return createAnthropicMockStream({ signal: requestOptions?.signal }) as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const providerRetryWait = vi.fn(async () => {});
 
@@ -228,11 +225,14 @@ describe("anthropic first-event timeouts", () => {
 			providerRetryWait,
 		}).result();
 
-		expect(attempts).toBe(2);
-		expect(providerRetryWait).toHaveBeenCalledTimes(1);
-		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "recovered once" }]);
-		expect(result.usage.totalTokens).toBe(16);
+		expect(attempts).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.transportFailure).toMatchObject({
+			providerCode: "stream_first_event_timeout",
+			retryMaxAttempts: 2,
+		});
+		expect(result.usage.totalTokens).toBe(0);
 	});
 
 	it("gives custom endpoints bounded grace so a late 529 surfaces instead of a timeout", async () => {
@@ -367,6 +367,23 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.duration).toBeLessThan(1_000);
 	});
 
+	it("preserves an explicit zero first-event timeout for a large custom-endpoint request", async () => {
+		const controller = new AbortController();
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			return createAnthropicMockStream({ signal: requestOptions?.signal }) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		setTimeout(() => controller.abort(), 5);
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), contextWithBytes(1_670_000), {
+			client: { messages: { create } } as Anthropic,
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 0,
+		}).result();
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
+	});
+
 	it("surfaces large retry-after Anthropic 429s instead of first-event timeouts", async () => {
 		let attempts = 0;
 		const fetchMock = (async () => {
@@ -471,11 +488,17 @@ describe("anthropic first-event timeouts", () => {
 		expect((result.errorMessage ?? "").toLowerCase()).toContain("abort");
 	});
 
-	it("stops a small-body timeout retry when the caller aborts during backoff", async () => {
+	it("stops a transient provider retry when the caller aborts during backoff", async () => {
 		let attempts = 0;
-		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+		const create = ((_body: unknown) => {
 			attempts += 1;
-			return createAnthropicMockStream({ signal: requestOptions?.signal }) as never;
+			return {
+				async withResponse() {
+					const error = new Error("529 Overloaded");
+					(error as Error & { status: number }).status = 529;
+					throw error;
+				},
+			} as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const controller = new AbortController();
 		const providerRetryWait = vi.fn(async (_delayMs: number, signal?: AbortSignal) => {
@@ -486,7 +509,6 @@ describe("anthropic first-event timeouts", () => {
 		const result = await streamAnthropic(model, context, {
 			client: { messages: { create } } as Anthropic,
 			signal: controller.signal,
-			streamFirstEventTimeoutMs: 1,
 			providerRetryWait,
 		}).result();
 

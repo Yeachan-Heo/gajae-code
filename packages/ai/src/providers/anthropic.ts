@@ -1497,6 +1497,7 @@ function resolveAnthropicFirstEventWatchdogMs(
 ): number | undefined {
 	if (
 		firstEventTimeoutMs === undefined ||
+		firstEventTimeoutMs <= 0 ||
 		endpointClass === "canonical" ||
 		requestBytes < ANTHROPIC_LARGE_REQUEST_BYTES
 	) {
@@ -2370,10 +2371,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				} catch (streamError) {
 					const localAbortReason = activeAbortTracker.getLocalAbortReason();
 					const streamFailure = localAbortReason ?? streamError;
-					if (
-						(localAbortReason && !(localAbortReason instanceof FirstEventTimeoutError)) ||
-						sawProviderSafetyStop
-					) {
+					if (localAbortReason || sawProviderSafetyStop) {
 						throw streamFailure;
 					}
 					if (
