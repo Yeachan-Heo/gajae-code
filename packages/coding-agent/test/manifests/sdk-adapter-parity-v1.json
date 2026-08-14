@@ -26,21 +26,27 @@
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts"
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-M-"
 			]
 		},
 		{
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts"
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-A-"
 			]
 		},
 		{
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts"
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-L-"
 			]
 		},
 		{
@@ -93,9 +99,6 @@
 		"packages/coding-agent/test/sdk-acp-adapter.test.ts",
 		"packages/coding-agent/test/sdk-acp-provider-reconnect.test.ts",
 		"packages/coding-agent/test/sdk-acp-two-client-race.test.ts",
-		"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
-		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
-		"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
 		"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 		"packages/coding-agent/test/sdk-client.test.ts",
 		"packages/coding-agent/test/sdk-daemon-cli-e2e.test.ts",
@@ -157,12 +160,12 @@
 			"sdkId": "turn.prompt",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C01:"
 			],
@@ -173,12 +176,12 @@
 			"sdkId": "turn.prompt",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C01:"
 			],
@@ -189,12 +192,12 @@
 			"sdkId": "turn.prompt",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C01:"
 			],
@@ -253,12 +256,12 @@
 			"sdkId": "turn.steer",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C02:"
 			],
@@ -269,12 +272,12 @@
 			"sdkId": "turn.steer",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C02:"
 			],
@@ -285,12 +288,12 @@
 			"sdkId": "turn.steer",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C02:"
 			],
@@ -349,12 +352,12 @@
 			"sdkId": "turn.follow_up",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C03:"
 			],
@@ -365,12 +368,12 @@
 			"sdkId": "turn.follow_up",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C03:"
 			],
@@ -381,12 +384,12 @@
 			"sdkId": "turn.follow_up",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C03:"
 			],
@@ -445,12 +448,12 @@
 			"sdkId": "turn.abort",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C04:"
 			],
@@ -461,12 +464,12 @@
 			"sdkId": "turn.abort",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C04:"
 			],
@@ -477,12 +480,12 @@
 			"sdkId": "turn.abort",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C04:"
 			],
@@ -541,12 +544,12 @@
 			"sdkId": "turn.abort_and_prompt",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C05:"
 			],
@@ -557,12 +560,12 @@
 			"sdkId": "turn.abort_and_prompt",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C05:"
 			],
@@ -573,12 +576,12 @@
 			"sdkId": "turn.abort_and_prompt",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C05:"
 			],
@@ -637,12 +640,12 @@
 			"sdkId": "ask.answer",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C06:"
 			],
@@ -653,12 +656,12 @@
 			"sdkId": "ask.answer",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C06:"
 			],
@@ -669,12 +672,12 @@
 			"sdkId": "ask.answer",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C06:"
 			],
@@ -733,12 +736,12 @@
 			"sdkId": "workflow.gate_answer",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C07:"
 			],
@@ -749,12 +752,12 @@
 			"sdkId": "workflow.gate_answer",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C07:"
 			],
@@ -765,12 +768,12 @@
 			"sdkId": "workflow.gate_answer",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C07:"
 			],
@@ -829,12 +832,12 @@
 			"sdkId": "workflow.plan_approve",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C08",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C08:"
 			],
@@ -845,12 +848,12 @@
 			"sdkId": "workflow.plan_approve",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C08",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C08:"
 			],
@@ -861,12 +864,12 @@
 			"sdkId": "workflow.plan_approve",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C08",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C08:"
 			],
@@ -925,12 +928,12 @@
 			"sdkId": "skill.invoke",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C09",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C09:"
 			],
@@ -941,12 +944,12 @@
 			"sdkId": "skill.invoke",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C09",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C09:"
 			],
@@ -957,12 +960,12 @@
 			"sdkId": "skill.invoke",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C09",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C09:"
 			],
@@ -1021,12 +1024,12 @@
 			"sdkId": "mode.plan.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C10",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C10:"
 			],
@@ -1037,12 +1040,12 @@
 			"sdkId": "mode.plan.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C10",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C10:"
 			],
@@ -1053,12 +1056,12 @@
 			"sdkId": "mode.plan.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C10",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C10:"
 			],
@@ -1117,12 +1120,12 @@
 			"sdkId": "mode.goal.operate",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C11",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C11:"
 			],
@@ -1133,12 +1136,12 @@
 			"sdkId": "mode.goal.operate",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C11",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C11:"
 			],
@@ -1149,12 +1152,12 @@
 			"sdkId": "mode.goal.operate",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C11",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C11:"
 			],
@@ -1213,12 +1216,12 @@
 			"sdkId": "todo.replace",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C12",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C12:"
 			],
@@ -1229,12 +1232,12 @@
 			"sdkId": "todo.replace",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C12",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C12:"
 			],
@@ -1245,12 +1248,12 @@
 			"sdkId": "todo.replace",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C12",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C12:"
 			],
@@ -1309,12 +1312,12 @@
 			"sdkId": "model.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C13",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C13:"
 			],
@@ -1325,12 +1328,12 @@
 			"sdkId": "model.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C13",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C13:"
 			],
@@ -1341,12 +1344,12 @@
 			"sdkId": "model.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C13",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C13:"
 			],
@@ -1405,12 +1408,12 @@
 			"sdkId": "model.cycle",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C14",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C14:"
 			],
@@ -1421,12 +1424,12 @@
 			"sdkId": "model.cycle",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C14",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C14:"
 			],
@@ -1437,12 +1440,12 @@
 			"sdkId": "model.cycle",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C14",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C14:"
 			],
@@ -1501,12 +1504,12 @@
 			"sdkId": "thinking.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C15",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C15:"
 			],
@@ -1517,12 +1520,12 @@
 			"sdkId": "thinking.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C15",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C15:"
 			],
@@ -1533,12 +1536,12 @@
 			"sdkId": "thinking.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C15",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C15:"
 			],
@@ -1597,12 +1600,12 @@
 			"sdkId": "thinking.cycle",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C16",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C16:"
 			],
@@ -1613,12 +1616,12 @@
 			"sdkId": "thinking.cycle",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C16",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C16:"
 			],
@@ -1629,12 +1632,12 @@
 			"sdkId": "thinking.cycle",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C16",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C16:"
 			],
@@ -1693,12 +1696,12 @@
 			"sdkId": "permission_mode.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C17",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C17:"
 			],
@@ -1709,12 +1712,12 @@
 			"sdkId": "permission_mode.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C17",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C17:"
 			],
@@ -1725,12 +1728,12 @@
 			"sdkId": "permission_mode.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C17",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C17:"
 			],
@@ -1789,12 +1792,12 @@
 			"sdkId": "queue.steering_mode.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C18",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C18:"
 			],
@@ -1805,12 +1808,12 @@
 			"sdkId": "queue.steering_mode.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C18",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C18:"
 			],
@@ -1821,12 +1824,12 @@
 			"sdkId": "queue.steering_mode.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C18",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C18:"
 			],
@@ -1885,12 +1888,12 @@
 			"sdkId": "queue.follow_up_mode.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C19",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C19:"
 			],
@@ -1901,12 +1904,12 @@
 			"sdkId": "queue.follow_up_mode.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C19",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C19:"
 			],
@@ -1917,12 +1920,12 @@
 			"sdkId": "queue.follow_up_mode.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C19",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C19:"
 			],
@@ -1981,12 +1984,12 @@
 			"sdkId": "queue.interrupt_mode.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C20",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C20:"
 			],
@@ -1997,12 +2000,12 @@
 			"sdkId": "queue.interrupt_mode.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C20",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C20:"
 			],
@@ -2013,12 +2016,12 @@
 			"sdkId": "queue.interrupt_mode.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C20",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C20:"
 			],
@@ -2077,12 +2080,12 @@
 			"sdkId": "compaction.run",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C21",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C21:"
 			],
@@ -2093,12 +2096,12 @@
 			"sdkId": "compaction.run",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C21",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C21:"
 			],
@@ -2109,12 +2112,12 @@
 			"sdkId": "compaction.run",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C21",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C21:"
 			],
@@ -2173,12 +2176,12 @@
 			"sdkId": "compaction.auto.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C22",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C22:"
 			],
@@ -2189,12 +2192,12 @@
 			"sdkId": "compaction.auto.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C22",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C22:"
 			],
@@ -2205,12 +2208,12 @@
 			"sdkId": "compaction.auto.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C22",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C22:"
 			],
@@ -2269,12 +2272,12 @@
 			"sdkId": "retry.auto.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C23",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C23:"
 			],
@@ -2285,12 +2288,12 @@
 			"sdkId": "retry.auto.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C23",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C23:"
 			],
@@ -2301,12 +2304,12 @@
 			"sdkId": "retry.auto.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C23",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C23:"
 			],
@@ -2365,12 +2368,12 @@
 			"sdkId": "retry.abort",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C24",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C24:"
 			],
@@ -2381,12 +2384,12 @@
 			"sdkId": "retry.abort",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C24",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C24:"
 			],
@@ -2397,12 +2400,12 @@
 			"sdkId": "retry.abort",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C24",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C24:"
 			],
@@ -2460,49 +2463,49 @@
 			"adapterTestId": "AD-M-C25",
 			"sdkId": "bash.execute",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C25",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C25:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C25",
 			"sdkId": "bash.execute",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C25",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C25:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C25",
 			"sdkId": "bash.execute",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C25",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C25:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C26",
@@ -2556,55 +2559,55 @@
 			"adapterTestId": "AD-M-C26",
 			"sdkId": "bash.abort",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C26",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C26:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C26",
 			"sdkId": "bash.abort",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C26",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C26:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C26",
 			"sdkId": "bash.abort",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C26",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C26:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C27",
 			"sdkId": "session.new",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C27",
 			"argv": [
@@ -2614,13 +2617,13 @@
 				"--test-name-pattern",
 				"^AD-T-C27:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-C27",
 			"sdkId": "session.new",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C27",
 			"argv": [
@@ -2630,13 +2633,13 @@
 				"--test-name-pattern",
 				"^AD-D-C27:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-C27",
 			"sdkId": "session.new",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C27",
 			"argv": [
@@ -2646,61 +2649,61 @@
 				"--test-name-pattern",
 				"^AD-S-C27:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-C27",
 			"sdkId": "session.new",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C27",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C27:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C27",
 			"sdkId": "session.new",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C27",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C27:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C27",
 			"sdkId": "session.new",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C27",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C27:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C28",
 			"sdkId": "session.fork",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C28",
 			"argv": [
@@ -2710,13 +2713,13 @@
 				"--test-name-pattern",
 				"^AD-T-C28:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-C28",
 			"sdkId": "session.fork",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C28",
 			"argv": [
@@ -2726,13 +2729,13 @@
 				"--test-name-pattern",
 				"^AD-D-C28:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-C28",
 			"sdkId": "session.fork",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C28",
 			"argv": [
@@ -2742,61 +2745,61 @@
 				"--test-name-pattern",
 				"^AD-S-C28:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-C28",
 			"sdkId": "session.fork",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C28",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C28:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C28",
 			"sdkId": "session.fork",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C28",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C28:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C28",
 			"sdkId": "session.fork",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C28",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C28:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C29",
 			"sdkId": "session.resume",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C29",
 			"argv": [
@@ -2806,13 +2809,13 @@
 				"--test-name-pattern",
 				"^AD-T-C29:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-C29",
 			"sdkId": "session.resume",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C29",
 			"argv": [
@@ -2822,13 +2825,13 @@
 				"--test-name-pattern",
 				"^AD-D-C29:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-C29",
 			"sdkId": "session.resume",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C29",
 			"argv": [
@@ -2838,61 +2841,61 @@
 				"--test-name-pattern",
 				"^AD-S-C29:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-C29",
 			"sdkId": "session.resume",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C29",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C29:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C29",
 			"sdkId": "session.resume",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C29",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C29:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C29",
 			"sdkId": "session.resume",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C29",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C29:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C30",
 			"sdkId": "session.close",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C30",
 			"argv": [
@@ -2902,13 +2905,13 @@
 				"--test-name-pattern",
 				"^AD-T-C30:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-C30",
 			"sdkId": "session.close",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C30",
 			"argv": [
@@ -2918,13 +2921,13 @@
 				"--test-name-pattern",
 				"^AD-D-C30:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-C30",
 			"sdkId": "session.close",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C30",
 			"argv": [
@@ -2934,61 +2937,61 @@
 				"--test-name-pattern",
 				"^AD-S-C30:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-C30",
 			"sdkId": "session.close",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C30",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C30:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C30",
 			"sdkId": "session.close",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C30",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C30:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C30",
 			"sdkId": "session.close",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C30",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C30:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C31",
 			"sdkId": "session.switch",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C31",
 			"argv": [
@@ -2998,13 +3001,13 @@
 				"--test-name-pattern",
 				"^AD-T-C31:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-C31",
 			"sdkId": "session.switch",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C31",
 			"argv": [
@@ -3014,13 +3017,13 @@
 				"--test-name-pattern",
 				"^AD-D-C31:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-C31",
 			"sdkId": "session.switch",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C31",
 			"argv": [
@@ -3030,61 +3033,61 @@
 				"--test-name-pattern",
 				"^AD-S-C31:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-C31",
 			"sdkId": "session.switch",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C31",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C31:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C31",
 			"sdkId": "session.switch",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C31",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C31:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C31",
 			"sdkId": "session.switch",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C31",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C31:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C32",
 			"sdkId": "session.branch",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C32",
 			"argv": [
@@ -3094,13 +3097,13 @@
 				"--test-name-pattern",
 				"^AD-T-C32:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-C32",
 			"sdkId": "session.branch",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C32",
 			"argv": [
@@ -3110,13 +3113,13 @@
 				"--test-name-pattern",
 				"^AD-D-C32:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-C32",
 			"sdkId": "session.branch",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C32",
 			"argv": [
@@ -3126,55 +3129,55 @@
 				"--test-name-pattern",
 				"^AD-S-C32:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-C32",
 			"sdkId": "session.branch",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C32",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C32:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C32",
 			"sdkId": "session.branch",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C32",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C32:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C32",
 			"sdkId": "session.branch",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C32",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C32:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C33",
@@ -3229,12 +3232,12 @@
 			"sdkId": "session.rename",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C33",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C33:"
 			],
@@ -3245,12 +3248,12 @@
 			"sdkId": "session.rename",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C33",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C33:"
 			],
@@ -3261,12 +3264,12 @@
 			"sdkId": "session.rename",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C33",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C33:"
 			],
@@ -3276,7 +3279,7 @@
 			"adapterTestId": "AD-T-C34",
 			"sdkId": "session.handoff",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C34",
 			"argv": [
@@ -3286,13 +3289,13 @@
 				"--test-name-pattern",
 				"^AD-T-C34:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-C34",
 			"sdkId": "session.handoff",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C34",
 			"argv": [
@@ -3302,13 +3305,13 @@
 				"--test-name-pattern",
 				"^AD-D-C34:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-C34",
 			"sdkId": "session.handoff",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C34",
 			"argv": [
@@ -3318,55 +3321,55 @@
 				"--test-name-pattern",
 				"^AD-S-C34:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-C34",
 			"sdkId": "session.handoff",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C34",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C34:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C34",
 			"sdkId": "session.handoff",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C34",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C34:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C34",
 			"sdkId": "session.handoff",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C34",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C34:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C35",
@@ -3421,12 +3424,12 @@
 			"sdkId": "session.export_html",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C35",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C35:"
 			],
@@ -3437,12 +3440,12 @@
 			"sdkId": "session.export_html",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C35",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C35:"
 			],
@@ -3453,12 +3456,12 @@
 			"sdkId": "session.export_html",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C35",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C35:"
 			],
@@ -3565,12 +3568,12 @@
 			"sdkId": "config.patch",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C36",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C36:"
 			],
@@ -3581,12 +3584,12 @@
 			"sdkId": "config.patch",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C36-secret",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C36-secret:"
 			],
@@ -3597,12 +3600,12 @@
 			"sdkId": "config.patch",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C36",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C36:"
 			],
@@ -3613,12 +3616,12 @@
 			"sdkId": "config.patch",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C36-secret",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C36-secret:"
 			],
@@ -3629,12 +3632,12 @@
 			"sdkId": "config.patch",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C36",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C36:"
 			],
@@ -3645,12 +3648,12 @@
 			"sdkId": "config.patch",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C36-secret",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C36-secret:"
 			],
@@ -3709,12 +3712,12 @@
 			"sdkId": "runtime.reload",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C37",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C37:"
 			],
@@ -3725,12 +3728,12 @@
 			"sdkId": "runtime.reload",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C37",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C37:"
 			],
@@ -3741,12 +3744,12 @@
 			"sdkId": "runtime.reload",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C37",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C37:"
 			],
@@ -3805,12 +3808,12 @@
 			"sdkId": "auth.login",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C38",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C38:"
 			],
@@ -3821,12 +3824,12 @@
 			"sdkId": "auth.login",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C38",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C38:"
 			],
@@ -3837,12 +3840,12 @@
 			"sdkId": "auth.login",
 			"adapter": "daemonCli",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C38",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C38:"
 			],
@@ -3901,12 +3904,12 @@
 			"sdkId": "host_tools.register",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C39",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C39:"
 			],
@@ -3917,12 +3920,12 @@
 			"sdkId": "host_tools.register",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C39",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C39:"
 			],
@@ -3933,12 +3936,12 @@
 			"sdkId": "host_tools.register",
 			"adapter": "daemonCli",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C39",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C39:"
 			],
@@ -3997,12 +4000,12 @@
 			"sdkId": "host_uri.register",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C40",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C40:"
 			],
@@ -4013,12 +4016,12 @@
 			"sdkId": "host_uri.register",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C40",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C40:"
 			],
@@ -4029,12 +4032,12 @@
 			"sdkId": "host_uri.register",
 			"adapter": "daemonCli",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C40",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C40:"
 			],
@@ -4093,12 +4096,12 @@
 			"sdkId": "service_tier.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C41",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C41:"
 			],
@@ -4109,12 +4112,12 @@
 			"sdkId": "service_tier.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C41",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C41:"
 			],
@@ -4125,12 +4128,12 @@
 			"sdkId": "service_tier.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C41",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C41:"
 			],
@@ -4189,12 +4192,12 @@
 			"sdkId": "tools.active.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C42",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C42:"
 			],
@@ -4205,12 +4208,12 @@
 			"sdkId": "tools.active.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C42",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C42:"
 			],
@@ -4221,12 +4224,12 @@
 			"sdkId": "tools.active.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C42",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C42:"
 			],
@@ -4285,12 +4288,12 @@
 			"sdkId": "queue.message.remove",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C43",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C43:"
 			],
@@ -4301,12 +4304,12 @@
 			"sdkId": "queue.message.remove",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C43",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C43:"
 			],
@@ -4317,12 +4320,12 @@
 			"sdkId": "queue.message.remove",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C43",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C43:"
 			],
@@ -4381,12 +4384,12 @@
 			"sdkId": "queue.message.move",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C44",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C44:"
 			],
@@ -4397,12 +4400,12 @@
 			"sdkId": "queue.message.move",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C44",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C44:"
 			],
@@ -4413,12 +4416,12 @@
 			"sdkId": "queue.message.move",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C44",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C44:"
 			],
@@ -4477,12 +4480,12 @@
 			"sdkId": "queue.message.update",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C45",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C45:"
 			],
@@ -4493,12 +4496,12 @@
 			"sdkId": "queue.message.update",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C45",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C45:"
 			],
@@ -4509,12 +4512,12 @@
 			"sdkId": "queue.message.update",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C45",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C45:"
 			],
@@ -4573,12 +4576,12 @@
 			"sdkId": "extension.set_enabled",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C46",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C46:"
 			],
@@ -4589,12 +4592,12 @@
 			"sdkId": "extension.set_enabled",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C46",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C46:"
 			],
@@ -4605,12 +4608,12 @@
 			"sdkId": "extension.set_enabled",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C46",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C46:"
 			],
@@ -4669,12 +4672,12 @@
 			"sdkId": "context.clear",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C47",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C47:"
 			],
@@ -4685,12 +4688,12 @@
 			"sdkId": "context.clear",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C47",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C47:"
 			],
@@ -4701,12 +4704,12 @@
 			"sdkId": "context.clear",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C47",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C47:"
 			],
@@ -4716,7 +4719,7 @@
 			"adapterTestId": "AD-T-C48",
 			"sdkId": "session.delete",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C48",
 			"argv": [
@@ -4726,13 +4729,13 @@
 				"--test-name-pattern",
 				"^AD-T-C48:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-C48",
 			"sdkId": "session.delete",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C48",
 			"argv": [
@@ -4742,13 +4745,13 @@
 				"--test-name-pattern",
 				"^AD-D-C48:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-C48",
 			"sdkId": "session.delete",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C48",
 			"argv": [
@@ -4758,55 +4761,55 @@
 				"--test-name-pattern",
 				"^AD-S-C48:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-C48",
 			"sdkId": "session.delete",
 			"adapter": "mcp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C48",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C48:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-A-C48",
 			"sdkId": "session.delete",
 			"adapter": "acp",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C48",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C48:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-L-C48",
 			"sdkId": "session.delete",
 			"adapter": "daemonCli",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C48",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C48:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-T-C49",
@@ -4861,12 +4864,12 @@
 			"sdkId": "session.cwd.move",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C49",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C49:"
 			],
@@ -4877,12 +4880,12 @@
 			"sdkId": "session.cwd.move",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C49",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C49:"
 			],
@@ -4893,12 +4896,12 @@
 			"sdkId": "session.cwd.move",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C49",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C49:"
 			],
@@ -4957,12 +4960,12 @@
 			"sdkId": "retry.last",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C50",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C50:"
 			],
@@ -4973,12 +4976,12 @@
 			"sdkId": "retry.last",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C50",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C50:"
 			],
@@ -4989,12 +4992,12 @@
 			"sdkId": "retry.last",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C50",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C50:"
 			],
@@ -5053,12 +5056,12 @@
 			"sdkId": "retry.now",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C51",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C51:"
 			],
@@ -5069,12 +5072,12 @@
 			"sdkId": "retry.now",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C51",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C51:"
 			],
@@ -5085,12 +5088,12 @@
 			"sdkId": "retry.now",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C51",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C51:"
 			],
@@ -5149,12 +5152,12 @@
 			"sdkId": "bash.background",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C52",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C52:"
 			],
@@ -5165,12 +5168,12 @@
 			"sdkId": "bash.background",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C52",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C52:"
 			],
@@ -5181,12 +5184,12 @@
 			"sdkId": "bash.background",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C52",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C52:"
 			],
@@ -5245,12 +5248,12 @@
 			"sdkId": "model.profile.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C53",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-C53:"
 			],
@@ -5261,12 +5264,12 @@
 			"sdkId": "model.profile.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C53",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C53:"
 			],
@@ -5277,12 +5280,12 @@
 			"sdkId": "model.profile.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C53",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-C53:"
 			],
@@ -5341,12 +5344,12 @@
 			"sdkId": "session.list",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-G01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-G01:"
 			],
@@ -5357,12 +5360,12 @@
 			"sdkId": "session.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-G01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G01:"
 			],
@@ -5373,12 +5376,12 @@
 			"sdkId": "session.list",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-G01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-G01:"
 			],
@@ -5437,12 +5440,12 @@
 			"sdkId": "session.get_endpoint",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-G02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-G02:"
 			],
@@ -5453,12 +5456,12 @@
 			"sdkId": "session.get_endpoint",
 			"adapter": "acp",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-G02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G02:"
 			],
@@ -5469,12 +5472,12 @@
 			"sdkId": "session.get_endpoint",
 			"adapter": "daemonCli",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-G02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-G02:"
 			],
@@ -5484,7 +5487,7 @@
 			"adapterTestId": "AD-T-G03",
 			"sdkId": "session.create",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G03",
 			"argv": [
@@ -5494,13 +5497,13 @@
 				"--test-name-pattern",
 				"^AD-T-G03:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-G03",
 			"sdkId": "session.create",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G03",
 			"argv": [
@@ -5510,13 +5513,13 @@
 				"--test-name-pattern",
 				"^AD-D-G03:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-G03",
 			"sdkId": "session.create",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G03",
 			"argv": [
@@ -5526,19 +5529,19 @@
 				"--test-name-pattern",
 				"^AD-S-G03:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-G03",
 			"sdkId": "session.create",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-G03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-G03:"
 			],
@@ -5549,12 +5552,12 @@
 			"sdkId": "session.create",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-G03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G03:"
 			],
@@ -5565,12 +5568,12 @@
 			"sdkId": "session.create",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-G03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-G03:"
 			],
@@ -5580,7 +5583,7 @@
 			"adapterTestId": "AD-T-G04",
 			"sdkId": "session.fork",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G04",
 			"argv": [
@@ -5590,13 +5593,13 @@
 				"--test-name-pattern",
 				"^AD-T-G04:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-G04",
 			"sdkId": "session.fork",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G04",
 			"argv": [
@@ -5606,13 +5609,13 @@
 				"--test-name-pattern",
 				"^AD-D-G04:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-G04",
 			"sdkId": "session.fork",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G04",
 			"argv": [
@@ -5622,19 +5625,19 @@
 				"--test-name-pattern",
 				"^AD-S-G04:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-G04",
 			"sdkId": "session.fork",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-G04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-G04:"
 			],
@@ -5645,12 +5648,12 @@
 			"sdkId": "session.fork",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-G04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G04:"
 			],
@@ -5661,12 +5664,12 @@
 			"sdkId": "session.fork",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-G04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-G04:"
 			],
@@ -5676,7 +5679,7 @@
 			"adapterTestId": "AD-T-G05",
 			"sdkId": "session.resume",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G05",
 			"argv": [
@@ -5686,13 +5689,13 @@
 				"--test-name-pattern",
 				"^AD-T-G05:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-G05",
 			"sdkId": "session.resume",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G05",
 			"argv": [
@@ -5702,13 +5705,13 @@
 				"--test-name-pattern",
 				"^AD-D-G05:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-G05",
 			"sdkId": "session.resume",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G05",
 			"argv": [
@@ -5718,19 +5721,19 @@
 				"--test-name-pattern",
 				"^AD-S-G05:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-G05",
 			"sdkId": "session.resume",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-G05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-G05:"
 			],
@@ -5741,12 +5744,12 @@
 			"sdkId": "session.resume",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-G05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G05:"
 			],
@@ -5757,12 +5760,12 @@
 			"sdkId": "session.resume",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-G05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-G05:"
 			],
@@ -5772,7 +5775,7 @@
 			"adapterTestId": "AD-T-G06",
 			"sdkId": "session.close",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G06",
 			"argv": [
@@ -5782,13 +5785,13 @@
 				"--test-name-pattern",
 				"^AD-T-G06:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-G06",
 			"sdkId": "session.close",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G06",
 			"argv": [
@@ -5798,13 +5801,13 @@
 				"--test-name-pattern",
 				"^AD-D-G06:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-G06",
 			"sdkId": "session.close",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G06",
 			"argv": [
@@ -5814,19 +5817,19 @@
 				"--test-name-pattern",
 				"^AD-S-G06:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-G06",
 			"sdkId": "session.close",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-G06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-G06:"
 			],
@@ -5837,12 +5840,12 @@
 			"sdkId": "session.close",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-G06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G06:"
 			],
@@ -5853,12 +5856,12 @@
 			"sdkId": "session.close",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-G06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-G06:"
 			],
@@ -5868,7 +5871,7 @@
 			"adapterTestId": "AD-T-G07",
 			"sdkId": "session.delete",
 			"adapter": "telegram",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G07",
 			"argv": [
@@ -5878,13 +5881,13 @@
 				"--test-name-pattern",
 				"^AD-T-G07:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-D-G07",
 			"sdkId": "session.delete",
 			"adapter": "discord",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G07",
 			"argv": [
@@ -5894,13 +5897,13 @@
 				"--test-name-pattern",
 				"^AD-D-G07:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-S-G07",
 			"sdkId": "session.delete",
 			"adapter": "slack",
-			"disposition": "prohibited",
+			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G07",
 			"argv": [
@@ -5910,19 +5913,19 @@
 				"--test-name-pattern",
 				"^AD-S-G07:"
 			],
-			"expected": "rejected_before_send"
+			"expected": "forwarded"
 		},
 		{
 			"adapterTestId": "AD-M-G07",
 			"sdkId": "session.delete",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-G07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-G07:"
 			],
@@ -5933,12 +5936,12 @@
 			"sdkId": "session.delete",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-G07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G07:"
 			],
@@ -5949,12 +5952,12 @@
 			"sdkId": "session.delete",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-G07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-G07:"
 			],
@@ -6013,12 +6016,12 @@
 			"sdkId": "transcript.list",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q01:"
 			],
@@ -6029,12 +6032,12 @@
 			"sdkId": "transcript.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q01:"
 			],
@@ -6045,12 +6048,12 @@
 			"sdkId": "transcript.list",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q01:"
 			],
@@ -6109,12 +6112,12 @@
 			"sdkId": "transcript.body",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q02:"
 			],
@@ -6125,12 +6128,12 @@
 			"sdkId": "transcript.body",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q02:"
 			],
@@ -6141,12 +6144,12 @@
 			"sdkId": "transcript.body",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q02:"
 			],
@@ -6205,12 +6208,12 @@
 			"sdkId": "context.get",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q03:"
 			],
@@ -6221,12 +6224,12 @@
 			"sdkId": "context.get",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q03:"
 			],
@@ -6237,12 +6240,12 @@
 			"sdkId": "context.get",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q03:"
 			],
@@ -6301,12 +6304,12 @@
 			"sdkId": "goal.list/get",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q04:"
 			],
@@ -6317,12 +6320,12 @@
 			"sdkId": "goal.list/get",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q04:"
 			],
@@ -6333,12 +6336,12 @@
 			"sdkId": "goal.list/get",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q04:"
 			],
@@ -6397,12 +6400,12 @@
 			"sdkId": "todo.list",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q05:"
 			],
@@ -6413,12 +6416,12 @@
 			"sdkId": "todo.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q05:"
 			],
@@ -6429,12 +6432,12 @@
 			"sdkId": "todo.list",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q05:"
 			],
@@ -6493,12 +6496,12 @@
 			"sdkId": "diff.list_files",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q06:"
 			],
@@ -6509,12 +6512,12 @@
 			"sdkId": "diff.list_files",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q06:"
 			],
@@ -6525,12 +6528,12 @@
 			"sdkId": "diff.list_files",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q06:"
 			],
@@ -6589,12 +6592,12 @@
 			"sdkId": "diff.list_hunks",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q07:"
 			],
@@ -6605,12 +6608,12 @@
 			"sdkId": "diff.list_hunks",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q07:"
 			],
@@ -6621,12 +6624,12 @@
 			"sdkId": "diff.list_hunks",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q07:"
 			],
@@ -6685,12 +6688,12 @@
 			"sdkId": "diff.read_hunk",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q08",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q08:"
 			],
@@ -6701,12 +6704,12 @@
 			"sdkId": "diff.read_hunk",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q08",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q08:"
 			],
@@ -6717,12 +6720,12 @@
 			"sdkId": "diff.read_hunk",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q08",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q08:"
 			],
@@ -6781,12 +6784,12 @@
 			"sdkId": "usage.get",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q09",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q09:"
 			],
@@ -6797,12 +6800,12 @@
 			"sdkId": "usage.get",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q09",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q09:"
 			],
@@ -6813,12 +6816,12 @@
 			"sdkId": "usage.get",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q09",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q09:"
 			],
@@ -6877,12 +6880,12 @@
 			"sdkId": "models.list/current",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q10",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q10:"
 			],
@@ -6893,12 +6896,12 @@
 			"sdkId": "models.list/current",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q10",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q10:"
 			],
@@ -6909,12 +6912,12 @@
 			"sdkId": "models.list/current",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q10",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q10:"
 			],
@@ -6973,12 +6976,12 @@
 			"sdkId": "skill.list/state",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q11",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q11:"
 			],
@@ -6989,12 +6992,12 @@
 			"sdkId": "skill.list/state",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q11",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q11:"
 			],
@@ -7005,12 +7008,12 @@
 			"sdkId": "skill.list/state",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q11",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q11:"
 			],
@@ -7069,12 +7072,12 @@
 			"sdkId": "workflow.gates.list",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q12",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q12:"
 			],
@@ -7085,12 +7088,12 @@
 			"sdkId": "workflow.gates.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q12",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q12:"
 			],
@@ -7101,12 +7104,12 @@
 			"sdkId": "workflow.gates.list",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q12",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q12:"
 			],
@@ -7165,12 +7168,12 @@
 			"sdkId": "config.list/get",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q13",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q13:"
 			],
@@ -7181,12 +7184,12 @@
 			"sdkId": "config.list/get",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q13",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q13:"
 			],
@@ -7197,12 +7200,12 @@
 			"sdkId": "config.list/get",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q13",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q13:"
 			],
@@ -7261,12 +7264,12 @@
 			"sdkId": "session.metadata",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q14",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q14:"
 			],
@@ -7277,12 +7280,12 @@
 			"sdkId": "session.metadata",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q14",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q14:"
 			],
@@ -7293,12 +7296,12 @@
 			"sdkId": "session.metadata",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q14",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q14:"
 			],
@@ -7357,12 +7360,12 @@
 			"sdkId": "session.stats",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q15",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q15:"
 			],
@@ -7373,12 +7376,12 @@
 			"sdkId": "session.stats",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q15",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q15:"
 			],
@@ -7389,12 +7392,12 @@
 			"sdkId": "session.stats",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q15",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q15:"
 			],
@@ -7453,12 +7456,12 @@
 			"sdkId": "session.branch_candidates",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q16",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q16:"
 			],
@@ -7469,12 +7472,12 @@
 			"sdkId": "session.branch_candidates",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q16",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q16:"
 			],
@@ -7485,12 +7488,12 @@
 			"sdkId": "session.branch_candidates",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q16",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q16:"
 			],
@@ -7549,12 +7552,12 @@
 			"sdkId": "session.last_assistant",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q17",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q17:"
 			],
@@ -7565,12 +7568,12 @@
 			"sdkId": "session.last_assistant",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q17",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q17:"
 			],
@@ -7581,12 +7584,12 @@
 			"sdkId": "session.last_assistant",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q17",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q17:"
 			],
@@ -7645,12 +7648,12 @@
 			"sdkId": "runtime.capabilities",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q18",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q18:"
 			],
@@ -7661,12 +7664,12 @@
 			"sdkId": "runtime.capabilities",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q18",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q18:"
 			],
@@ -7677,12 +7680,12 @@
 			"sdkId": "runtime.capabilities",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q18",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q18:"
 			],
@@ -7741,12 +7744,12 @@
 			"sdkId": "auth.providers",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q19",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q19:"
 			],
@@ -7757,12 +7760,12 @@
 			"sdkId": "auth.providers",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q19",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q19:"
 			],
@@ -7773,12 +7776,12 @@
 			"sdkId": "auth.providers",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q19",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q19:"
 			],
@@ -7837,12 +7840,12 @@
 			"sdkId": "tools.list",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q20",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q20:"
 			],
@@ -7853,12 +7856,12 @@
 			"sdkId": "tools.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q20",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q20:"
 			],
@@ -7869,12 +7872,12 @@
 			"sdkId": "tools.list",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q20",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q20:"
 			],
@@ -7933,12 +7936,12 @@
 			"sdkId": "queue.messages.list",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q21",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q21:"
 			],
@@ -7949,12 +7952,12 @@
 			"sdkId": "queue.messages.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q21",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q21:"
 			],
@@ -7965,12 +7968,12 @@
 			"sdkId": "queue.messages.list",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q21",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q21:"
 			],
@@ -8029,12 +8032,12 @@
 			"sdkId": "extensions.list",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q22",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q22:"
 			],
@@ -8045,12 +8048,12 @@
 			"sdkId": "extensions.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q22",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q22:"
 			],
@@ -8061,12 +8064,12 @@
 			"sdkId": "extensions.list",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q22",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q22:"
 			],
@@ -8125,12 +8128,12 @@
 			"sdkId": "resource.body",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q23",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q23:"
 			],
@@ -8141,12 +8144,12 @@
 			"sdkId": "resource.body",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q23",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q23:"
 			],
@@ -8157,12 +8160,12 @@
 			"sdkId": "resource.body",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q23",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q23:"
 			],
@@ -8221,12 +8224,12 @@
 			"sdkId": "artifact.read",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q24",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q24:"
 			],
@@ -8237,12 +8240,12 @@
 			"sdkId": "artifact.read",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q24",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q24:"
 			],
@@ -8253,12 +8256,12 @@
 			"sdkId": "artifact.read",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q24",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q24:"
 			],
@@ -8317,12 +8320,12 @@
 			"sdkId": "runtime.jobs.list",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q25",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q25:"
 			],
@@ -8333,12 +8336,12 @@
 			"sdkId": "runtime.jobs.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q25",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q25:"
 			],
@@ -8349,12 +8352,12 @@
 			"sdkId": "runtime.jobs.list",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q25",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q25:"
 			],
@@ -8413,12 +8416,12 @@
 			"sdkId": "turn.result",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q26",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q26:"
 			],
@@ -8429,12 +8432,12 @@
 			"sdkId": "turn.result",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q26",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q26:"
 			],
@@ -8445,12 +8448,12 @@
 			"sdkId": "turn.result",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q26",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q26:"
 			],
@@ -8509,12 +8512,12 @@
 			"sdkId": "models.profiles.list",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q27",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q27:"
 			],
@@ -8525,12 +8528,12 @@
 			"sdkId": "models.profiles.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q27",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q27:"
 			],
@@ -8541,14 +8544,110 @@
 			"sdkId": "models.profiles.list",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q27",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q27:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-T-Q28",
+			"sdkId": "skill.invoke_status",
+			"adapter": "telegram",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-T-Q28",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-T-Q28:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-D-Q28",
+			"sdkId": "skill.invoke_status",
+			"adapter": "discord",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-D-Q28",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-D-Q28:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-S-Q28",
+			"sdkId": "skill.invoke_status",
+			"adapter": "slack",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-S-Q28",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-S-Q28:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-M-Q28",
+			"sdkId": "skill.invoke_status",
+			"adapter": "mcp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-M-Q28",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-M-Q28:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-A-Q28",
+			"sdkId": "skill.invoke_status",
+			"adapter": "acp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-A-Q28",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-A-Q28:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-L-Q28",
+			"sdkId": "skill.invoke_status",
+			"adapter": "daemonCli",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-L-Q28",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-L-Q28:"
 			],
 			"expected": "forwarded"
 		},
@@ -8605,12 +8704,12 @@
 			"sdkId": "providers.list/active",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q29",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q29:"
 			],
@@ -8621,12 +8720,12 @@
 			"sdkId": "providers.list/active",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q29",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q29:"
 			],
@@ -8637,12 +8736,12 @@
 			"sdkId": "providers.list/active",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q29",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q29:"
 			],
@@ -8701,12 +8800,12 @@
 			"sdkId": "session.checkpoint",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-Q30",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-Q30:"
 			],
@@ -8717,12 +8816,12 @@
 			"sdkId": "session.checkpoint",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-Q30",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q30:"
 			],
@@ -8733,110 +8832,14 @@
 			"sdkId": "session.checkpoint",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-Q30",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q30:"
-			],
-			"expected": "forwarded"
-		},
-		{
-			"adapterTestId": "AD-T-Q31",
-			"sdkId": "turn.steer_status",
-			"adapter": "telegram",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-			"testNamePattern": "AD-T-Q31",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-				"--test-name-pattern",
-				"^AD-T-Q31:"
-			],
-			"expected": "rejected_before_send"
-		},
-		{
-			"adapterTestId": "AD-D-Q31",
-			"sdkId": "turn.steer_status",
-			"adapter": "discord",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-			"testNamePattern": "AD-D-Q31",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-				"--test-name-pattern",
-				"^AD-D-Q31:"
-			],
-			"expected": "rejected_before_send"
-		},
-		{
-			"adapterTestId": "AD-S-Q31",
-			"sdkId": "turn.steer_status",
-			"adapter": "slack",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-			"testNamePattern": "AD-S-Q31",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-				"--test-name-pattern",
-				"^AD-S-Q31:"
-			],
-			"expected": "rejected_before_send"
-		},
-		{
-			"adapterTestId": "AD-M-Q31",
-			"sdkId": "turn.steer_status",
-			"adapter": "mcp",
-			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
-			"testNamePattern": "AD-M-Q31",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
-				"--test-name-pattern",
-				"^AD-M-Q31:"
-			],
-			"expected": "forwarded"
-		},
-		{
-			"adapterTestId": "AD-A-Q31",
-			"sdkId": "turn.steer_status",
-			"adapter": "acp",
-			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
-			"testNamePattern": "AD-A-Q31",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
-				"--test-name-pattern",
-				"^AD-A-Q31:"
-			],
-			"expected": "forwarded"
-		},
-		{
-			"adapterTestId": "AD-L-Q31",
-			"sdkId": "turn.steer_status",
-			"adapter": "daemonCli",
-			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
-			"testNamePattern": "AD-L-Q31",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
-				"--test-name-pattern",
-				"^AD-L-Q31:"
 			],
 			"expected": "forwarded"
 		},
@@ -8893,12 +8896,12 @@
 			"sdkId": "terminal.create/output/release/wait",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-R01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-R01:"
 			],
@@ -8909,12 +8912,12 @@
 			"sdkId": "terminal.create/output/release/wait",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-R01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R01:"
 			],
@@ -8925,12 +8928,12 @@
 			"sdkId": "terminal.create/output/release/wait",
 			"adapter": "daemonCli",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-R01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-R01:"
 			],
@@ -8989,12 +8992,12 @@
 			"sdkId": "filesystem.read/write",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-R02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-R02:"
 			],
@@ -9005,12 +9008,12 @@
 			"sdkId": "filesystem.read/write",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-R02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R02:"
 			],
@@ -9021,12 +9024,12 @@
 			"sdkId": "filesystem.read/write",
 			"adapter": "daemonCli",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-R02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-R02:"
 			],
@@ -9085,12 +9088,12 @@
 			"sdkId": "permission.request",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-R03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-R03:"
 			],
@@ -9101,12 +9104,12 @@
 			"sdkId": "permission.request",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-R03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R03:"
 			],
@@ -9117,12 +9120,12 @@
 			"sdkId": "permission.request",
 			"adapter": "daemonCli",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-R03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-R03:"
 			],
@@ -9181,12 +9184,12 @@
 			"sdkId": "ui.select/confirm/input/editor/open_url",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-R04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-R04:"
 			],
@@ -9197,12 +9200,12 @@
 			"sdkId": "ui.select/confirm/input/editor/open_url",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-R04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R04:"
 			],
@@ -9213,12 +9216,12 @@
 			"sdkId": "ui.select/confirm/input/editor/open_url",
 			"adapter": "daemonCli",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-R04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-R04:"
 			],
@@ -9277,12 +9280,12 @@
 			"sdkId": "host_tool.invoke/cancel/update/result",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-R05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-R05:"
 			],
@@ -9293,12 +9296,12 @@
 			"sdkId": "host_tool.invoke/cancel/update/result",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-R05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R05:"
 			],
@@ -9309,12 +9312,12 @@
 			"sdkId": "host_tool.invoke/cancel/update/result",
 			"adapter": "daemonCli",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-R05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-R05:"
 			],
@@ -9373,12 +9376,12 @@
 			"sdkId": "host_uri.read/write/cancel/result",
 			"adapter": "mcp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-R06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-M-R06:"
 			],
@@ -9389,12 +9392,12 @@
 			"sdkId": "host_uri.read/write/cancel/result",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-R06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R06:"
 			],
@@ -9405,12 +9408,12 @@
 			"sdkId": "host_uri.read/write/cancel/result",
 			"adapter": "daemonCli",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-R06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-R06:"
 			],

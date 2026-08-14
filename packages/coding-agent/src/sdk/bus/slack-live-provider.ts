@@ -50,7 +50,7 @@ export interface SlackLiveProviderOptions {
 	fetch?: (input: string, init?: RequestInit) => Promise<Response>;
 	webSocket?: (url: string) => SlackWebSocket;
 	now?: () => number;
-	sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+	sleep?: (milliseconds: number) => Promise<void>;
 	reconnectDelayMs?: number;
 	maxRateLimitRetries?: number;
 	maxRetryAfterMs?: number;
@@ -93,27 +93,6 @@ function retryAfterMilliseconds(response: Response, body: SlackApiResponse, maxi
 	return Math.min(Math.max(0, Number.isFinite(seconds) ? seconds * 1_000 : 1_000), maximum);
 }
 
-async function sleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
-	if (!signal) {
-		await Bun.sleep(milliseconds);
-		return;
-	}
-	signal.throwIfAborted();
-	const settled = Promise.withResolvers<void>();
-	const timer = setTimeout(settled.resolve, milliseconds);
-	const abort = (): void => {
-		clearTimeout(timer);
-		settled.reject(signal.reason);
-	};
-	signal.addEventListener("abort", abort, { once: true });
-	try {
-		await settled.promise;
-	} finally {
-		clearTimeout(timer);
-		signal.removeEventListener("abort", abort);
-	}
-}
-
 function socketFromGlobal(url: string): SlackWebSocket {
 	return new WebSocket(url);
 }
@@ -139,7 +118,7 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 	readonly #fetch: (input: string, init?: RequestInit) => Promise<Response>;
 	readonly #webSocket: (url: string) => SlackWebSocket;
 	readonly #now: () => number;
-	readonly #sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+	readonly #sleep: (milliseconds: number) => Promise<void>;
 	readonly #reconnectDelayMs: number;
 	readonly #maxRateLimitRetries: number;
 	readonly #maxRetryAfterMs: number;
@@ -169,7 +148,8 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 		this.#fetch = options.fetch ?? fetch;
 		this.#webSocket = options.webSocket ?? socketFromGlobal;
 		this.#now = options.now ?? Date.now;
-		this.#sleep = options.sleep ?? sleep;
+		this.#sleep =
+			options.sleep ?? (async milliseconds => await new Promise<void>(resolve => setTimeout(resolve, milliseconds)));
 		this.#reconnectDelayMs = Math.max(0, options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS);
 		this.#maxRateLimitRetries = Math.max(0, options.maxRateLimitRetries ?? MAX_RATE_LIMIT_RETRIES);
 		this.#maxRetryAfterMs = Math.max(0, options.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS);
@@ -275,18 +255,13 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 		text: string;
 		threadTs?: string;
 		clientMsgId: string;
-		signal?: AbortSignal;
 	}): Promise<SlackPostedMessage> {
-		const response = await this.#api(
-			"chat.postMessage",
-			{
-				channel: input.channel,
-				text: input.text,
-				thread_ts: input.threadTs,
-				client_msg_id: input.clientMsgId,
-			},
-			input.signal,
-		);
+		const response = await this.#api("chat.postMessage", {
+			channel: input.channel,
+			text: input.text,
+			thread_ts: input.threadTs,
+			client_msg_id: input.clientMsgId,
+		});
 		const message = this.#message(response);
 		// A successful HTTP response without a usable receipt can still represent a
 		// remote acceptance. The daemon must reconcile by client_msg_id before retrying.
@@ -298,16 +273,11 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 		channel: string;
 		clientMsgId: string;
 		threadTs?: string;
-		signal?: AbortSignal;
 	}): Promise<SlackMessageSearchResult | null> {
-		const response = await this.#api("conversations.history", { channel: input.channel }, input.signal);
+		const response = await this.#api("conversations.history", { channel: input.channel });
 		const fromHistory = this.#findMessage(response, input.clientMsgId, input.channel);
 		if (fromHistory || !input.threadTs) return fromHistory;
-		const replies = await this.#api(
-			"conversations.replies",
-			{ channel: input.channel, ts: input.threadTs },
-			input.signal,
-		);
+		const replies = await this.#api("conversations.replies", { channel: input.channel, ts: input.threadTs });
 		return this.#findMessage(replies, input.clientMsgId, input.channel);
 	}
 
@@ -423,30 +393,10 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 		return url;
 	}
 
-	async #api(
-		operation: string,
-		body: Record<string, string | undefined>,
-		signal?: AbortSignal,
-	): Promise<SlackApiResponse> {
-		const result = await this.#request(operation, this.#botToken, body, true, signal);
+	async #api(operation: string, body: Record<string, string | undefined>): Promise<SlackApiResponse> {
+		const result = await this.#request(operation, this.#botToken, body, true);
 		if (result.ok === true) return result;
 		throw new SlackProviderError("web_api", operation);
-	}
-
-	async #sleepUntilAbort(milliseconds: number, signal?: AbortSignal): Promise<void> {
-		if (!signal) {
-			await this.#sleep(milliseconds);
-			return;
-		}
-		signal.throwIfAborted();
-		const aborted = Promise.withResolvers<void>();
-		const abort = (): void => aborted.reject(signal.reason);
-		signal.addEventListener("abort", abort, { once: true });
-		try {
-			await Promise.race([this.#sleep(milliseconds, signal), aborted.promise]);
-		} finally {
-			signal.removeEventListener("abort", abort);
-		}
 	}
 
 	async #request(
@@ -500,7 +450,7 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 				throw new SlackProviderError("rate_limited", operation, response.status, retryAfterMs);
 			}
 			const startedAt = this.#now();
-			await this.#sleepUntilAbort(retryAfterMs, signal);
+			await this.#sleep(retryAfterMs);
 			if (this.#now() - startedAt > this.#maxRetryAfterMs) {
 				throw new SlackProviderError("rate_limited", operation, response.status, retryAfterMs);
 			}

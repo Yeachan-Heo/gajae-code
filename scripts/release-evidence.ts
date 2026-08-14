@@ -26,6 +26,7 @@ export interface PublicPackageDefinition {
 export const PUBLIC_PACKAGE_DEFINITIONS: readonly PublicPackageDefinition[] = [
 	{ dir: "packages/agent", name: "@gajae-code/agent-core" },
 	{ dir: "packages/ai", name: "@gajae-code/ai" },
+	{ dir: "packages/bridge-client", name: "@gajae-code/bridge-client" },
 	{ dir: "packages/coding-agent", name: "@gajae-code/coding-agent" },
 	{ dir: "packages/natives", name: "@gajae-code/natives" },
 	{ dir: "packages/natives-darwin-arm64", name: "@gajae-code/natives-darwin-arm64" },

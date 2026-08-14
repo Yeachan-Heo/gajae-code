@@ -838,8 +838,43 @@ function rpcModeInvocationViolations(file: string, contents: string): string[] {
 }
 
 function bridgeClientPackageMetadataViolation(file: string, contents: string): string | undefined {
-	if (!file.endsWith("package.json")) return undefined;
-	if (file !== bridgeClientPackageManifestPath && !contents.includes(bridgeClientPackageName)) return undefined;
+	if (
+		!file.endsWith("package.json") ||
+		(file !== bridgeClientPackageManifestPath && !contents.includes(bridgeClientPackageName))
+	)
+		return undefined;
+	try {
+		const manifest = JSON.parse(contents) as {
+			catalog?: Record<string, unknown>;
+			dependencies?: Record<string, unknown>;
+			name?: unknown;
+			optionalDependencies?: Record<string, unknown>;
+			peerDependencies?: Record<string, unknown>;
+			workspaces?: { catalog?: Record<string, unknown> };
+		};
+		if (file === bridgeClientPackageManifestPath) {
+			if (manifest.name !== bridgeClientPackageName)
+				return `${file}: is not the canonical bridge-client package manifest`;
+			if (
+				Object.keys(manifest.dependencies ?? {}).length > 0 ||
+				Object.keys(manifest.peerDependencies ?? {}).length > 0 ||
+				Object.keys(manifest.optionalDependencies ?? {}).length > 0
+			)
+				return `${file}: canonical bridge-client package must remain runtime-dependency-free`;
+			return undefined;
+		}
+		if (
+			file === "package.json" &&
+			(typeof manifest.catalog?.[bridgeClientPackageName] === "string" ||
+				typeof manifest.workspaces?.catalog?.[bridgeClientPackageName] === "string")
+		)
+			return undefined;
+		if (file === packageManifestPath && typeof manifest.dependencies?.[bridgeClientPackageName] === "string")
+			return undefined;
+	} catch {
+		return `${file}: declares unsupported bridge-client package metadata`;
+	}
+
 	return `${file}: declares unsupported bridge-client package metadata`;
 }
 
@@ -2582,8 +2617,7 @@ async function selfTest(): Promise<void> {
 			"packages/coding-agent/src/sdk/client/client.ts":
 				'export { SdkClient } from "@gajae-code/bridge-client";\nexport type { SdkClientOptions } from "@gajae-code/bridge-client";\n',
 		},
-		1,
-		"declares unsupported bridge-client package metadata",
+		0,
 	);
 	await runSelfTestFixture(
 		{
@@ -2591,7 +2625,7 @@ async function selfTest(): Promise<void> {
 				'{"name":"@gajae-code/bridge-client","dependencies":{"unsafe":"1.0.0"}}\n',
 		},
 		1,
-		"declares unsupported bridge-client package metadata",
+		"canonical bridge-client package must remain runtime-dependency-free",
 	);
 	await runSelfTestFixture(
 		{

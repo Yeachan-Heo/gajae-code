@@ -1,22 +1,21 @@
-import { randomBytes } from "node:crypto";
-import * as fsSync from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { createInterface } from "node:readline/promises";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClientError } from "../client";
-import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
-import type {
-	SessionLifecycleMutationRequest,
-	SessionLifecycleOperation,
-	SessionLifecycleSavedSession,
-	SessionLifecycleSavedSessionIdentity,
-} from "../lifecycle/service";
-import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
-import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
+import {
+	readSdkBrokerDiscovery,
+	readSdkSessionEndpoint,
+	SdkClient,
+	SdkClientError,
+	SdkDiscoveryError,
+	type SdkSentRecord,
+} from "../client";
+import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status.js";
+import { validateAdapterControl } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
-import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
-import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 import {
 	type SdkCheckpointRecordV1,
 	type SdkRetentionGapV1,
@@ -25,79 +24,54 @@ import {
 	SESSION_ROWS_VERSION,
 	stripSecretFields,
 	toCheckpointRecordV1,
+	toOfflineSessionRowV1,
 	toRetentionGapV1,
 	toSessionRowV1,
 	toTailItemV1,
 } from "./rows";
 
-export type SdkSessionCliAction =
-	| "list"
-	| "inspect"
-	| "send"
-	| "status"
-	| "tail"
-	| "raw"
-	| "control"
-	| "query"
-	| "global";
+export type SdkSessionCliAction = "list" | "inspect" | "send" | "status" | "tail" | "elevate" | "raw";
 export type SdkSessionCliRawKind = "control" | "query" | "global";
 
 export interface SdkSessionCliArgs {
 	action?: string;
+	/** Raw dispatch kind when action is "raw" (control | query | global). */
 	rawAction?: string;
 	sessionId?: string;
+	/** Caller-chosen operation reference (ULID) for `send`; required target for `status`. */
 	opRef?: string;
 	operation?: string;
 	query?: string;
+	/** Convenience `send` body: forwarded as the `text` field of turn.prompt. */
 	text?: string;
 	jsonInput?: string;
 	jsonInputFile?: string;
 	jsonInputStdin?: boolean;
 	idempotencyKey?: string;
+	elevationRequestId?: string;
+	operationKind?: OperationKind;
 	confirm?: boolean;
+	/** Raw query continuation cursor, or a saved checkpoint token to resume `tail` from (re-minted per connection). */
 	cursor?: string;
+	showEndpointCredential?: boolean;
+	yes?: boolean;
+	/** `send --wait`: poll turn.prompt_status until terminal or the wait window elapses. */
 	wait?: boolean;
+	/** Bounded wait for `send --wait`, `status`, and live `tail` follow. */
 	timeoutMs?: number;
+	/** `tail --strict`: fail closed on retention gaps (exit 1 retention_gap). */
 	strict?: boolean;
+	/** `tail --until-idle`: exit once the observed event stream reaches a terminal turn state. */
 	untilIdle?: boolean;
+	/** `tail --all-events`: include every event-ring kind instead of the tail subset. */
 	allEvents?: boolean;
 	repo?: string;
 	agentDir?: string;
 }
 
 type JsonRecord = Record<string, unknown>;
-type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.list">;
-type TailExitReason = "idle" | "close";
-export interface RetainedTranscriptTailReader {
-	readonly size: number;
-	readRange(start: number, end: number): Promise<Uint8Array>;
-}
-
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
-const SDK_SESSION_CLI_LIFECYCLE_ACTOR = { id: "gjc-sdk-session-cli", namespace: "sdk:session-cli" } as const;
-const ROUTER_START_TIMEOUT_MS = 10_000;
-const ROUTER_STOP_TIMEOUT_MS = 5_000;
-const TAIL_STATUS_POLL_MS = 100;
-const TAIL_OFFLINE_MAX_ENTRIES = 200;
-const TAIL_OFFLINE_SCAN_CHUNK_BYTES = 64 * 1024;
-const TAIL_OFFLINE_MAX_SCAN_BYTES = 4 * 1024 * 1024;
-const TAIL_OFFLINE_MAX_SCANNED_LINES = 4_096;
-const TAIL_OFFLINE_MAX_LINE_BYTES = 256 * 1024;
-const transcriptDecoder = new TextDecoder("utf-8", { fatal: true });
-
-const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end", "agent_failed"]);
-const CLOSE_EVENT_KINDS = new Set(["session_closed", "session_terminated"]);
-const DEFAULT_TAIL_KINDS = new Set([
-	"session_ready",
-	"session_prepared",
-	"session_closed",
-	"session_terminated",
-	"turn_start",
-	"turn_end",
-	"agent_start",
-	"agent_end",
-	"agent_failed",
-]);
+const MAX_SESSION_LIST_PAGES = 10_000;
 
 class SdkSessionCliError extends Error {
 	constructor(
@@ -110,42 +84,17 @@ class SdkSessionCliError extends Error {
 	}
 }
 
-class RetainedTranscriptTailError extends Error {
-	constructor(
-		readonly reason: "unavailable" | "corrupt" | "line_limit" | "scan_limit" | "changed",
-		message: string,
-	) {
-		super(message);
-	}
-}
-
 function writeJson(value: unknown): void {
 	process.stdout.write(`${JSON.stringify(value)}\n`);
-}
-
-function isRecord(value: unknown): value is JsonRecord {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function object(value: unknown): JsonRecord | undefined {
-	return isRecord(value) ? value : undefined;
-}
-
-function arrayOf(value: unknown): unknown[] {
-	return Array.isArray(value) ? value : [];
-}
-
-function resultObject(response: unknown): JsonRecord | undefined {
-	const record = object(response);
-	return object(record?.result);
 }
 
 function parseInput(raw: string | undefined, source: string): JsonRecord {
 	if (raw === undefined) return {};
 	try {
 		const value: unknown = JSON.parse(raw);
-		if (!isRecord(value)) throw new SdkSessionCliError("invalid_input", `${source} must be a JSON object.`, 2);
-		return value;
+		if (!value || typeof value !== "object" || Array.isArray(value))
+			throw new SdkSessionCliError("invalid_input", `${source} must be a JSON object.`, 2);
+		return value as JsonRecord;
 	} catch (error) {
 		if (error instanceof SdkSessionCliError) throw error;
 		throw new SdkSessionCliError("invalid_json", `${source} must contain valid JSON.`, 2);
@@ -154,8 +103,12 @@ function parseInput(raw: string | undefined, source: string): JsonRecord {
 
 function containsSecretField(value: unknown): boolean {
 	if (Array.isArray(value)) return value.some(containsSecretField);
-	if (!isRecord(value)) return false;
+	if (!value || typeof value !== "object") return false;
 	return Object.entries(value).some(([key, nested]) => SECRET_FIELD.test(key) || containsSecretField(nested));
+}
+
+function object(value: unknown): JsonRecord | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : undefined;
 }
 
 async function inputFromArgs(args: SdkSessionCliArgs): Promise<JsonRecord> {
@@ -202,13 +155,12 @@ function isEndpointOperation(operation: string): boolean {
 	return operation === "session.get_endpoint";
 }
 
-function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
+function isCredentialBearingOperation(operation: string): boolean {
 	return (
+		isEndpointOperation(operation) ||
 		operation === "session.create" ||
 		operation === "session.fork" ||
-		operation === "session.resume" ||
-		operation === "session.close" ||
-		operation === "session.delete"
+		operation === "session.resume"
 	);
 }
 
@@ -219,164 +171,156 @@ function cliOperationError(kind: OperationKind, operation: string): { code: stri
 	if (row?.adapterDispositions.daemonCli === "prohibited")
 		return {
 			code: error.code,
-			message: `${operation} is unavailable through the SDK session CLI.`,
+			message: `${operation} is unavailable through the ordinary CLI; provider mode is out of scope this phase.`,
 		};
 	return error;
 }
 
-async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-	let timer: NodeJS.Timeout | undefined;
-	const timeout = Promise.withResolvers<never>();
-	try {
-		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
-		return await Promise.race([promise, timeout.promise]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
-}
-
-function reportRouterCleanupFailure(error: unknown): void {
-	const message = error instanceof Error ? error.message : String(error);
-	process.stderr.write(`SDK session Router cleanup failed: ${message}\n`);
-}
-
-async function withRouter<T>(
-	agentDir: string,
-	action: (router: SessionRouter) => Promise<T>,
-	onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void,
-): Promise<T> {
-	const router = new SessionRouter({
-		agentDir,
-		...(onFrame === undefined ? {} : { deps: { onFrame } }),
-	});
-	let result!: T;
-	let actionFailed = false;
-	let actionError: unknown;
-	try {
-		await bounded(router.start(), ROUTER_START_TIMEOUT_MS, "SDK session Router startup timed out.");
-		result = await action(router);
-	} catch (error) {
-		actionFailed = true;
-		actionError = error;
-	}
-	try {
-		await bounded(router.stop(), ROUTER_STOP_TIMEOUT_MS, "SDK session Router shutdown timed out.");
-	} catch (error) {
-		reportRouterCleanupFailure(error);
-	}
-	if (actionFailed) throw actionError;
-	return result;
-}
-
-function attachmentFor(router: SessionRouter, sessionId: string): SessionAttachment {
-	const attachment = router.attachment(sessionId);
-	if (!attachment)
-		throw new SdkSessionCliError(
-			"session_unavailable",
-			`SDK session ${sessionId} is unavailable through the session Router.`,
-			1,
-		);
-	return attachment;
-}
-
-function throwResponseFailure(response: unknown): void {
-	const record = object(response);
-	if (record?.ok !== false) return;
-	const failure = object(record.error);
-	throw new SdkSessionCliError(
-		typeof failure?.code === "string" ? failure.code : "unavailable",
-		typeof failure?.message === "string" ? failure.message : "SDK request failed.",
-		1,
-		failure,
+function isLifecycleOperation(operation: string): boolean {
+	return (
+		operation === "session.create" ||
+		operation === "session.fork" ||
+		operation === "session.resume" ||
+		operation === "session.close" ||
+		operation === "session.delete"
 	);
 }
 
-async function paginatedSessionList(
-	router: SessionRouter,
-	input: JsonRecord = {},
-	requestKey = `${SDK_SESSION_CLI_LIFECYCLE_ACTOR.namespace}:session.list`,
-): Promise<unknown> {
+async function confirmEndpointCredentialOutput(): Promise<boolean> {
+	const prompt = createInterface({ input: process.stdin, output: process.stderr });
 	try {
-		const pages = await traverseSessionList(
-			input,
-			async pageInput => {
-				const response = object(await router.listBrokerSessions(pageInput, requestKey));
-				if (response?.ok === false) {
-					const failure = object(response.error);
-					throw new SdkClientError(
-						typeof failure?.code === "string" ? failure.code : "broker_error",
-						typeof failure?.message === "string" ? failure.message : "session.list failed",
-					);
-				}
-				return response;
-			},
-			response => sessionListPageFromResponse(response),
+		return (await prompt.question("Print the endpoint credential to stdout? [y/N] ")).trim().toLowerCase() === "y";
+	} finally {
+		prompt.close();
+	}
+}
+
+async function connectBroker(agentDir: string): Promise<SdkClient> {
+	await ensureBroker({ agentDir });
+	const discovery = await readSdkBrokerDiscovery(agentDir);
+	if (!discovery) throw new SdkSessionCliError("broker_unavailable", "SDK broker discovery is unavailable.", 1);
+	return await SdkClient.connect(discovery.url, discovery.token);
+}
+
+async function connectExistingBroker(agentDir: string): Promise<SdkClient> {
+	const discovery = await readSdkBrokerDiscovery(agentDir);
+	if (!discovery) throw new SdkSessionCliError("broker_unavailable", "SDK broker discovery is unavailable.", 1);
+	return await SdkClient.connect(discovery.url, discovery.token);
+}
+
+function brokerAbsent(error: unknown): boolean {
+	if (error instanceof SdkSessionCliError) return error.code === "broker_unavailable";
+	const details = error instanceof SdkClientError ? error.details : error;
+	const code = (details as { code?: unknown } | undefined)?.code;
+	return (
+		code === "ENOENT" ||
+		code === "ECONNREFUSED" ||
+		/(?:ENOENT|ECONNREFUSED|connection refused)/i.test(error instanceof Error ? error.message : "")
+	);
+}
+
+async function paginatedSessionList(client: SdkClient, input: JsonRecord = {}): Promise<unknown> {
+	const aggregate: JsonRecord = {};
+	const sessions: unknown[] = [];
+	let firstResponse: JsonRecord | undefined;
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_SESSION_LIST_PAGES; pageCount++) {
+		const response = object(
+			await client.global("session.list", { ...input, ...(cursor === undefined ? {} : { cursor }) }),
 		);
-		const aggregate: JsonRecord = {};
-		const sessions: unknown[] = [];
-		for (const { page } of pages) {
-			for (const [key, value] of Object.entries(page)) {
+		firstResponse ??= response;
+		if (response?.ok === false) {
+			const failure = object(response.error);
+			throw new SdkClientError(
+				typeof failure?.code === "string" ? failure.code : "broker_error",
+				typeof failure?.message === "string" ? failure.message : "session.list failed",
+			);
+		}
+		const listing = object(response?.result) ?? response;
+		if (listing) {
+			for (const [key, value] of Object.entries(listing)) {
 				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
 			}
-			sessions.push(...page.sessions);
+			if (Array.isArray(listing.sessions)) sessions.push(...listing.sessions);
+			const nextCursor =
+				typeof listing.continuationCursor === "string" && listing.continuationCursor.length > 0
+					? listing.continuationCursor
+					: undefined;
+			if (nextCursor) {
+				cursor = nextCursor;
+				continue;
+			}
 		}
 		const result = { ...aggregate, sessions };
-		const firstResponse = pages[0]?.response;
-		return firstResponse && Object.hasOwn(firstResponse, "result") ? { ...firstResponse, result } : result;
+		return firstResponse && "result" in firstResponse ? { ...firstResponse, result } : result;
+	}
+	throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
+}
+
+/**
+ * Broker-bound session endpoint resolution (C10): the broker validates the
+ * indexed session against its durable endpoint record and returns the
+ * credential, which the CLI uses to connect and never renders. Both clients
+ * (broker + session) are returned so callers close exactly what they opened.
+ */
+async function connectSessionViaBroker(
+	agentDir: string,
+	sessionId: string,
+): Promise<{ broker: SdkClient; session: SdkClient; endpoint: unknown }> {
+	const broker = await connectBroker(agentDir);
+	try {
+		const response = await broker.global("session.get_endpoint", { sessionId });
+		const endpoint = (response as { result?: unknown } | undefined)?.result;
+		const url = (endpoint as { url?: unknown } | undefined)?.url;
+		const token = (endpoint as { token?: unknown } | undefined)?.token;
+		if (typeof url !== "string" || !url || typeof token !== "string")
+			throw new SdkSessionCliError(
+				"session_unavailable",
+				`SDK endpoint for session ${sessionId} is unavailable.`,
+				1,
+			);
+		const session = await SdkClient.connect(url, token);
+		return { broker, session, endpoint };
 	} catch (error) {
-		if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
+		await broker.close();
 		throw error;
 	}
 }
 
-type SessionRows = {
-	indexSeq?: number;
-	warnings: unknown[];
-	sessions: SdkSessionRowV1[];
-};
-
-async function sessionRows(agentDir: string): Promise<SessionRows> {
-	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => {
-		const response = await paginatedSessionList(router);
-		const result = resultObject(response) ?? {};
-		let sessions: SdkSessionRowV1[];
-		try {
-			sessions = arrayOf(result.sessions).map(toSessionRowV1);
-		} catch {
-			throw new SdkClientError("protocol_error", "session.list returned a malformed session row.");
-		}
-		return {
-			...(typeof result.indexSeq === "number" ? { indexSeq: result.indexSeq } : {}),
-			warnings: arrayOf(result.warnings),
-			sessions,
-		};
-	});
+function resultObject(response: unknown): Record<string, unknown> | undefined {
+	const result = (response as { result?: unknown } | undefined)?.result;
+	return result && typeof result === "object" && !Array.isArray(result)
+		? (result as Record<string, unknown>)
+		: undefined;
 }
 
-async function runList(agentDir: string): Promise<unknown> {
-	const listing = await sessionRows(agentDir);
-	return {
-		ok: true,
-		result: {
-			version: SESSION_ROWS_VERSION,
-			source: "broker",
-			...(listing.indexSeq === undefined ? {} : { indexSeq: listing.indexSeq }),
-			sessions: listing.sessions,
-			warnings: listing.warnings,
-		},
-	};
+function arrayOf(value: unknown): unknown[] {
+	return Array.isArray(value) ? value : [];
 }
 
-async function runInspect(agentDir: string, sessionId: string): Promise<unknown> {
-	const listing = await sessionRows(agentDir);
-	const session = listing.sessions.find(candidate => candidate.sessionId === sessionId);
-	if (!session)
-		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);
-	return { ok: true, result: { version: SESSION_ROWS_VERSION, source: "broker", session } };
-}
+const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end", "agent_failed"]);
+const CLOSE_EVENT_KINDS = new Set(["session_closed", "session_terminated"]);
+/** Default tail emission subset; `--all-events` widens to every ring kind. */
+const DEFAULT_TAIL_KINDS = new Set([
+	"session_ready",
+	"session_prepared",
+	"session_closed",
+	"session_terminated",
+	"turn_start",
+	"turn_end",
+	"agent_start",
+	"agent_end",
+	"agent_failed",
+]);
+const TAIL_OFFLINE_MAX_ENTRIES = 200;
+const TAIL_STATUS_POLL_MS = 100;
 
-/** Creates a lowercase ULID operation reference for prompt reconciliation. */
+/**
+ * Time-ordered operation reference (ULID): 48-bit millisecond timestamp plus
+ * 80 bits of randomness, Crockford base32, lowercase. The ref is used as the
+ * `turn.prompt` clientRef so `send`/`status` correlate without a broker round
+ * trip, and matches the plan's durable op-ref ledger shape (C7).
+ */
 export function createOperationRef(now: number = Date.now()): string {
 	const crockford = "0123456789abcdefghjkmnpqrstvwxyz";
 	let random = 0n;
@@ -388,7 +332,8 @@ export function createOperationRef(now: number = Date.now()): string {
 }
 
 function clientRefFromInput(input: JsonRecord): string | undefined {
-	return typeof input.clientRef === "string" ? input.clientRef.trim() : undefined;
+	const raw = typeof input.clientRef === "string" ? input.clientRef.trim() : undefined;
+	return raw;
 }
 
 function assertClientRef(clientRef: string): void {
@@ -400,131 +345,122 @@ function assertClientRef(clientRef: string): void {
 		);
 }
 
-async function requestControl(
-	router: SessionRouter,
-	sessionId: string,
-	operation: string,
-	input: JsonRecord,
-	args: SdkSessionCliArgs,
-): Promise<JsonRecord> {
-	const attachment = attachmentFor(router, sessionId);
-	const response = await router.request(
-		sessionId,
-		{ type: "control_request", operation, input, confirm: args.confirm === true },
-		attachment.generation,
-		attachment,
-		args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
-	);
-	throwResponseFailure(response);
-	return response;
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function requestQuery(
-	router: SessionRouter,
-	sessionId: string,
-	query: string,
-	input: JsonRecord,
-	args: SdkSessionCliArgs,
-): Promise<JsonRecord> {
-	const attachment = attachmentFor(router, sessionId);
-	const response = await router.request(
-		sessionId,
-		{
-			type: "query_request",
-			query,
-			input,
-			...(args.cursor === undefined ? {} : { cursor: args.cursor }),
-		},
-		attachment.generation,
-		attachment,
-		args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
-	);
-	throwResponseFailure(response);
-	return response;
+/** Renders the broker `session.list` result as a versioned, credential-free DTO. */
+async function runList(agentDir: string): Promise<unknown> {
+	const client = await connectBroker(agentDir);
+	try {
+		const response = await paginatedSessionList(client);
+		const result = resultObject(response) ?? {};
+		const sessions = arrayOf(result.sessions).map(toSessionRowV1);
+		return {
+			ok: true,
+			result: {
+				version: SESSION_ROWS_VERSION,
+				source: "broker",
+				indexSeq: typeof result.indexSeq === "number" ? result.indexSeq : undefined,
+				sessions,
+				warnings: arrayOf(result.warnings),
+			},
+		};
+	} finally {
+		await client.close();
+	}
 }
 
-/** Exported for tests: each status poll must stay inside the caller's wait window. */
-export async function waitForTerminalStatus(
-	router: SessionRouter,
-	sessionId: string,
+async function runInspect(repo: string, agentDir: string, sessionId: string): Promise<unknown> {
+	try {
+		const client = await connectExistingBroker(agentDir);
+		try {
+			const response = await paginatedSessionList(client);
+			const sessions = arrayOf(resultObject(response)?.sessions).map(toSessionRowV1);
+			const row = sessions.find(candidate => candidate.sessionId === sessionId);
+			if (!row)
+				throw new SdkSessionCliError(
+					"session_unavailable",
+					`Session ${sessionId} is not indexed by the broker.`,
+					1,
+				);
+			return { ok: true, result: { version: SESSION_ROWS_VERSION, source: "broker", session: row } };
+		} finally {
+			await client.close();
+		}
+	} catch (error) {
+		// Broker absent: offline inspect-only (principle 1) from the local
+		// endpoint discovery record, still projected without credentials.
+		if (!brokerAbsent(error)) throw error;
+		const endpoint = await readSdkSessionEndpoint(repo, sessionId);
+		if (!endpoint)
+			throw new SdkSessionCliError(
+				"session_unavailable",
+				`SDK endpoint for session ${sessionId} is unavailable.`,
+				1,
+			);
+		return {
+			ok: true,
+			result: { version: SESSION_ROWS_VERSION, source: "offline", session: toOfflineSessionRowV1(endpoint) },
+		};
+	}
+}
+
+async function waitForTerminalStatus(
+	session: SdkClient,
 	clientRef: string,
 	timeoutMs: number | undefined,
 ): Promise<{ terminal: boolean; status: string; detail: unknown }> {
 	const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
-	let status = "unknown";
-	let detail: unknown = {};
 	for (;;) {
-		// Each poll is bounded by what is left of the caller's wait window, twice over.
-		// The request budget bounds the reply, and `bounded` bounds the whole poll: a
-		// disconnected transport reconnects before the reply timer is even installed,
-		// so without the outer bound the router's independent reconnect budget could
-		// still dispatch the query after the caller's window closed.
-		const remainingMs = deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
-		const poll = requestQuery(
-			router,
-			sessionId,
-			"turn.result",
-			{ kind: "prompt", clientRef },
-			remainingMs === undefined ? {} : { timeoutMs: remainingMs },
-		);
-		let response: JsonRecord;
-		try {
-			response =
-				remainingMs === undefined
-					? await poll
-					: await bounded(poll, remainingMs, `Prompt ${clientRef} status poll exceeded the wait window.`);
-		} catch (error) {
-			// An elapsed wait window is the documented `wait_timeout` outcome with the
-			// last observed status, not a transport failure. Anything else — and any
-			// failure with window left — is a real error the caller must see.
-			if (deadline !== undefined && Date.now() >= deadline && isWaitWindowFailure(error))
-				return { terminal: false, status, detail };
-			throw error;
-		}
-		const result = resultObject(response) ?? {};
-		status = typeof result.status === "string" ? result.status : "unknown";
-		detail = result;
+		const response = await session.query("turn.prompt_status", { clientRef });
+		const result = resultObject(response);
+		const status = typeof result?.status === "string" ? result.status : "unknown";
 		if (status === "terminal_ok" || status === "failed") return { terminal: true, status, detail: result };
-		if (deadline !== undefined && Date.now() >= deadline) return { terminal: false, status, detail: result };
+		if (deadline !== undefined && Date.now() >= deadline) return { terminal: false, status, detail: undefined };
 		await Bun.sleep(TAIL_STATUS_POLL_MS);
 	}
 }
 
-/**
- * True for the failures a poll produces when the wait window itself ends it:
- * the outer bound, the request reply timer, and the uncertain send the transport
- * reports when a request that was already on the wire is abandoned.
- */
-function isWaitWindowFailure(error: unknown): boolean {
-	if (error instanceof SdkClientError) return error.code === "timeout" || error.code === "uncertain_after_send";
-	return error instanceof SdkSessionCliError && error.code === "timeout";
-}
-
 async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliArgs): Promise<unknown> {
+	const generatedRef = createOperationRef();
 	const input = await inputFromArgs(args);
 	if (args.text !== undefined && Object.keys(input).length > 0)
 		throw new SdkSessionCliError("usage", "Use either --text or one JSON input source for the prompt, not both.", 2);
-	const promptInput: JsonRecord = args.text === undefined ? { ...input } : { text: args.text };
+	const promptInput: JsonRecord = args.text !== undefined ? { text: args.text } : { ...input };
 	const inputRef = clientRefFromInput(promptInput);
-	const clientRef = inputRef ?? args.opRef?.trim() ?? createOperationRef();
+	const clientRef = inputRef ?? args.opRef?.trim() ?? generatedRef;
 	if (args.opRef !== undefined && inputRef !== undefined && inputRef !== args.opRef.trim())
 		throw new SdkSessionCliError("usage", "--op-ref must match the clientRef in the JSON input.", 2);
 	assertClientRef(clientRef);
 	if (inputRef === undefined) promptInput.clientRef = clientRef;
 	const invalid = validateAdapterControl("turn.prompt", promptInput);
 	if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
-	await ensureBroker({ agentDir });
-
-	return await withRouter(agentDir, async router => {
-		const response = await requestControl(router, sessionId, "turn.prompt", promptInput, args);
+	const { broker, session } = await connectSessionViaBroker(agentDir, sessionId);
+	try {
+		const response = await broker.global("session.control", {
+			sessionId,
+			operation: "turn.prompt",
+			input: promptInput,
+			confirm: args.confirm === true,
+		});
+		if (isRecord(response) && response.ok === false) {
+			const responseError = isRecord(response.error) ? response.error : {};
+			throw new SdkSessionCliError(
+				typeof responseError.code === "string" ? responseError.code : "unavailable",
+				typeof responseError.message === "string" ? responseError.message : "Prompt dispatch failed.",
+				1,
+			);
+		}
+		const receipt = resultObject(response) ?? response;
 		const result: JsonRecord = {
 			version: SESSION_ROWS_VERSION,
 			operationRef: clientRef,
 			status: "accepted",
-			receipt: resultObject(response) ?? response,
+			receipt,
 		};
 		if (args.wait === true) {
-			const outcome = await waitForTerminalStatus(router, sessionId, clientRef, args.timeoutMs ?? 30_000);
+			const outcome = await waitForTerminalStatus(session, clientRef, args.timeoutMs ?? 30_000);
 			if (!outcome.terminal)
 				throw new SdkSessionCliError(
 					"wait_timeout",
@@ -535,32 +471,34 @@ async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliA
 			result.status = outcome.status;
 			result.statusDetail = outcome.detail;
 		}
-		return { ok: true, result };
-	});
+		return { ok: true, result: stripSecretFields(result) };
+	} finally {
+		await session.close();
+		await broker.close();
+	}
 }
 
-async function runStatus(
-	agentDir: string,
-	sessionId: string,
-	opRef: string,
-	args: SdkSessionCliArgs,
-): Promise<unknown> {
+async function runStatus(agentDir: string, sessionId: string, opRef: string): Promise<unknown> {
 	assertClientRef(opRef);
-	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => {
-		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef: opRef }, args);
-		const status = resultObject(response) ?? {};
-		const raw = typeof status.status === "string" ? status.status : "unknown";
+	const { broker, session } = await connectSessionViaBroker(agentDir, sessionId);
+	try {
+		const response = await session.query("turn.prompt_status", { clientRef: opRef });
+		const status = resultObject(response);
+		const record = status ?? (isRecord(response) ? response : {});
+		const raw = typeof record.status === "string" ? record.status : "unknown";
 		return {
 			ok: true,
-			result: {
+			result: stripSecretFields({
 				version: SESSION_ROWS_VERSION,
 				operationRef: opRef,
-				status,
+				status: record,
 				summary: { completed: raw === "terminal_ok" || raw === "failed" },
-			},
+			}),
 		};
-	});
+	} finally {
+		await session.close();
+		await broker.close();
+	}
 }
 
 type CheckpointExtraction = {
@@ -575,6 +513,9 @@ function extractCheckpoint(response: unknown): CheckpointExtraction {
 	const gap = toRetentionGapV1(result.gap);
 	if (gap !== undefined) return { gap };
 	const record = toCheckpointRecordV1(result.checkpoint ?? result);
+	// The Q30 result's `cursor`/`checkpointToken` is the signed checkpoint
+	// cursor: `cursor` is the legacy alias kept for wire compatibility, and the
+	// signed token is the resume artifact (`--cursor`) consumed by Q01.
 	const cursor =
 		typeof result.cursor === "string" && result.cursor
 			? result.cursor
@@ -585,9 +526,8 @@ function extractCheckpoint(response: unknown): CheckpointExtraction {
 }
 
 function extractTranscriptPage(response: unknown): { items: unknown[]; complete: boolean; cursor?: string } {
-	const record = object(response);
-	const page = object(record?.page) ?? object(resultObject(response)?.page);
-	if (!page) return { items: arrayOf(resultObject(response)?.items), complete: true };
+	const page = (response as { page?: unknown } | undefined)?.page;
+	if (!isRecord(page)) return { items: arrayOf(resultObject(response)?.items), complete: true };
 	return {
 		items: arrayOf(page.items),
 		complete: page.complete === true,
@@ -595,9 +535,20 @@ function extractTranscriptPage(response: unknown): { items: unknown[]; complete:
 	};
 }
 
+function eventKindOf(frame: Record<string, unknown>): string | undefined {
+	if (typeof frame.kind === "string" && frame.kind) return frame.kind;
+	if (typeof frame.name === "string" && frame.name) return frame.name;
+	return undefined;
+}
+
 function tailItemKey(item: SdkTailItemV1): string {
+	// Ring events carry a synchronous generation/seq identity; keying on it (not
+	// kind+optional id) keeps repeated same-kind no-id events distinct and
+	// dedupes the replay/live overlap exactly once.
 	if (item.generation !== undefined && item.seq !== undefined)
 		return `${item.kind}\u0000${item.generation}\u0000${item.seq}`;
+	// Retained transcript entries have stable ids (or none); never silently drop
+	// distinct identity-less items, so fall back to the payload itself.
 	if (item.id !== undefined) return `${item.kind}\u0000${item.id}`;
 	return `${item.kind}\u0000${JSON.stringify(item.payload)}`;
 }
@@ -618,7 +569,7 @@ function mergeTailItems(
 
 function eventGapToRetentionGap(
 	value: unknown,
-	frame: JsonRecord,
+	frame: Record<string, unknown>,
 	record: SdkCheckpointRecordV1 | undefined,
 ): SdkRetentionGapV1 | undefined {
 	const existing = toRetentionGapV1(value);
@@ -641,384 +592,149 @@ function eventGapToRetentionGap(
 	return undefined;
 }
 
-function publicationSequence(publicationId: string): number | undefined {
-	const parts = publicationId.split(":");
-	const value = Number(parts.at(-1));
-	return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
-}
-
-function tailItemFromRouterFrame(frame: SessionRouterFrame): SdkTailItemV1 | undefined {
-	if (frame.publicationId === undefined || frame.name === undefined) return undefined;
-	const seq = publicationSequence(frame.publicationId);
-	return toTailItemV1(
-		{
-			kind: frame.name,
-			...(frame.generation === undefined ? {} : { generation: frame.generation }),
-			...(seq === undefined ? {} : { seq }),
-			payload: frame.body,
-		},
-		{
-			kind: frame.name,
-			...(frame.generation === undefined ? {} : { generation: frame.generation }),
-			...(seq === undefined ? {} : { seq }),
-		},
+async function requestEventReplay(
+	session: SdkClient,
+	record: SdkCheckpointRecordV1 | undefined,
+	timeoutMs: number,
+): Promise<{ events: SdkTailItemV1[]; gap?: SdkRetentionGapV1; closed: boolean }> {
+	const id = randomUUID();
+	const { promise, resolve, reject } = Promise.withResolvers<{
+		events: SdkTailItemV1[];
+		gap?: SdkRetentionGapV1;
+		closed: boolean;
+	}>();
+	const bufferedLiveEvents: SdkTailItemV1[] = [];
+	const off = session.onFrame(frame => {
+		if (frame.type === "event") {
+			bufferedLiveEvents.push(toTailItemV1(frame, { kind: eventKindOf(frame) ?? "event" }));
+			return;
+		}
+		if (frame.type !== "event_replay_result" || frame.id !== id) return;
+		const replayFrame = frame as Record<string, unknown>;
+		const events = [
+			...arrayOf(replayFrame.events).map(event => toTailItemV1(event, { kind: "event" })),
+			...bufferedLiveEvents,
+		];
+		const gap = eventGapToRetentionGap(replayFrame.gap, replayFrame, record);
+		resolve({ events, ...(gap !== undefined ? { gap } : {}), closed: false });
+	});
+	const offFailed = session.onReconnectFailed(() => resolve({ events: [], closed: true }));
+	const timer = setTimeout(
+		() => reject(new SdkSessionCliError("tail_timeout", "Timed out waiting for the event replay response.", 1)),
+		timeoutMs,
 	);
-}
-
-function retainedTranscriptUnavailable(): RetainedTranscriptTailError {
-	return new RetainedTranscriptTailError("unavailable", "Retained transcript history is unavailable.");
-}
-
-function retainedTranscriptOpenFlags(): number {
-	const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW;
-	if (process.platform !== "win32" && !noFollow) throw retainedTranscriptUnavailable();
-	return (
-		fsSync.constants.O_RDONLY | noFollow | (process.platform === "win32" ? 0 : (fsSync.constants.O_NONBLOCK ?? 0))
-	);
-}
-
-function retainedTranscriptIdentityMismatch(): RetainedTranscriptTailError {
-	return new RetainedTranscriptTailError(
-		"changed",
-		"Retained transcript history no longer matches the Broker-selected identity; refusing to replay it.",
-	);
-}
-
-function matchesRetainedTranscriptIdentity(
-	identity: SessionLifecycleSavedSessionIdentity,
-	descriptor: fsSync.BigIntStats,
-): boolean {
 	try {
-		return (
-			descriptor.isFile() &&
-			descriptor.dev === BigInt(identity.dev) &&
-			descriptor.ino === BigInt(identity.ino) &&
-			descriptor.nlink === BigInt(identity.nlink) &&
-			descriptor.size === BigInt(identity.size) &&
-			descriptor.mtimeMs === BigInt(identity.mtimeMs) &&
-			descriptor.mtimeNs === BigInt(identity.mtimeNs) &&
-			descriptor.ctimeNs === BigInt(identity.ctimeNs)
-		);
-	} catch {
-		return false;
-	}
-}
-
-function retainedTranscriptCorrupt(): RetainedTranscriptTailError {
-	return new RetainedTranscriptTailError(
-		"corrupt",
-		"Retained transcript history contains unparseable entries; refusing to replay corrupted history.",
-	);
-}
-
-export async function scanRetainedTranscriptTail(reader: RetainedTranscriptTailReader): Promise<unknown[]> {
-	if (!Number.isSafeInteger(reader.size) || reader.size < 0) throw retainedTranscriptUnavailable();
-	const entries: unknown[] = [];
-	let position = reader.size;
-	let scannedBytes = 0;
-	let scannedLines = 0;
-	let trailingFragment = new Uint8Array();
-	while (position > 0 && entries.length < TAIL_OFFLINE_MAX_ENTRIES) {
-		const remainingBytes = TAIL_OFFLINE_MAX_SCAN_BYTES - scannedBytes;
-		if (remainingBytes <= 0)
-			throw new RetainedTranscriptTailError(
-				"scan_limit",
-				"Retained transcript history exceeds the bounded tail replay limit.",
-			);
-		const length = Math.min(TAIL_OFFLINE_SCAN_CHUNK_BYTES, position, remainingBytes);
-		const start = position - length;
-		let chunk: Uint8Array;
-		try {
-			chunk = await reader.readRange(start, position);
-		} catch {
-			throw retainedTranscriptUnavailable();
-		}
-		if (chunk.byteLength !== length) throw retainedTranscriptUnavailable();
-		scannedBytes += chunk.byteLength;
-		const combined = new Uint8Array(chunk.byteLength + trailingFragment.byteLength);
-		combined.set(chunk);
-		combined.set(trailingFragment, chunk.byteLength);
-
-		let complete = combined;
-		let partial = new Uint8Array();
-		if (start > 0) {
-			const firstNewline = combined.indexOf(0x0a);
-			if (firstNewline === -1) {
-				if (combined.byteLength > TAIL_OFFLINE_MAX_LINE_BYTES)
-					throw new RetainedTranscriptTailError(
-						"line_limit",
-						"Retained transcript history exceeds the bounded tail replay limit.",
-					);
-				trailingFragment = combined;
-				position = start;
-				continue;
-			}
-			partial = combined.subarray(0, firstNewline);
-			complete = combined.subarray(firstNewline + 1);
-		}
-
-		let lineEnd = complete.byteLength;
-		while (lineEnd > 0 && entries.length < TAIL_OFFLINE_MAX_ENTRIES) {
-			const newline = complete.lastIndexOf(0x0a, lineEnd - 1);
-			const lineStart = newline < 0 ? 0 : newline + 1;
-			const line = complete.subarray(lineStart, lineEnd);
-			lineEnd = newline < 0 ? 0 : newline;
-			scannedLines++;
-			if (scannedLines > TAIL_OFFLINE_MAX_SCANNED_LINES)
-				throw new RetainedTranscriptTailError(
-					"scan_limit",
-					"Retained transcript history exceeds the bounded tail replay limit.",
-				);
-			if (line.byteLength === 0) continue;
-			if (line.byteLength > TAIL_OFFLINE_MAX_LINE_BYTES)
-				throw new RetainedTranscriptTailError(
-					"line_limit",
-					"Retained transcript history exceeds the bounded tail replay limit.",
-				);
-			try {
-				entries.push(JSON.parse(transcriptDecoder.decode(line)));
-			} catch {
-				throw retainedTranscriptCorrupt();
-			}
-		}
-		if (entries.length === TAIL_OFFLINE_MAX_ENTRIES) break;
-		if (start > 0) {
-			if (partial.byteLength > TAIL_OFFLINE_MAX_LINE_BYTES)
-				throw new RetainedTranscriptTailError(
-					"line_limit",
-					"Retained transcript history exceeds the bounded tail replay limit.",
-				);
-			trailingFragment = partial;
-		}
-		position = start;
-	}
-	return entries.reverse();
-}
-
-async function readRetainedTranscriptTail(savedSession: SessionLifecycleSavedSession): Promise<unknown[]> {
-	let descriptor: fs.FileHandle | undefined;
-	try {
-		descriptor = await fs.open(savedSession.path, retainedTranscriptOpenFlags());
-		const before = await descriptor.stat({ bigint: true });
-		if (!matchesRetainedTranscriptIdentity(savedSession.identity, before)) throw retainedTranscriptIdentityMismatch();
-		if (before.size > BigInt(Number.MAX_SAFE_INTEGER)) throw retainedTranscriptUnavailable();
-		// Bind every range read to the opened descriptor so a later pathname replacement
-		// cannot change the retained history selected by the lifecycle lookup.
-		const file = Bun.file(descriptor.fd);
-		const entries = await scanRetainedTranscriptTail({
-			size: Number(before.size),
-			readRange: async (start, end) => new Uint8Array(await file.slice(start, end).arrayBuffer()),
+		session.send({
+			type: "event_replay",
+			id,
+			// Resume strictly after the checkpoint sequence: the checkpoint event
+			// was already observed, so re-emitting it would let a terminal
+			// checkpoint event satisfy --until-idle without any new turn.
+			...(record !== undefined ? { sinceGeneration: record.generation, sinceSeq: record.seq } : {}),
 		});
-		const after = await descriptor.stat({ bigint: true });
-		if (
-			!matchesRetainedTranscriptIdentity(savedSession.identity, after) ||
-			before.dev !== after.dev ||
-			before.ino !== after.ino ||
-			before.size !== after.size ||
-			before.mtimeNs !== after.mtimeNs ||
-			before.ctimeNs !== after.ctimeNs
-		)
-			throw new RetainedTranscriptTailError(
-				"changed",
-				"Retained transcript history changed while reading; refusing to replay it.",
-			);
-		return entries;
-	} catch (error) {
-		if (error instanceof RetainedTranscriptTailError) throw error;
-		throw retainedTranscriptUnavailable();
+		return await promise;
 	} finally {
-		if (descriptor !== undefined) await descriptor.close().catch(() => {});
+		clearTimeout(timer);
+		off();
+		offFailed();
 	}
 }
 
+async function followLiveEvents(
+	session: SdkClient,
+	items: SdkTailItemV1[],
+	seen: Set<string>,
+	args: SdkSessionCliArgs,
+	include: (kind: string) => boolean,
+	timeoutMs: number,
+): Promise<{ reason: "idle" | "close" | "timeout" | "reconnect" | "reconnect_failed" }> {
+	const { promise, resolve } = Promise.withResolvers<{
+		reason: "idle" | "close" | "timeout" | "reconnect" | "reconnect_failed";
+	}>();
+	const off = session.onFrame(frame => {
+		if (!isRecord(frame) || frame.type !== "event") return;
+		const kind = eventKindOf(frame);
+		if (kind === undefined) return;
+		const item = toTailItemV1(frame, { kind });
+		const key = tailItemKey(item);
+		if (!seen.has(key)) {
+			seen.add(key);
+			if (include(kind)) items.push(item);
+		}
+		if (TERMINAL_TURN_KINDS.has(kind) && args.untilIdle === true) resolve({ reason: "idle" });
+		if (CLOSE_EVENT_KINDS.has(kind)) resolve({ reason: "close" });
+	});
+	const offClosed = session.onReconnectFailed(() => resolve({ reason: "reconnect_failed" }));
+	const offReconnect = session.onReconnect(() => resolve({ reason: "reconnect" }));
+	const timer = setTimeout(() => resolve({ reason: "timeout" }), timeoutMs);
+	try {
+		const result = await promise;
+		return result;
+	} finally {
+		clearTimeout(timer);
+		off();
+		offClosed();
+		offReconnect();
+	}
+}
+
+/** Read-only retained-history replay for a stopped/terminal session (offline, no endpoint). */
 async function offlineTailReplay(
 	repo: string,
 	agentDir: string,
 	sessionId: string,
 	row: SdkSessionRowV1,
 ): Promise<unknown> {
-	const lifecycle = createBrokerSessionLifecycleService(agentDir);
-	const outcome = await lifecycle.list({
-		actor: SDK_SESSION_CLI_LIFECYCLE_ACTOR,
-		capability: "session.list",
-		target: { cwd: repo, resolveSessionId: sessionId },
-	});
-	if (!outcome.ok)
-		throw new SdkSessionCliError(outcome.error.code, outcome.error.message, 1, { certainty: outcome.certainty });
-	const savedSession = outcome.result.savedSession;
-	if (!savedSession)
-		throw new SdkSessionCliError(
-			"session_unavailable",
-			`Session ${sessionId} is stopped and has no retained transcript replay.`,
-			1,
-		);
-	let entries: unknown[];
+	const broker = await connectBroker(agentDir);
 	try {
-		entries = await readRetainedTranscriptTail(savedSession);
-	} catch (error) {
-		const retained = error instanceof RetainedTranscriptTailError ? error : retainedTranscriptUnavailable();
-		throw new SdkSessionCliError("retention_gap", retained.message, 1, {
-			code: "retention_gap",
-			reason: retained.reason,
-		});
+		const response = await broker.global("session.list", { resolveSessionId: sessionId, cwd: repo });
+		const savedSession = resultObject(response)?.savedSession;
+		const savedPath = isRecord(savedSession) && typeof savedSession.path === "string" ? savedSession.path : undefined;
+		if (!savedPath) {
+			throw new SdkSessionCliError(
+				"session_unavailable",
+				`Session ${sessionId} is stopped and has no retained transcript replay.`,
+				1,
+			);
+		}
+		const text = await fs.readFile(savedPath, "utf8");
+		const parsedEntries: unknown[] = [];
+		const malformed: number[] = [];
+		const lines = text.split("\n");
+		for (let index = 0; index < lines.length; index++) {
+			const line = lines[index]!;
+			if (!line) continue;
+			try {
+				parsedEntries.push(JSON.parse(line));
+			} catch {
+				malformed.push(index);
+			}
+		}
+		// Retained-history corruption is never silently skipped: a torn or
+		// unparseable line means the retained replay is not trustworthy, so tail
+		// fails closed with a typed retention error instead of reporting success.
+		if (malformed.length > 0)
+			throw new SdkSessionCliError(
+				"retention_gap",
+				"Retained transcript history contains unparseable entries; refusing to replay corrupted history.",
+				1,
+				{ code: "retention_gap", lines: malformed },
+			);
+		const entries = parsedEntries.slice(-TAIL_OFFLINE_MAX_ENTRIES);
+		const items = entries.map((entry, index) => toTailItemV1(entry, { kind: "transcript", seq: index }));
+		return {
+			ok: true,
+			result: {
+				version: SESSION_ROWS_VERSION,
+				source: "offline",
+				session: row,
+				items,
+				terminal: true,
+			},
+		};
+	} finally {
+		await broker.close();
 	}
-	return {
-		ok: true,
-		result: {
-			version: SESSION_ROWS_VERSION,
-			source: "offline",
-			session: row,
-			items: entries.map((entry, index) => toTailItemV1(entry, { kind: "transcript", seq: index })),
-			terminal: true,
-		},
-	};
-}
-
-async function runLiveTail(
-	agentDir: string,
-	sessionId: string,
-	row: SdkSessionRowV1,
-	args: SdkSessionCliArgs,
-): Promise<unknown> {
-	const include = (kind: string): boolean =>
-		kind === "transcript" || args.allEvents === true || DEFAULT_TAIL_KINDS.has(kind);
-	const items: SdkTailItemV1[] = [];
-	const seen = new Set<string>();
-	let checkpoint: SdkCheckpointRecordV1 | undefined;
-	let gap: SdkRetentionGapV1 | undefined;
-	let liveReason: TailExitReason | undefined;
-	let resolveLive: ((reason: TailExitReason) => void) | undefined;
-
-	const recordLiveFrame = (attachment: SessionAttachment, frame: SessionRouterFrame): void => {
-		if (attachment.sessionId !== sessionId) return;
-		const item = tailItemFromRouterFrame(frame);
-		if (!item) return;
-		mergeTailItems(items, seen, [item], include);
-		if (args.untilIdle === true && TERMINAL_TURN_KINDS.has(item.kind)) {
-			liveReason = "idle";
-			resolveLive?.("idle");
-		}
-		if (CLOSE_EVENT_KINDS.has(item.kind)) {
-			liveReason = "close";
-			resolveLive?.("close");
-		}
-	};
-
-	return await withRouter(
-		agentDir,
-		async router => {
-			const attachment = attachmentFor(router, sessionId);
-			const checkpointResponse = await router.request(
-				sessionId,
-				{
-					type: "query_request",
-					query: "session.checkpoint",
-					input: args.cursor === undefined ? {} : { checkpointToken: args.cursor },
-				},
-				attachment.generation,
-				attachment,
-				args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
-			);
-			throwResponseFailure(checkpointResponse);
-			const extraction = extractCheckpoint(checkpointResponse);
-			checkpoint = extraction.record;
-			gap = extraction.gap;
-			if (gap !== undefined && args.strict === true)
-				throw new SdkSessionCliError(
-					"retention_gap",
-					"Retained history is missing entries before the checkpoint (strict mode).",
-					1,
-					gap,
-				);
-
-			let cursor = extraction.cursor;
-			while (cursor !== undefined) {
-				const response = await router.request(
-					sessionId,
-					{ type: "query_request", query: "transcript.list", input: {}, cursor },
-					attachment.generation,
-					attachment,
-					args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
-				);
-				throwResponseFailure(response);
-				const page = extractTranscriptPage(response);
-				mergeTailItems(
-					items,
-					seen,
-					page.items.map(item => toTailItemV1(item, { kind: "transcript" })),
-					include,
-				);
-				if (page.complete || page.cursor === undefined) break;
-				cursor = page.cursor;
-			}
-
-			const replayResponse = await router.request(
-				sessionId,
-				{
-					type: "event_replay",
-					...(checkpoint === undefined
-						? {}
-						: { sinceGeneration: checkpoint.generation, sinceSeq: checkpoint.seq }),
-				},
-				attachment.generation,
-				attachment,
-				args.timeoutMs === undefined ? undefined : { timeoutMs: args.timeoutMs },
-			);
-			throwResponseFailure(replayResponse);
-			const replay = object(replayResponse) ?? {};
-			const replayGap = eventGapToRetentionGap(replay.gap, replay, checkpoint);
-			if (replayGap !== undefined) {
-				gap = replayGap;
-				if (args.strict === true)
-					throw new SdkSessionCliError(
-						"retention_gap",
-						"The event ring dropped entries before the checkpoint (strict mode).",
-						1,
-						replayGap,
-					);
-			}
-			const replayItems = arrayOf(replay.events).map(event => toTailItemV1(event, { kind: "event" }));
-			mergeTailItems(items, seen, replayItems, include);
-			if (args.untilIdle === true && replayItems.some(item => TERMINAL_TURN_KINDS.has(item.kind)))
-				liveReason = "idle";
-			if (liveReason === undefined) {
-				const completion = Promise.withResolvers<TailExitReason>();
-				resolveLive = completion.resolve;
-				const timeoutMs = args.timeoutMs ?? 10_000;
-				const timer = setTimeout(
-					() =>
-						completion.reject(
-							new SdkSessionCliError(
-								"tail_timeout",
-								"Tail did not reach an exit condition within the wait window.",
-								1,
-								{ sessionId, timeoutMs },
-							),
-						),
-					timeoutMs,
-				);
-				try {
-					liveReason = await completion.promise;
-				} finally {
-					clearTimeout(timer);
-					resolveLive = undefined;
-				}
-			}
-			return {
-				ok: true,
-				result: {
-					version: SESSION_ROWS_VERSION,
-					source: "session",
-					session: row,
-					...(checkpoint === undefined ? {} : { checkpoint }),
-					...(gap === undefined ? {} : { gap }),
-					items,
-					terminal: liveReason === "idle" || liveReason === "close",
-				},
-			};
-		},
-		recordLiveFrame,
-	);
 }
 
 export async function runTail(
@@ -1027,13 +743,174 @@ export async function runTail(
 	sessionId: string,
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
-	const row = (await sessionRows(agentDir)).sessions.find(candidate => candidate.sessionId === sessionId);
+	const broker = await connectBroker(agentDir);
+	let row: SdkSessionRowV1 | undefined;
+	try {
+		const response = await paginatedSessionList(broker);
+		row = arrayOf(resultObject(response)?.sessions ?? undefined)
+			.map(toSessionRowV1)
+			.find(candidate => candidate.sessionId === sessionId);
+	} finally {
+		await broker.close();
+	}
 	if (!row)
 		throw new SdkSessionCliError("session_unavailable", `Session ${sessionId} is not indexed by the broker.`, 1);
 	if (row.deleted)
 		throw new SdkSessionCliError("session_deleted", `Session ${sessionId} was deleted and has no tail.`, 1);
-	if (!row.live || row.terminalUncertain === true) return await offlineTailReplay(repo, agentDir, sessionId, row);
-	return await runLiveTail(agentDir, sessionId, row, args);
+
+	const include = (kind: string): boolean =>
+		kind === "transcript" || args.allEvents === true || DEFAULT_TAIL_KINDS.has(kind);
+	const items: SdkTailItemV1[] = [];
+	const seen = new Set<string>();
+	let checkpoint: SdkCheckpointRecordV1 | undefined;
+	let gap: SdkRetentionGapV1 | undefined;
+	const timeoutMs = args.timeoutMs ?? 10_000;
+
+	let brokerClient: SdkClient | undefined;
+	let session: SdkClient | undefined;
+	try {
+		try {
+			const connected = await connectSessionViaBroker(agentDir, sessionId);
+			brokerClient = connected.broker;
+			session = connected.session;
+		} catch (error) {
+			if (row.live === false && brokerAbsent(error) === false)
+				return await offlineTailReplay(repo, agentDir, sessionId, row);
+			throw error;
+		}
+
+		let cursor: string | undefined;
+		// Q30 exchanges a still-valid signed checkpoint claim into a fresh
+		// connection-owned pin; direct cross-connection cursor consumption remains rejected.
+		const checkpointResponse = await session.query(
+			"session.checkpoint",
+			args.cursor === undefined ? {} : { checkpointToken: args.cursor },
+		);
+		const extraction = extractCheckpoint(checkpointResponse);
+		checkpoint = extraction.record;
+		gap = extraction.gap;
+		cursor = extraction.cursor;
+		if (gap !== undefined && args.strict === true)
+			throw new SdkSessionCliError(
+				"retention_gap",
+				"Retained history is missing entries before the checkpoint (strict mode).",
+				1,
+				gap,
+			);
+
+		// Continue paginating the retained transcript from the checkpoint cursor
+		// (the resume page above may itself be incomplete).
+		while (cursor !== undefined) {
+			const page = extractTranscriptPage(await session.query("transcript.list", {}, cursor));
+			mergeTailItems(
+				items,
+				seen,
+				page.items.map(item => toTailItemV1(item, { kind: "transcript" })),
+				include,
+			);
+			if (page.complete || !page.cursor) break;
+			cursor = page.cursor;
+		}
+
+		// Stopped/terminal sessions replay retained history and exit; live
+		// sessions follow the event ring from the checkpoint position. A
+		// lifecycle-terminal row is treated as terminal for exit purposes even
+		// when its process is still alive (uncertain stop), so `tail` never
+		// hangs on a session whose lifecycle already ended.
+		if (row.live === false || row.terminalUncertain === true) {
+			return {
+				ok: true,
+				result: {
+					version: SESSION_ROWS_VERSION,
+					source: "session",
+					session: row,
+					...(checkpoint !== undefined ? { checkpoint } : {}),
+					...(gap !== undefined ? { gap } : {}),
+					items,
+					terminal: true,
+				},
+			};
+		}
+
+		let outcome: { reason: "idle" | "close" | "timeout" | "reconnect" | "reconnect_failed" } = { reason: "close" };
+		for (let reconnectAttempt = 0; reconnectAttempt <= 3; reconnectAttempt++) {
+			const replay = await requestEventReplay(session, checkpoint, timeoutMs);
+			if (replay.closed)
+				throw new SdkSessionCliError(
+					"reconnect_failed",
+					"Tail connection exhausted reconnect attempts before replay continuity was restored.",
+					1,
+				);
+			if (replay.gap !== undefined) {
+				gap = replay.gap;
+				if (args.strict === true)
+					throw new SdkSessionCliError(
+						"retention_gap",
+						"The event ring dropped entries before the checkpoint (strict mode).",
+						1,
+						replay.gap,
+					);
+			}
+			mergeTailItems(items, seen, replay.events, include);
+			const terminal = replay.events.some(item => TERMINAL_TURN_KINDS.has(item.kind)) && args.untilIdle === true;
+			if (args.untilIdle === true && terminal) {
+				return {
+					ok: true,
+					result: {
+						version: SESSION_ROWS_VERSION,
+						source: "session",
+						session: row,
+						...(checkpoint !== undefined ? { checkpoint } : {}),
+						items,
+						terminal: true,
+					},
+				};
+			}
+			outcome = await followLiveEvents(session, items, seen, args, include, timeoutMs);
+			if (outcome.reason !== "reconnect") break;
+			if (reconnectAttempt === 3)
+				throw new SdkSessionCliError(
+					"reconnect_failed",
+					"Tail could not restore replay continuity after reconnect.",
+					1,
+				);
+			const lastEvent = [...items].reverse().find(item => item.generation !== undefined && item.seq !== undefined);
+			if (lastEvent?.generation !== undefined && lastEvent.seq !== undefined)
+				checkpoint = {
+					revision: checkpoint?.revision ?? 0,
+					generation: lastEvent.generation,
+					seq: lastEvent.seq,
+				};
+		}
+		if (outcome.reason === "reconnect_failed")
+			throw new SdkSessionCliError(
+				"reconnect_failed",
+				"Tail connection exhausted reconnect attempts before continuity was restored.",
+				1,
+			);
+		if (outcome.reason === "timeout")
+			throw new SdkSessionCliError(
+				"tail_timeout",
+				`Tail did not reach an exit condition within the wait window.`,
+				1,
+				{ sessionId, timeoutMs },
+			);
+		return {
+			ok: true,
+			result: {
+				version: SESSION_ROWS_VERSION,
+				source: "session",
+				session: row,
+				...(checkpoint !== undefined ? { checkpoint } : {}),
+				...(gap !== undefined ? { gap } : {}),
+				items,
+				terminal: outcome.reason === "idle" || outcome.reason === "close",
+			},
+		};
+	} finally {
+		if (session !== undefined) await session.close();
+		if (brokerClient !== undefined) await brokerClient.close();
+	}
 }
 
 async function runRawControl(
@@ -1045,8 +922,18 @@ async function runRawControl(
 ): Promise<unknown> {
 	const invalid = validateAdapterControl(operation, input);
 	if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
-	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => await requestControl(router, sessionId, operation, input, args));
+	const broker = await connectBroker(agentDir);
+	try {
+		return await broker.global("session.control", {
+			sessionId,
+			operation,
+			input,
+			confirm: args.confirm === true,
+			...(args.elevationRequestId === undefined ? {} : { elevationRequestId: args.elevationRequestId }),
+		});
+	} finally {
+		await broker.close();
+	}
 }
 
 async function runRawQuery(
@@ -1056,41 +943,13 @@ async function runRawQuery(
 	input: JsonRecord,
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
-	await ensureBroker({ agentDir });
-	return await withRouter(agentDir, async router => await requestQuery(router, sessionId, operation, input, args));
-}
-
-function lifecycleMutationRequest(
-	operation: LifecycleMutationOperation,
-	input: JsonRecord,
-	requestKey: string,
-	timeoutMs: number | undefined,
-): SessionLifecycleMutationRequest {
-	const base = {
-		actor: SDK_SESSION_CLI_LIFECYCLE_ACTOR,
-		requestKey,
-		...(timeoutMs === undefined ? {} : { timeoutMs }),
-	};
-	if (operation === "session.create" || operation === "session.fork") {
-		if (typeof input.cwd !== "string" || input.cwd.length === 0)
-			throw new SdkSessionCliError("invalid_input", `${operation} requires a string cwd in the input payload.`, 2);
-		const target = input as JsonRecord & { cwd: string };
-		return operation === "session.create"
-			? { ...base, operation, capability: operation, target }
-			: { ...base, operation, capability: operation, target };
+	const { broker, session } = await connectSessionViaBroker(agentDir, sessionId);
+	try {
+		return await session.query(operation, input, args.cursor);
+	} finally {
+		await session.close();
+		await broker.close();
 	}
-	if (typeof input.sessionId !== "string" || input.sessionId.length === 0)
-		throw new SdkSessionCliError(
-			"invalid_input",
-			`${operation} requires a string sessionId in the input payload.`,
-			2,
-		);
-	const target = input as JsonRecord & { sessionId: string };
-	return operation === "session.resume"
-		? { ...base, operation, capability: operation, target }
-		: operation === "session.close"
-			? { ...base, operation, capability: operation, target }
-			: { ...base, operation, capability: "session.delete", target };
 }
 
 async function runRawGlobal(
@@ -1099,30 +958,81 @@ async function runRawGlobal(
 	input: JsonRecord,
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
-	if (operation === "session.list") {
-		await ensureBroker({ agentDir });
-		return await withRouter(agentDir, async router => await paginatedSessionList(router, input));
-	}
-	if (!isLifecycleOperation(operation))
-		throw new SdkSessionCliError("unknown_operation", `Unknown global operation: ${operation}`, 1);
-	if (!args.idempotencyKey)
+	const idempotencyKey = args.idempotencyKey;
+	if (isLifecycleOperation(operation) && !idempotencyKey)
 		throw new SdkSessionCliError("invalid_input", "--idempotency-key is required for lifecycle operations.", 2);
-	const lifecycle = createBrokerSessionLifecycleService(agentDir);
-	const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-	const response = await lifecycle.execute(lifecycleMutationRequest(operation, input, args.idempotencyKey, timeoutMs));
-	throwResponseFailure(response);
-	return response;
+	const client = await connectBroker(agentDir);
+	try {
+		try {
+			const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+			const response = await client.global(operation, input, {
+				idempotencyKey,
+				...(timeoutMs === undefined ? {} : { timeoutMs }),
+				...(args.elevationRequestId === undefined ? {} : { elevationRequestId: args.elevationRequestId }),
+			});
+			return args.showEndpointCredential ? response : stripSecretFields(response);
+		} catch (error) {
+			if (
+				isLifecycleOperation(operation) &&
+				error instanceof SdkClientError &&
+				error.code === "uncertain_after_send" &&
+				error.details &&
+				typeof error.details === "object"
+			)
+				return stripSecretFields(await client.lookupLifecycle(error.details as SdkSentRecord));
+			throw error;
+		}
+	} finally {
+		await client.close();
+	}
 }
 
-function rawKind(action: string, args: SdkSessionCliArgs): SdkSessionCliRawKind | undefined {
-	if (action === "raw")
-		return args.rawAction === "control" || args.rawAction === "query" || args.rawAction === "global"
-			? args.rawAction
-			: undefined;
-	return action === "control" || action === "query" || action === "global" ? action : undefined;
+async function runElevate(agentDir: string, sessionId: string, args: SdkSessionCliArgs): Promise<unknown> {
+	if (args.confirm !== true || !process.stdin.isTTY)
+		throw new SdkSessionCliError(
+			"operator_confirmation_required",
+			"Elevation approval requires an attended TTY and --confirm.",
+			1,
+		);
+	const kind = args.operationKind;
+	if (kind !== "control" && kind !== "global")
+		throw new SdkSessionCliError("usage", "elevate requires --kind control|global.", 2);
+	const operation = requireValue(args.operation, "--op");
+	const input = await inputFromArgs(args);
+	const broker = await connectBroker(agentDir);
+	try {
+		const issued = await broker.global("elevation.issue", {
+			sessionId,
+			operation: { kind, sdkId: operation },
+			input,
+			requester: { source: "broker_connection", connectionId: `operator-cli:${process.pid}` },
+		});
+		if (isRecord(issued) && issued.ok === false) return issued;
+		const result = resultObject(issued);
+		const elevationRequestId = typeof result?.elevationRequestId === "string" ? result.elevationRequestId : undefined;
+		const presentedDigest = typeof result?.requestDigest === "string" ? result.requestDigest : undefined;
+		if (!elevationRequestId || !presentedDigest)
+			throw new SdkSessionCliError("unavailable", "Broker returned a malformed elevation request.", 1);
+		const directory = path.join(agentDir, "sdk", "elevation", "operator");
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		const target = path.join(directory, `${elevationRequestId}.json`);
+		const temporary = `${target}.${randomUUID()}.tmp`;
+		await Bun.write(
+			temporary,
+			`${JSON.stringify({ version: 1, elevationRequestId, answer: "approve", presentedDigest, createdAt: Date.now() })}\n`,
+		);
+		await fs.chmod(temporary, 0o600);
+		await fs.rename(temporary, target);
+		return { ok: true, result: { elevationRequestId, requestDigest: presentedDigest, state: "approval_submitted" } };
+	} finally {
+		await broker.close();
+	}
 }
 
-/** Runs the broker-bound `gjc sdk session` command family without exposing endpoint credentials. */
+/**
+ * Runs the `gjc sdk session` command family: semantic verbs (list, inspect,
+ * send, status, tail) plus the explicit raw control/query/global hatch.
+ */
 export async function runSdkSessionCli(
 	args: SdkSessionCliArgs,
 	writeOutput: (value: unknown) => void = writeJson,
@@ -1138,85 +1048,99 @@ export async function runSdkSessionCli(
 			action !== "send" &&
 			action !== "status" &&
 			action !== "tail" &&
-			action !== "raw" &&
-			action !== "control" &&
-			action !== "query" &&
-			action !== "global"
+			action !== "elevate" &&
+			action !== "raw"
 		)
 			throw new SdkSessionCliError(
 				"usage",
-				"Expected one of: list, inspect, send, status, tail, raw (control|query|global).",
+				"Expected one of: list, inspect, send, status, tail, elevate, raw (control|query|global).",
 				2,
 			);
+		const repo = args.repo ?? process.cwd();
 		const agentDir = args.agentDir ?? getAgentDir();
+
 		if (action === "list") {
-			writeOutput(stripSecretFields(await runList(agentDir)));
+			writeOutput(await runList(agentDir));
 			return;
 		}
+		const sessionId =
+			action === "raw" && args.rawAction === "global" ? undefined : requireValue(args.sessionId, "<sessionId>");
 		if (action === "inspect") {
-			writeOutput(stripSecretFields(await runInspect(agentDir, requireValue(args.sessionId, "<sessionId>"))));
+			writeOutput(await runInspect(repo, agentDir, requireValue(sessionId, "<sessionId>")));
 			return;
 		}
 		if (action === "send") {
-			writeOutput(stripSecretFields(await runSend(agentDir, requireValue(args.sessionId, "<sessionId>"), args)));
+			writeOutput(await runSend(agentDir, requireValue(sessionId, "<sessionId>"), args));
 			return;
 		}
 		if (action === "status") {
 			writeOutput(
-				stripSecretFields(
-					await runStatus(
-						agentDir,
-						requireValue(args.sessionId, "<sessionId>"),
-						requireValue(args.opRef, "<opRef>"),
-						args,
-					),
-				),
+				await runStatus(agentDir, requireValue(sessionId, "<sessionId>"), requireValue(args.opRef, "<opRef>")),
 			);
 			return;
 		}
 		if (action === "tail") {
-			writeOutput(
-				stripSecretFields(
-					await runTail(args.repo ?? process.cwd(), agentDir, requireValue(args.sessionId, "<sessionId>"), args),
-				),
-			);
+			writeOutput(await runTail(repo, agentDir, requireValue(sessionId, "<sessionId>"), args));
 			return;
 		}
-
-		const kind = rawKind(requireValue(action, "<verb>"), args);
-		if (!kind) throw new SdkSessionCliError("usage", "raw requires one of: control, query, global.", 2);
-		const operation = kind === "query" ? requireValue(args.query, "--query") : requireValue(args.operation, "--op");
+		if (action === "elevate") {
+			writeOutput(await runElevate(agentDir, requireValue(sessionId, "<sessionId>"), args));
+			return;
+		}
+		const rawAction = args.rawAction;
+		if (rawAction !== "control" && rawAction !== "query" && rawAction !== "global")
+			throw new SdkSessionCliError("usage", "raw requires one of: control, query, global.", 2);
+		const operation =
+			rawAction === "query" ? requireValue(args.query, "--query") : requireValue(args.operation, "--op");
+		const kind: OperationKind = rawAction === "query" ? "query" : rawAction === "global" ? "global" : "control";
 		const dispositionError = cliOperationError(kind, operation);
 		if (dispositionError) throw new SdkSessionCliError(dispositionError.code, dispositionError.message, 1);
-		if (isEndpointOperation(operation))
+		if (isEndpointOperation(operation) && !args.showEndpointCredential)
 			throw new SdkSessionCliError(
 				"endpoint_credential_forbidden",
-				"session.get_endpoint is not available through the SDK session CLI.",
+				"session.get_endpoint requires --show-endpoint-credential.",
+				1,
+			);
+		if (
+			isCredentialBearingOperation(operation) &&
+			args.showEndpointCredential &&
+			process.stdout.isTTY &&
+			!args.yes &&
+			!(await confirmEndpointCredentialOutput())
+		)
+			throw new SdkSessionCliError(
+				"endpoint_credential_confirmation_required",
+				"Endpoint credential output was not confirmed.",
 				1,
 			);
 		const input = await inputFromArgs(args);
-		const secretError = validateAdapterSecretFields(operation, input);
-		if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
-		if (kind === "global") {
-			writeOutput(stripSecretFields(await runRawGlobal(agentDir, operation, input, args)));
+		if (rawAction === "global") {
+			writeOutput(await runRawGlobal(agentDir, operation, input, args));
 			return;
 		}
-		const sessionId = requireValue(args.sessionId, "<sessionId>");
-		writeOutput(
-			stripSecretFields(
-				kind === "control"
-					? await runRawControl(agentDir, sessionId, operation, input, args)
-					: await runRawQuery(agentDir, sessionId, operation, input, args),
-			),
-		);
+		if (rawAction === "control") {
+			writeOutput(await runRawControl(agentDir, requireValue(sessionId, "<sessionId>"), operation, input, args));
+			return;
+		}
+		writeOutput(await runRawQuery(agentDir, requireValue(sessionId, "<sessionId>"), operation, input, args));
 	} catch (error) {
+		if (brokerAbsent(error)) {
+			writeOutput({ ok: false, error: { code: "broker_unavailable", message: "SDK broker is unavailable." } });
+			setExitCode(1);
+			return;
+		}
 		const cliError =
 			error instanceof SdkSessionCliError
 				? error
-				: error instanceof SessionRouterError
-					? new SdkSessionCliError(error.phase, error.message, 1)
-					: error instanceof SdkClientError
-						? new SdkSessionCliError(error.code, error.message, 1, error.details)
+				: error instanceof SdkClientError
+					? new SdkSessionCliError(
+							error.code,
+							error.message,
+							1,
+							(error.details as { details?: unknown } | undefined)?.details,
+						)
+					: error instanceof SdkDiscoveryError
+						? new SdkSessionCliError(error.code, error.message, 1)
 						: new SdkSessionCliError(
 								"operation_failed",
 								error instanceof Error ? error.message : "SDK operation failed.",
@@ -1227,7 +1151,7 @@ export async function runSdkSessionCli(
 			error: {
 				code: cliError.code,
 				message: cliError.message,
-				...(cliError.details === undefined ? {} : { details: stripSecretFields(cliError.details) }),
+				...(cliError.details ? { details: stripSecretFields(cliError.details) } : {}),
 			},
 		});
 		setExitCode(cliError.exitCode);

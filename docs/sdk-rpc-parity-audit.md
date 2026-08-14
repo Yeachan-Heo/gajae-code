@@ -19,7 +19,8 @@ and
 `6e147d58~1:packages/coding-agent/src/modes/shared/agent-wire/session-registry.ts:1-53`.
 `SDK equivalent` means a current operation or documented SDK protocol covers the
 control/query intent, not that its transport or event semantics are identical.
-`transport-gap — retired` means the direct `gjc sdk serve` relay and standalone transport clients were removed when `SessionRouter` became the sole external attachment authority.
+`transport-gap — closed by Phase 1` means Phase 1's `gjc sdk serve` and typed
+`gjc_sdk` Python package provide the replacement transport/client surface.
 `phase-2-gap` means no equivalent has been implemented by this audit.
 
 Operation names and their stated roles are from
@@ -92,8 +93,8 @@ sources above.
 | Host URI sub-protocol | scheme registration, read/write/cancel/result | Partial SDK equivalent — provider-only/machine attachment; not installed on the ordinary per-session endpoint: `host_uri.register` plus reverse callback operations | `6e147d58~1:docs/rpc.md:46,55,293-323,357`; registry:106,165; dispatch:222-223; sdk/bus/index.ts:1654,1726-1738,2325-2327 |
 | Unattended sub-protocol | `negotiate_unattended` declaration/budget/scopes/allowlist | phase-2-gap | retired doc; docs/sdk.md §Coordinator MCP question pull loop |
 | `rpc-sessions` registry | Cross-process session registry and reattach semantics | phase-2-gap. Per-session discovery files are only partial endpoint location, not a registry/reattach protocol | parent source: `6e147d58~1:packages/coding-agent/src/modes/rpc/rpc-mode.ts:892-907,984-992`; `6e147d58~1:packages/coding-agent/src/modes/shared/agent-wire/session-registry.ts:1-53`; docs/sdk.md §Endpoint discovery, §Architecture |
-| Transport | stdio JSONL | retired. Direct stdio relay was removed; managed clients use Router-owned capabilities. | parent source: `6e147d58~1:packages/coding-agent/src/modes/rpc/rpc-mode.ts:892-907,984-992`; removal evidence: SDK-owned session lifecycle handoff |
-| Transport | `--listen` Unix socket | retired. Direct Unix-socket relay was removed; managed clients use Router-owned capabilities. | parent source: `6e147d58~1:packages/coding-agent/src/cli/args.ts:157-158`; removal evidence: SDK-owned session lifecycle handoff |
+| Transport | stdio JSONL | transport-gap — closed by Phase 1 (`gjc sdk serve` + `gjc_sdk` typed Python client) | retired doc; Phase 1 approved plan; removal evidence `args.ts:117-127` |
+| Transport | `--listen` Unix socket | transport-gap — closed by Phase 1 (`gjc sdk serve` + `gjc_sdk` typed Python client); replacement is not Unix-socket wire compatibility | parent source: `6e147d58~1:packages/coding-agent/src/cli/args.ts:157-158`; `6e147d58~1:packages/coding-agent/src/modes/rpc/rpc-mode.ts:892-971`; Phase 1 approved plan; docs/sdk.md §Endpoint discovery; removal evidence `args.ts:117-127` |
 
 ## Five-gap reduction verdict
 
@@ -103,8 +104,11 @@ workflow operations (`operation-registry.ts:66-166`), and control dispatch
 implements the control path (`dispatch.ts:138-253`). That does **not** erase the
 user-perceived reduction. It is **REAL** across five dimensions:
 
-1. **stdio JSONL and Unix-socket transports.** The interim `gjc sdk serve` relay was retired; external attachment now requires Router-owned opaque capabilities and never forwards endpoint credentials.
-2. **Typed Python client.** The interim public Python transport client was retired with the direct relay; cross-process integrations require Router-owned capabilities.
+1. **stdio JSONL and Unix-socket transports.** Phase 1 (`gjc sdk serve` plus the
+   typed `gjc_sdk` Python package) closes this transport/client gap, while not
+   promising byte-for-byte JSONL or Unix-socket compatibility.
+2. **Typed Python client.** Phase 1 closes the absence of a supported typed
+   Python client through `gjc_sdk`.
 3. **`negotiate_unattended`.** No fail-closed unattended negotiation with the
    retired declaration, budget, scope, and allowlist exists: this remains Phase 2.
 4. **Cross-process session registry/reattach.** Discovery files locate a live
@@ -122,7 +126,11 @@ user-perceived reduction. It is **REAL** across five dimensions:
    `workflow.gates.list` plus the Coordinator MCP pull loop can enumerate and
    answer durable workflow gates; they are not unattended negotiation
    (`docs/sdk.md §Coordinator MCP question pull loop`).
-2. **Reattachment semantics — implemented in SDK core.** `SessionRouter` exclusively resolves private endpoint publication, retains credentials, reconnects, replays, rotates transports, and issues exact opaque attachment capabilities. External adapters do not consume discovery files or raw endpoint credentials.
+2. **Reattach/registry — NOT implemented.** Define cross-process registry and
+   reattachment semantics. Partial equivalent only: discovery files at
+   `.gjc/state/sdk/<sessionId>.json` provide endpoint location and token for a
+   live session (`docs/sdk.md §Endpoint discovery`); architecture explicitly says there is no
+   shared upstream registry (`docs/sdk.md §Architecture`).
 3. **Full event stream — NOT implemented.** Define a renderer-grade session
    event contract only if consumers require it. Partial equivalent only:
    `action_needed`, `action_resolved`, `reply_rejected`, and optional threaded

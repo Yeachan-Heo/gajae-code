@@ -8,7 +8,7 @@ import { notificationsEnabled } from "../../src/sdk/bus";
 console.log(
 	JSON.stringify({
 		enabled: notificationsEnabled(),
-		// Provider setup resolves its bot token through the same credential boundary.
+		// telegram-cli resolves its bot token through the same resolver
 		botToken: $credentialEnv("GJC_TG_BOT_TOKEN") ?? null,
 	}),
 );

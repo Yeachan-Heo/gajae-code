@@ -13,7 +13,6 @@ import {
 	awaitCodexWakePublishesForTest,
 	createCoordinatorMcpServer,
 } from "../src/coordinator-mcp/server";
-import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
 import { persistMcpDelegateHostContext } from "../src/hooks/mcp-delegate-host-context";
 import { schemaHash } from "../src/modes/shared/agent-wire/workflow-gate-schema";
 import {
@@ -33,21 +32,14 @@ import {
 	type EnsureBrokerSettings,
 	startFixtureBrokerWithLeaseForTest,
 } from "../src/sdk/broker/ensure";
-import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
+
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
-import { type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
-import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 import {
 	cleanupFixtureRoot,
 	createFixtureBrokerEnvironment,
 	createFixtureRootCleanup,
 } from "./helpers/fixture-broker-cleanup";
-import { prepareExactSessionAuthority } from "./helpers/sdk-exact-session-authority";
-
-// Coordinator state writes serialize on a lock whose removals go through identity-bound
-// native primitives; point them at a working implementation.
-installExactIdentityNatives();
 
 const tempDirs: string[] = [];
 
@@ -69,7 +61,18 @@ afterEach(async () => {
 });
 
 type SdkControl = { operation: string; input: Record<string, unknown>; idempotencyKey?: string };
+function brokerEndpointIncarnation(
+	sessionId: string,
+	endpointGeneration: number,
+	pid: number,
+	endpointMtimeMs: number,
+): string {
+	return createHash("sha256")
+		.update(JSON.stringify({ endpointGeneration, endpointMtimeMs, pid, sessionId }))
+		.digest("hex");
+}
 
+type EndpointRequestHandler = (input: Record<string, unknown>, sessions: Array<Record<string, unknown>>) => unknown;
 type SdkControlServerOptions = {
 	platform?: NodeJS.Platform;
 	canonicalizePath?: (value: string) => Promise<string>;
@@ -82,8 +85,6 @@ type SdkControlServerOptions = {
 
 	promptAckTimeoutMs?: number;
 	controlOptions?: Array<{ idempotencyKey?: string; timeoutMs?: number }>;
-	/** Per-query transport options, in dispatch order, parallel to the recorded query names. */
-	queryOptions?: Array<{ timeoutMs?: number } | undefined>;
 	/** Every raw session frame the server sent, in order (activation frames included). */
 	sessionFrames?: Array<Record<string, unknown>>;
 	sessionFrameResult?: (frame: Record<string, unknown>) => unknown;
@@ -92,7 +93,9 @@ type SdkControlServerOptions = {
 	>["codexTransportFactory"];
 };
 function lifecycleControls(controls: SdkControl[]): SdkControl[] {
-	return controls.filter(control => control.operation !== "session.list");
+	return controls.filter(
+		control => control.operation !== "session.list" && control.operation !== "session.get_endpoint",
+	);
 }
 
 function sharedAskGate(
@@ -134,7 +137,7 @@ function sharedAskGate(
 type BrokerTestServices = {
 	ensureBroker: (settings: EnsureBrokerSettings) => Promise<BrokerDiscovery>;
 	readSdkBrokerDiscovery: (agentDir: string) => Promise<BrokerDiscovery | null>;
-	connectBroker: (url: string, token: string) => Promise<SdkClient>;
+	connectSdk: (url: string, token: string) => Promise<SdkClient>;
 };
 
 function testBrokerDiscovery(): BrokerDiscovery {
@@ -214,50 +217,12 @@ async function createSdkControlServer(
 		},
 	],
 	sessionCommand?: string,
-	_reserved?: never,
+	endpointRequestHandler?: EndpointRequestHandler,
 	serverOptions: SdkControlServerOptions = {},
 ): Promise<ReturnType<typeof createCoordinatorMcpServer>> {
 	const stateRoot = path.join(root, ".gjc", "coordinator-state");
 	const agentDir = path.join(root, "agent-global");
 	let createdSessions = 0;
-	for (const session of brokerSessions) {
-		if (session.live !== true) continue;
-		const sessionId = String(session.sessionId ?? session.session_id ?? "");
-		if (!sessionId) continue;
-		const cwd = root;
-		const authority = await prepareExactSessionAuthority({
-			agentDir,
-			cwd,
-			sessionId,
-			url: "ws://sdk.example.test",
-			token: "test-token",
-			endpointGeneration: typeof session.endpointGeneration === "number" ? session.endpointGeneration : 1,
-		});
-		session.pid = authority.pid;
-		session.endpointMtimeMs = authority.endpointMtimeMs;
-	}
-	const routerIndex = {
-		open: async () => {},
-		refresh: async () => {},
-		listSessions: () => ({
-			indexSeq: 1,
-			sessions: brokerSessions.map(session => {
-				const sessionId = String(session.sessionId ?? session.session_id ?? "");
-				const repo = root;
-				return {
-					sessionId,
-					locator: { repo, stateRoot: path.join(repo, ".gjc", "state") },
-					live: session.live === true,
-					terminalUncertain: session.terminalUncertain === true,
-					endpointGeneration: session.endpointGeneration,
-					pid: session.pid,
-					endpointMtimeMs: session.endpointMtimeMs,
-					indexSeq: 1,
-				};
-			}),
-			warnings: [],
-		}),
-	} as unknown as SessionIndex;
 	const server = createCoordinatorMcpServer({
 		env: {
 			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
@@ -276,8 +241,24 @@ async function createSdkControlServer(
 			resolveModelProfiles: () => new Map([["codex-eco", { name: "codex-eco" }]]),
 			canonicalizePath: serverOptions.canonicalizePath,
 			codexTransportFactory: serverOptions.codexTransportFactory,
-			connectBroker: async () =>
+			connectSdk: async () =>
 				({
+					control: async (
+						operation: string,
+						input: Record<string, unknown>,
+						options: { idempotencyKey?: string; timeoutMs?: number },
+					) => {
+						const control = { operation, input, idempotencyKey: options.idempotencyKey };
+						controls.push(control);
+						serverOptions.controlOptions?.push(options);
+						return (
+							serverOptions.controlResult?.(control) ?? {
+								accepted: true,
+								command_id: `sdk-command-${controls.length}`,
+								turn_id: `sdk-turn-${controls.length}`,
+							}
+						);
+					},
 					global: async (
 						operation: string,
 						input: Record<string, unknown>,
@@ -287,6 +268,16 @@ async function createSdkControlServer(
 						const customResult = serverOptions.globalResult?.(operation, input, brokerSessions);
 						if (customResult !== undefined) return customResult;
 						if (operation === "session.list") return { ok: true, result: { sessions: brokerSessions } };
+						if (operation === "session.get_endpoint") {
+							if (endpointRequestHandler) return endpointRequestHandler(input, brokerSessions);
+							return {
+								ok: true,
+								result: {
+									url: "ws://broker.example.test/endpoint?token=broker-endpoint-secret",
+									token: "Bearer broker-endpoint-secret",
+								},
+							};
+						}
 						if (operation === "session.close") {
 							const sessionId = input.sessionId;
 							const index = brokerSessions.findIndex(session => session.sessionId === sessionId);
@@ -299,25 +290,18 @@ async function createSdkControlServer(
 							const lifecycleCwd = worktree?.enabled === true ? path.join(root, "hermes-worktree") : undefined;
 							const sessionId = `created-session-${++createdSessions}`;
 							const sessionCwd = lifecycleCwd ?? root;
-							const endpointPath = path.join(sessionCwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-							await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+							await fs.mkdir(path.join(sessionCwd, ".gjc", "state", "sdk"), { recursive: true });
 							await Bun.write(
-								endpointPath,
-								JSON.stringify({
-									sessionId,
-									pid: process.pid,
-									url: "ws://sdk.example.test",
-									token: "test-token",
-								}),
+								path.join(sessionCwd, ".gjc", "state", "sdk", `${sessionId}.json`),
+								JSON.stringify({ url: "ws://sdk.example.test", token: "test-token" }),
 							);
-							const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
 							brokerSessions.push({
 								sessionId,
 								locator: { repo: sessionCwd },
 								live: true,
 								endpointGeneration: 1,
-								pid: process.pid,
-								endpointMtimeMs,
+								pid: 10_000 + createdSessions,
+								endpointMtimeMs: createdSessions,
 							});
 							return {
 								ok: true,
@@ -326,7 +310,12 @@ async function createSdkControlServer(
 									...(lifecycleCwd
 										? {
 												cwd: lifecycleCwd,
-												worktree: { enabled: true, cwd: lifecycleCwd, created: true, reused: false },
+												worktree: {
+													enabled: true,
+													cwd: lifecycleCwd,
+													created: true,
+													reused: false,
+												},
 											}
 										: {}),
 									endpoint: {
@@ -339,59 +328,25 @@ async function createSdkControlServer(
 						}
 						return { ok: true, result: { sessionId: String(input.sessionId ?? "visible-session") } };
 					},
+					query: async (query: string, _input: Record<string, unknown>, cursor?: string) => {
+						queries.push(query);
+						return queryResult(query, cursor);
+					},
+					request: async (frame: Record<string, unknown>) => {
+						serverOptions.sessionFrames?.push(frame);
+						return (
+							serverOptions.sessionFrameResult?.(frame) ?? {
+								type: "session_activate_result",
+								id: "activate-1",
+								ok: true,
+								status: "activated",
+								sessionId: frame.sessionId,
+								generation: frame.endpointGeneration,
+							}
+						);
+					},
 					close: async () => {},
 				}) as unknown as SdkClient,
-			routerDeps: {
-				createIndex: () => routerIndex,
-				createClient: async endpoint => {
-					const client: SessionRouterClient = {
-						onFrame: _handler => () => {},
-						request: async (frame, requestOptions) => {
-							if (frame.type === "control_request") {
-								const control = {
-									operation: String(frame.operation),
-									input: (frame.input as Record<string, unknown>) ?? {},
-									idempotencyKey: typeof frame.idempotencyKey === "string" ? frame.idempotencyKey : undefined,
-								};
-								controls.push(control);
-								serverOptions.controlOptions?.push({ idempotencyKey: control.idempotencyKey });
-								return (serverOptions.controlResult?.(control) ?? {
-									accepted: true,
-									command_id: `sdk-command-${controls.length}`,
-									turn_id: `sdk-turn-${controls.length}`,
-								}) as Record<string, unknown>;
-							}
-							if (frame.type === "query_request") {
-								const query = String(frame.query);
-								queries.push(query);
-								serverOptions.queryOptions?.push(requestOptions);
-								return queryResult(
-									query,
-									typeof frame.cursor === "string" ? frame.cursor : undefined,
-								) as Record<string, unknown>;
-							}
-							if (frame.type === "session_activate") {
-								serverOptions.sessionFrames?.push(frame);
-								return (serverOptions.sessionFrameResult?.(frame) ?? {
-									type: "session_activate_result",
-									id: "activate-1",
-									ok: true,
-									status: "activated",
-									sessionId: frame.sessionId,
-									generation: frame.endpointGeneration,
-								}) as Record<string, unknown>;
-							}
-							return {};
-						},
-						close: async () => {},
-						send: () => {},
-					};
-					void endpoint;
-					return client;
-				},
-				setInterval: (() => 0) as unknown as typeof setInterval,
-				clearInterval: (() => {}) as unknown as typeof clearInterval,
-			},
 		},
 	});
 	await fs.mkdir(path.join(root, ".gjc", "state", "sdk"), { recursive: true });
@@ -408,6 +363,10 @@ async function createSdkControlServer(
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
 	});
+	await Bun.write(
+		path.join(root, ".gjc", "state", "sdk", "visible-session.json"),
+		JSON.stringify({ url: "ws://sdk.example.test", token: "session-endpoint-secret" }),
+	);
 	return server;
 }
 
@@ -423,56 +382,6 @@ async function registerSdkSession(server: ReturnType<typeof createCoordinatorMcp
 }
 
 describe("Coordinator MCP canonical SDK controls", () => {
-	async function pingServer(root: string) {
-		const server = createCoordinatorMcpServer({
-			env: {
-				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
-				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
-				GJC_COORDINATOR_MCP_PROFILE: "local",
-				GJC_COORDINATOR_MCP_REPO: "repo",
-			},
-			services: { getAgentDir: () => path.join(root, "agent-global") },
-		});
-		return server;
-	}
-
-	it("answers the MCP ping keepalive with an empty result instead of method-not-found", async () => {
-		const root = await tempRoot();
-		const server = await pingServer(root);
-		const response = await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "ping" });
-		expect(response).toEqual({ jsonrpc: "2.0", id: 1, result: {} });
-	});
-
-	it("preserves a string request id in the ping response", async () => {
-		const root = await tempRoot();
-		const server = await pingServer(root);
-		const response = await server.handleJsonRpc({ jsonrpc: "2.0", id: "keepalive-1", method: "ping" });
-		expect(response).toEqual({ jsonrpc: "2.0", id: "keepalive-1", result: {} });
-	});
-
-	it("answers ping with extra params by ignoring them (params carry no payload)", async () => {
-		const root = await tempRoot();
-		const server = await pingServer(root);
-		const response = await server.handleJsonRpc({
-			jsonrpc: "2.0",
-			id: 42,
-			method: "ping",
-			params: { unexpected: "ignored" },
-		});
-		expect(response).toEqual({ jsonrpc: "2.0", id: 42, result: {} });
-	});
-
-	it("does not write any coordinator state files for a ping keepalive", async () => {
-		const root = await tempRoot();
-		const stateRoot = path.join(root, ".gjc", "coordinator-state");
-		const server = await pingServer(root);
-		await server.handleJsonRpc({ jsonrpc: "2.0", id: 1, method: "ping" });
-		const exists = await fs
-			.stat(stateRoot)
-			.then(() => true)
-			.catch(() => false);
-		expect(exists).toBe(false);
-	});
 	it("uses agent-global SDK discovery and returns credential-free broker status", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -501,6 +410,20 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				source: "coordinator",
 				live: true,
 				reason: "Bearer session-state-secret",
+				last_activity_at: "2026-08-11T00:00:00.000Z",
+				activity: {
+					sequence: 4,
+					kind: "tool_execution",
+					phase: "started",
+					tool_name: "bash",
+					observed_at: "2026-08-11T00:00:00.000Z",
+					active_tool_count: 9,
+					private_args: "do not expose",
+				},
+				active_tools: [
+					{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z", tool_call_id: "private-tool-id" },
+				],
+				active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
 			}),
 		);
 		const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
@@ -508,6 +431,11 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			ok: true,
 			session: { session_id: "visible-session" },
 			status: { authority: "sdk_broker", live: true },
+			session_state: {
+				last_activity_at: "2026-08-11T00:00:00.000Z",
+				activity: { sequence: 4, tool_name: "bash", active_tool_count: 9 },
+				active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
+			},
 		});
 		const publicResult = JSON.stringify(status);
 		expect(publicResult).not.toContain("broker-endpoint-secret");
@@ -515,330 +443,76 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(publicResult).not.toContain("session-endpoint-secret");
 		expect(publicResult).not.toContain("session-record-secret");
 		expect(publicResult).not.toContain("session-state-secret");
-
+		expect(publicResult).not.toContain("private-tool-id");
+		expect(publicResult).not.toContain("do not expose");
 		expect(publicResult).not.toContain(root);
 		expect(controls).toEqual([
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
+			{
+				operation: "session.get_endpoint",
+				input: {
+					sessionId: "visible-session",
+					endpointGeneration: 1,
+					endpointIncarnation: brokerEndpointIncarnation("visible-session", 1, 101, 1),
+				},
+				idempotencyKey: "register-1",
+			},
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
 		]);
-	});
-	const ACTIVITY_AT = "2026-03-01T00:00:02.000Z";
-	/** Full-length correlation digests; anything shorter is refused as malformed. */
-	const DIGEST_A = `a${"0".repeat(63)}`;
-	const DIGEST_B = `b${"1".repeat(63)}`;
-
-	function sessionStatePath(root: string): string {
-		return path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json");
-	}
-
-	/** A sidecar-shaped snapshot, including the private correlation state readers must never see. */
-	function activitySnapshot(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-		return {
-			seq: 4,
-			last_activity_at: ACTIVITY_AT,
-			tool: "bash",
-			phase: "started",
-			outcome: null,
-			elapsed_ms: null,
-			active_tool_count: 1,
-			active_tools: [{ tool: "bash", started_at: ACTIVITY_AT }],
-			in_flight: [{ digest: DIGEST_A, tool: "bash", started_at: ACTIVITY_AT }],
-			...overrides,
-		};
-	}
-
-	/** Annotate the coordinator's own session state exactly as the runtime sidecar does. */
-	async function annotateSessionState(root: string, activity: unknown, state = "running"): Promise<void> {
-		const file = sessionStatePath(root);
-		const payload = JSON.parse(await Bun.file(file).text()) as Record<string, unknown>;
-		await Bun.write(
-			file,
-			JSON.stringify({
-				...payload,
-				state,
-				ready_for_input: false,
-				live: state === "running",
-				source: "agent_session_event",
-				activity,
+		await expect(
+			server.callTool("gjc_coordinator_register_session", {
+				session_id: "visible-session",
+				cwd: root,
+				tmux_session: "visible-session",
+				tmux_target: "visible-session:0.0",
+				idempotency_key: "preserve-activity-registration",
+				allow_mutation: true,
 			}),
-		);
-	}
-
-	async function readStatusActivity(
-		server: ReturnType<typeof createCoordinatorMcpServer>,
-	): Promise<{ status: Record<string, unknown>; activity: Record<string, unknown> | undefined }> {
-		const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
-		const sessionState = status.session_state as Record<string, unknown>;
-		return { status, activity: sessionState.activity as Record<string, unknown> | undefined };
-	}
-
-	it("projects a public-safe tool activity snapshot into coordinator session state", async () => {
-		const root = await tempRoot();
-		const server = await createSdkControlServer(root, []);
-		await registerSdkSession(server, root);
-		await annotateSessionState(root, activitySnapshot());
-
-		const { status, activity } = await readStatusActivity(server);
-		expect(status).toMatchObject({ ok: true, session_state: { state: "running" } });
-		expect(activity).toEqual({
-			seq: 4,
-			last_activity_at: ACTIVITY_AT,
-			tool: "bash",
-			phase: "started",
-			outcome: null,
-			elapsed_ms: null,
-			active_tool_count: 1,
-			active_tools: [{ tool: "bash", started_at: ACTIVITY_AT }],
+		).resolves.toMatchObject({ ok: true });
+		const lifecyclePayload = JSON.parse(
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(lifecyclePayload).toMatchObject({
+			last_activity_at: "2026-08-11T00:00:00.000Z",
+			activity: { sequence: 4, active_tool_count: 9 },
+			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
+			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
 		});
-		const serialized = JSON.stringify(status);
-		expect(serialized).not.toContain(DIGEST_A);
-		expect(serialized).not.toContain("in_flight");
-	});
-
-	it("bounds the public active-tool list while publishing the exact count", async () => {
-		const root = await tempRoot();
-		const server = await createSdkControlServer(root, []);
-		await registerSdkSession(server, root);
-		// Only the public list is capped; the private set is exact current state.
-		const inFlight = Array.from({ length: 12 }, (_entry, index) => ({
-			digest: `${index.toString(16)}${"c".repeat(63)}`,
-			tool: "bash",
-			started_at: ACTIVITY_AT,
-		}));
-		await annotateSessionState(
-			root,
-			activitySnapshot({
-				seq: 12,
-				active_tool_count: 12,
-				active_tools: inFlight.slice(-8).map(({ digest: _digest, ...entry }) => entry),
-				in_flight: inFlight,
+		const sent = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "complete and repair projections",
+			idempotency_key: "repair-activity-turn",
+			allow_mutation: true,
+		});
+		const turnId = (sent as { turn_id?: unknown }).turn_id;
+		if (typeof turnId !== "string") throw new Error("expected turn id");
+		await expect(
+			server.callTool("gjc_coordinator_report_status", {
+				session_id: "visible-session",
+				turn_id: turnId,
+				status: "completed",
+				summary: "repaired terminal projection",
+				idempotency_key: "repair-activity-terminal",
+				allow_mutation: true,
 			}),
-		);
-
-		const { status, activity } = await readStatusActivity(server);
-		expect(activity).toMatchObject({ seq: 12, tool: "bash", active_tool_count: 12 });
-		const activeTools = activity?.active_tools as Array<Record<string, unknown>>;
-		expect(activeTools).toHaveLength(8);
-		expect(activeTools.every(entry => Object.keys(entry).sort().join(",") === "started_at,tool")).toBe(true);
-		expect(JSON.stringify(status)).not.toContain("in_flight");
-	});
-
-	for (const { name, activity } of [
-		{ name: "an unparseable phase", activity: { phase: "exfiltrating", note: "LEAKY-NOTE" } },
-		{
-			name: "an unproven tool label from disk",
-			activity: { tool: "bash --command 'echo LEAKY-NOTE'" },
-		},
-		{
-			name: "a truncated correlation digest",
-			activity: { in_flight: [{ digest: "abc123", tool: "bash", started_at: ACTIVITY_AT }] },
-		},
-		{
-			name: "a public count contradicting the private set",
-			activity: { active_tool_count: 9, note: "LEAKY-NOTE" },
-		},
-		{
-			name: "a duplicated correlation digest",
-			activity: {
-				active_tool_count: 2,
-				active_tools: [
-					{ tool: "bash", started_at: ACTIVITY_AT },
-					{ tool: "bash", started_at: ACTIVITY_AT },
-				],
-				in_flight: [
-					{ digest: DIGEST_A, tool: "bash", started_at: ACTIVITY_AT },
-					{ digest: DIGEST_A, tool: "bash", started_at: ACTIVITY_AT },
-				],
-			},
-		},
-	]) {
-		it(`omits a snapshot carrying ${name} instead of publishing it`, async () => {
-			const root = await tempRoot();
-			const server = await createSdkControlServer(root, []);
-			await registerSdkSession(server, root);
-			await annotateSessionState(root, activitySnapshot(activity));
-
-			const { status, activity: published } = await readStatusActivity(server);
-			expect(status.session_state).toMatchObject({ state: "running" });
-			expect(published).toBeUndefined();
-			expect(JSON.stringify(status)).not.toContain("LEAKY-NOTE");
-		});
-	}
-
-	it("omits an activity value that is not an object at all", async () => {
-		const root = await tempRoot();
-		const server = await createSdkControlServer(root, []);
-		await registerSdkSession(server, root);
-		await annotateSessionState(root, "LEAKY-NOTE");
-
-		const { status, activity } = await readStatusActivity(server);
-		expect(status.session_state).toMatchObject({ state: "running" });
-		expect(activity).toBeUndefined();
-		expect(JSON.stringify(status)).not.toContain("LEAKY-NOTE");
-	});
-
-	it("waits for a state lock held in the shared owner format and keeps the activity snapshot", async () => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const server = await createSdkControlServer(root, controls);
-		await registerSdkSession(server, root);
-		await annotateSessionState(root, activitySnapshot());
-
-		// The runtime sidecar holds this exact lock through the shared implementation;
-		// a coordinator lifecycle write must queue behind it, not fault on its format.
-		let releasedAt = 0;
-		const held = withSessionStateFileLock(sessionStatePath(root), async () => {
-			await Bun.sleep(150);
-			releasedAt = Date.now();
-		});
-		await Bun.sleep(25);
-
-		const response = await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "work",
-			idempotency_key: "state-lock-1",
-			allow_mutation: true,
-		});
-		const wroteAt = Date.now();
-		await held;
-
-		expect(response).toMatchObject({ ok: true, session_state: { state: "running" } });
-		expect(releasedAt).toBeGreaterThan(0);
-		expect(wroteAt).toBeGreaterThanOrEqual(releasedAt);
-		expect((await readStatusActivity(server)).activity).toMatchObject({ seq: 4, active_tool_count: 1 });
-	});
-
-	it("settles orphaned active tools when canonical terminal repair completes the session", async () => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const server = await createSdkControlServer(root, controls);
-		await registerSdkSession(server, root);
-		const prompted = await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "work",
-			idempotency_key: "repair-prompt-1",
-			allow_mutation: true,
-		});
-		expect(prompted).toMatchObject({ ok: true });
-		// Two calls the runtime started and never ended before the report arrived.
-		await annotateSessionState(
-			root,
-			activitySnapshot({
-				seq: 7,
-				active_tool_count: 2,
-				active_tools: [
-					{ tool: "bash", started_at: ACTIVITY_AT },
-					{ tool: "edit", started_at: ACTIVITY_AT },
-				],
-				in_flight: [
-					{ digest: DIGEST_A, tool: "bash", started_at: ACTIVITY_AT },
-					{ digest: DIGEST_B, tool: "edit", started_at: ACTIVITY_AT },
-				],
-			}),
-		);
-
-		// A terminal report rebuilds every legacy projection from canonical state.
-		const report = await server.callTool("gjc_coordinator_report_status", {
-			session_id: "visible-session",
-			turn_id: prompted.turn_id,
-			status: "completed",
-			summary: "done",
-			idempotency_key: "repair-report-1",
-			allow_mutation: true,
-		});
-		expect(report).toMatchObject({ ok: true, session_state: { state: "completed" } });
-
-		const persisted = JSON.parse(await Bun.file(sessionStatePath(root)).text()) as Record<string, unknown>;
-		expect(persisted.state).toBe("completed");
-		// A settled session cannot still be running a tool, and the orphans are named
-		// cancelled rather than claimed as a success nothing observed.
-		expect(persisted.activity).toMatchObject({
-			seq: 8,
-			tool: "bash",
-			phase: "finished",
-			outcome: "cancelled",
-			elapsed_ms: null,
-			active_tool_count: 0,
-			active_tools: [],
-			in_flight: [],
-		});
-		expect((report.session_state as Record<string, unknown>).activity).toMatchObject({
-			seq: 8,
-			outcome: "cancelled",
-			active_tool_count: 0,
-			active_tools: [],
+		).resolves.toMatchObject({ ok: true });
+		const repairedPayload = JSON.parse(
+			await fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "session-states", "visible-session.json"),
+				"utf8",
+			),
+		) as Record<string, unknown>;
+		expect(repairedPayload).toMatchObject({
+			state: "completed",
+			last_activity_at: "2026-08-11T00:00:00.000Z",
+			activity: { sequence: 4, active_tool_count: 9 },
+			active_tools: [{ tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" }],
+			active_tool_calls: { "private-tool-id": { tool_name: "bash", started_at: "2026-08-11T00:00:00.000Z" } },
 		});
 	});
-
-	it("preserves the previous activity when a terminal repair has nothing in flight", async () => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const server = await createSdkControlServer(root, controls);
-		await registerSdkSession(server, root);
-		const prompted = await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "work",
-			idempotency_key: "settled-prompt-1",
-			allow_mutation: true,
-		});
-		expect(prompted).toMatchObject({ ok: true });
-		const settled = {
-			seq: 7,
-			last_activity_at: ACTIVITY_AT,
-			tool: "bash",
-			phase: "finished",
-			outcome: "success",
-			elapsed_ms: 1200,
-			active_tool_count: 0,
-			active_tools: [],
-			in_flight: [],
-		};
-		await annotateSessionState(root, settled);
-
-		const report = await server.callTool("gjc_coordinator_report_status", {
-			session_id: "visible-session",
-			turn_id: prompted.turn_id,
-			status: "completed",
-			summary: "done",
-			idempotency_key: "settled-report-1",
-			allow_mutation: true,
-		});
-		expect(report).toMatchObject({ ok: true, session_state: { state: "completed" } });
-
-		const persisted = JSON.parse(await Bun.file(sessionStatePath(root)).text()) as Record<string, unknown>;
-		expect(persisted.activity).toEqual(settled);
-	});
-
-	it("keeps a malformed activity snapshot hidden across canonical terminal repair", async () => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const server = await createSdkControlServer(root, controls);
-		await registerSdkSession(server, root);
-		const prompted = await server.callTool("gjc_coordinator_send_prompt", {
-			session_id: "visible-session",
-			prompt: "work",
-			idempotency_key: "malformed-prompt-1",
-			allow_mutation: true,
-		});
-		expect(prompted).toMatchObject({ ok: true });
-		await annotateSessionState(root, activitySnapshot({ phase: "exfiltrating", note: "LEAKY-NOTE" }));
-
-		const report = await server.callTool("gjc_coordinator_report_status", {
-			session_id: "visible-session",
-			turn_id: prompted.turn_id,
-			status: "completed",
-			summary: "done",
-			idempotency_key: "malformed-report-1",
-			allow_mutation: true,
-		});
-		expect(report).toMatchObject({ ok: true, session_state: { state: "completed" } });
-		// Never re-seeded into a valid-looking snapshot, and never published.
-		expect(JSON.stringify(report)).not.toContain("LEAKY-NOTE");
-		const persisted = JSON.parse(await Bun.file(sessionStatePath(root)).text()) as Record<string, unknown>;
-		expect(persisted.activity).toMatchObject({ phase: "exfiltrating", note: "LEAKY-NOTE" });
-		expect((report.session_state as Record<string, unknown>).activity).toBeUndefined();
-	});
-
 	it("marks lifecycle-created sessions ready after successful SDK lifecycle binding", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -855,7 +529,11 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			session: { session_id: "created-session-1" },
 			session_state: { state: "ready_for_input", ready_for_input: true },
 		});
-		expect(controls.map(control => control.operation)).toEqual(["session.create", "session.list"]);
+		expect(controls.map(control => control.operation)).toEqual([
+			"session.create",
+			"session.list",
+			"session.get_endpoint",
+		]);
 	});
 
 	it("preserves multiline delegated task text in one SDK turn.prompt control", async () => {
@@ -1036,7 +714,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			fs.readdir(path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns")),
 		).rejects.toMatchObject({ code: "ENOENT" });
 	});
-	it("surfaces Router request timeout errors without persisting a turn", async () => {
+	it("passes the bounded acknowledgement timeout to the SDK and surfaces timeout errors", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const controlOptions: Array<{ idempotencyKey?: string; timeoutMs?: number }> = [];
@@ -1060,37 +738,12 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(controls.filter(control => control.operation === "turn.prompt")).toEqual([
 			{ operation: "turn.prompt", input: { text: "bounded timeout" }, idempotencyKey: "bounded-timeout" },
 		]);
-		expect(controlOptions).toContainEqual({ idempotencyKey: "bounded-timeout" });
+		expect(controlOptions).toContainEqual({ idempotencyKey: "bounded-timeout", timeoutMs: 17 });
 		await expect(
 			fs.readdir(path.join(root, ".gjc", "coordinator-state", "local", "repo", "turns")),
 		).rejects.toMatchObject({ code: "ENOENT" });
 	});
-	it("keeps post-send Router ambiguity retryable under the same prompt idempotency key", async () => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		let attempts = 0;
-		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
-			controlResult: control => {
-				if (control.operation === "turn.prompt" && attempts++ === 0)
-					throw new SessionRouterError("ambiguous", "response crossed attachment rotation");
-				return { accepted: true, command_id: "reconciled-command", turn_id: "reconciled-turn" };
-			},
-		});
-		await registerSdkSession(server, root);
-		const args = {
-			session_id: "visible-session",
-			prompt: "reconcile this prompt",
-			idempotency_key: "ambiguous-prompt",
-			allow_mutation: true,
-		};
-		const ambiguous = await server.callTool("gjc_coordinator_send_prompt", args);
-		expect(ambiguous).toMatchObject({ ok: false, error: { code: "ambiguous" } });
-		const reconciled = await server.callTool("gjc_coordinator_send_prompt", args);
-		expect(reconciled).toMatchObject({ ok: true, result: { accepted: true } });
-		expect(await server.callTool("gjc_coordinator_send_prompt", args)).toEqual(reconciled);
-		expect(controls.filter(control => control.operation === "turn.prompt")).toHaveLength(2);
-	});
-	it("keeps prompt acknowledgement timing under Router ownership", async () => {
+	it("caps and defaults prompt acknowledgement timeouts passed to the SDK", async () => {
 		for (const [configuredTimeoutMs, expectedTimeoutMs] of [
 			[undefined, 10_000],
 			[300_001, 300_000],
@@ -1111,7 +764,9 @@ describe("Coordinator MCP canonical SDK controls", () => {
 					allow_mutation: true,
 				}),
 			).toMatchObject({ ok: true });
-			expect(controlOptions).toEqual([{ idempotencyKey: `prompt-timeout-${expectedTimeoutMs}` }]);
+			expect(controlOptions).toEqual([
+				{ idempotencyKey: `prompt-timeout-${expectedTimeoutMs}`, timeoutMs: expectedTimeoutMs },
+			]);
 		}
 	});
 
@@ -1199,54 +854,6 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			{ operation: "session.list", input: { cwd: root, cursor: "page-2" }, idempotencyKey: undefined },
 		]);
 	});
-	it("rejects repeated coordinator session.list cursors without partial status", async () => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const page = { sessionId: "page", locator: { repo: root }, live: true };
-		const server = await createSdkControlServer(root, controls, [], undefined, [page], undefined, undefined, {
-			globalResult: operation =>
-				operation === "session.list"
-					? { ok: true, result: { sessions: [page], continuationCursor: "repeat" } }
-					: undefined,
-		});
-
-		const status = await server.callTool("gjc_coordinator_read_status");
-
-		expect(status).toMatchObject({
-			ok: false,
-			error: { code: "protocol_error", message: "session.list returned a repeated continuation cursor." },
-		});
-		expect(status).not.toHaveProperty("sessions");
-		expect(controls).toEqual([
-			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
-			{ operation: "session.list", input: { cwd: root, cursor: "repeat" }, idempotencyKey: undefined },
-		]);
-	});
-	it("rejects malformed coordinator session.list continuation pages without partial status", async () => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const page = { sessionId: "page", locator: { repo: root }, live: true };
-		const server = await createSdkControlServer(root, controls, [], undefined, [page], undefined, undefined, {
-			globalResult: (operation, input) => {
-				if (operation !== "session.list") return undefined;
-				return input.cursor === undefined
-					? { ok: true, result: { sessions: [page], continuationCursor: "page-2" } }
-					: { ok: true, result: { sessions: "not-an-array" } };
-			},
-		});
-
-		const status = await server.callTool("gjc_coordinator_read_status");
-
-		expect(status).toMatchObject({
-			ok: false,
-			error: { code: "protocol_error", message: "session.list returned a malformed page." },
-		});
-		expect(status).not.toHaveProperty("sessions");
-		expect(controls).toEqual([
-			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },
-			{ operation: "session.list", input: { cwd: root, cursor: "page-2" }, idempotencyKey: undefined },
-		]);
-	});
 	it("reads bounded tail output through the SDK", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -1314,9 +921,9 @@ describe("Coordinator MCP canonical SDK controls", () => {
 
 		await expect(server.callTool("gjc_coordinator_read_turn", { turn_id: sent.turn_id })).resolves.toMatchObject({
 			ok: true,
-			advisory_status: { authority: "sdk", live: null, reason: "endpoint_stale" },
+			advisory_status: { authority: "sdk", live: true, is_streaming: true },
 		});
-		expect(queries).toEqual([]);
+		expect(queries).toEqual(["Q12", "context.get"]);
 	});
 
 	it("passes a resolved mpreset into the SDK lifecycle create request and persists it with the session", async () => {
@@ -1567,21 +1174,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			recordPath,
 			JSON.stringify({ ...record, ephemeral: true, created_at: new Date(Date.now() - 31 * 60_000).toISOString() }),
 		);
-		const successor = await prepareExactSessionAuthority({
-			agentDir: path.join(root, "agent-global"),
-			cwd: root,
-			sessionId: "visible-session",
-			url: "ws://sdk-successor.example.test",
-			token: "successor-token",
-			endpointGeneration: 1,
-		});
-		const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
-		await fs.utimes(endpointPath, 0.002, 0.002);
-		sessions[0] = {
-			...sessions[0]!,
-			pid: successor.pid,
-			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
-		};
+		sessions[0]!.endpointMtimeMs = 2;
 
 		await expect(
 			server.callTool("gjc_coordinator_send_prompt", {
@@ -1601,10 +1194,8 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			controls.filter(control => control.operation === "turn.prompt" || control.operation === "session.close"),
 		).toEqual([]);
 	});
-	it("fails closed when a same-generation successor moves to a different broker workspace", async () => {
+	it("does not return successor credentials after a same-generation restart between list and endpoint retrieval", async () => {
 		const root = await tempRoot();
-		const otherWorkspace = path.join(root, "successor-workspace");
-		await fs.mkdir(otherWorkspace);
 		const controls: SdkControl[] = [];
 		const sessions = [
 			{
@@ -1616,66 +1207,47 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				endpointMtimeMs: 1,
 			},
 		];
-		const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
-		await registerSdkSession(server, root);
-		const successor = await prepareExactSessionAuthority({
-			agentDir: path.join(root, "agent-global"),
-			cwd: otherWorkspace,
-			sessionId: "visible-session",
-			url: "ws://sdk-successor.example.test",
-			token: "successor-token",
-			endpointGeneration: 1,
+		let rotateAtEndpointRetrieval = false;
+		const initialIncarnation = brokerEndpointIncarnation("visible-session", 1, 101, 1);
+		const server = await createSdkControlServer(root, controls, undefined, undefined, sessions, undefined, input => {
+			if (!rotateAtEndpointRetrieval)
+				return {
+					ok: true,
+					result: {
+						url: "ws://broker.example.test/endpoint?token=broker-endpoint-secret",
+						token: "Bearer broker-endpoint-secret",
+					},
+				};
+			sessions[0] = { ...sessions[0]!, pid: 202, endpointMtimeMs: 2 };
+			if (input.endpointIncarnation === initialIncarnation)
+				return { ok: false, error: { code: "endpoint_stale", message: "session endpoint is stale" } };
+			return {
+				ok: true,
+				result: {
+					url: "ws://broker.example.test/successor?token=successor-endpoint-secret",
+					token: "Bearer successor-endpoint-secret",
+				},
+			};
 		});
-		const endpointPath = path.join(otherWorkspace, ".gjc", "state", "sdk", "visible-session.json");
-		await fs.utimes(endpointPath, 0.003, 0.003);
-		sessions[0] = {
-			...sessions[0]!,
-			locator: { repo: otherWorkspace },
-			pid: successor.pid,
-			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
-		};
-		await expect(
-			server.callTool("gjc_coordinator_send_prompt", {
-				session_id: "visible-session",
-				prompt: "must not reach successor workspace",
-				idempotency_key: "stale-workspace-prompt",
-				allow_mutation: true,
-			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
-		expect(controls.filter(control => control.operation === "turn.prompt")).toEqual([]);
-	});
-	it("rejects a stale same-generation attachment before dispatch", async () => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const sessions = [
-			{
-				sessionId: "visible-session",
-				locator: { repo: root },
-				live: true,
-				endpointGeneration: 1,
-				pid: 101,
-				endpointMtimeMs: 1,
-			},
-		];
-		const server = await createSdkControlServer(root, controls, undefined, undefined, sessions);
 		await registerSdkSession(server, root);
-		await server.router.start();
-		const staleAttachment = server.router.attachment("visible-session", 1);
-		if (!staleAttachment) throw new Error("missing initial session attachment");
-		const endpointPath = path.join(root, ".gjc", "state", "sdk", "visible-session.json");
-		await Bun.write(endpointPath, JSON.stringify({ url: "ws://successor.test", token: "successor-endpoint-secret" }));
-		await fs.utimes(endpointPath, 0.002, 0.002);
-		sessions[0]!.endpointMtimeMs = 2;
-		await server.router.reconcile();
-		await expect(
-			server.router.request(
-				"visible-session",
-				{ type: "control_request", operation: "turn.prompt", input: { text: "must not dispatch" } },
-				1,
-				staleAttachment,
-			),
-		).rejects.toThrow();
+		rotateAtEndpointRetrieval = true;
+
+		const result = await server.callTool("gjc_coordinator_send_prompt", {
+			session_id: "visible-session",
+			prompt: "must not reach successor",
+			idempotency_key: "same-generation-restart",
+			allow_mutation: true,
+		});
+		expect(result).toMatchObject({ ok: false, error: { code: "endpoint_stale" } });
+		expect(JSON.stringify(result)).not.toContain("successor-endpoint-secret");
 		expect(controls.filter(control => control.operation === "turn.prompt")).toEqual([]);
+		expect(controls.filter(control => control.operation === "session.get_endpoint").at(-1)).toMatchObject({
+			input: {
+				sessionId: "visible-session",
+				endpointGeneration: 1,
+				endpointIncarnation: initialIncarnation,
+			},
+		});
 	});
 	it("fails closed on corrupt or crash-left coordinator idempotency records", async () => {
 		const root = await tempRoot();
@@ -1717,7 +1289,9 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		);
 		const completed = JSON.parse(await fs.readFile(registerFile, "utf8"));
 		await Bun.write(registerFile, JSON.stringify({ ...completed, state: "in_progress" }));
+		const endpointReads = controls.filter(control => control.operation === "session.get_endpoint").length;
 		await expect(registerSdkSession(server, root)).resolves.toMatchObject({ ok: true, registered: true });
+		expect(controls.filter(control => control.operation === "session.get_endpoint")).toHaveLength(endpointReads);
 	});
 	it("fails closed on workspace and endpoint-generation binding changes", async () => {
 		const root = await tempRoot();
@@ -1938,9 +1512,9 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			{ operation: "turn.abort_and_prompt", input: { text: "replace" }, idempotencyKey: "prompt-3" },
 		]);
 		expect(controlOptions).toEqual([
-			{ idempotencyKey: "prompt-1" },
-			{ idempotencyKey: "prompt-2" },
-			{ idempotencyKey: "prompt-3" },
+			{ idempotencyKey: "prompt-1", timeoutMs: 17 },
+			{ idempotencyKey: "prompt-2", timeoutMs: 17 },
+			{ idempotencyKey: "prompt-3", timeoutMs: 17 },
 		]);
 	});
 
@@ -2055,57 +1629,6 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				allow_mutation: true,
 			}),
 		).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
-	});
-
-	it("bounds every Q12 snapshot page by the remaining snapshot budget", async () => {
-		const root = await tempRoot();
-		const controls: SdkControl[] = [];
-		const queries: string[] = [];
-		const queryOptions: Array<{ timeoutMs?: number } | undefined> = [];
-		const server = await createSdkControlServer(
-			root,
-			controls,
-			queries,
-			(query, cursor) => {
-				if (query !== "Q12") return { ok: true, page: { items: [], complete: true, revision: "context" } };
-				return cursor
-					? { ok: true, page: { items: [], complete: true, revision: "q12-budget" } }
-					: {
-							ok: true,
-							page: {
-								items: [],
-								complete: false,
-								preview: true,
-								continuationCursor: "page-2",
-								revision: "q12-budget",
-							},
-						};
-			},
-			undefined,
-			undefined,
-			undefined,
-			{ queryOptions },
-		);
-		await registerSdkSession(server, root);
-		const listed = await server.callTool("gjc_coordinator_list_questions", { session_id: "visible-session" });
-		expect(listed).toMatchObject({ ok: true, reconciliation: { complete: true } });
-
-		const q12Budgets = queries
-			.map((query, index) => (query === "Q12" ? queryOptions[index]?.timeoutMs : undefined))
-			.filter((timeoutMs): timeoutMs is number => timeoutMs !== undefined);
-		// The snapshot deadline is only checked between pages, so a page that carried
-		// no budget of its own would outlive the whole 5s bound on the Router default.
-		expect(q12Budgets).toHaveLength(queries.filter(query => query === "Q12").length);
-		for (const timeoutMs of q12Budgets) {
-			expect(timeoutMs).toBeGreaterThan(0);
-			expect(timeoutMs).toBeLessThanOrEqual(5_000);
-		}
-		expect(q12Budgets.length).toBeGreaterThanOrEqual(2);
-		// Each page gets the remainder, not a fresh 5s: a later page can never be
-		// granted more time than an earlier one, which a fixed per-page budget would
-		// allow. Pages resolve in the same millisecond here, so equality is legal.
-		for (let index = 1; index < q12Budgets.length; index++)
-			expect(q12Budgets[index]!).toBeLessThanOrEqual(q12Budgets[index - 1]!);
 	});
 
 	it("diagnoses malformed gate rows without misclassifying legal Q12 pagination", async () => {
@@ -3202,7 +2725,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				phases.push(`read:${agentDir}`);
 				return testBrokerDiscovery();
 			},
-			connectBroker: async () => {
+			connectSdk: async () => {
 				phases.push("connect");
 				return {
 					global: async () => ({ ok: true, result: { sessions: [] } }),
@@ -3234,7 +2757,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				return await inFlight;
 			},
 			readSdkBrokerDiscovery: async () => testBrokerDiscovery(),
-			connectBroker: async () =>
+			connectSdk: async () =>
 				({
 					global: async () => ({ ok: true, result: { sessions: [] } }),
 					close: async () => {},
@@ -3358,7 +2881,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 					if (testCase.stage === "read") throw testCase.error;
 					return testBrokerDiscovery();
 				},
-				connectBroker: async () => {
+				connectSdk: async () => {
 					if (testCase.stage === "connect") throw testCase.error;
 					return client;
 				},
@@ -3372,7 +2895,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const nullServer = createBrokerTestServer(root, {
 			ensureBroker: async () => testBrokerDiscovery(),
 			readSdkBrokerDiscovery: async () => null,
-			connectBroker: async () =>
+			connectSdk: async () =>
 				({ global: async () => ({ ok: true }), close: async () => {} }) as unknown as SdkClient,
 		});
 		await expect(nullServer.callTool("gjc_coordinator_list_sessions", {})).resolves.toMatchObject({
@@ -3391,7 +2914,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			const server = createBrokerTestServer(root, {
 				ensureBroker: async () => testBrokerDiscovery(),
 				readSdkBrokerDiscovery: async () => testBrokerDiscovery(),
-				connectBroker: async () =>
+				connectSdk: async () =>
 					({
 						global: async () => {
 							throw requestError;
@@ -3413,7 +2936,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const closeFailureServer = createBrokerTestServer(root, {
 			ensureBroker: async () => testBrokerDiscovery(),
 			readSdkBrokerDiscovery: async () => testBrokerDiscovery(),
-			connectBroker: async () =>
+			connectSdk: async () =>
 				({
 					global: async () => ({ ok: true, result: { sessions: [] } }),
 					close: async () => {
@@ -3560,7 +3083,7 @@ async function callActivate(
 
 describe("Coordinator MCP prepared session activation", () => {
 	it("activates a prepared session against its exact endpoint generation", async () => {
-		const { server, root, frames } = await createActivationHarness();
+		const { server, root, controls, frames } = await createActivationHarness();
 		await writeCoordinatorSessionState(root, "prepared");
 
 		const response = await callActivate(server, "activate-prepared-1");
@@ -3573,6 +3096,15 @@ describe("Coordinator MCP prepared session activation", () => {
 			endpoint_generation: 1,
 		});
 		expect(frames).toEqual([{ type: "session_activate", sessionId: "visible-session", endpointGeneration: 1 }]);
+		expect(controls).toContainEqual({
+			operation: "session.get_endpoint",
+			input: {
+				sessionId: "visible-session",
+				endpointGeneration: 1,
+				endpointIncarnation: brokerEndpointIncarnation("visible-session", 1, 101, 1),
+			},
+			idempotencyKey: "activate-prepared-1",
+		});
 		await expect(readCoordinatorSessionState(root)).resolves.toMatchObject({
 			state: "ready_for_input",
 			live: true,
@@ -3635,7 +3167,7 @@ describe("Coordinator MCP prepared session activation", () => {
 	});
 
 	it("answers already for a ready session only from a corroborated host response", async () => {
-		const { server, root, frames } = await createActivationHarness(frame => ({
+		const { server, root, controls, frames } = await createActivationHarness(frame => ({
 			type: "session_activate_result",
 			id: "activate-ready",
 			ok: true,
@@ -3655,6 +3187,15 @@ describe("Coordinator MCP prepared session activation", () => {
 			endpoint_generation: 1,
 		});
 		expect(frames).toEqual([{ type: "session_activate", sessionId: "visible-session", endpointGeneration: 1 }]);
+		expect(controls).toContainEqual({
+			operation: "session.get_endpoint",
+			input: {
+				sessionId: "visible-session",
+				endpointGeneration: 1,
+				endpointIncarnation: brokerEndpointIncarnation("visible-session", 1, 101, 1),
+			},
+			idempotencyKey: "activate-ready-1",
+		});
 		// A corroborated `already` transitions nothing, so durable state is untouched.
 		await expect(readCoordinatorSessionState(root)).resolves.toEqual(before);
 	});
@@ -3879,51 +3420,4 @@ it("keeps parallel pending questions isolated when one answer is submitted", asy
 	await expect(
 		fs.access(path.join(rootB, ".gjc", "coordinator-state", "local", "repo", "codex-wake-events")),
 	).rejects.toThrow();
-});
-
-it("issue-4351: completed coordinator session reports ready_for_input false and ended_at", async () => {
-	const root = await tempRoot();
-	const controls: SdkControl[] = [];
-	const server = await createSdkControlServer(root, controls);
-	await registerSdkSession(server, root);
-	const sent = await server.callTool("gjc_coordinator_send_prompt", {
-		session_id: "visible-session",
-		prompt: "terminal transition for issue-4351",
-		idempotency_key: "issue-4351-completed",
-		allow_mutation: true,
-	});
-	const turnId = (sent as { turn_id?: unknown }).turn_id;
-	if (typeof turnId !== "string") throw new Error("expected turn id");
-	await server.callTool("gjc_coordinator_report_status", {
-		session_id: "visible-session",
-		turn_id: turnId,
-		status: "completed",
-		summary: "completed session must not be ready_for_input",
-		idempotency_key: "issue-4351-terminal",
-		allow_mutation: true,
-	});
-	const statePath = path.join(
-		root,
-		".gjc",
-		"coordinator-state",
-		"local",
-		"repo",
-		"session-states",
-		"visible-session.json",
-	);
-	const durable = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
-	expect(durable.state).toBe("completed");
-	expect(durable.ready_for_input).toBe(false);
-	expect(typeof durable.ended_at).toBe("string");
-	expect(Number.isFinite(Date.parse(durable.ended_at as string))).toBe(true);
-
-	const status = await server.callTool("gjc_coordinator_read_status", { session_id: "visible-session" });
-	expect(status).toMatchObject({
-		session_state: {
-			state: "completed",
-			ready_for_input: false,
-		},
-	});
-	const publicState = (status as { session_state?: Record<string, unknown> }).session_state;
-	expect(typeof publicState?.ended_at).toBe("string");
 });

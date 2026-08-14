@@ -8,19 +8,18 @@ product.
 
 ## What you are setting up
 
-Gajae-Code notifications use the SDK session runtime, the global Broker index,
-and a managed Telegram provider supervisor:
+Gajae-Code notifications are a loopback WebSocket SDK plus a managed Telegram
+reference daemon:
 
-- each eligible GJC session registers its exact endpoint generation with the
-  Broker;
-- SDK-core `SessionRouter` resolves endpoint authority, keeps URL/token
-  credentials private, and presents only opaque current-generation attachments
-  to Telegram;
-- the Telegram supervisor owns `getUpdates`, rate limits, retries, topics,
-  messages, callbacks, and delivery receipts;
-- replies and inline button taps route through the Router attachment to the
-  exact session/action. Only coordinator/lifecycle sessions are represented by
-  Telegram topics; ordinary sessions use flat delivery.
+- each GJC session publishes a local notification endpoint under
+  `.gjc/state/sdk/<sessionId>.json`;
+- the managed Telegram daemon scans those endpoints, connects to them, and sends
+  action-needed events to the configured Telegram chat;
+- replies and inline button taps route back to the exact session/action through
+  the same notification protocol. Coordinator/lifecycle-managed sessions use one
+  Telegram forum topic per session when the configured chat supports topics.
+- ordinary sessions may still host their local SDK endpoint or use another
+  notification provider, but they do not register a Telegram topic.
 
 The setup command stores global notification settings in your GJC agent config
 and later sessions auto-connect when notifications are enabled.
@@ -83,8 +82,8 @@ DM. This is intentional for safe local discovery: group chats must not receive
 session names, action ids, or pending status by accident.
 
 
-Telegram private-chat topics: the managed daemon's coordinator/lifecycle delivery uses
-Telegram forum topics (`createForumTopic` + `message_thread_id`). Telegram now
+Telegram private-chat topics: the managed daemon's coordinator/lifecycle-session
+delivery uses Telegram forum topics (`createForumTopic` + `message_thread_id`).
 supports forum topics in **private chats** when the bot owner enables **Threaded
 Mode** for the bot in @BotFather. GJC cannot enable Threaded Mode through the Bot
 API; setup only detects the capability (`getMe.has_topics_enabled`) and guides the
@@ -99,26 +98,28 @@ capability unevenly across clients/accounts/bot states, and GJC cannot force the
 menu to appear through the Bot API. The safe fallback is to continue setup with a
 private DM pairing: choose `skip` in the interactive prompt (or use
 `--token <botToken> --chat-id <chatId>` for non-interactive setup). GJC will save
-`threaded=unverified`/`threaded=unknown`, try topics at runtime when possible,
+`threaded=unverified`/`threaded=unknown`, try topics for eligible orchestration
+sessions at runtime when possible,
 and otherwise deliver flat to the paired private chat with outbound notifications
 and inline ask buttons only plus the one-time nudge shown below.
 
 Setup verification is capability verification, not a delivery guarantee: even when
 setup reports `threaded=verified`, the first runtime `createForumTopic` for the
-paired chat can still fail if Telegram refuses it. When orchestration-session
-topics are unavailable, the daemon does **not** drop notifications — it routes them to the
-normal (flat) paired chat and posts a one-time nudge: `Flat Telegram private chat
-supports outbound notifications and inline ask buttons only. Enable Threaded Mode
-in @BotFather > Bot Settings > Threads Settings for free-text replies and session
-commands.` Because pairing is private-only, flat delivery lands in your own
-private DM with the bot.
+paired chat can still fail if Telegram refuses it. When coordinator/lifecycle
+session topics are unavailable, the daemon does **not** drop notifications — it
+routes them to the normal (flat) paired chat and posts a one-time nudge: `Flat
+Telegram private chat supports outbound notifications and inline ask buttons only.
+Enable Threaded Mode in @BotFather > Bot Settings > Threads Settings for free-text
+replies and session commands.` Because pairing is private-only, flat delivery lands
+in your own private DM with the bot.
 
 The final setup line reports a `threaded=` status:
 
 - `threaded=verified`: the bot has Threaded Mode capability (`has_topics_enabled`
   was true during setup);
 - `threaded=unverified`: Threaded Mode was off and you skipped, or setup ran
-  non-interactively; setup is saved, topics are attempted when available, and
+  non-interactively; setup is saved, topics for eligible orchestration sessions are
+  attempted when available, and
   runtime delivery falls back to the paired flat private chat with outbound
   notifications and inline ask buttons only when Telegram refuses topic creation;
 - `threaded=unknown`: the Telegram response did not include `has_topics_enabled`,
@@ -194,27 +195,29 @@ layer:
 Provider completeness, malformed-state quarantine, desired intent, effective enablement, runtime readiness, and delivery outcome are separate status dimensions. Telegram is complete when its bot token and private-chat id are valid; it is effective only when it is complete, not quarantined, desired on, and the global master is on. Provider-local malformed values are quarantined without erasing safe sibling values or secrets. Removing Telegram is adapter-local: it removes only Telegram credentials and sets Telegram desired intent off without changing `notifications.enabled` or any Discord/Slack state.
 
 
-Three gates keep SDK hosting, provider setup, and managed delivery separate:
+Three lifecycle gates keep SDK hosting, setup, and managed delivery separate:
 
 1. An eligible host receives the dormant notification control surface. `GJC_NOTIFY=off`,
    `0`, or `false` is a hard process opt-out; unsupported hosts and
    helper/subagent sessions are also ineligible.
-2. Every eligible top-level session hosts its local SDK endpoint and registers
-   exact authority with the Broker by default, independently of notification
-   configuration. `GJC_SDK_DISABLE=1` opts out for that session. `SessionRouter`
-   alone reads the endpoint credential and manages replay/reconnect.
-3. A managed Telegram supervisor is ensured only for a complete global Telegram
-   configuration with managed delivery enabled. It reconstructs opaque
-   attachments from Broker state; Discord-only, Slack-only, and environment-only
-   sessions do not start a Telegram supervisor.
+2. Every eligible top-level session hosts its local SDK endpoint by default,
+   independently of notification configuration. `GJC_SDK_DISABLE=1` opts out of
+   SDK hosting for that session.
+3. A managed Telegram daemon is ensured only for a complete global Telegram
+   configuration with managed delivery enabled. Discord-only, Slack-only, and
+   environment-only sessions do not start a Telegram daemon.
+   Telegram forum-topic ownership is narrower: only coordinator/lifecycle-managed
+   sessions register a session root, so ordinary sessions never create a topic even
+   when Telegram is configured or `GJC_NOTIFICATIONS=1` is set.
 
 Environment/session precedence for managed delivery is implemented in
 `packages/coding-agent/src/sdk/bus/config.ts`:
 
 For a GJC-spawned child, `notifications.sessionScope=primary` suppresses managed
-notification delivery to avoid duplicate topics; `all` permits it.
-`GJC_NOTIFICATIONS=1` or `GJC_NOTIFICATIONS_TOKEN` explicitly opts that child in,
-but never overrides a hard opt-out or a helper/subagent exclusion.
+notification delivery unless the child carries explicit coordinator/lifecycle
+provenance. Topic admission is independent of the legacy opt-in environment:
+`GJC_NOTIFICATIONS=1` or `GJC_NOTIFICATIONS_TOKEN` cannot turn an ordinary session
+into a Telegram topic.
 
 Managed-delivery precedence is highest first; it does not change independently
 hosted SDK endpoints:
@@ -266,8 +269,8 @@ retain-configuration choice.
 ## 7. Use the Telegram chat
 
 The managed daemon prefers Telegram forum-topic delivery for coordinator/lifecycle
-session routing in the paired private chat. When Threaded Mode is available for the bot (verified
-during setup via `getMe.has_topics_enabled`), the daemon calls
+sessions in the paired private chat. When Threaded Mode is available for the bot
+(verified during setup via `getMe.has_topics_enabled`), the daemon calls
 `createForumTopic`/`editForumTopic` and sends messages with `message_thread_id`
 against the paired `notifications.telegram.chatId`. If BotFather does not show
 **Threads Settings**/**Threaded Mode**, or if Telegram refuses topic creation even
@@ -295,9 +298,8 @@ as `/verbose`, `/lean`, `/verbosity`, and `/redact` require Threaded Mode/topic
 routing.
 
 Flat private-chat fallback preserves outbound notifications and inline-button
-answers, but it cannot provide a separate Telegram topic per orchestration
-session. Free-
-text replies and in-topic config commands depend on topic routing, so enable
+answers, but it cannot provide a separate Telegram topic per orchestration session.
+Free-text replies and in-topic config commands depend on topic routing, so enable
 Threaded Mode in @BotFather > Bot Settings > Threads Settings when you need
 multi-session reply separation or session commands from Telegram. Do not
 pair a group, supergroup, or channel as a substitute: setup intentionally accepts
@@ -399,6 +401,18 @@ does not edit global config or credentials:
 
 `GJC_NOTIFICATIONS=0` suppresses automatic generic current-session admission only. An explicit `/notify on` may override that one automatic-admission suppression for the current session; it does not alter durable provider intent or enable a direct provider API. `GJC_NOTIFY=off`, `0`, or `false` remains the hard process-level opt-out and exposes no notification control surface to override.
 
+## 9. Debug-only manual bridge
+
+The manual Telegram CLI remains a reference/debug tool:
+
+```sh
+bun run packages/coding-agent/src/sdk/bus/telegram-cli.ts --bot-token "$BOT_TOKEN"
+```
+
+If a fresh managed daemon already owns the same bot token and paired chat, the
+manual CLI refuses to start by default because a second poller would cause
+Telegram `409 Conflict`. Use `--force` only for deliberate debugging after you
+understand which daemon owns polling.
 
 ## Troubleshooting
 
@@ -427,13 +441,14 @@ that points to @BotFather > Bot Settings > Threads Settings. Flat fallback is
 limited to outbound notifications and inline ask buttons; free-text replies and
 session commands require Threaded Mode/topic routing.
 
-### Managed adapter lacks ask controls
+### Third-party or older client lacks ask controls
 
-A custom client must not attach to a GJC session transport. Upgrade or configure
-the bundled managed Telegram adapter; `SessionRouter` performs its internal
-capability negotiation and rejects unsupported controlled asks without exposing
-the endpoint or credentials. Third-party controllers use Coordinator MCP or the
-SDK session CLI instead.
+A custom client that omits ClientHello, or sends one without `ask_controls_v1`,
+will still receive ordinary empty-controls asks but receives
+`action_unavailable` for controlled asks after the short Hello grace or explicit
+non-capable negotiation. Upgrade it to send
+`{ "type": "hello", "protocolVersion": 3, "capabilities": ["ask_controls_v1"] }`
+on each WebSocket open; reconnecting starts a new negotiation.
 
 ### Telegram 409 conflict
 
@@ -446,12 +461,11 @@ recovery removes only dead-owner artifacts and never touches a live owner.
 
 Check, in order:
 
-1. `gjc notify status` and confirm Telegram is complete, not quarantined, desired on, and effective
+1. `gjc notify status` and confirm the selected provider is complete, not quarantined, desired on, and effective
 2. the session has not run `/notify off`; when `GJC_NOTIFICATIONS=0` suppresses automatic admission, run `/notify on` explicitly
-3. the Broker reports the session as live with a current endpoint generation
-4. the Telegram supervisor is ready and `SessionRouter` has reconstructed the attachment
-5. the provider owner state is fresh under the GJC agent notifications directory
+3. the repo has `.gjc/state/sdk/<sessionId>.json`, or `.gjc/state/chat/sdk/<sessionId>.json` when a proven foreign Telegram owner is isolated while Discord/Slack remains effective
+4. the selected provider runtime is ready or attached
+5. the managed daemon state is fresh under the GJC agent notifications directory
 
-Endpoint discovery records contain per-session credentials. They are SDK-core
-implementation details and must not be copied into provider state or public
-issues.
+Do not paste endpoint discovery files into public issues; they contain the
+per-session WebSocket token needed by clients.

@@ -61,7 +61,6 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 			isStreaming: false,
 			sendCustomMessage: vi.fn(async () => undefined),
 			sendUserMessage: vi.fn(async () => undefined),
-			navigateTree: vi.fn(async () => ({ cancelled: false })),
 			switchSession: vi.fn(async () => {
 				sessionId = nextSessionId;
 				return true;
@@ -121,33 +120,25 @@ function createFixture(initialSessionId = "session-a"): Fixture {
 }
 
 describe("ExtensionUiController transcript rebuild policy", () => {
-	it("rejects extension-owned session switches through the Broker lifecycle boundary", async () => {
+	it("resets identity when a hook-runner switch loads a different session id from the same path", async () => {
 		const fixture = createFixture();
-		await fixture.controller.initHooksAndCustomTools();
-
-		await expect(fixture.getCommandActions().switchSession("/tmp/project/session.jsonl")).rejects.toMatchObject({
-			code: "operation_prohibited",
-		});
-		expect(fixture.ctx.session.switchSession).not.toHaveBeenCalled();
-		expect(fixture.resetIrcSidebarSession).not.toHaveBeenCalled();
-		expect(fixture.rebuildInitialMessages).not.toHaveBeenCalled();
-	});
-	it("keeps extension tree navigation local in both interactive initialization paths", async () => {
-		const fixture = createFixture();
-		await fixture.controller.initHooksAndCustomTools();
-
-		await expect(fixture.getCommandActions().navigateTree("entry-from-hooks", { summarize: true })).resolves.toEqual({
-			cancelled: false,
-		});
-		expect(fixture.ctx.session.navigateTree).toHaveBeenLastCalledWith("entry-from-hooks", { summarize: true });
-
+		fixture.setNextSessionId("session-b");
 		fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
-		await expect(
-			fixture.getCommandActions().navigateTree("entry-from-runner", { summarize: false }),
-		).resolves.toEqual({
-			cancelled: false,
-		});
-		expect(fixture.ctx.session.navigateTree).toHaveBeenLastCalledWith("entry-from-runner", { summarize: false });
+
+		await fixture.getCommandActions().switchSession("/tmp/project/session.jsonl");
+
+		expect(fixture.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
+		expect(fixture.rebuildInitialMessages).toHaveBeenCalledWith("replace-identity");
+	});
+
+	it("reconciles a true same-session switch in the foreground extension path", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+
+		await fixture.getCommandActions().switchSession("/tmp/project/session.jsonl");
+
+		expect(fixture.resetIrcSidebarSession).not.toHaveBeenCalled();
+		expect(fixture.rebuildInitialMessages).toHaveBeenCalledWith("reconcile-same-transcript");
 	});
 	it("resets identity when hook-runner reload replaces the logical session", async () => {
 		const fixture = createFixture();

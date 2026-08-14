@@ -38,6 +38,16 @@ import type {
 	NotificationSessionReconcileResult,
 	NotificationSessionStatus,
 } from "@gajae-code/coding-agent/sdk/bus/session-control";
+import {
+	readNotificationRootRegistration,
+	registerNotificationRoot,
+	withNotificationRootRegistryFence,
+} from "@gajae-code/coding-agent/sdk/bus/telegram-daemon";
+
+import {
+	withoutTelegramOrchestrationProvenance,
+	withTelegramOrchestrationProvenance,
+} from "./helpers/telegram-topic-test";
 
 const TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
 
@@ -349,6 +359,7 @@ describe("notification settings controller adapter", () => {
 		const setupCalls: Array<Record<string, unknown>> = [];
 		const identityCalls: Array<Record<string, unknown>> = [];
 		const serviceCalls: string[] = [];
+		const registerRoots: boolean[] = [];
 
 		const dependencies: Partial<NotificationsEditorOperationDependencies> = {
 			buildNotificationStatusReport: input => {
@@ -371,6 +382,7 @@ describe("notification settings controller adapter", () => {
 				expect(input).toMatchObject({ settings, stateRoot: path.join("/workspace/current", ".gjc", "state") });
 				return recovery();
 			},
+			unregisterNotificationRoot: async () => ({ root: "/workspace/current/.gjc/state", remainingRoots: 1 }),
 			stopTelegramDaemon: async input => {
 				expect(input).toBe(settings);
 				expect(getNotificationConfig(input).toolActivity.enabled).toBe(true);
@@ -391,7 +403,8 @@ describe("notification settings controller adapter", () => {
 			},
 
 			ensureTelegramDaemonRunningDetailed: async input => {
-				expect(input).toEqual({ settings: ctx.settings });
+				expect(input).toMatchObject({ cwd: "/workspace/current", sessionId: "session-current" });
+				registerRoots.push(input.registerRoot === true);
 				return "attached";
 			},
 			runTelegramSetup: async input => {
@@ -434,13 +447,15 @@ describe("notification settings controller adapter", () => {
 		await operations.refreshHealth({ probe: true, signal });
 		await operations.sendTest();
 		await operations.recover();
-		await operations.reconnect();
+		await withoutTelegramOrchestrationProvenance(() => operations.reconnect());
+		await withTelegramOrchestrationProvenance(() => operations.reconnect());
 		expect(controller.clearBlockedRuntime).toHaveBeenCalledWith(
 			expect.objectContaining({ sessionManager: ctx.sessionManager }),
 		);
 		expect(controller.reconcileCurrentSession).toHaveBeenCalledWith(
 			expect.objectContaining({ sessionManager: ctx.sessionManager }),
 		);
+		expect(registerRoots).toEqual([false, true]);
 		expect(healthCalls).toContainEqual(
 			expect.objectContaining({ stateRoot: path.join("/workspace/current", ".gjc", "state"), probe: true, signal }),
 		);
@@ -830,8 +845,10 @@ describe("notification settings controller adapter", () => {
 		expect(typeof committed.retainCommitted).toBe("function");
 		expect(events).toEqual(["commit", "ensure", "enter-blocked", "commit", "notify"]);
 	});
-	it("stops the Telegram supervisor before removing its configuration", async () => {
+	it("removes the active tokenized production root and stops the last Telegram daemon", async () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-settings-remove-"));
+		const cwd = path.join(agentDir, "workspace");
+		const sessionId = "session-current";
 		const currentSnapshot = snapshot();
 		const events: string[] = [];
 		const settings = {
@@ -844,6 +861,8 @@ describe("notification settings controller adapter", () => {
 						currentSnapshot.telegram.botToken = undefined;
 					if (patch.path === "notifications.telegram.chatId" && patch.op === "unset")
 						currentSnapshot.telegram.chatId = undefined;
+					if (patch.path === "notifications.enabled" && patch.op === "set")
+						currentSnapshot.enabled = patch.value === true;
 					if (patch.path === "notifications.telegram.enabled" && patch.op === "set")
 						currentSnapshot.telegram.enabled = patch.value === true;
 				}
@@ -863,11 +882,13 @@ describe("notification settings controller adapter", () => {
 			},
 		};
 		try {
+			const registration = await registerNotificationRoot({ settings, cwd, sessionId });
+			expect(registration.token).toBeTruthy();
 			const operations = createNotificationsEditorOperations(
 				{
 					settings,
 					session: { notificationSessionController: controller },
-					sessionManager: { getCwd: () => agentDir, getSessionId: () => "session-current" },
+					sessionManager: { getCwd: () => cwd, getSessionId: () => sessionId },
 				} as unknown as NotificationsEditorAdapterContext,
 				{
 					stopTelegramDaemon: async input => {
@@ -877,9 +898,96 @@ describe("notification settings controller adapter", () => {
 					},
 				},
 			);
+
 			await operations.removeTelegram();
+
+			expect(await readNotificationRootRegistration({ settings, sessionId })).toEqual({
+				root: undefined,
+				managed: false,
+				token: undefined,
+			});
 			expect(events).toEqual(["blocked", "stop", "commit", "cleared"]);
+			expect(currentSnapshot.enabled).toBe(true);
 			expect(currentSnapshot.telegram.enabled).toBe(false);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+	it("does not stop a replacement tokenized root after a stale last-root observation", async () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-settings-remove-race-"));
+		const cwd = path.join(agentDir, "workspace");
+		const sessionId = "session-current";
+		const events: string[] = [];
+		const conditionalEntered = deferred<void>();
+		const resumeConditional = deferred<void>();
+		let stopCalls = 0;
+		const settings = {
+			getAgentDir: () => agentDir,
+			getNotificationSettingsSnapshot: () => snapshot(),
+			commitAtomicBatch: async () => {
+				events.push("commit");
+				return receipt();
+			},
+		} as unknown as Settings;
+		const controller = {
+			query: () => sessionStatus(),
+			setLocalEnabled: async () => sessionResult(),
+			reconcileCurrentSession: async () => sessionResult(),
+			enterBlockedRuntime: async () => {
+				events.push("blocked");
+				return true;
+			},
+			clearBlockedRuntime: async () => {
+				events.push("cleared");
+			},
+		};
+		try {
+			const registration = await registerNotificationRoot({ settings, cwd, sessionId });
+			const operations = createNotificationsEditorOperations(
+				{
+					settings,
+					session: { notificationSessionController: controller },
+					sessionManager: { getCwd: () => cwd, getSessionId: () => sessionId },
+				} as unknown as NotificationsEditorAdapterContext,
+				{
+					stopTelegramDaemon: async () => {
+						stopCalls += 1;
+						return { ok: true, message: "stopped", before: { health: "running" } };
+					},
+					stopTelegramDaemonIfRootRegistryFenceMatches: async input => {
+						conditionalEntered.resolve();
+						await resumeConditional.promise;
+						return await withNotificationRootRegistryFence({
+							settings: input.settings,
+							registryFingerprint: input.registryFingerprint,
+							action: async () => {
+								const stopped = await input.stop();
+								if (!stopped.ok) throw new Error(stopped.message);
+							},
+						});
+					},
+				},
+			);
+
+			const removal = operations.removeTelegram();
+			await conditionalEntered.promise;
+			expect(await readNotificationRootRegistration({ settings, sessionId })).toEqual({
+				root: undefined,
+				managed: false,
+				token: undefined,
+			});
+			const replacement = await registerNotificationRoot({ settings, cwd, sessionId });
+			expect(replacement.token).not.toBe(registration.token);
+			resumeConditional.resolve();
+			await removal;
+
+			expect(stopCalls).toBe(0);
+			expect(await readNotificationRootRegistration({ settings, sessionId })).toEqual({
+				root: path.join(cwd, ".gjc", "state"),
+				managed: true,
+				token: replacement.token,
+			});
+			expect(events).toEqual(["blocked", "commit", "cleared"]);
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}

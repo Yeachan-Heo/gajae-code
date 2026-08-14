@@ -27,6 +27,7 @@ import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { isProcessIncarnation } from "../broker/process-incarnation";
 
 import { getNotificationConfig, isTelegramComplete, tokenFingerprint } from "./config";
+import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "./notification-service";
 import {
 	type AttestedLegacyDaemonOwner,
 	confirmTelegramDaemonSpawn,
@@ -37,6 +38,7 @@ import {
 	isFreshLiveOwner,
 	isSignalableMatchingOwner,
 	readAttestedLegacyDaemonOwner,
+	readDaemonRoots,
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
 	spawnTelegramDaemonOwner,
@@ -47,6 +49,9 @@ import {
 
 const nodeFs: TelegramDaemonFs = {
 	...(fs.promises as unknown as TelegramDaemonFs),
+	readEndpointFile: readNotificationEndpointFile,
+	exactUnlink: async (file, identity) =>
+		exactUnlinkNotificationFile(file, identity, `.gjc-delete-daemon-transition-${crypto.randomUUID()}.json`),
 };
 const DEFAULT_GRACEFUL_TIMEOUT_MS = 8_000;
 const DEFAULT_KILL_TIMEOUT_MS = 3_000;
@@ -222,6 +227,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		}
 		const snapshot = await readOwnerFreshnessSnapshot({ settings: this.settings, fs: this.fsImpl });
 		const state = snapshot.state;
+		const roots = await readDaemonRoots(this.settings, this.fsImpl);
 		const health: DaemonHealth =
 			!state || state.stoppedAt !== undefined || !this.pidAlive(state.pid)
 				? "stopped"
@@ -244,6 +250,8 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			ownerId: state?.ownerId,
 			startedAt: state?.startedAt,
 			heartbeatAt: snapshot.effectiveHeartbeatAt,
+			roots,
+			rootCount: roots.length,
 			runtime,
 		};
 	}
@@ -262,11 +270,12 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 	}
 
 	private async spawnAndWait(
+		roots: string[],
 		token: string,
 		chatId: string,
 	): Promise<{ spawned: TelegramSpawnOwnerResult; ready: boolean }> {
 		const spawned = await spawnTelegramDaemonOwner(
-			{ settings: this.settings, tokenFingerprint: token, chatId },
+			{ settings: this.settings, roots, tokenFingerprint: token, chatId },
 			this.spawnDeps(),
 		);
 		const ready = await confirmTelegramDaemonSpawn({
@@ -470,6 +479,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 		const cfg = getNotificationConfig(this.settings);
 		const fp = tokenFingerprint(cfg.botToken as string);
 		const chatId = cfg.chatId as string;
+		const roots = before.roots ?? (await readDaemonRoots(this.settings, this.fsImpl));
 		const gracefulTimeoutMs = opts.gracefulTimeoutMs ?? DEFAULT_GRACEFUL_TIMEOUT_MS;
 		const killTimeoutMs = opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
 
@@ -534,7 +544,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 			if (!(opts.spawnIfStopped ?? true)) {
 				return this.result(action, true, "no running telegram daemon to reload", before, before, warnings);
 			}
-			const { spawned, ready } = await this.spawnAndWait(fp, chatId);
+			const { spawned, ready } = await this.spawnAndWait(roots, fp, chatId);
 			warnings.push(...spawned.warnings);
 			const after = await this.status();
 			if (spawned.result === "blocked") {
@@ -694,7 +704,7 @@ export class TelegramDaemonController implements BuiltInDaemonController {
 				warnings,
 			);
 		}
-		const { spawned, ready } = await this.spawnAndWait(fp, chatId);
+		const { spawned, ready } = await this.spawnAndWait(roots, fp, chatId);
 		warnings.push(...spawned.warnings);
 		const after = await this.status();
 		if (spawned.result === "attached") {

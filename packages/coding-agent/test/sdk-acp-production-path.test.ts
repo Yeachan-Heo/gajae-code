@@ -1,11 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, stat, utimes } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { SessionIndex } from "../src/sdk/broker/session-index";
 
 type TestServer = {
 	port: number | undefined;
@@ -22,14 +21,14 @@ afterEach(async () => {
 });
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 15_000;
+	const deadline = Date.now() + 2_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await Bun.sleep(5);
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 }
-async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 15_000): Promise<T> {
+async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 2_000): Promise<T> {
 	return await Promise.race([
 		promise,
 		Bun.sleep(timeoutMs).then(() => {
@@ -206,54 +205,13 @@ test("production ACP rejects an ok:false session.list continuation instead of re
 		abort.abort();
 	}
 });
-
-test("production ACP rejects repeated session.list cursors without returning partial sessions", async () => {
-	const fixture = await createSessionListBroker(() => ({
-		ok: true,
-		result: { sessions: [{ sessionId: "page" }], continuationCursor: "repeat" },
-	}));
-	const abort = new AbortController();
-	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
-		agentDir: fixture.agentDir,
-	});
-	try {
-		await expect(agent.listSessions({})).rejects.toMatchObject({
-			code: "protocol_error",
-			message: "session.list returned a repeated continuation cursor.",
-		});
-		expect(fixture.requests.map(request => request.input)).toEqual([{}, { cursor: "repeat" }]);
-	} finally {
-		abort.abort();
-	}
-});
-
-test("production ACP rejects malformed session.list continuation pages without partial sessions", async () => {
-	const fixture = await createSessionListBroker(input =>
-		input.cursor === undefined
-			? { ok: true, result: { sessions: [{ sessionId: "page-one" }], continuationCursor: "page-2" } }
-			: { ok: true, result: { sessions: "not-an-array" } },
-	);
-	const abort = new AbortController();
-	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
-		agentDir: fixture.agentDir,
-	});
-	try {
-		await expect(agent.listSessions({})).rejects.toMatchObject({
-			code: "protocol_error",
-			message: "session.list returned a malformed page.",
-		});
-		expect(fixture.requests.map(request => request.input)).toEqual([{}, { cursor: "page-2" }]);
-	} finally {
-		abort.abort();
-	}
-});
 test("production ACP preserves lifecycle, turn, replay, and connection ownership contracts over SDK WebSockets", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-contract-"));
 	directories.push(directory);
 	const agentDir = path.join(directory, ".gjc", "agent");
 	const cwd = path.join(directory, "workspace");
 	const token = "acp-contract-token";
-	const brokerSessions: Record<string, unknown>[] = [
+	let brokerSessions: Record<string, unknown>[] = [
 		{ sessionId: "owned-session", locator: { repo: cwd }, live: true, endpointGeneration: 1 },
 	];
 	const lifecycleInputs: Record<string, unknown>[] = [];
@@ -264,8 +222,6 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const abortFrames: Record<string, unknown>[] = [];
 	const updates: SessionNotification[] = [];
 	const providerRegistrations: Array<Record<string, unknown>> = [];
-	let closeSessionTransport: (() => void) | undefined;
-	let reconnectingSessionTransport = false;
 	let promptSocket: { send(message: string): void } | undefined;
 	let holdSkillPreflight = false;
 	let pendingSkillControlId: string | undefined;
@@ -274,6 +230,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const sessionCloseLedger = new Map<string, Record<string, unknown>>();
 	let makeNextSessionCloseUncertain = true;
 	let rejectNextSessionClose = false;
+	let holdPermissionModeSet = false;
+	let releasePermissionModeSet: (() => void) | undefined;
 	let activeModelPreset = "test-preset";
 	let completeNextPromptBeforeAck = false;
 	/** Queries `#sessionState` issues before `session/new` can answer. */
@@ -291,14 +249,11 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		},
 		websocket: {
 			open(socket) {
-				const connectionId = reconnectingSessionTransport ? "acp-contract-reconnected" : "acp-contract";
-				reconnectingSessionTransport = false;
-				socket.send(JSON.stringify({ type: "hello", connectionId }));
+				socket.send(JSON.stringify({ type: "hello", connectionId: "acp-contract" }));
 			},
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				if (frame.type === "register_provider") {
-					closeSessionTransport = () => socket.close();
 					providerRegistrations.push(frame);
 					socket.send(
 						JSON.stringify({ type: "register_provider_result", id: frame.id, ok: true, leaseId: "lease" }),
@@ -316,15 +271,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 								ok: true,
 								result: {
 									sessionId: "owned-session",
-									endpointGeneration: 1,
-									pid: process.pid,
-									endpointMtimeMs,
-									endpoint: {
-										sessionId: "owned-session",
-										pid: process.pid,
-										url: `ws://127.0.0.1:${server.port}`,
-										token,
-									},
+									endpoint: { url: `ws://127.0.0.1:${server.port}`, token },
 								},
 							}),
 						);
@@ -400,10 +347,6 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 						return;
 					}
 					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
-					return;
-				}
-				if (frame.type === "event_replay") {
-					socket.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
 					return;
 				}
 				if (frame.type === "query_request") {
@@ -504,6 +447,12 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 					if (queryStallMs > 0 && SESSION_STATE_QUERIES.has(String(frame.query)))
 						setTimeout(sendQueryResponse, queryStallMs);
 					else sendQueryResponse();
+					return;
+				}
+				if (frame.operation === "permission_mode.set" && holdPermissionModeSet) {
+					releasePermissionModeSet = () => {
+						socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, result: {} }));
+					};
 					return;
 				}
 				if (frame.type === "control_request") {
@@ -612,34 +561,6 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	});
 	servers.push(server);
 	await mkdir(cwd, { recursive: true });
-	const endpointPath = path.join(cwd, ".gjc", "state", "sdk", "owned-session.json");
-	await mkdir(path.dirname(endpointPath), { recursive: true });
-	await Bun.write(
-		endpointPath,
-		JSON.stringify({
-			sessionId: "owned-session",
-			pid: process.pid,
-			url: `ws://127.0.0.1:${server.port}`,
-			token,
-		}),
-	);
-	await utimes(endpointPath, 0.001, 0.001);
-	const endpointMtimeMs = (await stat(endpointPath)).mtimeMs;
-	brokerSessions[0] = {
-		...brokerSessions[0],
-		pid: process.pid,
-		endpointMtimeMs,
-	};
-	const index = await new SessionIndex(agentDir).open();
-	await index.append({
-		type: "host_registered",
-		sessionId: "owned-session",
-		locator: { repo: cwd, stateRoot: path.join(cwd, ".gjc", "state") },
-		endpointGeneration: 1,
-		pid: process.pid,
-		endpointMtimeMs,
-	});
-	await index.checkpointLiveHeartbeats();
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
@@ -779,22 +700,6 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		}),
 	]);
 	await waitFor(
-		() => closeSessionTransport !== undefined && providerRegistrations.length > 0,
-		"ACP provider registration",
-	);
-	const initialProviderRegistrationCount = providerRegistrations.length;
-	reconnectingSessionTransport = true;
-	closeSessionTransport!();
-	await waitFor(
-		() => providerRegistrations.length > initialProviderRegistrationCount,
-		"ACP provider re-registration after transport reconnect",
-	);
-	expect(providerRegistrations.slice(initialProviderRegistrationCount)).toEqual(
-		expect.arrayContaining([
-			expect.objectContaining({ connectionId: "acp-contract-reconnected", expectedLeaseId: "lease" }),
-		]),
-	);
-	await waitFor(
 		() => updates.some(update => update.update.sessionUpdate === "available_commands_update"),
 		"ACP available commands",
 	);
@@ -928,10 +833,6 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		promptSocket!.send(
 			JSON.stringify({
 				type: "event",
-				kind: event.type,
-				sessionId: created.sessionId,
-				commandId: "prompt-command",
-				turnId: "prompt-turn",
 				payload: { event_type: event.type, event },
 			}),
 		);
@@ -1287,5 +1188,282 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			}),
 		]),
 	);
+	const loaderAbort = new AbortController();
+	const loader = new AcpAgent(
+		{
+			sessionUpdate: async () => {},
+			signal: loaderAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	const registrationsBeforeLiveAttach = providerRegistrations.length;
+	const brokerRequestsBeforeLiveAttach = brokerRequests.length;
+	await bounded(
+		Promise.all([
+			loader.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+			loader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		]),
+		"concurrent live attach",
+	);
+	const liveAttachRequests = brokerRequests.slice(brokerRequestsBeforeLiveAttach);
+	expect(liveAttachRequests.filter(request => request.operation === "session.resume")).toHaveLength(0);
+	expect(liveAttachRequests.filter(request => request.operation === "session.get_endpoint")).toEqual([
+		expect.objectContaining({ input: { sessionId: created.sessionId, endpointGeneration: 1 } }),
+	]);
+	expect(providerRegistrations).toHaveLength(registrationsBeforeLiveAttach + 1);
+	const requestsBeforeRepeatedMcp = brokerRequests.length;
+	await bounded(
+		loader.resumeSession({
+			sessionId: created.sessionId,
+			cwd,
+			mcpServers: [{ name: "Air", command: "/Applications/Air.app/Contents/bin/mcp-proxy", args: [], env: [] }],
+		}),
+		"attached session MCP replay",
+	);
+	expect(brokerRequests).toHaveLength(requestsBeforeRepeatedMcp);
+
+	const liveMcpAbort = new AbortController();
+	const liveMcpLoader = new AcpAgent(
+		{
+			sessionUpdate: async () => {},
+			signal: liveMcpAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	const requestsBeforeLiveMcp = brokerRequests.length;
+	await bounded(
+		liveMcpLoader.loadSession({
+			sessionId: created.sessionId,
+			cwd,
+			mcpServers: [{ name: "Air", command: "/Applications/Air.app/Contents/bin/mcp-proxy", args: [], env: [] }],
+		}),
+		"live session MCP replay",
+	);
+	expect(brokerRequests.slice(requestsBeforeLiveMcp)).toEqual([
+		expect.objectContaining({ operation: "session.list", input: { cwd } }),
+		expect.objectContaining({
+			operation: "session.get_endpoint",
+			input: { sessionId: created.sessionId, endpointGeneration: 1 },
+		}),
+	]);
+	liveMcpAbort.abort();
+	const firstGenerationCloseStart = brokerRequests.filter(request => request.operation === "session.close").length;
+	const closeResults = await Promise.allSettled([
+		loader.closeSession({ sessionId: created.sessionId }),
+		loader.closeSession({ sessionId: created.sessionId }),
+	]);
+	expect(closeResults[0]).toEqual(closeResults[1]);
+	expect(closeResults[0]).toMatchObject({ status: "rejected", reason: { code: "terminal_uncertain" } });
+	const firstGenerationClose = brokerRequests
+		.filter(request => request.operation === "session.close")
+		.slice(firstGenerationCloseStart);
+	expect(firstGenerationClose).toHaveLength(1);
+	const firstGenerationKey = firstGenerationClose[0].idempotencyKey;
+
+	holdPermissionModeSet = true;
+	brokerSessions = [{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 2 }];
+	const provisionalResume = loader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] });
+	await waitFor(() => releasePermissionModeSet !== undefined, "held permission mode initialization");
+	const provisionalCloseStart = brokerRequests.filter(request => request.operation === "session.close").length;
+	const provisionalClose = loader.closeSession({ sessionId: created.sessionId });
+	expect(brokerRequests.filter(request => request.operation === "session.close")).toHaveLength(provisionalCloseStart);
+	holdPermissionModeSet = false;
+	releasePermissionModeSet!();
+	releasePermissionModeSet = undefined;
+	await expect(bounded(provisionalResume, "provisional attachment cancellation")).rejects.toThrow(
+		"closed while attaching",
+	);
+	await bounded(provisionalClose, "first generation close retry");
+	const provisionalCloseRequests = brokerRequests
+		.filter(request => request.operation === "session.close")
+		.slice(provisionalCloseStart);
+	expect(provisionalCloseRequests).toHaveLength(1);
+	expect(provisionalCloseRequests[0].idempotencyKey).toBe(firstGenerationKey);
+
+	await bounded(
+		loader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		"second generation attach",
+	);
+	rejectNextSessionClose = true;
+	const secondGenerationCloseStart = brokerRequests.filter(request => request.operation === "session.close").length;
+	await expect(loader.closeSession({ sessionId: created.sessionId })).rejects.toMatchObject({
+		code: "terminal_uncertain",
+	});
+	const secondGenerationClose = brokerRequests
+		.filter(request => request.operation === "session.close")
+		.slice(secondGenerationCloseStart);
+	expect(secondGenerationClose).toHaveLength(1);
+	const secondGenerationKey = secondGenerationClose[0].idempotencyKey;
+	expect(secondGenerationKey).not.toBe(firstGenerationKey);
+
+	await bounded(loader.listSessions({ cwd }), "re-establish close scope after definitive rejection");
+	const definitiveRetryStart = brokerRequests.filter(request => request.operation === "session.close").length;
+	await bounded(loader.closeSession({ sessionId: created.sessionId }), "definitive close retry");
+	const definitiveRetry = brokerRequests
+		.filter(request => request.operation === "session.close")
+		.slice(definitiveRetryStart);
+	expect(definitiveRetry).toHaveLength(1);
+	expect(definitiveRetry[0].idempotencyKey).not.toBe(secondGenerationKey);
+	brokerSessions = [{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 }];
+
+	brokerSessions = [
+		{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 },
+		{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 2 },
+	];
+	const conflictAbort = new AbortController();
+	const conflictingLoader = new AcpAgent(
+		{ signal: conflictAbort.signal, closed: Promise.withResolvers<void>().promise } as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	const brokerRequestsBeforeConflict = brokerRequests.length;
+	await expect(conflictingLoader.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] })).rejects.toThrow(
+		"Broker returned duplicate session id",
+	);
+	expect(brokerRequests.slice(brokerRequestsBeforeConflict)).toEqual([
+		expect.objectContaining({ operation: "session.list", input: { cwd } }),
+	]);
+	conflictAbort.abort();
+
+	brokerSessions = [
+		{ sessionId: created.sessionId, locator: { repo: path.join(directory, "other-workspace") }, live: true },
+	];
+	const scopeConflictAbort = new AbortController();
+	const scopeConflictingLoader = new AcpAgent(
+		{
+			signal: scopeConflictAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	const brokerRequestsBeforeScopeConflict = brokerRequests.length;
+	await expect(
+		scopeConflictingLoader.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+	).rejects.toThrow("Broker returned conflicting session scope");
+	expect(brokerRequests.slice(brokerRequestsBeforeScopeConflict)).toEqual([
+		expect.objectContaining({ operation: "session.list", input: { cwd } }),
+	]);
+	scopeConflictAbort.abort();
+	brokerSessions = [{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 }];
+	const deletingPrompt = agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "delete me" }] });
+	const deletingPromptError = deletingPrompt.then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	await waitFor(() => promptInputs.length === 6, "delete prompt delivery");
+	await expect(
+		bounded(agent.deleteSession({ sessionId: created.sessionId }), "owned session delete"),
+	).resolves.toEqual({});
+	expect(await bounded(deletingPromptError, "deleted prompt rejection")).toMatchObject({
+		message: "ACP session was deleted.",
+	});
+	const closeRequests = brokerRequests.filter(request => request.operation === "session.close");
+	expect(
+		closeRequests.every(request => typeof request.idempotencyKey === "string" && request.idempotencyKey.length > 0),
+	).toBe(true);
+	expect(brokerRequests).toContainEqual(
+		expect.objectContaining({
+			operation: "session.delete",
+			idempotencyKey: `acp:session.delete:${created.sessionId}`,
+		}),
+	);
+	brokerSessions = [{ sessionId: created.sessionId, locator: { repo: cwd }, live: true, endpointGeneration: 1 }];
+	const frameFailureAbort = new AbortController();
+	let rejectFrameUpdates = false;
+	let frameBootstrapPublished = false;
+	const frameFailureAgent = new AcpAgent(
+		{
+			sessionUpdate: async () => {
+				if (rejectFrameUpdates) throw new Error("delivery broke");
+				frameBootstrapPublished = true;
+			},
+			signal: frameFailureAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	await bounded(
+		frameFailureAgent.resumeSession({ sessionId: created.sessionId, cwd, mcpServers: [] }),
+		"frame failure attach",
+	);
+	await waitFor(() => frameBootstrapPublished, "frame failure bootstrap");
+	const frameFailurePrompt = frameFailureAgent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "frame failure" }],
+	});
+	await waitFor(() => promptInputs.length === 7, "frame failure prompt delivery");
+	rejectFrameUpdates = true;
+	promptSocket!.send(
+		JSON.stringify({
+			type: "event",
+			payload: { event: { type: "auto_compaction_start", reason: "manual", action: "manual" } },
+		}),
+	);
+	await expect(bounded(frameFailurePrompt, "frame failure prompt rejection")).rejects.toMatchObject({
+		code: "frame_processing_failed",
+		message: "ACP session frame processing failed: delivery broke",
+	});
+	await expect(
+		frameFailureAgent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "closed" }] }),
+	).rejects.toThrow("Unknown session, not found");
+	frameFailureAbort.abort();
+
+	brokerSessions = [];
+	const followupAbort = new AbortController();
+	const followupAgent = new AcpAgent(
+		{
+			sessionUpdate: async () => {},
+			signal: followupAbort.signal,
+			closed: Promise.withResolvers<void>().promise,
+		} as unknown as AgentSideConnection,
+		{ agentDir },
+	);
+	await bounded(
+		followupAgent.loadSession({
+			sessionId: created.sessionId,
+			cwd,
+			mcpServers: [
+				{ name: "Air", command: "/Applications/Air.app/Contents/bin/mcp-proxy", args: ["--stdio"], env: [] },
+			],
+		}),
+		"offline session reload with MCP servers",
+	);
+	expect(lifecycleInputs.at(-1)).toEqual(
+		expect.objectContaining({
+			cwd,
+			sessionId: created.sessionId,
+			readinessTimeoutMs: 30_500,
+			mcpServers: [{ name: "Air", command: "/Applications/Air.app/Contents/bin/mcp-proxy", args: ["--stdio"] }],
+		}),
+	);
+	expect(
+		await followupAgent.extMethod("session/set_model", {
+			sessionId: created.sessionId,
+			modelId: "openai/gpt",
+		}),
+	).toEqual({});
+	expect(controlOperations.at(-1)).toBe("model.set");
+	const followupPrompt = followupAgent.prompt({
+		sessionId: created.sessionId,
+		prompt: [{ type: "text", text: "follow up" }],
+	});
+	await waitFor(() => promptInputs.length === 8, "restored-session follow-up prompt delivery");
+	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "busy" }));
+	promptSocket!.send(JSON.stringify({ type: "activity", sessionId: created.sessionId, state: "idle" }));
+	promptSocket!.send(
+		JSON.stringify({
+			type: "agent_end",
+			sessionId: created.sessionId,
+			commandId: "prompt-command",
+			turnId: "prompt-turn",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		}),
+	);
+	expect(await bounded(followupPrompt, "restored-session follow-up prompt completion")).toEqual({
+		stopReason: "end_turn",
+	});
+	followupAbort.abort();
+	loaderAbort.abort();
 	controller.abort();
 }, 30_000);

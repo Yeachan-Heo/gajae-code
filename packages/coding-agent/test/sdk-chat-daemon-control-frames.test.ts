@@ -3,12 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionIndex } from "../src/sdk/broker/session-index";
-import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
+import { ChatDaemonRuntime, type ChatDaemonSdkClient } from "../src/sdk/bus/chat-daemon-runtime";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
 import type { SlackProviderClient } from "../src/sdk/bus/slack-provider";
 import { SESSION_PREPARED_EVENT } from "../src/sdk/host";
-import type { SessionRouterClient } from "../src/sdk/router";
 
 const SESSION_ID = "control-frame-session";
 const GENERATION = 4;
@@ -41,9 +40,9 @@ class FakeSlackProvider implements SlackProviderClient {
 }
 
 /**
- * The exact protocol answer `SessionRouter` provokes on every attachment:
- * `SdkClient` settles the pending `event_replay` request and still forwards the same
- * frame to every observer.
+ * The exact protocol answer `ChatDaemonRuntime.attach()` provokes on every
+ * attachment: `SdkClient` settles the pending `event_replay` request and still
+ * forwards the same frame to every observer.
  */
 const EVENT_REPLAY_RESULT_FRAME = {
 	type: "event_replay_result",
@@ -91,7 +90,7 @@ async function withRuntime(
 		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
 		await fs.writeFile(
 			endpointFile,
-			`${JSON.stringify({ version: 1, sessionId: SESSION_ID, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
+			`${JSON.stringify({ version: 1, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
 		);
 		const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
 		const index = await new SessionIndex(agentDir).open();
@@ -115,7 +114,7 @@ async function withRuntime(
 
 		const provider = new FakeSlackProvider();
 		let observer: ((frame: Record<string, unknown>) => void) | undefined;
-		const client: SessionRouterClient = {
+		const client: ChatDaemonSdkClient = {
 			onFrame: handler => {
 				observer = handler;
 				return () => {
@@ -144,12 +143,9 @@ async function withRuntime(
 			},
 			{
 				createSlackProvider: () => provider,
-				routerDeps: {
-					createIndex: () => index,
-					createClient: async () => client,
-					setInterval: (() => 0) as unknown as typeof setInterval,
-					clearInterval: (() => undefined) as unknown as typeof clearInterval,
-				},
+				createClient: async () => client,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => undefined) as unknown as typeof clearInterval,
 			},
 		);
 		await runtime.start();

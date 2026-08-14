@@ -287,12 +287,12 @@ describe("release package evidence", () => {
 		)).rejects.toThrow("redirect destination");
 		expect(() => validateNpmRegistryTarballUrl("https://evil.invalid/ai.tgz", "test tarball")).toThrow("must remain");
 	});
-	test("requires exactly the complete sorted 13-package set and closed expected schema", () => {
+	test("requires exactly the complete sorted 14-package set and closed expected schema", () => {
 		const { expected } = expectedFixture();
-		expect(expected.packages).toHaveLength(13);
+		expect(expected.packages).toHaveLength(14);
 		expect(validateExpectedEvidence(expected)).toEqual(expected);
 		expect(() => validateExpectedEvidence({ ...expected, unexpected: true })).toThrow("unknown or missing");
-		expect(() => validateExpectedEvidence({ ...expected, packages: expected.packages.slice(1) })).toThrow("exactly 13 packages");
+		expect(() => validateExpectedEvidence({ ...expected, packages: expected.packages.slice(1) })).toThrow("exactly 14 packages");
 		expect(() => validateExpectedEvidence({ ...expected, packages: [...expected.packages].reverse() })).toThrow("complete public package set");
 	});
 

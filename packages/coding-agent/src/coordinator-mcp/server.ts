@@ -4,34 +4,27 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isKnownSinkPeerClosedError } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
+
+import { withFileLock } from "../config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 	type CoordinatorToolName,
 } from "../coordinator/contract";
-import { SessionStateLockUnavailableError, withSessionStateFileLock } from "../gjc-runtime/session-state-lock";
-import {
-	classifyRuntimeToolActivity,
-	publicRuntimeToolActivity,
-	terminallySettledRuntimeToolActivity,
-} from "../gjc-runtime/session-state-sidecar";
 import { listMcpDelegateHostContexts } from "../hooks/mcp-delegate-host-context";
 import type { WorkflowGate, WorkflowGateQueryRecord } from "../modes/shared/agent-wire/workflow-gate-types";
 import type { BrokerDiscovery } from "../sdk/broker/discovery";
 import { type EnsureBrokerSettings, ensureBroker } from "../sdk/broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../sdk/broker/startup-budget";
 import { UnsupportedStateVersionError } from "../sdk/broker/state-version";
-import { SdkClient, SdkClientError } from "../sdk/client/client";
+import { SdkClient, SdkClientError, type SdkSentRecord } from "../sdk/client/client";
 import { readSdkBrokerDiscovery } from "../sdk/client/discovery";
-import { reduceTerminalReceiptState } from "../sdk/receipt-state";
-import { type SessionAttachment, SessionRouter, type SessionRouterDeps, SessionRouterError } from "../sdk/router";
 import {
 	type ActivatedPreparedSession,
 	requestPreparedSessionActivation,
 	SessionActivationError,
 } from "../sdk/session-activation";
-import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../sdk/session-list";
 import {
 	ackCodexWakeEvent,
 	bindDelegateCodexHandoff,
@@ -118,6 +111,16 @@ interface JsonRpcResponse {
 	error?: { code: number; message: string; data?: unknown };
 }
 
+function isLifecycleOperation(operation: string): boolean {
+	return (
+		operation === "session.create" ||
+		operation === "session.fork" ||
+		operation === "session.resume" ||
+		operation === "session.close" ||
+		operation === "session.delete"
+	);
+}
+
 function sinkErrorCode(error: unknown): string | undefined {
 	if (error === null || (typeof error !== "object" && typeof error !== "function")) return undefined;
 	try {
@@ -170,11 +173,10 @@ interface CoordinatorFinalResponse {
 	truncated: boolean;
 }
 
-function reportableFinalResponse(response: CoordinatorFinalResponse | undefined): boolean {
-	return Boolean(
-		response &&
-			((typeof response.text === "string" && response.text.trim().length > 0) ||
-				(typeof response.artifact_path === "string" && response.artifact_path.trim().length > 0)),
+function reportableFinalResponse(response: CoordinatorFinalResponse): boolean {
+	return (
+		(typeof response.text === "string" && response.text.trim().length > 0) ||
+		(typeof response.artifact_path === "string" && response.artifact_path.trim().length > 0)
 	);
 }
 
@@ -184,8 +186,7 @@ interface RuntimeSessionStatePayload extends CoordinatorSessionState {
 }
 
 interface CoordinatorServices {
-	connectBroker?: (url: string, token: string) => Promise<SdkClient>;
-	routerDeps?: SessionRouterDeps;
+	connectSdk?: (url: string, token: string) => Promise<SdkClient>;
 	ensureBroker?: (settings: EnsureBrokerSettings) => Promise<BrokerDiscovery>;
 	readSdkBrokerDiscovery?: (agentDir: string) => Promise<BrokerDiscovery | null>;
 	getAgentDir?: () => string;
@@ -276,15 +277,13 @@ interface CoordinatorSessionState {
 	current_turn_id: string | null;
 	last_turn_id: string | null;
 	updated_at: string;
-	ended_at?: string;
 	source: "coordinator" | "agent_session_event";
 	live: boolean | null;
 	reason: string | null;
-	/**
-	 * Tool-activity snapshot owned by the runtime sidecar; never lifecycle state. It is
-	 * carried opaquely because only the sidecar's validator decides what is publishable.
-	 */
+	last_activity_at?: string;
 	activity?: unknown;
+	active_tools?: unknown;
+	active_tool_calls?: unknown;
 }
 
 type CoordinatorEventKind =
@@ -339,15 +338,8 @@ const UNOBSERVED_COMPENSATION_CODE = "broker_compensation_unobserved";
 const MISSING_FINAL_RESPONSE_ADVISORY = "completion_missing_final_response";
 const PROMPT_ACK_TIMEOUT_REASON = "runtime_prompt_ack_timeout";
 const DEFAULT_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 10_000;
-/**
- * Pagination window for `readCompleteQ12Snapshot`: it stops starting pages once
- * this much time has passed and gives each page only the remainder as its reply
- * budget. It bounds pagination, not the whole call — attachment resolution runs
- * before the window opens, and a page's budget is a post-connect reply deadline,
- * so transport reconnect time sits outside it.
- */
-const Q12_SNAPSHOT_BUDGET_MS = 5_000;
 const MAX_RUNTIME_PROMPT_ACK_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_COORDINATOR_SESSION_LIST_PAGES = 10_000;
 const ACTIVE_TURN_STATUSES = new Set<TurnStatus>(["delivering", "active", "waiting_for_answer", "completing"]);
 const TERMINAL_TURN_STATUSES = new Set<TurnStatus>(["completed", "failed", "cancelled", "superseded"]);
 const TURN_ID_PATTERN = /^turn-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1249,10 +1241,7 @@ function publicLifecycleReceipt(result: Record<string, unknown>, sessionId: stri
 
 function publicCoordinatorSessionState(state: CoordinatorSessionState | null): Record<string, unknown> | null {
 	if (!state) return null;
-	// The sidecar owns the one projection that strips its private correlation state and
-	// withholds any snapshot that contradicts the lifecycle state published beside it.
-	const activity = publicRuntimeToolActivity(state.activity, state.state);
-	return {
+	const result: Record<string, unknown> = {
 		session_id: state.session_id,
 		state: state.state,
 		ready_for_input: state.ready_for_input,
@@ -1260,11 +1249,56 @@ function publicCoordinatorSessionState(state: CoordinatorSessionState | null): R
 		last_turn_id: state.last_turn_id,
 		updated_at: state.updated_at,
 		...(typeof state.live === "boolean" ? { live: state.live } : {}),
-		...(activity ? { activity } : {}),
-		...(typeof state.ended_at === "string" && Number.isFinite(Date.parse(state.ended_at))
-			? { ended_at: state.ended_at }
-			: {}),
 	};
+	const activity = asRecord(state.activity);
+	if (
+		typeof state.last_activity_at === "string" &&
+		Number.isFinite(Date.parse(state.last_activity_at)) &&
+		activity &&
+		typeof activity.sequence === "number" &&
+		Number.isSafeInteger(activity.sequence) &&
+		activity.sequence > 0 &&
+		activity.kind === "tool_execution" &&
+		(activity.phase === "started" || activity.phase === "finished") &&
+		typeof activity.tool_name === "string" &&
+		/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(activity.tool_name) &&
+		typeof activity.observed_at === "string" &&
+		Number.isFinite(Date.parse(activity.observed_at)) &&
+		typeof activity.active_tool_count === "number" &&
+		Number.isSafeInteger(activity.active_tool_count) &&
+		activity.active_tool_count >= 0
+	) {
+		result.last_activity_at = state.last_activity_at;
+		result.activity = {
+			sequence: activity.sequence,
+			kind: activity.kind,
+			phase: activity.phase,
+			tool_name: activity.tool_name,
+			observed_at: activity.observed_at,
+			...(typeof activity.started_at === "string" && Number.isFinite(Date.parse(activity.started_at))
+				? { started_at: activity.started_at }
+				: {}),
+			...(typeof activity.elapsed_ms === "number" &&
+			Number.isSafeInteger(activity.elapsed_ms) &&
+			activity.elapsed_ms >= 0
+				? { elapsed_ms: activity.elapsed_ms }
+				: {}),
+			...(activity.outcome === "succeeded" || activity.outcome === "failed" ? { outcome: activity.outcome } : {}),
+			active_tool_count: activity.active_tool_count,
+		};
+		if (Array.isArray(state.active_tools))
+			result.active_tools = state.active_tools.slice(0, 8).flatMap(value => {
+				const tool = asRecord(value);
+				return tool &&
+					typeof tool.tool_name === "string" &&
+					/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(tool.tool_name) &&
+					typeof tool.started_at === "string" &&
+					Number.isFinite(Date.parse(tool.started_at))
+					? [{ tool_name: tool.tool_name, started_at: tool.started_at }]
+					: [];
+			});
+	}
+	return result;
 }
 
 function eventTimestamp(record: Record<string, unknown>): string | null {
@@ -1854,52 +1888,35 @@ async function writeSessionStateUnlocked(
 		live?: boolean | null;
 		reason?: string | null;
 		source?: CoordinatorSessionState["source"];
-		/** Rebuild the lifecycle fields from canonical state instead of the previous projection. */
 		overwrite?: boolean;
 	} = {},
 ): Promise<CoordinatorSessionState> {
-	const persisted = await readSessionState(namespaceDir, sessionId);
-	// An overwrite is a canonical lifecycle repair, not proof that tool activity ended.
-	const previous = options.overwrite ? null : persisted;
+	const existing = await readSessionState(namespaceDir, sessionId);
+	const previous = options.overwrite ? null : existing;
 	const hasCurrentTurn = Object.hasOwn(options, "currentTurnId");
 	const hasLastTurn = Object.hasOwn(options, "lastTurnId");
 	const hasLive = Object.hasOwn(options, "live");
-	const updatedAt = new Date().toISOString();
-	// A coordinator write says nothing about tool activity, so every lifecycle path —
-	// including canonical repair — carries the sidecar's snapshot and its sequence
-	// forward. A TERMINAL lifecycle state is the one exception: it is authority that
-	// nothing can still be running, so it settles orphaned in-flight calls through the
-	// exact helper the runtime uses. A malformed snapshot is preserved verbatim rather
-	// than reset to a lower sequence; the public projection refuses to publish it either way.
-	const terminal = state === "completed" || state === "errored";
-	const activity = terminal
-		? terminallySettledRuntimeToolActivity(persisted?.activity, updatedAt)
-		: classifyRuntimeToolActivity(persisted?.activity);
-	const isTerminalState = state === "completed" || state === "errored" || state === "stale";
-	const endedAt = isTerminalState
-		? updatedAt
-		: typeof persisted?.ended_at === "string" && Number.isFinite(Date.parse(persisted.ended_at))
-			? persisted.ended_at
-			: undefined;
 	const payload: CoordinatorSessionState = {
 		schema_version: 1,
 		session_id: sessionId,
 		state,
-		ready_for_input: state === "ready_for_input",
+		ready_for_input: state === "ready_for_input" || state === "completed",
 		current_turn_id: hasCurrentTurn
 			? (options.currentTurnId ?? null)
 			: state === "running"
 				? (previous?.current_turn_id ?? null)
 				: null,
 		last_turn_id: hasLastTurn ? (options.lastTurnId ?? null) : (previous?.last_turn_id ?? null),
-		updated_at: updatedAt,
+		updated_at: new Date().toISOString(),
 		source: options.source ?? "coordinator",
 		live: hasLive ? (options.live ?? null) : (previous?.live ?? null),
 		reason: options.reason ?? null,
-		...(endedAt !== undefined ? { ended_at: endedAt } : {}),
-		...(activity.kind === "absent"
-			? {}
-			: { activity: activity.kind === "valid" ? activity.activity : persisted?.activity }),
+		...(typeof existing?.last_activity_at === "string" ? { last_activity_at: existing.last_activity_at } : {}),
+		...(existing?.activity && typeof existing.activity === "object" ? { activity: existing.activity } : {}),
+		...(Array.isArray(existing?.active_tools) ? { active_tools: existing.active_tools } : {}),
+		...(existing?.active_tool_calls && typeof existing.active_tool_calls === "object"
+			? { active_tool_calls: existing.active_tool_calls }
+			: {}),
 	};
 	await writeJsonFile(sessionStateFile(namespaceDir, sessionId), payload);
 	if (
@@ -1927,24 +1944,8 @@ async function writeSessionStateUnlocked(
 	return payload;
 }
 
-/**
- * Serialize a coordinator state mutation on the same lock the runtime sidecar takes.
- *
- * Both writers contend for `<file>.lock`, so they must use one implementation and one
- * on-disk owner format. That format is the base Coordinator's regular-file owner JSON,
- * now shared: a directory-style lock here would make a base-version `<file>.lock` regular
- * file permanently unusable (`ENOTDIR` on `<file>.lock/info`), stranding the session. The
- * base runtime did use a directory at this path, so the shared implementation reclaims
- * that shape too. Live owners are waited for; dead and malformed ones are reclaimed by
- * that implementation's own liveness and staleness checks.
- */
 async function withSessionStateLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
-	try {
-		return await withSessionStateFileLock(stateFile, operation);
-	} catch (error) {
-		if (error instanceof SessionStateLockUnavailableError) throw new Error("coordinator_state_unreadable");
-		throw error;
-	}
+	return await withFileLock(stateFile, operation, { staleMs: 30_000, retries: 12_000, retryDelayMs: 5 });
 }
 
 async function writeSessionState(
@@ -1992,12 +1993,7 @@ async function markTurnTerminalFromSessionState(
 	turn: TurnRecord,
 	sessionState: CoordinatorSessionState,
 ): Promise<TurnRecord> {
-	const receiptState = reduceTerminalReceiptState({
-		execution: sessionState.state === "errored" ? "failed" : "completed",
-		reportable: reportableFinalResponse((sessionState as RuntimeSessionStatePayload).final_response),
-	});
-	const terminalStatus: TurnStatus =
-		receiptState.receipt === "missing" ? "failed" : sessionState.state === "errored" ? "failed" : "completed";
+	const terminalStatus: TurnStatus = sessionState.state === "errored" ? "failed" : "completed";
 	const runtimeState = sessionState as RuntimeSessionStatePayload;
 	const finalResponse = runtimeState.final_response ?? {
 		text: null,
@@ -2016,21 +2012,24 @@ async function markTurnTerminalFromSessionState(
 			state: "acknowledged",
 		},
 		final_response: finalResponse,
-		evidence: turn.evidence,
-		error:
-			receiptState.receipt === "missing"
-				? {
-						code: "receipt_missing",
+		evidence: reportableFinalResponse(finalResponse)
+			? turn.evidence
+			: [
+					...turn.evidence,
+					{
+						type: MISSING_FINAL_RESPONSE_ADVISORY,
 						message: "Runtime completed without reportable final_response text or artifact_path.",
+						created_at: timestamp,
+					},
+				],
+		error:
+			terminalStatus === "failed"
+				? (runtimeState.error ?? {
+						code: "runtime_errored",
+						message: sessionState.reason ?? "runtime_errored",
 						recoverable: true,
-					}
-				: terminalStatus === "failed"
-					? (runtimeState.error ?? {
-							code: "runtime_errored",
-							message: sessionState.reason ?? "runtime_errored",
-							recoverable: true,
-						})
-					: null,
+					})
+				: null,
 		updated_at: timestamp,
 		completed_at: timestamp,
 	};
@@ -2364,16 +2363,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	const config = buildCoordinatorMcpConfig(env);
 	const promptAckTimeoutMs = boundedRuntimePromptAckTimeoutMs(env.GJC_COORDINATOR_MCP_PROMPT_ACK_TIMEOUT_MS);
 	const services = options.services ?? {};
-	const routerAgentDir = services.getAgentDir?.() ?? getAgentDir();
-	const router = new SessionRouter({ agentDir: routerAgentDir, deps: services.routerDeps });
-	let routerReady: Promise<void> | null = null;
-	async function ensureRouterReady(): Promise<void> {
-		routerReady ??= router.start().catch(error => {
-			routerReady = null;
-			throw error;
-		});
-		await routerReady;
-	}
 	const platform = options.platform ?? process.platform;
 	const loadModelProfiles = services.resolveModelProfiles ?? loadCoordinatorModelProfiles;
 	const namespaceDir = path.join(
@@ -2843,111 +2832,27 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		}
 	}
 
-	type CoordinatorSessionAttachment = {
-		sessionId: string;
-		generation: number;
-		attachment: SessionAttachment;
-	};
-
-	async function resolveSessionAttachment(session: Record<string, unknown>): Promise<CoordinatorSessionAttachment> {
-		const sessionId = optionalString(session.session_id) ?? optionalString(session.sessionId);
-		const generation =
-			typeof session.endpoint_generation === "number" &&
-			Number.isSafeInteger(session.endpoint_generation) &&
-			session.endpoint_generation > 0
-				? session.endpoint_generation
-				: null;
-		const workspace = optionalString(session.broker_workspace);
-		const incarnation = optionalString(session.endpoint_incarnation);
-		if (!sessionId || generation === null)
-			throw new SdkClientError("not_found", "Coordinator session has no usable endpoint generation.");
-		if (!workspace || !incarnation)
-			throw new SdkClientError("endpoint_stale", "Coordinator session has no exact endpoint authority.");
-		let persistedWorkspace: string;
-		try {
-			persistedWorkspace = await canonicalBrokerWorkspace(workspace);
-		} catch {
-			throw new SdkClientError("endpoint_stale", "Coordinator session workspace authority is unavailable.");
-		}
-		await ensureRouterReady();
-		await router.reconcile();
-		const attachment = router.attachment(sessionId, generation);
-		if (!attachment?.isCurrent())
-			throw new SdkClientError("endpoint_stale", "Coordinator session attachment is unavailable or stale.");
-		let authority: BrokerSessionAuthority;
-		try {
-			authority = await exactBrokerSessionAuthority(sessionId, persistedWorkspace);
-		} catch (error) {
-			if (error instanceof SdkClientError && (error.code === "not_found" || error.code === "endpoint_stale"))
-				throw new SdkClientError(
-					"endpoint_stale",
-					"Coordinator session endpoint authority is unavailable or stale.",
-				);
-			throw error;
-		}
-		if (
-			!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
-			authority.endpointGeneration !== generation ||
-			authority.endpointIncarnation !== incarnation
-		)
-			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint authority changed.");
-		return { sessionId, generation, attachment };
-	}
-
-	function sdkResponse(response: Record<string, unknown>, operation: string): Record<string, unknown> {
-		if (response.ok !== true) {
-			const error = asRecord(response.error);
-			throw new SdkClientError(
-				typeof error?.code === "string" ? error.code : "unavailable",
-				typeof error?.message === "string" ? error.message : `SDK ${operation} request failed.`,
-			);
-		}
-		return response;
-	}
-
-	async function requestSessionFrame(
-		target: CoordinatorSessionAttachment,
-		frame: Record<string, unknown>,
-		options?: { timeoutMs?: number },
-	): Promise<Record<string, unknown>> {
-		try {
-			return await router.request(target.sessionId, frame, target.generation, target.attachment, options);
-		} catch (error) {
-			if (error instanceof SessionRouterError)
-				throw new SdkClientError(
-					error.phase === "ambiguous" ? "ambiguous" : "endpoint_stale",
-					error.phase === "ambiguous"
-						? "Coordinator session request may have been accepted before attachment changed."
-						: "Coordinator session attachment changed before request dispatch.",
-					error,
-				);
-			throw error;
-		}
-	}
-
 	async function controlSession(
 		session: Record<string, unknown>,
 		operation: string,
 		input: Record<string, unknown>,
 		idempotencyKey: string,
 	): Promise<unknown> {
-		const target = await resolveSessionAttachment(session);
-		const promptOperation =
-			operation === "turn.prompt" || operation === "turn.follow_up" || operation === "turn.abort_and_prompt";
-		const response = asRecord(
-			await requestSessionFrame(
-				target,
-				{
-					type: "control_request",
-					operation,
-					input,
-					idempotencyKey,
-				},
-				promptOperation ? { timeoutMs: promptAckTimeoutMs } : undefined,
-			),
+		const endpoint = await resolveSessionEndpoint(session, idempotencyKey);
+		const client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
+			endpoint.url,
+			endpoint.token,
 		);
-		if (response?.ok === false) sdkResponse(response, operation);
-		return response;
+		const isPromptOperation =
+			operation === "turn.prompt" || operation === "turn.follow_up" || operation === "turn.abort_and_prompt";
+		try {
+			return await client.control(operation, input, {
+				idempotencyKey,
+				...(isPromptOperation ? { timeoutMs: promptAckTimeoutMs } : {}),
+			});
+		} finally {
+			await client.close();
+		}
 	}
 
 	async function querySession(
@@ -2956,17 +2861,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		input: Record<string, unknown> = {},
 		cursor?: string,
 	): Promise<Record<string, unknown>> {
-		const target = await resolveSessionAttachment(session);
-		const response = asRecord(
-			await requestSessionFrame(target, {
-				type: "query_request",
-				query,
-				input,
-				...(cursor === undefined ? {} : { cursor }),
-			}),
+		const endpoint = await resolveSessionEndpoint(session);
+		const client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
+			endpoint.url,
+			endpoint.token,
 		);
-		if (!response) throw new SdkClientError("unavailable", `SDK ${query} query returned an invalid response.`);
-		return sdkResponse(response, query);
+		try {
+			const response = asRecord(await client.query(query, input, cursor));
+			if (response?.ok !== true) {
+				const error = asRecord(response?.error);
+				throw new SdkClientError(
+					typeof error?.code === "string" ? error.code : "unavailable",
+					typeof error?.message === "string" ? error.message : `SDK ${query} query failed.`,
+				);
+			}
+			return response;
+		} finally {
+			await client.close();
+		}
 	}
 
 	async function readCompleteQ12Snapshot(session: Record<string, unknown>): Promise<{
@@ -2975,36 +2887,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		complete: boolean;
 		reason: "pagination_malformed" | "query_unavailable" | null;
 	}> {
-		const deadline = Date.now() + Q12_SNAPSHOT_BUDGET_MS;
+		const deadline = Date.now() + 5_000;
 		const items: unknown[] = [];
 		const cursors = new Set<string>();
 		let cursor: string | undefined;
 		let revision: string | null = null;
 		let bytes = 0;
-		let target: CoordinatorSessionAttachment;
+		let client: SdkClient;
 		try {
-			target = await resolveSessionAttachment(session);
+			const endpoint = await resolveSessionEndpoint(session);
+			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
+				endpoint.url,
+				endpoint.token,
+			);
 		} catch {
 			return { items: [], revision, complete: false, reason: "query_unavailable" };
 		}
 		try {
 			for (let pageCount = 0; pageCount < 8 && Date.now() <= deadline; pageCount++) {
-				// The snapshot deadline is only checked between pages, so each page has to
-				// carry what is left of it. Without that budget the page inherits the
-				// Router's session reply budget and one wedged page outlives the whole
-				// snapshot bound this function promises its callers.
-				const response = asRecord(
-					await requestSessionFrame(
-						target,
-						{
-							type: "query_request",
-							query: "Q12",
-							input: {},
-							...(cursor === undefined ? {} : { cursor }),
-						},
-						{ timeoutMs: Math.max(1, deadline - Date.now()) },
-					),
-				);
+				const response = asRecord(await client.query("Q12", {}, cursor));
 				if (response?.ok !== true) return { items: [], revision, complete: false, reason: "query_unavailable" };
 				const page = asRecord(response.page);
 				const pageItems = page?.items;
@@ -3045,6 +2946,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			return { items: [], revision, complete: false, reason: "pagination_malformed" };
 		} catch {
 			return { items: [], revision, complete: false, reason: "query_unavailable" };
+		} finally {
+			await client.close().catch(() => undefined);
 		}
 	}
 
@@ -3089,11 +2992,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return error?.code === UNOBSERVED_COMPENSATION_CODE;
 	}
 
-	function isRouterRequestAmbiguous(response: Record<string, unknown>): boolean {
-		if (response.ok !== false) return false;
-		return asRecord(response.error)?.code === "ambiguous";
-	}
-
 	function sdkError(error: unknown): Record<string, unknown> {
 		if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
 		return {
@@ -3108,20 +3006,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return key;
 	}
 
-	/**
-	 * Path for the lock owner file that serializes idempotency mutations.
-	 *
-	 * Lock artifacts (owner records, transition markers, quarantine placeholders) are
-	 * created as siblings of the locked path by {@link withSessionStateFileLock}.
-	 * The record directory must enumerate as parseable records only, so the lock
-	 * path lives in a sibling `idempotency-locks` directory: its artifacts can never
-	 * appear inside `idempotency/`, which would surface as
-	 * `JSON Parse error: Unexpected EOF` during replay or enumeration.
-	 */
-	function idempotencyLockFile(idempotencyKey: string): string {
-		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
-		return path.join(namespaceDir, "idempotency-locks", `${keyDigest}.json`);
-	}
 	function idempotencyFile(idempotencyKey: string): string {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		return path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
@@ -3137,8 +3021,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	 * the remote effect settled. A tool may declare such a response nonterminal,
 	 * which returns it to this caller while the receipt stays `in_progress`, so
 	 * an exact same-key retry re-runs the observation under the same request
-	 * digest. Router post-send ambiguity is nonterminal by default; every other
-	 * tool-specific exception is supplied by its handler.
+	 * digest. The default declares nothing nonterminal, so every other tool keeps
+	 * its existing caching, conflict, and replay behaviour unchanged.
 	 */
 	async function withToolIdempotency(
 		tool: string,
@@ -3146,15 +3030,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		canonicalArgs: Record<string, unknown>,
 		operation: () => Promise<Record<string, unknown>>,
 		recoverInProgress = false,
-		isNonterminal: (response: Record<string, unknown>) => boolean = isRouterRequestAmbiguous,
+		isNonterminal: (response: Record<string, unknown>) => boolean = () => false,
 	): Promise<Record<string, unknown>> {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		const requestDigest = createHash("sha256")
 			.update(canonicalJson({ tool, args: canonicalArgs }))
 			.digest("hex");
 		const file = idempotencyFile(idempotencyKey);
-		const lockFile = idempotencyLockFile(idempotencyKey);
-		return await withSessionStateLock(lockFile, async () => {
+		return await withSessionStateLock(file, async () => {
 			const existingFile = await readCoordinatorIdempotencyFile(file);
 			if (existingFile.kind === "corrupt")
 				return {
@@ -3261,7 +3144,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 		let client: SdkClient;
 		try {
-			client = await (services.connectBroker ?? ((url, token) => SdkClient.connect(url, token)))(
+			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
 				discovery.url,
 				discovery.token,
 			);
@@ -3278,7 +3161,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				...(timeoutMs === undefined ? {} : { timeoutMs }),
 			});
 		} catch (error) {
-			requestError = toCoordinatorBrokerError("request", error);
+			const mapped = toCoordinatorBrokerError("request", error);
+			if (
+				isLifecycleOperation(operation) &&
+				mapped.code === "uncertain_after_send" &&
+				mapped.details &&
+				typeof mapped.details === "object"
+			)
+				result = await client.lookupLifecycle(mapped.details as SdkSentRecord);
+			else requestError = mapped;
 		}
 		try {
 			await client.close();
@@ -3305,29 +3196,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		cwd: string,
 		input: Record<string, unknown>,
 	): Promise<Record<string, unknown>> {
-		try {
-			const pages = await traverseSessionList(
-				input,
-				async pageInput => {
-					const response = await brokerSession(cwd, "session.list", pageInput);
-					if (asRecord(response)?.ok === false) brokerResult(response);
-					return response;
-				},
-				response => sessionListPageFromResponse(response),
+		const aggregate: Record<string, unknown> = {};
+		const sessions: unknown[] = [];
+		let cursor: string | undefined;
+		for (let pageCount = 0; pageCount < MAX_COORDINATOR_SESSION_LIST_PAGES; pageCount++) {
+			const page = brokerResult(
+				await brokerSession(cwd, "session.list", {
+					...input,
+					...(cursor === undefined ? {} : { cursor }),
+				}),
 			);
-			const aggregate: Record<string, unknown> = {};
-			const sessions: unknown[] = [];
-			for (const { page } of pages) {
-				for (const [key, value] of Object.entries(page)) {
-					if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
-				}
-				sessions.push(...page.sessions);
+			for (const [key, value] of Object.entries(page)) {
+				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
 			}
-			return { ...aggregate, sessions };
-		} catch (error) {
-			if (error instanceof SessionListTraversalError) throw new SdkClientError("protocol_error", error.message);
-			throw error;
+			if (Array.isArray(page.sessions)) sessions.push(...page.sessions);
+			const nextCursor =
+				typeof page.continuationCursor === "string" && page.continuationCursor.length > 0
+					? page.continuationCursor
+					: undefined;
+			if (!nextCursor) return { ...aggregate, sessions };
+			cursor = nextCursor;
 		}
+		throw new SdkClientError("protocol_error", "session.list exceeded the page budget.");
 	}
 
 	async function canonicalBrokerWorkspace(cwd: string): Promise<string> {
@@ -3405,29 +3295,123 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return { workspace: match.workspace, endpointGeneration, endpointIncarnation };
 	}
 
-	async function exactBrokerSessionBinding(sessionId: string, workspace: string): Promise<BrokerSessionAuthority> {
-		return await exactBrokerSessionAuthority(sessionId, workspace);
+	async function exactBrokerSessionBinding(
+		sessionId: string,
+		workspace: string,
+		idempotencyKey?: string,
+	): Promise<BrokerSessionAuthority & { endpoint: { url: string; token: string } }> {
+		const authority = await exactBrokerSessionAuthority(sessionId, workspace);
+		const endpointRecord = brokerResult(
+			await brokerSession(
+				workspace,
+				"session.get_endpoint",
+				{
+					sessionId,
+					endpointGeneration: authority.endpointGeneration,
+					endpointIncarnation: authority.endpointIncarnation,
+				},
+				idempotencyKey,
+			),
+		);
+		const url = optionalString(endpointRecord.url);
+		const token = optionalString(endpointRecord.token);
+		if (!url || !token)
+			throw new SdkClientError("endpoint_stale", "Broker returned an invalid incarnation-bound endpoint.");
+		return { ...authority, endpoint: { url, token } };
+	}
+
+	async function resolveSessionEndpoint(
+		session: Record<string, unknown>,
+		idempotencyKey?: string,
+	): Promise<{ url: string; token: string }> {
+		const sessionId = optionalString(session.session_id) ?? optionalString(session.sessionId);
+		const cwd = optionalString(session.cwd);
+		const persistedWorkspace = optionalString(session.broker_workspace);
+		const persistedGeneration =
+			typeof session.endpoint_generation === "number" &&
+			Number.isSafeInteger(session.endpoint_generation) &&
+			session.endpoint_generation > 0
+				? session.endpoint_generation
+				: null;
+		const persistedIncarnation = optionalString(session.endpoint_incarnation);
+		if (!sessionId || !cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
+			throw new SdkClientError("not_found", "Coordinator session has no incarnation-bound broker identity.");
+		const workspace = await canonicalBrokerWorkspace(cwd);
+		if (!sameCanonicalPath(workspace, persistedWorkspace, platform))
+			throw new SdkClientError("endpoint_stale", "Coordinator session workspace binding is stale.");
+		const binding = await exactBrokerSessionBinding(sessionId, workspace, idempotencyKey);
+		if (binding.endpointGeneration !== persistedGeneration || binding.endpointIncarnation !== persistedIncarnation)
+			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint incarnation is stale.");
+		return binding.endpoint;
 	}
 
 	/**
-	 * Ask a prepared session to publish its withheld readiness through the
-	 * Router-owned attachment. Endpoint credentials and SDK clients never leave
-	 * SessionRouter.
+	 * The same incarnation-bound authority `resolveSessionEndpoint` requires,
+	 * plus the exact endpoint generation the activation frame has to name. A
+	 * session whose endpoint rolled or whose workspace binding drifted is refused
+	 * here, before any activation is attempted.
+	 */
+	async function resolveSessionActivationTarget(
+		session: Record<string, unknown>,
+		idempotencyKey?: string,
+	): Promise<{ endpoint: { url: string; token: string }; endpointGeneration: number }> {
+		const sessionId = optionalString(session.session_id) ?? optionalString(session.sessionId);
+		const cwd = optionalString(session.cwd);
+		const persistedWorkspace = optionalString(session.broker_workspace);
+		const persistedGeneration =
+			typeof session.endpoint_generation === "number" &&
+			Number.isSafeInteger(session.endpoint_generation) &&
+			session.endpoint_generation > 0
+				? session.endpoint_generation
+				: null;
+		const persistedIncarnation = optionalString(session.endpoint_incarnation);
+		if (!sessionId || !cwd || !persistedWorkspace || persistedGeneration === null || !persistedIncarnation)
+			throw new SdkClientError("not_found", "Coordinator session has no incarnation-bound broker identity.");
+		const workspace = await canonicalBrokerWorkspace(cwd);
+		if (!sameCanonicalPath(workspace, persistedWorkspace, platform))
+			throw new SdkClientError("endpoint_stale", "Coordinator session workspace binding is stale.");
+		const binding = await exactBrokerSessionBinding(sessionId, workspace, idempotencyKey);
+		if (binding.endpointGeneration !== persistedGeneration || binding.endpointIncarnation !== persistedIncarnation)
+			throw new SdkClientError("endpoint_stale", "Coordinator session endpoint incarnation is stale.");
+		return { endpoint: binding.endpoint, endpointGeneration: binding.endpointGeneration };
+	}
+
+	/**
+	 * Ask a prepared session to publish its withheld readiness.
+	 *
+	 * The Coordinator never writes a chat mapping and never fakes a readiness
+	 * signal: it proves exact endpoint authority, then delegates to the same
+	 * activation exchange the `gjc notify activate-thread` CLI uses. The session's
+	 * own activation gate remains the authority on whether a binding exists.
 	 */
 	async function activatePreparedCoordinatorSession(
 		session: Record<string, unknown>,
 		sessionId: string,
-		_idempotencyKey: string,
+		idempotencyKey: string,
 	): Promise<ActivatedPreparedSession> {
-		const target = await resolveSessionAttachment(session);
-		return await requestPreparedSessionActivation(
-			{
-				request: async frame => await requestSessionFrame(target, frame),
-				close: async () => {},
-			},
-			sessionId,
-			target.generation,
-		);
+		const target = await resolveSessionActivationTarget(session, idempotencyKey);
+		let client: SdkClient;
+		try {
+			client = await (services.connectSdk ?? ((url, token) => SdkClient.connect(url, token)))(
+				target.endpoint.url,
+				target.endpoint.token,
+			);
+		} catch {
+			// Nothing was sent, so no activation can have been applied.
+			throw new SessionActivationError("activation_unavailable", "The session endpoint could not be reached.");
+		}
+		try {
+			return await requestPreparedSessionActivation(
+				{
+					request: async frame => (await client.request(frame)) as Record<string, unknown>,
+					close: async () => await client.close(),
+				},
+				sessionId,
+				target.endpointGeneration,
+			);
+		} finally {
+			await client.close().catch(() => undefined);
+		}
 	}
 
 	async function listSessions(cwd?: string): Promise<Array<Record<string, unknown>>> {
@@ -3544,49 +3528,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			await advanceDeletion(questionPaths, deletionId, "broker_closed");
 
 			try {
-				const listing = await paginatedBrokerSessionList(workspace, { cwd: workspace });
-				const rows = jsonRecords(
-					Array.isArray((listing as Record<string, unknown>).sessions)
-						? ((listing as Record<string, unknown>).sessions as unknown[])
-						: [],
-				);
-				const candidates: Array<Record<string, unknown>> = [];
-				for (const row of rows) {
-					if (brokerSessionId(row) !== id) continue;
-					const declaredWorkspace = brokerSessionScope(row);
-					if (!declaredWorkspace) continue;
-					let canonicalDeclared: string;
-					try {
-						canonicalDeclared = await canonicalBrokerWorkspace(declaredWorkspace);
-					} catch {
-						continue;
-					}
-					if (sameCanonicalPath(canonicalDeclared, workspace, platform)) candidates.push(row);
-				}
-				if (candidates.length === 0) {
-					// No retained row: proven deletion (session_deleted) after successful close.
-				} else if (candidates.length !== 1) {
-					return { ok: false, reason: "close_failed", detail: "endpoint_stale", closed: false };
-				} else {
-					const row = candidates[0]!;
-					const gen = brokerEndpointGeneration(row);
-					const inc = brokerEndpointIncarnation(row, id);
-					const genMatches = gen === persistedGeneration;
-					const incMatches = inc === persistedIncarnation;
-					if (!genMatches || !incMatches) return { ok: false, reason: "endpoint_stale", closed: false };
-					const isAmbiguous = row.ambiguous === true;
-					const isTerminalUncertain =
-						row.terminalUncertain === true || (row as Record<string, unknown>).terminal_uncertain === true;
-					const isTerminal = row.terminal === true;
-					const isLive = row.live === true;
-					if (isAmbiguous || isTerminalUncertain)
-						return { ok: false, reason: "close_failed", detail: "endpoint_stale", closed: false };
-					if (!isTerminal || isLive) return { ok: false, reason: "endpoint_stale", closed: false };
-				}
+				await exactBrokerSessionAuthority(id, workspace);
+				return { ok: false, reason: "endpoint_stale", closed: false };
 			} catch (error) {
-				if (error instanceof SdkClientError)
-					return { ok: false, reason: "close_failed", detail: error.code, closed: false };
-				return { ok: false, reason: "close_failed", detail: "unavailable", closed: false };
+				if (!(error instanceof SdkClientError) || error.code !== "not_found")
+					return {
+						ok: false,
+						reason: "close_failed",
+						detail: error instanceof SdkClientError ? error.code : "unavailable",
+						closed: false,
+					};
 			}
 			await fs.rm(sessionFile(id), { force: true });
 			await fs.rm(sessionStateFile(namespaceDir, id), { force: true });
@@ -3820,12 +3771,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const existing = transaction.requests.prompts[keyDigest];
 			if (existing) {
 				if (existing.request_digest !== requestDigest) throw new Error("idempotency_conflict");
-				if (existing.phase === "uncertain") throw new Error("terminal_uncertain");
-				// The host deduplicates this key, so a post-send Router ambiguity may re-dispatch it to recover the receipt.
-				if (existing.phase === "remote_started") {
-					existing.updated_at = new Date().toISOString();
-					return;
-				}
+				if (existing.phase === "remote_started" || existing.phase === "uncertain")
+					throw new Error("terminal_uncertain");
+				return;
 			}
 			const now = new Date().toISOString();
 			transaction.requests.prompts[keyDigest] = {
@@ -4222,7 +4170,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
 						if (creation.request.phase === "completed" && creation.request.safe_response)
 							return creation.request.safe_response;
-						const binding = await exactBrokerSessionBinding(sessionId, cwd);
+						const binding = await exactBrokerSessionBinding(sessionId, cwd, idempotencyKey);
 						const session = normalizeSession({
 							session_id: sessionId,
 							cwd,
@@ -4607,7 +4555,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											message: "Coordinator session is bound to another workspace.",
 										},
 									};
-								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
+								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd, idempotencyKey);
 								if (
 									!sameCanonicalPath(
 										optionalString(existing.broker_workspace) ?? "",
@@ -4671,7 +4619,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									const createdCwd = await canonicalBrokerWorkspace(
 										optionalString(created.cwd) ?? canonicalCwd,
 									);
-									const binding = await exactBrokerSessionBinding(sessionId, createdCwd);
+									const binding = await exactBrokerSessionBinding(sessionId, createdCwd, idempotencyKey);
 									session = normalizeSession({
 										session_id: sessionId,
 										cwd: createdCwd,
@@ -4927,7 +4875,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							}
 							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
 							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
-							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
+							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd, idempotencyKey);
 							session = normalizeSession({
 								session_id: sessionId,
 								cwd: sessionCwd,
@@ -5008,7 +4956,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						return response;
 					},
 					true,
-					response => isUnobservedCompensation(response) || isRouterRequestAmbiguous(response),
+					isUnobservedCompensation,
 				);
 			}
 			if (name === "gjc_coordinator_activate_session") {
@@ -5107,7 +5055,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					 * `already` rather than publishing readiness twice.
 					 */
 					true,
-					response => isUnknownActivationOutcome(response) || isRouterRequestAmbiguous(response),
+					isUnknownActivationOutcome,
 				);
 			}
 			if (name === "gjc_coordinator_send_prompt") {
@@ -5197,7 +5145,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
 							};
 						}),
-					true,
 				);
 			}
 			if (name === "gjc_coordinator_read_turn") {
@@ -5746,9 +5693,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				},
 			};
 		}
-		if (request.method === "ping") {
-			return { jsonrpc: "2.0", id, result: {} };
-		}
 		if (request.method === "tools/list") {
 			return { jsonrpc: "2.0", id, result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(toolSchema) } };
 		}
@@ -5766,19 +5710,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown_method:${request.method}` } };
 	}
 
-	return {
-		config,
-		callTool,
-		handleJsonRpc,
-		handle: handleJsonRpc,
-		reapSession,
-		sessionReaper,
-		router,
-		close: async () => {
-			sessionReaper.stop();
-			await router.stop();
-		},
-	};
+	return { config, callTool, handleJsonRpc, handle: handleJsonRpc, reapSession, sessionReaper };
 }
 
 function legacyToolResult(payload: unknown): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
@@ -5819,15 +5751,11 @@ export async function handleCoordinatorMcpRequest(
 	const params = (request.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
 	const args = params.arguments ?? {};
 	const server = createCoordinatorMcpServer({ env: options.env ?? process.env });
-	try {
-		return {
-			jsonrpc: "2.0",
-			id: request.id ?? null,
-			result: legacyToolResult(await server.callTool(params.name ?? "", args)),
-		};
-	} finally {
-		await server.close();
-	}
+	return {
+		jsonrpc: "2.0",
+		id: request.id ?? null,
+		result: legacyToolResult(await server.callTool(params.name ?? "", args)),
+	};
 }
 
 export interface PumpCoordinatorOptions {
@@ -6051,6 +5979,6 @@ export async function runCoordinatorMcpStdio(options: CoordinatorMcpServerOption
 			},
 		);
 	} finally {
-		await server.close();
+		server.sessionReaper.stop();
 	}
 }

@@ -49,7 +49,6 @@ const CODING_AGENT_SHARD_ONE_COVERAGE_PATHS = [
 	"packages/coding-agent/src/coordinator-mcp/",
 	"packages/coding-agent/test/sdk-host-wiring.test.ts",
 	"packages/coding-agent/test/coordinator-mcp/send-prompt-concurrency.test.ts",
-	"packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts",
 ] as const;
 
 
@@ -64,7 +63,7 @@ const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-
 // not follow the source-file basename convention. They supplement, rather than
 // replace, direct-basename test selection and owner fallback tasks.
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
-	"packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
+	"artifacts/architecture-2383-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
@@ -240,10 +239,10 @@ export function planFullTasks(packages: readonly WorkspacePackage[]): Task[] {
 	const tasks = new Map<string, Task>();
 	addNativeBuild(tasks);
 	addWorkspaceTestTasks(tasks, packages);
-	add(tasks, "test:scripts/run-bun-test-files.test.ts", "Test fresh-process Bun harness", ["bun", "test", "scripts/run-bun-test-files.test.ts"]);
 	add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 	addRustTestTasks(tasks);
 	add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
+	addPythonTasks(tasks);
 	add(tasks, "runtime-check", "Runtime checks (needs native addon)", ["bun", "run", "check:runtime"], resolvePackageCwd("packages/coding-agent"));
 	// root-check (ci:check:full) is intentionally omitted: Main CI runs it in the
 	// dedicated native-free `check` job, so emitting it here would double-run it.
@@ -270,6 +269,11 @@ function addRustTestTasks(tasks: Map<string, Task>): void {
 }
 
 
+function addPythonTasks(tasks: Map<string, Task>): void {
+	add(tasks, "python-check", "Python SDK type check", ["bun", "run", "check:py-sdk"], undefined, { rust: false, nextest: false, nativeConsumer: false, nativeProducer: false }, "python");
+	add(tasks, "python-test", "Python SDK tests", ["bun", "run", "test:py-sdk"], undefined, { rust: false, nextest: false, nativeConsumer: true, nativeProducer: false }, "python");
+	add(tasks, "python-build-smoke", "Python SDK build smoke", ["bun", "run", "ci:test:py-sdk-build"], undefined, { rust: false, nextest: false, nativeConsumer: false, nativeProducer: false }, "python");
+}
 async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 	if (isForceFullMode()) return planFullTasks(await getWorkspacePackages());
 	const fromArtifact = await loadCanonicalPlan();
@@ -352,7 +356,7 @@ function taskNeedsNative(key: string): boolean {
 		key === "wrapper-version" ||
 		key === "deep-interview-definitions" ||
 		key === "deep-interview-runtime" ||
-		key === "sdk-package-smoke" ||
+		key === "bridge-client-sdk-package-smoke" ||
 		key.startsWith("test:")
 	);
 }
@@ -415,25 +419,20 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 	return paths.some(isDarwinArm64TabWorkerSmokePath);
 }
 
-// Paths whose Windows drive-letter vs Volume-GUID canonicalization, Bun
-// `node:fs` resident-cache write semantics, or session-index snapshot fsync
-// semantics the fix governs. On Ubuntu the windows-canonical-path regression
-// suite is skipped by `describe.skipIf`, so a Linux shard cannot verify those
-// fixes; dev-ci consumes this emitted flag to run and require the
-// windows-latest job whenever any of these change.
+// Paths whose Windows drive-letter vs Volume-GUID canonicalization and Bun
+// `node:fs` resident-cache write semantics the fix governs. On Ubuntu the
+// windows-canonical-path regression suite is skipped by `describe.skipIf`, so a
+// Linux shard cannot verify the ENOENT fix; dev-ci consumes this emitted flag to
+// run and require the windows-latest job whenever any of these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
-	return (
-		changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
+	return changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
 		changedPath === "packages/coding-agent/src/session/internal/managed-session-storage.ts" ||
 		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/session-directory.ts" ||
 		changedPath === "packages/coding-agent/src/session/session-manager.ts" ||
-		changedPath === "packages/coding-agent/src/sdk/broker/session-index.ts" ||
 		changedPath === "packages/coding-agent/test/session-manager/windows-canonical-path.test.ts" ||
 		changedPath === "packages/coding-agent/test/session/managed-lock-lease.windows.test.ts" ||
-		changedPath === "packages/coding-agent/test/sdk-session-directory.windows.test.ts" ||
-		changedPath === "packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts"
-	);
+		changedPath === "packages/coding-agent/test/sdk-session-directory.windows.test.ts";
 }
 
 export function needsWindowsSessionPathRegression(paths: readonly string[]): boolean {
@@ -777,10 +776,14 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	if (publishChanged) {
 		addReleasePublishTasks(tasks);
 	}
-	if (paths.some(isSdkPackageSmokePath)) {
-		add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
+	if (paths.some(isBridgeClientSdkPackageSmokePath)) {
+		add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
 	}
 
+	if (paths.some(isPythonPath)) {
+		addPythonTasks(tasks);
+		addNativeBuild(tasks);
+	}
 	if (rustChanged) {
 		add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 		add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
@@ -793,7 +796,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	}
 	if (paths.some(isWorkflowOrScriptPath)) {
 		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
-		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/run-bun-test-files.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
+		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
 		add(tasks, "workflow-permissions", "Workflow permission policy regression", ["bun", "test", "scripts/check-workflow-permissions.test.ts", "scripts/release-policy.test.ts"]);
 		if (paths.some(isWorkflowPath)) {
 			add(tasks, "workflow-yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
@@ -866,6 +869,10 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 			}
 			continue;
 		}
+		if (isPythonPath(changedPath)) {
+			addPythonTasks(tasks);
+			continue;
+		}
 		if (isInstallPath(changedPath)) {
 			add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
 			continue;
@@ -876,16 +883,16 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 				add(tasks, "wrapper-version", "Unscoped wrapper CLI version smoke", ["bun", "packages/gajae-code/bin/gjc.js", "--version"]);
 			}
 		}
-		if (isSdkPackageSmokePath(changedPath)) {
-			add(tasks, "sdk-package-smoke", "SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
-			const sdkClientOwner = owningPackage(changedPath, packages);
-			if (sdkClientOwner?.manifest.scripts?.check) {
+		if (isBridgeClientSdkPackageSmokePath(changedPath)) {
+			add(tasks, "bridge-client-sdk-package-smoke", "Bridge-client SDK package smoke", ["bun", "packages/coding-agent/scripts/build-sdk-package-smoke.ts"]);
+			const bridgeClientOwner = owningPackage(changedPath, packages);
+			if (bridgeClientOwner?.manifest.scripts?.check) {
 				add(
 					tasks,
-					`check:${sdkClientOwner.name}`,
-					`Check ${sdkClientOwner.name}`,
+					`check:${bridgeClientOwner.name}`,
+					`Check ${bridgeClientOwner.name}`,
 					packageScriptCommand("check"),
-					resolvePackageCwd(sdkClientOwner.dir),
+					resolvePackageCwd(bridgeClientOwner.dir),
 				);
 			}
 		}
@@ -932,7 +939,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
 	}
 	if (needCiSelftest) {
-		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/run-bun-test-files.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
+		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
 		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
 	}
 	if (needYamlParse) {
@@ -969,22 +976,6 @@ function addWorkspaceTestTasks(tasks: Map<string, Task>, packages: readonly Work
 }
 
 function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: WorkspacePackage): void {
-	if (workspacePackage.name === "@gajae-code/ai") {
-		add(
-			tasks,
-			`test:${workspacePackage.name}`,
-			`Test ${workspacePackage.name}`,
-			[
-				"bun",
-				"scripts/run-bun-test-files.ts",
-				"--root=packages/ai",
-				"--timeout=30000",
-				"--file-timeout=300000",
-				"--concurrency=1",
-			],
-		);
-		return;
-	}
 	if (workspacePackage.name !== "@gajae-code/coding-agent") {
 		add(tasks, `test:${workspacePackage.name}`, `Test ${workspacePackage.name}`, packageScriptCommand("test"), resolvePackageCwd(workspacePackage.dir));
 		return;
@@ -1002,15 +993,8 @@ function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total:
 		tasks,
 		`test:@gajae-code/coding-agent:shard-${shard}-of-${total}`,
 		`Test @gajae-code/coding-agent shard ${shard}/${total}`,
-		[
-			"bun",
-			"scripts/run-bun-test-files.ts",
-			"--root=packages/coding-agent",
-			`--shard=${shard}/${total}`,
-			"--timeout=30000",
-			"--file-timeout=300000",
-			"--concurrency=1",
-		],
+		["bun", "test", `--shard=${shard}/${total}`],
+		resolvePackageCwd("packages/coding-agent"),
 	);
 }
 
@@ -1019,7 +1003,13 @@ function addCodingAgentSdkProductionHostTask(tasks: Map<string, Task>): void {
 		tasks,
 		"test:@gajae-code/coding-agent:sdk-production-host-isolated",
 		"Test @gajae-code/coding-agent production SDK host in isolation",
-		["bun", "../../scripts/run-sdk-production-host-isolated.ts"],
+		[
+			"bun",
+			"test",
+			"test/sdk-chat-daemon-worker.test.ts",
+			"-t",
+			"routes Slack safe queries through the production Session SDK host",
+		],
 		resolvePackageCwd("packages/coding-agent"),
 	);
 }
@@ -1090,7 +1080,7 @@ function isTestFilePath(changedPath: string): boolean {
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
-	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/run-bun-test-files.ts" || changedPath === "scripts/run-bun-test-files.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts" || changedPath === "scripts/ci-risk-canary-manifest.ts" || changedPath === "scripts/ci-risk-canary-manifest.test.ts" || changedPath === "scripts/ci-virtual-integration.ts" || changedPath === "scripts/ci-virtual-integration.test.ts";
+	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts" || changedPath === "scripts/ci-risk-canary-manifest.ts" || changedPath === "scripts/ci-risk-canary-manifest.test.ts" || changedPath === "scripts/ci-virtual-integration.ts" || changedPath === "scripts/ci-virtual-integration.test.ts";
 }
 
 
@@ -1209,6 +1199,9 @@ function addReleasePublishTasks(tasks: Map<string, Task>): void {
 }
 
 
+function isPythonPath(changedPath: string): boolean {
+	return changedPath.startsWith("python/gjc-sdk/");
+}
 
 function isRustPath(changedPath: string): boolean {
 	const fileName = path.basename(changedPath);
@@ -1227,8 +1220,11 @@ function isCodingAgentRuntimePath(changedPath: string): boolean {
 	return changedPath.startsWith("packages/coding-agent/") || changedPath.startsWith("packages/agent/") || changedPath.startsWith("packages/ai/");
 }
 
-function isSdkPackageSmokePath(changedPath: string): boolean {
-	return changedPath.startsWith("packages/coding-agent/src/sdk/client/");
+function isBridgeClientSdkPackageSmokePath(changedPath: string): boolean {
+	return (
+		changedPath.startsWith("packages/bridge-client/") ||
+		changedPath.startsWith("packages/coding-agent/src/sdk/client/")
+	);
 }
 
 function isDeepInterviewOnly(paths: readonly string[]): boolean {
@@ -1484,8 +1480,6 @@ function isWorkflowHarnessPath(changedPath: string): boolean {
 		isWorkflowPath(changedPath) ||
 		changedPath === "scripts/ci-dev-affected.ts" ||
 		changedPath === "scripts/ci-dev-affected.test.ts" ||
-		changedPath === "scripts/run-bun-test-files.ts" ||
-		changedPath === "scripts/run-bun-test-files.test.ts" ||
 		changedPath === "scripts/dev-ci-guard-topology.test.ts" ||
 		changedPath === "scripts/check-workflow-yaml.ts" ||
 		changedPath === "scripts/check-workflow-permissions.ts" ||
@@ -1505,6 +1499,7 @@ function isReleasePublishPath(changedPath: string): boolean {
 	return (
 		changedPath === "scripts/ci-release-publish.ts" ||
 		changedPath === "scripts/release-evidence.ts" ||
+		changedPath.startsWith("packages/bridge-client/") ||
 		changedPath.startsWith("packages/gajae-code/") ||
 		changedPath.startsWith("packages/natives-") ||
 		changedPath === "packages/natives/package.json"

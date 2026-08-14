@@ -18,25 +18,9 @@ import {
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
 import type { AgentSession } from "../session/agent-session";
+
 import { parseThinkingLevel } from "../thinking";
 import type { TodoPhase } from "../tools/todo-write";
-
-const BROKER_LIFECYCLE_OPERATIONS = new Set([
-	"session.new",
-	"session.fork",
-	"session.resume",
-	"session.close",
-	"session.switch",
-	"session.branch",
-	"session.handoff",
-	"session.delete",
-]);
-
-function prohibitBrokerLifecycleOperation(operation: string): never {
-	throw Object.assign(new Error(`${operation} is available only through the Broker lifecycle service.`), {
-		code: "operation_prohibited",
-	});
-}
 
 /** Action name for an extension-originated send failure. */
 export type ExtensionSendAction = "extension_send" | "extension_send_user";
@@ -359,8 +343,57 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					case "retry.abort":
 						session.abortRetry();
 						return { aborted: true };
+					case "session.new":
+						return { created: await session.newSession() };
+					case "session.fork":
+						return { session: await session.fork() };
+					case "session.resume":
+						return { resumed: await session.switchSession(String(input.id)) };
+					case "session.close":
+						await session.sessionManager.flush();
+						return { closed: true };
+					case "session.switch":
+						return { switched: await session.switchSession(String(input.id)) };
+					case "session.branch":
+						try {
+							return await session.branch(String(input.entryId));
+						} catch (error) {
+							throw Object.assign(
+								new Error(error instanceof Error ? error.message : "Branch entry was not found."),
+								{ code: "resource_gone" },
+							);
+						}
 					case "session.rename":
 						return { renamed: await session.setSessionName(String(input.name), "user") };
+					case "session.handoff":
+						try {
+							return {
+								handoff: await session.handoff(
+									typeof input.target === "string"
+										? input.target
+										: typeof input.instructions === "string"
+											? input.instructions
+											: undefined,
+								),
+							};
+						} catch (error) {
+							const typed = error as { code?: unknown; handoffDocument?: unknown };
+							const handoffDocument =
+								typeof typed?.handoffDocument === "string"
+									? { handoffDocument: typed.handoffDocument }
+									: undefined;
+							// Preserve a safe typed code (e.g. transient `busy`) so clients keep
+							// correct retry/backoff semantics; only synthesize invalid_request for
+							// otherwise-untyped failures.
+							const code = typed?.code === "busy" ? "busy" : "invalid_request";
+							throw Object.assign(
+								new Error(
+									error instanceof Error ? error.message : "Handoff is unavailable for the current state.",
+								),
+								{ code },
+								handoffDocument,
+							);
+						}
 					case "session.export_html":
 						try {
 							return {
@@ -434,11 +467,13 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						}
 						return { changed: true, enabled: on };
 					}
+					case "session.delete":
+						await session.sessionManager.dropSession(String(input.id));
+						return { deleted: true };
 					case "session.cwd.move":
 						await session.sessionManager.moveTo(String(input.path));
 						return { moved: true, cwd: session.sessionManager.getCwd() };
 					default:
-						if (BROKER_LIFECYCLE_OPERATIONS.has(operation)) prohibitBrokerLifecycleOperation(operation);
 						throw Object.assign(new Error(`${operation} has no AgentSession implementation.`), {
 							code: "unavailable",
 						});
@@ -449,13 +484,25 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			getContextUsage: () => session.getContextUsage(),
 			waitForIdle: () => session.agent.waitForIdle(),
-			newSession: async () => prohibitBrokerLifecycleOperation("session.new"),
-			branch: async () => prohibitBrokerLifecycleOperation("session.branch"),
+			newSession: async newOptions => {
+				const success = await session.newSession({ parentSession: newOptions?.parentSession });
+				if (success && newOptions?.setup) {
+					await newOptions.setup(session.sessionManager);
+				}
+				return { cancelled: !success };
+			},
+			branch: async entryId => {
+				const result = await session.branch(entryId);
+				return { cancelled: result.cancelled };
+			},
 			navigateTree: async (targetId, navOptions) => {
 				const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
 				return { cancelled: result.cancelled };
 			},
-			switchSession: async () => prohibitBrokerLifecycleOperation("session.switch"),
+			switchSession: async sessionPath => {
+				const success = await session.switchSession(sessionPath);
+				return { cancelled: !success };
+			},
 			reload: async () => {
 				await session.reload();
 			},

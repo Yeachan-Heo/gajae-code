@@ -28,6 +28,7 @@ export interface ConversationStoreFs {
 	readFile(file: string, encoding: "utf8"): Promise<string>;
 	writeFile(file: string, data: string, options: { mode: number }): Promise<void>;
 	rename(from: string, to: string): Promise<void>;
+	link(from: string, to: string): Promise<void>;
 	unlink(file: string): Promise<void>;
 	open(file: string, flags: string): Promise<ConversationStoreFileHandle>;
 	stat?(file: string): Promise<{ mtimeMs: number }>;
@@ -46,11 +47,22 @@ export class ConversationLockTimeoutError extends Error {
 interface ConversationStoreLock {
 	pid: number;
 	incarnation: string;
+	isolateId?: string;
 	timestamp: number;
+	/** Uniquely identifies one acquire; lets a release prove it owns the lock file. */
+	nonce?: string;
 }
 
 const nodeFs: ConversationStoreFs = fs;
-const UNPUBLISHED_LOCK_STALE_MS = 30_000;
+/** Unique to this module evaluation, including one Bun worker isolate. */
+const processIsolateId = randomUUID();
+
+/**
+ * Lock files this process currently holds or is acquiring, across every store.
+ * The token lets a releasing predecessor preserve a successor's marker when
+ * the same path has already been reacquired.
+ */
+const heldLockFiles = new Map<string, Set<string>>();
 
 export function conversationStorePath(agentDir: string, kind: string, fileName = "conversations.json"): string {
 	return path.join(agentDir, "sdk", "daemons", kind, fileName);
@@ -214,50 +226,110 @@ export class ConversationStore<T extends ConversationRecord> {
 		const tail = previous.then(() => gate.promise);
 		this.#locks.set(this.#file, tail);
 		await previous;
+		const lockFile = `${this.#file}.lock`;
 		let fileLock: ConversationStoreFileHandle | undefined;
+		let lockToken: ConversationStoreLock | undefined;
 		try {
-			fileLock = await this.#acquireFileLock();
+			const acquired = await this.#acquireFileLock();
+			fileLock = acquired.handle;
+			lockToken = acquired.lock;
 			return await operation();
 		} finally {
 			try {
-				await closeConversationStoreFileLock(fileLock);
-				if (fileLock)
-					await this.#fs.unlink(`${this.#file}.lock`).catch(error => {
-						if (!isMissing(error)) throw error;
-					});
+				// A failed close must never skip the unlink: that would leak a
+				// well-formed lock whose pid is still alive and block every later
+				// waiter for the full timeout. The unlink is ownership-checked so
+				// it can only ever remove the lock this holder wrote.
+				if (fileLock) await fileLock.close().catch(() => undefined);
+				if (fileLock && lockToken) await this.#unlinkOwnedLock(lockFile, lockToken);
 			} finally {
+				if (lockToken) this.#releaseHeldLock(lockFile, lockToken);
 				gate.resolve();
 				if (this.#locks.get(this.#file) === tail) this.#locks.delete(this.#file);
 			}
 		}
 	}
 
-	async #acquireFileLock(): Promise<ConversationStoreFileHandle> {
+	#releaseHeldLock(lockFile: string, lock: ConversationStoreLock): void {
+		const tokens = heldLockFiles.get(lockFile);
+		if (!tokens) return;
+		tokens.delete(lock.nonce!);
+		if (tokens.size === 0) heldLockFiles.delete(lockFile);
+	}
+
+	async #unlinkOwnedLock(lockFile: string, expected: ConversationStoreLock): Promise<boolean> {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await this.#fs.readFile(lockFile, "utf8"));
+		} catch (error) {
+			if (isMissing(error)) return false;
+			return false; // unreadable: never remove a lock we cannot identify
+		}
+		if (
+			!isConversationStoreLock(parsed) ||
+			parsed.pid !== expected.pid ||
+			parsed.incarnation !== expected.incarnation ||
+			parsed.isolateId !== expected.isolateId ||
+			parsed.timestamp !== expected.timestamp ||
+			parsed.nonce !== expected.nonce
+		)
+			return false; // a successor holds the path now; leave it
+		try {
+			await this.#fs.unlink(lockFile);
+			return true;
+		} catch (error) {
+			if (isMissing(error)) return false;
+			throw error;
+		}
+	}
+
+	async #acquireFileLock(): Promise<{ handle: ConversationStoreFileHandle; lock: ConversationStoreLock }> {
 		const lockFile = `${this.#file}.lock`;
 		const deadline = Date.now() + this.#lockTimeoutMs;
 		await this.#fs.mkdir(this.#directory, { recursive: true, mode: 0o700 });
 		for (;;) {
 			try {
-				const handle = await this.#fs.open(lockFile, "wx");
-				try {
-					const lock: ConversationStoreLock = {
-						pid: this.#pid,
-						incarnation: this.#pidIncarnation(this.#pid) ?? "unavailable",
-						timestamp: this.#clock(),
-					};
-					await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
-					await handle.sync();
-					return handle;
-				} catch (error) {
-					await handle.close().catch(() => undefined);
-					await this.#fs.unlink(lockFile).catch(() => undefined);
-					throw error;
-				}
+				return await this.#createLockFile(lockFile);
 			} catch (error) {
 				if (!isAlreadyExists(error)) throw error;
 				if (await this.#reclaimStaleLock(lockFile)) continue;
+				if (await this.#reclaimSameProcessLeak(lockFile)) continue;
 				if (Date.now() >= deadline) throw new ConversationLockTimeoutError(lockFile, this.#lockTimeoutMs);
 				await this.#sleep(Math.min(10, Math.max(1, deadline - Date.now())));
+			}
+		}
+	}
+
+	/**
+	 * Removes a well-formed lock this process wrote but no longer holds. Healing
+	 * is serialized by its own ownership-tracked reclaim lock, so concurrent
+	 * waiters cannot delete a successor after the original leak is removed.
+	 */
+	async #reclaimSameProcessLeak(lockFile: string): Promise<boolean> {
+		const expected = await this.#readLock(lockFile);
+		if (
+			!expected ||
+			expected.pid !== this.#pid ||
+			expected.isolateId !== processIsolateId ||
+			heldLockFiles.has(lockFile)
+		)
+			return false;
+
+		const reclaimFile = `${lockFile}.reclaim`;
+		const reclaimLock = await this.#acquireReclaimLock(reclaimFile);
+		if (!reclaimLock) return false;
+		try {
+			if (expected.pid !== this.#pid || expected.isolateId !== processIsolateId || heldLockFiles.has(lockFile))
+				return false;
+			return await this.#unlinkOwnedLock(lockFile, expected);
+		} catch {
+			return false;
+		} finally {
+			await reclaimLock.handle.close().catch(() => undefined);
+			try {
+				await this.#unlinkOwnedLock(reclaimFile, reclaimLock.lock).catch(() => undefined);
+			} finally {
+				this.#releaseHeldLock(reclaimFile, reclaimLock.lock);
 			}
 		}
 	}
@@ -268,54 +340,106 @@ export class ConversationStore<T extends ConversationRecord> {
 		const reclaimLock = await this.#acquireReclaimLock(reclaimFile);
 		if (!reclaimLock) return false;
 		try {
-			if (!(await this.#isStaleLock(lockFile))) return false;
-			await this.#fs.unlink(lockFile).catch(() => undefined);
-			return true;
+			const staleLock = await this.#readLock(lockFile);
+			if (!staleLock || !(await this.#isStaleLock(lockFile))) return false;
+			return await this.#unlinkOwnedLock(lockFile, staleLock);
+		} catch {
+			return false;
 		} finally {
-			await reclaimLock.close().catch(() => undefined);
-			await this.#fs.unlink(reclaimFile).catch(() => undefined);
-		}
-	}
-	async #acquireReclaimLock(reclaimFile: string): Promise<ConversationStoreFileHandle | undefined> {
-		try {
-			return await this.#createLockFile(reclaimFile);
-		} catch (error) {
-			if (!isAlreadyExists(error) || !(await this.#isStaleLock(reclaimFile))) return undefined;
-			await this.#fs.unlink(reclaimFile).catch(() => undefined);
+			await reclaimLock.handle.close().catch(() => undefined);
 			try {
-				return await this.#createLockFile(reclaimFile);
-			} catch (retryError) {
-				if (isAlreadyExists(retryError)) return undefined;
-				throw retryError;
+				await this.#unlinkOwnedLock(reclaimFile, reclaimLock.lock).catch(() => undefined);
+			} finally {
+				this.#releaseHeldLock(reclaimFile, reclaimLock.lock);
 			}
 		}
 	}
-	async #createLockFile(lockFile: string): Promise<ConversationStoreFileHandle> {
-		const handle = await this.#fs.open(lockFile, "wx");
+
+	async #acquireReclaimLock(
+		reclaimFile: string,
+	): Promise<{ handle: ConversationStoreFileHandle; lock: ConversationStoreLock } | undefined> {
 		try {
-			const lock: ConversationStoreLock = {
+			return await this.#createLockFile(reclaimFile);
+		} catch (error) {
+			if (!isAlreadyExists(error)) return undefined;
+			if (await this.#reclaimStaleLock(reclaimFile)) {
+				try {
+					return await this.#createLockFile(reclaimFile);
+				} catch (retryError) {
+					if (isAlreadyExists(retryError)) return undefined;
+					throw retryError;
+				}
+			}
+			if (await this.#reclaimSameProcessLeak(reclaimFile)) {
+				try {
+					return await this.#createLockFile(reclaimFile);
+				} catch (retryError) {
+					if (isAlreadyExists(retryError)) return undefined;
+					throw retryError;
+				}
+			}
+			return undefined;
+		}
+	}
+
+	async #createLockFile(
+		lockFile: string,
+	): Promise<{ handle: ConversationStoreFileHandle; lock: ConversationStoreLock }> {
+		const pendingFile = `${lockFile}.${this.#pid}.${randomUUID()}.pending`;
+		const handle = await this.#fs.open(pendingFile, "wx");
+		let lock: ConversationStoreLock | undefined;
+		let published = false;
+		try {
+			lock = {
 				pid: this.#pid,
 				incarnation: this.#pidIncarnation(this.#pid) ?? "unavailable",
+				isolateId: processIsolateId,
 				timestamp: this.#clock(),
+				nonce: randomUUID(),
 			};
+			const heldTokens = heldLockFiles.get(lockFile) ?? new Set<string>();
+			heldTokens.add(lock.nonce!);
+			heldLockFiles.set(lockFile, heldTokens);
 			await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
 			await handle.sync();
-			return handle;
+			await this.#fs.link(pendingFile, lockFile);
+			published = true;
+			await this.#fs.unlink(pendingFile);
+			return { handle, lock };
 		} catch (error) {
-			await handle.close().catch(() => undefined);
-			await this.#fs.unlink(lockFile).catch(() => undefined);
+			try {
+				await handle.close().catch(() => undefined);
+				try {
+					if (published && lock) await this.#unlinkOwnedLock(lockFile, lock);
+				} finally {
+					await this.#fs.unlink(pendingFile).catch(() => undefined);
+				}
+			} finally {
+				if (lock) this.#releaseHeldLock(lockFile, lock);
+			}
 			throw error;
 		}
 	}
+
+	async #readLock(lockFile: string): Promise<ConversationStoreLock | undefined> {
+		try {
+			const parsed: unknown = JSON.parse(await this.#fs.readFile(lockFile, "utf8"));
+			return isConversationStoreLock(parsed) ? parsed : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	async #isStaleLock(lockFile: string): Promise<boolean> {
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(await this.#fs.readFile(lockFile, "utf8"));
-		} catch (error) {
-			if (isMissing(error)) return true;
-			return await this.#isExpiredUnpublishedLock(lockFile);
+		} catch {
+			// An unreadable legacy marker may still have an open creator. It is
+			// never safe to reclaim it based on age alone.
+			return false;
 		}
-		if (!isConversationStoreLock(parsed)) return await this.#isExpiredUnpublishedLock(lockFile);
+		if (!isConversationStoreLock(parsed)) return false;
 		const currentIncarnation = this.#pidIncarnation(parsed.pid);
 		return (
 			!this.#pidAlive(parsed.pid) ||
@@ -323,10 +447,6 @@ export class ConversationStore<T extends ConversationRecord> {
 				(!isProcessIncarnation(parsed.incarnation) ||
 					(currentIncarnation !== undefined && currentIncarnation !== parsed.incarnation)))
 		);
-	}
-	async #isExpiredUnpublishedLock(lockFile: string): Promise<boolean> {
-		const stat = this.#fs.stat ? await this.#fs.stat(lockFile).catch(() => undefined) : undefined;
-		return Boolean(stat && this.#clock() - stat.mtimeMs >= UNPUBLISHED_LOCK_STALE_MS);
 	}
 
 	async #readDocument(): Promise<ConversationStoreDocument<T>> {
@@ -366,15 +486,6 @@ export class ConversationStore<T extends ConversationRecord> {
 
 function isMissing(error: unknown): error is NodeJS.ErrnoException {
 	return isRecord(error) && error.code === "ENOENT";
-}
-
-async function closeConversationStoreFileLock(handle: ConversationStoreFileHandle | undefined): Promise<void> {
-	if (!handle) return;
-	// A failed close must never skip the unlink: that would leak a well-formed
-	// lock whose pid is still alive and block every later waiter. The unlink is
-	// ownership-checked by the pending-file model so it can only ever remove the
-	// lock this holder wrote, making a best-effort close safe.
-	await handle.close().catch(() => undefined);
 }
 
 async function syncParentDirectory(
@@ -433,6 +544,7 @@ function isConversationStoreLock(value: unknown): value is ConversationStoreLock
 		Number.isSafeInteger(value.pid) &&
 		value.pid > 0 &&
 		typeof value.incarnation === "string" &&
+		(value.isolateId === undefined || typeof value.isolateId === "string") &&
 		typeof value.timestamp === "number"
 	);
 }

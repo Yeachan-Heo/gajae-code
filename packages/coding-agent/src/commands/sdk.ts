@@ -8,7 +8,6 @@ import type { Args as ParsedArgs } from "../cli/args";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
-import { initTheme } from "../modes/theme/theme";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
@@ -511,12 +510,6 @@ export async function runSessionHost(
 			throw await registrationFailure(error);
 		}
 
-		try {
-			await initTheme(false);
-		} catch (error) {
-			throw await registrationFailure(error);
-		}
-
 		// The longer MCP startup ceiling is scoped to ACP lifecycle launches only:
 		// it applies when this request actually carried `mcpServers`. Ordinary
 		// CLI/SDK `mcpConfigPath` consumers keep the manager's short default.
@@ -525,8 +518,8 @@ export async function runSessionHost(
 		// Inside it, the throw would be caught, reclassified as
 		// `registration`/`failed`, and written a second time, losing the
 		// `startup`/`pending` outcome the readiness cutoff is supposed to report.
-		// Session-manager open, MCP config write, and theme initialization already
-		// consumed part of the budget, so re-read the clock here.
+		// Session-manager open and MCP config write already consumed part of the
+		// budget, so re-read the clock here rather than reusing the earlier check.
 		let mcpStartupTimeoutMs: number | undefined;
 		if (mcpConfigPath !== undefined) {
 			const remaining = request.semanticReadyDeadlineAt - now() - ACP_MCP_STARTUP_HEADROOM_MS;
@@ -613,43 +606,9 @@ export async function runSessionHost(
 		})();
 		return failureRollback;
 	};
-	const sessionEndpointPath = path.join(request.stateRoot, "sdk", `${request.sessionId}.json`);
-	const exitAfterSessionDisposal = async (): Promise<void> => {
-		await disposeSession();
-		let failure: SdkStartupFailure | undefined;
-		try {
-			const endpoint = JSON.parse(await fs.readFile(sessionEndpointPath, "utf8")) as {
-				pid?: unknown;
-				sessionId?: unknown;
-			};
-			if (endpoint.pid === process.pid && endpoint.sessionId === request.sessionId)
-				failure = {
-					phase: "startup",
-					reason: "failed",
-					message: `SDK host endpoint remained after graceful shutdown: ${request.sessionId}`,
-				};
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-				failure = {
-					phase: "startup",
-					reason: "failed",
-					message: `SDK host endpoint cleanup could not be verified: ${request.sessionId}`,
-				};
-			}
-		}
-		if (failure) {
-			process.exitCode = 1;
-			process.stderr.write(`${failure.message}\n`);
-			await writeFailure(failure, rollback.result).catch(() => {});
-		}
-		process.exit(process.exitCode ?? 0);
-	};
-	let stopping = false;
 	const stop = () => {
 		if (capability.result?.status === "started") {
-			if (stopping) return;
-			stopping = true;
-			void exitAfterSessionDisposal();
+			void disposeSession().finally(() => process.exit(0));
 			return;
 		}
 		const failure = capability.normalizeFailure("startup", "failed", "SDK lifecycle host terminated.");
@@ -774,45 +733,50 @@ class SdkServeHelp extends Command {
 
 class SdkSessionHelp extends Command {
 	static description =
-		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound and credential-free.";
+		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail|elevate`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound, credential-free by default, and elevation approval requires an attended operator.";
 	static args = {
 		verb: Args.string({
 			description: "Session verb",
 			required: false,
-			options: ["list", "inspect", "send", "status", "tail", "raw"],
+			options: ["list", "inspect", "send", "status", "tail", "elevate", "raw"],
 		}),
 		target: Args.string({
 			description: "Session id (or the raw kind control|query|global for `raw`)",
 			required: false,
 		}),
-		opRef: Args.string({
-			description: "Operation reference for status, or session id for raw control/query",
-			required: false,
-		}),
+		opRef: Args.string({ description: "Operation reference to report on (status only)", required: false }),
 	};
 	static flags = {
 		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
+		json: Flags.boolean({ description: "Emit JSON output (default for SDK session commands)" }),
 		repo: Flags.string({
 			description: "Workspace directory for saved-session resolution (default: current directory)",
 		}),
 		op: Flags.string({ description: "Raw control or global operation" }),
 		query: Flags.string({ description: "Raw query name" }),
+		kind: Flags.string({ description: "Elevation operation kind (control|global)", options: ["control", "global"] }),
 		"json-input": Flags.string({ description: "SDK request JSON object" }),
 		"json-input-file": Flags.string({ description: "Read SDK request JSON from a 0600 file" }),
 		"json-input-stdin": Flags.boolean({ description: "Read SDK request JSON from standard input" }),
 		"idempotency-key": Flags.string({ description: "Caller idempotency key required for SDK lifecycle globals" }),
+		"elevation-request-id": Flags.string({ description: "Approved elevation grant id for allowlisted raw controls" }),
 		confirm: Flags.boolean({ description: "Confirm a destructive SDK control operation" }),
 		cursor: Flags.string({
-			description: "Raw query continuation cursor, or a saved checkpoint token to resume tail from",
+			description:
+				"Raw query continuation cursor, or a saved checkpoint token to resume tail from (re-minted per connection)",
 		}),
+		"show-endpoint-credential": Flags.boolean({ description: "Allow session.get_endpoint secret output" }),
+		yes: Flags.boolean({ description: "Confirm endpoint credential output on a TTY" }),
 		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),
 		"op-ref": Flags.string({ description: "Operation reference for send (defaults to a generated ULID)" }),
 		wait: Flags.boolean({
-			description: "send --wait: poll turn.result with kind=prompt until terminal or the wait window elapses",
+			description: "send --wait: poll turn.prompt_status until terminal or the wait window elapses (never cancels)",
 		}),
 		"timeout-ms": Flags.string({ description: "Wait window for send --wait, status, and live tail follow" }),
-		strict: Flags.boolean({ description: "tail --strict: fail closed on retention gaps" }),
-		"until-idle": Flags.boolean({ description: "tail --until-idle: exit after an observed terminal turn state" }),
+		strict: Flags.boolean({ description: "tail --strict: fail closed (exit 1 retention_gap) on retention gaps" }),
+		"until-idle": Flags.boolean({
+			description: "tail --until-idle: exit once the observed event stream reaches a terminal turn state",
+		}),
 		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
 	};
 	async run(): Promise<void> {}
@@ -827,6 +791,7 @@ class SdkSessionCommand extends Command {
 		const verb = args.verb;
 		const target = args.target;
 		const flagRec = flags as Record<string, unknown>;
+		const timeoutMs = parsePositiveTimeout(flagRec["timeout-ms"] as string | undefined, "--timeout-ms");
 		await runSdkSessionCli({
 			action: verb,
 			...(verb === "raw"
@@ -844,9 +809,13 @@ class SdkSessionCommand extends Command {
 			jsonInputStdin: Boolean(flagRec["json-input-stdin"]),
 			confirm: Boolean(flagRec.confirm),
 			idempotencyKey: flagRec["idempotency-key"] as string | undefined,
+			elevationRequestId: flagRec["elevation-request-id"] as string | undefined,
+			operationKind: flagRec.kind as "control" | "global" | undefined,
 			cursor: flagRec.cursor as string | undefined,
+			showEndpointCredential: Boolean(flagRec["show-endpoint-credential"]),
+			yes: Boolean(flagRec.yes),
 			wait: Boolean(flagRec.wait),
-			timeoutMs: parsePositiveTimeout(flagRec["timeout-ms"] as string | undefined, "--timeout-ms"),
+			timeoutMs,
 			strict: Boolean(flagRec.strict),
 			untilIdle: Boolean(flagRec["until-idle"]),
 			allEvents: Boolean(flagRec["all-events"]),
@@ -863,7 +832,7 @@ class SdkGuidesHelp extends Command {
 		guideId: Args.string({ required: false, description: "Guide id for show" }),
 	};
 	static flags = {
-		"agent-dir": Flags.string({ description: "SDK state directory for the verified guide cache" }),
+		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
 		url: Flags.string({ description: "HTTPS allowlisted manifest URL for refresh" }),
 		"timeout-ms": Flags.string({ description: "Bounded refresh timeout in milliseconds" }),
 	};
@@ -917,11 +886,13 @@ export default class Sdk extends Command {
 			return;
 		}
 		if (action === "session") {
-			await new SdkSessionCommand(this.argv.slice(1), this.config).run();
+			const instance = new SdkSessionCommand(this.argv.slice(1), this.config);
+			await instance.run();
 			return;
 		}
 		if (action === "guides") {
-			await new SdkGuidesCommand(this.argv.slice(1), this.config).run();
+			const instance = new SdkGuidesCommand(this.argv.slice(1), this.config);
+			await instance.run();
 			return;
 		}
 		if (action === "serve") {
@@ -946,26 +917,22 @@ export default class Sdk extends Command {
 		try {
 			await broker.start();
 		} catch (error) {
-			// This process spawns detached with stdio ignored (see ensure.ts), so the
-			// durable marker is the only channel the caller has to see why start()
-			// failed instead of a bare exit code (#3963).
+			// Surface why this detached broker failed before discovery: the caller
+			// spawns with stdio ignored, so the durable marker is the only channel.
 			await writeBrokerStartupFailureMarker(agentDir, {
 				reason: error instanceof Error ? error.message : String(error),
 				exitCode: 1,
 				signal: null,
-				pid: process.pid,
 			});
 			throw error;
 		}
 		if (!broker.ownsDiscovery) {
 			// Another broker owns discovery; this process exits cleanly (code 0) as
-			// the race loser. Record why so a caller polling for a winner that never
-			// appears can diagnose the loss instead of seeing only a bare exit 0.
+			// the race loser. Record why so the caller can diagnose a missing winner.
 			await writeBrokerStartupFailureMarker(agentDir, {
 				reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
 				exitCode: 0,
 				signal: null,
-				pid: process.pid,
 			});
 			return;
 		}

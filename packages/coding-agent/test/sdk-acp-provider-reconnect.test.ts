@@ -1,122 +1,98 @@
 import { expect, test } from "bun:test";
 import { AcpSdkAdapter } from "../src/sdk/acp";
-import type { SessionAttachment } from "../src/sdk/router";
+import { SdkClient } from "../src/sdk/client";
 
-const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
+const waitFor = async <T>(read: () => T | undefined, label: string): Promise<T> => {
 	const deadline = Date.now() + 2_000;
 	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await Bun.sleep(5);
+		const value = read();
+		if (value !== undefined) return value;
+		await Bun.sleep(10);
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 };
 
-test("ACP provider activation retries the current Router attachment after rotation during registration", async () => {
-	let currentGeneration = 1;
-	const firstRegistration = Promise.withResolvers<Record<string, unknown>>();
-	const registrations: Array<{
-		frame: Record<string, unknown>;
-		generation: number | undefined;
-		attachment: SessionAttachment | undefined;
-	}> = [];
-	const router = {
-		request: async (
-			_sessionId: string,
-			frame: Record<string, unknown>,
-			generation?: number,
-			attachment?: SessionAttachment,
-		) => {
-			registrations.push({ frame, generation, attachment });
-			if (registrations.length === 1) return await firstRegistration.promise;
-			return {
-				ok: true,
-				result: { leaseId: typeof frame.expectedLeaseId === "string" ? frame.expectedLeaseId : "lease-1" },
-			};
-		},
-	};
-	const attachment = (generation: number): SessionAttachment => ({
-		authorityId: `session-1:${generation}`,
-		sessionId: "session-1",
-		generation,
-		isCurrent: () => currentGeneration === generation,
-		send: async () => {},
-	});
-	const firstAttachment = attachment(1);
-	const secondAttachment = attachment(2);
-	const adapter = new AcpSdkAdapter({
-		router: router as never,
-		attachment: firstAttachment,
-		sessionId: firstAttachment.sessionId,
-		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
-	});
-	const start = adapter.start();
-	try {
-		await waitFor(() => registrations.length === 1, "initial provider registration");
-		currentGeneration = 2;
-		adapter.acceptAttachment(secondAttachment);
-		firstRegistration.resolve({ ok: true, result: { leaseId: "lease-1" } });
-		await start;
-		await waitFor(() => registrations.length === 2, "provider registration on rotated attachment");
-		expect(registrations[0]).toMatchObject({ generation: 1, attachment: firstAttachment });
-		expect(registrations[1]).toMatchObject({
-			generation: 2,
-			attachment: secondAttachment,
-			frame: { type: "register_provider", capability: "ui" },
-		});
-	} finally {
-		await adapter.close();
-	}
-});
+test("ACP provider reconnects after a server-side heartbeat disconnect, awaits hello, and reclaims its lease", async () => {
+	let server!: ReturnType<typeof Bun.serve>;
 
-test("ACP provider readiness renews leases on the same attachment after transport reconnect", async () => {
+	let port = 0;
+	let connection = 0;
+	let closeOnHeartbeat = false;
 	const registrations: Record<string, unknown>[] = [];
-	const attachment: SessionAttachment = {
-		authorityId: "session-1:stable",
-		sessionId: "session-1",
-		generation: 1,
-		isCurrent: () => true,
-		send: async () => {},
-	};
-	const adapter = new AcpSdkAdapter({
-		router: {
-			request: async (_sessionId: string, frame: Record<string, unknown>) => {
-				registrations.push(frame);
-				return { ok: true, result: { leaseId: "lease-1" } };
+	const start = () => {
+		server = Bun.serve({
+			hostname: "127.0.0.1",
+			port,
+			fetch(request) {
+				if (!server.upgrade(request, { data: undefined })) return new Response("Upgrade failed", { status: 400 });
 			},
-		} as never,
-		attachment,
-		sessionId: attachment.sessionId,
+			websocket: {
+				open(socket) {
+					socket.send(JSON.stringify({ type: "hello", connectionId: `connection-${++connection}` }));
+				},
+				message(socket, raw) {
+					const frame = JSON.parse(String(raw)) as Record<string, unknown>;
+					if (frame.type === "register_provider") {
+						registrations.push(frame);
+						socket.send(
+							JSON.stringify({ type: "register_provider_result", id: frame.id, leaseId: "stable-lease" }),
+						);
+					}
+					if (frame.type === "provider_heartbeat" && closeOnHeartbeat) {
+						closeOnHeartbeat = false;
+						server.stop(true);
+						start();
+					}
+				},
+			},
+		});
+		port = server.port ?? port;
+	};
+	start();
+	const adapter = new AcpSdkAdapter({
+		url: `ws://127.0.0.1:${port}`,
+		token: "token",
 		providers: [{ capability: "ui", definitions: [{ name: "select" }] }],
+		heartbeatMs: 10,
 	});
 	try {
 		await adapter.start();
-		expect(registrations).toHaveLength(1);
-		await adapter.attachmentReady(attachment);
-		expect(registrations).toHaveLength(2);
-		expect(registrations[1]).toMatchObject({
-			type: "register_provider",
-			capability: "ui",
-			expectedLeaseId: "lease-1",
-		});
+		const firstConnectionId = adapter.connectionId;
+		expect(adapter.leaseIds.get("ui")).toBe("stable-lease");
+		closeOnHeartbeat = true;
+		await waitFor(
+			() =>
+				adapter.connectionId !== firstConnectionId && registrations.length === 2 ? adapter.connectionId : undefined,
+			"hello-gated reconnect and lease reclaim",
+		);
+		expect(registrations[1]).toMatchObject({ expectedLeaseId: "stable-lease", connectionId: adapter.connectionId });
 	} finally {
 		await adapter.close();
+		server.stop(true);
 	}
 });
 
-test("Broker lifecycle client cannot activate per-session providers", async () => {
-	const client = {
-		connectionId: "broker-connection",
-		onFrame: () => () => {},
-		onReconnect: () => () => {},
-		onReconnectFailed: () => () => {},
-		connect: async () => {},
-		global: async () => ({ ok: true }),
-		close: async () => {},
-	};
+// The ACP reconnect budget deliberately outlives the host heartbeat TTL (#4012),
+// so exhausting the production budget against a dead endpoint burns tens of
+// seconds of real backoff. Inject a one-shot client so this stays an assertion
+// about the typed rejection; the budget itself is asserted from its constants in
+// acp-session-reconnect.test.ts.
+test("ACP reconnect exhaustion is observable as a typed rejection", async () => {
+	// The ACP session reconnect budget (ACP_SESSION_RECONNECT) deliberately
+	// outlives the host heartbeat TTL — 23 attempts with backoff up to 2s, ~40s
+	// total. That budget is exercised under a fake clock in
+	// acp-session-reconnect.test.ts; here, inject a bounded client so the
+	// adapter's typed-rejection propagation is still asserted without a 40s
+	// real-time wait in CI.
 	const adapter = new AcpSdkAdapter({
-		client: client as never,
+		url: "ws://127.0.0.1:1",
+		token: "token",
 		providers: [{ capability: "ui", definitions: [] }],
+		client: new SdkClient("ws://127.0.0.1:1", "token", {
+			reconnectAttempts: 1,
+			reconnectBackoffMs: 1,
+			reconnectMaxBackoffMs: 1,
+		}),
 	});
-	await expect(adapter.start()).rejects.toMatchObject({ code: "operation_prohibited" });
-	await adapter.close();
+	await expect(adapter.start()).rejects.toMatchObject({ code: "reconnect_exhausted" });
 });

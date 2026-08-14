@@ -1,9 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
-import { SdkClient } from "../src/sdk/client";
+import { listSdkSessionEndpoints, SdkClient } from "../src/sdk/client";
 import { listManagedSessionCandidates } from "../src/sdk/session-directory";
 import {
 	createLifecycleFixture,
@@ -44,7 +43,7 @@ async function expectRetainedAuthorityDeleteSucceeded(
 	sessionId: string,
 	sessionPath: string,
 ): Promise<void> {
-	expect(response).toMatchObject({ ok: true, operation: "session.delete", result: { sessionId } });
+	expect(response).toMatchObject({ type: "broker_response", ok: true, result: { sessionId } });
 	await expect(fs.access(sessionPath)).rejects.toMatchObject({ code: "ENOENT" });
 	await expect(fs.access(sessionPath.slice(0, -6))).rejects.toMatchObject({ code: "ENOENT" });
 }
@@ -323,13 +322,12 @@ async function closeSharedOwner(
 ) {
 	const endpointPath = path.join(workspace.stateRoot, "sdk", `${sessionId}.json`);
 	const markerPath = path.join(workspace.stateRoot, "sdk", `${sessionId}.lifecycle.json`);
-	const discovery = await readBrokerDiscovery(life.agentDir);
-	if (!discovery) throw new Error("Shared lifecycle Broker discovery is unavailable.");
-	const client = await SdkClient.connect(discovery.url, discovery.token, { timeoutMs: 5_000, reconnectAttempts: 0 });
+	const discovery = await listSdkSessionEndpoints(workspace.cwd);
+	const endpoint = discovery.endpoints.find(candidate => candidate.sessionId === sessionId);
+	if (!endpoint) throw new Error(`Persisted lifecycle endpoint is unavailable for ${sessionId}.`);
+	const client = await SdkClient.connect(endpoint.url, endpoint.token, { timeoutMs: 2_000, reconnectAttempts: 0 });
 	try {
-		expect(
-			await client.global("session.close", { sessionId }, { idempotencyKey: `shared-owner-close-${sessionId}` }),
-		).toMatchObject({ ok: true });
+		expect(await client.control("session.close")).toMatchObject({ ok: true });
 	} finally {
 		await client.close();
 	}

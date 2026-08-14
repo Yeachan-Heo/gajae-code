@@ -693,7 +693,10 @@ describe("SDK broker identity and discovery", () => {
 		let heartbeatAttempts = 0;
 		const realSetInterval = globalThis.setInterval;
 		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
-			watchdog = callback;
+			// Broker.start() registers the publication watchdog first, then the
+			// index-compaction (and optional operator) timers; only the first
+			// callback is the watchdog under test.
+			watchdog ??= callback;
 			return realSetInterval(() => {}, 2 ** 31 - 1);
 		}) as typeof setInterval);
 		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
@@ -727,7 +730,10 @@ describe("SDK broker identity and discovery", () => {
 		let heartbeatAttempts = 0;
 		const realSetInterval = globalThis.setInterval;
 		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
-			watchdog = callback;
+			// Broker.start() registers the publication watchdog first, then the
+			// index-compaction (and optional operator) timers; only the first
+			// callback is the watchdog under test.
+			watchdog ??= callback;
 			return realSetInterval(() => {}, 2 ** 31 - 1);
 		}) as typeof setInterval);
 		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
@@ -866,7 +872,10 @@ describe("SDK broker identity and discovery", () => {
 		let watchdog: (() => void) | undefined;
 		const realSetInterval = globalThis.setInterval;
 		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
-			watchdog = callback;
+			// Broker.start() registers the publication watchdog first, then the
+			// index-compaction (and optional operator) timers; only the first
+			// callback is the watchdog under test.
+			watchdog ??= callback;
 			return realSetInterval(() => {}, 2 ** 31 - 1);
 		}) as typeof setInterval);
 		const broker = new Broker({ agentDir: dir });
@@ -901,7 +910,10 @@ describe("SDK broker identity and discovery", () => {
 		let watchdog: (() => void) | undefined;
 		const realSetInterval = globalThis.setInterval;
 		const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
-			watchdog = callback;
+			// Broker.start() registers the publication watchdog first, then the
+			// index-compaction (and optional operator) timers; only the first
+			// callback is the watchdog under test.
+			watchdog ??= callback;
 			return realSetInterval(() => {}, 2 ** 31 - 1);
 		}) as typeof setInterval);
 		const broker = new Broker({ agentDir: dir });
@@ -1174,13 +1186,6 @@ describe("SDK broker identity and discovery", () => {
 			pid: process.pid,
 			endpointMtimeMs,
 		});
-		await broker.index.append({
-			type: "host_heartbeat",
-			sessionId: "s",
-			locator: { repo: "r", stateRoot },
-			endpointGeneration: 3,
-			pid: process.pid,
-		});
 		const endpointIncarnation = createHash("sha256")
 			.update(JSON.stringify({ endpointGeneration: 3, endpointMtimeMs, pid: process.pid, sessionId: "s" }))
 			.digest("hex");
@@ -1215,13 +1220,6 @@ describe("SDK broker identity and discovery", () => {
 			endpointGeneration: 4,
 			pid: process.pid,
 			endpointMtimeMs: endpointMtimeMs + 1,
-		});
-		await broker.index.append({
-			type: "host_heartbeat",
-			sessionId: "s",
-			locator: { repo: "r", stateRoot },
-			endpointGeneration: 4,
-			pid: process.pid,
 		});
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "s", endpointGeneration: 4 })).toEqual({
 			ok: false,
@@ -1260,12 +1258,16 @@ describe("SDK broker identity and discovery", () => {
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 			});
+			// A fresh heartbeat makes the registration read as live, so the resume
+			// routes through the live-scope fence instead of saved-session lookup.
 			await broker.index.append({
 				type: "host_heartbeat",
 				sessionId,
 				locator: { repo: liveCwd, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				activity: { state: "idle", at: Date.now() },
 			});
 			const result = await broker.handleRequest(
 				"session.resume",
@@ -2539,13 +2541,6 @@ describe("SDK broker identity and discovery", () => {
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 			});
-			await broker.index.append({
-				type: "host_heartbeat",
-				sessionId,
-				locator: { repo: dir, stateRoot },
-				endpointGeneration: 1,
-				pid: process.pid,
-			});
 			expect(await broker.handleRequest("session.close", { sessionId }, "rotating-close")).toEqual({
 				ok: false,
 				error: { code: "endpoint_stale", message: "session endpoint is stale" },
@@ -2607,14 +2602,6 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
-				lifecycleRequestId: "flush-close-capability",
-			});
-			await broker.index.append({
-				type: "host_heartbeat",
-				sessionId,
-				locator: { repo: dir, stateRoot },
-				endpointGeneration: 1,
-				pid: process.pid,
 			});
 			expect(await broker.handleRequest("session.close", { sessionId }, "flush-close")).toEqual({
 				ok: false,

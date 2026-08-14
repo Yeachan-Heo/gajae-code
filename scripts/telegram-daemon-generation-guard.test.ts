@@ -3,27 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import manifest from "./telegram-daemon-generation-manifest.json" with { type: "json" };
-import {
-	assertGuardAuthority,
-	computeRepairPlan,
-	currentTreeDigests,
-	declaration,
-	evaluate,
-	FIX_GENERATIONS_REMEDIATION,
-	GUARD_CONTRACT_VERSION,
-	isLegacyBootstrapBase,
-	manifestForCurrentTree,
-	protectedInventory,
-	replaceNumericLiteral,
-	TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS,
-	TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS,
-	validateCiInputs,
-	validateCurrentTreeManifest,
-	validateInventory,
-	validateManifest,
-	validateSha,
-	writeManifest,
-} from "./telegram-daemon-generation-guard";
+import { assertGuardAuthority, currentTreeDigests, declaration, evaluate, GUARD_CONTRACT_VERSION, isLegacyBootstrapBase, manifestForCurrentTree, protectedInventory, TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS, validateCiInputs, validateCurrentTreeManifest, validateInventory, validateManifest, validateSha, writeManifest } from "./telegram-daemon-generation-guard";
 
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
@@ -35,10 +15,9 @@ const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-contr
 
 const chatControl = "packages/coding-agent/src/sdk/bus/chat-daemon-control.ts";
 const chatCli = "packages/coding-agent/src/sdk/bus/chat-daemon-cli.ts";
+const chatRuntime = "packages/coding-agent/src/sdk/bus/chat-daemon-runtime.ts";
 const sdkDiscovery = "packages/coding-agent/src/sdk/client/discovery.ts";
 const config = "packages/coding-agent/src/sdk/bus/config.ts";
-const busIndex = "packages/coding-agent/src/sdk/bus/index.ts";
-const sessionRouter = "packages/coding-agent/src/sdk/router/session-router.ts";
 const inventory = {
 	telegram: { [telegramContract]: ["DAEMON_GENERATION"], [telegramDaemon]: ["acquireDaemonOwnership"] },
 	discord: {
@@ -114,11 +93,7 @@ const chatConfigHelpers = {
 	],
 } as const;
 const chatEndpointHelpers = {
-	[sessionRouter]: [
-		"SessionRouter.#attach",
-		"SessionRouter.#createAttachedClient",
-		"SessionRouter.#publishAttachment",
-	],
+	[chatRuntime]: ["attach"],
 	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
 const telegramToolActivityDeclarations = {
@@ -130,16 +105,6 @@ const telegramToolActivityDeclarations = {
 		"toolActivityDeliveryIsCurrent",
 		"handleSessionMessage",
 		"processTelegramUpdate",
-	],
-} as const;
-
-const telegramTopicAdmissionDeclarations = {
-	[config]: ["isTelegramSessionEligible"],
-	[busIndex]: ["buildIdentity", "createNotificationsExtension"],
-	[telegramDaemon]: [
-		"TelegramNotificationDaemon.#topicAdmissionAllows",
-		"TelegramNotificationDaemon.#rejectTopicAdmission",
-		"loadTopics",
 	],
 } as const;
 const helperInventory = {
@@ -232,9 +197,7 @@ function mappedHelperMutation(input: {
 		discordGeneration: input.family === "discord" && input.generationBumped ? 5 : 4,
 		slackGeneration: input.family === "slack" && input.generationBumped ? 5 : 4,
 	});
-	const before = input.name.includes(".#")
-		? `export class ${input.name.split(".#")[0]} { #${input.name.split(".#")[1]}() { return "before"; } }`
-		: `export function ${input.name}() { return "before"; }`;
+	const before = `export function ${input.name}() { return "before"; }`;
 	base.set(input.file, before);
 	head.set(input.file, before.replace("before", "after"));
 	const inventory = {
@@ -345,17 +308,6 @@ test("requires mapped generation bumps for Telegram lease, chat CLI, and configu
 
 test("requires a Telegram bump for tool-activity defaults and delivery admission policy", () => {
 	for (const [file, declarations] of Object.entries(telegramToolActivityDeclarations)) {
-		for (const name of declarations) {
-			const missing = mappedHelperMutation({ family: "telegram", file, name, generationBumped: false });
-			expect(missing.protectedChanges).toContain(`telegram:${file}:${name}`);
-			expect(missing.telegramGenerationBumped).toBe(false);
-			expect(mappedHelperMutation({ family: "telegram", file, name, generationBumped: true }).telegramGenerationBumped).toBe(true);
-		}
-	}
-});
-
-test("requires a Telegram bump for topic-admission provenance, identity production, and registry policy", () => {
-	for (const [file, declarations] of Object.entries(telegramTopicAdmissionDeclarations)) {
 		for (const name of declarations) {
 			const missing = mappedHelperMutation({ family: "telegram", file, name, generationBumped: false });
 			expect(missing.protectedChanges).toContain(`telegram:${file}:${name}`);
@@ -779,8 +731,8 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(() => validateManifest({ contractVersion: GUARD_CONTRACT_VERSION, inventory: narrowed })).toThrow("Telegram owner-lock handoff primitives");
 	});
 
-	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, topic-admission, chat CLI, endpoint discovery, or provider configuration authorities", () => {
-		for (const symbol of TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS) {
+	test("rejects inventories missing required Telegram lifecycle, lease, tool-activity, chat CLI, or provider configuration authorities", () => {
+		for (const symbol of ["validBotToken", "requestStop", "startLifecycleControl", "run"] as const) {
 			const telegram = mutableInventory();
 			telegram.telegram[telegramDaemon] = telegram.telegram[telegramDaemon]!.filter(name => name !== symbol);
 			expect(() => validateInventory(telegram)).toThrow("Telegram authentication and lifecycle primitives");
@@ -797,15 +749,6 @@ test("fails closed when a protected native authority declaration is missing or m
 				expect(() => validateInventory(toolActivity)).toThrow("Telegram tool-activity configuration and delivery policy");
 			}
 		}
-		for (const [file, declarations] of Object.entries(telegramTopicAdmissionDeclarations)) {
-			for (const symbol of declarations) {
-				const topicAdmission = mutableInventory();
-				const remaining = topicAdmission.telegram[file]!.filter(name => name !== symbol);
-				if (remaining.length === 0) delete topicAdmission.telegram[file];
-				else topicAdmission.telegram[file] = remaining;
-				expect(() => validateInventory(topicAdmission)).toThrow("Telegram topic-admission provenance, identity, and registry authorities");
-			}
-		}
 		for (const symbol of ["DaemonProcessReference", "defaultProcessReference"] as const) {
 			const processAuthority = mutableInventory();
 			processAuthority.telegram[telegramControl] = processAuthority.telegram[telegramControl]!.filter(name => name !== symbol);
@@ -817,26 +760,14 @@ test("fails closed when a protected native authority declaration is missing or m
 		const providerConfig = mutableInventory();
 		providerConfig.slack[config] = providerConfig.slack[config]!.filter(name => name !== "isSlackComplete");
 		expect(() => validateInventory(providerConfig)).toThrow("chat configuration primitives");
-		for (const family of ["discord", "slack"] as const) {
-			for (const [file, declarations] of Object.entries(chatEndpointHelpers)) {
-				for (const symbol of declarations) {
-					const endpointDiscovery = mutableInventory();
-					const remaining = endpointDiscovery[family][file]!.filter(name => name !== symbol);
-					if (remaining.length === 0) delete endpointDiscovery[family][file];
-					else endpointDiscovery[family][file] = remaining;
-					expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
-				}
-			}
-		}
+		const endpointDiscovery = mutableInventory();
+		delete endpointDiscovery.discord[chatRuntime];
+		expect(() => validateInventory(endpointDiscovery)).toThrow("isolated chat endpoint discovery");
 	});
 	test("protects Telegram shutdown admission and durable drain authorities", () => {
 		expect(protectedInventory.telegram[telegramDaemon]).toEqual(
 			expect.arrayContaining([...TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS]),
 		);
-	});
-	test("protects Telegram topic-admission provenance, identity production, and registry authorities", () => {
-		for (const [file, declarations] of Object.entries(telegramTopicAdmissionDeclarations))
-			expect(protectedInventory.telegram[file] ?? []).toEqual(expect.arrayContaining(declarations));
 	});
 
 	test("protects Telegram provenance and signaling authorities", () => {
@@ -859,8 +790,7 @@ test("fails closed when a protected native authority declaration is missing or m
 				"isPhysicalMatchingOwner",
 				"validBotToken",
 				"requestStop",
-				"ensureTelegramDaemonRunningDetailed",
-				"TelegramNotificationDaemon.#socketLease",
+				"startLifecycleControl",
 				"run",
 				"writeJsonAtomic",
 				"syncTelegramFile",
@@ -1120,150 +1050,4 @@ test("fails closed when a protected native authority declaration is missing or m
 		expect(() => assertGuardAuthority({ ...pr, eventName: "schedule" })).toThrow("unsupported CI event");
 	});
 
-});
-
-describe("fix-generations auto-repair", () => {
-	const contractFile = telegramContract;
-	const telegramOwnershipFn = "export function acquireDaemonOwnership() { return true; }";
-
-	function repairFiles(input: {
-		telegramGeneration: number;
-		discordGeneration: number;
-		slackGeneration: number;
-		telegramOwnership?: string;
-		chatLifecycle?: string;
-	}): Map<string, string> {
-		return files({
-			telegramGeneration: input.telegramGeneration,
-			discordGeneration: input.discordGeneration,
-			slackGeneration: input.slackGeneration,
-			telegramOwnership: input.telegramOwnership,
-			chatLifecycle: input.chatLifecycle,
-		});
-	}
-
-	test("replaceNumericLiteral bumps a unique numeric declaration preserving formatting", () => {
-		const source = "export const DAEMON_GENERATION = 160;\n";
-		expect(replaceNumericLiteral(source, "DAEMON_GENERATION", 161)).toBe("export const DAEMON_GENERATION = 161;\n");
-		const chat = "export const CHAT_DAEMON_GENERATIONS = { discord: 63, slack: 66 } as const;";
-		expect(replaceNumericLiteral(chat, "CHAT_DAEMON_GENERATIONS", 64, "discord")).toBe("export const CHAT_DAEMON_GENERATIONS = { discord: 64, slack: 66 } as const;");
-		expect(replaceNumericLiteral(chat, "CHAT_DAEMON_GENERATIONS", 67, "slack")).toBe("export const CHAT_DAEMON_GENERATIONS = { discord: 63, slack: 67 } as const;");
-	});
-
-	test("replaceNumericLiteral rejects non-numeric, missing, and duplicate declarations", () => {
-		expect(() => replaceNumericLiteral("export const DAEMON_GENERATION = getCurrent();", "DAEMON_GENERATION", 5)).toThrow("must be a unique numeric literal");
-		expect(() => replaceNumericLiteral("export const unrelated = 1;", "DAEMON_GENERATION", 5)).toThrow("must be a unique numeric literal");
-		expect(() => replaceNumericLiteral("export const DAEMON_GENERATION = 1;\nexport const DAEMON_GENERATION = 2;", "DAEMON_GENERATION", 5)).toThrow("must be a unique numeric literal");
-	});
-
-	test("computeRepairPlan produces a Telegram-only bump for a Telegram-only change", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return false;" });
-		const plan = computeRepairPlan(base, head, inventory);
-		expect(plan.generationEdits).toEqual([{ kind: "telegram", file: contractFile, from: 160, to: 161 }]);
-		expect(plan.needsGuardPolicyAuthority).toBe(false);
-		expect(plan.guardContractEdit).toBeUndefined();
-	});
-
-	test("computeRepairPlan bumps Discord and Slack together for a shared chat-daemon-control change", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		head.set(chatControl, (head.get(chatControl) ?? "").replace("return value !== null", "return Boolean(value)"));
-		const plan = computeRepairPlan(base, head, inventory);
-		const kinds = plan.generationEdits.map(edit => edit.kind);
-		expect(kinds).toContain("discord");
-		expect(kinds).toContain("slack");
-		expect(kinds).not.toContain("telegram");
-		expect(plan.generationEdits).toEqual(
-			expect.arrayContaining([
-				{ kind: "discord", file: chatControl, from: 63, to: 64 },
-				{ kind: "slack", file: chatControl, from: 66, to: 67 },
-			]),
-		);
-	});
-
-	test("computeRepairPlan repairs all three families in one pass", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return false;" });
-		head.set(chatControl, (head.get(chatControl) ?? "").replace("return value !== null", "return Boolean(value)"));
-		const plan = computeRepairPlan(base, head, inventory);
-		expect(plan.generationEdits).toEqual(
-			expect.arrayContaining([
-				{ kind: "telegram", file: contractFile, from: 160, to: 161 },
-				{ kind: "discord", file: chatControl, from: 63, to: 64 },
-				{ kind: "slack", file: chatControl, from: 66, to: 67 },
-			]),
-		);
-		expect(plan.generationEdits).toHaveLength(3);
-	});
-
-	test("computeRepairPlan preserves an already-higher generation and never decrements", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 165, discordGeneration: 70, slackGeneration: 66, telegramOwnership: "return false;" });
-		const plan = computeRepairPlan(base, head, inventory);
-		expect(plan.generationEdits).toEqual([{ kind: "slack", file: chatControl, from: 66, to: 67 }]);
-	});
-
-	test("computeRepairPlan produces no edits when generations are already bumped", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 161, discordGeneration: 64, slackGeneration: 67, telegramOwnership: "return false;" });
-		const plan = computeRepairPlan(base, head, inventory);
-		expect(plan.generationEdits).toEqual([]);
-		expect(plan.noProtectedChanges).toBe(false);
-	});
-
-	test("computeRepairPlan returns no edits and noProtectedChanges for a no-op tree", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const plan = computeRepairPlan(base, head, inventory);
-		expect(plan.generationEdits).toEqual([]);
-		expect(plan.noProtectedChanges).toBe(true);
-	});
-
-	test("computeRepairPlan surfaces malformed declarations without partial computation", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		head.set(telegramDaemon, "export function acquireDaemonOwnership( {");
-		const plan = computeRepairPlan(base, head, inventory);
-		expect(plan.malformedDeclarations.length).toBeGreaterThan(0);
-		expect(plan.generationEdits).toEqual([]);
-	});
-
-	test("computeRepairPlan throws for a non-numeric Telegram generation constant", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return false;" });
-		head.set(contractFile, "export const DAEMON_GENERATION = getGeneration();");
-		expect(() => computeRepairPlan(base, head, inventory)).toThrow("DAEMON_GENERATION is missing or non-numeric");
-	});
-
-	test("computeRepairPlan throws for a non-numeric Discord generation constant", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		head.set(chatControl, (head.get(chatControl) ?? "").replace("return value !== null", "return Boolean(value)").replace("discord: 63", "discord: getGen()"));
-		expect(() => computeRepairPlan(base, head, inventory)).toThrow("CHAT_DAEMON_GENERATIONS.discord is missing or non-numeric");
-	});
-
-	test("computeRepairPlan refuses guard policy changes without explicit authority", () => {
-		const guard = `export const GUARD_CONTRACT_VERSION = ${GUARD_CONTRACT_VERSION};`;
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		base.set(guardScript, `${guard}\nexport const policy = true;`);
-		head.set(guardScript, `${guard}\nexport const policy = false;`);
-		const plan = computeRepairPlan(base, head, inventory);
-		expect(plan.needsGuardPolicyAuthority).toBe(true);
-		expect(plan.guardContractEdit).toEqual({ from: GUARD_CONTRACT_VERSION, to: GUARD_CONTRACT_VERSION + 1 });
-		expect(plan.generationEdits).toEqual([]);
-	});
-
-	test("guard failure messages include the fix-generations remediation hint", () => {
-		const base = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
-		const head = repairFiles({ telegramGeneration: 160, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return false;" });
-		const decision = evaluate(base, head, inventory);
-		expect(decision.telegramGenerationBumped).toBe(false);
-		const telegramChanges = decision.protectedChanges.filter(change => change.startsWith("telegram:"));
-		expect(telegramChanges.length).toBeGreaterThan(0);
-		const remediationMessage = `protected Telegram lifecycle change requires a strictly higher DAEMON_GENERATION: ${telegramChanges.join(", ")}\n${FIX_GENERATIONS_REMEDIATION}`;
-		expect(remediationMessage).toContain("--fix-generations");
-		expect(FIX_GENERATIONS_REMEDIATION).toContain("base-sha");
-	});
 });

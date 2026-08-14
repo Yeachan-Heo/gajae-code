@@ -105,12 +105,14 @@ describe("unscoped gajae-code package publication", () => {
 
 	test("release publish order publishes the alias after its scoped dependency", async () => {
 		const releaseScript = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
+		const bridgeClientIndex = releaseScript.indexOf('dir: "packages/bridge-client"');
 		const codingAgentIndex = releaseScript.indexOf('dir: "packages/coding-agent"');
 		const aliasIndex = releaseScript.indexOf('dir: "packages/gajae-code"');
 
 		expect(codingAgentIndex).toBeGreaterThan(-1);
 		expect(aliasIndex).toBeGreaterThan(codingAgentIndex);
-		expect(releaseScript).not.toContain('dir: "packages/bridge-client"');
+		expect(bridgeClientIndex).toBeGreaterThan(-1);
+		expect(bridgeClientIndex).toBeLessThan(codingAgentIndex);
 	});
 
 	test("native platform packages publish before the stable loader package", () => {
@@ -300,12 +302,12 @@ describe("release bump set equals publish set", () => {
 	});
 });
 describe("immutable stable release contracts", () => {
-	test("publisher configuration equals the closed public evidence definition", () => {
+	test("publisher configuration equals the closed 14-package evidence definition", () => {
 		const publishedDirs = publishPackages.map(pkg => pkg.dir).sort();
 		const evidencedDirs = PUBLIC_PACKAGE_DEFINITIONS.map(definition => definition.dir).sort();
 
-		expect(PUBLIC_PACKAGE_DEFINITIONS).toHaveLength(13);
-		expect(publishPackages).toHaveLength(13);
+		expect(PUBLIC_PACKAGE_DEFINITIONS).toHaveLength(14);
+		expect(publishPackages).toHaveLength(14);
 		expect(publishedDirs).toEqual(evidencedDirs);
 	});
 
@@ -535,9 +537,8 @@ describe("native release binary coverage", () => {
 		const installer = await Bun.file(path.join(repoRoot, "scripts/install-tests/run-ci.sh")).text();
 		expect(installer).toContain("stage_linux_x64_optional_package");
 		expect(installer).toContain(
-			"for pkg in utils natives-linux-x64 natives ai agent tui stats coding-agent gajae-code",
+			"for pkg in utils natives-linux-x64 natives ai agent bridge-client tui stats coding-agent gajae-code",
 		);
-		expect(installer).not.toContain("bridge-client");
 		expect(installer).toContain("@gajae-code/natives-linux-x64");
 		expect(installer).toContain("gajae-code-natives-[0-9]*.tgz");
 	});

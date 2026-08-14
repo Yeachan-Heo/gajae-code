@@ -2,12 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent, transcriptReplayContent } from "@gajae-code/coding-agent/modes/acp/acp-agent";
+import { writeBrokerDiscovery } from "@gajae-code/coding-agent/sdk/broker/discovery";
 import { TempDir } from "@gajae-code/utils";
-import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
-import {
-	type ExactSessionAuthorityFixture,
-	registerExactSessionAuthority,
-} from "../helpers/sdk-exact-session-authority";
 
 const TOKEN = "acp-transcript-replay-token";
 
@@ -110,7 +106,6 @@ describe("ACP transcript replay degradation", () => {
 	let loadRejection: unknown;
 	let agentDir = "";
 	let cwd = "";
-	let authority: ExactSessionAuthorityFixture;
 
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@acp-transcript-replay-");
@@ -143,19 +138,12 @@ describe("ACP transcript replay degradation", () => {
 						);
 						return;
 					}
-					if (frame.type === "event_replay") {
-						socket.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
-						return;
-					}
 					if (frame.type === "broker_request") {
 						const result =
 							frame.operation === "session.create"
 								? {
-										sessionId: authority.sessionId,
-										endpointGeneration: authority.endpointGeneration,
-										pid: authority.pid,
-										endpointMtimeMs: authority.endpointMtimeMs,
-										endpoint: authority.endpoint,
+										sessionId: "replay-session",
+										endpoint: { url: `ws://127.0.0.1:${server!.port}`, token: TOKEN },
 									}
 								: {};
 						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
@@ -228,13 +216,6 @@ describe("ACP transcript replay degradation", () => {
 
 		const port = server.port;
 		if (port === undefined) throw new Error("Expected ACP fixture server port");
-		authority = await registerExactSessionAuthority({
-			agentDir,
-			cwd,
-			sessionId: "replay-session",
-			url: `ws://127.0.0.1:${port}`,
-			token: TOKEN,
-		});
 		await writeBrokerDiscovery(agentDir, {
 			version: 1,
 			protocolVersion: 3,

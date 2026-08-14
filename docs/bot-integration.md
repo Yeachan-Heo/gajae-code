@@ -1,6 +1,6 @@
 # External controller integration guide
 
-This guide is for authors of bots and orchestrators that want to drive Gajae-Code (`gjc`) without scraping terminal scrollback. Hermes, OpenClaw, GitHub bots, chatops bots, and custom schedulers are examples of external controllers; none of them need bespoke GJC behavior if they use Coordinator MCP, the broker-bound SDK session CLI, or a managed SDK-core adapter.
+This guide is for authors of bots and orchestrators that want to drive Gajae-Code (`gjc`) without scraping terminal scrollback. Hermes, OpenClaw, GitHub bots, chatops bots, and custom schedulers are examples of external controllers; none of them need bespoke GJC behavior if they can speak the Coordinator MCP tools or the SDK WebSocket lifecycle below.
 
 GJC is an external runner. Your controller owns queueing, identity, policy, and credentials; GJC owns the coding-agent session, workflows, tools, artifacts, and evidence inside the selected repository or worktree.
 
@@ -12,7 +12,8 @@ Use the smallest surface that fits your bot:
 | --- | --- | --- | --- |
 | Coordinator MCP | Any external controller that can discover SDK-backed sessions, send turns, answer questions, and read artifacts. | `gjc mcp-serve coordinator` | Preferred orchestration surface. `gjc mcp-serve hermes` is a compatibility alias, not a separate contract. |
 | Setup adapter | Rendering a portable MCP config and operator instructions for a controller profile. | `gjc setup hermes --root /path/to/repo` | Compatibility-oriented config renderer; does not call an LLM or validate provider credentials. |
-| SDK session CLI | Broker-bound semantic session operations and explicit raw SDK dispatch with JSON output. | `gjc sdk session list|inspect|send|status|tail` or `gjc sdk session raw control|query|global` | Resolves authority through the broker and never exposes endpoint credentials. |
+| SDK WebSocket | A controller that drives one live session directly: state queries, events, actions, and workflow-gate replies. | Connect to the session's loopback SDK endpoint (see [`docs/sdk.md`](./sdk.md)) | The canonical machine interface. `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. |
+| SDK session CLI | Broker-bound semantic session operations and explicit raw SDK dispatch with JSON output. | `gjc sdk session list|inspect|send|status|tail|elevate` or `gjc sdk session raw control|query|global` | Resolves authority through the broker and never renders endpoint credentials by default. |
 
 ## Recommended architecture
 
@@ -152,7 +153,7 @@ A stock session publishes readiness immediately, so a running chat daemon surfac
 
 A prepared session is live and endpoint-addressable but withholds its readiness signal, so no root is claimed. The response carries `session_id` and `state: "prepared"`, and `session_state.ready_for_input` is `false`. `prepare_existing_thread` refuses an initial `prompt`, and `gjc_coordinator_send_prompt` refuses the session with `session_not_activated` until it is activated.
 
-Preparation requires a configured, session-enabled Slack target in the selected workdir. Slack owns the existing-thread presentation mapping, while `SessionRouter` supplies exact endpoint-generation proof and performs activation without exposing endpoint credentials. Without that combined authority the start fails closed with a lifecycle startup failure instead of returning a prepared session that could activate before any thread is bound.
+Preparation requires a configured, session-enabled Slack target in the selected workdir: that target plus the agent directory is what supplies the daemon-owned bind/activation authority. Without it the start fails closed with a lifecycle startup failure instead of returning a prepared session that could be activated before any thread is bound.
 
 Bind the existing thread through the daemon-owned command path, which is the only writer of chat mappings:
 
@@ -316,21 +317,21 @@ Use `gjc_coordinator_list_artifacts` to inspect safe roots and `gjc_coordinator_
 
 Artifact paths are canonicalized, symlink escapes are rejected, and output is byte-capped. Use `gjc_coordinator_read_coordination_status` for status reports written through `gjc_coordinator_report_status`.
 
-## Managed SDK attachment integration
+## SDK WebSocket integration
 
-Bots must attach through a managed SDK-core adapter backed by `SessionRouter`. Do not read `.gjc/state/sdk` endpoint records, retain URL/token credentials, or open raw per-session WebSockets. `SessionRouter` owns endpoint resolution, credentials, replay, reconnect, rotation, and exact opaque attachment authority; provider code owns only transport and presentation state.
-
-Use the Telegram, Discord, or Slack managed adapter for a single live session. Use Coordinator MCP for multi-session orchestration, artifacts, status, and durable workflow-gate operations. Lifecycle mutations always enter `SessionLifecycleService` and the Broker ledger with a stable idempotency identity.
-The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+Use the SDK when your bot owns a single live session rather than an MCP coordinator. Each running session exposes a loopback WebSocket endpoint discovered via `.gjc/state/sdk/<sessionId>.json`; the wire protocol (state queries, control operations, event subscription and replay, workflow-gate replies, reverse host-tool leases) is documented in [`docs/sdk.md`](./sdk.md).
 
 Key SDK workflow-gate facts:
-- `gjc sdk session raw control|query|global` resolves through `SessionRouter` or the lifecycle facade and emits credential-free JSON. Scripts never receive the underlying transport credentials.
+- The discovery file carries the endpoint URL and per-session token; a wrong
+  token is rejected at the WebSocket handshake. `server_hello` marks a
+  connection ready, and `gjc sdk session raw control|query|global` uses the same
+  protocol for shell scripts.
 
 - `action_needed.id` is an opaque, transient presentation ID. It is the only
   generic `reply.id` authority. Do not equate it with a durable workflow gate.
-- A durable workflow-gate presentation optionally includes additive SDK v3 `workflowGateId`. It correlates to Q12's durable `gate_id` only within `(sessionId, workflowGateId)` on the current Router-issued attachment; it never authorizes generic reply.
+- A durable workflow-gate presentation optionally includes additive SDK v3 `workflowGateId`. It correlates to Q12's durable `gate_id` only within `(sessionId, workflowGateId)` on the current authenticated endpoint; it never authorizes generic reply.
 - `workflow.gate_answer` and `workflow.plan_approve` use the durable `gate_id`. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 clients continue to work, but new clients must send it. Mandatory enforcement or removal may occur no earlier than SDK v4 and only after at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before resolution.
-- One session has one active answerable presentation. Additional Q12 gates stay queued while Q12 exposes durable pending records and additive SDK v3 diagnostics. Router replay retains the active action ID; a process restart quarantines old records and a rebuilt workflow remints fresh gate and presentation IDs.
+- One session has one active answerable presentation. Additional Q12 gates stay queued while Q12 exposes durable pending records and additive SDK v3 diagnostics. A same-server reconnect replays the active action ID; a process restart quarantines old records and a rebuilt workflow remints fresh gate and presentation IDs.
 - A native generic reply claim wins a direct-control race once acquired; a direct control wins only by atomically retiring the exact unclaimed active presentation. Terminal, stale, and reissued action IDs never regain authority. Do not use text, option/order, durable-ID, or history heuristics, and fail closed rather than guess when identity is unsafe or ambiguous. Do not persist private route/claim/receipt/epoch/generation state.
 - Rust/N-API compatibility is additive: legacy `ActionNeeded`, `register_ask`,
   and `registerAsk` stay uncorrelated; explicit workflow reader/registration
@@ -338,11 +339,10 @@ Key SDK workflow-gate facts:
 - The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
 
 The prior documented invariant `action_needed.id == gate_id` is incorrect for
-v3 and must not be implemented by controllers. See [the SDK session CLI guide](./sdk-session-cli.md)
-for broker-bound controls and [the SDK guide](./sdk.md) for Router and lifecycle
-ownership. `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed
-and have no compatibility shim; migrate controllers to Coordinator MCP,
-`gjc sdk session`, or a managed Telegram, Discord, or Slack adapter.
+v3 and must not be implemented by controllers. See [`docs/sdk.md`](./sdk.md)
+for exact wire examples, Q12 tags/lifecycle diagnostics, and control payloads.
+
+`--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed along with their JSONL/HTTPS protocols and the former Python RPC client. There are no compatibility shims; migrate controllers to the SDK endpoint or Coordinator MCP.
 
 ## Error handling playbook
 
@@ -350,11 +350,11 @@ and have no compatibility shim; migrate controllers to Coordinator MCP,
 | --- | --- |
 | `coordinator_mutation_class_disabled:*` | Re-render setup with the required mutation class, or keep the bot in read-only mode. |
 | `coordinator_mutation_call_not_allowed:*` | Add `allow_mutation: true` only after policy approval for that specific call. |
-| `unknown_session` | Re-list sessions through the Broker, then start a new managed session or report a recoverable blocker. |
+| `unknown_session` | Re-list sessions; start a new managed session or register a session after its SDK endpoint is discoverable. |
 | `active_turn_exists` | Poll the active turn, send with `queue: true`, or use `force: true` only when supersession is intentional. |
 | `timeout` from `await_turn` | Treat as non-terminal. Poll again or inspect `read_status`; do not mark failure solely from a bounded wait timeout. |
 | Coordinator cancellation | Use `gjc_coordinator_report_status` with `status: "cancelled"` for an intentionally stopped turn, or send replacement work with `force: true` when supersession is policy-approved. This is coordinator state, not process control. |
-| Stale session state | Check `read_status.session_state` and broker-backed session status. Report a recoverable blocker rather than inspecting endpoint state. |
+| Stale session state | Check `read_status.session_state` and SDK endpoint discovery. Register a new discoverable session or report the turn failed with a recoverable blocker. |
 | Provider/auth failure | Capture the model/provider error in `report_status` with `status: "failed"`; do not retry forever without a policy budget. |
 | Artifact denied | Keep the artifact inside allowlisted roots and avoid symlink escapes. |
 | Malformed or invalid question answer | Re-read the question/gate schema and submit a value matching the advertised shape. |
@@ -395,10 +395,6 @@ Example controller loop:
 ```
 
 Hermes and OpenClaw can use the same MCP tool contract. Their names here are examples of controller products, not privileged integration modes.
-
-## Long-running prompts are progress-aware
-
-`sdk.promptDeadlineMs` (default `1_800_000` ms) is an inactivity lease, not a fixed wall-clock kill. The SDK renews the accepted prompt's terminal deadline from attributable `tool_execution_start` / `tool_execution_end` events for the exact `commandId`/`turnId`, bounded by `sdk.promptMaxRuntimeMs` (default `21_600_000` ms, max `86_400_000`). Persist `session_id` / `turn_id` from the accepted prompt and reconcile via `turn.result` (Q26) or `gjc sdk session status` rather than replaying blindly. Heartbeats, streaming chatter, retries, and other-turn activity do not extend the lease. Distinguish `timeout_ms` on `await_turn` / coordinator await from the SDK terminal deadline.
 
 ## Security and credential boundaries
 

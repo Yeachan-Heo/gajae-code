@@ -3,17 +3,17 @@
 import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { SessionIndex } from "../../src/sdk/broker/session-index";
+import { Broker } from "../../src/sdk/broker/broker";
 
 // fixtures/ -> test/ -> package root (packages/coding-agent)
 const packageRoot = path.resolve(import.meta.dir, "..", "..");
 const cliEntry = path.join(packageRoot, "src", "cli.ts");
 
 const repo = await mkdtemp(path.join(tmpdir(), "mcp-sdk-e2e-"));
-const agentDir = path.join(repo, "agent");
 const received: string[] = [];
 let server: ReturnType<typeof Bun.serve> | undefined;
 let child: ReturnType<typeof Bun.spawn> | undefined;
+let broker: Broker | undefined;
 
 const cleanup = async () => {
 	if (child) {
@@ -37,6 +37,10 @@ const cleanup = async () => {
 		}
 		server = undefined;
 	}
+	if (broker) {
+		await broker.stop();
+		broker = undefined;
+	}
 	await rm(repo, { recursive: true, force: true });
 };
 
@@ -54,10 +58,6 @@ try {
 			message(ws, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				received.push(String(frame.type));
-				if (frame.type === "event_replay") {
-					ws.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
-					return;
-				}
 				if (frame.type === "query_request")
 					ws.send(
 						JSON.stringify({
@@ -70,20 +70,32 @@ try {
 			},
 		},
 	});
-	await mkdir(path.join(repo, ".gjc", "state", "sdk"), { recursive: true });
+	const stateRoot = path.join(repo, ".gjc", "state");
+	const endpointPath = path.join(stateRoot, "sdk", "s1.json");
+	await mkdir(path.dirname(endpointPath), { recursive: true });
 	await writeFile(
-		path.join(repo, ".gjc", "state", "sdk", "s1.json"),
-		JSON.stringify({ sessionId: "s1", pid: process.pid, url: `ws://127.0.0.1:${server.port}`, token: "tok" }),
+		endpointPath,
+		JSON.stringify({ sessionId: "s1", url: `ws://127.0.0.1:${server.port}`, token: "tok", pid: process.pid }),
 	);
-	const endpointMtimeMs = (await stat(path.join(repo, ".gjc", "state", "sdk", "s1.json"))).mtimeMs;
-	const index = await new SessionIndex(agentDir).open();
-	await index.append({
+	const agentDir = path.join(repo, "agent");
+	broker = new Broker({ agentDir, packageGeneration: "test" });
+	await broker.start();
+	await broker.index.append({
 		type: "host_registered",
 		sessionId: "s1",
-		locator: { repo, stateRoot: path.join(repo, ".gjc", "state") },
+		locator: { repo, stateRoot },
 		endpointGeneration: 1,
 		pid: process.pid,
-		endpointMtimeMs,
+		endpointMtimeMs: (await stat(endpointPath)).mtimeMs,
+	});
+	await broker.index.append({
+		type: "host_heartbeat",
+		sessionId: "s1",
+		locator: { repo, stateRoot },
+		endpointGeneration: 1,
+		pid: process.pid,
+		endpointMtimeMs: (await stat(endpointPath)).mtimeMs,
+		activity: { state: "idle", at: Date.now() },
 	});
 
 	// Default: package source under test (CI monorepo with natives).
@@ -98,7 +110,7 @@ try {
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
-		env: { ...process.env, GJC_AGENT_DIR: agentDir, GJC_CODING_AGENT_DIR: agentDir },
+		env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
 	});
 	child = proc;
 	proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" })}\n`);
@@ -117,7 +129,7 @@ try {
 	const errPromise = new Response(proc.stderr).text();
 	const exitState = await Promise.race([
 		proc.exited.then(code => ({ kind: "exit" as const, code })),
-		Bun.sleep(25_000).then(() => ({ kind: "timeout" as const })),
+		Bun.sleep(15_000).then(() => ({ kind: "timeout" as const })),
 	]);
 	if (exitState.kind === "timeout") {
 		try {
@@ -129,7 +141,7 @@ try {
 	const [out, err] = await Promise.all([outPromise, errPromise]);
 	const exitCode = exitState.kind === "exit" ? exitState.code : await child.exited;
 	if (exitState.kind === "timeout") {
-		throw new Error(`mcp-serve sdk did not exit within 25s after stdin EOF\nstdout:\n${out}\nstderr:\n${err}`);
+		throw new Error(`mcp-serve sdk did not exit within 15s after stdin EOF\nstdout:\n${out}\nstderr:\n${err}`);
 	}
 	if (exitCode !== 0) {
 		throw new Error(`mcp-serve sdk exited ${exitCode}\nstdout:\n${out}\nstderr:\n${err}`);

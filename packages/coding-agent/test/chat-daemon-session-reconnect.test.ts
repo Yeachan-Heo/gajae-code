@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
@@ -16,16 +15,6 @@ import { drainReconnects, expectedBackoffs, FakeWebSocket, withFakeTransport } f
 const SESSION_ID = "chat-reconnect-session";
 const GENERATION = 4;
 const wallClockNow = Date.now;
-
-function currentHostIncarnation(): string {
-	const incarnation = processIncarnation(process.pid);
-	if (!incarnation) throw new Error("Current process incarnation is unavailable.");
-	return incarnation;
-}
-
-// Keep the Router's independent attach deadline outside the fake reconnect clock.
-const inertAttachmentTimeout = (() => ({ unref: () => undefined })) as unknown as typeof setTimeout;
-const clearInertAttachmentTimeout = (() => undefined) as unknown as typeof clearTimeout;
 /**
  * Mirrors `REPLAY_BARRIER_LIMIT`: how many live frames one attachment holds behind an
  * outstanding replay. Too low a mirror still overflows the real barrier; too high a real
@@ -386,22 +375,27 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
 		await fs.writeFile(
 			endpointFile,
-			`${JSON.stringify({ version: 1, sessionId: SESSION_ID, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
+			`${JSON.stringify({ version: 1, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
 		);
 		const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
 		const index = await new SessionIndex(agentDir).open();
-		const hostIncarnation = currentHostIncarnation();
 		await index.append({
 			type: "host_registered",
 			sessionId: SESSION_ID,
 			locator: { repo: agentDir, stateRoot },
 			endpointGeneration: GENERATION,
 			pid: process.pid,
-			processIncarnation: hostIncarnation,
-			hostIncarnation,
 			endpointMtimeMs,
 		});
-		await index.checkpointLiveHeartbeats();
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: SESSION_ID,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: GENERATION,
+			pid: process.pid,
+			endpointMtimeMs,
+			activity: { state: "active", at: Date.now() },
+		});
 
 		const provider = new FakeSlackProvider();
 		let reconcileTick: (() => void) | undefined;
@@ -423,15 +417,11 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 			},
 			{
 				createSlackProvider: () => provider,
-				routerDeps: {
-					setInterval: ((callback: () => void) => {
-						reconcileTick = callback;
-						return 0;
-					}) as unknown as typeof setInterval,
-					clearInterval: (() => undefined) as unknown as typeof clearInterval,
-					setTimeout: inertAttachmentTimeout,
-					clearTimeout: clearInertAttachmentTimeout,
-				},
+				setInterval: ((callback: () => void) => {
+					reconcileTick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => undefined) as unknown as typeof clearInterval,
 			},
 		);
 		await run({
@@ -446,11 +436,18 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 					locator: { repo: agentDir, stateRoot },
 					endpointGeneration: GENERATION + 1,
 					pid: process.pid,
-					processIncarnation: hostIncarnation,
-					hostIncarnation,
 					endpointMtimeMs,
 				});
-				await index.checkpointLiveHeartbeats(wallClockNow());
+				await index.append({
+					type: "host_heartbeat",
+					sessionId: SESSION_ID,
+					locator: { repo: agentDir, stateRoot },
+					endpointGeneration: GENERATION + 1,
+					pid: process.pid,
+					endpointMtimeMs,
+					ts: wallClockNow(),
+					activity: { state: "active", at: Date.now() },
+				});
 			},
 		});
 	} finally {
@@ -475,22 +472,27 @@ async function withAttachedDiscordRuntime(
 		await fs.mkdir(path.dirname(endpointFile), { recursive: true });
 		await fs.writeFile(
 			endpointFile,
-			`${JSON.stringify({ version: 1, sessionId: SESSION_ID, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
+			`${JSON.stringify({ version: 1, url: "ws://localhost:1/", token: "not-persisted", pid: process.pid })}\n`,
 		);
 		const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
 		const index = await new SessionIndex(agentDir).open();
-		const hostIncarnation = currentHostIncarnation();
 		await index.append({
 			type: "host_registered",
 			sessionId: SESSION_ID,
 			locator: { repo: agentDir, stateRoot },
 			endpointGeneration: GENERATION,
 			pid: process.pid,
-			processIncarnation: hostIncarnation,
-			hostIncarnation,
 			endpointMtimeMs,
 		});
-		await index.checkpointLiveHeartbeats();
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: SESSION_ID,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: GENERATION,
+			pid: process.pid,
+			endpointMtimeMs,
+			activity: { state: "active", at: Date.now() },
+		});
 
 		const provider = new FakeDiscordProvider();
 		let reconcileTick: (() => void) | undefined;
@@ -512,15 +514,11 @@ async function withAttachedDiscordRuntime(
 			},
 			{
 				createDiscordProvider: () => provider,
-				routerDeps: {
-					setInterval: ((callback: () => void) => {
-						reconcileTick = callback;
-						return 0;
-					}) as unknown as typeof setInterval,
-					clearInterval: (() => undefined) as unknown as typeof clearInterval,
-					setTimeout: inertAttachmentTimeout,
-					clearTimeout: clearInertAttachmentTimeout,
-				},
+				setInterval: ((callback: () => void) => {
+					reconcileTick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => undefined) as unknown as typeof clearInterval,
 			},
 		);
 		await run({ runtime, provider, reconcile: () => reconcileTick?.() });
@@ -581,93 +579,13 @@ async function awaitReplayRequests(host: FakeSessionHost, count: number): Promis
 	expect(host.replayRequests).toHaveLength(count);
 }
 
-test("chat daemon startup isolates an unreachable indexed endpoint from a healthy attachment", async () => {
-	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-chat-reconcile-"));
-	let runtime: ChatDaemonRuntime | undefined;
-	const warnings: string[] = [];
-	const warnSpy = spyOn(logger, "warn").mockImplementation((message: string) => {
-		warnings.push(message);
-	});
-	try {
-		const stateRoot = path.join(agentDir, ".gjc", "state");
-		const endpointDir = path.join(stateRoot, "sdk");
-		await fs.mkdir(endpointDir, { recursive: true });
-		const sessions = [
-			{ sessionId: "chat-unreachable", url: "ws://unreachable.test/", token: "chat-unreachable-secret" },
-			{ sessionId: "chat-healthy", url: "ws://healthy.test/", token: "chat-healthy-secret" },
-		] as const;
-		const index = await new SessionIndex(agentDir).open();
-		const hostIncarnation = currentHostIncarnation();
-		for (const session of sessions) {
-			const endpointFile = path.join(endpointDir, `${session.sessionId}.json`);
-			await fs.writeFile(endpointFile, `${JSON.stringify({ ...session, pid: process.pid })}\n`);
-			const endpointMtimeMs = (await fs.stat(endpointFile)).mtimeMs;
-			await index.append({
-				type: "host_registered",
-				sessionId: session.sessionId,
-				locator: { repo: agentDir, stateRoot },
-				endpointGeneration: 1,
-				pid: process.pid,
-				processIncarnation: hostIncarnation,
-				hostIncarnation,
-				endpointMtimeMs,
-			});
-		}
-		await index.checkpointLiveHeartbeats();
-		const provider = new FakeSlackProvider();
-		const attachedSessions: string[] = [];
-		runtime = new ChatDaemonRuntime(
-			{
-				kind: "slack",
-				agentDir,
-				config: {
-					identity: "test-identity",
-					notifications: {
-						slack: {
-							botToken: "xoxb-not-persisted",
-							appToken: "xapp-not-persisted",
-							workspaceId: "T1",
-							channelId: "C1",
-						},
-					},
-				},
-			},
-			{
-				createSlackProvider: () => provider,
-				routerDeps: {
-					createClient: async endpoint => {
-						if (endpoint.sessionId === "chat-unreachable") throw new Error("connect failed");
-						attachedSessions.push(endpoint.sessionId);
-						return {
-							onFrame: () => () => {},
-							request: async () => ({ events: [] }),
-							close: async () => {},
-							send: () => {},
-						};
-					},
-					setInterval: (() => 0) as unknown as typeof setInterval,
-					clearInterval: (() => {}) as unknown as typeof clearInterval,
-				},
-			},
-		);
-		await runtime.start();
-		expect(runtime.transportHealthy()).toBe(true);
-		expect(attachedSessions).toEqual(["chat-healthy"]);
-		expect(warnings.some(message => message.includes("chat-unreachable"))).toBe(true);
-		expect(warnings.every(message => !message.includes("chat-unreachable-secret"))).toBe(true);
-	} finally {
-		await runtime?.stop();
-		warnSpy.mockRestore();
-		await fs.rm(agentDir, { recursive: true, force: true });
-	}
-});
-test("an unreachable attached chat session exhausts its long-lived reconnect budget without blocking startup", async () => {
+test("an attached chat session reconnects on a budget that outlives the host heartbeat TTL", async () => {
 	await withAttachedSessionRuntime(async ({ runtime }) => {
 		await withFakeTransport(async clock => {
 			const starting = runtime.start();
 			await awaitSocket(1);
 			const observed = await drainReconnects(clock);
-			await expect(starting).resolves.toBeUndefined();
+			await expect(starting).rejects.toMatchObject({ code: "reconnect_exhausted" });
 
 			// The attached-session client must follow the shared long-lived schedule,
 			// not the transport's one-shot defaults (3 attempts, 25/50/100ms = 175ms).
@@ -1366,14 +1284,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			// of what live delivery carried rather than against a partially drained queue.
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none"]);
 
-			provider.failPosts = 1;
 			provider.releasePosts();
-			await awaitRefusals(provider, 1);
-			await Bun.sleep(50);
-			host.stallReplay = false;
-			reconcile();
-			host.accept(await awaitSocket(3));
-			await awaitReplayRequests(host, 3);
 			await awaitPosts(provider, 3);
 			await Bun.sleep(20);
 
@@ -1402,9 +1313,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			expect(host.replayRequests).toEqual([
 				{ sinceGeneration: GENERATION, sinceSeq: 0 },
 				{ sinceGeneration: GENERATION, sinceSeq: 0 },
-				{ sinceGeneration: GENERATION, sinceSeq: 2 },
 			]);
-			expect(warnings.filter(line => line.includes("publication failed at seq 2"))).toHaveLength(1);
 		});
 	});
 }, 20_000);
@@ -1465,10 +1374,9 @@ test("an ambiguously acknowledged Slack session-ready publication is not posted 
 			await Bun.sleep(100);
 
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC session ready."]);
-			const readyAttempts = provider.postAttempts.filter(post => post.text === "GJC session ready.");
-			expect(readyAttempts.length).toBeGreaterThanOrEqual(1);
-			expect(readyAttempts.length).toBeLessThanOrEqual(2);
-			expect(readyAttempts.every(post => post.clientMsgId === provider.posts[0]?.clientMsgId)).toBe(true);
+			expect(
+				provider.postAttempts.filter(post => post.text === "GJC session ready.").map(post => post.clientMsgId),
+			).toEqual([provider.posts[0]?.clientMsgId, provider.posts[0]?.clientMsgId]);
 		});
 	});
 }, 20_000);

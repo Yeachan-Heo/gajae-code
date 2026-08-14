@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { listRecentSessions } from "@gajae-code/coding-agent/sdk/lifecycle/recent-sessions";
+import { listRecentSessions } from "@gajae-code/coding-agent/sdk/bus/recent-activity";
 import * as native from "@gajae-code/natives";
 import {
 	prepareManagedSessionScopeForWriteSync,

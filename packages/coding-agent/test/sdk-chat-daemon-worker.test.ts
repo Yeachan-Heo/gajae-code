@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
-import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
+import { ChatDaemonRuntime, type ChatDaemonSdkClient } from "../src/sdk/bus/chat-daemon-runtime";
 import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type {
@@ -15,7 +15,6 @@ import type {
 import { type SlackConversation, slackConversationKey } from "../src/sdk/bus/slack-conversation";
 import type { SlackProviderClient, SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
-import { type SessionRouterClient, sessionAttachmentAuthorityId } from "../src/sdk/router";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type SlackPost = { channel: string; text: string; threadTs?: string; clientMsgId: string };
@@ -185,7 +184,7 @@ class FakeDiscordProvider implements DiscordProvider {
 	}
 }
 
-class FakeSdkClient implements SessionRouterClient {
+class FakeSdkClient implements ChatDaemonSdkClient {
 	closed = false;
 	sent: Record<string, unknown>[] = [];
 	requests: Record<string, unknown>[] = [];
@@ -256,7 +255,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "endpoint-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token", pid: process.pid }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -266,6 +265,15 @@ describe("chat daemon worker", () => {
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
 		});
 		const provider = new FakeDiscordProvider();
 		const client = new FakeSdkClient();
@@ -323,13 +331,11 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => provider,
-				routerDeps: {
-					createClient: async () => client,
-					createBrokerClient: async () => brokerClient,
-					createIndex: () => index,
-					setInterval: (() => 0) as unknown as typeof setInterval,
-					clearInterval: (() => {}) as typeof clearInterval,
-				},
+				createClient: async () => client,
+				createBrokerClient: async () => brokerClient,
+				createIndex: () => index,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
 			},
 		);
 
@@ -476,6 +482,35 @@ describe("chat daemon worker", () => {
 			),
 		).toBe(false);
 		expect(JSON.stringify(provider.messages)).not.toContain("daemon-result-secret");
+		const globalRequest = brokerClient.waitForRequest(
+			request => request.type === "broker_request" && request.operation === "session.list",
+		);
+		const globalResult = provider.waitForMessage(
+			message =>
+				message.content ===
+				JSON.stringify({ ok: true, result: { operation: "session.list", status: "completed" } }),
+		);
+		await provider.handler?.({
+			id: "global",
+			guildId: "guild",
+			parentId: "parent",
+			threadId: "thread-1",
+			authorId: "human",
+			content: "/sdk global session.list {}",
+		});
+		await Promise.all([globalRequest, globalResult]);
+		expect(brokerClient.requests).toContainEqual(
+			expect.objectContaining({
+				type: "broker_request",
+				operation: "session.list",
+				input: {},
+				idempotencyKey: expect.any(String),
+			}),
+		);
+		expect(provider.messages).toContainEqual({
+			threadId: "thread-1",
+			content: JSON.stringify({ ok: true, result: { operation: "session.list", status: "completed" } }),
+		});
 		const archivedThread = provider.waitForArchiveCount(1);
 		client.handler?.({
 			type: "event",
@@ -503,12 +538,12 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "chat-only-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "chat-only-token", pid: process.pid }),
 		);
 		await fs.mkdir(path.dirname(defaultEndpointPath), { recursive: true });
 		await fs.writeFile(
 			defaultEndpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:2", token: "shared-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:2", token: "shared-token", pid: process.pid }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -519,9 +554,18 @@ describe("chat daemon worker", () => {
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { repo: root, stateRoot: path.join(stateRoot, "chat") },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
+		});
 		const provider = new FakeDiscordProvider();
 		const client = new FakeSdkClient();
-		let attachedAuthority: Record<string, unknown> | undefined;
+		let attachedToken: string | undefined;
 		const runtime = new ChatDaemonRuntime(
 			{
 				kind: "discord",
@@ -535,20 +579,17 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => provider,
-				routerDeps: {
-					createClient: async authority => {
-						attachedAuthority = authority;
-						return client;
-					},
-					createIndex: () => index,
-					setInterval: (() => 0) as unknown as typeof setInterval,
-					clearInterval: (() => {}) as typeof clearInterval,
+				createClient: async endpoint => {
+					attachedToken = endpoint.token;
+					return client;
 				},
+				createIndex: () => index,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
 			},
 		);
 		await runtime.start();
-		expect(attachedAuthority).toMatchObject({ sessionId: "session", generation: 1 });
-		expect(attachedAuthority).not.toHaveProperty("token");
+		expect(attachedToken).toBe("chat-only-token");
 		await runtime.stop();
 	});
 
@@ -560,7 +601,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "authorized-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "authorized-token", pid: process.pid }),
 		);
 		const authorizedMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
 		const index = await new SessionIndex(agentDir).open();
@@ -576,9 +617,9 @@ describe("chat daemon worker", () => {
 			endpointPath,
 			JSON.stringify({
 				sessionId: "session",
-				pid: process.pid,
 				url: "ws://127.0.0.1:2",
 				token: "substituted-token",
+				pid: process.pid,
 			}),
 		);
 		const later = new Date(authorizedMtimeMs + 2_000);
@@ -602,15 +643,13 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => new FakeDiscordProvider(),
-				routerDeps: {
-					createClient: async () => {
-						connected = true;
-						return new FakeSdkClient();
-					},
-					createIndex: () => index,
-					setInterval: (() => 0) as unknown as typeof setInterval,
-					clearInterval: (() => {}) as typeof clearInterval,
+				createClient: async () => {
+					connected = true;
+					return new FakeSdkClient();
 				},
+				createIndex: () => index,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
 			},
 		);
 		await runtime.start();
@@ -626,7 +665,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "old-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "old-token", pid: process.pid }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -637,10 +676,18 @@ describe("chat daemon worker", () => {
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
+		});
 		const provider = new FakeDiscordProvider();
 		const oldClient = new FakeSdkClient();
 		let tick: (() => void) | undefined;
-		let createClientCalls = 0;
 		const runtime = new ChatDaemonRuntime(
 			{
 				kind: "discord",
@@ -654,25 +701,23 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => provider,
-				routerDeps: {
-					createClient: async () => {
-						if (++createClientCalls === 2) throw new Error("replacement unavailable");
-						return oldClient;
-					},
-					createIndex: () => index,
-					setInterval: ((callback: () => void) => {
-						tick = callback;
-						return 0;
-					}) as unknown as typeof setInterval,
-					clearInterval: (() => {}) as typeof clearInterval,
+				createClient: async endpoint => {
+					if (endpoint.token === "new-token") throw new Error("replacement unavailable");
+					return oldClient;
 				},
+				createIndex: () => index,
+				setInterval: ((callback: () => void) => {
+					tick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
 			},
 		);
 		await runtime.start();
 		const lateOldFrame = oldClient.handler!;
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "new-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "new-token", pid: process.pid }),
 		);
 		await index.append({
 			type: "host_registered",
@@ -683,7 +728,7 @@ describe("chat daemon worker", () => {
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 		});
 		tick?.();
-		for (let attempt = 0; attempt < 2_000 && !oldClient.closed; attempt++) await Bun.sleep(1);
+		await Bun.sleep(10);
 		expect(oldClient.closed).toBe(true);
 		lateOldFrame({ type: "turn_stream", sessionId: "session", text: "stale" });
 		await Bun.sleep(10);
@@ -691,7 +736,7 @@ describe("chat daemon worker", () => {
 		await runtime.stop();
 	});
 
-	it("discards queued frames emitted by a same-generation successor attachment", async () => {
+	it("discards queued frames emitted by a replaced attachment", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-frame-"));
 		const agentDir = path.join(root, "agent");
 		const stateRoot = path.join(root, ".gjc", "state");
@@ -699,7 +744,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "old-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "old-token", pid: process.pid }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -709,6 +754,15 @@ describe("chat daemon worker", () => {
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
 		});
 		const provider = new FakeDiscordProvider();
 		const entered = Promise.withResolvers<void>();
@@ -723,7 +777,6 @@ describe("chat daemon worker", () => {
 		const oldClient = new FakeSdkClient();
 		const newClient = new FakeSdkClient();
 		let tick: (() => void) | undefined;
-		let createClientCalls = 0;
 		const runtime = new ChatDaemonRuntime(
 			{
 				kind: "discord",
@@ -737,15 +790,13 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createDiscordProvider: () => provider,
-				routerDeps: {
-					createClient: async () => (++createClientCalls === 1 ? oldClient : newClient),
-					createIndex: () => index,
-					setInterval: ((callback: () => void) => {
-						tick = callback;
-						return 0;
-					}) as unknown as typeof setInterval,
-					clearInterval: (() => {}) as typeof clearInterval,
-				},
+				createClient: async endpoint => (endpoint.token === "old-token" ? oldClient : newClient),
+				createIndex: () => index,
+				setInterval: ((callback: () => void) => {
+					tick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
 			},
 		);
 		await runtime.start();
@@ -755,15 +806,24 @@ describe("chat daemon worker", () => {
 		oldClient.handler?.({ type: "turn_stream", sessionId: "session", text: "stale queued" });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "new-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "new-token", pid: process.pid }),
 		);
 		await index.append({
 			type: "host_registered",
 			sessionId: "session",
 			locator: { repo: root, stateRoot },
-			endpointGeneration: 1,
+			endpointGeneration: 2,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 2,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
 		});
 		const replacementReplay = newClient.waitForRequest(frame => frame.type === "event_replay");
 		tick?.();
@@ -787,7 +847,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "endpoint-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token", pid: process.pid }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -797,6 +857,15 @@ describe("chat daemon worker", () => {
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
 		});
 		const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
 		const readConversation = async (): Promise<SlackConversation | undefined> =>
@@ -826,7 +895,7 @@ describe("chat daemon worker", () => {
 				},
 			},
 		};
-		const routerDeps = {
+		const timerDeps = {
 			createIndex: () => index,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as typeof clearInterval,
@@ -834,10 +903,10 @@ describe("chat daemon worker", () => {
 		const firstProvider = new FakeSlackProvider();
 		const firstClient = new FakeSdkClient();
 		const firstRuntime = new ChatDaemonRuntime(runtimeInput, {
-			routerDeps: { ...routerDeps, createClient: async () => firstClient },
+			...timerDeps,
 			createSlackProvider: () => firstProvider,
+			createClient: async () => firstClient,
 		});
-
 		await firstRuntime.start();
 		firstClient.handler?.({
 			type: "action_needed",
@@ -854,8 +923,9 @@ describe("chat daemon worker", () => {
 		const restartedProvider = new FakeSlackProvider();
 		const restartedClient = new FakeSdkClient();
 		const restartedRuntime = new ChatDaemonRuntime(runtimeInput, {
-			routerDeps: { ...routerDeps, createClient: async () => restartedClient },
+			...timerDeps,
 			createSlackProvider: () => restartedProvider,
+			createClient: async () => restartedClient,
 		});
 		await restartedRuntime.start();
 		const persisted = await readConversation();
@@ -914,7 +984,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "endpoint-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token", pid: process.pid }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -924,6 +994,15 @@ describe("chat daemon worker", () => {
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
 		});
 		await writeBrokerDiscovery(agentDir, {
 			version: 1,
@@ -966,13 +1045,11 @@ describe("chat daemon worker", () => {
 			},
 			{
 				createSlackProvider: () => provider,
-				routerDeps: {
-					createClient: async () => client,
-					createBrokerClient: async () => broker,
-					createIndex: () => index,
-					setInterval: (() => 0) as unknown as typeof setInterval,
-					clearInterval: (() => {}) as typeof clearInterval,
-				},
+				createClient: async () => client,
+				createBrokerClient: async () => broker,
+				createIndex: () => index,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as typeof clearInterval,
 			},
 		);
 		await runtime.start();
@@ -1065,7 +1142,7 @@ describe("chat daemon worker", () => {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 		await fs.writeFile(
 			endpointPath,
-			JSON.stringify({ sessionId: "session", pid: process.pid, url: "ws://127.0.0.1:1", token: "endpoint-token" }),
+			JSON.stringify({ sessionId: "session", url: "ws://127.0.0.1:1", token: "endpoint-token", pid: process.pid }),
 		);
 		const index = await new SessionIndex(agentDir).open();
 		await index.append({
@@ -1075,6 +1152,15 @@ describe("chat daemon worker", () => {
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: "session",
+			locator: { repo: root, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			activity: { state: "idle", at: Date.now() },
 		});
 		const runtimeInput = {
 			kind: "slack" as const,
@@ -1092,7 +1178,7 @@ describe("chat daemon worker", () => {
 				},
 			},
 		};
-		const routerDeps = {
+		const timerDeps = {
 			createIndex: () => index,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as typeof clearInterval,
@@ -1106,10 +1192,10 @@ describe("chat daemon worker", () => {
 			throw new SdkClientError("uncertain_after_send", "SDK connection closed after accepting the control request");
 		};
 		const firstRuntime = new ChatDaemonRuntime(runtimeInput, {
-			routerDeps: { ...routerDeps, createClient: async () => firstClient },
+			...timerDeps,
 			createSlackProvider: () => firstProvider,
+			createClient: async () => firstClient,
 		});
-
 		await firstRuntime.start();
 		const rootTs = "1.1";
 		expect(firstProvider.posts).toHaveLength(1);
@@ -1148,8 +1234,9 @@ describe("chat daemon worker", () => {
 		const restartedProvider = new FakeSlackProvider();
 		const restartedClient = new FakeSdkClient();
 		const restartedRuntime = new ChatDaemonRuntime(runtimeInput, {
-			routerDeps: { ...routerDeps, createClient: async () => restartedClient },
+			...timerDeps,
 			createSlackProvider: () => restartedProvider,
+			createClient: async () => restartedClient,
 		});
 		await restartedRuntime.start();
 		expect(restartedClient.requests).toEqual([expect.objectContaining({ type: "event_replay" })]);
@@ -1216,7 +1303,7 @@ describe("chat daemon worker", () => {
 			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 			await fs.writeFile(
 				endpointPath,
-				JSON.stringify({ sessionId: "session", pid: process.pid, url: `ws://127.0.0.1:${server.port}`, token }),
+				JSON.stringify({ sessionId: "session", url: `ws://127.0.0.1:${server.port}`, token, pid: process.pid }),
 			);
 			const index = await new SessionIndex(agentDir).open();
 			await index.append({
@@ -1226,6 +1313,15 @@ describe("chat daemon worker", () => {
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			});
+			await index.append({
+				type: "host_heartbeat",
+				sessionId: "session",
+				locator: { repo: root, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				activity: { state: "idle", at: Date.now() },
 			});
 			const provider = new FakeDiscordProvider();
 			const runtime = new ChatDaemonRuntime(
@@ -1246,11 +1342,9 @@ describe("chat daemon worker", () => {
 				},
 				{
 					createDiscordProvider: () => provider,
-					routerDeps: {
-						createIndex: () => index,
-						setInterval: (() => 0) as unknown as typeof setInterval,
-						clearInterval: (() => {}) as typeof clearInterval,
-					},
+					createIndex: () => index,
+					setInterval: (() => 0) as unknown as typeof setInterval,
+					clearInterval: (() => {}) as typeof clearInterval,
 				},
 			);
 			const replayedThread = provider.waitForThreadCount(1);
@@ -1302,7 +1396,7 @@ describe("chat daemon worker", () => {
 	const skipProductionSessionHost =
 		process.env.AFFECTED_TASK_KEY?.startsWith("test:@gajae-code/coding-agent:shard-") ?? false;
 	const productionSessionHostTestName =
-		"routes Slack safe queries through the production Session SDK host across worker restart";
+		"routes Slack safe queries through the production Session SDK host across generation and worker restart";
 	it.skipIf(skipProductionSessionHost)(
 		productionSessionHostTestName,
 		async () => {
@@ -1310,6 +1404,7 @@ describe("chat daemon worker", () => {
 			const agentDir = path.join(root, ".gjc", "agent");
 			const host = await startProductionSdkHost(root);
 			const index = await new SessionIndex(agentDir).open();
+			let tick: (() => void) | undefined;
 			const config = {
 				identity: "fingerprint-only",
 				notifications: {
@@ -1344,12 +1439,13 @@ describe("chat daemon worker", () => {
 					{ kind: "slack", agentDir, config },
 					{
 						createSlackProvider: () => provider,
-						routerDeps: {
-							createIndex: () => index,
-							onReconciled,
-							setInterval: (() => 0) as unknown as typeof setInterval,
-							clearInterval: (() => {}) as typeof clearInterval,
-						},
+						createIndex: () => index,
+						onReconciled,
+						setInterval: ((callback: () => void) => {
+							tick = callback;
+							return 0;
+						}) as unknown as typeof setInterval,
+						clearInterval: (() => {}) as typeof clearInterval,
 					},
 				);
 			try {
@@ -1361,6 +1457,15 @@ describe("chat daemon worker", () => {
 					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,
 				});
+				await index.append({
+					type: "host_heartbeat",
+					sessionId: host.sessionId,
+					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
+					endpointGeneration: 1,
+					pid: host.endpoint.pid,
+					endpointMtimeMs: host.endpointMtimeMs,
+					activity: { state: "idle", at: Date.now() },
+				});
 				const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
 				const rootKey = slackConversationKey({ teamId: "team", channelId: "channel", rootTs: "root" });
 				await store.write(rootKey, undefined, {
@@ -1371,16 +1476,6 @@ describe("chat daemon worker", () => {
 					rootTs: "root",
 					sessionId: host.sessionId,
 					endpointGeneration: 1,
-					// Derive through the Router's identity helper using the exact host
-					// process tuple; hand-rolled or test-runner pids create stale roots.
-					attachmentAuthorityId: sessionAttachmentAuthorityId({
-						sessionId: host.sessionId,
-						generation: 1,
-						pid: host.endpoint.pid,
-						endpointMtimeMs: host.endpointMtimeMs,
-						url: host.endpoint.url,
-						token: host.endpoint.token,
-					}),
 					updatedAt: Date.now(),
 					seenEventIds: [],
 					seenContextIds: [],
@@ -1390,7 +1485,12 @@ describe("chat daemon worker", () => {
 				});
 
 				const firstProvider = new FakeSlackProvider();
-				const firstRuntime = startRuntime(firstProvider);
+				const generationTwoReconciled = Promise.withResolvers<void>();
+				let reconciliationCount = 0;
+				const firstRuntime = startRuntime(firstProvider, () => {
+					reconciliationCount++;
+					if (reconciliationCount === 2) generationTwoReconciled.resolve();
+				});
 				await withStageTimeout("first runtime start", firstRuntime.start());
 				const firstCommandResult = firstProvider.waitForPostCount(1, post =>
 					post.text.includes('"operation":"todo.list"'),
@@ -1399,6 +1499,37 @@ describe("chat daemon worker", () => {
 				await withStageTimeout("first Slack SDK result", firstCommandResult);
 				expect(firstProvider.posts.filter(post => post.text.includes('"operation":"todo.list"'))).toHaveLength(1);
 
+				await index.append({
+					type: "host_registered",
+					sessionId: host.sessionId,
+					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
+					endpointGeneration: 2,
+					pid: host.endpoint.pid,
+					endpointMtimeMs: host.endpointMtimeMs,
+				});
+				await index.append({
+					type: "host_heartbeat",
+					sessionId: host.sessionId,
+					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
+					endpointGeneration: 2,
+					pid: host.endpoint.pid,
+					endpointMtimeMs: host.endpointMtimeMs,
+					activity: { state: "idle", at: Date.now() },
+				});
+				await store.transact(rootKey, current =>
+					current
+						? { ...current, generation: current.generation + 1, endpointGeneration: 2, updatedAt: Date.now() }
+						: current,
+				);
+				expect(tick).toBeDefined();
+				tick?.();
+				await withStageTimeout("generation-two reconciliation", generationTwoReconciled.promise);
+				const generationTwoCommandResult = firstProvider.waitForPostCount(2, post =>
+					post.text.includes('"operation":"todo.list"'),
+				);
+				await firstProvider.handler?.(command("generation-two"));
+				await withStageTimeout("generation-two Slack SDK result", generationTwoCommandResult);
+				expect(firstProvider.posts.filter(post => post.text.includes('"operation":"todo.list"'))).toHaveLength(2);
 				await withStageTimeout("first runtime stop", firstRuntime.stop());
 				expect(firstProvider.stopped).toBe(true);
 

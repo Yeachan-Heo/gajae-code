@@ -50,13 +50,17 @@ pub struct EndpointRecord {
 	/// Epoch-millis when the server stopped, if known.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub stopped_at:           Option<u64>,
-	/// Lifecycle marker associated with the session's core-owned startup
-	/// request.
+	/// Lifecycle marker echoed when this session was spawned by the control
+	/// ingress, so a `session_create` matches by marker (never "newest").
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lifecycle_request_id: Option<String>,
-	/// Startup-prompt reference associated with the session's startup request.
+	/// Startup-prompt reference echoed when spawned by the control ingress.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub startup_prompt_ref:   Option<String>,
+	/// The preallocated intended session id propagated to the child, when the
+	/// session was spawned by the control ingress.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub intended_session_id:  Option<String>,
 }
 
 impl EndpointRecord {
@@ -84,7 +88,24 @@ impl EndpointRecord {
 			stopped_at: None,
 			lifecycle_request_id: None,
 			startup_prompt_ref: None,
+			intended_session_id: None,
 		}
+	}
+
+	/// Attach control-ingress correlation markers to a freshly built record so a
+	/// `session_create` can match this endpoint by marker instead of by "newest
+	/// fresh endpoint in a root".
+	#[must_use]
+	pub fn with_lifecycle(
+		mut self,
+		lifecycle_request_id: impl Into<String>,
+		intended_session_id: impl Into<String>,
+		startup_prompt_ref: Option<String>,
+	) -> Self {
+		self.lifecycle_request_id = Some(lifecycle_request_id.into());
+		self.intended_session_id = Some(intended_session_id.into());
+		self.startup_prompt_ref = startup_prompt_ref;
+		self
 	}
 
 	/// A log-safe clone with the token masked. Use this anywhere a record is
@@ -120,6 +141,113 @@ pub fn endpoint_dir(state_root: &Path) -> PathBuf {
 #[must_use]
 pub fn endpoint_path(state_root: &Path, session_id: &str) -> PathBuf {
 	endpoint_dir(state_root).join(format!("{session_id}.json"))
+}
+
+/// On-disk descriptor for the daemon-owned, session-independent lifecycle
+/// control endpoint.
+///
+/// Unlike [`EndpointRecord`], this is **not** per-session: a single control
+/// endpoint accepts `session_create` / `session_close` / `session_resume`
+/// frames before any session exists. It lives under the daemon agent dir, not a
+/// repo state root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlEndpointRecord {
+	/// Schema version.
+	pub version:    u32,
+	/// The OS process id hosting the control server (for dead-PID cleanup).
+	pub pid:        u32,
+	/// Bind host (always loopback in practice).
+	pub host:       String,
+	/// Bound port.
+	pub port:       u16,
+	/// Full `ws://host:port` URL.
+	pub url:        String,
+	/// Identifier of the daemon that owns this endpoint.
+	pub owner_id:   String,
+	/// Epoch-millis when the control server started.
+	pub started_at: u64,
+	/// Epoch-millis of the last update.
+	pub updated_at: u64,
+	/// Set true when the server stopped but the file could not be removed.
+	#[serde(default)]
+	pub stale:      bool,
+	/// Epoch-millis when the server stopped, if known.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stopped_at: Option<u64>,
+}
+
+impl ControlEndpointRecord {
+	/// Build a fresh control-endpoint record for a just-bound control server.
+	#[must_use]
+	pub fn new(host: &str, port: u16, owner_id: impl Into<String>) -> Self {
+		let now = now_millis();
+		let host = host.to_owned();
+		Self {
+			version: 1,
+			pid: std::process::id(),
+			url: format!("ws://{host}:{port}"),
+			host,
+			port,
+			owner_id: owner_id.into(),
+			started_at: now,
+			updated_at: now,
+			stale: false,
+			stopped_at: None,
+		}
+	}
+}
+
+/// Path of the daemon-owned control-endpoint file under an agent dir.
+#[must_use]
+pub fn control_endpoint_path(agent_dir: &Path) -> PathBuf {
+	agent_dir.join("notifications").join("control.json")
+}
+
+/// Atomically write the control-endpoint file under an agent dir.
+///
+/// # Errors
+/// Propagates filesystem errors (permissions, disk, etc.).
+pub fn write_control_endpoint(
+	agent_dir: &Path,
+	record: &ControlEndpointRecord,
+) -> std::io::Result<PathBuf> {
+	let dir = agent_dir.join("notifications");
+	fs::create_dir_all(&dir)?;
+	harden_dir(&dir)?;
+
+	let final_path = control_endpoint_path(agent_dir);
+	let tmp_path = dir.join(format!(".control.{}.tmp", std::process::id()));
+
+	let json = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
+	{
+		let mut file = create_private_file(&tmp_path)?;
+		file.write_all(&json)?;
+		file.sync_all()?;
+	}
+	fs::rename(&tmp_path, &final_path)?;
+	harden_file(&final_path)?;
+	Ok(final_path)
+}
+
+/// Read and parse the control-endpoint file, if present and valid.
+#[must_use]
+pub fn read_control_endpoint(agent_dir: &Path) -> Option<ControlEndpointRecord> {
+	let bytes = fs::read(control_endpoint_path(agent_dir)).ok()?;
+	serde_json::from_slice(&bytes).ok()
+}
+
+/// Remove the control-endpoint file. If removal fails, mark it `stale` instead.
+///
+/// # Errors
+/// Returns an error only if neither removal nor stale-marking succeeds.
+pub fn remove_control_endpoint(agent_dir: &Path) -> std::io::Result<()> {
+	let path = control_endpoint_path(agent_dir);
+	match fs::remove_file(&path) {
+		Ok(()) => Ok(()),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+		Err(_) => mark_control_stale(&path),
+	}
 }
 
 /// Atomically write the endpoint file for a session.
@@ -178,6 +306,26 @@ fn mark_stale(path: &Path) -> std::io::Result<()> {
 	record.token = String::new();
 	let json = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
 	fs::write(path, json)
+}
+
+/// Mark a **control** endpoint file stale when it cannot be deleted. The
+/// control record never persists a token, so this only flips the stale
+/// flag/timestamp.
+fn mark_control_stale(path: &Path) -> std::io::Result<()> {
+	let Some(mut record) = read_control_endpoint_at(path) else {
+		return fs::remove_file(path);
+	};
+	record.stale = true;
+	record.stopped_at = Some(now_millis());
+	let json = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
+	fs::write(path, json)
+}
+
+/// Read a control-endpoint record from an explicit path (used by
+/// stale-marking).
+fn read_control_endpoint_at(path: &Path) -> Option<ControlEndpointRecord> {
+	let bytes = fs::read(path).ok()?;
+	serde_json::from_slice(&bytes).ok()
 }
 
 /// Remove stale endpoint files in the directory: those explicitly marked stale,
@@ -309,12 +457,15 @@ mod tests {
 	#[test]
 	fn endpoint_with_lifecycle_markers_roundtrips() {
 		let root = temp_root();
-		let mut rec = EndpointRecord::new("sess-1", "127.0.0.1", 5555, "secret-token");
-		rec.lifecycle_request_id = Some("lc_01".into());
-		rec.startup_prompt_ref = Some("prompt_lc_01".into());
+		let rec = EndpointRecord::new("sess-1", "127.0.0.1", 5555, "secret-token").with_lifecycle(
+			"lc_01",
+			"sess-1",
+			Some("prompt_lc_01".into()),
+		);
 		let path = write_endpoint(&root, &rec).unwrap();
 		let read = read_endpoint(&path).unwrap();
 		assert_eq!(read.lifecycle_request_id.as_deref(), Some("lc_01"));
+		assert_eq!(read.intended_session_id.as_deref(), Some("sess-1"));
 		assert_eq!(read.startup_prompt_ref.as_deref(), Some("prompt_lc_01"));
 		assert_eq!(read, rec);
 	}
@@ -340,6 +491,27 @@ mod tests {
 		let json = serde_json::to_value(&rec).unwrap();
 		assert!(json.get("lifecycleRequestId").is_none());
 		assert!(json.get("startupPromptRef").is_none());
+		assert!(json.get("intendedSessionId").is_none());
+	}
+
+	#[test]
+	fn control_endpoint_write_read_remove_and_never_persists_token() {
+		let root = temp_root();
+		let rec = ControlEndpointRecord::new("127.0.0.1", 6000, "daemon-1");
+		let path = write_control_endpoint(&root, &rec).unwrap();
+		assert_eq!(path, control_endpoint_path(&root));
+		let read = read_control_endpoint(&root).unwrap();
+		assert_eq!(read, rec);
+		// The control discovery file MUST NOT carry any token: the daemon owns the
+		// in-memory secret and is the only client; persisting it would be a leak.
+		let json: serde_json::Value =
+			serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+		assert!(json.get("token").is_none(), "control.json must not contain a token field");
+		assert_eq!(json.get("url").and_then(|v| v.as_str()), Some("ws://127.0.0.1:6000"));
+		remove_control_endpoint(&root).unwrap();
+		assert!(read_control_endpoint(&root).is_none());
+		// idempotent remove.
+		remove_control_endpoint(&root).unwrap();
 	}
 
 	#[test]

@@ -20,7 +20,6 @@ import {
 } from "../../src/session/internal/managed-session-storage";
 import { createManagedTaskPersistence, type ExecutorOptions, runSubprocess } from "../../src/task/executor";
 import { buildTaskReceipt, findRawTaskLeakKeys } from "../../src/task/receipt";
-import "../../src/tools/review";
 import type { AgentDefinition, SingleResult } from "../../src/task/types";
 import { EventBus } from "../../src/utils/event-bus";
 

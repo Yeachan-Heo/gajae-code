@@ -1,5 +1,3 @@
-import { logger } from "@gajae-code/utils";
-import { redactBrokerRuntimeCloseCapability } from "./control/runtime-gate";
 import { type EventFrame, SessionEventStream } from "./events";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
@@ -45,8 +43,6 @@ export type SessionActivationGate = (input: { sessionId: string; generation: num
 export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	control?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	query?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
-	/** Test/lifecycle seam invoked synchronously before fire-and-forget dispatch. */
-	onFrameAdmitted?: (connectionId: string, frame: SdkFrame) => void;
 	/** Best-effort diagnostic observation of accepted control/query frames. */
 	onRequest?: SdkRequestObserver;
 	/** Runs before a control response is sent; identity transitions use sendTerminal. */
@@ -54,22 +50,10 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 		connectionId: string,
 		request: SdkFrame,
 		response: SdkFrame,
-		sendTerminal: () => Promise<unknown>,
+		sendTerminal: () => Promise<void>,
 	) => void | Promise<void>;
 	/** Runs only after a successful control response has been sent to the client. */
 	afterControlResponse?: (connectionId: string, request: SdkFrame, response: SdkFrame) => void | Promise<void>;
-	/**
-	 * Classifies the awaited control-response write exactly once: `written`
-	 * (sent), `rejected` (the write threw), or `dropped` (the send adapter
-	 * deliberately skipped delivery). `afterControlResponse` runs only
-	 * on `written`. Used to persist monotonic response-state transitions.
-	 */
-	onControlResponseDelivery?: (
-		connectionId: string,
-		request: SdkFrame,
-		response: SdkFrame,
-		outcome: "written" | "rejected" | "dropped",
-	) => void | Promise<void>;
 	installProviderDefinitions?: (capability: string, definitions: unknown) => void;
 	onProviderDefinitionsRemoved?: (capability: string) => void;
 	onReverseCancel?: (requestId: string, reason: "provider_disconnected" | "lease_released") => void;
@@ -255,7 +239,6 @@ export class SessionSdkHost {
 				generation: this.events.generation,
 			});
 		const disposer = this.#options.onFrame((connectionId, frame) => {
-			this.#options.onFrameAdmitted?.(connectionId, frame);
 			void this.#onFrame(connectionId, frame);
 		});
 		this.#unsubscribe = typeof disposer === "function" ? disposer : undefined;
@@ -370,8 +353,8 @@ export class SessionSdkHost {
 			});
 	}
 
-	async #send(connectionId: string, frame: SdkFrame): Promise<"written" | "dropped"> {
-		return await this.#options.sendFrame(connectionId, frame);
+	async #send(connectionId: string, frame: SdkFrame): Promise<void> {
+		await this.#options.sendFrame(connectionId, frame);
 	}
 
 	/**
@@ -412,45 +395,14 @@ export class SessionSdkHost {
 					if (result !== undefined) {
 						const response = { type: "control_response", ...(result as SdkFrame) };
 						let terminalSent = false;
-						let sendOutcome: "written" | "rejected" | "dropped" = "dropped";
-						const sendTerminal = async (): Promise<"written" | "rejected" | "dropped"> => {
-							// Repeat calls (early hook send + fallback) return the FIRST,
-							// actual outcome — never a false dropped for an already
-							// written response (early-identity-rotation pattern).
-							if (terminalSent) return sendOutcome;
+						const sendTerminal = async (): Promise<void> => {
+							if (terminalSent) return;
 							terminalSent = true;
-							try {
-								const outcome = await this.#send(connectionId, response);
-								sendOutcome = outcome === "written" ? "written" : "dropped";
-							} catch {
-								sendOutcome = "rejected";
-							}
-							return sendOutcome;
+							await this.#send(connectionId, response);
 						};
-						try {
-							await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
-							// Fallback: if the before hook did not send early (identity
-							// rotation), the response is always sent here.
-							if (!terminalSent) sendOutcome = await sendTerminal();
-						} finally {
-							// Classify exactly once, immediately after the send attempt and
-							// BEFORE the optional post-write hook, so a rejected/dropped
-							// write (or an afterControlResponse throw) never mislabels it.
-							try {
-								await this.#options.onControlResponseDelivery?.(connectionId, frame, response, sendOutcome);
-							} catch (error) {
-								// Contain observer persistence failures: the response was already
-								// sent (or classified) and its delivery state recorded; rethrowing
-								// would escape into the outer #onFrame catch and send a SECOND
-								// control_response for the same request id (review thread P2).
-								logger.warn("sdk control delivery observer failed", {
-									error: error instanceof Error ? error.message : String(error),
-								});
-							}
-						}
-						if (sendOutcome === "written") {
-							await this.#options.afterControlResponse?.(connectionId, frame, response);
-						}
+						await this.#options.beforeControlResponse?.(connectionId, frame, response, sendTerminal);
+						await sendTerminal();
+						await this.#options.afterControlResponse?.(connectionId, frame, response);
 					}
 					break;
 				}
@@ -590,7 +542,7 @@ export class SessionSdkHost {
 	}
 	#observeRequest(kind: "control" | "query", connectionId: string, frame: SdkFrame): void {
 		try {
-			this.#options.onRequest?.(kind, connectionId, redactBrokerRuntimeCloseCapability(frame));
+			this.#options.onRequest?.(kind, connectionId, frame);
 		} catch {
 			// Diagnostic observers must not change request handling.
 		}

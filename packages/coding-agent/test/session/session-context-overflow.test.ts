@@ -371,8 +371,8 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 
 		await session.prompt("overflow");
 
-		// The observable seam retries the accepted prompt after rebuilding context; internal compaction reads vary by storage mode.
-		expect(buildSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+		// The seam builds twice; forced compaction performs one internal context read.
+		expect(buildSpy).toHaveBeenCalledTimes(3);
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		expect(submitted).toHaveLength(1);
@@ -556,8 +556,9 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 
 		await session.prompt("roster-overflow");
 
-		// Exactly one compaction, one retry, and one accepted prompt commit the claimed roster once.
-		expect(buildSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+		// Exactly one compaction, one retry, one accepted prompt with the one
+		// claimed roster message committed (never reconstructed nor duplicated).
+		expect(buildSpy).toHaveBeenCalledTimes(3);
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		expect(submitted).toHaveLength(1);
@@ -565,7 +566,7 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 			submitted[0]?.filter(message => message.role === "custom" && message.customType === "irc-peer-roster"),
 		).toHaveLength(1);
 	});
-	it("rethrows the original overflow after bounded failed compaction attempts without continuation", async () => {
+	it("rethrows the original overflow after one failed forced compaction without continuation", async () => {
 		await session.dispose();
 		await makeSession({ "compaction.keepRecentTokens": 1 });
 		appendConversation("failure");
@@ -578,9 +579,8 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 
 		await expect(session.prompt("overflow")).rejects.toBe(overflow);
 		expect(buildSpy).toHaveBeenCalledTimes(1);
-		// The forced workflow may include bounded maintenance-model fallbacks before stopping.
-		expect(compactSpy.mock.calls.length).toBeGreaterThanOrEqual(1);
-		expect(compactSpy.mock.calls.length).toBeLessThanOrEqual(4);
+		// The single forced workflow tries its configured maintenance-model fallback before stopping.
+		expect(compactSpy).toHaveBeenCalledTimes(2);
 		expect(promptSpy).not.toHaveBeenCalled();
 	});
 	it("keeps synchronous overflow protection on while the async recovery switch is disabled", async () => {

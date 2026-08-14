@@ -1,10 +1,9 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
-import { Agent, type AgentTool, type RunSettlementProof } from "@gajae-code/agent-core";
+import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { closeModelCache, getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { NotificationServer } from "@gajae-code/natives";
@@ -47,11 +46,10 @@ import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { formatPromptSettlementDiagnostic, PresentationArbiter } from "../src/sdk/bus";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
-import { reconciliationStorePath } from "../src/sdk/bus/reconciliation-store";
-import type { NotificationSessionController } from "../src/sdk/bus/session-control";
-import { SdkClient } from "../src/sdk/client";
+import { getNotificationConfig } from "../src/sdk/bus/config";
+import { NotificationSessionController } from "../src/sdk/bus/session-control";
+import * as telegramDaemon from "../src/sdk/bus/telegram-daemon";
 import { SessionSdkHost } from "../src/sdk/host";
-import type { SessionAttachment } from "../src/sdk/router/session-router";
 import { createAgentSession } from "../src/sdk/session";
 import {
 	attachLifecycleStartupCapability,
@@ -99,38 +97,6 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 		await Bun.sleep(20);
 	}
 }
-function pauseNextReconciliationCommit(
-	sessionFile: string,
-	sessionId: string,
-): {
-	started: Promise<void>;
-	release: () => void;
-	restore: () => void;
-	arm: () => void;
-} {
-	const target = reconciliationStorePath(sessionFile, sessionId);
-	const started = Promise.withResolvers<void>();
-	const release = Promise.withResolvers<void>();
-	const realRename = fsPromises.rename.bind(fsPromises);
-	let armed = false;
-	let paused = false;
-	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
-		if (armed && !paused && String(to) === target) {
-			paused = true;
-			started.resolve();
-			await release.promise;
-		}
-		await realRename(from, to);
-	});
-	return {
-		started: started.promise,
-		release: () => release.resolve(),
-		restore: () => rename.mockRestore(),
-		arm: () => {
-			armed = true;
-		},
-	};
-}
 
 async function closeSocket(socket: WebSocket): Promise<void> {
 	if (socket.readyState === WebSocket.CLOSED) return;
@@ -163,7 +129,12 @@ function start(
 	commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>(),
 	lifecycle?: { startupCapability: SdkStartupCapability; lifecycleRequired: true },
 	autoStart = true,
-	ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<"attached" | "blocked">,
+	ensureTelegramDaemon?: (input: {
+		settings: Settings;
+		cwd: string;
+		sessionId: string;
+		onRegistered?: (registration: telegramDaemon.RegisterNotificationRootResult) => void;
+	}) => Promise<"attached" | "blocked">,
 	controller?: NotificationSessionController,
 	ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>,
 ): Map<string, (event: unknown, context: unknown) => unknown> {
@@ -181,11 +152,6 @@ function start(
 			if (forwardPreflightCallbacks) return Promise.resolve(sendUserMessage(content, options));
 			const { onPreflightAccepted, onPreflightAcceptCommit, ...delivery } = options ?? {};
 			const submission = sendUserMessage(content, Object.keys(delivery).length > 0 ? delivery : undefined);
-			// The returned chain adopts `submission` only once the durable fence
-			// resolves; mark it handled immediately so an early preflight rejection
-			// is not surfaced as an unhandled rejection by the test runtime. The
-			// default harness stub resolves to undefined, so guard the call.
-			if (typeof submission?.catch === "function") submission.catch(() => {});
 			// Prefer awaitable durable fence; fall back to legacy sync accept for older mocks.
 			if (onPreflightAcceptCommit) {
 				return Promise.resolve(onPreflightAcceptCommit()).then(() => {
@@ -209,40 +175,27 @@ function start(
 					ensureTelegramDaemon,
 					ensureProviderDaemon,
 					controller,
-					terminalAbortSeams: {
-						getTerminalTurnEpoch: () =>
-							(ctx as { getTerminalTurnEpoch?: () => number | undefined }).getTerminalTurnEpoch?.(),
-						cancelPendingPreflightForTerminalAbort: () =>
-							(
-								ctx as { cancelPendingPreflightForTerminalAbort?: () => void }
-							).cancelPendingPreflightForTerminalAbort?.(),
-						captureTerminalAbortSteeringSnapshot: () =>
-							(
-								ctx as { captureTerminalAbortSteeringSnapshot?: () => number | undefined }
-							).captureTerminalAbortSteeringSnapshot?.(),
-						discardTerminalAbortSteeringSnapshot: (token: number) =>
-							(
-								ctx as { discardTerminalAbortSteeringSnapshot?: (token: number) => void }
-							).discardTerminalAbortSteeringSnapshot?.(token),
-						rebindTerminalAbortSteeringSnapshot: (token: number) =>
-							(
-								ctx as { rebindTerminalAbortSteeringSnapshot?: (token: number) => void }
-							).rebindTerminalAbortSteeringSnapshot?.(token),
-						abortPromptAndWaitWithTerminal: (handle, seamOptions) =>
-							(
-								ctx as {
-									abortPromptAndWait?: (
-										handle: string,
-										options: { graceMs: number; terminal?: { scope: string } },
-									) => Promise<unknown>;
-								}
-							).abortPromptAndWait?.(handle, seamOptions) as unknown as Promise<RunSettlementProof>,
-					},
 				}
 			: undefined,
 	);
 	if (autoStart) void handlers.get("session_start")?.({ type: "session_start" }, ctx);
 	return handlers;
+}
+
+function telegramSettings(agentDir: string, configured: boolean): Settings {
+	const settings = Settings.isolated({
+		"notifications.enabled": true,
+		...(configured
+			? { "notifications.telegram.botToken": "123456:token", "notifications.telegram.chatId": "42" }
+			: {}),
+	}) as Settings;
+	return new Proxy(settings, {
+		get(target, prop) {
+			if (prop === "getAgentDir") return () => agentDir;
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as Settings;
 }
 
 function context(
@@ -572,7 +525,217 @@ test("lifecycle cleanup fences same-id startup and preserves proven owner releas
 	}
 }, 60_000);
 
-test("a blocked Telegram ownership race preserves the canonical endpoint and withholds adapters", async () => {
+test("Telegram root release failure is retained and retried through lifecycle shutdown", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-retry-"));
+	dirs.push(cwd);
+	const sessionId = `telegram-root-retry-${Date.now()}`;
+	const settings = telegramSettings(path.join(cwd, "agent"), true);
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const unregisterImpl = telegramDaemon.unregisterNotificationRoot;
+	let unregisterAttempts = 0;
+	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot").mockImplementation(async input => {
+		unregisterAttempts++;
+		// Fail the first owner-release attempt for the live registration token.
+		if (unregisterAttempts === 1) throw new Error("roots write failed");
+		return await unregisterImpl(input);
+	});
+	const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(
+			sessionContext,
+			settings,
+			() => {},
+			false,
+			new Map(),
+			{ startupCapability: capability, lifecycleRequired: true },
+			false,
+			async input => {
+				const registration = await telegramDaemon.registerNotificationRoot(input);
+				input.onRegistered?.(registration);
+				return "attached";
+			},
+		);
+		// Await full start+reconcile so shutdown uses the final replacement token only.
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		// First shutdown retains the failed owner release (exactly one attempt).
+		expect(unregister).toHaveBeenCalledTimes(1);
+		expect(unregister.mock.calls[0]?.[0].registrationToken).toEqual(expect.any(String));
+		expect(
+			errorSpy.mock.calls.some(([message]) =>
+				String(message).includes(`SDK notification runtime ${sessionId} owner release failed`),
+			),
+		).toBe(true);
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
+		// Explicit later lifecycle shutdown retries the retained release and succeeds.
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).toHaveBeenCalledTimes(2);
+		expect(unregister.mock.calls[1]?.[0].registrationToken).toBe(unregister.mock.calls[0]?.[0].registrationToken);
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBeUndefined();
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
+			version: 1,
+			roots: [],
+			managedRoots: [],
+			sessions: {},
+			registrationTokens: {},
+		});
+		await expect(
+			handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
+		).resolves.toBeUndefined();
+		expect(unregister).toHaveBeenCalledTimes(2);
+	} finally {
+		unregister.mockRestore();
+		errorSpy.mockRestore();
+	}
+}, 60_000);
+
+test("Telegram cleanup is never retained without a registration token", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-tokenless-"));
+	dirs.push(cwd);
+	const sessionId = `telegram-root-tokenless-${Date.now()}`;
+	const settings = telegramSettings(path.join(cwd, "agent"), true);
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(
+			sessionContext,
+			settings,
+			() => {},
+			false,
+			new Map(),
+			{ startupCapability: capability, lifecycleRequired: true },
+			false,
+			async () => "attached",
+		);
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).not.toHaveBeenCalled();
+	} finally {
+		unregister.mockRestore();
+	}
+}, 60_000);
+
+test("shutdown releases a Telegram root registered before sibling readiness settles", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-startup-race-"));
+	dirs.push(cwd);
+	const sessionId = `telegram-root-startup-race-${Date.now()}`;
+	const settings = telegramSettings(path.join(cwd, "agent"), true);
+	settings.set("notifications.discord.enabled", true);
+	settings.set("notifications.discord.botToken", "discord-token");
+	settings.set("notifications.discord.applicationId", "discord-app");
+	settings.set("notifications.discord.guildId", "discord-guild");
+	settings.set("notifications.discord.parentChannelId", "discord-parent");
+	const registered = Promise.withResolvers<void>();
+	const releaseProvider = Promise.withResolvers<void>();
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
+	let registrationToken: string | undefined;
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(
+			sessionContext,
+			settings,
+			() => {},
+			false,
+			new Map(),
+			{ startupCapability: capability, lifecycleRequired: true },
+			false,
+			async input => {
+				const registration = await telegramDaemon.registerNotificationRoot(input);
+				registrationToken = registration.token;
+				input.onRegistered?.(registration);
+				registered.resolve();
+				return "attached";
+			},
+			undefined,
+			async () => await releaseProvider.promise,
+		);
+		const startup = Promise.resolve(handlers.get("session_start")!({ type: "session_start" }, sessionContext));
+		await registered.promise;
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).toHaveBeenCalledWith(expect.objectContaining({ sessionId, registrationToken }));
+		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
+			version: 1,
+			roots: [],
+			managedRoots: [],
+			sessions: {},
+			registrationTokens: {},
+		});
+		releaseProvider.resolve();
+		await startup;
+		await expect(capability.promise).resolves.toMatchObject({ status: "failed" });
+	} finally {
+		releaseProvider.resolve();
+		unregister.mockRestore();
+	}
+}, 60_000);
+
+test("provider retry replaces and releases the Telegram root registration token", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-provider-retry-"));
+	dirs.push(cwd);
+	const sessionId = `telegram-root-provider-retry-${Date.now()}`;
+	const settings = telegramSettings(path.join(cwd, "agent"), true);
+	settings.set("notifications.discord.enabled", true);
+	settings.set("notifications.discord.botToken", "discord-token");
+	settings.set("notifications.discord.applicationId", "discord-app");
+	settings.set("notifications.discord.guildId", "discord-guild");
+	settings.set("notifications.discord.parentChannelId", "discord-parent");
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	const unregister = spyOn(telegramDaemon, "unregisterNotificationRoot");
+	const registrationTokens: string[] = [];
+	let providerAttempts = 0;
+	try {
+		const sessionContext = context(cwd, sessionId);
+		const handlers = start(
+			sessionContext,
+			settings,
+			() => {},
+			false,
+			new Map(),
+			{ startupCapability: capability, lifecycleRequired: true },
+			false,
+			async input => {
+				const registration = await telegramDaemon.registerNotificationRoot(input);
+				registrationTokens.push(registration.token);
+				input.onRegistered?.(registration);
+				return "attached";
+			},
+			undefined,
+			async () => {
+				providerAttempts++;
+				if (providerAttempts === 1) throw new Error("Discord unavailable");
+			},
+		);
+		await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
+		await expect(capability.promise).resolves.toEqual({ status: "started" });
+		expect(providerAttempts).toBe(2);
+		expect(registrationTokens.length).toBeGreaterThanOrEqual(2);
+		expect(registrationTokens.at(-1)).not.toBe(registrationTokens[0]);
+		await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+		expect(unregister).toHaveBeenCalledWith(
+			expect.objectContaining({ sessionId, registrationToken: registrationTokens.at(-1) }),
+		);
+		const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
+		expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
+			version: 1,
+			roots: [],
+			managedRoots: [],
+			sessions: {},
+			registrationTokens: {},
+		});
+	} finally {
+		unregister.mockRestore();
+	}
+}, 60_000);
+
+test("late Telegram ownership races preserve the published canonical core endpoint", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-sibling-isolation-"));
 	dirs.push(cwd);
 	const agentDir = path.join(cwd, "agent");
@@ -611,15 +774,10 @@ test("a blocked Telegram ownership race preserves the canonical endpoint and wit
 	await handlers.get("session_start")!({ type: "session_start" }, sessionContext);
 	await expect(capability.promise).resolves.toEqual({ status: "started" });
 	const defaultEndpoint = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	const chatStateRoot = path.join(cwd, ".gjc", "state", "chat");
-	const chatEndpoint = path.join(chatStateRoot, "sdk", `${sessionId}.json`);
-	// No durable foreign-owner state exists up front, so the session publishes
-	// its canonical endpoint immediately; the ownership race discovered by the
-	// background ensure degrades to withheld notification adapters and never
-	// republishes or blocks the session (fail-closed daemon isolation).
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const chatEndpoint = path.join(stateRoot, "chat", "sdk", `${sessionId}.json`);
 	expect(fs.existsSync(defaultEndpoint)).toBe(true);
 	expect(fs.existsSync(chatEndpoint)).toBe(false);
-	const stateRoot = path.join(cwd, ".gjc", "state");
 	const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
 	expect(sessions).toContainEqual(
 		expect.objectContaining({
@@ -629,6 +787,54 @@ test("a blocked Telegram ownership race preserves the canonical endpoint and wit
 		}),
 	);
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+}, 60_000);
+test("Telegram root ownership is recorded when reconciliation configures Telegram after startup", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-telegram-root-reconcile-"));
+	dirs.push(cwd);
+	const sessionId = `telegram-root-reconcile-${Date.now()}`;
+	const settings = telegramSettings(path.join(cwd, "agent"), false);
+	const controller = new NotificationSessionController({
+		eligible: true,
+		getConfig: () => getNotificationConfig(settings),
+	});
+	const capability = new SdkStartupCapability(new SdkStartupRollbackTracker());
+	let registrations = 0;
+	const sessionContext = context(cwd, sessionId);
+	const handlers = start(
+		sessionContext,
+		settings,
+		() => {},
+		false,
+		new Map(),
+		{ startupCapability: capability, lifecycleRequired: true },
+		true,
+		async input => {
+			registrations++;
+			const registration = await telegramDaemon.registerNotificationRoot(input);
+			input.onRegistered?.(registration);
+			return "attached";
+		},
+		controller,
+	);
+	await expect(capability.promise).resolves.toEqual({ status: "started" });
+	expect(registrations).toBe(0);
+	settings.set("notifications.telegram.botToken", "123456:token");
+	settings.set("notifications.telegram.chatId", "42");
+	await expect(controller.reconcileCurrentSession(sessionContext as never)).resolves.toMatchObject({
+		outcome: "started",
+	});
+	const rootsFile = telegramDaemon.daemonPaths(settings.getAgentDir()).roots;
+	expect(JSON.parse(fs.readFileSync(rootsFile, "utf8")).sessions[sessionId]).toBe(path.join(cwd, ".gjc", "state"));
+	await expect(
+		handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext),
+	).resolves.toBeUndefined();
+	expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toEqual({
+		version: 1,
+		roots: [],
+		managedRoots: [],
+		sessions: {},
+		registrationTokens: {},
+	});
 }, 60_000);
 
 test("production SDK host starts exactly one instrumented server (no duplicate auto-host)", async () => {
@@ -1010,8 +1216,9 @@ test("interactive SDK control routes synthetic gajae-code selections to session-
 		contextActions?.sdkControl?.("model.set", { id: "gajae-code/codex-eco", thinkingLevel: "high" }),
 	).rejects.toMatchObject({ code: "invalid_input" });
 });
-test("interactive SDK controls reject Broker-owned session handoff", async () => {
+test("interactive session.handoff SDK control threads focus instructions to session.handoff", async () => {
 	let contextActions: ExtensionContextActions | undefined;
+	const handoffCalls: (string | undefined)[] = [];
 	const runner = {
 		initialize(
 			_actions: ExtensionActions,
@@ -1023,12 +1230,26 @@ test("interactive SDK controls reject Broker-owned session handoff", async () =>
 		},
 	};
 	const controller = new ExtensionUiController({
-		session: { extensionRunner: runner },
+		session: {
+			extensionRunner: runner,
+			handoff: async (instructions?: string) => {
+				handoffCalls.push(instructions);
+				return { document: "## Goal\nContinue", savedPath: undefined };
+			},
+		},
 	} as unknown as InteractiveModeContext);
 	controller.initializeHookRunner({} as ExtensionUIContext, false);
-	await expect(
-		contextActions?.sdkControl?.("session.handoff", { target: "preserve failing test" }),
-	).rejects.toMatchObject({ code: "operation_prohibited" });
+
+	// The wire carries the focus under `target` (see sdk-control-dispatch);
+	// the SDK control seam must forward it to session.handoff.
+	expect(await contextActions?.sdkControl?.("session.handoff", { target: "preserve failing test" })).toEqual({
+		handoff: { document: "## Goal\nContinue", savedPath: undefined },
+	});
+	expect(handoffCalls).toEqual(["preserve failing test"]);
+
+	// A bare handoff (no focus) forwards undefined.
+	await contextActions?.sdkControl?.("session.handoff", {});
+	expect(handoffCalls).toEqual(["preserve failing test", undefined]);
 });
 
 test("startup records identity before an early lifecycle event and publishes it only after NotificationServer starts", async () => {
@@ -1081,11 +1302,7 @@ test("startup records identity before an early lifecycle event and publishes it 
 		const events = replay.events as Array<Record<string, unknown>>;
 		expect(events.map(event => event.payload)).toEqual(
 			expect.arrayContaining([
-				// Telegram is not configured in this harness, so the session correctly
-				// declares itself ineligible. Eligibility tracks configuration only;
-				// `isTelegramSessionEligible` owns that rule and is covered directly in
-				// notifications-config.test.ts.
-				expect.objectContaining({ type: "identity_header", sessionId, telegramTopicsEnabled: false }),
+				expect.objectContaining({ type: "identity_header", sessionId }),
 				expect.objectContaining({ type: "activity", sessionId, state: "busy" }),
 			]),
 		);
@@ -1099,7 +1316,7 @@ test("startup records identity before an early lifecycle event and publishes it 
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 });
 
-test("serializes concurrent /notify on across overlapping replacement startups", async () => {
+test("serializes concurrent /notify on across cancelled and replacement startups", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-host-notify-startup-"));
 	dirs.push(cwd);
 	const sessionId = `notify-startup-${Date.now()}`;
@@ -1133,11 +1350,8 @@ test("serializes concurrent /notify on across overlapping replacement startups",
 		await Promise.all([firstEnable, secondEnable]);
 
 		expect(getAskAnswerSource(sessionId)).toBeDefined();
-		// Both startups serialize behind the single controller queue and converge
-		// to enabled: the first startup is no longer reported as failed once its
-		// server start completes (activeRuntimeId is claimed at start settlement).
 		expect(messages).toEqual([
-			{ message: "Notifications enabled for this session.", level: "info" },
+			{ message: "Notifications failed to start for this session.", level: "error" },
 			{ message: "Notifications enabled for this session.", level: "info" },
 		]);
 	} finally {
@@ -1526,12 +1740,9 @@ test("SDK host preserves ordered prompt image blocks in the host payload", async
 				{ type: "image", data: "cG5nLWJ5dGVz", mimeType: "image/png" },
 				{ type: "image", data: "ZGVmYXVsdC1taW1l", mimeType: "image/jpeg" },
 			],
-			{ preflightSignal: expect.any(AbortSignal) },
+			undefined,
 		],
-		[
-			[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }],
-			{ preflightSignal: expect.any(AbortSignal) },
-		],
+		[[{ type: "image", data: "d2VicC1ieXRlcw", mimeType: "image/webp" }]],
 	]);
 });
 
@@ -1555,9 +1766,6 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 		socket.addEventListener("open", () => resolve(), { once: true });
 		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 	});
-	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	await Bun.sleep(10);
-	expect(frames.some(frame => frame.type === "agent_start" && frame.commandId !== undefined)).toBe(false);
 	socket.send(
 		JSON.stringify({
 			type: "control_request",
@@ -1580,19 +1788,8 @@ test("SDK host correlates follow-up acknowledgements with the later agent start"
 		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
 	});
 	if (typeof commandId !== "string" || typeof turnId !== "string") throw new Error("missing follow-up correlation");
-	const sentOptions = sent[0]?.[1];
-	const sdkRunToken = sentOptions && "sdkRunToken" in sentOptions ? sentOptions.sdkRunToken : undefined;
-	expect(sent).toEqual([
-		[
-			"queued follow-up",
-			{ deliverAs: "followUp", preflightSignal: expect.any(AbortSignal), sdkRunToken: expect.any(String) },
-		],
-	]);
-	if (typeof sdkRunToken !== "string") throw new Error("missing SDK follow-up run token");
-	void handlers.get("agent_end")?.({ type: "agent_end", messages: [], stopReason: "completed" }, sessionContext);
-	await Bun.sleep(10);
-	expect(frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId)).toBe(false);
-	void handlers.get("agent_start")?.({ type: "agent_start", sdkRunToken }, sessionContext);
+	expect(sent).toEqual([["queued follow-up", { deliverAs: "followUp" }]]);
+	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 	await waitFor(
 		() => frames.some(frame => frame.type === "agent_start" && frame.commandId === commandId),
 		"correlated agent start",
@@ -1947,28 +2144,14 @@ test("SDK host replays an accepted prompt terminal after its requester disconnec
 		recovery.addEventListener("open", () => resolve(), { once: true });
 		recovery.addEventListener("error", () => reject(new Error("recovery WS error")), { once: true });
 	});
-	// The terminalization claim is durable and lands asynchronously after the
-	// lifecycle event is published to the ring, so poll the ring until the
-	// correlated terminal appears instead of racing its first snapshot.
-	const pollReplay = () =>
-		recovery.send(JSON.stringify({ type: "event_replay", id: "disconnect-replay", sinceGeneration: 1, sinceSeq: 0 }));
-	pollReplay();
-	await waitFor(() => {
-		const results = recoveryFrames.filter(
-			frame => frame.type === "event_replay_result" && frame.id === "disconnect-replay",
-		);
-		const events =
-			(results.at(-1) as { events?: Array<{ payload?: Record<string, unknown> }> } | undefined)?.events ?? [];
-		const terminal = events.find(
-			event => event.payload?.commandId === correlation.commandId && event.payload?.type === "agent_end",
-		);
-		if (terminal) return true;
-		pollReplay();
-		return false;
-	}, "disconnected prompt replay");
-	const replay = recoveryFrames
-		.filter(frame => frame.type === "event_replay_result" && frame.id === "disconnect-replay")
-		.at(-1) as {
+	recovery.send(JSON.stringify({ type: "event_replay", id: "disconnect-replay", sinceGeneration: 1, sinceSeq: 0 }));
+	await waitFor(
+		() => recoveryFrames.some(frame => frame.type === "event_replay_result" && frame.id === "disconnect-replay"),
+		"disconnected prompt replay",
+	);
+	const replay = recoveryFrames.find(
+		frame => frame.type === "event_replay_result" && frame.id === "disconnect-replay",
+	) as {
 		events?: Array<{ payload?: Record<string, unknown> }>;
 	};
 	const lifecycle = replay.events?.filter(
@@ -2244,558 +2427,6 @@ test("SDK host terminalizes a cancelled preflight and releases prompt authority"
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
 });
 
-test("SDK host cancels canonical skill invocation before agent start and fences late acceptance", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-preflight-cancelled-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-skill-preflight-cancelled-${Date.now()}`;
-	const preflightStarted = Promise.withResolvers<void>();
-	const releasePreflight = Promise.withResolvers<void>();
-	let executionStarted = false;
-	const sessionContext = context(cwd, sessionId);
-	const baseBindings = sessionContext.sdkBindings as () => string[];
-	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
-	sessionContext.invokeSkill = async (
-		name: string,
-		args: string | undefined,
-		options?: {
-			onSkillPrepared?: (meta: { name: string; path: string }) => void;
-			onPreflightAcceptCommit?: () => void | Promise<void>;
-			preflightSignal?: AbortSignal;
-		},
-	) => {
-		expect(name).toBe("fixture-skill");
-		expect(args).toBe("cancel before start");
-		preflightStarted.resolve();
-		const cancelled = Promise.withResolvers<never>();
-		const onAbort = () =>
-			cancelled.reject(
-				Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" }),
-			);
-		options?.preflightSignal?.addEventListener("abort", onAbort, { once: true });
-		try {
-			await Promise.race([releasePreflight.promise, cancelled.promise]);
-		} finally {
-			options?.preflightSignal?.removeEventListener("abort", onAbort);
-		}
-		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
-		await options?.onPreflightAcceptCommit?.();
-		if (options?.preflightSignal?.aborted)
-			throw Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" });
-		executionStarted = true;
-		return { name, path: "/fixture/SKILL.md", args };
-	};
-	const handlers = start(sessionContext);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	await new Promise<void>((resolve, reject) => {
-		socket.addEventListener("open", () => resolve(), { once: true });
-		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	});
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "skill-preflight",
-			operation: "skill.invoke",
-			input: { name: "fixture-skill", args: "cancel before start" },
-		}),
-	);
-	await preflightStarted.promise;
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "abort-skill-preflight",
-			operation: "turn.abort",
-			input: {},
-		}),
-	);
-	await waitFor(
-		() =>
-			frames.some(frame => frame.type === "control_response" && frame.id === "skill-preflight") &&
-			frames.some(frame => frame.type === "control_response" && frame.id === "abort-skill-preflight"),
-		"skill preflight cancellation responses",
-	);
-	expect(frames.find(frame => frame.type === "control_response" && frame.id === "skill-preflight")).toMatchObject({
-		ok: false,
-		error: { code: "busy", message: "Skill preflight was cancelled before execution." },
-	});
-	expect(
-		frames.find(frame => frame.type === "control_response" && frame.id === "abort-skill-preflight"),
-	).toMatchObject({
-		ok: true,
-		result: { aborted: true, disposition: "preflight_cancelled" },
-	});
-	releasePreflight.resolve();
-	await Promise.resolve();
-	await Promise.resolve();
-	expect(executionStarted).toBe(false);
-	expect(frames.some(frame => frame.type === "agent_start")).toBe(false);
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-});
-
-test("SDK host waits for accepted handleless skill settlement before publishing cancellation", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-accepted-handleless-cancel-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-skill-accepted-handleless-cancel-${Date.now()}`;
-	const acceptedWithoutHandle = Promise.withResolvers<void>();
-	const abortObserved = Promise.withResolvers<void>();
-	const releaseSettlement = Promise.withResolvers<void>();
-	let executionStarted = false;
-	const sessionContext = context(cwd, sessionId);
-	const baseBindings = sessionContext.sdkBindings as () => string[];
-	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
-	sessionContext.invokeSkill = async (
-		name: string,
-		args: string | undefined,
-		options?: {
-			onSkillPrepared?: (meta: { name: string; path: string }) => void;
-			onPreflightAcceptCommit?: () => void | Promise<void>;
-			preflightSignal?: AbortSignal;
-		},
-	) => {
-		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md" });
-		await options?.onPreflightAcceptCommit?.();
-		acceptedWithoutHandle.resolve();
-		options?.preflightSignal?.addEventListener("abort", () => abortObserved.resolve(), { once: true });
-		await releaseSettlement.promise;
-		if (options?.preflightSignal?.aborted)
-			throw Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" });
-		executionStarted = true;
-		return { name, path: "/fixture/SKILL.md", args };
-	};
-	const handlers = start(sessionContext);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	await new Promise<void>((resolve, reject) => {
-		socket.addEventListener("open", () => resolve(), { once: true });
-		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	});
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "accepted-handleless-skill",
-			operation: "skill.invoke",
-			input: { name: "fixture-skill", args: "cancel after acceptance" },
-		}),
-	);
-	await acceptedWithoutHandle.promise;
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "accepted-handleless-skill"),
-		"accepted handleless skill response",
-	);
-	const acceptedFrame = frames.find(
-		frame => frame.type === "control_response" && frame.id === "accepted-handleless-skill",
-	) as { result?: { commandId?: string; turnId?: string } } | undefined;
-	const acceptedCommandId = acceptedFrame?.result?.commandId;
-	const acceptedTurnId = acceptedFrame?.result?.turnId;
-	expect(acceptedFrame).toMatchObject({
-		ok: true,
-		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
-	});
-
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "abort-accepted-handleless-skill",
-			operation: "turn.abort",
-			input: {},
-		}),
-	);
-	await abortObserved.promise;
-	await Bun.sleep(20);
-	expect(
-		frames.some(frame => frame.type === "control_response" && frame.id === "abort-accepted-handleless-skill"),
-	).toBe(false);
-	expect(
-		frames.some(
-			frame =>
-				(frame.type === "agent_end" || frame.type === "agent_failed") &&
-				frame.commandId === acceptedFrame?.result?.commandId &&
-				frame.turnId === acceptedFrame?.result?.turnId,
-		),
-	).toBe(false);
-
-	releaseSettlement.resolve();
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-accepted-handleless-skill"),
-		"accepted handleless cancellation response",
-	);
-	await waitFor(
-		() =>
-			frames.some(
-				frame =>
-					frame.type === "agent_end" && frame.commandId === acceptedCommandId && frame.turnId === acceptedTurnId,
-			),
-		"accepted handleless cancellation terminal",
-	);
-	expect(
-		frames.find(frame => frame.type === "control_response" && frame.id === "abort-accepted-handleless-skill"),
-	).toMatchObject({
-		ok: true,
-		result: { aborted: true, disposition: "cancelled" },
-	});
-	expect(
-		frames.find(
-			frame =>
-				frame.type === "agent_end" && frame.commandId === acceptedCommandId && frame.turnId === acceptedTurnId,
-		),
-	).toMatchObject({
-		outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-	});
-	expect(executionStarted).toBe(false);
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-});
-test("SDK host waits for durable prompt acceptance before completing concurrent cancellation", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-durable-accept-cancel-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-prompt-durable-accept-cancel-${Date.now()}`;
-	const sessionFile = path.join(cwd, "session.jsonl");
-	const sessionContext = context(cwd, sessionId);
-	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
-	sessionContext.sessionManager = {
-		...sessionManager,
-		getSessionFile: () => sessionFile,
-	};
-	let executionStarted = false;
-	const abortObserved = Promise.withResolvers<void>();
-	const handlers = start(
-		sessionContext,
-		undefined,
-		async (_content, options) => {
-			const signal = options?.preflightSignal;
-			const onAbort = () => abortObserved.resolve();
-			if (signal?.aborted) onAbort();
-			else signal?.addEventListener("abort", onAbort, { once: true });
-			try {
-				await options?.onPreflightAcceptCommit?.();
-			} finally {
-				signal?.removeEventListener("abort", onAbort);
-			}
-			if (signal?.aborted)
-				throw Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
-			executionStarted = true;
-		},
-		true,
-		new Map(),
-		undefined,
-		false,
-	);
-	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
-	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
-	try {
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-		const frames: Record<string, unknown>[] = [];
-		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-		sockets.push(socket);
-		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			socket.addEventListener("open", () => resolve(), { once: true });
-			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
-
-		pausedCommit.arm();
-		socket.send(
-			JSON.stringify({
-				type: "control_request",
-				id: "durable-prompt-acceptance",
-				operation: "turn.prompt",
-				input: { text: "cancel while durable prompt acceptance is pending" },
-			}),
-		);
-		await pausedCommit.started;
-		socket.send(
-			JSON.stringify({
-				type: "control_request",
-				id: "abort-durable-prompt-acceptance",
-				operation: "turn.abort",
-				input: {},
-			}),
-		);
-		await abortObserved.promise;
-		expect(frames.some(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance")).toBe(
-			false,
-		);
-		expect(
-			frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
-		).toBe(false);
-		expect(frames.some(frame => frame.type === "agent_end" || frame.type === "agent_failed")).toBe(false);
-
-		pausedCommit.release();
-		await waitFor(
-			() => frames.some(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance"),
-			"durable prompt acceptance response",
-		);
-		await waitFor(
-			() =>
-				frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
-			"durable prompt abort response",
-		);
-		await waitFor(
-			() =>
-				frames.some(
-					frame =>
-						frame.type === "agent_end" &&
-						typeof frame.commandId === "string" &&
-						typeof frame.turnId === "string" &&
-						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.kind === "stopped" &&
-						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.reason === "cancelled",
-				),
-			"durable prompt cancellation terminal",
-		);
-		expect(
-			frames.find(frame => frame.type === "control_response" && frame.id === "durable-prompt-acceptance"),
-		).toMatchObject({
-			ok: true,
-			result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
-		});
-		expect(
-			frames.find(frame => frame.type === "control_response" && frame.id === "abort-durable-prompt-acceptance"),
-		).toMatchObject({
-			ok: true,
-			result: { aborted: true, disposition: "preflight_cancelled" },
-		});
-		expect(executionStarted).toBe(false);
-		expect(frames.some(frame => frame.type === "agent_start" || frame.type === "agent_failed")).toBe(false);
-	} finally {
-		pausedCommit.release();
-		pausedCommit.restore();
-		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-	}
-}, 30_000);
-
-test("SDK host waits for durable skill acceptance before completing concurrent cancellation", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-durable-accept-cancel-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-skill-durable-accept-cancel-${Date.now()}`;
-	const sessionFile = path.join(cwd, "session.jsonl");
-	const sessionContext = context(cwd, sessionId);
-	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
-	sessionContext.sessionManager = {
-		...sessionManager,
-		getSessionFile: () => sessionFile,
-	};
-	const baseBindings = sessionContext.sdkBindings as () => string[];
-	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
-	let executionStarted = false;
-	const abortObserved = Promise.withResolvers<void>();
-	sessionContext.invokeSkill = async (
-		name: string,
-		args: string | undefined,
-		options?: {
-			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
-			onPreflightAcceptCommit?: () => void | Promise<void>;
-			preflightSignal?: AbortSignal;
-		},
-	) => {
-		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md", cleanedArgs: args });
-		const signal = options?.preflightSignal;
-		const onAbort = () => abortObserved.resolve();
-		if (signal?.aborted) onAbort();
-		else signal?.addEventListener("abort", onAbort, { once: true });
-		try {
-			await options?.onPreflightAcceptCommit?.();
-		} finally {
-			signal?.removeEventListener("abort", onAbort);
-		}
-		if (signal?.aborted)
-			throw Object.assign(new Error("Skill preflight was cancelled before execution."), { code: "busy" });
-		executionStarted = true;
-		return { name, path: "/fixture/SKILL.md", args };
-	};
-	const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
-	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
-	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
-	try {
-		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-		const frames: Record<string, unknown>[] = [];
-		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-		sockets.push(socket);
-		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			socket.addEventListener("open", () => resolve(), { once: true });
-			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
-
-		pausedCommit.arm();
-		socket.send(
-			JSON.stringify({
-				type: "control_request",
-				id: "durable-skill-acceptance",
-				operation: "skill.invoke",
-				input: { name: "fixture-skill", args: "cancel while durable skill acceptance is pending" },
-			}),
-		);
-		await pausedCommit.started;
-		socket.send(
-			JSON.stringify({
-				type: "control_request",
-				id: "abort-durable-skill-acceptance",
-				operation: "turn.abort",
-				input: {},
-			}),
-		);
-		await abortObserved.promise;
-		expect(frames.some(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance")).toBe(
-			false,
-		);
-		expect(
-			frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
-		).toBe(false);
-		expect(frames.some(frame => frame.type === "agent_end" || frame.type === "agent_failed")).toBe(false);
-
-		pausedCommit.release();
-		await waitFor(
-			() => frames.some(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance"),
-			"durable skill acceptance response",
-		);
-		await waitFor(
-			() => frames.some(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
-			"durable skill abort response",
-		);
-		await waitFor(
-			() =>
-				frames.some(
-					frame =>
-						frame.type === "agent_end" &&
-						typeof frame.commandId === "string" &&
-						typeof frame.turnId === "string" &&
-						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.kind === "stopped" &&
-						(frame.outcome as { kind?: unknown; reason?: unknown } | undefined)?.reason === "cancelled",
-				),
-			"durable skill cancellation terminal",
-		);
-		expect(
-			frames.find(frame => frame.type === "control_response" && frame.id === "durable-skill-acceptance"),
-		).toMatchObject({
-			ok: true,
-			result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
-		});
-		expect(
-			frames.find(frame => frame.type === "control_response" && frame.id === "abort-durable-skill-acceptance"),
-		).toMatchObject({
-			ok: true,
-			result: { aborted: true, disposition: "preflight_cancelled" },
-		});
-		expect(executionStarted).toBe(false);
-		expect(frames.some(frame => frame.type === "agent_start" || frame.type === "agent_failed")).toBe(false);
-	} finally {
-		pausedCommit.release();
-		pausedCommit.restore();
-		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-	}
-}, 60_000);
-
-test("SDK host rolls back canonical skill ownership when durable acceptance fails", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-acceptance-failed-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-skill-acceptance-failed-${Date.now()}`;
-	const sessionFile = path.join(cwd, "session.jsonl");
-	const sessionContext = context(cwd, sessionId);
-	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
-	sessionContext.sessionManager = {
-		...sessionManager,
-		getSessionFile: () => sessionFile,
-	};
-	const baseBindings = sessionContext.sdkBindings as () => string[];
-	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
-	let executionCount = 0;
-	sessionContext.invokeSkill = async (
-		name: string,
-		args: string | undefined,
-		options?: {
-			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
-			onPreflightAcceptCommit?: () => void | Promise<void>;
-		},
-	) => {
-		options?.onSkillPrepared?.({ name, path: "/fixture/SKILL.md", cleanedArgs: args });
-		await options?.onPreflightAcceptCommit?.();
-		executionCount++;
-		return { name, path: "/fixture/SKILL.md", args };
-	};
-	const storeDirectory = path.dirname(reconciliationStorePath(sessionFile, sessionId));
-	fs.rmSync(storeDirectory, { recursive: true, force: true });
-	fs.writeFileSync(storeDirectory, "block reconciliation persistence");
-	const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
-	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	await new Promise<void>((resolve, reject) => {
-		socket.addEventListener("open", () => resolve(), { once: true });
-		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	});
-
-	const clientRef = "skill-acceptance-failure-ref";
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "skill-acceptance-failed",
-			operation: "skill.invoke",
-			input: { name: "fixture-skill", args: "persist", clientRef },
-		}),
-	);
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-acceptance-failed"),
-		"failed skill acceptance response",
-	);
-	expect(
-		frames.find(frame => frame.type === "control_response" && frame.id === "skill-acceptance-failed"),
-	).toMatchObject({
-		ok: false,
-		error: {
-			code: "unavailable",
-			message: "Skill reconciliation state is unavailable; retry after restart.",
-		},
-	});
-	expect(executionCount).toBe(0);
-	expect(frames.some(frame => frame.type === "agent_start")).toBe(false);
-
-	fs.unlinkSync(storeDirectory);
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "skill-acceptance-retry",
-			operation: "skill.invoke",
-			input: { name: "fixture-skill", args: "retry", clientRef },
-		}),
-	);
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-acceptance-retry"),
-		"retried skill acceptance response",
-	);
-	expect(
-		frames.find(frame => frame.type === "control_response" && frame.id === "skill-acceptance-retry"),
-	).toMatchObject({
-		ok: true,
-		result: {
-			accepted: true,
-			name: "fixture-skill",
-			args: "retry",
-			clientRef,
-		},
-	});
-	expect(executionCount).toBe(1);
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-});
-
 test("SDK host terminalizes a never-resolving preflight on abort and fences late acceptance", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-preflight-never-"));
 	dirs.push(cwd);
@@ -2812,17 +2443,7 @@ test("SDK host terminalizes a never-resolving preflight on abort and fences late
 				? () => void options.onPreflightAcceptCommit?.()
 				: options?.onPreflightAccepted;
 			preflightStarted.resolve();
-			const cancelled = Promise.withResolvers<never>();
-			const onAbort = () =>
-				cancelled.reject(
-					Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
-				);
-			options?.preflightSignal?.addEventListener("abort", onAbort, { once: true });
-			try {
-				await Promise.race([neverPreflight.promise, cancelled.promise]);
-			} finally {
-				options?.preflightSignal?.removeEventListener("abort", onAbort);
-			}
+			await neverPreflight.promise;
 		},
 		true,
 	);
@@ -2870,75 +2491,6 @@ test("SDK host terminalizes a never-resolving preflight on abort and fences late
 	latePreflightAccepted?.();
 	await Promise.resolve();
 	expect(frames.filter(frame => frame.type === "control_response" && frame.id === "never-preflight")).toHaveLength(1);
-	expect(frames.some(frame => frame.type === "agent_failed" || frame.type === "agent_start")).toBe(false);
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
-});
-
-test("terminal abort cancels a pending prompt preflight (never accepts)", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-preflight-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-terminal-preflight-${Date.now()}`;
-	const live = { idle: true };
-	const neverPreflight = Promise.withResolvers<never>();
-	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
-	const sessionContext = {
-		...context(cwd, sessionId, "main", live),
-		sessionManager: {
-			...(context(cwd, sessionId, "main", live).sessionManager as Record<string, unknown>),
-			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
-		},
-		getTerminalTurnEpoch: () => 1,
-	};
-	const handlers = start(
-		sessionContext,
-		undefined,
-		async (content, options) => {
-			deliveries.push([content, options]);
-			if (content === "never resolve") {
-				await neverPreflight.promise;
-			}
-			await firePreflightAccept(options);
-		},
-		true,
-	);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	const { promise, resolve, reject } = Promise.withResolvers<void>();
-	socket.addEventListener("open", () => resolve(), { once: true });
-	socket.addEventListener("error", () => reject(new Error("socket error")), { once: true });
-	await promise;
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "term-prompt",
-			operation: "turn.prompt",
-			input: { text: "never resolve", images: [] },
-		}),
-	);
-	await waitFor(() => deliveries.length > 0, "prompt preflight started");
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "term-abort",
-			operation: "turn.abort",
-			input: { mode: "terminal" },
-			idempotencyKey: "term-abort-key-1",
-		}),
-	);
-	await waitFor(
-		() =>
-			frames.some(frame => frame.type === "control_response" && frame.id === "term-abort") &&
-			frames.some(frame => frame.type === "control_response" && frame.id === "term-prompt"),
-		"terminal abort + cancelled preflight responses",
-	);
-	// The preflight is cancelled (never accepted), so the prompt never starts.
-	const promptResponse = frames.find(frame => frame.type === "control_response" && frame.id === "term-prompt");
-	expect(promptResponse).toMatchObject({ ok: false });
 	expect(frames.some(frame => frame.type === "agent_failed" || frame.type === "agent_start")).toBe(false);
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
 });
@@ -3091,451 +2643,6 @@ test("SDK host waits for asynchronous abort unwind before delivering an abort-an
 	expect(frames.find(frame => frame.type === "control_response" && frame.id === "abort-and-prompt")).toMatchObject({
 		ok: true,
 		result: { accepted: true, commandId: expect.any(String), turnId: expect.any(String) },
-	});
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-});
-test("SDK host turn.abort terminal mode returns no-effect with no active turn", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-noop-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-terminal-noop-${Date.now()}`;
-	const sessionContext = {
-		...context(cwd, sessionId),
-		// Provide a file-backed session so the terminal abort has a reconciliation
-		// owner (the no-store gate only fires for genuinely store-less sessions).
-		sessionManager: {
-			...(context(cwd, sessionId).sessionManager as Record<string, unknown>),
-			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
-		},
-	};
-	const handlers = start(sessionContext, undefined, () => {}, true);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	const { promise, resolve, reject } = Promise.withResolvers<void>();
-	socket.addEventListener("open", () => resolve(), { once: true });
-	socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	await promise;
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "terminal-noop",
-			operation: "turn.abort",
-			input: { mode: "terminal" },
-			idempotencyKey: "terminal-noop-key",
-		}),
-	);
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "terminal-noop"),
-		"terminal abort no-effect response",
-	);
-	expect(frames.find(frame => frame.type === "control_response" && frame.id === "terminal-noop")).toMatchObject({
-		ok: true,
-		result: {
-			selection: "turn",
-			turn: "no_active_turn",
-			terminal: "terminal_no_effect",
-		},
-	});
-	// No agent turn ever started.
-	expect(frames.some(frame => frame.type === "agent_start")).toBe(false);
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-});
-test("terminal abort from a queued requester never cancels another connection's pending preflight", async () => {
-	// Review thread P1: two connections submit prompts before either receives a
-	// run handle. The queued requester's terminal abort rejects its own
-	// wrapper preflight but must NOT invoke the session-wide preflight seam —
-	// it cancels the session's single controller captured by the OTHER
-	// connection's active preflight, failing an unrelated prompt.
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-preflight-scope-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-preflight-scope-${Date.now()}`;
-	let sessionPreflightCancelled = 0;
-	const neverPreflight = Promise.withResolvers<never>();
-	const deliveries: unknown[][] = [];
-	const handlers = start(
-		{
-			...context(cwd, sessionId),
-			cancelPendingPreflightForTerminalAbort: () => {
-				sessionPreflightCancelled += 1;
-			},
-		},
-		undefined,
-		async (content, options) => {
-			deliveries.push([content, options]);
-			if (content === "conn-a pending prompt") {
-				await neverPreflight.promise;
-			}
-			await firePreflightAccept(options);
-		},
-		true,
-	);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const connect = async () => {
-		const frames: Record<string, unknown>[] = [];
-		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-		sockets.push(socket);
-		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			socket.addEventListener("open", () => resolve(), { once: true });
-			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
-		return { socket, frames };
-	};
-	const connA = await connect();
-	const connB = await connect();
-	// Conn A's prompt enters preflight and stays there (never resolves).
-	connA.socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "scope-prompt-a",
-			operation: "turn.prompt",
-			input: { text: "conn-a pending prompt", images: [] },
-		}),
-	);
-	await waitFor(() => deliveries.length === 1, "conn-a preflight started");
-	// Conn B terminal-aborts while conn A's preflight is still pending: the
-	// aborting requester has no admission of its own yet, so only conn A's
-	// preflight could be hit by the session-wide seam.
-	connB.socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "scope-abort-b",
-			operation: "turn.abort",
-			input: { mode: "terminal" },
-			idempotencyKey: "scope-abort-b-key",
-		}),
-	);
-	await waitFor(
-		() => connB.frames.some(frame => frame.type === "control_response" && frame.id === "scope-abort-b"),
-		"queued requester abort response",
-	);
-	// The session-wide seam was never invoked while another connection's
-	// preflight was pending: conn A's prompt must still be able to complete.
-	expect(sessionPreflightCancelled).toBe(0);
-	neverPreflight.resolve();
-	await waitFor(
-		() => connA.frames.some(frame => frame.type === "control_response" && frame.id === "scope-prompt-a"),
-		"conn-a prompt response after preflight release",
-	);
-	expect(connA.frames.find(f => f.type === "control_response" && f.id === "scope-prompt-a")).toMatchObject({
-		ok: true,
-	});
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
-});
-
-test("full-bus terminal replay advances a finalized row through the stored replay payload hash", async () => {
-	// Review thread P2: the full-bus no-effect finalization must store the
-	// replay-shaped payload hash alongside the original response hash — a
-	// same-key retry delivers the replay envelope, and the delivery observer
-	// only advances a pending row when the written response matches either
-	// stored hash. Without replayPayloadHash the written replay stays durably
-	// pending forever.
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-fullbus-replay-hash-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-fullbus-replay-hash-${Date.now()}`;
-	const sessionFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`);
-	const handlers = start(
-		{
-			...context(cwd, sessionId),
-			sessionManager: {
-				...(context(cwd, sessionId).sessionManager as Record<string, unknown>),
-				getSessionFile: () => sessionFile,
-			},
-			getTerminalTurnEpoch: () => 1,
-		},
-		undefined,
-		() => {},
-		true,
-	);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	await new Promise<void>((resolve, reject) => {
-		socket.addEventListener("open", () => resolve(), { once: true });
-		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	});
-	// Idle abort: durable no-effect reservation, finalized to plain no_effect.
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "fh-abort-1",
-			operation: "turn.abort",
-			input: { mode: "terminal" },
-			idempotencyKey: "fh-key-1",
-		}),
-	);
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "fh-abort-1"),
-		"first abort response",
-	);
-	expect(frames.find(f => f.type === "control_response" && f.id === "fh-abort-1")).toMatchObject({
-		ok: true,
-		result: { turn: "no_active_turn", terminal: "terminal_no_effect" },
-	});
-	// The finalized row stores BOTH the original and the replay-shaped hash.
-	const storeFile = reconciliationStorePath(sessionFile, sessionId);
-	await waitFor(() => fs.existsSync(storeFile), "durable store file");
-	const row = JSON.parse(fs.readFileSync(storeFile, "utf8")).terminalScopes?.find(
-		(scope: { idempotencyKeyHash?: string }) => scope.idempotencyKeyHash,
-	);
-	expect(row).toMatchObject({ turnDisposition: "no_effect", responsePayloadHash: expect.any(String) });
-	expect(typeof row.replayPayloadHash).toBe("string");
-	// Same-key retry: the replay is delivered and the written response advances
-	// the pending row to sent (its hash matches the stored replay-shaped hash).
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "fh-abort-2",
-			operation: "turn.abort",
-			input: { mode: "terminal" },
-			idempotencyKey: "fh-key-1",
-		}),
-	);
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "fh-abort-2"),
-		"retry abort response",
-	);
-	expect(frames.find(f => f.type === "control_response" && f.id === "fh-abort-2")).toMatchObject({
-		ok: true,
-		result: expect.objectContaining({ turn: "no_active_turn", terminal: "terminal_no_effect" }),
-	});
-	const sentDeadline = Date.now() + 15_000;
-	let advancedRow: { responseState?: string } | undefined;
-	while (Date.now() < sentDeadline) {
-		const doc = JSON.parse(fs.readFileSync(storeFile, "utf8")) as {
-			terminalScopes?: Array<{ idempotencyKeyHash?: string; responseState?: string }>;
-		};
-		advancedRow = doc.terminalScopes?.find(scope => scope.idempotencyKeyHash);
-		if (advancedRow?.responseState === "sent") break;
-		await Bun.sleep(20);
-	}
-	expect(advancedRow?.responseState).toBe("sent");
-	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, context(cwd, sessionId));
-});
-
-test("terminal abort durable replay after restart never cancels a NEW unrelated pending preflight", async () => {
-	// A successful durable row replayed after the in-memory dispatch entry
-	// expires/restart returns stopped/stopped_owned/no_effect WITH `stored`; the
-	// admission predicate must treat EVERY stored-carrying replay as a
-	// non-admission — cancelling the requester's unrelated in-preflight prompt
-	// there would give an idempotency replay real effects (review thread P1).
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-replay-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-terminal-replay-${Date.now()}`;
-	const sessionFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`);
-	const makeContext = () => ({
-		...context(cwd, sessionId),
-		sessionManager: {
-			...(context(cwd, sessionId).sessionManager as Record<string, unknown>),
-			getSessionFile: () => sessionFile,
-		},
-		getTerminalTurnEpoch: () => 1,
-	});
-	// Host #1: file-backed store. The first abort (no active turn) durably
-	// reserves a no-effect row for the key.
-	const handlersA = start(makeContext(), undefined, () => {}, true);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint (host A)");
-	const endpointA = (await Bun.file(endpointFile).json()) as { url: string; token: string };
-	const framesA: Record<string, unknown>[] = [];
-	const socketA = new WebSocket(`${endpointA.url}/?token=${encodeURIComponent(endpointA.token)}`);
-	socketA.addEventListener("message", event => framesA.push(JSON.parse(String(event.data))));
-	sockets.push(socketA);
-	const { promise: promiseA, resolve: resolveA, reject: rejectA } = Promise.withResolvers<void>();
-	socketA.addEventListener("open", () => resolveA(), { once: true });
-	socketA.addEventListener("error", () => rejectA(new Error("WS error (host A)")), { once: true });
-	await promiseA;
-	socketA.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "replay-abort-1",
-			operation: "turn.abort",
-			input: { mode: "terminal" },
-			idempotencyKey: "mq-key-1",
-		}),
-	);
-	await waitFor(
-		() => framesA.some(frame => frame.type === "control_response" && frame.id === "replay-abort-1"),
-		"host A abort response",
-	);
-	expect(framesA.find(f => f.type === "control_response" && f.id === "replay-abort-1")).toMatchObject({
-		ok: true,
-		result: { selection: "turn", turn: "no_active_turn", terminal: "terminal_no_effect" },
-	});
-	// The durable no-effect reservation is written to the reconciliation store
-	// (a sibling of the transcript, derived path).
-	expect(fs.existsSync(reconciliationStorePath(sessionFile, sessionId))).toBe(true);
-	await handlersA.get("session_shutdown")?.({ type: "session_shutdown" }, makeContext());
-	await closeSocket(socketA);
-	// Shutdown may leave the endpoint file behind; remove it so host B's
-	// waitFor below observes a FRESH endpoint (token/port) instead of A's stale
-	// one — otherwise the reconnect would hang on a dead server.
-	fs.rmSync(endpointFile, { force: true });
-	await Bun.sleep(25);
-
-	// Host #2: FRESH in-memory dispatch (restart) over the SAME durable store.
-	let sessionPreflightCancelled = 0;
-	const ctxB = {
-		...makeContext(),
-		cancelPendingPreflightForTerminalAbort: () => {
-			sessionPreflightCancelled += 1;
-		},
-	};
-	const neverPreflight = Promise.withResolvers<never>();
-	const deliveries: unknown[][] = [];
-	const handlersB = start(
-		ctxB,
-		undefined,
-		async (content, options) => {
-			deliveries.push([content, options]);
-			if (content === "unrelated pending prompt") {
-				await neverPreflight.promise;
-			}
-			await firePreflightAccept(options);
-		},
-		true,
-	);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint (host B)");
-	const endpointB = (await Bun.file(endpointFile).json()) as { url: string; token: string };
-	const framesB: Record<string, unknown>[] = [];
-	const socketB = new WebSocket(`${endpointB.url}/?token=${encodeURIComponent(endpointB.token)}`);
-	socketB.addEventListener("message", event => framesB.push(JSON.parse(String(event.data))));
-	sockets.push(socketB);
-	const { promise: promiseB, resolve: resolveB, reject: rejectB } = Promise.withResolvers<void>();
-	socketB.addEventListener("open", () => resolveB(), { once: true });
-	socketB.addEventListener("error", () => rejectB(new Error("WS error (host B)")), { once: true });
-	await promiseB;
-	await waitFor(() => framesB.some(frame => frame.type === "hello"), "host B hello");
-	// A NEW unrelated prompt enters PREFLIGHT (never resolves) on the SAME
-	// connection while the replay lands.
-	socketB.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "new-prompt",
-			operation: "turn.prompt",
-			input: { text: "unrelated pending prompt", images: [] },
-		}),
-	);
-	await waitFor(() => deliveries.length > 0, "new prompt preflight started");
-	socketB.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "replay-abort-2",
-			operation: "turn.abort",
-			input: { mode: "terminal" },
-			idempotencyKey: "mq-key-1",
-		}),
-	);
-	// Host B's store hydration (restart recovery) can stall on file I/O under
-	// load; give the replay response a longer observation window than the
-	// shared 15s waitFor before failing.
-	const replayDeadline = Date.now() + 30_000;
-	while (!framesB.some(frame => frame.type === "control_response" && frame.id === "replay-abort-2")) {
-		if (Date.now() > replayDeadline) throw new Error("Timed out waiting for replay abort response (host B)");
-		await Bun.sleep(20);
-	}
-	const replay = framesB.find(f => f.type === "control_response" && f.id === "replay-abort-2")!;
-	expect(replay).toMatchObject({ ok: true, result: { terminal: "terminal_no_effect", replay: expect.any(Object) } });
-	// The stored-carrying replay is a NON-admission: neither the connection-level
-	// waiter cancel nor the session preflight seam may fire, and the prompt stays
-	// pending (no response, no cancellation).
-	await Bun.sleep(100);
-	expect(sessionPreflightCancelled).toBe(0);
-	expect(framesB.some(f => f.type === "control_response" && f.id === "new-prompt")).toBe(false);
-	// Releasing the preflight completes the prompt normally — it was never
-	// cancelled by the replay.
-	neverPreflight.resolve();
-	await waitFor(
-		() => framesB.some(frame => frame.type === "control_response" && frame.id === "new-prompt"),
-		"new prompt response after preflight release",
-	);
-	expect(framesB.find(f => f.type === "control_response" && f.id === "new-prompt")).toMatchObject({ ok: true });
-	await handlersB.get("session_shutdown")?.({ type: "session_shutdown" }, ctxB);
-}, 20_000);
-
-test("SDK host turn.abort terminal mode finalizes an accepted-but-not-started prompt as cancelled", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-terminal-fence-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-terminal-fence-${Date.now()}`;
-	const live = { idle: true };
-	const deliveries: Parameters<ExtensionActions["sendUserMessage"]>[] = [];
-	const sessionContext = {
-		...context(cwd, sessionId, "main", live),
-		// File-backed reconciliation owner so the terminal abort reaches the
-		// fence path (and fails closed there) instead of the no-store gate.
-		sessionManager: {
-			...(context(cwd, sessionId, "main", live).sessionManager as Record<string, unknown>),
-			getSessionFile: () => path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.jsonl`),
-		},
-		// The initial-marker seam: a stable epoch so the marker is written
-		// before the fence attempts (and fails closed) on the missing seam.
-		getTerminalTurnEpoch: () => 1,
-	};
-	const handlers = start(
-		sessionContext,
-		undefined,
-		async (content, options) => {
-			deliveries.push([content, options]);
-			await firePreflightAccept(options);
-		},
-		true,
-	);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = (await Bun.file(endpointFile).json()) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	const { promise, resolve, reject } = Promise.withResolvers<void>();
-	socket.addEventListener("open", () => resolve(), { once: true });
-	socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	await promise;
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "terminal-prompt",
-			operation: "turn.prompt",
-			input: { text: "terminalize me" },
-		}),
-	);
-	await waitFor(() => deliveries.length === 1, "terminal prompt accepted");
-	void handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
-	// The fixture harness fires agent_start without binding an exact run handle,
-	// so the prompt is accepted-but-not-started: terminal abort must cancel the
-	// in-flight session preflight and FINALIZE the accepted prompt as a pre-run
-	// cancellation (no_active_turn / terminal_no_effect) instead of terminalizing
-	// with no run handle (which would wrongly fence the connection).
-	socket.send(
-		JSON.stringify({
-			type: "control_request",
-			id: "terminal-abort",
-			operation: "turn.abort",
-			input: { mode: "terminal" },
-			idempotencyKey: "terminal-abort-key",
-		}),
-	);
-	await waitFor(
-		() => frames.some(frame => frame.type === "control_response" && frame.id === "terminal-abort"),
-		"terminal abort uncertainty response",
-	);
-	expect(frames.find(frame => frame.type === "control_response" && frame.id === "terminal-abort")).toMatchObject({
-		ok: true,
-		result: {
-			selection: "turn",
-			turn: "no_active_turn",
-			terminal: "terminal_no_effect",
-		},
 	});
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
@@ -3936,12 +3043,7 @@ test("ACP permission attachment normalizes decisions through the registered prov
 	start(ctx);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as {
-		sessionId: string;
-		pid: number;
-		url: string;
-		token: string;
-	};
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 
 	let nextResponse: unknown;
 	let waitForReverseAbort = false;
@@ -3970,32 +3072,13 @@ test("ACP permission attachment normalizes decisions through the registered prov
 			return await promise;
 		},
 	} as unknown as AgentSideConnection;
-	const client = new SdkClient(endpoint.url, endpoint.token);
-	const routedFrame = (frame: Record<string, unknown>): Record<string, unknown> => ({
-		...frame,
-		connectionId: client.connectionId,
-	});
-	const attachment: SessionAttachment = {
-		sessionId: acpSessionId,
-		generation: 1,
-		isCurrent: () => true,
-		send: async frame => client.send(routedFrame(frame)),
-		retire: async () => {},
-	};
-	const adapter = new AcpSdkAdapter({
-		router: {
-			request: async (_sessionId: string, frame: Record<string, unknown>) =>
-				await client.request(routedFrame(frame)),
-		} as never,
-		attachment,
-		sessionId: acpSessionId,
+	const adapter = await AcpSdkAdapter.connect({
+		url: endpoint.url,
+		token: endpoint.token,
 		connection: createAcpReverseConnection(connection, acpSessionId),
 		providers: [{ capability: "permission", definitions: [] }],
 		heartbeatMs: 60_000,
 	});
-	const unsubscribe = client.onFrame(frame => adapter.acceptFrame(frame));
-	await client.connect();
-	await adapter.start();
 
 	try {
 		await waitFor(() => permissionProvider !== undefined, "ACP permission provider installation");
@@ -4050,9 +3133,7 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		expect(reverseCalls.every(call => call.input.sessionId === acpSessionId)).toBe(true);
 		expect(reverseCalls.every(call => call.signal instanceof AbortSignal)).toBe(true);
 	} finally {
-		unsubscribe();
 		await adapter.close();
-		await client.close();
 		await agentSession.dispose();
 	}
 });
@@ -4238,130 +3319,6 @@ test("SDK host routes AskUserQuestion through a live ACP form elicitation provid
 	disposePriorAnswerSource();
 });
 
-test("SDK ACP form elicitation remains preferred after /notify on and falls back on provider disconnect", async () => {
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-ui-provider-notify-priority-"));
-	dirs.push(cwd);
-	const host = await startProductionSdkHost(cwd, { notificationsInitiallyEnabled: false });
-	const { sessionId, endpoint } = host;
-	try {
-		expect(getAskAnswerSource(sessionId)).toBeUndefined();
-		const frames: Record<string, unknown>[] = [];
-		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-		sockets.push(socket);
-		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			socket.addEventListener("open", () => resolve(), { once: true });
-			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
-		await waitFor(() => frames.some(frame => frame.type === "hello"), "SDK hello");
-		const connectionId = String(frames.find(frame => frame.type === "hello")?.connectionId);
-		socket.send(
-			JSON.stringify({
-				type: "register_provider",
-				id: "ui",
-				connectionId,
-				capability: "ui",
-				definitions: [],
-			}),
-		);
-		await waitFor(
-			() => frames.some(frame => frame.type === "register_provider_result" && frame.id === "ui"),
-			"UI provider registration",
-		);
-		const priorNotifications = process.env.GJC_NOTIFICATIONS;
-		process.env.GJC_NOTIFICATIONS = "1";
-		try {
-			await host.runCommand("/notify on");
-		} finally {
-			if (priorNotifications === undefined) delete process.env.GJC_NOTIFICATIONS;
-			else process.env.GJC_NOTIFICATIONS = priorNotifications;
-		}
-
-		const protocolAnswerSource = getAskAnswerSource(sessionId);
-		expect(protocolAnswerSource).toBeDefined();
-		const protocolAnswer = protocolAnswerSource!.awaitAnswerRequest!(
-			{
-				question: "Choose the protocol answer",
-				options: ["First", "Second"],
-				interaction: "selector",
-				controls: [],
-			},
-			new AbortController().signal,
-		);
-		await waitFor(() => frames.some(frame => frame.type === "reverse_request"), "protocol elicitation request");
-		const protocolRequest = frames.find(frame => frame.type === "reverse_request")!;
-		expect(protocolRequest).toMatchObject({
-			payload: {
-				method: "ui.elicit",
-				payload: { mode: "form", message: "Choose the protocol answer" },
-			},
-		});
-		socket.send(
-			JSON.stringify({
-				type: "reverse_response",
-				id: protocolRequest.id,
-				connectionId,
-				leaseId: protocolRequest.leaseId,
-				ok: true,
-				result: { action: "accept", content: { value: "option:1" } },
-			}),
-		);
-		expect(await protocolAnswer).toBe("Second");
-
-		await closeSocket(socket);
-		await waitFor(() => {
-			const selected = getAskAnswerSource(sessionId);
-			return selected !== undefined && selected !== protocolAnswerSource;
-		}, "interactive answer source restoration");
-		const fallbackFrames: Record<string, unknown>[] = [];
-		const fallbackSocket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-		sockets.push(fallbackSocket);
-		fallbackSocket.addEventListener("message", event => fallbackFrames.push(JSON.parse(String(event.data))));
-		await new Promise<void>((resolve, reject) => {
-			fallbackSocket.addEventListener("open", () => resolve(), { once: true });
-			fallbackSocket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-		});
-		await waitFor(() => fallbackFrames.some(frame => frame.type === "hello"), "fallback SDK hello");
-		const interactiveAnswerSource = getAskAnswerSource(sessionId);
-		expect(interactiveAnswerSource).toBeDefined();
-		expect(interactiveAnswerSource).not.toBe(protocolAnswerSource);
-		const fallbackAnswer = interactiveAnswerSource!.awaitAnswer("Choose the interactive fallback", [
-			"Continue",
-			"Stop",
-		]);
-		await waitFor(
-			() => fallbackFrames.some(frame => frame.type === "action_needed" && frame.kind === "ask"),
-			"interactive fallback presentation",
-		);
-		const fallbackAction = fallbackFrames.find(frame => frame.type === "action_needed" && frame.kind === "ask")!;
-		fallbackSocket.send(
-			JSON.stringify({
-				type: "control_command",
-				sessionId,
-				token: endpoint.token,
-				requestId: "interactive-fallback-answer",
-				command: {
-					type: "control_request",
-					id: "interactive-fallback-answer",
-					operation: "ask.answer",
-					input: { id: fallbackAction.id, answer: 0 },
-					idempotencyKey: "interactive-fallback-answer",
-				},
-			}),
-		);
-		await waitFor(
-			() =>
-				fallbackFrames.some(
-					frame => frame.type === "control_command_result" && frame.requestId === "interactive-fallback-answer",
-				),
-			"interactive fallback answer",
-		);
-		expect(await fallbackAnswer).toBe("Continue");
-		expect(frames.filter(frame => frame.type === "reverse_request")).toHaveLength(1);
-	} finally {
-		await host.stop();
-	}
-});
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-provider-validation-"));
 	dirs.push(cwd);
@@ -4441,7 +3398,6 @@ test("SDK host replay gaps are generation-scoped and sequence gaps remain cohere
 		token: "test-token",
 		sendFrame: (_connectionId, frame) => {
 			sent.push(frame);
-			return "written";
 		},
 		onFrame: handler => {
 			receive = handler;
@@ -4862,11 +3818,20 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 		...context(cwd, sessionId),
 		getSkillState: () => activeSkills,
 		getGoalState: () => goal,
-		invokeSkill: async (name: string, args?: string) => {
+		invokeSkill: async (
+			name: string,
+			args?: string,
+			options?: {
+				onSkillPrepared?: (meta: { name: string; path: string }) => void;
+				onPreflightAcceptCommit?: () => Promise<void>;
+			},
+		) => {
 			if (name !== "fixture-skill")
 				throw Object.assign(new Error(`Skill ${name} was not found.`), { code: "invalid_input" });
+			options?.onSkillPrepared?.({ name, path: "fixture-skill.md" });
+			await options?.onPreflightAcceptCommit?.();
 			activeSkills.push({ name, args });
-			return { name, args };
+			return "production skill completion";
 		},
 		setPlanMode: (on: boolean) => {
 			plan = on ? { enabled: true, planFilePath: "local://PLAN.md" } : undefined;
@@ -4930,13 +3895,22 @@ test("SDK endpoint applies typed skill, plan, goal, and config controls with obs
 			type: "control_request",
 			id: "skill",
 			operation: "skill.invoke",
-			input: { name: "fixture-skill", args: "run" },
+			input: { name: "fixture-skill", args: "run", clientRef: "skill-result" },
 		}),
 	).toMatchObject({ ok: true });
 	expect(await request("q11", { type: "query_request", id: "q11", query: "Q11" })).toMatchObject({
 		ok: true,
 		page: { items: [{ name: "fixture-skill", args: "run" }] },
 	});
+	await Bun.sleep(50);
+	expect(
+		await request("turn-result", {
+			type: "query_request",
+			id: "turn-result",
+			query: "turn.result",
+			input: { kind: "skill", clientRef: "skill-result" },
+		}),
+	).toMatchObject({ ok: true, result: { status: "terminal_ok", content: { text: "production skill completion" } } });
 	expect(
 		await request("plan", { type: "control_request", id: "plan", operation: "mode.plan.set", input: { on: true } }),
 	).toMatchObject({ ok: true, result: { state: { enabled: true, planFilePath: "local://PLAN.md" } } });
@@ -5462,16 +4436,6 @@ test("session teardown drains admitted direct gate resolution before detaching i
 		resolveGate.mockRestore();
 		registerController.mockRestore();
 	}
-});
-test("SDK runtime bounds gate resolution drain at a finite ceiling", () => {
-	// GATE_RESOLUTION_QUIESCENCE_MS is a finite constant that bounds
-	// waitForGateResolutionQuiescence. The original PR removed the bound
-	// (unbounded Promise.allSettled); this verifies it is restored.
-	// The constant is not exported, so verify through the source file.
-	const source = fs.readFileSync(path.resolve(__dirname, "../src/sdk/host/session-runtime.ts"), "utf8");
-	expect(source).toContain("GATE_RESOLUTION_QUIESCENCE_MS");
-	expect(source).toContain("Promise.race([settled, timeout])");
-	expect(source).not.toMatch(/waitForGateResolutionQuiescence[^}]*await Promise\.allSettled/);
 });
 test("PresentationArbiter drops a retired presentation before terminal persistence recovery", async () => {
 	const publications: string[] = [];
@@ -6800,39 +5764,15 @@ test("AC2/AC8: SDK host completes successful session mutations over its live Web
 	});
 });
 
-test("turn.prompt_status settles durable acceptance after disconnect before agent_start", async () => {
+test("turn.prompt_status reconciles an accepted prompt across client reconnect without duplicate execution", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-reconcile-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-reconcile-${Date.now()}`;
-	const sessionFile = path.join(cwd, "session.jsonl");
 	const sessionContext = context(cwd, sessionId);
-	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
-	sessionContext.sessionManager = {
-		...sessionManager,
-		getSessionFile: () => sessionFile,
-	};
 	const deliveries: unknown[] = [];
-	const releaseExecution = Promise.withResolvers<void>();
-	let preflightAborted = false;
-	const handlers = start(
-		sessionContext,
-		undefined,
-		async (content, options) => {
-			await options?.onPreflightAcceptCommit?.();
-			deliveries.push(content);
-			const signal = options?.preflightSignal;
-			const onAbort = () => {
-				preflightAborted = true;
-			};
-			signal?.addEventListener("abort", onAbort, { once: true });
-			try {
-				await releaseExecution.promise;
-			} finally {
-				signal?.removeEventListener("abort", onAbort);
-			}
-		},
-		true,
-	);
+	const handlers = start(sessionContext, undefined, (content: unknown) => {
+		deliveries.push(content);
+	});
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
@@ -6873,26 +5813,19 @@ test("turn.prompt_status settles durable acceptance after disconnect before agen
 	// Simulate client-process death without consuming the control response. The
 	// caller retained only its fresh clientRef, not the generated IDs.
 	await closeSocket(first.socket);
-	await Bun.sleep(20);
-	expect(preflightAborted).toBe(false);
 	await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 
 	// Reconnect: clientRef recovers the canonical generated pair, which then
 	// reconciles identically through the generated-ID selector.
 	const second = await connect();
-	let byRef: Record<string, unknown> | undefined;
-	for (let attempt = 0; attempt < 50; attempt++) {
-		byRef = await second.request({
-			type: "query_request",
-			id: `status-ref-${attempt}`,
-			query: "turn.prompt_status",
-			input: { clientRef: "recon-ref-1" },
-		});
-		if ((byRef.result as { status?: unknown } | undefined)?.status === "in_flight") break;
-		await Bun.sleep(20);
-	}
+	const byRef = await second.request({
+		type: "query_request",
+		id: "status-ref",
+		query: "turn.prompt_status",
+		input: { clientRef: "recon-ref-1" },
+	});
 	expect(byRef).toMatchObject({ ok: true, result: { status: "in_flight", clientRef: "recon-ref-1" } });
-	const { commandId, turnId } = (byRef?.result ?? {}) as { commandId: string; turnId: string };
+	const { commandId, turnId } = (byRef.result ?? {}) as { commandId: string; turnId: string };
 	expect(typeof commandId).toBe("string");
 	expect(typeof turnId).toBe("string");
 	const byPair = await second.request({
@@ -6923,19 +5856,13 @@ test("turn.prompt_status settles durable acceptance after disconnect before agen
 	expect(duplicate).toMatchObject({ ok: false, error: { code: "client_ref_conflict" } });
 
 	await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-	let terminal: Record<string, unknown> | undefined;
-	for (let attempt = 0; attempt < 50; attempt++) {
-		terminal = await second.request({
-			type: "query_request",
-			id: `status-terminal-${attempt}`,
-			query: "turn.prompt_status",
-			input: { commandId, turnId },
-		});
-		if ((terminal.result as { status?: unknown } | undefined)?.status === "terminal_ok") break;
-		await Bun.sleep(20);
-	}
+	const terminal = await second.request({
+		type: "query_request",
+		id: "status-terminal",
+		query: "turn.prompt_status",
+		input: { commandId, turnId },
+	});
 	expect(terminal).toMatchObject({ ok: true, result: { status: "terminal_ok" } });
-	releaseExecution.resolve();
 
 	// Exactly one execution happened across the whole reconnect/reconcile flow.
 	expect(deliveries).toHaveLength(1);
@@ -7003,7 +5930,7 @@ test("ordered turn.prompt ignores envelope idempotencyKey: no replay and no idem
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
 });
 
-test("turn.result validates selectors and its prompt alias rejects invalid clientRef input", async () => {
+test("turn.prompt_status validates selectors and rejects invalid clientRef input", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-validation-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-prompt-validation-${Date.now()}`;
@@ -7053,16 +5980,7 @@ test("turn.result validates selectors and its prompt alias rejects invalid clien
 			input: { clientRef: "r" },
 			cursor: "x",
 		}),
-	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
-	expect(
-		await request({
-			type: "query_request",
-			id: "q-canonical-empty-cursor",
-			query: "turn.result",
-			input: { kind: "prompt", clientRef: "r" },
-			cursor: "",
-		}),
-	).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	).toMatchObject({ ok: false, error: { code: "invalid_cursor" } });
 	expect(
 		await request({
 			type: "query_request",
@@ -7345,10 +6263,7 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 		query: "turn.prompt_status",
 		input: { clientRef: "long-ref" },
 	});
-	// The merged status query returns the authoritative admission record; the
-	// run is live (accepted or in flight, never terminal) at this point.
-	expect(inFlight).toMatchObject({ ok: true, result: { kind: "prompt", clientRef: "long-ref" } });
-	expect((inFlight.result as { status?: string }).status).toMatch(/^(accepted|in_flight)$/);
+	expect(inFlight).toMatchObject({ ok: true, result: { status: "in_flight" } });
 	await handlers.get("agent_end")?.(
 		{
 			type: "agent_end",
@@ -7365,18 +6280,12 @@ test("long-running prompt settles terminally after the delivery buffer expires",
 
 	// Authoritative settlement fired at lifecycle ingress even though the delivery
 	// buffer expired, and the provider error is retained only as a safe failed code.
-	let settled: Record<string, unknown> = {};
-	const settledDeadline = Date.now() + 15_000;
-	for (let poll = 0; Date.now() < settledDeadline; poll++) {
-		settled = await request({
-			type: "query_request",
-			id: `long-settled-${poll}`,
-			query: "turn.prompt_status",
-			input: { clientRef: "long-ref" },
-		});
-		if ((settled.result as { status?: string } | undefined)?.status !== "in_flight") break;
-		await Bun.sleep(20);
-	}
+	const settled = await request({
+		type: "query_request",
+		id: "long-settled",
+		query: "turn.prompt_status",
+		input: { clientRef: "long-ref" },
+	});
 	expect(settled).toMatchObject({
 		ok: true,
 		result: { status: "failed", error: { code: "agent_error", message: "Prompt submission failed." } },
@@ -7655,83 +6564,4 @@ test("SDK host keeps the prompt correlation across a mid-prompt continuation age
 	expect(frames.filter(frame => frame.type === "agent_start").length).toBe(1);
 
 	await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-});
-
-test("notification host rebinds the steering snapshot before terminalizing with a token", async () => {
-	// Review thread P1: the notification (bus) path must invoke
-	// rebindTerminalAbortSteeringSnapshot before the settlement whenever a
-	// steering admission token is present — an abort admitted under another
-	// connection's turn whose requester's prompt wins the race would otherwise
-	// have the session reject the still-old token as unknown_run.
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-notif-rebind-"));
-	dirs.push(cwd);
-	const sessionId = `sdk-notif-rebind-${Date.now()}`;
-	const rebinds: number[] = [];
-	const sessionContext = {
-		...context(cwd, sessionId),
-		getActivePromptHandle: () => "exact-run-handle",
-		getTerminalTurnEpoch: () => 3,
-		captureTerminalAbortSteeringSnapshot: () => 42,
-		discardTerminalAbortSteeringSnapshot: (token: number) => {
-			// never expected in this flow (the settlement consumes the token)
-			rebinds.push(token);
-		},
-		rebindTerminalAbortSteeringSnapshot: (token: number) => {
-			rebinds.push(token);
-		},
-		abortPromptAndWait: async () => ({ status: "settled", terminalScope: {} }),
-	};
-	const handlers = start(sessionContext, { get: () => undefined, getAgentDir: () => cwd } as unknown as Settings);
-	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
-	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
-	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const frames: Record<string, unknown>[] = [];
-	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
-	sockets.push(socket);
-	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
-	await new Promise<void>((resolve, reject) => {
-		socket.addEventListener("open", () => resolve(), { once: true });
-		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
-	});
-	const request = async (command: Record<string, unknown>): Promise<Record<string, unknown>> => {
-		const requestId = String(command.id);
-		socket.send(JSON.stringify(command));
-		const responseType = command.type === "query_request" ? "query_response" : "control_response";
-		await waitFor(
-			() => frames.some(frame => frame.type === responseType && frame.id === requestId),
-			`${requestId} response`,
-		);
-		return frames.find(frame => frame.type === responseType && frame.id === requestId)!;
-	};
-	try {
-		const ack = await request({
-			type: "control_request",
-			id: "rebind-prompt",
-			operation: "turn.prompt",
-			input: { text: "requester turn", clientRef: "rebind-ref" },
-		});
-		expect(ack.ok).toBe(true);
-		const ackResult = ack.result as { commandId: string; turnId: string };
-		// Bind the exact run handle through the correlation-carrying agent_start
-		// so the abort reaches the ACTIVE terminalization path.
-		await handlers.get("agent_start")?.(
-			{ type: "agent_start", runId: "exact-run-handle", commandId: ackResult.commandId, turnId: ackResult.turnId },
-			sessionContext,
-		);
-		// Terminal abort: the admission captured token 42 and the
-		// terminalization passes it through — the bus must rebind it before the
-		// settlement.
-		const abort = await request({
-			type: "control_request",
-			id: "rebind-abort",
-			operation: "turn.abort",
-			input: { mode: "terminal" },
-			idempotencyKey: "rebind-abort-key",
-		});
-		expect(abort.ok).toBe(true);
-		expect(rebinds).toContain(42);
-	} finally {
-		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
-		socket.close();
-	}
 });

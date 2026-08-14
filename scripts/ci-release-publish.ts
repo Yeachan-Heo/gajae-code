@@ -206,6 +206,7 @@ export const packages: PublishPackage[] = [
 		extraTypeConfigs: ["tsconfig.publish.client.json"],
 	},
 	{ dir: "packages/agent", kind: "typescript" },
+	{ dir: "packages/bridge-client", kind: "typescript" },
 	{ dir: "packages/coding-agent", kind: "typescript" },
 	{ dir: "packages/gajae-code", kind: "manifest" },
 ];

@@ -586,7 +586,7 @@ test("a stop that cannot prove it still owns the root drains the queued startups
 
 test("the ACP caller deadline covers the admission wait even when readiness is defaulted", async () => {
 	const defaulted = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: defaulted as never }).global(
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: defaulted as never }).global(
 		"session.create",
 		{ cwd: "/workspace" },
 		"defaulted-readiness",
@@ -594,7 +594,7 @@ test("the ACP caller deadline covers the admission wait even when readiness is d
 	expect(defaulted.timeoutMs).toBe(lifecycleStartupBudgetMs(DEFAULT_READINESS_TIMEOUT_MS) + 1_000);
 
 	const requested = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: requested as never }).global(
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: requested as never }).global(
 		"session.create",
 		{ cwd: "/workspace", readinessTimeoutMs: 4_000 },
 		"requested-readiness",
@@ -603,7 +603,7 @@ test("the ACP caller deadline covers the admission wait even when readiness is d
 
 	// An operation that never queues for a startup slot keeps its own readiness sizing.
 	const closing = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: closing as never }).global(
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: closing as never }).global(
 		"session.close",
 		{ sessionId: "s", readinessTimeoutMs: 4_000 },
 		"closing",
@@ -613,7 +613,7 @@ test("the ACP caller deadline covers the admission wait even when readiness is d
 
 test("a default startup admitted late by the production broker stays inside the ACP caller deadline", async () => {
 	const sdk = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: sdk as never }).global(
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: sdk as never }).global(
 		"session.create",
 		{ cwd: "/workspace" },
 		"default-late-admission",
@@ -747,7 +747,7 @@ test("the ACP caller deadline follows a supplied lifecycle deadline tuple, not t
 	// ignores `readinessTimeoutMs` entirely, so budgeting the overridden field would cut the
 	// caller off long before the broker reaches its own terminal.
 	const supplied = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: supplied as never }).global(
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: supplied as never }).global(
 		"session.create",
 		{ cwd: "/workspace", readinessTimeoutMs: 4_000, ...tuple },
 		"supplied-deadline-tuple",
@@ -756,7 +756,7 @@ test("the ACP caller deadline follows a supplied lifecycle deadline tuple, not t
 
 	// A close carries no admission wait, so it is budgeted on the tuple's readiness alone.
 	const closing = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: closing as never }).global(
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: closing as never }).global(
 		"session.close",
 		{ sessionId: "s", ...tuple },
 		"closing-deadline-tuple",
@@ -769,7 +769,7 @@ test("the ACP caller leaves an unbudgetable lifecycle request on the generic cli
 	// out-of-range readiness value is out of contract on its own. Both are refused as invalid
 	// input before anything is queued, so neither may claim a startup-sized caller deadline.
 	const partial = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: partial as never }).global(
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: partial as never }).global(
 		"session.create",
 		{ cwd: "/workspace", receivedAt: 1_000_000, requestedReadinessTimeoutMs: 30_000 },
 		"partial-deadline-tuple",
@@ -777,7 +777,7 @@ test("the ACP caller leaves an unbudgetable lifecycle request on the generic cli
 	expect(partial.timeoutMs).toBeUndefined();
 
 	const outOfRange = new TimeoutCapturingSdkClient();
-	await new AcpSdkAdapter({ client: outOfRange as never }).global(
+	await new AcpSdkAdapter({ url: "ws://unused", token: "secret", client: outOfRange as never }).global(
 		"session.create",
 		{ cwd: "/workspace", readinessTimeoutMs: 600_000 },
 		"out-of-range-readiness",

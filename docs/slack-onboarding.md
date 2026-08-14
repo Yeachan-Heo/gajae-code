@@ -95,15 +95,13 @@ prepare session authority → bind the existing root through the live daemon →
    exact mapping in the durable conversation store, so a stale or forged
    `status:"ok"` answer is reported as `binding_outcome_unknown` rather than as a
    success.
-3. **Activate.** `gjc notify activate-thread --session-id <id>` asks
-   `SessionRouter` to validate the exact indexed endpoint generation and invoke
-   the session host internally. The host authorizes readiness against the
-   provider-owned mapping through a redacted `{sessionId, endpointGeneration}`
-   gate: activation before the binding is applied is refused (`not_bound`) with
-   no grace period, and activation is idempotent, so an exact retry answers
-   `already` rather than publishing a second readiness signal. The CLI never
-   reads an endpoint URL/token or constructs an SDK client. When readiness is
-   published, Slack adopts the bound root and posts zero replacement roots.
+3. **Activate.** `gjc notify activate-thread --session-id <id>` asks the
+   session's own host to publish the readiness it withheld. The host authorizes
+   that publication against the daemon-owned mapping: activation before the
+   binding is applied is refused (`not_bound`) with no grace period, and
+   activation is idempotent, so an exact retry answers `already` rather than
+   publishing a second readiness signal. When readiness is published, the daemon
+   adopts the bound root and posts zero replacement roots.
 
 The opt-in is per session and explicit: only the exact value `1` prepares a
 session, and a session without it keeps the stock immediate-ready root. The
@@ -120,13 +118,13 @@ environment opt-in is refused for lifecycle-managed sessions, so an inherited
 process-global flag can never silently defer a broker-created session.
 
 Either authority additionally requires a configured, session-enabled Slack
-target, because the activation gate is the existing-thread presentation
-mapping. The mapping stays provider-owned, while `SessionRouter` alone proves
-the current endpoint generation and performs activation. A preparation request
-that cannot build the configured mapping gate fails closed — the lifecycle child
-settles a startup failure and the environment opt-in throws — rather than
-degrading to ordinary immediate readiness or handing back a prepared session
-that could activate with no binding at all.
+target, because the activation gate *is* the existing-thread bind authority: it
+can only be built from the configured workspace/channel plus the agent directory
+holding the daemon-owned mapping. A preparation request that cannot produce that
+gate fails closed — the lifecycle child settles a startup failure and the
+environment opt-in throws — rather than degrading to ordinary immediate
+readiness or handing back a prepared session that could activate with no
+binding at all.
 
 Through the Coordinator MCP surface the same three phases are
 `gjc_coordinator_start_session` with `prepare_existing_thread: true` (which

@@ -103,6 +103,56 @@ export declare class NativeRetainedBrokerPublication {
   close(): NativeBrokerPublicationOperation
 }
 
+/**
+ * In-process, session-independent lifecycle **control** server exposed to TS.
+ *
+ * Transport-only: it authenticates (handshake + per-frame), forwards valid
+ * lifecycle requests to the TS daemon, and routes TS-produced responses back
+ * by request id. All policy/spawn/idempotency/rate-limit/audit lives in TS.
+ *
+ * Call order: construct, [`Self::on_lifecycle_request`] (before start), then
+ * [`Self::start`].
+ */
+export declare class NotificationControlServer {
+  /**
+   * Create a control server authenticated by `token` and owned by `owner_id`.
+   *
+   * `agent_dir` (when given) is where the control discovery file is written
+   * (e.g. the daemon agent dir).
+   */
+  constructor(token: string, ownerId: string, agentDir?: string | undefined | null)
+  /**
+   * Register the lifecycle-request callback. Must be called before
+   * [`Self::start`].
+   */
+  onLifecycleRequest(callback: (err: null | Error, req: LifecycleRequestEvent) => void): void
+  /**
+   * Bind the loopback control endpoint and start serving. Resolves with the
+   * bound endpoint info once the socket is bound.
+   *
+   * # Errors
+   * Fails if already started, a non-loopback bind is requested, or the socket
+   * cannot be bound.
+   */
+  start(): Promise<ControlEndpoint>
+  /**
+   * Send a host-produced lifecycle response, routed back to the originating
+   * client by request id. `response_json` is a JSON `LifecycleServerMessage`.
+   *
+   * # Errors
+   * Fails if not started or `response_json` is not a valid
+   * `LifecycleServerMessage`.
+   */
+  respond(responseJson: string): void
+  /** Number of currently connected control clients. */
+  clientCount(): number
+  /**
+   * Stop the control server (idempotent) and remove the control discovery
+   * file.
+   */
+  stop(): void
+}
+
 /** In-process notification server handle exposed to TypeScript. */
 export declare class NotificationServer {
   /**
@@ -216,7 +266,7 @@ export declare class NotificationServer {
   /**
    * Publish a replayable `session_ready` readiness signal. `ready_json` is a
    * JSON `SessionReady`. Unlike [`Self::push_frame`], this frame is buffered
-   * and replayed to late-connecting clients, so an SDK client
+   * and replayed to late-connecting clients, so a lifecycle control client
    * can wait for readiness deterministically instead of treating WS-open as
    * readiness.
    *
@@ -787,6 +837,18 @@ export interface ContextLine {
   lineNumber: number
   /** Raw line content (trimmed line ending). */
   line: string
+}
+
+/** Bound endpoint info returned from [`NotificationControlServer::start`]. */
+export interface ControlEndpoint {
+  /** Bind host (loopback). */
+  host: string
+  /** Bound port. */
+  port: number
+  /** `ws://host:port` URL. */
+  url: string
+  /** The daemon owner id this control endpoint serves. */
+  ownerId: string
 }
 
 /**
@@ -1436,6 +1498,20 @@ export interface KnownGoodFrameStats {
    * side crosses raw `Buffer` bytes and never allocates the base64 string).
    */
   fileAttachmentRustBase64Chars: number
+}
+
+/** A lifecycle request forwarded to the TypeScript daemon for orchestration. */
+export interface LifecycleRequestEvent {
+  /** One of `"session_create"`, `"session_close"`, `"session_resume"`. */
+  kind: string
+  /** The request correlation id to echo in the response. */
+  requestId: string
+  /**
+   * JSON-encoded `LifecycleClientMessage` with the control `token` stripped.
+   * The ingress already authenticated the frame, so the secret is never
+   * forwarded into JS; all other (non-token) fields are preserved.
+   */
+  payloadJson: string
 }
 
 /**

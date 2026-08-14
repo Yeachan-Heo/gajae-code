@@ -29,10 +29,8 @@ describe("external controller integration docs", () => {
 		expect(guide).toContain("Dry-run lifecycle smoke");
 		expect(guide).toContain("Optional live smoke");
 		expect(guide).toContain("not privileged integration modes");
-		expect(guide).toContain("Managed SDK attachment integration");
+		expect(guide).toContain("SDK WebSocket integration");
 		expect(guide).toContain("have been removed");
-		expect(guide).not.toContain("SDK WebSocket lifecycle");
-		expect(guide).not.toContain("Connect to the session's loopback SDK endpoint");
 		expect(guide).not.toContain("RPC lifecycle below");
 		expect(guide).not.toContain("gjc --mode " + "rpc");
 		expect(guide).not.toContain("docs/rpc.md");

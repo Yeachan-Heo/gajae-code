@@ -405,8 +405,8 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 				"delete-key",
 			);
 			expect(deleted).toMatchObject({
+				type: "broker_response",
 				ok: true,
-				operation: "session.delete",
 				result: { sessionId: forkId },
 			});
 			expect(
@@ -426,7 +426,12 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 				{ sessionId: forkId, stateRoot, cwd: repo, sessionPath: forkPath },
 				"delete-key",
 			);
-			expect(replayed).toEqual(deleted);
+			expect(replayed).toMatchObject({ type: "broker_response", ok: true, result: { sessionId: forkId } });
+			const deletedFrameId = (deleted as { id?: unknown }).id;
+			const replayedFrameId = (replayed as { id?: unknown }).id;
+			expect(typeof deletedFrameId).toBe("string");
+			expect(typeof replayedFrameId).toBe("string");
+			expect(replayedFrameId).not.toBe(deletedFrameId);
 			expect(
 				await global(
 					"session.delete",

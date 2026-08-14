@@ -73,58 +73,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * generation 29 / slack generation 28 advance the replay cursor only after a frame is
  * published, so an owner at an earlier generation acknowledges an event before delivering
  * it and loses that event for good the first time a surface refuses it. Discord generation 30 /
- * slack generation 29 move lifecycle and attachment authority into SDK core; generation 30 also
- * isolates per-session Router attachment failures so one stale endpoint cannot block healthy sessions.
- * Discord generation 31 bounds one REST operation across response parsing and multi-request flows.
- * Slack generation 30 bounds shutdown, tracks outbound work, and fences late effect commits.
- * Slack generation 31 fences late post admission and tracks close-marker shutdown work.
- * Slack generation 32 bounds provider teardown and preserves close markers after Router revocation.
- * Slack generation 33 bounds lifecycle predecessors under the shutdown deadline.
- * Slack generation 34 CAS-fences cleanup mapping commits against successors.
- * Slack generation 35 identity-fences detached startup cleanup from restarted daemon state.
- * Slack generation 36 retains stop ownership for every detached lifecycle generation.
- * Discord generation 32 / Slack generation 37 bind cleanup to the removed attachment generation.
- * Discord generation 33 / Slack generation 38 identity-fence cleanup callbacks on exact attachments.
- * Discord generation 34 / Slack generation 39 clear stale attachment identity before provider reassignment.
- * Discord generation 35 / Slack generation 40 capture provider ownership before cleanup awaits.
- * Discord generation 36 / Slack generation 41 drain prior cleanup before provider restart.
- * Discord generation 37 / Slack generation 42 serialize successor attachment visibility after cleanup.
- * Discord generation 38 / Slack generation 43 hold successor frames behind cleanup settlement.
- * Discord generation 39 / Slack generation 44 recover durable cleanup before attachment publication.
- * Slack generation 45 persists exact pending cleanup intent through recovery.
- * Discord generation 40 bounds provider lifecycle joins before Router revocation.
- * Discord generation 41 / Slack generation 46 revoke Router authority despite provider shutdown failure.
- * Discord generation 42 / Slack generation 47 retain daemon objects across restart to preserve detached lifecycle fences.
- * Discord generation 43 / Slack generation 48 fence Router attachment publication and Broker-adopted endpoint authority.
- * Discord generation 44 / Slack generation 49 retain provider shutdown tails and rejected lifecycle errors so no successor transport starts before ownership settles.
- * Discord generation 45 / Slack generation 50 clean predecessor presentation authority before exact Router replacement and reject post-stop Discord callbacks.
- * Discord generation 46 / Slack generation 51 establish replay barriers before reconnect awaits, distinguish replacement from terminal cleanup, and await lifecycle-fenced Discord inbound work.
- * Discord generation 47 / Slack generation 52 preserve presentation continuity across replacement while exact opaque authority fences stale work.
- * Discord generation 48 / Slack generation 53 allow exact publication-time requests without reconciliation deadlock.
- * Discord generation 49 / Slack generation 54 revalidate endpoint authority before exact publication-time requests.
- * Discord generation 50 / Slack generation 55 terminalize predecessor routes only for a changed same-generation endpoint incarnation.
- * Slack generation 56 clears predecessor inbound receipts before same-generation successor publication.
- * Discord generation 51 / Slack generation 57 persist restart-stable Router endpoint-incarnation authority in provider mappings.
- * Discord generation 52 / Slack generation 58 classify reconnect-time endpoint changes before provider retirement.
- * Discord generation 53 / Slack generation 59 serialize successor attach behind predecessor provider retirement.
- * Discord generation 54 / Slack generation 60 version-fence attaches already in flight when retirement begins.
- * Discord generation 55 / Slack generation 61 fence durable inbound work by exact attachment identity.
- * Discord generation 56 / Slack generation 62 fence durable provider-post and thread-effect recovery by attachment identity.
- * Discord generation 57 removes missing-authority wildcard behavior from durable binding checks.
- * Discord generation 58 preserves exact authority through unarchive replacement fallback.
- * Discord generation 59 / Slack generation 63 derive attachment authority ids from one Router function so persisted provider bindings and live attachments cannot drift apart.
- * Discord generation 62 / Slack generation 65 fence the Windows process-incarnation
- * authority change (#4362): the native binding fallback no longer spawns powershell.exe.
- * Discord generation 63 / Slack generation 66 retain the shared ownership fence
- * unless a zero-signal process probe returns ESRCH. EPERM and unknown failures are
- * indeterminate, so earlier owners must not reclaim, replace, or spawn through them.
- * Discord generation 64 / Slack generation 67 contain synchronous provider-
- * subscription admission and ready-hook failures without revoking shared Router
- * attachment authority.
+ * slack generation 29 invalidate existing owners after SDK discovery validation changes.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 64,
-	slack: 67,
+	discord: 30,
+	slack: 29,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -389,10 +342,8 @@ function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
-	} catch (error) {
-		// Only ESRCH proves the process is gone. EPERM and other probe failures are
-		// indeterminate and must retain ownership rather than permit replacement.
-		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	} catch {
+		return false;
 	}
 }
 /** Windows process ownership uses immutable StartTime/FileTime provenance through
@@ -580,18 +531,9 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		const warnings = before.runtime.warning ? [before.runtime.warning] : [];
 		if (!before.configured)
 			return this.result(action, false, `${this.kind} notifications are not configured`, before, before, warnings);
-		if (action === "reload" && !this.effectivelyEnabled() && !opts.allowDisabledNoop) {
+		if (action === "reload" && !this.effectivelyEnabled()) {
 			return this.result(action, false, `${this.kind} notifications are not enabled`, before, before, warnings);
 		}
-		if (action === "reload" && !this.effectivelyEnabled())
-			return this.result(
-				action,
-				true,
-				`${this.kind} notifications are disabled; leaving daemon stopped`,
-				before,
-				before,
-				warnings,
-			);
 		const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
 		const classification = this.classify(state, this.identity());
 		if (classification === "newer")

@@ -121,8 +121,10 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const windowsContract = namedStep(safety, "Run Windows daemon provenance safety contract");
 		expect(windowsContract.run).toContain("--test-name-pattern");
 		expect(windowsContract.run).toContain("incarnation|captured-owner|owner-lock");
-		expect(windowsContract.run).toContain("provider owner state contains transport authority");
-		expect(windowsContract.run).toContain("constructing or restarting provider transport cannot mutate session lifecycle");
+		expect(windowsContract.run).toContain("heartbeat fails closed");
+		expect(windowsContract.run).toContain("Windows production preflight");
+		expect(windowsContract.run).toContain("parent-format|transition lock");
+		expect(windowsContract.run).toContain("runDaemonInternal rewrites persisted owner pid");
 	});
 
 	test("keeps affected validation pinned while reserving an explicit virtual-integration dispatch head", async () => {

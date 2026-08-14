@@ -190,25 +190,32 @@ describe("Issue #2261 extension session.new", () => {
 		commandActions = undefined;
 	});
 
-	it("rejects extension-owned replacement without tearing down session state", async () => {
-		const { context, unsubscribePreviousListener, unsubscribeSuccessorListener } = createExtensionContext(false);
-		const controller = new ExtensionUiController(context);
-		const stopLoading = context.loadingAnimation?.stop;
-		controller.initializeHookRunner({} as never, true);
-		controller.addExtensionTerminalInputListener(() => undefined);
-		if (!commandActions) throw new Error("Expected extension command actions");
+	for (const success of [false, true]) {
+		it(`${success ? "tears down only predecessor" : "retains"} extension terminal listeners and the compaction queue when replacement ${success ? "succeeds" : "fails"}`, async () => {
+			const { context, unsubscribePreviousListener, unsubscribeSuccessorListener } = createExtensionContext(success);
+			const controller = new ExtensionUiController(context);
+			const stopLoading = context.loadingAnimation?.stop;
+			controller.initializeHookRunner({} as never, true);
+			controller.addExtensionTerminalInputListener(() => undefined);
+			(context.session.newSession as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+				if (success) controller.addExtensionTerminalInputListener(() => undefined);
+				return success;
+			});
+			if (!commandActions) throw new Error("Expected extension command actions");
 
-		await expect(commandActions.newSession()).rejects.toMatchObject({ code: "operation_prohibited" });
+			const result = await commandActions.newSession();
+			expect(result).toEqual({ cancelled: !success });
 
-		expect(context.session.newSession).not.toHaveBeenCalled();
-		expect(unsubscribePreviousListener).not.toHaveBeenCalled();
-		expect(unsubscribeSuccessorListener).not.toHaveBeenCalled();
-		expect(stopLoading).not.toHaveBeenCalled();
-		expect(context.statusContainer.clear).not.toHaveBeenCalled();
-		expect(context.chatContainer.clear).not.toHaveBeenCalled();
-		expect(context.pendingMessagesContainer.clear).not.toHaveBeenCalled();
-		expect(context.compactionQueuedMessages).toEqual([{ text: "queued", mode: "followUp" }]);
-		expect(context.pendingTools.has("old-tool")).toBe(true);
-		expect(context.reloadTodos).not.toHaveBeenCalled();
-	});
+			expect(context.session.newSession).toHaveBeenCalledTimes(1);
+			expect(unsubscribePreviousListener).toHaveBeenCalledTimes(success ? 1 : 0);
+			expect(unsubscribeSuccessorListener).not.toHaveBeenCalled();
+			expect(stopLoading).toHaveBeenCalledTimes(success ? 1 : 0);
+			expect(context.statusContainer.clear).toHaveBeenCalledTimes(success ? 1 : 0);
+			expect(context.chatContainer.clear).toHaveBeenCalledTimes(success ? 1 : 0);
+			expect(context.pendingMessagesContainer.clear).toHaveBeenCalledTimes(success ? 1 : 0);
+			expect(context.compactionQueuedMessages).toEqual(success ? [] : [{ text: "queued", mode: "followUp" }]);
+			expect(context.pendingTools.has("old-tool")).toBe(!success);
+			expect(context.reloadTodos).toHaveBeenCalledTimes(success ? 1 : 0);
+		});
+	}
 });

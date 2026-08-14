@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
+import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import {
 	cleanupFixtureRoots,
 	createNotificationFixtureRoot,
@@ -11,7 +12,6 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
-import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
 
 /**
  * Regression for "hard terminal close orphans the Telegram topic": a native
@@ -77,7 +77,7 @@ async function createHarness(prefix: string) {
 }
 
 async function connectFrames(endpoint: string): Promise<Frame[]> {
-	const { url, token } = readTestSdkEndpoint(endpoint);
+	const { url, token } = readEndpoint(endpoint);
 	const frames: Frame[] = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
 	openSockets.push(ws);

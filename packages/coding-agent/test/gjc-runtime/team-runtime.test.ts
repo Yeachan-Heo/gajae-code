@@ -5118,7 +5118,7 @@ describe("stalled worker continuation protocol", () => {
 			if (scenario === "zero_claims" || scenario === "multiple_claims")
 				expect(await readEvents(fixture.stateDir)).toContain("invalid_claim_count");
 		}
-	}, 60_000);
+	}, 20_000);
 
 	it("rejects insufficient lease, corrupt reservations, digest-mismatched outcomes, and restarts without an outcome", async () => {
 		const insufficient = await prepareContinuation("continuation-insufficient-lease-team");

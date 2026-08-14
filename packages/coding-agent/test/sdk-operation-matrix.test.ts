@@ -1,16 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { CHAT_OPERATION_POLICY, sendAuthorizedChatOperation } from "../src/sdk/bus/chat-command-policy.js";
-import { dispatchControl } from "../src/sdk/host/control/dispatch.js";
-import type { ControlSurface } from "../src/sdk/host/control/operations.js";
-import { createSdkSurfacePolicy } from "../src/sdk/host/surface-policy.js";
-import {
-	ADAPTERS,
-	type AdapterDisposition,
-	findOperation,
-	OPERATIONS,
-	TURN_RESULT_PROMPT_ALIAS,
-	TURN_RESULT_SKILL_ALIAS,
-} from "../src/sdk/protocol/operation-registry.js";
+import { ADAPTERS, type AdapterDisposition, OPERATIONS } from "../src/sdk/protocol/operation-registry.js";
 
 type InventoryRow = {
 	sourceId: string;
@@ -41,49 +31,17 @@ const expectedDispositions: Record<string, Record<string, AdapterDisposition>> =
 		telegram: "prohibited",
 		discord: "prohibited",
 		slack: "prohibited",
-		mcp: "prohibited",
-		acp: "prohibited",
-		daemonCli: "prohibited",
+		mcp: "generic_safe",
+		acp: "generic_safe",
+		daemonCli: "generic_safe",
 	},
 	C26: {
 		telegram: "prohibited",
 		discord: "prohibited",
 		slack: "prohibited",
-		mcp: "prohibited",
-		acp: "prohibited",
-		daemonCli: "prohibited",
-	},
-	C27: {
-		telegram: "prohibited",
-		discord: "prohibited",
-		slack: "prohibited",
-		mcp: "prohibited",
-		acp: "prohibited",
-		daemonCli: "prohibited",
-	},
-	C28: {
-		telegram: "prohibited",
-		discord: "prohibited",
-		slack: "prohibited",
-		mcp: "prohibited",
-		acp: "prohibited",
-		daemonCli: "prohibited",
-	},
-	C29: {
-		telegram: "prohibited",
-		discord: "prohibited",
-		slack: "prohibited",
-		mcp: "prohibited",
-		acp: "prohibited",
-		daemonCli: "prohibited",
-	},
-	C30: {
-		telegram: "prohibited",
-		discord: "prohibited",
-		slack: "prohibited",
-		mcp: "prohibited",
-		acp: "prohibited",
-		daemonCli: "prohibited",
+		mcp: "generic_safe",
+		acp: "generic_safe",
+		daemonCli: "generic_safe",
 	},
 	Q29: {
 		telegram: "prohibited",
@@ -169,17 +127,6 @@ describe("SDK operation matrix", () => {
 		for (const [id, disposition] of Object.entries(expectedDispositions))
 			expect(OPERATIONS.find(operation => operation.id === id)?.adapterDispositions).toEqual(disposition);
 	});
-	it("resolves retained prompt and skill aliases to canonical Q26 and its error table", () => {
-		const canonical = findOperation("query", "turn.result");
-		for (const alias of [TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS])
-			expect(findOperation("query", alias)).toBe(canonical);
-		expect(canonical).toMatchObject({
-			id: "Q26",
-			sdkId: "turn.result",
-			aliases: [TURN_RESULT_PROMPT_ALIAS, TURN_RESULT_SKILL_ALIAS],
-			errorCodes: ["invalid_request", "resource_gone"],
-		});
-	});
 
 	it("gives every generated operation an explicit reviewed Discord and Slack chat disposition", () => {
 		for (const transport of ["discord", "slack"] as const) {
@@ -195,11 +142,6 @@ describe("SDK operation matrix", () => {
 		for (const transport of ["discord", "slack"] as const) {
 			for (const request of [
 				{ kind: "global" as const, operation: "session.get_endpoint" },
-				{ kind: "global" as const, operation: "session.create" },
-				{ kind: "global" as const, operation: "session.fork" },
-				{ kind: "global" as const, operation: "session.resume" },
-				{ kind: "global" as const, operation: "session.close" },
-				{ kind: "global" as const, operation: "session.delete" },
 				{ kind: "control" as const, operation: "bash.execute" },
 				{ kind: "control" as const, operation: "bash.abort" },
 				{ kind: "control" as const, operation: "bash.background" },
@@ -233,44 +175,5 @@ describe("SDK operation matrix", () => {
 			expect(secretSends).toBe(0);
 			expect(JSON.stringify(secretResult)).not.toContain(secret);
 		}
-	});
-	it("removes Broker lifecycle controls from host surfaces before mutation", async () => {
-		const lifecycleOperations = [
-			"session.new",
-			"session.fork",
-			"session.resume",
-			"session.switch",
-			"session.branch",
-			"session.handoff",
-			"session.delete",
-		];
-		const policy = createSdkSurfacePolicy({ bindings: ["sdkControl"], workflowGateAvailable: false });
-		for (const operation of lifecycleOperations) expect(policy.installedControls.has(operation)).toBe(false);
-		expect(policy.installedControls.has("session.rename")).toBe(true);
-		expect(policy.installedControls.has("session.cwd.move")).toBe(true);
-
-		let mutations = 0;
-		const surface = new Proxy(
-			{},
-			{
-				get: () => () => {
-					mutations++;
-				},
-			},
-		) as unknown as ControlSurface;
-		for (const operation of lifecycleOperations) {
-			const row = OPERATIONS.find(candidate => candidate.kind === "control" && candidate.sdkId === operation);
-			const response = await dispatchControl(surface, row, {
-				id: operation,
-				operation,
-				input: { id: "session-id", entryId: "entry-id", target: "target" },
-				confirm: true,
-			});
-			expect(response).toMatchObject({
-				ok: false,
-				error: { code: "operation_prohibited" },
-			});
-		}
-		expect(mutations).toBe(0);
 	});
 });

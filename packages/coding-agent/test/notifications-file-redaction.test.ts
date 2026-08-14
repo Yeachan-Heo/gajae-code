@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getTelegramFileSink } from "../src/sdk/bus/attachment-registry";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
+import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import {
 	cleanupFixtureRoots,
 	createNotificationFixtureRoot,
@@ -11,7 +12,6 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
-import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Promise<void> {
@@ -104,7 +104,7 @@ async function startAndConnect(harness: Awaited<ReturnType<typeof createHarness>
 	});
 	await harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
 	await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "endpoint file");
-	const { url, token } = readTestSdkEndpoint(harness.endpoint());
+	const { url, token } = readEndpoint(harness.endpoint());
 	const frames: Frame[] = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
 	openSockets.push(ws);

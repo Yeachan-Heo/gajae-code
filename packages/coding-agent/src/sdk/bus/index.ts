@@ -24,6 +24,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -48,7 +49,6 @@ function sdkBusNatives(): NativeSdkBusBindings {
 type NotificationServer = NativeNotificationServer;
 
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
-import { AsyncJobManager } from "../../async";
 import { Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import { INTERACTIVE_SELECTOR_RESUME_ORIGIN } from "../../extensibility/shared-events";
@@ -61,12 +61,6 @@ import {
 } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { ClientBridge } from "../../session/client-bridge";
-import {
-	boundTerminalRetentionState,
-	findOwnedRegistrationsForTurn,
-	isOwnedAttemptRegistrationIncomplete,
-	settleOwnedWork,
-} from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
 import type {
 	AskAnswerRequest,
@@ -90,9 +84,9 @@ import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
+import { elevationAuthorityPath, verifyElevationCapability } from "../elevation/capability";
 import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
-import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
-import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
+import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "../host/control";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
 import {
@@ -110,7 +104,6 @@ import {
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 } from "../startup-capability";
-import type { TurnResultContent } from "../turn-result";
 import { registerTelegramFileSink } from "./attachment-registry";
 import { ensureDiscordDaemon, ensureSlackDaemon } from "./chat-daemon-control";
 import {
@@ -118,12 +111,11 @@ import {
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
 	isSlackComplete,
-	isTelegramSessionEligible,
+	isTelegramOrchestrationSession,
 	type NotificationConfig,
 	type NotificationSettingsReader,
 	resolveGenericNotificationSessionEligibility,
 	sessionTag,
-	tokenFingerprint,
 } from "./config";
 import { telegramControlCommandUsage } from "./config-commands";
 import {
@@ -138,26 +130,20 @@ import {
 	isExistingThreadBindingRequested,
 } from "./existing-thread-readiness";
 import { imageAttachmentsFromMessage, notificationActionPayload, summaryFromMessage, truncate } from "./helpers";
-import {
-	createKindAwareReconciliation,
-	type KindAwareReconciliation,
-	type ReconciliationKind,
-} from "./kind-aware-reconciliation";
+import { createKindAwareReconciliation } from "./kind-aware-reconciliation";
 import { assertNativeRuntimeCompatibility } from "./native-runtime-compatibility";
 import { proposedTelegramIdentity } from "./notification-orchestration";
 import { createPromptReconciliation } from "./prompt-reconciliation";
-import {
-	createReconciliationStore,
-	type DurableTerminalScopeRecord,
-	type EvictedTerminalKeyEntry,
-	resolveReconciliationSessionFile,
-} from "./reconciliation-store";
+import { createReconciliationStore } from "./reconciliation-store";
 import { NotificationSessionController, type NotificationSessionRuntime } from "./session-control";
 import type { SlackConversation } from "./slack-conversation";
 import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
+	endpointAuthorityDigest,
 	ensureTelegramDaemonRunningDetailed,
+	type RegisterNotificationRootResult,
+	unregisterNotificationRoot,
 } from "./telegram-daemon";
 
 export type {
@@ -208,27 +194,6 @@ function formatPromptTerminalFailureReason(reason: unknown): string {
 	return rawReason ? rawReason.slice(0, PROMPT_TERMINAL_FAILURE_REASON_LOG_MAX) : "unreported";
 }
 
-/**
- * Thrown from a serialized durable terminal-scope transaction when the
- * idempotency key is already owned by a DIFFERENT input (scope). The generic
- * dispatch cache normally rejects this before the surface, but after its
- * 256-entry eviction two concurrent requests can both pass the earlier
- * snapshot check; the atomic recheck inside the transaction must reject the
- * second instead of appending a duplicate-key row (review thread P2).
- */
-class TerminalIdempotencyConflictError extends Error {
-	constructor() {
-		super("Idempotency key was reused with different input.");
-	}
-}
-
-function endpointAuthorityDigest(url: string, token: string): string {
-	const parsed = new URL(url);
-	parsed.hash = "";
-	parsed.search = "";
-	parsed.hostname = parsed.hostname.toLowerCase();
-	return crypto.createHash("sha256").update(`${parsed.toString()} ${token}`, "utf8").digest("hex");
-}
 export function formatPromptSettlementDiagnostic(
 	proof: Extract<RunSettlementProof, { status: "unfenced" }>,
 	now = Date.now(),
@@ -246,11 +211,15 @@ export function formatPromptSettlementDiagnostic(
 }
 
 // ===========================================================================
-// Session lifecycle presentation contract
+// Session lifecycle control protocol (TypeScript mirror of the Rust wire
+// contract in `crates/gjc-sdk/src/lifecycle.rs`).
+//
+// These describe the frames exchanged over the daemon-owned, session-independent
+// control endpoint for remote session create / close / resume. Field names are
+// camelCase on the wire; `type`/`kind` discriminators are snake_case. The Rust
+// ingress authenticates and forwards; the daemon (TypeScript) owns all policy,
+// spawn orchestration, idempotency, rate limiting, audit, and UX.
 // ===========================================================================
-// Provider-neutral lifecycle command targets and credential-free presentation outcomes.
-// SessionLifecycleService owns request authorization/idempotency; these types contain no
-// control endpoint, process, tmux, session-state, or SDK endpoint authority.
 
 /** Where a `session_create` should run. Discriminated by `kind`. */
 export type SessionCreateTarget =
@@ -261,6 +230,10 @@ export type SessionCreateTarget =
 /** Identifies the session a `session_close` targets. */
 export interface SessionCloseTarget {
 	sessionId: string;
+	/** Expected GJC-managed tmux session name (defense-in-depth match). */
+	tmuxSession?: string;
+	/** Expected `@gjc-session-state-file` tag (defense-in-depth match). */
+	sessionStateFile?: string;
 }
 
 /** Identifies the session a `session_resume` targets. */
@@ -270,33 +243,110 @@ export interface SessionResumeTarget {
 	path?: string;
 }
 
+/** Create a new session. */
+export interface SessionCreateFrame {
+	type: "session_create";
+	requestId: string;
+	/** Deterministic lifecycle marker preallocated by the daemon before spawn. */
+	lifecycleRequestId: string;
+	/** Session id the daemon preallocated and propagates to the child. */
+	intendedSessionId: string;
+	/** Telegram update id (idempotency key on the daemon side). */
+	updateId: number;
+	chatId: string;
+	/** Control-endpoint token authorizing this frame. */
+	token: string;
+	target: SessionCreateTarget;
+	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
+	startupPromptRef?: string;
+	/** Model profile preset to activate for the spawned session (--mpreset). */
+	modelPreset?: string;
+}
+
+/** Close (hard-kill, history preserved) a session. */
+export interface SessionCloseFrame {
+	type: "session_close";
+	requestId: string;
+	updateId: number;
+	chatId: string;
+	token: string;
+	target: SessionCloseTarget;
+	/** Required force-only close flag; false/omitted is rejected by daemon policy. */
+	force?: boolean;
+}
+
+/** Resume a session (reattach if alive, else cold-restart from history). */
+export interface SessionResumeFrame {
+	type: "session_resume";
+	requestId: string;
+	updateId: number;
+	chatId: string;
+	token: string;
+	target: SessionResumeTarget;
+	/** Reserved for a future capability transport; any supplied value is rejected before lifecycle acceptance. */
+	startupPromptRef?: string;
+}
+
+/** Any client -> ingress lifecycle request frame. */
+export type SessionLifecycleRequest = SessionCreateFrame | SessionCloseFrame | SessionResumeFrame;
+
+/** Terminal status of a lifecycle request. */
 export type LifecycleStatus = "ok" | "error";
 
+/** A connected session's per-session endpoint, returned to the control client. */
+export interface LifecycleEndpoint {
+	url: string;
+	token: string;
+}
+
+/** The Telegram topic/thread a session is surfaced in. */
+export interface LifecycleTopic {
+	chatId: string;
+	threadId: string;
+}
+
+/** How a create request was correlated to its spawned session. */
+export type MatchedBy = "spawn_marker" | "session_ready";
+
+/** Response to a successful `session_create`. */
 export interface SessionCreateResponseFrame {
 	type: "session_create_response";
 	requestId: string;
 	status: LifecycleStatus;
+	lifecycleRequestId: string;
 	sessionId: string;
+	matchedBy: MatchedBy;
+	endpoint: LifecycleEndpoint;
+	topic: LifecycleTopic;
 	target: SessionCreateTarget;
 }
 
+/** Response to a successful `session_close`. */
 export interface SessionCloseResponseFrame {
 	type: "session_close_response";
 	requestId: string;
 	status: LifecycleStatus;
 	sessionId: string;
+	processGone: boolean;
+	historyPreserved: boolean;
+	endpointStale: boolean;
 }
 
+/** Whether a resume reattached to a live session or cold-restarted a dead one. */
 export type ResumeMode = "reattached" | "cold_restarted";
 
+/** Response to a successful `session_resume`. */
 export interface SessionResumeResponseFrame {
 	type: "session_resume_response";
 	requestId: string;
 	status: LifecycleStatus;
 	sessionId: string;
 	mode: ResumeMode;
+	endpoint: LifecycleEndpoint;
+	topic: LifecycleTopic;
 }
 
+/** Machine-readable reason a lifecycle request failed. */
 export type LifecycleErrorReason =
 	| "unauthorized"
 	| "rate_limited"
@@ -311,12 +361,15 @@ export type LifecycleErrorReason =
 	| "terminal_uncertain"
 	| "unsupported_platform";
 
+/** A candidate returned with an `ambiguous_target` resume error. */
 export interface ResumeCandidate {
 	sessionId: string;
 	path?: string;
+	/** Last-activity epoch-millis (session history file mtime), if known. */
 	mtimeMs?: number;
 }
 
+/** A structured lifecycle error frame. */
 export interface SessionLifecycleErrorFrame {
 	type: "session_lifecycle_error";
 	requestId: string;
@@ -326,6 +379,7 @@ export interface SessionLifecycleErrorFrame {
 	candidates?: ResumeCandidate[];
 }
 
+/** Any ingress -> client lifecycle response frame. */
 export type SessionLifecycleResponse =
 	| SessionCreateResponseFrame
 	| SessionCloseResponseFrame
@@ -1120,8 +1174,6 @@ interface SessionRuntime {
 	/** Discovery scope is fixed before publication; a live default endpoint is never rotated in place. */
 	endpointScope: "default" | "chat";
 	idleSeq: number;
-	/** Stops delayed session-name observation when this runtime loses authority. */
-	stopSessionNameObserver: () => void;
 	/** Interactive asks awaiting a remote answer, by action id. */
 	pendingInteractive: Map<string, PendingInteractiveAsk>;
 	/** Deregisters this session's ask answer source. */
@@ -1134,12 +1186,6 @@ interface SessionRuntime {
 	notificationsActive: boolean;
 	/** Provider ownership state is independent from the already-published core SDK runtime. */
 	notificationOwnerState: "ready" | "retry" | "blocked";
-	/**
-	 * Ownership-relevant configuration identity this runtime's owner state was
-	 * proved under. A settled outcome may only be applied while it still matches,
-	 * so a credential/destination/enablement change forces a re-proof.
-	 */
-	notificationOwnerKey?: string;
 	/** Rejects new SDK frames while a leased terminal response drains. */
 	inboundFenced: boolean;
 	/** Set as soon as terminal teardown is requested, before startup settles. */
@@ -1173,14 +1219,14 @@ interface SessionRuntime {
 	/** This runtime's own host-liveness publication; only its teardown may retract it. */
 	evidencePublication?: SessionHostRuntimePublication;
 	brokerRegistrationReleased: boolean;
+	/** Managed Telegram root registration released during terminal teardown. */
+	notificationRootRegistration?: { settings: Settings; cwd: string; registrationToken: string };
 	verbosity: "lean" | "verbose";
 	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
 	busy: boolean;
 	/** Prompt command/turn identities awaiting their corresponding agent_start. */
 	pendingPromptCorrelations: Array<{ commandId: string; turnId: string }>;
-	/** SDK run tokens bind an accepted queued follow-up to only its matching agent_start. */
-	pendingPromptCorrelationsBySdkRunToken: Map<string, { commandId: string; turnId: string }>;
 	/** Identity bound to the agent lifecycle currently in flight. */
 	activePromptCorrelation?: { commandId: string; turnId: string };
 	/** Binds the executing Agent run to a correlated prompt so cleanup targets only it. */
@@ -1200,7 +1246,7 @@ interface SessionRuntime {
 	notePromptReconciliation: (
 		correlation: { commandId: string; turnId: string } | undefined,
 		frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
-	) => void | Promise<void>;
+	) => void;
 	/** Settles and emits one sanitized correlated prompt failure. */
 	emitPromptFailure: (correlation: { commandId: string; turnId: string }, error: unknown) => void;
 	/** Records correlated lifecycle frames for replay and delivers them only to the accepted requester after acknowledgement. */
@@ -1243,27 +1289,13 @@ interface SessionRuntime {
 	 * frames so a stale live edit can never be emitted after the finalized turn. */
 	turnClosed?: boolean;
 	/** Finalized while provisional policy was held; flush exactly once on stable activation. */
-	pendingFinal?: {
-		window: number;
-		receipts: Array<{ text: string; messageRef?: string; origin: "user" | "autonomous" | "continuation" }>;
-	};
-	/** Monotonic user-request boundary for deferred lean delivery. */
-	settlementWindow: number;
-	/** Provenance of the currently executing assistant turn. */
-	currentTurnSettlementOrigin?: "user" | "autonomous" | "continuation";
-	/** Immutable settlement boundary captured when the current turn begins. */
-	currentTurnSettlementWindow?: number;
+	pendingFinal?: { text?: string; messageRef?: string };
 	/**
-	 * Lean-mode deferred receipts for the current user-request settlement window.
-	 * Ordinary tool-loop turns retain latest-turn-wins behaviour. An autonomous
-	 * continuation has no new user request, so it appends instead of erasing the
-	 * prior receipt. The small fixed receipt bound prevents an unbounded idle wait
-	 * from retaining the full transcript.
+	 * Lean-mode deferred final answer: latest assistant text observed at `turn_end`,
+	 * emitted once at `agent_end` so intermediate tool-turn narration does not flood
+	 * remote clients. Cleared after flush or when replaced by a newer turn.
 	 */
-	pendingSettled?: {
-		window: number;
-		receipts: Array<{ text: string; messageRef?: string; origin: "user" | "autonomous" | "continuation" }>;
-	};
+	pendingSettled?: { text: string; messageRef?: string };
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
 	deferredInboundControls: Array<() => void>;
 	/** Started tool calls awaiting a terminal activity frame, keyed by tool call id. */
@@ -2270,9 +2302,6 @@ function sdkQuerySurface(
 		turnId?: string;
 		clientRef?: string;
 	}) => unknown = () => ({ status: "unknown" }),
-	steerStatusLookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown = () => ({
-		status: "unknown",
-	}),
 ): SessionSurface {
 	return createSdkSurfaceFactory({
 		ctx,
@@ -2283,7 +2312,6 @@ function sdkQuerySurface(
 		configOverrides,
 		settings,
 		turnResultLookup,
-		steerStatusLookup,
 		hostTools: () => getInstalledDefinitions("host_tools") !== undefined,
 	}).query;
 }
@@ -2354,14 +2382,8 @@ function sdkControlSurface(
 		requesterConnectionId?: string,
 		clientRef?: string,
 		trackReconciliation?: boolean,
-		preflightAbort?: () => void | Promise<void>,
-		reconciliationKind?: ReconciliationKind,
-		sdkRunToken?: string,
 	) => void | Promise<void> = () => {},
-	onPromptFailed: (
-		correlation: { commandId: string; turnId: string },
-		error: unknown,
-	) => void | Promise<void> = () => {},
+	onPromptFailed: (correlation: { commandId: string; turnId: string }, error: unknown) => void = () => {},
 	onPromptAcceptFailed: (correlation: { commandId: string; turnId: string }) => void = () => {},
 	acceptGateResolution: () => boolean,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>,
@@ -2371,41 +2393,13 @@ function sdkControlSurface(
 	settings?: Settings,
 	configOverrides: Map<string, unknown> = new Map(),
 	configRevision: { current: number } = { current: 0 },
+	elevationAuthorityToken?: string,
 	abortOwnedPrompt: (
 		connectionId: string | undefined,
 	) => Promise<{ aborted: true; disposition: "cancelled" | "already_terminal" | "idle" }> = async () => ({
 		aborted: true,
 		disposition: "idle",
 	}),
-	abortTerminalPrompt: (
-		connectionId: string | undefined,
-		scope: AbortScope,
-		idempotencyKey?: string,
-		preflightCancel?: {
-			hasPending: () => boolean;
-			cancel: () => void;
-		},
-		// True only when NO OTHER connection has a pending preflight admission;
-		// the session-wide preflight seam must not be invoked while another
-		// connection's active preflight could be cancelled by it (review P1).
-		noOtherConnectionPreflights?: () => boolean,
-	) => Promise<
-		| {
-				ok: true;
-				outcome:
-					| "stopped"
-					| "stopped_owned"
-					| "no_active_turn"
-					| "already_terminal"
-					| "no_store"
-					| "no_effect"
-					| "no_effect_replay"
-					| "pending_replay"
-					| "uncertain_replay";
-				stored?: { responseState: string; responsePayloadHash: string; terminalPublished: boolean };
-		  }
-		| { ok: false; reason: "worker_unsettled" | "owned_unsettled" | "conflict" | "reservation_failed" }
-	> = async () => ({ ok: true, outcome: "no_active_turn" }),
 	skillRecon?: {
 		admit: (clientRef?: string) => void;
 		release: (clientRef?: string) => void;
@@ -2414,27 +2408,15 @@ function sdkControlSurface(
 			clientRef?: string,
 			extra?: { skillName?: string },
 		) => Promise<void>;
-		cancel: (correlation: { commandId: string; turnId: string }) => Promise<void>;
 		noteTransition: (
 			correlation: { commandId: string; turnId: string } | undefined,
-			frame:
-				| { type: "agent_start" | "agent_end"; content?: TurnResultContent }
-				| { type: "agent_failed"; error: unknown; content?: TurnResultContent },
+			frame: { type: "agent_start" | "agent_end" } | { type: "agent_failed"; error: unknown },
 		) => Promise<void>;
 		lookup: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown;
-		reserveSteer?: KindAwareReconciliation["reserveSteer"];
-		settleSteer?: KindAwareReconciliation["settleSteer"];
-	},
-	terminalAbortSeams?: {
-		getTerminalTurnEpoch: () => number | undefined;
-		cancelPendingPreflightForTerminalAbort: () => void;
-		captureTerminalAbortSteeringSnapshot?: () => void;
-		discardTerminalAbortSteeringSnapshot?: (token: number) => void;
-		rebindTerminalAbortSteeringSnapshot?: (token: number) => void;
 	},
 ): ControlSurface & {
-	cancelPendingPreflights(): Promise<void>;
-	cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
+	cancelPendingPreflights(): void;
+	cancelPendingPreflightsForConnection(connectionId: string): void;
 } {
 	const unavailable = (operation: string, reason: string) => () => {
 		throw Object.assign(new Error(`${operation} is unavailable: ${reason}`), { code: "unavailable" });
@@ -2475,29 +2457,11 @@ function sdkControlSurface(
 		}
 		return "unknown";
 	};
-	const sendSteer = async (text: string, clientRef?: string) => {
-		if (clientRef === undefined) {
-			const correlation = { commandId: crypto.randomUUID(), turnId: crypto.randomUUID() };
-			await api.sendUserMessage(text, { deliverAs: "steer" });
-			return { ...correlation, accepted: true };
-		}
-		const normalizedClientRef = clientRef.trim();
-		if (!skillRecon?.reserveSteer || !skillRecon.settleSteer)
-			throw Object.assign(new Error("Steer reconciliation is unavailable."), { code: "unavailable" });
-		const reservation = await skillRecon.reserveSteer(normalizedClientRef, text);
-		if (reservation.replay) return { sessionId: ctx.sessionManager.getSessionId(), ...reservation.result };
-		try {
-			await api.sendUserMessage(text, { deliverAs: "steer" });
-			return {
-				sessionId: ctx.sessionManager.getSessionId(),
-				...(await skillRecon.settleSteer(normalizedClientRef, "accepted")),
-			};
-		} catch (error) {
-			return {
-				sessionId: ctx.sessionManager.getSessionId(),
-				...(await skillRecon.settleSteer(normalizedClientRef, "rejected", error)),
-			};
-		}
+	const sendSteer = async (text: string) => {
+		// Await admission so a rejection (e.g. handoff in progress) surfaces as a
+		// control error instead of a false `accepted: true`.
+		await api.sendUserMessage(text, { deliverAs: "steer" });
+		return { commandId: crypto.randomUUID(), accepted: true };
 	};
 	const resolveModel = (id: string) => {
 		const [provider, ...modelId] = id.split("/");
@@ -2564,22 +2528,19 @@ function sdkControlSurface(
 			return unavailable(operation, "no typed session seam is installed")();
 		return ctx.sdkControl(operation, input);
 	};
-	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => Promise<void> }>();
+	const pendingPreflightCancellations = new Map<string, { connectionId?: string; cancel: () => void }>();
 	const preflightKey = (connectionId: string | undefined, correlation: { commandId: string; turnId: string }) =>
 		`${connectionId ?? ""}\0${correlation.commandId}\0${correlation.turnId}`;
-	const cancelPendingPreflights = async () => {
-		await Promise.all([...pendingPreflightCancellations.values()].map(async entry => await entry.cancel()));
+	const cancelPendingPreflights = () => {
+		for (const { cancel } of pendingPreflightCancellations.values()) cancel();
 	};
-	const cancelPendingPreflightsForConnection = async (connectionId: string) => {
-		await Promise.all(
-			[...pendingPreflightCancellations.values()]
-				.filter(entry => entry.connectionId === connectionId)
-				.map(async entry => await entry.cancel()),
-		);
+	const cancelPendingPreflightsForConnection = (connectionId: string) => {
+		for (const entry of pendingPreflightCancellations.values())
+			if (entry.connectionId === connectionId) entry.cancel();
 	};
 	const isSessionBusy = () => isBusy() || ctx.isIdle?.() === false;
 	const awaitAbortReady = async () => {
-		await cancelPendingPreflights();
+		cancelPendingPreflights();
 		await (ctx.abort as () => unknown)();
 		while (isSessionBusy()) {
 			await Bun.sleep(10);
@@ -2644,71 +2605,39 @@ function sdkControlSurface(
 				: text;
 		const commandId = crypto.randomUUID();
 		const turnId = crypto.randomUUID();
-		const sdkRunToken = deliverAs === "followUp" ? crypto.randomUUID() : undefined;
 		type PreflightTerminalResult = { status: "accepted" } | { status: "rejected"; error: unknown };
 		const preflight = Promise.withResolvers<PreflightTerminalResult>();
-		const preflightController = new AbortController();
-		const cancellationError = Object.assign(new Error("Prompt preflight was cancelled before execution."), {
-			code: "busy",
-		});
 		let preflightSettled = false;
-		let accepting = false;
 		let accepted = false;
-		let submission: Promise<void> | undefined;
-		const submissionSettled = Promise.withResolvers<void>();
-		let cancellation: Promise<void> | undefined;
 		const correlation = { commandId, turnId };
-		const key = preflightKey(requesterConnectionId, correlation);
 		const settlePreflight = (result: PreflightTerminalResult) => {
 			if (preflightSettled) return;
 			preflightSettled = true;
 			preflight.resolve(result);
 		};
-		// This is retained by the accepted durable record. It settles only this
-		// submission; terminal authority remains with the pending cancellation owner.
-		const settleSubmission = async () => {
-			preflightController.abort();
-			await submissionSettled.promise;
-		};
-		const cancelPreflight = () => {
-			cancellation ??= (async () => {
-				preflightController.abort();
-				if (!accepting) settlePreflight({ status: "rejected", error: cancellationError });
-				const ownedCancellation = await abortOwnedPrompt(requesterConnectionId);
-				if (ownedCancellation.disposition === "idle") await settleSubmission();
-			})();
-			return cancellation;
-		};
-		pendingPreflightCancellations.set(key, {
+		const cancelPreflight = () =>
+			settlePreflight({
+				status: "rejected",
+				error: Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" }),
+			});
+		pendingPreflightCancellations.set(preflightKey(requesterConnectionId, correlation), {
 			connectionId: requesterConnectionId,
 			cancel: cancelPreflight,
 		});
 		const settleAccepted = async () => {
 			if (preflightSettled) return;
-			accepting = true;
+			accepted = true;
 			try {
-				await onPromptAccepted(
-					correlation,
-					requesterConnectionId,
-					trimmedClientRef,
-					trackReconciliation,
-					settleSubmission,
-					"prompt",
-					sdkRunToken,
-				);
+				await onPromptAccepted(correlation, requesterConnectionId, trimmedClientRef, trackReconciliation);
 			} catch (error) {
-				accepting = false;
 				// Durable acceptance failed, so the prompt was never accepted: reject the
 				// control preflight and rethrow so the awaiting session does not execute it.
+				accepted = false;
 				onPromptAcceptFailed(correlation);
 				settlePreflight({ status: "rejected", error });
 				throw error;
 			}
-			accepting = false;
-			accepted = true;
-			pendingPreflightCancellations.delete(key);
 			settlePreflight({ status: "accepted" });
-			if (preflightController.signal.aborted) throw cancellationError;
 		};
 		// Durable fence preferred; keep legacy onPreflightAccepted for hosts/tests that only fire the sync hook.
 		const onPreflightAcceptCommit = settleAccepted;
@@ -2719,19 +2648,17 @@ function sdkControlSurface(
 		};
 		// Do not acknowledge the prompt until AgentSession's async preflight
 		// succeeds. The terminal result records correlation before agent_start can fire.
+		let submission: Promise<void> | undefined;
 		try {
 			submission = Promise.resolve(
 				api.sendUserMessage(content, {
 					...(deliverAs ? { deliverAs } : !forceFresh && isBusy() ? { deliverAs: "steer" as const } : {}),
 					onPreflightAcceptCommit,
 					onPreflightAccepted,
-					preflightSignal: preflightController.signal,
-					...(sdkRunToken ? { sdkRunToken } : {}),
 				}),
 			);
 		} catch (error) {
-			submissionSettled.resolve();
-			if (accepted && !preflightController.signal.aborted) void onPromptFailed(correlation, error);
+			if (accepted) onPromptFailed(correlation, error);
 			else settlePreflight({ status: "rejected", error });
 		}
 		if (submission) {
@@ -2744,12 +2671,10 @@ function sdkControlSurface(
 								code: "busy",
 							}),
 						});
-					submissionSettled.resolve();
 				},
 				error => {
-					if (accepted && !preflightController.signal.aborted) void onPromptFailed(correlation, error);
+					if (accepted) onPromptFailed(correlation, error);
 					else settlePreflight({ status: "rejected", error });
-					submissionSettled.resolve();
 				},
 			);
 		}
@@ -2761,16 +2686,19 @@ function sdkControlSurface(
 			if (trackReconciliation) releasePromptAdmission(trimmedClientRef);
 			throw error;
 		} finally {
-			pendingPreflightCancellations.delete(key);
+			pendingPreflightCancellations.delete(preflightKey(requesterConnectionId, correlation));
 		}
 	};
 	const surface: ControlSurface & {
-		cancelPendingPreflights(): Promise<void>;
-		cancelPendingPreflightsForConnection(connectionId: string): Promise<void>;
+		cancelPendingPreflights(): void;
+		cancelPendingPreflightsForConnection(connectionId: string): void;
 	} = {
+		authorizeElevationClaim: (sdkId, input, capability) =>
+			elevationAuthorityToken !== undefined &&
+			verifyElevationCapability(elevationAuthorityToken, capability, sdkId, input),
 		prompt: (text, images, clientRef) =>
 			submitPrompt(text, images, false, undefined, true, controlRequesterContext.getStore(), clientRef, true),
-		steer: (text, clientRef) => sendSteer(text, clientRef),
+		steer: text => sendSteer(text),
 		followUp: text => submitPrompt(text, undefined, false, "followUp", false, controlRequesterContext.getStore()),
 		abort: async () => {
 			const requesterConnectionId = controlRequesterContext.getStore();
@@ -2778,192 +2706,11 @@ function sdkControlSurface(
 				entry => entry.connectionId === requesterConnectionId,
 			);
 			if (pendingPreflight) {
-				// Fire-and-forget the cancel: the preflight signal is aborted
-				// immediately (synchronously inside cancelPreflight), but the
-				// full cleanup (settleRun awaiting executionSettled) may be
-				// gated by a durable acceptance commit that this same abort
-				// path fences. Awaiting it would deadlock. The response is
-				// published once the pending writes settle.
-				if (requesterConnectionId) void cancelPendingPreflightsForConnection(requesterConnectionId);
-				else void cancelPendingPreflights();
+				if (requesterConnectionId) cancelPendingPreflightsForConnection(requesterConnectionId);
+				else cancelPendingPreflights();
 				return { aborted: true, disposition: "preflight_cancelled" };
 			}
 			return await abortOwnedPrompt(requesterConnectionId);
-		},
-		abortTerminal: async (input, idempotencyKey) => {
-			// Terminal abort (C04 mode:"terminal", approved plan): stop the root
-			// worker's current turn and block only its own continuation routes.
-			// Left-running owned work (background Bash/task jobs, detached
-			// subagents) keeps running and its completions are delivered normally
-			// through the existing followUp/prompt path as a fresh turn — owned
-			// delivery is intentionally NOT suppressed.
-			const requesterConnectionId = controlRequesterContext.getStore();
-			// Capture the requester's preflight entries AT ADMISSION: a successor
-			// prompt pipelined by the same connection while the abort awaits must
-			// never be cancelled as part of this abort (review thread P1).
-			const capturedRequesterPreflights = requesterConnectionId
-				? [...pendingPreflightCancellations.values()].filter(entry => entry.connectionId === requesterConnectionId)
-				: [...pendingPreflightCancellations.values()].filter(entry => entry.connectionId === undefined);
-			const cancelCapturedPreflights = () => {
-				for (const entry of capturedRequesterPreflights) entry.cancel();
-			};
-			// Preflight cancellation happens INSIDE abortTerminalPrompt, AFTER the
-			// durable admission/replay decision: a no-store request or a same-key
-			// replay/conflict must NOT cancel a pending prompt — only a newly
-			// admitted abort may (review thread P2).
-			const scope: AbortScope = input.scope === "owned" ? "owned" : "turn";
-			const outcome = await abortTerminalPrompt(
-				requesterConnectionId,
-				scope,
-				idempotencyKey,
-				{
-					hasPending: () => capturedRequesterPreflights.length > 0,
-					cancel: cancelCapturedPreflights,
-				},
-				// The seam cancels the SESSION-WIDE preflight controller; the
-				// internal per-connection map lets the queued requester's abort
-				// verify no OTHER connection has a pending admission before
-				// invoking it (review thread P1).
-				() =>
-					![...pendingPreflightCancellations.values()].some(entry => entry.connectionId !== requesterConnectionId),
-			);
-			// Preflight cancellation happens ONLY for a NEWLY ADMITTED abort,
-			// after the durable admission/replay decision inside
-			// abortTerminalPrompt: a no-store request or a same-key
-			// replay/conflict must never cancel a pending prompt (review
-			// thread P2). A turn.prompt still in PREFLIGHT has no
-			// promptSubmissions entry, so the new no-active abort cancels the
-			// connection's pending preflights and invalidates the underlying
-			// session preflight — otherwise the prompt could start after this
-			// abort.
-			// Treat ANY outcome carrying the durable replay marker as a
-			// non-admission: after the in-memory dispatch entry expires or a
-			// restart, a SUCCESSFUL replay returns stopped/stopped_owned with
-			// `stored`, and cancelling the requester's unrelated in-preflight
-			// prompt there would give an idempotency replay real effects (review
-			// thread P1). Only a newly admitted abort may cancel preflights.
-			const outcomeIsNewAdmission =
-				outcome.ok &&
-				outcome.stored === undefined &&
-				outcome.outcome !== "no_store" &&
-				outcome.outcome !== "no_effect";
-			if (outcomeIsNewAdmission && capturedRequesterPreflights.length > 0) {
-				// Cancel ONLY the preflight entries captured when the abort was
-				// admitted: a successor prompt pipelined by the same connection
-				// while the abort was completing must never be cancelled as part of
-				// this abort (review thread P1). The session seam stays
-				// requester-gated so an unrelated connection's prompt is not
-				// failed: it cancels the SESSION-WIDE preflight controller, so it
-				// is invoked only when no OTHER connection has a pending admission
-				// (review thread P1).
-				cancelCapturedPreflights();
-				const otherConnectionPreflights = [...pendingPreflightCancellations.values()].some(
-					entry => entry.connectionId !== requesterConnectionId,
-				);
-				if (!otherConnectionPreflights) terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
-			}
-			if (!outcome.ok && outcome.reason === "conflict") {
-				// Throw a typed control error instead of returning a nested result
-				// so dispatchControl produces a TOP-LEVEL ok:false response with
-				// code idempotency_conflict (the generic cache does the same for
-				// in-cache conflicts; this path covers the evicted/restart case).
-				throw new TypedControlError("idempotency_conflict", "Idempotency key was reused with different input.");
-			}
-			if (!outcome.ok) {
-				return {
-					ok: true,
-					selection: scope,
-					turn: "uncertain",
-					ownedWork: scope === "turn" ? "left_running" : "uncertain",
-					automaticDelivery: scope === "turn" ? "enabled" : "none",
-					resumeOnOwnedCompletion: scope === "turn",
-					reason: outcome.reason,
-				};
-			}
-			if (outcome.outcome === "no_active_turn" || outcome.outcome === "already_terminal") {
-				// No active root turn to stop: process-local no-effect, no fence.
-				return {
-					ok: true,
-					selection: scope,
-					turn: "no_active_turn",
-					terminal: "terminal_no_effect",
-					...(outcome.stored ? { replay: outcome.stored } : {}),
-				};
-			}
-			if (outcome.outcome === "no_store") {
-				// No file-backed reconciliation owner: terminal admission is gated
-				// off before any fence/stop/cleanup (plan AC 5).
-				return {
-					ok: true,
-					selection: scope,
-					turn: "no_store",
-					terminal: "terminal_no_effect",
-				};
-			}
-			if (outcome.outcome === "no_effect") {
-				// Initial marker could not be persisted before any destructive work
-				// (AC 10): process-local no-effect, no fence, no stop. A
-				// marker-failure reservation replays through this same outcome, so
-				// one idempotency key always returns the same result after
-				// eviction/restart.
-				return {
-					ok: true,
-					selection: scope,
-					turn: "no_effect",
-					terminal: "terminal_no_effect",
-					...(outcome.stored ? { replay: outcome.stored } : {}),
-				};
-			}
-			if (outcome.outcome === "no_effect_replay") {
-				// Durable idle/already-terminal reservation replayed: exact
-				// no_active_turn, so a same-key retry after eviction/restart never
-				// aborts an unrelated later turn.
-				return {
-					ok: true,
-					selection: scope,
-					turn: "no_active_turn",
-					terminal: "terminal_no_effect",
-					...(outcome.stored ? { replay: outcome.stored } : {}),
-				};
-			}
-			if (outcome.outcome === "pending_replay" || outcome.outcome === "uncertain_replay") {
-				// A crashed or restart-settled attempt left a non-stopped durable
-				// marker (AC 4/41): replay safe uncertainty without re-running the
-				// stop/cleanup/event, carrying the stored immutable row.
-				return {
-					ok: true,
-					selection: scope,
-					turn: "uncertain",
-					ownedWork: scope === "turn" ? "left_running" : "uncertain",
-					automaticDelivery: scope === "turn" ? "enabled" : "none",
-					resumeOnOwnedCompletion: scope === "turn",
-					reason: outcome.outcome === "pending_replay" ? "replay_pending" : "replay_uncertain",
-					...(outcome.stored ? { replay: outcome.stored } : {}),
-				};
-			}
-			if (outcome.outcome === "stopped_owned") {
-				// scope:"owned" stopped the exact captured owned work and proved
-				// quiescence (every captured generation/entry terminal); stopped
-				// work can never resume the agent.
-				return {
-					ok: true,
-					selection: "owned",
-					turn: "stopped",
-					ownedWork: "stopped",
-					automaticDelivery: "none",
-					resumeOnOwnedCompletion: false,
-					...(outcome.stored ? { replay: outcome.stored } : {}),
-				};
-			}
-			return {
-				ok: true,
-				selection: "turn",
-				turn: "stopped",
-				ownedWork: "left_running",
-				automaticDelivery: "enabled",
-				resumeOnOwnedCompletion: true,
-				...(outcome.stored ? { replay: outcome.stored } : {}),
-			};
 		},
 		abortAndPrompt: async text => {
 			await awaitAbortReady();
@@ -2983,7 +2730,7 @@ function sdkControlSurface(
 			pending.completeDirect();
 			return { resolved: true };
 		},
-		answerGate: async (id, response, expectedSessionId, idempotencyKey) => {
+		answerGate: async (id, response, expectedSessionId, idempotencyKey, _elevationRequestId) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow gate is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.gate_answer");
@@ -3058,7 +2805,7 @@ function sdkControlSurface(
 				code: "terminal_uncertain",
 			});
 		},
-		approvePlan: async (id, choice, expectedSessionId) => {
+		approvePlan: async (id, choice, expectedSessionId, _elevationRequestId) => {
 			if (!acceptGateResolution())
 				throw Object.assign(new Error("Workflow plan is no longer answerable."), { code: "resource_gone" });
 			if (expectedSessionId === undefined) auditMissingExpectedSessionId("workflow.plan_approve");
@@ -3144,7 +2891,6 @@ function sdkControlSurface(
 			const commandId = crypto.randomUUID();
 			const turnId = crypto.randomUUID();
 			const correlation = { commandId, turnId };
-			const requesterConnectionId = controlRequesterContext.getStore();
 			if (skillRecon) {
 				try {
 					await awaitReconciliationReady();
@@ -3155,116 +2901,44 @@ function sdkControlSurface(
 				}
 				skillRecon.admit(trimmedClientRef);
 			}
-			const cancellationError = Object.assign(new Error("Skill preflight was cancelled before execution."), {
-				code: "busy",
-			});
-			const preflightController = new AbortController();
 			const { promise: acceptedP, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
-			let phase: "pending" | "accepting" | "accepted" | "rejected" = "pending";
-			let promptOwned = false;
-			let durableSkillAccepted = false;
-			let admissionReleased = false;
-			const releaseAdmission = () => {
-				if (admissionReleased || durableSkillAccepted) return;
-				admissionReleased = true;
-				skillRecon?.release(trimmedClientRef);
-			};
+			let phase: "pending" | "accepted" | "rejected" = "pending";
 			const settleAccept = (value: Record<string, unknown>) => {
-				if (phase !== "pending" && phase !== "accepting") return;
+				if (phase !== "pending") return;
 				phase = "accepted";
 				resolve(value);
 			};
 			const settleReject = (error: unknown) => {
-				if (phase === "accepted" || phase === "rejected") return;
+				if (phase !== "pending") return;
 				phase = "rejected";
 				reject(error);
 			};
-			const executionSettled = Promise.withResolvers<void>();
-			let cancellation: Promise<void> | undefined;
-			const key = preflightKey(requesterConnectionId, correlation);
-			// This is retained by the accepted durable record. It settles only this
-			// invocation; terminal authority remains with the pending cancellation owner.
-			const settleRun = async () => {
-				preflightController.abort();
-				await executionSettled.promise;
-			};
-			const cancelPreflight = () => {
-				cancellation ??= (async () => {
-					preflightController.abort();
-					if (phase === "pending") {
-						releaseAdmission();
-						settleReject(cancellationError);
-					}
-					const ownedCancellation = await abortOwnedPrompt(requesterConnectionId);
-					if (ownedCancellation.disposition === "idle") {
-						await settleRun();
-						if (durableSkillAccepted && skillRecon) await skillRecon.cancel(correlation);
-					}
-				})();
-				return cancellation;
-			};
-			pendingPreflightCancellations.set(key, {
-				connectionId: requesterConnectionId,
-				cancel: cancelPreflight,
-			});
 			let prepared: { name: string; path: string; lineCount?: number; cleanedArgs?: string } | undefined;
-			let run: Promise<unknown>;
-			try {
-				run = Promise.resolve(
-					ctx.invokeSkill(name, args as string | undefined, {
-						preflightSignal: preflightController.signal,
-						onSkillPrepared: meta => {
-							prepared = meta;
-						},
-						onPreflightAcceptCommit: async () => {
-							if (preflightController.signal.aborted) throw cancellationError;
-							phase = "accepting";
-							const meta = prepared ?? { name: String(name), path: "" };
-							const acceptedValue = {
-								accepted: true,
-								commandId,
-								turnId,
-								name: meta.name,
-								path: meta.path,
-								...(meta.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
-								...(meta.cleanedArgs !== undefined ? { args: meta.cleanedArgs } : {}),
-								...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
-							};
-							try {
-								await onPromptAccepted(
-									correlation,
-									requesterConnectionId,
-									undefined,
-									false,
-									settleRun,
-									"skill",
-								);
-								promptOwned = requesterConnectionId !== undefined;
-								if (skillRecon) {
-									await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
-									durableSkillAccepted = true;
-								}
-							} catch (error) {
-								onPromptAcceptFailed(correlation);
-								releaseAdmission();
-								settleReject(error);
-								throw error;
-							}
-							pendingPreflightCancellations.delete(key);
-							settleAccept(acceptedValue);
-							if (preflightController.signal.aborted) throw cancellationError;
-						},
-					}),
-				);
-			} catch (error) {
-				releaseAdmission();
-				settleReject(error);
-				run = Promise.reject(error);
-			}
-			void run.then(
+			const run = Promise.resolve(
+				ctx.invokeSkill(name, args as string | undefined, {
+					onSkillPrepared: meta => {
+						prepared = meta;
+					},
+					onPreflightAcceptCommit: async () => {
+						const meta = prepared ?? { name: String(name), path: "" };
+						if (skillRecon)
+							await skillRecon.noteAccepted(correlation, trimmedClientRef, { skillName: meta.name });
+						settleAccept({
+							accepted: true,
+							commandId,
+							turnId,
+							name: meta.name,
+							path: meta.path,
+							...(meta.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
+							...(meta.cleanedArgs !== undefined ? { args: meta.cleanedArgs } : {}),
+							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
+						});
+					},
+				}),
+			).then(
 				result => {
 					if (phase === "pending") {
-						pendingPreflightCancellations.delete(key);
+						// Completed without fence (e.g. queue path) — still surface result.
 						settleAccept({
 							accepted: true,
 							commandId,
@@ -3272,7 +2946,7 @@ function sdkControlSurface(
 							...(typeof result === "object" && result ? (result as object) : {}),
 							...(trimmedClientRef ? { clientRef: trimmedClientRef } : {}),
 						});
-					} else if (durableSkillAccepted && skillRecon) {
+					} else if (skillRecon) {
 						void skillRecon.noteTransition(correlation, {
 							type: "agent_end",
 							...(typeof result === "string"
@@ -3280,25 +2954,20 @@ function sdkControlSurface(
 								: {}),
 						});
 					}
-					executionSettled.resolve();
+					return result;
 				},
 				error => {
-					if (phase === "pending" || phase === "accepting") {
-						releaseAdmission();
+					if (phase === "pending") {
+						if (skillRecon) skillRecon.release(trimmedClientRef);
 						settleReject(error);
-					} else if (phase === "accepted" && promptOwned && !preflightController.signal.aborted) {
-						void onPromptFailed(correlation, error);
-					}
-					if (durableSkillAccepted && skillRecon && !preflightController.signal.aborted)
+					} else if (skillRecon) {
 						void skillRecon.noteTransition(correlation, { type: "agent_failed", error });
-					executionSettled.resolve();
+					}
+					throw error;
 				},
 			);
-			try {
-				return await acceptedP;
-			} finally {
-				pendingPreflightCancellations.delete(key);
-			}
+			void run.catch(() => {});
+			return await acceptedP;
 		},
 		setPlanMode: async on => {
 			if (!bindings.has("setPlanMode") || !ctx.setPlanMode)
@@ -3408,11 +3077,7 @@ function sdkControlSurface(
 		newSession: () => typed("session.new"),
 		forkSession: () => typed("session.fork"),
 		resumeSession: id => typed("session.resume", { id }),
-		closeSession: capability =>
-			typed(
-				"session.close",
-				capability === undefined ? {} : { [BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: capability },
-			),
+		closeSession: () => typed("session.close"),
 		switchSession: id => typed("session.switch", { id }),
 		branchSession: entryId => typed("session.branch", { entryId }),
 		renameSession: name => typed("session.rename", { name }),
@@ -3866,13 +3531,9 @@ function sdkInboundFrame(commandJson: string | undefined): Record<string, unknow
 	}
 }
 /**
- * Ensures every configured chat-provider daemon is ready.
- *
- * This runs strictly AFTER the SDK publishes session identity and its core
- * endpoint, through the detached ownership coordinator: chat providers are
- * optional notification adapters, never session authority. A rejected ensure
- * therefore degrades notification delivery only — the coordinator records it
- * as `failed`, adapters stay withheld, and a later reconcile re-attempts.
+ * Ensures every configured chat-provider daemon is ready before the SDK
+ * publishes session identity. A rejected ensure is startup-fatal: presenting
+ * an identity for a transport that never became available is false success.
  */
 export async function ensureConfiguredProviderDaemons(
 	settings: Settings,
@@ -3902,7 +3563,12 @@ export function createNotificationsExtension(
 	api: ExtensionAPI,
 	options: {
 		settings?: Settings;
-		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
+		ensureTelegramDaemon?: (input: {
+			settings: Settings;
+			cwd: string;
+			sessionId: string;
+			onRegistered?: (registration: RegisterNotificationRootResult) => void;
+		}) => Promise<EnsureDaemonResult>;
 		ensureProviderDaemon?: (provider: "discord" | "slack", settings: Settings) => Promise<unknown>;
 		/** Suppress auto-delivery for a GJC-spawned child under `sessionScope=primary`. */
 		spawnedByGjc?: boolean;
@@ -3916,34 +3582,11 @@ export function createNotificationsExtension(
 		onBranchStartupSettled?: (receipt: { sessionId: string; status: SessionStartResult["status"] }) => void;
 		readNotificationFile?: (path: string) => Promise<Buffer>;
 		readNotificationDiffStat?: (cwd: string) => Promise<string | undefined>;
-		/**
-		 * INTERNAL terminal-abort session seams, threaded directly from the owning
-		 * session — deliberately NOT on the public ExtensionContext so third-party
-		 * extensions cannot observe attempt epochs or cancel the session-global
-		 * preflight outside the durable admission path (review thread P2).
-		 */
-		terminalAbortSeams?: {
-			getTerminalTurnEpoch: () => number | undefined;
-			cancelPendingPreflightForTerminalAbort: () => void;
-			captureTerminalAbortSteeringSnapshot?: () => void;
-			discardTerminalAbortSteeringSnapshot?: (token: number) => void;
-			rebindTerminalAbortSteeringSnapshot?: (token: number) => void;
-			abortPromptAndWaitWithTerminal: (
-				handle: string,
-				options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
-			) => Promise<RunSettlementProof>;
-		};
 	} = {},
 ): void {
-	const terminalAbortSeams = options.terminalAbortSeams;
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
-	// Telegram session eligibility follows the user's configuration, not how the
-	// session happened to be launched. Any session may own a forum topic and
-	// receive notifications once Telegram is configured and effectively active;
-	// gating this on coordinator/lifecycle provenance silently denied every
-	// ordinary interactive session (the daemon refuses an identity header that
-	// declares itself ineligible, so nothing was ever delivered).
-	const telegramTopicsEnabled = (): boolean => isTelegramSessionEligible(resolveSettings(options.settings).cfg);
+	const telegramTopicsEnabled =
+		lifecycleStartupCapability !== undefined || isTelegramOrchestrationSession(process.env);
 	const runtimes = new Map<string, SessionRuntime>();
 	const controller =
 		options.controller ??
@@ -3971,12 +3614,29 @@ export function createNotificationsExtension(
 		| undefined;
 	let extensionShuttingDown = false;
 
-	async function ensureTelegramOwner(settings: Settings): Promise<"ready" | "blocked_identity"> {
-		if (!telegramTopicsEnabled()) return "blocked_identity";
+	async function ensureTelegramOwner(
+		settings: Settings,
+		cwd: string,
+		id: string,
+		onRegistered?: (registrationToken: string) => void,
+	): Promise<"ready" | "blocked_identity"> {
+		if (!telegramTopicsEnabled) return "blocked_identity";
 		if (options.ensureTelegramDaemon) {
-			return (await options.ensureTelegramDaemon({ settings })) === "blocked" ? "blocked_identity" : "ready";
+			return (await options.ensureTelegramDaemon({
+				settings,
+				cwd,
+				sessionId: id,
+				onRegistered: registration => onRegistered?.(registration.token),
+			})) === "blocked"
+				? "blocked_identity"
+				: "ready";
 		}
-		return (await ensureTelegramDaemonRunningDetailed({ settings })) === "blocked_identity"
+		return (await ensureTelegramDaemonRunningDetailed({
+			settings,
+			cwd,
+			sessionId: id,
+			onRegistered: registration => onRegistered?.(registration.token),
+		})) === "blocked_identity"
 			? "blocked_identity"
 			: "ready";
 	}
@@ -3984,8 +3644,11 @@ export function createNotificationsExtension(
 	async function ensureConfiguredDaemonOwners(
 		settings: Settings,
 		cfg: NotificationConfig,
+		cwd: string,
+		id: string,
+		onRegistered?: (registrationToken: string) => void,
 	): Promise<ConfiguredDaemonOwnerResult> {
-		if (telegramTopicsEnabled() && isProviderEffectivelyEnabled(cfg, "telegram")) {
+		if (telegramTopicsEnabled && isProviderEffectivelyEnabled(cfg, "telegram")) {
 			const telegramMarker = getCurrentTelegramActivationMarker(cfg);
 			if (telegramMarker) {
 				if (!isProviderEffectivelyEnabled(cfg, "discord") && !isProviderEffectivelyEnabled(cfg, "slack")) {
@@ -3994,7 +3657,7 @@ export function createNotificationsExtension(
 				await ensureConfiguredProviderDaemons(settings, cfg, options.ensureProviderDaemon);
 				return "blocked_identity_with_sibling";
 			}
-			const telegram = await ensureTelegramOwner(settings);
+			const telegram = await ensureTelegramOwner(settings, cwd, id, onRegistered);
 			if (telegram === "blocked_identity") {
 				if (!isProviderEffectivelyEnabled(cfg, "discord") && !isProviderEffectivelyEnabled(cfg, "slack")) {
 					return "blocked_identity";
@@ -4007,149 +3670,23 @@ export function createNotificationsExtension(
 		return "ready";
 	}
 
-	/**
-	 * Single-flight chat-daemon ownership acquisition.
-	 *
-	 * Chat daemons are optional notification adapters, never session authority,
-	 * so NO session-lifecycle path (startSession, reconcile, authority rotation)
-	 * may await ownership — a wedged ensure would hold `session/new` open. This
-	 * coordinator keeps at most one ensure in flight and exposes it as a
-	 * settle-or-pending read: {@link peekDaemonOwnership} answers `undefined`
-	 * while an ensure is still running, and callers proceed without it. Exactly
-	 * one ensure runs at a time, so two callers can never race two outcomes onto
-	 * the same runtime.
-	 */
-	type DaemonOwnershipOutcome = ConfiguredDaemonOwnerResult | "failed";
-	let daemonOwnershipInFlight: { key: string; task: Promise<DaemonOwnershipOutcome> } | undefined;
-	let daemonOwnershipSettled: DaemonOwnershipOutcome | undefined;
-	let daemonOwnershipSettledKey: string | undefined;
-
-	/**
-	 * Identity of the ownership-relevant configuration. A settled outcome is
-	 * only reusable while this is unchanged: toggling enablement, credentials,
-	 * destination, or the activation marker must force a fresh ensure, while a
-	 * delivery-only change (redaction, verbosity) must not.
-	 */
-	function daemonOwnershipKey(cfg: NotificationConfig): string {
-		// Secrets are keyed by non-reversible fingerprint, never by raw value or
-		// length: a same-length credential rotation MUST invalidate the outcome.
-		const fingerprint = (secret: string | undefined): string | null =>
-			secret === undefined || secret.length === 0 ? null : tokenFingerprint(secret);
-		return JSON.stringify([
-			isProviderEffectivelyEnabled(cfg, "telegram"),
-			isProviderEffectivelyEnabled(cfg, "discord"),
-			isProviderEffectivelyEnabled(cfg, "slack"),
-			fingerprint(cfg.botToken),
-			cfg.chatId ?? null,
-			fingerprint(cfg.discord.botToken),
-			cfg.discord.applicationId ?? null,
-			cfg.discord.guildId ?? null,
-			cfg.discord.parentChannelId ?? null,
-			fingerprint(cfg.slack.botToken),
-			fingerprint(cfg.slack.appToken),
-			cfg.slack.workspaceId ?? null,
-			cfg.slack.channelId ?? null,
-			// Slack's inbound actor authorization is part of the daemon's durable
-			// identity: rotating the paired user must re-prove ownership, or the
-			// previous user keeps command authority through a stale outcome.
-			cfg.slack.authorizedUserId ?? null,
-			getCurrentTelegramActivationMarker(cfg) ?? null,
-			// Redaction and verbosity are ordinarily delivery policy, applied
-			// in-process. For Discord/Slack they are also part of the DAEMON's
-			// durable identity (chatDaemonIdentity) and are snapshotted into the
-			// provider's presentation engine at construction, so only a daemon
-			// re-proof can retire a presenter still rendering under the old policy.
-			// Key them exactly when such a provider is effective, so a Telegram-only
-			// session is not churned by an in-process policy change.
-			isProviderEffectivelyEnabled(cfg, "discord") || isProviderEffectivelyEnabled(cfg, "slack")
-				? `${String(cfg.redact)}:${cfg.verbosity}`
-				: null,
-		]);
-	}
-
-	function peekDaemonOwnership(cfg: NotificationConfig): DaemonOwnershipOutcome | undefined {
-		if (daemonOwnershipInFlight) return undefined;
-		return daemonOwnershipSettledKey === daemonOwnershipKey(cfg) ? daemonOwnershipSettled : undefined;
-	}
-
-	function kickDaemonOwnership(
+	function retainNotificationRootRegistration(
+		runtime: SessionRuntime,
 		settings: Settings,
-		cfg: NotificationConfig,
-		onSettled?: (outcome: DaemonOwnershipOutcome, key: string) => void,
+		cwd: string,
+		id: string,
+		registrationToken: string,
 	): void {
-		const key = daemonOwnershipKey(cfg);
-		const existing = daemonOwnershipInFlight;
-		// Only an ensure for the SAME configuration can serve this caller. An
-		// in-flight ensure for a different key is superseded: its outcome proves
-		// nothing about this configuration, and its callbacks are key-checked.
-		if (existing && existing.key === key) {
-			if (onSettled)
-				void existing.task.then(
-					outcome => onSettled(outcome, key),
-					() => {},
-				);
+		if (runtimes.get(id) === runtime && !runtime.stopping) {
+			runtime.notificationRootRegistration = { settings, cwd, registrationToken };
 			return;
 		}
-		daemonOwnershipSettled = undefined;
-		daemonOwnershipSettledKey = undefined;
-		const task = (async (): Promise<DaemonOwnershipOutcome> => {
-			try {
-				return await ensureConfiguredDaemonOwners(settings, cfg);
-			} catch (error) {
-				logger.warn(
-					`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
-				);
-				return "failed";
-			}
-		})();
-		daemonOwnershipInFlight = { key, task };
-		void task.then(outcome => {
-			if (daemonOwnershipInFlight?.task === task) {
-				daemonOwnershipInFlight = undefined;
-				daemonOwnershipSettled = outcome;
-				daemonOwnershipSettledKey = key;
-			}
-			onSettled?.(outcome, key);
-		});
+		runtime.notificationRootRegistration = { settings, cwd, registrationToken };
+		cleanupRetries.set(id, runtime);
+		void stopSession(id, "session", runtime).catch(error =>
+			logger.warn(`notifications: late Telegram root unregister failed: ${String(error)}`),
+		);
 	}
-
-	/**
-	 * Apply one settled ownership outcome to exactly one runtime.
-	 *
-	 * Four guards keep a late or superseded outcome harmless: the runtime must
-	 * still be the registered one for its id and not be stopping (a replacement
-	 * session never inherits a predecessor's outcome), the state must still be
-	 * `retry` (an outcome that lost a race must never downgrade a runtime whose
-	 * adapters are already active), and the outcome must have been proved under
-	 * the exact configuration this runtime is waiting on — an outcome proved for
-	 * a superseded configuration can never authorize adapters. A `failed` ensure
-	 * leaves the state retryable.
-	 */
-	function applyDaemonOwnership(
-		id: string,
-		runtime: SessionRuntime,
-		outcome: DaemonOwnershipOutcome,
-		isolateChatEndpoint: boolean,
-		key: string,
-	): void {
-		if (runtimes.get(id) !== runtime || runtime.stopping) return;
-		if (runtime.notificationOwnerState !== "retry") return;
-		if (runtime.notificationOwnerKey !== key) return;
-		if (outcome === "failed") return;
-		runtime.notificationOwnerState =
-			outcome === "ready" || (outcome === "blocked_identity_with_sibling" && isolateChatEndpoint)
-				? "ready"
-				: "blocked";
-		if (outcome === "blocked_identity") {
-			logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
-		}
-		if (outcome === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
-			logger.warn(
-				"notifications: Telegram ownership changed after core publication; preserving the canonical endpoint and withholding adapters.",
-			);
-		}
-	}
-
 	const identityControlOperations = new Set([
 		"session.new",
 		"session.fork",
@@ -4173,7 +3710,6 @@ export function createNotificationsExtension(
 			requestedRuntime.stopping = true;
 			requestedRuntime.abortEphemeralTurns();
 		}
-		if (reason === "session" && requestedRuntime) requestedRuntime.stopSessionNameObserver();
 		if (reason === "session" && requestedRuntime) {
 			// Fence the exact runtime before awaiting its startup promise: a late start
 			// must observe removal and clean itself up rather than becoming reachable.
@@ -4304,6 +3840,20 @@ export function createNotificationsExtension(
 			hostStopped: rt.hostStopped && rt.serverStopped,
 			brokerRegistrationReleased: rt.brokerRegistrationReleased,
 		});
+		if (rt.notificationRootRegistration) {
+			try {
+				await unregisterNotificationRoot({
+					settings: rt.notificationRootRegistration.settings,
+					cwd: rt.notificationRootRegistration.cwd,
+					sessionId: id,
+					registrationToken: rt.notificationRootRegistration.registrationToken,
+				});
+				rt.notificationRootRegistration = undefined;
+			} catch (e) {
+				ownerReleaseFailures.push(e);
+				logger.warn(`notifications: Telegram root unregister failed: ${String(e)}`);
+			}
+		}
 		if (ownerReleaseFailures.length > 0) {
 			cleanupRetries.set(id, rt);
 			throw new AggregateError(ownerReleaseFailures, `SDK notification runtime ${id} owner release failed.`);
@@ -4398,7 +3948,6 @@ export function createNotificationsExtension(
 
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
-		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
 		const tag = sessionTag(id);
 		let runtime: SessionRuntime | undefined;
 
@@ -4407,6 +3956,11 @@ export function createNotificationsExtension(
 		// build information and required capability while lifecycle startup can settle
 		// a structured failure instead of leaving the lifecycle caller pending.
 		const token = resolveToken();
+		const elevationAuthorityToken = crypto.randomBytes(32).toString("base64url");
+		const elevationAuthorityFile = elevationAuthorityPath(endpointStateRoot, id);
+		await fsPromises.mkdir(path.dirname(elevationAuthorityFile), { recursive: true, mode: 0o700 });
+		await Bun.write(elevationAuthorityFile, `${JSON.stringify({ version: 1, token: elevationAuthorityToken })}\n`);
+		await fsPromises.chmod(elevationAuthorityFile, 0o600);
 		let server: NotificationServer;
 		try {
 			const { NotificationServer, nativeBuildInfo } = sdkBusNatives();
@@ -4447,7 +4001,6 @@ export function createNotificationsExtension(
 				createSdkPermissionAskAnswerSource(
 					async (params, signal) => await host!.reverse.request("permission", "request", params, signal),
 				),
-				"protocol",
 			);
 		};
 		const installProviderDefinitions = (capability: string, definitions: unknown) => {
@@ -4491,7 +4044,6 @@ export function createNotificationsExtension(
 					createSdkUiAskAnswerSource(
 						async (params, signal) => await host!.reverse.request("ui", "ui.elicit", params, signal),
 					),
-					"protocol",
 				);
 				disposePermissionAnswerSource?.();
 				disposePermissionAnswerSource = undefined;
@@ -4557,8 +4109,6 @@ export function createNotificationsExtension(
 		const PROMPT_TERMINAL_TOMBSTONE_TTL_MS = 15 * 60_000;
 		// SDK-owned terminalization grace; injectable in tests, never a user setting.
 		const PROMPT_TERMINALIZATION_GRACE_MS = 10_000;
-		// Fixed grace for exact owned-job stop before the second quiescence proof.
-		const OWNED_SETTLEMENT_GRACE_MS = 500;
 		const promptSubmissionKey = (correlation: { commandId: string; turnId: string }) =>
 			`${correlation.commandId}:${correlation.turnId}`;
 		type PromptLifecycleFrame =
@@ -4594,27 +4144,21 @@ export function createNotificationsExtension(
 			outcome?: SdkPromptTerminalOutcome;
 			/** Agent-owned resource run captured at acceptance; cleanup targets only this handle. */
 			executionHandle?: string;
-			/** Cancels accepted skill preparation before an execution handle exists. */
-			preflightAbort?: () => void | Promise<void>;
-			reconciliationKind: ReconciliationKind;
 			bufferedFrames: Array<PromptLifecycleFrame | Record<string, unknown>>;
 		};
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		/** Connections fenced by a fatal prompt closure; their later frames are refused. */
 		const fencedConnections = new Set<string>();
-		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
+		let cancelPreflightsForConnection: ((connectionId: string) => void) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
-		// Authoritative bounded reconciliation state for canonical Q26 turn.result
+		// Authoritative bounded reconciliation state for Q26 turn.prompt_status
 		// (contract documented in ./prompt-reconciliation and ../prompt-status).
 		// Active records never age into terminal; documented TTL/capacity
 		// eviction is the only removal, after which lookups report `unknown`.
-		const persistedSessionFile =
+		const sessionFile =
 			typeof ctx.sessionManager?.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : null;
 		const reconciliationSessionId =
 			typeof ctx.sessionManager?.getSessionId === "function" ? ctx.sessionManager.getSessionId() : "";
-		const sessionFile = reconciliationSessionId
-			? resolveReconciliationSessionFile(persistedSessionFile, stateRoot, String(reconciliationSessionId))
-			: null;
 		const durableStore =
 			sessionFile && reconciliationSessionId
 				? createReconciliationStore({ sessionFile, sessionId: String(reconciliationSessionId) })
@@ -4622,22 +4166,12 @@ export function createNotificationsExtension(
 		const kindReconciliation = createKindAwareReconciliation({ store: durableStore });
 		// Restart recovery must commit before any prompt is admitted; otherwise a new
 		// admission can race the hydrated full-state replacement.
-		let reconciliationReady: Promise<void> = durableStore ? kindReconciliation.hydrateFromStore() : Promise.resolve();
+		const reconciliationReady: Promise<void> = durableStore
+			? kindReconciliation.hydrateFromStore()
+			: Promise.resolve();
 		// Never let a hydration rejection become an unhandled rejection; tracked prompts
 		// re-await the same promise and fail closed below.
 		void reconciliationReady.catch(() => {});
-		const awaitReconciliationReady = async () => {
-			const observed = reconciliationReady;
-			try {
-				await observed;
-			} catch {
-				if (reconciliationReady === observed) {
-					reconciliationReady = durableStore ? kindReconciliation.hydrateFromStore() : Promise.resolve();
-					void reconciliationReady.catch(() => {});
-				}
-				await reconciliationReady;
-			}
-		};
 		// Backward-compatible process-local prompt reconciler kept for unit-test isolation;
 		// production path uses kindReconciliation for prompt+skill.
 		const reconciliation = createPromptReconciliation();
@@ -4654,10 +4188,6 @@ export function createNotificationsExtension(
 				candidate => candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId,
 			);
 			if (pendingIndex !== -1) pendingPromptCorrelations.splice(pendingIndex, 1);
-			for (const [sdkRunToken, candidate] of pendingPromptCorrelationsBySdkRunToken) {
-				if (candidate.commandId === correlation.commandId && candidate.turnId === correlation.turnId)
-					pendingPromptCorrelationsBySdkRunToken.delete(sdkRunToken);
-			}
 		};
 		const addTerminalTombstone = (key: string, connectionId: string, now = Date.now()) => {
 			promptTerminalTombstones.delete(key);
@@ -4774,9 +4304,6 @@ export function createNotificationsExtension(
 			requesterConnectionId?: string,
 			clientRef?: string,
 			trackReconciliation = false,
-			preflightAbort?: () => void | Promise<void>,
-			reconciliationKind: ReconciliationKind = "prompt",
-			sdkRunToken?: string,
 		) => {
 			if (!requesterConnectionId) {
 				// No delivery owner: tracked prompts cannot be reconciled. Release
@@ -4796,8 +4323,7 @@ export function createNotificationsExtension(
 					);
 				expirePromptDelivery(oldestTerminal[0], oldestTerminal[1]);
 			}
-			if (sdkRunToken) pendingPromptCorrelationsBySdkRunToken.set(sdkRunToken, correlation);
-			else pendingPromptCorrelations.push(correlation);
+			pendingPromptCorrelations.push(correlation);
 			const submission: PromptSubmission = {
 				acknowledged: false,
 				connectionId: requesterConnectionId,
@@ -4810,8 +4336,6 @@ export function createNotificationsExtension(
 				phase: "active",
 				// Bound to the Agent run at `agent_start`; acceptance precedes execution.
 				executionHandle: undefined,
-				...(preflightAbort ? { preflightAbort } : {}),
-				reconciliationKind,
 				bufferedFrames: [],
 			};
 			promptSubmissions.set(promptSubmissionKey(correlation), submission);
@@ -4832,8 +4356,6 @@ export function createNotificationsExtension(
 		};
 		/** Roll back process-local registration when durable acceptance failed. */
 		const discardPromptAcceptance = (correlation: { commandId: string; turnId: string }) => {
-			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (submission?.deadlineTimer) clearTimeout(submission.deadlineTimer);
 			promptSubmissions.delete(promptSubmissionKey(correlation));
 			removePendingPromptCorrelation(correlation);
 		};
@@ -4886,10 +4408,7 @@ export function createNotificationsExtension(
 			// connection is marked failed (every later inbound frame from it is refused),
 			// its reverse leases are released, and its deliveries are abandoned. The durable
 			// record stays active for Q26 and restart recovery.
-			if (cancelPreflightsForConnection)
-				void cancelPreflightsForConnection(submission.connectionId).catch(error =>
-					logger.warn(`sdk: failed to cancel fenced preflight: ${String(error)}`),
-				);
+			cancelPreflightsForConnection?.(submission.connectionId);
 			fencedConnections.add(submission.connectionId);
 			host?.handleDisconnect(submission.connectionId);
 			for (const [key, owned] of promptSubmissions)
@@ -4909,10 +4428,7 @@ export function createNotificationsExtension(
 			handle: string | undefined,
 		) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
-			if (submission) {
-				submission.executionHandle = handle;
-				submission.preflightAbort = undefined;
-			}
+			if (submission) submission.executionHandle = handle;
 		};
 		const terminalizePrompt = async (
 			correlation: { commandId: string; turnId: string },
@@ -4920,35 +4436,15 @@ export function createNotificationsExtension(
 			// Cleanup-initiated claims (cancel, deadline, owner disconnect) must abort the
 			// run and prove settlement. A natural `agent_end`/`agent_failed` already unwound,
 			// so aborting there would cancel the next turn instead of fencing this one.
-			options: { fence?: boolean; terminal?: { scope: AbortScope; steeringSnapshotToken?: number } } = {},
+			options: { fence?: boolean } = {},
 			extra?: PromptTerminalExtra,
-			capture?: {
-				proof?: RunSettlementProof & {
-					terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
-				};
-				/** Whether the correlated agent_end event was published (AC 19). */
-				published?: boolean;
-				/** Whether terminalization reached the durable terminal (fail-closed paths leave this unset). */
-				terminalized?: boolean;
-			},
 		) => {
-			const receiptState = extra?.finalText?.trim() ? "present" : "missing";
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission || submission.terminal || submission.phase !== "active") return;
 			submission.phase = "outcome_claimed";
-			// Capture the attempt epoch BEFORE the durable claim: a successor
-			// prompt admitted while the claim is awaited advances the epoch, so
-			// the seam must refuse to fence the successor's lineage (review
-			// thread P1).
-			const terminalExpectedEpoch = options.terminal ? terminalAbortSeams?.getTerminalTurnEpoch?.() : undefined;
 			let winner: SdkPromptTerminalOutcome;
 			try {
-				winner = await kindReconciliation.claimPendingOutcome(
-					submission.reconciliationKind,
-					correlation,
-					requestedOutcome,
-					receiptState,
-				);
+				winner = await kindReconciliation.claimPendingOutcome(correlation, requestedOutcome);
 			} catch (error) {
 				// The claim is the durability boundary: without it nothing may be published
 				// and the endpoint must fail closed so the client rejects exactly once. The
@@ -4960,17 +4456,12 @@ export function createNotificationsExtension(
 			submission.outcome = winner;
 			submission.phase = "terminalizing";
 			if (options.fence) {
-				// Terminal fencing goes through a BUS-PRIVATE session capability
-				// (never the extension context, whose abortPromptAndWait has no
-				// terminal option): a JavaScript extension cannot register a
-				// closed terminal scope without the SDK's durable admission
-				// (review thread P2).
+				const seam = ctx as typeof ctx & {
+					abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
+				};
 				// Only the handle captured for this correlation may be fenced; a later run
 				// must never be aborted by an older prompt's cleanup.
-				if (
-					typeof terminalAbortSeams?.abortPromptAndWaitWithTerminal !== "function" ||
-					!submission.executionHandle
-				) {
+				if (typeof seam.abortPromptAndWait !== "function" || !submission.executionHandle) {
 					failPromptClosed(
 						correlation,
 						submission,
@@ -4979,27 +4470,10 @@ export function createNotificationsExtension(
 					);
 					return;
 				}
-				// Rebind the steering snapshot to the current turn before the
-				// settlement: the token was captured under the abort's admission
-				// turn, which may differ from the now-active turn that the
-				// settlement will fence. Without the rebind the session rejects
-				// the still-old token as unknown_run (review thread P1).
-				if (options.terminal?.steeringSnapshotToken !== undefined) {
-					terminalAbortSeams?.rebindTerminalAbortSteeringSnapshot?.(options.terminal.steeringSnapshotToken);
-				}
 				let proof: RunSettlementProof;
 				try {
-					proof = await terminalAbortSeams.abortPromptAndWaitWithTerminal(submission.executionHandle, {
+					proof = await seam.abortPromptAndWait(submission.executionHandle, {
 						graceMs: PROMPT_TERMINALIZATION_GRACE_MS,
-						// Terminal abort registers the continuation fence for the
-						// aborted turn before the run is interrupted (see
-						// AgentSession.abortPromptAndWait). Ordinary cancels pass no
-						// terminal option and register nothing. The request-time epoch
-						// travels with the scope so the seam refuses to fence a
-						// successor turn admitted while the durable claim was awaited.
-						...(options.terminal
-							? { terminal: { ...options.terminal, expectedEpoch: terminalExpectedEpoch } }
-							: {}),
 					});
 				} catch (error) {
 					logger.warn(`sdk: prompt resource fencing failed: ${String(error)}`);
@@ -5023,16 +4497,9 @@ export function createNotificationsExtension(
 					);
 					return;
 				}
-				if (capture) capture.proof = proof;
 			}
 			try {
-				await kindReconciliation.finalizeOutcome(
-					submission.reconciliationKind,
-					correlation,
-					winner,
-					extra?.error,
-					extra?.finalText,
-				);
+				await kindReconciliation.finalizePromptOutcome(correlation, winner, extra?.error, extra?.finalText);
 			} catch (error) {
 				// The durable pending claim survives; publishing an unpersisted terminal
 				// would contradict it, so fail the endpoint closed instead.
@@ -5060,57 +4527,25 @@ export function createNotificationsExtension(
 					reason: formatPromptTerminalFailureReason(diagnostic?.reason),
 				});
 			}
-			try {
-				if (winner.kind === "failed") {
-					emitPromptLifecycle(correlation, {
-						type: "agent_failed",
-						sessionId: runtime.id,
-						...correlation,
-						error: extra?.error ?? { code: winner.code, message: winner.message },
-						outcome: winner,
-					});
-				} else {
-					emitPromptLifecycle(correlation, {
-						type: "agent_end",
-						sessionId: runtime.id,
-						...correlation,
-						...(extra?.finalText ? { finalText: extra.finalText } : {}),
-						outcome: winner,
-						// Terminal abort: one correlated existing agent_end carries bounded
-						// scope/turn/ownedWork/automatic metadata before the first terminal
-						// success. ownedWork is pre-proof here (owned cleanup settles it in
-						// the terminal response); later owned-completion feedback uses the
-						// ordinary fresh-turn event path, never a second terminal event.
-						...(options.terminal
-							? {
-									terminal: {
-										scope: options.terminal.scope,
-										turn: "stopped",
-										ownedWork: options.terminal.scope === "turn" ? "left_running" : "uncertain",
-										automaticDelivery: options.terminal.scope === "turn" ? "enabled" : "none",
-										resumeOnOwnedCompletion: options.terminal.scope === "turn",
-									},
-								}
-							: {}),
-					});
-				}
-				// The correlated event was published (AC 19): record the outcome so
-				// the durable terminal-scope record carries terminalPublished:true.
-				// terminalized marks a genuinely landed durable terminal — the
-				// submission may already have been finalized/deleted for an
-				// acknowledged prompt, so the callback must not re-derive success
-				// from promptSubmissions after this point (P1).
-				if (capture) {
-					capture.published = true;
-					capture.terminalized = true;
-				}
-			} catch (error) {
-				// Event publication failed: the semantic terminal stands but the
-				// event bit stays false (no second event is ever emitted on replay).
-				logger.warn(`sdk: prompt terminal event publication failed: ${String(error)}`);
+			if (winner.kind === "failed") {
+				emitPromptLifecycle(correlation, {
+					type: "agent_failed",
+					sessionId: runtime.id,
+					...correlation,
+					error: extra?.error ?? { code: winner.code, message: winner.message },
+					outcome: winner,
+				});
+			} else {
+				emitPromptLifecycle(correlation, {
+					type: "agent_end",
+					sessionId: runtime.id,
+					...correlation,
+					...(extra?.finalText ? { finalText: extra.finalText } : {}),
+					outcome: winner,
+				});
 			}
 		};
-		const emitPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
+		const emitPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			logger.error("SDK prompt submission failed", {
 				commandId: correlation.commandId,
 				turnId: correlation.turnId,
@@ -5133,7 +4568,7 @@ export function createNotificationsExtension(
 				provenance: outcome.provenance,
 				reason: formatPromptTerminalFailureReason(error),
 			});
-			await terminalizePrompt(
+			void terminalizePrompt(
 				correlation,
 				outcome,
 				{},
@@ -5142,7 +4577,7 @@ export function createNotificationsExtension(
 				{ error: sanitized, diagnostic: { reason: error }, diagnosticAlreadyLogged: true },
 			);
 		};
-		const recordPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
+		const recordPromptFailure = (correlation: { commandId: string; turnId: string }, error: unknown) => {
 			const submission = promptSubmissions.get(promptSubmissionKey(correlation));
 			if (!submission) return;
 			submission.failed = true;
@@ -5152,7 +4587,7 @@ export function createNotificationsExtension(
 				runtime.activePromptCorrelation.turnId === correlation.turnId
 			)
 				runtime.activePromptCorrelation = undefined;
-			await emitPromptFailure(correlation, error);
+			emitPromptFailure(correlation, error);
 		};
 		const acknowledgePrompt = (connectionId: string, correlation: { commandId: string; turnId: string }) => {
 			const key = promptSubmissionKey(correlation);
@@ -5183,7 +4618,6 @@ export function createNotificationsExtension(
 				configOverrides,
 				settings,
 				selector => kindReconciliation.lookupResult(selector.kind, selector),
-				selector => kindReconciliation.lookupSteer(selector),
 			),
 			id,
 			revisions,
@@ -5194,10 +4628,7 @@ export function createNotificationsExtension(
 			pendingInteractive,
 			gatePresentations,
 			api,
-			() =>
-				runtime?.busy === true ||
-				pendingPromptCorrelations.length > 0 ||
-				pendingPromptCorrelationsBySdkRunToken.size > 0,
+			() => runtime?.busy === true || pendingPromptCorrelations.length > 0,
 			recordPromptAccepted,
 			recordPromptFailure,
 			discardPromptAcceptance,
@@ -5205,1017 +4636,33 @@ export function createNotificationsExtension(
 			trackGateResolution,
 			admitPromptSubmission,
 			releasePromptAdmission,
-			awaitReconciliationReady,
+			() => reconciliationReady,
 			settings,
 			configOverrides,
 			configRevision,
+			elevationAuthorityToken,
 			async connectionId => {
 				const active = [...promptSubmissions.entries()].find(
 					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
 				);
 				if (!active) return { aborted: true, disposition: "idle" as const };
-				const [key, submission] = active;
-				const [commandId, turnId] = key.split(":", 2);
-				if (commandId && turnId) {
-					const hasExecutionHandle = Boolean(submission.executionHandle);
-					const cancellationOutcome: SdkPromptTerminalOutcome = {
-						kind: "stopped",
-						reason: "cancelled",
-						provenance: "client_cancel",
-					};
-					if (!hasExecutionHandle && submission.preflightAbort) {
-						try {
-							await kindReconciliation.claimPendingOutcome(
-								submission.reconciliationKind,
-								{ commandId, turnId },
-								cancellationOutcome,
-							);
-						} catch (error) {
-							logger.warn(`sdk: accepted preflight cancellation claim failed: ${String(error)}`);
-							failPromptClosed(
-								{ commandId, turnId },
-								submission,
-								"terminal_uncertain",
-								"Accepted prompt cancellation could not be persisted.",
-							);
-							return { aborted: true, disposition: "cancelled" as const };
-						}
-						try {
-							await submission.preflightAbort();
-						} catch (error) {
-							logger.warn(`sdk: accepted preflight cancellation failed: ${String(error)}`);
-							failPromptClosed(
-								{ commandId, turnId },
-								submission,
-								"terminal_uncertain",
-								"Accepted prompt preparation could not be settled before cancellation.",
-							);
-							return { aborted: true, disposition: "cancelled" as const };
-						}
-					}
-					await terminalizePrompt({ commandId, turnId }, cancellationOutcome, {
-						fence: hasExecutionHandle || !submission.preflightAbort,
-					});
-				}
-				return { aborted: true, disposition: "cancelled" as const };
-			},
-			async (connectionId, scope, idempotencyKey, preflightCancel, noOtherConnectionPreflights) => {
-				// Capture the steering snapshot at ADMISSION (before the durable
-				// marker transaction): client steering admitted while the abort
-				// is in flight classifies as post-snapshot and is preserved at
-				// abortPromptAndWait (review thread P1).
-				const steeringSnapshotToken = terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
-				// Hash the EXACT response payload this abort will return: the durable
-				// row stores it at finalization so the response-state advance requires
-				// equality instead of trusting a non-pending placeholder (review
-				// thread P2).
-				const hashResult = (value: unknown): string =>
-					crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
-				// The public uncertain disposition the client receives for an
-				// {ok:false, reason} outcome (single source for finalization hashes).
-				const hashPublicUncertain = (reason: "worker_unsettled" | "owned_unsettled"): string =>
-					hashResult({
-						ok: true,
-						selection: scope,
-						turn: "uncertain",
-						ownedWork: scope === "turn" ? "left_running" : "uncertain",
-						automaticDelivery: scope === "turn" ? "enabled" : "none",
-						resumeOnOwnedCompletion: scope === "turn",
-						reason,
-					});
-				// Terminal abort stops the root turn through the same durable
-				// terminalization as ordinary client cancel, then verifies the
-				// terminal actually landed before claiming "stopped". The fence
-				// for the aborted turn is registered by the session (via the
-				// terminal option on abortPromptAndWait) so a later left-running
-				// owned completion classifies by exact source. A fatal
-				// fail-closed path (no exact run handle or unsettled resources)
-				// reports safe uncertainty, never a fabricated stop.
-				if (!durableStore?.path) {
-					// No FILE-BACKED reconciliation owner: terminal admission is
-					// gated off (plan AC 5) before any fence, stop, or cleanup. A
-					// memory-only store (path null, e.g. an unsafe session header
-					// id) must not report durable success — restart would lose the
-					// idempotency row and a same-key retry could affect a later
-					// turn (review thread P2).
-					return { ok: true as const, outcome: "no_store" as const };
-				}
-				// Await the startup reconciliation hydration before ANY snapshot or
-				// terminal-scope transaction, so a same-key retry immediately after
-				// a restarted endpoint becomes reachable replays the durable row
-				// instead of racing the still-pending store load (P2).
-				await reconciliationReady;
-				// Same-key replay/conflict: a durable terminal-scope record already
-				// exists for this bounded idempotency key. Same key + same
-				// normalized input -> return the stored dispositions exactly, never
-				// re-run cleanup, never a second event. Same key + different input
-				// (scope change) -> deterministic conflict (AC 3).
-				const keyHash = idempotencyKey
-					? crypto.createHash("sha256").update(idempotencyKey).digest("hex")
-					: undefined;
-				const inputHash = crypto
-					.createHash("sha256")
-					.update(JSON.stringify({ mode: "terminal", scope }))
-					.digest("hex");
-				if (keyHash) {
-					const existing = durableStore.snapshotTerminalScopes().find(s => s.idempotencyKeyHash === keyHash);
-					if (!existing) {
-						// The completed row may have been evicted by the retention
-						// cap; its compact key tombstone survives, so a same-key
-						// retry replays as already-handled instead of aborting an
-						// unrelated later prompt. Look the tombstone up by keyHash
-						// FIRST: reusing the key with the OTHER scope must return
-						// idempotency_conflict, not bypass the conflict path
-						// (review thread P1).
-						const tombstone = durableStore.snapshotTerminalKeys().find(k => k.keyHash === keyHash);
-						if (tombstone) {
-							if (tombstone.inputHash !== inputHash) {
-								return { ok: false as const, reason: "conflict" as const };
-							}
-							// The evicted row's compact tombstone carries its
-							// disposition, so the replay reconstructs the ORIGINAL
-							// result (stopped/stopped_owned/uncertain/no_effect)
-							// with the stored response/publication state instead of
-							// collapsing everything to no_effect (review thread P2).
-							const storedRow = {
-								responseState: tombstone.responseState ?? "",
-								responsePayloadHash: tombstone.responsePayloadHash ?? "",
-								terminalPublished: tombstone.terminalPublished === true,
-							};
-							if (tombstone.turnDisposition === "stopped") {
-								return {
-									ok: true as const,
-									outcome: (tombstone.ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped") as
-										| "stopped"
-										| "stopped_owned",
-									stored: storedRow,
-								};
-							}
-							if (tombstone.turnDisposition === "uncertain") {
-								return { ok: true as const, outcome: "uncertain_replay" as const, stored: storedRow };
-							}
-							if (tombstone.turnDisposition === "no_effect_marker_failure") {
-								// Marker failure before any destructive work: replay the SAME
-								// no_effect result, so eviction/restart can never turn it into
-								// a fabricated no_active_turn (review thread P2).
-								return { ok: true as const, outcome: "no_effect" as const, stored: storedRow };
-							}
-							if (tombstone.turnDisposition === "no_effect_reserved") {
-								// A transitional reservation evicted mid-flight: the result was
-								// never finalized, so replay safe uncertainty — never a
-								// fabricated no_active_turn (review thread P2).
-								return { ok: true as const, outcome: "uncertain_replay" as const, stored: storedRow };
-							}
-							// Idle/already-terminal reservation: replay as no_active_turn so a
-							// same-key retry after eviction/restart never aborts an unrelated
-							// later turn.
-							return { ok: true as const, outcome: "no_effect_replay" as const, stored: storedRow };
-						}
-					}
-					if (existing) {
-						if (existing.selection !== scope || existing.idempotencyInputHash !== inputHash) {
-							return { ok: false as const, reason: "conflict" as const };
-						}
-						// Replay every persisted durable row (AC 18/19/41) WITHOUT
-						// re-running the stop, cleanup, or event, carrying the stored
-						// response state, payload hash, and publication bit so the
-						// client sees the exact immutable row.
-						const storedRow = {
-							responseState: existing.responseState,
-							responsePayloadHash: existing.responsePayloadHash,
-							terminalPublished: existing.terminalPublished === true,
-						};
-						if (existing.turnDisposition === "stopped") {
-							return {
-								ok: true as const,
-								outcome: (existing.ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped") as
-									| "stopped"
-									| "stopped_owned",
-								stored: storedRow,
-							};
-						}
-						if (existing.turnDisposition === "pending") {
-							// A crashed attempt left an incomplete marker: replay the
-							// plan's pending row (AC 4/41) — safe uncertainty, NO
-							// re-run of the stop, cleanup, or event.
-							return { ok: true as const, outcome: "pending_replay" as const, stored: storedRow };
-						}
-						if (existing.turnDisposition === "no_effect_marker_failure") {
-							// Marker failure before any destructive work: replay the SAME
-							// no_effect result the request returned, never a fabricated
-							// no_active_turn (review thread P2).
-							return { ok: true as const, outcome: "no_effect" as const, stored: storedRow };
-						}
-						if (existing.turnDisposition === "no_effect_reserved") {
-							// A transitional reservation: the abort may still transition to
-							// active, so a duplicate must never claim no_active_turn over a
-							// provisional row (review thread P2).
-							return { ok: true as const, outcome: "uncertain_replay" as const, stored: storedRow };
-						}
-						if (existing.turnDisposition === "no_effect") {
-							// A durable idle/already-terminal reservation: replay the exact
-							// no_active_turn result so a same-key retry after
-							// eviction/restart never aborts an unrelated later turn and
-							// never turns the reservation into a no_effect marker failure.
-							return { ok: true as const, outcome: "no_effect_replay" as const, stored: storedRow };
-						}
-						// uncertain (restart-settled) or any other durable state: safe
-						// uncertainty replay, never a re-run (AC 41 restart row).
-						return { ok: true as const, outcome: "uncertain_replay" as const, stored: storedRow };
-					}
-				}
-				// Durable terminal-state writes below go through the shared
-				// `boundTerminalRetentionState` bound (see
-				// `session/terminal-abort.ts`), which the SDK-only host runtime uses
-				// too: idle aborts with unique keys cannot grow the reconciliation
-				// document, only the oldest COMPLETED rows are evicted, and evicted
-				// keys are retained as compact tombstones (review thread P2).
-				// Set when the no-effect reservation finds an existing SAME-input row
-				// or tombstone: the caller replays it instead of returning a no-active
-				// result over the original row's replay authority (review thread P2).
-				let existingReplay: DurableTerminalScopeRecord | EvictedTerminalKeyEntry | undefined;
-				// Finalize THIS abort's transitional no_effect_reserved reservation to
-				// plain no_effect once the recheck confirms there is no active turn to
-				// stop: a later same-key retry then replays the deterministic
-				// no_active_turn result instead of reservation uncertainty. Only OUR
-				// row (exact key+input, still reserved) is touched (review thread P2).
-				const finalizeNoEffectReservation = async (payloadHash: string): Promise<void> => {
-					if (!keyHash) return;
-					// The same-key retry delivers the replay envelope; store its hash
-					// too so a written replay can advance the finalized row (review
-					// thread P2).
-					const replayPayloadHash = hashResult({
-						ok: true,
-						selection: scope,
-						turn: "no_active_turn",
-						terminal: "terminal_no_effect",
-						replay: {
-							responseState: "pending",
-							responsePayloadHash: payloadHash,
-							terminalPublished: false,
-						},
-					});
-					try {
-						await durableStore.transactTerminalState(state => {
-							const scopes: DurableTerminalScopeRecord[] = state.scopes.map(record =>
-								record.idempotencyKeyHash === keyHash &&
-								record.idempotencyInputHash === inputHash &&
-								record.turnDisposition === "no_effect_reserved"
-									? {
-											...record,
-											turnDisposition: "no_effect",
-											responsePayloadHash: payloadHash,
-											replayPayloadHash,
-										}
-									: record,
-							);
-							// Finalized reservations become evictable completed rows: apply
-							// the SAME bounded retention as reserveTerminalNoEffect so a
-							// burst of idle aborts cannot grow the document (review
-							// thread P2).
-							return boundTerminalRetentionState(state.keys, scopes);
-						});
-					} catch {
-						// Best-effort: the row stays reserved (replays as uncertainty)
-						// rather than failing the abort (review thread P2).
-					}
-				};
-				// Finalize pending markers through the SAME bounded retention as the
-				// admission writes: mapping pending rows to completed dispositions
-				// (uncertain/stopped) must evict the oldest completed rows and
-				// retain tombstones, or a burst of concurrent distinct-key aborts of
-				// one slow turn leaves an arbitrarily large reconciliation document
-				// (review thread P2).
-				const transactBoundedTerminalScopes = async (
-					mutate: (scopes: DurableTerminalScopeRecord[]) => DurableTerminalScopeRecord[],
-				): Promise<void> => {
-					await durableStore.transactTerminalState(state => {
-						return boundTerminalRetentionState(state.keys, mutate(state.scopes));
-					});
-				};
-				const replayExisting = (row: DurableTerminalScopeRecord | EvictedTerminalKeyEntry) => {
-					const storedRow = {
-						responseState: row.responseState ?? "",
-						responsePayloadHash: row.responsePayloadHash ?? "",
-						terminalPublished: row.terminalPublished === true,
-					};
-					if (row.turnDisposition === "stopped") {
-						return {
-							ok: true as const,
-							outcome: (row.ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped") as
-								| "stopped"
-								| "stopped_owned",
-							stored: storedRow,
-						};
-					}
-					if (row.turnDisposition === "pending") {
-						return { ok: true as const, outcome: "pending_replay" as const, stored: storedRow };
-					}
-					if (row.turnDisposition === "uncertain") {
-						return { ok: true as const, outcome: "uncertain_replay" as const, stored: storedRow };
-					}
-					if (row.turnDisposition === "no_effect_marker_failure") {
-						return { ok: true as const, outcome: "no_effect" as const, stored: storedRow };
-					}
-					if (row.turnDisposition === "no_effect_reserved") {
-						// A transitional reservation never finalized: replay safe
-						// uncertainty, never a fabricated no_active_turn (review
-						// thread P2).
-						return { ok: true as const, outcome: "uncertain_replay" as const, stored: storedRow };
-					}
-					return { ok: true as const, outcome: "no_effect_replay" as const, stored: storedRow };
-				};
-				const reserveTerminalNoEffect = async (
-					reason: "idle" | "marker_failure" = "idle",
-				): Promise<"ok" | "failed" | "conflict"> => {
-					if (!keyHash) return "ok";
-					try {
-						await durableStore.transactTerminalState(state => {
-							// Atomic recheck: a concurrent request may have committed a
-							// DIFFERENT input under this key after the earlier snapshot
-							// check (the 256-entry dispatch cache evicted the in-flight
-							// entry). Appending a second same-key row would make later
-							// replay's .find() by key hash ambiguous and could report a
-							// conflict for a request that already succeeded; reject the
-							// conflicting input inside the transaction instead (review
-							// thread P2).
-							const conflicting = state.scopes.find(s => s.idempotencyKeyHash === keyHash);
-							if (conflicting && conflicting.idempotencyInputHash !== inputHash)
-								throw new TerminalIdempotencyConflictError();
-							// A SAME-input live row is durable replay authority (the
-							// original in-flight abort's marker): never replace it with a
-							// no-effect reservation, or the successful abort would replay
-							// later as no_active_turn. Leave the store unchanged and let
-							// the caller replay the existing row (review thread P2).
-							if (conflicting) {
-								existingReplay = conflicting;
-								return { scopes: state.scopes, keys: state.keys };
-							}
-							// A concurrent admission may ALSO have evicted a same-key row
-							// into the tombstone collection after this request's snapshot;
-							// recheck keys so a different input can never install a fresh
-							// marker over existing durable replay authority (review
-							// thread P2). A same-input tombstone already carries the
-							// reservation: leave the store unchanged and replay it.
-							const tombstone = state.keys.find(s => s.keyHash === keyHash);
-							if (tombstone) {
-								if (tombstone.inputHash !== inputHash) throw new TerminalIdempotencyConflictError();
-								existingReplay = tombstone;
-								return { scopes: state.scopes, keys: state.keys };
-							}
-							const retained = state.scopes.filter(
-								s => !(s.idempotencyKeyHash === keyHash && s.idempotencyInputHash === inputHash),
-							);
-							const preBound: DurableTerminalScopeRecord[] = [
-								...retained,
-								{
-									selection: scope,
-									idempotencyKeyHash: keyHash,
-									idempotencyInputHash: inputHash,
-									// Idle reservations write a TRANSITIONAL reserved disposition: the
-									// prompt may become active while the reservation is awaited, and a
-									// duplicate must never claim no_active_turn over a provisional row
-									// — the row is finalized to plain no_effect only when the recheck
-									// confirms no active turn. Marker-failure reservations use a
-									// distinct final disposition so replay returns the SAME no_effect
-									// result instead of a fabricated no_active_turn (review thread
-									// P2).
-									turnDisposition:
-										reason === "marker_failure" ? "no_effect_marker_failure" : "no_effect_reserved",
-									ownedWorkDisposition: "not_requested",
-									automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
-									resumeOnOwnedCompletion: scope === "turn",
-									turnContinuationFence: {
-										state: "retained",
-										abortedAttemptEpoch: 0,
-										blockedContinuationIds: [],
-										predecessorTombstones: [],
-										ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
-									},
-									responseState: "pending",
-									// marker_failure rows are FINAL as written (the abort
-									// returns the public no_effect result immediately, with no
-									// later finalization), so store the public payload hash;
-									// idle reservations are finalized by
-									// finalizeNoEffectReservation (review thread P2).
-									responsePayloadHash:
-										reason === "marker_failure"
-											? hashResult({
-													ok: true,
-													selection: scope,
-													turn: "no_effect",
-													terminal: "terminal_no_effect",
-												})
-											: inputHash,
-									acceptedAt: Date.now(),
-								} satisfies DurableTerminalScopeRecord,
-							];
-							// Compact key tombstones for rows evicted by the cap are
-							// retained ATOMICALLY with the scope write (review thread P2).
-							return boundTerminalRetentionState(state.keys, preBound);
-						});
-						return "ok";
-					} catch (error) {
-						if (error instanceof TerminalIdempotencyConflictError) return "conflict";
-						logger.warn(`sdk: terminal no-effect reservation failed: ${String(error)}`);
-						return "failed";
-					}
-				};
-				let active = [...promptSubmissions.entries()].find(
-					([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-				);
-				if (!active) {
-					// DURABLY reserve the key even for a no-active-turn abort: the
-					// generic idempotency cache is in-memory only, so after restart
-					// or eviction a same-key retry while a later prompt is active
-					// must replay this no-effect row instead of aborting an
-					// unrelated turn (review thread P2). No active turn means no
-					// fence epoch; the marker uses sentinel 0. The reservation is
-					// bounded (see reserveTerminalNoEffect).
-					const reservation = await reserveTerminalNoEffect();
-					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
-					if (reservation === "failed") {
-						// Without the durable reservation a same-key retry after
-						// eviction/restart could abort an unrelated later turn, so a
-						// failed reservation must NOT report success.
-						return { ok: false as const, reason: "reservation_failed" as const };
-					}
-					// A SAME-input row/tombstone existed while the reservation awaited
-					// the store: it is durable replay authority — replay its stored
-					// result instead of returning no_active_turn over it (review
-					// thread P2).
-					if (existingReplay) return replayExisting(existingReplay);
-					// RE-SCAN after the async reservation: the requester's prompt may
-					// have moved from preflight to accepted during the filesystem
-					// write. Returning no_active_turn here would leave the accepted
-					// prompt to start (its pending-preflight entry may already be
-					// removed, so the surface cleanup skips both cancellation seams)
-					// and the durable no-effect row would block a same-key retry from
-					// stopping it — fall through to the pre-run / active fencing path
-					// when a submission now exists (review thread P1).
-					active = [...promptSubmissions.entries()].find(
-						([, submission]) => submission.connectionId === connectionId && !submission.terminal,
-					);
-					if (!active) {
-						// Close the remaining acceptance race: cancel the requester's
-						// preflights HERE, in the same synchronous region as the
-						// rescan (no await boundary between the scan and the cancel,
-						// as the surface-level post-check had), so a prompt accepted
-						// in that window cannot start with its preflight entry
-						// already removed (review thread P1).
-						if (preflightCancel?.hasPending()) {
-							preflightCancel.cancel();
-							// The seam cancels the SESSION-WIDE preflight controller:
-							// invoke it only when no OTHER connection has a pending
-							// admission, or this queued requester's abort would fail an
-							// unrelated connection's active preflight (review thread P1).
-							if (noOtherConnectionPreflights?.() !== false)
-								terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
-						}
-						// No prompt won the race: finalize the reserved row so a later
-						// same-key retry (including after restart) replays this
-						// deterministic no_active_turn result instead of reservation
-						// uncertainty (review thread P2).
-						const no_active_turnResult = { ok: true as const, outcome: "no_active_turn" as const };
-						// Hash the PUBLIC disposition the client receives (abortTerminal
-						// transforms the outcome into {ok,selection,turn,terminal}); the
-						// response-state observer hashes response.result, so hashing the
-						// internal outcome shape could never match (review thread P2).
-						await finalizeNoEffectReservation(
-							hashResult({ ok: true, selection: scope, turn: "no_active_turn", terminal: "terminal_no_effect" }),
-						);
-						return no_active_turnResult;
-					}
-				}
 				const [commandId, turnId] = active[0].split(":", 2);
-				if (!commandId || !turnId) {
-					const reservation = await reserveTerminalNoEffect();
-					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
-					if (reservation === "failed") {
-						// Same durable-reservation guarantee as the no-active path.
-						return { ok: false as const, reason: "reservation_failed" as const };
-					}
-					if (existingReplay) return replayExisting(existingReplay);
-					const already_terminalResult = { ok: true as const, outcome: "already_terminal" as const };
-					// Hash the PUBLIC disposition the client receives (abortTerminal
-					// transforms the outcome into {ok,selection,turn,terminal}); the
-					// response-state observer hashes response.result, so hashing the
-					// internal outcome shape could never match (review thread P2).
-					await finalizeNoEffectReservation(
-						hashResult({ ok: true, selection: scope, turn: "no_active_turn", terminal: "terminal_no_effect" }),
+				if (commandId && turnId)
+					await terminalizePrompt(
+						{ commandId, turnId },
+						{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+						{ fence: true },
 					);
-					return already_terminalResult;
-				}
-				// Accepted-but-not-started window: the submission exists but
-				// agent_start has not bound executionHandle yet, and the preflight
-				// cancellation entry was already removed after accept. Cancel the
-				// in-flight session preflight so the pending #promptWithMessage
-				// cannot continue into the agent, and FINALIZE the accepted prompt
-				// as a pre-run client cancellation WITHOUT terminalizing — there is
-				// no run handle to fence, and terminalizePrompt's missing-handle
-				// fail-closed path would wrongly fence the SDK connection and leave
-				// reconciliation unfinalized for a prompt that will never run
-				// (review thread P2).
-				if (!active[1].executionHandle) {
-					// Persist the durable no-effect reservation BEFORE cancelling the
-					// session preflight: a failed reservation must NOT leave the
-					// prompt cancelled with no durable row (a later same-key retry
-					// after eviction/restart could then abort an unrelated turn —
-					// review thread P2).
-					const reservation = await reserveTerminalNoEffect();
-					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
-					if (reservation === "failed") {
-						return { ok: false as const, reason: "reservation_failed" as const };
-					}
-					if (existingReplay) return replayExisting(existingReplay);
-					// RECHCK after the async write: agent_start may have bound the
-					// execution handle during the reservation, so this is no longer
-					// a pre-run cancellation — fall through to the ACTIVE-turn
-					// fencing path below (terminalizePrompt with fence) instead of
-					// finalizing without abortPromptAndWait (review thread P2).
-					if (!active[1].executionHandle) {
-						// REVALIDATE the captured submission: another abort may have
-						// terminalized it during the reservation while a NEW prompt
-						// entered preflight — cancelling the session-global preflight
-						// for the stale capture would abort that unrelated prompt.
-						// Only proceed when this exact nonterminal submission is still
-						// authoritative (review thread P1).
-						const currentSubmission = promptSubmissions.get(promptSubmissionKey({ commandId, turnId }));
-						if (currentSubmission !== active[1] || currentSubmission.terminal) {
-							// The captured submission is no longer authoritative: finalize
-							// our provisional reservation so the durable row reflects the
-							// settled outcome rather than lingering mid-transition (review
-							// thread P2).
-							const already_terminalResult = { ok: true as const, outcome: "already_terminal" as const };
-							// Hash the PUBLIC disposition the client receives (abortTerminal
-							// transforms the outcome into {ok,selection,turn,terminal}); the
-							// response-state observer hashes response.result, so hashing the
-							// internal outcome shape could never match (review thread P2).
-							await finalizeNoEffectReservation(
-								hashResult({
-									ok: true,
-									selection: scope,
-									turn: "no_active_turn",
-									terminal: "terminal_no_effect",
-								}),
-							);
-							return already_terminalResult;
-						}
-						if (preflightCancel?.hasPending()) {
-							preflightCancel.cancel();
-							// The seam cancels the SESSION-WIDE preflight controller:
-							// invoke it only when no OTHER connection has a pending
-							// admission (review thread P1).
-							if (noOtherConnectionPreflights?.() !== false)
-								terminalAbortSeams?.cancelPendingPreflightForTerminalAbort?.();
-						}
-						await terminalizePrompt(
-							{ commandId, turnId },
-							{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-							{},
-						);
-						// No prompt won the race: finalize the reserved row so a later
-						// same-key retry replays this deterministic no_active_turn result
-						// instead of reservation uncertainty (review thread P2).
-						const no_active_turnResult = { ok: true as const, outcome: "no_active_turn" as const };
-						// Hash the PUBLIC disposition the client receives (abortTerminal
-						// transforms the outcome into {ok,selection,turn,terminal}); the
-						// response-state observer hashes response.result, so hashing the
-						// internal outcome shape could never match (review thread P2).
-						await finalizeNoEffectReservation(
-							hashResult({ ok: true, selection: scope, turn: "no_active_turn", terminal: "terminal_no_effect" }),
-						);
-						return no_active_turnResult;
-					}
-				}
-				// Plan ordered step 4: write the bounded INITIAL MARKER (key/input
-				// hashes, pending dispositions, publication false, response pending)
-				// BEFORE any fence/stop/event effect, so a crash between the stop
-				// and the semantic CAS still leaves a same-key retry that replays
-				// deterministically instead of re-running effects. Marker failure is
-				// process-local no-effect (AC 10) — nothing destructive has run yet.
-				const markerEpoch = terminalAbortSeams?.getTerminalTurnEpoch?.();
-				if (markerEpoch === undefined) return { ok: true as const, outcome: "no_effect" as const };
-				let pendingReplay: DurableTerminalScopeRecord | undefined;
-				let tombstoneReplay: EvictedTerminalKeyEntry | undefined;
-				try {
-					// Write the marker and any evicted-row key tombstones in ONE
-					// atomic document transaction so a crash cannot leave the
-					// durable store with neither the row nor its tombstone
-					// (review thread P2). The marker itself stays pending (never
-					// evicted); only completed rows are bounded.
-					await durableStore.transactTerminalState(state => {
-						// Atomic recheck: a concurrent request may have committed a
-						// DIFFERENT input under this key after the earlier snapshot
-						// check (dispatch-cache eviction), and the filter below must
-						// never wipe that row — replacing it would let a later replay
-						// of the SUCCEEDED request report a conflict (review thread
-						// P2). A same-input PENDING row is an in-flight duplicate:
-						// replay it instead of installing a second marker, so the
-						// duplicate cannot race terminalization and flip the row to
-						// uncertain while the original returns stopped (review
-						// thread P2).
-						const conflicting = state.scopes.find(s => keyHash && s.idempotencyKeyHash === keyHash);
-						if (conflicting) {
-							if (conflicting.idempotencyInputHash !== inputHash) throw new TerminalIdempotencyConflictError();
-							if (conflicting.turnDisposition === "pending") {
-								pendingReplay = conflicting;
-								return { scopes: state.scopes, keys: state.keys };
-							}
-						}
-						// A concurrent admission may ALSO have evicted a same-key row
-						// into the tombstone collection after this request's snapshot;
-						// recheck keys so a different input can never install a fresh
-						// marker over existing durable replay authority (review
-						// thread P2). A same-input tombstone already carries replay
-						// authority: never install a second marker here.
-						const tombstone = state.keys.find(s => keyHash && s.keyHash === keyHash);
-						if (tombstone) {
-							if (tombstone.inputHash !== inputHash) throw new TerminalIdempotencyConflictError();
-							tombstoneReplay = tombstone;
-							return { scopes: state.scopes, keys: state.keys };
-						}
-						const retained = state.scopes.filter(s => !(keyHash && s.idempotencyKeyHash === keyHash));
-						const preBound: DurableTerminalScopeRecord[] = [
-							...retained,
-							{
-								selection: scope,
-								...(keyHash ? { idempotencyKeyHash: keyHash, idempotencyInputHash: inputHash } : {}),
-								turnDisposition: "pending",
-								terminalPublished: false,
-								ownedWorkDisposition: "not_requested",
-								automaticDeliveryDisposition: scope === "turn" ? "enabled" : "none",
-								resumeOnOwnedCompletion: scope === "turn",
-								turnContinuationFence: {
-									state: "retained",
-									abortedAttemptEpoch: markerEpoch,
-									blockedContinuationIds: [],
-									predecessorTombstones: [],
-									ownedCompletionPolicy: scope === "turn" ? "enabled" : "disabled",
-								},
-								responseState: "pending",
-								responsePayloadHash: inputHash,
-								acceptedAt: Date.now(),
-							} satisfies DurableTerminalScopeRecord,
-						];
-						return boundTerminalRetentionState(state.keys, preBound);
-					});
-				} catch (error) {
-					if (error instanceof TerminalIdempotencyConflictError) {
-						// A different input won the durable key race inside the
-						// transaction; reject rather than replacing its row.
-						return { ok: false as const, reason: "conflict" as const };
-					}
-					logger.warn(`sdk: terminal initial marker persistence failed: ${String(error)}`);
-					// No durable marker exists: do NOT acknowledge success without a
-					// durable row — a same-key retry after restart/expiry would miss
-					// replay and could abort an unrelated later prompt. Persist a
-					// bounded marker-failure reservation first (review thread P2).
-					const reservation = await reserveTerminalNoEffect("marker_failure");
-					if (reservation === "conflict") return { ok: false as const, reason: "conflict" as const };
-					if (reservation === "failed") {
-						return { ok: false as const, reason: "reservation_failed" as const };
-					}
-					if (existingReplay) return replayExisting(existingReplay);
-					return { ok: true as const, outcome: "no_effect" as const };
-				}
-				if (pendingReplay) {
-					// An in-flight duplicate of this exact key+input was already
-					// admitted; replay its pending row WITHOUT re-running the stop,
-					// cleanup, or event.
-					return {
-						ok: true as const,
-						outcome: "pending_replay" as const,
-						stored: {
-							responseState: pendingReplay.responseState,
-							responsePayloadHash: pendingReplay.responsePayloadHash,
-							terminalPublished: pendingReplay.terminalPublished === true,
-						},
-					};
-				}
-				if (tombstoneReplay) {
-					// The key gained durable replay authority via an eviction
-					// tombstone while this request was in flight; never install a
-					// second marker or run the stop. Reconstruct the ORIGINAL stored
-					// result exactly as the same-key replay path would (review
-					// thread P2).
-					const storedRow = {
-						responseState: tombstoneReplay.responseState ?? "",
-						responsePayloadHash: tombstoneReplay.responsePayloadHash ?? "",
-						terminalPublished: tombstoneReplay.terminalPublished === true,
-					};
-					if (tombstoneReplay.turnDisposition === "stopped") {
-						return {
-							ok: true as const,
-							outcome: (tombstoneReplay.ownedWorkDisposition === "stopped" ? "stopped_owned" : "stopped") as
-								| "stopped"
-								| "stopped_owned",
-							stored: storedRow,
-						};
-					}
-					if (tombstoneReplay.turnDisposition === "uncertain") {
-						return { ok: true as const, outcome: "uncertain_replay" as const, stored: storedRow };
-					}
-					if (tombstoneReplay.turnDisposition === "no_effect_marker_failure") {
-						return { ok: true as const, outcome: "no_effect" as const, stored: storedRow };
-					}
-					return { ok: true as const, outcome: "no_effect_replay" as const, stored: storedRow };
-				}
-				const captured: {
-					proof?: RunSettlementProof & {
-						terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
-					};
-					published?: boolean;
-					terminalized?: boolean;
-				} = {};
-				await terminalizePrompt(
-					{ commandId, turnId },
-					{ kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
-					{
-						fence: true,
-						terminal: { scope, ...(steeringSnapshotToken !== undefined ? { steeringSnapshotToken } : {}) },
-					},
-					undefined,
-					captured,
-				);
-				// Success is decided by the terminalizePrompt outcome, NOT by the
-				// submission record: an already-acknowledged prompt is finalized
-				// (deleted) during emission, so a lookup here can return undefined
-				// even for a landed terminal (P1). fail-closed paths leave
-				// terminalized unset.
-				if (captured.terminalized !== true) {
-					// A CONCURRENT abort won the shared submission: settle THIS
-					// request's pending marker to a completed uncertainty state so
-					// the retention bound can evict it — otherwise concurrent
-					// distinct-key aborts leave pending rows that grow the
-					// reconciliation document unboundedly until restart (review
-					// thread P2).
-					try {
-						await transactBoundedTerminalScopes(scopes =>
-							scopes.map(scopeRecord => {
-								const isMarker =
-									(keyHash !== undefined && scopeRecord.idempotencyKeyHash === keyHash) ||
-									(keyHash === undefined &&
-										scopeRecord.selection === scope &&
-										scopeRecord.turnDisposition === "pending");
-								if (!isMarker) return scopeRecord;
-								const responsePayloadHash = hashPublicUncertain("worker_unsettled");
-								return {
-									...scopeRecord,
-									turnDisposition: "uncertain" as const,
-									ownedWorkDisposition: "uncertain" as const,
-									// Hash the public worker_unsettled disposition the client
-									// receives, or the response can never advance the row
-									// (review thread P2).
-									responsePayloadHash,
-									// A same-key retry delivers the replay envelope (with the
-									// replay reason); store its hash so the written replay can
-									// advance the row (review thread P2).
-									replayPayloadHash: hashResult({
-										ok: true,
-										selection: scope,
-										turn: "uncertain",
-										ownedWork: scope === "turn" ? "left_running" : "uncertain",
-										automaticDelivery: scope === "turn" ? "enabled" : "none",
-										resumeOnOwnedCompletion: scope === "turn",
-										reason: "replay_uncertain",
-										replay: {
-											responseState: "pending",
-											responsePayloadHash,
-											terminalPublished: captured.published === true,
-										},
-									}),
-									// Preserve the captured publication bit: if agent_end
-									// was already published before settlement failed, the
-									// implementation will NOT publish a second event, so the
-									// durable row must not claim publication never occurred
-									// (review thread P2).
-									terminalPublished: captured.published === true,
-								};
-							}),
-						);
-					} catch (error) {
-						logger.warn(`sdk: terminal losing-marker settle failed: ${String(error)}`);
-					}
-					return { ok: false as const, reason: "worker_unsettled" as const };
-				}
-				// For scope:"owned", stop the exact captured owned work and prove
-				// quiescence before claiming stopped. Exactness comes from the
-				// registered five-tuples of this turn's lineage+epoch; foreign or
-				// unclassified work is never swept and yields uncertainty.
-				const terminalScope = captured.proof?.terminalScope;
-				let ownedStopped = true;
-				// Owned settlement failed (incomplete authority, unavailable
-				// manager, or a job that did not unwind within the grace):
-				// transition this request's PENDING marker to completed
-				// uncertainty BEFORE returning — otherwise distinct-key retries
-				// accumulate non-evictable pending rows and same-key retries
-				// misleadingly replay pending (review thread P2).
-				const settleMarkerToUncertain = async (
-					reason: "worker_unsettled" | "owned_unsettled",
-				): Promise<{ ok: false; reason: "worker_unsettled" | "owned_unsettled" }> => {
-					// The EXACT response payload is stored at finalization so the
-					// response-state advance requires equality (review thread P2).
-					// The EXACT PUBLIC payload is stored at finalization: abortTerminal
-					// maps {ok:false, reason} to the uncertain disposition the client
-					// receives, and the response-state observer hashes response.result,
-					// so the internal outcome shape can never match (review thread P2).
-					const result = { ok: false as const, reason };
-					const responsePayloadHash = hashPublicUncertain(reason);
-					// A same-key retry delivers the replay envelope (with the replay
-					// reason); store its hash so the written replay can advance the
-					// row (review thread P2).
-					const replayPayloadHash = hashResult({
-						ok: true,
-						selection: scope,
-						turn: "uncertain",
-						ownedWork: scope === "turn" ? "left_running" : "uncertain",
-						automaticDelivery: scope === "turn" ? "enabled" : "none",
-						resumeOnOwnedCompletion: scope === "turn",
-						reason: "replay_uncertain",
-						replay: {
-							responseState: "pending",
-							responsePayloadHash,
-							terminalPublished: captured.published === true,
-						},
-					});
-					try {
-						await transactBoundedTerminalScopes(scopes =>
-							scopes.map(scopeRecord => {
-								const isMarker =
-									(keyHash !== undefined && scopeRecord.idempotencyKeyHash === keyHash) ||
-									(keyHash === undefined &&
-										scopeRecord.selection === scope &&
-										scopeRecord.turnDisposition === "pending");
-								if (!isMarker) return scopeRecord;
-								return {
-									...scopeRecord,
-									turnDisposition: "uncertain" as const,
-									ownedWorkDisposition: "uncertain" as const,
-									responsePayloadHash,
-									replayPayloadHash,
-									// Preserve the captured publication bit: if agent_end
-									// was already published before settlement failed, the
-									// implementation will NOT publish a second event, so the
-									// durable row must not claim publication never occurred
-									// (review thread P2).
-									terminalPublished: captured.published === true,
-								};
-							}),
-						);
-					} catch (error) {
-						logger.warn(`sdk: terminal owned-uncertain marker settle failed: ${String(error)}`);
-					}
-					return result;
-				};
-				const settleOwnedUncertain = async () => await settleMarkerToUncertain("owned_unsettled");
-				if (!terminalScope) {
-					// The terminal scope was NOT registered (process-wide
-					// saturation refused admission): no continuation fence bounds
-					// the aborted turn. FAIL CLOSED to uncertainty — never report
-					// stopped/stopped_owned without a registered fence (review
-					// thread P2).
-					return await settleMarkerToUncertain("worker_unsettled");
-				}
-				if (scope === "owned") {
-					// The attempt's registration set may be KNOWN incomplete
-					// (registry saturation skipped a tuple under the 8192 cap):
-					// fail closed to uncertainty instead of settling an
-					// incomplete set and claiming stopped_owned while a live job
-					// keeps running (review thread P2).
-					if (
-						terminalScope &&
-						isOwnedAttemptRegistrationIncomplete(terminalScope.lineageIdHash, terminalScope.abortedAttemptEpoch)
-					) {
-						return await settleOwnedUncertain();
-					}
-					const exactJobs = terminalScope
-						? findOwnedRegistrationsForTurn(terminalScope.lineageIdHash, terminalScope.abortedAttemptEpoch)
-						: [];
-					if (exactJobs.length > 0) {
-						// Resolve the manager from the ABORTING ENDPOINT (session)
-						// captured on the registrations — the process-global
-						// instance is the last-created session, so using it could
-						// cancel another session's same-id foreign job and report
-						// stopped_owned while the aborting session's job keeps
-						// running (review thread P1). Fall back to the global for
-						// legacy endpoint-less registrations.
-						const endpointId = exactJobs[0]?.endpointId;
-						const manager = AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
-						if (!manager) {
-							return await settleOwnedUncertain();
-						}
-						ownedStopped = (await settleOwnedWork(manager, exactJobs, OWNED_SETTLEMENT_GRACE_MS)) === "stopped";
-						if (!ownedStopped) return await settleOwnedUncertain();
-					}
-				}
-				// Semantic CAS: advance the INITIAL MARKER (matched by key hash, or
-				// by selection+epoch when keyless) to the final dispositions through
-				// the same full-document owner (plan step 15). The prompt terminal
-				// is already durable; a failed write fails closed to safe
-				// uncertainty — never a stopped disposition the record cannot prove.
-				try {
-					await transactBoundedTerminalScopes(scopes =>
-						scopes.map(scopeRecord => {
-							const isMarker =
-								(keyHash !== undefined && scopeRecord.idempotencyKeyHash === keyHash) ||
-								(keyHash === undefined &&
-									scopeRecord.selection === scope &&
-									scopeRecord.turnDisposition === "pending");
-							if (!isMarker) return scopeRecord;
-							const ownedWorkDisposition =
-								scope === "turn" ? "left_running" : ownedStopped ? "stopped" : "uncertain";
-							// Hash the EXACT public result the client receives: the surface
-							// returns {ok: true, selection, turn, ...} and the delivery
-							// observer hashes response.result, so the stored hash must
-							// include ok or payloadMatches would never match a fresh
-							// stopped/stopped_owned response and the durable responseState
-							// would stay pending after a successful write (review thread
-							// P2).
-							const payloadHash = crypto
-								.createHash("sha256")
-								.update(
-									JSON.stringify({
-										ok: true,
-										selection: scope,
-										turn: "stopped",
-										ownedWork: ownedWorkDisposition,
-										automaticDelivery: scope === "turn" ? "enabled" : "none",
-										resumeOnOwnedCompletion: scope === "turn",
-									}),
-								)
-								.digest("hex");
-							// A same-key retry delivers the replay envelope; store its
-							// hash too so a written replay can advance the pending row
-							// (review thread P2).
-							const replayPayloadHash = crypto
-								.createHash("sha256")
-								.update(
-									JSON.stringify({
-										ok: true,
-										selection: scope,
-										turn: "stopped",
-										ownedWork: ownedWorkDisposition,
-										automaticDelivery: scope === "turn" ? "enabled" : "none",
-										resumeOnOwnedCompletion: scope === "turn",
-										replay: {
-											responseState: "pending",
-											responsePayloadHash: payloadHash,
-											terminalPublished: captured.published === true,
-										},
-									}),
-								)
-								.digest("hex");
-							return {
-								...scopeRecord,
-								turnDisposition: "stopped" as const,
-								terminalPublished: captured.published === true,
-								ownedWorkDisposition,
-								turnContinuationFence: {
-									...scopeRecord.turnContinuationFence,
-									abortedAttemptEpoch:
-										terminalScope?.abortedAttemptEpoch ??
-										scopeRecord.turnContinuationFence.abortedAttemptEpoch,
-								},
-								responsePayloadHash: payloadHash,
-								replayPayloadHash,
-								terminalAt: Date.now(),
-							};
-						}),
-					);
-				} catch (error) {
-					logger.warn(`sdk: terminal scope persistence failed: ${String(error)}`);
-					// The prompt terminalization succeeded but the final marker
-					// write failed: best-effort transition the pending marker to
-					// completed uncertainty so same-key retries do not replay a
-					// stale pending row and repeated failures do not accumulate
-					// non-evictable rows (review thread P2).
-					return await settleMarkerToUncertain("worker_unsettled");
-				}
-				if (scope === "owned") {
-					return { ok: true as const, outcome: "stopped_owned" as const };
-				}
-				return { ok: true as const, outcome: "stopped" as const };
+				return { aborted: true, disposition: "cancelled" as const };
 			},
 			{
 				admit: (clientRef?: string) => kindReconciliation.admit("skill", clientRef),
 				release: (clientRef?: string) => kindReconciliation.releaseAdmission("skill", clientRef),
 				noteAccepted: (correlation, clientRef, extra) =>
 					kindReconciliation.noteAccepted("skill", correlation, clientRef, extra),
-				cancel: async correlation => {
-					const outcome = await kindReconciliation.claimPendingOutcome("skill", correlation, {
-						kind: "stopped",
-						reason: "cancelled",
-						provenance: "client_cancel",
-					});
-					await kindReconciliation.finalizeOutcome("skill", correlation, outcome);
-				},
 				noteTransition: (correlation, frame) => kindReconciliation.noteTransition("skill", correlation, frame),
 				lookup: selector => kindReconciliation.lookup("skill", selector),
-				reserveSteer: kindReconciliation.reserveSteer,
-				settleSteer: kindReconciliation.settleSteer,
 			},
-			terminalAbortSeams,
 		);
 		cancelPreflightsForConnection = controlSurface.cancelPendingPreflightsForConnection;
 		const abandonPromptResponse = (connectionId: string, frame: Record<string, unknown>) => {
@@ -6236,11 +4683,10 @@ export function createNotificationsExtension(
 			abandonPrompt(submission);
 		};
 
-		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>): "written" | "dropped" => {
+		const sendSdkFrame = (connectionId: string, frame: Record<string, unknown>) => {
 			if (extensionShuttingDown || runtime?.stopping || runtimes.get(id) !== runtime) {
-				// Deliberate drop (AC 17/20): no write, no post-write hook, no fallback.
 				abandonPromptResponse(connectionId, frame);
-				return "dropped";
+				return;
 			}
 			const json = JSON.stringify(frame);
 			if (connectionId.startsWith("seam:")) {
@@ -6257,7 +4703,7 @@ export function createNotificationsExtension(
 					abandonPromptResponse(connectionId, frame);
 					throw error;
 				}
-				return "written";
+				return;
 			}
 			try {
 				server.sendTo(connectionId, json);
@@ -6266,7 +4712,6 @@ export function createNotificationsExtension(
 				abandonPromptResponse(connectionId, frame);
 				throw error;
 			}
-			return "written";
 		};
 
 		/**
@@ -6351,105 +4796,6 @@ export function createNotificationsExtension(
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
 			onRequest: options.onSdkRequest,
-			onControlResponseDelivery: async (_connectionId, request, response, outcome) => {
-				// Terminal abort: persist the monotonic response-state transition
-				// (AC 18) — pending -> sent on a written response, pending -> failed
-				// on a rejected/dropped write. A same-key retry then replays the
-				// stored disposition with the matching response state.
-				if (
-					request.operation === "turn.abort" &&
-					typeof request.input === "object" &&
-					request.input !== null &&
-					(request.input as { mode?: unknown }).mode === "terminal" &&
-					typeof request.idempotencyKey === "string" &&
-					durableStore
-				) {
-					const keyHash = crypto.createHash("sha256").update(request.idempotencyKey).digest("hex");
-					// Match the NORMALIZED terminal input hash too: a same-key
-					// request with a different scope (conflict after in-memory
-					// eviction) must never advance the ORIGINAL pending marker's
-					// response state — only the response for the exact input that
-					// produced the record may transition it (review thread P2).
-					// Strictly validate first: a MALFORMED retry (e.g. scope:"bogus")
-					// rejected by dispatch must not match a prior valid scope:"turn"
-					// row through the "not owned => turn" fallback.
-					const input = request.input as Record<string, unknown>;
-					const mode = input.mode;
-					const rawScope = input.scope;
-					if (mode !== "terminal") return;
-					if (rawScope !== undefined && rawScope !== "turn" && rawScope !== "owned") return;
-					for (const key of Object.keys(input)) if (key !== "mode" && key !== "scope") return;
-					const scopeInput = rawScope === "owned" ? "owned" : "turn";
-					const inputHash = crypto
-						.createHash("sha256")
-						.update(JSON.stringify({ mode: "terminal", scope: scopeInput }))
-						.digest("hex");
-					try {
-						// Same hydration barrier as the abort path: never race a still
-						// pending store load with the response-state transition (P2).
-						await reconciliationReady;
-						// Update the matching LIVE scope OR its evicted compact
-						// tombstone atomically: if the row was moved to
-						// evictedTerminalKeys by the 256-row retention cap while this
-						// write was in flight, scanning only live scope rows would
-						// leave the tombstone responseState:"pending" and a same-key
-						// replay after cache expiry/restart would report a false
-						// durable delivery state (review thread P2).
-						// Hash the ACTUAL written response payload: the durable state may only
-						// advance when the written response corresponds to the row's payload.
-						// When more than 256 concurrent requests evict an in-flight abort from
-						// the dispatch cache, a same-key retry can return pending_replay while
-						// the original is still terminalizing — matching only key+input would
-						// mark the original marker sent for the retry's uncertainty response,
-						// and the original's later stopped CAS would replace the payload hash
-						// without resetting the state, making durable replay claim the stopped
-						// payload was sent when only the pending response was written (review
-						// thread P2). A final non-pending row whose stored hash is the input
-						// placeholder (no_effect/uncertain) still advances: its own response is
-						// the only one written for it.
-						const responsePayloadHash =
-							response && typeof response === "object" && "result" in response
-								? crypto
-										.createHash("sha256")
-										.update(JSON.stringify((response as { result: unknown }).result))
-										.digest("hex")
-								: undefined;
-						// Require EXACT payload equality: finalization now stores the precise
-						// final response hash for every disposition (including uncertainty and
-						// no-effect), so a pending_replay retry whose payload differs can never
-						// mark the durable row sent (review thread P2). A same-key retry
-						// delivers the replay-shaped payload (replay envelope, and the replay
-						// reason for uncertainty), so finalization also stores its hash and the
-						// written replay response advances the row exactly like the original
-						// response would (review thread P2).
-						const payloadMatches = (record: { responsePayloadHash?: string; replayPayloadHash?: string }) =>
-							responsePayloadHash !== undefined &&
-							(record.responsePayloadHash === responsePayloadHash ||
-								record.replayPayloadHash === responsePayloadHash);
-						const nextResponseState: "sent" | "failed" = outcome === "written" ? "sent" : "failed";
-						await durableStore.transactTerminalState(state => ({
-							scopes: state.scopes.map(scope =>
-								scope.idempotencyKeyHash === keyHash &&
-								scope.idempotencyInputHash === inputHash &&
-								scope.responseState === "pending" &&
-								payloadMatches(scope)
-									? { ...scope, responseState: nextResponseState }
-									: scope,
-							),
-							keys: state.keys.map(key =>
-								key.keyHash === keyHash &&
-								key.inputHash === inputHash &&
-								key.responseState === "pending" &&
-								payloadMatches(key)
-									? { ...key, responseState: nextResponseState }
-									: key,
-							),
-						}));
-					} catch (error) {
-						logger.warn(`sdk: terminal response-state persistence failed: ${String(error)}`);
-					}
-				}
-			},
 			beforeControlResponse: async (_connectionId, request, response, sendTerminal) => {
 				if (typeof request.operation !== "string" || !identityControlOperations.has(request.operation)) return;
 				const pending = deferredIdentityRotation;
@@ -6523,8 +4869,7 @@ export function createNotificationsExtension(
 				if (
 					(request.operation === "turn.prompt" ||
 						request.operation === "turn.follow_up" ||
-						request.operation === "turn.abort_and_prompt" ||
-						request.operation === "skill.invoke") &&
+						request.operation === "turn.abort_and_prompt") &&
 					response.ok === true &&
 					response.result &&
 					typeof response.result === "object" &&
@@ -6579,15 +4924,7 @@ export function createNotificationsExtension(
 					dispatchControl(
 						controlSurface,
 						OPERATIONS.find(row => row.kind === "control" && row.sdkId === operation),
-						{
-							id: requestId,
-							operation,
-							input: request.input,
-							expectedRevision:
-								typeof request.expectedRevision === "string" ? request.expectedRevision : undefined,
-							idempotencyKey: typeof request.idempotencyKey === "string" ? request.idempotencyKey : undefined,
-							confirm: request.confirm === true,
-						},
+						controlRequestFromFrame(request as Record<string, unknown>),
 					),
 				);
 
@@ -6599,6 +4936,16 @@ export function createNotificationsExtension(
 			},
 			query: async (connectionId, frame) => {
 				const request = frame as { id?: unknown; query?: unknown; input?: unknown; cursor?: unknown };
+				// D1: a non-string top-level cursor is rejected, never silently
+				// dropped into a fresh-snapshot query (parity with the loopback
+				// session-runtime adapter).
+				if (request.cursor !== undefined && typeof request.cursor !== "string")
+					return {
+						type: "query_response",
+						id: typeof request.id === "string" ? request.id : undefined,
+						ok: false,
+						error: { code: "invalid_input", message: "cursor must be a non-empty string" },
+					};
 				const response = await queryHandlers.dispatch({
 					id: typeof request.id === "string" ? request.id : undefined,
 					query: typeof request.query === "string" ? request.query : "",
@@ -6627,7 +4974,6 @@ export function createNotificationsExtension(
 			id,
 			endpointScope: isolateChatEndpoint ? "chat" : "default",
 			idleSeq: 0,
-			stopSessionNameObserver: () => {},
 			pendingInteractive,
 			brokerRegistrationActive: false,
 			hostStopped: false,
@@ -6655,33 +5001,21 @@ export function createNotificationsExtension(
 			cancelPostmortemCleanup: () => {},
 
 			redact: true,
-			// Provisional policy withholds delivery. This is not a committed redaction
-			// decision: terminal text may be retained in the bounded settlement window
-			// until the parsed policy either clears it for redaction or activates it.
-			committedRedact: false,
+			committedRedact: true,
 			policySuspended: true,
 			verbosity: "lean",
 			stream: false,
-			settlementWindow: 0,
 			policyGeneration: 0,
 			workflowGatePublicationEpoch: 0,
 			sessionTag: tag,
 			busy: false,
 			pendingPromptCorrelations,
-			pendingPromptCorrelationsBySdkRunToken,
 			activePromptCorrelation: undefined,
 			bindPromptExecutionHandle,
-			peekPromptPendingOutcome: correlation => {
-				const kind =
-					promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const);
-				return kindReconciliation.peekPendingOutcome(kind, correlation);
-			},
+			peekPromptPendingOutcome: correlation => kindReconciliation.peekPendingOutcome(correlation),
 			terminalizePrompt: (correlation, outcome, extra) => terminalizePrompt(correlation, outcome, {}, extra),
 			notePromptReconciliation: (correlation, frame) => {
-				const kind = correlation
-					? (promptSubmissions.get(promptSubmissionKey(correlation))?.reconciliationKind ?? ("prompt" as const))
-					: "prompt";
-				return kindReconciliation.noteTransition(kind, correlation, frame);
+				void kindReconciliation.noteTransition("prompt", correlation, frame);
 			},
 			emitPromptFailure,
 			emitPromptLifecycle,
@@ -6692,6 +5026,7 @@ export function createNotificationsExtension(
 				{ toolName: string; args?: unknown; pendingPhase?: "completed" | "failed" | "cancelled" }
 			>(),
 			deferredInboundControls: [],
+			notificationRootRegistration: undefined,
 		};
 		const initializedRuntime = runtime;
 		runtimes.set(id, initializedRuntime);
@@ -6821,9 +5156,7 @@ export function createNotificationsExtension(
 			});
 			server.onConnectionClose((_err, connectionId) => {
 				if (!connectionId) return;
-				void controlSurface
-					.cancelPendingPreflightsForConnection(connectionId)
-					.catch(error => logger.warn(`sdk: failed to cancel disconnected preflight: ${String(error)}`));
+				controlSurface.cancelPendingPreflightsForConnection(connectionId);
 				host.handleDisconnect(connectionId);
 				hostCapCache.delete(connectionId);
 				// The socket is gone, so its fence has nothing left to refuse. Dropping the
@@ -6837,9 +5170,7 @@ export function createNotificationsExtension(
 				// therefore only abandons delivery; ACP rejects its own local waiter once and
 				// terminal authority stays with the eventual normalized SDK outcome.
 				for (const submission of promptSubmissions.values())
-					if (submission.connectionId === connectionId) {
-						abandonPrompt(submission);
-					}
+					if (submission.connectionId === connectionId) abandonPrompt(submission);
 			});
 
 			server.onReply((err, reply) => {
@@ -7249,42 +5580,44 @@ export function createNotificationsExtension(
 				await cleanupAbandonedStartup();
 				return { status: "failed" };
 			}
-
-			// Fail-closed daemon isolation: the chat daemons (Telegram, Discord,
-			// Slack) are optional notification adapters, never session authority.
-			// No daemon ownership is acquired, awaited, or verified before core
-			// publication — a slow, wedged, blocked, or crashed daemon must degrade
-			// ONLY notification delivery, never an ACP/MCP session open. Native
-			// frames are ephemeral, so publish identity first; late SDK consumers
-			// recover it from event_replay.
+			// Record canonical identity before transport startup so lifecycle events emitted
+			// by an early server-start callback cannot overtake it in replay. The direct
+			// socket publication remains below, after the server is listening.
 			const identityHeader = {
 				type: "identity_header",
 				sessionId: id,
-				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled),
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
+			// Core SDK authority is published before optional notification adapters acquire
+			// daemon ownership. A blocked adapter must not make an interactive session
+			// undiscoverable or uncontrollable.
 			const endpoint = await sdkRuntime.startTransport();
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
-				// Daemon ownership is acquired AFTER the core SDK endpoint is
-				// published, and is deliberately NOT tracked in
-				// `sessionLifecycleTasks`: shutdown joins that set, so a wedged
-				// ensure tracked there would hang teardown. Every write the settled
-				// outcome performs is identity-guarded instead. Until it settles the
-				// owner state stays "retry", so activate() withholds notification
-				// adapters and a later reconcile re-attempts.
 				initializedRuntime.notificationOwnerState = "retry";
-				initializedRuntime.notificationOwnerKey = daemonOwnershipKey(cfg);
-				const ownershipRuntime = initializedRuntime;
-				kickDaemonOwnership(settings, cfg, (outcome, key) => {
-					applyDaemonOwnership(id, ownershipRuntime, outcome, isolateChatEndpoint, key);
-					// Adapters activate only through reconciliation, so re-run it once
-					// ownership is known. Detached: no lifecycle path awaits this.
-					if (runtimes.get(id) !== ownershipRuntime || ownershipRuntime.stopping || extensionShuttingDown) return;
-					void controller
-						.reconcileCurrentSession(ctx)
-						.catch(error => logger.warn(`notifications: post-ownership reconciliation failed: ${String(error)}`));
-				});
+				try {
+					const ownership = await ensureConfiguredDaemonOwners(settings, cfg, ctx.cwd, id, token => {
+						retainNotificationRootRegistration(initializedRuntime, settings, ctx.cwd, id, token);
+					});
+					initializedRuntime.notificationOwnerState =
+						ownership === "ready" || (ownership === "blocked_identity_with_sibling" && isolateChatEndpoint)
+							? "ready"
+							: "blocked";
+					if (ownership === "blocked_identity") {
+						logger.warn("notifications: Telegram daemon ownership is blocked; core SDK remains available.");
+					}
+					if (ownership === "blocked_identity_with_sibling" && !isolateChatEndpoint) {
+						logger.warn(
+							"notifications: Telegram ownership changed after core publication; preserving the canonical endpoint and withholding adapters.",
+						);
+					}
+				} catch (error) {
+					initializedRuntime.notificationOwnerState = "retry";
+					logger.warn(
+						`notifications: provider daemon ownership unavailable; core SDK remains available: ${String(error)}`,
+					);
+				}
 			}
 
 			// The native server owns the only authoritative view of this host's live
@@ -7293,10 +5626,7 @@ export function createNotificationsExtension(
 			// runtime's alone, so only this runtime's teardown can retract it.
 			initializedRuntime.evidencePublication = publishSessionHostRuntimeEvidence({
 				attachedClients: () => server.clientCount(),
-				workInFlight: () =>
-					initializedRuntime.busy ||
-					initializedRuntime.pendingPromptCorrelations.length > 0 ||
-					initializedRuntime.pendingPromptCorrelationsBySdkRunToken.size > 0,
+				workInFlight: () => initializedRuntime.busy || initializedRuntime.pendingPromptCorrelations.length > 0,
 			});
 			ephemeralTurns.configureAuthority({
 				sessionId: id,
@@ -7311,35 +5641,6 @@ export function createNotificationsExtension(
 			}
 
 			server.pushFrame(JSON.stringify(identityHeader));
-			let publishedSessionName = identityHeader.title;
-			const sessionNameObserver = setInterval(() => {
-				if (runtime?.stopping || runtimes.get(id) !== runtime) return;
-				if (ctx.sessionManager.getSessionId() !== id) return;
-				const sessionName = ctx.sessionManager.getSessionName();
-				if (!sessionName || sessionName === publishedSessionName) return;
-				publishedSessionName = sessionName;
-				const identity = {
-					type: "identity_header",
-					sessionId: id,
-					...buildIdentity(ctx.cwd, sessionName, telegramTopicsEnabled()),
-				};
-				host.emitEvent({ kind: identity.type, payload: identity });
-				server.pushFrame(JSON.stringify(identity));
-			}, 250);
-			sessionNameObserver.unref?.();
-			runtime.stopSessionNameObserver = () => clearInterval(sessionNameObserver);
-			const sessionNameAfterStartup =
-				ctx.sessionManager.getSessionId() === id ? ctx.sessionManager.getSessionName() : undefined;
-			if (sessionNameAfterStartup && sessionNameAfterStartup !== publishedSessionName) {
-				publishedSessionName = sessionNameAfterStartup;
-				const identity = {
-					type: "identity_header",
-					sessionId: id,
-					...buildIdentity(ctx.cwd, sessionNameAfterStartup, telegramTopicsEnabled()),
-				};
-				host.emitEvent({ kind: identity.type, payload: identity });
-				server.pushFrame(JSON.stringify(identity));
-			}
 			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
 
@@ -7559,7 +5860,7 @@ export function createNotificationsExtension(
 			logger.warn(`notifications: failed to start server: ${String(e)}`);
 			const result = failLifecycleStartup("failed", e);
 			finishStartup(result);
-			let suppressExtensionError = false;
+			let suppressExtensionError = result.failure?.message === "Lifecycle SDK startup was cancelled.";
 			let stopped = false;
 			try {
 				stopped = await stopSession(id, "session", runtime);
@@ -7596,18 +5897,23 @@ export function createNotificationsExtension(
 				if (runtime.notificationOwnerState === "retry") {
 					const { cfg, settings, settingsAvailable } = resolveSettings(options.settings);
 					if (!settingsAvailable || !settings) return "failed";
-					// Settle-or-pending: never await ownership on this path. A pending
-					// ensure leaves the state retryable and adapters withheld; its
-					// settle callback applies the outcome and re-reconciles.
-					const settled = peekDaemonOwnership(cfg);
-					const isolated = runtime.endpointScope === "chat";
-					runtime.notificationOwnerKey = daemonOwnershipKey(cfg);
-					if (settled === undefined) {
-						kickDaemonOwnership(settings, cfg, (outcome, key) =>
-							applyDaemonOwnership(binding.sessionId, runtime, outcome, isolated, key),
+					try {
+						const ownership = await ensureConfiguredDaemonOwners(
+							settings,
+							cfg,
+							binding.cwd,
+							binding.sessionId,
+							token => {
+								retainNotificationRootRegistration(runtime, settings, binding.cwd, binding.sessionId, token);
+							},
 						);
-					} else {
-						applyDaemonOwnership(binding.sessionId, runtime, settled, isolated, runtime.notificationOwnerKey);
+						runtime.notificationOwnerState =
+							ownership === "ready" ||
+							(ownership === "blocked_identity_with_sibling" && runtime.endpointScope === "chat")
+								? "ready"
+								: "blocked";
+					} catch {
+						return "failed";
 					}
 				}
 				return "started";
@@ -7658,11 +5964,8 @@ export function createNotificationsExtension(
 			runtime.redact = policy.redact;
 			runtime.verbosity = policy.verbosity;
 			runtime.stream = policy.stream;
-			if (redactionEnabled) {
-				runtime.pendingFinal = undefined;
-				runtime.pendingSettled = undefined;
-				terminalizeInFlightTools(runtime, runtime.id, "cancelled", true);
-			} else if (wasPolicySuspended && !policy.redact) settleProvisionalToolTerminals(runtime, runtime.id);
+			if (redactionEnabled) terminalizeInFlightTools(runtime, runtime.id, "cancelled", true);
+			else if (wasPolicySuspended && !policy.redact) settleProvisionalToolTerminals(runtime, runtime.id);
 		},
 		activate: binding => {
 			const runtime = runtimes.get(binding.sessionId);
@@ -7675,89 +5978,35 @@ export function createNotificationsExtension(
 			runtime.gatePresentations?.setPublicationSuspended(false);
 			runtime.gatePresentations?.activateDeferred(runtime.workflowGatePublicationEpoch);
 			flushPendingFinal(runtime, runtime.id);
-			flushPendingSettled(runtime, runtime.id);
 			for (const processControl of runtime.deferredInboundControls.splice(0)) processControl();
 		},
-		reproveOwnership: async binding => {
-			// PROVIDER-NEUTRAL ownership re-proof. Reconciliation calls this for any
-			// effective chat provider, not just Telegram: a Discord-only or
-			// Slack-only credential/destination/actor change must withhold adapters
-			// exactly like a Telegram one, or the old identity keeps delivery and
-			// (for Slack) inbound command authority through a stale outcome.
-			//
-			// Never awaits the ensure itself — only the adapter teardown, which is
-			// local. Lifecycle paths must not block on daemon ownership.
-			const { settings, settingsAvailable, cfg } = resolveSettings(options.settings);
-			if (!settingsAvailable || !settings) return;
-			const key = daemonOwnershipKey(cfg);
-			const sessionIdForOwnership = binding.sessionId;
-			// The binding is released when reconciliation returns, so capture the
-			// context eagerly: the settle callback runs strictly later.
-			const ownershipCtx = binding.context;
-			const runtime = runtimes.get(sessionIdForOwnership);
-			if (!runtime || runtime.notificationOwnerKey === key) return;
-			// The ownership-relevant configuration changed under a runtime whose
-			// LOCAL adapters were authorized for the OLD configuration. Withhold
-			// them first (`stop` with reason "notifications" tears down adapters
-			// and answer sources while leaving the core SDK host untouched), then
-			// re-prove.
-			//
-			// SCOPE: this does NOT revoke an already-attached external Discord or
-			// Slack daemon's SessionRouter attachment. Such a daemon can still
-			// observe host events and reach the host's inbound/control paths until
-			// it notices the change itself. Closing that requires one coherent
-			// authenticated chat-attachment authority boundary at the Router layer
-			// (provenance per connection, revocation on re-proof and on
-			// last-provider disable, covering replies and raw v3 frames uniformly).
-			// That is tracked as a follow-up; per-callback heuristics here were
-			// tried and reverted because they were bypassable and, on a blocked
-			// identity, silently refused legitimate Telegram inbound forever.
-			runtime.notificationOwnerKey = key;
-			runtime.notificationOwnerState = "retry";
-			if (runtime.notificationsActive) await stopSession(sessionIdForOwnership, "notifications");
-			kickDaemonOwnership(settings, cfg, (outcome, outcomeKey) => {
-				const current = runtimes.get(sessionIdForOwnership);
-				if (!current) return;
-				applyDaemonOwnership(sessionIdForOwnership, current, outcome, current.endpointScope === "chat", outcomeKey);
-				if (current.stopping || extensionShuttingDown) return;
-				// One detached reconciliation so adapters activate once the new
-				// configuration is proved. No lifecycle path awaits this.
-				void controller
-					.reconcileCurrentSession(ownershipCtx)
-					.catch(error => logger.warn(`notifications: post-ownership reconciliation failed: ${String(error)}`));
-			});
-		},
 		ensureTelegramDaemon: async binding => {
-			const { settings, settingsAvailable, cfg } = resolveSettings(options.settings);
+			if (!telegramTopicsEnabled) return "blocked_identity";
+			const { settings, settingsAvailable } = resolveSettings(options.settings);
 			if (!settingsAvailable || !settings) return "blocked_identity";
-			// Reconciliation runs on awaited session-lifecycle paths (session_start,
-			// switch, branch, fork, resume), so this preflight must NEVER await a
-			// daemon ensure. A pending ensure answers "pending": reconciliation
-			// proceeds without activating adapters, and the settle callback
-			// re-reconciles once ownership is known.
-			const sessionIdForOwnership = binding.sessionId;
-			const ownershipCtx = binding.context;
-			const settled = peekDaemonOwnership(cfg);
-			if (settled === undefined) {
-				kickDaemonOwnership(settings, cfg, (outcome, outcomeKey) => {
-					const current = runtimes.get(sessionIdForOwnership);
-					if (!current) return;
-					applyDaemonOwnership(
-						sessionIdForOwnership,
-						current,
-						outcome,
-						current.endpointScope === "chat",
-						outcomeKey,
-					);
-					if (current.stopping || extensionShuttingDown) return;
-					void controller
-						.reconcileCurrentSession(ownershipCtx)
-						.catch(error => logger.warn(`notifications: post-ownership reconciliation failed: ${String(error)}`));
+			try {
+				let registrationToken: string | undefined;
+				const result = await ensureTelegramOwner(settings, binding.cwd, binding.sessionId, token => {
+					registrationToken = token;
 				});
-				return "pending";
+				const runtime = runtimes.get(binding.sessionId);
+				const configured = isProviderEffectivelyEnabled(resolveSettings(options.settings).cfg, "telegram");
+				if (result === "ready" && runtime && !runtime.stopping && configured && registrationToken !== undefined) {
+					runtime.notificationRootRegistration = { settings, cwd: binding.cwd, registrationToken };
+				} else if (registrationToken !== undefined) {
+					await unregisterNotificationRoot({
+						settings,
+						cwd: binding.cwd,
+						sessionId: binding.sessionId,
+						registrationToken,
+					});
+				}
+				if (runtime?.notificationOwnerState === "blocked")
+					runtime.notificationOwnerState = result === "ready" ? "ready" : "blocked";
+				return result;
+			} catch {
+				return "failed";
 			}
-			if (settled === "failed") return "failed";
-			return settled === "ready" ? "ready" : "blocked_identity";
 		},
 	};
 	controller.attachRuntime(sessionRuntime);
@@ -7908,7 +6157,6 @@ export function createNotificationsExtension(
 		if (!predecessor || cleanupRetries.has(id))
 			throw new Error(`notifications: predecessor runtime ${id} is not safely send-capable.`);
 		predecessor.inboundFenced = true;
-		predecessor.stopSessionNameObserver();
 		// Release broker/host authority while leaving the native server alive for
 		// the one accepted terminal response. stopAndWait is deferred to stopSession.
 		const stopped = await predecessor.host.stop();
@@ -8052,96 +6300,27 @@ export function createNotificationsExtension(
 		rt.lastLiveText = undefined;
 	};
 
-	/**
-	 * Session messages historically omitted attribution for direct user prompts;
-	 * that wire shape remains user-originated. Explicit agent attribution always
-	 * wins, including on a role:"user" internal resource notification.
-	 */
-	const isUserSettlementBoundary = (message: { role?: unknown; attribution?: unknown }): boolean =>
-		message.attribution === "user" || (message.role === "user" && message.attribution === undefined);
-	const isFrameworkPromptContext = (message: { role?: unknown; customType?: unknown }): boolean =>
-		message.role === "custom" && message.customType === "volatile-project-context";
-
-	type SettlementOrigin = "user" | "autonomous" | "continuation";
-
-	const deferLeanReceipt = (
-		rt: SessionRuntime,
-		text: string,
-		messageRef?: string,
-		window: number = rt.currentTurnSettlementWindow ?? rt.settlementWindow,
-		origin: SettlementOrigin = rt.currentTurnSettlementOrigin ?? "continuation",
-	): void => {
-		if (window !== rt.settlementWindow) return;
-		const receipt = { text, ...(messageRef ? { messageRef } : {}), origin };
-		const pending = rt.pendingSettled;
-		if (!pending || pending.window !== window) {
-			rt.pendingSettled = { window, receipts: [receipt] };
-			return;
-		}
-		if (origin === "autonomous") {
-			const prior = pending.receipts[pending.receipts.length - 1];
-			if (prior?.text === text) return;
-			// Keep the user-request receipt plus the newest autonomous outcome.
-			pending.receipts = [pending.receipts[0]!, receipt];
-			return;
-		}
-		if (origin === "continuation" && pending.receipts[0]?.origin === "user") {
-			pending.receipts = [pending.receipts[0]!, receipt];
-			return;
-		}
-		pending.receipts = [receipt];
-	};
-
-	const deferProvisionalReceipt = (rt: SessionRuntime, text: string | undefined, messageRef?: string): void => {
-		if (!text) return;
-		const window = rt.currentTurnSettlementWindow ?? rt.settlementWindow;
-		if (window !== rt.settlementWindow) return;
-		const origin = rt.currentTurnSettlementOrigin ?? "continuation";
-		const receipt = { text, ...(messageRef ? { messageRef } : {}), origin };
-		const pending = rt.pendingFinal;
-		if (!pending || pending.window !== window) {
-			rt.pendingFinal = { window, receipts: [receipt] };
-			return;
-		}
-		if (origin === "autonomous") {
-			if (pending.receipts[pending.receipts.length - 1]?.text === text) return;
-			pending.receipts = [pending.receipts[0]!, receipt];
-			return;
-		}
-		if (origin === "continuation" && pending.receipts[0]?.origin === "user") {
-			pending.receipts = [pending.receipts[0]!, receipt];
-			return;
-		}
-		pending.receipts = [receipt];
-	};
-
-	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => rt.pendingSettled?.receipts[0]?.origin === "user";
-
 	const flushPendingFinal = (rt: SessionRuntime, id: string): void => {
 		const pending = rt.pendingFinal;
 		if (!pending) return;
 		rt.pendingFinal = undefined;
-		if (pending.window !== rt.settlementWindow) return;
-		if (pending.receipts.length && rt.notificationsActive && !rt.redact) {
+		if (pending.text && rt.notificationsActive && !rt.redact) {
 			// Under lean, hold intermediate finals until agent_end when the agent is still
 			// running so provisional-policy activation cannot reintroduce per-turn spam.
-			// A receipt retained from an idle reached during provisional policy has the
-			// same settlement window. Merge it before either path publishes so stable
-			// activation emits one composed terminal receipt, not two messages.
-			if (rt.verbosity === "lean" && (rt.busy || rt.pendingSettled?.window === pending.window)) {
-				for (const receipt of pending.receipts)
-					deferLeanReceipt(rt, receipt.text, receipt.messageRef, pending.window, receipt.origin);
+			if (rt.verbosity === "lean" && rt.busy) {
+				rt.pendingSettled = {
+					text: pending.text,
+					...(pending.messageRef ? { messageRef: pending.messageRef } : {}),
+				};
 			} else {
-				const text = pending.receipts.map(receipt => receipt.text).join("\n\n");
-				const messageRef = pending.receipts.length === 1 ? pending.receipts[0]?.messageRef : undefined;
 				try {
 					pushSessionFrame(rt, {
 						type: "turn_stream",
 						sessionId: id,
 						phase: "finalized",
 						finalAnswer: true,
-						text,
-						...(messageRef ? { messageRef } : {}),
+						text: pending.text,
+						...(pending.messageRef ? { messageRef: pending.messageRef } : {}),
 					});
 				} catch (error) {
 					logger.warn(`notifications: pushFrame (pending turn) failed: ${String(error)}`);
@@ -8154,53 +6333,38 @@ export function createNotificationsExtension(
 	/** Emit the deferred lean settled answer exactly once (agent_end / idle). */
 	const flushPendingSettled = (rt: SessionRuntime, id: string): void => {
 		const settled = rt.pendingSettled;
-		if (!settled?.receipts.length || !rt.notificationsActive || rt.redact || rt.policySuspended) return;
 		rt.pendingSettled = undefined;
-		const text = settled.receipts.map(receipt => receipt.text).join("\n\n");
-		// A composition represents multiple finalized turns. It must be a fresh
-		// terminal message rather than editing either constituent turn's stream.
-		const messageRef = settled.receipts.length === 1 ? settled.receipts[0]?.messageRef : undefined;
+		if (!settled?.text || !rt.notificationsActive || rt.redact || rt.policySuspended) return;
 		const previousLiveRef = rt.liveRef;
-		if (messageRef) rt.liveRef = messageRef;
+		if (settled.messageRef) rt.liveRef = settled.messageRef;
 		try {
-			flushTurnText(rt, id, text, true);
+			flushTurnText(rt, id, settled.text, true);
 		} finally {
-			if (!messageRef) rt.liveRef = previousLiveRef;
+			if (!settled.messageRef) rt.liveRef = previousLiveRef;
 		}
 	};
 
 	// Drive the live typing indicator: mark busy when the agent loop starts so
 	// the daemon shows "typing…" in the thread while the agent is thinking,
 	// before any turn output exists. Cleared on `agent_end` below.
-	api.on("agent_start", async (event, ctx) => {
+	api.on("agent_start", (_event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		// Streaming state is SDK-visible session truth (context.get isStreaming);
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
-		// The first prompt message arrives after turn_start. A pre-existing deferred
-		// receipt means a message-less run is autonomous until a direct user prompt
-		// authoritatively overrides it; otherwise start unbound.
-		if (!rt.currentTurnSettlementOrigin && rt.pendingSettled) {
-			rt.currentTurnSettlementOrigin = "autonomous";
-			rt.currentTurnSettlementWindow = rt.settlementWindow;
-		} else if (!rt.currentTurnSettlementOrigin) rt.currentTurnSettlementWindow = undefined;
 		// A continuation re-enters the agent loop inside the same prompt and emits
-		// another `agent_start`. Only a queued follow-up's exact SDK token may
-		// claim its correlation; unrelated queue work must not consume it.
-		const sdkRunToken = event.sdkRunToken;
-		const correlation =
-			rt.activePromptCorrelation ??
-			(sdkRunToken
-				? rt.pendingPromptCorrelationsBySdkRunToken.get(sdkRunToken)
-				: rt.pendingPromptCorrelations.shift());
-		if (sdkRunToken && correlation) rt.pendingPromptCorrelationsBySdkRunToken.delete(sdkRunToken);
+		// another `agent_start`. Shifting again would pop nothing and clobber the
+		// live correlation with `undefined`, so the prompt's `agent_end` could no
+		// longer be terminalized and the caller would hang until the deadline.
+		// Only claim the next pending correlation when this session has no active one.
+		const correlation = rt.activePromptCorrelation ?? rt.pendingPromptCorrelations.shift();
 		const continuation = rt.activePromptCorrelation !== undefined;
 		rt.activePromptCorrelation = correlation;
 		if (correlation && !continuation) rt.bindPromptExecutionHandle(correlation, ctx.getActivePromptHandle());
 		if (continuation) return;
-		await rt.notePromptReconciliation(correlation, { type: "agent_start" });
+		rt.notePromptReconciliation(correlation, { type: "agent_start" });
 		rt.emitPromptLifecycle(correlation, { type: "agent_start", sessionId: id, ...correlation });
 		try {
 			// `activity` is the native live-host lifecycle surface. The separately
@@ -8219,9 +6383,6 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.turnSeq = (rt.turnSeq ?? 0) + 1;
-		// Agent-loop prompts arrive after turn_start. Retain already-bound logical
-		// provenance across tool/message-less continuation turns; a user prompt can
-		// still authoritatively override framework-injected context below.
 		if (!rt.notificationsActive) return;
 		// A new turn is live: re-open the live-stream window (see turnClosed).
 		rt.turnClosed = false;
@@ -8240,7 +6401,7 @@ export function createNotificationsExtension(
 	// per `turn_end`. turn_end fires once per turn iteration, so a single
 	// user-visible idle previously produced many idle pings (the flood); agent_end
 	// fires exactly once per settle, yielding exactly one idle notification.
-	api.on("agent_end", async (event, ctx) => {
+	api.on("agent_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		if (!rt) return;
@@ -8298,7 +6459,7 @@ export function createNotificationsExtension(
 			// contract (see `sanitizePromptFailure`). Assistant failure messages may
 			// still remain in the local session transcript; terminalization copies only
 			// a bounded reason into the local operator log.
-			await rt.terminalizePrompt(correlation, outcome, {
+			void rt.terminalizePrompt(correlation, outcome, {
 				...(finalText ? { finalText } : {}),
 				...(outcome.kind === "failed"
 					? {
@@ -8343,7 +6504,7 @@ export function createNotificationsExtension(
 			pushSessionFrame(rt, {
 				type: "identity_header",
 				sessionId: id,
-				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled),
 			});
 		} catch {}
 		try {
@@ -8368,10 +6529,6 @@ export function createNotificationsExtension(
 		// Intermediate tool-turn narration was held on turn_end; ask lead-ins were
 		// already flushed immediately and deduped via preAskFlushedText.
 		flushPendingSettled(rt, id);
-		// A terminal idle closes the logical settlement run. The next agent_start
-		// must establish provenance from its own prompt messages.
-		rt.currentTurnSettlementOrigin = undefined;
-		rt.currentTurnSettlementWindow = undefined;
 
 		// On idle, stream a context update with metadata (token/model usage +
 		// working-tree diff) unless redaction is on. Under verbose the agent's last
@@ -8417,8 +6574,7 @@ export function createNotificationsExtension(
 		rt.preAskFlushedText = text;
 		// Ask lead-ins supersede any deferred lean settled answer from earlier turns
 		// so agent_end does not re-emit stale intermediate narration (#2863 review).
-		if (!finalAnswer && rt.currentTurnSettlementOrigin !== "autonomous" && !hasUserSettlementReceipt(rt))
-			rt.pendingSettled = undefined;
+		if (!finalAnswer) rt.pendingSettled = undefined;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
 		// async-queued and none landed before this flush, reuse the per-turn ref
@@ -8453,8 +6609,6 @@ export function createNotificationsExtension(
 		rt?.emitPromptEvent(event);
 		if (event.toolName === "ask") {
 			if (!rt?.notificationsActive || rt.redact) return;
-			if (rt.currentTurnSettlementWindow !== undefined && rt.currentTurnSettlementWindow !== rt.settlementWindow)
-				return;
 			flushTurnText(rt, id, rt.currentTurnText, false);
 		}
 		if (!rt?.notificationsActive || rt.redact) return;
@@ -8567,7 +6721,7 @@ export function createNotificationsExtension(
 	api.on("turn_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (!rt || (!rt.notificationsActive && !rt.policySuspended)) return;
+		if (!rt?.notificationsActive) return;
 		const text = rt.policySuspended
 			? rt.committedRedact
 				? undefined
@@ -8576,27 +6730,25 @@ export function createNotificationsExtension(
 				? undefined
 				: summaryFromMessage(event.message, turnTextMax());
 		if (rt.policySuspended) {
-			deferProvisionalReceipt(rt, text, rt.liveRef);
+			rt.pendingFinal = { text, messageRef: rt.liveRef };
 			rt.turnClosed = true;
 			return;
 		}
 		if (text) {
-			if (rt.currentTurnSettlementWindow !== undefined && rt.currentTurnSettlementWindow !== rt.settlementWindow) {
-				resetTurnStreamState(rt);
-				return;
-			}
 			if (rt.verbosity === "verbose") {
 				// Verbose: one finalized turn_stream per turn with assistant text.
 				flushTurnText(rt, id, text, true);
 			} else if (text !== rt.preAskFlushedText) {
 				// Lean: hold the latest answer until agent_end. Skip when this turn
 				// already flushed the same text as an ask lead-in (no duplicate at idle).
-				deferLeanReceipt(rt, text, rt.liveRef);
+				rt.pendingSettled = {
+					text,
+					...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
+				};
 			} else {
 				// Lead-in already flushed: drop any older deferred settled text so idle
 				// does not re-emit intermediate narration after the ask prompt (#2863).
-				if (rt.currentTurnSettlementOrigin === "user" || !hasUserSettlementReceipt(rt))
-					rt.pendingSettled = undefined;
+				rt.pendingSettled = undefined;
 			}
 		}
 		resetTurnStreamState(rt);
@@ -8636,33 +6788,6 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
-		if (rt) {
-			const message = event.message as { role?: unknown; attribution?: unknown; customType?: unknown };
-			if (isUserSettlementBoundary(message)) {
-				const openingTurn = rt.currentTurnSettlementOrigin !== "user";
-				const supersedingSettledTurn =
-					rt.currentTurnSettlementOrigin === "user" &&
-					(rt.pendingSettled !== undefined || rt.pendingFinal !== undefined);
-				// A provider batch can carry several user messages after one turn_start.
-				// They share that turn's boundary. A later user submission after the old
-				// turn has produced a receipt opens a new window but must not relabel the
-				// already-running turn as its response.
-				if (openingTurn || supersedingSettledTurn) rt.settlementWindow++;
-				if (openingTurn || supersedingSettledTurn) {
-					rt.currentTurnSettlementWindow = rt.settlementWindow;
-					rt.currentTurnSettlementOrigin = "user";
-				}
-				rt.pendingSettled = undefined;
-				rt.pendingFinal = undefined;
-			} else if (message.role !== "assistant") {
-				// The assembled direct prompt can contain framework context after its
-				// user message. A user boundary is authoritative for this turn.
-				if (rt.currentTurnSettlementOrigin !== "user" || !isFrameworkPromptContext(message)) {
-					rt.currentTurnSettlementWindow = rt.settlementWindow;
-					rt.currentTurnSettlementOrigin = "autonomous";
-				}
-			}
-		}
 		if (!rt?.notificationsActive || rt.redact) return;
 		// Capture the in-flight ASSISTANT text here (message_end is on the awaited
 		// extension path and ordered before tool_execution_start) so the pre-ask

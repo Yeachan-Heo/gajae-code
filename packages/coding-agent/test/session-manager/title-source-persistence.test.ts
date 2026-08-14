@@ -322,22 +322,13 @@ describe("session title source persistence", () => {
 					? { ok: false, code: "header_patch_write_failed" }
 					: "passthrough",
 			);
-			let failure: Error | undefined;
 			try {
-				await session.moveTo(destinationCwd);
-			} catch (error) {
-				failure = error as Error;
+				await expect(session.moveTo(destinationCwd)).rejects.toThrow("header_patch_write_failed");
+				injection.assertHit();
+				expect(injection.hits()).toBe(1);
 			} finally {
 				injection.restore();
 			}
-			expect(failure).toBeInstanceOf(Error);
-			if (!failure) throw new Error("Expected moveTo to reject");
-			expect(["header_patch_write_failed", "managed_append_committed_outcome_uncertain"]).toContain(failure.message);
-			if (failure.message === "managed_append_committed_outcome_uncertain")
-				expect((failure as Error & { cause?: unknown }).cause).toMatchObject({
-					message: "header_patch_write_failed",
-				});
-			injection.assertHit();
 			expect(session.getCwd()).toBe(cwd);
 			expect(session.getSessionFile()).toBe(originalFile);
 			expect(fs.readFileSync(originalFile!)).toEqual(originalBytes);

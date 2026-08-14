@@ -1,6 +1,22 @@
-/** Telegram transport and presentation helpers shared by the managed provider adapter. */
+/**
+ * Telegram **reference** client for the Gajae-Code SDK.
+ *
+ * This is an example/template, NOT an upstream-owned integration: it implements
+ * the documented WS protocol (see `docs/sdk.md`) so you can copy it
+ * to build Discord/Slack/etc. clients with zero upstream changes. The Bot API
+ * transport shape is salvaged from the removed `telegram-remote` package.
+ *
+ * Flow: read the endpoint discovery file -> connect to the session WS -> render
+ * `action_needed` to a Telegram chat (inline keyboard for options) -> map button
+ * taps / text replies to `reply` frames -> reflect `action_resolved` /
+ * `reply_rejected`.
+ *
+ * Dependency-free: uses global `fetch` and `WebSocket` (Bun/Node 22+).
+ */
 
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import { logger } from "@gajae-code/utils";
 import {
 	bold,
 	buildCompactChoiceGrid,
@@ -10,6 +26,53 @@ import {
 	splitTelegramHtml,
 	TELEGRAM_PARSE_MODE,
 } from "./html-format";
+import { renderThreadedFrame } from "./threaded-render";
+
+/** `ask_controls_v1` is a protocol version 3 wire token. Keep this local because
+ * `telegram-daemon.ts` imports this reference client. */
+const REFERENCE_CLIENT_HELLO = {
+	type: "hello",
+	protocolVersion: 3,
+	capabilities: ["ask_controls_v1"],
+} as const;
+
+const MAX_DIAGNOSTIC_CAPABILITIES = 4;
+const MAX_DIAGNOSTIC_CAPABILITY_CODE_POINTS = 64;
+const MAX_DIAGNOSTIC_ERROR_NAME_CODE_POINTS = 64;
+const MAX_DIAGNOSTIC_ERROR_MESSAGE_CODE_POINTS = 128;
+
+function boundedDiagnosticText(value: string, maxCodePoints: number): string {
+	let result = "";
+	let codePoints = 0;
+	for (const character of value) {
+		const codePoint = character.codePointAt(0)!;
+		if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) continue;
+		result += character;
+		codePoints++;
+		if (codePoints === maxCodePoints) break;
+	}
+	return result;
+}
+
+function boundedDiagnosticCallbackError(error: unknown): Readonly<{ errorName: string; errorMessage: string }> {
+	let errorName = "UnknownError";
+	let errorMessage = "Diagnostic callback threw";
+	try {
+		if (error instanceof Error) {
+			errorName = boundedDiagnosticText(error.name, MAX_DIAGNOSTIC_ERROR_NAME_CODE_POINTS) || "Error";
+			errorMessage =
+				boundedDiagnosticText(error.message, MAX_DIAGNOSTIC_ERROR_MESSAGE_CODE_POINTS) ||
+				"Diagnostic callback threw";
+		} else {
+			errorMessage =
+				boundedDiagnosticText(String(error), MAX_DIAGNOSTIC_ERROR_MESSAGE_CODE_POINTS) ||
+				"Diagnostic callback threw";
+		}
+	} catch {
+		// Hostile thrown values must not escape the diagnostic failure boundary.
+	}
+	return Object.freeze({ errorName, errorMessage });
+}
 
 /** One inline-keyboard button. */
 export interface InlineButton {
@@ -362,4 +425,166 @@ export function routeInboundUpdate(update: unknown, ctx: RouteInboundContext): R
 		return { kind: "reply", ...routeWithAnswer(route, text) };
 	}
 	return { kind: "ignore" };
+}
+
+/** Read `{url, token, pid?, stale?}` from an endpoint discovery file. */
+export function readEndpoint(path: string): { url: string; token: string; pid?: number; stale?: boolean } {
+	const raw = JSON.parse(fs.readFileSync(path, "utf8")) as {
+		url?: unknown;
+		token?: unknown;
+		pid?: unknown;
+		stale?: unknown;
+	};
+	if (typeof raw.url !== "string" || typeof raw.token !== "string") {
+		throw new Error(`invalid endpoint file: ${path}`);
+	}
+	return {
+		url: raw.url,
+		token: raw.token,
+		pid: typeof raw.pid === "number" ? raw.pid : undefined,
+		stale: raw.stale === true,
+	};
+}
+
+/** A bounded, diagnostic-only notification mirrored to reference-client embedders. */
+export type TelegramReferenceDiagnostic = Readonly<{
+	code: "action_unavailable";
+	requiredCapabilities: readonly string[];
+}>;
+
+/** Options for {@link runTelegramReferenceClient}. */
+export interface TelegramReferenceOptions {
+	botToken: string;
+	chatId: string;
+	endpointFile: string;
+	apiBase?: string;
+	fetchImpl?: typeof fetch;
+	sound?: TelegramNotificationSound;
+	/**
+	 * Additive mirror of bounded logger diagnostics. It never receives tokens,
+	 * identifiers, raw frames, Telegram content, or WebSocket replies.
+	 */
+	onDiagnostic?: (diagnostic: TelegramReferenceDiagnostic) => void;
+}
+
+/**
+ * Run the reference bridge until the WebSocket closes. Sends `action_needed` to
+ * the chat and forwards taps/text as replies. This is a minimal example loop;
+ * production clients add reconnection, multi-chat routing, and persistence.
+ */
+export async function runTelegramReferenceClient(opts: TelegramReferenceOptions): Promise<void> {
+	const fetchImpl = opts.fetchImpl ?? fetch;
+	const apiBase = opts.apiBase ?? "https://api.telegram.org";
+	const api = `${apiBase}/bot${opts.botToken}`;
+	const { url, token } = readEndpoint(opts.endpointFile);
+
+	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
+	let latestPendingAskId: string | undefined;
+
+	const send: TelegramSend = (method, body) =>
+		fetchImpl(`${api}/${method}`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+
+	const handleServerMessage = async (data: string): Promise<void> => {
+		const msg = JSON.parse(data) as {
+			type: string;
+			kind?: "ask" | "idle";
+			id?: string;
+			question?: string;
+			options?: string[];
+			recommendedIndex?: unknown;
+			controls?: TelegramActionControl[];
+			summary?: string;
+			reason?: string;
+			requiredCapabilities?: unknown;
+		};
+		if (msg.type === "action_needed" && msg.id) {
+			if (msg.kind === "ask") latestPendingAskId = msg.id;
+			const rendered = buildActionMessage({
+				kind: msg.kind ?? "ask",
+				id: msg.id,
+				question: msg.question,
+				options: msg.options,
+				recommendedIndex: msg.recommendedIndex,
+				controls: msg.controls,
+				summary: msg.summary,
+			});
+			await sendTelegramHtmlChunks(
+				send,
+				opts.chatId,
+				rendered.text,
+				rendered.inline_keyboard,
+				opts.sound,
+				msg.kind ?? "ask",
+			);
+		} else if (msg.type === "action_unavailable") {
+			const requiredCapabilities = Object.freeze(
+				Array.isArray(msg.requiredCapabilities)
+					? msg.requiredCapabilities
+							.filter((capability): capability is string => typeof capability === "string")
+							.slice(0, MAX_DIAGNOSTIC_CAPABILITIES)
+							.map(capability => boundedDiagnosticText(capability, MAX_DIAGNOSTIC_CAPABILITY_CODE_POINTS))
+					: [],
+			);
+			const diagnostic: TelegramReferenceDiagnostic = Object.freeze({
+				code: "action_unavailable",
+				requiredCapabilities,
+			});
+			logger.warn("Telegram reference client action unavailable", diagnostic);
+			try {
+				opts.onDiagnostic?.(diagnostic);
+			} catch (error) {
+				logger.warn("Telegram reference client diagnostic callback failed", {
+					code: "diagnostic_callback_failed",
+					...boundedDiagnosticCallbackError(error),
+				});
+			}
+			// Diagnostic only: never turn it into a Telegram prompt or option buttons.
+			return;
+		} else if (msg.type === "action_resolved" && msg.id === latestPendingAskId) {
+			latestPendingAskId = undefined;
+		} else {
+			// Threaded frames (identity/context/turn/config): render as plain messages
+			// in this flat example client. The bundled daemon renders them into the
+			// session's forum topic; this reference shows the minimal handling.
+			const threaded = renderThreadedFrame(msg as never);
+			if (threaded?.text) {
+				await sendTelegramHtmlChunks(send, opts.chatId, threaded.text, undefined, opts.sound, threaded.lane);
+			}
+		}
+	};
+
+	let messageQueue = Promise.resolve();
+	ws.addEventListener("open", () => {
+		if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(REFERENCE_CLIENT_HELLO));
+	});
+	ws.addEventListener("message", ev => {
+		const data = String(ev.data);
+		messageQueue = messageQueue.catch(() => undefined).then(() => handleServerMessage(data));
+		void messageQueue.catch(() => undefined);
+	});
+
+	// Telegram long-poll loop.
+	let offset = 0;
+	let running = true;
+	ws.addEventListener("close", () => {
+		running = false;
+	});
+
+	while (running) {
+		const res = await send("getUpdates", { offset, timeout: 25, allowed_updates: ["message", "callback_query"] });
+		const body = (await res.json()) as { result?: Array<{ update_id: number } & Record<string, unknown>> };
+		for (const update of body.result ?? []) {
+			offset = update.update_id + 1;
+			const callbackId = (update as { callback_query?: { id?: unknown } }).callback_query?.id;
+			if (typeof callbackId === "string") {
+				void send("answerCallbackQuery", { callback_query_id: callbackId });
+			}
+			const reply = telegramUpdateToReply(update, token, latestPendingAskId);
+			if (reply && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(reply));
+		}
+	}
 }

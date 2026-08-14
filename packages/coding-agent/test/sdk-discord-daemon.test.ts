@@ -15,7 +15,8 @@ import {
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type { DiscordConversation } from "../src/sdk/bus/discord-conversation";
 import {
-	DiscordAttachmentBindingError,
+	type DiscordEndpointBinding,
+	DiscordEndpointBindingError,
 	type DiscordLeaseRecoveryScheduler,
 	DiscordNotificationDaemon,
 	type DiscordNotificationDaemonOptions,
@@ -27,7 +28,6 @@ import type {
 	DiscordThread,
 } from "../src/sdk/bus/discord-provider";
 import { SdkClientError } from "../src/sdk/client/client";
-import type { SessionAttachment } from "../src/sdk/router";
 
 const actionCustomIds = new Map<string, string>();
 
@@ -164,7 +164,7 @@ class FakeDiscordProvider implements DiscordProvider {
 
 async function withDaemon(
 	run: (daemon: DiscordNotificationDaemon, provider: FakeDiscordProvider, agentDir: string) => Promise<void>,
-	overrides: Partial<Pick<DiscordNotificationDaemonOptions, "resolveAttachment" | "onCommand" | "now">> = {},
+	overrides: Partial<Pick<DiscordNotificationDaemonOptions, "resolveEndpoint" | "onCommand" | "now">> = {},
 ): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-daemon-"));
 	let daemon: DiscordNotificationDaemon | undefined;
@@ -174,11 +174,11 @@ async function withDaemon(
 
 		daemon = new DiscordNotificationDaemon({
 			agentDir,
+			repo: agentDir,
 			guildId: "guild",
 			parentChannelId: "parent",
 			provider,
-			resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
-				sessionId,
+			resolveEndpoint: async (_sessionId, expectedGeneration = 1) => ({
 				generation: expectedGeneration,
 				isCurrent: () => true,
 				send: () => {},
@@ -235,10 +235,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			};
 			const other = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
 			});
 			const first = daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "first" });
 			await entered.promise;
@@ -249,70 +250,17 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			expect(provider.creates).toBe(1);
 		});
 	});
-	test("fences a creating predecessor when a same-generation attachment is retired", async () => {
-		let authorityId = "predecessor";
-		let providerCreated = false;
-		let postCreateBindingChecks = 0;
-		const commitBindingEntered = Promise.withResolvers<void>();
-		const releaseCommitBinding = Promise.withResolvers<void>();
-		await withDaemon(
-			async (daemon, provider, agentDir) => {
-				const originalCreate = provider.createThread.bind(provider);
-				provider.createThread = async input => {
-					const thread = await originalCreate(input);
-					providerCreated = true;
-					return thread;
-				};
-				const predecessor = daemon.notify({
-					sessionId: "session",
-					endpointGeneration: 1,
-					attachmentAuthorityId: "predecessor",
-					content: "predecessor",
-				});
-				await commitBindingEntered.promise;
-				await daemon.retireAttachment("session", 1);
-				authorityId = "successor";
-				releaseCommitBinding.resolve();
-				await expect(predecessor).rejects.toThrow("create intent lost its fence before mapping commit");
 
-				const successor = await daemon.notify({
-					sessionId: "session",
-					endpointGeneration: 1,
-					attachmentAuthorityId: "successor",
-					content: "successor",
-				});
-				expect(successor.threadId).toBe("thread-2");
-				expect(provider.creates).toBe(2);
-				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
-				expect(await store.read("app:guild:parent:thread-1")).toBeUndefined();
-			},
-			{
-				resolveAttachment: async (sessionId, expectedGeneration = 1) => {
-					const resolvedAuthorityId = authorityId;
-					if (providerCreated && ++postCreateBindingChecks === 2) {
-						commitBindingEntered.resolve();
-						await releaseCommitBinding.promise;
-					}
-					return {
-						authorityId: resolvedAuthorityId,
-						sessionId,
-						generation: expectedGeneration,
-						isCurrent: () => true,
-						send: () => {},
-					};
-				},
-			},
-		);
-	});
 	test("restores a durable mapping after daemon restart without creating another thread", async () => {
 		await withDaemon(async (daemon, provider, agentDir) => {
 			const first = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 2, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 2, isCurrent: () => true, send: () => {} }),
 			});
 			const restored = await restarted.notify({
 				sessionId: "session",
@@ -326,43 +274,19 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 	});
 
 	test("archives then unarchives a resumable thread and replaces it when permission prevents unarchive", async () => {
-		await withDaemon(
-			async (daemon, provider) => {
-				const original = await daemon.notify({
-					sessionId: "session",
-					endpointGeneration: 1,
-					attachmentAuthorityId: "authority",
-					content: "open",
-				});
-				await daemon.archive("session");
-				const resumed = await daemon.resume("session", 2, "authority");
-				expect(resumed?.threadId).toBe(original.threadId);
-				expect(provider.unarchived).toEqual([original.threadId!]);
+		await withDaemon(async (daemon, provider) => {
+			const original = await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
+			await daemon.archive("session");
+			const resumed = await daemon.resume("session", 2);
+			expect(resumed?.threadId).toBe(original.threadId);
+			expect(provider.unarchived).toEqual([original.threadId!]);
 
-				await daemon.archive("session");
-				provider.failUnarchive = true;
-				const replacement = await daemon.resume("session", 3, "authority");
-				expect(replacement?.threadId).toBe("thread-2");
-				expect(replacement?.attachmentAuthorityId).toBe("authority");
-				const reused = await daemon.notify({
-					sessionId: "session",
-					endpointGeneration: 3,
-					attachmentAuthorityId: "authority",
-					content: "continued",
-				});
-				expect(reused.threadId).toBe(replacement?.threadId);
-				expect(provider.creates).toBe(2);
-			},
-			{
-				resolveAttachment: async (sessionId, expectedGeneration = 1) => ({
-					authorityId: "authority",
-					sessionId,
-					generation: expectedGeneration,
-					isCurrent: () => true,
-					send: () => {},
-				}),
-			},
-		);
+			await daemon.archive("session");
+			provider.failUnarchive = true;
+			const replacement = await daemon.resume("session", 3);
+			expect(replacement?.threadId).toBe("thread-2");
+			expect(provider.creates).toBe(2);
+		});
 	});
 
 	test("fails closed for stale, superseded, and unavailable inbound routes", async () => {
@@ -431,15 +355,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				]);
 				const restarted = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
-					resolveAttachment: async sessionId => ({
-						sessionId,
-						generation: 4,
-						isCurrent: () => true,
-						send: () => {},
-					}),
+					resolveEndpoint: async () => ({ generation: 4, isCurrent: () => true, send: () => {} }),
 				});
 				await restarted.resolveAction("session", "ask");
 				await restarted.handleInbound(inbound(conversation.threadId!, "resolved", 4));
@@ -449,7 +369,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 			},
 			{
-				resolveAttachment: async sessionId => ({ sessionId, generation: 4, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 4, isCurrent: () => true, send: () => {} }),
 			},
 		);
 	});
@@ -468,7 +388,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				expect(selected.threadId).not.toBe(original.threadId);
 			},
 			{
-				resolveAttachment: async sessionId => ({ sessionId, generation, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation, isCurrent: () => true, send: () => {} }),
 			},
 		);
 	});
@@ -563,12 +483,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				]);
 			},
 			{
-				resolveAttachment: async sessionId => ({
-					sessionId,
-					generation: 4,
-					isCurrent: () => true,
-					send: frame => client.send(frame),
-				}),
+				resolveEndpoint: async () => ({ generation: 4, isCurrent: () => true, send: frame => client.send(frame) }),
 			},
 		);
 	});
@@ -601,10 +516,9 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				]);
 			},
 			{
-				resolveAttachment: async sessionId => {
+				resolveEndpoint: async () => {
 					if (blockResolver) await resolverRelease.promise;
 					return {
-						sessionId,
 						generation: 1,
 						isCurrent: () => true,
 						send: frame => {
@@ -663,11 +577,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 
 					recovery = new DiscordNotificationDaemon({
 						agentDir,
+						repo: agentDir,
 						guildId: "guild",
 						parentChannelId: "parent",
 						provider,
-						resolveAttachment: async sessionId => ({
-							sessionId,
+						resolveEndpoint: async () => ({
 							generation: 1,
 							isCurrent: () => true,
 							send: frame => {
@@ -701,8 +615,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					recovery = undefined;
 				},
 				{
-					resolveAttachment: async sessionId => ({
-						sessionId,
+					resolveEndpoint: async () => ({
 						generation: 1,
 						isCurrent: () => true,
 						send: frame => {
@@ -787,16 +700,12 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				now = 60_001;
 				const restarted = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
 					now: () => now,
-					resolveAttachment: async sessionId => ({
-						sessionId,
-						generation: 1,
-						isCurrent: () => true,
-						send: () => {},
-					}),
+					resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
 				});
 				await restarted.start();
 				const stored = await fs.readFile(
@@ -881,16 +790,12 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				}));
 				const restarted = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
 					now: () => now,
-					resolveAttachment: async sessionId => ({
-						sessionId,
-						generation: 1,
-						isCurrent: () => true,
-						send: () => {},
-					}),
+					resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
 				});
 				await restarted.start();
 				const stored = await fs.readFile(
@@ -962,15 +867,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				}));
 				const restarted = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
-					resolveAttachment: async sessionId => ({
-						sessionId,
-						generation: 2,
-						isCurrent: () => true,
-						send: () => {},
-					}),
+					resolveEndpoint: async () => ({ generation: 2, isCurrent: () => true, send: () => {} }),
 				});
 				await restarted.start();
 				expect((await store.read(key))?.state).toBe(state);
@@ -1044,10 +945,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			}));
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 2, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 2, isCurrent: () => true, send: () => {} }),
 			});
 			await restarted.start();
 			expect(await store.read(`app:guild:parent:${stale.id}`)).toBeUndefined();
@@ -1088,10 +990,9 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					]);
 				},
 				{
-					resolveAttachment: async (sessionId): Promise<SessionAttachment | null> =>
+					resolveEndpoint: async (): Promise<DiscordEndpointBinding | null> =>
 						current
 							? {
-									sessionId,
 									generation: 7,
 									isCurrent: () => current,
 									send: frame => {
@@ -1101,7 +1002,6 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 							: unavailable === "removed"
 								? null
 								: {
-										sessionId,
 										generation: 8,
 										isCurrent: () => false,
 										send: frame => {
@@ -1131,11 +1031,12 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				).rejects.toThrow("callback failed");
 				const restarted = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
-					resolveAttachment: async sessionId =>
-						staleBinding ? null : { sessionId, generation: 1, isCurrent: () => true, send: () => {} },
+					resolveEndpoint: async () =>
+						staleBinding ? null : { generation: 1, isCurrent: () => true, send: () => {} },
 				});
 				await restarted.start();
 				const effects = await new ChatEffectJournal({ agentDir, transport: "discord" }).list();
@@ -1201,8 +1102,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 			},
 			{
-				resolveAttachment: async (sessionId): Promise<SessionAttachment | null> => ({
-					sessionId,
+				resolveEndpoint: async (): Promise<DiscordEndpointBinding | null> => ({
 					generation: 1,
 					isCurrent: () => current,
 					send: frame => {
@@ -1227,7 +1127,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						actionId: "stale",
 						options: ["No"],
 					}),
-				).rejects.toBeInstanceOf(DiscordAttachmentBindingError);
+				).rejects.toBeInstanceOf(DiscordEndpointBindingError);
 				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
 				const mapping = await store.read(`app:guild:parent:${initial.threadId}`);
 				expect(mapping).toMatchObject({ endpointGeneration: 1 });
@@ -1257,8 +1157,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				expect(raced?.state).toBe("leased");
 			},
 			{
-				resolveAttachment: async (sessionId): Promise<SessionAttachment> => ({
-					sessionId,
+				resolveEndpoint: async (): Promise<DiscordEndpointBinding> => ({
 					generation,
 					isCurrent: () => generation === 1,
 					send: () => {},
@@ -1321,7 +1220,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 	test("retries definite pre-send SDK and binding failures but preserves ambiguous sends", async () => {
 		const frames: Record<string, unknown>[] = [];
 		const failures: Error[] = [
-			new DiscordAttachmentBindingError(),
+			new DiscordEndpointBindingError(),
 			new SdkClientError("connection_closed", "SDK unavailable before send"),
 		];
 		let ambiguous = false;
@@ -1364,8 +1263,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				expect(frames).toHaveLength(2);
 			},
 			{
-				resolveAttachment: async (sessionId): Promise<SessionAttachment> => ({
-					sessionId,
+				resolveEndpoint: async (): Promise<DiscordEndpointBinding> => ({
 					generation: 1,
 					isCurrent: () => true,
 					send: frame => {
@@ -1386,8 +1284,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 		const release = Promise.withResolvers<void>();
 		await withDaemon(
 			async (_daemon, provider, agentDir) => {
-				const attachment = async (sessionId: string): Promise<SessionAttachment> => ({
-					sessionId,
+				const endpoint = async (): Promise<DiscordEndpointBinding> => ({
 					generation: 1,
 					isCurrent: () => true,
 					send: frame => {
@@ -1396,11 +1293,12 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 				const first = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
 					now: () => now,
-					resolveAttachment: attachment,
+					resolveEndpoint: endpoint,
 				});
 				const conversation = await first.notify({
 					sessionId: "session",
@@ -1418,11 +1316,12 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				now = 60_001;
 				const restarted = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
 					now: () => now,
-					resolveAttachment: attachment,
+					resolveEndpoint: endpoint,
 				});
 				await restarted.start();
 				expect(frames).toHaveLength(1);
@@ -1446,11 +1345,12 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				).rejects.toThrow("Discord interaction callback failed");
 				const afterPreSend = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
 					now: () => now,
-					resolveAttachment: attachment,
+					resolveEndpoint: endpoint,
 				});
 				await afterPreSend.start();
 				expect(frames).toHaveLength(1);
@@ -1465,9 +1365,8 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				expect(uncertain.pendingActionNonce).toBeDefined();
 				const uncertainCustomId = `gjc:1:ask-uncertain:${uncertain.pendingActionNonce!}`;
 				provider.deferInteraction = async () => {};
-				const originalSend = (await attachment("session")).send;
-				const throwingAttachment = async (sessionId: string): Promise<SessionAttachment> => ({
-					sessionId,
+				const originalSend = (await endpoint()).send;
+				const throwingEndpoint = async (): Promise<DiscordEndpointBinding> => ({
 					generation: 1,
 					isCurrent: () => true,
 					send: frame => {
@@ -1477,28 +1376,29 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 				const sender = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
 					now: () => now,
-					resolveAttachment: throwingAttachment,
+					resolveEndpoint: throwingEndpoint,
 				});
 				await sender.handleInbound(inbound(uncertain.threadId!, "uncertain-post-send", 1, uncertainCustomId));
 				expect(frames).toHaveLength(2);
 				const afterUncertain = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
 					now: () => now,
-					resolveAttachment: attachment,
+					resolveEndpoint: endpoint,
 				});
 				await afterUncertain.start();
 				expect(frames).toHaveLength(2);
 			},
 			{
-				resolveAttachment: async sessionId => ({
-					sessionId,
+				resolveEndpoint: async () => ({
 					generation: 1,
 					isCurrent: () => true,
 					send: frame => {
@@ -1528,7 +1428,7 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				});
 			},
 			{
-				resolveAttachment: async sessionId => ({ sessionId, generation, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation, isCurrent: () => true, send: () => {} }),
 				onCommand: async (_sessionId, content) => {
 					commands.push(content);
 					return true;
@@ -1628,12 +1528,12 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 						now = 60_001;
 						recovery = new DiscordNotificationDaemon({
 							agentDir,
+							repo: agentDir,
 							guildId: "guild",
 							parentChannelId: "parent",
 							provider,
 							now: () => now,
-							resolveAttachment: async sessionId => ({
-								sessionId,
+							resolveEndpoint: async () => ({
 								generation: 1,
 								isCurrent: () => true,
 								send: frame => {
@@ -1691,11 +1591,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 
 				const recovered = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
-					resolveAttachment: async sessionId => ({
-						sessionId,
+					resolveEndpoint: async () => ({
 						generation: 1,
 						isCurrent: () => true,
 						send: frame => {
@@ -1712,12 +1612,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				await recovered.stop();
 			},
 			{
-				resolveAttachment: async sessionId => ({
-					sessionId,
+				resolveEndpoint: async () => ({
 					generation: 1,
 					isCurrent: () => true,
 					send: () => {
-						throw new DiscordAttachmentBindingError();
+						throw new DiscordEndpointBindingError();
 					},
 				}),
 			},
@@ -1734,10 +1633,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			expect([...provider.messageNonces.keys()][0]).toMatch(/^gjc-[a-f0-9]{21}$/);
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
 			});
 			await restarted.start();
 			expect(provider.messages).toHaveLength(1);
@@ -1762,11 +1662,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			const publishedCustomId = actionCustomIds.get(threadId)!;
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({
-					sessionId,
+				resolveEndpoint: async () => ({
 					generation: 1,
 					isCurrent: () => true,
 					send: frame => {
@@ -1822,11 +1722,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({
-					sessionId,
+				resolveEndpoint: async () => ({
 					generation: 1,
 					isCurrent: () => true,
 					send: frame => {
@@ -1887,10 +1787,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			});
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
 				onCommand: async (_sessionId, command) => {
 					commands.push(command);
 					return true;
@@ -1932,10 +1833,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			};
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
 				onCommand: async (_sessionId, content) => {
 					commands.push(content);
 					return true;
@@ -1982,11 +1884,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			await daemon.resolveAction("session", "ask");
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({
-					sessionId,
+				resolveEndpoint: async () => ({
 					generation: 1,
 					isCurrent: () => true,
 					send: frame => {
@@ -2037,11 +1939,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			expect(actionCustomIds.get(conversation.threadId!)).not.toBe(oldCustomId);
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({
-					sessionId,
+				resolveEndpoint: async () => ({
 					generation: 1,
 					isCurrent: () => true,
 					send: frame => {
@@ -2095,26 +1997,9 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				expect(provider.unarchived).toEqual([]);
 			},
 			{
-				resolveAttachment: async sessionId => ({
-					sessionId,
-					generation,
-					isCurrent: () => generation === 1,
-					send: () => {},
-				}),
+				resolveEndpoint: async () => ({ generation, isCurrent: () => generation === 1, send: () => {} }),
 			},
 		);
-	});
-
-	test("rejects a delayed cleanup callback for a successor generation", async () => {
-		await withDaemon(async (daemon, provider) => {
-			await daemon.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
-			await daemon.resume("session", 2);
-			const messageCount = provider.messages.length;
-			const archiveCount = provider.archived.length;
-			await daemon.close("session", 1);
-			expect(provider.messages).toHaveLength(messageCount);
-			expect(provider.archived).toHaveLength(archiveCount);
-		});
 	});
 
 	test("terminalizes stale post, archive, and unarchive effects after close and generation-rotated resume", async () => {
@@ -2182,10 +2067,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			provider.startEvent = inbound(conversation.threadId!, "callback-health", 1);
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
 			});
 			await expect(restarted.start()).rejects.toThrow("Discord interaction callback failed");
 			const effectId = `discord:app:guild:parent:${conversation.threadId}:callback-health`;
@@ -2202,20 +2088,21 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			let failScheduledDrain = false;
 			let failedScheduledDrains = 0;
 			const provider = new FakeDiscordProvider();
-			const attachment = async (sessionId: string): Promise<SessionAttachment> => {
+			const endpoint = async (): Promise<DiscordEndpointBinding> => {
 				if (failScheduledDrain) {
 					failedScheduledDrains++;
-					throw new Error("transient attachment lookup failure");
+					throw new Error("transient endpoint lookup failure");
 				}
-				return { sessionId, generation: 1, isCurrent: () => true, send: () => {} };
+				return { generation: 1, isCurrent: () => true, send: () => {} };
 			};
 			const first = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
 				now: () => now,
-				resolveAttachment: attachment,
+				resolveEndpoint: endpoint,
 			});
 			const conversation = await first.notify({ sessionId: "session", endpointGeneration: 1, content: "open" });
 			const journal = new ChatEffectJournal({ agentDir, transport: "discord", now: () => now });
@@ -2245,12 +2132,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			const recoveryScheduler = new ManualLeaseRecoveryScheduler();
 			restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
 				now: () => now,
 				leaseRecoveryScheduler: recoveryScheduler,
-				resolveAttachment: attachment,
+				resolveEndpoint: endpoint,
 				onCommand: async (_sessionId, command) => {
 					commands.push(command);
 					return true;
@@ -2294,12 +2182,13 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			const stoppedRecoveryScheduler = new ManualLeaseRecoveryScheduler(0);
 			restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
 				now: () => now,
 				leaseRecoveryScheduler: stoppedRecoveryScheduler,
-				resolveAttachment: attachment,
+				resolveEndpoint: endpoint,
 				onCommand: async (_sessionId, command) => {
 					stoppedCommands.push(command);
 					return true;
@@ -2355,11 +2244,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 
 				const recovery = new DiscordNotificationDaemon({
 					agentDir,
+					repo: agentDir,
 					guildId: "guild",
 					parentChannelId: "parent",
 					provider,
-					resolveAttachment: async sessionId => ({
-						sessionId,
+					resolveEndpoint: async () => ({
 						generation: 1,
 						isCurrent: () => true,
 						send: frame => {
@@ -2375,23 +2264,10 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 				await recovery.stop();
 			},
 			{
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
 			},
 		);
 	});
-
-	test("bounds a provider stop that never settles", async () => {
-		await withDaemon(async (daemon, provider) => {
-			await daemon.start();
-			const never = Promise.withResolvers<void>();
-			provider.stop = async () => await never.promise;
-			const outcome = await Promise.race([
-				daemon.stop().then(() => "stopped" as const),
-				Bun.sleep(6_000).then(() => "timeout" as const),
-			]);
-			expect(outcome).toBe("stopped");
-		});
-	}, 7_000);
 
 	test("fences a stopped Gateway start and keeps repeated starts idempotent", async () => {
 		await withDaemon(async (daemon, provider) => {
@@ -2566,10 +2442,11 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 
 			const restarted = new DiscordNotificationDaemon({
 				agentDir,
+				repo: agentDir,
 				guildId: "guild",
 				parentChannelId: "parent",
 				provider,
-				resolveAttachment: async sessionId => ({ sessionId, generation: 1, isCurrent: () => true, send: () => {} }),
+				resolveEndpoint: async () => ({ generation: 1, isCurrent: () => true, send: () => {} }),
 			});
 			await restarted.start();
 			expect((await store.read(key))?.inboundDispatches ?? []).toEqual([]);

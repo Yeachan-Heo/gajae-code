@@ -28,7 +28,6 @@ import {
 	type GjcLaunchWorktreePlan,
 	planLaunchWorktree,
 } from "../../gjc-runtime/launch-worktree";
-import { probeLinuxProcPidSync } from "../../gjc-runtime/linux-proc";
 import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -45,7 +44,6 @@ import {
 } from "../../session/session-storage";
 import type { SessionLifecycleMcpServer } from "../acp/mcp";
 import { SdkClient, SdkClientError } from "../client/client";
-import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { SESSION_PREPARED_EVENT } from "../host/host";
 import {
 	type LogicalSessionCandidate,
@@ -74,7 +72,6 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
-import { isSessionAuthorityEligible } from "./session-index";
 import {
 	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
@@ -92,6 +89,8 @@ export {
 
 const POLL_MS = 50;
 const CLOSE_TIMEOUT_MS = 2_000;
+const STARTUP_CLEANUP_PROOF_GRACE_MS = 500;
+
 const MAX_RECEIVED_AT_SKEW_MS = 5_000;
 const MAX_LIFECYCLE_METADATA_BYTES = 4096;
 const MAX_EFFECT_MARKER_LENGTH = 128;
@@ -558,7 +557,6 @@ type LiveResumeRecord = {
 	pid: number;
 	endpointMtimeMs?: number;
 	live: boolean;
-	ambiguous: boolean;
 };
 type ResumeScope = {
 	cwd: string;
@@ -593,7 +591,6 @@ function sameResumeSessionIdentity(left: ResumeScope, right: ResumeScope): boole
 function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRecord): boolean {
 	return (
 		current.live &&
-		isSessionAuthorityEligible(current) &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
@@ -750,8 +747,6 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 		// published about its own process has to survive it: dropping the incarnation
 		// here would silently disarm the teardown fence for every lifecycle session.
 		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
-		...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
-		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 		endpointMtimeMs: record.endpointMtimeMs,
 	});
 }
@@ -800,8 +795,7 @@ type ReadinessResult =
 	| { kind: "startup_failed"; failure: SdkStartupFailure }
 	| { kind: "child_exited" }
 	| { kind: "timeout" };
-type BrokerIndex = Pick<Broker, "index">;
-const processIncarnationReadersForTest = new WeakMap<BrokerIndex, (pid: number) => string | undefined>();
+const processIncarnationReadersForTest = new WeakMap<Broker, (pid: number) => string | undefined>();
 
 export function setProcessIncarnationForTest(
 	broker: Broker,
@@ -811,7 +805,7 @@ export function setProcessIncarnationForTest(
 	else processIncarnationReadersForTest.delete(broker);
 }
 
-function processIncarnationForBroker(broker: BrokerIndex, pid: number): string | undefined {
+function processIncarnationForBroker(broker: Broker, pid: number): string | undefined {
 	const reader = processIncarnationReadersForTest.get(broker);
 	return reader ? reader(pid) : processIncarnation(pid);
 }
@@ -832,11 +826,6 @@ function observeProcess(
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
 	}
-	if (process.platform === "linux") {
-		const probe = probeLinuxProcPidSync(pid);
-		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
-			return "exited";
-	}
 	if (!expectedIncarnation) return "uncertain";
 	const actualIncarnation = readIncarnation(pid);
 	if (!actualIncarnation) return "uncertain";
@@ -850,41 +839,6 @@ function hasObservedProcessExit(pid: number): boolean {
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ESRCH";
 	}
-}
-
-type StableProcessExitObserver = {
-	hasExited(): boolean;
-};
-
-/**
- * Pin the indexed process before shutdown so exit remains observable after it
- * becomes a zombie. `kill(pid, 0)` and `/proc/<pid>/stat` continue to describe
- * an unreaped zombie as present, which otherwise makes a timely SIGTERM exit
- * look unverifiable and incorrectly escalates the close to terminal uncertainty.
- */
-function stableProcessExitObserver(record: CloseRecord): StableProcessExitObserver | undefined {
-	if (!record.processIncarnation) return undefined;
-	try {
-		const reference = nativeLifecycle().Process.fromPid(record.pid);
-		if (!reference || reference.incarnation !== record.processIncarnation) return undefined;
-		return { hasExited: () => reference.status() === "exited" };
-	} catch {
-		return undefined;
-	}
-}
-
-function observedProcessExited(
-	pid: number,
-	expectedIncarnation: string | undefined,
-	observer: StableProcessExitObserver | undefined,
-): boolean {
-	try {
-		if (observer?.hasExited()) return true;
-	} catch {}
-	if (hasObservedProcessExit(pid)) return true;
-	if (process.platform !== "linux" || !expectedIncarnation?.startsWith("linux:")) return false;
-	const probe = probeLinuxProcPidSync(pid);
-	return probe.kind === "live" && probe.state === "Z" && `linux:${probe.startTime}` === expectedIncarnation;
 }
 
 function isEffectMarker(value: unknown): value is EffectMarker {
@@ -2005,6 +1959,7 @@ type SignalTarget = {
 	pid: number;
 	lifecycleRequestId?: string;
 	processIncarnation?: string;
+	hostIncarnation?: string;
 };
 
 /**
@@ -2027,7 +1982,11 @@ async function hasDurableProcessIdentity(target: SignalTarget, id: string, expec
 			marker.incarnation === processIncarnation(target.pid)
 		);
 	if (expected && (expected.pid !== target.pid || target.lifecycleRequestId !== expected.effectMarker)) return false;
-	return target.processIncarnation !== undefined && target.processIncarnation === processIncarnation(target.pid);
+	// Hosts that pass an explicit incarnation record it as `processIncarnation`;
+	// the index's append path auto-stamps `hostIncarnation` for everything else.
+	// Either binding is the same pid-to-incarnation proof.
+	const recorded = target.hostIncarnation ?? target.processIncarnation;
+	return recorded !== undefined && recorded === processIncarnation(target.pid);
 }
 
 async function hasOwnedReadinessEvidence(
@@ -2115,13 +2074,7 @@ function captureLifecycleFile(file: string, requireRegular = false, bounded = fa
 	}
 }
 
-async function removeOwnedLifecycleArtifacts(
-	root: string,
-	id: string,
-	expected: EffectMarker,
-	onRetainedUnknown?: () => void,
-	onDurablePlaceholder?: (file: string) => void,
-): Promise<boolean> {
+async function removeOwnedLifecycleArtifacts(root: string, id: string, expected: EffectMarker): Promise<boolean> {
 	const marker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!marker || !sameEffectMarker(marker, expected)) return false;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
@@ -2153,7 +2106,7 @@ async function removeOwnedLifecycleArtifacts(
 		} catch {
 			return false;
 		}
-		if (parsed.pid !== expected.pid || observeProcess(expected.pid, expected.incarnation) !== "exited") return false;
+		if (parsed.pid !== expected.pid || !hasObservedProcessExit(expected.pid)) return false;
 		if (createHash("sha256").update(endpoint.bytes).digest("hex") !== endpoint.digest) return false;
 		const endpointRemoval = exactUnlinkLifecycleFile(
 			endpointSource,
@@ -2165,49 +2118,7 @@ async function removeOwnedLifecycleArtifacts(
 					: finalEndpointPath,
 			{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
 		);
-		if (!endpointRemoval.ok) {
-			if (endpointRemoval.retainedUnknownPath) {
-				onRetainedUnknown?.();
-				return false;
-			}
-			if (endpointRemoval.code !== "cleanup_pending") return false;
-			if (endpointRemoval.retainedPlaceholderPath) {
-				if (endpointRemoval.payloadDurable !== true) return false;
-				onDurablePlaceholder?.(path.resolve(endpointRemoval.retainedPlaceholderPath));
-				for (const candidate of [endpointSource, plannedEndpointPath, retryEndpointPath, finalEndpointPath]) {
-					try {
-						if (fsSync.lstatSync(candidate).size === 0) onDurablePlaceholder?.(path.resolve(candidate));
-					} catch {
-						// Absent aliases carry no retained authority.
-					}
-				}
-			}
-			// A payload-durable POSIX detach has scrubbed its quarantine payload to a
-			// zero-byte placeholder, so the original identity cannot authorize a retry.
-			if (
-				endpointRemoval.detachedPath &&
-				endpointRemoval.payloadDurable !== true &&
-				fsSync.existsSync(endpointRemoval.detachedPath)
-			) {
-				const detachedPath = path.resolve(endpointRemoval.detachedPath);
-				if (path.dirname(detachedPath) !== path.dirname(path.resolve(endpointPath))) return false;
-				let detachedRemoval: NativeExactUnlinkResult;
-				try {
-					detachedRemoval = exactUnlinkLifecycleFile(
-						detachedPath,
-						endpoint.identity,
-						path.join(
-							path.dirname(detachedPath),
-							`.gjc-delete-endpoint-detached-${expected.effectMarker}-${path.basename(endpointPath)}`,
-						),
-						{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
-					);
-				} catch {
-					return false;
-				}
-				if (!detachedRemoval.ok && detachedRemoval.code !== "not_found") return false;
-			}
-		}
+		if (!endpointRemoval.ok) return false;
 	}
 	const currentMarker = await readEffectMarker(lifecycleMarkerPath(root, id));
 	if (!currentMarker || !sameEffectMarker(currentMarker, expected)) return false;
@@ -2228,8 +2139,6 @@ async function recordTerminalUncertain(broker: Broker, id: string, root: string,
 			locator: registered.locator,
 			endpointGeneration: registered.endpointGeneration,
 			pid: registered.pid,
-			...(registered.processIncarnation === undefined ? {} : { processIncarnation: registered.processIncarnation }),
-			...(registered.hostIncarnation === undefined ? {} : { hostIncarnation: registered.hostIncarnation }),
 			terminalUncertain: true,
 		});
 	else
@@ -2276,12 +2185,6 @@ async function terminateSpawnedChild(
 	};
 
 	let observation = observe();
-	const recheckOwnedExitObservation = async (): Promise<void> => {
-		if (observation !== "uncertain") return;
-		// This direct ChildProcess is owned by this broker invocation. A process-incarnation
-		// read can briefly lag its exit event, so recheck only this owned child before failing.
-		observation = await waitForExit(deadline);
-	};
 	if (observation === "alive") {
 		await waitUntil(timing, terminationStartDeadlineAt);
 		observation = observe();
@@ -2289,7 +2192,6 @@ async function terminateSpawnedChild(
 	if (observation === "alive") {
 		if (!(await signalVerifiedSession({ locator: { stateRoot: root }, pid }, id, "SIGTERM", expected))) {
 			observation = observe();
-			await recheckOwnedExitObservation();
 			if (observation !== "exited") {
 				await recordTerminalUncertain(broker, id, root, pid);
 				return false;
@@ -2303,7 +2205,6 @@ async function terminateSpawnedChild(
 	if (observation === "alive") {
 		if (!(await signalVerifiedSession({ locator: { stateRoot: root }, pid }, id, "SIGKILL", expected))) {
 			observation = observe();
-			await recheckOwnedExitObservation();
 			if (observation !== "exited") {
 				await recordTerminalUncertain(broker, id, root, pid);
 				return false;
@@ -2312,7 +2213,6 @@ async function terminateSpawnedChild(
 			observation = await waitForExit(deadline);
 		}
 	}
-	await recheckOwnedExitObservation();
 	if (observation !== "exited") {
 		await recordTerminalUncertain(broker, id, root, pid);
 		return false;
@@ -2384,186 +2284,14 @@ async function endpointRemoved(root: string, id: string): Promise<boolean> {
 	}
 }
 
-async function removeExactDeadSessionEndpoint(
-	broker: Broker,
-	id: string,
-	record: CloseRecord,
-	attempt = 0,
-	authorizedSource?: string,
-	durablePlaceholders?: Set<string>,
-): Promise<boolean> {
-	if (record.endpointMtimeMs === undefined) return await endpointRemoved(record.locator.stateRoot, id);
-	await broker.index.refresh();
-	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	if (
-		!current ||
-		current.endpointGeneration !== record.endpointGeneration ||
-		current.pid !== record.pid ||
-		current.endpointMtimeMs !== record.endpointMtimeMs ||
-		current.lifecycleRequestId !== record.lifecycleRequestId ||
-		current.processIncarnation !== record.processIncarnation ||
-		path.resolve(current.locator.stateRoot) !== path.resolve(record.locator.stateRoot)
-	)
-		return false;
-	const endpointPath = path.join(record.locator.stateRoot, "sdk", `${id}.json`);
-	const suffix = `${id}-${record.endpointGeneration}-${record.pid}-${String(record.endpointMtimeMs).replaceAll(".", "_")}.json`;
-	const plannedEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-${suffix}`);
-	const retryEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-retry-${suffix}`);
-	const finalEndpointPath = path.join(path.dirname(endpointPath), `.gjc-dead-endpoint-final-${suffix}`);
-	const ownedEndpointPaths = record.lifecycleRequestId
-		? [
-				`.gjc-delete-endpoint-detached-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
-				`.gjc-delete-endpoint-final-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
-				`.gjc-delete-endpoint-retry-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
-				`.gjc-delete-endpoint-${record.lifecycleRequestId}-${path.basename(endpointPath)}`,
-			].map(name => path.join(path.dirname(endpointPath), name))
-		: [];
-	const ownedPayloadPaths: string[] = [];
-	for (const ownedPath of ownedEndpointPaths) {
-		let size: number;
-		try {
-			size = fsSync.lstatSync(ownedPath).size;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-			return false;
-		}
-		if (size > 0) ownedPayloadPaths.push(ownedPath);
-	}
-	const candidates = [...ownedPayloadPaths, finalEndpointPath, retryEndpointPath, plannedEndpointPath, endpointPath];
-	let authorizedDetachedSource: string | undefined;
-	if (authorizedSource && path.dirname(path.resolve(authorizedSource)) === path.dirname(path.resolve(endpointPath))) {
-		try {
-			if (fsSync.lstatSync(authorizedSource).size > 0) authorizedDetachedSource = authorizedSource;
-		} catch {
-			// The detached source was already retired; deterministic candidates remain authoritative.
-		}
-	}
-	const endpointSource =
-		authorizedDetachedSource && fsSync.existsSync(authorizedDetachedSource)
-			? authorizedDetachedSource
-			: candidates.find(candidate => {
-					try {
-						return fsSync.lstatSync(candidate).isFile();
-					} catch {
-						return false;
-					}
-				});
-	if (!endpointSource) return await endpointRemoved(record.locator.stateRoot, id);
-	const plannedPath =
-		endpointSource === endpointPath
-			? plannedEndpointPath
-			: endpointSource === plannedEndpointPath
-				? retryEndpointPath
-				: finalEndpointPath;
-	let handle: fs.FileHandle | undefined;
-	try {
-		handle = await fs.open(endpointSource, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
-		const metadata = await handle.stat({ bigint: true });
-		if (!metadata.isFile() || metadata.nlink !== 1n || metadata.size > 4096n) return false;
-		const bytes = Buffer.alloc(Number(metadata.size) + 1);
-		const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-		if (bytesRead !== Number(metadata.size)) return false;
-		const source = bytes.subarray(0, bytesRead);
-		const endpoint = JSON.parse(source.toString("utf8")) as { sessionId?: unknown; pid?: unknown; stale?: unknown };
-		const indexedEndpointMtimeMs = Math.trunc(record.endpointMtimeMs);
-		if (
-			endpoint.sessionId !== id ||
-			endpoint.pid !== record.pid ||
-			endpoint.stale === true ||
-			!Number.isSafeInteger(indexedEndpointMtimeMs) ||
-			metadata.mtimeNs / 1_000_000n !== BigInt(indexedEndpointMtimeMs)
-		)
-			return false;
-		await handle.close();
-		handle = undefined;
-		const removed = exactUnlinkLifecycleFile(
-			endpointSource,
-			{
-				dev: metadata.dev,
-				ino: metadata.ino,
-				nlink: metadata.nlink,
-				size: metadata.size,
-				mtimeNs: metadata.mtimeNs,
-				sha256: createHash("sha256").update(source).digest("hex"),
-			},
-			plannedPath,
-			(() => {
-				const parent = lifecycleParentIdentity(path.dirname(endpointSource));
-				return parent ? { dev: BigInt(parent.dev), ino: BigInt(parent.ino) } : undefined;
-			})(),
-		);
-		if (removed.ok || removed.code === "not_found") return true;
-		if (removed.code === "cleanup_pending" && removed.retainedUnknownPath) return false;
-		if (removed.code === "cleanup_pending" && removed.retainedPlaceholderPath) {
-			if (removed.payloadDurable !== true) return false;
-			durablePlaceholders?.add(path.resolve(removed.retainedPlaceholderPath));
-			for (const candidate of [endpointSource, plannedEndpointPath, retryEndpointPath, finalEndpointPath]) {
-				try {
-					if (fsSync.lstatSync(candidate).size === 0) durablePlaceholders?.add(path.resolve(candidate));
-				} catch {
-					// Absent aliases carry no retained authority.
-				}
-			}
-		}
-		if (removed.code === "cleanup_pending" && attempt < 4)
-			return await removeExactDeadSessionEndpoint(
-				broker,
-				id,
-				record,
-				attempt + 1,
-				removed.detachedPath,
-				durablePlaceholders,
-			);
-		return false;
-	} catch {
-		return false;
-	} finally {
-		await handle?.close();
-	}
-}
-
-async function hasOwnedEndpointPayload(
-	root: string,
-	id: string,
-	effectMarker: string,
-	durablePlaceholders: ReadonlySet<string>,
-): Promise<boolean> {
-	const directory = path.join(root, "sdk");
-	const endpointName = `${id}.json`;
-	let names: string[];
-	try {
-		names = await fs.readdir(directory);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code !== "ENOENT";
-	}
-	for (const name of names) {
-		if (!name.startsWith(".gjc-delete-endpoint-") || !name.includes(effectMarker) || !name.includes(endpointName))
-			continue;
-		try {
-			const candidate = path.join(directory, name);
-			const metadata = await fs.lstat(candidate);
-			if (
-				!metadata.isFile() ||
-				metadata.size > 0 ||
-				(metadata.size === 0 && !durablePlaceholders.has(path.resolve(candidate)))
-			)
-				return true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
-		}
-	}
-	return false;
-}
 async function waitForClose(
 	broker: Broker,
 	id: string,
-	record: CloseRecord,
+	record: { locator: { stateRoot: string }; endpointGeneration: number; pid: number; lifecycleRequestId?: string },
 	timeoutMs: number,
-	processExitObserver?: StableProcessExitObserver,
 ): Promise<boolean> {
 	const timing = lifecycleTiming(broker);
 	const deadline = timing.now() + timeoutMs;
-	const durablePlaceholders = new Set<string>();
 	while (timing.now() < deadline) {
 		await broker.index.refresh();
 		const registration = broker.index.findHostRegistration(
@@ -2576,14 +2304,7 @@ async function waitForClose(
 			registration &&
 			broker.index.hostUnregisteredAfter(registration) &&
 			(await endpointRemoved(record.locator.stateRoot, id)) &&
-			observedProcessExited(record.pid, record.processIncarnation, processExitObserver) &&
-			(!record.lifecycleRequestId ||
-				!(await hasOwnedEndpointPayload(
-					record.locator.stateRoot,
-					id,
-					record.lifecycleRequestId,
-					durablePlaceholders,
-				)))
+			hasObservedProcessExit(record.pid)
 		)
 			return true;
 		// A host that dies before it can withdraw its own registration — killed
@@ -2592,36 +2313,17 @@ async function waitForClose(
 		// That is exactly the evidence the dead-registration sweep retires records
 		// on, so retire it here too instead of escalating signals at a pid that no
 		// longer exists and then reporting the teardown as unfinished.
-		if (registration && observedProcessExited(record.pid, record.processIncarnation, processExitObserver)) {
-			const expected =
-				typeof record.lifecycleRequestId === "string" && typeof record.processIncarnation === "string"
-					? {
-							pid: record.pid,
-							effectMarker: record.lifecycleRequestId,
-							incarnation: record.processIncarnation,
-						}
-					: undefined;
-			let retainedUnknown = false;
-			if (expected)
-				await removeOwnedLifecycleArtifacts(
-					record.locator.stateRoot,
-					id,
-					expected,
-					() => {
-						retainedUnknown = true;
-					},
-					file => durablePlaceholders.add(path.resolve(file)),
-				);
-			if (retainedUnknown) return false;
-			if (!(await removeExactDeadSessionEndpoint(broker, id, record, 0, undefined, durablePlaceholders)))
-				return false;
-			if (
-				expected &&
-				(await hasOwnedEndpointPayload(record.locator.stateRoot, id, expected.effectMarker, durablePlaceholders))
-			)
-				return false;
-			if (!(await broker.index.unregisterIfCurrent(registration))) return false;
-			return await endpointRemoved(record.locator.stateRoot, id);
+		if (registration && hasObservedProcessExit(record.pid)) {
+			await broker.index.append({
+				type: "host_unregistered",
+				sessionId: id,
+				locator: registration.locator,
+				endpointGeneration: registration.endpointGeneration,
+				pid: registration.pid,
+				...(registration.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registration.endpointMtimeMs }),
+				...(registration.lifecycleRequestId ? { lifecycleRequestId: registration.lifecycleRequestId } : {}),
+			});
+			return true;
 		}
 		await timing.sleep(POLL_MS);
 	}
@@ -2647,10 +2349,6 @@ async function currentReadyAuthority(
 			token?: unknown;
 			pid?: unknown;
 		};
-		// A new lifecycle registration has no heartbeat until the broker checkpoints it.
-		// Publish that positive liveness evidence through the broker-owned checkpoint before
-		// enforcing ready authority; endpoint, marker, incarnation, and generation checks below remain unchanged.
-		await broker.heartbeatSessions();
 		await broker.index.refresh();
 		const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 		if (
@@ -3286,7 +2984,6 @@ type CloseRecord = {
 	pid: number;
 	endpointMtimeMs?: number;
 	lifecycleRequestId?: string;
-	processIncarnation?: string;
 };
 
 function endpointIncarnation(record: CloseRecord, sessionId: string): string | undefined {
@@ -3336,50 +3033,13 @@ function sameCloseAuthority(authority: CloseAuthority, record: CloseRecord, sess
 	);
 }
 
-function sameCloseStoredProcessIdentity(expected: CloseRecord, current: CloseRecord): boolean {
+function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
 	return (
+		current.live &&
 		current.pid === expected.pid &&
-		typeof expected.processIncarnation === "string" &&
-		expected.processIncarnation.length > 0 &&
-		current.processIncarnation === expected.processIncarnation &&
 		typeof expected.lifecycleRequestId === "string" &&
 		expected.lifecycleRequestId.length > 0 &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
-		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
-	);
-}
-
-/**
- * Endpoint control remains safe without a durable signal identity: the caller has
- * just read and re-read this exact generation before connecting. This narrower
- * identity is never sufficient for signal fallback, but permits the host's typed
- * close response to remain observable instead of being masked as stale.
- */
-function sameCloseEndpointIdentity(expected: CloseRecord, current: CloseRecord): boolean {
-	return (
-		current.endpointGeneration === expected.endpointGeneration &&
-		current.pid === expected.pid &&
-		current.endpointMtimeMs !== undefined &&
-		expected.endpointMtimeMs !== undefined &&
-		current.lifecycleRequestId === expected.lifecycleRequestId &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
-		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
-	);
-}
-
-function sameCloseProcessIdentity(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
-	return current.live && sameCloseStoredProcessIdentity(expected, current);
-}
-
-function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { live: boolean }): boolean {
-	return (
-		current.live &&
-		current.endpointGeneration === expected.endpointGeneration &&
-		current.pid === expected.pid &&
-		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		current.lifecycleRequestId === expected.lifecycleRequestId &&
-		current.processIncarnation === expected.processIncarnation &&
 		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
@@ -3390,18 +3050,18 @@ async function revalidateCloseGeneration(
 	id: string,
 	expected: CloseRecord,
 	authority: CloseAuthority | undefined,
+	allowUnreachable = false,
 ): Promise<BrokerResponse | undefined> {
 	await broker.index.refresh();
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	if (
-		!authority &&
-		current &&
-		(sameCloseEndpointIdentity(expected, current) || sameCloseStoredProcessIdentity(expected, current))
-	) {
-		expected.endpointMtimeMs = current.endpointMtimeMs;
-		return undefined;
-	}
-	return authority && current && sameCloseGeneration(expected, current) && sameCloseAuthority(authority, current, id)
+	return current &&
+		(allowUnreachable || current.live) &&
+		current.endpointGeneration === expected.endpointGeneration &&
+		current.pid === expected.pid &&
+		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot) &&
+		(!authority || sameCloseAuthority(authority, current, id))
 		? undefined
 		: fail("endpoint_stale", "session endpoint is stale");
 }
@@ -3409,7 +3069,9 @@ async function revalidateCloseGeneration(
 function isTransportFailure(error: unknown): error is SdkClientError {
 	return (
 		error instanceof SdkClientError &&
-		["unavailable", "timeout", "connection_closed", "reconnect_exhausted"].includes(error.code)
+		["unavailable", "timeout", "connection_closed", "uncertain_after_send", "reconnect_exhausted"].includes(
+			error.code,
+		)
 	);
 }
 
@@ -3443,14 +3105,11 @@ async function executeLifecycleResponse(
 		return fail("invalid_input", "sourceSessionId must be a canonical safe identifier.");
 	if (operation === "session.create" || operation === "session.fork" || operation === "session.resume") {
 		await broker.index.refresh();
-		await broker.heartbeatSessions();
 		if (operation === "session.resume") {
 			const requestedSessionId = sessionId(input);
 			const existing = requestedSessionId
 				? broker.index.listSessions().sessions.find(session => session.sessionId === requestedSessionId)
 				: undefined;
-			if (existing && !isSessionAuthorityEligible(existing))
-				return fail("endpoint_stale", "Session authority is ambiguous and cannot be resumed safely.");
 			if (existing?.live) {
 				const initialScope = await validateLiveResumeScope(broker, input, requestedSessionId!, existing);
 				if ("ok" in initialScope) return initialScope;
@@ -3477,16 +3136,12 @@ async function executeLifecycleResponse(
 				if ("ok" in finalScope) return finalScope;
 				if (!sameResumeSessionIdentity(initialScope, finalScope))
 					return fail("endpoint_stale", "Saved session changed while its resume authority was being verified.");
-				if (current.endpointMtimeMs === undefined)
-					return fail("endpoint_stale", "Live session endpoint authority is incomplete.");
 				return {
 					ok: true,
 					result: {
 						sessionId: requestedSessionId,
 						cwd: finalScope.cwd,
 						endpointGeneration: current.endpointGeneration,
-						pid: current.pid,
-						endpointMtimeMs: current.endpointMtimeMs,
 						endpoint: endpoint.result,
 						reused: true,
 					},
@@ -3778,9 +3433,6 @@ async function executeLifecycleResponse(
 			result: {
 				sessionId: launch.id,
 				cwd: launch.cwd,
-				endpointGeneration: verified.endpointGeneration,
-				pid: verified.endpoint.pid,
-				endpointMtimeMs: verified.endpointMtimeMs,
 				endpoint: verified.endpoint,
 				...(launch.readiness === "deferred" ? { readiness: "prepared" as const } : {}),
 				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
@@ -3795,30 +3447,18 @@ async function executeLifecycleResponse(
 	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (operation === "session.close") {
 		if (!record) return fail("not_found", "session is not indexed");
+		// DR-1 retains closed/unregistered rows for inspect and offline tail.
+		// Pre-DR-1 they vanished from the listing and close answered not_found;
+		// a terminal row is the same already-gone outcome, never an escalation
+		// target — signalling its recorded pid could hit a reused process.
+		if (record.terminal) return fail("resource_gone", "Session is already closed and unregistered.");
 		if (record.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
-		if (!isSessionAuthorityEligible(record))
-			return fail("endpoint_stale", "Session authority is ambiguous and cannot be closed safely.");
-		if (!record.live && !record.terminal) {
-			await broker.heartbeatSessions();
-			await broker.index.refresh();
-			record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-			if (!record) return fail("not_found", "session is not indexed");
-			if (record.terminalUncertain)
-				return fail("terminal_uncertain", "Session ownership is uncertain and cannot be closed safely.");
-			if (!isSessionAuthorityEligible(record))
-				return fail("endpoint_stale", "Session authority is ambiguous and cannot be closed safely.");
-		}
 		const requestedAuthority = requestedCloseAuthority(input);
 		if ("error" in requestedAuthority) return requestedAuthority.error;
 		if (requestedAuthority.authority && !sameCloseAuthority(requestedAuthority.authority, record, id))
 			return fail("endpoint_stale", "session endpoint is stale");
 		await broker.ledger.transition(identity, "effect_started", { intendedSessionId: id, effectMarker: randomUUID() });
-		const signalAuthority: EffectMarker | undefined =
-			typeof record.lifecycleRequestId === "string" && typeof record.processIncarnation === "string"
-				? { pid: record.pid, effectMarker: record.lifecycleRequestId, incarnation: record.processIncarnation }
-				: undefined;
-		let processExitObserver = stableProcessExitObserver(record);
 
 		let usedSignalFallback = false;
 		let note: string | undefined;
@@ -3828,7 +3468,6 @@ async function executeLifecycleResponse(
 		});
 		if (!endpointResult.ok && endpointResult.error.code === "endpoint_stale" && !requestedAuthority.authority) {
 			await broker.index.refresh();
-			await broker.heartbeatSessions();
 			const refreshed = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 			if (refreshed && sameCloseProcessIdentity(record, refreshed)) {
 				record = refreshed;
@@ -3839,9 +3478,13 @@ async function executeLifecycleResponse(
 			}
 		}
 		if (!endpointResult.ok) {
-			if (endpointResult.error.code === "endpoint_stale") return endpointResult;
-			if (endpointResult.error.code !== "resource_gone") return endpointResult;
-			usedSignalFallback = true;
+			if (endpointResult.error.code === "endpoint_stale") {
+				if (requestedAuthority.authority) return endpointResult;
+				usedSignalFallback = true;
+			} else {
+				if (endpointResult.error.code !== "resource_gone") return endpointResult;
+				usedSignalFallback = true;
+			}
 		} else {
 			const endpoint = closeEndpoint(endpointResult.result);
 			if (!endpoint) return fail("close_refused", "Session endpoint is malformed.");
@@ -3851,35 +3494,11 @@ async function executeLifecycleResponse(
 					timeoutMs: 2_000,
 					reconnectAttempts: 0,
 				});
-				let refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
+				const refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
 					sessionId: id,
 					endpointGeneration: record.endpointGeneration,
 				});
-				if (
-					!refreshedEndpointResult.ok &&
-					refreshedEndpointResult.error.code === "endpoint_stale" &&
-					!requestedAuthority.authority
-				) {
-					await broker.index.refresh();
-					const heartbeatRecord = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-					if (
-						heartbeatRecord &&
-						heartbeatRecord.endpointGeneration === record.endpointGeneration &&
-						sameCloseProcessIdentity(record, heartbeatRecord)
-					) {
-						record = heartbeatRecord;
-						refreshedEndpointResult = await broker.handleRequest("session.get_endpoint", {
-							sessionId: id,
-							endpointGeneration: record.endpointGeneration,
-						});
-					}
-				}
 				if (!refreshedEndpointResult.ok) return refreshedEndpointResult;
-				await broker.index.refresh();
-				const refreshedRecord = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-				if (!refreshedRecord || !sameCloseEndpointIdentity(record, refreshedRecord))
-					return fail("endpoint_stale", "session endpoint is stale");
-				record = refreshedRecord;
 				const refreshedEndpoint = closeEndpoint(refreshedEndpointResult.result);
 				if (
 					!refreshedEndpoint ||
@@ -3889,23 +3508,11 @@ async function executeLifecycleResponse(
 					return fail("endpoint_stale", "session endpoint is stale");
 				const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 				if (stale) return stale;
-				if (record.lifecycleRequestId === undefined) {
-					usedSignalFallback = true;
-				} else {
-					processExitObserver ??= stableProcessExitObserver(record);
-					const response = await client.control("session.close", {
-						[BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD]: record.lifecycleRequestId,
-					});
-					if ((response as { ok?: unknown }).ok !== true) {
-						const closeError = (response as { error?: { code?: unknown } }).error;
-						if (closeError?.code === "operation_prohibited") usedSignalFallback = true;
-						else return fail("close_refused", "Session endpoint rejected session.close.");
-					}
-				}
+				const response = await client.control("session.close");
+				if ((response as { ok?: unknown }).ok !== true)
+					return fail("close_refused", "Session endpoint rejected session.close.");
 			} catch (error) {
 				if (isTransportFailure(error)) usedSignalFallback = true;
-				else if (error instanceof SdkClientError && error.code === "operation_prohibited")
-					usedSignalFallback = true;
 				else if (error instanceof SdkClientError) return fail(error.code, error.message);
 				else
 					return fail(
@@ -3913,40 +3520,26 @@ async function executeLifecycleResponse(
 						`Session endpoint close failed: ${error instanceof Error ? error.message : String(error)}`,
 					);
 			} finally {
-				await client
-					?.close()
-					.catch(error =>
-						logger.warn(
-							`SDK session-close client cleanup failed after control dispatch: ${error instanceof Error ? error.message : String(error)}`,
-						),
-					);
+				await client?.close();
 			}
 		}
 
 		if (usedSignalFallback) {
-			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
+			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority, true);
 			if (stale) return stale;
-			processExitObserver ??= stableProcessExitObserver(record);
-			const exited =
-				typeof record.processIncarnation === "string" &&
-				observeProcess(record.pid, record.processIncarnation, value =>
-					processIncarnationForBroker(broker, value),
-				) === "exited";
-			if (!exited) {
-				if (!(await signalVerifiedSession(record, id, "SIGTERM", signalAuthority)))
-					return fail(
-						"close_refused",
-						"Session endpoint is unavailable and its durable process identity could not be verified.",
-					);
-				note = "Endpoint close was unreachable; sent SIGTERM to the durably identified session process.";
-			}
+			if (!(await signalVerifiedSession(record, id, "SIGTERM")))
+				return fail(
+					"close_refused",
+					"Session endpoint is unavailable and its durable process identity could not be verified.",
+				);
+			note = "Endpoint close was unreachable; sent SIGTERM to the durably identified session process.";
 		}
 
-		let closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS, processExitObserver);
+		let closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
 		if (!closed && !usedSignalFallback) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
-			if (!(await signalVerifiedSession(record, id, "SIGTERM", signalAuthority))) {
+			if (!(await signalVerifiedSession(record, id, "SIGTERM"))) {
 				await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
 				return fail(
 					"terminal_uncertain",
@@ -3955,12 +3548,12 @@ async function executeLifecycleResponse(
 			}
 			note =
 				"Session acknowledged session.close but graceful teardown did not complete within the bounded deadline; sent SIGTERM to the durably identified session process.";
-			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS, processExitObserver);
+			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
 		}
 		if (!closed) {
 			const stale = await revalidateCloseGeneration(broker, id, record, requestedAuthority.authority);
 			if (stale) return stale;
-			if (!(await signalVerifiedSession(record, id, "SIGKILL", signalAuthority))) {
+			if (!(await signalVerifiedSession(record, id, "SIGKILL"))) {
 				await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
 				return fail(
 					"terminal_uncertain",
@@ -3969,7 +3562,7 @@ async function executeLifecycleResponse(
 			}
 			note =
 				"Session teardown did not complete after SIGTERM within the bounded deadline; sent SIGKILL to the durably identified session process.";
-			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS, processExitObserver);
+			closed = await waitForClose(broker, id, record, CLOSE_TIMEOUT_MS);
 		}
 		if (!closed) {
 			await recordTerminalUncertain(broker, id, record.locator.stateRoot, record.pid);
@@ -3984,8 +3577,6 @@ async function executeLifecycleResponse(
 	if (operation === "session.delete") {
 		if (record?.terminalUncertain)
 			return fail("terminal_uncertain", "Session ownership is uncertain and cannot be deleted safely.");
-		if (record && !isSessionAuthorityEligible(record))
-			return fail("endpoint_stale", "Session authority is ambiguous and cannot be deleted safely.");
 		if (record?.live) return fail("live_session", "Refusing to delete a live session; close it first.");
 		if (cleanup === undefined) {
 			const requestedTranscriptPath = text(input.sessionPath);
@@ -4600,7 +4191,7 @@ async function executeLifecycleResponse(
 		}
 		if (record)
 			await broker.index.append({
-				type: "session_deleted",
+				type: "session_closed",
 				sessionId: id,
 				locator: record.locator,
 				endpointGeneration: record.endpointGeneration,
@@ -4671,6 +4262,23 @@ async function exactCleanupProof(
 		: undefined;
 }
 
+async function waitForExactCleanupProof(
+	broker: Broker,
+	root: string | undefined,
+	id: string | undefined,
+	expected: EffectMarker | undefined,
+	evidence: { artifact: LifecycleFailureArtifact } | undefined,
+): Promise<LifecycleCleanupProof | undefined> {
+	const timing = lifecycleTiming(broker);
+	const deadline = timing.now() + STARTUP_CLEANUP_PROOF_GRACE_MS;
+	for (;;) {
+		const proof = await exactCleanupProof(broker, root, id, expected, evidence);
+		if (proof) return proof;
+		const remaining = deadline - timing.now();
+		if (remaining <= 0) return undefined;
+		await timing.sleep(Math.min(POLL_MS, remaining));
+	}
+}
 function validateLifecycleDeleteMetadataBinding(
 	broker: Broker,
 	operation: string,
@@ -4784,7 +4392,7 @@ export async function executeLifecycle(
 					expected,
 				)
 			: undefined;
-	const cleanupProof = await exactCleanupProof(broker, root, entry?.intendedSessionId, expected, evidence);
+	const cleanupProof = await waitForExactCleanupProof(broker, root, entry?.intendedSessionId, expected, evidence);
 	const startupFailure: LifecycleStartupFailureReceipt | undefined = evidence
 		? {
 				artifactDigest: evidence.digest,
@@ -4984,22 +4592,14 @@ export function sessionHostWorkInFlight(): boolean {
  * How often a live broker re-checks its own session registrations against OS
  * process liveness.
  *
- * This sweep can never disturb healthy work: a registration is dropped only when
- * `observeProcess` proves its exact published process identity exited. A live
- * replacement at the same pid retires the stale registration without being
- * signaled. One minute keeps `gjc_sessions`/`session.get_endpoint` from
- * advertising a corpse for longer than a single poll while costing one index
- * refresh per minute on an otherwise idle broker.
+ * This sweep can never disturb healthy work: a registration is only dropped
+ * when `process.kill(pid, 0)` proves the exact published pid is gone, and a
+ * working host answers that probe for its entire life no matter how long a turn
+ * runs. One minute keeps `gjc_sessions`/`session.get_endpoint` from advertising
+ * a corpse for longer than a single poll while costing one index refresh per
+ * minute on an otherwise idle broker.
  */
 export const BROKER_DEAD_REGISTRATION_SWEEP_MS = 60_000;
-
-/**
- * Registrations reaped per sweep. Every reap is its own locked index transaction,
- * so an uncapped sweep over a long-lived index turns one broker into a continuous
- * holder of the shared session-index lock and starves unrelated `gjc` launches out
- * of their bounded retry budget. Surplus dead rows are reaped by later sweeps.
- */
-export const BROKER_DEAD_REGISTRATION_SWEEP_LIMIT = 64;
 
 /** One reaped registration, as recorded by {@link reapDeadSessionRegistrations}. */
 export interface ReapedSessionRegistration {
@@ -5017,29 +4617,35 @@ export interface ReapedSessionRegistration {
  * missing heartbeat merely makes a session read as not-live — the host may
  * still be running ahead of the next heartbeat checkpoint pass, so it is never
  * grounds for a reap. EPERM and unreadable incarnations stay "uncertain", so an
- * alien or unreadable process is never mistaken for a dead one. Terminal and
- * terminal-uncertain identities are retained. Identity-level rows let the sweep
- * retire a dead losing root without disturbing the surviving authority.
+ * alien or unreadable process is never mistaken for a dead one. Registrations
+ * already terminal or marked `terminalUncertain` are left alone: their
+ * disposition belongs to the terminal-uncertainty reconciliation path, and
+ * silently dropping them would turn a fail-closed `session.close`/
+ * `session.delete` refusal into `not_found`.
  */
 export async function reapDeadSessionRegistrations(
-	broker: BrokerIndex,
-	limit = BROKER_DEAD_REGISTRATION_SWEEP_LIMIT,
+	broker: Pick<Broker, "index">,
 ): Promise<ReapedSessionRegistration[]> {
 	await broker.index.refresh();
 	const dead = broker.index
-		.listSessionIdentities()
-		.filter(session => {
-			if (session.terminal || session.terminalUncertain) return false;
-			const recordedIncarnation = session.hostIncarnation ?? session.processIncarnation;
-			return (
-				observeProcess(session.pid, recordedIncarnation, pid => processIncarnationForBroker(broker, pid)) ===
-				"exited"
-			);
-		})
-		.slice(0, Math.max(0, limit));
+		.listSessions()
+		.sessions.filter(
+			session =>
+				!session.terminal &&
+				!session.terminalUncertain &&
+				observeProcess(session.pid, session.hostIncarnation ?? session.processIncarnation) === "exited",
+		);
 	const reaped: ReapedSessionRegistration[] = [];
 	for (const session of dead) {
-		if (!(await broker.index.unregisterIfCurrent(session))) continue;
+		await broker.index.append({
+			type: "host_unregistered",
+			sessionId: session.sessionId,
+			locator: session.locator,
+			endpointGeneration: session.endpointGeneration,
+			pid: session.pid,
+			...(session.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: session.endpointMtimeMs }),
+			...(session.lifecycleRequestId ? { lifecycleRequestId: session.lifecycleRequestId } : {}),
+		});
 		const record = {
 			sessionId: session.sessionId,
 			pid: session.pid,

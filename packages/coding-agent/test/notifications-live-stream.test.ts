@@ -4,11 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Settings } from "../src/config/settings";
 import { getNotificationConfig } from "../src/sdk/bus/config";
-import { createNotificationsExtension } from "../src/sdk/bus/index";
 import type { NotificationSessionContext } from "../src/sdk/bus/session-control";
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { type EnsureDaemonResult, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { TelegramDaemonController } from "../src/sdk/bus/telegram-daemon-control";
+import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { renderThreadedFrame } from "../src/sdk/bus/threaded-render";
 import {
 	cleanupFixtureRoot,
@@ -18,8 +18,7 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
-import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
-import { withTelegramOrchestrationProvenance } from "./helpers/telegram-topic-test";
+import { createOrchestrationNotificationsExtension } from "./helpers/telegram-topic-test";
 
 // ---------------------------------------------------------------------------
 // 1) Pure render contract: streamed turn frames become editable, and live +
@@ -149,7 +148,11 @@ test("abandons a premature endpoint generation before handing out its replacemen
 async function bootSession(
 	settingsOverrides: Record<string, unknown> = {},
 	options: {
-		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
+		ensureTelegramDaemon?: (input: {
+			settings: Settings;
+			cwd: string;
+			sessionId: string;
+		}) => Promise<EnsureDaemonResult>;
 	} = {},
 	replacePrematureEndpoint = true,
 ): Promise<{
@@ -187,13 +190,11 @@ async function bootSession(
 		eligible: true,
 		getConfig: () => getNotificationConfig(settings),
 	});
-	withTelegramOrchestrationProvenance(() =>
-		createNotificationsExtension(api, {
-			settings,
-			controller,
-			ensureTelegramDaemon: options.ensureTelegramDaemon ?? (async () => "attached"),
-		}),
-	);
+	createOrchestrationNotificationsExtension(api, {
+		settings,
+		controller,
+		ensureTelegramDaemon: options.ensureTelegramDaemon,
+	});
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -221,7 +222,7 @@ async function bootSession(
 	await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");
-	const { url, token } = readTestSdkEndpoint(endpointFile);
+	const { url, token } = readEndpoint(endpointFile);
 
 	const frames: Frame[] = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
@@ -320,7 +321,7 @@ test("rapid live updates are throttled to a single frame within the interval", a
 	expect(live().length).toBe(1); // later updates fall inside the throttle window
 }, 15_000);
 
-test("a deferred ownership preflight never holds reconciliation and the turn finalizes once on the live ref", async () => {
+test("defers a finalized turn during ownership preflight and flushes it once with the live message reference", async () => {
 	setEnv({ GJC_NOTIFICATIONS: "1", GJC_NOTIFICATIONS_STREAM_INTERVAL_MS: "100000" });
 	let deferEnsure = false;
 	const ensureEntered = Promise.withResolvers<void>();
@@ -346,25 +347,29 @@ test("a deferred ownership preflight never holds reconciliation and the turn fin
 	await waitFor(() => streams().some(frame => frame.phase === "live"), 3000, "live frame");
 	const liveRef = streams().find(frame => frame.phase === "live")?.messageRef;
 
-	// Reconciliation must never await daemon ownership. Ownership identity is
-	// unchanged here (only a delivery-policy change), so adapters stay authorized
-	// and the settled outcome is reused; the contract under test is that
-	// reconciliation settles promptly and the turn finalizes exactly once on the
-	// live ref. Adapter withholding on an ownership-identity change is covered in
-	// notifications-daemon-isolation.test.ts.
 	settings.set("notifications.telegram.streaming.enabled", false);
-	const settled = await Promise.race([
-		controller.reconcileCurrentSession(ctx).then(() => "settled" as const),
-		Bun.sleep(5000).then(() => "hung" as const),
+	const reconciliation = controller.reconcileCurrentSession(ctx);
+	await Promise.race([
+		ensureEntered.promise,
+		Bun.sleep(3000).then(() => {
+			throw new Error("deferred ensure was not entered");
+		}),
 	]);
-	expect(settled).toBe("settled");
-
 	await handlers.get("turn_end")!(
 		{ type: "turn_end", message: { role: "assistant", content: "authoritative final during preflight" } },
 		ctx,
 	);
+	await sleep(50);
+	expect(streams().some(frame => frame.phase === "finalized")).toBe(false);
+
 	releaseEnsure.resolve();
-	await waitFor(() => streams().some(frame => frame.phase === "finalized"), 3000, "finalized frame");
+	await Promise.race([
+		reconciliation,
+		Bun.sleep(3000).then(() => {
+			throw new Error("reconciliation did not settle after ensure release");
+		}),
+	]);
+	await waitFor(() => streams().some(frame => frame.phase === "finalized"), 3000, "deferred finalized frame");
 	const finalized = streams().filter(frame => frame.phase === "finalized");
 	expect(finalized).toHaveLength(1);
 	expect(finalized[0]?.messageRef).toBe(liveRef);

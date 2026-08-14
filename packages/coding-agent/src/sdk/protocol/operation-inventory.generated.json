@@ -441,9 +441,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -459,9 +459,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -474,12 +474,12 @@
 		"decision": "include",
 		"sdkId": "session.new",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -492,12 +492,12 @@
 		"decision": "include",
 		"sdkId": "session.fork",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -510,12 +510,12 @@
 		"decision": "include",
 		"sdkId": "session.resume",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -528,12 +528,12 @@
 		"decision": "include",
 		"sdkId": "session.close",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -546,12 +546,12 @@
 		"decision": "include",
 		"sdkId": "session.switch",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -564,12 +564,12 @@
 		"decision": "include",
 		"sdkId": "session.branch",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -600,12 +600,12 @@
 		"decision": "include",
 		"sdkId": "session.handoff",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -852,12 +852,12 @@
 		"decision": "include",
 		"sdkId": "session.delete",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -996,9 +996,9 @@
 		"decision": "include",
 		"sdkId": "session.create",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -1014,9 +1014,9 @@
 		"decision": "include",
 		"sdkId": "session.fork",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -1032,9 +1032,9 @@
 		"decision": "include",
 		"sdkId": "session.resume",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -1050,9 +1050,9 @@
 		"decision": "include",
 		"sdkId": "session.close",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -1068,9 +1068,9 @@
 		"decision": "include",
 		"sdkId": "session.delete",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
 			"mcp": "generic_safe",
 			"acp": "generic_safe",
 			"daemonCli": "generic_safe"
@@ -2166,12 +2166,12 @@
 		"decision": "include",
 		"sdkId": "session.new",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -2213,12 +2213,12 @@
 		"decision": "include",
 		"sdkId": "session.handoff",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -2242,12 +2242,12 @@
 		"decision": "include",
 		"sdkId": "session.resume",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -3864,12 +3864,12 @@
 		"decision": "include",
 		"sdkId": "session.new",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -3918,12 +3918,12 @@
 		"decision": "include",
 		"sdkId": "session.fork",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4617,12 +4617,12 @@
 		"decision": "include",
 		"sdkId": "session.handoff",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4761,9 +4761,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4790,9 +4790,9 @@
 			"telegram": "prohibited",
 			"discord": "prohibited",
 			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4944,12 +4944,12 @@
 		"decision": "include",
 		"sdkId": "session.switch",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
@@ -4962,12 +4962,12 @@
 		"decision": "include",
 		"sdkId": "session.branch",
 		"adapterMappings": {
-			"telegram": "prohibited",
-			"discord": "prohibited",
-			"slack": "prohibited",
-			"mcp": "prohibited",
-			"acp": "prohibited",
-			"daemonCli": "prohibited"
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
 		},
 		"testIds": [
 			"packages/coding-agent/test/sdk-operation-inventory.test.ts"

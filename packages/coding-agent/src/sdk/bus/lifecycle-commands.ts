@@ -293,13 +293,13 @@ function isSafeBranch(value: string): boolean {
 export function formatLifecycleOutcome(r: SessionLifecycleResponse, verb?: LifecycleCommandVerb): string {
 	switch (r.type) {
 		case "session_create_response":
-			return `\u{1f680} Launching session ${r.sessionId} through SDK core. It will appear once ready — check /session_recent.`;
+			return `\u{1f680} Launching session ${r.sessionId} in tmux. It will appear once ready \u2014 check /session_recent.`;
 		case "session_close_response":
 			return `\u2705 Closed session ${r.sessionId} (history preserved \u2014 you can resume it later).`;
 		case "session_resume_response":
 			return r.mode === "reattached"
 				? `\u2705 Reattached to live session ${r.sessionId}.`
-				: `\u{1f680} Resuming session ${r.sessionId} from saved history through SDK core — check /session_recent.`;
+				: `\u{1f680} Cold-restarting session ${r.sessionId} from saved history in tmux \u2014 check /session_recent.`;
 		case "session_lifecycle_error":
 			break;
 		default:

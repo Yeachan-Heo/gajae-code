@@ -213,7 +213,7 @@ describe("TopicRegistry", () => {
 		expect(fresh.topicId).toBe("43");
 		expect(reg.sessionForTopic("43")).toBe("s1");
 	});
-	test("ignores transient replay generation changes without mutating durable topic authority", async () => {
+	test("rejects a lower replay generation for the same endpoint without mutating durable authority", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "42", Date.now, undefined, {
 			chatId: "42",
@@ -236,13 +236,12 @@ describe("TopicRegistry", () => {
 				endpointDigest: "digest",
 				endpointGeneration: 8,
 			}),
-		).toBe("unchanged");
+		).toBe("rejected");
 		expect(reg.serialize().topics.s1).toMatchObject({
-			telegramBinding: { chatId: "42", transport: "telegram" },
+			endpointGeneration: 9,
+			endpointKey: "endpoint",
+			endpointDigest: "digest",
 		});
-		expect(reg.serialize().topics.s1).not.toHaveProperty("endpointGeneration");
-		expect(reg.serialize().topics.s1).not.toHaveProperty("endpointKey");
-		expect(reg.serialize().topics.s1).not.toHaveProperty("endpointDigest");
 	});
 
 	test("resolves session for a topic id (inbound routing)", async () => {
@@ -328,7 +327,7 @@ describe("TopicRegistry", () => {
 		expect(creates).toBe(0);
 		expect(reg.pendingCreateClaims()).toEqual([{ sessionId: "s1", authorityEpoch: 0, createdAt: 1 }]);
 	});
-	test("restored create claim reconciles by stable Telegram binding instead of endpoint credentials", () => {
+	test("restored create claim rejects different active binding evidence", () => {
 		const claimBinding = {
 			chatId: "42",
 			endpointKey: "old-key",
@@ -357,16 +356,22 @@ describe("TopicRegistry", () => {
 				s1: { sessionId: "s1", authorityEpoch: 0, createdAt: 1, binding: claimBinding },
 			},
 		});
-		expect(reg.reconcileCreateClaim("s1", reg.get("s1"))).toBe(true);
-		expect(reg.pendingCreateClaims()).toEqual([]);
+		expect(reg.reconcileCreateClaim("s1", reg.get("s1"))).toBe(false);
+		expect(reg.pendingCreateClaims()).toEqual([
+			{ sessionId: "s1", authorityEpoch: 0, createdAt: 1, binding: claimBinding },
+		]);
 	});
 
 	test("retains archived topic records and never recreates physical topics", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "1");
+		expect(reg.acquireLease("s1", "host", 100, 1_000, 500)).toBe(true);
+		expect(reg.releaseLeaseToGrace("s1", "host", 200, 500)).toBe(true);
+		expect(reg.get("s1")?.disconnectGraceExpiresAt).toBe(700);
 
-		reg.beginArchive("s1", undefined, Date.now(), "session_closed");
+		reg.beginArchive("s1");
 		expect(reg.get("s1")?.authorityState).toBe("archive_pending");
+		expect(reg.get("s1")?.disconnectGraceExpiresAt).toBeUndefined();
 		expect(reg.sessionForTopic("1")).toBeUndefined();
 
 		await expect(reg.getOrCreateTopic("s1", async () => "2")).rejects.toThrow("topic authority is archive-fenced");
@@ -377,7 +382,7 @@ describe("TopicRegistry", () => {
 		await reg.getOrCreateTopic("s1", async () => "1");
 		expect(reg.markOrphaned("s1", 1_000)).toBe(true);
 
-		reg.beginArchive("s1", undefined, 2_000, "session_closed");
+		reg.beginArchive("s1", undefined, 2_000);
 		const snapshot = reg.serialize();
 
 		expect(snapshot.topics.s1).toMatchObject({ authorityState: "archive_pending", orphanedAt: 1_000 });
@@ -412,86 +417,6 @@ describe("TopicRegistry", () => {
 		expect(snapshot.topics.s1.disconnectGraceExpiresAt).toBeUndefined();
 		expect(parseTopicRegistryState(snapshot)).toBeDefined();
 	});
-	test("accepts an archive fence poisoned with a stray grace deadline and heals it on load", () => {
-		// v0.12.12–v0.12.17 beginArchive moved disconnect_grace records to
-		// archive_pending without clearing disconnectGraceExpiresAt. Rejecting
-		// that persisted shape bricked the shared registry: the CAS authority
-		// refused every subsequent read and write.
-		const poisoned = {
-			version: 2,
-			registryGeneration: 4056,
-			topics: {
-				s1: {
-					topicId: "14261",
-					topicOrigin: "daemon_created",
-					sessionUuid: "94fd6b56-a281-455b-b014-2ab3975bfa21",
-					identitySent: true,
-					createdAt: 1_785_971_485_050,
-					orphanedAt: 1_785_991_593_616,
-					creationLeaseEpoch: 0,
-					authorityEpoch: 1,
-					authorityState: "archive_pending",
-					chatId: "42",
-					endpointKey: "endpoint",
-					endpointDigest: "digest",
-					endpointGeneration: 1,
-					endpointIncarnation: 0,
-					archiveHostId: "host-a",
-					archiveLeaseEpoch: 1,
-					disconnectGraceExpiresAt: 1_785_991_623_616,
-				},
-			},
-		} as unknown as TopicRegistryState;
-
-		const state = parseTopicRegistryState(poisoned);
-		expect(state).toBeDefined();
-
-		const reg = new TopicRegistry(state);
-		expect(reg.get("s1")).toMatchObject({ topicId: "14261", authorityState: "archive_pending" });
-		const snapshot = reg.serialize();
-		expect(snapshot.topics.s1.disconnectGraceExpiresAt).toBeUndefined();
-		expect(parseTopicRegistryState(snapshot)).toBeDefined();
-	});
-	test("still rejects disconnect grace records missing the deadline or orphan timestamp", () => {
-		const record = {
-			topicId: "1",
-			topicOrigin: "daemon_created",
-			sessionUuid: "94fd6b56-a281-455b-b014-2ab3975bfa22",
-			identitySent: false,
-			createdAt: 1,
-			authorityState: "disconnect_grace",
-			orphanedAt: 1_000,
-			disconnectGraceExpiresAt: 31_000,
-			chatId: "42",
-			endpointKey: "endpoint",
-			endpointDigest: "digest",
-		};
-		const stateWith = (patch: object) =>
-			({
-				version: 2,
-				registryGeneration: 1,
-				topics: { s1: { ...record, ...patch } },
-			}) as unknown as TopicRegistryState;
-
-		expect(parseTopicRegistryState(stateWith({}))).toBeDefined();
-		expect(() => parseTopicRegistryState(stateWith({ disconnectGraceExpiresAt: undefined }))).toThrow(
-			"malformed Telegram topic state",
-		);
-		expect(() => parseTopicRegistryState(stateWith({ orphanedAt: undefined }))).toThrow(
-			"malformed Telegram topic state",
-		);
-		expect(() => parseTopicRegistryState(stateWith({ disconnectGraceExpiresAt: "soon" }))).toThrow(
-			"malformed Telegram topic state",
-		);
-		// The archive-family tolerance is scoped: a stray grace deadline on any
-		// non-archive state is still rejected, never interpreted as healthy.
-		expect(() => parseTopicRegistryState(stateWith({ authorityState: "active" }))).toThrow(
-			"malformed Telegram topic state",
-		);
-		expect(() => parseTopicRegistryState(stateWith({ authorityState: "delete_pending" }))).toThrow(
-			"malformed Telegram topic state",
-		);
-	});
 
 	test("restores the exact disconnect grace deadline after archive publication fails", async () => {
 		const reg = new TopicRegistry();
@@ -499,7 +424,7 @@ describe("TopicRegistry", () => {
 		expect(reg.markOrphaned("s1", 1_000)).toBe(true);
 		const authority = reg.captureArchiveAuthority("s1");
 
-		reg.beginArchive("s1", undefined, 2_000, "session_closed");
+		reg.beginArchive("s1", undefined, 2_000);
 		expect(reg.restoreArchiveAuthority(authority)).toBe(true);
 		const snapshot = reg.serialize();
 
@@ -544,7 +469,7 @@ describe("TopicRegistry", () => {
 		const reg = new TopicRegistry();
 		const created = Promise.withResolvers<string>();
 		const create = reg.getOrCreateTopic("s1", () => created.promise);
-		expect(reg.beginArchive("s1", undefined, Date.now(), "session_closed")).toBeUndefined();
+		expect(reg.beginArchive("s1")).toBeUndefined();
 		created.resolve("42");
 		await expect(create).rejects.toThrow("topic authority was revoked during creation");
 		expect(reg.get("s1")).toMatchObject({ topicId: "42", authorityState: "archive_pending" });
@@ -561,7 +486,7 @@ describe("TopicRegistry", () => {
 				undefined,
 				undefined,
 				async () => {
-					reg.beginArchive("s1", undefined, Date.now(), "session_closed");
+					reg.beginArchive("s1");
 				},
 			),
 		).rejects.toThrow("topic authority was revoked during creation");
@@ -577,7 +502,7 @@ describe("TopicRegistry", () => {
 			endpointDigest: "digest-s1",
 			endpointGeneration: 1,
 		});
-		reg.beginArchive("s1", undefined, Date.now(), "session_closed");
+		reg.beginArchive("s1");
 
 		const reloaded = new TopicRegistry(reg.serialize());
 
@@ -669,7 +594,7 @@ describe("TopicRegistry", () => {
 		});
 		await reg.getOrCreateTopic("A", async () => "42", Date.now, undefined, binding("A"));
 		const snapshot = reg.captureArchiveAuthority("A");
-		reg.beginArchive("A", undefined, Date.now(), "session_closed");
+		reg.beginArchive("A");
 		await reg.getOrCreateTopic("B", async () => "42", Date.now, undefined, binding("B"));
 
 		expect(reg.restoreArchiveAuthority(snapshot)).toBe(true);
@@ -699,31 +624,19 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 166 at serving epoch 87", () => {
+test("publishes generation 63 at serving epoch 5", () => {
+	// Generation 55: shared-topic-authority outage hardening (#3974).
+	// Generation 56: lazy native authority for startup-cost cut (#3846).
+	// Generation 57: parser-valid archive transitions after disconnect grace.
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 152: a thrown steady heartbeat renewal in the run loop is
-	// contained instead of terminating the daemon (#4200).
-	// Generation 153: strict orchestration admission fences Telegram topics.
-	// Generation 154: private-chat archives dispatch deleteForumTopic, settle
-	// TOPIC_ID_INVALID, and drain durable archive retries periodically.
-	// Generation 155: unified durable terminal-retention write path (#4329).
-	// Generation 156: session eligibility follows configuration, and threaded
-	// mode always uses threads instead of refusing a session's own declaration.
-	// Generation 157: orphan-topic reconciliation with FORUM_TOPIC_NOT_FOUND
-	// settlement and unsupported-method fallback.
-	// Generation 158: fences the master-worker lifecycle: older daemons cannot
-	// continue serving while this daemon adds or removes master-channel delivery
-	// authority.
-	// Generation 159: terminal-abort notification admission and cleanup semantics.
-	// Generation 160: provider-local Telegram subscription fault containment.
-	// Generation 161: durable cleanup/archive receipts and stable topic recovery.
-	// Generation 162: detached chat-provider daemon ownership from session lifecycle.
-	// Generation 164: auto-reap superseded Telegram daemon owners (#4403).
-	// Generation 165: bounded lean settlement windows preserve user receipts.
-	// Generation 166: complete owned process-group cleanup, fail-closed watchdog,
-	// and daemon-internal orphan-owner reconciliation (#4403).
-	expect(DAEMON_GENERATION).toBe(166);
-	expect(SERVING_EPOCH).toBe(87);
+	// Generation 59: attached OPEN-socket count in the heartbeat sidecar (#4128).
+	// Generation 60: transient heartbeat-sidecar publication failures are
+	// contained instead of crashing the daemon (#4200).
+	// Generation 61: fenced same-session transport recovery and strict Telegram topic admission.
+	// Generation 62: replay-gap authority validation.
+	// Generation 63: orchestration-only topic routing with durable-registry fail-closed admission.
+	expect(DAEMON_GENERATION).toBe(63);
+	expect(SERVING_EPOCH).toBe(5);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();
@@ -734,20 +647,20 @@ test("archives pending topics into retained inactive records", async () => {
 		endpointGeneration: 1,
 	});
 
-	registry.beginArchive("session", undefined, Date.now(), "session_closed");
+	registry.beginArchive("session");
 	expect(registry.get("session")?.authorityState).toBe("archive_pending");
-	expect(registry.settleArchive("session", "42", registry.authorityEpoch("session"), "session_closed")).toBe(true);
+	expect(registry.settleArchive("session", "42", registry.authorityEpoch("session"))).toBe(true);
 	expect(registry.get("session")?.authorityState).toBe("inactive");
 	expect(registry.serialize().topics.session?.topicId).toBe("42");
 });
 test("a stale archive result cannot settle a newer archive fence", async () => {
 	const registry = new TopicRegistry();
 	await registry.getOrCreateTopic("session", async () => "43");
-	expect(registry.beginArchive("session", "host-a", 100, "session_closed")).toBeDefined();
+	expect(registry.beginArchive("session", "host-a", 100)).toBeDefined();
 	const dispatchedEpoch = registry.authorityEpoch("session");
-	expect(registry.beginArchive("session", "host-a", 101, "session_closed")).toBeDefined();
+	expect(registry.beginArchive("session", "host-a", 101)).toBeDefined();
 
-	expect(registry.settleArchive("session", "43", dispatchedEpoch, "session_closed")).toBe(false);
+	expect(registry.settleArchive("session", "43", dispatchedEpoch)).toBe(false);
 	expect(registry.get("session")).toMatchObject({
 		topicId: "43",
 		authorityState: "archive_pending",
@@ -785,10 +698,10 @@ test("saturated authority epochs fail closed for create, archive, and settlement
 		},
 		fences: { session: Number.MAX_SAFE_INTEGER },
 	});
-	expect(saturated.beginArchive("session", "host-a", 100, "session_closed")).toBeUndefined();
+	expect(saturated.beginArchive("session", "host-a", 100)).toBeUndefined();
 	expect(saturated.get("session")?.authorityState).toBe("archive_exhausted");
-	expect(saturated.settleArchive("session", "45", Number.MAX_SAFE_INTEGER, "session_closed")).toBe(false);
-	expect(saturated.archivePendingSessionIds(100)).toEqual([]);
+	expect(saturated.settleArchive("session", "45", Number.MAX_SAFE_INTEGER)).toBe(false);
+	expect(saturated.archivePendingSessionIds(100)).toEqual(["session"]);
 });
 
 test("rejects future topic registry versions and quarantines retained legacy records", () => {
@@ -811,6 +724,67 @@ test("rejects future topic registry versions and quarantines retained legacy rec
 
 	expect(registry.get("legacy")).toMatchObject({ topicId: "42", authorityState: "legacy_quarantined" });
 	expect(registry.sessionForTopic("42")).toBeUndefined();
+});
+
+test("repairs an archive record carrying a stale disconnect-grace marker", () => {
+	const snapshot = {
+		version: 2,
+		registryGeneration: 7,
+		topics: {
+			session: {
+				topicId: "42",
+				topicOrigin: "daemon_created",
+				sessionUuid: "session-uuid",
+				identitySent: true,
+				createdAt: 1,
+				orphanedAt: 2,
+				authorityEpoch: 1,
+				authorityState: "archive_pending",
+				chatId: "42",
+				endpointKey: "endpoint",
+				endpointDigest: "digest",
+				endpointGeneration: 1,
+				archiveHostId: "host",
+				archiveLeaseEpoch: 1,
+				disconnectGraceExpiresAt: 3,
+			},
+		},
+	};
+	const original = structuredClone(snapshot);
+	const state = parseTopicRegistryState(snapshot);
+
+	expect(state?.topics.session?.authorityState).toBe("archive_pending");
+	expect(state?.topics.session?.disconnectGraceExpiresAt).toBeUndefined();
+	expect(snapshot).toEqual(original);
+});
+test("normalizes stale disconnect-grace markers in retired history without mutating the snapshot", () => {
+	const snapshot = {
+		version: 2,
+		registryGeneration: 7,
+		topics: {},
+		retiredTopics: {
+			session: [
+				{
+					topicId: "42",
+					topicOrigin: "daemon_created",
+					sessionUuid: "session-uuid",
+					identitySent: true,
+					createdAt: 1,
+					orphanedAt: 2,
+					authorityEpoch: 1,
+					authorityState: "inactive",
+					chatId: "42",
+					disconnectGraceExpiresAt: 3,
+				},
+			],
+		},
+	};
+	const original = structuredClone(snapshot);
+	const state = parseTopicRegistryState(snapshot);
+
+	expect(state?.retiredTopics?.session?.[0]?.disconnectGraceExpiresAt).toBeUndefined();
+	expect(new TopicRegistry(state).serialize().retiredTopics?.session?.[0]?.disconnectGraceExpiresAt).toBeUndefined();
+	expect(snapshot).toEqual(original);
 });
 test("fences a concurrent host and permits same-topic resume only before grace expiry", async () => {
 	const registry = new TopicRegistry();
@@ -858,11 +832,11 @@ test("terminal archive states cannot be revived by lease or orphan transitions",
 			endpointDigest: "digest",
 		},
 	);
-	registry.beginArchive("session", undefined, Date.now(), "session_closed");
-	for (let attempt = 0; attempt < 9; attempt++) registry.scheduleArchiveRetry("session", attempt, "session_closed");
+	registry.beginArchive("session");
+	for (let attempt = 0; attempt < 9; attempt++) registry.scheduleArchiveRetry("session", attempt);
 	expect(registry.get("session")?.authorityState).toBe("archive_pending");
 	expect(registry.acquireLease("session", "host", 10, 1_000, 500)).toBe(false);
-	expect(registry.archivePendingSessionIds(1_000_000)).toEqual(["session"]);
+	expect(registry.archivePendingSessionIds(70_000)).toEqual(["session"]);
 	expect(registry.archiveExhaustedSessionIds()).toEqual([]);
 	expect(registry.markOrphaned("session", 10)).toBe(false);
 	expect(registry.clearOrphaned("session")).toBe(false);
@@ -907,7 +881,7 @@ test("retains adopted topics and rejects an unexpired foreign archive owner", as
 		undefined,
 		"user_created",
 	);
-	expect(registry.beginArchive("session", "host-a", 100, "session_closed")).toBeUndefined();
+	expect(registry.beginArchive("session", "host-a", 100)).toBeUndefined();
 	expect(registry.serialize().topics.session?.topicOrigin).toBe("user_created");
 
 	const daemonTopic = new TopicRegistry();
@@ -919,8 +893,8 @@ test("retains adopted topics and rejects an unexpired foreign archive owner", as
 		{ chatId: "42", endpointKey: "endpoint-2", endpointDigest: "digest-2" },
 	);
 	expect(daemonTopic.acquireLease("daemon", "host-a", 100, 1_000, 0)).toBe(true);
-	expect(daemonTopic.beginArchive("daemon", "host-b", 101, "session_closed")).toBeUndefined();
-	expect(daemonTopic.beginArchive("daemon", "host-b", 1_101, "session_closed")?.archiveHostId).toBe("host-b");
+	expect(daemonTopic.beginArchive("daemon", "host-b", 101)).toBeUndefined();
+	expect(daemonTopic.beginArchive("daemon", "host-b", 1_101)?.archiveHostId).toBe("host-b");
 	expect(daemonTopic.archiveAuthorityAllows("daemon", "host-b", 1_101)).toBe(true);
 });
 test("accepted-create compensation publishes exact host and archive epoch authority", async () => {
@@ -933,18 +907,7 @@ test("accepted-create compensation publishes exact host and archive epoch author
 		undefined,
 		binding,
 	);
-	const fenced = registry.fenceAcceptedCreateForLease(
-		"session",
-		"44",
-		0,
-		"host-a",
-		() => 101,
-		undefined,
-		binding,
-		undefined,
-		undefined,
-		"create_compensation",
-	);
+	const fenced = registry.fenceAcceptedCreateForLease("session", "44", 0, "host-a", () => 101, undefined, binding);
 	expect(fenced).toMatchObject({
 		topicId: "44",
 		authorityState: "archive_pending",
@@ -966,8 +929,8 @@ test("retains inactive predecessor evidence when an authenticated successor rota
 		undefined,
 		original,
 	);
-	expect(registry.beginArchive("session", "host-a", 101, "session_closed")).toBeDefined();
-	expect(registry.settleArchive("session", "45", registry.authorityEpoch("session"), "session_closed")).toBe(true);
+	expect(registry.beginArchive("session", "host-a", 101)).toBeDefined();
+	expect(registry.settleArchive("session", "45", registry.authorityEpoch("session"))).toBe(true);
 	expect(
 		registry.retireInactiveEndpointForSuccessor("session", {
 			chatId: "42",

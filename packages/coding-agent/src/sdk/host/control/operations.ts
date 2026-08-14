@@ -54,7 +54,7 @@ export interface ControlSurface {
 	newSession(): Promise<ControlValue> | ControlValue;
 	forkSession(): Promise<ControlValue> | ControlValue;
 	resumeSession(id: string): Promise<ControlValue> | ControlValue;
-	closeSession(capability?: string): Promise<ControlValue> | ControlValue;
+	closeSession(): Promise<ControlValue> | ControlValue;
 	switchSession(id: string): Promise<ControlValue> | ControlValue;
 	branchSession(entryId: string): Promise<ControlValue> | ControlValue;
 	renameSession(name: string): Promise<ControlValue> | ControlValue;

@@ -10,8 +10,8 @@ export {
 	UnknownModelProfileError,
 } from "../config/model-profile-contract";
 export * as bus from "./bus";
+export * from "./client";
 export * as host from "./host";
-export * as lifecycle from "./lifecycle";
 export * as mcp from "./mcp";
 export type {
 	Q10CurrentThinkingLevel,
@@ -23,7 +23,6 @@ export type {
 } from "./models";
 export * from "./prompt-status";
 export type { ActiveProviderConnectionKind, ActiveProviderDescriptor } from "./providers";
-export * as router from "./router";
 export * from "./session";
 export * from "./session-directory";
 export * from "./turn-result";

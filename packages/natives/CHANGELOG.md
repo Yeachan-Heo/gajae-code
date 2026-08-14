@@ -30,13 +30,10 @@
 - macOS Terminal.app Meta-wrapped escape sequences such as Option+Arrow are now recognized by the native key matcher and parser.
 - POSIX checked file publication now retains an open source descriptor across no-replace rename/link validation, pins exact replacements behind a verified private source link, and can retire one explicitly authorized staging hard-link name without touching the remaining published alias.
 
-### Removed
-
-- Removed the obsolete `NotificationControlServer` N-API surface. Session lifecycle mutations now enter the coding-agent SDK Broker path instead of a provider-owned native control endpoint.
-
 ## [0.12.21] - 2026-08-09
 
 ## [0.12.20] - 2026-08-09
+
 ## [0.12.19] - 2026-08-08
 
 ## [0.12.18] - 2026-08-08

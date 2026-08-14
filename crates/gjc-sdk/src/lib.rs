@@ -15,7 +15,9 @@
 pub mod actions;
 pub mod broker_protocol;
 pub mod control;
+pub mod control_server;
 pub mod discovery;
+pub mod lifecycle;
 pub mod protocol;
 pub mod query;
 pub mod reverse;
@@ -29,7 +31,19 @@ pub use broker_protocol::{
 pub use control::{
 	ControlClientFrame, ControlError, ControlRequest, ControlResponse, ControlServerFrame,
 };
-pub use discovery::{EndpointRecord, clean_stale, endpoint_path, read_endpoint, write_endpoint};
+pub use control_server::{ControlServerConfig, ControlServerHandle, start_control};
+pub use discovery::{
+	ControlEndpointRecord, EndpointRecord, clean_stale, control_endpoint_path, endpoint_path,
+	read_control_endpoint, read_endpoint, remove_control_endpoint, write_control_endpoint,
+	write_endpoint,
+};
+pub use lifecycle::{
+	LifecycleClientMessage, LifecycleEndpoint, LifecycleErrorReason, LifecycleServerMessage,
+	LifecycleState, LifecycleStatus, MatchedBy, ResumeCandidate, ResumeMode, SessionClose,
+	SessionCloseResponse, SessionCloseTarget, SessionCreate, SessionCreateResponse,
+	SessionCreateTarget, SessionLifecycleError, SessionResume, SessionResumeResponse,
+	SessionResumeTarget,
+};
 pub use protocol::{
 	ActionKind, ActionNeeded, ActionResolved, ActionUnavailable, ActionUnavailableReason,
 	AnswerSelector, ClientMessage, RejectReason, Reply, ReplyAnswer, ReplyRejected, ResolvedBy,

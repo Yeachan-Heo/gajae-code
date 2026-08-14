@@ -93,7 +93,7 @@ gate(
 );
 gate(
 	"single-use human approval",
-	operate.includes("Approval is single-use") && operate.includes("send no CLI request") && author.includes("single-use human approval"),
+	operate.includes("Approval is single-use") && operate.includes("send no SDK request") && author.includes("single-use human approval"),
 	"approval contract",
 );
 gate(
@@ -101,94 +101,59 @@ gate(
 	["session.delete", "managed bash", "configuration mutation", "authentication mutation", "permission-mode mutation", "tool activation mutation", "extension mutation", "session cwd mutation"].every(value => operate.includes(value)),
 	"exclusion list",
 );
-const skillBypassMarkers = [
-	"Read the local SDK discovery records",
-	"listSdkSessionEndpoints",
-	"read_session_endpoint",
-	"select_live_endpoint",
-	"SdkClient.connect",
-	"connect_ws",
-] as const;
 
 gate(
-	"skill guidance stays on broker-bound surfaces",
-	discover.includes("gjc sdk session list") &&
-		author.includes("gjc sdk session") &&
-		operate.includes("gjc sdk session raw") &&
-		![discover, operate, author].some(contents => skillBypassMarkers.some(marker => contents.includes(marker))),
-	"CLI guidance without endpoint-client instructions",
-);
-
-const endpointBypassMarkers = [
-	".gjc/state/sdk",
-	"listSdkSessionEndpoints",
-	"read_session_endpoint",
-	"select_live_endpoint",
-	"SdkClient",
-	"connect_ws",
-	"WebSocket",
-	"endpoint.url",
-	"endpoint.token",
-] as const;
-
-gate(
-	"templates use the broker-bound session CLI",
-	typeScript.includes('Bun.spawn(["gjc", "sdk", "session"') &&
-		python.includes('["gjc", "sdk", "session", *arguments]') &&
-		typeScript.includes("cwd: repo") &&
-		python.includes("cwd=repo"),
-	"gjc sdk session through repository cwd",
+	"templates are direct SDK clients",
+	typeScript.includes('@gajae-code/coding-agent/sdk') && python.includes("from gjc_sdk import") && python.includes("SdkClient"),
+	"maintained SDK imports",
 );
 gate(
-	"templates require explicit repository and session inputs",
-	typeScript.includes('values.get("--repo")') &&
-		typeScript.includes('values.get("--session-id")') &&
-		python.includes('parser.add_argument("--repo", required=True)') &&
-		python.includes('parser.add_argument("--session-id", required=True)'),
-	"--repo and --session-id",
+	"templates require repository input",
+	typeScript.includes('values.get("--repo")') && python.includes('parser.add_argument("--repo", required=True)'),
+	"--repo",
 );
 gate(
 	"templates require immediate nonce-bound approval",
-	typeScript.includes("await requireApproval(args.sessionId, args.operation, input)") &&
-		python.includes("require_approval(args.session_id, operation, operation_input)") &&
+	typeScript.includes("await requireApproval(endpoint.sessionId, args.operation, args.input)") &&
+		python.includes("require_approval(endpoint.session_id, operation, operation_input)") &&
 		typeScript.includes("randomBytes(8)") &&
 		python.includes("secrets.token_hex(8)") &&
 		typeScript.includes("Type the exact challenge") &&
 		python.includes("Type the exact challenge") &&
 		typeScript.includes("human_approval_required") &&
 		python.includes("human_approval_required"),
-		"single-process operation/session/input/nonce approval",
-	);
+	"single-process operation/session/input/nonce approval",
+);
 gate(
 	"python approval challenge stays off stdout",
 	python.includes("file=sys.stderr") && python.includes("sys.stdin.readline()"),
 	"challenge on stderr, answer from stdin",
 );
 gate(
-	"templates redact and reject secret-shaped fields",
+	"templates close clients",
+	typeScript.includes("finally {\n\t\tawait client.close();") && python.includes("finally:\n        await client.close()"),
+	"finally close",
+);
+gate(
+	"templates redact secret-shaped fields and endpoint token values",
 	typeScript.includes("SECRET_FIELD") &&
 		python.includes("SECRET_FIELD") &&
-		typeScript.includes("hasSecretField(input)") &&
-		python.includes("has_secret_field(operation_input)") &&
-		typeScript.includes('"[REDACTED]"') &&
-		python.includes('"[REDACTED]"'),
-	"redact output and reject secret-shaped input",
+		typeScript.includes('value.replaceAll(endpointToken, "[REDACTED]")') &&
+		python.includes('value.replace(endpoint_token, "[REDACTED]")'),
+	"field and value redaction",
 );
 gate(
 	"templates omit token CLI arguments",
 	!typeScript.includes('"--token"') && !python.includes('"--token"'),
 	"no --token",
 );
+
 gate(
 	"templates reject unsupported CLI arguments",
 	typeScript.includes("ALLOWED_ARGUMENTS.has(token)") && python.includes("argparse.ArgumentParser"),
 	"closed argument grammar",
 );
-gate(
-	"templates contain no endpoint authority bypass",
-	![typeScript, python].some(contents => endpointBypassMarkers.some(marker => contents.includes(marker))),
-	endpointBypassMarkers.join(", "),
-);
+
 gate(
 	"no MCP or coordinator commands",
 	![...files.values()].some(contents => /\bmcp-serve\b|\bcoordinator-mcp\b|\bmcp-serve coordinator\b/.test(contents)),

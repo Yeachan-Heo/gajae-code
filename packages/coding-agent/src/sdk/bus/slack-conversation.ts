@@ -10,7 +10,6 @@ export interface SlackInboundDispatchReceipt {
 	actionId?: string;
 	/** The endpoint generation and SDK effect captured before Socket Mode ACK. */
 	endpointGeneration: number;
-	attachmentAuthorityId?: string;
 	/** Identifier of the protected journal payload; mappings never retain message bodies. */
 	effectId: string;
 	idempotencyKey: string;
@@ -26,10 +25,7 @@ export interface SlackConversation extends ConversationRecord {
 	rootTs?: string;
 	sessionId?: string;
 	endpointGeneration?: number;
-	attachmentAuthorityId?: string;
 	clientMsgId?: string;
-	/** Exact pending Router-removal cleanup; cleared only after the mapping close CAS commits. */
-	cleanupEffectId?: string;
 	/** Exclusive, expiring authority for provider reconciliation/publication of the root intent. */
 	rootPublicationOwner?: string;
 	rootPublicationLeaseExpiresAt?: number;

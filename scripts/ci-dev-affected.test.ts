@@ -3,10 +3,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
-import {
-	runSdkProductionHostIsolated,
-	sdkProductionHostIsolatedSuites,
-} from "./run-sdk-production-host-isolated";
 
 // Matrix planning validates live workspace and Cargo manifests in subprocesses.
 // Hosted runners can need more than Bun's 5s default during their first cold scan.
@@ -21,23 +17,6 @@ const packages: WorkspacePackage[] = [
 ];
 
 const EMBEDDED_DOCS_GATE_KEY = "test:packages/coding-agent/test/docs-index-lazy.test.ts";
-
-test("the production SDK host suites run sequentially and stop after a failure", async () => {
-	const started: string[] = [];
-	let active = 0;
-	let maxActive = 0;
-	const exitCode = await runSdkProductionHostIsolated(async suite => {
-		active += 1;
-		maxActive = Math.max(maxActive, active);
-		started.push(suite.file);
-		await Bun.sleep(1);
-		active -= 1;
-		return suite.file === sdkProductionHostIsolatedSuites[0].file ? 0 : 17;
-	});
-	expect(started).toEqual(sdkProductionHostIsolatedSuites.map(suite => suite.file));
-	expect(maxActive).toBe(1);
-	expect(exitCode).toBe(17);
-});
 
 function planForPaths(paths: readonly string[]) {
 	return planTasks(paths, packages);
@@ -99,7 +78,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
 		expect(workflow).toContain("  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}");
-		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
+		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-python-matrix, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
 		expect(workflow).toContain("artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}");
 		expect(workflow).toContain("artifact-ids: ${{ needs.affected-evidence-producer.outputs.artifact_id }}");
@@ -117,9 +96,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain(".ci-dev-affected-evidence.receipt.json");
 		expect(workflow).not.toContain("evidencePath");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_RESULT: ${{ needs.telegram-daemon-generation.result }}");
-		expect(workflow).toContain(
-			"CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon')",
-		);
+		expect(workflow).toContain("CI_DEV_TELEGRAM_GUARD_REQUIRED: ${{ contains(needs.affected-plan.outputs.changed_paths, 'telegram-daemon')");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_RESULT: ${{ needs.windows-telegram-daemon-safety.result }}");
 		expect(workflow).toContain("CI_DEV_TELEGRAM_WINDOWS_REQUIRED:");
 		expect(workflow).toContain("bun test ./packages/natives/test/path-identity-windows.test.ts");
@@ -177,7 +154,6 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		// and enforced workflow-wide by dev-ci-guard-topology.test.ts.
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-manager/windows-canonical-path.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
-		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
 		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
@@ -606,7 +582,6 @@ describe("describeTasks matrix emission", () => {
 				"bun",
 				"test",
 				"scripts/ci-dev-affected.test.ts",
-				"scripts/run-bun-test-files.test.ts",
 				"scripts/dev-ci-guard-topology.test.ts",
 				"scripts/ci-risk-canary-manifest.test.ts",
 				"scripts/ci-virtual-integration.test.ts",
@@ -614,11 +589,6 @@ describe("describeTasks matrix emission", () => {
 		}
 		const riskTasks = planTasks(["packages/coding-agent/src/session/session-manager.ts"], packages);
 		expect(riskTasks.some(task => task.key === "test:packages/coding-agent/test/notifications-live-stream.test.ts")).toBe(true);
-	});
-
-	test("full plan includes the fresh-process harness regression", () => {
-		const task = planFullTasks(packages).find(candidate => candidate.key === "test:scripts/run-bun-test-files.test.ts");
-		expect(task?.command).toEqual(["bun", "test", "scripts/run-bun-test-files.test.ts"]);
 	});
 
 	test("cwd is emitted repo-relative for package-scoped tasks", () => {
@@ -751,6 +721,18 @@ describe("--matrix-json and --task CLI fan-out", () => {
 			CI_DEV_PLAN_SOURCE_SHA: planSourceSha,
 		});
 		expect(validation.exitCode).toBe(0);
+	});
+	test("CI_FORCE_FULL emits Python work outside the shard matrix", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ci-dev-affected-python-full-"));
+		tempDirs.push(tempDir);
+		const outputFile = path.join(tempDir, "github-output.txt");
+		const { stdout, exitCode } = await runScript(["--matrix-json"], "", { CI_FORCE_FULL: "1", GITHUB_OUTPUT: outputFile });
+		expect(exitCode).toBe(0);
+		expect((JSON.parse(stdout.trim()) as Array<{ key: string }>).filter(entry => entry.key.startsWith("python-"))).toHaveLength(3);
+		const output = await Bun.file(outputFile).text();
+		expect(output).toContain("has_python=true");
+		const matrix = JSON.parse((output.split("\n").find(line => line.startsWith("matrix=")) ?? "matrix={}").slice("matrix=".length));
+		expect(matrix.include.some((entry: { key: string }) => entry.key.startsWith("python-"))).toBe(false);
 	});
 
 	test("changed-path ranges use the canonical source head instead of ambient PR merge SHA", async () => {
@@ -1035,7 +1017,12 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		dir: "packages/coding-agent",
 		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
 	};
-	const targetingPackages: WorkspacePackage[] = [codingAgent];
+	const bridgeClient: WorkspacePackage = {
+		name: "@gajae-code/bridge-client",
+		dir: "packages/bridge-client",
+		manifest: { name: "@gajae-code/bridge-client", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const targetingPackages: WorkspacePackage[] = [codingAgent, bridgeClient];
 	const testFiles = [
 		"packages/coding-agent/test/edit/foo.test.ts",
 		"packages/coding-agent/test/edit/bar.test.ts",
@@ -1043,10 +1030,9 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		"packages/coding-agent/test/rlm-live-model-e2e.test.ts",
 		"packages/coding-agent/test/startup-update-contract.test.ts",
 		"packages/coding-agent/test/sdk-host-wiring.test.ts",
-		"packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts",
 		"packages/coding-agent/test/sdk/index.test.ts",
 		"packages/coding-agent/test/other/index.test.ts",
-		"packages/coding-agent/test/sdk-client.test.ts",
+		"packages/bridge-client/test/client.test.ts",
 	];
 
 	function targeted(paths: readonly string[]) {
@@ -1076,42 +1062,18 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		]) {
 			const tasks = targeted([changedPath]);
 			const keys = tasks.map(task => task.key);
-		expect(keys).toContain(shardOne);
-		expect(tasks.find(task => task.key === shardOne)?.command).toEqual([
-			"bun",
-			"scripts/run-bun-test-files.ts",
-			"--root=packages/coding-agent",
-			"--shard=1/8",
-			"--timeout=30000",
-			"--file-timeout=300000",
-			"--concurrency=1",
-		]);
+			expect(keys).toContain(shardOne);
+			expect(tasks.find(task => task.key === shardOne)?.command).toEqual(["bun", "test", "--shard=1/8"]);
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([shardOne]);
 			expect(keys).toContain(isolated);
 			expect(tasks.find(task => task.key === isolated)?.command).toEqual([
 				"bun",
-				"../../scripts/run-sdk-production-host-isolated.ts",
+				"test",
+				"test/sdk-chat-daemon-worker.test.ts",
+				"-t",
+				"routes Slack safe queries through the production Session SDK host",
 			]);
 		}
-	});
-
-	test("prompt terminal diagnostics changes run directly and on the isolated SDK host", () => {
-		const testFile = "packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts";
-		const tasks = targeted([testFile]);
-		expect(tasks.find(task => task.key === `test:${testFile}`)?.command).toEqual(["bun", "test", testFile]);
-		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.command).toEqual([
-			"bun",
-			"scripts/run-bun-test-files.ts",
-			"--root=packages/coding-agent",
-			"--shard=1/8",
-			"--timeout=30000",
-			"--file-timeout=300000",
-			"--concurrency=1",
-		]);
-		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated")?.command).toEqual([
-			"bun",
-			"../../scripts/run-sdk-production-host-isolated.ts",
-		]);
 	});
 
 	test("basename collisions fall back to package checks instead of arbitrary tests", () => {
@@ -1173,11 +1135,9 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/session/blob-store.ts",
 			"packages/coding-agent/src/sdk/session-directory.ts",
 			"packages/coding-agent/src/session/session-manager.ts",
-			"packages/coding-agent/src/sdk/broker/session-index.ts",
 			"packages/coding-agent/test/session-manager/windows-canonical-path.test.ts",
 			"packages/coding-agent/test/session/managed-lock-lease.windows.test.ts",
 			"packages/coding-agent/test/sdk-session-directory.windows.test.ts",
-			"packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
@@ -1262,8 +1222,8 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("test:scripts/clean.test.ts");
 		expect(keys).toContain("root-check");
 	});
-	test("cache-eval fixture adds its focused AI test without bypassing root fallback coverage", () => {
-		const tasks = targeted(["packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json"]);
+	test("cache-eval evidence artifact adds its focused AI test without bypassing root fallback coverage", () => {
+		const tasks = targeted(["artifacts/architecture-2383-eval.json"]);
 		expect(tasks.map(task => task.key)).toEqual([
 			"test:packages/ai/test/anthropic-cache-eval.integration.test.ts",
 			"root-check",
@@ -1304,19 +1264,10 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"bun",
 			"test",
 			"scripts/ci-dev-affected.test.ts",
-			"scripts/run-bun-test-files.test.ts",
 			"scripts/dev-ci-guard-topology.test.ts",
 			"scripts/ci-risk-canary-manifest.test.ts",
 			"scripts/ci-virtual-integration.test.ts",
 		]);
-	});
-
-	test("the fresh-process runner is a first-class CI harness path", () => {
-		for (const changedPath of ["scripts/run-bun-test-files.ts", "scripts/run-bun-test-files.test.ts"]) {
-			const keys = targeted([changedPath]).map(task => task.key);
-			expect(keys).toContain("ci-selftest");
-			expect(keys).toContain("ci-dry-run");
-		}
 	});
 
 	test("native platform package changes plan release publish validation", () => {
@@ -1326,16 +1277,20 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys).toContain("release-publish-dry-run");
 	});
 
-	test("internal SDK client changes retain package validation and packed-surface coverage", () => {
-		const tasks = targeted(["packages/coding-agent/src/sdk/client/client.ts"]);
+	test("bridge-client changes retain package validation alongside release publish coverage", () => {
+		const tasks = targeted(["packages/bridge-client/src/client.ts"]);
 		const keys = tasks.map(task => task.key);
-		expect(keys.filter(key => key === "check:@gajae-code/coding-agent")).toHaveLength(1);
-		expect(keys.filter(key => key === "sdk-package-smoke")).toHaveLength(1);
-		expect(tasks.find(task => task.key === "sdk-package-smoke")?.command).toEqual([
+		expect(keys.filter(key => key === "check:@gajae-code/bridge-client")).toHaveLength(1);
+		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
+		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
+		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
+		expect(keys.filter(key => key === "bridge-client-sdk-package-smoke")).toHaveLength(1);
+		expect(keys.filter(key => key === "test:packages/bridge-client/test/client.test.ts")).toHaveLength(1);
+		expect(tasks.find(task => task.key === "bridge-client-sdk-package-smoke")?.command).toEqual([
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
-		expect(describeTasks(tasks).find(task => task.key === "sdk-package-smoke")?.native).toBe(true);
+		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
 
@@ -1427,6 +1382,15 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		}
 	});
 
+test("Python SDK changes plan dedicated Python validation and one native build", () => {
+	const changed = ["python/gjc-sdk/gjc_sdk/client.py"];
+	for (const tasks of [planTasks(changed, packages), planTargetedTasks(changed, packages, [])]) {
+		expect(tasks.map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke", "native-linux-x64"]);
+		expect(tasks.filter(task => task.phase === "python").map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke"]);
+	}
+	const full = planFullTasks(packages);
+	expect(full.filter(task => task.phase === "python").map(task => task.key)).toEqual(["python-check", "python-test", "python-build-smoke"]);
+});
 
 
 	test("native-consuming test files pull in a single native build task", () => {
@@ -1449,6 +1413,11 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
 	};
 
+	const bridgeClient: WorkspacePackage = {
+		name: "@gajae-code/bridge-client",
+		dir: "packages/bridge-client",
+		manifest: { name: "@gajae-code/bridge-client", scripts: { check: "biome check .", test: "bun test" } },
+	};
 	test("push mode splits the package-wide coding-agent test across bounded shards", () => {
 		const tasks = planTasks(["packages/coding-agent/src/edit/foo.ts"], [codingAgent]);
 		const keys = tasks.map(task => task.key);
@@ -1464,39 +1433,13 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"test:@gajae-code/coding-agent:shard-7-of-8",
 			"test:@gajae-code/coding-agent:shard-8-of-8",
 		]);
-		expect(testShards[0]?.command).toEqual([
-			"bun",
-			"scripts/run-bun-test-files.ts",
-			"--root=packages/coding-agent",
-			"--shard=1/8",
-			"--timeout=30000",
-			"--file-timeout=300000",
-			"--concurrency=1",
-		]);
-		expect(testShards[0]?.cwd).toBeUndefined();
+		expect(testShards[0]?.command).toEqual(["bun", "test", "--shard=1/8"]);
+		expect(testShards[0]?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
 		expect(keys).toContain("check:@gajae-code/coding-agent");
 
 		const entries = describeTasks(tasks);
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.native).toBe(true);
-	});
-
-	test("push mode runs the AI suite with the same fresh-process boundary", () => {
-		const ai: WorkspacePackage = {
-			name: "@gajae-code/ai",
-			dir: "packages/ai",
-			manifest: { name: "@gajae-code/ai", scripts: { check: "biome check .", test: "bun test" } },
-		};
-		const task = planTasks(["packages/ai/src/index.ts"], [ai]).find(candidate => candidate.key === "test:@gajae-code/ai");
-		expect(task?.command).toEqual([
-			"bun",
-			"scripts/run-bun-test-files.ts",
-			"--root=packages/ai",
-			"--timeout=30000",
-			"--file-timeout=300000",
-			"--concurrency=1",
-		]);
-		expect(task?.cwd).toBeUndefined();
 	});
 
 	test("push mode schedules release evidence contract, dry-run, and focused coverage once", () => {
@@ -1518,16 +1461,22 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(rootCheck).toMatchObject({ command: ["bun", "run", "ci:check:full"], native: true, nativeBuild: false });
 	});
 
-	test("push mode selects the SDK package smoke for internal client changes", () => {
-		const tasks = planTasks(["packages/coding-agent/src/sdk/client/client.ts"], [codingAgent]);
+	test("push mode selects the bridge-client SDK package smoke exactly once for package and SDK client changes", () => {
+		const tasks = planTasks(
+			["packages/bridge-client/package.json", "packages/coding-agent/src/sdk/client/client.ts"],
+			[codingAgent, bridgeClient],
+		);
 		const keys = tasks.map(task => task.key);
-		expect(keys.filter(key => key === "sdk-package-smoke")).toHaveLength(1);
-		expect(tasks.find(task => task.key === "sdk-package-smoke")?.command).toEqual([
+		expect(keys.filter(key => key === "bridge-client-sdk-package-smoke")).toHaveLength(1);
+		expect(tasks.find(task => task.key === "bridge-client-sdk-package-smoke")?.command).toEqual([
 			"bun",
 			"packages/coding-agent/scripts/build-sdk-package-smoke.ts",
 		]);
-		expect(describeTasks(tasks).find(task => task.key === "sdk-package-smoke")?.native).toBe(true);
+		expect(describeTasks(tasks).find(task => task.key === "bridge-client-sdk-package-smoke")?.native).toBe(true);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
+		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
+		expect(describeTasks(tasks).find(task => task.key === "release-publish-contract")?.native).toBe(true);
+		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 	});
 
 	test("full-workspace changes partition root tests into matrix shards", () => {
@@ -1536,6 +1485,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 
 		expect(keys).toContain("root-check");
 		expect(keys).toContain("root-test:release");
+		expect(describeTasks(tasks).find(task => task.key === "root-test:release")?.native).toBe(true);
 		expect(keys).not.toContain("root-test");
 		expect(tasks.filter(task => task.key.startsWith("test:@gajae-code/coding-agent:shard-")).map(task => task.key)).toEqual([
 			"test:@gajae-code/coding-agent:shard-1-of-8",
@@ -1677,7 +1627,13 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		const isolatedSdkHost = tasks.find(
 			task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated",
 		);
-		expect(isolatedSdkHost?.command).toEqual(["bun", "../../scripts/run-sdk-production-host-isolated.ts"]);
+		expect(isolatedSdkHost?.command).toEqual([
+			"bun",
+			"test",
+			"test/sdk-chat-daemon-worker.test.ts",
+			"-t",
+			"routes Slack safe queries through the production Session SDK host",
+		]);
 		expect(isolatedSdkHost?.cwd).toBe(resolvePackageCwd("packages/coding-agent"));
 	});
 

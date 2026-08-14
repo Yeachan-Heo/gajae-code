@@ -7,7 +7,6 @@ import {
 	type AuthenticateResponse,
 	type AuthMethod,
 	type AvailableCommand,
-	type CancelNotification,
 	type ClientCapabilities,
 	type CloseSessionRequest,
 	type CloseSessionResponse,
@@ -50,13 +49,9 @@ import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
-import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
-import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
-import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
-import { resolveAcpAbortScope } from "./abort-scope";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -75,6 +70,7 @@ const ACP_CUSTOM_MODEL_PRESET = "__custom__";
 const THINKING_CONFIG_ID = "thinking";
 const SESSION_PAGE_SIZE = 50;
 const MAX_ACP_REPLAY_PAGES = 10_000;
+const MAX_ACP_SESSION_LIST_PAGES = 10_000;
 /** Bounded retention of settled prompt correlations so late duplicates stay closed. */
 const SETTLED_PROMPT_CORRELATION_RETENTION = 16;
 /**
@@ -121,19 +117,6 @@ interface PromptWaiter {
 	cancelWatchdog?: () => void;
 	/** What the host is observably doing — a tool running, a model call unanswered — and the bound that follows from it. */
 	activity: PromptActivity;
-	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
-	cancelAttempt?: Promise<boolean>;
-	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
-	 *  a later failed attempt must not erase an earlier success (review thread P2). */
-	cancelAcknowledged?: boolean;
-	/** In-flight cancel attempts for this prompt: cancellation intent must stay
-	 *  set while any attempt can still acknowledge, so a failure only clears
-	 *  the shared flag when no attempt remains pending (review thread P2). */
-	pendingCancelAttempts?: number;
-	/** Shared resolver for cancelAttempt: ANY successful attempt resolves it
-	 *  immediately (no request-order serialization), and the LAST failing
-	 *  attempt resolves false (review thread P2). */
-	cancelAttemptResolve?: (acknowledged: boolean) => void;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -146,7 +129,6 @@ type PendingAttachment = { epoch: number; task: Promise<void> };
 type SessionRecord = {
 	cwd: string;
 	adapter: AcpSdkAdapter;
-	attachment: SessionAttachment;
 	closeIdempotencyKey: string;
 	unsubscribe: () => void;
 	reconnectUnsubscribe: () => void;
@@ -174,10 +156,13 @@ function promptWaiterRetired(record: SessionRecord, waiter: PromptWaiter): boole
 	return waiter.settled || record.activePrompt !== waiter;
 }
 
+type Endpoint = { url: string; token: string };
+
 type BrokerSession = {
 	sessionId: string;
 	locator?: { repo?: string };
 	live?: boolean;
+	terminal?: boolean;
 	endpointGeneration?: number;
 	endpointMtimeMs?: number;
 	title?: string;
@@ -211,44 +196,40 @@ function object(value: unknown): JsonObject | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : undefined;
 }
 
-function isAcpUnavailableSlashCommand(text: string): boolean {
-	return /^\/import-session(?:\s|:|$)/u.test(text);
-}
-
 async function collectAcpSessionList(
 	request: (input: JsonObject) => Promise<unknown>,
 	input: JsonObject = {},
 ): Promise<JsonObject> {
-	try {
-		const pages = await traverseSessionList(
-			input,
-			async pageInput => {
-				const response = await request(pageInput);
-				const envelope = object(response);
-				if (envelope?.ok === false) {
-					const failure = object(envelope.error);
-					throw new AcpSdkAdapterError(
-						typeof failure?.code === "string" ? failure.code : "broker_error",
-						typeof failure?.message === "string" ? failure.message : "session.list failed",
-					);
-				}
-				return response;
-			},
-			response => sessionListPageFromResponse(response),
-		);
-		const aggregate: JsonObject = {};
-		const sessions: unknown[] = [];
-		for (const { page } of pages) {
-			for (const [key, value] of Object.entries(page)) {
+	const aggregate: JsonObject = {};
+	const sessions: unknown[] = [];
+	let cursor: string | undefined;
+	for (let pageCount = 0; pageCount < MAX_ACP_SESSION_LIST_PAGES; pageCount++) {
+		const response = object(await request({ ...input, ...(cursor === undefined ? {} : { cursor }) }));
+		const listing = object(response?.result) ?? response;
+		if (response?.ok === false) {
+			const failure = object(response.error);
+			throw new AcpSdkAdapterError(
+				typeof failure?.code === "string" ? failure.code : "broker_error",
+				typeof failure?.message === "string" ? failure.message : "session.list failed",
+			);
+		}
+		if (listing) {
+			for (const [key, value] of Object.entries(listing)) {
 				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
 			}
-			sessions.push(...page.sessions);
+			if (Array.isArray(listing.sessions)) sessions.push(...listing.sessions);
+			const nextCursor =
+				typeof listing.continuationCursor === "string" && listing.continuationCursor.length > 0
+					? listing.continuationCursor
+					: undefined;
+			if (nextCursor) {
+				cursor = nextCursor;
+				continue;
+			}
 		}
 		return { ...aggregate, sessions };
-	} catch (error) {
-		if (error instanceof SessionListTraversalError) throw new AcpSdkAdapterError("protocol_error", error.message);
-		throw error;
 	}
+	throw new AcpSdkAdapterError("protocol_error", "session.list exceeded the page budget.");
 }
 
 function aggregateAcpFailure(code: string, message: string, failures: unknown[]): AcpSdkAdapterError {
@@ -272,7 +253,11 @@ export function paginateAcpSessions(
 			(value): value is BrokerSession & { locator: { repo: string } } =>
 				typeof value?.sessionId === "string" && typeof value.locator?.repo === "string",
 		)
-		.filter(value => !cwd || value.locator.repo === cwd);
+		.filter(value => !cwd || value.locator.repo === cwd)
+		// DR-1 retains closed/unregistered rows in the broker index for inspect
+		// and offline tail; ACP's session/list advertises only loadable sessions,
+		// so terminal rows are excluded here (matching the pre-DR-1 wire shape).
+		.filter(value => value.terminal !== true);
 	const sessions = filtered.slice(offset, offset + SESSION_PAGE_SIZE).map(value => {
 		const metadata = sessionMetadata.get(value.sessionId);
 		const updatedAt =
@@ -299,6 +284,15 @@ export function paginateAcpSessions(
 		sessions,
 		nextCursor: offset + sessions.length < filtered.length ? String(offset + sessions.length) : undefined,
 	};
+}
+
+function endpoint(value: unknown): Endpoint {
+	const candidate = object(value);
+	const result = object(candidate?.result) ?? candidate;
+	const nested = object(result?.endpoint) ?? result;
+	if (typeof nested?.url !== "string" || typeof nested.token !== "string")
+		throw new AcpSdkAdapterError("unavailable", "SDK lifecycle response omitted a session endpoint.");
+	return { url: nested.url, token: nested.token };
 }
 
 function sessionId(value: unknown): string {
@@ -388,26 +382,6 @@ function promptAcknowledgement(value: unknown): PromptCorrelation | undefined {
 	if (typeof payload.commandId !== "string" || payload.commandId.trim().length === 0) return undefined;
 	if (typeof payload.turnId !== "string" || payload.turnId.trim().length === 0) return undefined;
 	return { commandId: payload.commandId, turnId: payload.turnId };
-}
-
-/**
- * A `session/cancel` is acknowledged ONLY by a matching-scope C04 `stopped`
- * disposition (`{ok:true, turn:"stopped", selection: <requested scope>, ...}`)
- * or by the legacy `{aborted:true}` plain-abort ack from a broker that predates
- * terminal mode. The no-effect dispositions (`no_active_turn`, `no_effect`,
- * `no_store`) and `uncertain` explicitly provide NO proof the worker was
- * stopped — the agent turn may keep running and executing tools — so accepting
- * them would settle the ACP prompt as cancelled against a live worker (review
- * thread P1). `no_active_turn` can also be a requester-ownership no-op after an
- * SDK reconnect. Anything else means the SDK did not confirm the stop and the
- * client must see an error rather than a settled turn.
- */
-function isAbortAcknowledged(value: unknown, scope: AbortScope): boolean {
-	const candidate = object(value);
-	const result = object(candidate?.result) ?? candidate;
-	if (result === undefined) return false;
-	if (result.aborted === true) return true;
-	return result.ok === true && result.turn === "stopped" && result.selection === scope;
 }
 function strictCorrelationFrom(...values: unknown[]): PromptCorrelation | undefined {
 	const correlation: PromptCorrelation = {};
@@ -625,36 +599,6 @@ function receivedSdkEvent(frame: JsonObject): ReceivedSdkEvent | undefined {
 	return {
 		event,
 		...(object(payload.event) ? { wirePayload: payload } : {}),
-	};
-}
-
-const ROUTER_PASSTHROUGH_FRAME_TYPES = new Set([
-	"hello",
-	"server_hello",
-	"reverse_request",
-	"reverse_cancel",
-	"reverse_request_cancel",
-	"reverse_request_cancelled",
-]);
-
-function acpFrameFromRouted(frame: SessionRouterFrame): JsonObject {
-	if (
-		frame.body.type === "activity" ||
-		frame.body.type === "agent_start" ||
-		frame.body.type === "agent_end" ||
-		frame.body.type === "agent_failed"
-	)
-		return frame.body;
-	if (typeof frame.body.type === "string" && ROUTER_PASSTHROUGH_FRAME_TYPES.has(frame.body.type)) return frame.body;
-	const connectionId = typeof frame.body.connectionId === "string" ? frame.body.connectionId : undefined;
-	return {
-		type: "event",
-		...(frame.name === undefined ? {} : { kind: frame.name }),
-		...(frame.sessionId === undefined ? {} : { sessionId: frame.sessionId }),
-		...(frame.commandId === undefined ? {} : { commandId: frame.commandId }),
-		...(frame.turnId === undefined ? {} : { turnId: frame.turnId }),
-		...(connectionId === undefined ? {} : { connectionId }),
-		payload: frame.body,
 	};
 }
 
@@ -920,14 +864,6 @@ export function acpSessionStateFromConfig(
 	};
 }
 
-/** Recognize a canonical ACP skill command only when it is the complete, single text prompt. */
-export function acpSkillInvocation(blocks: PromptRequest["prompt"]): { name: string; args: string } | undefined {
-	if (blocks.length !== 1 || blocks[0]?.type !== "text") return undefined;
-	const match = /^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/.exec(blocks[0].text.trim());
-	if (!match?.[1]) return undefined;
-	return { name: match[1], args: match[2]?.trim() ?? "" };
-}
-
 /** Convert every ACP prompt block the agent advertises without silently discarding context. */
 export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 	text: string;
@@ -1125,15 +1061,10 @@ export async function applyAcpStartupOptions(
 export class AcpAgent implements Agent {
 	readonly #connection: AgentSideConnection;
 	readonly #agentDir: string;
-	readonly #router: SessionRouter;
-	readonly #pendingRouterAdapters = new Map<string, AcpSdkAdapter>();
-	readonly #pendingRouterFrames = new Map<string, Record<string, unknown>[]>();
-	#routerStartPromise: Promise<void> | undefined;
 	readonly #sessions = new Map<string, SessionRecord>();
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
-	readonly #knownSessionMcpServers = new Map<string, SessionLifecycleMcpServer[]>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
 	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
 	readonly #pendingCloseIdempotencyKeys = new Map<string, string>();
@@ -1162,39 +1093,6 @@ export class AcpAgent implements Agent {
 		this.#connection = connection;
 		const candidate = object(options);
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
-		this.#router = new SessionRouter({
-			agentDir: this.#agentDir,
-			deps: {
-				onAttachment: attachment => {
-					const record = this.#sessions.get(attachment.sessionId);
-					const adapter = record?.adapter ?? this.#pendingRouterAdapters.get(attachment.sessionId);
-					if (!adapter) return;
-					if (record) record.attachment = attachment;
-					adapter.acceptAttachment(attachment);
-				},
-				onAttachmentReady: async attachment => {
-					const record = this.#sessions.get(attachment.sessionId);
-					const adapter = record?.adapter ?? this.#pendingRouterAdapters.get(attachment.sessionId);
-					if (!adapter) return;
-					if (record) record.attachment = attachment;
-					await adapter.attachmentReady(attachment);
-				},
-				onFrame: (attachment, frame) => {
-					const acpFrame = acpFrameFromRouted(frame);
-					const adapter =
-						this.#sessions.get(attachment.sessionId)?.adapter ??
-						this.#pendingRouterAdapters.get(attachment.sessionId);
-					if (adapter) adapter.acceptFrame(acpFrame);
-					else this.#pendingRouterFrames.get(attachment.sessionId)?.push(acpFrame);
-				},
-				onSessionRemoved: attachment => {
-					const adapter =
-						this.#sessions.get(attachment.sessionId)?.adapter ??
-						this.#pendingRouterAdapters.get(attachment.sessionId);
-					adapter?.revokeAttachment(attachment);
-				},
-			},
-		});
 		this.#startupOptions = parseAcpStartupOptions(candidate?.startupOptions);
 		this.#cancelSettlementGraceMs =
 			typeof candidate?.cancelSettlementGraceMs === "number" &&
@@ -1276,9 +1174,8 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
-		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
-			await this.#attach(id, params.cwd, undefined, result);
+			await this.#attach(id, params.cwd, endpoint(result));
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
 			const response = { sessionId: id, ...(await this.#sessionState(id, true)) };
 			this.#scheduleBootstrap(id);
@@ -1293,7 +1190,6 @@ export class AcpAgent implements Agent {
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
-		if (mcpServers.length > 0) this.#knownSessionMcpServers.set(params.sessionId, mcpServers);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
 		await this.#replaySession(params.sessionId);
 		const response = await this.#sessionState(params.sessionId);
@@ -1305,7 +1201,6 @@ export class AcpAgent implements Agent {
 		const mcpServers = this.#mcpServers(params);
 		this.#assertAbsoluteCwd(params.cwd);
 		this.#assertNoAdditionalDirectories(params.additionalDirectories);
-		if (mcpServers.length > 0) this.#knownSessionMcpServers.set(params.sessionId, mcpServers);
 		await this.#attachExisting(params.sessionId, params.cwd, mcpServers);
 		const response = await this.#sessionState(params.sessionId);
 		this.#scheduleBootstrap(params.sessionId);
@@ -1331,9 +1226,8 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
-		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
-			await this.#attach(id, params.cwd, undefined, result);
+			await this.#attach(id, params.cwd, endpoint(result));
 			const response = { sessionId: id, ...(await this.#sessionState(id)) };
 			this.#scheduleBootstrap(id);
 			return response;
@@ -1356,7 +1250,10 @@ export class AcpAgent implements Agent {
 				if (
 					typeof candidate?.sessionId !== "string" ||
 					typeof candidate.locator?.repo !== "string" ||
-					path.resolve(candidate.locator.repo) !== path.resolve(params.cwd)
+					path.resolve(candidate.locator.repo) !== path.resolve(params.cwd) ||
+					// A DR-1 terminal row is not a loadable session: adopting its cwd
+					// here would re-arm teardown authority for a host that is gone.
+					candidate.terminal === true
 				)
 					continue;
 				if (discovered.has(candidate.sessionId))
@@ -1412,11 +1309,7 @@ export class AcpAgent implements Agent {
 		}
 		this.#beginTeardown(params.sessionId);
 		try {
-			// A retained delete locator proves the prior attempt already completed
-			// connection/process teardown and reached durable artifact cleanup. Re-closing
-			// that terminal session can only replace the authoritative cleanup_pending
-			// result with unrelated close uncertainty, so retries resume deletion directly.
-			await this.#teardownSession(params.sessionId, "deleted", pendingLocator === undefined || record !== undefined);
+			await this.#teardownSession(params.sessionId, "deleted", true);
 			let saved = pendingLocator?.cwd === cwd ? pendingLocator.path : undefined;
 			if (!saved) {
 				try {
@@ -1424,7 +1317,6 @@ export class AcpAgent implements Agent {
 				} catch (error) {
 					if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
 						this.#knownSessionCwds.delete(params.sessionId);
-						this.#knownSessionMcpServers.delete(params.sessionId);
 						this.#knownSessionMetadata.delete(params.sessionId);
 						return {};
 					}
@@ -1438,7 +1330,6 @@ export class AcpAgent implements Agent {
 				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
 			);
 			this.#knownSessionCwds.delete(params.sessionId);
-			this.#knownSessionMcpServers.delete(params.sessionId);
 			this.#knownSessionMetadata.delete(params.sessionId);
 			this.#pendingDeleteLocators.delete(params.sessionId);
 			return {};
@@ -1501,21 +1392,6 @@ export class AcpAgent implements Agent {
 		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
 		record.cancelRequested = false;
 		const payload = acpPromptPayload(params.prompt);
-		const skillInvocation = acpSkillInvocation(params.prompt);
-		if (isAcpUnavailableSlashCommand(payload.text)) {
-			await this.#publishSessionUpdate(
-				params.sessionId,
-				{
-					sessionId: params.sessionId,
-					update: {
-						sessionUpdate: "agent_message_chunk",
-						content: { type: "text", text: "Slash command /import-session is unavailable over ACP." },
-					},
-				},
-				record.adapter,
-			);
-			return { stopReason: "end_turn" };
-		}
 		// The SDK transport hard-caps a single request frame at 256 KiB and answers an
 		// oversize frame by closing the socket (CloseCode::Size, crates/gjc-sdk/src/server.rs),
 		// which surfaces to the client as an opaque `connection_closed` mid-turn. Reject
@@ -1526,11 +1402,8 @@ export class AcpAgent implements Agent {
 		const promptFrameBytes = Buffer.byteLength(
 			JSON.stringify({
 				type: "control_request",
-				operation: skillInvocation ? "skill.invoke" : "turn.prompt",
-				input: skillInvocation ?? { text: payload.text, images: payload.images },
-				// AcpSdkAdapter.control passes `confirm: false` to SdkClient, which serializes
-				// the field even though it is not part of the skill input payload.
-				...(skillInvocation ? { confirm: false } : {}),
+				operation: "turn.prompt",
+				input: { text: payload.text, images: payload.images },
 				id: PROMPT_FRAME_ID_PLACEHOLDER,
 			}),
 		);
@@ -1584,12 +1457,10 @@ export class AcpAgent implements Agent {
 			);
 		}
 		const acknowledgementTask = (async (): Promise<PromptResponse> => {
-			const acknowledgement = skillInvocation
-				? await record.adapter.control("skill.invoke", skillInvocation)
-				: await record.adapter.prompt({
-						text: payload.text,
-						...(payload.images.length ? { images: payload.images } : {}),
-					});
+			const acknowledgement = await record.adapter.prompt({
+				text: payload.text,
+				...(payload.images.length ? { images: payload.images } : {}),
+			});
 			const acknowledgementCorrelation = promptAcknowledgement(acknowledgement);
 			if (!acknowledgementCorrelation)
 				throw new AcpSdkAdapterError(
@@ -1675,21 +1546,12 @@ export class AcpAgent implements Agent {
 		try {
 			return await Promise.race([response, acknowledgementTask]);
 		} catch (error) {
-			if (waiter.cancelAttempt && (await waiter.cancelAttempt) && waiter.settled) return await response;
 			waiter.deferredFrames.length = 0;
 			waiter.deferredActivityFrames.length = 0;
 			clearPromptWatchdog(waiter);
 			waiter.terminal = undefined;
 			waiter.settled = true;
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
-			// Keep a late terminal for this (cancelled) turn closed, exactly like the
-			// other settlement paths, so an aborted run's trailing frame can never
-			// publish over a later prompt that reuses the identity.
-			if (hasCompleteCorrelation(waiter.correlation)) {
-				record.settledPromptCorrelations.push(waiter.correlation);
-				while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
-					record.settledPromptCorrelations.shift();
-			}
 			// A prompt cancelled before the SDK acknowledged it still ends this turn by
 			// client request, and ACP is explicit: "Agents MUST catch these errors and
 			// return the semantically meaningful `cancelled` stop reason, so that Clients
@@ -1697,110 +1559,28 @@ export class AcpAgent implements Agent {
 			// rejection instead would show the user a spurious error for their own cancel.
 			if (record.cancelRequested) {
 				record.cancelRequested = false;
-				// The client's turn is settled by the return; the advisory idle publication
-				// must not gate it and must still be attempted so the running phase is
-				// released (gjcRunning:false) instead of spinning behind a settled cancel.
-				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
 				return { stopReason: "cancelled" };
 			}
 			throw error;
 		}
 	}
 
-	async cancel(params: CancelNotification): Promise<void> {
+	async cancel(params: { sessionId: string }): Promise<void> {
 		const record = this.#sessions.get(params.sessionId);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		// Record the client's intent before awaiting the SDK so a prompt that rejects
 		// mid-cancel (e.g. preflight `busy`) can still settle as `cancelled`.
 		record.cancelRequested = true;
-		// C04 terminal abort: an external client cancel stops the current turn
-		// (`scope:"turn"`, the default, matching the SDK `turn.abort` default and
-		// other ACP clients' cancel behavior). A client that also wants exact owned
-		// subagents and background tasks stopped opts in with
-		// `_meta.gjc.abortScope: "owned"` (or `GJC_ACP_ABORT_SCOPE=owned`).
-		const scope = resolveAcpAbortScope(params._meta, process.env);
-		const waiter = record.activePrompt;
-		if (waiter) {
-			// Overlapping cancels must not lose an earlier successful
-			// acknowledgement: ANY successful attempt resolves the shared
-			// waiter promise IMMEDIATELY (aggregation, not request-order
-			// serialization — an unanswered first attempt must not delay the
-			// second attempt's acknowledged success, or a prompt rejection
-			// awaiting cancelAttempt could hang past the grace bound; review
-			// thread P2). The LAST failing attempt resolves false. In-flight
-			// attempts are counted so a failure only clears the shared intent
-			// when no earlier attempt can still acknowledge.
-			waiter.pendingCancelAttempts = (waiter.pendingCancelAttempts ?? 0) + 1;
-			if (!waiter.cancelAttemptResolve) {
-				const deferred = Promise.withResolvers<boolean>();
-				waiter.cancelAttempt = deferred.promise;
-				waiter.cancelAttemptResolve = deferred.resolve;
-			}
-		}
-		try {
-			const acknowledgement = await record.adapter.cancel(scope);
-			const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
-			if (!isAbortAcknowledged(acknowledgement, scope))
-				throw new AcpSdkAdapterError(
-					"abort_unacknowledged",
-					"SDK did not acknowledge cancellation of the active prompt.",
-				);
-			if (waiter) waiter.cancelAcknowledged = true;
-			if (waiter && record.activePrompt !== waiter) {
-				waiter.cancelAttemptResolve?.(true);
-				return;
-			}
-			if (
-				result?.disposition === "preflight_cancelled" &&
-				waiter &&
-				record.activePrompt === waiter &&
-				!waiter.acknowledged &&
-				!waiter.settled
-			) {
-				record.activePrompt = undefined;
-				waiter.settled = true;
-				waiter.deferredFrames.length = 0;
-				waiter.terminal = undefined;
-				waiter.resolve({ stopReason: "cancelled" });
-				// Release the running phase for consistency with the resolved cancel; the
-				// publication is advisory and must never gate the settlement above.
-				void this.#publishPromptPhaseIdle(params.sessionId, record.adapter);
-			} else {
-				// The acknowledgement proves the run was aborted, not that its terminal was
-				// published. Arm the bounded settlement so the turn cannot outlive the cancel.
-				this.#scheduleCancelSettlement(params.sessionId, record);
-			}
-			waiter?.cancelAttemptResolve?.(true);
-		} catch (error) {
-			if (!waiter) record.cancelRequested = false;
-			// Only the LAST in-flight attempt resolves the shared promise false;
-			// an earlier attempt may still acknowledge (review thread P2). After
-			// every attempt of this wave failed, RE-ARM the aggregate: a later
-			// cancellation wave must get a fresh resolver — a stale resolved-false
-			// promise would let the prompt path observe the old failure
-			// immediately and report cancelled while the retry is still pending
-			// (review thread P2).
-			// Only clear and re-arm the aggregate when the LAST in-flight
-			// attempt fails AND the entire wave was unacknowledged: a
-			// failing attempt that follows an acknowledged one must not
-			// erase the already-resolved successful aggregate, or a later
-			// cancel installs a fresh unresolved cancelAttempt that a
-			// concurrent prompt-preflight rejection awaits past the grace
-			// bound (review thread P2).
-			if (waiter && (waiter.pendingCancelAttempts ?? 0) <= 1 && !waiter.cancelAcknowledged) {
-				waiter.cancelAttemptResolve?.(false);
-				waiter.cancelAttempt = undefined;
-				waiter.cancelAttemptResolve = undefined;
-			}
-			throw error;
-		} finally {
-			if (waiter) {
-				waiter.pendingCancelAttempts = Math.max(0, (waiter.pendingCancelAttempts ?? 1) - 1);
-				if (waiter.pendingCancelAttempts === 0 && !waiter.cancelAcknowledged && record.activePrompt === waiter) {
-					record.cancelRequested = false;
-				}
-			}
-		}
+		const acknowledgement = await record.adapter.cancel();
+		const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
+		if (result?.aborted !== true)
+			throw new AcpSdkAdapterError(
+				"abort_unacknowledged",
+				"SDK did not acknowledge cancellation of the active prompt.",
+			);
+		// The acknowledgement proves the run was aborted, not that its terminal was
+		// published. Arm the bounded settlement so the turn cannot outlive the cancel.
+		this.#scheduleCancelSettlement(params.sessionId, record);
 	}
 
 	/**
@@ -1835,14 +1615,8 @@ export class AcpAgent implements Agent {
 			while (record.settledPromptCorrelations.length > SETTLED_PROMPT_CORRELATION_RETENTION)
 				record.settledPromptCorrelations.shift();
 		}
-		// The client's turn ends with the resolution, not with the advisory idle update.
-		// Publishing the phase transition first made a backpressured ACP transport hold
-		// the settlement hostage: `sessionUpdate` awaits the stream write, a client that
-		// stops reading (force-cancel in progress) blocks it, and `waiter.resolve` never
-		// ran — the acknowledged cancel left the prompt pending forever, the client
-		// force-cancelled, and the next prompt collided with the stale foreground turn.
+		await this.#publishPromptPhaseIdle(id, record.adapter);
 		waiter.resolve({ stopReason: "cancelled" });
-		void this.#publishPromptPhaseIdle(id, record.adapter);
 	}
 
 	async extMethod(method: string, params: JsonObject): Promise<JsonObject> {
@@ -1933,18 +1707,6 @@ export class AcpAgent implements Agent {
 		return !["terminal_uncertain", "cleanup_pending", "broker_restarting", "unavailable"].includes(error.code);
 	}
 
-	async #ensureRouterReady(): Promise<void> {
-		if (!this.#routerStartPromise) {
-			let pending!: Promise<void>;
-			pending = this.#router.start().catch(error => {
-				if (this.#routerStartPromise === pending) this.#routerStartPromise = undefined;
-				throw error;
-			});
-			this.#routerStartPromise = pending;
-		}
-		await this.#routerStartPromise;
-	}
-
 	async #attachExisting(id: string, cwd: string, mcpServers: SessionLifecycleMcpServer[] = []): Promise<void> {
 		const epoch = this.#sessionEpoch(id);
 		const attached = this.#sessions.get(id);
@@ -1954,7 +1716,6 @@ export class AcpAgent implements Agent {
 			// ACP clients replay their declared MCP servers when reconnecting. The live
 			// session host remains authoritative for its immutable configuration, so
 			// attachment must not reinterpret the replay as a mutation request.
-			this.#pendingDeleteLocators.delete(id);
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -1994,7 +1755,9 @@ export class AcpAgent implements Agent {
 		if (indexed?.live) {
 			// A reconnect may repeat the client's MCP declaration. Attaching to the
 			// existing endpoint preserves the live host's immutable configuration.
-			await this.#attach(id, cwd, epoch);
+			const result = await this.#brokerEndpoint(id, indexed.endpointGeneration);
+			this.#assertSessionEpoch(id, epoch);
+			await this.#attach(id, cwd, endpoint(result), epoch);
 			return;
 		}
 
@@ -2013,7 +1776,7 @@ export class AcpAgent implements Agent {
 			mcpServers,
 		);
 		this.#assertSessionEpoch(id, epoch);
-		await this.#attach(id, cwd, epoch, result);
+		await this.#attach(id, cwd, endpoint(result), epoch);
 	}
 
 	async #scopedBrokerSession(id: string, cwd: string): Promise<BrokerSession | undefined> {
@@ -2032,7 +1795,7 @@ export class AcpAgent implements Agent {
 		return matches[0];
 	}
 
-	async #attach(id: string, cwd: string, epoch = this.#sessionEpoch(id), lifecycleResult?: unknown): Promise<void> {
+	async #attach(id: string, cwd: string, discovered: Endpoint, epoch = this.#sessionEpoch(id)): Promise<void> {
 		this.#assertSessionEpoch(id, epoch);
 		const existing = this.#sessions.get(id);
 		if (existing) {
@@ -2051,7 +1814,7 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
-		const task = this.#attachEndpoint(id, cwd, epoch, lifecycleResult);
+		const task = this.#attachEndpoint(id, cwd, discovered, epoch);
 		const pending = { epoch, task };
 		this.#attaching.set(id, pending);
 		try {
@@ -2062,37 +1825,15 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #attachEndpoint(id: string, cwd: string, epoch: number, lifecycleResult?: unknown): Promise<void> {
+	async #attachEndpoint(id: string, cwd: string, discovered: Endpoint, epoch: number): Promise<void> {
 		let adapter: AcpSdkAdapter | undefined;
-		const bufferedFrames: Record<string, unknown>[] = [];
-		const pendingAdapterFrames: Record<string, unknown>[] = [];
-		let unsubscribePendingFrames = () => {};
-		this.#pendingRouterFrames.set(id, bufferedFrames);
 		try {
-			await this.#ensureRouterReady();
-			const attachment = lifecycleResult
-				? await this.#router.adoptLifecycleResult(lifecycleResult, { sessionId: id, cwd })
-				: this.#router.attachment(id);
-			if (!attachment)
-				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} has no current Router attachment.`);
-			let currentAttachment = this.#router.attachment(id);
-			for (let attempt = 0; !currentAttachment && attempt < 40; attempt++) {
-				await Bun.sleep(50);
-				await this.#router.reconcile();
-				currentAttachment = this.#router.attachment(id);
-			}
-			if (!currentAttachment)
-				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} lost exact Router authority.`);
-			adapter = new AcpSdkAdapter({
-				router: this.#router,
-				attachment: currentAttachment,
-				sessionId: id,
+			adapter = await AcpSdkAdapter.connect({
+				url: discovered.url,
+				token: discovered.token,
 				connection: this.#reverseConnection(id),
 				providers: this.#providers(),
 			});
-			unsubscribePendingFrames = adapter.onFrame(frame => pendingAdapterFrames.push(frame));
-			this.#pendingRouterAdapters.set(id, adapter);
-			await adapter.start();
 			let capabilities: JsonObject | undefined;
 			try {
 				const response = object(await adapter.query("runtime.capabilities"));
@@ -2107,13 +1848,9 @@ export class AcpAgent implements Agent {
 					"This ACP client requires a newer GJC SDK session; restart the session.",
 				);
 			this.#assertSessionEpoch(id, epoch);
-			const exactAttachment = this.#router.attachment(id) ?? currentAttachment;
-			if (!exactAttachment.isCurrent())
-				throw new AcpSdkAdapterError("unavailable", `ACP session ${id} lost exact Router authority.`);
 			const record: SessionRecord = {
 				cwd,
 				adapter,
-				attachment: exactAttachment,
 				closeIdempotencyKey: randomUUID(),
 				unsubscribe: () => {},
 				reconnectUnsubscribe: () => {},
@@ -2129,40 +1866,20 @@ export class AcpAgent implements Agent {
 				this.#recoverSessionAfterTransportFailure(id, adapter!, error),
 			);
 			this.#sessions.set(id, record);
-			unsubscribePendingFrames();
-			for (const frame of bufferedFrames) adapter.acceptFrame(frame);
-			for (const frame of pendingAdapterFrames) this.#enqueueSdkFrame(id, adapter, frame);
-			this.#pendingRouterAdapters.delete(id);
-			this.#pendingRouterFrames.delete(id);
 			this.#knownSessionCwds.set(id, cwd);
 			await applyAcpPermissionMode(adapter, this.#clientCapabilities);
 			this.#assertSessionEpoch(id, epoch);
-			// A successful attachment establishes a new live-owner epoch. Any locator
-			// retained from an earlier cleanup_pending delete belongs to the terminal
-			// owner and must not suppress remote close when this live session is deleted.
-			this.#pendingDeleteLocators.delete(id);
 			this.#pendingCloseIdempotencyKeys.delete(id);
 		} catch (error) {
-			unsubscribePendingFrames();
-			this.#pendingRouterAdapters.delete(id);
-			this.#pendingRouterFrames.delete(id);
 			if (adapter && this.#sessions.get(id)?.adapter === adapter) {
 				try {
 					await this.#teardownSession(id, "attachment failed", false);
 				} finally {
 					this.#knownSessionCwds.delete(id);
-					this.#knownSessionMcpServers.delete(id);
 				}
 			} else if (adapter) {
 				try {
 					await adapter.close();
-				} catch {}
-				try {
-					await this.#router.attachment(id)?.retire?.();
-				} catch {}
-			} else {
-				try {
-					await this.#router.attachment(id)?.retire?.();
 				} catch {}
 			}
 			throw error;
@@ -2172,16 +1889,6 @@ export class AcpAgent implements Agent {
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
-		if (error instanceof SdkClientError && error.code !== "reconnect_exhausted") {
-			logger.warn(
-				`ACP session ${id} transport failure is not reconnect_exhausted (${error.code}); ignoring terminal recovery.`,
-			);
-			return;
-		}
-		if (!(error instanceof SdkClientError)) {
-			logger.warn(`ACP session ${id} non-transport error reached reconnect handler; ignoring terminal recovery.`);
-			return;
-		}
 		const detail = error.message || "SDK transport reconnect failed.";
 		const terminal = new AcpSdkAdapterError("connection_closed", `ACP session transport was lost: ${detail}`);
 		void this.#recoverSessionAfterTransportFailureAsync(id, adapter, record.cwd, terminal);
@@ -2195,28 +1902,16 @@ export class AcpAgent implements Agent {
 	): Promise<void> {
 		await this.#failSession(id, adapter, error);
 		if (this.#disposed || this.#knownSessionCwds.get(id) !== cwd) return;
-		const mcpServers = this.#knownSessionMcpServers.get(id) ?? [];
 		try {
-			await this.#attachExisting(id, cwd, mcpServers);
-		} catch (attachError) {
-			const detail = attachError instanceof Error ? attachError.message : String(attachError);
-			logger.warn(`ACP session ${id} auto-reattach after transport loss failed: ${detail}`);
-			try {
-				await this.#connection.sessionUpdate({
-					sessionId: id,
-					update: {
-						sessionUpdate: "session_info_update",
-						_meta: { gjcRecoverFailed: true, gjcRecoverError: detail },
-					},
-				});
-			} catch {}
+			await this.#attachExisting(id, cwd);
+		} catch {
+			// The affected prompt was rejected and the stale adapter was removed. A later load/resume retries discovery.
 		}
 	}
 
 	async #discardNewSession(id: string): Promise<void> {
 		await this.#teardownSession(id, "discarded", true);
 		this.#knownSessionCwds.delete(id);
-		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
 	}
 
@@ -2229,7 +1924,6 @@ export class AcpAgent implements Agent {
 			if (attaching) await Promise.allSettled([attaching.task]);
 			await this.#teardownSession(id, "closed", true);
 			this.#knownSessionCwds.delete(id);
-			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
 			return {};
 		} finally {
@@ -2270,6 +1964,11 @@ export class AcpAgent implements Agent {
 			}
 
 			const failures: unknown[] = [];
+			try {
+				await record?.adapter.close();
+			} catch (error) {
+				failures.push(error);
+			}
 			if (closeRemote) {
 				const closeIdempotencyKey =
 					record?.closeIdempotencyKey ?? this.#pendingCloseIdempotencyKeys.get(id) ?? randomUUID();
@@ -2280,16 +1979,6 @@ export class AcpAgent implements Agent {
 					if (this.#isDefinitiveBrokerResponse(error)) this.#pendingCloseIdempotencyKeys.delete(id);
 					if (!(ownershipBound && this.#isAlreadyGone(error))) failures.push(error);
 				}
-			}
-			try {
-				await record?.adapter.close();
-			} catch (error) {
-				failures.push(error);
-			}
-			try {
-				await record?.attachment.retire?.();
-			} catch (error) {
-				failures.push(error);
 			}
 			if (failures.length > 0) {
 				const detail = failures
@@ -2317,13 +2006,16 @@ export class AcpAgent implements Agent {
 		try {
 			await adapter.close();
 		} catch {}
-		try {
-			await record.attachment.retire?.();
-		} catch {}
 	}
 
 	async #brokerAdapter(): Promise<AcpSdkAdapter> {
 		return (await this.#brokerConnection()).adapter;
+	}
+
+	/** Machine-local endpoint lookup; never routed through ACP extension methods. */
+	async #brokerEndpoint(sessionId: string, endpointGeneration: number | undefined): Promise<unknown> {
+		const input = { sessionId, ...(endpointGeneration === undefined ? {} : { endpointGeneration }) };
+		return await (await this.#brokerConnection()).client.global("session.get_endpoint", input);
 	}
 
 	async #brokerConnection(): Promise<BrokerConnection> {
@@ -2334,7 +2026,7 @@ export class AcpAgent implements Agent {
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
 				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
-				const adapter = new AcpSdkAdapter({ client });
+				const adapter = new AcpSdkAdapter({ url: discovery.url, token: discovery.token, client });
 				adapter.onReconnectFailed(() => {
 					if (this.#broker === pending) this.#broker = undefined;
 					void adapter.close().catch(() => undefined);
@@ -2490,7 +2182,6 @@ export class AcpAgent implements Agent {
 	#enqueueSdkFrame(id: string, adapter: AcpSdkAdapter, frame: JsonObject): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
-		if (typeof frame.connectionId === "string") record.connectionId = frame.connectionId;
 		// Ingress ordering is recorded before queued work begins.
 		this.#observeSessionActivity(record, frame);
 		// Correlation is checked at ingress before a prompt-owned frame may refresh the
@@ -2526,9 +2217,6 @@ export class AcpAgent implements Agent {
 							"The prompt owner connection was lost before completion.",
 						),
 					);
-					// The turn is settled by the rejection; release the running phase
-					// best-effort so a cancelled prompt is not left reporting working.
-					void this.#publishPromptPhaseIdle(id, record.adapter);
 				}
 			}
 			return;
@@ -2712,22 +2400,17 @@ export class AcpAgent implements Agent {
 				record.settledPromptCorrelations.shift();
 		}
 		// The turn is over even though it ended badly, so the client's running phase has
-		// to be released. Rejection is the settlement; the advisory idle publication must
-		// never gate it (a backpressured transport would otherwise hold the rejection
-		// forever). Skipping the idle publish entirely is what left a client composer
-		// spinning on a turn that already produced its terminal.
+		// to be released. Skipping it here is what leaves a client composer spinning on a
+		// turn that will never produce another frame.
+		await this.#publishPromptPhaseIdle(id, record.adapter);
 		waiter.reject(error);
-		void this.#publishPromptPhaseIdle(id, record.adapter);
 	}
 
 	/**
 	 * Publishes only the phase transition — no `context.get`/`session.metadata` queries —
 	 * because an abnormal settlement has no trustworthy usage or title to report. Publish
 	 * failures are swallowed: the turn is already settled, and escalating to session
-	 * failure here would tear down a session the client can still use. Callers must
-	 * settle the prompt BEFORE invoking this (or detach it with `void`): `sessionUpdate`
-	 * awaits the transport write, so awaiting it ahead of resolution lets a backpressured
-	 * client hold the settlement hostage.
+	 * failure here would tear down a session the client can still use.
 	 */
 	async #publishPromptPhaseIdle(id: string, adapter: AcpSdkAdapter): Promise<void> {
 		const record = this.#sessions.get(id);
@@ -3478,7 +3161,7 @@ export class AcpAgent implements Agent {
 		mcpServers: SessionLifecycleMcpServer[],
 	): Promise<unknown> {
 		try {
-			return await (await this.#brokerAdapter()).lifecycle(operation, input, idempotencyKey);
+			return await (await this.#brokerAdapter()).global(operation, input, idempotencyKey);
 		} catch (error) {
 			throw acpMcpLaunchFailure(error, mcpServers);
 		}
@@ -3507,7 +3190,6 @@ export class AcpAgent implements Agent {
 		this.#attaching.clear();
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
-		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
 		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
@@ -3521,13 +3203,6 @@ export class AcpAgent implements Agent {
 			} catch (error) {
 				failures.push(error);
 			}
-		}
-		this.#pendingRouterAdapters.clear();
-		this.#pendingRouterFrames.clear();
-		try {
-			await this.#router.stop();
-		} catch (error) {
-			failures.push(error);
 		}
 		if (failures.length > 0) {
 			const detail = failures

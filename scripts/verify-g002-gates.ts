@@ -532,9 +532,9 @@ async function probeForbiddenPackageSymbols(): Promise<string[]> {
 
 async function verifyLocalToolsPreserved(): Promise<GateResult> {
 	const missing = REQUIRED_LOCAL_TOOL_FILES.filter(relativePath => !fs.existsSync(path.join(repoRoot, relativePath)));
-	const toolRegistry = `${await readText("packages/coding-agent/src/tools/index.ts")}\n${await readText("packages/coding-agent/src/tools/descriptors.ts")}`;
+	const toolIndex = await readText("packages/coding-agent/src/tools/index.ts");
 	const requiredRegistryNames = ["read", "write", "edit", "bash", "find", "search", "ast_grep", "ast_edit"];
-	const missingRegistryNames = requiredRegistryNames.filter(name => !toolRegistry.includes(`${name}:`));
+	const missingRegistryNames = requiredRegistryNames.filter(name => !toolIndex.includes(`${name}:`));
 
 	return {
 		name: "inline/local tools preserved",

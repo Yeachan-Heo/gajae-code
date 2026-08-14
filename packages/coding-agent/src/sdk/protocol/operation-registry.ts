@@ -224,16 +224,8 @@ const reverse = [
 ] as const;
 
 function controlDisposition(id: string): Record<Adapter, AdapterDisposition> {
-	if (["C25", "C26", "C27", "C28", "C29", "C30", "C31", "C32", "C34", "C48"].includes(id))
-		return dispositions({
-			telegram: "prohibited",
-			discord: "prohibited",
-			slack: "prohibited",
-			mcp: "prohibited",
-			acp: "prohibited",
-			daemonCli: "prohibited",
-		});
-	if (id === "C52") return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
+	if (["C25", "C26", "C52"].includes(id))
+		return dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" });
 	if (id === "C38")
 		return dispositions({
 			telegram: "prohibited",
@@ -349,9 +341,7 @@ export const OPERATIONS: readonly Operation[] = [
 							acp: "machine_only",
 							daemonCli: "machine_only",
 						})
-					: ["G03", "G04", "G05", "G06", "G07"].includes(id)
-						? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
-						: dispositions(),
+					: dispositions(),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),

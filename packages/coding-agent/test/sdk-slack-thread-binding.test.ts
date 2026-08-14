@@ -13,7 +13,7 @@ import {
 import { chatDaemonGeneration, chatDaemonIdentity, chatDaemonPaths } from "../src/sdk/bus/chat-daemon-control";
 import { ConversationStore, type ConversationStoreFs, conversationStorePath } from "../src/sdk/bus/conversation-store";
 import { type SlackConversation, slackConversationKey } from "../src/sdk/bus/slack-conversation";
-import { SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
+import { type SlackEndpoint, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
 import { SlackProvider } from "../src/sdk/bus/slack-provider";
 import {
@@ -21,7 +21,6 @@ import {
 	isBoundedSlackRootTs,
 	SlackThreadBindingError,
 } from "../src/sdk/bus/slack-thread-binding";
-import type { SessionAttachment } from "../src/sdk/router";
 
 const TEAM = "T1";
 const CHANNEL = "C1";
@@ -62,14 +61,8 @@ class FakeSlack {
 	}
 }
 
-function endpoint(sessionId: string, generation: number): SessionAttachment {
-	return {
-		authorityId: `${sessionId}:${generation}`,
-		sessionId,
-		generation,
-		isCurrent: () => true,
-		send: () => undefined,
-	};
+function endpoint(sessionId: string, generation: number): SlackEndpoint {
+	return { sessionId, url: "ws://localhost", token: "not-persisted", path: "", generation };
 }
 
 function intentKey(sessionId: string): string {
@@ -90,6 +83,7 @@ function parentSyncFailingFs(directory: string): ConversationStoreFs & { failPar
 		readFile: async (file, encoding) => await fs.readFile(file, encoding),
 		writeFile: async (file, data, options) => await fs.writeFile(file, data, options),
 		rename: async (from, to) => await fs.rename(from, to),
+		link: async (from, to) => await fs.link(from, to),
 		unlink: async file => await fs.unlink(file),
 		stat: async file => await fs.stat(file),
 		open: async (file, flags) => {
@@ -115,7 +109,6 @@ async function withDaemon(
 		store: ConversationStore<SlackConversation>;
 		agentDir: string;
 		setGeneration: (generation: number) => void;
-		setAuthorityAvailable: (available: boolean) => void;
 	}) => Promise<void>,
 	createStore?: (agentDir: string) => ConversationStore<SlackConversation>,
 ): Promise<void> {
@@ -124,7 +117,6 @@ async function withDaemon(
 	try {
 		const fake = new FakeSlack();
 		let generation = 3;
-		let authorityAvailable = true;
 		let id = 0;
 		daemon = new SlackNotificationDaemon({
 			agentDir,
@@ -133,9 +125,8 @@ async function withDaemon(
 			channelId: CHANNEL,
 			provider: new SlackProvider(fake),
 			randomId: () => `client-id-${++id}`,
-			resolveAttachment: async sessionId => endpoint(sessionId, generation),
-			resolveBindingAuthority: async sessionId =>
-				authorityAvailable ? { sessionId, endpointGeneration: generation } : undefined,
+			createClient: () => ({ send: () => undefined }),
+			resolveEndpoint: async sessionId => endpoint(sessionId, generation),
 			...(createStore ? { store: createStore(agentDir) } : {}),
 		});
 		await run({
@@ -147,9 +138,6 @@ async function withDaemon(
 			agentDir,
 			setGeneration: value => {
 				generation = value;
-			},
-			setAuthorityAvailable: available => {
-				authorityAvailable = available;
 			},
 		});
 	} finally {
@@ -188,15 +176,6 @@ describe("slack existing-root adoption", () => {
 			expect(fake.posts).toEqual([]);
 			const document = await store.load();
 			expect(Object.keys(document.conversations)).toEqual([intentKey("s1")]);
-		});
-	});
-
-	test("missing Router binding authority is refused before provider lookup or CAS", async () => {
-		await withDaemon(async ({ daemon, fake, store, setAuthorityAvailable }) => {
-			setAuthorityAvailable(false);
-			await expect(daemon.bindExistingRoot("s1", EXISTING_ROOT)).rejects.toMatchObject({ code: "session_not_live" });
-			expect(fake.timestampLookups).toEqual([]);
-			expect(Object.keys((await store.load()).conversations)).toEqual([]);
 		});
 	});
 

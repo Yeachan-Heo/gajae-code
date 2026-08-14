@@ -8,6 +8,7 @@ const packageDir = path.resolve(import.meta.dir, "..");
 const packageName = "@gajae-code/coding-agent";
 const agentPackageDir = path.resolve(packageDir, "../agent");
 const aiPackageDir = path.resolve(packageDir, "../ai");
+const bridgeClientPackageDir = path.resolve(packageDir, "../bridge-client");
 const tuiPackageDir = path.resolve(packageDir, "../tui");
 const nativesPackageDir = path.resolve(packageDir, "../natives");
 const linuxX64PackageDir = path.resolve(packageDir, "../natives-linux-x64");
@@ -46,6 +47,10 @@ async function runSmoke(): Promise<Surface> {
 		}
 		const agentTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], agentPackageDir);
 		const aiTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], aiPackageDir);
+		const bridgeClientTarball = run(
+			["bun", "pm", "pack", "--destination", tempDir, "--quiet"],
+			bridgeClientPackageDir,
+		);
 		const tuiTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], tuiPackageDir);
 		const nativesTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], nativesPackageDir);
 		const linuxX64Tarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], stagedLinuxX64Dir);
@@ -53,6 +58,9 @@ async function runSmoke(): Promise<Surface> {
 		const codingAgentTarball = run(["bun", "pm", "pack", "--destination", tempDir, "--quiet"], packageDir);
 		const agentTarballPath = path.isAbsolute(agentTarball) ? agentTarball : path.join(agentPackageDir, agentTarball);
 		const aiTarballPath = path.isAbsolute(aiTarball) ? aiTarball : path.join(aiPackageDir, aiTarball);
+		const bridgeClientTarballPath = path.isAbsolute(bridgeClientTarball)
+			? bridgeClientTarball
+			: path.join(bridgeClientPackageDir, bridgeClientTarball);
 		const tuiTarballPath = path.isAbsolute(tuiTarball) ? tuiTarball : path.join(tuiPackageDir, tuiTarball);
 		const nativesTarballPath = path.isAbsolute(nativesTarball)
 			? nativesTarball
@@ -73,6 +81,7 @@ async function runSmoke(): Promise<Surface> {
 					dependencies: {
 						"@gajae-code/agent-core": `file:${agentTarballPath}`,
 						"@gajae-code/ai": `file:${aiTarballPath}`,
+						"@gajae-code/bridge-client": `file:${bridgeClientTarballPath}`,
 						[packageName]: `file:${codingAgentTarballPath}`,
 						"@gajae-code/tui": `file:${tuiTarballPath}`,
 						"@gajae-code/natives": `file:${nativesTarballPath}`,
@@ -82,6 +91,7 @@ async function runSmoke(): Promise<Surface> {
 					overrides: {
 						"@gajae-code/agent-core": `file:${agentTarballPath}`,
 						"@gajae-code/ai": `file:${aiTarballPath}`,
+						"@gajae-code/bridge-client": `file:${bridgeClientTarballPath}`,
 						"@gajae-code/tui": `file:${tuiTarballPath}`,
 						"@gajae-code/natives": `file:${nativesTarballPath}`,
 						"@gajae-code/natives-linux-x64": `file:${linuxX64TarballPath}`,
@@ -150,14 +160,15 @@ async function runSmoke(): Promise<Surface> {
 		const probePath = path.join(tempDir, "probe.ts");
 		await fs.writeFile(
 			probePath,
-			`import * as fs from "node:fs/promises";\nimport * as path from "node:path";\nimport * as root from ${JSON.stringify(packageName)};\nimport * as sdk from ${JSON.stringify(`${packageName}/sdk`)};\nimport * as bus from ${JSON.stringify(`${packageName}/sdk/bus`)};\nconst required = [[root, "createAgentSession", "root"], [root, "SESSION_DIRECTORY_API_VERSION", "root"], [root, "resolveManagedSessionScope", "root"], [root, "listManagedSessionCandidates", "root"], [sdk, "createAgentSession", "sdk"], [bus, "createNotificationsExtension", "sdk/bus"], [sdk, "SESSION_DIRECTORY_API_VERSION", "sdk"], [sdk, "resolveManagedSessionScope", "sdk"], [sdk, "listManagedSessionCandidates", "sdk"]] as const;\nfor (const [module, name, subpath] of required) if (!(name in module)) throw new Error(subpath + " missing " + name);\nconst sandbox = path.join(process.cwd(), "managed-listing-smoke");\nconst cwd = path.join(sandbox, "workspace", "a-b", "c");\nconst agentDir = path.join(sandbox, "agent");\nconst sessionsRoot = path.join(agentDir, "sessions");\nawait fs.mkdir(cwd, { recursive: true });\nconst resolved = await sdk.resolveManagedSessionScope({ cwd, agentDir, sessionsRoot });\nif (resolved.kind !== "resolved") throw new Error("packed resolver failed: " + resolved.message);\nawait fs.mkdir(resolved.scope.directoryPath, { recursive: true, mode: 0o700 });\nawait fs.chmod(sessionsRoot, 0o700);\nawait fs.chmod(resolved.scope.directoryPath, 0o700);\nawait fs.writeFile(path.join(resolved.scope.directoryPath, ".gjc-managed-session-scope.v2.json"), JSON.stringify({ schemaVersion: 1, layoutVersion: 2, identityVersion: 1, platform: process.platform === "win32" ? "win32" : "posix", canonicalPath: resolved.scope.canonicalCwd, identityDigest: resolved.scope.directoryName.slice(3) }) + "\\n", { mode: 0o600 });\nconst transcriptPath = path.join(resolved.scope.directoryPath, "packed-session.jsonl");\nawait fs.writeFile(transcriptPath, JSON.stringify({ type: "session", id: "packed-session", cwd }) + "\\n", { mode: 0o600 });\nconst snapshot = async () => Promise.all((await fs.readdir(sandbox, { recursive: true })).sort().map(async name => { const pathname = path.join(sandbox, name); const stat = await fs.lstat(pathname); return [name, stat.mode, stat.size, stat.mtimeMs, stat.isFile() ? await fs.readFile(pathname, "utf8") : null]; }));\nconst before = JSON.stringify(await snapshot());\nconst listing = await sdk.listManagedSessionCandidates({ scope: resolved.scope });\nif (listing.kind !== "complete" || listing.owned.length !== 1 || listing.owned[0]?.sessionId !== "packed-session") throw new Error("packed readonly listing failed: " + JSON.stringify(listing));\nconst after = JSON.stringify(await snapshot());\nif (after !== before) throw new Error("packed readonly listing mutated the filesystem");\nconst privateSubpath = ${JSON.stringify(`${packageName}/session/internal/managed-session-scope`)};\ntry { await import(privateSubpath); throw new Error("private managed-session scope subpath resolved"); } catch (error) {\n\tif (error instanceof Error && error.message === "private managed-session scope subpath resolved") throw error;\n\tconst message = String(error);\n\tconst exportsRejected = /Package subpath .* is not defined by "exports"/.test(message);\n\tconst bunRejected = message.startsWith("ResolveMessage: Cannot find module '" + privateSubpath + "' from '") && message.endsWith("/probe.ts'");\n\tif (!exportsRejected && !bunRejected) throw new Error("private managed-session scope failed for an unexpected reason: " + message);\n}\nprocess.stdout.write(JSON.stringify({ root: Object.keys(root).sort(), sdk: Object.keys(sdk).sort() }));\n`,
+			`import * as fs from "node:fs/promises";\nimport * as path from "node:path";\nimport * as root from ${JSON.stringify(packageName)};\nimport * as sdk from ${JSON.stringify(`${packageName}/sdk`)};\nimport * as bus from ${JSON.stringify(`${packageName}/sdk/bus`)};\nconst required = [[root, "createAgentSession", "root"], [root, "SESSION_DIRECTORY_API_VERSION", "root"], [root, "resolveManagedSessionScope", "root"], [root, "listManagedSessionCandidates", "root"], [sdk, "createAgentSession", "sdk"], [bus, "createNotificationsExtension", "sdk/bus"], [sdk, "SdkClient", "sdk"], [sdk, "SESSION_DIRECTORY_API_VERSION", "sdk"], [sdk, "resolveManagedSessionScope", "sdk"], [sdk, "listManagedSessionCandidates", "sdk"]] as const;\nfor (const [module, name, subpath] of required) if (!(name in module)) throw new Error(subpath + " missing " + name);\nconst sandbox = path.join(process.cwd(), "managed-listing-smoke");\nconst cwd = path.join(sandbox, "workspace", "a-b", "c");\nconst agentDir = path.join(sandbox, "agent");\nconst sessionsRoot = path.join(agentDir, "sessions");\nawait fs.mkdir(cwd, { recursive: true });\nconst resolved = await sdk.resolveManagedSessionScope({ cwd, agentDir, sessionsRoot });\nif (resolved.kind !== "resolved") throw new Error("packed resolver failed: " + resolved.message);\nawait fs.mkdir(resolved.scope.directoryPath, { recursive: true, mode: 0o700 });\nawait fs.chmod(sessionsRoot, 0o700);\nawait fs.chmod(resolved.scope.directoryPath, 0o700);\nawait fs.writeFile(path.join(resolved.scope.directoryPath, ".gjc-managed-session-scope.v2.json"), JSON.stringify({ schemaVersion: 1, layoutVersion: 2, identityVersion: 1, platform: process.platform === "win32" ? "win32" : "posix", canonicalPath: resolved.scope.canonicalCwd, identityDigest: resolved.scope.directoryName.slice(3) }) + "\\n", { mode: 0o600 });\nconst transcriptPath = path.join(resolved.scope.directoryPath, "packed-session.jsonl");\nawait fs.writeFile(transcriptPath, JSON.stringify({ type: "session", id: "packed-session", cwd }) + "\\n", { mode: 0o600 });\nconst snapshot = async () => Promise.all((await fs.readdir(sandbox, { recursive: true })).sort().map(async name => { const pathname = path.join(sandbox, name); const stat = await fs.lstat(pathname); return [name, stat.mode, stat.size, stat.mtimeMs, stat.isFile() ? await fs.readFile(pathname, "utf8") : null]; }));\nconst before = JSON.stringify(await snapshot());\nconst listing = await sdk.listManagedSessionCandidates({ scope: resolved.scope });\nif (listing.kind !== "complete" || listing.owned.length !== 1 || listing.owned[0]?.sessionId !== "packed-session") throw new Error("packed readonly listing failed: " + JSON.stringify(listing));\nconst after = JSON.stringify(await snapshot());\nif (after !== before) throw new Error("packed readonly listing mutated the filesystem");\nconst privateSubpath = ${JSON.stringify(`${packageName}/session/internal/managed-session-scope`)};\ntry { await import(privateSubpath); throw new Error("private managed-session scope subpath resolved"); } catch (error) {\n\tif (error instanceof Error && error.message === "private managed-session scope subpath resolved") throw error;\n\tconst message = String(error);\n\tconst exportsRejected = /Package subpath .* is not defined by "exports"/.test(message);\n\tconst bunRejected = message.startsWith("ResolveMessage: Cannot find module '" + privateSubpath + "' from '") && message.endsWith("/probe.ts'");\n\tif (!exportsRejected && !bunRejected) throw new Error("private managed-session scope failed for an unexpected reason: " + message);\n}\nprocess.stdout.write(JSON.stringify({ root: Object.keys(root).sort(), sdk: Object.keys(sdk).sort() }));\n`,
 		);
 		await fs.appendFile(
 			probePath,
-			`\nconst rootBefore = JSON.stringify(await snapshot());\nconst rootListing = await root.listManagedSessionCandidates({ scope: resolved.scope });\nif (rootListing.kind !== "complete" || rootListing.owned.length !== listing.owned.length || rootListing.owned[0]?.sessionId !== listing.owned[0]?.sessionId || rootListing.owned[0]?.path !== listing.owned[0]?.path) throw new Error("packed root readonly listing diverged from SDK listing");\nconst rootAfter = JSON.stringify(await snapshot());\nif (rootAfter !== rootBefore) throw new Error("packed root readonly listing mutated the filesystem");\n`,
+			`\nconst rootBefore = JSON.stringify(await snapshot());\nconst rootListing = await root.listManagedSessionCandidates({ scope: resolved.scope });\nif (rootListing.kind !== "complete" || rootListing.owned.length !== listing.owned.length || rootListing.owned[0]?.sessionId !== listing.owned[0]?.sessionId || rootListing.owned[0]?.path !== listing.owned[0]?.path) throw new Error("packed root readonly listing diverged from SDK listing");\nconst rootAfter = JSON.stringify(await snapshot());\nif (rootAfter !== rootBefore) throw new Error("packed root readonly listing mutated the filesystem");\nconst bridgeClient = await import("@gajae-code/bridge-client");\nif (sdk.SdkClient !== bridgeClient.SdkClient) throw new Error("SdkClient class identity differs between sdk and bridge-client");\n`,
 		);
 		const surface = JSON.parse(run(["bun", "run", probePath], tempDir)) as Surface;
 		assertExport(Object.fromEntries(surface.root.map(name => [name, true])), "createAgentSession", "root");
+		assertExport(Object.fromEntries(surface.sdk.map(name => [name, true])), "SdkClient", "sdk");
 		return { root: [...surface.root].sort(), sdk: [...surface.sdk].sort() };
 	} finally {
 		await fs.rm(tempDir, { recursive: true, force: true });

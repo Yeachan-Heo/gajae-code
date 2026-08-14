@@ -11,7 +11,6 @@ import type {
 const API_BASE = "https://discord.com/api/v10";
 const GATEWAY_INTENTS = 1 + 512 + 32_768;
 const MAX_RATE_LIMIT_RETRIES = 2;
-const REST_REQUEST_TIMEOUT_MS = 5_000;
 const NONCE_PREFIX = "<!-- gjc-thread-nonce:";
 const INVALID_SESSION_RECONNECT_DELAY_MS = 1_000;
 const TERMINAL_GATEWAY_CLOSE_CODES: ReadonlySet<number> = new Set([4_004, 4_010, 4_011, 4_012, 4_013, 4_014]);
@@ -43,22 +42,6 @@ export interface DiscordLiveProviderOptions {
 }
 
 type JsonRecord = Record<string, unknown>;
-type DiscordRequestContext = {
-	deadline: number;
-	controller: AbortController;
-	signal: AbortSignal;
-	timeoutError: Error;
-	timeout: NodeJS.Timeout;
-};
-
-function discordRequestTimeoutError(): Error {
-	return new Error("Discord API request timed out");
-}
-
-function discordAbortError(signal: AbortSignal): Error {
-	const reason = signal.reason;
-	return reason instanceof Error ? reason : new Error("Discord API request aborted");
-}
 
 /** Discord REST/Gateway implementation. The only credential is held privately and is never emitted. */
 export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticProvider {
@@ -129,47 +112,33 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		name: string;
 		nonce: string;
 	}): Promise<DiscordThread> {
-		return await this.#withRequestContext(undefined, async context => {
-			const marker = `${NONCE_PREFIX}${input.nonce}${NONCE_SUFFIX}`;
-			const starter = await this.#findStarterMessage(input.parentId, marker, context);
-			if (starter?.thread) {
-				const existing = this.#starterThread(starter.thread, input.guildId, input.parentId);
-				if (!existing) throw new Error("Discord returned an invalid starter-message thread");
-				return existing;
-			}
-			const messageId = starter?.id ?? (await this.#createStarterMessage(input.parentId, marker, context));
-			const body = await this.#request(
-				`/channels/${input.parentId}/messages/${messageId}/threads`,
-				{
-					method: "POST",
-					body: JSON.stringify({ name: input.name, auto_archive_duration: 1_440 }),
-				},
-				context,
-			);
-			return this.#thread(body, input.guildId, input.parentId);
+		const marker = `${NONCE_PREFIX}${input.nonce}${NONCE_SUFFIX}`;
+		const starter = await this.#findStarterMessage(input.parentId, marker);
+		if (starter?.thread) {
+			const existing = this.#starterThread(starter.thread, input.guildId, input.parentId);
+			if (!existing) throw new Error("Discord returned an invalid starter-message thread");
+			return existing;
+		}
+		const messageId = starter?.id ?? (await this.#createStarterMessage(input.parentId, marker));
+		const body = await this.#request(`/channels/${input.parentId}/messages/${messageId}/threads`, {
+			method: "POST",
+			body: JSON.stringify({ name: input.name, auto_archive_duration: 1_440 }),
 		});
+		return this.#thread(body, input.guildId, input.parentId);
 	}
 
-	async #createStarterMessage(parentId: string, marker: string, context: DiscordRequestContext): Promise<string> {
-		const message = await this.#request(
-			`/channels/${parentId}/messages`,
-			{
-				method: "POST",
-				body: JSON.stringify({ content: marker }),
-			},
-			context,
-		);
+	async #createStarterMessage(parentId: string, marker: string): Promise<string> {
+		const message = await this.#request(`/channels/${parentId}/messages`, {
+			method: "POST",
+			body: JSON.stringify({ content: marker }),
+		});
 		const id = this.#string(message, "id");
 		if (!id) throw new Error("Discord returned an invalid starter-message response");
 		return id;
 	}
 
-	async #findStarterMessage(
-		parentId: string,
-		marker: string,
-		context: DiscordRequestContext,
-	): Promise<{ id: string; thread?: unknown } | undefined> {
-		const messages = await this.#request(`/channels/${parentId}/messages?limit=100`, {}, context);
+	async #findStarterMessage(parentId: string, marker: string): Promise<{ id: string; thread?: unknown } | undefined> {
+		const messages = await this.#request(`/channels/${parentId}/messages?limit=100`);
 		if (!Array.isArray(messages)) return undefined;
 		for (const message of messages) {
 			if (!this.#messageContent(message).includes(marker)) continue;
@@ -184,23 +153,21 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 	}
 
 	async findThreadByNonce(input: { guildId: string; parentId: string; nonce: string }): Promise<DiscordThread | null> {
-		return await this.#withRequestContext(undefined, async context => {
-			const marker = `${NONCE_PREFIX}${input.nonce}${NONCE_SUFFIX}`;
-			const parentMessages = await this.#request(`/channels/${input.parentId}/messages?limit=100`, {}, context);
-			if (Array.isArray(parentMessages))
-				for (const message of parentMessages) {
-					if (!this.#messageContent(message).includes(marker)) continue;
-					const thread = this.#starterThread(this.#record(message).thread, input.guildId, input.parentId);
-					if (thread) return thread;
-				}
-			const candidates = await this.#listThreads(input.guildId, input.parentId, context);
-			for (const candidate of candidates) {
-				const messages = await this.#request(`/channels/${candidate.id}/messages?limit=25`, {}, context);
-				if (Array.isArray(messages) && messages.some(message => this.#messageContent(message).includes(marker)))
-					return candidate;
+		const marker = `${NONCE_PREFIX}${input.nonce}${NONCE_SUFFIX}`;
+		const parentMessages = await this.#request(`/channels/${input.parentId}/messages?limit=100`);
+		if (Array.isArray(parentMessages))
+			for (const message of parentMessages) {
+				if (!this.#messageContent(message).includes(marker)) continue;
+				const thread = this.#starterThread(this.#record(message).thread, input.guildId, input.parentId);
+				if (thread) return thread;
 			}
-			return null;
-		});
+		const candidates = await this.#listThreads(input.guildId, input.parentId);
+		for (const candidate of candidates) {
+			const messages = await this.#request(`/channels/${candidate.id}/messages?limit=25`);
+			if (Array.isArray(messages) && messages.some(message => this.#messageContent(message).includes(marker)))
+				return candidate;
+		}
+		return null;
 	}
 
 	async postMessage(input: {
@@ -275,17 +242,15 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 	async probeConfiguration(signal?: AbortSignal): Promise<DiscordConfigurationProbeResult> {
 		if (signal?.aborted) return { ok: false, detail: "Discord configuration probe cancelled." };
 		try {
-			return await this.#withRequestContext(signal, async context => {
-				const currentUser = await this.#request("/users/@me", {}, context);
-				const botUserId = this.#string(currentUser, "id");
-				if (!botUserId) throw new Error("Discord returned an invalid bot identity.");
-				const application = await this.#request("/applications/@me", {}, context);
-				const applicationId = this.#string(application, "id");
-				if (!applicationId || applicationId !== this.applicationId) {
-					throw new Error("Discord application identity does not match the configured application ID.");
-				}
-				return { ok: true, detail: "Discord bot and application credentials are valid.", botUserId };
-			});
+			const currentUser = await this.#request("/users/@me", { signal });
+			const botUserId = this.#string(currentUser, "id");
+			if (!botUserId) return { ok: false, detail: "Discord returned an invalid bot identity." };
+			const application = await this.#request("/applications/@me", { signal });
+			const applicationId = this.#string(application, "id");
+			if (!applicationId || applicationId !== this.applicationId) {
+				return { ok: false, detail: "Discord application identity does not match the configured application ID." };
+			}
+			return { ok: true, detail: "Discord bot and application credentials are valid.", botUserId };
 		} catch (error) {
 			if (signal?.aborted) return { ok: false, detail: "Discord configuration probe cancelled." };
 			const detail = error instanceof Error ? error.message : "Discord configuration probe failed.";
@@ -300,25 +265,20 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 	}): Promise<DiscordOneShotTestResult> {
 		if (input.signal?.aborted) return { ok: false, detail: "Discord notification test cancelled." };
 		try {
-			return await this.#withRequestContext(input.signal, async context => {
-				const response = await this.#request(
-					`/channels/${input.channelId}/messages`,
-					{
-						method: "POST",
-						body: JSON.stringify({ content: input.message }),
-					},
-					context,
-				);
-				const messageId = this.#string(response, "id");
-				if (!messageId) {
-					return {
-						ok: false,
-						detail: "Discord may have accepted the message but returned no message receipt.",
-						uncertain: true,
-					};
-				}
-				return { ok: true, detail: "Discord notification test delivered.", messageId };
+			const response = await this.#request(`/channels/${input.channelId}/messages`, {
+				method: "POST",
+				body: JSON.stringify({ content: input.message }),
+				signal: input.signal,
 			});
+			const messageId = this.#string(response, "id");
+			if (!messageId) {
+				return {
+					ok: false,
+					detail: "Discord may have accepted the message but returned no message receipt.",
+					uncertain: true,
+				};
+			}
+			return { ok: true, detail: "Discord notification test delivered.", messageId };
 		} catch (error) {
 			if (input.signal?.aborted) return { ok: false, detail: "Discord notification test cancelled." };
 			const detail = error instanceof Error ? error.message : "Discord notification test failed.";
@@ -331,17 +291,15 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		this.#onEvent = onEvent;
 		this.#stopped = false;
 		try {
-			await this.#withRequestContext(undefined, async context => {
-				const me = await this.#request("/users/@me", {}, context);
-				const id = this.#string(me, "id");
-				if (!id) throw new Error("Discord returned an invalid current-user response");
-				this.#botUserId = id;
-				const gateway = await this.#request("/gateway/bot", {}, context);
-				const url = this.#string(gateway, "url");
-				if (!url) throw new Error("Discord returned an invalid gateway response");
-				this.#gatewayUrl = url;
-				this.#connect(url);
-			});
+			const me = await this.#request("/users/@me");
+			const id = this.#string(me, "id");
+			if (!id) throw new Error("Discord returned an invalid current-user response");
+			this.#botUserId = id;
+			const gateway = await this.#request("/gateway/bot");
+			const url = this.#string(gateway, "url");
+			if (!url) throw new Error("Discord returned an invalid gateway response");
+			this.#gatewayUrl = url;
+			this.#connect(url);
 		} catch (error) {
 			await this.stop();
 			throw error;
@@ -504,18 +462,16 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		);
 	}
 
-	async #listThreads(guildId: string, parentId: string, context: DiscordRequestContext): Promise<DiscordThread[]> {
+	async #listThreads(guildId: string, parentId: string): Promise<DiscordThread[]> {
 		const result: DiscordThread[] = [];
-		const active = this.#record(await this.#request(`/guilds/${guildId}/threads/active`, {}, context));
+		const active = this.#record(await this.#request(`/guilds/${guildId}/threads/active`));
 		const activeThreads = active.threads;
 		if (Array.isArray(activeThreads))
 			for (const thread of activeThreads) {
 				const parsed = this.#threadOrUndefined(thread, guildId, parentId);
 				if (parsed) result.push(parsed);
 			}
-		const archived = this.#record(
-			await this.#request(`/channels/${parentId}/threads/archived/public?limit=100`, {}, context),
-		);
+		const archived = this.#record(await this.#request(`/channels/${parentId}/threads/archived/public?limit=100`));
 		const archivedThreads = archived.threads;
 		if (Array.isArray(archivedThreads))
 			for (const thread of archivedThreads) {
@@ -525,112 +481,29 @@ export class DiscordLiveProvider implements DiscordProvider, DiscordDiagnosticPr
 		return result;
 	}
 
-	async #withRequestContext<T>(
-		callerSignal: AbortSignal | undefined,
-		run: (context: DiscordRequestContext) => Promise<T>,
-	): Promise<T> {
-		const controller = new AbortController();
-		const timeoutError = discordRequestTimeoutError();
-		const deadline = this.#now() + REST_REQUEST_TIMEOUT_MS;
-		const signal = callerSignal ? AbortSignal.any([callerSignal, controller.signal]) : controller.signal;
-		const timeout = setTimeout(() => controller.abort(timeoutError), REST_REQUEST_TIMEOUT_MS);
-		const context: DiscordRequestContext = {
-			deadline,
-			controller,
-			signal,
-			timeoutError,
-			timeout,
-		};
-		try {
-			return await run(context);
-		} finally {
-			clearTimeout(timeout);
-		}
-	}
-
-	async #request(path: string, init: RequestInit = {}, context?: DiscordRequestContext): Promise<unknown> {
-		if (context) {
-			return await this.#requestWithHeaders(
-				path,
-				{ Authorization: `Bot ${this.#token}`, "Content-Type": "application/json" },
-				init,
-				context,
-			);
-		}
-		return await this.#withRequestContext(init.signal ?? undefined, requestContext =>
-			this.#requestWithHeaders(
-				path,
-				{ Authorization: `Bot ${this.#token}`, "Content-Type": "application/json" },
-				init,
-				requestContext,
-			),
+	async #request(path: string, init: RequestInit = {}): Promise<unknown> {
+		return await this.#requestWithHeaders(
+			path,
+			{ Authorization: `Bot ${this.#token}`, "Content-Type": "application/json" },
+			init,
 		);
 	}
-	async #interactionRequest(path: string, init: RequestInit = {}, context?: DiscordRequestContext): Promise<unknown> {
-		if (context) return await this.#requestWithHeaders(path, { "Content-Type": "application/json" }, init, context);
-		return await this.#withRequestContext(init.signal ?? undefined, requestContext =>
-			this.#requestWithHeaders(path, { "Content-Type": "application/json" }, init, requestContext),
-		);
+	async #interactionRequest(path: string, init: RequestInit = {}): Promise<unknown> {
+		return await this.#requestWithHeaders(path, { "Content-Type": "application/json" }, init);
 	}
-	async #requestWithHeaders(
-		path: string,
-		headers: Record<string, string>,
-		init: RequestInit,
-		context: DiscordRequestContext,
-	): Promise<unknown> {
+	async #requestWithHeaders(path: string, headers: Record<string, string>, init: RequestInit): Promise<unknown> {
 		for (let attempt = 0; ; attempt++) {
-			this.#assertRequestDeadline(context);
 			const mergedHeaders = new Headers(headers);
 			for (const [key, value] of new Headers(init.headers)) mergedHeaders.set(key, value);
-			const response = await this.#requestPhase(
-				() =>
-					this.#fetch(`${this.#apiBaseUrl}${path}`, { ...init, headers: mergedHeaders, signal: context.signal }),
-				context,
-			);
+			const response = await this.#fetch(`${this.#apiBaseUrl}${path}`, { ...init, headers: mergedHeaders });
 			if (response.status !== 429) {
 				if (!response.ok) throw new Error(`Discord API request failed (${response.status})`);
-				return response.status === 204 ? undefined : await this.#responseJson(response, context);
+				return response.status === 204 ? undefined : await response.json();
 			}
 			if (attempt >= MAX_RATE_LIMIT_RETRIES) throw new Error("Discord API rate limit retry exhausted");
-			const limited = this.#record(await this.#responseJson(response, context));
+			const limited = this.#record(await response.json());
 			const seconds = this.#number(limited, "retry_after") ?? 1;
-			this.#assertRequestDeadline(context);
-			const retryRemaining = context.deadline - this.#now();
-			await this.#requestPhase(() => this.#sleep(Math.min(Math.max(0, seconds * 1_000), retryRemaining)), context);
-		}
-	}
-
-	async #responseJson(response: Response, context: DiscordRequestContext): Promise<unknown> {
-		return await this.#requestPhase(() => response.json(), context);
-	}
-
-	async #requestPhase<T>(phase: () => Promise<T> | T, context: DiscordRequestContext): Promise<T> {
-		this.#assertRequestDeadline(context);
-		const aborted = Promise.withResolvers<never>();
-		const onAbort = () => aborted.reject(discordAbortError(context.signal));
-		context.signal.addEventListener("abort", onAbort, { once: true });
-		if (context.signal.aborted) onAbort();
-		try {
-			const value = await Promise.race([Promise.resolve().then(phase), aborted.promise]);
-			this.#assertRequestDeadline(context);
-			return value as T;
-		} catch (error) {
-			if (context.controller.signal.aborted || this.#now() >= context.deadline) {
-				if (!context.controller.signal.aborted) context.controller.abort(context.timeoutError);
-				throw context.timeoutError;
-			}
-			throw error;
-		} finally {
-			context.signal.removeEventListener("abort", onAbort);
-		}
-	}
-
-	#assertRequestDeadline(context: DiscordRequestContext): void {
-		if (context.controller.signal.aborted) throw context.timeoutError;
-		if (context.signal.aborted) throw discordAbortError(context.signal);
-		if (this.#now() >= context.deadline) {
-			context.controller.abort(context.timeoutError);
-			throw context.timeoutError;
+			await this.#sleep(Math.max(0, seconds * 1_000));
 		}
 	}
 

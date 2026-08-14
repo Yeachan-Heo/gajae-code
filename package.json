@@ -22,6 +22,7 @@
       "@gajae-code/stats": "0.13.2",
       "@gajae-code/agent-core": "0.13.2",
       "@gajae-code/ai": "0.13.2",
+      "@gajae-code/bridge-client": "workspace:*",
       "@gajae-code/coding-agent": "0.13.2",
       "@gajae-code/natives": "0.13.2",
       "@gajae-code/natives-darwin-arm64": "0.13.2",
@@ -160,8 +161,7 @@
     "generate-docs-index": "bun --cwd=packages/coding-agent run generate-docs-index",
     "generate-template": "bun --cwd=packages/coding-agent run generate-template",
     "check-spoofed-versions": "bun scripts/check-spoofed-versions.ts",
-    "check:gjc-ui": "bun scripts/verify-gjc-ui-redesign.ts && bun scripts/rebrand-inventory.ts --strict",
-    "fix:daemon-generations": "bun scripts/telegram-daemon-generation-guard.ts --fix-generations"
+    "check:gjc-ui": "bun scripts/verify-gjc-ui-redesign.ts && bun scripts/rebrand-inventory.ts --strict"
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",

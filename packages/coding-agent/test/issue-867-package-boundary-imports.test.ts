@@ -41,5 +41,5 @@ async function collectWorkspaceSourceImports(): Promise<string[]> {
 describe("published package import boundaries", () => {
 	it("does not import sibling workspace package source files through relative paths", async () => {
 		await expect(collectWorkspaceSourceImports()).resolves.toEqual([]);
-	}, 20_000);
+	});
 });

@@ -16,17 +16,6 @@ export function hasSdkWorkflowGateCapability(workflowGate: unknown): boolean {
 const UNINSTALLED_CONTROL_OPERATIONS = new Set(["auth.login", "host_tools.register", "host_uri.register"]);
 /** Advertised only when the context carries a real durable workflow-gate bridge. */
 const WORKFLOW_GATE_CONTROL_OPERATIONS = new Set(["workflow.gate_answer", "workflow.plan_approve"]);
-/** Lifecycle mutations are Broker-owned and never advertised on generic session controls. */
-const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
-	"session.new",
-	"session.fork",
-	"session.resume",
-	"session.switch",
-	"session.branch",
-	"session.handoff",
-	"session.close",
-	"session.delete",
-]);
 
 const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"model.cycle": "cycleModel",
@@ -45,7 +34,14 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"retry.abort": "sdkControl",
 	"bash.execute": "sdkControl",
 	"bash.abort": "sdkControl",
+	"session.new": "sdkControl",
+	"session.fork": "sdkControl",
+	"session.resume": "sdkControl",
+	"session.close": "sdkControl",
+	"session.switch": "sdkControl",
+	"session.branch": "sdkControl",
 	"session.rename": "sdkControl",
+	"session.handoff": "sdkControl",
 	"session.export_html": "sdkControl",
 	"runtime.reload": "sdkControl",
 	"service_tier.set": "sdkControl",
@@ -53,6 +49,7 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"queue.message.move": "sdkControl",
 	"queue.message.update": "sdkControl",
 	"extension.set_enabled": "sdkControl",
+	"session.delete": "sdkControl",
 	"session.cwd.move": "sdkControl",
 	"retry.last": "sdkControl",
 	"retry.now": "sdkControl",
@@ -93,7 +90,6 @@ export function createSdkSurfacePolicy(options: SdkSurfacePolicyOptions): SdkSur
 			OPERATIONS.filter(
 				operation =>
 					operation.kind === kind &&
-					!BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					!UNINSTALLED_CONTROL_OPERATIONS.has(operation.sdkId) &&
 					(!WORKFLOW_GATE_CONTROL_OPERATIONS.has(operation.sdkId) || options.workflowGateAvailable) &&
 					(!required[operation.sdkId] || hasBinding(required[operation.sdkId]!)),

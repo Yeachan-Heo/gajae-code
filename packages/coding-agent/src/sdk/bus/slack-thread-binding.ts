@@ -7,16 +7,20 @@
  *  2. *Daemon*: only the running owner may mutate mappings, and only while it is
  *     still the exact owner (`ownerId`/`pid`/`incarnation`/daemon generation)
  *     captured before the request was published.
- *  3. *Session*: the running daemon supplies a redacted Router authority proving
- *     the exact session and endpoint generation; this module never resolves an
- *     endpoint or retains its credentials.
+ *  3. *Session*: the SDK session must be attachable right now — indexed, live,
+ *     non-terminal, with a readable, non-stale endpoint whose pid matches the
+ *     indexed host and whose generation has not rolled.
  *
  * Provider verification happens before any lock is taken, and the mapping commit
- * re-proves daemon and session authority inside the store lock, so an authority
- * that changes mid-flight leaves no mapping behind.
+ * re-proves session authority inside the store lock, so an authority that
+ * changes mid-flight leaves no mapping behind.
  */
 
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { Settings } from "../../config/settings";
+import type { SessionIndex } from "../broker/session-index";
+import { readSdkSessionEndpoint, type SdkSessionEndpoint, type SdkSessionEndpointScope } from "../client/discovery";
 import {
 	type ChatDaemonCommandOwner,
 	type ChatDaemonCommandSubmission,
@@ -112,6 +116,100 @@ export function assertBoundedSlackRootTs(rootTs: string): void {
 		);
 }
 
+/** Proven right to bind one session at one endpoint generation. */
+async function defaultStatEndpoint(endpointPath: string): Promise<{ mtimeMs: number } | undefined> {
+	const stat = await fs.stat(endpointPath).catch(() => undefined);
+	return stat ? { mtimeMs: stat.mtimeMs } : undefined;
+}
+
+export interface SlackSessionBindingAuthority {
+	sessionId: string;
+	endpointGeneration: number;
+	pid: number;
+	repo: string;
+	/**
+	 * The exact endpoint this authority was proven against. Callers must use it
+	 * rather than re-reading discovery: a second read can observe a different
+	 * process whose endpoint generation happens to repeat, and the numeric
+	 * generation alone cannot tell the two apart.
+	 */
+	endpoint: SdkSessionEndpoint;
+	scope: SdkSessionEndpointScope;
+	endpointMtimeMs: number;
+}
+
+export interface SessionBindingAuthorityInput {
+	sessionIndex: SessionIndex;
+	sessionId: string;
+	readEndpoint?: (
+		repo: string,
+		sessionId: string,
+		scope?: SdkSessionEndpointScope,
+	) => Promise<SdkSessionEndpoint | null>;
+	statEndpoint?: (endpointPath: string) => Promise<{ mtimeMs: number } | undefined>;
+}
+
+/**
+ * Resolve exact discovery/attachment authority for one session.
+ *
+ * `IndexedSession.live` alone is only pid liveness, which a terminated or
+ * unregistered session can still satisfy through pid reuse or a stale record.
+ * Adoption additionally requires an intact index replay, a non-terminal record,
+ * and a discovery endpoint that is present, well-formed, not marked stale, and
+ * owned by the same host pid the index recorded.
+ */
+export async function resolveSessionBindingAuthority(
+	input: SessionBindingAuthorityInput,
+): Promise<SlackSessionBindingAuthority | undefined> {
+	await input.sessionIndex.refresh();
+	const listing = input.sessionIndex.listSessions();
+	// A truncated replay cannot prove the tail is free of a terminal or
+	// unregistration event, so a degraded index is never binding authority.
+	if (listing.warnings.length > 0) return undefined;
+	const session = listing.sessions.find(candidate => candidate.sessionId === input.sessionId);
+	if (!session?.live || session.terminalUncertain) return undefined;
+	if (!Number.isSafeInteger(session.endpointGeneration) || session.endpointGeneration <= 0) return undefined;
+	if (!Number.isSafeInteger(session.pid) || session.pid <= 0) return undefined;
+	// Same scope derivation the runtime's attach() fence uses. Reading a
+	// `.gjc/state/chat/sdk` session at the default scope would either miss it or
+	// prove the wrong endpoint, so an underivable scope is not authority.
+	const repo = path.resolve(session.locator.repo);
+	const defaultStateRoot = path.join(repo, ".gjc", "state");
+	const indexedStateRoot = path.resolve(session.locator.stateRoot);
+	const scope: SdkSessionEndpointScope | undefined =
+		indexedStateRoot === defaultStateRoot
+			? "default"
+			: indexedStateRoot === path.join(defaultStateRoot, "chat")
+				? "chat"
+				: undefined;
+	if (!scope || session.endpointMtimeMs === undefined) return undefined;
+
+	let endpoint: SdkSessionEndpoint | null;
+	try {
+		endpoint = await (input.readEndpoint ?? readSdkSessionEndpoint)(session.locator.repo, input.sessionId, scope);
+	} catch {
+		// A malformed discovery record is not authority for anything.
+		return undefined;
+	}
+	if (!endpoint || endpoint.stale === true || !endpoint.url || !endpoint.token) return undefined;
+	if (endpoint.pid === undefined || endpoint.pid !== session.pid) return undefined;
+
+	// The endpoint file must be the exact one the index observed. Without this
+	// the numeric generation is the only fence, and it repeats across processes.
+	const stat = await (input.statEndpoint ?? defaultStatEndpoint)(endpoint.path);
+	if (!stat || stat.mtimeMs !== session.endpointMtimeMs) return undefined;
+
+	return {
+		sessionId: input.sessionId,
+		endpointGeneration: session.endpointGeneration,
+		pid: session.pid,
+		repo: session.locator.repo,
+		endpoint,
+		scope,
+		endpointMtimeMs: session.endpointMtimeMs,
+	};
+}
+
 /** States in which a mapping still owns its session's root claim. */
 function holdsRootClaim(record: SlackConversation): boolean {
 	return record.state === "active" || record.state === "posting_root" || record.state === "resumed_root";
@@ -126,7 +224,6 @@ export interface SlackThreadClaimInput {
 	sessionId: string;
 	rootTs: string;
 	endpointGeneration: number;
-	attachmentAuthorityId?: string;
 	/**
 	 * Re-proves session authority inside the store lock, immediately before
 	 * commit. It may be invoked more than once for one claim: authority here is
@@ -184,8 +281,7 @@ export async function claimSlackThreadBinding(input: SlackThreadClaimInput): Pro
 		bound?.state !== "active" ||
 		bound.sessionId !== input.sessionId ||
 		bound.rootTs !== input.rootTs ||
-		bound.endpointGeneration !== input.endpointGeneration ||
-		bound.attachmentAuthorityId !== input.attachmentAuthorityId
+		bound.endpointGeneration !== input.endpointGeneration
 	)
 		throw new SlackThreadBindingError("binding_failed", "Slack root binding could not be claimed.");
 	return bound;
@@ -284,7 +380,6 @@ function claimTransaction(
 			rootTs: input.rootTs,
 			sessionId: input.sessionId,
 			endpointGeneration: input.endpointGeneration,
-			...(input.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: input.attachmentAuthorityId }),
 			updatedAt: now(),
 			seenEventIds: current?.seenEventIds ?? [],
 			seenContextIds: current?.seenContextIds ?? [],

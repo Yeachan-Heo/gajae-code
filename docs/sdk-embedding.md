@@ -1,11 +1,11 @@
 # SDK
 
-For managed control and notification attachment policy, see [the Gajae-Code SDK](./sdk.md).
+For the external control and notification wire protocol, see [the Gajae-Code SDK](./sdk.md).
 
 The SDK is the in-process integration surface for `@gajae-code/coding-agent`.
 Use it when you want direct access to agent state, event streaming, tool wiring, and session control from your own Bun/Node process.
 
-For process-isolated control, use a managed SDK-core adapter backed by `SessionRouter`; raw endpoint discovery and direct WebSocket clients are not public integration surfaces.
+For cross-language or process-isolated control, use the [SDK WebSocket machine interface](./sdk.md).
 
 ## Installation
 
@@ -13,6 +13,7 @@ For process-isolated control, use a managed SDK-core adapter backed by `SessionR
 bun add @gajae-code/coding-agent
 ```
 
+For process-isolated TypeScript integrations, install `@gajae-code/bridge-client` and import `SdkClient` from that standalone transport-only package. `@gajae-code/coding-agent/sdk` remains a compatibility re-export with the same `SdkClient` class identity and associated types. Both surfaces use only the v3 SDK transport; no historical BridgeClient backend protocol, handshake/commands/SSE endpoint, or direct host-control path is restored.
 
 ## Entry points
 

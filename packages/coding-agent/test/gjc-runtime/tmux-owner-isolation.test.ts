@@ -1226,69 +1226,6 @@ describe("tmux owner isolation", () => {
 		}
 	});
 
-	it("does not coalesce current and foreign-generation terminal observations", async () => {
-		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-generation-observation-"));
-		try {
-			const generation = await replaceOwnerGeneration(state, "session", "current");
-			const observation = {
-				schema_version: 1 as const,
-				op: "observe_terminal" as const,
-				session_id: "session",
-				owner_generation: generation,
-				state_dir: state,
-				socket_key: "socket",
-				observer: "sidecar" as const,
-				observed_at: "2026-01-01T00:00:01.000Z",
-				signal: "EXIT" as const,
-				exit_code: 0,
-				exit_kind: "exit",
-				reason: "sidecar",
-			};
-			const current = observeOwnerTerminal(observation);
-			const foreign = observeOwnerTerminal({ ...observation, owner_generation: "foreign" });
-			await expect(foreign).rejects.toThrow("generation_mismatch");
-			await expect(current).resolves.toMatchObject({ generation, server_key: "socket" });
-		} finally {
-			await fs.rm(state, { recursive: true, force: true });
-		}
-	});
-
-	it("does not coalesce terminal observations from different socket authorities", async () => {
-		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-socket-observation-"));
-		try {
-			const generation = await replaceOwnerGeneration(state, "session", "generation");
-			const observation = {
-				schema_version: 1 as const,
-				op: "observe_terminal" as const,
-				session_id: "session",
-				owner_generation: generation,
-				state_dir: state,
-				socket_key: "socket-a",
-				observer: "sidecar" as const,
-				observed_at: "2026-01-01T00:00:01.000Z",
-				signal: "EXIT" as const,
-				exit_code: 0,
-				exit_kind: "exit",
-				reason: "sidecar",
-			};
-			const [first, second] = await Promise.allSettled([
-				observeOwnerTerminal(observation),
-				observeOwnerTerminal({ ...observation, socket_key: "socket-b" }),
-			]);
-			if (first.status === "fulfilled") {
-				expect(second.status).toBe("rejected");
-				expect(["socket-a", "socket-b"]).toContain(first.value.server_key);
-				if (second.status === "rejected") expect(second.reason.message).toBe("immutable_record_conflict");
-			} else {
-				expect(second.status).toBe("fulfilled");
-				expect(first.reason.message).toBe("immutable_record_conflict");
-				if (second.status === "fulfilled") expect(["socket-a", "socket-b"]).toContain(second.value.server_key);
-			}
-		} finally {
-			await fs.rm(state, { recursive: true, force: true });
-		}
-	});
-
 	it("rejects a partial persisted verdict and still records the observed owner-loss incident", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
 		try {

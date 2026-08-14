@@ -7,38 +7,79 @@ For a beginner-friendly application development guide (recipes, customization, a
   <img src="../assets/telegram-mobile-hero.png" alt="Gajae Code mobile answers for coding agents hero illustration" width="100%" />
 </p>
 
-The SDK exposes a generic action/reply protocol without requiring integrations to scrape the terminal. SDK core owns all managed attachment discovery and credential-bearing clients through `SessionRouter`; Telegram, Discord, Slack, ACP, MCP, and CLI adapters receive only capability-scoped operations and never endpoint credentials.
+A small, transport-agnostic SDK for receiving **action-needed** signals from a
+GJC session and sending **replies** back without scraping the terminal.
 
-> Status: the Rust core (`crates/gjc-sdk`) provides the session-local wire protocol and endpoint record. TypeScript SDK core provides Broker lifecycle authority and `SessionRouter` attachment authority. Endpoint records and tokens are internal implementation details, not an external attachment surface.
+The stable contract is deliberately generic: every top-level running session
+hosts one loopback WebSocket endpoint by default, and integrations are
+user-written clients that connect to that endpoint. Telegram, Discord, Slack,
+mobile apps, and local tools all use the same JSON protocol. No upstream Rust,
+N-API, or wire-protocol change is required for a new integration.
 
-## External attachment policy
+> Status: the Rust core (`crates/gjc-sdk`) provides the wire protocol, action
+> lifecycle, loopback WebSocket server, and endpoint discovery file. The bundled
+> Telegram daemon is a reference client layered on top of this SDK; it is not the
+> upstream topology.
 
-External and managed integrations attach through SDK-core surfaces only:
+## TypeScript transport client
 
-- lifecycle mutations use `SessionLifecycleService` and the Broker lifecycle ledger;
-- live session controls use opaque `SessionAttachment` capabilities issued by `SessionRouter`;
-- endpoint URL/token discovery, raw WebSocket relays, and `gjc sdk serve` are not public attachment mechanisms;
-- lifecycle-equivalent per-session controls are prohibited on Telegram, Discord, Slack, ACP, MCP, and daemon CLI adapters.
+Install the standalone transport-only client when connecting to the v3 SDK WebSocket endpoint from TypeScript:
 
-For terminal-side session operation, use the broker-bound [SDK session CLI](./sdk-session-cli.md):
-`gjc sdk session list|inspect|send|status|tail` plus the explicit `raw`
-`control|query|global` hatch. The CLI resolves the exact attachment through SDK
-core and emits credential-free JSON.
+```bash
+bun add @gajae-code/bridge-client
+```
 
-## Migration from removed external transports
+```ts
+import { SdkClient } from "@gajae-code/bridge-client";
+```
 
-The retired `--mode rpc`, `rpc-ui`, `bridge`, and `gjc sdk serve` transports
-have no replacement wire client. Process-isolated controllers use Coordinator
-MCP, `gjc sdk session`, or a configured managed adapter. In-process applications
-use the [embedding SDK](./sdk-embedding.md).
+`@gajae-code/coding-agent/sdk` remains a compatibility re-export of this same `SdkClient` class and associated types, so both entry points preserve class identity. The package is a client for the documented v3 transport only: it does not restore the historical BridgeClient backend protocol, handshake/commands/SSE endpoints, or any direct host-control path.
+For terminal-side session operation, see [the SDK session CLI guide](./sdk-session-cli.md):
+`gjc sdk session list|inspect|send|status|tail` plus the explicit raw
+`control|query|global` hatch, all broker-bound and credential-free.
+
+## Migration from the removed RPC mode
+
+The retired `--mode rpc`, `rpc-ui`, and `bridge` modes are removed. The SDK v3
+WebSocket endpoint is now the canonical external control/query bus.
+
+| Retired RPC commands | SDK v3 control/query operations |
+| --- | --- |
+| `prompt`, `steer`, `follow_up`, `abort` | `turn.prompt`, `turn.steer`, `turn.follow_up`, `turn.abort` |
+| Model, thinking, queue, retry, and compaction controls | `model.*`, `thinking.*`, `queue.*`, `retry.*`, and `compaction.*` |
+| Session and transcript queries | `session.*`, `transcript.*`, `context.get`, and `session.stats` |
+| Workflow-gate response | `workflow.gate_answer` |
+
+See the [RPC-to-SDK v3 parity audit](./sdk-rpc-parity-audit.md) for the full
+matrix, partial equivalents, and evidence.
+
+For a local non-WebSocket transport, run one of these commands:
+
+```sh
+gjc sdk serve --stdio
+```
+
+```sh
+gjc sdk serve --socket <path>
+```
+
+It relays the identical SDK v3 frames over stdio or a Unix socket. Socket
+clients send an authentication preface and the socket is mode `0600`; stdio is
+one parent-owned connection.
+
+Python clients install the `gjc_sdk` package from `python/gjc-sdk`:
+
+```sh
+python -m pip install ./python/gjc-sdk
+```
+
+Import `SdkClient` with `from gjc_sdk import SdkClient`, then use
+`SdkClient.connect_ws`, `SdkClient.connect_socket`, or `SdkClient.connect_stdio`.
+The client supplies `reply.token` for replies.
 
 ## External-agent SDK skills
 
-The generated `sdk-skills/` bundle provides host-neutral guidance for scripts
-that invoke the broker-bound session CLI. It is intentionally separate from
-GJC's four internal workflow skills, the coordinator MCP plugin, and the SDK MCP
-adapter. Its TypeScript and Python templates do not discover endpoints or create
-transport clients.
+The generated `sdk-skills/` bundle provides host-neutral guidance for external agents that operate local GJC sessions directly through SDK v3. It is intentionally separate from GJC's four internal workflow skills, the coordinator MCP plugin, and the SDK MCP adapter.
 
 The bundle owns exactly six files:
 
@@ -49,51 +90,89 @@ The bundle owns exactly six files:
 - `gjc-sdk-author/templates/direct-sdk.ts`
 - `gjc-sdk-author/templates/direct-sdk.py`
 
-Regenerate with `bun run generate-sdk-skills`; CI checks byte-for-byte content
-and rejects unexpected files with `bun run check:sdk-skills`.
+Regenerate with `bun run generate-sdk-skills`; CI checks byte-for-byte content and rejects unexpected files with `bun run check:sdk-skills`.
 
 ### Bundle format version
 
-`manifest.json` is the versioned root of the on-disk bundle contract. It
-identifies `formatVersion` (currently `1`) and the exact relative file closure
-that regeneration owns. Consumers must treat a bundle whose manifest is missing,
-malformed, or declares an unsupported version as unreadable and fail closed. The
-skill prompts are authored as static Markdown sources under
-`scripts/gjc-sdk-skills/prompts/`; the generator copies them verbatim and
-`check:sdk-skills` proves the committed bundle matches the generated artifacts.
+`manifest.json` is the versioned root of the on-disk bundle contract. It declares `formatVersion` (currently `1`) and the exact relative file closure the bundle owns. Consumers must treat any bundle whose manifest is missing, malformed, or declares an unsupported `formatVersion` as unreadable and fail closed — never guess at an unknown layout. The skill prompts are authored as static Markdown sources under `scripts/gjc-sdk-skills/prompts/`; the generator copies them verbatim and `check:sdk-skills` proves the committed bundle matches the generated artifacts byte-for-byte, so prompt text is reviewed and diffed as content, not as generator strings.
+
+The compatibility contract is additive: `formatVersion` only bumps when the layout becomes incompatible, and regeneration upgrades an installed bundle in place. A legacy unversioned bundle (the original five-file layout) is unsupported and must be rejected with a regeneration hint rather than read ambiguously.
 
 ### Trust boundary
 
-The templates invoke only the broker-bound CLI. `SessionRouter` keeps endpoint
-resolution, credentials, SDK clients, replay, reconnect, and rotation inside SDK
-core. The templates' fixed allowlists and nonce-bound approval are trusted-local
-procedural safeguards, not capability isolation; lifecycle and attachment
-authority remain enforced by Broker and Router.
+Authentication for a direct SDK connection checks only possession of the endpoint token carried by the discovery record; there is no further per-request capability check at the transport. Once authenticated, requests reach the SDK operation registry dispatcher, which can serve managed bash, configuration, permissions, tools, extensions, and destructive session operations. The `sdk-skills/` templates and their allowlists are a procedural safety policy for reviewed local scripts — they are **not** a security boundary. A modified local script that has read the endpoint token can call more of the SDK than the templates permit, with that token's authority.
 
-No renderer-grade cross-process event stream is exposed to external scripts.
-Use managed adapters or Coordinator MCP for event-driven orchestration; see the
-[RPC-to-SDK v3 parity audit](./sdk-rpc-parity-audit.md) for remaining gaps.
+The skills use a trusted-local procedural model. They require exact live-session selection, never log or persist endpoint credentials, compose a provenance-labeled inspection view from existing queries, and require single-use human approval before allowlisted lifecycle operations. They do not claim capability isolation: a modified local script that can read an endpoint token has the authority of that token.
+
+Phase 2 still does **not** provide unattended negotiation, a cross-process
+reattach/registry, or a renderer-grade full event stream. No event-plane parity
+is claimed; see the audit's [ranked Phase-2 register](./sdk-rpc-parity-audit.md#ranked-phase-2-follow-up-register--not-implemented).
 
 ## Architecture
 
 ```
-Broker lifecycle → Session runtime endpoint → SessionRouter → opaque adapter capability
+GJC session (upstream)                          your client (anywhere)
+┌───────────────────────────────┐               ┌──────────────────────────┐
+│ ask-tool fires / agent idle    │  action_needed │ Telegram / Discord / ... │
+│   → notifications core         │ ─────────────▶ │  render + collect reply  │
+│ ws://127.0.0.1:<port> (+token) │ ◀───────────── │                          │
+│   reply → resolve ask gate     │     reply       │                          │
+└───────────────────────────────┘               └──────────────────────────┘
 ```
 
-The Broker is the sole lifecycle executor and durable terminal authority. `SessionRouter` is the sole credential-bearing external attachment manager. Provider supervisors own only provider transport and presentation state.
-
-- **One endpoint per top-level session.** Each top-level session runs its own loopback WebSocket server. Subagents do not host endpoints. The Broker index is the authoritative live-session catalog, and `SessionRouter` multiplexes managed provider attachments across indexed sessions.
-- **Hosted by default.** SDK hosting is independent of notification configuration. Set `GJC_SDK_DISABLE=1` to opt out of hosting for a top-level session.
-- **Notification delivery is optional.** Configure and enable a managed notification adapter only when remote delivery is needed; the SDK endpoint remains available without one.
-- **Managed integrations use opaque attachments.** Telegram, Discord, Slack, ACP, MCP, and CLI adapters compose SDK-core services; they do not discover endpoint files or receive URL/token credentials.
-- **Zero wire-protocol change.** New transports do not require changes to `crates/gjc-sdk` or the JSON protocol.
+- **One endpoint per top-level session.** Each top-level session runs its own
+  loopback WebSocket server. Subagents do not host endpoints. Upstream does not
+  maintain a shared daemon, singleton, or chat-to-session registry;
+  multiplexing many sessions into one integration is a client-side concern.
+- **Hosted by default.** SDK hosting is independent of notification
+  configuration. Set `GJC_SDK_DISABLE=1` to opt out of hosting for a top-level
+  session.
+- **Notification delivery is optional.** Configure and enable a managed
+  notification adapter only when remote delivery is needed; the SDK endpoint
+  remains available without one.
+- **Integrations are clients.** A client discovers endpoint files, connects to
+  one or more WebSockets, renders `action_needed`, and sends `reply` messages.
+- **Zero upstream change.** New transports do not require changes to
+  `crates/gjc-sdk` or the JSON protocol.
 - **tmux-agnostic.** The endpoint behaves identically with or without tmux.
 
-## Internal endpoint publication
+## Endpoint discovery
 
-A running session publishes an implementation-private credential record for Broker resolution. `SessionRouter` is the sole consumer of the resolved URL/token pair and the sole owner of per-session SDK clients, replay, reconnect, rotation, prepared activation, and opaque attachment capabilities.
+A running session writes a discovery file at:
 
-The record path, schema, credential transport, and handshake are not public client contracts. ACP, MCP, Coordinator, CLI, provider daemons, extensions, and integrations must use Router-issued attachments or Broker lifecycle services; they must not scan state roots, parse discovery files, retain endpoint credentials, or open raw per-session WebSockets. Broker and Router validate process identity, endpoint generation, incarnation, and file integrity before attachment, and fail closed on stale or uncertain state.
+```
+<repo>/.gjc/state/sdk/<sessionId>.json
+```
+
+(`.gjc/state/` is git-ignored.) Shape:
+
+```json
+{
+  "version": 1,
+  "sessionId": "019edd41-...",
+  "pid": 12345,
+  "host": "127.0.0.1",
+  "port": 53124,
+  "url": "ws://127.0.0.1:53124",
+  "token": "<per-session token>",
+  "startedAt": 1718760000000,
+  "updatedAt": 1718760000000,
+  "stale": false
+}
+```
+
+- The file is created `0700`/`0600` (unix) and written atomically.
+- The **token is in the file** because clients need it; never log it raw.
+  Stale files (dead PID, past TTL, or explicitly marked) are cleaned up on the
+  next start.
+
+Connect with the token as a query parameter:
+
+```
+ws://127.0.0.1:<port>/?token=<token>
+```
+
+A wrong/missing token is rejected at the handshake with HTTP `401`.
 
 ### Internal broker launch isolation
 
@@ -101,14 +180,12 @@ When the SDK starts its default internal broker or session host from the publish
 
 This boundary prevents a child from newly loading caller-cwd or user-global Bun preload/dotenv policy. It cannot determine how a value already present in the parent environment was originally loaded, so ordinary provider/GJC environment values remain inherited. Default internal children, including compiled self-spawns, remove inherited `BUN_OPTIONS` so parent eval/test/inspect/debug/runtime options cannot be replayed into a detached child. Compiled binaries otherwise retain their existing self-spawn command contract, corroborated by a dedicated embedded marker and exact anchored Bun virtual-filesystem identity. The explicit `GJC_SDK_SESSION_COMMAND` session-host override remains a trusted legacy operator boundary and is not parsed as a shell-safe general command API. There is no broker-command override.
 
-Broker and per-session discovery tokens remain in their authoritative private discovery files for SDK-core resolution. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
+Broker and per-session discovery tokens remain in their authoritative private discovery files because clients need them. Launch errors, logs, and diagnostics redact those tokens and never include the child environment or isolation configuration contents.
 
-## Internal protocol
+## Protocol
 
-The following frame shapes are SDK-core implementation details for maintainers.
-External integrations must not construct these frames, attach to session
-transports, or receive endpoint credentials; use a Router-issued attachment, the
-broker-bound CLI, or Coordinator MCP instead.
+JSON text frames. Field names are `camelCase`; the `type` discriminator is
+`snake_case`.
 
 ### Server → client
 
@@ -130,9 +207,9 @@ broker-bound CLI, or Coordinator MCP instead.
   "sessionId": "sess-1", "summary": "finished refactor; awaiting next step" }
 ```
 
-- `id` is an opaque, transient presentation/action ID. It is the **only** authority accepted by generic `reply.id` through the current Router-issued attachment. It is not a durable workflow ID.
-- `workflowGateId?: string` is optional, additive SDK v3 correlation metadata, present only for the active presentation of a durable workflow gate. When present, it equals that gate's Q12 `gate_id`. Its public correlation key is `(sessionId, workflowGateId)` on the current Router-issued attachment; it never authorizes generic `reply`.
-- `kind: "ask"` is answerable in interactive/TUI and SDK workflow-gate sessions. `kind: "idle"` is notify-only and ephemeral (not replayed to attachments that start later). Ordinary asks and idle frames omit `workflowGateId`.
+- `id` is an opaque, transient presentation/action ID. It is the **only** authority accepted by generic `reply.id`; use it only with the current authenticated endpoint. It is not a durable workflow ID.
+- `workflowGateId?: string` is optional, additive SDK v3 correlation metadata, present only for the active presentation of a durable workflow gate. When present, it equals that gate's Q12 `gate_id`. Its public correlation key is `(sessionId, workflowGateId)` at the current authenticated endpoint; it never authorizes generic `reply`.
+- `kind: "ask"` is answerable in interactive/TUI and SDK workflow-gate sessions. `kind: "idle"` is notify-only and ephemeral (not replayed to clients that connect later). Ordinary asks and idle frames omit `workflowGateId`.
 - `recommendedIndex?: number` is optional, zero-based display metadata for `options`. Clients must validate that it is an in-range integer and ignore malformed values. Raw option labels and reply indices remain authoritative; never decorate submitted answers or infer a recommendation from position. The additive field is wire-compatible, but Rust consumers constructing the public `ActionNeeded` struct by literal must provide `recommended_index: None` when no recommendation exists.
 - This corrects the pre-v3 documentation invariant that `action_needed.id == gate_id`: they are deliberately different values. Clients must not preserve that invariant, infer a relationship from question/options/order, or retain private route, claim, receipt, epoch, token, or endpoint-generation maps.
 
@@ -153,14 +230,39 @@ broker-bound CLI, or Coordinator MCP instead.
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 `resolver_unavailable`, `idempotency_conflict`, `unauthorized`.
 
-The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
+The frames above are the minimal contract every client implements. Threaded
+clients (like the managed Telegram daemon) may also receive optional
+server → client frames they can render or ignore: `identity_header` (one-time
+per-session repo/branch/machine header), `context_update` (last message, task,
+goal, token usage, model, diff), `turn_stream` (live/finalized turn output),
+`image_attachment` (agent-produced images), `activity` (busy/idle, drives the
+typing indicator), `inbound_ack` (delivery state of an injected user message),
+`session_closed` (endpoint teardown; threaded clients may delete/archive the
+remote conversation), `config_update` (current verbosity/redact), `hello`
+(server capability/version), and `pong`. A minimal client only needs
+`action_needed`, `action_resolved`, and `reply_rejected`.
 
-### Internal inbound frames
+### Client → server
 
-SDK core creates inbound frames only after Router attachment checks. External
-integrations must not construct or persist them. Managed adapters use their
-opaque `SessionAttachment`, and process-isolated scripts use `gjc sdk session`;
-neither path receives transport credentials.
+`reply` — answer a pending `ask`:
+
+```json
+{ "type": "reply", "id": "act_9e31", "answer": 0, "token": "<token>" }
+```
+
+`answer` accepts:
+
+- a number — zero-based option index (`0` = first option);
+- a string — an option label, or free text;
+- an object — `{ "selected": [0, "Maybe"], "custom": "..." }` for multi-select.
+
+Optional `idempotencyKey` makes retries safe: the same key + same body re-acks;
+the same key + different body is rejected with `idempotency_conflict`.
+
+Threaded clients may also send optional client → server frames: `user_message`
+(inject/steer a turn with free text), `config_command` (toggle verbosity/redact
+in-thread), `hello` (capability/version), and `ping`. A minimal client only
+needs `reply`.
 
 ## Model catalog query (Q10)
 
@@ -296,25 +398,26 @@ its asynchronous preflight accepts the prompt. That receipt is a durable,
 later finalizes that claim with exactly one `SdkPromptTerminalOutcome`; cleanup
 may follow only after the claim is durable.
 
-The authoritative public reconciliation query is `Q26` / `turn.result`, scoped
-to the same live session runtime. Callers supply `kind: "prompt"`; its `outcome`
+The authoritative public reconciliation query is `Q26` /
+`turn.prompt_status`, scoped to the same live session runtime. Its `outcome`
 field is exposed only after finalization. A pending claim is never represented
-or exposed as a terminal outcome. `turn.prompt_status` remains a legacy
-prompt-only alias that injects the same `kind`.
-
-Every prompt and skill status response includes `receiptState`: active records are `absent`; terminal records are `present`, `missing`, or `unknown`; unknown lookup is `unknown`. Ordinary success requires `status: "terminal_ok"`, `receiptState: "present"`, and readable non-empty text or an artifact path. A failed execution may retain a partial `present` receipt. Legacy version-1 reconciliation records without this additive field remain readable and project `unknown` rather than optimistic success.
+or exposed as a terminal outcome.
 
 Callers that must recover from a lost acknowledgement should assign one fresh
-`clientRef` (a trimmed, non-empty string of at most 128 characters) to each
-logical prompt, then reconcile through the broker-bound CLI:
+`clientRef` (a trimmed, non-empty string of at most 128 characters) to each logical
+prompt. Reconnect to the same session endpoint and query with exactly one selector:
 
-```sh
-gjc sdk session raw query <sessionId> --query turn.result \
-  --json-input '{"kind":"prompt","clientRef":"request-018f"}'
+```json
+{ "type": "query_request", "query": "turn.prompt_status",
+  "input": { "clientRef": "request-018f" } }
 ```
 
-The alternate selector uses the same `kind` with
-`{"kind":"prompt","commandId":"command-id","turnId":"turn-id"}` as its JSON input.
+or:
+
+```json
+{ "type": "query_request", "query": "turn.prompt_status",
+  "input": { "commandId": "command-id", "turnId": "turn-id" } }
+```
 
 The result status is `accepted`, `in_flight`, `terminal_ok`, `failed`, or
 `unknown`. Known records include `acceptedAt`; in-flight and terminal records add
@@ -326,7 +429,19 @@ Correlated `agent_end` and `agent_failed` frames carry the same finalized
 `outcome`. Clients must correlate those frames and Q26 by the prompt identifiers,
 not infer terminality from stream activity or an earlier pending claim.
 
-Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity/TTL, subject to crash-consistent fsync. A non-terminal prompt record at restart finalizes its pending outcome and receipt state. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are retained for 15 minutes, capped at 256 per kind, and evicted oldest-terminal first. Reconciliation stores no prompt, transcript, credential, or provider-response body.
+Reconciliation state survives client disconnect/reconnect. With the session-private
+durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also
+survive **GJC session-process restart** for the same session identity within
+capacity/TTL, subject to crash-consistent fsync. A non-terminal prompt record at
+restart finalizes its pending outcome; if that claim is absent, it finalizes as
+`{ kind: "failed", code: "prompt_failed", ... }`. This prompt-specific recovery
+does not apply to skill records: active `skill.invoke` records retain
+`error.code = process_restart` because their reconciliation is incomplete, not
+proof of a skill failure. Eviction or absence still returns honest `unknown`; that
+means the prior outcome is unknowable, not that execution did not occur. Active
+records are capped at 128 per kind and are never aged into terminal. Terminal
+records are retained for 15 minutes, capped at 256 per kind, and evicted
+oldest-terminal first.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
@@ -340,41 +455,20 @@ prompt.
 
 `sdk.promptDeadlineMs` defaults to `1_800_000`. It accepts only safe integers in
 `[60_000, 86_400_000]`; there is no disable value. The SDK snapshots the setting
-when the prompt is durably accepted as the initial inactivity lease. Fresh
-**attributable** progress for the exact accepted `commandId`/`turnId` — `tool_execution_start` /
-`tool_execution_end` observed at the prompt/agent runtime boundary — renews the deadline to
-`lastProgressAt + sdk.promptDeadlineMs`, bounded by the hard maximum `sdk.promptMaxRuntimeMs`
-(default `21_600_000`, same `60_000–86_400_000` range). Only tool-execution boundaries for the
-accepted turn count; heartbeats, streaming text/thinking deltas, retries, other turns/sessions, and
-unrelated session noise do not renew the lease, and out-of-order delivery never shortens it. The
-hard maximum is never unbounded: every renewal is capped at `acceptedAt + sdk.promptMaxRuntimeMs` so a
-wedged or continuously noisy prompt still reaches a deterministic terminal outcome. Terminalization then has a fixed `10_000` ms
+when the prompt is durably accepted. Terminalization then has a fixed `10_000` ms
 grace period, which is not configurable. A controlled terminal failure reaches ACP
 as JSON-RPC `-32603` with `data.code` of `prompt_failed` or
 `prompt_deadline_exceeded`.
 
-## Skill invoke reconciliation
+## Skill invoke reconciliation (Q28)
 
 `skill.invoke` accepts optional `clientRef` and returns an early accepted receipt
 `{ accepted: true, commandId, turnId, clientRef?, name, path, lineCount?, args? }` after
 durable/preflight accept (SDK control path), not after skill completion. Query prior
-status with `Q26` / `turn.result` and `kind: "skill"`. `skill.invoke_status`
-remains a legacy skill-only alias that injects the same `kind`. Kind-scoped indexes
-mean prompt and skill `clientRef` values never collide. Skill records use the same
-capacity/TTL limits, but an active skill record at restart settles with
+status with `Q28` / `skill.invoke_status` using the same selectors as Q26. Kind-scoped
+indexes mean prompt and skill `clientRef` values never collide. Skill records use the
+same capacity/TTL limits, but an active skill record at restart settles with
 `error.code = process_restart`.
-
-## Correlated steer acknowledgement (Q30)
-
-`turn.steer` accepts an optional `clientRef` (trimmed, non-empty, at most 128 characters). When present, GJC hashes the exact validated steer text with SHA-256 and durably reserves `dispatching` before queueing. The result contains `sessionId`, `clientRef`, `status: accepted | rejected | uncertain`, known `acceptedAt` or `terminalAt`, and bounded error metadata; it never echoes text.
-
-Replay the same `clientRef` with the same text to recover the retained result without dispatching again. Reuse with different text returns `client_ref_conflict`. A live `dispatching` record and a restart during dispatch both project `uncertain`; GJC never automatically redispatches an ordered control whose first effect is unknowable. Query the same session with:
-
-```json
-{ "type": "query_request", "query": "turn.steer_status", "input": { "clientRef": "steer-018f" } }
-```
-
-Q31 returns `accepted`, `rejected`, `uncertain`, or `unknown` and never dispatches work. Settled steer records share the 15-minute/256-record retention bound; live dispatching records are not terminal-evicted. Existing uncorrelated `turn.steer` calls retain their legacy non-idempotent behavior. Version-1 reconciliation remains additive, and only digest plus bounded metadata is stored—never steer text.
 
 ## Model profile discovery and validation (Q27)
 
@@ -447,10 +541,20 @@ Generic and direct controls may race. Once the native generic claim is acquired,
 
 ### Durable workflow controls and Q12
 
-`workflow.gate_answer` and `workflow.plan_approve` operate on the durable Q12
-`gate_id`, not `action_needed.id`. Managed adapters bind `expectedSessionId`
-from their current Router-issued attachment. Process-isolated operators use the
-raw-control flow documented in the [SDK session CLI guide](./sdk-session-cli.md); they do not construct protocol frames.
+`workflow.gate_answer` and `workflow.plan_approve` operate on the durable
+Q12 `gate_id`, not `action_needed.id`. Both accept optional
+`expectedSessionId`; clients should always send the `sessionId` observed from
+the current authenticated endpoint:
+
+```json
+{ "type": "control_request", "operation": "workflow.gate_answer",
+  "input": { "id": "wg_run_stage_1", "response": "approve", "expectedSessionId": "sess-1" } }
+```
+
+```json
+{ "type": "control_request", "operation": "workflow.plan_approve",
+  "input": { "id": "wg_run_stage_1", "choice": "approve", "expectedSessionId": "sess-1" } }
+```
 
 `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 control clients continue to work; new clients must send it now. It cannot become mandatory, or be removed from the controls, before SDK v4 and at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before the gate resolver runs. Neither control accepts a presentation ID, remaps an old ID to a reminted gate, or uses heuristic matching.
 
@@ -479,35 +583,39 @@ state remain private: these APIs do not create a public authority value.
 
 The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions. The native loader requires the matching version sentinel; mixed native/runtime versions are unsupported and must not claim SDK compatibility.
 
-## Minimal provider adapter example
-
-Provider integrations compose SDK core's `SessionRouter`; they never read endpoint files or retain URL/token credentials:
+## Minimal client example
 
 ```js
-import { router } from "@gajae-code/coding-agent/sdk";
+import { readFileSync } from "node:fs";
+import WebSocket from "ws";
 
-const sessionRouter = new router.SessionRouter({
-  agentDir,
-  deps: {
-    onAttachment: (attachment) => provider.bind(attachment.sessionId, attachment),
-    onFrame: (attachment, frame) => provider.render(attachment.sessionId, frame.body),
-    onSessionRemoved: (attachment) => provider.unbind(attachment.sessionId),
-  },
+const { url, token } = JSON.parse(
+  readFileSync(`.gjc/state/sdk/${sessionId}.json`, "utf8"),
+);
+
+const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
+
+ws.on("message", (data) => {
+  const msg = JSON.parse(data.toString());
+  if (msg.type === "action_needed" && msg.kind === "ask") {
+    // present msg.question / msg.options to the human, then:
+    ws.send(JSON.stringify({ type: "reply", id: msg.id, answer: 0, token }));
+  } else if (msg.type === "action_resolved") {
+    // mark this action as no longer answerable in your UI
+  } else if (msg.type === "reply_rejected") {
+    // e.g. reason === "already_answered" → the ask was answered elsewhere
+  }
 });
-
-await sessionRouter.start();
-const attachment = sessionRouter.attachment(sessionId);
-if (!attachment) throw new Error("session attachment unavailable");
-await attachment.send({ type: "reply", id: actionId, answer });
 ```
 
-Telegram, Discord, Slack, and third-party adapters own only their provider transport and presentation state. `SessionRouter` performs exact endpoint resolution, credential custody, replay, reconnect, rotation, and dispatch-time stale-lease rejection.
+Swap `ws` for a Telegram bot's long-poll loop, a Discord gateway client, or a
+Slack socket-mode app — the contract above is all you implement.
 
 ## Fallback chains
 
 Model-role selectors may be ordered fallback chains; see [Fallback chains](./models.md#fallback-chains) for configuration and retry-budget details. Resolution-time skips do not consume attempts. When a request-time retry advances to another eligible entry, the selected default fallback remains sticky for later prompts in that session until an explicit model selection or a chain reset changes it.
 
-`model_fallback_switched { eventId, from, to, reason, role, scope, activeIndex, chainLength, attemptsUsed }` is the canonical session lifecycle event for every real fallback-model switch. It replaces the legacy `retry_fallback_applied` / `retry_fallback_succeeded` event names. Embedding clients can subscribe to this in-process session event; managed adapters receive only the status projections their SDK-core integration supports.
+`model_fallback_switched { eventId, from, to, reason, role, scope, activeIndex, chainLength, attemptsUsed }` is the canonical session lifecycle event for every real fallback-model switch. It replaces the legacy `retry_fallback_applied` / `retry_fallback_succeeded` event names. Embedding clients can subscribe to this session event; generic WebSocket clients should use only the protocol frames documented above and any adapter-specific status updates they support.
 
 
 ## Managed session-directory adapter guidance
@@ -534,7 +642,9 @@ This is a readonly resolver/listing contract. Do not import `@gajae-code/coding-
 The resolver uses canonical native identity: supported POSIX and Windows local aliases can designate one scope, while UNC/network workspaces are unsupported. Scope digests are collision-resistant identifiers, not injective aliases, credentials, or authentication. The owner-only checks protect managed local storage paths but do not authenticate an adapter or make hostile concurrent filesystem races safe. Adapters that need mutations must use the higher-level lifecycle/session APIs rather than the readonly directory API.
 ## Managed notification adapters
 
-GJC ships managed SDK adapters for Telegram, Discord, and Slack. `SessionRouter` resolves one session-owned endpoint per attachment and keeps every endpoint credential inside SDK core. Provider daemons receive only opaque attachment capabilities; they neither change the wire protocol nor expose a remote shell.
+GJC ships managed SDK-client adapters for Telegram, Discord, and Slack. They use
+one local SDK endpoint per session; the adapters do not change the wire protocol,
+keep endpoint credentials in provider state, or expose a remote shell.
 
 The recommended interactive path is `/settings` → **Notifications**. It owns
 setup, health, test, recovery, reconnect, local enablement, and Telegram
@@ -551,7 +661,7 @@ setup fails closed without saving or exposing the raw token.
 
 Configuration completeness, provider-local quarantine, durable desired intent, effective enablement, runtime readiness, and delivery outcomes are separate contracts. The global `notifications.enabled` master never erases provider credentials or desired flags. `/settings` edits secrets through explicit `keep`, `replace`, or `remove` actions, commits only the selected provider in one CAS batch, and reports post-commit observer or activation failures without pretending the durable save rolled back. Malformed provider-local values are quarantined for explicit repair while safe sibling providers remain usable; malformed global notification structure remains fail-closed.
 
-`GJC_NOTIFICATIONS=0` suppresses only automatic generic current-session admission. Explicit `/notify on` can opt the current session back in without mutating durable provider state, and direct provider APIs remain governed by provider effectiveness and their own runtime readiness. Telegram, Discord, and Slack attachments are reconstructed through `SessionRouter`; no provider receives the shared endpoint token.
+`GJC_NOTIFICATIONS=0` suppresses only automatic generic current-session admission. Explicit `/notify on` can opt the current session back in without mutating durable provider state, and direct provider APIs remain governed by provider effectiveness and their own runtime readiness. If Telegram ownership is proven foreign while Discord or Slack is effective, GJC publishes the chat daemon endpoint under the isolated `.gjc/state/chat/sdk/` discovery path; the blocked Telegram scanner never receives the shared endpoint token.
 
 - [Telegram notification onboarding](./telegram-onboarding.md) documents
   `gjc notify setup` and private-chat pairing.
@@ -564,34 +674,36 @@ Configuration completeness, provider-local quarantine, durable desired intent, e
 
 `gjc notify status` reports provider completeness, repair/quarantine state, desired intent, effective enablement, and masked tokens. Destination identifiers remain visible and may be sensitive. The Discord and Slack setup commands are non-interactive and require their documented identifier and token flags; supply secrets through an approved local mechanism, not examples, committed files, shell history, logs, or chat. `gjc notify health --provider <provider> --probe` performs a provider-owned REST diagnostic even when complete credentials are intentionally inactive, while `gjc notify test --provider <provider>` additionally requires effective enablement and runtime readiness.
 
-Session lifecycle and attachment routing are SDK-core services shared by every
-chat provider. `SessionLifecycleService` authorizes typed create, fork, resume,
-close, delete, and list requests, derives the Broker idempotency identity, and
-projects credential-free outcomes. The Broker remains the only lifecycle
-executor and durable terminal authority.
+The daemon/session engine is shared. Session discovery, WebSocket protocol,
+redaction decisions, rate-limit pooling, reply routing, singleton ownership, and
+lifecycle control are not reimplemented by each chat surface. Telegram, Discord,
+and Slack adapters are thin presentation layers: they render internal notification
+events into transport payloads and map transport interactions back to `{sessionId,
+actionId,answer}` replies.
 
-`SessionRouter` consumes the Broker `SessionIndex`, resolves exact endpoint
-authority, retains endpoint credentials and SDK clients, and owns replay,
-reconnect, rotation, and stale-attachment revocation. Telegram, Discord, and
-Slack receive only opaque current-generation attachments. Provider daemons own
-transport leases, cursors, rate limits, threads/topics/messages, presentation
-journals, and delivery receipts; they cannot read endpoint files or tokens,
-allocate SessionIds, or perform session process lifecycle effects.
+Discord maps a session to an archiveable thread; resume unarchives it or creates
+a replacement, and stale/superseded thread input fails closed. Slack maps a
+session to an immutable root thread; resume creates a new root, acknowledges all
+Socket Mode envelopes immediately, and does not persist a Socket Mode cursor.
 
+The Discord and Slack acceptance suites use fake providers only. They exercise
+provider failure, reconciliation, restart, dedupe, lifecycle, and reconnect paths
+without live credentials or live-provider end-to-end tests.
 
 ## Managed Telegram daemon (bundled reference client)
 
-The managed Telegram client is a provider supervisor and presentation adapter.
-It owns the single `getUpdates` poller and Telegram topic state, while
-`SessionRouter` reconstructs SDK attachments from Broker state. A provider
-restart never creates, resumes, closes, or mutates a GJC session by itself.
+GJC also ships a managed Telegram reference client for the common phone-notify
+workflow. It remains a client of the generic SDK: it scans registered session
+roots and may inspect their endpoint files, but only coordinator/lifecycle
+sessions can claim Telegram forum topics. Ordinary sessions remain topic-free.
+Run `gjc notify setup` once to complete Telegram's interactive private-chat
+pairing flow.
 
-For Telegram forum topics, the daemon deletes the presentation topic through
-`deleteForumTopic` (falling back to `closeForumTopic` when deletion is unavailable)
-when `SessionRouter` retires the current attachment or when the daemon confirms
-that no eligible local session still owns the topic. A resumed session creates or
-rebinds a fresh current-generation topic before sending again. Topic cleanup is
-best-effort and cannot change the Broker lifecycle result.
+For Telegram forum topics, the daemon deletes the coordinator/lifecycle session
+topic when the local notification endpoint shuts down, so it disappears from the
+topic list. A resumed orchestration session creates a fresh topic before sending
+again. The bot must be allowed to delete messages in that chat; without that
+permission, deletion is best-effort and delivery continues.
 
 ### Singleton poller and trust model
 
@@ -611,12 +723,12 @@ The trust model is intentionally strict:
 
 ### Routing in private-chat topics
 
-The paired private chat prefers Telegram topics for coordinator/lifecycle sessions
-(Threaded Mode). The daemon tags messages by session, stores compact callback
-aliases for inline buttons, and routes replies back to the exact session/action.
-Ordinary sessions use flat delivery and do not create topics. A forum-enabled
-supergroup is no longer required: when the bot owner enables Threaded Mode in
-@BotFather, the daemon creates topics only for admitted orchestration sessions.
+The paired private chat prefers one Telegram topic per coordinator/lifecycle
+session (Threaded Mode). The daemon tags messages by session, stores compact
+callback aliases for inline buttons, and routes replies back to the exact
+session/action. A forum-enabled supergroup is no longer required: when the bot
+owner enables Threaded Mode in @BotFather, the daemon creates topics only for
+orchestration sessions in the paired private chat.
 GJC cannot enable Threaded Mode through the Bot API; setup only verifies the
 capability and guides the manual BotFather toggle.
 
@@ -709,60 +821,112 @@ Inside a GJC session, `/notify` controls the current session only:
 - `/notify on` re-enables the current session when global setup is complete and
   `GJC_NOTIFICATIONS=0` is not forcing opt-out.
 
-## Session lifecycle and attachment surfaces
+### Manual Telegram CLI is for debugging
 
-SDK core exposes two related provider-neutral capabilities:
+`packages/coding-agent/src/sdk/bus/telegram-cli.ts` remains as a manual
+reference/debug client and template for other integrations. It is not the primary
+Telegram UX.
 
-1. **`SessionLifecycleService`** accepts an authenticated actor, an explicit
-   operation capability, a stable caller request key, and a typed target. It
-   derives one Broker idempotency key and invokes the canonical Broker lifecycle
-   operation. Results never expose endpoint URLs, tokens, process identities,
-   cleanup paths, or raw Broker receipts.
-2. **`SessionRouter`** owns live attachment discovery and transport. It validates
-   the exact indexed endpoint generation, keeps credentials and `SdkClient`
-   instances private, replays from the attachment cursor, reconnects after
-   rotation, and revokes stale capabilities. Provider-facing attachments expose
-   only `sessionId`, `generation`, `isCurrent()`, and `send()`.
+```sh
+bun run packages/coding-agent/src/sdk/bus/telegram-cli.ts --bot-token "$BOT_TOKEN"
+```
 
-There is no daemon-owned lifecycle control endpoint, provider lifecycle ledger,
-notification-root scanner, or provider-created SessionId. Telegram `/session_*`
-commands call the SDK lifecycle service directly. A Telegram update or topic
-reservation supplies the stable provider request identity; the Broker allocates
-the SessionId, and Telegram CAS-binds the returned opaque ID to its presentation
-mapping.
+By default it refuses to start when a fresh managed daemon already owns the same
+bot token for the same paired chat, because a second poller will cause Telegram
+409 conflicts. Use `--force` only for deliberate debugging when you have stopped
+or intentionally want to override the daemon guard.
+## Two client surfaces: per-session vs daemon-owned lifecycle control
 
-### Lifecycle trust and recovery
+The SDK now exposes **two distinct surfaces**. Do not confuse them:
 
-- paired provider identity and operation capability are checked before the
-  Broker call;
-- retries reuse the same provider request key, so one request produces one
-  Broker ledger identity and at most one lifecycle effect;
-- `terminal_uncertain` remains uncertain and is reconciled from Broker ledger,
-  effect marker, process incarnation, endpoint/index, readiness, and exact
-  cleanup evidence only;
-- provider transport restart reloads cursor and presentation state, while the
-  Router reconstructs attachments from Broker state;
-- stale endpoint generations and attachments fail closed;
-- provider topic/thread/message cleanup cannot rewrite a confirmed lifecycle
-  outcome.
+1. **Per-session notification clients (the normal, documented contract above).**
+   A client discovers `<repo>/.gjc/state/sdk/<sessionId>.json`, connects
+   to that session's loopback WebSocket, and handles `action_needed`,
+   `action_resolved`, `reply_rejected`, and the optional threaded frames. This is
+   all an ordinary integration (Telegram, Discord, Slack, mobile, local tools)
+   needs. It requires **zero** upstream changes.
 
+2. **The daemon-owned session *lifecycle* control endpoint (privileged).**
+   A separate, **session-independent**, loopback-only, authenticated control
+   endpoint that accepts `session_create` / `session_close` / `session_resume`
+   frames. It exists because creating a session cannot use a per-session socket
+   (none exists before the session does). It is **not** part of the normal
+   integration contract: ordinary clients never implement it. Only the bundled,
+   trusted daemon (e.g. the managed Telegram daemon) speaks it.
+
+### Lifecycle control endpoint
+
+- **Discovery:** `<agentDir>/notifications/control.json` (daemon-owned, mode
+  `0600`), distinct from per-session endpoint files. It carries only non-secret
+  endpoint metadata (url/host/port/pid/owner). The control token is held **in
+  memory** by the daemon (the sole client) and is **never** written to disk.
+- **Auth and routing:** the loopback SDK broker requires
+  `?token=<control-token>` (HTTP `401` otherwise) and re-checks every
+  lifecycle frame's `token` (`unauthorized` on mismatch). It routes accepted
+  requests through the canonical SDK lifecycle operation.
+- **Frames:** `session_create` (target `existing_path` | `worktree` |
+  `plain_dir`), `session_close` (hard-kill, history preserved, recoverable),
+  `session_resume` (reattach if alive, else cold-restart from history); responses
+  `session_create_response` / `session_close_response` / `session_resume_response`
+  / `session_lifecycle_error`. The protocol also defines a replayable
+  `session_ready` per-session frame for readiness-gated creates; the current MVP
+  daemon replies once the tmux launch is requested (see the phone guide) rather
+  than waiting on it. Inline prompt text (`-- <prompt>`) is rejected in the MVP.
+
+### Trust model and hardening (daemon side)
+
+The control endpoint trusts the configured paired chat for any path (an accepted
+risk). It is hardened around that boundary:
+
+- **Strict paired-chat gating** — non-paired chats are rejected *before* any path
+  parsing, filesystem, or process action.
+- **Durable idempotency** — a locked, atomic, fsynced ledger keyed by
+  `chatId:updateId` + request hash (`telegram-lifecycle-idempotency.json`).
+  Duplicate updates never repeat side effects, including across daemon restart; a
+  duplicate while in-progress reports pending (never a second spawn); a same id
+  with a different body is `duplicate_conflict`; an effect failure is recorded
+  `terminal_uncertain` (never auto-respawned).
+- **Per-chat create rate limit.**
+- **Audit log** — append-only `telegram-lifecycle-audit.jsonl` (`0600`) recording
+  every accept/reject/duplicate/rate-limit/spawn/success/failure. Raw control
+  tokens and raw prompts are never logged (prompt hash + byte length only).
+- **Inline prompts rejected (MVP)** — `session_create` with `-- <prompt>` text is
+  rejected with usage; no prompt is ever placed in argv, audit, or responses. (A
+  redacted prompt-ref flow is reserved for a future revision.)
+- **GJC-managed-only close** — force-close re-reads the exact `@gjc-profile`
+  immediately before kill and requires the `@gjc-session-id` (and optional
+  `@gjc-session-state-file`) tag to match; it never touches non-GJC tmux.
+- **Recent-activity picker** — sessions are ranked by history-file mtime and
+  enriched with terminal breadcrumbs so the operator picks a recent repo/session
+  instead of typing raw paths. Ambiguous resumes fail closed with candidates.
 ### Phone test guide (create / close / resume from Telegram)
 
 End-to-end manual check once `gjc notify setup` has paired your private chat:
 
-1. Run `gjc notify setup` and start or reload the Telegram provider supervisor.
-   The supervisor owns only the Telegram poller and presentation state.
-2. Send `/session_create path <repo-dir>`, `/session_create worktree <repo>
-   <branch>`, or `/session_create dir <newdir>`. The SDK lifecycle service submits
-   one canonical Broker create request; the bot reports the credential-free
-   outcome.
-3. `/session_recent` lists verified recent managed sessions.
-4. `/session_close <sessionId>` asks Broker lifecycle to close the exact managed
-   session and preserves history.
-5. `/session_resume <sessionId|prefix>` resolves verified managed history,
-   reattaches a live session or performs canonical Broker resume, and refuses
-   ambiguous prefixes.
+1. **Pair + start.** Run `gjc notify setup` (BotFather token, DM the bot to pair).
+   Start any GJC session with notifications enabled so the daemon owner is
+   running (`gjc launch` in a repo, or `GJC_NOTIFICATIONS=1`). The owner starts
+   the loopback control endpoint and accepts `/session_*` while running; with zero
+   active sessions it still idle-exits after the inactivity timeout.
+2. **Create.** From your paired chat, pick `/session_create` from the Telegram
+   command menu or send `/session_create path <repo-dir>` (or
+   `/session_create worktree <repo> <branch>`, or `/session_create dir <newdir>`).
+   `<repo-dir>`, `<repo>`, and `<newdir>` may use `~`/`~/...` for your own home
+   directory; named-user forms such as `~alice/repo` are rejected. The bot replies
+   once the tmux launch is requested; the session shows up in `/session_recent`
+   once it is ready. (Inline prompts via `-- <text>` are rejected for now with
+   usage text.)
+3. **List.** `/session_recent` shows recent sessions (most-recent first) to copy
+   an id from.
+4. **Close.** `/session_close <sessionId>` hard-kills the GJC-managed session
+   (history is preserved); the bot confirms.
+5. **Resume.** `/session_resume <sessionId|prefix>` reattaches if it is still
+   alive, otherwise cold-restarts it from saved history. An ambiguous prefix
+   replies with the matching candidates instead of guessing.
 
-Commands are accepted only from the paired chat. Duplicate Telegram updates and
-replayed topic reservations reuse their original request identity; they never
-allocate or spawn a second session.
+Commands are accepted **only** from the paired chat; **create** is rate-limited,
+and all lifecycle commands are idempotent per Telegram update id and audited (no
+tokens or prompts are logged).
+For an automated proof of the wire path without a real bot, see
+`packages/coding-agent/scripts/g011-daemon-path-smoke.ts` (real native control
+endpoint + loopback WebSocket).

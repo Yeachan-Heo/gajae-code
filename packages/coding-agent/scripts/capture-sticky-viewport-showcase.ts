@@ -209,6 +209,7 @@ export const PROVENANCE_DIFF_SCOPE = [
 
 	"packages/agent/src",
 	"packages/ai/src",
+	"packages/bridge-client/src",
 	"packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
 	"packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
 	"packages/coding-agent/src",

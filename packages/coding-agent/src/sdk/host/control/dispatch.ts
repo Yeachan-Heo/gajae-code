@@ -5,7 +5,6 @@ import {
 } from "../../../session/default-model-selection";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import type { ControlInput, ControlSurface, ControlValue } from "./operations";
-import { brokerRuntimeCloseCapability, hasBrokerRuntimeCloseCapability } from "./runtime-gate";
 
 export interface ControlRequest {
 	id: string;
@@ -67,20 +66,7 @@ const SHARED_ERROR_CODES = new Set([
 	"cursor_expired",
 	"event_gap",
 	"unavailable",
-	"operation_prohibited",
 	"internal",
-]);
-
-/** Lifecycle mutations must enter through the Broker-backed lifecycle service. */
-const BROKER_LIFECYCLE_CONTROL_OPERATIONS = new Set([
-	"session.new",
-	"session.fork",
-	"session.resume",
-	"session.switch",
-	"session.branch",
-	"session.handoff",
-	"session.close",
-	"session.delete",
 ]);
 const IDEMPOTENCY_TTL_MS = 15 * 60 * 1_000;
 const MAX_IDEMPOTENCY_ENTRIES = 256;
@@ -279,10 +265,22 @@ function invoke(
 			return surface.executeBash(text(input, "cmd"));
 		case "bash.abort":
 			return surface.abortBash();
+		case "session.new":
+			return surface.newSession();
+		case "session.fork":
+			return surface.forkSession();
+		case "session.resume":
+			return surface.resumeSession(text(input, "id"));
 		case "session.close":
-			return surface.closeSession(brokerRuntimeCloseCapability(input));
+			return surface.closeSession();
+		case "session.switch":
+			return surface.switchSession(text(input, "id"));
+		case "session.branch":
+			return surface.branchSession(text(input, "entryId"));
 		case "session.rename":
 			return surface.renameSession(text(input, "name"));
+		case "session.handoff":
+			return surface.handoffSession(input.target);
 		case "session.export_html":
 			return surface.exportHtml();
 		case "config.patch":
@@ -312,6 +310,8 @@ function invoke(
 			return surface.setExtensionEnabled(text(input, "id"), input.on as boolean);
 		case "context.clear":
 			return surface.clearContext(confirm === true);
+		case "session.delete":
+			return surface.deleteSession(text(input, "id"), confirm === true);
 		case "session.cwd.move":
 			return surface.moveCwd(text(input, "path"));
 		case "retry.last":
@@ -443,20 +443,7 @@ export function dispatchControl(
 		return Promise.resolve(
 			failure(request.id, "unknown_operation", `Unknown control operation: ${request.operation}.`),
 		);
-	const brokerCloseAuthorized = row.sdkId === "session.close" && hasBrokerRuntimeCloseCapability(request.input);
-	if (BROKER_LIFECYCLE_CONTROL_OPERATIONS.has(row.sdkId) && !brokerCloseAuthorized)
-		return Promise.resolve(
-			failure(
-				request.id,
-				"operation_prohibited",
-				`${request.operation} is available only through the Broker lifecycle service.`,
-			),
-		);
-	if (
-		!brokerCloseAuthorized &&
-		surface.installedOperations instanceof Set &&
-		!surface.installedOperations.has(row.sdkId)
-	)
+	if (surface.installedOperations instanceof Set && !surface.installedOperations.has(row.sdkId))
 		return Promise.resolve(
 			failure(request.id, "operation_not_session_owned", `${request.operation} is not installed for this session.`),
 		);
