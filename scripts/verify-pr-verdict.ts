@@ -283,7 +283,15 @@ async function validatePreflight(command: string, cwd: string, trustedRoot: stri
 	const parsed = parseGhPrCreate(command);
 	if (parsed === null) return { ok: true, diagnostics: [] };
 	if (!parsed.bodyFile && parsed.body === undefined) return { ok: false, diagnostics: ["gh pr create must provide --body-file or --body so the PR verdict can be validated before submission."] };
-	const body = parsed.bodyFile ? await Bun.file(path.resolve(invocationCwd, parsed.bodyFile)).text().catch(() => "") : parsed.body!;
+	let body = parsed.body!;
+	if (parsed.bodyFile) {
+		const bodyPath = path.resolve(invocationCwd, parsed.bodyFile);
+		try {
+			body = await Bun.file(bodyPath).text();
+		} catch (error) {
+			return { ok: false, diagnostics: [`Could not read PR body file ${bodyPath}: ${error instanceof Error ? error.message : String(error)}`] };
+		}
+	}
 	const baseRef = parsed.base ?? "dev";
 	const refreshBase = await git(["fetch", "--no-tags", "origin", "dev"], cwd);
 	if (refreshBase.exitCode !== 0) {

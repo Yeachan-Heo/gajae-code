@@ -142,7 +142,7 @@ function dynamicMutationBindings(content: string): { aliases: Set<string>; names
 	const namespaceNames = new Set([...importedFsNamespaces(content), ...namespaces]);
 	for (const namespace of namespaceNames) {
 		const member = `(?:${[...MUTATION_EXPORTS].join("|")})`;
-		for (const match of content.matchAll(new RegExp(`(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${namespace}(?:\\.promises)?(?:\\.${member}|\\[['\"]${member}['\"]\\])\\b`, "gu"))) {
+		for (const match of content.matchAll(new RegExp(`(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${namespace}(?:\\.promises)?(?:\\.${member}\\b|\\[['\"]${member}['\"]\\])`, "gu"))) {
 			aliases.add(match[1]!);
 		}
 	}
@@ -163,17 +163,6 @@ function matchedApi(line: string, aliases: ReadonlySet<string>, namespaces: Read
 		if (match) return match[0].replace(/\s*\($/u, "");
 	}
 	return null;
-}
-
-function locallyReferencesGjc(lines: readonly string[], index: number): boolean {
-	const start = Math.max(0, index - 25);
-	const end = Math.min(lines.length - 1, index + 25);
-	for (let i = start; i <= end; i++) {
-		const line = lines[i]?.trim() ?? "";
-		if (line.startsWith("//") || line.startsWith("*")) continue;
-		if (sameLineReferencesGjc(line)) return true;
-	}
-	return false;
 }
 
 function lineLooksLikeGeneratedStringLiteral(line: string): boolean {

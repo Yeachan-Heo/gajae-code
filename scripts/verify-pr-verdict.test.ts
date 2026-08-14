@@ -114,6 +114,12 @@ test("hook keeps repository root separate from nested invocation cwd", async () 
 	expect(hook).toContain('"--repo", repositoryRoot, "--invocation-cwd", invocationCwd');
 });
 
+test("preflight preserves missing body-file diagnostics", async () => {
+	const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+	expect(source).toContain("Could not read PR body file");
+	expect(source).not.toContain('.text().catch(() => "")');
+});
+
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(workflow).toContain("pull_request_target:");
