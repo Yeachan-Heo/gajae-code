@@ -2628,6 +2628,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							}
 						}
 						params = candidate.params;
+						// The corrective replay uploads the repaired body: count it so the
+						// first-event timeout ceiling bounds TOTAL uploads (issue #4464).
+						providerUploadCount++;
 						// The provider retry budget is deliberately NOT reset here: a repair that
 						// keeps being rejected must run out instead of renewing the budget it is
 						// supposed to consume (issue #4011).
@@ -2802,6 +2805,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							// out instead of renewing the budget it is supposed to consume
 							// (issue #4011), and the recurrence branch below terminalizes
 							// before the generic 5xx retry can re-send the unchanged request.
+							// This corrective replay uploads the steered body: count it so the
+							// first-event timeout ceiling bounds TOTAL uploads (issue #4464).
+							providerUploadCount++;
 							resetOutputForRetry();
 							continue;
 						}
