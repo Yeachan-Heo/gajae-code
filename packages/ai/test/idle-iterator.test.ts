@@ -28,6 +28,32 @@ describe("iterateWithIdleTimeout transport facts", () => {
 		expect(transportFailureFacts(facts)).toEqual(facts);
 	});
 
+	it("retains statusless first-event retry ceiling facts idempotently", () => {
+		const error = Object.assign(new Error("socket hang up"), {
+			requestBytes: 1_750_732,
+			firstEventElapsedMs: 300_001,
+			firstEventTimeoutMs: 300_000,
+			endpointClass: "custom" as const,
+			retryMaxAttempts: 1,
+		});
+		const facts = transportFailureFacts(error);
+
+		expect(facts).toEqual({
+			kind: "transport",
+			status: undefined,
+			providerCode: undefined,
+			anthropicErrorType: undefined,
+			openaiErrorCode: undefined,
+			headers: undefined,
+			requestBytes: 1_750_732,
+			firstEventElapsedMs: 300_001,
+			firstEventTimeoutMs: 300_000,
+			endpointClass: "custom",
+			retryMaxAttempts: 1,
+		});
+		expect(transportFailureFacts(facts)).toEqual(facts);
+	});
+
 	it("keeps post-progress idle expiry distinct from first-event expiry", async () => {
 		vi.useFakeTimers();
 		const source = (async function* () {

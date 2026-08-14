@@ -289,6 +289,48 @@ describe("anthropic first-event timeouts", () => {
 		});
 	});
 
+	it("retains the large-request ceiling for a statusless socket failure during grace", async () => {
+		let attempts = 0;
+		const providerRetryWait = vi.fn(async () => {});
+		const create = ((_body: unknown) => {
+			attempts += 1;
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				[Symbol.asyncIterator]() {
+					return {
+						async next(): Promise<IteratorResult<MockAnthropicEvent>> {
+							await Bun.sleep(5);
+							throw new Error("socket hang up");
+						},
+					};
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+
+		const result = await streamAnthropic(model, contextWithBytes(1_670_000), {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("socket hang up");
+		expect(result.transportFailure).toMatchObject({
+			requestBytes: expect.any(Number),
+			firstEventTimeoutMs: 1,
+			endpointClass: "custom",
+			retryMaxAttempts: 1,
+		});
+	});
+
 	it("honors caller abort while a custom endpoint is inside its bounded grace", async () => {
 		let attempts = 0;
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
@@ -626,5 +668,38 @@ describe("anthropic first-event timeouts", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Anthropic stream stalled while waiting for the next event");
+	});
+
+	it("does not let pre-message_start pings rearm the first-event deadline", async () => {
+		const controller = new AbortController();
+		const abortFallback = setTimeout(() => controller.abort(), 50);
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					while (!requestOptions?.signal?.aborted) {
+						await Bun.sleep(1);
+						yield { type: "ping" };
+					}
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+
+		const result = await streamAnthropic(model, context, {
+			client: { messages: { create } } as Anthropic,
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 5,
+			streamIdleTimeoutMs: 5000,
+			streamMaxRetries: 0,
+		}).result();
+		clearTimeout(abortFallback);
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("timed out while waiting for the first event");
 	});
 });

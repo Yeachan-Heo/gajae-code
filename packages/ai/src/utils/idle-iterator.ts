@@ -220,6 +220,8 @@ export async function* iterateWithIdleTimeout<T>(
 		}
 	};
 	let lastProgressAt = Date.now();
+	const firstItemDeadlineAt =
+		firstItemTimeoutMs !== undefined && firstItemTimeoutMs > 0 ? Date.now() + firstItemTimeoutMs : undefined;
 
 	const noTimeoutEnforced =
 		(firstItemTimeoutMs === undefined || firstItemTimeoutMs <= 0) &&
@@ -228,7 +230,8 @@ export async function* iterateWithIdleTimeout<T>(
 	while (true) {
 		let activeTimeoutMs: number | undefined;
 		if (awaitingFirstItem) {
-			activeTimeoutMs = firstItemTimeoutMs;
+			activeTimeoutMs =
+				firstItemDeadlineAt === undefined ? undefined : Math.max(0, firstItemDeadlineAt - Date.now());
 		} else if (options.idleTimeoutMs !== undefined && options.idleTimeoutMs > 0) {
 			activeTimeoutMs = options.idleTimeoutMs - (Date.now() - lastProgressAt);
 			// The idle deadline may already have elapsed because the *consumer*
@@ -253,10 +256,7 @@ export async function* iterateWithIdleTimeout<T>(
 
 		let timer: NodeJS.Timeout | undefined;
 		let resolveTimeout: ((value: { kind: "timeout" }) => void) | undefined;
-		const enforceTimeout =
-			!noTimeoutEnforced &&
-			activeTimeoutMs !== undefined &&
-			(awaitingFirstItem ? activeTimeoutMs > 0 : activeTimeoutMs >= 0);
+		const enforceTimeout = !noTimeoutEnforced && activeTimeoutMs !== undefined && activeTimeoutMs >= 0;
 		if (enforceTimeout) {
 			const { promise, resolve } = Promise.withResolvers<{ kind: "timeout" }>();
 			resolveTimeout = resolve;

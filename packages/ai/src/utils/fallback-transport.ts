@@ -240,7 +240,12 @@ export function transportFailureFacts(
 		!isRateLimitCode(normalizedCode) &&
 		!isContextOverflowCode(normalizedCode) &&
 		normalizedCode !== STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE &&
-		normalizedCode !== EMPTY_RESPONSE_PROVIDER_CODE
+		normalizedCode !== EMPTY_RESPONSE_PROVIDER_CODE &&
+		requestBytes === undefined &&
+		firstEventElapsedMs === undefined &&
+		firstEventTimeoutMs === undefined &&
+		endpointClass === undefined &&
+		retryMaxAttempts === undefined
 	) {
 		return undefined;
 	}
