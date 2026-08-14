@@ -60,7 +60,6 @@ const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max]
 const DEEPSEEK_V4_FLASH_0731_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 const GROK_4_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
 const GROK_4_6_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
-const GLM_5_3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const CLOUDFLARE_AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic";
@@ -468,17 +467,6 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	// Pin to the true 1M so context-cap / auto-compaction thresholds aren't tripped ~5x early.
 	if (model.provider === "zai" && model.id === "glm-5.2") {
 		model.contextWindow = 1_000_000;
-	}
-	if (model.provider === "zai" && model.id === "glm-5.3") {
-		model.contextWindow = 1_000_000;
-		model.maxTokens = 131_072;
-		model.thinking = {
-			mode: "anthropic-budget-effort",
-			minLevel: Effort.Low,
-			maxLevel: Effort.Max,
-			levels: GLM_5_3_EFFORTS,
-			defaultLevel: Effort.Max,
-		};
 	}
 	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
 		model.contextWindow = 1_000_000;
