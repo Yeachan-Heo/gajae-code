@@ -33,6 +33,11 @@ import {
 	replaceOwnerGeneration,
 } from "../src/gjc-runtime/tmux-owner-isolation";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
+import { coordinatorDurabilityAvailable } from "./helpers/issue-4545-gates";
+
+// Dependency-conditional runner for the #4545 masking tests (#4459 semantics):
+// full strength once the durability module exists, visible skip before that.
+const maskingIt = coordinatorDurabilityAvailable() ? it : it.skip;
 
 const tempDirs: string[] = [];
 // Every write below serializes on the coordinator state lock, whose removals go through
@@ -2066,6 +2071,116 @@ describe("coordinator runtime state sidecar", () => {
 		expect(await readJson(readinessFile)).toEqual(left);
 		expect((await fs.readdir(root)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
 	});
+	maskingIt("does not let a failing readiness cleanup mask the publication error (#4545)", async () => {
+		const root = await tempRoot();
+		const readinessFile = path.join(root, "runtime-input-ready.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "masking-session";
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "masking-launch";
+		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		// Primary: the readiness publication (fs.link to the readiness file)
+		// fails with EIO. Secondary: the finally-block temp-file cleanup (fs.rm)
+		// fails with EACCES. Pre-fix (`try { ... } finally { await fs.rm(...) }`)
+		// the cleanup error replaced the publication error entirely. Post-#4459
+		// the primary survives with the cleanup failure attached.
+		const realLink = fs.link;
+		const realRm = fs.rm;
+		const link = spyOn(fs, "link").mockImplementation(async (source, destination) => {
+			if (destination === readinessFile) throw Object.assign(new Error("EIO"), { code: "EIO" });
+			return realLink(source, destination);
+		});
+		const rm = spyOn(fs, "rm").mockImplementation(async (target, options) => {
+			if (String(target).endsWith(".tmp")) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+			return realRm(target, options);
+		});
+		try {
+			const observed = await persistCoordinatorRuntimeInputReady().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(observed).toBeInstanceOf(AggregateError);
+			const aggregate = observed as AggregateError;
+			const codes = aggregate.errors.map(cause => (cause as NodeJS.ErrnoException).code);
+			expect(codes[0]).toBe("EIO");
+			expect(codes).toContain("EACCES");
+			expect(aggregate.message).toContain("readiness publication and cleanup failed");
+		} finally {
+			link.mockRestore();
+			rm.mockRestore();
+		}
+	});
+
+	maskingIt("does not let a failing close mask the readiness write error (#4545)", async () => {
+		const root = await tempRoot();
+		const readinessFile = path.join(root, "runtime-input-ready.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "masking-close-session";
+		process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "masking-close-launch";
+		process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+		// Primary: the temp-file write fails with EIO. Secondary: handle.close()
+		// fails with EACCES. Pre-fix (`try { write; sync } finally { close }`) the
+		// close error replaced the write error. Post-#4459 both survive.
+		const realOpen = fs.open;
+		const open = spyOn(fs, "open").mockImplementation(async (target, flags) => {
+			if (String(target).endsWith(".tmp")) {
+				return {
+					writeFile: async () => {
+						throw Object.assign(new Error("EIO"), { code: "EIO" });
+					},
+					sync: async () => {},
+					close: async () => {
+						throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+					},
+				} as unknown as Awaited<ReturnType<typeof fs.open>>;
+			}
+			return realOpen(target, flags);
+		});
+		try {
+			const observed = await persistCoordinatorRuntimeInputReady().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(observed).toBeInstanceOf(AggregateError);
+			const aggregate = observed as AggregateError;
+			const codes = aggregate.errors.map(cause => (cause as NodeJS.ErrnoException).code);
+			expect(codes[0]).toBe("EIO");
+			expect(codes).toContain("EACCES");
+			expect(aggregate.message).toContain("readiness write and close failed");
+		} finally {
+			open.mockRestore();
+		}
+	});
+
+	maskingIt(
+		"still publishes the readiness marker when cleanup succeeds after a publication failure (#4545)",
+		async () => {
+			const root = await tempRoot();
+			const readinessFile = path.join(root, "runtime-input-ready.json");
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = path.join(root, "state.json");
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "primary-only-session";
+			process.env[GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV] = "primary-only-launch";
+			process.env[GJC_COORDINATOR_SESSION_READINESS_FILE_ENV] = readinessFile;
+			// Publication fails, cleanup succeeds: the primary error must surface
+			// alone (not swallowed, not replaced).
+			const realLink = fs.link;
+			const link = spyOn(fs, "link").mockImplementation(async (source, destination) => {
+				if (destination === readinessFile) throw Object.assign(new Error("EIO"), { code: "EIO" });
+				return realLink(source, destination);
+			});
+			try {
+				const observed = await persistCoordinatorRuntimeInputReady().then(
+					() => undefined,
+					(error: unknown) => error,
+				);
+				expect(observed).toBeDefined();
+				expect((observed as NodeJS.ErrnoException).code).toBe("EIO");
+				expect(observed).not.toBeInstanceOf(AggregateError);
+				expect((await fs.readdir(root)).filter(entry => entry.endsWith(".tmp"))).toEqual([]);
+			} finally {
+				link.mockRestore();
+			}
+		},
+	);
 
 	it("keeps the input readiness marker independent from subsequent mutable state writes", async () => {
 		const root = await tempRoot();
