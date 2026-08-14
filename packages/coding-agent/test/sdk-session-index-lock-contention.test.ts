@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { withFileLock } from "../src/config/file-lock";
 import { SessionIndex } from "../src/sdk/broker/session-index";
@@ -28,7 +29,7 @@ function deferred<T = void>() {
  */
 describe("SDK session index lock contention (#4544)", () => {
 	it("reports the live lock owner when a launch exhausts the lock budget", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-4544-owner-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-owner-"));
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		await fs.mkdir(sessionsDir, { recursive: true });
 		const logPath = path.join(sessionsDir, "index.jsonl");
@@ -65,7 +66,7 @@ describe("SDK session index lock contention (#4544)", () => {
 	});
 
 	it("keeps the append path's OS incarnation derivation outside the lock-held section", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-4544-append-probe-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-append-probe-"));
 		const index = await new SessionIndex(dir).open();
 		const incarnationModule = await import("../src/sdk/broker/process-incarnation");
 		const realProcessIncarnation = incarnationModule.processIncarnation;
@@ -102,7 +103,7 @@ describe("SDK session index lock contention (#4544)", () => {
 	});
 
 	it("keeps the heartbeat pass's OS incarnation probes outside the lock-held section", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-4544-heartbeat-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-heartbeat-"));
 		const index = await new SessionIndex(dir).open();
 		await index.append(event("live-host"));
 		const incarnationModule = await import("../src/sdk/broker/process-incarnation");
@@ -140,7 +141,7 @@ describe("SDK session index lock contention (#4544)", () => {
 	});
 
 	it("releases the lock when the critical section throws, and aborted acquisition fails fast", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-4544-throw-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-throw-"));
 		const index = await new SessionIndex(dir).open();
 		await index.append(event("one"));
 		const boom = new Error("critical section failed");
@@ -183,7 +184,7 @@ describe("SDK session index lock contention (#4544)", () => {
 	});
 
 	it("bounds concurrent launches behind a legitimate holder and converges after release", async () => {
-		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-4544-concurrent-"));
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-concurrent-"));
 		const seed = await new SessionIndex(dir).open();
 		await seed.append(event("seed"));
 		// Simulate a long-but-bounded holder (compaction/audit on a large index):
