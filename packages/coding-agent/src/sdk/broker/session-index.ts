@@ -535,6 +535,13 @@ const SESSION_INDEX_LOCK_OPTIONS = { retries: 600, retryDelayMs: 100 } as const;
 const SESSION_INDEX_OP_SLOW_MS = 10_000;
 
 /**
+ * An incarnation observation older than this at lock-acquire time is refreshed
+ * before any heartbeat is written (#4544 review): pid reuse between probe and
+ * write would otherwise checkpoint a dead session as live.
+ */
+const SESSION_INDEX_LOCK_STALE_PROBE_MS = 1_000;
+
+/**
  * One locked session-index transaction (#4544): every critical section over the
  * machine-global lock runs through this single choke point, so (a) the operation
  * is named in a slow-operation warning when it holds the lock beyond the
@@ -542,11 +549,23 @@ const SESSION_INDEX_OP_SLOW_MS = 10_000;
  * site.
  */
 function withSessionIndexLock<T>(operation: string, agentDir: string, callback: () => Promise<T>): Promise<T> {
-	const note = setTimeout(
-		() => logger.warn(`sdk broker: session index "${operation}" still holds the index lock after 10s`),
-		SESSION_INDEX_OP_SLOW_MS,
+	return withFileLock(
+		logFor(agentDir),
+		async () => {
+			// Armed only once the lock is actually held: queueing time behind another
+			// legitimate holder must not be attributed to this operation.
+			const note = setTimeout(
+				() => logger.warn(`sdk broker: session index "${operation}" still holds the index lock after 10s`),
+				SESSION_INDEX_OP_SLOW_MS,
+			);
+			try {
+				return await callback();
+			} finally {
+				clearTimeout(note);
+			}
+		},
+		SESSION_INDEX_LOCK_OPTIONS,
 	);
-	return withFileLock(logFor(agentDir), callback, SESSION_INDEX_LOCK_OPTIONS).finally(() => clearTimeout(note));
 }
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
 	if (!snapshot || typeof snapshot !== "object") return false;
@@ -1304,6 +1323,7 @@ export class SessionIndex {
 			// set can only skip a heartbeat for one cycle, never checkpoint a wrong
 			// host (fail-closed).
 			const probed = new Map<string, string | undefined>();
+			let probedAt = now;
 			for (const row of reduceEvents(this.#events, now, this.#agentDir).sessions) {
 				if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
 				if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
@@ -1314,6 +1334,29 @@ export class SessionIndex {
 				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
 			}
 			return await withSessionIndexLock("heartbeat checkpoint", this.#agentDir, async () => {
+				// A pid can exit and be reused between the probe above and this locked
+				// section (lock acquisition may queue behind another holder for up to
+				// the full retry budget). Observations older than the acquisition are
+				// never trusted: `alive(pid)` alone would see the reused pid while a
+				// stale incarnation still matched the dead process, checkpointing the
+				// wrong host. Refresh the observation set whenever contention delayed
+				// the pass; a fresh-enough set is kept as-is.
+				if (Date.now() - probedAt > SESSION_INDEX_LOCK_STALE_PROBE_MS) {
+					probed.clear();
+					probedAt = Date.now();
+					for (const row of reduceEvents(this.#events, now, this.#agentDir).sessions) {
+						if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
+						if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
+							continue;
+						if (!alive(row.pid)) continue;
+						const recorded = row.hostIncarnation ?? row.processIncarnation;
+						if (recorded === undefined) continue;
+						probed.set(
+							`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`,
+							processIncarnation(row.pid),
+						);
+					}
+				}
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) return 0;
 				const events: SessionIndexEvent[] = [];

@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { withFileLock } from "../src/config/file-lock";
+import * as lockModule from "../src/config/file-lock";
+import * as incarnationModule from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
 const event = (sessionId: string) => ({
@@ -46,7 +47,7 @@ describe("SDK session index lock contention (#4544)", () => {
 		// shortened retry delay but the same diagnostics surface.
 		let failure: unknown;
 		try {
-			await withFileLock(path.join(sessionsDir, "index.jsonl"), async () => {}, {
+			await lockModule.withFileLock(path.join(sessionsDir, "index.jsonl"), async () => {}, {
 				retries: 2,
 				retryDelayMs: 5,
 			});
@@ -68,9 +69,7 @@ describe("SDK session index lock contention (#4544)", () => {
 	it("keeps the append path's OS incarnation derivation outside the lock-held section", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-append-probe-"));
 		const index = await new SessionIndex(dir).open();
-		const incarnationModule = await import("../src/sdk/broker/process-incarnation");
 		const realProcessIncarnation = incarnationModule.processIncarnation;
-		const lockModule = await import("../src/config/file-lock");
 		const realWithFileLock = lockModule.withFileLock;
 		let depth = 0;
 		let probedUnderLock = false;
@@ -106,14 +105,12 @@ describe("SDK session index lock contention (#4544)", () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-heartbeat-"));
 		const index = await new SessionIndex(dir).open();
 		await index.append(event("live-host"));
-		const incarnationModule = await import("../src/sdk/broker/process-incarnation");
 		// An unlock-time probe record: the pass must observe liveness for each
 		// candidate row BEFORE taking the machine-global lock (or after releasing
 		// it), because on Windows the probe can spawn powershell.exe — an
 		// unbounded OS operation to hold a machine-global critical section across.
 		let depth = 0;
 		let probedUnderLock = false;
-		const lockModule = await import("../src/config/file-lock");
 		const realProcessIncarnation = incarnationModule.processIncarnation;
 		const realWithFileLock = lockModule.withFileLock;
 		const spy = vi
@@ -163,18 +160,20 @@ describe("SDK session index lock contention (#4544)", () => {
 		const acquired = deferred();
 		const holderDone = deferred();
 		void (async () => {
-			await withFileLock(path.join(dir, "sdk", "sessions", "index.jsonl"), async () => {
+			await lockModule.withFileLock(path.join(dir, "sdk", "sessions", "index.jsonl"), async () => {
 				acquired.resolve();
 				await holderDone.promise;
 			});
 		})();
 		await acquired.promise;
 		const started = Date.now();
-		const competing = withFileLock(path.join(dir, "sdk", "sessions", "index.jsonl"), async () => {}, {
-			signal: controller.signal,
-			retries: 600,
-			retryDelayMs: 100,
-		}).catch(error => error as Error);
+		const competing = lockModule
+			.withFileLock(path.join(dir, "sdk", "sessions", "index.jsonl"), async () => {}, {
+				signal: controller.signal,
+				retries: 600,
+				retryDelayMs: 100,
+			})
+			.catch(error => error as Error);
 		// Abort while the contender is inside its retry loop.
 		setTimeout(() => controller.abort(), 150);
 		const outcome = await competing;
