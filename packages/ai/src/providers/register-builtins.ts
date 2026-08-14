@@ -339,12 +339,15 @@ function createLazyStream<TApi extends Api>(
 	limits?: LazyStreamLimits,
 ): (model: Model<TApi>, context: Context, options: OptionsForApi<TApi>) => EventStreamImpl {
 	return (model, context, options) => {
-		const outer = new EventStreamImpl();
+		let abortTracker: AbortSourceTracker | undefined;
+		const outer = new EventStreamImpl(() =>
+			abortTracker?.abortLocally(new Error("Provider stream consumer stopped before completion")),
+		);
 		const streamOptions = (options ?? {}) as OptionsForApi<TApi>;
 
 		loadModule()
 			.then(module => {
-				const abortTracker = createAbortSourceTracker(streamOptions.signal);
+				abortTracker = createAbortSourceTracker(streamOptions.signal);
 				const providerOptions = { ...streamOptions, signal: abortTracker.requestSignal } as OptionsForApi<TApi>;
 				const inner = module.stream(model, context, providerOptions);
 				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
