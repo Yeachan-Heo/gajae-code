@@ -2280,7 +2280,7 @@ export class ModelSelectorComponent extends Container {
 		}
 	}
 	#renderRoleThinkingMenu(choices: RoleThinkingChoices): void {
-		const { item, roles, levels, currentRoleIndex, selectedLevels } = choices;
+		const { roles, levels, currentRoleIndex, selectedLevels } = choices;
 		const currentRole = roles[currentRoleIndex];
 		const roleInfo = GJC_MODEL_ASSIGNMENT_TARGETS[currentRole];
 		const roleTag = roleInfo?.tag ?? currentRole.toUpperCase();
@@ -2337,7 +2337,7 @@ export class ModelSelectorComponent extends Container {
 			if (allSet) {
 				const saved = this.#pendingRoleThinkingChoices;
 				this.#pendingRoleThinkingChoices = undefined;
-				void this.#applyRoleEffortSelection(item, saved.roles, saved.selectedLevels);
+				if (saved) void this.#applyRoleEffortSelection(item, saved.roles, saved.selectedLevels);
 				return;
 			}
 			this.#pendingRoleThinkingChoices = { ...choices, currentRoleIndex: currentRoleIndex + 1, selectedLevels };
