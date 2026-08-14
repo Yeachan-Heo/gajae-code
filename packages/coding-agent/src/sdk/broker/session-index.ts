@@ -533,13 +533,17 @@ const SESSION_INDEX_LOCK_OPTIONS = { retries: 600, retryDelayMs: 100 } as const;
  * lock-exhaustion crash on every later launch.
  */
 const SESSION_INDEX_OP_SLOW_MS = 10_000;
-
 /**
- * An incarnation observation older than this at lock-acquire time is refreshed
- * before any heartbeat is written (#4544 review): pid reuse between probe and
- * write would otherwise checkpoint a dead session as live.
+ * How long a completed incarnation-probe batch stays trustworthy when the
+ * heartbeat pass acquires the machine-global index lock (#4544 review). A pid
+ * can exit and be reused while the pass queues behind another holder, and
+ * `alive(pid)` alone would see the reused pid while the observation still
+ * matched the dead process. Beyond this bound the cycle writes no heartbeat
+ * (fail-closed); the OS is never probed under the lock. The bound only needs
+ * to cover an uncontended acquisition plus scheduler jitter — real contention
+ * queues for the retry delay (100ms) or far longer.
  */
-const SESSION_INDEX_LOCK_STALE_PROBE_MS = 1_000;
+const SESSION_INDEX_PROBE_FRESHNESS_MS = 50;
 
 /**
  * One locked session-index transaction (#4544): every critical section over the
@@ -1318,12 +1322,16 @@ export class SessionIndex {
 			// (#4544): on Windows a probe can spawn powershell.exe, and holding the
 			// index lock across an unbounded OS spawn starves every later launch.
 			// The probe reads only the last replayed history to pick WHICH pids are
-			// worth observing; the locked section below re-validates every candidate
-			// against the fresh replay and the probed observation, so a stale probe
-			// set can only skip a heartbeat for one cycle, never checkpoint a wrong
-			// host (fail-closed).
+			// worth observing. The observations are then bound to the instant the
+			// probe batch COMPLETED: if anything delays this pass past that instant —
+			// lock contention queueing behind another holder, or simply time — the
+			// observation set is discarded and this cycle writes no heartbeat. A pid
+			// can exit and be reused in that window, and `alive(pid)` alone would see
+			// the reused pid while a stale observation still matched the dead
+			// process, checkpointing the wrong host. Failing closed is the only
+			// revalidation that never probes the OS under the lock: the next pass
+			// re-probes from scratch.
 			const probed = new Map<string, string | undefined>();
-			let probedAt = now;
 			for (const row of reduceEvents(this.#events, now, this.#agentDir).sessions) {
 				if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
 				if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
@@ -1333,30 +1341,15 @@ export class SessionIndex {
 				if (recordedIncarnation === undefined) continue;
 				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
 			}
+			const probedAt = Date.now();
 			return await withSessionIndexLock("heartbeat checkpoint", this.#agentDir, async () => {
-				// A pid can exit and be reused between the probe above and this locked
-				// section (lock acquisition may queue behind another holder for up to
-				// the full retry budget). Observations older than the acquisition are
-				// never trusted: `alive(pid)` alone would see the reused pid while a
-				// stale incarnation still matched the dead process, checkpointing the
-				// wrong host. Refresh the observation set whenever contention delayed
-				// the pass; a fresh-enough set is kept as-is.
-				if (Date.now() - probedAt > SESSION_INDEX_LOCK_STALE_PROBE_MS) {
-					probed.clear();
-					probedAt = Date.now();
-					for (const row of reduceEvents(this.#events, now, this.#agentDir).sessions) {
-						if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
-						if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
-							continue;
-						if (!alive(row.pid)) continue;
-						const recorded = row.hostIncarnation ?? row.processIncarnation;
-						if (recorded === undefined) continue;
-						probed.set(
-							`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`,
-							processIncarnation(row.pid),
-						);
-					}
-				}
+				// Contended or delayed acquisition invalidates the observation set:
+				// never trust identity evidence gathered meaningfully before the
+				// lock was held. The checkpoint is skipped this cycle (fail-closed);
+				// the OS is never probed while the machine-global lock is held. The
+				// bound tolerates scheduler jitter on an uncontended acquisition —
+				// which is the only path where the evidence is trustworthy.
+				if (Date.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return 0;
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) return 0;
 				const events: SessionIndexEvent[] = [];
