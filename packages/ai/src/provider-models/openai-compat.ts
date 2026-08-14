@@ -1407,12 +1407,9 @@ export interface OmlxModelManagerConfig {
 	baseUrl?: string;
 }
 
-export function omlxModelManagerOptions(
-	config?: OmlxModelManagerConfig,
-): ModelManagerOptions<"openai-completions"> {
+export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? Bun.env.OMLX_BASE_URL ?? "http://127.0.0.1:8080";
-	const references = createBundledReferenceMap<"openai-completions">("omlx" as any);
+	const baseUrl = config?.baseUrl ?? Bun.env.OMLX_BASE_URL ?? "http://127.0.0.1:8080/v1";
 	return {
 		providerId: "omlx",
 		fetchDynamicModels: () =>
@@ -1422,7 +1419,6 @@ export function omlxModelManagerOptions(
 				baseUrl,
 				apiKey,
 				mapModel: (entry, defaults) => {
-					const reference = references.get(defaults.id);
 					return {
 						...defaults,
 						id: entry.id as string,

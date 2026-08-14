@@ -1767,7 +1767,7 @@ export class ModelRegistry {
 			this.#discoveryManager.addProvider({
 				provider: "omlx",
 				api: "openai-completions",
-				baseUrl: Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8080",
+				baseUrl: Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8080/v1",
 				discovery: { type: "omlx" },
 				optional: true,
 			});
