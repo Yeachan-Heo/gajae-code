@@ -1569,8 +1569,17 @@ function createAnthropicFirstEventTimeoutError(args: {
 	requestBytes: number;
 	firstEventTimeoutMs: number | undefined;
 	endpointClass: "canonical" | "custom";
+	/** Uploads this provider invocation already consumed before the timeout. */
+	providerAttemptsConsumed?: number;
 }): FirstEventTimeoutError {
-	const retryMaxAttempts = resolveAnthropicFirstEventTimeoutMaxAttempts(args.requestBytes);
+	const totalCeiling = resolveAnthropicFirstEventTimeoutMaxAttempts(args.requestBytes);
+	// The session counts a whole provider invocation as one attempt, so the
+	// ceiling handed up must bound TOTAL uploads across the invocation: subtract
+	// the provider replays already spent inside this invocation. A small request
+	// whose first upload 529'd and whose replay then timed out has already
+	// consumed two uploads; reporting the full two-attempt ceiling would let the
+	// session upload a third time.
+	const retryMaxAttempts = Math.max(1, totalCeiling - (args.providerAttemptsConsumed ?? 0));
 	const timeoutLabel = args.firstEventTimeoutMs === undefined ? "disabled" : `${args.firstEventTimeoutMs}ms`;
 	return new FirstEventTimeoutError(
 		`Anthropic stream timed out while waiting for the first event (elapsed=${args.elapsedMs}ms request_bytes=${args.requestBytes} endpoint=${args.endpointClass} configured_timeout=${timeoutLabel}; override with PI_STREAM_FIRST_EVENT_TIMEOUT_MS)`,
@@ -2118,6 +2127,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								requestBytes,
 								firstEventTimeoutMs,
 								endpointClass,
+								providerAttemptsConsumed: providerRetryAttempt,
 							});
 							activeAbortTracker.abortLocally(firstEventTimeoutAbortError);
 						},

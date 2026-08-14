@@ -185,6 +185,61 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.transportFailure?.requestBytes).toBeGreaterThan(0);
 	});
 
+	it("counts a consumed provider replay when reporting the timeout attempt ceiling", async () => {
+		// The session counts a whole provider invocation as one attempt, so the
+		// ceiling must bound TOTAL uploads: a small request whose first upload
+		// 529'd (provider replay consumed one upload) and whose replay then timed
+		// out must report the REMAINING ceiling, not the full two-attempt budget —
+		// otherwise the session uploads the request a third time.
+		let attempt = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempt += 1;
+			if (attempt === 1) {
+				return {
+					async withResponse(): Promise<never> {
+						const error = new Error("529 Overloaded");
+						(error as Error & { status: number }).status = 529;
+						throw error;
+					},
+				} as never;
+			}
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					// Never yields a first event; resolves on abort so the process settles.
+					await new Promise<void>(resolve => {
+						const timer = setTimeout(resolve, 10_000);
+						requestOptions?.signal?.addEventListener(
+							"abort",
+							() => {
+								clearTimeout(timer);
+								resolve();
+							},
+							{ once: true },
+						);
+					});
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+
+		const result = await streamAnthropic(model, context, {
+			client: { messages: { create } } as Anthropic,
+			streamFirstEventTimeoutMs: 30,
+			requestMaxRetries: 0,
+			providerRetryWait: async () => {},
+		}).result();
+
+		expect(attempt).toBe(2);
+		expect(result.stopReason).toBe("error");
+		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
+	});
+
 	it("does not upload a multi-megabyte body again after a full-window first-event timeout", async () => {
 		let attempts = 0;
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
