@@ -1763,6 +1763,18 @@ export class ModelRegistry {
 			this.#optionalAuthProviders.add("lm-studio");
 			this.#keylessProviders.add("lm-studio");
 		}
+		if (!configuredProviders.has("omlx") && !disabledProviders.has("omlx")) {
+			this.#discoveryManager.addProvider({
+				provider: "omlx",
+				api: "openai-completions",
+				baseUrl: Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8080",
+				discovery: { type: "omlx" },
+				optional: true,
+			});
+			// Implicit oMLX auth is optional and may be added after startup.
+			this.#optionalAuthProviders.add("omlx");
+			this.#keylessProviders.add("omlx");
+		}
 	}
 
 	#loadCustomModels(): CustomModelsResult {
@@ -2454,6 +2466,7 @@ export class ModelRegistry {
 			case "llama.cpp":
 				return this.#discoverLlamaCppModels(providerConfig, apiKey);
 			case "lm-studio":
+			case "omlx":
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
 			case "models-dev":
