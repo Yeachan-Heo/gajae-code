@@ -308,6 +308,33 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 								: records,
 						]),
 					),
+		// Pre-#4401 writers persisted closed-endpoint bindings without the
+		// `transport` discriminator. Rejecting them would permanently brick an
+		// otherwise-healthy shared registry (the same class as the
+		// disconnectGraceExpiresAt artifact below): the CAS authority refuses
+		// every read and write forever. The transport can only be "telegram" in
+		// those snapshots, so heal the in-memory record; the serializer no
+		// longer persists closed endpoints at all. Only heal records that match
+		// the complete pre-#4401 shape (chatId + endpointKey + endpointDigest +
+		// endpointGeneration): partial records are corruption, not legacy data.
+		closedEndpoints:
+			state.closedEndpoints === undefined
+				? undefined
+				: isObject(state.closedEndpoints)
+					? Object.fromEntries(
+							Object.entries(state.closedEndpoints).map(([sessionId, binding]) => [
+								sessionId,
+								isObject(binding) &&
+								binding.transport === undefined &&
+								isValidBindingString(binding.chatId) &&
+								isValidBindingString(binding.endpointKey) &&
+								isValidBindingString(binding.endpointDigest) &&
+								isValidBindingGeneration(binding.endpointGeneration)
+									? ({ chatId: binding.chatId, transport: "telegram" } as TelegramTopicBinding)
+									: binding,
+							]),
+						)
+					: state.closedEndpoints,
 	};
 	state.topics = Object.fromEntries(
 		Object.entries(state.topics).map(([sessionId, record]) => [

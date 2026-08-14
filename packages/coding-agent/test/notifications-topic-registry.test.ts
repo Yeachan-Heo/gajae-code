@@ -493,6 +493,63 @@ describe("TopicRegistry", () => {
 		);
 	});
 
+	test("heals legacy closed-endpoint bindings persisted without a transport discriminator", () => {
+		// Pre-#4401 writers stored closedEndpoints as bare
+		// { chatId, endpointKey, endpointDigest, endpointGeneration } records.
+		// Rejecting them bricked the shared CAS authority on every read.
+		const stateWithClosed = (binding: object) =>
+			({
+				version: 2,
+				registryGeneration: 1,
+				topics: {},
+				closedEndpoints: { s1: binding },
+			}) as unknown as TopicRegistryState;
+
+		const legacy = {
+			chatId: "1824716193",
+			endpointKey: "c367bef42406c4b5ab90f21f9e1634a49d6ca3fd8ec66f5cb14f2bd69a551034",
+			endpointDigest: "c367bef42406c4b5ab90f21f9e1634a49d6ca3fd8ec66f5cb14f2bd69a551034",
+			endpointGeneration: 1,
+		};
+		const state = parseTopicRegistryState(stateWithClosed(legacy));
+		expect(state?.closedEndpoints?.s1).toMatchObject({ chatId: "1824716193", transport: "telegram" });
+		// The input snapshot is never mutated; healing is in-memory only.
+		expect("transport" in legacy).toBe(false);
+		// Healed records are stripped to the durable Telegram binding shape:
+		// no SDK endpoint identity (endpointKey/digest/generation) leaks
+		// into the healed in-memory record.
+		const healed = state?.closedEndpoints?.s1 as unknown as Record<string, unknown>;
+		expect(healed.endpointKey).toBeUndefined();
+		expect(healed.endpointDigest).toBeUndefined();
+		expect(healed.endpointGeneration).toBeUndefined();
+
+		// Partial legacy records (missing endpointDigest/generation) are
+		// corruption, not pre-#4401 legacy data, and must stay rejected.
+		expect(() => parseTopicRegistryState(stateWithClosed({ chatId: "1", endpointKey: "key" }))).toThrow(
+			"malformed Telegram topic state",
+		);
+
+		// Truly malformed entries remain rejected.
+		expect(() => parseTopicRegistryState(stateWithClosed({ endpointGeneration: 1 }))).toThrow(
+			"malformed Telegram topic state",
+		);
+		expect(() => parseTopicRegistryState(stateWithClosed({ chatId: "1", transport: "discord" }))).toThrow(
+			"malformed Telegram topic state",
+		);
+		// Non-object closedEndpoints (scalar/bool/array) stays rejected: the
+		// healing path must not coerce it to {} and bypass fail-closed.
+		for (const malformed of [1, true, []]) {
+			expect(() =>
+				parseTopicRegistryState({
+					version: 2,
+					registryGeneration: 1,
+					topics: {},
+					closedEndpoints: malformed,
+				} as unknown as TopicRegistryState),
+			).toThrow("malformed Telegram topic state");
+		}
+	});
+
 	test("restores the exact disconnect grace deadline after archive publication fails", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "1");
