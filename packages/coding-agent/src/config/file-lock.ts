@@ -339,6 +339,17 @@ async function lockHolderDescription(lockPath: string): Promise<string> {
 	try {
 		const info = await readLockInfo(lockPath);
 		if (info) {
+			// A lock record carrying a foreign owner_host_id belongs to another
+			// machine (shared-volume topic registry): its pid is meaningful only
+			// on that host, so probing the same numeric pid here could mislabel a
+			// coincident local process as the holder. Report the owner host with
+			// unknown liveness instead.
+			if (info.owner_host_id !== undefined) {
+				return (
+					`held by pid ${info.pid} on host ${info.owner_host_id} (liveness unknown from this host)` +
+					` since ${new Date(info.timestamp).toISOString()}`
+				);
+			}
 			const liveness = ownerLiveness(info.pid);
 			return (
 				`held by pid ${info.pid}` +

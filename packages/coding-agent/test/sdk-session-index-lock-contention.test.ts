@@ -187,6 +187,60 @@ describe("SDK session index lock contention (#4544)", () => {
 		expect(await index.checkpointLiveHeartbeats()).toBe(1);
 	});
 
+	it("keeps the unregister pass's OS incarnation probes outside the lock-held section", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-unregister-probe-"));
+		const index = await new SessionIndex(dir).open();
+		const appended = await index.append(event("retire-me"));
+		expect(appended.hostIncarnation).toBeDefined();
+		// Review round 5 on #4544: the conditional-unregister pass projects every
+		// composite identity under the machine-global lock. An unlocked
+		// projection probes the OS once per identity (powershell.exe on Windows),
+		// so projecting under the lock recreated the starvation this change
+		// removes. The probes must run before the lock is taken and be passed
+		// into the locked projection.
+		let depth = 0;
+		let probedUnderLock = false;
+		const realProcessIncarnation = incarnationModule.processIncarnation;
+		const realWithFileLock = lockModule.withFileLock;
+		const spy = vi
+			.spyOn(lockModule, "withFileLock")
+			.mockImplementation(async (filePath: Parameters<typeof realWithFileLock>[0], fn, options) => {
+				depth++;
+				try {
+					return await realWithFileLock(filePath, fn, options);
+				} finally {
+					depth--;
+				}
+			});
+		const incarnation = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation(pid => {
+			if (depth > 0) probedUnderLock = true;
+			return realProcessIncarnation(pid);
+		});
+		try {
+			expect(
+				await index.unregisterIfCurrent({
+					sessionId: "retire-me",
+					locator: { repo: "r", stateRoot: "q" },
+					endpointGeneration: 1,
+					pid: process.pid,
+					indexSeq: appended.indexSeq,
+					processIncarnation: appended.processIncarnation,
+					hostIncarnation: appended.hostIncarnation,
+					identityProvenance: "composite",
+					ambiguous: false,
+					live: true,
+					terminal: false,
+					terminalUncertain: false,
+				}),
+			).toBe(true);
+			expect(incarnation).toHaveBeenCalled();
+			expect(probedUnderLock).toBe(false);
+		} finally {
+			incarnation.mockRestore();
+			spy.mockRestore();
+		}
+	});
+
 	it("releases the lock when the critical section throws, and aborted acquisition fails fast", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-throw-"));
 		const index = await new SessionIndex(dir).open();

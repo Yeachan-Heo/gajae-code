@@ -1157,10 +1157,25 @@ export class SessionIndex {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			// OS incarnation probes run BEFORE the machine-global lock is taken
+			// (#4544 review round 5): this pass projects every composite identity
+			// to find the current authority row, and an unlocked projection probes
+			// the OS once per identity — on Windows that can spawn powershell.exe,
+			// which a machine-global critical section must never await. The
+			// pre-lock observations seed the projection under the lock; the
+			// equality check below still compares against the replayed events, so
+			// a stale observation can only refuse an unregister (fail-closed),
+			// never retire a live registration.
+			const probed = new Map<string, string | undefined>();
+			for (const row of reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).identities) {
+				const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
+				if (recordedIncarnation === undefined) continue;
+				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
+			}
 			return await withFileLock(logFor(this.#agentDir), async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) throw new Error("Cannot conditionally unregister from a corrupt session index");
-				const identities = this.listSessionIdentities();
+				const identities = this.listSessionIdentities(probed);
 				const current = identities.find(
 					session =>
 						session.sessionId === expected.sessionId &&
@@ -1303,8 +1318,8 @@ export class SessionIndex {
 	 * this retains losing roots so an exact dead registration can be retired without
 	 * disturbing the surviving authority.
 	 */
-	listSessionIdentities(): IndexedSession[] {
-		return reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).identities;
+	listSessionIdentities(probedIncarnations?: ReadonlyMap<string, string | undefined>): IndexedSession[] {
+		return reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations).identities;
 	}
 
 	/**
