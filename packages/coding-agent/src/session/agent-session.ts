@@ -5386,7 +5386,6 @@ export class AgentSession {
 						attempt: this.#retryAttempt,
 					});
 					this.#retryAttempt = 0;
-					this.#providerRetryMaxAttempts = undefined;
 					// Settle the retry gate here, colocated with the success event, rather
 					// than relying on the generic #resolveRetry() at the end of the
 					// agent_end branch. That tail resolver is bypassed by every early
@@ -5396,6 +5395,9 @@ export class AgentSession {
 					// #waitForPostPromptRecovery and the session as permanently busy.
 					// #resolveRetry() is idempotent, so the later tail call is a no-op.
 					this.#resolveRetry();
+				}
+				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+					this.#providerRetryMaxAttempts = undefined;
 				}
 			}
 
@@ -18757,6 +18759,7 @@ export class AgentSession {
 		if (lastMsg.role !== "assistant") {
 			if (!this.#isInterruptedRetryTail(lastMsg)) return false;
 			this.#retryAttempt = 0;
+			this.#providerRetryMaxAttempts = undefined;
 			this.#scheduleAgentContinue({ delayMs: 1 });
 			return true;
 		}
@@ -18775,6 +18778,7 @@ export class AgentSession {
 
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
+		this.#providerRetryMaxAttempts = undefined;
 
 		// Re-attempt the turn
 		this.#scheduleAgentContinue({ delayMs: 1 });
