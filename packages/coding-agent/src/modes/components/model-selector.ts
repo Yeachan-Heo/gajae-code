@@ -95,6 +95,15 @@ interface CanonicalModelItem {
 	explicitThinkingLevel?: boolean;
 }
 
+/** Per-role effort selection state for "Set for all role agents" flow. */
+interface RoleThinkingChoices {
+	item: ModelItem | CanonicalModelItem;
+	roles: readonly GjcModelAssignmentTargetId[];
+	levels: ThinkingLevel[];
+	currentRoleIndex: number;
+	selectedLevels: ThinkingLevel[];
+}
+
 type ScopedModelItem = ScopedModelSelection;
 
 interface RoleAssignment {
@@ -373,6 +382,8 @@ export class ModelSelectorComponent extends Container {
 	#selectedActionIndex: number = 0;
 	#pendingThinkingChoice?: PendingThinkingChoice;
 	#selectedThinkingIndex: number = 0;
+	// Per-role effort selection when "Set for all role agents" is chosen.
+	#pendingRoleThinkingChoices?: RoleThinkingChoices;
 	#assignmentState: "idle" | "assigning" = "idle";
 	#closeAfterAssignment = false;
 	#unsubscribeCatalogChanged: () => void = () => {};
@@ -1815,7 +1826,9 @@ export class ModelSelectorComponent extends Container {
 			this.#listContainer.addChild(
 				new Text(theme.fg("muted", `  Model Name: ${selected.model.name}${suffix}`), 0, 0),
 			);
-			if (this.#pendingThinkingChoice) {
+			if (this.#pendingRoleThinkingChoices) {
+				this.#renderRoleThinkingMenu(this.#pendingRoleThinkingChoices);
+			} else if (this.#pendingThinkingChoice) {
 				this.#renderThinkingMenu(this.#pendingThinkingChoice);
 			} else if (this.#pendingActionItem) {
 				this.#renderActionMenu(this.#pendingActionItem);
@@ -1929,6 +1942,10 @@ export class ModelSelectorComponent extends Container {
 		}
 		if (this.#pendingThinkingChoice) {
 			this.#handleThinkingMenuInput(keyData);
+			return;
+		}
+		if (this.#pendingRoleThinkingChoices) {
+			this.#handleRoleThinkingMenuInput(keyData);
 			return;
 		}
 		if (this.#pendingActionItem) {
@@ -2262,6 +2279,130 @@ export class ModelSelectorComponent extends Container {
 			this.#updateList();
 		}
 	}
+	#renderRoleThinkingMenu(choices: RoleThinkingChoices): void {
+		const { item, roles, levels, currentRoleIndex, selectedLevels } = choices;
+		const currentRole = roles[currentRoleIndex];
+		const roleInfo = GJC_MODEL_ASSIGNMENT_TARGETS[currentRole];
+		const roleTag = roleInfo?.tag ?? currentRole.toUpperCase();
+		const level = selectedLevels[currentRoleIndex];
+		const metadata = level ? getThinkingLevelMetadata(level) : undefined;
+		const selectedLabel = metadata?.label ?? "\u2014";
+
+		this.#listContainer.addChild(new Spacer(1));
+		this.#listContainer.addChild(new Text(theme.fg("muted", `  Current: ${roleTag} → ${selectedLabel}`), 0, 0));
+		this.#listContainer.addChild(new Spacer(1));
+
+		for (let i = 0; i < levels.length; i++) {
+			const lvl = levels[i];
+			const lvlMeta = getThinkingLevelMetadata(lvl);
+			const prefix = i === this.#selectedThinkingIndex ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
+			const label = `${lvlMeta.label} — ${lvlMeta.description}`;
+			this.#listContainer.addChild(
+				new Text(`${prefix}${i === this.#selectedThinkingIndex ? theme.fg("accent", label) : label}`, 0, 0),
+			);
+		}
+
+		this.#listContainer.addChild(new Spacer(1));
+		this.#listContainer.addChild(
+			new Text(theme.fg("muted", "  Enter: confirm | Esc: cancel | Left/Right: prev/next role"), 0, 0),
+		);
+	}
+
+	#handleRoleThinkingMenuInput(keyData: string): void {
+		const choices = this.#pendingRoleThinkingChoices;
+		if (!choices) return;
+		const { item, roles, levels, currentRoleIndex, selectedLevels } = choices;
+
+		// Navigate effort levels for current role
+		if (matchesKey(keyData, "up")) {
+			this.#selectedThinkingIndex =
+				this.#selectedThinkingIndex === 0 ? levels.length - 1 : this.#selectedThinkingIndex - 1;
+			this.#updateList();
+			return;
+		}
+		if (matchesKey(keyData, "down")) {
+			this.#selectedThinkingIndex = (this.#selectedThinkingIndex + 1) % levels.length;
+			this.#updateList();
+			return;
+		}
+
+		// Enter: confirm level for current role, move to next
+		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+			const level = levels[this.#selectedThinkingIndex];
+			if (!level) return;
+			selectedLevels[currentRoleIndex] = level;
+			this.#selectedThinkingIndex = 0;
+
+			const allSet = selectedLevels.every(l => l !== undefined && l !== ThinkingLevel.Inherit);
+			if (allSet) {
+				const saved = this.#pendingRoleThinkingChoices;
+				this.#pendingRoleThinkingChoices = undefined;
+				void this.#applyRoleEffortSelection(item, saved.roles, saved.selectedLevels);
+				return;
+			}
+			this.#pendingRoleThinkingChoices = { ...choices, currentRoleIndex: currentRoleIndex + 1, selectedLevels };
+			this.#updateList();
+			return;
+		}
+
+		// Navigate between roles
+		if (keyData === "\x1b\x1b[D" || keyData === "\x1bO D") {
+			// Left arrow: previous role
+			const prevIdx = currentRoleIndex === 0 ? roles.length - 1 : currentRoleIndex - 1;
+			this.#selectedThinkingIndex = 0;
+			this.#pendingRoleThinkingChoices = { ...choices, currentRoleIndex: prevIdx, selectedLevels };
+			this.#updateList();
+			return;
+		}
+		if (keyData === "\x1b\x1b[C" || keyData === "\x1bO C") {
+			// Right arrow: next role
+			const nextIdx = (currentRoleIndex + 1) % roles.length;
+			this.#selectedThinkingIndex = 0;
+			this.#pendingRoleThinkingChoices = { ...choices, currentRoleIndex: nextIdx, selectedLevels };
+			this.#updateList();
+			return;
+		}
+
+		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
+			this.#pendingRoleThinkingChoices = undefined;
+			this.#selectedThinkingIndex = 0;
+			this.#updateList();
+		}
+	}
+
+	async #applyRoleEffortSelection(
+		item: ModelItem | CanonicalModelItem,
+		roles: readonly GjcModelAssignmentTargetId[],
+		selectedLevels: ThinkingLevel[],
+	): Promise<void> {
+		for (let i = 0; i < roles.length; i++) {
+			const targetRole = roles[i];
+			const level = selectedLevels[i];
+			const selectorValue = formatModelSelectorValue(item.selector, level);
+			this.#roles[targetRole] = { model: item.model, thinkingLevel: level };
+			if (this.#isTrackedSingleAssignment({ kind: "assignment", model: item.model, role: targetRole } as any)) {
+				await void this.#handleTrackedAssignment({
+					kind: "assignment",
+					model: item.model,
+					role: targetRole,
+					thinkingLevel: level,
+					selector: selectorValue,
+				} as any);
+			} else {
+				await Promise.resolve(
+					this.#onSelectCallback({
+						kind: "assignment",
+						model: item.model,
+						role: targetRole,
+						thinkingLevel: level,
+						selector: selectorValue,
+					} as any),
+				);
+			}
+		}
+		this.#updateList();
+	}
+
 	#getInitialThinkingChoiceIndex(
 		item: ModelItem | CanonicalModelItem,
 		levels: ThinkingLevel[],
@@ -2332,6 +2473,31 @@ export class ModelSelectorComponent extends Container {
 		const needsExplicitThinkingChoice = roles
 			? roles.some(targetRole => requiresExplicitThinkingChoice(item.model, targetRole))
 			: requiresExplicitThinkingChoice(item.model, role);
+
+		// Multi-role: enter per-role effort selection mode
+		if (
+			role === "default" &&
+			roles &&
+			roles.length > 1 &&
+			!hasExplicitThinkingChoice &&
+			needsExplicitThinkingChoice
+		) {
+			const levels = getSelectableThinkingLevels(item.model);
+			const selectedLevels = roles.map(targetRole => this.#getCurrentRoleThinkingLevel(targetRole));
+			this.#pendingRoleThinkingChoices = {
+				item,
+				roles,
+				levels,
+				currentRoleIndex: selectedLevels.findIndex(l => l !== ThinkingLevel.Inherit),
+				selectedLevels,
+			};
+			if (this.#pendingRoleThinkingChoices.currentRoleIndex === -1) {
+				this.#pendingRoleThinkingChoices.currentRoleIndex = 0;
+			}
+			this.#updateList();
+			return;
+		}
+
 		if (!hasExplicitThinkingChoice && needsExplicitThinkingChoice) {
 			const levels = getSelectableThinkingLevels(item.model);
 			this.#pendingThinkingChoice = { item, role, roles, levels };
