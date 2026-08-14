@@ -1526,6 +1526,14 @@ function resolveAnthropicFirstEventTimeoutMaxAttempts(requestBytes: number): num
 		: ANTHROPIC_SMALL_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS;
 }
 
+function normalizeStreamFailure(error: unknown): unknown {
+	if (error instanceof Error) return error;
+	// `null`/`undefined` rejections carry no message; keep them distinguishable
+	// from a real throw of those values by wrapping as an Error with the same
+	// string form downstream matchers already use (String(error)).
+	return new Error(String(error));
+}
+
 function attachAnthropicGraceFailureFacts(
 	error: unknown,
 	args: {
@@ -2432,7 +2440,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					break;
 				} catch (streamError) {
 					const localAbortReason = activeAbortTracker.getLocalAbortReason();
-					const streamFailure = localAbortReason ?? streamError;
+					// Normalize unknown rejections (a primitive string from an injected
+					// custom client is a supported surface) to a mutable Error. Boxed
+					// primitives silently discard every fact stamped below, which let
+					// a ceiling-bound upload slip past the one-attempt ceiling and
+					// string-matched corrective branches re-upload the body.
+					const streamFailure = localAbortReason ?? normalizeStreamFailure(streamError);
 					attachAnthropicGraceFailureFacts(streamFailure, {
 						elapsedMs: Date.now() - (firstEventWaitStartedAt ?? Date.now()),
 						requestBytes,

@@ -331,6 +331,37 @@ describe("anthropic first-event timeouts", () => {
 		});
 	});
 
+	it("normalizes a primitive-string rejection so the upload ceiling survives", async () => {
+		// An injected custom client (options.client is a supported surface) may
+		// reject withResponse() with a plain string. Stamping facts on the boxed
+		// temporary silently discarded them, so a ceiling-bound request slipped
+		// past the one-attempt ceiling and a string-matched corrective branch
+		// (CPA tool-alias restore) re-uploaded the multi-megabyte body.
+		let attempts = 0;
+		const create = ((_body: unknown) => {
+			attempts += 1;
+			return {
+				async withResponse(): Promise<never> {
+					throw 'cannot restore Claude OAuth MCP tool alias "mcp__srv__tok_tool": no unique request-local match';
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), contextWithBytes(1_670_000), {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 100,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.transportFailure).toMatchObject({
+			requestBytes: expect.any(Number),
+			endpointClass: "custom",
+			retryMaxAttempts: 1,
+		});
+	});
+
 	it("does not run strict-tool corrective replay after a large grace ceiling is reached", async () => {
 		let attempts = 0;
 		const create = ((_body: unknown) => {
