@@ -1413,6 +1413,36 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(0);
 		expect(lastAssistant(session).errorMessage).toContain("exhausted after 1 attempts");
 	});
+	it("honors a large-request grace ceiling on a late 529", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "529 Overloaded",
+			errorStatus: 529,
+			transportFailure: {
+				kind: "transport",
+				status: 529,
+				anthropicErrorType: "overloaded_error",
+				requestBytes: 1_750_732,
+				firstEventElapsedMs: 305_000,
+				firstEventTimeoutMs: 300_000,
+				endpointClass: "custom",
+				retryMaxAttempts: 1,
+			},
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 5 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("late grace failure must not replay");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(1);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).errorMessage).toMatch(
+			/^First-event\/grace retry ceiling exhausted after 1 attempts; waited \d+ms total: 529 Overloaded$/,
+		);
+	});
 	it("honors the provider first-event retry ceiling for a small request", async () => {
 		const requestedModels: string[] = [];
 		session = buildStatusErrorSession({
@@ -1474,7 +1504,7 @@ describe("AgentSession resilient retry", () => {
 		expect(requestedModels).toHaveLength(2);
 		expect(retryStartEvents).toHaveLength(1);
 		expect(lastAssistant(session).errorMessage).toMatch(
-			/^First-event stream timeout retry ceiling exhausted after 2 attempts; waited \d+ms total: 529 Overloaded$/,
+			/^First-event\/grace retry ceiling exhausted after 2 attempts; waited \d+ms total: 529 Overloaded$/,
 		);
 	});
 	it("clears the first-event ceiling after a successful retry before a tool continuation", async () => {

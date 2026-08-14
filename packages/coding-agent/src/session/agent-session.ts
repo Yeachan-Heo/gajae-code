@@ -18363,7 +18363,7 @@ export class AgentSession {
 				const prefix =
 					classification === "first_event_timeout"
 						? "First-event stream timeout exhausted"
-						: "First-event stream timeout retry ceiling exhausted";
+						: "First-event/grace retry ceiling exhausted";
 				message.errorMessage = `${prefix} after ${attemptsUsed} attempts; waited ${elapsedMs}ms total: ${message.errorMessage ?? "Unknown error"}`;
 			}
 			return false;
@@ -18432,10 +18432,10 @@ export class AgentSession {
 					attempt: this.#retryAttempt,
 					maxAttempts:
 						managedFallback && !localSnapshot
-							? firstEventTimeout
+							? firstEventTimeout || this.#providerRetryMaxAttempts !== undefined
 								? Math.min(controller.maxAttempts, this.#providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY)
 								: controller.maxAttempts
-							: firstEventTimeout
+							: firstEventTimeout || this.#providerRetryMaxAttempts !== undefined
 								? Math.min(
 										retrySettings.maxRetries + 1,
 										this.#providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY,
