@@ -542,6 +542,13 @@ const SESSION_INDEX_OP_SLOW_MS = 10_000;
  * (fail-closed); the OS is never probed under the lock. The bound only needs
  * to cover an uncontended acquisition plus scheduler jitter — real contention
  * queues for the retry delay (100ms) or far longer.
+ *
+ * Both freshness bounds are measured on the MONOTONIC clock
+ * (`performance.now()`), never `Date.now()`: a backward wall-clock step
+ * (manual clock fix, NTP slew, VM snapshot restore) would make a wall-clock
+ * interval negative and pass the bound, consuming an arbitrarily stale
+ * observation batch. Monotonic time never steps backward, so the fail-closed
+ * guarantee cannot be defeated by the system clock moving.
  */
 const SESSION_INDEX_PROBE_FRESHNESS_MS = 50;
 /**
@@ -575,6 +582,9 @@ function withSessionIndexLock<T>(operation: string, agentDir: string, callback: 
 				() => logger.warn(`sdk broker: session index "${operation}" still holds the index lock after 10s`),
 				SESSION_INDEX_OP_SLOW_MS,
 			);
+			// A diagnostic timer must never keep the process alive on an exit path
+			// that races the 10s window; fast paths always clear it in `finally`.
+			note.unref?.();
 			try {
 				return await callback();
 			} finally {
@@ -1162,17 +1172,17 @@ export class SessionIndex {
 			// to find the current authority row, and an unlocked projection probes
 			// the OS once per identity — on Windows that can spawn powershell.exe,
 			// which a machine-global critical section must never await. The
-			// pre-lock observations seed the projection under the lock; the
-			// equality check below still compares against the replayed events, so
-			// a stale observation can only refuse an unregister (fail-closed),
-			// never retire a live registration.
+			// unregister decision below never consults the projected `live` flag —
+			// it compares persisted identity fields against the replayed events —
+			// so the pre-lock observations cannot change the outcome either way;
+			// they exist only so the locked projection performs no OS probes.
 			const probed = new Map<string, string | undefined>();
 			for (const row of reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).identities) {
 				const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
 				if (recordedIncarnation === undefined) continue;
 				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
 			}
-			return await withFileLock(logFor(this.#agentDir), async () => {
+			return await withSessionIndexLock("conditional unregister", this.#agentDir, async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) throw new Error("Cannot conditionally unregister from a corrupt session index");
 				const identities = this.listSessionIdentities(probed);
@@ -1369,7 +1379,7 @@ export class SessionIndex {
 				if (recordedIncarnation === undefined) continue;
 				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
 			}
-			const probedAt = Date.now();
+			const probedAt = performance.now();
 			return await withSessionIndexLock("heartbeat checkpoint", this.#agentDir, async () => {
 				// Contended or delayed acquisition invalidates the observation set:
 				// never trust identity evidence gathered meaningfully before the
@@ -1377,7 +1387,7 @@ export class SessionIndex {
 				// the OS is never probed while the machine-global lock is held. The
 				// bound tolerates scheduler jitter on an uncontended acquisition —
 				// which is the only path where the evidence is trustworthy.
-				if (Date.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return 0;
+				if (performance.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return 0;
 				await this.#replayUnderLock();
 				// Recheck AFTER the awaited replay too (#4544 review round 4): the
 				// replay re-reads the whole log (up to the 4 MiB rotation bound) and
@@ -1388,7 +1398,7 @@ export class SessionIndex {
 				// process as the dead row. The replay bound covers the full locked
 				// replay cost envelope of a healthy machine; anything slower fails
 				// closed (no heartbeat this cycle) and the next pass re-probes.
-				if (Date.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return 0;
+				if (performance.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return 0;
 				if (this.#corruptSuffix) return 0;
 				const events: SessionIndexEvent[] = [];
 				const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;

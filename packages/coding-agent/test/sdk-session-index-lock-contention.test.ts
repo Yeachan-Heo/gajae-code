@@ -204,8 +204,10 @@ describe("SDK session index lock contention (#4544)", () => {
 			const result = await realReadFile(...args);
 			if (!jumped && incarnationCalls > 0 && String(args[0]).endsWith("index.jsonl")) {
 				jumped = true;
-				const realNow = Date.now;
-				vi.spyOn(Date, "now").mockImplementation(() => realNow() + 2_100);
+				// The freshness bounds are monotonic (performance.now), so the
+				// stretch must advance the monotonic clock, not the wall clock.
+				const realMono = performance.now.bind(performance);
+				vi.spyOn(performance, "now").mockImplementation(() => realMono() + 2_100);
 			}
 			return result;
 		}) as typeof fs.readFile);
@@ -223,6 +225,90 @@ describe("SDK session index lock contention (#4544)", () => {
 			vi.restoreAllMocks();
 		}
 		// The next pass, on a fast replay, re-probes and writes normally.
+		expect(await index.checkpointLiveHeartbeats()).toBe(1);
+	});
+
+	it("fails closed on a stale batch even when the wall clock steps backward", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-clock-regress-"));
+		const seed = await new SessionIndex(dir).open();
+		await seed.append(event("clock-regress"));
+		const index = await new SessionIndex(dir).open();
+		// Boundary cohort red-team case 2: the freshness bounds must be monotonic.
+		// A backward wall-clock step (manual clock fix, NTP slew, VM snapshot
+		// restore) would make a Date.now()-based interval negative and pass both
+		// bounds, consuming an arbitrarily stale observation batch. With a
+		// monotonic bound the wall clock can move freely without reopening the
+		// fail-closed guarantee.
+		let incarnationCalls = 0;
+		const realProcessIncarnation = incarnationModule.processIncarnation;
+		const incarnation = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation(pid => {
+			incarnationCalls++;
+			return realProcessIncarnation(pid);
+		});
+		let regressed = false;
+		const realReadFile = fs.readFile;
+		const readFileSpy = vi.spyOn(fs, "readFile").mockImplementation((async (
+			...args: Parameters<typeof fs.readFile>
+		) => {
+			const result = await realReadFile(...args);
+			if (!regressed && incarnationCalls > 0 && String(args[0]).endsWith("index.jsonl")) {
+				regressed = true;
+				// Step the WALL clock back 70s AND advance the monotonic clock past
+				// the replay bound: the monotonic advance must dominate.
+				const realNow = Date.now;
+				vi.spyOn(Date, "now").mockImplementation(() => realNow() - 70_000);
+				const realMono = performance.now.bind(performance);
+				vi.spyOn(performance, "now").mockImplementation(() => realMono() + 2_100);
+			}
+			return result;
+		}) as typeof fs.readFile);
+		try {
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			expect(regressed).toBe(true);
+			const rows = index.listSessions().sessions;
+			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
+		} finally {
+			readFileSpy.mockRestore();
+			incarnation.mockRestore();
+			vi.restoreAllMocks();
+		}
+		expect(await index.checkpointLiveHeartbeats()).toBe(1);
+	});
+
+	it("fails closed when lock acquisition alone outlives the probe freshness window", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-acq-bound-"));
+		const seed = await new SessionIndex(dir).open();
+		await seed.append(event("acq-bound"));
+		const index = await new SessionIndex(dir).open();
+		// The FIRST bound (SESSION_INDEX_PROBE_FRESHNESS_MS = 50ms) fires at lock
+		// acquisition, before the replay: a probe batch that queues behind even a
+		// short legitimate holder is discarded. Advance the monotonic clock during
+		// acquisition (inside the lock wrapper, before the callback body).
+		let incarnationCalls = 0;
+		const realProcessIncarnation = incarnationModule.processIncarnation;
+		const incarnation = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation(pid => {
+			incarnationCalls++;
+			return realProcessIncarnation(pid);
+		});
+		const realWithFileLock = lockModule.withFileLock;
+		const spy = vi
+			.spyOn(lockModule, "withFileLock")
+			.mockImplementation(async (filePath: Parameters<typeof realWithFileLock>[0], fn, options) => {
+				if (incarnationCalls > 0 && String(filePath).endsWith("index.jsonl")) {
+					const realMono = performance.now.bind(performance);
+					vi.spyOn(performance, "now").mockImplementation(() => realMono() + 100);
+				}
+				return await realWithFileLock(filePath, fn, options);
+			});
+		try {
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			const rows = index.listSessions().sessions;
+			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
+		} finally {
+			spy.mockRestore();
+			incarnation.mockRestore();
+			vi.restoreAllMocks();
+		}
 		expect(await index.checkpointLiveHeartbeats()).toBe(1);
 	});
 

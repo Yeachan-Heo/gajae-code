@@ -350,12 +350,15 @@ async function lockHolderDescription(lockPath: string): Promise<string> {
 					` since ${new Date(info.timestamp).toISOString()}`
 				);
 			}
-			const liveness = ownerLiveness(info.pid);
+			// Same-host holder: use the full liveness proof (pid alive AND, when the
+			// record carries a start_time, the start-time identity match) so a dead
+			// holder whose pid was already reused is not mislabeled "(live)".
+			const alive = ownerIsAlive(info);
 			return (
 				`held by pid ${info.pid}` +
-				(liveness === "alive"
+				(alive
 					? " (live)"
-					: liveness === "dead"
+					: ownerLiveness(info.pid) === "dead"
 						? " (dead but not reaped)"
 						: " (liveness unknown)") +
 				` since ${new Date(info.timestamp).toISOString()}`
