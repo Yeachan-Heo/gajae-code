@@ -1,4 +1,6 @@
 import * as path from "node:path";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { $ } from "bun";
 import { isProcessIncarnation } from "../broker/process-incarnation";
 import type { TelegramDaemonFs } from "./telegram-daemon";
 import {
@@ -27,6 +29,17 @@ export interface TelegramOrphanProcessRef {
 	terminateTree(signal?: NodeJS.Signals): boolean;
 }
 
+/**
+ * A pinned reference that can additionally prove the process's kernel-derived
+ * launch arguments. Used only by the legacy-stray sweep: candidate PIDs come
+ * from an untrusted enumeration, but every authorization fact (incarnation,
+ * argv) is read from this pinned reference, never from the enumeration.
+ */
+export interface TelegramStrayProcessRef extends TelegramOrphanProcessRef {
+	/** Launch arguments reported by the kernel for the pinned incarnation. */
+	args(): string[];
+}
+
 export interface TelegramOrphanReapDeps {
 	fs?: TelegramDaemonFs;
 	now?: () => number;
@@ -39,6 +52,21 @@ export interface TelegramOrphanReapDeps {
 	 */
 	processReference?: (pid: number) => TelegramOrphanProcessRef | undefined;
 	platform?: NodeJS.Platform;
+	/**
+	 * Enumerates candidate PIDs for the legacy-stray sweep. The list is
+	 * untrusted discovery input only; authorization derives exclusively from
+	 * the pinned {@link TelegramStrayProcessRef}. Defaults to a bounded POSIX
+	 * `ps` listing; returns nothing on Windows or enumeration failure.
+	 */
+	listCandidatePids?: () => Promise<number[]>;
+	/** Opens a pinned argv-capable reference for stray verification. */
+	strayReference?: (pid: number) => TelegramStrayProcessRef | undefined;
+	/**
+	 * First-sighting ledger for stray confirmation, keyed by
+	 * `pid|incarnation` with the first-seen timestamp. Injectable for tests;
+	 * defaults to a process-lifetime module ledger.
+	 */
+	straySightings?: Map<string, number>;
 }
 
 export interface TelegramOrphanCandidate {
@@ -78,6 +106,88 @@ const MAX_REAP_CANDIDATES = 64;
 const TERM_GRACE_MS = 2_000;
 /** Bounded hard-kill wait before declaring termination failed (ms). */
 const KILL_WAIT_MS = 1_500;
+
+/** Maximum PIDs the legacy-stray enumeration will inspect per sweep. */
+const MAX_STRAY_SCAN_PIDS = 4096;
+/** Maximum stray terminations per sweep; the rest wait for the next cadence. */
+const MAX_STRAY_TERMINATIONS = 8;
+/**
+ * A stray must be sighted twice with the same pinned incarnation at least this
+ * far apart before it may be terminated. A legitimate successor daemon reaches
+ * ownership (and writes its marker) within seconds of spawning, so it can
+ * never accumulate a confirmed unmarked sighting; a pre-registry zombie
+ * persists across sweeps and is confirmed on the second one.
+ */
+const STRAY_CONFIRMATION_MS = 45_000;
+/** Bounded size of the first-sighting ledger. */
+const MAX_STRAY_SIGHTINGS = 256;
+
+/** Process-lifetime default first-sighting ledger for the stray sweep. */
+const moduleStraySightings = new Map<string, number>();
+
+/**
+ * Exact invocation-signature test for a legacy Telegram daemon owner:
+ * a `notify daemon-internal` subcommand bound to exactly this agent dir.
+ * This is deliberately an exact-token match on kernel-reported argv from a
+ * pinned reference — never a substring similarity over an untrusted dump.
+ */
+export function isLegacyStrayDaemonArgs(args: readonly string[], agentDir: string): boolean {
+	const resolvedAgentDir = path.resolve(agentDir);
+	let hasSubcommand = false;
+	let agentDirMatches = false;
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] === "notify" && args[i + 1] === "daemon-internal") hasSubcommand = true;
+		if (args[i] === "--agent-dir") {
+			const value = args[i + 1];
+			if (typeof value === "string" && path.resolve(value) === resolvedAgentDir) agentDirMatches = true;
+		}
+	}
+	return hasSubcommand && agentDirMatches;
+}
+
+/** Bounded POSIX PID enumeration; empty on Windows or on any failure. */
+async function defaultListCandidatePids(platform: NodeJS.Platform): Promise<number[]> {
+	if (platform === "win32") return [];
+	try {
+		const out = await $`ps -axo pid=`.quiet().text();
+		const pids: number[] = [];
+		for (const line of out.split("\n")) {
+			const pid = Number.parseInt(line.trim(), 10);
+			if (Number.isSafeInteger(pid) && pid > 0) pids.push(pid);
+			if (pids.length >= MAX_STRAY_SCAN_PIDS) break;
+		}
+		return pids;
+	} catch {
+		return [];
+	}
+}
+
+/** Default pinned argv-capable reference over the native process bindings. */
+function defaultStrayReference(pid: number): TelegramStrayProcessRef | undefined {
+	try {
+		const ref = nativeProcessBindings().Process.fromPid(pid);
+		if (!ref || !isProcessIncarnation(ref.incarnation)) return undefined;
+		return {
+			incarnation: ref.incarnation,
+			args: () => {
+				try {
+					return ref.args();
+				} catch {
+					return [];
+				}
+			},
+			terminateTree: (signal?: NodeJS.Signals) => {
+				try {
+					return ref.killTree(signal === "SIGKILL" ? 9 : 15) > 0;
+				} catch {
+					return false;
+				}
+			},
+		};
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * Identity-bound, process-group-aware termination.
@@ -287,6 +397,65 @@ export async function reapTelegramDaemonOrphans(input: {
 			refused += 1;
 			reasons.termination_failed = (reasons.termination_failed ?? 0) + 1;
 		}
+	}
+
+	// Legacy-stray sweep: daemons spawned by builds that predate the marker
+	// registry never registered a marker and may not own the state file, so the
+	// marker sweep above cannot see them — they keep polling getUpdates and
+	// 409-starve every fresh owner. Candidate PIDs come from an untrusted
+	// enumeration; ALL authorization facts (incarnation, argv) come from the
+	// pinned native reference. Termination additionally requires a confirmed
+	// second sighting of the same pinned incarnation, so a legitimate successor
+	// mid-handoff (which reaches ownership and writes its marker within
+	// seconds) can never be killed.
+	try {
+		const markerPids = new Set<number>();
+		for (const entry of candidates) if (entry.marker) markerPids.add(entry.marker.pid);
+		const clock = deps.now ?? Date.now;
+		const sightings = deps.straySightings ?? moduleStraySightings;
+		const listPids = deps.listCandidatePids ?? (() => defaultListCandidatePids(deps.platform ?? process.platform));
+		const strayRef = deps.strayReference ?? defaultStrayReference;
+		const liveKeys = new Set<string>();
+		let strayTerminations = 0;
+		for (const pid of (await listPids()).slice(0, MAX_STRAY_SCAN_PIDS)) {
+			if (pid === input.currentPid || pid === process.pid || markerPids.has(pid)) continue;
+			const ref = strayRef(pid);
+			if (!ref || !isProcessIncarnation(ref.incarnation)) continue;
+			if (ref.incarnation === input.currentIncarnation) continue;
+			if (!isLegacyStrayDaemonArgs(ref.args(), input.agentDir)) continue;
+			const key = `${pid}|${ref.incarnation}`;
+			liveKeys.add(key);
+			const firstSeenAt = sightings.get(key);
+			if (firstSeenAt === undefined) {
+				if (sightings.size < MAX_STRAY_SIGHTINGS) sightings.set(key, clock());
+				reasons.legacy_stray_pending_confirmation = (reasons.legacy_stray_pending_confirmation ?? 0) + 1;
+				continue;
+			}
+			if (clock() - firstSeenAt < STRAY_CONFIRMATION_MS) {
+				reasons.legacy_stray_pending_confirmation = (reasons.legacy_stray_pending_confirmation ?? 0) + 1;
+				continue;
+			}
+			if (strayTerminations >= MAX_STRAY_TERMINATIONS) break;
+			const acquisitionId = `legacy-stray:${pid}`;
+			const exited = await terminateOwnedProcessTree(pid, ref, deps);
+			if (exited || !deps.pidAlive(pid)) {
+				decisions.push({ kind: "reaped", pid, acquisitionId });
+				terminated += 1;
+				strayTerminations += 1;
+				sightings.delete(key);
+				liveKeys.delete(key);
+				reasons.legacy_stray_reaped = (reasons.legacy_stray_reaped ?? 0) + 1;
+			} else {
+				decisions.push({ kind: "refused", pid, acquisitionId, reason: "termination_failed" });
+				refused += 1;
+				reasons.legacy_stray_termination_failed = (reasons.legacy_stray_termination_failed ?? 0) + 1;
+			}
+		}
+		// Drop ledger entries whose process no longer matched this sweep, so the
+		// bounded ledger cannot fill with dead incarnations.
+		for (const key of [...sightings.keys()]) if (!liveKeys.has(key)) sightings.delete(key);
+	} catch {
+		reasons.legacy_stray_scan_failed = (reasons.legacy_stray_scan_failed ?? 0) + 1;
 	}
 
 	// If the registry exceeded the bound, record the overflow.
