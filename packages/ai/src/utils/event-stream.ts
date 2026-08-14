@@ -35,8 +35,9 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	rejectFinalResult!: (err: unknown) => void;
 	isComplete: (event: T) => boolean;
 	extractResult: (event: T) => R;
+	#onConsumerClose?: () => void;
 
-	constructor(isComplete: (event: T) => boolean, extractResult: (event: T) => R) {
+	constructor(isComplete: (event: T) => boolean, extractResult: (event: T) => R, onConsumerClose?: () => void) {
 		const { promise, resolve, reject } = Promise.withResolvers<R>();
 		// Prevent an unhandled rejection when fail() is called but nobody awaits result().
 		// Callers who do await result() still receive the rejection normally.
@@ -46,6 +47,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		this.rejectFinalResult = reject;
 		this.isComplete = isComplete;
 		this.extractResult = extractResult;
+		this.#onConsumerClose = onConsumerClose;
 	}
 
 	#enqueue(node: QueueNode<T>): void {
@@ -240,6 +242,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		} finally {
 			this.#activeConsumerCount -= 1;
 			this.#settleAllConsumerDrains("reject", new Error("Event stream consumer stopped before drain completed"));
+			if (!this.done) this.#onConsumerClose?.();
 		}
 	}
 
@@ -249,7 +252,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 }
 
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
+	constructor(onConsumerClose?: () => void) {
 		super(
 			event => event.type === "done" || event.type === "error",
 			event => {
@@ -260,6 +263,7 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				}
 				throw new Error("Unexpected event type for final result");
 			},
+			onConsumerClose,
 		);
 	}
 }

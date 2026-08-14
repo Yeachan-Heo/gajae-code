@@ -2658,6 +2658,70 @@ describe("openai-codex streaming", () => {
 		expect(transportDetails.fallbackCount).toBe(1);
 	});
 
+	it("releases an in-flight websocket request when the stream consumer returns early", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const sentTypesByConnection: string[][] = [];
+		let constructorCount = 0;
+
+		class ConsumerReturnWebSocket extends MockWebSocket {
+			#connectionIndex: number;
+
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.#connectionIndex = constructorCount++;
+				sentTypesByConnection[this.#connectionIndex] = [];
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as { type?: string };
+				const requestType = typeof request.type === "string" ? request.type : "";
+				sentTypesByConnection[this.#connectionIndex]?.push(requestType);
+				if (this.#connectionIndex === 0) {
+					this.sendJson({
+						type: "response.output_item.added",
+						item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] },
+					});
+					this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+					this.sendJson({ type: "response.output_text.delta", delta: "oversized provisional payload" });
+					return;
+				}
+				this.emitCodexResponse({ messageId: "msg_2", responseId: "resp_2", text: "clean successor" });
+			}
+		}
+
+		global.WebSocket = ConsumerReturnWebSocket as unknown as typeof WebSocket;
+		global.fetch = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		}) as unknown as typeof fetch;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const first = streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+			sessionId: "ws-consumer-return-session",
+			providerSessionState,
+		});
+		const iterator = first[Symbol.asyncIterator]();
+		for (let i = 0; i < 3; i++) {
+			const event = await iterator.next();
+			expect(event.done).toBe(false);
+		}
+		await iterator.return?.();
+
+		const successor = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+			sessionId: "ws-consumer-return-session",
+			providerSessionState,
+		}).result();
+
+		expect(successor.stopReason).toBe("stop");
+		expect(successor.content).toEqual([expect.objectContaining({ type: "text", text: "clean successor" })]);
+		expect(constructorCount).toBe(2);
+		expect(sentTypesByConnection).toEqual([["response.create"], ["response.create"]]);
+	});
+
 	it("resets websocket append state after an aborted request closes the connection", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
