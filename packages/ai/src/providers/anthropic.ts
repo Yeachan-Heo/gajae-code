@@ -2055,6 +2055,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					endpointClass,
 					requestBytes,
 				);
+				const requestUploadCeilingBound =
+					endpointClass === "custom" &&
+					requestBytes >= ANTHROPIC_LARGE_REQUEST_BYTES &&
+					firstEventTimeoutMs !== undefined &&
+					firstEventTimeoutMs > 0;
 				// Retries reset output.content; drop stale block correlations from the aborted attempt.
 				blocksByAnthropicIndex.clear();
 				truncatedToolCalls.clear();
@@ -2064,7 +2069,13 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				const idleTimeoutAbortError = new Error("Anthropic stream stalled while waiting for the next event");
 				const { requestSignal } = activeAbortTracker;
 				setRawRequestDump(params);
-				const anthropicRequest = client.messages.create({ ...params, stream: true }, { signal: requestSignal });
+				const anthropicRequest = client.messages.create(
+					{ ...params, stream: true },
+					{
+						signal: requestSignal,
+						...(requestUploadCeilingBound ? { maxRetries: 0 } : {}),
+					},
+				);
 				let streamedReplayUnsafeContent = false;
 				let sawProviderSafetyStop = false;
 				let sawFirstSemanticEvent = false;
@@ -2427,7 +2438,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						endpointClass,
 						awaitingFirstEvent: !sawFirstSemanticEvent,
 					});
+					const firstEventRetryMaxAttempts =
+						typeof (streamFailure as { retryMaxAttempts?: unknown }).retryMaxAttempts === "number"
+							? (streamFailure as { retryMaxAttempts: number }).retryMaxAttempts
+							: undefined;
 					if (localAbortReason || sawProviderSafetyStop) {
+						throw streamFailure;
+					}
+					if (firstEventRetryMaxAttempts !== undefined && providerRetryAttempt + 1 >= firstEventRetryMaxAttempts) {
 						throw streamFailure;
 					}
 					if (
@@ -2735,10 +2753,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					const canRetryTransientEnvelopeFailure = isTransientEnvelopeFailure && !streamedReplayUnsafeContent;
 					const canRetryProviderFailure =
 						firstTokenTime === undefined && isProviderRetryableError(streamFailure, model.provider);
-					const firstEventRetryMaxAttempts =
-						typeof (streamFailure as { retryMaxAttempts?: unknown }).retryMaxAttempts === "number"
-							? (streamFailure as { retryMaxAttempts: number }).retryMaxAttempts
-							: undefined;
 					if (
 						activeAbortTracker.wasCallerAbort() ||
 						(firstEventRetryMaxAttempts !== undefined &&

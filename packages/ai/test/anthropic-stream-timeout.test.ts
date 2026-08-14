@@ -331,6 +331,53 @@ describe("anthropic first-event timeouts", () => {
 		});
 	});
 
+	it("does not run strict-tool corrective replay after a large grace ceiling is reached", async () => {
+		let attempts = 0;
+		const create = ((_body: unknown) => {
+			attempts += 1;
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				[Symbol.asyncIterator]() {
+					return {
+						async next(): Promise<IteratorResult<MockAnthropicEvent>> {
+							await Bun.sleep(5);
+							const error = new Error("400 invalid_request_error: compiled grammar is too large");
+							(error as Error & { status: number }).status = 400;
+							throw error;
+						},
+					};
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+		const strictContext: Context = {
+			...contextWithBytes(1_670_000),
+			tools: [
+				{
+					name: "edit",
+					description: "Edit a value",
+					strict: true,
+					parameters: { type: "object", properties: {} },
+				},
+			],
+		};
+
+		const result = await streamAnthropic(model, strictContext, {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 1,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("compiled grammar is too large");
+		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
+	});
+
 	it("does not attach first-event grace ceilings after message_start progress", async () => {
 		const create = ((_body: unknown) => {
 			const response = new Response(null, { status: 200 });
@@ -518,6 +565,33 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.errorMessage).toContain("retry-after-ms=62291000");
 		expect(result.errorMessage).toContain("anthropic-ratelimit-unified-overage-disabled-reason=out_of_credits");
 		expect(result.errorMessage).not.toContain("timed out while waiting for the first event");
+	});
+
+	it("disables Anthropic SDK retries for a large custom request with a first-event ceiling", async () => {
+		let attempts = 0;
+		const fetchMock = (async () => {
+			attempts += 1;
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: { type: "overloaded_error", message: "Overloaded" },
+				}),
+				{ status: 529, headers: { "content-type": "application/json" } },
+			);
+		}) as FetchImpl;
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), contextWithBytes(1_670_000), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			requestMaxRetries: 5,
+			streamMaxRetries: 0,
+			streamFirstEventTimeoutMs: 1,
+		}).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorStatus).toBe(529);
+		expect(result.errorMessage).toContain("overloaded_error");
 	});
 
 	it("does not arm the Anthropic first-event watchdog before the stream connects", async () => {
