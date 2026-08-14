@@ -114,6 +114,20 @@ test("detects aliases assigned from computed namespace members", async () => {
 	}
 });
 
+test("detects dollar-suffixed target variables", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-writer-dollar-target-"));
+	try {
+		const file = path.join(root, "packages", "coding-agent", "src", "dollar-target.ts");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await Bun.write(file, 'import { writeFile } from "node:fs/promises";\nconst target$ = ".gjc/state.json";\nawait writeFile(target$, "x");\n');
+		const result = await run(root);
+		expect(result.exitCode).toBe(1);
+		expect(`${result.stdout}\n${result.stderr}`).toContain("dollar-target.ts");
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("detects constructed constant .gjc paths", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-writer-constructed-"));
 	try {

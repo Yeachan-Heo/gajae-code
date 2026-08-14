@@ -183,7 +183,10 @@ function nearbyAssignmentTargetsThisLine(lines: readonly string[], index: number
 		const prior = lines[i]?.trim() ?? "";
 		if (!sameLineReferencesGjc(prior)) continue;
 		const assignment = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/u.exec(prior);
-		if (assignment && new RegExp(`\\b${assignment[1]}\\b`, "u").test(line)) return true;
+		if (assignment) {
+			const escapedAssignment = escapeRegExp(assignment[1]!);
+			if (new RegExp(`(?<![\\w$])${escapedAssignment}(?![\\w$])`, "u").test(line)) return true;
+		}
 	}
 	return false;
 }
