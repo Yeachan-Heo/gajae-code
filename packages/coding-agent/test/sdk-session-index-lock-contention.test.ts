@@ -136,6 +136,56 @@ describe("SDK session index lock contention (#4544)", () => {
 			spy.mockRestore();
 		}
 	});
+	it("fails closed when the locked replay outlives the probe freshness window", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-replay-stale-"));
+		const seed = await new SessionIndex(dir).open();
+		await seed.append(event("slow-replay"));
+		const index = await new SessionIndex(dir).open();
+		// Review round 4 on #4544: the freshness check ran at lock acquisition,
+		// but the observation set is consumed only AFTER `#replayUnderLock()` —
+		// a whole-log re-read plus fsynced audit appends that a large index or a
+		// wedged Windows sync-family await can stretch arbitrarily while the
+		// machine-global lock is held. A pid can exit and be reused across that
+		// awaited replay; the cached incarnation would still match the dead row
+		// while `alive(pid)` sees the replacement, writing a heartbeat for the
+		// wrong host. Simulate the stretch deterministically: jump the clock
+		// past the replay freshness bound exactly when the locked replay reads
+		// the log (the first index.jsonl read after the unlocked probe batch).
+		let incarnationCalls = 0;
+		const realProcessIncarnation = incarnationModule.processIncarnation;
+		const incarnation = vi.spyOn(incarnationModule, "processIncarnation").mockImplementation(pid => {
+			incarnationCalls++;
+			return realProcessIncarnation(pid);
+		});
+		let jumped = false;
+		const realReadFile = fs.readFile;
+		const readFileSpy = vi.spyOn(fs, "readFile").mockImplementation((async (
+			...args: Parameters<typeof fs.readFile>
+		) => {
+			const result = await realReadFile(...args);
+			if (!jumped && incarnationCalls > 0 && String(args[0]).endsWith("index.jsonl")) {
+				jumped = true;
+				const realNow = Date.now;
+				vi.spyOn(Date, "now").mockImplementation(() => realNow() + 2_100);
+			}
+			return result;
+		}) as typeof fs.readFile);
+		try {
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			expect(jumped).toBe(true);
+			// No heartbeat was written for the still-live host: the cycle failed
+			// closed instead of trusting the pre-replay observation set.
+			const rows = index.listSessions().sessions;
+			expect(rows).toHaveLength(1);
+			expect(rows[0]?.lastHeartbeatAt).toBeUndefined();
+		} finally {
+			readFileSpy.mockRestore();
+			incarnation.mockRestore();
+			vi.restoreAllMocks();
+		}
+		// The next pass, on a fast replay, re-probes and writes normally.
+		expect(await index.checkpointLiveHeartbeats()).toBe(1);
+	});
 
 	it("releases the lock when the critical section throws, and aborted acquisition fails fast", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-throw-"));

@@ -534,7 +534,7 @@ const SESSION_INDEX_LOCK_OPTIONS = { retries: 600, retryDelayMs: 100 } as const;
  */
 const SESSION_INDEX_OP_SLOW_MS = 10_000;
 /**
- * How long a completed incarnation-probe batch stays trustworthy when the
+ * How long a completed incarnation-probe batch stays trustworthy while the
  * heartbeat pass acquires the machine-global index lock (#4544 review). A pid
  * can exit and be reused while the pass queues behind another holder, and
  * `alive(pid)` alone would see the reused pid while the observation still
@@ -544,6 +544,19 @@ const SESSION_INDEX_OP_SLOW_MS = 10_000;
  * queues for the retry delay (100ms) or far longer.
  */
 const SESSION_INDEX_PROBE_FRESHNESS_MS = 50;
+/**
+ * The same trust bound re-checked AFTER the locked replay (#4544 review):
+ * replay re-reads the whole log (up to the 4 MiB rotation bound) and fsyncs
+ * pending audit rows, so a large index or a slow Windows sync-family await can
+ * stretch the interval between the probe batch and the heartbeat write past
+ * the acquisition bound above. A pid can exit and be reused across that
+ * awaited replay; consuming the cached observation then would checkpoint the
+ * replacement process as the dead row. The replay bound therefore covers the
+ * full locked replay cost envelope of a healthy machine instead of scheduler
+ * jitter alone; anything slower still fails closed (no heartbeat this cycle)
+ * and the next pass re-probes from scratch.
+ */
+const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
 
 /**
  * One locked session-index transaction (#4544): every critical section over the
@@ -1351,6 +1364,16 @@ export class SessionIndex {
 				// which is the only path where the evidence is trustworthy.
 				if (Date.now() - probedAt > SESSION_INDEX_PROBE_FRESHNESS_MS) return 0;
 				await this.#replayUnderLock();
+				// Recheck AFTER the awaited replay too (#4544 review round 4): the
+				// replay re-reads the whole log (up to the 4 MiB rotation bound) and
+				// fsyncs pending audit rows, so the probe→write interval can stretch
+				// well past the acquisition bound above while the lock is held. The
+				// same pid-reuse window exists across that awaited replay; consuming
+				// the cached observation then would checkpoint the replacement
+				// process as the dead row. The replay bound covers the full locked
+				// replay cost envelope of a healthy machine; anything slower fails
+				// closed (no heartbeat this cycle) and the next pass re-probes.
+				if (Date.now() - probedAt > SESSION_INDEX_REPLAY_FRESHNESS_MS) return 0;
 				if (this.#corruptSuffix) return 0;
 				const events: SessionIndexEvent[] = [];
 				const rows = reduceEvents(this.#events, now, this.#agentDir, probed).sessions;
