@@ -1319,6 +1319,13 @@ describe("ModelRegistry", () => {
 		});
 	});
 
+	/** Hermetic candidate set for fixture providers only (excludes ambient host providers). */
+	function fixtureCandidates(registry: ModelRegistry, providers: readonly string[], modelId: string): Model<Api>[] {
+		return providers
+			.map(provider => registry.find(provider, modelId))
+			.filter((model): model is NonNullable<typeof model> => model !== undefined);
+	}
+
 	describe("provider selection policy and alias resolution", () => {
 		test("dedupes explicit provider order and assigns disjoint rank bands", () => {
 			const policy = createProviderSelectionPolicy({
@@ -1391,9 +1398,15 @@ describe("ModelRegistry", () => {
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			// Pin candidates to the demo fixture plus the bundled anthropic exact-id
+			// variant (hermetic pattern from #3207) so ambient host credentials (e.g.
+			// GH_TOKEN/GITHUB_TOKEN enabling other bundled providers) cannot change
+			// alias or canonical resolution in this test.
+			const demoVariants = fixtureCandidates(registry, ["demo"], "anthropic/claude-sonnet-4.5");
+			const candidates = [...demoVariants, ...fixtureCandidates(registry, ["anthropic"], "claude-sonnet-4-5")];
 			const resolved = registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
 				availableOnly: false,
-				candidates: registry.getAll(),
+				candidates,
 			});
 
 			expect(resolved?.provider).toBe("demo");
@@ -1407,13 +1420,13 @@ describe("ModelRegistry", () => {
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4-5", {
 					availableOnly: false,
-					candidates: registry.getAll(),
+					candidates,
 				}),
 			).toMatchObject({ id: "claude-sonnet-4-5" });
 			expect(
 				registry.resolveCanonicalModel("claude-sonnet-4.5", {
 					availableOnly: false,
-					candidates: registry.getAll(),
+					candidates,
 				}),
 			).toBeUndefined();
 		});
@@ -1488,9 +1501,12 @@ describe("ModelRegistry", () => {
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			// Pin candidates to the demo fixture (hermetic pattern from #3207): the
+			// fixture's inline wire id must survive alias resolution regardless of
+			// ambient host credentials enabling other bundled providers.
 			const resolved = registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
 				availableOnly: false,
-				candidates: registry.getAll(),
+				candidates: fixtureCandidates(registry, ["demo"], "anthropic/claude-sonnet-4.5"),
 			});
 
 			expect(resolved?.provider).toBe("demo");
@@ -1510,19 +1526,24 @@ describe("ModelRegistry", () => {
 			});
 
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			// Pin candidates to the demo fixture (hermetic pattern from #3207): the
+			// alias must fail closed because the only fixture variant is
+			// credential-less, regardless of ambient host credentials enabling other
+			// bundled providers' claude-sonnet-4.5 variants.
+			const fixtureModel = registry.find("demo", "anthropic/claude-sonnet-4.5")!;
 			expect(registry.lookupAliasExists("claude-sonnet-4.5")).toBe(true);
 			// Canonical-id access stays alias-unaware.
 			expect(registry.getCanonicalVariants("claude-sonnet-4.5")).toEqual([]);
 			expect(
 				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
 					availableOnly: true,
-					candidates: registry.getAll(),
+					candidates: [fixtureModel],
 				}),
 			).toBeUndefined();
 			expect(
 				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
 					availableOnly: false,
-					candidates: registry.getAll(),
+					candidates: [fixtureModel],
 				}),
 			).toBeUndefined();
 		});
@@ -1797,6 +1818,11 @@ describe("ModelRegistry", () => {
 		});
 
 		test("ranks expired OAuth ahead of an environment key because requests refresh OAuth first", async () => {
+			// Pin the anthropic env surface before writing the fixture value: the
+			// credential env resolver prefers an ambient ANTHROPIC_OAUTH_TOKEN from
+			// the launching shell over any in-process ANTHROPIC_API_KEY write, so
+			// unset it to keep the fixture key the effective environment key.
+			const restoreAnthropicOAuthToken = unsetEnvForTest("ANTHROPIC_OAUTH_TOKEN");
 			const restoreAnthropicKey = setEnvForTest("ANTHROPIC_API_KEY", "environment-anthropic-key");
 			try {
 				await authStorage.set("anthropic", [
@@ -1813,6 +1839,7 @@ describe("ModelRegistry", () => {
 				expect(registry.getEffectiveProviderAuth("anthropic")).toBe("oauth");
 			} finally {
 				restoreAnthropicKey();
+				restoreAnthropicOAuthToken();
 			}
 		});
 		test("ranks a mixed manual+OAuth provider in the non-OAuth band by default", async () => {
@@ -2065,18 +2092,20 @@ describe("ModelRegistry", () => {
 			expect(registry.lookupAliasExists("claude-sonnet-4.5")).toBe(true);
 			expect(registry.lookupAliasExists("claude-sonnet-45")).toBe(true);
 
-			// Alias `claude-sonnet-4.5` resolves only the dotted variant.
+			// Alias `claude-sonnet-4.5` resolves only the dotted variant. Candidates
+			// are pinned to the demo fixture (hermetic pattern from #3207) so ambient
+			// host credentials cannot inject sibling variants from other providers.
 			expect(
 				registry.resolveModelByLookupAlias("claude-sonnet-4.5", {
 					availableOnly: true,
-					candidates: registry.getAll(),
+					candidates: [dotVariant, compactVariant],
 				}),
 			).toBe(dotVariant);
 			// Alias `claude-sonnet-45` resolves only the compact variant.
 			expect(
 				registry.resolveModelByLookupAlias("claude-sonnet-45", {
 					availableOnly: true,
-					candidates: registry.getAll(),
+					candidates: [dotVariant, compactVariant],
 				}),
 			).toBe(compactVariant);
 			// Supplying only the compact variant cannot satisfy the dotted alias.
@@ -5792,19 +5821,23 @@ describe("ModelRegistry", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			await registry.refresh();
 
-			expect(registry.getActiveProviders()).toEqual([{ provider: "local", connectionKind: "credential" }]);
+			// Rows are scoped to the local fixture (hermetic pattern from #3207) so
+			// ambient host credentials (e.g. OPENAI_API_KEY) enabling unrelated bundled
+			// providers cannot change this provider's credential/discovery activity.
+			expect(activeRowsFor(registry, ["local"])).toEqual([{ provider: "local", connectionKind: "credential" }]);
 			expect(await registry.getApiKeyForProvider("local")).toBe("STORED_TEST_KEY");
 			await authStorage.set("local", []);
 
 			expect(registry.find("local", "local-model")).toBeDefined();
-			expect(registry.getActiveProviders()).toEqual([]);
+			expect(activeRowsFor(registry, ["local"])).toEqual([]);
 		});
 	});
+	/** Active-provider rows scoped to fixture providers only (excludes ambient host providers). */
+	const activeRowsFor = (registry: ModelRegistry, providerIds: readonly string[]) => {
+		const selected = new Set(providerIds);
+		return registry.getActiveProviders().filter(provider => selected.has(provider.provider));
+	};
 	describe("active provider resolution", () => {
-		const activeRowsFor = (registry: ModelRegistry, providerIds: readonly string[]) => {
-			const selected = new Set(providerIds);
-			return registry.getActiveProviders().filter(provider => selected.has(provider.provider));
-		};
 		test("rechecks non-fingerprinted environment credentials for active providers", () => {
 			const previous = process.env.GITLAB_TOKEN;
 			delete process.env.GITLAB_TOKEN;
@@ -5896,7 +5929,10 @@ describe("ModelRegistry", () => {
 			await registry.refreshProvider("credentialless-provider", "online");
 			await authStorage.set("credentialless-provider", []);
 
-			expect(registry.getActiveProviders()).toEqual([
+			// Rows are scoped to the fixture provider (hermetic pattern from #3207)
+			// so ambient host credentials enabling unrelated bundled providers cannot
+			// affect this provider's credentialless discovery activity.
+			expect(activeRowsFor(registry, ["credentialless-provider"])).toEqual([
 				{ provider: "credentialless-provider", connectionKind: "credentialless" },
 			]);
 			expect(registry.getAvailable().some(model => model.provider === "credentialless-provider")).toBe(true);
@@ -5956,18 +5992,24 @@ describe("ModelRegistry", () => {
 		});
 		test("excludes bundled providers when the selected stored key resolver returns undefined", async () => {
 			authStorage.close();
+			const restoreAnthropicKey = unsetEnvForTest("ANTHROPIC_API_KEY");
+			const restoreAnthropicToken = unsetEnvForTest("ANTHROPIC_OAUTH_TOKEN");
 			authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"), {
 				configValueResolver: async () => undefined,
 			});
 			await authStorage.set("anthropic", [{ type: "api_key", key: "!missing-anthropic-key" }]);
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			await registry.refresh();
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh();
 
-			expect(registry.getAll().some(model => model.provider === "anthropic")).toBe(true);
-			expect(activeRowsFor(registry, ["anthropic"])).toEqual([]);
+				expect(registry.getAll().some(model => model.provider === "anthropic")).toBe(true);
+				expect(activeRowsFor(registry, ["anthropic"])).toEqual([]);
+			} finally {
+				restoreAnthropicKey();
+				restoreAnthropicToken();
+			}
 		});
-
 		test("tracks credential addition, replacement, removal, dedupe, and registry-only exclusions", async () => {
 			writeRawModelsJson({
 				"tracked-provider": {
