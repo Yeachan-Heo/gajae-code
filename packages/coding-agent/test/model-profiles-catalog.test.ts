@@ -83,10 +83,10 @@ const expectedProfiles: Array<{
 		requiredProviders: ["commandcode-goat"],
 		mapping: {
 			default: "commandcode-goat/zai-org/GLM-5.3",
-			executor: "commandcode-goat/deepseek/deepseek-v4-flash:high",
+			executor: "commandcode-goat/deepseek/deepseek-v4-flash",
 			planner: "commandcode-goat/moonshotai/Kimi-K3",
-			critic: "commandcode-goat/zai-org/GLM-5.2:high",
-			architect: "commandcode-goat/deepseek/deepseek-v4-pro:high",
+			critic: "commandcode-goat/zai-org/GLM-5.2",
+			architect: "commandcode-goat/deepseek/deepseek-v4-pro",
 		},
 	},
 	{
