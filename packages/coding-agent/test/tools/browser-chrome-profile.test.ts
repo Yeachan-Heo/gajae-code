@@ -19,7 +19,7 @@ import {
 	isSafeCdpAddressForTest,
 } from "../../src/tools/browser/attach";
 import * as launch from "../../src/tools/browser/launch";
-import { chromeUserDataRoots } from "../../src/tools/browser/profile-discovery";
+import { chromeUserDataRoots, type DiscoveryEnv, defaultDiscoveryEnv } from "../../src/tools/browser/profile-discovery";
 import {
 	type AcquireBrowserOptions,
 	type BrowserHandle,
@@ -253,10 +253,9 @@ describe("Chrome profile browser mode (#809)", () => {
 	});
 
 	it("rejects an explicit default Chrome user data directory on every platform", async () => {
-		// Drive the refusal through the injectable seam with explicit platforms and
-		// homes: ambient `os.homedir()` on the host only proves the host's own
-		// default root (the darwin branch never lists `~/.config/google-chrome`,
-		// so the old form failed on macOS while the guard was correct).
+		// The resolver must use the same injected discovery environment to resolve
+		// and compare the path. The live environment may override a platform's
+		// conventional root through CHROME_USER_DATA_DIR or XDG_CONFIG_HOME.
 		const matrix: Array<{ platform: NodeJS.Platform; home: string; defaultRoot: string }> = [
 			{
 				platform: "darwin",
@@ -274,15 +273,39 @@ describe("Chrome profile browser mode (#809)", () => {
 				defaultRoot: path.posix.join("/home/u", ".config", "google-chrome"),
 			},
 		];
-		for (const entry of matrix) {
-			expect(await isDefaultChromeUserDataDirForTest(entry.defaultRoot, [entry.defaultRoot], entry.platform)).toBe(
-				true,
-			);
-		}
-		// End-to-end refusal keeps exercising the live resolution path, but with the
-		// host's actual platform default root instead of a Linux-only spelling.
-		const hostRoot = chromeUserDataRoots({ platform: process.platform, home: os.homedir(), exists: () => false })[0]!;
 		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
+		for (const entry of matrix) {
+			const discoveryEnv: DiscoveryEnv = {
+				platform: entry.platform,
+				home: entry.home,
+				exists: () => false,
+			};
+			expect(
+				await isDefaultChromeUserDataDirForTest(
+					entry.defaultRoot,
+					chromeUserDataRoots(discoveryEnv),
+					entry.platform,
+				),
+			).toBe(true);
+			await expect(
+				resolveBrowserKindForTest(
+					{ action: "open", app: { browser: "chrome", user_data_dir: entry.defaultRoot } },
+					makeSession("/work"),
+					undefined,
+					discoveryEnv,
+				),
+			).rejects.toThrow(/Refusing Chrome's default user data directory/);
+			const customRoot = entry.platform === "win32" ? "D:\\automation\\chrome" : "/tmp/automation-chrome";
+			await expect(
+				resolveBrowserKindForTest(
+					{ action: "open", app: { browser: "chrome", user_data_dir: customRoot } },
+					makeSession("/work"),
+					undefined,
+					discoveryEnv,
+				),
+			).resolves.toMatchObject({ kind: "chrome-profile", userDataDir: customRoot });
+		}
+		const hostRoot = chromeUserDataRoots(defaultDiscoveryEnv(() => false))[0]!;
 		await expect(
 			resolveBrowserKindForTest(
 				{

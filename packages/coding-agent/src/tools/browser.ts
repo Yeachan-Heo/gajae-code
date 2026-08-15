@@ -7,7 +7,7 @@ import browserDescription from "../prompts/tools/browser.md" with { type: "text"
 import type { ToolSession } from "../sdk";
 import { type BrowserActionStep, compileActionSteps } from "./browser/actions";
 import { isChromeProfileExecutableForLaunch, isEdgeExecutable, resolveSystemChromeForProfile } from "./browser/launch";
-import { chromeUserDataRoots, defaultDiscoveryEnv } from "./browser/profile-discovery";
+import { chromeUserDataRoots, type DiscoveryEnv, defaultDiscoveryEnv } from "./browser/profile-discovery";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import { acquireTab, dropHeadlessTabs, getTab, releaseAllTabs, releaseTab, runInTab } from "./browser/tab-supervisor";
@@ -130,8 +130,9 @@ export function resolveBrowserKindForTest(
 	params: BrowserParams,
 	session: ToolSession,
 	signal?: AbortSignal,
+	discoveryEnv?: DiscoveryEnv,
 ): Promise<BrowserKind> {
-	return resolveBrowserKind(params, session, signal);
+	return resolveBrowserKind(params, session, signal, discoveryEnv);
 }
 
 /**
@@ -144,6 +145,7 @@ async function resolveChromeProfileKind(
 	app: NonNullable<BrowserParams["app"]>,
 	session: ToolSession,
 	signal?: AbortSignal,
+	discoveryEnv?: DiscoveryEnv,
 ): Promise<BrowserKind> {
 	const profileDirectory = app.profile_directory ?? "Default";
 	const exe = app.path ? resolveToCwd(app.path, session.cwd) : resolveSystemChromeForProfile();
@@ -165,8 +167,8 @@ async function resolveChromeProfileKind(
 			'app.user_data_dir is required for app.browser "chrome". Chrome 136+ disables remote debugging for the default Chrome data directory; pass a separate non-default user data directory, or attach to an already-authorized browser with app.cdp_url.',
 		);
 	}
-	const userDataDir = resolveToCwd(app.user_data_dir, session.cwd);
-	if (await isDefaultChromeUserDataDir(userDataDir, signal)) {
+	const userDataDir = resolveChromeProfileUserDataDir(app.user_data_dir, session.cwd, discoveryEnv?.platform);
+	if (await isDefaultChromeUserDataDir(userDataDir, signal, discoveryEnv)) {
 		throw new ToolError(
 			`Refusing Chrome's default user data directory ${JSON.stringify(userDataDir)}. Chrome 136+ disables remote debugging there; pass a separate non-default app.user_data_dir, or use app.cdp_url for an already-authorized browser.`,
 		);
@@ -187,7 +189,8 @@ async function canonicalPath(
 	platform: NodeJS.Platform = process.platform,
 	signal?: AbortSignal,
 ): Promise<string> {
-	let resolved = platform === "win32" ? path.win32.resolve(candidate) : path.resolve(candidate);
+	const platformPath = platform === "win32" ? path.win32 : path.posix;
+	let resolved = platformPath.resolve(candidate);
 	if (platform === process.platform) {
 		throwIfAborted(signal);
 		try {
@@ -198,13 +201,27 @@ async function canonicalPath(
 	return platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
-function isDefaultChromeUserDataDir(candidate: string, signal?: AbortSignal): Promise<boolean> {
+function isDefaultChromeUserDataDir(
+	candidate: string,
+	signal?: AbortSignal,
+	discoveryEnv: DiscoveryEnv = defaultDiscoveryEnv(() => false),
+): Promise<boolean> {
 	return isDefaultChromeUserDataDirForTest(
 		candidate,
-		chromeUserDataRoots(defaultDiscoveryEnv(() => false)),
-		process.platform,
+		chromeUserDataRoots(discoveryEnv),
+		discoveryEnv.platform,
 		signal,
 	);
+}
+
+function resolveChromeProfileUserDataDir(
+	candidate: string,
+	cwd: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	if (platform === process.platform) return resolveToCwd(candidate, cwd);
+	const platformPath = platform === "win32" ? path.win32 : path.posix;
+	return platformPath.isAbsolute(candidate) ? platformPath.resolve(candidate) : platformPath.resolve(cwd, candidate);
 }
 
 export async function isDefaultChromeUserDataDirForTest(
@@ -224,13 +241,14 @@ async function resolveBrowserKind(
 	params: BrowserParams,
 	session: ToolSession,
 	signal?: AbortSignal,
+	discoveryEnv?: DiscoveryEnv,
 ): Promise<BrowserKind> {
 	const app = params.app;
 	if (app?.cdp_url) {
 		return { kind: "connected", cdpUrl: app.cdp_url.replace(/\/+$/, "") };
 	}
 	if (app?.browser === "chrome") {
-		return resolveChromeProfileKind(app, session, signal);
+		return resolveChromeProfileKind(app, session, signal, discoveryEnv);
 	}
 	if (app?.path) {
 		const exe = resolveToCwd(app.path, session.cwd);
