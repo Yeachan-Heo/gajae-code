@@ -157,11 +157,7 @@ export class InputController {
 				return process.platform !== "win32";
 			case "app.thinking.cycle":
 			case "app.thinking.toggle":
-				return Boolean(
-					this.ctx.session.model?.reasoning ||
-						this.ctx.session.model?.thinking ||
-						this.ctx.session.thinkingLevel !== undefined,
-				);
+				return Boolean(this.ctx.session.model?.reasoning && this.ctx.session.model.thinking);
 			case "app.commandPalette.open":
 				return this.ctx.editor.getText().trim().length === 0;
 			case "app.model.cycleForward":

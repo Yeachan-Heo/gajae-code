@@ -2613,17 +2613,6 @@ function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {
 	try {
 		efforts = getSupportedEfforts(model);
 	} catch {
-		if (model.provider === "omlx" || (model.reasoning && model.provider !== "openai")) {
-			return [
-				ThinkingLevel.Off,
-				ThinkingLevel.Minimal,
-				ThinkingLevel.Low,
-				ThinkingLevel.Medium,
-				ThinkingLevel.High,
-				ThinkingLevel.XHigh,
-				ThinkingLevel.Max,
-			];
-		}
 		return levels;
 	}
 	for (const effort of efforts) {

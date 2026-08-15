@@ -366,4 +366,32 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.cycleThinkingLevel()).toBe(Effort.Minimal);
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
 	});
+
+	it("fails closed when reasoning metadata omits the supported effort range", async () => {
+		const model = { ...getAnthropicModelOrThrow("claude-sonnet-4-5"), thinking: undefined };
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+				thinkingLevel: Effort.High,
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-missing-thinking.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-missing-thinking.yml"));
+
+		sessionSettings = Settings.isolated();
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: sessionSettings,
+			modelRegistry,
+		});
+
+		expect(session.getAvailableThinkingLevels()).toEqual([]);
+		expect(session.cycleThinkingLevel()).toBeUndefined();
+		expect(session.thinkingLevel).toBeUndefined();
+	});
 });

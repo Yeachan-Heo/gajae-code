@@ -360,7 +360,7 @@ describe("InputController keybinding setup", () => {
 		const { InputController, ctx } = await createContext();
 		const session = ctx.session as unknown as {
 			isStreaming: boolean;
-			model: { reasoning?: boolean } | undefined;
+			model: { reasoning?: boolean; thinking?: { mode: "effort"; minLevel: "low"; maxLevel: "high" } } | undefined;
 			getRoleModelCycleCandidateCount: Mock<() => number>;
 		};
 		const controller = new InputController(ctx);
@@ -372,6 +372,8 @@ describe("InputController keybinding setup", () => {
 		expect(controller.actionRegistry.isAvailable("app.transcript.browse")).toBe(false);
 
 		session.model = { reasoning: true };
+		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(false);
+		session.model = { reasoning: true, thinking: { mode: "effort", minLevel: "low", maxLevel: "high" } };
 		session.getRoleModelCycleCandidateCount.mockReturnValue(2);
 		session.isStreaming = true;
 		await Promise.resolve();
