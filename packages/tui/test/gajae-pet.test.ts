@@ -135,6 +135,31 @@ describe("gajae pixel frames", () => {
 		expect(built.frames.base.startsWith('\x1bP0;1;0q"1;1;36;45')).toBe(true);
 	});
 
+	it("centers iTerm2 art in a three-row raster and advertises the padded canvas", () => {
+		const built = buildGajaePixelFrames({
+			protocol: "iterm2",
+			cellWidthPx: 9,
+			cellHeightPx: 18,
+			targetRows: 2,
+			iterm2TopPaddingPx: 9,
+			iterm2BottomPaddingPx: 9,
+		});
+		const decoded = decodeIterm2Png(built.frames.base);
+		expect(built.rows).toBe(2);
+		expect(built.rasterRows).toBe(3);
+		expect(built.heightPx).toBe(54);
+		expect(built.frames.base).toContain("width=4;height=3;preserveAspectRatio=0");
+		expect(decoded.width).toBe(36);
+		expect(decoded.height).toBe(54);
+		const alpha = (x: number, y: number) => decoded.rgba[(y * decoded.width + x) * 4 + 3];
+		for (const y of [0, 8, 45, 53]) {
+			expect(Array.from({ length: decoded.width }, (_, x) => alpha(x, y))).toEqual(Array(decoded.width).fill(0));
+		}
+		expect(
+			decoded.rgba.some((value, index) => index % 4 === 3 && value === 255 && index / 4 / decoded.width >= 9),
+		).toBe(true);
+	});
+
 	it("carries the >< effort face on danceL and the ^^ victory face on flex", () => {
 		const effort = __gajaePetTestHooks
 			.getPixelGrid("danceL")

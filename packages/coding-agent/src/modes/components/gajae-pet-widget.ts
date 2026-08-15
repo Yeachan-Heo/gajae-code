@@ -38,6 +38,8 @@ const KITTY_DROP_FRACTION = 0.45;
 const petKittyDropPx = (cellHeightPx: number): number =>
 	Math.min(Math.max(0, cellHeightPx - 1), Math.floor(cellHeightPx * KITTY_DROP_FRACTION));
 const PET_RAISE_ROWS = 1;
+const PET_ART_ROWS = 2;
+const ITERM_CANVAS_ROWS = 3;
 const allocatedPetKittyImageIds = new Set<number>();
 
 function allocatePetKittyImageId(): number {
@@ -308,6 +310,9 @@ export class GajaePetWidget {
 		this.#builtCellW = cell.widthPx;
 		this.#builtCellH = cell.heightPx;
 		const skin: PetSkinId = this.#mode === "off" ? "red" : this.#mode;
+		const iterm2TopPaddingPx = protocol === "iterm2" ? Math.floor(cell.heightPx / 2) : 0;
+		const iterm2BottomPaddingPx =
+			protocol === "iterm2" ? (ITERM_CANVAS_ROWS - PET_ART_ROWS) * cell.heightPx - iterm2TopPaddingPx : 0;
 		if (protocol === "kitty") {
 			this.#kittyImageId ??= allocatePetKittyImageId();
 			this.#kittyCleanupPending = true;
@@ -317,17 +322,16 @@ export class GajaePetWidget {
 			skin,
 			cellWidthPx: cell.widthPx,
 			cellHeightPx: cell.heightPx,
-			// Every protocol uses the same two-row geometry contract. iTerm2 emits
-			// the derived cell block rather than fixed pixels so Retina/font changes
-			// cannot shrink the visible footprint.
-			targetRows: 2,
+			// Kitty and Sixel keep the two-row art footprint; iTerm2 adds one centered
+			// canvas row via the protocol-specific transparent insets below.
+			targetRows: PET_ART_ROWS,
 			sixelTopPaddingPx: protocol === "sixel" ? PET_SIXEL_DROP_PX : 0,
 			kittyCellYOffsetPx: protocol === "kitty" ? petKittyDropPx(cell.heightPx) : 0,
 			kittyImageId: protocol === "kitty" ? this.#kittyImageId : undefined,
-			// Keep the iTerm2 raster inside the same two-row footprint reserved for
-			// Kitty and Sixel; horizontal cell rounding is padded by the builder.
-			iterm2TopPaddingPx: 0,
-			iterm2BottomPaddingPx: 0,
+			// Horizontal cell rounding is padded by the builder; iTerm2 gets a centered
+			// three-row canvas while Kitty/Sixel retain their two-row footprint.
+			iterm2TopPaddingPx,
+			iterm2BottomPaddingPx,
 		});
 		this.#framedEditor.setReserve(this.#pixel.columns + PET_SIDE_MARGIN);
 	}
@@ -367,12 +371,15 @@ export class GajaePetWidget {
 		}
 	}
 
-	/** Clear the shared post-render slot only while this widget still owns it. */
+	/** Clear shared TUI slots only while this widget still owns them. */
 	#releaseOverlayEmitter(): void {
-		if (petOverlayEmitterOwners.get(this.#ui) === this) {
-			this.#ui.setPostRenderEmitter(undefined);
-			petOverlayEmitterOwners.delete(this.#ui);
-		}
+		if (!this.#isActiveOwner()) return;
+		this.#ui.setPostRenderEmitter(undefined);
+		petOverlayEmitterOwners.delete(this.#ui);
+	}
+
+	#isActiveOwner(): boolean {
+		return petOverlayEmitterOwners.get(this.#ui) === this;
 	}
 
 	#mountEditor(framed: boolean): void {
@@ -492,11 +499,11 @@ export class GajaePetWidget {
 		// back onto the composer's bottom border per protocol (sixel via transparent
 		// top padding, kitty via a sub-cell Y offset baked into the frames).
 		const composerBottom = rows - this.#getComposerBottomOffset();
-		// iTerm2 anchors an inline image at the current cursor row. The shared
-		// safety lift keeps its geometry-derived cell block aligned with the
-		// cursor-neutral Kitty/Sixel overlays and above the HUD boundary.
-		const safetyLift = PET_RAISE_ROWS;
-		const y = composerBottom - pixel.rows - safetyLift;
+		// iTerm2 anchors an inline image at the current cursor row. Its geometry-derived
+		// 3-row centered canvas (ITERM_CANVAS_ROWS) already aligns to the composer
+		// bottom, so no extra safety lift is needed; Kitty/Sixel keep the lift.
+		const imageRows = pixel.protocol === "iterm2" ? pixel.rasterRows : pixel.rows;
+		const y = pixel.protocol === "iterm2" ? composerBottom - imageRows : composerBottom - imageRows - PET_RAISE_ROWS;
 		const x = columns - pixel.columns - PET_SIDE_MARGIN;
 		if (y < 0 || x < 0) return null;
 		return { x, y };

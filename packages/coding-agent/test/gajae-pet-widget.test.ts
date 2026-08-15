@@ -119,13 +119,13 @@ const ITERM_WIDGET_GEOMETRY_FIXTURES = [
 		name: "80x30 terminal with 9x18 cells",
 		terminal: { columns: 80, rows: 30 },
 		cell: { widthPx: 9, heightPx: 18 },
-		expected: { imageColumns: 4, imageRows: 2, renderedWidth: 75, cursor: "\x1b[28;76H" },
+		expected: { imageColumns: 4, imageRows: 3, renderedWidth: 75, cursor: "\x1b[28;76H" },
 	},
 	{
 		name: "120x40 terminal with 18x24 cells",
 		terminal: { columns: 120, rows: 40 },
 		cell: { widthPx: 18, heightPx: 24 },
-		expected: { imageColumns: 3, imageRows: 2, renderedWidth: 116, cursor: "\x1b[38;117H" },
+		expected: { imageColumns: 3, imageRows: 3, renderedWidth: 116, cursor: "\x1b[38;117H" },
 	},
 ] as const;
 
@@ -230,7 +230,7 @@ describe("GajaePetWidget", () => {
 
 			setCellDimensions({ widthPx: 12, heightPx: 24 });
 			vi.advanceTimersByTime(100);
-			expect(getEmitter()?.()).toContain("width=4;height=2");
+			expect(getEmitter()?.()).toContain("width=4;height=3");
 
 			setTerminalSize(12, 30);
 			expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");

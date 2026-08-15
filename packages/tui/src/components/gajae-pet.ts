@@ -655,10 +655,10 @@ export interface GajaePixelFrames {
  * - `rows = ceil(scaledSpriteHeightPx / cellHeightPx)`
  * - the square sprite is centered in a `columns * cellWidthPx` PNG canvas
  *
- * iTerm2 receives unitless `width=columns;height=rows`, so it resolves the
- * reserved block with its live cell metrics. The padded PNG has that block's
- * pixel aspect ratio, allowing `preserveAspectRatio=0` without stretching the
- * authored square sprite. Kitty and Sixel retain their protocol-specific paths.
+ * iTerm2 receives unitless `width=columns;height=rasterRows`, so it resolves the
+ * padded block with its live cell metrics. The PNG has that block's pixel aspect
+ * ratio, allowing `preserveAspectRatio=0` without stretching the authored square
+ * sprite. Kitty and Sixel retain their protocol-specific paths.
  */
 export function buildGajaePixelFrames(options: {
 	protocol: "sixel" | "kitty" | "iterm2";
@@ -672,7 +672,7 @@ export function buildGajaePixelFrames(options: {
 	kittyImageId?: number;
 	/** Additional transparent iTerm2-only top padding for sub-cell vertical alignment. */
 	iterm2TopPaddingPx?: number;
-	/** Transparent iTerm2-only bottom padding inside the two-row canvas. */
+	/** Transparent iTerm2-only bottom padding inside the canvas. */
 	iterm2BottomPaddingPx?: number;
 	/** Color skin for the sprite palette (default "red"). */
 	skin?: PetSkinId;
@@ -713,9 +713,14 @@ export function buildGajaePixelFrames(options: {
 	const canvasWidthPx = widthPx + leftPaddingPx + rightPaddingPx;
 	// When minimum 1x art is taller than targetRows (only possible with tiny
 	// cells), top-pad iTerm2 to the full reserved row block. Its unitless OSC
-	// height then maps the PNG 1:1 without vertically stretching the sprite.
+	// height then maps the PNG 1:1 without vertically stretching the authored square sprite.
 	const iterm2TopPaddingPx =
 		allocatedHeightPx - visibleHeightPx + (options.protocol === "iterm2" ? (options.iterm2TopPaddingPx ?? 0) : 0);
+	const protocolHeightPx =
+		options.protocol === "iterm2"
+			? visibleHeightPx + iterm2TopPaddingPx + (options.iterm2BottomPaddingPx ?? 0)
+			: heightPx;
+	const rasterRows = Math.ceil(protocolHeightPx / options.cellHeightPx);
 	if (
 		widthPx > MAX_PET_FRAME_DIMENSION ||
 		heightPx > MAX_PET_FRAME_DIMENSION ||
@@ -736,7 +741,7 @@ export function buildGajaePixelFrames(options: {
 							grid,
 							scale,
 							columns,
-							rows,
+							rasterRows,
 							iterm2TopPaddingPx,
 							options.iterm2BottomPaddingPx ?? 0,
 							leftPaddingPx,
@@ -757,10 +762,7 @@ export function buildGajaePixelFrames(options: {
 						);
 	}
 
-	const protocolHeightPx =
-		options.protocol === "iterm2"
-			? visibleHeightPx + iterm2TopPaddingPx + (options.iterm2BottomPaddingPx ?? 0)
-			: heightPx;
+
 	return {
 		frames,
 		protocol: options.protocol,
@@ -768,6 +770,6 @@ export function buildGajaePixelFrames(options: {
 		heightPx: protocolHeightPx,
 		columns,
 		rows,
-		rasterRows: Math.ceil(protocolHeightPx / options.cellHeightPx),
+		rasterRows,
 	};
 }
