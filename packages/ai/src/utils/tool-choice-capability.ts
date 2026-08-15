@@ -147,23 +147,23 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 			};
 		} catch (error) {
 			if (!(error && typeof error === "object" && (error as { code?: unknown }).code === "EEXIST")) return;
+			const claimPath = `${lockPath}.${crypto.randomUUID()}.claim`;
 			try {
-				const lockOwner = fs.readFileSync(lockPath, "utf8");
+				fs.linkSync(lockPath, claimPath);
+				const lockOwner = fs.readFileSync(claimPath, "utf8");
 				const ownerPid = Number(lockOwner.split(":", 1)[0]);
 				const ownerIsAlive = Number.isSafeInteger(ownerPid) && ownerPid > 0 && isProcessAlive(ownerPid);
 				const staleOwner =
-					!ownerIsAlive && Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS;
+					!ownerIsAlive && Date.now() - fs.statSync(claimPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS;
 				if (staleOwner) {
-					const reapingPath = `${lockPath}.${crypto.randomUUID()}.reaping`;
-					try {
-						fs.renameSync(lockPath, reapingPath);
-						fs.rmSync(reapingPath, { force: true });
-					} catch {
-						// Another waiter won the atomic takeover race.
-					}
+					const current = fs.statSync(lockPath);
+					const claimed = fs.statSync(claimPath);
+					if (current.dev === claimed.dev && current.ino === claimed.ino) fs.rmSync(lockPath, { force: true });
 				}
 			} catch {
-				// The lock holder released the file while it was being inspected.
+				// The lock changed while this waiter was taking its identity-bound claim.
+			} finally {
+				fs.rmSync(claimPath, { force: true });
 			}
 			Atomics.wait(sleeper, 0, 0, 10);
 		}
