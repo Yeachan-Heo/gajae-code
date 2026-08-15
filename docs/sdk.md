@@ -326,7 +326,7 @@ Correlated `agent_end` and `agent_failed` frames carry the same finalized
 `outcome`. Clients must correlate those frames and Q26 by the prompt identifiers,
 not infer terminality from stream activity or an earlier pending claim.
 
-Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity/TTL, subject to crash-consistent fsync. A non-terminal prompt record at restart finalizes its pending outcome and receipt state. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are retained for 15 minutes, capped at 256 per kind, and evicted oldest-terminal first. Reconciliation stores no prompt, transcript, credential, or provider-response body.
+Reconciliation state survives client disconnect/reconnect. With the session-private durable store (`.sdk-reconciliation/`), accepted and terminal prompt records also survive **GJC session-process restart** for the same session identity within capacity, subject to crash-consistent fsync. A non-terminal prompt record at restart finalizes its pending outcome and receipt state. A stopped prompt without receipt evidence becomes `terminal_ok + missing`; failed prompt or skill settlement without body evidence becomes `unknown`. Eviction or absence still returns honest `unknown`; that means the prior outcome is unknowable, not that execution did not occur. Active records are capped at 128 per kind and are never aged into terminal. Terminal records are capped at 256 per kind and evicted oldest-terminal first, with no age-based eviction. Reconciliation stores no prompt, transcript, credential, or provider-response body.
 
 `turn.prompt` remains ordered and non-idempotent. Its envelope `idempotencyKey`
 does not replay a response or produce `idempotency_conflict`. A retained duplicate
@@ -361,7 +361,7 @@ durable/preflight accept (SDK control path), not after skill completion. Query p
 status with `Q26` / `turn.result` and `kind: "skill"`. `skill.invoke_status`
 remains a legacy skill-only alias that injects the same `kind`. Kind-scoped indexes
 mean prompt and skill `clientRef` values never collide. Skill records use the same
-capacity/TTL limits, but an active skill record at restart settles with
+capacity/retention limits, but an active skill record at restart settles with
 `error.code = process_restart`.
 
 ## Correlated steer acknowledgement (Q30)
@@ -374,7 +374,7 @@ Replay the same `clientRef` with the same text to recover the retained result wi
 { "type": "query_request", "query": "turn.steer_status", "input": { "clientRef": "steer-018f" } }
 ```
 
-Q31 returns `accepted`, `rejected`, `uncertain`, or `unknown` and never dispatches work. Settled steer records share the 15-minute/256-record retention bound; live dispatching records are not terminal-evicted. Existing uncorrelated `turn.steer` calls retain their legacy non-idempotent behavior. Version-1 reconciliation remains additive, and only digest plus bounded metadata is stored—never steer text.
+Q31 returns `accepted`, `rejected`, `uncertain`, or `unknown` and never dispatches work. Settled steer records share the 256-record oldest-terminal-first capacity bound with no age-based eviction; live dispatching records are not terminal-evicted. Existing uncorrelated `turn.steer` calls retain their legacy non-idempotent behavior. Version-1 reconciliation remains additive, and only digest plus bounded metadata is stored—never steer text.
 
 ## Model profile discovery and validation (Q27)
 

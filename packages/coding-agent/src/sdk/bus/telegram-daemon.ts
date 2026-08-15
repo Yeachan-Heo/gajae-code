@@ -88,6 +88,11 @@ import {
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 } from "./html-format";
+import {
+	InboundReactionSequencer,
+	inboundReactionRetractPayload,
+	inboundReactionSetPayload,
+} from "./inbound-reaction-ordering";
 import type { SessionCloseTarget, SessionCreateTarget, SessionResumeTarget } from "./index";
 import {
 	formatLifecycleOutcome,
@@ -3992,6 +3997,17 @@ export class TelegramUpdatePoller {
 }
 
 /** Mutable dispatch state shared by session frames and inbound Telegram updates. */
+export type InboundReactionAction = "none" | "queued" | "consumed" | "retract";
+
+/** Exact daemon reaction correction for a session-side inbound acknowledgement. */
+export function inboundReactionAction(state: unknown, hasTarget: boolean): InboundReactionAction {
+	if (!hasTarget) return "none";
+	if (state === "accepted") return "queued";
+	if (state === "consumed") return "consumed";
+	if (state === "rejected" || state === "dropped") return "retract";
+	return "none";
+}
+
 export class TelegramEventDispatchState {
 	readonly busy = new Set<string>();
 	readonly inboundReactions = new Map<
@@ -4609,6 +4625,8 @@ export class TelegramNotificationDaemon {
 	> {
 		return this.dispatchState.inboundReactions;
 	}
+	/** Per-update inbound reaction ordering: serialized transitions, terminal states monotonic. */
+	readonly #inboundReactions = new InboundReactionSequencer();
 	/** SDK-owned service is the sole lifecycle executor and terminal authority. */
 	readonly #lifecycleService: AgentDirSessionLifecycleService;
 	/** Attempt tombstones live for the daemon lifetime so a commit key can never send twice. */
@@ -5589,14 +5607,19 @@ export class TelegramNotificationDaemon {
 				name: "inbound_ack",
 				matches: msg => msg.type === "inbound_ack" && typeof msg.updateId === "number",
 				handle: async (session, msg) => {
-					const target = this.inboundReactions.get(msg.updateId as number);
-					if (target && msg.state === "consumed") {
-						this.inboundReactions.delete(msg.updateId as number);
-						await this.setReaction(
-							target.messageId,
-							CONSUMED_REACTION,
-							target.socketLease ?? this.#socketLease(session),
-						);
+					const updateId = msg.updateId as number;
+					const target = this.inboundReactions.get(updateId);
+					const action = inboundReactionAction(msg.state, target !== undefined);
+					if (!target || action === "none") return;
+					if (action === "queued") {
+						// Nonterminal: leave the correction target installed for the eventual
+						// consumed/retract ack, but skip a stale eyes once a terminal state
+						// already ran for this update (see #inboundReactionSequencer).
+						await this.#applyInboundReaction(updateId, target, QUEUED_REACTION, false, session);
+					} else if (action === "consumed") {
+						await this.#applyInboundReaction(updateId, target, CONSUMED_REACTION, true, session);
+					} else if (action === "retract") {
+						await this.#applyInboundReaction(updateId, target, "", true, session);
 					}
 				},
 			})
@@ -9897,14 +9920,54 @@ export class TelegramNotificationDaemon {
 		if ((socketLease && !this.#leaseTokenAllows(socketLease)) || !(await this.pairedChatIsPrivate())) return;
 		try {
 			if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
-			await this.botApi.call("setMessageReaction", {
-				chat_id: this.opts.chatId,
-				message_id: messageId,
-				reaction: [{ type: "emoji", emoji }],
-			});
+			await this.botApi.call("setMessageReaction", inboundReactionSetPayload(this.opts.chatId, messageId, emoji));
 		} catch {
 			// Best-effort: reactions may be disallowed in the chat; never throw.
 		}
+	}
+
+	/**
+	 * Retract a native reaction by sending the empty reaction list the Bot API
+	 * requires; an empty `emoji` string is not a valid reaction and is silently
+	 * rejected, leaving the stale queued marker visible.
+	 */
+	private async retractReaction(
+		messageId: number,
+		socketLease?: { session: AttachmentSession; token: number; logicalSessionId: string },
+	): Promise<void> {
+		if ((socketLease && !this.#leaseTokenAllows(socketLease)) || !(await this.pairedChatIsPrivate())) return;
+		try {
+			if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
+			await this.botApi.call("setMessageReaction", inboundReactionRetractPayload(this.opts.chatId, messageId));
+		} catch {
+			// Best-effort: reactions may be disallowed in the chat; never throw.
+		}
+	}
+
+	/**
+	 * Serialize and order inbound reaction transitions per update id through the
+	 * shared {@link InboundReactionSequencer}: Bot API calls stay ordered and a
+	 * late queued marker can never overwrite a terminal consumed/retraction.
+	 */
+	async #applyInboundReaction(
+		updateId: number,
+		target: {
+			messageId: number;
+			socketLease?: { session: AttachmentSession; token: number; logicalSessionId: string };
+		},
+		emoji: string,
+		terminal: boolean,
+		session: AttachmentSession,
+	): Promise<void> {
+		const lease = target.socketLease ?? this.#socketLease(session);
+		await this.#inboundReactions.apply(updateId, {
+			terminal,
+			effect: async () => {
+				if (emoji === "") await this.retractReaction(target.messageId, lease);
+				else await this.setReaction(target.messageId, emoji, lease);
+				if (terminal) this.inboundReactions.delete(updateId);
+			},
+		});
 	}
 
 	private startTypingTimer(): void {
@@ -12426,37 +12489,40 @@ export class TelegramNotificationDaemon {
 							}),
 						);
 						await this.rememberSeenUpdateId(inbound.updateId);
-						if (inbound.messageId !== undefined)
-							await this.setReaction(inbound.messageId, QUEUED_REACTION, routeLease);
+						// Ask replies have native claim/rejection feedback but no correlated
+						// inbound_ack id. Never show an optimistic queued reaction that a
+						// fenced or suspended host cannot retract.
 						return;
 					}
 					if (!routeAllows()) return;
-					await session.transport.send(
-						JSON.stringify(
-							cfg
-								? { type: "config_command", sessionId: inbound.sessionId, ...cfg }
-								: {
-										type: "user_message",
-										sessionId: inbound.sessionId,
-										text: injectedText,
-										updateId: inbound.updateId,
-										threadId: inbound.threadId,
-										images,
-									},
-						),
-					);
-					await this.rememberSeenUpdateId(inbound.updateId);
-					// User turns get a native delivery double-check: queued on receipt,
-					// flipped to consumed when the session acks the turn that picks it
-					// up. Config commands are not user turns and get no reaction.
+					// Install the correction target before transport send: the local host
+					// can answer quickly enough for inbound_ack to race this await.
 					if (!cfg && inbound.messageId !== undefined) {
-						if (!routeAllows()) return;
 						this.inboundReactions.set(inbound.updateId, {
 							messageId: inbound.messageId,
 							socketLease: routeLease,
 						});
-						await this.setReaction(inbound.messageId, QUEUED_REACTION, routeLease);
 					}
+					try {
+						await session.transport.send(
+							JSON.stringify(
+								cfg
+									? { type: "config_command", sessionId: inbound.sessionId, ...cfg }
+									: {
+											type: "user_message",
+											sessionId: inbound.sessionId,
+											text: injectedText,
+											updateId: inbound.updateId,
+											threadId: inbound.threadId,
+											images,
+										},
+							),
+						);
+					} catch (error) {
+						if (!cfg) this.inboundReactions.delete(inbound.updateId);
+						throw error;
+					}
+					await this.rememberSeenUpdateId(inbound.updateId);
 				}
 				return;
 			}

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@gajae-code/agent-core";
@@ -119,6 +119,48 @@ describe("AgentSession manual retry", () => {
 		expect(mock.calls.length).toBe(2);
 		expect(lastAgentMessage(session).stopReason).toBe("stop");
 		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "recovered after manual retry" });
+	});
+
+	it("does not start a retry deferred behind selection after abort", async () => {
+		const model = getTestModel();
+		const mock = createMockModel({ responses: [{ throw: "manual retry test failure" }] });
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const modelRegistry = new ModelRegistry(authStorage);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+		await session.prompt("fail once");
+		await session.waitForIdle();
+		const selectionModel = { ...model, id: "selection-holds-retry" };
+		const selectionValidationStarted = Promise.withResolvers<void>();
+		const releaseSelectionValidation = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		spyOn(modelRegistry, "getApiKey").mockImplementation(async (selectedModel, ...args) => {
+			if (selectedModel === selectionModel) {
+				selectionValidationStarted.resolve();
+				await releaseSelectionValidation.promise;
+			}
+			return originalGetApiKey(selectedModel, ...args);
+		});
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined);
+		await selectionValidationStarted.promise;
+		await expect(session.retry()).resolves.toBe(true);
+		await session.abort();
+		releaseSelectionValidation.resolve();
+		await selection;
+		await session.waitForIdle();
+
+		expect(mock.calls.length).toBe(1);
+		expect(session.model).toBe(selectionModel);
 	});
 
 	it("continues from a persisted user tail left by a process crash", async () => {

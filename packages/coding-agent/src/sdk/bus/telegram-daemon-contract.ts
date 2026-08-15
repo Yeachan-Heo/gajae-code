@@ -269,8 +269,12 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * generator's post-fix manifest check always byte-compares the regenerated disk
  * manifest against the current tree, and auto-reaps pre-registry legacy stray
  * Telegram daemons (#4533).
+ * Generation 168 adds per-update inbound acknowledgement authority and monotonic
+ * reaction settlement for Telegram notification delivery (#4528).
+ * Generation 169 delivers every ring-positioned session event live through the
+ * bounded, capability-gated directed subscriber leg used by replay.
  */
-export const DAEMON_GENERATION = 167;
+export const DAEMON_GENERATION = 169;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

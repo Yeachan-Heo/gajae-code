@@ -521,13 +521,15 @@ describe("AgentSession mid-run maintenance outcomes", () => {
 			{ role: "user", content: "second distinct steering", timestamp: Date.now() },
 		]);
 
-		// With protectRecentTurns: 2 (default), the session manager's canonical
-		// entry ordering places the large orphan tool results inside the fence
-		// window, so they are not eligible for pruning — maintenance falls
-		// through to compaction. The short-circuit extension produces a
-		// compaction entry that preserves the recent paired result and steering.
+		// Canonical entry order equals emission order, so the three large orphan
+		// tool results land before the recent user turns and sit outside the
+		// protectRecentTurns: 2 fence. They are therefore prunable, and prune —
+		// the cheaper preferred rewrite — legitimately wins over compaction.
+		// The assertions below prove the fence classification is what changed:
+		// the protected paired result and both steering messages survive the
+		// rewrite, and the codex provider epoch is still reset.
 		const outcome = await session.runMidRunMaintenanceForTests(contextOf(session));
-		expect(outcome).toBe("compacted");
+		expect(outcome).toBe("pruned");
 		const persisted = session.sessionManager
 			.getBranch()
 			.flatMap(entry =>

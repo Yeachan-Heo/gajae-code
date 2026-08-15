@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 /**
  * Kind-aware invocation reconciliation (prompt | skill) with optional durable store.
- * Preserves Q26 admit/first-terminal/capacity/TTL semantics; indexes and caps are per-kind.
+ * Preserves Q26 admit/first-terminal/capacity semantics; indexes and caps are per-kind.
  */
 
 import { sanitizePromptFailure } from "../prompt-failure";
@@ -12,7 +12,6 @@ import { sanitizeTurnResultContent, type TurnResultContent, type TurnResultPage 
 import {
 	PROMPT_RECONCILIATION_ACTIVE_CAPACITY,
 	PROMPT_RECONCILIATION_TERMINAL_CAPACITY,
-	PROMPT_RECONCILIATION_TERMINAL_TTL_MS,
 	type PromptCorrelation,
 } from "./prompt-reconciliation";
 import type {
@@ -130,11 +129,6 @@ export function createKindAwareReconciliation(
 	};
 
 	const cleanupRecords = (source: Map<string, DurableReconciliationRecord>) => {
-		const at = now();
-		for (const [key, record] of source) {
-			const terminalAt = record.kind === "steer" ? record.settledAt : record.terminalAt;
-			if (terminalAt !== undefined && terminalAt + PROMPT_RECONCILIATION_TERMINAL_TTL_MS <= at) source.delete(key);
-		}
 		for (const kind of ["prompt", "skill"] as const) {
 			const terminalEntries = [...source.entries()].filter(
 				([, record]) => record.kind === kind && record.terminalAt !== undefined,

@@ -14,14 +14,14 @@
  * - The clientRef index is scoped to one live session runtime: identical refs
  *   may coexist in different sessions, lookups never cross sessions, a ref
  *   conflicts only while its record is retained (`client_ref_conflict`), and
- *   after terminal TTL/capacity eviction a ref may be admitted again with the
+ *   after terminal capacity eviction a ref may be admitted again with the
  *   prior outcome unknown — callers MUST NOT reuse a clientRef as a retry
  *   mechanism and MUST treat `unknown` as uncertainty, not proof of
  *   non-execution.
  * - Prompt records survive process restart: an active prompt is finalized from its
  *   durable pending outcome, or as `prompt_failed` when it has none. Only skill
  *   records settle as `process_restart`, and a lookup reports `unknown` only after
- *   retained-record TTL/capacity eviction.
+ *   retained-record capacity eviction.
  * - Q26 tracks prompts accepted through the SDK control surface (which always
  *   carries a requesting connection); submissions without a delivery owner are
  *   outside the reconciliation contract and hold no reservation.

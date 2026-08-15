@@ -117,7 +117,7 @@ adapter dispositions up front and never renders endpoint-disclosure results.
 ## Lossless prompt results
 
 `turn.result` with `kind: "prompt"` reports `accepted`, `in_flight`,
-`terminal_ok`, or `failed`; only retained-record TTL/capacity eviction yields
+`terminal_ok`, or `failed`; only retained-record capacity eviction yields
 `unknown`. `turn.prompt_status` remains a legacy prompt-only alias. A prompt
 that is active at process restart is finalized from its durable pending outcome
 (or `prompt_failed` when it has none), so it never reports as `unknown` while a

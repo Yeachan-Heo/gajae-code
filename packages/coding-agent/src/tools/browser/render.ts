@@ -42,7 +42,7 @@ interface BrowserRenderContext {
 
 function describeBrowser(args: BrowserRenderArgs, details: BrowserToolDetails | undefined): string | undefined {
 	if (args.app?.cdp_url) return `connected ${args.app.cdp_url}`;
-	if (args.app?.browser === "chrome") return `Chrome profile ${args.app.profile_directory ?? "<profile>"}`;
+	if (args.app?.browser === "chrome") return `Chrome profile ${args.app.profile_directory ?? "Default"}`;
 	if (args.app?.path) return `spawned ${shortenPath(args.app.path)}`;
 	switch (details?.browser) {
 		case "headless":
@@ -54,6 +54,13 @@ function describeBrowser(args: BrowserRenderArgs, details: BrowserToolDetails | 
 		default:
 			return undefined;
 	}
+}
+
+export function describeBrowserForTest(
+	args: BrowserRenderArgs,
+	details: BrowserToolDetails | undefined,
+): string | undefined {
+	return describeBrowser(args, details);
 }
 
 function tabLabel(args: BrowserRenderArgs, details: BrowserToolDetails | undefined): string {

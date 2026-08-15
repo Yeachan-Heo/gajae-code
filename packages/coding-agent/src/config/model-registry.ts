@@ -11,6 +11,7 @@ import {
 	type Context,
 	codexContextOverrideKey,
 	createModelManager,
+	Effort,
 	enrichModelThinking,
 	getBundledModels,
 	getBundledProviders,
@@ -34,9 +35,10 @@ import {
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
 
-// Sentinel for local-only OAuth token (LM Studio, vLLM) — declared inline to avoid loading
-// any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts.
-const DEFAULT_LOCAL_TOKEN = "lm-studio-local";
+// Sentinels for local-only OAuth tokens (LM Studio/vLLM, oMLX) — declared inline to avoid loading
+// any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts and
+// oauth/omlx.ts respectively.
+const LOCAL_TOKEN_SENTINELS = new Set(["lm-studio-local", "omlx-local"]);
 
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
@@ -109,6 +111,38 @@ function stripUrlQuery(value: string): string {
 	const fragmentStart = value.indexOf("#", queryStart);
 	return value.slice(0, queryStart) + (fragmentStart < 0 ? "" : value.slice(fragmentStart));
 }
+/**
+ * First finite positive number among OpenAI models-list context-window fields,
+ * else undefined (caller applies its own fallbacks). Mirrors the
+ * firstPositiveModelNumber precedence in @gajae-code/ai discovery so a
+ * malformed catalog value (`1e400` -> Infinity, zero, negative) can never
+ * poison compaction thresholds.
+ */
+function toPositiveFiniteNumber(value: number | undefined): number | undefined {
+	if (value === undefined || !Number.isFinite(value) || value <= 0) return undefined;
+	return value;
+}
+
+function isOmlxReasoningModelId(modelId: string): boolean {
+	const normalized = modelId.toLowerCase();
+	return (
+		normalized.includes("qwen") ||
+		normalized.includes("deepseek") ||
+		normalized.includes("qwq") ||
+		normalized.includes("thinking") ||
+		normalized.includes("reason") ||
+		normalized.includes("r1")
+	);
+}
+
+const OMLX_REASONING_EFFORT_MAP = {
+	minimal: "low",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "max",
+	max: "max",
+} as const;
 
 function envAvailabilityFingerprint(): string {
 	return Object.entries(process.env)
@@ -1393,6 +1427,7 @@ export class ModelRegistry {
 				["OLLAMA_BASE_URL", Bun.env.OLLAMA_BASE_URL || ""],
 				["LLAMA_CPP_BASE_URL", Bun.env.LLAMA_CPP_BASE_URL || ""],
 				["LM_STUDIO_BASE_URL", Bun.env.LM_STUDIO_BASE_URL || ""],
+				["OMLX_BASE_URL", Bun.env.OMLX_BASE_URL || ""],
 			],
 			providerBaseUrls: [...providerBaseUrlEnvKeys].sort().map(name => [name, Bun.env[name] ?? ""]),
 		});
@@ -1686,7 +1721,9 @@ export class ModelRegistry {
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
 		const liveBaseUrl =
-			providerConfig.discovery.type === "openai-models-list" || providerConfig.discovery.type === "lm-studio"
+			providerConfig.discovery.type === "openai-models-list" ||
+			providerConfig.discovery.type === "lm-studio" ||
+			providerConfig.discovery.type === "omlx"
 				? this.#normalizeOpenAIModelsListBaseUrl(
 						this.#getProviderBaseUrlForDiscovery(providerConfig.provider) ?? providerConfig.baseUrl,
 					)
@@ -1710,7 +1747,9 @@ export class ModelRegistry {
 		});
 	}
 	#sanitizeDiscoverableModelsForCache(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		return providerConfig.discovery.type === "openai-models-list" || providerConfig.discovery.type === "lm-studio"
+		return providerConfig.discovery.type === "openai-models-list" ||
+			providerConfig.discovery.type === "lm-studio" ||
+			providerConfig.discovery.type === "omlx"
 			? this.#stripModelBaseUrlQueries(models)
 			: models;
 	}
@@ -1763,6 +1802,41 @@ export class ModelRegistry {
 			this.#optionalAuthProviders.add("lm-studio");
 			this.#keylessProviders.add("lm-studio");
 		}
+		if (
+			!configuredProviders.has("omlx") &&
+			!disabledProviders.has("omlx") &&
+			// oMLX's documented default port is 8000 (jundot/omlx ServerConfig.port=8000). Probe
+			// implicitly only when the endpoint is explicit or oMLX actually lives on its own
+			// default — never silently duplicate llama.cpp's 127.0.0.1:8080 probe.
+			(Bun.env.OMLX_BASE_URL !== undefined ||
+				!this.#llamaCppOwnsImplicitEndpoint(configuredProviders, disabledProviders))
+		) {
+			this.#discoveryManager.addProvider({
+				provider: "omlx",
+				api: "openai-completions",
+				baseUrl: Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8000/v1",
+				discovery: { type: "omlx" },
+				optional: true,
+			});
+			// Implicit oMLX auth is optional and may be added after startup.
+			this.#optionalAuthProviders.add("omlx");
+			this.#keylessProviders.add("omlx");
+		}
+	}
+
+	/**
+	 * True when llama.cpp's implicit endpoint would be the same URL oMLX would probe, so an
+	 * implicit oMLX registration would only duplicate llama.cpp traffic (and misattribute its
+	 * models). oMLX then requires an explicit OMLX_BASE_URL before it probes anything.
+	 */
+	#llamaCppOwnsImplicitEndpoint(
+		configuredProviders: ReadonlySet<string>,
+		disabledProviders: ReadonlySet<string>,
+	): boolean {
+		if (configuredProviders.has("llama.cpp") || disabledProviders.has("llama.cpp")) return false;
+		return (
+			(Bun.env.LLAMA_CPP_BASE_URL || "http://127.0.0.1:8080") === (Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8000")
+		);
 	}
 
 	#loadCustomModels(): CustomModelsResult {
@@ -2454,6 +2528,7 @@ export class ModelRegistry {
 			case "llama.cpp":
 				return this.#discoverLlamaCppModels(providerConfig, apiKey);
 			case "lm-studio":
+			case "omlx":
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
 			case "models-dev":
@@ -2778,7 +2853,7 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (apiKey && !LOCAL_TOKEN_SENTINELS.has(apiKey) && apiKey !== kNoAuth) {
 			headers.Authorization = `Bearer ${apiKey}`;
 		}
 		const response = await fetch(tagsUrl, {
@@ -2858,7 +2933,7 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (apiKey && !LOCAL_TOKEN_SENTINELS.has(apiKey) && apiKey !== kNoAuth) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
@@ -2979,7 +3054,7 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider, undefined, { baseUrl }));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (apiKey && !LOCAL_TOKEN_SENTINELS.has(apiKey) && apiKey !== kNoAuth) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
@@ -2998,7 +3073,17 @@ export class ModelRegistry {
 			throw new Error(`HTTP ${response.status} from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
 		const payload = (await response.json()) as {
-			data?: Array<{ id: string; name?: string; context_length?: number }>;
+			// oMLX /v1/models entries serve max_model_len (jundot/omlx ModelInfo);
+			// LM Studio serves max_context_length; other servers serve
+			// context_length. First present value wins, mirroring
+			// fetchOpenAICompatibleModels in @gajae-code/ai.
+			data?: Array<{
+				id: string;
+				name?: string;
+				context_length?: number;
+				max_model_len?: number;
+				max_context_length?: number;
+			}>;
 		};
 		const models = payload.data ?? [];
 		const discovered: Model<Api>[] = [];
@@ -3007,6 +3092,8 @@ export class ModelRegistry {
 			if (!id) continue;
 			const referenceModel = resolveCustomModelReference(id);
 			const api = this.#resolveDiscoveredModelApi(providerConfig, id);
+			// For oMLX, apply reasoning settings + 128K context to all models regardless of model ID
+			const isOmlxProvider = providerConfig.discovery.type === "omlx";
 			discovered.push(
 				enrichModelThinking({
 					id,
@@ -3014,12 +3101,21 @@ export class ModelRegistry {
 					api,
 					provider: providerConfig.provider,
 					baseUrl: requestBaseUrl,
-					reasoning: referenceModel?.reasoning ?? false,
-					thinking: referenceModel?.thinking,
+					reasoning: referenceModel?.reasoning ?? isOmlxProvider,
+					thinking:
+						referenceModel?.thinking ??
+						(isOmlxProvider ? { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max } : undefined),
 					input: referenceModel?.input ?? ["text"],
 					output: referenceModel?.output,
 					cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: item.context_length ?? referenceModel?.contextWindow ?? UNK_CONTEXT_WINDOW,
+					contextWindow:
+						isOmlxProvider
+							? 131072
+							: toPositiveFiniteNumber(item.max_model_len) ??
+								  toPositiveFiniteNumber(item.max_context_length) ??
+								  toPositiveFiniteNumber(item.context_length) ??
+								  referenceModel?.contextWindow ??
+								  UNK_CONTEXT_WINDOW,
 					maxTokens: referenceModel?.maxTokens ?? UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
 					compat: {
@@ -3027,6 +3123,12 @@ export class ModelRegistry {
 						supportsStore: false,
 						supportsDeveloperRole: false,
 						supportsReasoningEffort: false,
+						...(isOmlxProvider
+							? {
+									thinkingFormat: "qwen-chat-template" as const,
+									reasoningEffortMap: OMLX_REASONING_EFFORT_MAP,
+							  }
+							: {}),
 					},
 				}),
 			);
@@ -3823,7 +3925,9 @@ export class ModelRegistry {
 					this.#normalizeDiscoveryEvidenceEndpoint(
 						discoveryType === "ollama"
 							? `${this.#normalizeOllamaBaseUrl(baseUrl)}/v1`
-							: discoveryType === "openai-models-list" || discoveryType === "lm-studio"
+							: discoveryType === "openai-models-list" ||
+									discoveryType === "lm-studio" ||
+									discoveryType === "omlx"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
 								: (baseUrl ?? ""),
 					);

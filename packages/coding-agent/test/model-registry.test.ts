@@ -3660,6 +3660,83 @@ describe("ModelRegistry", () => {
 			);
 			expect(disabledProbeUrls).toEqual([]);
 		});
+		test("implicit omlx discovery probes port 8000 and stays off llama.cpp's 8080", async () => {
+			const restoreBase = unsetEnvForTest("OMLX_BASE_URL");
+			const restoreLlama = unsetEnvForTest("LLAMA_CPP_BASE_URL");
+			try {
+				const requestedUrls: string[] = [];
+				using _hook = hookFetch(input => {
+					requestedUrls.push(String(input));
+					return new Response(JSON.stringify({ data: [{ id: "Qwen3.6-35B-A3B-4bit", max_model_len: 262144 }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refresh("online");
+
+				// oMLX owns 8000 (jundot/omlx ServerConfig.port) and must register its
+				// own discovery entry; llama.cpp separately probes its own 8080, which
+				// is not oMLX traffic.
+				expect(requestedUrls).toContain("http://127.0.0.1:8000/v1/models");
+				expect(registry.getDiscoverableProviders()).toContain("omlx");
+				// The mapper maps max_model_len -> contextWindow and keeps the id
+				// fallback for name.
+				const model = registry.find("omlx", "Qwen3.6-35B-A3B-4bit");
+				expect(model?.contextWindow).toBe(262144);
+				expect(model?.name).toBe("Qwen3.6-35B-A3B-4bit");
+				expect(model).toMatchObject({
+					reasoning: true,
+					thinking: { mode: "effort", minLevel: "minimal", maxLevel: "max" },
+					compat: {
+						thinkingFormat: "qwen-chat-template",
+						reasoningEffortMap: { xhigh: "max", max: "max" },
+					},
+				});
+			} finally {
+				restoreBase();
+				restoreLlama();
+			}
+		});
+		test("implicit omlx discovery is suppressed when llama.cpp owns the endpoint", async () => {
+			const restoreBase = unsetEnvForTest("OMLX_BASE_URL");
+			const restoreLlama = setEnvForTest("LLAMA_CPP_BASE_URL", "http://127.0.0.1:8000");
+			try {
+				using _hook = hookFetch(() => {
+					throw new Error("no implicit omlx probe is allowed when llama.cpp owns the endpoint");
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				expect(registry.getDiscoverableProviders()).not.toContain("omlx");
+			} finally {
+				restoreBase();
+				restoreLlama();
+			}
+		});
+		test("omlx-local sentinel never becomes an Authorization Bearer header", async () => {
+			const restoreBase = unsetEnvForTest("OMLX_BASE_URL");
+			try {
+				await authStorage.set("omlx", [{ type: "api_key", key: "omlx-local" }]);
+				let sawAuthorization: string | undefined;
+				using _hook = hookFetch((_input, init) => {
+					sawAuthorization = (init?.headers as Record<string, string> | undefined)?.Authorization;
+					return new Response(JSON.stringify({ data: [{ id: "omlx-model", max_model_len: 131072 }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("omlx", "online");
+
+				expect(sawAuthorization).toBeUndefined();
+				expect(registry.find("omlx", "omlx-model")).toBeDefined();
+				await authStorage.set("omlx", []);
+			} finally {
+				restoreBase();
+			}
+		});
 		test("rebuilds implicit discovery when disabled providers change without models.json", async () => {
 			await Settings.init({
 				inMemory: true,

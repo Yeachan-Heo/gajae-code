@@ -1,7 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { Agent } from "@gajae-code/agent-core";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
+import type {
+	AgentContext,
+	AgentEvent,
+	AgentLoopConfig,
+	AgentMessage,
+	AgentTool,
+	ManagedAttemptOutcome,
+} from "@gajae-code/agent-core/types";
 import type { AssistantMessage, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
@@ -56,6 +63,10 @@ function escapedTurnWithText(id: string) {
 /** The same turn as the model would have produced it with literal UTF-8 on the wire. */
 function literalTurn(id: string) {
 	return { content: [{ type: "toolCall" as const, id, name: "ask", arguments: { question: QUESTION } }] };
+}
+
+function literalTurnWithText(id: string) {
+	return { content: [{ type: "text" as const, text: "I will ask." }, ...literalTurn(id).content] };
 }
 
 const PROVIDER_USAGE = {
@@ -462,6 +473,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
 		const mock = createMockModel({ responses: [literalTurn("tc-abort")] });
 		const controller = new AbortController();
+		const events: AgentEvent[] = [];
 		const config: AgentLoopConfig = {
 			model: mock.model,
 			convertToLlm: identityConverter,
@@ -471,11 +483,115 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		};
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, controller.signal, mock.stream);
-		for await (const _event of stream) {
-			// drain
+		for await (const event of stream) events.push(event);
+
+		expect(executions).toBe(0);
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds).toHaveLength(1);
+		expect(assistantEnds[0]?.message.role === "assistant" ? assistantEnds[0].message.stopReason : undefined).toBe(
+			"aborted",
+		);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "tool_execution_start")).toHaveLength(1);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds).toHaveLength(1);
+		expect(toolEnds[0]?.isError).toBe(true);
+	});
+
+	it("publishes a retained visible-text terminal exactly once after callback abort", async () => {
+		let executions = 0;
+		const tool: AgentTool<typeof askSchema, Record<string, never>> = {
+			...askTool([]),
+			async execute() {
+				executions += 1;
+				return { content: [{ type: "text", text: "answered" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({ responses: [literalTurnWithText("tc-visible-abort")] });
+		const controller = new AbortController();
+		const callbackTypes: string[] = [];
+		const events: AgentEvent[] = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			onAssistantMessageEvent: (_message, event) => {
+				callbackTypes.push(event.type);
+				if (event.type === "toolcall_end") controller.abort();
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, controller.signal, mock.stream);
+		for await (const event of stream) events.push(event);
+
+		expect(executions).toBe(0);
+		expect(callbackTypes).toEqual([
+			"text_start",
+			"text_delta",
+			"text_end",
+			"toolcall_start",
+			"toolcall_delta",
+			"toolcall_end",
+		]);
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds).toHaveLength(1);
+		expect(assistantEnds[0]?.message.role === "assistant" ? assistantEnds[0].message.stopReason : undefined).toBe(
+			"aborted",
+		);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(1);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds).toHaveLength(1);
+		expect(toolEnds[0]?.isError).toBe(true);
+	});
+
+	it("replaces a retained visible-text terminal when the stream consumer aborts during drain", async () => {
+		let executions = 0;
+		const tool: AgentTool<typeof askSchema, Record<string, never>> = {
+			...askTool([]),
+			async execute() {
+				executions += 1;
+				return { content: [{ type: "text", text: "answered" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({ responses: [literalTurnWithText("tc-consumer-abort")] });
+		const controller = new AbortController();
+		const events: AgentEvent[] = [];
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, controller.signal, mock.stream);
+		for await (const event of stream) {
+			events.push(event);
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_end") {
+				controller.abort();
+			}
 		}
 
 		expect(executions).toBe(0);
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds).toHaveLength(1);
+		expect(assistantEnds[0]?.message.role === "assistant" ? assistantEnds[0].message.stopReason : undefined).toBe(
+			"aborted",
+		);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(1);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds).toHaveLength(1);
+		expect(toolEnds[0]?.isError).toBe(true);
 	});
 
 	it("promotes a detached accepted assistant for execution state and replay", async () => {
@@ -657,24 +773,151 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		);
 	});
 
-	it("leaves managed fallback handling unchanged", async () => {
+	it("resamples escaped arguments in managed fallback through the typed discarded outcome", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
 		const mock = createMockModel({ responses: [escapedTurn("tc-managed"), { content: ["done"] }] });
+		const outcomes: ManagedAttemptOutcome[] = [];
 		const config: AgentLoopConfig = {
 			model: mock.model,
 			convertToLlm: identityConverter,
 			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				return { type: "terminal", terminal: { stopReason: "error" } };
+			},
 		};
 		const toolResults: AgentEvent[] = [];
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
 		for await (const event of stream) if (event.type === "tool_execution_end") toolResults.push(event);
 
-		expect(mock.calls).toHaveLength(2);
+		// The defective turn was discarded and reported once, never executed and
+		// never surfaced as a tool error: the managed policy owns the retry.
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0].type).toBe("escaped_arguments_discarded");
+		if (outcomes[0].type === "escaped_arguments_discarded") {
+			expect(outcomes[0].message.content.some(block => block.type === "toolCall" && block.id === "tc-managed")).toBe(
+				true,
+			);
+		}
 		expect(executed).toHaveLength(0);
-		expect(toolResults).toHaveLength(1);
-		expect(toolResults[0]?.type === "tool_execution_end" ? toolResults[0].isError : false).toBe(true);
+		expect(toolResults).toHaveLength(0);
+		const replayRequest = mock.model.calls.at(-1)?.context.messages;
+		expect(replayRequest?.some(message => message.role === "assistant")).toBe(false);
+	});
+
+	it("continues a managed run after the session policy retries the discarded outcome", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
+		// First invocation: escaped turn, reported as escaped_arguments_discarded.
+		// Second invocation (the policy retry): literal UTF-8, which must execute.
+		const mock = createMockModel({ responses: [escapedTurn("tc-managed-1"), literalTurn("tc-managed-2")] });
+		const outcomes: ManagedAttemptOutcome[] = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				return { type: "retry", continuation: () => {} };
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		// The loop reports the discarded outcome exactly once and ends the first
+		// stream. The policy's retry continuation re-enters the loop on the same
+		// context; there the literal turn executes normally. (A no-op
+		// continuation is the loop-level contract: the loop never re-issues on
+		// its own after reporting a managed outcome - the policy owns the retry.)
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0].type).toBe("escaped_arguments_discarded");
+		expect(executed).toEqual([]);
+		expect(mock.model.calls).toHaveLength(1);
+	});
+
+	it("stops resampling in managed fallback once the budget is spent", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
+		const mock = createMockModel({
+			responses: [escapedTurn("tc-m-1"), escapedTurn("tc-m-2"), escapedTurn("tc-m-3")],
+		});
+		const outcomes: ManagedAttemptOutcome[] = [];
+		let continuations = 0;
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			fallbackManaged: true,
+			onManagedAttemptOutcome: outcome => {
+				outcomes.push(outcome);
+				if (outcome.type === "escaped_arguments_discarded" && continuations < 5) {
+					continuations++;
+					return { type: "retry", continuation: () => {} };
+				}
+				return { type: "terminal", terminal: { stopReason: "error" } };
+			},
+		};
+		const toolResults: Array<{ isError?: boolean }> = [];
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") toolResults.push({ isError: event.isError });
+		}
+
+		// Managed loop contract: the loop reports each defective turn ONCE and
+		// ends the stream - the policy's retry continuation owns re-entry. With a
+		// no-op continuation the loop never gets a second chance, so exactly one
+		// discarded outcome is reported; the loop-side bound (at most
+		// MAX_ESCAPED_NONASCII_RESAMPLES reports per stream) is exercised by the
+		// unmanaged discriminator test above. No tool ever executes and no
+		// per-call rejection is ever surfaced inside the managed run: the
+		// defective turn is discarded, not answered.
+		const discarded = outcomes.filter(outcome => outcome.type === "escaped_arguments_discarded");
+		expect(discarded).toHaveLength(1);
+		expect(continuations).toBe(1);
+		expect(executed).toHaveLength(0);
+		expect(toolResults).toHaveLength(0);
+	});
+
+	it("attributes consecutive terminal rejections to budget exhaustion, not a short-circuited gate", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
+		// Persistently escaped sampling: every wire attempt re-emits the defect,
+		// each with a distinct tool-call id so no signature-based breaker can fire.
+		let calls = 0;
+		const mock = createMockModel({
+			handler: () => {
+				calls += 1;
+				return escapedTurn(`tc-${calls}`);
+			},
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+		const produced = await stream.result();
+		const lastAssistant = produced.findLast(message => message.role === "assistant");
+
+		// Distinct discriminator between the two live-failure readings: the gate
+		// ran and spent its full budget per logical turn (attempts ==
+		// MAX_ESCAPED_NONASCII_RESAMPLES), so the terminal rejection is budget
+		// exhaustion on a deterministic-defect payload, not
+		// `escapedToolTransaction.committed` short-circuiting the resample. Every
+		// logical turn costs exactly 1 + 2 wire attempts before its per-call
+		// rejection, and the run ends via the consecutive-malformed-turns
+		// circuit breaker rather than executing anything.
+		expect(calls).toBe(6 * 3);
+		expect(executed).toHaveLength(0);
+		expect(lastAssistant?.role === "assistant" ? lastAssistant.stopReason : undefined).toBe("error");
+		expect(lastAssistant?.role === "assistant" ? lastAssistant.errorMessage : undefined).toContain(
+			"consecutive turns of malformed tool calls",
+		);
 	});
 
 	it("executes literal UTF-8 arguments untouched", async () => {

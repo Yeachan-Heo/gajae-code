@@ -29,8 +29,72 @@ describe("profile-discovery", () => {
 	it("lists platform-appropriate roots", () => {
 		expect(chromeUserDataRoots(env({ platform: "linux", home: "/home/x", existing: [] }))).toEqual([
 			"/home/x/.config/google-chrome",
+			"/home/x/.config/google-chrome-beta",
+			"/home/x/.config/google-chrome-unstable",
+			"/home/x/.config/google-chrome-canary",
 			"/home/x/.config/chromium",
+			"/home/x/.var/app/com.google.Chrome/config/google-chrome",
+			"/home/x/.var/app/org.chromium.Chromium/config/chromium",
+			"/home/x/snap/chromium/common/chromium",
+			"/home/x/snap/chromium/current/.config/chromium",
 		]);
+		expect(
+			chromeUserDataRoots({
+				platform: "linux",
+				home: "/home/x",
+				exists: () => false,
+				chromeUserDataDir: "/srv/chrome-default",
+				chromeConfigHome: "/srv/chrome-config",
+				xdgConfigHome: "/srv/xdg-ignored",
+			}),
+		).toEqual([
+			"/srv/chrome-default",
+			"/srv/chrome-config/google-chrome",
+			"/srv/chrome-config/google-chrome-beta",
+			"/srv/chrome-config/google-chrome-unstable",
+			"/srv/chrome-config/google-chrome-canary",
+			"/srv/chrome-config/chromium",
+			"/home/x/.var/app/com.google.Chrome/config/google-chrome",
+			"/home/x/.var/app/org.chromium.Chromium/config/chromium",
+			"/home/x/snap/chromium/common/chromium",
+			"/home/x/snap/chromium/current/.config/chromium",
+		]);
+		expect(chromeUserDataRoots(env({ platform: "darwin", home: "/Users/x", existing: [] }))).toEqual([
+			"/Users/x/Library/Application Support/Google/Chrome",
+			"/Users/x/Library/Application Support/Google/Chrome Beta",
+			"/Users/x/Library/Application Support/Google/Chrome Dev",
+			"/Users/x/Library/Application Support/Google/Chrome Canary",
+			"/Users/x/Library/Application Support/Chromium",
+		]);
+		expect(
+			chromeUserDataRoots({
+				platform: "win32",
+				home: "C:\\Users\\x",
+				localAppData: "C:\\Users\\x\\AppData\\Local",
+				exists: () => false,
+			}),
+		).toEqual([
+			"C:\\Users\\x\\AppData\\Local\\Google\\Chrome\\User Data",
+			"C:\\Users\\x\\AppData\\Local\\Google\\Chrome Beta\\User Data",
+			"C:\\Users\\x\\AppData\\Local\\Google\\Chrome Dev\\User Data",
+			"C:\\Users\\x\\AppData\\Local\\Google\\Chrome SxS\\User Data",
+			"C:\\Users\\x\\AppData\\Local\\Chromium\\User Data",
+		]);
+	});
+
+	it("joins profile paths with the requested platform semantics", () => {
+		const root = "C:\\Users\\x\\AppData\\Local\\Google\\Chrome Beta\\User Data";
+		const profileDir = `${root}\\Profile 2`;
+		const found = discoverDefaultChromeProfile(
+			{
+				platform: "win32",
+				home: "C:\\Users\\x",
+				localAppData: "C:\\Users\\x\\AppData\\Local",
+				exists: candidate => candidate === profileDir,
+			},
+			"Profile 2",
+		);
+		expect(found).toEqual({ userDataDir: root, profileDirectory: "Profile 2", profileDir });
 	});
 });
 

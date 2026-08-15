@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Fixed
+- iTerm2 Gajae Pet frames now size their inline PNG to the geometry-derived reserved cell block instead of a fixed pixel box, preserving the authored sprite aspect ratio across terminal font, Retina, and cell-aspect geometries while leaving Kitty and Sixel encoding unchanged.
+
 - Non-finite overlay geometry can no longer turn frame padding into an infinite allocating loop on the main thread; margins, positions, offsets, and minimum widths now fall back to bounded terminal-relative values.
 
 - Kitty inline images are no longer deleted when live output moves their anchor above the viewport, so terminal-native scrollback keeps previously rendered images visible.

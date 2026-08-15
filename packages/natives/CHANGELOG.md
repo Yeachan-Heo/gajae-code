@@ -12,6 +12,7 @@
 - `renameNoReplacePathAsync` and `linkNoReplacePathAsync`, async variants of the checked no-replace namespace publication primitives, scheduled on the native blocking-work pool so managed output publication can await the rename/link syscall boundary without blocking the host event loop (#4394).
 
 ### Fixed
+- Bounded each SDK connection's queued host-directed frames to the positioned-event replay-ring capacity. Slow or stalled subscribers now reject excess directed sends for replay recovery instead of retaining an unbounded in-memory writer backlog; accepted frames remain serialized through the same connection writer.
 - `exactReplacePath` now retries transient Windows destination-sharing violations (#4330): when another handle denies delete sharing on the destination, the pre-mutation destination open is retried a bounded 30 × 100 ms before failing, and an exhausted retry reports the specific `sharing_violation` category with the underlying hex NTSTATUS (`windowsErrorCode`, e.g. `0xC0000043`) instead of a bare `io_error`. Only the destination open is retried — never after any namespace mutation — so a retry can never publish twice, and permission, path-not-found, disk-full, and identity failures are never retried.
 
 ## [0.13.2] - 2026-08-13

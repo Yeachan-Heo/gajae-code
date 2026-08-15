@@ -13,6 +13,8 @@ import type { TUI } from "@gajae-code/tui";
 import { hookFetch } from "@gajae-code/utils";
 
 const DOWN = "\x1b[B";
+const LEFT = "\x1b[D";
+const RIGHT = "\x1b[C";
 
 function normalizeRenderedText(text: string): string {
 	return text
@@ -156,6 +158,11 @@ function selectActionRow(selector: ModelSelectorComponent, rowIndex: number): vo
 // 6 = "Set for all role agents", 7 = "Set for all targets".
 const ALL_ROLE_AGENTS_ROW = 6;
 const ALL_TARGETS_ROW = 7;
+// Role tags rendered by the per-role effort menu ("Current: <TAG> → …"), in
+// the order the menu walks them for the "Set for all role agents" flow.
+const ROLE_TAGS = ["EXECUTOR", "ARCHITECT", "PLANNER", "CRITIC"] as const;
+// Full target order for the "Set for all targets" flow.
+const ALL_TARGET_TAGS = ["DEFAULT", "EXECUTOR", "ARCHITECT", "PLANNER", "CRITIC", "IMAGE"] as const;
 
 describe("ModelSelector batch assignment thinking menu", () => {
 	beforeAll(async () => {
@@ -163,35 +170,67 @@ describe("ModelSelector batch assignment thinking menu", () => {
 		installTestTheme();
 	});
 
-	test("all role agents batch opens the reasoning menu for anthropic reasoning models", async () => {
+	test("all role agents batch opens the per-role effort menu for anthropic reasoning models", async () => {
 		installTestTheme();
 		const model = createAnthropicReasoningModel("claude-fable-5");
 		const settings = Settings.isolated();
 
-		let selected: SelectionCapture | undefined;
+		const selections: SelectionCapture[] = [];
 		const selector = createSelector(model, settings, selection => {
-			if (selection.kind === "assignment") selected = selection;
+			if (selection.kind === "assignment") selections.push(selection);
 		});
 		await Bun.sleep(0);
 		installTestTheme();
 
 		selectActionRow(selector, ALL_ROLE_AGENTS_ROW);
 
-		// The batch includes role-agent targets, so an explicit effort choice is required.
-		expect(selected).toBeUndefined();
-		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(thinkingRendered).toContain("Reasoning for all role agents");
+		// The batch includes role-agent targets, so an explicit per-role effort
+		// choice is required before any assignment is emitted.
+		expect(selections).toEqual([]);
+		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Current: EXECUTOR");
+		expect(rendered).toContain("Left/Right: prev/next role");
 
-		// Levels are [off, low, medium, high, xhigh]; pick xhigh.
-		for (let i = 0; i < 4; i++) selector.handleInput(DOWN);
+		// Per-role levels are [off, low, medium, high, xhigh]; give every role
+		// xhigh to mirror the old batch-level xhigh expectation.
+		for (let roleIdx = 0; roleIdx < 4; roleIdx++) {
+			expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain(`Current: ${ROLE_TAGS[roleIdx]}`);
+			for (let i = 0; i < 4; i++) selector.handleInput(DOWN);
+			selector.handleInput("\n");
+			await Bun.sleep(0);
+		}
+
+		// Each role is assigned individually with its own effort suffix.
+		expect(selections.map(s => s.role)).toEqual(["executor", "architect", "planner", "critic"]);
+		for (const selection of selections) {
+			expect(selection.thinkingLevel).toBe(ThinkingLevel.XHigh);
+			expect(selection.selector).toBe("anthropic/claude-fable-5:xhigh");
+			expect(selection.roles).toBeUndefined();
+		}
+	});
+
+	test("per-role effort navigation uses standard arrows and wraps to the next unset role", async () => {
+		installTestTheme();
+		const model = createAnthropicReasoningModel("claude-fable-5");
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": {
+				critic: "anthropic/claude-fable-5:high",
+			},
+		});
+		const selector = createSelector(model, settings, () => {});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selectActionRow(selector, ALL_ROLE_AGENTS_ROW);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: CRITIC");
+
+		selector.handleInput(LEFT);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: PLANNER");
+		selector.handleInput(RIGHT);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: CRITIC");
+
 		selector.handleInput("\n");
-
-		const selectedAfterEnter = selected;
-		if (!selectedAfterEnter) throw new Error("Expected batch selection after picking a thinking level");
-		expect(selectedAfterEnter.role).toBe("default");
-		expect(selectedAfterEnter.roles).toEqual(["executor", "architect", "planner", "critic"]);
-		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.XHigh);
-		expect(selectedAfterEnter.selector).toBe("anthropic/claude-fable-5:xhigh");
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: EXECUTOR");
 	});
 
 	test("direct xAI Grok default assignment requires an explicit supported effort", async () => {
@@ -222,37 +261,40 @@ describe("ModelSelector batch assignment thinking menu", () => {
 		expect(selectedAfterEnter.selector).toBe("xai/grok-4.6");
 	});
 
-	test("all targets batch keeps every target through the reasoning menu", async () => {
+	test("all targets batch keeps every target through the per-role effort menu", async () => {
 		installTestTheme();
 		const model = createCodexReasoningModel("gpt-5.5");
 		const settings = Settings.isolated();
 
-		let selected: SelectionCapture | undefined;
+		const selections: SelectionCapture[] = [];
 		const selector = createSelector(model, settings, selection => {
-			if (selection.kind === "assignment") selected = selection;
+			if (selection.kind === "assignment") selections.push(selection);
 		});
 		await Bun.sleep(0);
 		installTestTheme();
 
 		selectActionRow(selector, ALL_TARGETS_ROW);
 
-		expect(selected).toBeUndefined();
-		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
-		expect(thinkingRendered).toContain("Reasoning for all targets");
+		expect(selections).toEqual([]);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: DEFAULT");
 
-		// Pick "high" (levels are [off, low, medium, high, xhigh]).
-		for (let i = 0; i < 3; i++) selector.handleInput(DOWN);
-		selector.handleInput("\n");
+		// Pick "high" for every target (levels are [off, low, medium, high, xhigh]).
+		for (const tag of ALL_TARGET_TAGS) {
+			expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain(`Current: ${tag}`);
+			for (let i = 0; i < 3; i++) selector.handleInput(DOWN);
+			selector.handleInput("\n");
+			await Bun.sleep(0);
+		}
 
-		const selectedAfterEnter = selected;
-		if (!selectedAfterEnter) throw new Error("Expected batch selection after picking a thinking level");
-		expect(selectedAfterEnter.role).toBe("default");
-		expect(selectedAfterEnter.roles).toEqual(["default", "executor", "architect", "planner", "critic", "image"]);
-		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.High);
-		expect(selectedAfterEnter.selector).toBe("openai-codex/gpt-5.5:high");
+		expect(selections.map(s => s.role)).toEqual(["default", "executor", "architect", "planner", "critic", "image"]);
+		for (const selection of selections) {
+			expect(selection.thinkingLevel).toBe(ThinkingLevel.High);
+			expect(selection.selector).toBe("openai-codex/gpt-5.5:high");
+			expect(selection.roles).toBeUndefined();
+		}
 	});
 
-	test("cancelling the batch reasoning menu restores the batch action row", async () => {
+	test("cancelling the per-role effort menu restores the batch action row", async () => {
 		installTestTheme();
 		const model = createAnthropicReasoningModel("claude-fable-5");
 		const settings = Settings.isolated();
@@ -265,7 +307,7 @@ describe("ModelSelector batch assignment thinking menu", () => {
 		installTestTheme();
 
 		selectActionRow(selector, ALL_TARGETS_ROW);
-		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Reasoning for all targets");
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: DEFAULT");
 
 		// Escape back to the action menu; no selection must have been emitted.
 		selector.handleInput("\x1b");

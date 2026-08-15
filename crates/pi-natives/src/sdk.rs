@@ -702,7 +702,7 @@ impl NotificationServer {
 		} else {
 			Err(Error::from_reason(
 				"SDK connection is unavailable or directed frame is invalid, oversized, or \
-				 unauthorized",
+				 unauthorized, or its writer backlog is full",
 			))
 		}
 	}

@@ -1527,7 +1527,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const {
 				model,
 				thinkingLevel: resolvedThinkingLevel,
-				explicitThinkingLevel,
 				authFallbackUsed,
 				requestedModel,
 				fallbackReason,
@@ -1583,9 +1582,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const forkContextSeed = options.forkContextSeed
 				? trimForkContextSeedForModel(options.forkContextSeed, model)
 				: undefined;
-			const effectiveThinkingLevel = explicitThinkingLevel
-				? resolvedThinkingLevel
-				: (thinkingLevel ?? resolvedThinkingLevel);
+			// Agent frontmatter wins over a selector suffix. When frontmatter is absent,
+			// TaskTool passes the profile model_mapping suffix through `thinkingLevel`.
+			const effectiveThinkingLevel = thinkingLevel ?? resolvedThinkingLevel;
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
 			const sessionManager = options.managedPersistence

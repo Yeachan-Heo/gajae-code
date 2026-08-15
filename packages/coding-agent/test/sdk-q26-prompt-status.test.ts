@@ -3,7 +3,6 @@ import {
 	createPromptReconciliation,
 	PROMPT_RECONCILIATION_ACTIVE_CAPACITY,
 	PROMPT_RECONCILIATION_TERMINAL_CAPACITY,
-	PROMPT_RECONCILIATION_TERMINAL_TTL_MS,
 	sanitizePromptFailure,
 } from "../src/sdk/bus/prompt-reconciliation";
 import { CursorRegistry, QueryHandlers, RevisionStore } from "../src/sdk/host/query/index.js";
@@ -128,26 +127,30 @@ describe("prompt reconciliation record", () => {
 		const rec = createPromptReconciliation({ now: clock.now });
 		rec.noteAccepted(correlation(), "ref-1");
 		rec.noteTransition(correlation(), { type: "agent_start" });
-		clock.advance(PROMPT_RECONCILIATION_TERMINAL_TTL_MS * 10);
+		clock.advance(24 * 60 * 60_000);
 		expect(rec.lookup({ clientRef: "ref-1" })).toMatchObject({ status: "in_flight" });
 		expect(() => rec.admit("ref-1")).toThrowError(/never reuse a clientRef/);
 	});
 
-	it("evicts terminal records after the documented TTL and releases the clientRef", () => {
+	it("retains terminal records and their clientRefs until capacity eviction", () => {
 		const clock = clocked();
 		const rec = createPromptReconciliation({ now: clock.now });
 		rec.noteAccepted(correlation(), "ref-1");
 		rec.noteTransition(correlation(), { type: "agent_start" });
 		rec.noteTransition(correlation(), { type: "agent_end" });
 		expect(rec.lookup({ clientRef: "ref-1" })).toMatchObject({ status: "terminal_ok" });
-		clock.advance(PROMPT_RECONCILIATION_TERMINAL_TTL_MS);
-		// Admission itself enforces cleanup; no preceding lookup is required.
-		expect(() => rec.admit("ref-1")).not.toThrow();
+		clock.advance(24 * 60 * 60_000);
+		expect(() => rec.admit("ref-1")).toThrowError(/never reuse a clientRef/);
+		expect(rec.lookup({ clientRef: "ref-1" })).toMatchObject({ status: "terminal_ok" });
+		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toMatchObject({ status: "terminal_ok" });
+
+		for (let n = 2; n <= PROMPT_RECONCILIATION_TERMINAL_CAPACITY + 1; n++) {
+			rec.noteAccepted(correlation(n), `ref-${n}`);
+			rec.noteTransition(correlation(n), { type: "agent_end" });
+			clock.advance(1);
+		}
 		expect(rec.lookup({ clientRef: "ref-1" })).toEqual({ status: "unknown", receiptState: "unknown" });
-		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
-			status: "unknown",
-			receiptState: "unknown",
-		});
+		expect(() => rec.admit("ref-1")).not.toThrow();
 	});
 
 	it("rejects a retained duplicate clientRef before execution", () => {

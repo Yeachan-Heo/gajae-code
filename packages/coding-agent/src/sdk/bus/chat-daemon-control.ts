@@ -121,10 +121,13 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 64 / Slack generation 67 contain synchronous provider-
  * subscription admission and ready-hook failures without revoking shared Router
  * attachment authority.
+ * Discord generation 65 / Slack generation 68 fence the off-reconcile-tail
+ * initial attachment replay introduced by #4542 so pre-upgrade daemon owners
+ * cannot retain the earlier SessionRouter attachment contract.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 64,
-	slack: 67,
+	discord: 65,
+	slack: 68,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

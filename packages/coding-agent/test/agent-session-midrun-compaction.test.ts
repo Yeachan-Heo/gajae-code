@@ -305,7 +305,7 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 						}
 						await options.afterStreamStart?.(streamOptions);
 						stream.push({ type: "done", reason: message.stopReason as never, message });
-					})();
+					})().catch(error => stream.fail(error));
 				});
 				return stream;
 			},
@@ -580,6 +580,7 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 
 		const loop = await buildLoopSession({
 			extensionSource: shortCircuitExtensionSource(),
+			settings: { "compaction.keepRecentTokens": 100 },
 			publishTextStartBeforeAfterStreamStart: true,
 			responder: call => {
 				if (call === 1) {
@@ -629,7 +630,7 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 			await seedLoop(loop.session, [
 				{ role: "user", content: "earlier request", timestamp: Date.now() },
 				assistantFor(model, {
-					content: [{ type: "text", text: "earlier response" }],
+					content: [{ type: "text", text: `earlier response ${"x".repeat(4_000)}` }],
 					totalTokens: 1_000,
 					stopReason: "stop",
 				}),
@@ -638,25 +639,61 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 			await loop.session.waitForIdle();
 
 			expect(originalAnchor).toBeDefined();
-			expect(loop.session.messages.includes(originalAnchor!)).toBe(false);
-			const cursorMessages = loop.agentEvents.flatMap(event => {
+			const maintenanceEvents = loop.agentEvents.filter(
+				(event): event is Extract<AgentEvent, { type: "agent_end" }> =>
+					event.type === "agent_end" && event.stopReason === "maintenance",
+			);
+			expect(maintenanceEvents).toHaveLength(1);
+			expect(maintenanceEvents[0]?.maintenanceOutcome).toBe("compacted");
+			expect(getLatestCompactionEntry(loop.session.sessionManager.getBranch())).not.toBeNull();
+
+			const canonicalMessages = loop.session.buildDisplaySessionContext().messages;
+			const canonicalPreamble = canonicalMessages.find(
+				message =>
+					message.role === "assistant" &&
+					JSON.stringify((message as { content?: unknown }).content ?? "").includes("Cursor preamble"),
+			);
+			const canonicalContinuation = canonicalMessages.find(
+				message =>
+					message.role === "assistant" &&
+					JSON.stringify((message as { content?: unknown }).content ?? "").includes("and continuation"),
+			);
+			const canonicalServerResult = canonicalMessages.find(
+				message => message.role === "toolResult" && message.toolCallId === "cursor-server-result",
+			);
+			expect(canonicalPreamble).toBeDefined();
+			expect(canonicalContinuation).toBeDefined();
+			expect(canonicalServerResult).toBeDefined();
+			const canonicalCursorOrder = canonicalMessages.flatMap(message => {
+				if (message === canonicalPreamble) return ["preamble"];
+				if (message === canonicalServerResult) return ["server-result"];
+				if (message === canonicalContinuation) return ["continuation"];
+				return [];
+			});
+			expect(canonicalCursorOrder).toEqual(["preamble", "server-result", "continuation"]);
+			const cursorEvents = loop.agentEvents.flatMap(event => {
 				if (event.type !== "message_end") return [];
 				const content = JSON.stringify((event.message as { content?: unknown }).content ?? "");
 				return content.includes("Cursor") || content.includes("and continuation") ? [event.message] : [];
 			});
-			expect(cursorMessages.map(message => message.role)).toEqual(["assistant", "toolResult", "assistant"]);
-			expect(JSON.stringify((cursorMessages[0] as { content?: unknown } | undefined)?.content)).toContain(
+			expect(cursorEvents.map(message => message.role)).toEqual(["assistant", "toolResult", "assistant"]);
+			expect(JSON.stringify((cursorEvents[0] as { content?: unknown } | undefined)?.content)).toContain(
 				"Cursor preamble",
 			);
-			expect(JSON.stringify((cursorMessages[1] as { content?: unknown } | undefined)?.content)).toContain(
+			expect(JSON.stringify((cursorEvents[1] as { content?: unknown } | undefined)?.content)).toContain(
 				"Cursor server-side result",
 			);
-			expect(JSON.stringify((cursorMessages[2] as { content?: unknown } | undefined)?.content)).toContain(
+			expect(JSON.stringify((cursorEvents[2] as { content?: unknown } | undefined)?.content)).toContain(
 				"and continuation",
 			);
 			expect(
-				loop.agentEvents.filter(event => event.type === "agent_end" && event.stopReason === "maintenance"),
-			).toHaveLength(1);
+				canonicalMessages.some(message => {
+					if (message.role !== "assistant") return false;
+					const content = JSON.stringify((message as { content?: unknown }).content ?? "");
+					return content.includes("Cursor preamble and continuation") && content.includes("cursor-call");
+				}),
+			).toBe(false);
+			expect(canonicalMessages).not.toContainEqual(originalAnchor!);
 			expect(loop.events.filter(event => event.type === "agent_end")).toHaveLength(1);
 			expect(loop.streamCallCount()).toBe(2);
 		} finally {

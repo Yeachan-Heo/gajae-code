@@ -90,7 +90,14 @@ import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
-import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
+import {
+	CAP_GATED_FRAME_KINDS,
+	createSdkSurfaceFactory,
+	type SessionSdkHost,
+	SessionSdkSessionRuntime,
+	shouldHostSdk,
+	TOOL_ACTIVITY_CAPABILITY,
+} from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
@@ -170,6 +177,29 @@ export {
 	runIdentityControlSuccessPath,
 	runIdentityControlTerminalPath,
 } from "./control-drain-lease";
+
+export type NotificationInboundAdmission =
+	| { outcome: "accept" }
+	| { outcome: "drop"; reason: "inbound_fenced" | "policy_suspended" }
+	| { outcome: "defer"; reason: "policy_suspended" };
+
+/** Exact production admission decision for daemon-originated session inbound. */
+export function notificationInboundAdmission(input: {
+	inboundFenced: boolean;
+	policySuspended: boolean;
+	notificationOrigin: boolean;
+	controlCommand: boolean;
+}): NotificationInboundAdmission {
+	if (input.inboundFenced) return { outcome: "drop", reason: "inbound_fenced" };
+	if (input.policySuspended && input.notificationOrigin) {
+		// Valid control commands are not dropped: they are deferred while policy is
+		// provisional and executed on activate. A terminal `dropped` ack would
+		// contradict that later execution and invite client-side retry duplication.
+		if (input.controlCommand) return { outcome: "defer", reason: "policy_suspended" };
+		return { outcome: "drop", reason: "policy_suspended" };
+	}
+	return { outcome: "accept" };
+}
 
 const PROMPT_SETTLEMENT_DIAGNOSTIC_ENTRY_LIMIT = 8;
 const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
@@ -1111,6 +1141,9 @@ export class PresentationArbiter {
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	/** Delivers one ring-positioned event envelope to every attached subscriber
+	 *  connection, applying the same capability gate as event replay. */
+	broadcastEventFrame: (event: SdkFrame) => void;
 	/** Owns stateRoot-backed revisions and removes their spills on terminal shutdown. */
 	revisions: RevisionStore;
 	/** Releases all snapshot pins before the revision store is closed. */
@@ -1326,11 +1359,22 @@ type SessionStartResult = {
 	suppressExtensionError?: boolean;
 };
 
+/** Ring append plus positioned live broadcast. An event retained for replay
+ *  must also reach already-attached subscribers live as the same positioned
+ *  envelope, or they can only observe it by issuing another replay. */
+function emitSessionEvent(
+	runtime: Pick<SessionRuntime, "host" | "broadcastEventFrame">,
+	frame: { type: string; [key: string]: unknown },
+	payload: Record<string, unknown> = frame,
+): void {
+	runtime.broadcastEventFrame(runtime.host.emitEvent({ kind: frame.type, payload }));
+}
+
 function pushSessionFrame(
-	runtime: Pick<SessionRuntime, "server" | "host">,
+	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: string; [key: string]: unknown },
 ): void {
-	runtime.host.emitEvent({ kind: frame.type, payload: frame });
+	emitSessionEvent(runtime, frame);
 	if (frame.type === "turn_stream") {
 		runtime.server.pushTurnStreamUnchecked(
 			String(frame.sessionId),
@@ -1345,30 +1389,30 @@ function pushSessionFrame(
 }
 
 async function pushTerminalSessionFrame(
-	runtime: Pick<SessionRuntime, "server" | "host">,
+	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: "session_closed"; sessionId: string },
 ): Promise<boolean> {
-	runtime.host.emitEvent({ kind: frame.type, payload: frame });
+	emitSessionEvent(runtime, frame);
 	return await runtime.server.pushFrameAndWait(JSON.stringify(frame), 1_000);
 }
 
 function pushFileAttachment(
-	runtime: Pick<SessionRuntime, "server" | "host">,
+	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: "file_attachment"; sessionId: string; name: string; mime?: string; caption?: string },
 	data: Buffer,
 ): void {
-	runtime.host.emitEvent({ kind: frame.type, payload: { ...frame, data: data.toString("base64") } });
+	emitSessionEvent(runtime, frame, { ...frame, data: data.toString("base64") });
 	runtime.server.pushFileAttachmentUnchecked(frame.sessionId, frame.name, frame.mime, data, frame.caption);
 }
 
 /** Agent lifecycle is SDK session truth, independent of optional chat delivery. */
 function emitAgentLifecycle(
-	runtime: Pick<SessionRuntime, "server" | "host">,
+	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: "agent_start" | "agent_end"; sessionId: string; commandId?: string; turnId?: string },
 ): void {
 	try {
 		const json = JSON.stringify(frame);
-		runtime.host.emitEvent({ kind: frame.type, payload: frame });
+		emitSessionEvent(runtime, frame);
 		runtime.server.pushFrame(json);
 	} catch (error) {
 		logger.warn(`sdk: lifecycle delivery failed: ${String(error)}`);
@@ -4602,6 +4646,29 @@ export function createNotificationsExtension(
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		/** Connections fenced by a fatal prompt closure; their later frames are refused. */
 		const fencedConnections = new Set<string>();
+		/**
+		 * Live positioned-event delivery to attached subscribers. The native
+		 * broadcast channel round-trips a closed frame enum and cannot carry the
+		 * positioned event envelope, so each envelope rides the validated directed
+		 * leg instead — to every connection that completed capability negotiation
+		 * or an event replay, which is exactly the attached-subscriber set. Fenced
+		 * connections are excluded like their inbound frames, and capability-gated
+		 * kinds follow the same gate replay applies, so live and replay delivery
+		 * stay one truth per connection.
+		 */
+		const broadcastEventFrame = (event: SdkFrame): void => {
+			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
+			const json = JSON.stringify(event);
+			for (const [connectionId, capabilities] of hostCapCache) {
+				if (fencedConnections.has(connectionId)) continue;
+				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
+				try {
+					server.sendTo(connectionId, json);
+				} catch {
+					// Broadcasts are best effort; directed responses surface send failures.
+				}
+			}
+		};
 		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
 		// Authoritative bounded reconciliation state for canonical Q26 turn.result
@@ -4710,7 +4777,7 @@ export function createNotificationsExtension(
 			const key = promptSubmissionKey(correlation);
 			const submission = promptSubmissions.get(key);
 			if (!submission) return;
-			runtime.host.emitEvent({ kind: frame.type, payload: frame });
+			emitSessionEvent(runtime, frame);
 			if (submission.abandoned) {
 				if (submission.terminal) finalizePrompt(key, correlation);
 				return;
@@ -6341,7 +6408,7 @@ export function createNotificationsExtension(
 				},
 				start: async () => await server.start(),
 				stop: async () => await server.stopAndWait(),
-				broadcastFrame: frame => server.pushFrame(JSON.stringify(frame)),
+				broadcastFrame: frame => broadcastEventFrame(frame),
 			},
 			...(preparesExistingThread ? { readiness: "deferred" as const } : {}),
 			...(activationGate ? { activationGate } : {}),
@@ -6622,6 +6689,7 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			broadcastEventFrame,
 			revisions,
 			cursors,
 			id,
@@ -6761,6 +6829,26 @@ export function createNotificationsExtension(
 				server.sendTo(
 					connectionId,
 					JSON.stringify({ type: "protocol_error", ok: false, error: { code: "invalid_frame", message } }),
+				);
+			} catch {}
+		};
+		const sendInboundAck = (
+			connectionId: string,
+			inbound: { sessionId: string; updateId?: number },
+			state: "accepted" | "rejected" | "dropped",
+			reason?: "inbound_fenced" | "policy_suspended" | "invalid_input" | "injection_failed",
+		): void => {
+			if (typeof inbound.updateId !== "number") return;
+			try {
+				server.sendTo(
+					connectionId,
+					JSON.stringify({
+						type: "inbound_ack",
+						sessionId: inbound.sessionId,
+						updateId: inbound.updateId,
+						state,
+						...(reason ? { reason } : {}),
+					}),
 				);
 			} catch {}
 		};
@@ -7089,9 +7177,17 @@ export function createNotificationsExtension(
 
 			// Inbound free-text injection / in-thread config command from a session
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
-			server.onInbound((err, inbound) => {
+			server.onInbound(async (err, inbound) => {
 				if (err || !inbound) return;
-				if (initializedRuntime.inboundFenced) {
+				const notificationOrigin = hostCapCache.get(inbound.connectionId)?.has(ASK_SELECTED_ACK_CAPABILITY);
+				const admission = notificationInboundAdmission({
+					inboundFenced: initializedRuntime.inboundFenced,
+					policySuspended: runtime?.policySuspended ?? false,
+					notificationOrigin: notificationOrigin ?? false,
+					controlCommand: inbound.kind === "control_command",
+				});
+				if (admission.outcome === "drop" && admission.reason === "inbound_fenced") {
+					sendInboundAck(inbound.connectionId, inbound, "dropped", admission.reason);
 					// A fenced predecessor keeps its native server alive for the terminal
 					// response, so the daemon can still deliver here after it has already
 					// ACKed the user's Telegram message. Dropping without a diagnostic
@@ -7108,30 +7204,31 @@ export function createNotificationsExtension(
 					messageId?: number;
 					reason?: string;
 				};
-				const notificationOrigin = hostCapCache
-					.get(authenticatedInbound.connectionId)
-					?.has(ASK_SELECTED_ACK_CAPABILITY);
-				if (runtime?.policySuspended && notificationOrigin) {
-					if (inbound.kind === "control_command") {
-						const frame = sdkInboundFrame(inbound.commandJson);
-						if (frame) {
-							const suspendedRuntime = runtime;
-							runtime.deferredInboundControls.push(() => {
-								if (
-									runtimes.get(id) === suspendedRuntime &&
-									!suspendedRuntime.stopping &&
-									!suspendedRuntime.policySuspended
-								)
-									inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
-							});
-						}
+				if (admission.outcome === "defer") {
+					// Provisional policy defers valid control commands to activate(); they are
+					// NOT dropped, so no terminal dropped acknowledgement is emitted. The
+					// control_command_result frame after execution is the authoritative reply.
+					const frame = sdkInboundFrame(inbound.commandJson);
+					if (frame) {
+						const suspendedRuntime = runtime;
+						runtime.deferredInboundControls.push(() => {
+							if (
+								runtimes.get(id) === suspendedRuntime &&
+								!suspendedRuntime.stopping &&
+								!suspendedRuntime.policySuspended
+							)
+								inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
+						});
 					}
-					if (inbound.kind !== "control_command")
-						logger.warn(
-							`notifications: inbound ${inbound.kind} dropped: notification policy is suspended (updateId=${String(
-								(inbound as { updateId?: unknown }).updateId ?? "none",
-							)})`,
-						);
+					return;
+				}
+				if (admission.outcome === "drop") {
+					sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "dropped", admission.reason);
+					logger.warn(
+						`notifications: inbound ${inbound.kind} dropped: notification policy is suspended (updateId=${String(
+							(inbound as { updateId?: unknown }).updateId ?? "none",
+						)})`,
+					);
 					return;
 				}
 				if (inbound.kind === "control_command") {
@@ -7164,12 +7261,14 @@ export function createNotificationsExtension(
 				if (inbound.kind === "user_message") {
 					// Inject as a user turn (steers/continues the agent; the resulting
 					// turn streams back via the turn_end handler even when not idle).
-					// Record the update id so it can be acked as "consumed" on the next
-					// turn_start, and steer (vs start a fresh turn) when already busy.
+					// Session-side acceptance is explicit: the daemon must not leave its
+					// optimistic queued reaction in place when this live host rejects/drop.
 					const text = inbound.text ?? "";
 					const images = inbound.images ?? [];
-					if (!text && images.length === 0) return;
-					if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
+					if (!text && images.length === 0) {
+						sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "rejected", "invalid_input");
+						return;
+					}
 					const content: string | (TextContent | ImageContent)[] =
 						images.length > 0
 							? [
@@ -7184,9 +7283,35 @@ export function createNotificationsExtension(
 									),
 								]
 							: text;
+					let acceptedSent = false;
+					const acceptAdmission = (): void => {
+						// Fired by AgentSession's preflight acceptance: after admission has
+						// committed but before the turn starts. Registering the update id and
+						// acking here means turn_start can no longer race ahead of the
+						// pendingInbound registration it consumes.
+						if (acceptedSent) return;
+						acceptedSent = true;
+						if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
+						sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "accepted");
+					};
 					try {
-						api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
+						// sendUserMessage is async and settles only after the full prompt, so
+						// acceptance is signalled by the preflight-acceptance callback instead
+						// of after the await; a rejection (preflight, admission, or later)
+						// still reaches the catch and maps to a rejected ack.
+						await api.sendUserMessage(content, {
+							...(runtime?.busy ? { deliverAs: "steer" as const } : {}),
+							onPreflightAcceptCommit: acceptAdmission,
+							onPreflightAccepted: acceptAdmission,
+						});
+						acceptAdmission();
 					} catch (e) {
+						sendInboundAck(
+							authenticatedInbound.connectionId,
+							authenticatedInbound,
+							"rejected",
+							"injection_failed",
+						);
 						logger.warn(`notifications: sendUserMessage failed: ${String(e)}`);
 					}
 					return;
@@ -7279,7 +7404,7 @@ export function createNotificationsExtension(
 				sessionId: id,
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
 			};
-			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
+			emitSessionEvent(initializedRuntime, identityHeader);
 			const endpoint = await sdkRuntime.startTransport();
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
@@ -7340,7 +7465,7 @@ export function createNotificationsExtension(
 					sessionId: id,
 					...buildIdentity(ctx.cwd, sessionName, telegramTopicsEnabled()),
 				};
-				host.emitEvent({ kind: identity.type, payload: identity });
+				emitSessionEvent(initializedRuntime, identity);
 				server.pushFrame(JSON.stringify(identity));
 			}, 250);
 			sessionNameObserver.unref?.();
@@ -7354,7 +7479,7 @@ export function createNotificationsExtension(
 					sessionId: id,
 					...buildIdentity(ctx.cwd, sessionNameAfterStartup, telegramTopicsEnabled()),
 				};
-				host.emitEvent({ kind: identity.type, payload: identity });
+				emitSessionEvent(initializedRuntime, identity);
 				server.pushFrame(JSON.stringify(identity));
 			}
 			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();

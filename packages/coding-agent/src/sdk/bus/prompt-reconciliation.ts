@@ -10,8 +10,8 @@
  *
  * Semantics (public contract, mirrored in sdk/prompt-status.ts):
  * - Active records are NEVER converted to terminal by age or capacity.
- * - Terminal records are retained for TERMINAL_TTL_MS and bounded to
- *   TERMINAL_CAPACITY, evicted oldest-terminal-first by terminalAt; only then
+ * - Terminal records are bounded to TERMINAL_CAPACITY and evicted
+ *   oldest-terminal-first by terminalAt; only then
  *   does a lookup honestly report `unknown`.
  * - Process-local durability floor is the live session process: restart means `unknown`.
  *   Session-scoped durable retention (kind-aware store) is provided by reconciliation-store.ts (#3032).
@@ -28,7 +28,6 @@ import type { ReceiptState } from "../receipt-state";
 export { PROMPT_FAILURE_CODE_MAX, sanitizePromptFailure };
 export const PROMPT_RECONCILIATION_ACTIVE_CAPACITY = 128;
 export const PROMPT_RECONCILIATION_TERMINAL_CAPACITY = 256;
-export const PROMPT_RECONCILIATION_TERMINAL_TTL_MS = 15 * 60_000;
 
 export type PromptReconciliationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed";
 
@@ -130,10 +129,6 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 	};
 
 	const cleanup = () => {
-		const at = now();
-		for (const [key, record] of records)
-			if (record.terminalAt !== undefined && record.terminalAt + PROMPT_RECONCILIATION_TERMINAL_TTL_MS <= at)
-				remove(key);
 		const terminalEntries = [...records.entries()].filter(([, record]) => record.terminalAt !== undefined);
 		if (terminalEntries.length <= PROMPT_RECONCILIATION_TERMINAL_CAPACITY) return;
 		// Evict oldest-terminal-first by terminalAt, not acceptance/insertion

@@ -1,8 +1,10 @@
+import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import type { Browser, Page } from "puppeteer-core";
 import { ToolError, throwIfAborted } from "../tool-errors";
+import { isChromeProfileExecutable } from "./launch";
 
 const ATTACH_TARGET_SKIP_PATTERN =
 	/request[\s_-]?handler|devtools|background[\s_-]?(?:page|host)|service[\s_-]?worker/i;
@@ -133,8 +135,10 @@ async function probeCdpAt(port: number, signal?: AbortSignal): Promise<boolean> 
 	try {
 		const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: probeSignal });
 		await res.body?.cancel();
+		throwIfAborted(signal);
 		return res.ok;
 	} catch {
+		throwIfAborted(signal);
 		return false;
 	}
 }
@@ -181,6 +185,7 @@ export async function findReusableCdp(
 		if (await probeCdpAt(port, signal)) {
 			return { cdpUrl: `http://127.0.0.1:${port}`, pid: proc.pid };
 		}
+		throwIfAborted(signal);
 	}
 	return null;
 }
@@ -196,10 +201,64 @@ export async function findRunningChromeProfile(
 	profile: { userDataDir: string; profileDirectory: string },
 	signal?: AbortSignal,
 ): Promise<RunningChromeProfile | null> {
-	const candidates = nativeProcessBindings()
-		.Process.fromPath(exe)
-		.filter(p => p.status() === nativeProcessBindings().ProcessStatus.Running);
+	return findRunningChromeProfileWithOptions(exe, profile, signal, {});
+}
+
+interface ProfileProcessScanOptions {
+	platform?: NodeJS.Platform;
+	linuxPids?: readonly number[];
+	linuxExecutablePaths?: ReadonlyMap<number, string>;
+	signal?: AbortSignal;
+}
+
+async function liveLinuxPids(): Promise<number[]> {
+	try {
+		const entries = await fs.readdir("/proc", { withFileTypes: true });
+		return entries
+			.filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name))
+			.map(entry => Number.parseInt(entry.name, 10));
+	} catch {
+		return [];
+	}
+}
+
+async function linuxExecutablePath(pid: number, options: ProfileProcessScanOptions): Promise<string | null> {
+	const injected = options.linuxExecutablePaths?.get(pid);
+	if (injected) return injected;
+	try {
+		return await fs.readlink(`/proc/${pid}/exe`);
+	} catch {
+		return null;
+	}
+}
+
+async function findRunningChromeProfileWithOptions(
+	exe: string,
+	profile: { userDataDir: string; profileDirectory: string },
+	signal: AbortSignal | undefined,
+	options: ProfileProcessScanOptions,
+): Promise<RunningChromeProfile | null> {
+	const bindings = nativeProcessBindings();
+	const candidates = bindings.Process.fromPath(exe).filter(p => p.status() === bindings.ProcessStatus.Running);
+	const seenPids = new Set(candidates.map(candidate => candidate.pid));
+	if ((options.platform ?? process.platform) === "linux" && candidates.length === 0) {
+		throwIfAborted(signal);
+		const linuxPids = options.linuxPids ?? (await liveLinuxPids());
+		throwIfAborted(signal);
+		for (const pid of linuxPids) {
+			throwIfAborted(signal);
+			if (seenPids.has(pid)) continue;
+			const candidate = bindings.Process.fromPid(pid);
+			if (!candidate || candidate.status() !== bindings.ProcessStatus.Running) continue;
+			const executablePath = await linuxExecutablePath(pid, options);
+			throwIfAborted(signal);
+			if (!executablePath || !isChromeProfileExecutable(executablePath)) continue;
+			seenPids.add(pid);
+			candidates.push(candidate);
+		}
+	}
 	for (const proc of candidates) {
+		throwIfAborted(signal);
 		let args: string[];
 		try {
 			args = proc.args();
@@ -216,10 +275,19 @@ export async function findRunningChromeProfile(
 			if (await probeCdpAt(port, signal)) {
 				return { pid: proc.pid, cdpUrl: `http://127.0.0.1:${port}` };
 			}
+			throwIfAborted(signal);
 		}
 		return { pid: proc.pid, cdpUrl: null };
 	}
 	return null;
+}
+
+export function findRunningChromeProfileForTest(
+	exe: string,
+	profile: { userDataDir: string; profileDirectory: string },
+	options: ProfileProcessScanOptions,
+): Promise<RunningChromeProfile | null> {
+	return findRunningChromeProfileWithOptions(exe, profile, options.signal, options);
 }
 
 /**

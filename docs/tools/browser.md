@@ -48,7 +48,7 @@
 | `viewport` | `{ width: number; height: number; scale?: number }` | No | Requested viewport. For headless launch this becomes the initial viewport; for a page it is applied with `page.setViewport()`. `scale` maps to Puppeteer `deviceScaleFactor`. |
 | `wait_until` | `"load" \| "domcontentloaded" \| "networkidle0" \| "networkidle2"` | No | Navigation wait condition. Defaults to `"networkidle2"` where omitted. |
 | `dialogs` | `"accept" \| "dismiss"` | No | Installs a page `dialog` handler that auto-accepts or auto-dismisses dialogs. Omitted means no handler. |
-| `app` | `{ path?: string; cdp_url?: string; browser?: "chrome"; user_data_dir?: string; profile_directory?: string; background?: boolean; no_focus?: boolean; cdp_port?: number; args?: string[]; target?: string }` | No | Selects browser kind. No `app` uses the session `browser.headless` setting. `app.path` alone is resolved against the session cwd and used as the executable path for spawn/attach reuse. `app.cdp_url` connects to an existing CDP endpoint. `app.browser: "chrome"` selects guarded saved-profile mode and requires `path`, `user_data_dir`, and `profile_directory`. `args` are appended only when spawning `app.path` or a Chrome profile. `target` is used for attached/spawned/profile page selection. |
+| `app` | `{ path?: string; cdp_url?: string; browser?: "chrome"; user_data_dir?: string; profile_directory?: string; background?: boolean; no_focus?: boolean; cdp_port?: number; args?: string[]; target?: string }` | No | Selects browser kind. No `app` uses the session `browser.headless` setting. `app.path` alone is resolved against the session cwd and used as the executable path for spawn/attach reuse. `app.cdp_url` connects to an existing CDP endpoint. `app.browser: "chrome"` selects guarded saved-profile mode: `path` defaults to installed Chrome/Chromium and `profile_directory` defaults to `"Default"`, while `user_data_dir` is required and must be a non-default Chrome data directory because Chrome 136+ disables remote debugging for its default data directory. Non-Chrome executables and default Chrome data roots are rejected. `args` are appended only when spawning `app.path` or a Chrome profile. `target` is used for attached/spawned/profile page selection. |
 
 ### `action: "close"`
 
@@ -92,7 +92,7 @@ The tool returns one result per call; no streaming partial output is emitted fro
 1. `BrowserTool.execute()` (`packages/coding-agent/src/tools/browser.ts`) abort-checks, clamps `timeout` via `clampTimeout("browser", ...)`, defaults `name` to `"main"`, and dispatches `open`, `close`, `act`, or `run`.
 2. `open` resolves browser kind with `resolveBrowserKind()`:
    - `app.cdp_url` → `{ kind: "connected" }` after trimming trailing slashes.
-   - `app.browser: "chrome"` → `{ kind: "chrome-profile" }` after resolving `path` and `user_data_dir` against session cwd and copying `profile_directory`, `background`, `no_focus`, and optional `cdp_port`.
+   - `app.browser: "chrome"` → `{ kind: "chrome-profile" }`. `path` defaults to installed Chrome/Chromium (`resolveSystemChromeForProfile()`, admitting only Chrome/Chromium brands) and `profile_directory` defaults to `"Default"`. `user_data_dir` is required, resolved against the session cwd, and rejected when it resolves (including through a symlink) to a platform default Stable/Beta/Dev/Canary/Chromium root; trusted Linux environment overrides plus Flatpak and Snap defaults are included. Chrome 136+ does not honor remote-debugging switches for default Chrome data directories. Explicit Edge, Brave, Vivaldi, Opera, and unknown browser executables are rejected before profile fields are resolved. `background`, `no_focus`, and optional `cdp_port` are copied through.
    - `app.path` → `{ kind: "spawned" }` after resolving against session cwd.
    - otherwise → `{ kind: "headless", headless: session.settings.get("browser.headless") }`.
 3. `open` rejects reusing the same tab name across different browser kinds (`sameBrowserKind()`); callers must close first.
@@ -114,9 +114,9 @@ The tool returns one result per call; no streaming partial output is emitted fro
 8. `WorkerCore.#init()` (`packages/coding-agent/src/tools/browser/tab-worker.ts`) connects back to the browser websocket endpoint. Headless mode opens a new page, applies stealth patches, applies viewport, installs dialog handling if requested, and optionally navigates. Attach mode resolves the requested target page and optionally installs dialog handling.
 9. On success the worker sends `ready` with `{ url, title, viewport, targetId }`; the supervisor stores a `TabSession`, increments browser-handle refcount with `holdBrowser()`, and keeps the tab in a process-global `Map<string, TabSession>`.
 
-### Existing Chrome profile mode
+### Existing non-default Chrome profile mode
 
-Use this mode when automation needs cookies and login state from a saved Chrome profile without risking the daily Chrome process:
+Use this mode for a dedicated, persistent Chrome data root that already contains the automation profile and login state. Chrome 136+ rejects remote debugging against the browser's default data root, so do not point this mode at the daily Chrome root. Create and sign in to a separate root first, close that Chrome instance, then let GJC reopen it with the guarded CDP lifecycle:
 
 ```json
 {
@@ -124,9 +124,8 @@ Use this mode when automation needs cookies and login state from a saved Chrome 
   "name": "work-browser",
   "app": {
     "browser": "chrome",
-    "path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "user_data_dir": "~/Library/Application Support/Google/Chrome",
-    "profile_directory": "Profile 10",
+    "user_data_dir": "~/Library/Application Support/GJC/Chrome Automation",
+    "profile_directory": "Default",
     "background": true,
     "no_focus": true,
     "target": "example.com"
@@ -137,6 +136,7 @@ Use this mode when automation needs cookies and login state from a saved Chrome 
 Security and lifecycle rules:
 
 - CDP is bound to `127.0.0.1`; do not expose logged-in profile CDP ports on a public interface. A CDP client has full browser-account access.
+- `user_data_dir` must be a separate non-default data root. Platform Stable/Beta/Dev/Canary/Chromium defaults, Linux environment/Flatpak/Snap defaults, and aliases to them are rejected before launch. Use `app.cdp_url` only for an already-authorized endpoint that you intentionally started and control.
 - Saved-profile and attached-CDP automation can read and act with that profile's cookies and authenticated accounts. Use it only when that credentialed access is intentional.
 - Never use generic `app.path` spawning for a daily Chrome profile: it may kill stale same-path processes. Use explicit `app.browser: "chrome"` profile mode, which applies the ownership guards below.
 - A matching already-running profile is reused only when its localhost CDP endpoint responds. A matching profile running normally without CDP is refused with remediation text; GJC does not kill or relaunch it.

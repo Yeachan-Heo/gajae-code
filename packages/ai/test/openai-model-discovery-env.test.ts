@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { lmStudioModelManagerOptions } from "../src/provider-models/openai-compat";
+import { lmStudioModelManagerOptions, omlxModelManagerOptions } from "../src/provider-models/openai-compat";
 
 const tempDirs: string[] = [];
 const originalFetch = globalThis.fetch;
@@ -114,5 +114,41 @@ describe("LM Studio model discovery metadata", () => {
 		const model = models?.find(candidate => candidate.id === "DeepSeek-V4-Flash-Q4_K_M.gguf");
 		expect(model?.contextWindow).toBe(131072);
 		expect(model?.maxTokens).toBe(8192);
+	});
+});
+
+describe("oMLX model discovery metadata", () => {
+	it("honors endpoint overrides, omits the local sentinel, and marks Qwen3.6 reasoning controls", async () => {
+		let requestUrl = "";
+		let authorization: string | null = null;
+		globalThis.fetch = vi.fn(async (input, init) => {
+			requestUrl = String(input);
+			authorization = new Headers(init?.headers).get("authorization");
+			return new Response(
+				JSON.stringify({
+					data: [{ id: "Qwen3.6-27B-UD-MLX-4bit", max_model_len: 131072 }],
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}) as unknown as typeof fetch;
+
+		const options = omlxModelManagerOptions({
+			apiKey: "omlx-local",
+			baseUrl: "http://127.0.0.1:18000/v1",
+		});
+		const models = await options.fetchDynamicModels?.();
+		const model = models?.find(candidate => candidate.id === "Qwen3.6-27B-UD-MLX-4bit");
+
+		expect(requestUrl).toBe("http://127.0.0.1:18000/v1/models");
+		expect(authorization).toBeNull();
+		expect(model).toMatchObject({
+			reasoning: true,
+			contextWindow: 131072,
+			thinking: { mode: "effort", minLevel: "low", maxLevel: "max" },
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				reasoningEffortMap: { low: "low", xhigh: "max", max: "max" },
+			},
+		});
 	});
 });

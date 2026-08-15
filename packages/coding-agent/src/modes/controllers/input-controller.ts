@@ -157,7 +157,11 @@ export class InputController {
 				return process.platform !== "win32";
 			case "app.thinking.cycle":
 			case "app.thinking.toggle":
-				return Boolean(this.ctx.session.model?.reasoning);
+				return Boolean(
+					this.ctx.session.model?.reasoning ||
+						this.ctx.session.model?.thinking ||
+						this.ctx.session.thinkingLevel !== undefined,
+				);
 			case "app.commandPalette.open":
 				return this.ctx.editor.getText().trim().length === 0;
 			case "app.model.cycleForward":
@@ -2097,6 +2101,8 @@ export class InputController {
 		} else {
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
+			this.ctx.ui.requestRender();
+			this.ctx.showStatus(`Reasoning effort: ${newLevel}`);
 		}
 	}
 

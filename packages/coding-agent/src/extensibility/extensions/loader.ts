@@ -242,9 +242,12 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		content: string | (TextContent | ImageContent)[],
 		options?: {
 			deliverAs?: "steer" | "followUp";
+			queuedAtDispatch?: boolean;
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
+			onQueuedPromoted?: () => void;
 			preflightSignal?: AbortSignal;
+			sdkRunToken?: string;
 		},
 	): Promise<void> {
 		return Promise.resolve(this.runtime.sendUserMessage(content, options));

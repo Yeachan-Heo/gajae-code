@@ -32,29 +32,37 @@ describe("kind-aware reconciliation", () => {
 		});
 		await fs.rm(root, { recursive: true, force: true });
 	});
-	test("retains bounded Unicode terminal content across restart", async () => {
+	test("retains bounded prompt and skill terminal content across a late restart", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-recon-content-"));
 		const sessionFile = path.join(root, "s.jsonl");
 		await fs.writeFile(sessionFile, "");
-		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
-		const rec = createKindAwareReconciliation({ store });
-		rec.admit("skill", "ref-content");
-		await rec.noteAccepted("skill", { commandId: "c1", turnId: "t1" }, "ref-content");
-		await rec.noteTransition(
-			"skill",
-			{ commandId: "c1", turnId: "t1" },
-			{
-				type: "agent_end",
-				content: { version: 1, type: "text", text: "😀".repeat(10_000), byteLength: 40_000, truncated: false },
-			},
-		);
+		const store = createReconciliationStore({ sessionFile, sessionId: "s1", now: () => 1_000 });
+		const rec = createKindAwareReconciliation({ store, now: () => 1_000 });
+		for (const kind of ["prompt", "skill"] as const) {
+			rec.admit(kind, `ref-${kind}`);
+			await rec.noteAccepted(kind, { commandId: `c-${kind}`, turnId: `t-${kind}` }, `ref-${kind}`);
+			await rec.noteTransition(
+				kind,
+				{ commandId: `c-${kind}`, turnId: `t-${kind}` },
+				{
+					type: "agent_end",
+					content: { version: 1, type: "text", text: "😀".repeat(10_000), byteLength: 40_000, truncated: false },
+				},
+			);
+		}
 		const reopened = createKindAwareReconciliation({
-			store: createReconciliationStore({ sessionFile, sessionId: "s1" }),
+			store: createReconciliationStore({ sessionFile, sessionId: "s1", now: () => 86_401_000 }),
+			now: () => 86_401_000,
 		});
 		await reopened.hydrateFromStore();
-		const result = reopened.lookupResult("skill", { clientRef: "ref-content" });
-		expect(result).toMatchObject({ status: "terminal_ok", content: { truncated: true } });
-		expect(new TextEncoder().encode(result.content?.text).length).toBeLessThanOrEqual(16_384);
+		for (const kind of ["prompt", "skill"] as const) {
+			const result = reopened.lookupResult(kind, { clientRef: `ref-${kind}` });
+			expect(result).toMatchObject({ status: "terminal_ok", content: { truncated: true } });
+			expect(new TextEncoder().encode(result.content?.text).length).toBeLessThanOrEqual(16_384);
+			expect(reopened.lookup(kind, { commandId: `c-${kind}`, turnId: `t-${kind}` })).toMatchObject({
+				status: "terminal_ok",
+			});
+		}
 		await fs.rm(root, { recursive: true, force: true });
 	});
 	test("terminal transitions preserve claimed skill outcomes across reload", async () => {

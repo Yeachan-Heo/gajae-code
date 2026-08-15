@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { ManagedAttemptOutcome } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
-import { agentLoopContinue, sanitizedDetachedClone } from "@gajae-code/agent-core/agent-loop";
+import {
+	agentLoopContinue,
+	managedAssistantEventSnapshot,
+	sanitizedDetachedClone,
+} from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agent-core/types";
 import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-code/ai";
 
@@ -1099,6 +1103,44 @@ describe("managed attempt transaction", () => {
 		expect(diagnostics[0]).toMatchObject({ stage: "shell.content", errorKind: "local_snapshot_failure" });
 		expect(typeof diagnostics[0].contentBlockCount).toBe("number");
 	});
+	it("keeps sanitizer-sentinel content fail-closed instead of degrading it to an empty turn", async () => {
+		const diagnostics = captureSnapshotDiagnostics();
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					// A proxy-wrapped content array makes the whole-message
+					// structuredClone fail, so the sanitizer replaces the content
+					// node with the "[unserializable]" sentinel string. That
+					// sentinel must never be mistaken for benign provider string
+					// content: degrading it to content: [] would silently drop the
+					// (possibly tool-call-bearing) payload behind a successful
+					// empty turn. It stays a local snapshot failure at the content
+					// stage.
+					const malformed = assistantMessage(mock.model) as unknown as { content: unknown };
+					malformed.content = new Proxy([{ type: "text", text: "hidden payload" }], {});
+					stream.push({ type: "start", partial: malformed as unknown as AssistantMessage });
+				});
+				return stream;
+			},
+		});
+		let outcomes = 0;
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: () => {
+				outcomes += 1;
+				return { type: "retry", continuation: () => {} };
+			},
+		});
+
+		expect(outcomes).toBe(0);
+		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_snapshot_failure");
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({ stage: "shell.content", errorKind: "local_snapshot_failure" });
+	});
 	it("ignores a foreign error that self-labels a local failure kind", async () => {
 		const diagnostics = captureSnapshotDiagnostics();
 		const mock = createMockModel();
@@ -1619,4 +1661,273 @@ it("emits an exhaustion diagnostic lifecycle once before terminal completion", a
 	expect(events.slice(-3)).toEqual(["message_start", "message_end", "agent_end"]);
 	expect(agent.state.messages).toContainEqual(diagnostic);
 	expectManagedRunStart(events);
+});
+
+describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
+	it("degrades non-array content to an empty content array instead of killing the run", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				stream.push({ type: "start", partial });
+				stream.push({ type: "done", reason: "stop", message: { ...partial, content: "raw string" as never } });
+			});
+			return stream;
+		};
+		const context: AgentContext = {
+			systemPrompt: ["test"],
+			messages: [{ role: "user", content: "run", timestamp: Date.now() }],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: messages => messages as Message[],
+			fallbackManaged: true,
+		};
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+		for await (const _event of stream) void _event;
+		const result = await stream.result();
+		expect(result).toHaveLength(1);
+		const committed = result[0] as AssistantMessage;
+		expect(committed.role).toBe("assistant");
+		expect(committed.content).toEqual([]);
+		expect(committed.stopReason).toBe("stop");
+	});
+
+	it("degrades a missing content array the same way as a non-array content value", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				stream.push({ type: "start", partial });
+				const noContent = { ...partial } as { content?: unknown };
+				delete noContent.content;
+				stream.push({ type: "done", reason: "stop", message: noContent as unknown as AssistantMessage });
+			});
+			return stream;
+		};
+		const context: AgentContext = {
+			systemPrompt: ["test"],
+			messages: [{ role: "user", content: "run", timestamp: Date.now() }],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: messages => messages as Message[],
+			fallbackManaged: true,
+		};
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+		for await (const _event of stream) void _event;
+		const result = await stream.result();
+		expect(result).toHaveLength(1);
+		expect((result[0] as AssistantMessage).content).toEqual([]);
+	});
+
+	it("degrades unknown event reasons to schema-valid values in staged snapshots", async () => {
+		// managedAssistantEventSnapshot is the managed-snapshot contract for
+		// staged assistant message events. An unknown done/error reason or
+		// unknown string type must degrade to a schema-valid value rather than
+		// throw, matching the closed StopReason vocabulary already normalized
+		// by managedAssistantShell.
+		const mock = createMockModel();
+		const callbacks: AssistantMessageEvent[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = assistantMessage(mock.model);
+					stream.push({ type: "start", partial });
+					// A text_delta that carries a valid-looking shape is the
+					// reachable staged-snapshot path. This confirms the benign
+					// proxy-wrapped event degrades cleanly through the snapshot.
+					stream.push(
+						new Proxy(
+							{ type: "text_delta" as const, contentIndex: 0, delta: "x", partial },
+							{},
+						) as AssistantMessageEvent,
+					);
+					stream.push({ type: "done", reason: "stop", message: partial });
+				});
+				return stream;
+			},
+			onAssistantMessageEvent: (_message, event) => callbacks.push(event),
+		});
+		await agent.prompt("run", { fallbackManaged: true });
+		expect(agent.state.error).toBeUndefined();
+		const deltas = callbacks.filter(event => event.type === "text_delta");
+		expect(deltas).toHaveLength(1);
+		expect(deltas[0]).toMatchObject({ type: "text_delta", delta: "x" });
+	});
+
+	it("normalizes malformed terminal and unknown-typed events at the staged snapshot boundary", () => {
+		// Terminal done/error events are consumed by streamAssistantResponse
+		// before the staged-event callback fires, so the normalization contract
+		// is asserted directly on managedAssistantEventSnapshot — the exact
+		// function the managed attempt transaction stages every assistant
+		// message event through (#assistantEventSnapshot -> this function).
+		// Unknown done/error reasons degrade into the closed vocabulary;
+		// unknown STRING event types degrade to a terminal done/stop; a
+		// non-string type stays fail-closed as malformed provider output.
+		const mock = createMockModel();
+		const message = assistantMessage(mock.model);
+
+		const done = managedAssistantEventSnapshot(
+			{ type: "done", reason: "out-of-vocabulary", message } as unknown as AssistantMessageEvent,
+			message,
+		);
+		expect(done).toMatchObject({ type: "done", reason: "stop", message });
+
+		const errored = managedAssistantEventSnapshot(
+			{ type: "error", reason: "kaboom", error: message } as unknown as AssistantMessageEvent,
+			message,
+		);
+		expect(errored).toMatchObject({ type: "error", reason: "error", error: message });
+
+		const unknown = managedAssistantEventSnapshot(
+			{ type: "totally-unknown-kind", message } as unknown as AssistantMessageEvent,
+			message,
+		);
+		expect(unknown).toMatchObject({ type: "done", reason: "stop", message });
+
+		let thrown: unknown;
+		try {
+			managedAssistantEventSnapshot({ type: 42, message } as unknown as AssistantMessageEvent, message);
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(Error);
+		expect((thrown as Error).name).toBe("ManagedAttemptSnapshotError");
+		expect((thrown as { errorKind?: string }).errorKind).toBe("local_snapshot_failure");
+		expect((thrown as { stage?: string }).stage).toBe("event.unknownType");
+	});
+
+	it("keeps hostile collapsed-root-proxy events failing fast without managed retry authority", async () => {
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = assistantMessage(mock.model);
+					stream.push({ type: "start", partial });
+					stream.push(
+						new Proxy({ type: "text_delta", contentIndex: 0, delta: "x", partial } as AssistantMessageEvent, {
+							get() {
+								throw new Error("collapsed");
+							},
+						}) as AssistantMessageEvent,
+					);
+					stream.push({ type: "done", reason: "stop", message: partial });
+				});
+				return stream;
+			},
+		});
+		let outcomes = 0;
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: () => {
+				outcomes += 1;
+				return { type: "retry", continuation: () => {} };
+			},
+		});
+		expect(outcomes).toBe(0);
+		expect(agent.state.error).toBeDefined();
+	});
+
+	it("keeps hostile getOwnPropertyDescriptor-trap events failing fast", async () => {
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = assistantMessage(mock.model);
+					stream.push({ type: "start", partial });
+					stream.push(
+						new Proxy({ type: "text_delta", contentIndex: 0, delta: "x", partial } as AssistantMessageEvent, {
+							getOwnPropertyDescriptor() {
+								throw new Error("hostile descriptor");
+							},
+						}) as AssistantMessageEvent,
+					);
+					stream.push({ type: "done", reason: "stop", message: partial });
+				});
+				return stream;
+			},
+		});
+		let outcomes = 0;
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: () => {
+				outcomes += 1;
+				return { type: "retry", continuation: () => {} };
+			},
+		});
+		expect(outcomes).toBe(0);
+		expect(agent.state.error).toBeDefined();
+	});
+
+	it("keeps non-string event types failing fast as malformed provider output", async () => {
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = assistantMessage(mock.model);
+					stream.push({ type: "start", partial });
+					stream.push(new Proxy({ type: 7, contentIndex: 0, partial } as unknown as AssistantMessageEvent, {}));
+					stream.push({ type: "done", reason: "stop", message: partial });
+				});
+				return stream;
+			},
+		});
+		let outcomes = 0;
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: () => {
+				outcomes += 1;
+				return { type: "retry", continuation: () => {} };
+			},
+		});
+		expect(outcomes).toBe(0);
+	});
+
+	it("fails fast when a hostile role getter throws, without managed retry authority", async () => {
+		// A live proxy whose role getter throws must fail the managed attempt
+		// fast. managedProperty catches the throw and degrades to undefined,
+		// so the role guard fails. The throw is contained — it never escapes
+		// to stream.fail — but the run fails as a local snapshot error with
+		// no transport facts and thus no retry authority.
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const hostile = new Proxy(assistantMessage(mock.model), {
+						get(target, key) {
+							if (key === "role") throw new Error("getter side effect");
+							return Reflect.get(target, key);
+						},
+					});
+					stream.push({ type: "done", reason: "stop", message: hostile });
+				});
+				return stream;
+			},
+		});
+		let outcomes = 0;
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: () => {
+				outcomes += 1;
+				return { type: "retry", continuation: () => {} };
+			},
+		});
+		expect(outcomes).toBe(0);
+		expect(agent.state.error).toContain("local snapshot");
+	});
 });

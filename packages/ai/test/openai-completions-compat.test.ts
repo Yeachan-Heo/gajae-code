@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod/v4";
+import { Effort } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/providers/openai-completions";
 import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
@@ -63,6 +64,38 @@ function baseContext(): Context {
 }
 
 describe("openai-completions compatibility", () => {
+	it("serializes oMLX Qwen effort through chat_template_kwargs", async () => {
+		const model: Model<"openai-completions"> = {
+			id: "Qwen3.6-27B-UD-MLX-4bit",
+			name: "Qwen3.6 27B",
+			api: "openai-completions",
+			provider: "omlx",
+			baseUrl: "http://127.0.0.1:8000/v1",
+			reasoning: true,
+			thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 131072,
+			maxTokens: 32768,
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				reasoningEffortMap: { xhigh: "max" },
+			},
+		};
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+
+		streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			reasoning: "xhigh",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload),
+		});
+
+		expect(await promise).toMatchObject({
+			chat_template_kwargs: { enable_thinking: true, reasoning_effort: "max" },
+		});
+	});
+
 	it("serializes direct xAI Grok 4.5 and 4.6 reasoning efforts without changing other Grok routes", async () => {
 		async function captureXaiPayload(modelId: "grok-4.5" | "grok-4.6", reasoning: "low" | "xhigh") {
 			const model: Model<"openai-completions"> = {

@@ -1,9 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createKindAwareReconciliation } from "../src/sdk/bus/kind-aware-reconciliation";
-import {
-	PROMPT_RECONCILIATION_TERMINAL_CAPACITY,
-	PROMPT_RECONCILIATION_TERMINAL_TTL_MS,
-} from "../src/sdk/bus/prompt-reconciliation";
+import { PROMPT_RECONCILIATION_TERMINAL_CAPACITY } from "../src/sdk/bus/prompt-reconciliation";
 import {
 	type DurableReconciliationRecord,
 	type DurableTerminalScopeRecord,
@@ -99,22 +96,24 @@ describe("SDK steer reconciliation", () => {
 		expect(reader.lookupSteer("missing")).toEqual({ clientRef: "missing", status: "unknown" });
 	});
 
-	test("retains live dispatching records while expiring and capacity-bounding settled steers", async () => {
+	test("retains live and settled steers until oldest-terminal-first capacity eviction", async () => {
 		let now = 0;
 		const reconciliation = createKindAwareReconciliation({ store: new MemoryStore(), now: () => now });
 		await reconciliation.reserveSteer("live", "body");
+		await reconciliation.reserveSteer("aged", "body-aged");
+		await reconciliation.settleSteer("aged", "accepted");
+		now += 24 * 60 * 60_000;
+		expect(reconciliation.lookupSteer("aged")).toMatchObject({ status: "accepted" });
 		for (let index = 0; index <= PROMPT_RECONCILIATION_TERMINAL_CAPACITY; index++) {
 			await reconciliation.reserveSteer(`settled-${index}`, `body-${index}`);
 			await reconciliation.settleSteer(`settled-${index}`, "accepted");
 			now++;
 		}
 		expect(reconciliation.lookupSteer("live")).toMatchObject({ status: "uncertain" });
+		expect(reconciliation.lookupSteer("aged")).toMatchObject({ status: "unknown" });
 		expect(reconciliation.lookupSteer("settled-0")).toMatchObject({ status: "unknown" });
-		now += PROMPT_RECONCILIATION_TERMINAL_TTL_MS;
-		await reconciliation.reserveSteer("new", "body-new");
-		expect(reconciliation.lookupSteer("live")).toMatchObject({ status: "uncertain" });
 		expect(reconciliation.lookupSteer(`settled-${PROMPT_RECONCILIATION_TERMINAL_CAPACITY}`)).toMatchObject({
-			status: "unknown",
+			status: "accepted",
 		});
 	});
 });

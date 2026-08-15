@@ -235,4 +235,160 @@ describe("AgentSession pre-admission artifact spill", () => {
 		expect(persisted.message).toEqual(toolResult);
 		expect(JSON.stringify(persisted.message)).not.toContain("artifact://");
 	});
+	it("keeps canonical admission live when the same message_end event object is emitted twice", async () => {
+		tempDir = TempDir.createSync("@gjc-pre-admission-spill-duplicate-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+		const agent = new Agent({
+			initialState: {
+				model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "duplicate-emission",
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(40_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		// A host bridge or replay can hand the agent the same event object twice
+		// before the first emission's spill finishes. The admission reservation
+		// must stay owned by each emission's own handler, so both admissions run
+		// and no later canonical admission is blocked forever.
+		const duplicateEvent = { type: "message_end", message: toolResult } as const;
+		agent.emitExternalEvent(duplicateEvent);
+		agent.emitExternalEvent(duplicateEvent);
+
+		await withTimeout(session.awaitSessionSettlement(), 5_000, "Duplicate emission deadlocked canonical admission");
+
+		const persistedToolResults = sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "message" && entry.message.role === "toolResult");
+		expect(persistedToolResults).toHaveLength(2);
+	});
+	it("appends canonical messages synchronously when no admission is contended", async () => {
+		tempDir = TempDir.createSync("@gjc-admission-sync-visibility-");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+		const agent = new Agent({
+			initialState: {
+				model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
+			modelRegistry: {} as never,
+		});
+
+		// An uncontended message_end (predecessor already released) must not cost
+		// a microtask: hosts emit external messages and read the persisted branch
+		// immediately (issue #2261 flow). A regression to an unconditional await
+		// breaks this contract even though the promise is already settled.
+		agent.emitExternalEvent({
+			type: "message_end",
+			message: { role: "user", content: "sync visible", timestamp: Date.now() },
+		});
+		const lastEntry = sessionManager.getBranch().at(-1);
+		expect(lastEntry?.type).toBe("message");
+		expect(lastEntry?.type === "message" && (lastEntry.message as { content?: unknown }).content).toBe(
+			"sync visible",
+		);
+	});
+
+	it("preserves FIFO admission when a contended predecessor is still in flight", async () => {
+		tempDir = TempDir.createSync("@gjc-admission-fifo-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+
+		// Gate the spill so the first tool result's admission is still pending when
+		// the assistant continuation is emitted; the continuation must wait for it.
+		const spillGate = Promise.withResolvers<void>();
+		const agent = new Agent({
+			initialState: {
+				model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		(sessionManager as unknown as { saveArtifact: typeof sessionManager.saveArtifact }).saveArtifact = async () => {
+			await spillGate.promise;
+			return { uri: "artifact://1", bytes: 4, sha256: "0".repeat(64) } as never;
+		};
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "fifo-gated",
+			toolName: "read",
+			content: [{ type: "text", text: "y".repeat(40_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		agent.emitExternalEvent({ type: "message_end", message: toolResult });
+		agent.emitExternalEvent({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "continuation after gated spill" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			} as AssistantMessage,
+		});
+
+		await Bun.sleep(25);
+		// While the spill is gated, neither message may have appended out of order;
+		// the continuation is blocked behind the tool result's pending admission.
+		const rolesSoFar = sessionManager
+			.getBranch()
+			.flatMap(entry => (entry.type === "message" ? [entry.message.role] : []));
+		expect(rolesSoFar).toEqual([]);
+
+		spillGate.resolve();
+		await withTimeout(session.awaitSessionSettlement(), 5_000, "Gated spill admission deadlocked");
+		const rolesAfter = sessionManager
+			.getBranch()
+			.flatMap(entry => (entry.type === "message" ? [entry.message.role] : []));
+		expect(rolesAfter).toEqual(["toolResult", "assistant"]);
+	});
 });

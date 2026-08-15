@@ -114,6 +114,7 @@ const MANAGED_LOCAL_FAILURE_STAGES = [
 	"staging.losslessSnapshot",
 	"staging.measure",
 	"staging.sanitize",
+	"staging.preMeasure",
 	"staging.overflow",
 	"overflow.preMeasure",
 	"overflow.staged",
@@ -654,6 +655,19 @@ function publishAgentEnd(
 export const MANAGED_SNAPSHOT_MAX_NODES = 100_000;
 
 /**
+ * The sanitizer's closed set of placeholder strings. A degraded snapshot can
+ * never distinguish these from provider-sent strings by value alone, so
+ * downstream shape checks treat a sentinel-valued field as "original value was
+ * non-cloneable", never as benign provider variance.
+ */
+const SANITIZER_SENTINELS: ReadonlySet<string> = new Set([
+	"[unserializable]",
+	"[accessor]",
+	"[truncated]",
+	"[Circular]",
+]);
+
+/**
  * Cycle-aware deep clone that always returns a detached, JSON-serializable
  * value. Used whenever a detached snapshot cannot be safely obtained or
  * measured: after `structuredClone` fails, and again when a (successfully
@@ -855,7 +869,16 @@ function losslessDetachedClone<T>(value: T): T {
 			} catch {
 				if (key === "transportFailure" && isManagedPlainRecord(descriptor.value)) {
 					const transport: Record<string, unknown> = {};
-					for (const transportKey of ["kind", "status", "code", "providerCode", "retryAfterMs"] as const) {
+					for (const transportKey of [
+						"kind",
+						"status",
+						"code",
+						"providerCode",
+						"openaiErrorCode",
+						"anthropicErrorType",
+						"retryAfterMs",
+						"headers",
+					] as const) {
 						const transportDescriptor = Object.getOwnPropertyDescriptor(descriptor.value, transportKey);
 						if (!transportDescriptor || !("value" in transportDescriptor)) continue;
 						try {
@@ -881,13 +904,31 @@ function losslessDetachedClone<T>(value: T): T {
 function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]): AssistantMessage {
 	const detailed = managedAttemptSnapshotDetailed(value);
 	const source = isManagedPlainRecord(detailed.snapshot) ? detailed.snapshot : value;
+	// A root that could not be snapshotted into a plain record is a live
+	// Proxy (the sanitizer collapses proxies to a placeholder). Benign
+	// proxy-wrapped provider messages are repaired by reading through the
+	// proxy — the provider's own view — with every read guarded so a hostile
+	// trap can only degrade to undefined, never escape. `managedProperty`
+	// is exactly that guarded read.
 	if (managedProperty(source, "role") !== "assistant") throw new ManagedAttemptSnapshotError("shell.role");
 	const rawContent = managedAttemptSnapshot(managedProperty(source, "content"));
-	if (!Array.isArray(rawContent)) throw new ManagedAttemptSnapshotError("shell.content");
-	const content = rawContent.flatMap(block => {
-		const normalized = managedAssistantContent(block);
-		return normalized ? [normalized] : [];
-	});
+	// Benign providers occasionally deliver a string or missing content value.
+	// Degrade those to an empty content array — an empty assistant turn —
+	// instead of failing the whole managed run: the staged shell must stay
+	// schema-valid, and empty content is the neutral, side-effect-free
+	// degradation. A string is benign ONLY when the provider actually sent a
+	// string: when the whole-message snapshot degraded, the sanitizer replaces
+	// a non-cloneable content value (proxy, function, accessor) with one of
+	// its own sentinel strings, and mistaking that sentinel for provider
+	// variance would silently drop real content (tool calls) behind a
+	// successful empty turn. Sentinel-string content therefore stays
+	// fail-closed, as does every other non-array shape, so the named-site
+	// diagnostic can report shell.content.
+	const rawArray = Array.isArray(rawContent) ? rawContent : undefined;
+	const benignContent =
+		rawContent === undefined || (typeof rawContent === "string" && !SANITIZER_SENTINELS.has(rawContent));
+	if (rawArray === undefined && !benignContent) throw new ManagedAttemptSnapshotError("shell.content");
+	const content = rawArray === undefined ? [] : rawArray.flatMap(managedContentBlock);
 	const usage = managedAssistantUsage(managedAttemptSnapshot(managedProperty(source, "usage")));
 	const api = managedProperty(source, "api");
 	const provider = managedProperty(source, "provider");
@@ -925,6 +966,11 @@ function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]):
 		...(typeof errorMessage === "string" ? { errorMessage } : {}),
 		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
 	};
+}
+
+function managedContentBlock(block: unknown): AssistantMessage["content"] {
+	const normalized = managedAssistantContent(block);
+	return normalized ? [normalized] : [];
 }
 
 function managedAssistantContent(value: unknown): AssistantMessage["content"][number] | undefined {
@@ -1001,7 +1047,10 @@ function managedAssistantUsage(value: unknown): AssistantMessage["usage"] {
 	};
 }
 
-function managedAssistantEventSnapshot(event: AssistantMessageEvent, message: AssistantMessage): AssistantMessageEvent {
+export function managedAssistantEventSnapshot(
+	event: AssistantMessageEvent,
+	message: AssistantMessage,
+): AssistantMessageEvent {
 	const snapshot = managedAttemptSnapshot(event);
 	if (!isManagedPlainRecord(snapshot)) throw new ManagedAttemptSnapshotError("event.snapshot");
 	const type = managedProperty(snapshot, "type");
@@ -1042,16 +1091,19 @@ function managedAssistantEventSnapshot(event: AssistantMessageEvent, message: As
 	}
 	if (type === "done") {
 		const reason = managedProperty(snapshot, "reason");
-		if (reason !== "stop" && reason !== "length" && reason !== "toolUse") {
-			throw new ManagedAttemptSnapshotError("event.done.reason");
-		}
-		return { type, reason, message };
+		// Degrade out-of-vocabulary done reasons to "stop", matching the closed
+		// StopReason vocabulary already normalized by managedAssistantShell.
+		const normalized = reason === "stop" || reason === "length" || reason === "toolUse" ? reason : "stop";
+		return { type, reason: normalized, message };
 	}
 	if (type === "error") {
 		const reason = managedProperty(snapshot, "reason");
-		if (reason !== "aborted" && reason !== "error") throw new ManagedAttemptSnapshotError("event.error.reason");
-		return { type, reason, error: message };
+		const normalized = reason === "aborted" || reason === "error" ? reason : "error";
+		return { type, reason: normalized, error: message };
 	}
+	// An unknown string event type degrades to a terminal done/stop; a
+	// non-string type is malformed provider output that must fail fast.
+	if (typeof type === "string") return { type: "done", reason: "stop", message } as AssistantMessageEvent;
 	throw new ManagedAttemptSnapshotError("event.unknownType");
 }
 
@@ -1105,11 +1157,12 @@ function warnManagedSnapshotFailure(
  * cancelled provider attempt is therefore unobservable to sessions and their
  * side-effect consumers. Non-managed streams bypass this object entirely.
  */
+type ManagedAttemptBatchItem =
+	| { type: "event"; event: AgentEvent }
+	| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent };
+
 class ManagedAttemptTransaction {
-	#batch: Array<
-		| { type: "event"; event: AgentEvent }
-		| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent }
-	> = [];
+	#batch: ManagedAttemptBatchItem[] = [];
 	#stagedEventCount = 0;
 	#stagedBytes = 0;
 	/** Shape snapshot retained across discard() for bounded failure diagnostics. */
@@ -1129,6 +1182,10 @@ class ManagedAttemptTransaction {
 
 	push(event: AgentEvent): void {
 		if (this.#committed) {
+			if (event.type === "message_end" || event.type === "turn_end") {
+				this.#batch.push({ type: "event", event });
+				return;
+			}
 			this.stream.push(event);
 			return;
 		}
@@ -1153,7 +1210,7 @@ class ManagedAttemptTransaction {
 	}
 
 	flush(): void {
-		if (this.#discarded || this.#committed) return;
+		if (this.#discarded) return;
 		for (const item of this.#batch) {
 			if (item.type === "assistant_event") {
 				this.onAssistantMessageEvent?.(item.message, item.event);
@@ -1165,6 +1222,47 @@ class ManagedAttemptTransaction {
 		this.#stagedBytes = 0;
 		this.#stagedEventCount = 0;
 		this.#committed = true;
+	}
+
+	flushNonTerminal(): void {
+		if (this.#discarded || this.#committed) return;
+		const retained: ManagedAttemptBatchItem[] = [];
+		for (const item of this.#batch) {
+			if (this.#isTerminalItem(item)) {
+				retained.push(item);
+			} else if (item.type === "assistant_event") {
+				this.onAssistantMessageEvent?.(item.message, item.event);
+			} else {
+				this.stream.push(item.event);
+			}
+		}
+		this.#batch = retained;
+	}
+
+	commitCallbacksAndUpdates(): void {
+		if (this.#discarded || this.#committed) return;
+		for (const item of this.#batch) {
+			if (item.type === "assistant_event") {
+				this.onAssistantMessageEvent?.(item.message, item.event);
+			} else if (item.event.type !== "message_end" && item.event.type !== "turn_end") {
+				this.stream.push(item.event);
+			}
+		}
+		this.#batch = this.#batch.filter(
+			item => item.type === "event" && (item.event.type === "message_end" || item.event.type === "turn_end"),
+		);
+		this.#committed = true;
+	}
+
+	replacePendingAssistantMessage(message: AssistantMessage): void {
+		this.#batch = this.#batch.map(item => {
+			if (item.type === "assistant_event") {
+				return { ...item, message, event: this.#assistantEventSnapshot(item.event, message) };
+			}
+			if (item.event.type === "message_end") return { ...item, event: { ...item.event, message } };
+			if (item.event.type === "turn_end") return { ...item, event: { ...item.event, message } };
+			return item;
+		});
 	}
 
 	get committed(): boolean {
@@ -1228,9 +1326,19 @@ class ManagedAttemptTransaction {
 	#stage(event: AgentEvent): void {
 		if (this.snapshotMode === "lossless") {
 			const snapshot = this.#repairAssistantEvent(event);
+			let rawBytes: number | undefined;
+			try {
+				rawBytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
+			} catch {
+				rawBytes = undefined;
+			}
+			if (rawBytes !== undefined && this.#wouldOverflow(rawBytes)) {
+				this.discard();
+				throw new ManagedAttemptSnapshotError("staging.preMeasure");
+			}
 			let detached: AgentEvent;
 			try {
-				detached = this.#losslessSnapshot(snapshot);
+				detached = this.#losslessAgentEventSnapshot(snapshot);
 			} catch {
 				this.discard();
 				throw new ManagedAttemptSnapshotError("staging.losslessSnapshot");
@@ -1334,6 +1442,28 @@ class ManagedAttemptTransaction {
 		return losslessDetachedClone(value);
 	}
 
+	#losslessAgentEventSnapshot(event: AgentEvent): AgentEvent {
+		switch (event.type) {
+			case "message_start":
+			case "message_end":
+				return { ...event, message: this.#losslessSnapshot(event.message) };
+			case "message_update": {
+				const message = this.#losslessSnapshot(event.message);
+				if (message.role !== "assistant") return { ...event, message };
+				const assistantMessageEvent = this.#assistantEventSnapshot(event.assistantMessageEvent, message);
+				return { ...event, message, assistantMessageEvent };
+			}
+			case "turn_end":
+				return {
+					...event,
+					message: this.#losslessSnapshot(event.message),
+					toolResults: this.#losslessSnapshot(event.toolResults),
+				};
+			default:
+				return this.#losslessSnapshot(event);
+		}
+	}
+
 	#assistantSnapshot(message: AssistantMessage): AssistantMessage {
 		return this.snapshotMode === "lossless"
 			? this.#losslessSnapshot(message)
@@ -1345,8 +1475,13 @@ class ManagedAttemptTransaction {
 		const snapshot = this.#losslessSnapshot(event);
 		if (snapshot.type === "done") return { ...snapshot, message };
 		if (snapshot.type === "error") return { ...snapshot, error: message };
-		if ("partial" in snapshot) return { ...snapshot, partial: message };
-		return snapshot;
+		if (snapshot.type === "toolChoiceIncapability") return snapshot;
+		return { ...snapshot, partial: message };
+	}
+
+	#isTerminalItem(item: ManagedAttemptBatchItem): boolean {
+		if (item.type === "assistant_event") return item.event.type === "done" || item.event.type === "error";
+		return item.event.type === "message_end" || item.event.type === "turn_end";
 	}
 }
 
@@ -2001,6 +2136,18 @@ async function runLoopBody(
 					}
 					await emitHarmonyAudit(config, err, "truncate_resume", harmonyRetryAttempt);
 				} else {
+					if (escapedToolTransaction?.committed) {
+						const contaminated = currentContext.messages.at(-1);
+						if (contaminated?.role !== "assistant") throw err;
+						const sanitized = escapedToolTransaction.acceptedAssistantSnapshot({
+							...contaminated,
+							content: [],
+							stopReason: "aborted",
+							providerPayload: undefined,
+						});
+						escapedToolTransaction.replacePendingAssistantMessage(sanitized);
+						escapedToolTransaction.flush();
+					}
 					if (harmonyRetryAttempt >= 2) {
 						await emitHarmonyAudit(config, err, "escalated", harmonyRetryAttempt);
 						throw new Error(
@@ -2102,10 +2249,11 @@ async function runLoopBody(
 			// back into the context the model samples from next. Drop the defective
 			// turn and re-request instead; the per-call rejection in
 			// `executeToolCalls` stays as the terminal answer once this budget is
-			// spent. Managed fallback owns its own retry policy, so this is scoped
-			// to the non-managed session path, matching the repairs above.
+			// spent. Managed fallback reports the discarded attempt through the
+			// typed `escaped_arguments_discarded` outcome so the session policy
+			// owns a bounded same-model retry; the defect is never treated as
+			// provider evidence, so the fallback chain never advances on it.
 			if (
-				!config.fallbackManaged &&
 				message.stopReason !== "error" &&
 				message.stopReason !== "aborted" &&
 				escapedNonAsciiResampleAttempt < MAX_ESCAPED_NONASCII_RESAMPLES &&
@@ -2119,6 +2267,24 @@ async function runLoopBody(
 				// still the tail: callbacks may append user/system history while the
 				// response settles, and none of that history belongs to this retry.
 				removeCommittedAssistantMessage(currentContext.messages, message);
+				// A managed invocation ends the run here and reports the discarded
+				// attempt to the session's fallback policy through the typed
+				// outcome below; the policy owns the same-model bounded retry and
+				// only falls back once it declines. The wire defect is not provider
+				// evidence, so the outcome deliberately carries no transport facts
+				// and the fallback chain never advances on it.
+				if (config.fallbackManaged) {
+					transaction?.discard();
+					currentContext.messages.splice(contextMessageCount);
+					newMessages.splice(newMessageCount);
+					await config.onManagedAttemptOutcome?.({
+						type: "escaped_arguments_discarded",
+						message,
+						scope: transaction?.scope,
+					});
+					stream.end(newMessages);
+					return;
+				}
 				continue;
 			}
 			escapedNonAsciiResampleAttempt = 0;
@@ -2178,23 +2344,27 @@ async function runLoopBody(
 			}
 
 			// One provider invocation is committed before any tool can run.
-			transaction?.flush();
 			if (escapedToolTransaction) {
 				const acceptedMessage = escapedToolTransaction.acceptedAssistantSnapshot(message);
-				const acceptedIndex = currentContext.messages.lastIndexOf(message);
-				if (acceptedIndex >= 0) currentContext.messages[acceptedIndex] = acceptedMessage;
+				const contextIndex = currentContext.messages.lastIndexOf(message);
+				if (contextIndex >= 0) currentContext.messages[contextIndex] = acceptedMessage;
 				const producedIndex = newMessages.lastIndexOf(message);
 				if (producedIndex >= 0) newMessages[producedIndex] = acceptedMessage;
 				message = acceptedMessage;
+				escapedToolTransaction.flushNonTerminal();
 				// Tool-call updates are staged so an escaped turn can disappear
 				// atomically. Once accepted, drain every published update through the
 				// Agent/AgentSession consumers before dispatch: streaming edit guards
 				// can then abort the run before any tool execute() is entered.
 				if (message.stopReason !== "aborted" && message.stopReason !== "error") {
-					if (loopSignal.aborted) break;
+					if (loopSignal.aborted) message.stopReason = "aborted";
 					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(new AbortController().signal);
-					if (loopSignal.aborted) break;
+					if (loopSignal.aborted) message.stopReason = "aborted";
 				}
+				escapedToolTransaction.replacePendingAssistantMessage(message);
+				escapedToolTransaction.flush();
+			} else {
+				transaction?.flush();
 			}
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
@@ -2818,7 +2988,7 @@ async function streamAssistantResponse(
 								// a later escaped tool call therefore falls through to the
 								// existing terminal per-call rejection instead.
 								if (event.type === "text_start" || event.type === "text_delta" || event.type === "text_end") {
-									provisionalToolTransaction?.flush();
+									provisionalToolTransaction?.commitCallbacksAndUpdates();
 								}
 							}
 							break;

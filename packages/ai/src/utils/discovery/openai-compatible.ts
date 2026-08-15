@@ -1,6 +1,7 @@
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import * as z from "zod/v4";
 import type { Api, FetchImpl, Model, Provider } from "../../types";
+import { toNumber } from "../../utils";
 
 const MODELS_PATH = "/models";
 
@@ -162,6 +163,17 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 
 	const deduped = new Map<string, Model<TApi>>();
 	for (const entry of entries) {
+		const rawContextWindow = firstPositiveModelNumber(
+			UNK_CONTEXT_WINDOW,
+			entry.max_model_len,
+			entry.context_length,
+			entry.context_window,
+			entry.max_context_length,
+			entry.max_position_embeddings,
+		);
+
+		const rawMaxTokens = firstPositiveModelNumber(UNK_MAX_TOKENS, entry.max_tokens, entry.max_output_tokens);
+
 		const defaults: Model<TApi> = {
 			id: entry.id,
 			name: typeof entry.name === "string" && entry.name.length > 0 ? entry.name : entry.id,
@@ -171,8 +183,8 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 			reasoning: false,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: UNK_CONTEXT_WINDOW,
-			maxTokens: UNK_MAX_TOKENS,
+			contextWindow: rawContextWindow,
+			maxTokens: rawMaxTokens,
 		};
 
 		const mapped = options.mapModel?.(entry, defaults, context) ?? defaults;
@@ -243,4 +255,21 @@ function extractModelEntriesFromNode(node: unknown): ParsedOpenAICompatibleModel
 	}
 
 	return null;
+}
+
+/**
+ * First finite positive number among candidates, else the fallback.
+ *
+ * Rejects non-numbers, non-finite values (JSON `1e400` parses to
+ * `Infinity`), zero, and negatives so a malformed catalog field can never
+ * poison compaction thresholds or output budgets with `Infinity`.
+ */
+function firstPositiveModelNumber(fallback: number, ...candidates: readonly unknown[]): number {
+	for (const candidate of candidates) {
+		const value = toNumber(candidate);
+		if (value !== undefined && value > 0 && Number.isFinite(value)) {
+			return value;
+		}
+	}
+	return fallback;
 }

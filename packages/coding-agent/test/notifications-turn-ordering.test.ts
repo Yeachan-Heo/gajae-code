@@ -38,6 +38,8 @@ type Frame = {
 	tokenUsage?: string;
 	model?: string;
 	cwd?: string;
+	state?: string;
+	updateId?: number;
 };
 
 type TestContextUsage = {
@@ -61,6 +63,7 @@ async function setup(
 		contextUsage?: TestContextUsage | false;
 		model?: TestModel | false;
 		readNotificationDiffStat?: (cwd: string) => Promise<string | undefined>;
+		sendUserMessageOverride?: (content: unknown, options: unknown) => Promise<void> | void;
 	} = {},
 ): Promise<{
 	handlers: Map<string, Handler>;
@@ -76,7 +79,7 @@ async function setup(
 			handlers.set(event, handler);
 		},
 		registerCommand: () => {},
-		sendUserMessage: () => {},
+		sendUserMessage: options?.sendUserMessageOverride ?? (() => {}),
 	} as never;
 
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-notif-order-"));
@@ -1035,5 +1038,61 @@ test("stream-enabled final always carries a messageRef and a late message_update
 		else process.env.GJC_NOTIFICATIONS = prevN;
 		if (prevS === undefined) delete process.env.GJC_NOTIFICATIONS_STREAM;
 		else process.env.GJC_NOTIFICATIONS_STREAM = prevS;
+	}
+}, 30000);
+
+// #4528 lifecycle regression: a daemon-originated user message must be acked
+// `accepted` at session preflight acceptance (before turn_start), and a late
+// admission rejection must ack `rejected` — never a false `accepted`.
+test("inbound user_message acks accepted at preflight acceptance and rejected on late failure", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		let admission: "accept" | "reject" = "accept";
+		const sendCalls: Array<Record<string, unknown>> = [];
+		const { handlers, ctx, frames, ws, token, sid } = await setup({
+			sendUserMessageOverride: (content, options) => {
+				sendCalls.push({ content, options });
+				// Simulate AgentSession preflight acceptance: fires before the prompt
+				// (and its turn_start) resolves, like the production session does.
+				const opts = options as { onPreflightAcceptCommit?: () => void } | undefined;
+				if (admission === "accept" && opts?.onPreflightAcceptCommit) opts.onPreflightAcceptCommit();
+				if (admission === "reject") return Promise.reject(new Error("admission rejected"));
+				return new Promise<void>(resolve => setTimeout(resolve, 50));
+			},
+		});
+		const acks = () =>
+			frames.filter(f => f.type === "inbound_ack").map(f => ({ state: f.state, updateId: f.updateId }));
+
+		// --- Accepted path: the ack must land at preflight acceptance, before the
+		// prompt promise settles, and before turn_start fires.
+		ws.send(
+			JSON.stringify({ type: "user_message", sessionId: sid, token, text: "hello from telegram", updateId: 9001 }),
+		);
+		await waitFor(() => acks().length === 1, 3000, "accepted inbound_ack");
+		expect(acks()[0]).toEqual({ state: "accepted", updateId: 9001 });
+
+		// turn_start now fires while the (still pending) prompt resolves: the
+		// update was already registered, so consumption acks rather than races.
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await waitFor(
+			() => acks().some(a => a.state === "consumed" && a.updateId === 9001),
+			3000,
+			"consumed inbound_ack",
+		);
+		expect(sendCalls.length).toBe(1);
+		expect(sendCalls[0]!.options).toHaveProperty("onPreflightAcceptCommit");
+
+		// --- Rejected path: a late admission rejection acks rejected, never accepted.
+		admission = "reject";
+		ws.send(JSON.stringify({ type: "user_message", sessionId: sid, token, text: "second try", updateId: 9002 }));
+		await waitFor(() => acks().some(a => a.updateId === 9002), 3000, "rejected inbound_ack");
+		const second = acks().find(a => a.updateId === 9002)!;
+		expect(second.state).toBe("rejected");
+		// Exactly one ack per update id — no accepted-then-rejected contradiction.
+		expect(acks().filter(a => a.updateId === 9002).length).toBe(1);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
 	}
 }, 30000);

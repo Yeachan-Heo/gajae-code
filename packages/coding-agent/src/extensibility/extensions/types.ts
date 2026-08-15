@@ -369,7 +369,7 @@ export interface ExtensionContext {
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle(): string | undefined;
 	/** Abort the current agent operation */
-	abort(): void;
+	abort(): void | Promise<void>;
 	/** Abort and prove whether resources for a specific prompt settled. */
 	abortPromptAndWait?(handle: string, options: { graceMs: number }): Promise<RunSettlementProof>;
 	/** Whether there are queued messages waiting */
@@ -1186,8 +1186,11 @@ export interface ExtensionAPI {
 		content: string | (TextContent | ImageContent)[],
 		options?: {
 			deliverAs?: "steer" | "followUp";
+			/** Internal SDK signal preserving a busy dispatch across async admission fences. */
+			queuedAtDispatch?: boolean;
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
+			onQueuedPromoted?: () => void;
 			preflightSignal?: AbortSignal;
 			/** Internal SDK correlation owner for an exact queued follow-up. */
 			sdkRunToken?: string;
@@ -1505,7 +1508,7 @@ export interface ExtensionContextActions {
 	isIdle: () => boolean;
 	/** Stable resource ownership identifier for the active prompt run. */
 	getActivePromptHandle?: () => string | undefined;
-	abort: () => void;
+	abort: () => void | Promise<void>;
 	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
 
 	hasPendingMessages: () => boolean;

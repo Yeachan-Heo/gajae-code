@@ -194,9 +194,9 @@ export class FooterComponent implements Component {
 		// Add model name on the right side, plus thinking level if model supports it
 		const modelName = state.model?.id || "no-model";
 
-		// Add thinking level hint when the current model advertises supported efforts
+		// Add thinking level hint when reasoning effort is active
 		let rightSide = modelName;
-		if (state.model?.thinking) {
+		if (state.model?.thinking || state.thinkingLevel || state.model?.reasoning) {
 			const thinkingLevel = state.thinkingLevel ?? ThinkingLevel.Off;
 			if (thinkingLevel !== ThinkingLevel.Off) {
 				rightSide = `${modelName} • ${thinkingLevel}`;

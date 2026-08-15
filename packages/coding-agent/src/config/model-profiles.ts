@@ -106,6 +106,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "opencode-go/mimo-v2.5-pro",
 		architect: "opencode-go/deepseek-v4-pro",
 	}),
+	profile("commandcode-goat", ["commandcode-goat"], {
+		default: "commandcode-goat/zai-org/GLM-5.3",
+		executor: "commandcode-goat/deepseek/deepseek-v4-flash",
+		planner: "commandcode-goat/moonshotai/Kimi-K3",
+		critic: "commandcode-goat/zai-org/GLM-5.2",
+		architect: "commandcode-goat/deepseek/deepseek-v4-pro",
+	}),
 	profile("open-weights-glm", [], {
 		default: "glm-5.2:medium",
 		executor: "glm-5.2:low",
@@ -445,6 +452,20 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "anthropic/claude-opus-5:high",
 		architect: "openai-codex/gpt-5.6-sol:xhigh",
 	}),
+	profile("omlx-qwen36-35b-moe", ["omlx"], {
+		default: "omlx/qwen3.6-35b-a3b:medium",
+		executor: "omlx/qwen3.6-35b-a3b:low",
+		planner: "omlx/qwen3.6-35b-a3b:high",
+		critic: "omlx/qwen3.6-35b-a3b:high",
+		architect: "omlx/qwen3.6-35b-a3b:high",
+	}),
+	profile("omlx-qwen36-27b-dense", ["omlx"], {
+		default: "omlx/qwen3.6-27b:medium",
+		executor: "omlx/qwen3.6-27b:low",
+		planner: "omlx/qwen3.6-27b:xhigh",
+		critic: "omlx/qwen3.6-27b:high",
+		architect: "omlx/qwen3.6-27b:xhigh",
+	}),
 ];
 
 /**
@@ -479,6 +500,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"codex-pro": { displayName: "Codex Pro", providerGroup: "CODEX" },
 	lunamaxxing: { displayName: "LunaMaxxing", providerGroup: "CODEX" },
 	opencodego: { displayName: "OpenCodeGo", providerGroup: "OPENCODEGO" },
+	"commandcode-goat": { displayName: "Command Code GOAT", providerGroup: "COMMAND CODE GOAT" },
 	"open-weights-glm": { displayName: "GLM", providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)" },
 	"open-weights-deepseek": {
 		displayName: "DeepSeek",
@@ -550,12 +572,16 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
 	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
+	"omlx-qwen36-35b-moe": { displayName: "oMLX Qwen3.6-35B MoE", providerGroup: "OMLX LOCAL" },
+	"omlx-qwen36-27b-dense": { displayName: "oMLX Qwen3.6-27B Dense", providerGroup: "OMLX LOCAL" },
 };
 
 const PROFILE_GROUP_ORDER = [
 	"CODEX",
 	"OPENCODEGO",
+	"COMMAND CODE GOAT",
 	"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+	"OMLX LOCAL",
 	"CLAUDE",
 	"GLM",
 	"KIMI CODING PLAN",
@@ -580,6 +606,8 @@ const OPEN_WEIGHT_PROFILE_ORDER = [
 	"open-weights-kimi-glm",
 	"open-weights-kimi-glm-deepseek",
 	"open-weights-all",
+	"omlx-qwen36-35b-moe",
+	"omlx-qwen36-27b-dense",
 ] as const;
 const OPEN_WEIGHT_PROFILE_RANK = new Map<string, number>(OPEN_WEIGHT_PROFILE_ORDER.map((name, index) => [name, index]));
 
@@ -587,6 +615,7 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	"openai-codex": "codex-medium",
 	anthropic: "claude-opus",
 	"opencode-go": "opencodego",
+	"commandcode-goat": "commandcode-goat",
 	zai: "glm-medium",
 	"kimi-code": "kimi-coding-plan-medium",
 	xiaomi: "mimo-medium",
@@ -598,6 +627,7 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	cursor: "cursor-medium",
 	"minimax-code": "minimax-medium",
 	"alibaba-token-plan": "alibaba-token-plan-balanced",
+	omlx: "omlx-qwen36-35b-moe",
 };
 
 export function getModelProfilePresentation(

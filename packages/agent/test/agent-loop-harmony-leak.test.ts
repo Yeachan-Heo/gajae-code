@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
-import type { AgentContext, AgentLoopConfig, AgentMessage, StreamFn } from "@gajae-code/agent-core/types";
-import type { Message } from "@gajae-code/ai";
+import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, StreamFn } from "@gajae-code/agent-core/types";
+import type { AssistantMessageEvent, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createUserMessage } from "./helpers";
 
@@ -57,6 +57,63 @@ describe("agent-loop harmony-leak mitigation wiring (openai-codex)", () => {
 		// The contaminated assistant message was dropped from the working context,
 		// so the model does not see its own leak as history on the retry.
 		expect(assistantContains(context.messages, "<invoke name=")).toBe(false);
+	});
+
+	it("publishes a sanitized aborted terminal without replayable native payload before retry", async () => {
+		const context: AgentContext = { systemPrompt: [], messages: [], tools: [] };
+		const mock = createMockModel({
+			provider: "openai-codex",
+			responses: [
+				{
+					content: [LEAKED],
+					providerPayload: {
+						type: "openaiResponsesHistory",
+						provider: "openai-codex",
+						items: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: LEAKED }] }],
+					},
+					transportFailure: {
+						kind: "transport",
+						status: 400,
+						headers: new Headers({ "x-provider": "live" }) as never,
+					},
+				},
+				{ content: ["ok"] },
+			],
+		});
+		const events: AgentEvent[] = [];
+		const callbackEvents: AssistantMessageEvent[] = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			onAssistantMessageEvent: (_message, event) => callbackEvents.push(event),
+		};
+
+		const stream = agentLoop([createUserMessage("hi")], context, config, undefined, mock.stream);
+		for await (const event of stream) events.push(event);
+
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds).toHaveLength(2);
+		const retryTerminal = assistantEnds[0]?.message;
+		expect(retryTerminal?.role).toBe("assistant");
+		if (retryTerminal?.role !== "assistant") throw new Error("Expected assistant retry terminal");
+		expect(retryTerminal.stopReason).toBe("aborted");
+		expect(retryTerminal.content).toEqual([]);
+		expect(retryTerminal.providerPayload).toBeUndefined();
+		expect(retryTerminal.transportFailure).toEqual({ kind: "transport", status: 400 });
+		expect(() => structuredClone(retryTerminal)).not.toThrow();
+		const updateEvents = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_update" }> => event.type === "message_update",
+		);
+		expect(updateEvents.every(event => "partial" in event.assistantMessageEvent)).toBe(true);
+		expect(
+			callbackEvents
+				.filter(event => event.type !== "done" && event.type !== "error")
+				.every(event => "partial" in event),
+		).toBe(true);
+		expect(JSON.stringify(mock.calls[1]?.context.messages)).not.toContain("<invoke name=");
 	});
 
 	it("does not retry a Harmony leak when fallback is managed", async () => {

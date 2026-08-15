@@ -114,6 +114,21 @@ function makeWidget(
 	return { ...stubs, widget };
 }
 
+const ITERM_WIDGET_GEOMETRY_FIXTURES = [
+	{
+		name: "80x30 terminal with 9x18 cells",
+		terminal: { columns: 80, rows: 30 },
+		cell: { widthPx: 9, heightPx: 18 },
+		expected: { imageColumns: 4, imageRows: 2, renderedWidth: 75, cursor: "\x1b[28;76H" },
+	},
+	{
+		name: "120x40 terminal with 18x24 cells",
+		terminal: { columns: 120, rows: 40 },
+		cell: { widthPx: 18, heightPx: 24 },
+		expected: { imageColumns: 3, imageRows: 2, renderedWidth: 116, cursor: "\x1b[38;117H" },
+	},
+] as const;
+
 describe("GajaePetWidget", () => {
 	afterEach(() => {
 		__animationSchedulerTestHooks.reset();
@@ -169,21 +184,32 @@ describe("GajaePetWidget", () => {
 		}
 	});
 
-	it("keeps the full-size iTerm2 footprint at the composer boundary", () => {
-		const { widget, editorContainer, getRenderedWidth, getEmitter } = makeWidget(80, 30, { protocol: "iterm2" });
-		try {
-			widget.setMode("red");
-			editorContainer.render(80);
-			expect(getRenderedWidth()).toBe(80 - 5);
-			const payload = getEmitter()?.();
-			expect(payload).toContain("\x1b[28;76H");
-			expect(payload).toContain("\x1b]1337;File=");
-			expect(payload).toContain("width=36px;height=36px;preserveAspectRatio=0");
-			expect(payload).toEndWith("\x1b\\");
-		} finally {
-			widget.dispose();
-		}
-	});
+	for (const fixture of ITERM_WIDGET_GEOMETRY_FIXTURES) {
+		it(`keeps the adaptive iTerm2 footprint at the composer boundary: ${fixture.name}`, () => {
+			const original = getCellDimensions();
+			setCellDimensions(fixture.cell);
+			const { widget, editorContainer, getRenderedWidth, getEmitter } = makeWidget(
+				fixture.terminal.columns,
+				fixture.terminal.rows,
+				{ protocol: "iterm2" },
+			);
+			try {
+				widget.setMode("red");
+				editorContainer.render(fixture.terminal.columns);
+				expect(getRenderedWidth()).toBe(fixture.expected.renderedWidth);
+				const payload = getEmitter()?.();
+				expect(payload).toContain(fixture.expected.cursor);
+				expect(payload).toContain("\x1b]1337;File=");
+				expect(payload).toContain(
+					`width=${fixture.expected.imageColumns};height=${fixture.expected.imageRows};preserveAspectRatio=0`,
+				);
+				expect(payload).toEndWith("\x1b\\");
+			} finally {
+				setCellDimensions(original);
+				widget.dispose();
+			}
+		});
+	}
 
 	it("clears iTerm2 frames on animation, resize, disable, and dispose", () => {
 		vi.useFakeTimers();
@@ -204,7 +230,7 @@ describe("GajaePetWidget", () => {
 
 			setCellDimensions({ widthPx: 12, heightPx: 24 });
 			vi.advanceTimersByTime(100);
-			expect(getEmitter()?.()).toContain("width=48px;height=48px");
+			expect(getEmitter()?.()).toContain("width=4;height=2");
 
 			setTerminalSize(12, 30);
 			expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");

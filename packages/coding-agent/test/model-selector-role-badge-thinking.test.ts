@@ -316,9 +316,9 @@ describe("ModelSelector canonical model selection", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 
-		let selected: SelectionCapture | undefined;
+		const selections: SelectionCapture[] = [];
 		const selector = createSelector(model, Settings.isolated(), selection => {
-			if (selection.kind === "assignment") selected = selection;
+			if (selection.kind === "assignment") selections.push(selection);
 		});
 		await Bun.sleep(0);
 		installTestTheme();
@@ -327,17 +327,24 @@ describe("ModelSelector canonical model selection", () => {
 		for (let i = 0; i < 6; i++) selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 
-		// Batch assignment of a reasoning model requires an explicit effort choice.
-		expect(selected).toBeUndefined();
-		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Reasoning for all role agents");
-		selector.handleInput("\n");
+		// Batch assignment of a reasoning model now walks a per-role effort menu
+		// before any assignment is emitted.
+		expect(selections).toEqual([]);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: EXECUTOR");
 
-		const selectedAfterEnter = selected;
-		if (!selectedAfterEnter) throw new Error("Expected batch role-agent selection");
-		expect(selectedAfterEnter.role).toBe("default");
-		expect(selectedAfterEnter.roles).toEqual(["executor", "architect", "planner", "critic"]);
-		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
-		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
+		// Confirm "off" for every role in the batch.
+		for (const tag of ["EXECUTOR", "ARCHITECT", "PLANNER", "CRITIC"]) {
+			expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain(`Current: ${tag}`);
+			selector.handleInput("\n");
+			await Bun.sleep(0);
+		}
+
+		expect(selections.map(s => s.role)).toEqual(["executor", "architect", "planner", "critic"]);
+		for (const selection of selections) {
+			expect(selection.thinkingLevel).toBe(ThinkingLevel.Off);
+			expect(selection.selector).toBe(`${model.provider}/${model.id}:off`);
+			expect(selection.roles).toBeUndefined();
+		}
 	});
 
 	test("selects batch all-targets assignment action", async () => {
@@ -345,9 +352,9 @@ describe("ModelSelector canonical model selection", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 
-		let selected: SelectionCapture | undefined;
+		const selections: SelectionCapture[] = [];
 		const selector = createSelector(model, Settings.isolated(), selection => {
-			if (selection.kind === "assignment") selected = selection;
+			if (selection.kind === "assignment") selections.push(selection);
 		});
 		await Bun.sleep(0);
 		installTestTheme();
@@ -356,17 +363,24 @@ describe("ModelSelector canonical model selection", () => {
 		for (let i = 0; i < 7; i++) selector.handleInput("\x1b[B");
 		selector.handleInput("\n");
 
-		// Batch assignment of a reasoning model requires an explicit effort choice.
-		expect(selected).toBeUndefined();
-		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Reasoning for all targets");
-		selector.handleInput("\n");
+		// Batch assignment of a reasoning model now walks a per-role effort menu
+		// across every target before any assignment is emitted.
+		expect(selections).toEqual([]);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: DEFAULT");
 
-		const selectedAfterEnter = selected;
-		if (!selectedAfterEnter) throw new Error("Expected all-targets selection");
-		expect(selectedAfterEnter.role).toBe("default");
-		expect(selectedAfterEnter.roles).toEqual(["default", "executor", "architect", "planner", "critic", "image"]);
-		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.Off);
-		expect(selectedAfterEnter.selector).toBe(`${model.provider}/${model.id}:off`);
+		// Confirm "off" for every target in the batch.
+		for (const tag of ["DEFAULT", "EXECUTOR", "ARCHITECT", "PLANNER", "CRITIC", "IMAGE"]) {
+			expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain(`Current: ${tag}`);
+			selector.handleInput("\n");
+			await Bun.sleep(0);
+		}
+
+		expect(selections.map(s => s.role)).toEqual(["default", "executor", "architect", "planner", "critic", "image"]);
+		for (const selection of selections) {
+			expect(selection.thinkingLevel).toBe(ThinkingLevel.Off);
+			expect(selection.selector).toBe(`${model.provider}/${model.id}:off`);
+			expect(selection.roles).toBeUndefined();
+		}
 	});
 
 	test("temporary scoped model selection carries selected reasoning", async () => {

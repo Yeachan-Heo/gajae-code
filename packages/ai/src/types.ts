@@ -176,6 +176,7 @@ export const KNOWN_PROVIDERS = [
 	"xiaomi-token-plan-cn",
 	"zenmux",
 	"lm-studio",
+	"omlx",
 ] as const;
 
 export type KnownProvider = (typeof KNOWN_PROVIDERS)[number];

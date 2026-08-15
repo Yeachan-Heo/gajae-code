@@ -207,7 +207,7 @@ export class ExtensionRunner {
 	#isIdleFn: () => boolean = () => true;
 	#getActivePromptHandleFn: () => string | undefined = () => undefined;
 	#waitForIdleFn: () => Promise<void> = async () => {};
-	#abortFn: () => void = () => {};
+	#abortFn: () => void | Promise<void> = () => {};
 	#abortPromptAndWaitFn: NonNullable<ExtensionContextActions["abortPromptAndWait"]> = async () => {
 		throw new Error("abortPromptAndWait binding is unavailable");
 	};

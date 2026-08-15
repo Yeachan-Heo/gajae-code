@@ -758,6 +758,9 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 }
 
 function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
+	if (model.provider === "omlx" && isOmlxReasoningModelId(model.id)) {
+		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX;
+	}
 	// Meta documents Muse Spark 1.2 as accepting the full minimal..xhigh
 	// reasoning range. Keep that capability provider-independent so runtime
 	// model discovery/merge cannot downgrade the bundled OpenRouter entry to
@@ -786,6 +789,18 @@ function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly
 		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 	}
 	return DEFAULT_REASONING_EFFORTS;
+}
+
+function isOmlxReasoningModelId(modelId: string): boolean {
+	const normalized = modelId.toLowerCase();
+	return (
+		normalized.includes("qwen") ||
+		normalized.includes("deepseek") ||
+		normalized.includes("qwq") ||
+		normalized.includes("thinking") ||
+		normalized.includes("reason") ||
+		normalized.includes("r1")
+	);
 }
 
 function inferThinkingControlMode<TApi extends Api>(

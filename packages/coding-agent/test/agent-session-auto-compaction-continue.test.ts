@@ -730,6 +730,179 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(session.model).toBe(selectionModel);
 	});
 
+	it("does not deadlock default selection waiting for an ownerless emergency continuation", async () => {
+		const releaseStartupBarrier = Promise.withResolvers<void>();
+		session.extendStartupTurnBarrier(releaseStartupBarrier.promise);
+		const compactionEnded = Promise.withResolvers<void>();
+		const runtimeSignals = getRuntimeSignals();
+		const pushRuntimeSignal = runtimeSignals.push.bind(runtimeSignals);
+		vi.spyOn(runtimeSignals, "push").mockImplementation((...signals) => {
+			const length = pushRuntimeSignal(...signals);
+			if (signals.includes("compaction:end:ok")) compactionEnded.resolve();
+			return length;
+		});
+		const order: string[] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			order.push("continuation");
+		});
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, id: "ownerless-selection-model" };
+		const selectionValidated = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			const apiKey = await originalGetApiKey(model, ...args);
+			if (model === selectionModel) selectionValidated.resolve();
+			return apiKey;
+		});
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		await compactionEnded.promise;
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onAfterMutation: () => order.push("selection"),
+		});
+		await selectionValidated.promise;
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		releaseStartupBarrier.resolve();
+		await selection;
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["continuation", "selection"]);
+		expect(session.model).toBe(selectionModel);
+	});
+
+	it("keeps an ownerless emergency continuation scheduled later behind selection", async () => {
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, id: "selection-before-ownerless-model" };
+		const selectionValidationStarted = Promise.withResolvers<void>();
+		const releaseSelectionValidation = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			if (model === selectionModel) {
+				selectionValidationStarted.resolve();
+				await releaseSelectionValidation.promise;
+			}
+			return originalGetApiKey(model, ...args);
+		});
+		const order: string[] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			order.push("continuation");
+		});
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onAfterMutation: () => order.push("selection"),
+		});
+		await selectionValidationStarted.promise;
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		releaseSelectionValidation.resolve();
+
+		await selection;
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["selection", "continuation"]);
+		expect(session.model).toBe(selectionModel);
+	});
+	it("keeps waitForIdle pending while a deferred continuation waits behind selection", async () => {
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, id: "selection-deferred-idle-model" };
+		const selectionValidationStarted = Promise.withResolvers<void>();
+		const releaseSelectionValidation = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			if (model === selectionModel) {
+				selectionValidationStarted.resolve();
+				await releaseSelectionValidation.promise;
+			}
+			return originalGetApiKey(model, ...args);
+		});
+		const order: string[] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			order.push("continuation");
+		});
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onAfterMutation: () => order.push("selection"),
+		});
+		await selectionValidationStarted.promise;
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		// The continuation is now parked behind the pending selection fence,
+		// having claimed the predecessor agent_end: external waitForIdle must
+		// not report the session idle while that continuation is still waiting
+		// on the fence, even once every other in-flight work settles.
+		let idleReported = false;
+		const idle = session.waitForIdle().then(() => {
+			idleReported = true;
+		});
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		expect(idleReported).toBe(false);
+		releaseSelectionValidation.resolve();
+
+		await selection;
+		await idle;
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["selection", "continuation"]);
+		expect(session.model).toBe(selectionModel);
+	});
+	it("does not deadlock when a second selection reserves while a continuation waits behind the first", async () => {
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const firstModel = { ...currentModel, id: "overlapping-selection-one" };
+		const secondModel = { ...currentModel, id: "overlapping-selection-two" };
+		const firstValidationStarted = Promise.withResolvers<void>();
+		const releaseFirstValidation = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			if (model === firstModel) {
+				firstValidationStarted.resolve();
+				await releaseFirstValidation.promise;
+			}
+			return originalGetApiKey(model, ...args);
+		});
+		const order: string[] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			order.push("continuation");
+		});
+		// Selection A reserves generation 1 and parks inside credential probing.
+		const first = session.setDefaultModelSelection(firstModel, undefined, {
+			onAfterMutation: () => order.push("selection-one"),
+		});
+		await firstValidationStarted.promise;
+		// A continuation defers behind A's fence.
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		// Selection B reserves generation 2 while A is still parked and the
+		// generation-1 continuation is still deferred behind A's fence.
+		const second = session.setDefaultModelSelection(secondModel, undefined, {
+			onAfterMutation: () => order.push("selection-two"),
+		});
+		releaseFirstValidation.resolve();
+
+		await Promise.all([first, second]);
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(order).toContain("selection-one");
+		expect(order).toContain("selection-two");
+		expect(order).toContain("continuation");
+		expect(session.model).toBe(secondModel);
+	});
+
 	it("reschedules an AgentBusyError racing the queued-followup continue until delivery", async () => {
 		session.agent.followUp({
 			role: "custom",

@@ -1,9 +1,13 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { type BrowserActionStep, compileActionSteps } from "./browser/actions";
+import { isChromeProfileExecutableForLaunch, isEdgeExecutable, resolveSystemChromeForProfile } from "./browser/launch";
+import { chromeUserDataRoots, type DiscoveryEnv, defaultDiscoveryEnv } from "./browser/profile-discovery";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import { acquireTab, dropHeadlessTabs, getTab, releaseAllTabs, releaseTab, runInTab } from "./browser/tab-supervisor";
@@ -19,11 +23,17 @@ export type { Observation, ObservationEntry } from "./browser/tab-protocol";
 const DEFAULT_TAB_NAME = "main";
 
 const appSchema = z.object({
-	path: z.string().describe("binary path to spawn").optional(),
+	path: z.string().describe("binary path to spawn (default: the installed Chrome/Chromium)").optional(),
 	cdp_url: z.string().describe("existing cdp endpoint").optional(),
 	browser: z.enum(["chrome"]).describe("existing browser profile mode").optional(),
-	user_data_dir: z.string().describe("Chrome user data directory containing profiles").optional(),
-	profile_directory: z.string().describe("Chrome profile directory name, e.g. Profile 10").optional(),
+	user_data_dir: z
+		.string()
+		.describe("non-default Chrome user data directory containing profiles (required for Chrome 136+ CDP)")
+		.optional(),
+	profile_directory: z
+		.string()
+		.describe('Chrome profile directory name, e.g. "Profile 10" (default "Default")')
+		.optional(),
 	background: z.boolean().describe("prefer background/hidden Chrome profile launch when supported").optional(),
 	no_focus: z.boolean().describe("avoid focusing Chrome during profile launch when supported").optional(),
 	cdp_port: z.number().int().positive().describe("local CDP port for launched Chrome profile").optional(),
@@ -116,30 +126,129 @@ export interface BrowserToolDetails {
 	meta?: OutputMeta;
 }
 
-export function resolveBrowserKindForTest(params: BrowserParams, session: ToolSession): BrowserKind {
-	return resolveBrowserKind(params, session);
+export function resolveBrowserKindForTest(
+	params: BrowserParams,
+	session: ToolSession,
+	signal?: AbortSignal,
+	discoveryEnv?: DiscoveryEnv,
+): Promise<BrowserKind> {
+	return resolveBrowserKind(params, session, signal, discoveryEnv);
 }
 
-function resolveBrowserKind(params: BrowserParams, session: ToolSession): BrowserKind {
+/**
+ * Resolve guarded Chrome profile mode. The executable falls back to the
+ * installed Chrome/Chromium and the profile directory to `"Default"`.
+ * Chrome 136+ refuses remote debugging against its default data directory, so
+ * callers must explicitly provide a non-default user data directory.
+ */
+async function resolveChromeProfileKind(
+	app: NonNullable<BrowserParams["app"]>,
+	session: ToolSession,
+	signal?: AbortSignal,
+	discoveryEnv?: DiscoveryEnv,
+): Promise<BrowserKind> {
+	const profileDirectory = app.profile_directory ?? "Default";
+	const exe = app.path ? resolveToCwd(app.path, session.cwd) : resolveSystemChromeForProfile();
+	if (!exe) {
+		throw new ToolError(
+			'No Chrome/Chromium executable found for app.browser "chrome". Install Chrome, or pass app.path with the binary path.',
+		);
+	}
+	const canonicalExe = await canonicalPath(exe, process.platform, signal);
+	if (!isChromeProfileExecutableForLaunch(exe, canonicalExe)) {
+		throw new ToolError(
+			isEdgeExecutable(canonicalExe)
+				? 'app.path for app.browser "chrome" must be Google Chrome or Chromium, not Microsoft Edge. Use Edge with app.path spawn mode and a separate profile, or pass a Chrome/Chromium executable.'
+				: 'app.path for app.browser "chrome" must be a Google Chrome or Chromium executable. Other Chromium-based browsers must use app.path spawn mode with their own separate profile.',
+		);
+	}
+	if (!app.user_data_dir) {
+		throw new ToolError(
+			'app.user_data_dir is required for app.browser "chrome". Chrome 136+ disables remote debugging for the default Chrome data directory; pass a separate non-default user data directory, or attach to an already-authorized browser with app.cdp_url.',
+		);
+	}
+	const userDataDir = resolveChromeProfileUserDataDir(app.user_data_dir, session.cwd, discoveryEnv?.platform);
+	if (await isDefaultChromeUserDataDir(userDataDir, signal, discoveryEnv)) {
+		throw new ToolError(
+			`Refusing Chrome's default user data directory ${JSON.stringify(userDataDir)}. Chrome 136+ disables remote debugging there; pass a separate non-default app.user_data_dir, or use app.cdp_url for an already-authorized browser.`,
+		);
+	}
+	return {
+		kind: "chrome-profile",
+		path: exe,
+		userDataDir,
+		profileDirectory,
+		background: app.background ?? false,
+		noFocus: app.no_focus ?? false,
+		cdpPort: app.cdp_port,
+	};
+}
+
+async function canonicalPath(
+	candidate: string,
+	platform: NodeJS.Platform = process.platform,
+	signal?: AbortSignal,
+): Promise<string> {
+	const platformPath = platform === "win32" ? path.win32 : path.posix;
+	let resolved = platformPath.resolve(candidate);
+	if (platform === process.platform) {
+		throwIfAborted(signal);
+		try {
+			resolved = signal ? await untilAborted(signal, () => fs.realpath(resolved)) : await fs.realpath(resolved);
+		} catch {}
+		throwIfAborted(signal);
+	}
+	return platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isDefaultChromeUserDataDir(
+	candidate: string,
+	signal?: AbortSignal,
+	discoveryEnv: DiscoveryEnv = defaultDiscoveryEnv(() => false),
+): Promise<boolean> {
+	return isDefaultChromeUserDataDirForTest(
+		candidate,
+		chromeUserDataRoots(discoveryEnv),
+		discoveryEnv.platform,
+		signal,
+	);
+}
+
+function resolveChromeProfileUserDataDir(
+	candidate: string,
+	cwd: string,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	if (platform === process.platform) return resolveToCwd(candidate, cwd);
+	const platformPath = platform === "win32" ? path.win32 : path.posix;
+	return platformPath.isAbsolute(candidate) ? platformPath.resolve(candidate) : platformPath.resolve(cwd, candidate);
+}
+
+export async function isDefaultChromeUserDataDirForTest(
+	candidate: string,
+	roots: readonly string[],
+	platform: NodeJS.Platform = process.platform,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const canonicalCandidate = await canonicalPath(candidate, platform, signal);
+	for (const root of roots) {
+		if ((await canonicalPath(root, platform, signal)) === canonicalCandidate) return true;
+	}
+	return false;
+}
+
+async function resolveBrowserKind(
+	params: BrowserParams,
+	session: ToolSession,
+	signal?: AbortSignal,
+	discoveryEnv?: DiscoveryEnv,
+): Promise<BrowserKind> {
 	const app = params.app;
 	if (app?.cdp_url) {
 		return { kind: "connected", cdpUrl: app.cdp_url.replace(/\/+$/, "") };
 	}
 	if (app?.browser === "chrome") {
-		if (!app.path) throw new ToolError('app.path is required when app.browser is "chrome".');
-		if (!app.user_data_dir) throw new ToolError('app.user_data_dir is required when app.browser is "chrome".');
-		if (!app.profile_directory)
-			throw new ToolError('app.profile_directory is required when app.browser is "chrome".');
-		const exe = resolveToCwd(app.path, session.cwd);
-		return {
-			kind: "chrome-profile",
-			path: exe,
-			userDataDir: resolveToCwd(app.user_data_dir, session.cwd),
-			profileDirectory: app.profile_directory,
-			background: app.background ?? false,
-			noFocus: app.no_focus ?? false,
-			cdpPort: app.cdp_port,
-		};
+		return resolveChromeProfileKind(app, session, signal, discoveryEnv);
 	}
 	if (app?.path) {
 		const exe = resolveToCwd(app.path, session.cwd);
@@ -217,7 +326,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
-		const kind = resolveBrowserKind(params, this.session);
+		const kind = await resolveBrowserKind(params, this.session, signal);
 		details.browser = kind.kind;
 
 		// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.

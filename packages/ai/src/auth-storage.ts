@@ -2958,6 +2958,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "omlx": {
+				const { loginOmlx } = await import("./utils/oauth/omlx");
+				const apiKey = await loginOmlx(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "ollama": {
 				const { loginOllama } = await import("./utils/oauth/ollama");
 				const apiKey = await loginOllama(ctrl);

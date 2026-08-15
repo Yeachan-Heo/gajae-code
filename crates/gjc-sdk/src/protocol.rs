@@ -1138,10 +1138,18 @@ pub struct Activity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboundAckState {
-	/// Received and queued (agent busy / message held as a steer).
+	/// Legacy receipt state retained for wire compatibility.
 	Queued,
+	/// Accepted by the live session host and queued for a turn.
+	Accepted,
 	/// Consumed by a turn (the agent has picked the message up).
 	Consumed,
+	/// Rejected before session injection; any optimistic client acknowledgement
+	/// must be retracted.
+	Rejected,
+	/// Dropped by a fenced or policy-suspended host; any optimistic client
+	/// acknowledgement must be retracted.
+	Dropped,
 }
 
 /// Acknowledges progress of an inbound [`UserMessage`] (matched by `update_id`)
@@ -1156,6 +1164,9 @@ pub struct InboundAck {
 	pub update_id:  i64,
 	/// The delivery state now reached.
 	pub state:      InboundAckState,
+	/// Bounded machine-readable reason for rejected/dropped outcomes.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reason:     Option<String>,
 }
 
 /// A replayable per-session readiness signal.
@@ -2102,5 +2113,16 @@ mod tests {
 		assert_eq!(ack.session_id, "sess-1");
 		assert_eq!(ack.update_id, 42);
 		assert_eq!(ack.state, InboundAckState::Consumed);
+		assert_eq!(ack.reason, None);
+	}
+
+	#[test]
+	fn inbound_ack_roundtrips_drop_reason() {
+		let raw = r#"{"type":"inbound_ack","sessionId":"sess-1","updateId":43,"state":"dropped","reason":"inbound_fenced"}"#;
+		let ServerMessage::InboundAck(ack) = serde_json::from_str(raw).unwrap() else {
+			panic!("expected inbound_ack")
+		};
+		assert_eq!(ack.state, InboundAckState::Dropped);
+		assert_eq!(ack.reason.as_deref(), Some("inbound_fenced"));
 	}
 }

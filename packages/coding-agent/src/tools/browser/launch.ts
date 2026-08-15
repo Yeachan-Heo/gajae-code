@@ -108,12 +108,18 @@ export function resolveBrowserEnvOverridesForTest(): {
 	proxy: string | undefined;
 	proxyBypassLoopback: boolean;
 	ignoreCertErrors: boolean;
+	programFiles: string | undefined;
+	programFilesX86: string | undefined;
+	localAppData: string | undefined;
 } {
 	return {
 		executablePath: trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH"),
 		proxy: trustedBrowserEnv("PUPPETEER_PROXY"),
 		proxyBypassLoopback: browserLaunchFlagEnabled("PUPPETEER_PROXY_BYPASS_LOOPBACK"),
 		ignoreCertErrors: browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS"),
+		programFiles: trustedBrowserEnv("ProgramFiles"),
+		programFilesX86: trustedBrowserEnv("ProgramFiles(x86)"),
+		localAppData: trustedBrowserEnv("LOCALAPPDATA"),
 	};
 }
 
@@ -208,7 +214,16 @@ function systemChromiumCandidates(): string[] {
 			break;
 		}
 		case "linux": {
-			const names = ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome"];
+			const names = [
+				"google-chrome-stable",
+				"google-chrome",
+				"google-chrome-beta",
+				"google-chrome-unstable",
+				"google-chrome-canary",
+				"chromium",
+				"chromium-browser",
+				"chrome",
+			];
 			for (const name of names) {
 				const found = $which(name);
 				if (found) candidates.push(found);
@@ -216,6 +231,9 @@ function systemChromiumCandidates(): string[] {
 			candidates.push(
 				"/usr/bin/google-chrome-stable",
 				"/usr/bin/google-chrome",
+				"/usr/bin/google-chrome-beta",
+				"/usr/bin/google-chrome-unstable",
+				"/usr/bin/google-chrome-canary",
 				"/usr/bin/chromium",
 				"/usr/bin/chromium-browser",
 				"/snap/bin/chromium",
@@ -232,13 +250,20 @@ function systemChromiumCandidates(): string[] {
 			break;
 		}
 		case "win32": {
-			const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
-			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
-			const localAppData = process.env.LOCALAPPDATA ?? path.join(home, "AppData\\Local");
+			const programFiles = trustedBrowserEnv("ProgramFiles") ?? "C:\\Program Files";
+			const programFilesX86 = trustedBrowserEnv("ProgramFiles(x86)") ?? "C:\\Program Files (x86)";
+			const localAppData = trustedBrowserEnv("LOCALAPPDATA") ?? path.join(home, "AppData\\Local");
 			candidates.push(
 				path.join(programFiles, "Google\\Chrome\\Application\\chrome.exe"),
 				path.join(programFilesX86, "Google\\Chrome\\Application\\chrome.exe"),
 				path.join(localAppData, "Google\\Chrome\\Application\\chrome.exe"),
+				path.join(programFiles, "Google\\Chrome Beta\\Application\\chrome.exe"),
+				path.join(programFilesX86, "Google\\Chrome Beta\\Application\\chrome.exe"),
+				path.join(localAppData, "Google\\Chrome Beta\\Application\\chrome.exe"),
+				path.join(programFiles, "Google\\Chrome Dev\\Application\\chrome.exe"),
+				path.join(programFilesX86, "Google\\Chrome Dev\\Application\\chrome.exe"),
+				path.join(localAppData, "Google\\Chrome Dev\\Application\\chrome.exe"),
+				path.join(localAppData, "Google\\Chrome SxS\\Application\\chrome.exe"),
 				path.join(programFiles, "Chromium\\Application\\chrome.exe"),
 				path.join(localAppData, "Chromium\\Application\\chrome.exe"),
 				path.join(programFiles, "Microsoft\\Edge\\Application\\msedge.exe"),
@@ -250,20 +275,68 @@ function systemChromiumCandidates(): string[] {
 	return candidates;
 }
 
-function resolveSystemChromium(): string | undefined {
-	if (resolvedChromium !== undefined) return resolvedChromium ?? undefined;
+function firstExecutableCandidate(candidates: string[], accept: (candidate: string) => boolean): string | undefined {
 	const seen = new Set<string>();
-	for (const candidate of systemChromiumCandidates()) {
+	for (const candidate of candidates) {
 		if (!candidate || seen.has(candidate)) continue;
 		seen.add(candidate);
-		if (isExecutableFile(candidate)) {
-			resolvedChromium = candidate;
-			logger.debug("Using system Chrome/Chromium", { path: candidate });
-			return candidate;
-		}
+		if (accept(candidate) && isExecutableFile(candidate)) return candidate;
 	}
-	resolvedChromium = null;
 	return undefined;
+}
+
+function resolveSystemChromium(): string | undefined {
+	if (resolvedChromium !== undefined) return resolvedChromium ?? undefined;
+	const found = firstExecutableCandidate(systemChromiumCandidates(), () => true);
+	resolvedChromium = found ?? null;
+	if (found) logger.debug("Using system Chrome/Chromium", { path: found });
+	return found;
+}
+
+/** Edge is Chromium-based but keeps its own profile format under its own user data root. */
+const EDGE_EXECUTABLE_PATTERN =
+	/(?:^|[/\\])(?:msedge(?:\.exe)?|microsoft-edge(?:-(?:stable|beta|dev|canary))?|com\.microsoft\.Edge|Microsoft Edge(?: Beta| Dev| Canary)?)$/i;
+
+/** True for a Microsoft Edge executable path (excluded from Chrome profile mode). */
+export function isEdgeExecutable(candidate: string): boolean {
+	return EDGE_EXECUTABLE_PATTERN.test(candidate);
+}
+
+const CHROME_PROFILE_EXECUTABLE_PATTERN =
+	/(?:^|[/\\])(?:google-chrome(?:-(?:stable|beta|unstable|canary))?|chromium(?:-browser)?|chrome(?:\.exe)?|Google Chrome(?: Beta| Dev| Canary)?|Chromium|com\.google\.Chrome|org\.chromium\.Chromium)$/i;
+
+/** True only for executable names owned by Google Chrome or Chromium. */
+export function isChromeProfileExecutable(candidate: string): boolean {
+	return CHROME_PROFILE_EXECUTABLE_PATTERN.test(candidate);
+}
+
+/**
+ * Validate the executable identity used for profile mode. Most symlinks are
+ * judged by their resolved target so a renamed cross-brand browser cannot pass
+ * by alias. Snap's canonical `/snap/bin/chromium` launcher is the exception:
+ * it resolves to the generic `/usr/bin/snap` dispatcher by design.
+ */
+export function isChromeProfileExecutableForLaunch(candidate: string, resolvedCandidate: string): boolean {
+	return (
+		(path.posix.normalize(candidate) === "/snap/bin/chromium" &&
+			path.posix.normalize(resolvedCandidate) === "/usr/bin/snap") ||
+		isChromeProfileExecutable(resolvedCandidate)
+	);
+}
+
+let resolvedProfileChrome: string | null | undefined; // undefined = unchecked; null = not found
+
+/**
+ * Installed Chrome/Chromium executable for saved-profile mode, or undefined when
+ * none is present. Edge is excluded on purpose: a discovered Chrome user data
+ * directory must never be opened by a different browser brand.
+ */
+export function resolveSystemChromeForProfile(): string | undefined {
+	if (resolvedProfileChrome !== undefined) return resolvedProfileChrome ?? undefined;
+	const found = firstExecutableCandidate(systemChromiumCandidates(), isChromeProfileExecutable);
+	resolvedProfileChrome = found ?? null;
+	if (found) logger.debug("Using system Chrome/Chromium for profile mode", { path: found });
+	return found;
 }
 
 export interface LaunchHeadlessOptions {

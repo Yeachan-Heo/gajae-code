@@ -121,6 +121,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "omlx",
+		name: "oMLX (Local OpenAI-compatible)",
+		available: true,
+	},
+	{
 		id: "ollama",
 		name: "Ollama (Local OpenAI-compatible)",
 		available: true,
@@ -401,6 +406,7 @@ export async function refreshOAuthToken(
 		case "together":
 		case "litellm":
 		case "lm-studio":
+		case "omlx":
 		case "alibaba-token-plan":
 		case "ollama":
 		case "ollama-cloud":
