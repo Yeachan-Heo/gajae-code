@@ -88,6 +88,43 @@ describe("register-builtins lazy streams", () => {
 		expect(result).toEqual(finalMessage);
 	});
 
+	it("aborts the lazy provider request when the public stream consumer returns early", async () => {
+		const partialMessage = createAssistantMessage("stop");
+		let providerSignal: AbortSignal | undefined;
+		let providerAborted = false;
+		const source = {
+			async *[Symbol.asyncIterator]() {
+				yield { type: "start", partial: partialMessage } as const;
+				const { promise, reject } = Promise.withResolvers<never>();
+				providerSignal?.addEventListener(
+					"abort",
+					() => {
+						providerAborted = true;
+						reject(new Error("Request was aborted"));
+					},
+					{ once: true },
+				);
+				await promise;
+			},
+		} as unknown as AssistantMessageEventStream;
+
+		setBedrockProviderModule({
+			streamBedrock: (_model, _context, options) => {
+				providerSignal = options.signal;
+				return source;
+			},
+		});
+
+		const stream = streamBedrock(createModel(), baseContext, {});
+		const iterator = stream[Symbol.asyncIterator]();
+		expect((await iterator.next()).done).toBe(false);
+		await iterator.return?.();
+		await Bun.sleep(0);
+
+		expect(providerSignal?.aborted).toBe(true);
+		expect(providerAborted).toBe(true);
+	});
+
 	it("turns iterator failures into terminal error results", async () => {
 		const partialMessage = createAssistantMessage("stop");
 		const source = {

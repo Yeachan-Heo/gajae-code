@@ -1853,24 +1853,29 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 	context: Context,
 	options?: OpenAICodexResponsesOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const consumerAbortController = new AbortController();
+	const stream = new AssistantMessageEventStream(() => consumerAbortController.abort());
+	const signal = options?.signal
+		? AbortSignal.any([options.signal, consumerAbortController.signal])
+		: consumerAbortController.signal;
+	const streamOptions = { ...options, signal };
 
 	(async () => {
 		const startTime = Date.now();
 		const output = createAssistantOutput(model);
-		const requestSetup = createRequestSetup(options);
+		const requestSetup = createRequestSetup(streamOptions);
 		let processingContext: CodexStreamProcessingContext | undefined;
 
 		try {
-			const requestContext = await buildCodexRequestContext(model, context, options, output);
+			const requestContext = await buildCodexRequestContext(model, context, streamOptions, output);
 			let initialTransport: CodexInitialTransport;
 			try {
-				initialTransport = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
+				initialTransport = await openInitialCodexEventStream(model, streamOptions, requestSetup, requestContext);
 			} catch (error) {
-				if (options?.fallbackManaged) throw error;
+				if (streamOptions.fallbackManaged) throw error;
 				initialTransport = await retryCodexInitialTransportWithoutToolChoice(
 					model,
-					options,
+					streamOptions,
 					requestSetup,
 					requestContext,
 					stream,
@@ -1889,7 +1894,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				model,
 				output,
 				stream,
-				options,
+				options: streamOptions,
 				requestSetup,
 				requestContext,
 				startTime,
@@ -1907,7 +1912,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					model,
 					output,
 					stream,
-					options,
+					options: streamOptions,
 					requestSetup,
 					requestContext: {
 						apiKey: "",
