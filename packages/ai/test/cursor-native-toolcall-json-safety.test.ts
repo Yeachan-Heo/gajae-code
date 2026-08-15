@@ -37,6 +37,37 @@ describe("cursor native toolCall JSON safety", () => {
 		expect(converted).toEqual({ fn: null, self: null });
 	});
 
+	it("bounds hostile graph traversal by node count and depth", () => {
+		const wide = Object.fromEntries(Array.from({ length: 10_050 }, (_, index) => [`key${index}`, index]));
+		const convertedWide = cursorJsonSafeValueForTest(wide) as Record<string, unknown>;
+		expect(Object.keys(convertedWide).length).toBeLessThan(Object.keys(wide).length);
+		expect(JSON.parse(JSON.stringify(convertedWide))).toEqual(convertedWide);
+
+		const deep: Record<string, unknown> = {};
+		let cursor = deep;
+		for (let index = 0; index < 500; index++) {
+			const next: Record<string, unknown> = {};
+			cursor.next = next;
+			cursor = next;
+		}
+		expect(() => JSON.stringify(cursorJsonSafeValueForTest(deep))).not.toThrow();
+	});
+
+	it("contains unreadable payload objects at the provider boundary", () => {
+		const unreadable = new Proxy(
+			{},
+			{
+				ownKeys() {
+					throw new Error("unreadable payload");
+				},
+			},
+		);
+		expect(cursorJsonSafeValueForTest(unreadable)).toBeNull();
+		expect(buildNativeToolCallBlock({ shellToolCall: { args: unreadable } }, "call-proxy", 0)?.arguments).toEqual({
+			raw: null,
+		});
+	});
+
 	it("builds native toolCall blocks with JSON-serializable arguments", () => {
 		const block = buildNativeToolCallBlock(
 			{

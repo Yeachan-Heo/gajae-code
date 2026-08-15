@@ -1919,6 +1919,7 @@ function cursorNativeToolName(kindKey: string): string {
 
 /** Hard node budget for one native-payload conversion; bounds hostile or cyclic graphs. */
 const CURSOR_JSON_SAFE_MAX_NODES = 10_000;
+const CURSOR_JSON_SAFE_MAX_DEPTH = 100;
 
 /**
  * Total conversion of a Cursor protobuf payload into plain JSON-safe data.
@@ -1934,34 +1935,45 @@ const CURSOR_JSON_SAFE_MAX_NODES = 10_000;
  * Rules: `$typeName` is stripped, safe-range bigints become numbers (decimal
  * strings beyond `Number.MAX_SAFE_INTEGER`), byte arrays become base64
  * strings, dates become ISO strings, functions/symbols are dropped, cycles
- * collapse to null, and everything past the node budget is truncated to null.
+ * and over-depth values collapse to null, and containers stop accepting
+ * entries once the shared node budget is exhausted.
  */
-function cursorJsonSafeValue(value: unknown, path?: Set<object>, budget?: { remaining: number }): unknown {
+function cursorJsonSafeValue(value: unknown, path?: Set<object>, budget?: { remaining: number }, depth = 0): unknown {
 	const seen = path ?? new Set<object>();
 	const nodes = budget ?? { remaining: CURSOR_JSON_SAFE_MAX_NODES };
 	if (nodes.remaining-- <= 0) return null;
+	if (depth >= CURSOR_JSON_SAFE_MAX_DEPTH) return null;
 	if (typeof value === "bigint") {
 		return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(-Number.MAX_SAFE_INTEGER)
 			? Number(value)
 			: value.toString();
 	}
 	if (typeof value === "function" || typeof value === "symbol" || value === undefined) return null;
+	if (typeof value === "number" && !Number.isFinite(value)) return null;
 	if (value === null || typeof value !== "object") return value;
 	if (seen.has(value)) return null;
 	if (value instanceof Uint8Array)
 		return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("base64");
-	if (value instanceof Date) return value.toISOString();
+	if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.toISOString() : null;
 	seen.add(value);
 	try {
 		if (Array.isArray(value)) {
-			return value.map(entry => cursorJsonSafeValue(entry, seen, nodes));
+			const array: unknown[] = [];
+			for (const entry of value) {
+				if (nodes.remaining <= 0) break;
+				array.push(cursorJsonSafeValue(entry, seen, nodes, depth + 1));
+			}
+			return array;
 		}
 		const record: Record<string, unknown> = {};
 		for (const [key, entry] of Object.entries(value)) {
 			if (key === "$typeName") continue;
-			record[key] = cursorJsonSafeValue(entry, seen, nodes);
+			if (nodes.remaining <= 0) break;
+			record[key] = cursorJsonSafeValue(entry, seen, nodes, depth + 1);
 		}
 		return record;
+	} catch {
+		return null;
 	} finally {
 		seen.delete(value);
 	}
@@ -1981,10 +1993,15 @@ export function buildNativeToolCallBlock(
 		if (!/ToolCall$/.test(key) || !payload || typeof payload !== "object") continue;
 		if (key === "mcpToolCall" || key === "updateTodosToolCall") continue;
 		const args = (payload as { args?: unknown }).args;
+		const hasObjectArgs = args !== null && typeof args === "object";
+		const convertedArgs = hasObjectArgs ? cursorJsonSafeValue(args) : undefined;
 		const safeArguments =
-			args && typeof args === "object"
-				? (cursorJsonSafeValue(args) as Record<string, unknown>)
-				: { raw: cursorJsonSafeValue(payload) };
+			convertedArgs !== undefined &&
+			convertedArgs !== null &&
+			typeof convertedArgs === "object" &&
+			!Array.isArray(convertedArgs)
+				? (convertedArgs as Record<string, unknown>)
+				: { raw: hasObjectArgs ? convertedArgs : cursorJsonSafeValue(payload) };
 		return {
 			type: "toolCall",
 			id: callId,
