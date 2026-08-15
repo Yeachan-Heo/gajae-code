@@ -200,7 +200,7 @@ describe("gajae pixel frames", () => {
 
 	it("encodes deterministic iTerm2 PNG dimensions, CRCs, colors, and transparent padding", () => {
 		const sequence = encodeGridIterm2(["R."], 2, 2, 2, 1, 1, 0, 0, { R: [12, 34, 56] });
-		expect(sequence).toContain("width=2;height=2;preserveAspectRatio=0;inline=1");
+		expect(sequence).toContain("name=Z2FqYWUtcGV0LnBuZw==;width=2;height=2;preserveAspectRatio=0;inline=1");
 		const decoded = decodeIterm2Png(sequence);
 		expect(decoded.width).toBe(4);
 		expect(decoded.height).toBe(4);

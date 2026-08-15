@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- iTerm2 Gajae Pet frames now carry a dedicated filename, so dragging one retains iTerm's native drag behavior while the coding agent can discard only the temporary pet pathname pasted back into its composer.
 - iTerm2 Gajae Pet frames now size their inline PNG to the geometry-derived reserved cell block instead of a fixed pixel box, preserving the authored sprite aspect ratio across terminal font, Retina, and cell-aspect geometries while leaving Kitty and Sixel encoding unchanged.
 
 - Non-finite overlay geometry can no longer turn frame padding into an infinite allocating loop on the main thread; margins, positions, offsets, and minimum widths now fall back to bounded terminal-relative values.

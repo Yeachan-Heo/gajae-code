@@ -569,7 +569,9 @@ export function encodeGridIterm2(
 	// Size in character cells, not pixels: iTerm2 applies its own cell metrics
 	// (and divides px values by the Retina backing scale), so cells keep the
 	// padded canvas 1:1 with the reserved block at every geometry.
-	const params = `width=${columns};height=${rows};preserveAspectRatio=0;inline=1`;
+	// iTerm uses the supplied filename when a user drags this inline image out.
+	// The unique name lets the composer discard only this pet's automatic path paste.
+	const params = `name=Z2FqYWUtcGV0LnBuZw==;width=${columns};height=${rows};preserveAspectRatio=0;inline=1`;
 	return `\x1b]1337;File=${params}:${png.toString("base64")}\x1b\\`;
 }
 

@@ -1193,6 +1193,22 @@ describe("InputController pasted image path transactions", () => {
 		}
 	});
 
+	it("consumes iTerm's generated Gajae Pet drag path without changing the composer", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		const handled = await editor.onPasteText?.(
+			"/var/folders/cp/9506bhz103gc1rg1k4xq3vcw0000gn/T/iTerm2.d54w3v.gajae-pet.png\n",
+			pasteTextContext(),
+		);
+
+		expect(handled).toBe(true);
+		expect(editor.getText()).toBe("");
+		expect(ctx.pendingImages).toEqual([]);
+		expect(spies.showStatus).toHaveBeenCalledWith("Ignored dragged Gajae Pet image.", { dim: true });
+	});
+
 	it("confirms and atomically attaches saved-image batches in source order", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-pasted-images-"));
 		const first = path.join(directory, "first.png");
