@@ -701,6 +701,16 @@ describe("SDK ToolSession forwards getWorkflowGateEmitter", () => {
 			"workflow-gates.json",
 		);
 		try {
+			// #4568: construction must not mkdir under the cwd; the durable store
+			// materializes on the first persisted gate, proving the persistent
+			// session still uses the file-backed store.
+			expect(fs.existsSync(persistentGatePath)).toBe(false);
+			const gatePromise = persistentSession.getWorkflowGateEmitter()!.emitGate({
+				stage: "deep-interview",
+				kind: "question",
+				schema: { type: "string" },
+			});
+			gatePromise.catch(() => {});
 			expect(fs.existsSync(persistentGatePath)).toBe(true);
 		} finally {
 			await persistentSession.dispose();
