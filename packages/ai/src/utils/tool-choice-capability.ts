@@ -155,16 +155,29 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 					!ownerIsAlive && Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS;
 				if (staleOwner) {
 					const reaperPath = `${lockPath}.reaper`;
+					const reaperOwner = `${process.pid}:${crypto.randomUUID()}`;
 					try {
 						const reaper = fs.openSync(reaperPath, "wx", 0o600);
+						fs.writeFileSync(reaper, reaperOwner);
 						fs.closeSync(reaper);
 						try {
 							if (fs.readFileSync(lockPath, "utf8") === lockOwner) fs.rmSync(lockPath, { force: true });
 						} finally {
-							fs.rmSync(reaperPath, { force: true });
+							if (fs.readFileSync(reaperPath, "utf8") === reaperOwner) fs.rmSync(reaperPath, { force: true });
 						}
 					} catch {
-						// Another waiter owns stale-lock reclamation.
+						try {
+							const electionOwner = fs.readFileSync(reaperPath, "utf8");
+							const electionPid = Number(electionOwner.split(":", 1)[0]);
+							if (
+								(!Number.isSafeInteger(electionPid) || electionPid <= 0 || !isProcessAlive(electionPid)) &&
+								Date.now() - fs.statSync(reaperPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS &&
+								fs.readFileSync(reaperPath, "utf8") === electionOwner
+							)
+								fs.rmSync(reaperPath, { force: true });
+						} catch {
+							// Another waiter owns or reclaimed stale-lock election.
+						}
 					}
 				}
 			} catch {
