@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -161,6 +162,73 @@ describe("edit-result persistence bounding (#4566)", () => {
 			}
 		} finally {
 			delete process.env.GJC_EDIT_VARIANT;
+			await manager.close();
+		}
+	});
+
+	it("computes snapshot receipts before generic 500k persistence truncation", async () => {
+		const root = makeTempDir("gjc-4566-exact-digest-");
+		const cwd = path.join(root, "proj");
+		const agentDir = path.join(root, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		try {
+			manager.appendMessage({ role: "user", content: [{ type: "text", text: "go" }], timestamp: 1 });
+			manager.appendMessage(makeAssistantMessage() as never);
+			await manager.ensureOnDisk();
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected managed session file");
+
+			// Deliberately exceed MAX_PERSIST_CHARS (500k). If generic truncation
+			// runs first, the durable receipt would identify only the prefix.
+			const oldText = `${"old-snapshot-line\n".repeat(40_000)}tail-old`;
+			const newText = `${"new-snapshot-line\n".repeat(40_000)}tail-new`;
+			expect(oldText.length).toBeGreaterThan(500_000);
+			expect(newText.length).toBeGreaterThan(500_000);
+
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "call-exact-digest",
+				toolName: "edit",
+				content: [{ type: "text", text: "Updated large.txt" }],
+				details: { diff: "@@\n-old\n+new", path: path.join(cwd, "large.txt"), oldText, newText },
+				isError: false,
+				timestamp: Date.now(),
+			});
+			await manager.flush();
+
+			const persisted = fs
+				.readFileSync(sessionFile, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line) as { type?: string; message?: Record<string, unknown> })
+				.find(
+					entry =>
+						entry.type === "message" &&
+						(entry.message as { toolCallId?: string } | undefined)?.toolCallId === "call-exact-digest",
+				);
+			const details = persisted?.message?.details as Record<string, unknown> | undefined;
+			const oldDigest = details?.oldTextDigest as { bytes: number; sha256: string } | undefined;
+			const newDigest = details?.newTextDigest as { bytes: number; sha256: string } | undefined;
+
+			expect(oldDigest).toEqual({
+				bytes: Buffer.byteLength(oldText, "utf8"),
+				sha256: createHash("sha256").update(Buffer.from(oldText, "utf8")).digest("hex"),
+			});
+			expect(newDigest).toEqual({
+				bytes: Buffer.byteLength(newText, "utf8"),
+				sha256: createHash("sha256").update(Buffer.from(newText, "utf8")).digest("hex"),
+			});
+			expect(details?.oldText).toBe(
+				"[edit snapshot externalized: see oldTextDigest/newTextDigest; full body omitted from transcript]",
+			);
+			expect(details?.newText).toBe(
+				"[edit snapshot externalized: see oldTextDigest/newTextDigest; full body omitted from transcript]",
+			);
+		} finally {
 			await manager.close();
 		}
 	});

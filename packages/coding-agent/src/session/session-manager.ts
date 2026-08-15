@@ -5715,8 +5715,10 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 }
 
 async function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStore): Promise<FileEntry> {
-	const truncated = (await truncateForPersistence(entry, blobStore)) as FileEntry;
-	return boundEditSnapshotFieldsForEntry(truncated);
+	// Bound edit snapshots before the generic 500k string truncation so the
+	// receipt hashes/lengths identify the exact source bodies, not truncated
+	// prefixes of files larger than MAX_PERSIST_CHARS (#4566).
+	return (await truncateForPersistence(boundEditSnapshotFieldsForEntry(entry), blobStore)) as FileEntry;
 }
 
 /**
@@ -5821,7 +5823,9 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 }
 
 function prepareEntryForPersistenceSync(entry: FileEntry, blobStore: BlobStore): FileEntry {
-	return boundEditSnapshotFieldsForEntry(truncateForPersistenceSync(entry, blobStore) as FileEntry);
+	// Keep this ordering identical to the async path: snapshot receipts must be
+	// computed from the complete body before generic persistence truncation.
+	return truncateForPersistenceSync(boundEditSnapshotFieldsForEntry(entry), blobStore) as FileEntry;
 }
 
 /**
