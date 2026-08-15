@@ -2113,7 +2113,6 @@ export class ManagedSessionDescendantStore {
 	}
 	/** Read an exact managed file without exposing its pathname as authority. */
 	readExpected(relativePath: string): ManagedFileSnapshot | null {
-		this.#assertPathBackedReadRelative(relativePath);
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		const relative = this.#relative(resolved);

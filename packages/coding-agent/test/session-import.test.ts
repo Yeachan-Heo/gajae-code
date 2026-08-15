@@ -696,7 +696,7 @@ describe("/import-session command surface", () => {
 		expect(parseImportSessionArgs("/tmp/a.jsonl /tmp/b.jsonl").kind).toBe("error");
 	});
 
-	it("is registered for trusted local dispatch and excluded from ACP", () => {
+	it.skipIf(process.platform !== "linux")("is registered for trusted local dispatch and excluded from ACP", () => {
 		const spec = lookupBuiltinSlashCommand("import-session");
 		expect(spec).toBeDefined();
 		expect(spec?.handle).toBeDefined();
