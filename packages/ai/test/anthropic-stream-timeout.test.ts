@@ -499,19 +499,21 @@ describe("anthropic first-event timeouts", () => {
 		expect(result.errorMessage).toContain("compiled grammar is too large");
 		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
 	});
-	it("counts corrective-policy replays when reporting the timeout attempt ceiling", async () => {
-		// A corrective replay (strict-tool fallback) resets providerRetryAttempt
+	it("counts forced-tool corrective replays when reporting the timeout attempt ceiling", async () => {
+		// A corrective replay (forced-tool fallback) resets providerRetryAttempt
 		// before `continue`, so the earlier providerRetryAttempt-based accounting
 		// reported the full two-attempt ceiling after two uploads had already
-		// happened — licensing a third upload of the corrected request.
+		// happened — licensing a third upload of the corrected request. Use this
+		// route rather than strict-tool fallback because GJC_NO_STRICT/PI_NO_STRICT
+		// intentionally removes strict markers before the request is sent.
 		let attempts = 0;
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
 			attempts += 1;
 			if (attempts === 1) {
-				// Corrective path: strict-grammar-too-large 400.
+				// Corrective path: forced tool_choice unsupported 400.
 				return {
 					async withResponse(): Promise<never> {
-						const error = new Error("400 invalid_request_error: compiled grammar is too large");
+						const error = new Error("400 invalid_request_error: forced tool_choice is not supported");
 						(error as Error & { status: number }).status = 400;
 						throw error;
 					},
@@ -541,21 +543,22 @@ describe("anthropic first-event timeouts", () => {
 			} as never;
 		}) as unknown as Anthropic["messages"]["create"];
 		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
-		const strictContext: Context = {
-			messages: [{ role: "user", content: "small strict request", timestamp: Date.now() }],
+		const forcedToolContext: Context = {
+			messages: [{ role: "user", content: "small forced-tool request", timestamp: Date.now() }],
 			tools: [
 				{
 					name: "edit",
 					description: "Edit a value",
-					strict: true,
 					parameters: { type: "object", properties: {} },
 				},
 			],
 		};
+		const forcedToolModel = { ...model, id: "claude-sonnet-4-5-timeout-forced-tool" };
 
-		const result = await streamAnthropic(model, strictContext, {
+		const result = await streamAnthropic(forcedToolModel, forcedToolContext, {
 			client: injectedClient,
 			streamFirstEventTimeoutMs: 30,
+			toolChoice: { type: "tool", name: "edit" },
 		}).result();
 
 		expect(attempts).toBe(2);
