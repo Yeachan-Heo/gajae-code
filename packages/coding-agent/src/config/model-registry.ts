@@ -123,9 +123,16 @@ function toPositiveFiniteNumber(value: number | undefined): number | undefined {
 	return value;
 }
 
-function isOmlxQwen36ReasoningModelId(modelId: string): boolean {
+function isOmlxReasoningModelId(modelId: string): boolean {
 	const normalized = modelId.toLowerCase();
-	return normalized.includes("qwen3.6-35b-a3b") || normalized.includes("qwen3.6-27b");
+	return (
+		normalized.includes("qwen") ||
+		normalized.includes("deepseek") ||
+		normalized.includes("qwq") ||
+		normalized.includes("thinking") ||
+		normalized.includes("reason") ||
+		normalized.includes("r1")
+	);
 }
 
 const OMLX_REASONING_EFFORT_MAP = {
@@ -1420,6 +1427,7 @@ export class ModelRegistry {
 				["OLLAMA_BASE_URL", Bun.env.OLLAMA_BASE_URL || ""],
 				["LLAMA_CPP_BASE_URL", Bun.env.LLAMA_CPP_BASE_URL || ""],
 				["LM_STUDIO_BASE_URL", Bun.env.LM_STUDIO_BASE_URL || ""],
+				["OMLX_BASE_URL", Bun.env.OMLX_BASE_URL || ""],
 			],
 			providerBaseUrls: [...providerBaseUrlEnvKeys].sort().map(name => [name, Bun.env[name] ?? ""]),
 		});
@@ -3084,7 +3092,8 @@ export class ModelRegistry {
 			if (!id) continue;
 			const referenceModel = resolveCustomModelReference(id);
 			const api = this.#resolveDiscoveredModelApi(providerConfig, id);
-			const omlxReasoning = providerConfig.discovery.type === "omlx" && isOmlxQwen36ReasoningModelId(id);
+			// For oMLX, apply reasoning settings + 128K context to all models regardless of model ID
+			const isOmlxProvider = providerConfig.discovery.type === "omlx";
 			discovered.push(
 				enrichModelThinking({
 					id,
@@ -3092,19 +3101,21 @@ export class ModelRegistry {
 					api,
 					provider: providerConfig.provider,
 					baseUrl: requestBaseUrl,
-					reasoning: referenceModel?.reasoning ?? omlxReasoning,
+					reasoning: referenceModel?.reasoning ?? isOmlxProvider,
 					thinking:
 						referenceModel?.thinking ??
-						(omlxReasoning ? { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max } : undefined),
+						(isOmlxProvider ? { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max } : undefined),
 					input: referenceModel?.input ?? ["text"],
 					output: referenceModel?.output,
 					cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow:
-						toPositiveFiniteNumber(item.max_model_len) ??
-						toPositiveFiniteNumber(item.max_context_length) ??
-						toPositiveFiniteNumber(item.context_length) ??
-						referenceModel?.contextWindow ??
-						UNK_CONTEXT_WINDOW,
+						isOmlxProvider
+							? 131072
+							: toPositiveFiniteNumber(item.max_model_len) ??
+								  toPositiveFiniteNumber(item.max_context_length) ??
+								  toPositiveFiniteNumber(item.context_length) ??
+								  referenceModel?.contextWindow ??
+								  UNK_CONTEXT_WINDOW,
 					maxTokens: referenceModel?.maxTokens ?? UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
 					compat: {
@@ -3112,11 +3123,11 @@ export class ModelRegistry {
 						supportsStore: false,
 						supportsDeveloperRole: false,
 						supportsReasoningEffort: false,
-						...(omlxReasoning
+						...(isOmlxProvider
 							? {
 									thinkingFormat: "qwen-chat-template" as const,
 									reasoningEffortMap: OMLX_REASONING_EFFORT_MAP,
-								}
+							  }
 							: {}),
 					},
 				}),

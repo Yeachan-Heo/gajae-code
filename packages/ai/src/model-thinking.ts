@@ -758,7 +758,7 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 }
 
 function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
-	if (model.provider === "omlx" && isOmlxQwen36ReasoningModelId(model.id)) {
+	if (model.provider === "omlx" && isOmlxReasoningModelId(model.id)) {
 		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX;
 	}
 	// Meta documents Muse Spark 1.2 as accepting the full minimal..xhigh
@@ -791,9 +791,16 @@ function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly
 	return DEFAULT_REASONING_EFFORTS;
 }
 
-function isOmlxQwen36ReasoningModelId(modelId: string): boolean {
+function isOmlxReasoningModelId(modelId: string): boolean {
 	const normalized = modelId.toLowerCase();
-	return normalized.includes("qwen3.6-35b-a3b") || normalized.includes("qwen3.6-27b");
+	return (
+		normalized.includes("qwen") ||
+		normalized.includes("deepseek") ||
+		normalized.includes("qwq") ||
+		normalized.includes("thinking") ||
+		normalized.includes("reason") ||
+		normalized.includes("r1")
+	);
 }
 
 function inferThinkingControlMode<TApi extends Api>(
