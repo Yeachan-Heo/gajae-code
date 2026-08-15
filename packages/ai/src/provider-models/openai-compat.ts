@@ -1407,10 +1407,16 @@ export interface OmlxModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
 }
-
-function isOmlxQwen36ReasoningModelId(modelId: string): boolean {
+function isOmlxReasoningModelId(modelId: string): boolean {
 	const normalized = modelId.toLowerCase();
-	return normalized.includes("qwen3.6-35b-a3b") || normalized.includes("qwen3.6-27b");
+	return (
+		normalized.includes("qwen") ||
+		normalized.includes("deepseek") ||
+		normalized.includes("qwq") ||
+		normalized.includes("thinking") ||
+		normalized.includes("reason") ||
+		normalized.includes("r1")
+	);
 }
 
 const OMLX_REASONING_EFFORT_MAP = {
@@ -1434,11 +1440,12 @@ export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelM
 				baseUrl,
 				apiKey,
 				mapModel: (entry, defaults) => {
-					const reasoning = isOmlxQwen36ReasoningModelId(defaults.id);
+					const reasoning = entry.supports_reasoning === true || isOmlxReasoningModelId(defaults.id);
 					return {
 						...defaults,
 						reasoning,
 						thinking: reasoning ? { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max } : undefined,
+						input: entry.supports_vision === true ? ["text", "image"] : ["text"],
 						contextWindow: toPositiveNumber(entry.max_model_len, defaults.contextWindow),
 						compat: reasoning
 							? {
