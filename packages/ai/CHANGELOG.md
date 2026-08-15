@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Added the `omlx` local provider for Apple Silicon ML inference servers: OAuth-surface `/login` (optional key, keyless placeholder sentinel), `OMLX_API_KEY` env fallback, and `omlxModelManagerOptions` discovery on `http://127.0.0.1:8000/v1` (override with `OMLX_BASE_URL`). The `/v1/models` mapper reads `max_model_len` → `contextWindow`, keeps the `id` fallback for `name` (oMLX serves no `name`), and honors `supports_reasoning`/`supports_vision` when present (#4561).
 - Generic OpenAI-compatible `/v1/models` discovery now reads served context-window and output-limit metadata instead of defaulting every dynamically listed model to the unknown-window sentinel. `max_model_len` (vLLM/SGLang/oMLX), `context_length`, `context_window`, `max_context_length` (LM Studio), and `max_position_embeddings` populate `contextWindow` in that precedence order, while `max_tokens`/`max_output_tokens` populate `maxTokens`; total-window fields never leak into the output-token ceiling. Malformed values (non-finite, zero, negative, non-numeric) are rejected per-field with fallback to the next candidate, so a `1e400`-style catalog entry can no longer poison compaction thresholds or compact-input budgets.
 - Refreshed the bundled ZAI catalog with GLM-5.3 and made it the provider's default model.
 - Added the typed `local_snapshot_failure` and `local_buffer_overflow` assistant error kinds so downstream retry policy can distinguish local event-snapshot and staging-buffer failures from provider failures.
