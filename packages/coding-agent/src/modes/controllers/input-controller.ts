@@ -56,7 +56,7 @@ export const BACKGROUND_FOLD_DOUBLE_PRESS_MS = 750;
 const DRAFT_CLEAR_DOUBLE_ESCAPE_WINDOW_MS = 800;
 const EMPTY_EDITOR_DOUBLE_ESCAPE_WINDOW_MS = 500;
 const IMAGE_PLACEHOLDER_PATTERN = /\[image ([1-9]\d*)\]/g;
-const ITERM_PET_DRAG_PATH_PATTERN = /^\/var\/folders\/[^/]+\/[^/]+\/T\/iTerm2\.[A-Za-z0-9]+\.gajae-pet\.png$/;
+const ITERM_PET_DRAG_PATH_PATTERN = /^\/var\/folders\/[^/]+\/[^/]+\/T\/iTerm2\.[A-Za-z0-9]+\.gajae-pet\.(?:png|gif)$/;
 const IMAGE_PLACEHOLDER_PRESENT_PATTERN = /\[image [1-9]\d*\]/;
 
 function isItermPetDragPaste(text: string): boolean {

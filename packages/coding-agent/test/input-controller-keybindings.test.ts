@@ -1199,7 +1199,7 @@ describe("InputController pasted image path transactions", () => {
 		controller.setupKeyHandlers();
 
 		const handled = await editor.onPasteText?.(
-			"/var/folders/cp/9506bhz103gc1rg1k4xq3vcw0000gn/T/iTerm2.d54w3v.gajae-pet.png\n",
+			"/var/folders/cp/9506bhz103gc1rg1k4xq3vcw0000gn/T/iTerm2.d54w3v.gajae-pet.gif\n",
 			pasteTextContext(),
 		);
 

@@ -1,23 +1,30 @@
 import {
 	type AnimationRegistration,
 	buildGajaePixelFrames,
+	burstTimeline,
+	type CellRect,
 	type Component,
 	type Container,
+	type GajaePixelFrameName,
 	type GajaePixelFrames,
 	getCellDimensions,
+	getGajaePetGifCached,
+	idleTimeline,
+	PARA_PARA_STEPS,
 	PET_SKINS,
-	type PetBurst,
 	type PetFrameName,
 	type PetMode,
 	type PetSkinId,
 	petBurstDurationMs,
 	petBurstFrame,
+	type RasterLeaseToken,
 	registerAnimationCallback,
-	resolvePetMode,
 	type TUI,
+	workingTimeline,
+	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "./custom-editor";
-import { getPetPixelProtocol } from "./pet-capability";
+import { getItermPetUnavailableReason, getPetPixelProtocol, getVerifiedItermPetAvailability } from "./pet-capability";
 
 /** Re-exported from the tui skin registry so widget-relative imports stay valid. */
 export type { PetMode, PetSkinId };
@@ -39,7 +46,7 @@ const petKittyDropPx = (cellHeightPx: number): number =>
 	Math.min(Math.max(0, cellHeightPx - 1), Math.floor(cellHeightPx * KITTY_DROP_FRACTION));
 const PET_RAISE_ROWS = 1;
 const PET_ART_ROWS = 2;
-const ITERM_CANVAS_ROWS = 3;
+const ITERM_CANVAS_ROWS = PET_ART_ROWS + 1;
 const allocatedPetKittyImageIds = new Set<number>();
 
 function allocatePetKittyImageId(): number {
@@ -62,68 +69,39 @@ function sameFootprint(left: SixelFootprint, right: SixelFootprint): boolean {
 	return left.x === right.x && left.y === right.y && left.columns === right.columns && left.rows === right.rows;
 }
 
+type PetOverlayEmission = {
+	payload: string;
+	onWritten?: () => void;
+};
+
 /**
  * Which widget currently owns each TUI's single shared post-render emitter
  * slot. A stale or repeated dispose (or off-switch) of a predecessor widget
  * must never clear a successor's overlay authority.
  */
 const petOverlayEmitterOwners = new WeakMap<TUI, GajaePetWidget>();
+const petOverlayOwnershipEpochs = new WeakMap<TUI, number>();
 
-/** Random gap between automatic claw flexes (fires while idle AND working). */
+/** Working animation: the shared para-para beats looped end to end. */
+const WORK_LOOP_TOTAL = PARA_PARA_STEPS.reduce((sum, [, ms]) => sum + ms, 0);
+/** Random gap between automatic claw flexes while work is active. */
 const AUTO_FLEX_MIN_GAP_MS = 12_000;
 const AUTO_FLEX_MAX_GAP_MS = 40_000;
+// Deterministic idle loop: gaze around with a rare visor flicker.
+const IDLE_LOOP: Array<[GajaePixelFrameName, number]> = [
+	["base", 1100],
+	["gazeL", 350],
+	["base", 500],
+	["gazeR", 350],
+	["base", 800],
+	["flicker", 150],
+];
+const IDLE_LOOP_TOTAL = IDLE_LOOP.reduce((sum, [, ms]) => sum + ms, 0);
 
-function animationFrameAt(
-	steps: ReadonlyArray<readonly [PetFrameName, number]>,
-	now: number,
-	fallback: PetFrameName,
-): PetFrameName {
-	const total = steps.reduce((sum, [, ms]) => sum + ms, 0);
-	if (total <= 0) return fallback;
-	let elapsed = now % total;
-	for (const [frame, ms] of steps) {
-		if (elapsed < ms) return frame;
-		elapsed -= ms;
-	}
-	return fallback;
-}
-
-function animationFrameAtElapsed(
-	steps: ReadonlyArray<readonly [PetFrameName, number]>,
-	elapsed: number,
-	fallback: PetFrameName,
-): PetFrameName {
-	for (const [frame, ms] of steps) {
-		if (elapsed < ms) return frame;
-		elapsed -= ms;
-	}
-	return fallback;
-}
-
-function animationDuration(steps: ReadonlyArray<readonly [PetFrameName, number]>): number {
-	return steps.reduce((sum, [, ms]) => sum + ms, 0);
-}
-
-interface WorkTransition {
-	startedAt: number;
-	steps: ReadonlyArray<readonly [PetFrameName, number]>;
-}
-
-const OUROBOROS_WORK_BURST_MIN_GAP_MS = 14_000;
-const OUROBOROS_WORK_BURST_MAX_GAP_MS = 30_000;
-
-/**
- * Selector preview: fire the first burst this soon after a skin is previewed, so the
- * pet shows one idle eye-roll (base -> gazeL -> base -> gazeR) and then its signature
- * flex/cry. Live use keeps the random AUTO_FLEX gap; only preview forces this demo.
- */
+/** Selector preview: fire the first burst this soon after a skin is previewed. */
 const PREVIEW_INTRO_MS = 2300;
 
-/**
- * Wraps the composer editor, reserving a right-side area beside it where the
- * real-pixel pet is drawn. The editor just renders narrower; the pet pixels
- * are emitted separately as an absolute-positioned overlay.
- */
+/** Reserve a right-side area beside the composer where the pixel pet is drawn. */
 export class PetFramedEditor implements Component {
 	#editor: CustomEditor;
 	#reserve = 0;
@@ -145,27 +123,12 @@ export class PetFramedEditor implements Component {
 	}
 
 	render(width: number): string[] {
-		if (!this.canFit(width)) {
-			return this.#editor.render(width);
-		}
+		if (!this.canFit(width)) return this.#editor.render(width);
 		return this.#editor.render(width - this.#reserve);
 	}
 }
 
-/**
- * The gajae pet: a real-pixel sprite living in a reserved area beside the
- * composer. It is nearest-neighbor scaled to the two terminal rows occupied
- * by an empty one-line composer and lifted one row so its feet meet the input
- * box's bottom edge.
- *
- * Rendering has two paths that share one payload builder:
- * - a post-render emitter re-draws the sprite after every TUI write (line
- *   renders clear the pet cells, so the overlay must be re-applied), and
- * - frame advances write the payload directly to the terminal, because the
- *   TUI skips writes entirely when no component line changed.
- *
- * Requires a Sixel-, Kitty-, or iTerm2-graphics terminal (`pixelProtocol()`).
- */
+/** The gajae pet pixel sprite and protocol-specific rendering lifecycle. */
 export class GajaePetWidget {
 	#ui: TUI;
 	#editor: CustomEditor;
@@ -179,31 +142,29 @@ export class GajaePetWidget {
 	#frame: PetFrameName = "base";
 	#animation: AnimationRegistration | undefined;
 	#flexUntil = 0;
-	#activeBurst: PetBurst | undefined;
 	#nextAutoFlexAt = 0;
-	#working = false;
-	#workTransition: WorkTransition | undefined;
-	#nextWorkBurstAt = 0;
-	#workBurstIndex = 0;
+	#flexSource: "preview" | "working" | undefined;
+	#previewFlexAt = 0;
 	#autoFlexGapMs: [number, number] | null;
-	#forcedProtocol: "sixel" | "kitty" | "iterm2" | undefined;
-	/** Cell metrics the current frames were built for; a change triggers a rebuild. */
+	#forcedProtocol: "sixel" | "kitty" | "iterm" | undefined;
 	#builtCellW = 0;
 	#builtCellH = 0;
 	#kittyImageId: number | undefined;
-	/** True while a kitty placement may exist on screen; cleared only after the delete escape is delivered. */
 	#kittyCleanupPending = false;
-	/** Last emitted Sixel raster position; retained until an erase is actually delivered. */
+	#kittyCleanupGeneration = 0;
 	#lastSixelFootprint: SixelFootprint | undefined;
-	/** Terminal state: a disposed widget never touches the TUI or shared slots again. */
 	#disposed = false;
-	/**
-	 * True while the previous overlay frame carried the cleanup payload. The
-	 * TUI writes the frame after the emitter returns, so delivery is
-	 * acknowledged only on the next emitter pass — and only while the terminal
-	 * stayed available, since a failed render write drops availability.
-	 */
-	#frameCleanupAwaitingAck = false;
+	#ownedOverlayEpoch = 0;
+	#itermLease: RasterLeaseToken | undefined;
+	#disposePromise: Promise<void> | undefined;
+	#disposeRasterBarrier: Promise<void> = Promise.resolve();
+	#disposeNeedsLifecycle = false;
+	#itermProtocol = false;
+	#itermLastSemantic = "";
+	#itermOwner = `gajae-pet-${Math.random().toString(36).slice(2)}`;
+	#itermGeneration = 0;
+	#itermSubmitPending = false;
+	#syncManagedItermCursor: (row: number, column: number) => Promise<boolean>;
 
 	constructor(options: {
 		ui: TUI;
@@ -211,10 +172,9 @@ export class GajaePetWidget {
 		editorContainer: Container;
 		floorContainer: Container;
 		isWorking: () => boolean;
-		/** Rows rendered below the composer box (pet floor + hook widgets). */
 		getComposerBottomOffset: () => number;
-		forcePixelProtocol?: "sixel" | "kitty" | "iterm2";
-		/** Random [min, max] ms between auto-flexes; null disables. */
+		syncManagedItermCursor: (row: number, column: number) => Promise<boolean>;
+		forcePixelProtocol?: "sixel" | "kitty";
 		autoFlexGapMs?: [number, number] | null;
 	}) {
 		this.#ui = options.ui;
@@ -224,13 +184,13 @@ export class GajaePetWidget {
 		this.#framedEditor = new PetFramedEditor(options.editor);
 		this.#isWorking = options.isWorking;
 		this.#getComposerBottomOffset = options.getComposerBottomOffset;
+		this.#syncManagedItermCursor = options.syncManagedItermCursor;
 		this.#forcedProtocol = options.forcePixelProtocol;
 		this.#autoFlexGapMs =
 			options.autoFlexGapMs === undefined ? [AUTO_FLEX_MIN_GAP_MS, AUTO_FLEX_MAX_GAP_MS] : options.autoFlexGapMs;
 	}
 
-	/** Protocol available for the real-pixel pet, if any. */
-	static pixelProtocol(): "sixel" | "kitty" | "iterm2" | null {
+	static pixelProtocol(): "sixel" | "kitty" | "iterm" | null {
 		return getPetPixelProtocol();
 	}
 
@@ -242,19 +202,25 @@ export class GajaePetWidget {
 		return performance.now() < this.#flexUntil;
 	}
 
-	setMode(mode: string): void {
-		this.#applyMode(resolvePetMode(mode), true);
+	setMode(mode: PetMode): void {
+		this.#applyMode(mode, true);
 	}
 
-	/** Live preview during a selector: change the sprite without re-mounting the
-	 *  composer editor (that would tear down the open overlay). After a short idle
-	 *  eye-roll it fires the signature burst once (RedGajae flex, BlueGajae para-para
-	 *  then sob) so the selector demos the animation instead of waiting the random gap. */
+	async suspendItermCapability(): Promise<void> {
+		if (!this.#isActiveOwner()) return;
+		this.#itermGeneration++;
+		const lease = this.#itermLease;
+		this.#itermLease = undefined;
+		this.#itermLastSemantic = "";
+		if (lease) await this.#ui.invalidateRasterLease({ token: lease, cause: "capability-loss" });
+		this.#ui.requestRender(true);
+	}
+
 	previewMode(mode: PetMode): void {
+		if (this.#disposed) return;
 		this.#applyMode(mode, false);
-		if (mode !== "off" && this.#autoFlexGapMs) {
-			this.#nextAutoFlexAt = performance.now() + PREVIEW_INTRO_MS;
-		}
+		if (!this.#isActiveOwner() || mode === "off" || !this.#autoFlexGapMs) return;
+		this.#previewFlexAt = performance.now() + PREVIEW_INTRO_MS;
 	}
 
 	commitPreviewMode(mode: PetMode): void {
@@ -263,18 +229,22 @@ export class GajaePetWidget {
 
 	#applyMode(mode: PetMode, mountComposer: boolean): void {
 		if (this.#disposed || mode === this.#mode) return;
-
 		if (mode === "off") {
-			this.#writeImageCleanup();
+			if (!this.#canMutateSharedUi()) return;
+			this.#itermGeneration++;
+			if (this.#itermLease) {
+				void this.#ui.invalidateRasterLease({ token: this.#itermLease, cause: "mode-off" });
+				this.#itermLease = undefined;
+			}
+			this.#itermLastSemantic = "";
+			this.#itermProtocol = false;
+			this.#queueImageCleanup(true);
 			this.#mode = "off";
 			this.#animation?.unregister();
 			this.#animation = undefined;
 			this.#releaseOverlayEmitter();
 			this.#floorContainer.clear();
 			this.#pixel = undefined;
-			this.#workTransition = undefined;
-			this.#nextWorkBurstAt = 0;
-			this.#activeBurst = undefined;
 			this.#framedEditor.setReserve(0);
 			if (mountComposer) this.#mountEditor(false);
 			this.#ui.requestRender(true);
@@ -282,104 +252,133 @@ export class GajaePetWidget {
 		}
 
 		const protocol = this.#forcedProtocol ?? GajaePetWidget.pixelProtocol();
-		if (!protocol) return;
-		if (this.#mode !== "off") this.#writeImageCleanup();
+		const ownershipEpoch = petOverlayOwnershipEpochs.get(this.#ui) ?? 0;
+		if (!protocol || (this.#ownedOverlayEpoch !== 0 && this.#ownedOverlayEpoch < ownershipEpoch)) return;
+		const predecessor = petOverlayEmitterOwners.get(this.#ui);
+		if (predecessor && predecessor !== this) predecessor.#retireForSuccessor();
+		this.#itermGeneration++;
+		if (this.#itermLease) {
+			void this.#ui.invalidateRasterLease({ token: this.#itermLease, cause: "explicit" });
+			this.#itermLease = undefined;
+		}
+		this.#itermLastSemantic = "";
+		if (this.#mode !== "off") {
+			const releasesKittyImage = this.#pixel?.protocol === "kitty" && protocol !== "kitty";
+			this.#queueImageCleanup(releasesKittyImage);
+		}
 		this.#mode = mode;
-		this.#frame = PET_SKINS[mode].baseFrame;
+		this.#frame = "base";
 		this.#flexUntil = 0;
-		this.#activeBurst = undefined;
+		this.#flexSource = undefined;
+		this.#previewFlexAt = 0;
 		this.#nextAutoFlexAt = 0;
-		this.#working = this.#isWorking();
-		this.#workTransition = undefined;
-		this.#nextWorkBurstAt = 0;
-		this.#workBurstIndex = 0;
 		this.#buildPixel(protocol);
 		if (mountComposer) this.#mountEditor(true);
-		// The pet overlays the composer's bottom rows; no floor row is reserved, so
-		// the composer stays pinned to the terminal bottom.
 		this.#floorContainer.clear();
-		this.#ui.setPostRenderEmitter(() => this.#overlayPayload());
+		this.#ui.setPostRenderEmitter(() => this.#overlayEmission());
+		this.#ownedOverlayEpoch = ownershipEpoch + 1;
+		petOverlayOwnershipEpochs.set(this.#ui, this.#ownedOverlayEpoch);
 		petOverlayEmitterOwners.set(this.#ui, this);
 		this.#animation ??= registerAnimationCallback(now => this.#tick(now), 80);
 		this.#ui.requestRender(true);
 	}
 
-	/** (Re)build the encoded frames for the current terminal cell metrics. */
-	#buildPixel(protocol: "sixel" | "kitty" | "iterm2"): void {
+	#isActiveOwner(): boolean {
+		return !this.#disposed && petOverlayEmitterOwners.get(this.#ui) === this;
+	}
+
+	#canMutateSharedUi(): boolean {
+		const owner = petOverlayEmitterOwners.get(this.#ui);
+		return (
+			owner === this ||
+			(owner === undefined &&
+				this.#ownedOverlayEpoch !== 0 &&
+				this.#ownedOverlayEpoch === (petOverlayOwnershipEpochs.get(this.#ui) ?? 0))
+		);
+	}
+
+	#retireForSuccessor(): void {
+		this.dispose();
+	}
+
+	#buildPixel(protocol: "sixel" | "kitty" | "iterm"): void {
 		const cell = getCellDimensions();
 		this.#builtCellW = cell.widthPx;
 		this.#builtCellH = cell.heightPx;
 		const skin: PetSkinId = this.#mode === "off" ? "red" : this.#mode;
-		const iterm2TopPaddingPx = protocol === "iterm2" ? Math.floor(cell.heightPx / 2) : 0;
-		const iterm2BottomPaddingPx =
-			protocol === "iterm2" ? (ITERM_CANVAS_ROWS - PET_ART_ROWS) * cell.heightPx - iterm2TopPaddingPx : 0;
 		if (protocol === "kitty") {
 			this.#kittyImageId ??= allocatePetKittyImageId();
+			this.#kittyCleanupGeneration++;
 			this.#kittyCleanupPending = true;
 		}
+		if (protocol === "iterm") {
+			this.#itermProtocol = true;
+			this.#pixel = undefined;
+			this.#framedEditor.setReserve(Math.max(1, Math.ceil((2 * cell.heightPx) / cell.widthPx)) + PET_SIDE_MARGIN);
+			return;
+		}
+		this.#itermProtocol = false;
 		this.#pixel = buildGajaePixelFrames({
 			protocol,
 			skin,
 			cellWidthPx: cell.widthPx,
 			cellHeightPx: cell.heightPx,
-			// Kitty and Sixel keep the two-row art footprint; iTerm2 adds one centered
-			// canvas row via the protocol-specific transparent insets below.
-			targetRows: PET_ART_ROWS,
+			targetRows: 2,
 			sixelTopPaddingPx: protocol === "sixel" ? PET_SIXEL_DROP_PX : 0,
 			kittyCellYOffsetPx: protocol === "kitty" ? petKittyDropPx(cell.heightPx) : 0,
 			kittyImageId: protocol === "kitty" ? this.#kittyImageId : undefined,
-			// Horizontal cell rounding is padded by the builder; iTerm2 gets a centered
-			// three-row canvas while Kitty/Sixel retain their two-row footprint.
-			iterm2TopPaddingPx,
-			iterm2BottomPaddingPx,
 		});
 		this.#framedEditor.setReserve(this.#pixel.columns + PET_SIDE_MARGIN);
 	}
 
 	dispose(): void {
 		if (this.#disposed) return;
+		const canMutateSharedUi = this.#canMutateSharedUi();
+		this.#disposeNeedsLifecycle = canMutateSharedUi;
 		this.#disposed = true;
-		const kittyImageId = this.#kittyImageId;
-		const cleanupPayload = this.#imageCleanupPayload();
-		try {
-			if (cleanupPayload) {
-				this.#ui.queueTerminalCleanup(
-					`\x1b[?2026h\x1b7${cleanupPayload}\x1b8\x1b[?2026l`,
-					kittyImageId === undefined ? undefined : () => allocatedPetKittyImageIds.delete(kittyImageId),
-				);
-			} else if (kittyImageId !== undefined) {
-				allocatedPetKittyImageIds.delete(kittyImageId);
-			}
-			this.#consumeCleanupAuthority();
-			this.#kittyImageId = undefined;
-		} finally {
-			this.#animation?.unregister();
-			this.#animation = undefined;
-			this.#releaseOverlayEmitter();
-			this.#mode = "off";
-			this.#pixel = undefined;
-			this.#workTransition = undefined;
-			this.#nextWorkBurstAt = 0;
-			this.#activeBurst = undefined;
+		this.#itermGeneration++;
+		const lease = this.#itermLease;
+		this.#itermLease = undefined;
+		if (lease)
+			this.#disposeRasterBarrier = this.#ui
+				.invalidateRasterLease({ token: lease, cause: "dispose" })
+				.then(() => undefined);
+		const cleanupBarrier = canMutateSharedUi ? this.#queueImageCleanup(true) : this.#queueImageCleanup(true, false);
+		this.#disposeRasterBarrier = Promise.all([this.#disposeRasterBarrier, cleanupBarrier]).then(() => undefined);
+		this.#animation?.unregister();
+		this.#animation = undefined;
+		this.#releaseOverlayEmitter();
+		this.#mode = "off";
+		this.#pixel = undefined;
+		if (canMutateSharedUi) {
 			this.#floorContainer.clear();
 			this.#framedEditor.setReserve(0);
-			// Restore the plain composer only while our framed wrapper is still
-			// mounted; a successor widget may already own the editor container.
-			if (this.#editorContainer.children.includes(this.#framedEditor)) {
-				this.#mountEditor(false);
-			}
+			if (this.#editorContainer.children.includes(this.#framedEditor)) this.#mountEditor(false);
 		}
 	}
 
-	/** Clear shared TUI slots only while this widget still owns them. */
-	#releaseOverlayEmitter(): void {
-		if (!this.#isActiveOwner()) return;
-		this.#ui.setPostRenderEmitter(undefined);
-		petOverlayEmitterOwners.delete(this.#ui);
+	async disposeAsync(): Promise<void> {
+		if (!this.#disposePromise) {
+			this.dispose();
+			if (!this.#disposeNeedsLifecycle) return;
+			this.#disposePromise = this.#disposeRasterBarrier
+				.then(() =>
+					this.#ui.notifyTerminalLifecycle({
+						kind: "explicit-cleanup",
+						source: "interactive-mode",
+						terminalGeneration: this.#ui.terminalGeneration,
+					}),
+				)
+				.then(() => undefined);
+		}
+		await this.#disposePromise;
 	}
 
-	#isActiveOwner(): boolean {
-		return petOverlayEmitterOwners.get(this.#ui) === this;
+	#releaseOverlayEmitter(): void {
+		if (petOverlayEmitterOwners.get(this.#ui) === this) {
+			this.#ui.setPostRenderEmitter(undefined);
+			petOverlayEmitterOwners.delete(this.#ui);
+		}
 	}
 
 	#mountEditor(framed: boolean): void {
@@ -387,51 +386,247 @@ export class GajaePetWidget {
 		this.#editorContainer.addChild(framed ? this.#framedEditor : this.#editor);
 	}
 
-	/** Re-mount the composer editor (framed when a skin is active) after an overlay. */
 	remountComposer(): void {
-		this.#mountEditor(this.#mode !== "off");
+		if (this.#canMutateSharedUi()) this.#mountEditor(this.#mode !== "off");
 	}
 
 	#pickFrame(now: number): PetFrameName {
 		const mode = this.#mode;
 		if (mode === "off") return "base";
-		const skin = PET_SKINS[mode];
-		const working = this.#isWorking();
-		if (working !== this.#working) {
-			this.#working = working;
-			this.#flexUntil = 0;
-			this.#activeBurst = undefined;
-			this.#nextWorkBurstAt = 0;
-			const steps = working ? skin.workEnter : skin.workExit;
-			this.#workTransition = steps?.length ? { startedAt: now, steps } : undefined;
-		}
-		if (this.#workTransition) {
-			const elapsed = now - this.#workTransition.startedAt;
-			const duration = animationDuration(this.#workTransition.steps);
-			if (elapsed < duration) {
-				return animationFrameAtElapsed(this.#workTransition.steps, elapsed, skin.baseFrame);
-			}
-			this.#workTransition = undefined;
-		}
-		// Random idle burst → the skin's own animation, driven by its burst descriptor
-		// (RedGajae holds a flex; BlueGajae dances the para-para then sobs).
 		if (now < this.#flexUntil) {
-			const burst = this.#activeBurst ?? skin.burst;
+			const burst = PET_SKINS[mode].burst;
 			const elapsed = now - (this.#flexUntil - petBurstDurationMs(burst));
 			return petBurstFrame(burst, elapsed, now);
 		}
-		// Working → loop the selected skin's activity animation.
 		if (this.#isWorking()) {
-			return animationFrameAt(skin.work, now, skin.baseFrame);
+			let d = now % WORK_LOOP_TOTAL;
+			for (const [frame, ms] of PARA_PARA_STEPS) {
+				if (d < ms) return frame;
+				d -= ms;
+			}
+			return "base";
 		}
-		return animationFrameAt(skin.idle, now, skin.baseFrame);
+		let t = now % IDLE_LOOP_TOTAL;
+		for (const [frame, ms] of IDLE_LOOP) {
+			if (t < ms) return frame;
+			t -= ms;
+		}
+		return "base";
 	}
 
-	#scheduleWorkBurst(now: number): void {
-		this.#nextWorkBurstAt =
-			now +
-			OUROBOROS_WORK_BURST_MIN_GAP_MS +
-			Math.random() * (OUROBOROS_WORK_BURST_MAX_GAP_MS - OUROBOROS_WORK_BURST_MIN_GAP_MS);
+	#tickIterm(now: number): void {
+		if (!this.#isActiveOwner() || this.#ui.manualViewportActive) return;
+		const cell = getCellDimensions();
+		const pixelColumns = Math.max(1, Math.ceil((PET_ART_ROWS * cell.heightPx) / cell.widthPx));
+		const pixelRows = ITERM_CANVAS_ROWS;
+		let metricsChanged = false;
+		if (cell.widthPx !== this.#builtCellW || cell.heightPx !== this.#builtCellH) {
+			metricsChanged = true;
+			this.#itermGeneration++;
+			const lease = this.#itermLease;
+			this.#itermLease = undefined;
+			if (lease) void this.#ui.invalidateRasterLease({ token: lease, cause: "resize" });
+			this.#itermLastSemantic = "";
+			this.#builtCellW = cell.widthPx;
+			this.#builtCellH = cell.heightPx;
+			this.#framedEditor.setReserve(pixelColumns + PET_SIDE_MARGIN);
+			this.#ui.requestRender(true);
+		}
+		if (!this.#framedEditor.canFit(this.#ui.terminal.columns)) {
+			if (!metricsChanged) {
+				this.#itermGeneration++;
+				const lease = this.#itermLease;
+				this.#itermLease = undefined;
+				if (lease) void this.#ui.invalidateRasterLease({ token: lease, cause: "resize" });
+			}
+			this.#itermLastSemantic = "";
+			return;
+		}
+		const terminalRows = this.#ui.terminal.rows;
+		if (terminalRows < ITERM_CANVAS_ROWS + PET_RAISE_ROWS) {
+			if (!metricsChanged) {
+				this.#itermGeneration++;
+				const lease = this.#itermLease;
+				this.#itermLease = undefined;
+				if (lease) void this.#ui.invalidateRasterLease({ token: lease, cause: "resize" });
+			}
+			this.#itermLastSemantic = "";
+			return;
+		}
+		const composerBottom = terminalRows - this.#getComposerBottomOffset();
+		const desiredRow = composerBottom - pixelRows;
+		const maxSafeRow =
+			terminalRows === ITERM_CANVAS_ROWS + PET_RAISE_ROWS
+				? terminalRows - pixelRows - PET_RAISE_ROWS
+				: terminalRows - pixelRows;
+		const rect: CellRect = {
+			column: Math.max(0, this.#ui.terminal.columns - pixelColumns - PET_SIDE_MARGIN),
+			row: Math.max(0, Math.min(desiredRow, maxSafeRow)),
+			width: pixelColumns,
+			height: pixelRows,
+		};
+		const availability = getVerifiedItermPetAvailability();
+		if (!availability?.available || getItermPetUnavailableReason() || !this.#ui.terminalAvailable) return;
+		const working = this.#isWorking();
+		const flexing = this.#flexUntil > now;
+		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${working}:${flexing}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
+		if (this.#itermSubmitPending || (semantic === this.#itermLastSemantic && this.#itermLease)) return;
+		this.#itermLastSemantic = semantic;
+		this.#itermSubmitPending = true;
+		const generation = this.#itermGeneration;
+		void this.#submitIterm(
+			rect,
+			generation,
+			availability.epoch,
+			availability.mode,
+			semantic,
+			working,
+			flexing,
+			{
+				columns: this.#ui.terminal.columns,
+				rows: terminalRows,
+				cellWidthPx: cell.widthPx,
+				cellHeightPx: cell.heightPx,
+			},
+			this.#getComposerBottomOffset(),
+		).finally(() => {
+			this.#itermSubmitPending = false;
+			if (!this.#itermLease) this.#itermLastSemantic = "";
+		});
+	}
+
+	async #submitIterm(
+		rect: CellRect,
+		generation: number,
+		epoch: number,
+		mode: "direct" | "managed",
+		semantic: string,
+		working: boolean,
+		flexing: boolean,
+		geometry: Readonly<{ columns: number; rows: number; cellWidthPx: number; cellHeightPx: number }>,
+		composerBottomOffset: number,
+	): Promise<void> {
+		const current = () => {
+			const availability = getVerifiedItermPetAvailability();
+			const flexingNow = this.#flexUntil > performance.now();
+			const terminal = this.#ui.terminal;
+			const cell = getCellDimensions();
+			const liveComposerBottomOffset = this.#getComposerBottomOffset();
+			const liveComposerBottom = terminal.rows - liveComposerBottomOffset;
+			const liveMaxSafeRow =
+				terminal.rows === ITERM_CANVAS_ROWS + PET_RAISE_ROWS
+					? terminal.rows - rect.height - PET_RAISE_ROWS
+					: terminal.rows - rect.height;
+			const expectedColumn = Math.max(0, terminal.columns - rect.width - PET_SIDE_MARGIN);
+			const expectedRow = Math.max(0, Math.min(liveComposerBottom - rect.height, liveMaxSafeRow));
+			return (
+				this.#isActiveOwner() &&
+				generation === this.#itermGeneration &&
+				availability?.available === true &&
+				availability.epoch === epoch &&
+				availability.mode === mode &&
+				!this.#ui.manualViewportActive &&
+				this.#isWorking() === working &&
+				flexingNow === flexing &&
+				this.#framedEditor.canFit(terminal.columns) &&
+				terminal.columns === geometry.columns &&
+				terminal.rows === geometry.rows &&
+				cell.widthPx === geometry.cellWidthPx &&
+				cell.heightPx === geometry.cellHeightPx &&
+				liveComposerBottomOffset === composerBottomOffset &&
+				rect.column === expectedColumn &&
+				rect.row === expectedRow &&
+				rect.column + rect.width <= terminal.columns &&
+				rect.row + rect.height <= terminal.rows
+			);
+		};
+		let token = this.#itermLease;
+		if (
+			token &&
+			(token.rect.column !== rect.column ||
+				token.rect.row !== rect.row ||
+				token.rect.width !== rect.width ||
+				token.rect.height !== rect.height)
+		) {
+			await this.#ui.invalidateRasterLease({ token, cause: "resize" });
+			if (this.#itermLease === token) this.#itermLease = undefined;
+			token = undefined;
+		}
+		if (!current()) return;
+		if (!token) {
+			const acquired = await this.#ui.acquireRasterLease({
+				ownerId: this.#itermOwner,
+				rect,
+				erase: {
+					type: "raster-erase",
+					bytes: new TextEncoder().encode(
+						`\x1b[0m${Array.from({ length: rect.height }, (_, row) => `\x1b[${rect.row + row + 1};${rect.column + 1}H\x1b[${rect.width}X`).join("")}`,
+					),
+				},
+				onInvalidated: notice => {
+					if (this.#itermLease === notice.token) {
+						this.#itermLease = undefined;
+						this.#itermLastSemantic = "";
+					}
+				},
+			});
+			if (!current() || acquired.status !== "acquired") {
+				if (acquired.status === "acquired")
+					await this.#ui.invalidateRasterLease({
+						token: acquired.token,
+						cause: this.#ui.manualViewportActive ? "manual-viewport" : "capability-loss",
+					});
+				return;
+			}
+			token = acquired.token;
+			this.#itermLease = token;
+		}
+		this.#itermLastSemantic = semantic;
+		const frames = flexing
+			? burstTimeline(this.#mode === "off" ? "red" : this.#mode)
+			: working
+				? workingTimeline()
+				: idleTimeline();
+		const cell = getCellDimensions();
+		const gif = getGajaePetGifCached({
+			skin: this.#mode === "off" ? "red" : this.#mode,
+			timeline: frames,
+			targetRows: PET_ART_ROWS,
+			rectangle: { width: rect.width * cell.widthPx, height: rect.height * cell.heightPx },
+			contentInset: { topPx: Math.floor(cell.heightPx / 2), bottomPx: Math.ceil(cell.heightPx / 2) },
+			displaySize: { width: rect.width, height: rect.height },
+		});
+		const cursorPosition = `\x1b[${rect.row + 1};${rect.column + 1}H`;
+		const cursorRestore =
+			mode === "managed" ? `${wrapITerm2RecordForTmux("\x1b8\x1b[?2026l")}\x1b8` : "\x1b8\x1b[?2026l";
+		const encodedRecords = (mode === "managed" ? gif.tmuxDcs : gif.multipart).map(record =>
+			new TextEncoder().encode(record),
+		);
+		const submit = await this.#ui.submitTerminalOutput({
+			token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: new TextEncoder().encode(
+					mode === "managed"
+						? `${wrapITerm2RecordForTmux("\x1b[?2026h\x1b7\x1b[?25l")}\x1b7${cursorPosition}`
+						: `\x1b[?2026h\x1b7\x1b[?25l${cursorPosition}`,
+				),
+				afterPrefix:
+					mode === "managed"
+						? async () => (current() ? await this.#syncManagedItermCursor(rect.row, rect.column) : false)
+						: undefined,
+				replayPrefix: mode === "managed" ? new TextEncoder().encode(cursorPosition) : undefined,
+				records: encodedRecords,
+				suffix: new TextEncoder().encode(cursorRestore),
+				abortSuffix: mode === "managed" ? new TextEncoder().encode(cursorRestore) : undefined,
+				restoreCursorVisibility: true,
+				shouldWrite: current,
+			},
+		});
+		if (!current() || submit.status !== "written") {
+			await this.#ui.invalidateRasterLease({ token, cause: "capability-loss" });
+			if (this.#itermLease === token) this.#itermLease = undefined;
+		}
 	}
 
 	#scheduleAutoFlex(now: number): void {
@@ -441,9 +636,39 @@ export class GajaePetWidget {
 	}
 
 	#tick(now: number): void {
+		if (!this.#isActiveOwner()) return;
+		const working = this.#isWorking();
+		if (!working) {
+			this.#nextAutoFlexAt = 0;
+			if (this.#flexSource === "working") {
+				this.#flexUntil = 0;
+				this.#flexSource = undefined;
+			}
+		}
+		if (now >= this.#flexUntil) {
+			this.#flexUntil = 0;
+			this.#flexSource = undefined;
+			if (this.#previewFlexAt !== 0 && now >= this.#previewFlexAt) {
+				const skin = this.#mode === "off" ? "red" : this.#mode;
+				this.#flexUntil = now + petBurstDurationMs(PET_SKINS[skin].burst);
+				this.#flexSource = "preview";
+				this.#previewFlexAt = 0;
+			} else if (this.#autoFlexGapMs && working) {
+				if (this.#nextAutoFlexAt === 0) this.#scheduleAutoFlex(now);
+				else if (now >= this.#nextAutoFlexAt) {
+					const skin = this.#mode === "off" ? "red" : this.#mode;
+					const burstMs = petBurstDurationMs(PET_SKINS[skin].burst);
+					this.#flexUntil = now + burstMs;
+					this.#flexSource = "working";
+					this.#scheduleAutoFlex(now + burstMs);
+				}
+			}
+		}
+		if (this.#itermProtocol) {
+			this.#tickIterm(now);
+			return;
+		}
 		if (this.#mode === "off" || !this.#pixel) return;
-		// A font/zoom change resizes the terminal cells; rebuild the frames so the
-		// kitty image and its sub-cell drop match the new cell metrics.
 		const cell = getCellDimensions();
 		if (cell.widthPx !== this.#builtCellW || cell.heightPx !== this.#builtCellH) {
 			const protocol = this.#forcedProtocol ?? GajaePetWidget.pixelProtocol();
@@ -453,42 +678,37 @@ export class GajaePetWidget {
 				this.#ui.requestRender(true);
 			}
 		}
-		// Random show-off, both while idle and while working. Each skin's burst runs for
-		// its own length (RedGajae a brief flex; BlueGajae a para-para cycle plus sob).
-		const skin = PET_SKINS[this.#mode];
-		const usesWorkBursts = this.#isWorking() && Boolean(skin.workBursts?.length);
-		if (this.#autoFlexGapMs && !usesWorkBursts && now >= this.#flexUntil) {
-			if (this.#nextAutoFlexAt === 0) {
-				this.#scheduleAutoFlex(now);
-			} else if (now >= this.#nextAutoFlexAt) {
-				const burstMs = petBurstDurationMs(PET_SKINS[this.#mode].burst);
-				this.#activeBurst = skin.burst;
-				this.#flexUntil = now + burstMs;
-				this.#scheduleAutoFlex(now + burstMs);
-			}
-		}
-		if (this.#isWorking() && !this.#workTransition && now >= this.#flexUntil && skin.workBursts?.length) {
-			if (this.#nextWorkBurstAt === 0) {
-				this.#scheduleWorkBurst(now);
-			} else if (now >= this.#nextWorkBurstAt) {
-				const burst = skin.workBursts[this.#workBurstIndex % skin.workBursts.length];
-				this.#workBurstIndex++;
-				this.#activeBurst = burst;
-				this.#flexUntil = now + petBurstDurationMs(burst);
-				this.#scheduleWorkBurst(this.#flexUntil);
-			}
-		}
 		const frame = this.#pickFrame(now);
 		if (frame === this.#frame) return;
 		this.#frame = frame;
-		// Write directly: a frame swap changes no component line, so the TUI
-		// would skip the render write (and with it the post-render emitter).
-		// iTerm replaces an inline image at the same cell block. Erasing that block
-		// before every animation frame exposes the composer background and makes the
-		// PNG reload visibly flicker; only Sixel requires the explicit frame erase.
-		const payload = this.#overlayPayload(this.#pixel.protocol === "sixel") ?? "";
-		if (payload && this.#ui.terminalAvailable) {
-			this.#ui.terminal.write(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`);
+		const pixel = this.#pixel;
+		const mode = this.#mode;
+		const position = this.#petPosition();
+		const terminalColumns = this.#ui.terminal.columns;
+		const terminalRows = this.#ui.terminal.rows;
+		const queuedCell = getCellDimensions();
+		const emission = this.#overlayEmission(true);
+		if (emission && pixel && this.#ui.terminalAvailable) {
+			void this.#ui.queueTerminalOutput(`\x1b[?2026h\x1b7${emission.payload}\x1b8\x1b[?2026l`, {
+				shouldWrite: () => {
+					const currentPosition = this.#petPosition();
+					const currentCell = getCellDimensions();
+					return (
+						this.#isActiveOwner() &&
+						this.#mode === mode &&
+						this.#pixel === pixel &&
+						this.#frame === frame &&
+						this.#ui.terminal.columns === terminalColumns &&
+						this.#ui.terminal.rows === terminalRows &&
+						currentCell.widthPx === queuedCell.widthPx &&
+						currentCell.heightPx === queuedCell.heightPx &&
+						(position === null
+							? currentPosition === null
+							: currentPosition?.x === position.x && currentPosition.y === position.y)
+					);
+				},
+				onWritten: emission.onWritten,
+			});
 		}
 	}
 
@@ -498,15 +718,8 @@ export class GajaePetWidget {
 		const columns = this.#ui.terminal.columns;
 		if (!this.#framedEditor.canFit(columns)) return null;
 		const rows = this.#ui.terminal.rows;
-		// The sprite is lifted one safety row above the scrolling edge, then dropped
-		// back onto the composer's bottom border per protocol (sixel via transparent
-		// top padding, kitty via a sub-cell Y offset baked into the frames).
 		const composerBottom = rows - this.#getComposerBottomOffset();
-		// iTerm2 anchors an inline image at the current cursor row. Its geometry-derived
-		// 3-row centered canvas (ITERM_CANVAS_ROWS) already aligns to the composer
-		// bottom, so no extra safety lift is needed; Kitty/Sixel keep the lift.
-		const imageRows = pixel.protocol === "iterm2" ? pixel.rasterRows : pixel.rows;
-		const y = pixel.protocol === "iterm2" ? composerBottom - imageRows : composerBottom - imageRows - PET_RAISE_ROWS;
+		const y = composerBottom - pixel.rows - PET_RAISE_ROWS;
 		const x = columns - pixel.columns - PET_SIDE_MARGIN;
 		if (y < 0 || x < 0) return null;
 		return { x, y };
@@ -514,21 +727,16 @@ export class GajaePetWidget {
 
 	#clearSixelFootprint(footprint: SixelFootprint): string {
 		let out = "\x1b[0m";
-		for (let row = 0; row < footprint.rows; row++) {
+		for (let row = 0; row < footprint.rows; row++)
 			out += `\x1b[${footprint.y + row + 1};${footprint.x + 1}H\x1b[${footprint.columns}X`;
-		}
 		return out;
 	}
 
-	/** Pending on-screen image cleanup. Pure: authority is consumed separately, on delivery. */
 	#imageCleanupPayload(): string {
 		let out = "";
-		if (this.#kittyCleanupPending && this.#kittyImageId !== undefined) {
+		if (this.#kittyCleanupPending && this.#kittyImageId !== undefined)
 			out += `\x1b_Ga=d,d=I,i=${this.#kittyImageId},q=2\x1b\\`;
-		}
-		if (this.#lastSixelFootprint) {
-			out += this.#clearSixelFootprint(this.#lastSixelFootprint);
-		}
+		if (this.#lastSixelFootprint) out += this.#clearSixelFootprint(this.#lastSixelFootprint);
 		return out;
 	}
 
@@ -537,67 +745,66 @@ export class GajaePetWidget {
 		this.#lastSixelFootprint = undefined;
 	}
 
-	/**
-	 * Best-effort direct erase of the on-screen pet image. Cleanup authority is
-	 * consumed only after the write is actually delivered: an unavailable
-	 * terminal or a throwing write keeps the erase pending so a later mode
-	 * switch or dispose can retry it.
-	 */
-	#writeImageCleanup(): void {
-		if (!this.#ui.terminalAvailable) return;
-		const payload = this.#imageCleanupPayload();
-		if (!payload) return;
-		try {
-			this.#ui.terminal.write(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`);
-		} catch {
-			// Keep the footprint/placement authority; the terminal write layer
-			// reports availability separately and callers retry on the next
-			// lifecycle transition.
-			return;
+	#queueImageCleanup(releaseKittyImage = false, includeSixel = true): Promise<void> {
+		const sixelFootprint = includeSixel ? this.#lastSixelFootprint : undefined;
+		const kittyImageId = this.#kittyCleanupPending ? this.#kittyImageId : undefined;
+		const deliveredKittyImageId = releaseKittyImage && kittyImageId === undefined ? this.#kittyImageId : undefined;
+		if (deliveredKittyImageId !== undefined) {
+			this.#kittyImageId = undefined;
+			allocatedPetKittyImageIds.delete(deliveredKittyImageId);
 		}
-		this.#consumeCleanupAuthority();
+		let payload = "";
+		if (kittyImageId !== undefined) payload += `\x1b_Ga=d,d=I,i=${kittyImageId},q=2\x1b\\`;
+		if (sixelFootprint) payload += this.#clearSixelFootprint(sixelFootprint);
+		if (!payload) return Promise.resolve();
+		const kittyCleanupGeneration = kittyImageId === undefined ? undefined : ++this.#kittyCleanupGeneration;
+		if (releaseKittyImage && kittyImageId !== undefined && this.#kittyImageId === kittyImageId)
+			this.#kittyImageId = undefined;
+		return this.#ui.queueTerminalCleanup(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`, () => {
+			if (sixelFootprint && this.#lastSixelFootprint && sameFootprint(this.#lastSixelFootprint, sixelFootprint))
+				this.#lastSixelFootprint = undefined;
+			if (
+				kittyImageId !== undefined &&
+				kittyCleanupGeneration === this.#kittyCleanupGeneration &&
+				(this.#kittyImageId === kittyImageId || this.#kittyImageId === undefined)
+			)
+				this.#kittyCleanupPending = false;
+			if (kittyImageId !== undefined && releaseKittyImage) allocatedPetKittyImageIds.delete(kittyImageId);
+		});
 	}
 
-	/** Draw escape payload at the pet's absolute position. */
-	#overlayPayload(clearPet = false): string | null {
+	#overlayEmission(clearPet = false): PetOverlayEmission | null {
+		if (!this.#isActiveOwner()) return null;
 		const pixel = this.#pixel;
 		if (!pixel) return null;
 		const pos = this.#petPosition();
 		if (!pos) {
-			// Deferred delivery acknowledgement: the TUI writes the frame after
-			// this emitter returns, and that write can fail. Consume the cleanup
-			// authority only once a later pass observes the terminal survived
-			// the frame that carried the payload; otherwise retain it so a later
-			// lifecycle cleanup retries the erase/delete.
-			if (this.#frameCleanupAwaitingAck && this.#ui.terminalAvailable) {
-				this.#consumeCleanupAuthority();
-			}
-			this.#frameCleanupAwaitingAck = false;
-			if (!this.#ui.terminalAvailable) return null;
 			const cleanup = this.#imageCleanupPayload();
 			if (!cleanup) return null;
-			this.#frameCleanupAwaitingAck = true;
-			return cleanup;
+			return {
+				payload: cleanup,
+				onWritten: () => {
+					if (this.#isActiveOwner()) this.#consumeCleanupAuthority();
+				},
+			};
 		}
-		// A full frame supersedes any cleanup-only frame still awaiting ack.
-		this.#frameCleanupAwaitingAck = false;
 		const { x, y } = pos;
 		let out = "";
-
-		if (pixel.protocol === "sixel" || pixel.protocol === "iterm2") {
+		let onWritten: (() => void) | undefined;
+		if (pixel.protocol === "sixel") {
 			const footprint = { x, y, columns: pixel.columns, rows: pixel.rasterRows };
-			if (this.#lastSixelFootprint && !sameFootprint(this.#lastSixelFootprint, footprint)) {
-				out += this.#clearSixelFootprint(this.#lastSixelFootprint);
-			}
+			const previous = this.#lastSixelFootprint;
+			if (previous && !sameFootprint(previous, footprint)) out += this.#clearSixelFootprint(previous);
 			if (clearPet) out += this.#clearSixelFootprint(footprint);
-			this.#lastSixelFootprint = footprint;
+			onWritten = () => {
+				if (this.#isActiveOwner()) this.#lastSixelFootprint = footprint;
+			};
 		} else {
-			// A kitty frame emitted below (re)places the image, so cleanup is
-			// pending again even if a narrow-terminal pass consumed it earlier.
-			this.#kittyCleanupPending = true;
+			onWritten = () => {
+				if (this.#isActiveOwner()) this.#kittyCleanupPending = true;
+			};
 		}
-
 		out += `\x1b[${y + 1};${x + 1}H${pixel.frames[this.#frame]}`;
-		return out;
+		return { payload: out, onWritten };
 	}
 }
