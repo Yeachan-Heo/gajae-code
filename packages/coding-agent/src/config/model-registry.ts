@@ -110,6 +110,17 @@ function stripUrlQuery(value: string): string {
 	const fragmentStart = value.indexOf("#", queryStart);
 	return value.slice(0, queryStart) + (fragmentStart < 0 ? "" : value.slice(fragmentStart));
 }
+/**
+ * First finite positive number among OpenAI models-list context-window fields,
+ * else undefined (caller applies its own fallbacks). Mirrors the
+ * firstPositiveModelNumber precedence in @gajae-code/ai discovery so a
+ * malformed catalog value (`1e400` -> Infinity, zero, negative) can never
+ * poison compaction thresholds.
+ */
+function toPositiveFiniteNumber(value: number | undefined): number | undefined {
+	if (value === undefined || !Number.isFinite(value) || value <= 0) return undefined;
+	return value;
+}
 
 function envAvailabilityFingerprint(): string {
 	return Object.entries(process.env)
@@ -3039,7 +3050,17 @@ export class ModelRegistry {
 			throw new Error(`HTTP ${response.status} from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
 		const payload = (await response.json()) as {
-			data?: Array<{ id: string; name?: string; context_length?: number }>;
+			// oMLX /v1/models entries serve max_model_len (jundot/omlx ModelInfo);
+			// LM Studio serves max_context_length; other servers serve
+			// context_length. First present value wins, mirroring
+			// fetchOpenAICompatibleModels in @gajae-code/ai.
+			data?: Array<{
+				id: string;
+				name?: string;
+				context_length?: number;
+				max_model_len?: number;
+				max_context_length?: number;
+			}>;
 		};
 		const models = payload.data ?? [];
 		const discovered: Model<Api>[] = [];
@@ -3060,7 +3081,12 @@ export class ModelRegistry {
 					input: referenceModel?.input ?? ["text"],
 					output: referenceModel?.output,
 					cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: item.context_length ?? referenceModel?.contextWindow ?? UNK_CONTEXT_WINDOW,
+					contextWindow:
+						toPositiveFiniteNumber(item.max_model_len) ??
+						toPositiveFiniteNumber(item.max_context_length) ??
+						toPositiveFiniteNumber(item.context_length) ??
+						referenceModel?.contextWindow ??
+						UNK_CONTEXT_WINDOW,
 					maxTokens: referenceModel?.maxTokens ?? UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
 					compat: {
