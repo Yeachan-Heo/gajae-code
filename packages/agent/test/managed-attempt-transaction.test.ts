@@ -49,6 +49,14 @@ function assistantMessage(model: ReturnType<typeof createMockModel>["model"]): A
 	};
 }
 
+class JsonSafeBigIntEnvelope {
+	sequence = 1n;
+
+	toJSON(): { sequence: string } {
+		return { sequence: this.sequence.toString() };
+	}
+}
+
 function expectManagedRunStart(events: string[]): void {
 	expect(events.filter(type => type === "agent_start")).toHaveLength(1);
 	const start = events.indexOf("agent_start");
@@ -155,6 +163,83 @@ describe("managed attempt transaction", () => {
 		for (const message of [messageUpdate!.message, messageEnd!.message, accepted, agentEnd!.messages[0], result[0]]) {
 			expect((message as AssistantMessage).content[0]).toEqual({ type: "text", text: "accepted" });
 		}
+	});
+
+	it("publishes JSON-serializable snapshots when structuredClone removes a payload class serializer", async () => {
+		const mock = createMockModel();
+		const liveEnvelope = new JsonSafeBigIntEnvelope();
+		const callbackValues: Array<{ path: string; value: unknown }> = [];
+		const publicValues: Array<{ path: string; value: unknown }> = [];
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).providerPayload = {
+					envelope: liveEnvelope,
+				};
+				stream.push({ type: "start", partial });
+				partial.content.push({ type: "text", text: "accepted" });
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+			onAssistantMessageEvent: (message, event) => {
+				callbackValues.push({ path: `callback.${event.type}.message`, value: message });
+				callbackValues.push({ path: `callback.${event.type}.event`, value: event });
+			},
+		});
+		agent.subscribe(event => publicValues.push({ path: `public.${event.type}`, value: event }));
+
+		await agent.prompt("run", { fallbackManaged: true });
+		liveEnvelope.sequence = 2n;
+
+		const failures = [...callbackValues, ...publicValues].flatMap(candidate => {
+			try {
+				JSON.stringify(candidate.value);
+				return [];
+			} catch {
+				return [
+					{
+						path: `${candidate.path}.providerPayload.envelope.sequence`,
+						valueClass: JsonSafeBigIntEnvelope.name,
+						valueType: "bigint",
+					},
+				];
+			}
+		});
+		expect(failures).toEqual([]);
+		const callbackMessage = callbackValues.find(candidate => candidate.path === "callback.text_start.message")!
+			.value as Record<string, unknown>;
+		const callbackEvent = callbackValues.find(candidate => candidate.path === "callback.text_start.event")!
+			.value as Extract<AssistantMessageEvent, { type: "text_start" }>;
+		const turnEnd = publicValues.find(candidate => candidate.path === "public.turn_end")!.value as Extract<
+			AgentEvent,
+			{ type: "turn_end" }
+		>;
+		const agentEnd = publicValues.find(candidate => candidate.path === "public.agent_end")!.value as Extract<
+			AgentEvent,
+			{ type: "agent_end" }
+		>;
+		const agentEndAssistant = agentEnd.messages.find(message => message.role === "assistant");
+		const sequence = (value: unknown): unknown => {
+			if (value === null || typeof value !== "object") return undefined;
+			const providerPayload = (value as Record<string, unknown>).providerPayload;
+			if (providerPayload === null || typeof providerPayload !== "object") return undefined;
+			const envelope = (providerPayload as Record<string, unknown>).envelope;
+			return envelope !== null && typeof envelope === "object"
+				? (envelope as Record<string, unknown>).sequence
+				: undefined;
+		};
+		expect([
+			sequence(callbackMessage),
+			sequence(callbackEvent.partial),
+			sequence(turnEnd.message),
+			sequence(agentEndAssistant),
+		]).toEqual(["1", "1", "1", "1"]);
 	});
 
 	it("replays mutating provider partials as event-time snapshots with callbacks first", async () => {

@@ -144,9 +144,8 @@ class ManagedAttemptBufferOverflowError extends Error {
  * or status, so managed fallback classification never treats it as a provider
  * retry trigger — it never burns the fallback chain, advances models, or
  * mutates credentials. The typed `local_snapshot_failure` kind lets session
- * retry policy recover it as a bounded same-model retry instead: the staged
- * attempt was discarded before publication, so a content-free re-issue is
- * replay-safe and, in practice, a fresh stream clears the failure.
+ * policy surface the producer-boundary diagnostic immediately instead of
+ * amplifying one deterministic local defect across identical retries.
  */
 class ManagedAttemptSnapshotError extends Error {
 	readonly errorKind = "local_snapshot_failure" as const;
@@ -801,12 +800,33 @@ export function sanitizedDetachedClone<T>(value: T, maxNodes: number = MANAGED_S
  * (e.g. a live `Headers` inside a provider error's `transportFailure` from a
  * legacy payload), and a thrown `DataCloneError` here would mask the real
  * provider outcome and burn the whole fallback chain.
+ *
+ * `structuredClone` success is not sufficient: it can erase a custom
+ * prototype `toJSON()` while retaining an own bigint field. The live value is
+ * JSON-safe, but the detached clone is not. Validate and measure the DETACHED
+ * value with the exact serialization operation used by staging; sanitize the
+ * detached clone when that validation fails so every accepted snapshot is
+ * both isolated and JSON-serializable.
  */
-function managedAttemptSnapshotDetailed<T>(value: T): { snapshot: T; degraded: boolean } {
+function managedSnapshotJsonBytes(value: unknown): number | undefined {
 	try {
-		return { snapshot: structuredClone(value), degraded: false };
+		const serialized = JSON.stringify(value);
+		return serialized === undefined ? undefined : managedAttemptTextEncoder.encode(serialized).byteLength;
 	} catch {
-		return { snapshot: sanitizedDetachedClone(value), degraded: true };
+		return undefined;
+	}
+}
+
+function managedAttemptSnapshotDetailed<T>(value: T): { snapshot: T; jsonBytes?: number } {
+	try {
+		const snapshot = structuredClone(value);
+		const jsonBytes = managedSnapshotJsonBytes(snapshot);
+		if (jsonBytes !== undefined) return { snapshot, jsonBytes };
+		const sanitized = sanitizedDetachedClone(snapshot);
+		return { snapshot: sanitized, jsonBytes: managedSnapshotJsonBytes(sanitized) };
+	} catch {
+		const snapshot = sanitizedDetachedClone(value);
+		return { snapshot, jsonBytes: managedSnapshotJsonBytes(snapshot) };
 	}
 }
 
@@ -1377,34 +1397,24 @@ class ManagedAttemptTransaction {
 		}
 		const repaired = this.#repairAssistantEvent(event);
 		const detailed = managedAttemptSnapshotDetailed(repaired);
-		let snapshot = detailed.snapshot;
-		if (bytes === undefined || detailed.degraded) {
-			// Account the bytes of what is actually retained: a degraded
-			// snapshot replaces non-JSON leaves with placeholders, so the raw
-			// pre-measure (which omits e.g. function-valued properties) can
-			// undercount the staged form.
-			try {
-				bytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
-			} catch {
-				try {
-					snapshot = sanitizedDetachedClone(snapshot);
-					bytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
-				} catch {
-					bytes = undefined;
-				}
-			}
-			if (bytes === undefined) {
-				// The sanitizer's output is total (detached, JSON-safe), so this
-				// is unreachable unless the sanitizer itself regresses. Fail as a
-				// dedicated local error: it carries no transport facts, so it is
-				// non-retryable and can never be misattributed to the provider.
-				this.discard();
-				throw new ManagedAttemptSnapshotError("staging.sanitize");
-			}
-			if (this.#wouldOverflow(bytes)) {
-				this.discard();
-				throw new ManagedAttemptBufferOverflowError("overflow.staged");
-			}
+		const snapshot = detailed.snapshot;
+		// Always account the exact detached value. A live custom class can use
+		// prototype `toJSON()` to serialize compactly while structuredClone
+		// removes that serializer and exposes a larger or JSON-hostile own value.
+		// Reusing the live pre-measure would therefore accept an unserializable
+		// snapshot or undercount the retained bytes.
+		bytes = detailed.jsonBytes;
+		if (bytes === undefined) {
+			// The sanitizer's output is total (detached, JSON-safe), so this is
+			// unreachable unless the sanitizer itself regresses. Fail as a
+			// dedicated local error: it carries no transport facts, so it is
+			// non-retryable and can never be misattributed to the provider.
+			this.discard();
+			throw new ManagedAttemptSnapshotError("staging.sanitize");
+		}
+		if (this.#wouldOverflow(bytes)) {
+			this.discard();
+			throw new ManagedAttemptBufferOverflowError("overflow.staged");
 		}
 		this.#batch.push({ type: "event", event: snapshot });
 		this.#stagedEventCount += 1;

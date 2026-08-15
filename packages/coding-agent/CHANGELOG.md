@@ -5,7 +5,7 @@
 
 - Telegram notification delivery now carries an explicit per-update inbound acknowledgement contract: user messages are acked `accepted` at session preflight acceptance (before the turn starts, so a fast turn can no longer out-race the pending-update registration), late admission failures ack `rejected`, and genuinely discarded frames ack `dropped`. Policy-suspended control commands are deferred to activation instead of being acked as dropped, per-update reaction transitions are serialized with terminal states monotonic (a slow queued 👀 can no longer overwrite a later ✅), and retraction sends the empty reaction list the Bot API requires. Daemon generation bumped 167→168. (#4528)
 
-- Managed fallback local snapshot failures now auto-recover with a bounded same-model retry (capped at `retry.maxRetries`) instead of terminating the turn: the discarded attempt is replay-safe and content-free, so the session re-issues the request without charging the provider fallback chain, advancing models, or mutating credentials. Exhausted retries still surface the explicit local diagnostic.
+- Managed fallback local snapshot failures now surface their one producer-boundary diagnostic immediately instead of re-issuing the identical request up to three times. The failure still never charges the provider fallback chain, advances models, or mutates credentials.
 
 - Managed fallback local buffer overflows (`local_buffer_overflow`) now surface immediately with the original local diagnostic instead of entering the bounded `unknown` retry class: re-streaming the same request reproduces the same oversized response, and a local staging failure must never charge or advance the provider fallback chain, emit `model_fallback_switched`, or rotate credentials.
 
