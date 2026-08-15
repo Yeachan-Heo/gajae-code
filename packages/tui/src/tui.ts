@@ -1931,12 +1931,15 @@ export class TUI extends Container {
 				if (!lease || lease.revoked || lease.token !== request?.token)
 					return { queueId: id, operation: op.type, status: lease?.revoked ? "revoked" : "stale-token" };
 			}
-			if (
-				(op.type === "raster-multipart-batch" || op.type === "queued-output") &&
-				op.shouldWrite !== undefined &&
-				!op.shouldWrite()
-			)
-				return { queueId: id, operation: op.type, status: "stale-token" };
+			if ((op.type === "raster-multipart-batch" || op.type === "queued-output") && op.shouldWrite !== undefined) {
+				let shouldWrite: boolean;
+				try {
+					shouldWrite = op.shouldWrite();
+				} catch {
+					return failed();
+				}
+				if (!shouldWrite) return { queueId: id, operation: op.type, status: "stale-token" };
+			}
 			if (op.type === "raster-multipart-batch" && op.prefix !== undefined && op.afterPrefix !== undefined) {
 				const prefixWritten = this.#guardTerminalOperation(() =>
 					this.terminal.write(new TextDecoder().decode(op.prefix)),
@@ -1969,9 +1972,18 @@ export class TUI extends Container {
 					abortBarrier();
 					return { queueId: id, operation: op.type, status: currentLease?.revoked ? "revoked" : "stale-token" };
 				}
-				if (op.shouldWrite !== undefined && !op.shouldWrite()) {
-					abortBarrier();
-					return { queueId: id, operation: op.type, status: "stale-token" };
+				if (op.shouldWrite !== undefined) {
+					let shouldWrite: boolean;
+					try {
+						shouldWrite = op.shouldWrite();
+					} catch {
+						abortBarrier();
+						return failed();
+					}
+					if (!shouldWrite) {
+						abortBarrier();
+						return { queueId: id, operation: op.type, status: "stale-token" };
+					}
 				}
 			}
 			const bytes =

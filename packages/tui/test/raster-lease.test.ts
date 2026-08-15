@@ -83,6 +83,41 @@ describe("TUI raster lease public boundary", () => {
 		expect(ack.status).toBe("written");
 		expect(terminal.getWriteLog()).toEqual(["ABC"]);
 	});
+
+	it("classifies a throwing shouldWrite predicate as a failed operation instead of rejecting", async () => {
+		const { tui, terminal } = await setup();
+		const lease = await tui.acquireRasterLease(request("throwing-predicate"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		terminal.clearWriteLog();
+
+		const queued = await tui.queueTerminalOutput("THROW", {
+			shouldWrite: () => {
+				throw new Error("predicate boom");
+			},
+		});
+		expect(queued.status).toBe("failed");
+
+		const ack = await tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				records: [bytes("A")],
+				shouldWrite: () => {
+					throw new Error("predicate boom");
+				},
+			},
+		});
+		expect(ack.status).toBe("failed");
+		expect(terminal.getWriteLog()).toEqual([]);
+
+		const stale = await tui.queueTerminalOutput("NOPE", { shouldWrite: () => false });
+		expect(stale.status).toBe("stale-token");
+		terminal.clearWriteLog();
+		const written = await tui.queueTerminalOutput("OK", { shouldWrite: () => true });
+		expect(written.status).toBe("written");
+		expect(terminal.getWriteLog()).toEqual(["OK"]);
+		tui.stop();
+	});
 	it("drops a stale multipart batch at the terminal-write boundary", async () => {
 		const { tui, terminal } = await setup();
 		const lease = await tui.acquireRasterLease(request("freshness"));
