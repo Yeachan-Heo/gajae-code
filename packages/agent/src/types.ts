@@ -182,6 +182,12 @@ export type ManagedAttemptOutcome =
 			};
 			scope?: AttemptScope;
 	  }
+	| {
+			type: "escaped_arguments_discarded";
+			/** The defective assistant turn; already removed from usable history by the loop. */
+			message: AssistantMessage;
+			scope?: AttemptScope;
+	  }
 	| { type: "context_overflow_discarded"; message: AssistantMessage; scope?: AttemptScope }
 	| { type: "run_terminal"; reason: "cancelled" | "error" | "exhausted"; scope?: AttemptScope };
 

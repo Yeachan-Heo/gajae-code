@@ -2249,10 +2249,11 @@ async function runLoopBody(
 			// back into the context the model samples from next. Drop the defective
 			// turn and re-request instead; the per-call rejection in
 			// `executeToolCalls` stays as the terminal answer once this budget is
-			// spent. Managed fallback owns its own retry policy, so this is scoped
-			// to the non-managed session path, matching the repairs above.
+			// spent. Managed fallback reports the discarded attempt through the
+			// typed `escaped_arguments_discarded` outcome so the session policy
+			// owns a bounded same-model retry; the defect is never treated as
+			// provider evidence, so the fallback chain never advances on it.
 			if (
-				!config.fallbackManaged &&
 				message.stopReason !== "error" &&
 				message.stopReason !== "aborted" &&
 				escapedNonAsciiResampleAttempt < MAX_ESCAPED_NONASCII_RESAMPLES &&
@@ -2266,6 +2267,24 @@ async function runLoopBody(
 				// still the tail: callbacks may append user/system history while the
 				// response settles, and none of that history belongs to this retry.
 				removeCommittedAssistantMessage(currentContext.messages, message);
+				// A managed invocation ends the run here and reports the discarded
+				// attempt to the session's fallback policy through the typed
+				// outcome below; the policy owns the same-model bounded retry and
+				// only falls back once it declines. The wire defect is not provider
+				// evidence, so the outcome deliberately carries no transport facts
+				// and the fallback chain never advances on it.
+				if (config.fallbackManaged) {
+					transaction?.discard();
+					currentContext.messages.splice(contextMessageCount);
+					newMessages.splice(newMessageCount);
+					await config.onManagedAttemptOutcome?.({
+						type: "escaped_arguments_discarded",
+						message,
+						scope: transaction?.scope,
+					});
+					stream.end(newMessages);
+					return;
+				}
 				continue;
 			}
 			escapedNonAsciiResampleAttempt = 0;

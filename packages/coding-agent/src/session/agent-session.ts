@@ -17828,6 +17828,23 @@ export class AgentSession {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return { type: "terminal", terminal: { stopReason: outcome.reason } };
 		}
+		if (outcome.type === "escaped_arguments_discarded") {
+			// An escaped-non-ASCII wire defect is a sampling accident, not provider
+			// evidence: never charge the attempt, advance the chain, or suppress the
+			// selector. The loop already removed the defective turn from history and
+			// bounded its own resample budget, so this decision just re-issues the
+			// same request on the same model. Once the loop declines (budget spent),
+			// it falls through to the terminal per-call rejection, so the retry here
+			// is a continuation of the same logical run rather than a new prompt.
+			this.#defaultFallbackChain().discardStartedAttempt();
+			return {
+				type: "retry",
+				continuation: async ownership => {
+					if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
+					await this.agent.continue(this.#managedFallbackPromptOptions());
+				},
+			};
+		}
 		if (outcome.type === "context_overflow_discarded") {
 			// The provider invocation happened, but overflow is context maintenance rather
 			// than a fallback-policy failure. Keep the logical run owner and do not charge,
