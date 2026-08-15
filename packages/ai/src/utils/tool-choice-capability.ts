@@ -22,6 +22,8 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const EMPTY_CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 256;
 const REGISTRY_MAX_ENTRIES = 256;
+const CACHE_MUTATION_LOCK_WAIT_MS = 3_000;
+const CACHE_MUTATION_LOCK_STALE_MS = 5_000;
 
 let cachePathOverride: string | undefined;
 let nowForTests: (() => number) | undefined;
@@ -99,13 +101,18 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 /** Records a discovered maximum supported tool-choice level for a model. */
 export function markToolChoiceIncapability(model: Model<Api>, maxSupport: ToolChoiceSupport, reason?: string): void {
 	const key = toolChoiceRegistryKey(model);
-	hydrateToolChoiceCapability(key);
-	const existing = registry.get(key);
-	const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
-	registry.set(key, next);
-	const persisted = persistToolChoiceCapability(key, next);
-	if (persisted) registry.set(key, persisted.support);
-	registryExpiresAt.set(key, (persisted?.observedAt ?? currentTime()) + CACHE_TTL_MS);
+	const releaseMutationLock = acquireCapabilityCacheMutationLock();
+	try {
+		hydrateToolChoiceCapability(key);
+		const existing = registry.get(key);
+		const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
+		registry.set(key, next);
+		const persisted = persistToolChoiceCapability(key, next);
+		if (persisted) registry.set(key, persisted.support);
+		registryExpiresAt.set(key, (persisted?.observedAt ?? currentTime()) + CACHE_TTL_MS);
+	} finally {
+		releaseMutationLock?.();
+	}
 
 	if (!loggedRegistryKeys.has(key)) {
 		loggedRegistryKeys.add(key);
@@ -118,6 +125,32 @@ export function markToolChoiceIncapability(model: Model<Api>, maxSupport: ToolCh
 			reason,
 		});
 	}
+}
+
+function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
+	if (process.env.NODE_ENV === "test" && cachePathOverride === undefined) return;
+	const cachePath = cachePathOverride ?? getToolChoiceCapabilityCachePath();
+	const lockPath = `${cachePath}.mutation.lock`;
+	const deadline = Date.now() + CACHE_MUTATION_LOCK_WAIT_MS;
+	const sleeper = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+	while (Date.now() < deadline) {
+		try {
+			fs.mkdirSync(path.dirname(cachePath), { recursive: true, mode: 0o700 });
+			const descriptor = fs.openSync(lockPath, "wx", 0o600);
+			fs.closeSync(descriptor);
+			return () => fs.rmSync(lockPath, { force: true });
+		} catch (error) {
+			if (!(error && typeof error === "object" && (error as { code?: unknown }).code === "EEXIST")) return;
+			try {
+				if (Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS)
+					fs.rmSync(lockPath, { force: true });
+			} catch {
+				// The lock holder released the file while it was being inspected.
+			}
+			Atomics.wait(sleeper, 0, 0, 10);
+		}
+	}
+	return undefined;
 }
 
 /**
