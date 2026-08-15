@@ -2316,6 +2316,10 @@ export class TUI extends Container {
 		return !this.#terminalUnavailable && this.terminal.available;
 	}
 
+	get isRunning(): boolean {
+		return !this.#stopped;
+	}
+
 	get terminalGeneration(): number {
 		return this.#terminalGeneration;
 	}

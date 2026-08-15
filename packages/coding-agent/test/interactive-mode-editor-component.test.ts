@@ -4,6 +4,10 @@ import { Agent } from "@gajae-code/agent-core";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { formatKeyHint, formatKeyHints, type KeyDisplayContext } from "@gajae-code/coding-agent/config/keybindings";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	PET_CAPABILITY_SETTLE_MS,
+	setVerifiedItermPetAvailability,
+} from "@gajae-code/coding-agent/modes/components/pet-capability";
 import { initTheme, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { CURSOR_MARKER, ImageProtocol, setTerminalImageProtocol, TERMINAL, Text, visibleWidth } from "@gajae-code/tui";
 import { TempDir } from "@gajae-code/utils";
@@ -113,6 +117,66 @@ describe("InteractiveMode.setEditorComponent", () => {
 			mode: "none",
 		});
 		expect(reconcile).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not spend the iTerm pet warning deadline during pre-start initialization", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		const envKeys = [
+			"TERM_PROGRAM",
+			"TERM_PROGRAM_VERSION",
+			"TERM",
+			"TMUX",
+			"TMUX_PANE",
+			"STY",
+			"ZELLIJ",
+			"GJC_TMUX_LAUNCHED",
+			"GJC_TMUX_ACTIVE_SESSION",
+			"GJC_MANAGED_OWNER_RUN_ID",
+		] as const;
+		const originalEnv = new Map(envKeys.map(key => [key, Bun.env[key]] as const));
+		vi.useFakeTimers();
+		try {
+			mode.stop();
+			setVerifiedItermPetAvailability(undefined);
+			setTerminalImageProtocol(null);
+			for (const key of envKeys) delete Bun.env[key];
+			Bun.env.TERM_PROGRAM = "iTerm.app";
+			Bun.env.TERM_PROGRAM_VERSION = "3.6.11";
+			Bun.env.TERM = "xterm-256color";
+			settings.set("pet.mode", "red");
+			settings.set("startup.quiet", true);
+			mode = new InteractiveMode(session, "test");
+			const showStatus = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
+			const startupOrder: string[] = [];
+			vi.spyOn(session, "getTodoPhases").mockImplementation(() => {
+				startupOrder.push("todos");
+				vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS);
+				return [];
+			});
+			vi.spyOn(mode.ui, "start").mockImplementation(() => {
+				startupOrder.push("ui.start");
+			});
+
+			await mode.init();
+
+			expect(startupOrder).toEqual(["todos", "ui.start"]);
+			expect(showStatus).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS - 1);
+			expect(showStatus).not.toHaveBeenCalled();
+			vi.advanceTimersByTime(1);
+			expect(showStatus).toHaveBeenCalledTimes(1);
+			expect(showStatus.mock.calls[0]?.[0]).toContain("Pets aren’t available");
+		} finally {
+			mode.stop();
+			setVerifiedItermPetAvailability(undefined);
+			setTerminalImageProtocol(originalProtocol);
+			for (const key of envKeys) {
+				const value = originalEnv.get(key);
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+			vi.useRealTimers();
+		}
 	});
 
 	it("reports output revision changes while chrome-only editor reflow reports no output mutation", async () => {

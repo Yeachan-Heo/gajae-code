@@ -28,6 +28,7 @@ function makeStubs(columns = 80, rows = 30) {
 	let renderRequests = 0;
 	let emitter: (() => string | null) | undefined;
 	let available = true;
+	let running = true;
 	let failWrites = false;
 	let manualViewportActive = false;
 	let rasterToken = 0;
@@ -80,6 +81,9 @@ function makeStubs(columns = 80, rows = 30) {
 		},
 		get terminalAvailable() {
 			return available;
+		},
+		get isRunning() {
+			return running;
 		},
 		get manualViewportActive() {
 			return manualViewportActive;
@@ -149,6 +153,9 @@ function makeStubs(columns = 80, rows = 30) {
 		},
 		setTerminalAvailable: (value: boolean) => {
 			available = value;
+		},
+		setRunning: (value: boolean) => {
+			running = value;
 		},
 		setWriteFailure: (value: boolean) => {
 			failWrites = value;
@@ -1148,6 +1155,41 @@ describe("GajaePetWidget", () => {
 		expect(widget.mode).toBe("off");
 		expect(stubs.getEmitter()).toBeUndefined();
 		widget.dispose();
+	});
+	it("does not acquire or submit iTerm raster frames while the TUI is stopped, then resumes", async () => {
+		vi.useFakeTimers();
+		const stubs = makeWidget(80, 30, { protocol: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			stubs.setRasterAcquireDelayed(true);
+			stubs.widget.setMode("red");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getPendingRasterAcquireCount()).toBe(1);
+
+			stubs.setRunning(false);
+			stubs.setRasterAcquireDelayed(false);
+			await flushAsyncChain();
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getRasterLeaseRequests()).toHaveLength(1);
+			expect(stubs.getRasterOutputs()).toHaveLength(0);
+			expect(stubs.getInvalidatedRasterLeases()).toHaveLength(1);
+
+			stubs.setRunning(true);
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			expect(stubs.getRasterLeaseRequests()).toHaveLength(2);
+			expect(
+				stubs
+					.getRasterOutputs()
+					.map(output => new TextDecoder().decode(output))
+					.some(output => output.includes("MultipartFile=")),
+			).toBe(true);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			stubs.widget.dispose();
+		}
 	});
 	it("drops an in-flight predecessor iTerm lease before successor takeover", async () => {
 		vi.useFakeTimers();

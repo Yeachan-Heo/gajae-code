@@ -838,23 +838,6 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.petWidget.setMode(saved);
 			}
 		});
-		if (configuredPetMode !== "off" && !isPetAvailable()) {
-			// The async Sixel capability probe (started by TUI.start()) may still
-			// enable graphics; warn only once the capability question is settled
-			// so a supported terminal is never told it is incompatible.
-			this.#petUnavailableWarningDisposer?.();
-			this.#petUnavailableWarningDisposer = warnWhenPetCapabilitySettled({
-				probePending: this.#itermPetTransport !== undefined || isPetCapabilityProbePending(),
-				onUnavailable: () => {
-					this.showStatus(
-						theme.fg("warning", `${getPetUnavailableWarning()} (${getItermPetUnavailableReason() ?? "unknown"})`),
-						{ dim: false },
-					);
-					this.ui.requestRender();
-				},
-			});
-		}
-
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
 		this.editor.onViewportPageScroll = direction => {
@@ -906,6 +889,22 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#itermPetTransport) {
 			if (this.#itermPetTransport.availability.mode === "direct") void this.#itermPetTransport.probe();
 			else this.#itermPetTransport.startManagedPolling();
+		}
+		if (configuredPetMode !== "off" && !isPetAvailable()) {
+			// An async terminal capability probe may still enable graphics; warn only once
+			// the capability question is settled so a supported terminal is never told it
+			// is incompatible.
+			this.#petUnavailableWarningDisposer?.();
+			this.#petUnavailableWarningDisposer = warnWhenPetCapabilitySettled({
+				probePending: this.#itermPetTransport !== undefined || isPetCapabilityProbePending(),
+				onUnavailable: () => {
+					this.showStatus(
+						theme.fg("warning", `${getPetUnavailableWarning()} (${getItermPetUnavailableReason() ?? "unknown"})`),
+						{ dim: false },
+					);
+					this.ui.requestRender();
+				},
+			});
 		}
 		pushTerminalTitle();
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());

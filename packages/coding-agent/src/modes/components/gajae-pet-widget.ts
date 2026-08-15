@@ -415,7 +415,7 @@ export class GajaePetWidget {
 	}
 
 	#tickIterm(now: number): void {
-		if (!this.#isActiveOwner() || this.#ui.manualViewportActive) return;
+		if (!this.#ui.isRunning || !this.#isActiveOwner() || this.#ui.manualViewportActive) return;
 		const cell = getCellDimensions();
 		const pixelColumns = Math.max(1, Math.ceil((PET_ART_ROWS * cell.heightPx) / cell.widthPx));
 		const pixelRows = ITERM_CANVAS_ROWS;
@@ -520,6 +520,7 @@ export class GajaePetWidget {
 			const expectedColumn = Math.max(0, terminal.columns - rect.width - PET_SIDE_MARGIN);
 			const expectedRow = Math.max(0, Math.min(liveComposerBottom - rect.height, liveMaxSafeRow));
 			return (
+				this.#ui.isRunning &&
 				this.#isActiveOwner() &&
 				generation === this.#itermGeneration &&
 				availability?.available === true &&
