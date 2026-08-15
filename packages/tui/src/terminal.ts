@@ -118,6 +118,15 @@ export interface Terminal {
 	 */
 	drainInput(maxMs?: number, idleMs?: number): Promise<void>;
 
+	/**
+	 * Wait for pending stdin to go quiet without changing terminal protocols or
+	 * the active input handler. Capability probes use this non-destructive drain;
+	 * shutdown paths must continue using drainInput().
+	 * @param maxMs - Maximum time to wait (default: 1000ms)
+	 * @param idleMs - Exit early if no input arrives within this time (default: 50ms)
+	 */
+	drainPendingInput?(maxMs?: number, idleMs?: number): Promise<void>;
+
 	// Write output to terminal
 	write(data: string): void;
 
@@ -820,6 +829,28 @@ export class ProcessTerminal implements Terminal {
 			this.#safeWrite("\x1b[>4;2m");
 			this.#modifyOtherKeysActive = true;
 		}, 150);
+	}
+
+	async drainPendingInput(maxMs = 1000, idleMs = 50): Promise<void> {
+		let lastDataTime = Date.now();
+		const onData = () => {
+			lastDataTime = Date.now();
+		};
+
+		process.stdin.on("data", onData);
+		const endTime = Date.now() + maxMs;
+
+		try {
+			while (true) {
+				const now = Date.now();
+				const timeLeft = endTime - now;
+				if (timeLeft <= 0) break;
+				if (now - lastDataTime >= idleMs) break;
+				await new Promise(resolve => setTimeout(resolve, Math.min(idleMs, timeLeft)));
+			}
+		} finally {
+			process.stdin.removeListener("data", onData);
+		}
 	}
 
 	async drainInput(maxMs = 1000, idleMs = 50): Promise<void> {

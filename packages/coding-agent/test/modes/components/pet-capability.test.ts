@@ -1,16 +1,62 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import {
+	getPetPixelProtocol,
 	PET_CAPABILITY_SETTLE_MS,
 	warnWhenPetCapabilitySettled,
 } from "@gajae-code/coding-agent/modes/components/pet-capability";
 import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@gajae-code/tui";
 
 const originalProtocol = TERMINAL.imageProtocol;
+const multiplexerEnvKeys = [
+	"TMUX",
+	"TMUX_PANE",
+	"STY",
+	"ZELLIJ",
+	"GJC_TMUX_LAUNCHED",
+	"TERM",
+	"PI_FORCE_IMAGE_PROTOCOL",
+	"GJC_FORCE_IMAGE_PROTOCOL",
+] as const;
+const originalMultiplexerEnv = new Map(multiplexerEnvKeys.map(key => [key, Bun.env[key]] as const));
+
+const multiplexerCases = [
+	["tmux", { TMUX: "/tmp/tmux-1000/default,1,0" }],
+	["screen", { STY: "1234.pts-0.host" }],
+	["zellij", { ZELLIJ: "session" }],
+] as const;
+
+function setForcedProtocol(protocol: "kitty" | "sixel", multiplexerEnv: Readonly<Record<string, string>>): void {
+	for (const key of multiplexerEnvKeys) delete Bun.env[key];
+	Bun.env.PI_FORCE_IMAGE_PROTOCOL = protocol;
+	for (const [key, value] of Object.entries(multiplexerEnv)) Bun.env[key] = value;
+	setTerminalImageProtocol(protocol === "kitty" ? ImageProtocol.Kitty : ImageProtocol.Sixel);
+}
 
 afterEach(() => {
 	setTerminalImageProtocol(originalProtocol);
+	for (const key of multiplexerEnvKeys) {
+		const value = originalMultiplexerEnv.get(key);
+		if (value === undefined) delete Bun.env[key];
+		else Bun.env[key] = value;
+	}
 	vi.useRealTimers();
 	vi.restoreAllMocks();
+});
+
+describe("getPetPixelProtocol", () => {
+	for (const [name, multiplexerEnv] of multiplexerCases) {
+		it(`keeps forced Kitty unavailable inside ${name}`, () => {
+			setForcedProtocol("kitty", multiplexerEnv);
+
+			expect(getPetPixelProtocol()).toBeNull();
+		});
+
+		it(`keeps forced Sixel available inside ${name}`, () => {
+			setForcedProtocol("sixel", multiplexerEnv);
+
+			expect(getPetPixelProtocol()).toBe("sixel");
+		});
+	}
 });
 
 describe("warnWhenPetCapabilitySettled", () => {

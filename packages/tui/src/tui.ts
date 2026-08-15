@@ -2416,11 +2416,7 @@ export class TUI extends Container {
 		return this.terminal.drainInput(maxMs, quiescenceMs);
 	}
 	drainPetProbeInput(maxMs: number, quiescenceMs: number): Promise<void> {
-		return (
-			(
-				this.terminal as Terminal & { drainPendingInput?: (maxMs?: number, idleMs?: number) => Promise<void> }
-			).drainPendingInput?.(maxMs, quiescenceMs) ?? this.terminal.drainInput(maxMs, quiescenceMs)
-		);
+		return this.terminal.drainPendingInput?.(maxMs, quiescenceMs) ?? Promise.resolve();
 	}
 
 	removeInputListener(listener: InputListener): void {

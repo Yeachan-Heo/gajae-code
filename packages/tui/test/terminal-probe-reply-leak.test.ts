@@ -23,6 +23,7 @@ const DA1_REPLY = "\x1b[?62;22;52c";
 const REPLY_PAIR = `${OSC11_REPLY}${DA1_REPLY}`;
 /** DA1 is forwarded by ProcessTerminal on purpose: `Tui` owns that reply. */
 const DA1_PATTERN = /^\x1b\[\?[\d;]*c$/u;
+const terminalWrites: string[] = [];
 
 function restoreProperty(target: object, key: string, descriptor: PropertyDescriptor | undefined): void {
 	if (descriptor) {
@@ -39,7 +40,10 @@ function mockTty(): void {
 	vi.spyOn(process, "kill").mockReturnValue(true);
 	vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
 	vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
-	vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+	vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+		terminalWrites.push(typeof chunk === "string" ? chunk : chunk.toString());
+		return true;
+	});
 }
 
 function restoreTty(): void {
@@ -149,6 +153,7 @@ describe("Tui probe-reply leaks", () => {
 
 	beforeEach(() => {
 		mockTty();
+		terminalWrites.length = 0;
 		received = [];
 		tui = new TUI(new ProcessTerminal());
 		tui.start();
@@ -171,6 +176,24 @@ describe("Tui probe-reply leaks", () => {
 		await sleep(60);
 		received = [];
 	}
+
+	it("drains probe input without disabling keyboard protocols or detaching input", async () => {
+		// Complete ProcessTerminal's Kitty query so the safe drain runs while the
+		// enhanced keyboard mode is active. A destructive drain would emit both
+		// protocol-disable sequences and drop the TUI input handler.
+		process.stdin.emit("data", Buffer.from("\x1b[?1u"));
+		terminalWrites.length = 0;
+
+		await tui!.drainPetProbeInput(25, 5);
+
+		const output = terminalWrites.join("");
+		expect(output).not.toContain("\x1b[<u");
+		expect(output).not.toContain("\x1b[>4;0m");
+
+		process.stdin.emit("data", Buffer.from("x"));
+		await sleep(20);
+		expect(received).toContain("x");
+	});
 
 	it("still hands the sixel probe its own DA1 reply", async () => {
 		const seen: string[] = [];

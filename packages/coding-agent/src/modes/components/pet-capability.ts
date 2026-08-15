@@ -47,7 +47,7 @@ export function getItermPetUnavailableReason(): string | undefined {
 }
 
 export function getPetPixelProtocol(): PetPixelProtocol | null {
-	if (TERMINAL.imageProtocol === ImageProtocol.Kitty) return "kitty";
+	if (TERMINAL.imageProtocol === ImageProtocol.Kitty && !isUnderTerminalMultiplexer()) return "kitty";
 	if (TERMINAL.imageProtocol === ImageProtocol.Sixel) return "sixel";
 	if (verifiedItermAvailability?.available) return "iterm";
 	return null;
