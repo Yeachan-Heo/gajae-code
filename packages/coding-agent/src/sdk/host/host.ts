@@ -85,8 +85,11 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	activationGate?: SessionActivationGate;
 }
 
-const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
-const CAP_GATED_FRAME_KINDS = new Set(["tool_activity", "reasoning_summary"]);
+/** Shared by the replay filter and transport live broadcasts: a connection
+ *  must see the same capability-gated event kinds on both legs, or live and
+ *  replay delivery diverge for the same subscriber. */
+export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
+export const CAP_GATED_FRAME_KINDS: ReadonlySet<string> = new Set(["tool_activity", "reasoning_summary"]);
 const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
 
 /** Safe, identifier-free explanations for every refused activation status. */

@@ -90,7 +90,14 @@ import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
 import { SessionIndex } from "../broker/session-index";
-import { createSdkSurfaceFactory, type SessionSdkHost, SessionSdkSessionRuntime, shouldHostSdk } from "../host";
+import {
+	CAP_GATED_FRAME_KINDS,
+	createSdkSurfaceFactory,
+	type SessionSdkHost,
+	SessionSdkSessionRuntime,
+	shouldHostSdk,
+	TOOL_ACTIVITY_CAPABILITY,
+} from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
@@ -1134,6 +1141,9 @@ export class PresentationArbiter {
 interface SessionRuntime {
 	server: NotificationServer;
 	host: SessionSdkHost;
+	/** Delivers one ring-positioned event envelope to every attached subscriber
+	 *  connection, applying the same capability gate as event replay. */
+	broadcastEventFrame: (event: SdkFrame) => void;
 	/** Owns stateRoot-backed revisions and removes their spills on terminal shutdown. */
 	revisions: RevisionStore;
 	/** Releases all snapshot pins before the revision store is closed. */
@@ -1349,11 +1359,22 @@ type SessionStartResult = {
 	suppressExtensionError?: boolean;
 };
 
+/** Ring append plus positioned live broadcast. An event retained for replay
+ *  must also reach already-attached subscribers live as the same positioned
+ *  envelope, or they can only observe it by issuing another replay. */
+function emitSessionEvent(
+	runtime: Pick<SessionRuntime, "host" | "broadcastEventFrame">,
+	frame: { type: string; [key: string]: unknown },
+	payload: Record<string, unknown> = frame,
+): void {
+	runtime.broadcastEventFrame(runtime.host.emitEvent({ kind: frame.type, payload }));
+}
+
 function pushSessionFrame(
-	runtime: Pick<SessionRuntime, "server" | "host">,
+	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: string; [key: string]: unknown },
 ): void {
-	runtime.host.emitEvent({ kind: frame.type, payload: frame });
+	emitSessionEvent(runtime, frame);
 	if (frame.type === "turn_stream") {
 		runtime.server.pushTurnStreamUnchecked(
 			String(frame.sessionId),
@@ -1368,30 +1389,30 @@ function pushSessionFrame(
 }
 
 async function pushTerminalSessionFrame(
-	runtime: Pick<SessionRuntime, "server" | "host">,
+	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: "session_closed"; sessionId: string },
 ): Promise<boolean> {
-	runtime.host.emitEvent({ kind: frame.type, payload: frame });
+	emitSessionEvent(runtime, frame);
 	return await runtime.server.pushFrameAndWait(JSON.stringify(frame), 1_000);
 }
 
 function pushFileAttachment(
-	runtime: Pick<SessionRuntime, "server" | "host">,
+	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: "file_attachment"; sessionId: string; name: string; mime?: string; caption?: string },
 	data: Buffer,
 ): void {
-	runtime.host.emitEvent({ kind: frame.type, payload: { ...frame, data: data.toString("base64") } });
+	emitSessionEvent(runtime, frame, { ...frame, data: data.toString("base64") });
 	runtime.server.pushFileAttachmentUnchecked(frame.sessionId, frame.name, frame.mime, data, frame.caption);
 }
 
 /** Agent lifecycle is SDK session truth, independent of optional chat delivery. */
 function emitAgentLifecycle(
-	runtime: Pick<SessionRuntime, "server" | "host">,
+	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: "agent_start" | "agent_end"; sessionId: string; commandId?: string; turnId?: string },
 ): void {
 	try {
 		const json = JSON.stringify(frame);
-		runtime.host.emitEvent({ kind: frame.type, payload: frame });
+		emitSessionEvent(runtime, frame);
 		runtime.server.pushFrame(json);
 	} catch (error) {
 		logger.warn(`sdk: lifecycle delivery failed: ${String(error)}`);
@@ -4625,6 +4646,29 @@ export function createNotificationsExtension(
 		const promptSubmissions = new Map<string, PromptSubmission>();
 		/** Connections fenced by a fatal prompt closure; their later frames are refused. */
 		const fencedConnections = new Set<string>();
+		/**
+		 * Live positioned-event delivery to attached subscribers. The native
+		 * broadcast channel round-trips a closed frame enum and cannot carry the
+		 * positioned event envelope, so each envelope rides the validated directed
+		 * leg instead — to every connection that completed capability negotiation
+		 * or an event replay, which is exactly the attached-subscriber set. Fenced
+		 * connections are excluded like their inbound frames, and capability-gated
+		 * kinds follow the same gate replay applies, so live and replay delivery
+		 * stay one truth per connection.
+		 */
+		const broadcastEventFrame = (event: SdkFrame): void => {
+			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
+			const json = JSON.stringify(event);
+			for (const [connectionId, capabilities] of hostCapCache) {
+				if (fencedConnections.has(connectionId)) continue;
+				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
+				try {
+					server.sendTo(connectionId, json);
+				} catch {
+					// Broadcasts are best effort; directed responses surface send failures.
+				}
+			}
+		};
 		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
 		// Authoritative bounded reconciliation state for canonical Q26 turn.result
@@ -4733,7 +4777,7 @@ export function createNotificationsExtension(
 			const key = promptSubmissionKey(correlation);
 			const submission = promptSubmissions.get(key);
 			if (!submission) return;
-			runtime.host.emitEvent({ kind: frame.type, payload: frame });
+			emitSessionEvent(runtime, frame);
 			if (submission.abandoned) {
 				if (submission.terminal) finalizePrompt(key, correlation);
 				return;
@@ -6364,7 +6408,7 @@ export function createNotificationsExtension(
 				},
 				start: async () => await server.start(),
 				stop: async () => await server.stopAndWait(),
-				broadcastFrame: frame => server.pushFrame(JSON.stringify(frame)),
+				broadcastFrame: frame => broadcastEventFrame(frame),
 			},
 			...(preparesExistingThread ? { readiness: "deferred" as const } : {}),
 			...(activationGate ? { activationGate } : {}),
@@ -6645,6 +6689,7 @@ export function createNotificationsExtension(
 		runtime = {
 			server,
 			host,
+			broadcastEventFrame,
 			revisions,
 			cursors,
 			id,
@@ -7359,7 +7404,7 @@ export function createNotificationsExtension(
 				sessionId: id,
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
 			};
-			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
+			emitSessionEvent(initializedRuntime, identityHeader);
 			const endpoint = await sdkRuntime.startTransport();
 			initializedRuntime.notificationOwnerState = "ready";
 			if (notificationsEnabledForSession && settingsAvailable && settings) {
@@ -7420,7 +7465,7 @@ export function createNotificationsExtension(
 					sessionId: id,
 					...buildIdentity(ctx.cwd, sessionName, telegramTopicsEnabled()),
 				};
-				host.emitEvent({ kind: identity.type, payload: identity });
+				emitSessionEvent(initializedRuntime, identity);
 				server.pushFrame(JSON.stringify(identity));
 			}, 250);
 			sessionNameObserver.unref?.();
@@ -7434,7 +7479,7 @@ export function createNotificationsExtension(
 					sessionId: id,
 					...buildIdentity(ctx.cwd, sessionNameAfterStartup, telegramTopicsEnabled()),
 				};
-				host.emitEvent({ kind: identity.type, payload: identity });
+				emitSessionEvent(initializedRuntime, identity);
 				server.pushFrame(JSON.stringify(identity));
 			}
 			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();

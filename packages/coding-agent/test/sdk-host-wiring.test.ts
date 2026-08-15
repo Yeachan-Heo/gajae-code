@@ -1471,6 +1471,56 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 	});
 });
 
+test("SDK host delivers positioned session events live to an attached direct subscriber", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-live-events-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-${Date.now()}`;
+	process.env.GJC_NOTIFICATIONS = "1";
+	const handlers = start(context(cwd, sessionId));
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const client = await SdkClient.connect(endpoint.url, endpoint.token);
+	try {
+		const liveEvents: Record<string, unknown>[] = [];
+		client.onFrame(frame => {
+			if (frame.type === "event") liveEvents.push(frame);
+		});
+		// Authoritative attachment: replay completes before the terminal event exists.
+		const replay = (await client.request({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 })) as {
+			ok: boolean;
+			generation: number;
+			lastSeq: number;
+		};
+		expect(replay.ok).toBe(true);
+		const attachedSeq = replay.lastSeq;
+		const sessionContext = context(cwd, sessionId);
+		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
+		// The already-attached subscriber must receive the later positioned terminal
+		// event live — no further query, replay, or reconnect is issued below.
+		await waitFor(
+			() =>
+				liveEvents.some(event => {
+					const payload = event.payload as Record<string, unknown> | undefined;
+					return payload?.type === "agent_end" && typeof event.seq === "number" && event.seq > attachedSeq;
+				}),
+			"live positioned terminal event",
+		);
+		const terminal = liveEvents.find(
+			event => (event.payload as Record<string, unknown> | undefined)?.type === "agent_end",
+		);
+		expect(terminal).toMatchObject({
+			type: "event",
+			kind: "agent_end",
+			generation: replay.generation,
+			payload: expect.objectContaining({ type: "agent_end", sessionId }),
+		});
+	} finally {
+		await client.close();
+	}
+});
+
 test("SDK host preserves ordered prompt image blocks in the host payload", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-images-"));
 	dirs.push(cwd);
