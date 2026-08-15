@@ -18261,7 +18261,7 @@ export class AgentSession {
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
 				: false;
 		}
-		const attemptsUsed = managedFallback && !localSnapshot ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const providerRetryCeilingReached =
 			providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts;
 		// Credential rotation: a content-free quota/rate-limit failure has no
