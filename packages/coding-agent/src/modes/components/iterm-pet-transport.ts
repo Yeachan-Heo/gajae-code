@@ -384,6 +384,7 @@ export class ItermPetTransport {
 		return this.availability;
 	}
 	async revoke(reason: PetUnavailableReason = "topology-lost"): Promise<PetTransportAvailability> {
+		if (!this.#available && this.#reason === reason) return this.availability;
 		this.#epoch++;
 		this.#clock.clearTimeout(this.#timeout);
 		this.#timeout = undefined;
