@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	consumeCapabilityInput,
 	ItermPetTransport,
 	type PetTransportClock,
 } from "@gajae-code/coding-agent/modes/components/iterm-pet-transport";
@@ -93,5 +94,45 @@ describe("managed iTerm Pet topology revocation", () => {
 		await x.transport.inspectManagedTopology();
 		expect(x.events.at(-1)).toEqual({ available: false, reason: "topology-ineligible", epoch: 4 });
 		expect(x.events).toHaveLength(5);
+	});
+});
+
+describe("capability input fragmentation", () => {
+	it.each([
+		["immediately after the ESC byte", "abcde\x1b", "]1337;Capabilities=F\x07", "abcde"],
+		["after two marker bytes", "abc\x1b]", "1337;Capabilities=F\x07", "abc"],
+		["after a long marker prefix", "xx\x1b]1337", ";Capabilities=F\x07", "xx"],
+		["with the marker alone in the first chunk", "\x1b]1337", ";Capabilities=F\x07", ""],
+		["before the ST terminator", "\x1b]1337;Capabilities=F\x1b", "\\", ""],
+	] as const)("captures the reply when it is split %s", (_label, firstChunk, secondChunk, expectedPassthrough) => {
+		const captured: string[] = [];
+		const consume = consumeCapabilityInput(data => captured.push(String(data)));
+
+		const first = consume(firstChunk);
+		if (expectedPassthrough) expect(first?.data).toBe(expectedPassthrough);
+		else expect(first?.consume ?? first === undefined).toBeTruthy();
+
+		const second = consume(secondChunk);
+		expect(second?.consume ?? second === undefined).toBeTruthy();
+		expect(captured).toEqual([
+			secondChunk === "\\" ? "\x1b]1337;Capabilities=F\x1b\\" : "\x1b]1337;Capabilities=F\x07",
+		]);
+	});
+
+	it("forwards ordinary input unchanged and keeps unrelated escape replies", () => {
+		const captured: string[] = [];
+		const consume = consumeCapabilityInput(data => captured.push(String(data)));
+		expect(consume("hello world")?.data).toBe("hello world");
+		expect(consume("\x1b[97;1u")?.data).toBe("\x1b[97;1u");
+		expect(consume("\x1b]11;rgb:1234/1234/1234\x1b\\")?.data).toBe("\x1b]11;rgb:1234/1234/1234\x1b\\");
+		expect(consume("\x1b[?62;22;52c")?.data ?? "pass").toBeTruthy();
+		expect(captured).toEqual([]);
+	});
+
+	it("captures every complete frame and passes interleaved text through", () => {
+		const captured: string[] = [];
+		const consume = consumeCapabilityInput(data => captured.push(String(data)));
+		expect(consume("\x1b]1337;Capabilities=F\x07xy\x1b]1337;Capabilities=x\x07")?.data).toBe("xy");
+		expect(captured).toEqual(["\x1b]1337;Capabilities=F\x07", "\x1b]1337;Capabilities=x\x07"]);
 	});
 });

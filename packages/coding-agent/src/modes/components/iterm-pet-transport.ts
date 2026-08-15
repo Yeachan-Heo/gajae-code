@@ -81,8 +81,14 @@ export function consumeCapabilityInput(callback: (data: Uint8Array | string) => 
 			const start = combined.indexOf(marker, offset);
 			if (start < 0) {
 				const suffixLength = Math.min(marker.length - 1, combined.length - offset);
-				const candidate = combined.slice(combined.length - suffixLength);
-				const keep = candidate.length > 1 && marker.startsWith(candidate) ? candidate : "";
+				let keep = "";
+				for (let len = suffixLength; len >= 1; len--) {
+					const candidate = combined.slice(combined.length - len);
+					if (marker.startsWith(candidate)) {
+						keep = candidate;
+						break;
+					}
+				}
 				passthrough += combined.slice(offset, combined.length - keep.length);
 				fragment = keep;
 				break;
