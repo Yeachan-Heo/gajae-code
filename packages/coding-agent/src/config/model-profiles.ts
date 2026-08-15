@@ -106,6 +106,13 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "opencode-go/mimo-v2.5-pro",
 		architect: "opencode-go/deepseek-v4-pro",
 	}),
+	profile("commandcode-goat", ["commandcode-goat"], {
+		default: "commandcode-goat/zai-org/GLM-5.3",
+		executor: "commandcode-goat/deepseek/deepseek-v4-flash:high",
+		planner: "commandcode-goat/moonshotai/Kimi-K3",
+		critic: "commandcode-goat/zai-org/GLM-5.2:high",
+		architect: "commandcode-goat/deepseek/deepseek-v4-pro:high",
+	}),
 	profile("open-weights-glm", [], {
 		default: "glm-5.2:medium",
 		executor: "glm-5.2:low",
@@ -479,6 +486,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"codex-pro": { displayName: "Codex Pro", providerGroup: "CODEX" },
 	lunamaxxing: { displayName: "LunaMaxxing", providerGroup: "CODEX" },
 	opencodego: { displayName: "OpenCodeGo", providerGroup: "OPENCODEGO" },
+	"commandcode-goat": { displayName: "Command Code GOAT", providerGroup: "COMMAND CODE GOAT" },
 	"open-weights-glm": { displayName: "GLM", providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)" },
 	"open-weights-deepseek": {
 		displayName: "DeepSeek",
@@ -555,6 +563,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 const PROFILE_GROUP_ORDER = [
 	"CODEX",
 	"OPENCODEGO",
+	"COMMAND CODE GOAT",
 	"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 	"CLAUDE",
 	"GLM",
@@ -587,6 +596,7 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	"openai-codex": "codex-medium",
 	anthropic: "claude-opus",
 	"opencode-go": "opencodego",
+	"commandcode-goat": "commandcode-goat",
 	zai: "glm-medium",
 	"kimi-code": "kimi-coding-plan-medium",
 	xiaomi: "mimo-medium",

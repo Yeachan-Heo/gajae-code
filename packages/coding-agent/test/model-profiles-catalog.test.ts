@@ -79,6 +79,17 @@ const expectedProfiles: Array<{
 		},
 	},
 	{
+		name: "commandcode-goat",
+		requiredProviders: ["commandcode-goat"],
+		mapping: {
+			default: "commandcode-goat/zai-org/GLM-5.3",
+			executor: "commandcode-goat/deepseek/deepseek-v4-flash:high",
+			planner: "commandcode-goat/moonshotai/Kimi-K3",
+			critic: "commandcode-goat/zai-org/GLM-5.2:high",
+			architect: "commandcode-goat/deepseek/deepseek-v4-pro:high",
+		},
+	},
+	{
 		name: "open-weights-glm",
 		requiredProviders: [],
 		mapping: {
@@ -612,6 +623,14 @@ const oldNames = [
 	"fable-codex",
 ];
 
+const commandCodeGoatModels = new Set([
+	"zai-org/GLM-5.2",
+	"zai-org/GLM-5.3",
+	"deepseek/deepseek-v4-flash",
+	"deepseek/deepseek-v4-pro",
+	"moonshotai/Kimi-K3",
+]);
+
 function selectorExists(selector: string): boolean {
 	const selectorWithoutThinking = splitSelectorThinkingSuffix(selector).selector;
 	if (!selectorWithoutThinking.includes("/")) {
@@ -623,6 +642,7 @@ function selectorExists(selector: string): boolean {
 	const parsed = parseModelString(selector);
 	if (!parsed) return false;
 	if (parsed.provider === "grok-build") return ["grok-composer-2.5-fast", "grok-build"].includes(parsed.id);
+	if (parsed.provider === "commandcode-goat") return commandCodeGoatModels.has(parsed.id);
 	return (modelsJson as Record<string, Record<string, unknown>>)[parsed.provider]?.[parsed.id] !== undefined;
 }
 
@@ -659,7 +679,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 49-profile matrix cell-for-cell", () => {
+	test("contains exact 50-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -831,6 +851,10 @@ describe("built-in model profile catalog", () => {
 			displayName: "GLM + DeepSeek",
 			providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 		});
+		expect(getModelProfilePresentation("commandcode-goat")).toEqual({
+			displayName: "Command Code GOAT",
+			providerGroup: "COMMAND CODE GOAT",
+		});
 		for (const [name, displayName] of Object.entries({
 			"grok-45-eco": "Grok 4.5 Eco",
 			"grok-45-medium": "Grok 4.5 Medium",
@@ -844,6 +868,7 @@ describe("built-in model profile catalog", () => {
 		expect([...groupModelProfilesForPresetLanding(profiles).keys()]).toEqual([
 			"CODEX",
 			"OPENCODEGO",
+			"COMMAND CODE GOAT",
 			"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 			"CLAUDE",
 			"GLM",
@@ -876,6 +901,7 @@ describe("built-in model profile catalog", () => {
 		expect(recommendModelProfileForProvider("openai-codex", profiles)?.name).toBe("codex-medium");
 		expect(recommendModelProfileForProvider("anthropic", profiles)?.name).toBe("claude-opus");
 		expect(recommendModelProfileForProvider("opencode-go", profiles)?.name).toBe("opencodego");
+		expect(recommendModelProfileForProvider("commandcode-goat", profiles)?.name).toBe("commandcode-goat");
 		expect(recommendModelProfileForProvider("zai", profiles)?.name).toBe("glm-medium");
 		expect(recommendModelProfileForProvider("kimi-code", profiles)?.name).toBe("kimi-coding-plan-medium");
 		expect(recommendModelProfileForProvider("xiaomi", profiles)?.name).toBe("mimo-medium");

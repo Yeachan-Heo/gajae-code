@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+- Added the `commandcode-goat` model profile for the Command Code GOAT provider, assigning GLM-5.3 to the default role, DeepSeek V4 Flash to execution, Kimi K3 to planning, GLM-5.2 to criticism, and DeepSeek V4 Pro to architecture.
+
 - Telegram notification delivery now carries an explicit per-update inbound acknowledgement contract: user messages are acked `accepted` at session preflight acceptance (before the turn starts, so a fast turn can no longer out-race the pending-update registration), late admission failures ack `rejected`, and genuinely discarded frames ack `dropped`. Policy-suspended control commands are deferred to activation instead of being acked as dropped, per-update reaction transitions are serialized with terminal states monotonic (a slow queued 👀 can no longer overwrite a later ✅), and retraction sends the empty reaction list the Bot API requires. Daemon generation bumped 167→168. (#4528)
 
 - Managed fallback local snapshot failures now auto-recover with a bounded same-model retry (capped at `retry.maxRetries`) instead of terminating the turn: the discarded attempt is replay-safe and content-free, so the session re-issues the request without charging the provider fallback chain, advancing models, or mutating credentials. Exhausted retries still surface the explicit local diagnostic.
