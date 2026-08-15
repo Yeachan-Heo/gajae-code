@@ -2,7 +2,7 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { BUN_TEST_IGNORE_OVERRIDES, DEDICATED_ONLY_TESTS, dedicatedTestCommand, describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isDedicatedOnlyTest, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 import {
 	runSdkProductionHostIsolated,
 	sdkProductionHostIsolatedSuites,
@@ -1851,5 +1851,107 @@ describe("planFullTasks — Main CI full mode (issue: shard main CI)", () => {
 		expect(entries.find(entry => entry.key === "cli-smoke")?.native).toBe(true);
 		expect(entries.find(entry => entry.key === "runtime-check")?.native).toBe(true);
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-16")?.native).toBe(true);
+	});
+});
+
+describe("dedicated-only tests — routing contract", () => {
+	const ACP_LIFECYCLE = "packages/coding-agent/test/acp/acp-lifecycle-smoke.test.ts";
+	const DEDICATED_TASK_KEY = `test:${ACP_LIFECYCLE}`;
+
+	test("the override argv restates every bunfig ignore pattern and appends the target", () => {
+		for (const pattern of BUN_TEST_IGNORE_OVERRIDES) {
+			expect(dedicatedTestCommand(ACP_LIFECYCLE)).toContain(pattern);
+		}
+		expect(dedicatedTestCommand(ACP_LIFECYCLE)).toEqual([
+			"bun",
+			"test",
+			"--path-ignore-patterns",
+			"**/node_modules/**",
+			"--path-ignore-patterns",
+			".wt/**",
+			"--path-ignore-patterns",
+			".worktrees/**",
+			ACP_LIFECYCLE,
+		]);
+	});
+
+	test("the planner override list stays in lockstep with bunfig.toml ignores", async () => {
+		const bunfig = await Bun.file("bunfig.toml").text();
+		const section = /\[test\][\s\S]*?pathIgnorePatterns\s*=\s*\[([^\]]*)\]/.exec(bunfig);
+		expect(section).toBeDefined();
+		const withoutComments = (section?.[1] ?? "")
+			.split("\n")
+			.map(line => line.replace(/^\s*#.*$/, ""))
+			.join("\n");
+		const bunfigPatterns = withoutComments
+			.split(",")
+			.map(entry => entry.trim().replace(/^["']|["']$/g, ""))
+			.filter(entry => entry.length > 0);
+		// bunfig must equal the canonical overrides plus exactly one prune per
+		// dedicated-only test — any other drift widens or narrows discovery.
+		expect(bunfigPatterns.length).toBe(BUN_TEST_IGNORE_OVERRIDES.length + DEDICATED_ONLY_TESTS.size);
+		for (const pattern of BUN_TEST_IGNORE_OVERRIDES) {
+			expect(bunfigPatterns).toContain(pattern);
+		}
+		for (const dedicated of DEDICATED_ONLY_TESTS) {
+			// bunfig stores a glob (`**/<tail>`), so the glob's tail must cover the file's tail.
+			const tail = dedicated.slice(dedicated.indexOf("/test/") + 1);
+			const covered = bunfigPatterns.some(entry => entry.endsWith(tail));
+			expect(covered).toBe(true);
+		}
+	});
+
+	test("a changed dedicated-only test plans exactly one runnable dedicated task with the override argv", () => {
+		const tasks = planTargetedTasks([ACP_LIFECYCLE], packages, [ACP_LIFECYCLE, "packages/coding-agent/test/edit/foo.test.ts"]);
+		const dedicated = tasks.find(task => task.key === DEDICATED_TASK_KEY);
+		expect(dedicated).toBeDefined();
+		expect(dedicated?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
+		// The plain `bun test <file>` form is exactly what failed in CI: a pruned
+		// file is never discovered, so the filter matches nothing (exit 1).
+		expect(dedicated?.command).not.toEqual(["bun", "test", ACP_LIFECYCLE]);
+		expect(tasks.filter(task => task.key === DEDICATED_TASK_KEY)).toHaveLength(1);
+		// Ordinary files keep the plain invocation.
+		const ordinary = planTargetedTasks(["packages/coding-agent/test/edit/foo.test.ts"], packages, [
+			"packages/coding-agent/test/edit/foo.test.ts",
+		]);
+		expect(ordinary.find(task => task.key === "test:packages/coding-agent/test/edit/foo.test.ts")?.command).toEqual([
+			"bun",
+			"test",
+			"packages/coding-agent/test/edit/foo.test.ts",
+		]);
+	});
+
+	test("the Main CI full plan schedules the dedicated-only suite exactly once", () => {
+		const tasks = planFullTasks(packages);
+		const dedicated = tasks.filter(task => task.key === "acp-lifecycle-smoke");
+		expect(dedicated).toHaveLength(1);
+		expect(dedicated[0]?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
+		expect(tasks.filter(task => task.key === DEDICATED_TASK_KEY)).toHaveLength(0);
+	});
+
+	test("the dedicated ACP smoke task is marked as needing the prebuilt native addon", () => {
+		for (const task of [...planFullTasks(packages), ...planTargetedTasks([ACP_LIFECYCLE], packages, [ACP_LIFECYCLE])]) {
+			if (task.key === "acp-lifecycle-smoke" || task.key === DEDICATED_TASK_KEY) {
+				expect(describeTasks([task])[0]?.native).toBe(true);
+			}
+		}
+	});
+
+	test("Main CI invokes the dedicated task through the planner, not a duplicated ignore list", async () => {
+		const workflow = await Bun.file(".github/workflows/ci.yml").text();
+		expect(workflow).toContain("bun scripts/ci-dev-affected.ts --task=acp-lifecycle-smoke");
+		// The workflow must not restate the override patterns itself; that would
+		// fork the contract away from BUN_TEST_IGNORE_OVERRIDES.
+		expect(workflow).not.toContain('--path-ignore-patterns="**/node_modules/**"');
+	});
+
+	test("dedicated-only tests never run through fresh-process shard inventory", async () => {
+		const { enumerateTestFiles } = await import("./run-bun-test-files");
+		const files = await enumerateTestFiles("packages/coding-agent");
+		expect(files).not.toContain(ACP_LIFECYCLE);
+		for (const dedicated of DEDICATED_ONLY_TESTS) {
+			expect(files).not.toContain(dedicated);
+			expect(isDedicatedOnlyTest(dedicated)).toBe(true);
+		}
 	});
 });

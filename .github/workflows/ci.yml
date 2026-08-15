@@ -318,14 +318,11 @@ jobs:
            # bunfig `[test] pathIgnorePatterns` keeps this out of the default suite, and
            # naming the path does NOT re-include it: `bun test <path>` filters files that
            # were already discovered, so a pruned file never matches. Overriding the list
-           # is the only way in. The repository's other ignore patterns are repeated here
-           # so the override does not silently widen discovery.
-           run: |
-              bun test \
-                 --path-ignore-patterns="**/node_modules/**" \
-                 --path-ignore-patterns=".wt/**" \
-                 --path-ignore-patterns=".worktrees/**" \
-                 packages/coding-agent/test/acp/acp-lifecycle-smoke.test.ts
+           # is the only way in. The canonical argv — which restates every repository
+           # ignore pattern so the override does not widen discovery — lives in
+           # ci-dev-affected.ts (BUN_TEST_IGNORE_OVERRIDES / dedicatedTestCommand), so
+           # this job invokes the planner task instead of duplicating the pattern list.
+           run: bun scripts/ci-dev-affected.ts --task=acp-lifecycle-smoke
 
    # Branch protection must keep requiring this stable aggregate status.
    test:

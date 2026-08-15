@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isDedicatedOnlyTest } from "./ci-dev-affected";
 
 export const DEFAULT_TEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_FILE_TIMEOUT_MS = 5 * 60_000;
@@ -78,6 +79,13 @@ function isCredentialEnvironmentName(name: string): boolean {
 // it, so package-wide runtime suites must not execute it implicitly.
 const SOURCE_BOUND_EVIDENCE_TESTS = new Set(["packages/ai/test/anthropic-cache-eval.integration.test.ts"]);
 
+// Dedicated-only tests (ci-dev-affected.ts DEDICATED_ONLY_TESTS) are pruned from
+// default Bun discovery by bunfig.toml because they are too expensive to run per
+// ordinary suite. This harness spawns `bun test ./<file>` per file, which obeys
+// the same bunfig prune, so scheduling such a file here would fail every time
+// with "filters did not match any test files". They run only through their
+// explicit dedicated task with the full ignore-list override.
+
 function usage(message?: string): never {
 	if (message) process.stderr.write(`${message}\n`);
 	process.stderr.write(
@@ -134,6 +142,7 @@ export async function enumerateTestFiles(root: string, base: string = repoRoot):
 		if (!TEST_FILE_PATTERN.test(normalized)) continue;
 		const file = path.posix.join(relativeRoot.split(path.sep).join("/"), normalized);
 		if (SOURCE_BOUND_EVIDENCE_TESTS.has(file)) continue;
+		if (isDedicatedOnlyTest(file)) continue;
 		files.push(file);
 	}
 	return files.sort();

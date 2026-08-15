@@ -252,6 +252,9 @@ export function planFullTasks(packages: readonly WorkspacePackage[]): Task[] {
 	addNativeBuild(tasks);
 	addWorkspaceTestTasks(tasks, packages);
 	add(tasks, "test:scripts/run-bun-test-files.test.ts", "Test fresh-process Bun harness", ["bun", "test", "scripts/run-bun-test-files.test.ts"]);
+	// Dedicated-only tests are pruned from package shards and default discovery, so
+	// the full plan must schedule them explicitly or Main CI never runs them.
+	add(tasks, "acp-lifecycle-smoke", "Test ACP session lifecycle smoke (dedicated)", dedicatedTestCommand("packages/coding-agent/test/acp/acp-lifecycle-smoke.test.ts"), undefined, { rust: false, nextest: false, nativeConsumer: true, nativeProducer: false });
 	add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 	addRustTestTasks(tasks);
 	add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
@@ -298,6 +301,43 @@ async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 // a changed source file to its directly-named test. node_modules is excluded so
 // the index is identical whether or not dependencies are installed (the planner
 // job skips install; shards install before running) — keeping plans stable.
+// Tests that `bunfig.toml` prunes from default Bun discovery because they are too
+// expensive or environment-heavy to run per ordinary suite, and that must therefore
+// run only through an explicit dedicated task. The bunfig prune removes the file
+// from *discovery*, so `bun test <path>` (a filter over already-discovered files)
+// can never select it — the only way in is replacing the ignore list via
+// `--path-ignore-patterns`, which is what dedicatedTestCommand() emits.
+// Fresh-process shard inventory (run-bun-test-files.ts) mirrors this exclusion so
+// package shards never schedule a file plain `bun test ./<file>` cannot run.
+export const DEDICATED_ONLY_TESTS: ReadonlySet<string> = new Set([
+	"packages/coding-agent/test/acp/acp-lifecycle-smoke.test.ts",
+]);
+
+// The complete ignore list a dedicated test invocation must restate. Overriding
+// `--path-ignore-patterns` replaces the bunfig list entirely, so dropping the
+// repository's other canonical patterns here would silently widen discovery.
+export const BUN_TEST_IGNORE_OVERRIDES: readonly string[] = [
+	"**/node_modules/**",
+	".wt/**",
+	".worktrees/**",
+];
+
+export function isDedicatedOnlyTest(testFile: string): boolean {
+	return DEDICATED_ONLY_TESTS.has(testFile);
+}
+
+// Argv for running exactly one test file. Dedicated-only files get the full
+// bunfig ignore-list override, which is the sole mechanism that makes a pruned
+// file runnable; ordinary files keep the plain invocation.
+export function dedicatedTestCommand(testFile: string): readonly string[] {
+	return [
+		"bun",
+		"test",
+		...BUN_TEST_IGNORE_OVERRIDES.flatMap(pattern => ["--path-ignore-patterns", pattern]),
+		testFile,
+	];
+}
+
 async function gatherTestFiles(): Promise<string[]> {
 	const patterns = ["packages/**/*.test.ts", "packages/**/*.test.tsx", "scripts/**/*.test.ts"];
 	const found = new Set<string>();
@@ -988,9 +1028,14 @@ export function planTargetedTasks(
 
 // Add a task that runs exactly one test file. Keyed as `test:<repo-relative-path>`
 // so the matrix shard name stays small and directly traceable to the file.
+// Dedicated-only files must run through the bunfig ignore-list override: plain
+// `bun test <file>` filters over already-discovered files, and a bunfig-pruned
+// file is never discovered, so the plain form deterministically fails with
+// "filters did not match any test files" (exit 1).
 function addTestFileTask(tasks: Map<string, Task>, testFile: string, requireExisting = false): void {
 	if (requireExisting && !fsSync.existsSync(path.join(repoRoot, testFile))) return;
-	add(tasks, `test:${testFile}`, `Test ${testFile}`, ["bun", "test", testFile]);
+	const command = isDedicatedOnlyTest(testFile) ? dedicatedTestCommand(testFile) : ["bun", "test", testFile];
+	add(tasks, `test:${testFile}`, `Test ${testFile}`, command);
 }
 
 function addWorkspaceTestTasks(tasks: Map<string, Task>, packages: readonly WorkspacePackage[]): void {

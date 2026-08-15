@@ -21,8 +21,9 @@ pathIgnorePatterns = [
   # Spawns a broker plus a session host per run and costs tens of seconds, so it
   # stays out of the default suite. Naming the path on the command line does NOT
   # re-include it -- `bun test <path>` is a filter over already-discovered files,
-  # so a pruned file can never match. The only way to run it is to override this
-  # list with `--path-ignore-patterns`, which is what the CI job does.
+  # so a pruned file can never match. The only way to run it is the canonical
+  # dedicated argv (ci-dev-affected.ts BUN_TEST_IGNORE_OVERRIDES override), which
+  # the planner emits; the fresh-process shard inventory also excludes it.
   "**/test/acp/acp-lifecycle-smoke.test.ts",
 ]
 

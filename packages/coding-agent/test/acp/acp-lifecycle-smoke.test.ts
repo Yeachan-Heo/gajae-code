@@ -8,10 +8,14 @@
  *
  * Excluded from default `bun test` discovery via `bunfig.toml`
  * `[test] pathIgnorePatterns` because it spawns a broker plus a session host and
- * costs tens of seconds. Naming this path on the command line does NOT re-include
- * it -- `bun test <path>` filters files that were already discovered, so a pruned
- * file can never match. The CI job runs it by overriding that list with
- * `--path-ignore-patterns`, which is the only way in.
+ * costs tens of seconds; it is a *dedicated-only* test (see ci-dev-affected.ts
+ * DEDICATED_ONLY_TESTS), so the fresh-process shard inventory skips it too.
+ * Naming this path on the command line does NOT re-include it -- `bun test
+ * <path>` filters files that were already discovered, so a pruned file can never
+ * match. The only way in is to override that list with `--path-ignore-patterns`,
+ * which is exactly what the canonical dedicated argv
+ * (ci-dev-affected.ts dedicatedTestCommand) does; every planner and CI route
+ * runs the suite through that argv, never a bare `bun test <file>`.
  *
  * Deliberately NOT covered: the unknown-session error *shape*. `close`/`delete` on
  * an unowned session no-op by design -- `AcpAgent.closeSession` documents "only
