@@ -5,11 +5,11 @@ import { renderSegment } from "../src/modes/components/status-line/segments";
 import { EMPTY_JOBS_SNAPSHOT } from "../src/modes/jobs-observer";
 import { initTheme, theme } from "../src/modes/theme/theme";
 
-function createCtx(thinkingLevel: ThinkingLevel): SegmentContext {
+function createCtx(thinkingLevel: ThinkingLevel, modelThinking = true): SegmentContext {
 	return {
 		session: {
 			state: {
-				model: { id: "claude-opus-4-5", name: "Claude Opus 4.5", thinking: true },
+				model: { id: "claude-opus-4-5", name: "Claude Opus 4.5", thinking: modelThinking },
 				thinkingLevel,
 			},
 			isFastModeActive: () => false,
@@ -48,5 +48,12 @@ describe("status line thinking indicator", () => {
 		expect(rendered.visible).toBe(true);
 		expect(rendered.content).toContain("Opus 4.5");
 		expect(rendered.content).toContain(theme.thinking.max);
+	});
+
+	it("renders an explicit effort even when discovered model metadata has no thinking block", () => {
+		const rendered = renderSegment("model", createCtx(ThinkingLevel.High, false));
+
+		expect(rendered.visible).toBe(true);
+		expect(rendered.content).toContain(theme.thinking.high);
 	});
 });

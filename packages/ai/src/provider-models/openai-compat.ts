@@ -11,6 +11,7 @@ import {
 } from "../utils/discovery/openai-compatible";
 import { toFireworksPublicModelId } from "../utils/fireworks-model-id";
 import { getGitHubCopilotBaseUrl, OPENCODE_HEADERS, parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
+import { DEFAULT_LOCAL_TOKEN as OMLX_DEFAULT_LOCAL_TOKEN } from "../utils/oauth/omlx";
 import { isClaudeForcedToolChoiceIncapableModelId } from "../utils/tool-choice-capability";
 import { createBundledReferenceMap, createReferenceResolver } from "./bundled-references";
 
@@ -1407,8 +1408,22 @@ export interface OmlxModelManagerConfig {
 	baseUrl?: string;
 }
 
+function isOmlxQwen36ReasoningModelId(modelId: string): boolean {
+	const normalized = modelId.toLowerCase();
+	return normalized.includes("qwen3.6-35b-a3b") || normalized.includes("qwen3.6-27b");
+}
+
+const OMLX_REASONING_EFFORT_MAP = {
+	minimal: "low",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "max",
+	max: "max",
+} as const;
+
 export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelManagerOptions<"openai-completions"> {
-	const apiKey = config?.apiKey;
+	const apiKey = config?.apiKey === OMLX_DEFAULT_LOCAL_TOKEN ? undefined : config?.apiKey;
 	const baseUrl = config?.baseUrl ?? Bun.env.OMLX_BASE_URL ?? "http://127.0.0.1:8000/v1";
 	return {
 		providerId: "omlx",
@@ -1419,15 +1434,20 @@ export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelM
 				baseUrl,
 				apiKey,
 				mapModel: (entry, defaults) => {
-					// oMLX /v1/models entries are {id, object, created, owned_by, max_model_len}
-					// (jundot/omlx ModelInfo). Only max_model_len is served; `name` is absent, so keep
-					// the defaults fallback (the id) instead of clobbering it with undefined.
+					const reasoning = isOmlxQwen36ReasoningModelId(defaults.id);
 					return {
 						...defaults,
-						reasoning: entry.supports_reasoning === true,
-						input: entry.supports_vision === true ? ["text", "image"] : ["text"],
+						reasoning,
+						thinking: reasoning ? { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max } : undefined,
 						contextWindow: toPositiveNumber(entry.max_model_len, defaults.contextWindow),
-						maxTokens: toPositiveNumber(entry.max_tokens, defaults.maxTokens),
+						compat: reasoning
+							? {
+									thinkingFormat: "qwen-chat-template",
+									reasoningEffortMap: OMLX_REASONING_EFFORT_MAP,
+									supportsDeveloperRole: false,
+									supportsStore: false,
+								}
+							: undefined,
 					};
 				},
 			}),

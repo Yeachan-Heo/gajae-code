@@ -345,7 +345,7 @@ type OpenAICompletionsParams = Omit<OpenAI.Chat.Completions.ChatCompletionCreate
 	repetition_penalty?: number;
 	thinking?: { type: "enabled" | "disabled" };
 	enable_thinking?: boolean;
-	chat_template_kwargs?: { enable_thinking: boolean };
+	chat_template_kwargs?: { enable_thinking: boolean; reasoning_effort?: string };
 	reasoning?: { effort?: string } | { enabled: false };
 	reasoning_effort?: OpenAICompletionsOptions["reasoning"];
 	provider?: OpenAICompat["openRouterRouting"];
@@ -1400,6 +1400,9 @@ function buildParams(
 	} else if (supportsReasoningParams && compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
 		params.chat_template_kwargs = {
 			enable_thinking: !!options?.reasoning && !options?.disableReasoning,
+			...(options?.reasoning && !options.disableReasoning
+				? { reasoning_effort: mapReasoningEffort(options.reasoning, compat.reasoningEffortMap) }
+				: {}),
 		};
 	} else if (supportsReasoningParams && compat.thinkingFormat === "openrouter" && model.reasoning) {
 		// OpenRouter normalizes reasoning across providers via a nested reasoning object.

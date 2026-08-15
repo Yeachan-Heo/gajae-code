@@ -13,6 +13,8 @@ import type { TUI } from "@gajae-code/tui";
 import { hookFetch } from "@gajae-code/utils";
 
 const DOWN = "\x1b[B";
+const LEFT = "\x1b[D";
+const RIGHT = "\x1b[C";
 
 function normalizeRenderedText(text: string): string {
 	return text
@@ -205,6 +207,30 @@ describe("ModelSelector batch assignment thinking menu", () => {
 			expect(selection.selector).toBe("anthropic/claude-fable-5:xhigh");
 			expect(selection.roles).toBeUndefined();
 		}
+	});
+
+	test("per-role effort navigation uses standard arrows and wraps to the next unset role", async () => {
+		installTestTheme();
+		const model = createAnthropicReasoningModel("claude-fable-5");
+		const settings = Settings.isolated({
+			"task.agentModelOverrides": {
+				critic: "anthropic/claude-fable-5:high",
+			},
+		});
+		const selector = createSelector(model, settings, () => {});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selectActionRow(selector, ALL_ROLE_AGENTS_ROW);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: CRITIC");
+
+		selector.handleInput(LEFT);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: PLANNER");
+		selector.handleInput(RIGHT);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: CRITIC");
+
+		selector.handleInput("\n");
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Current: EXECUTOR");
 	});
 
 	test("direct xAI Grok default assignment requires an explicit supported effort", async () => {

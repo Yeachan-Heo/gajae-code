@@ -11,6 +11,7 @@ import {
 	type Context,
 	codexContextOverrideKey,
 	createModelManager,
+	Effort,
 	enrichModelThinking,
 	getBundledModels,
 	getBundledProviders,
@@ -121,6 +122,20 @@ function toPositiveFiniteNumber(value: number | undefined): number | undefined {
 	if (value === undefined || !Number.isFinite(value) || value <= 0) return undefined;
 	return value;
 }
+
+function isOmlxQwen36ReasoningModelId(modelId: string): boolean {
+	const normalized = modelId.toLowerCase();
+	return normalized.includes("qwen3.6-35b-a3b") || normalized.includes("qwen3.6-27b");
+}
+
+const OMLX_REASONING_EFFORT_MAP = {
+	minimal: "low",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "max",
+	max: "max",
+} as const;
 
 function envAvailabilityFingerprint(): string {
 	return Object.entries(process.env)
@@ -3069,6 +3084,7 @@ export class ModelRegistry {
 			if (!id) continue;
 			const referenceModel = resolveCustomModelReference(id);
 			const api = this.#resolveDiscoveredModelApi(providerConfig, id);
+			const omlxReasoning = providerConfig.discovery.type === "omlx" && isOmlxQwen36ReasoningModelId(id);
 			discovered.push(
 				enrichModelThinking({
 					id,
@@ -3076,8 +3092,10 @@ export class ModelRegistry {
 					api,
 					provider: providerConfig.provider,
 					baseUrl: requestBaseUrl,
-					reasoning: referenceModel?.reasoning ?? false,
-					thinking: referenceModel?.thinking,
+					reasoning: referenceModel?.reasoning ?? omlxReasoning,
+					thinking:
+						referenceModel?.thinking ??
+						(omlxReasoning ? { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max } : undefined),
 					input: referenceModel?.input ?? ["text"],
 					output: referenceModel?.output,
 					cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -3094,6 +3112,12 @@ export class ModelRegistry {
 						supportsStore: false,
 						supportsDeveloperRole: false,
 						supportsReasoningEffort: false,
+						...(omlxReasoning
+							? {
+									thinkingFormat: "qwen-chat-template" as const,
+									reasoningEffortMap: OMLX_REASONING_EFFORT_MAP,
+								}
+							: {}),
 					},
 				}),
 			);

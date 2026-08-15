@@ -2282,6 +2282,7 @@ export class ModelSelectorComponent extends Container {
 	#renderRoleThinkingMenu(choices: RoleThinkingChoices): void {
 		const { roles, levels, currentRoleIndex, selectedLevels } = choices;
 		const currentRole = roles[currentRoleIndex];
+		if (!currentRole) return;
 		const roleInfo = GJC_MODEL_ASSIGNMENT_TARGETS[currentRole];
 		const roleTag = roleInfo?.tag ?? currentRole.toUpperCase();
 		const level = selectedLevels[currentRoleIndex];
@@ -2340,24 +2341,33 @@ export class ModelSelectorComponent extends Container {
 				if (saved) void this.#applyRoleEffortSelection(item, saved.roles, saved.selectedLevels);
 				return;
 			}
-			this.#pendingRoleThinkingChoices = { ...choices, currentRoleIndex: currentRoleIndex + 1, selectedLevels };
+			const nextRoleIndex = roles.findIndex(
+				(_role, index) => index > currentRoleIndex && selectedLevels[index] === ThinkingLevel.Inherit,
+			);
+			const wrappedRoleIndex = roles.findIndex(
+				(_role, index) => index < currentRoleIndex && selectedLevels[index] === ThinkingLevel.Inherit,
+			);
+			const nextUnsetRoleIndex = nextRoleIndex >= 0 ? nextRoleIndex : wrappedRoleIndex;
+			if (nextUnsetRoleIndex < 0) return;
+			this.#selectedThinkingIndex = Math.max(0, levels.indexOf(selectedLevels[nextUnsetRoleIndex]));
+			this.#pendingRoleThinkingChoices = { ...choices, currentRoleIndex: nextUnsetRoleIndex, selectedLevels };
 			this.#updateList();
 			return;
 		}
 
 		// Navigate between roles
-		if (keyData === "\x1b\x1b[D" || keyData === "\x1bO D") {
+		if (matchesKey(keyData, "left")) {
 			// Left arrow: previous role
 			const prevIdx = currentRoleIndex === 0 ? roles.length - 1 : currentRoleIndex - 1;
-			this.#selectedThinkingIndex = 0;
+			this.#selectedThinkingIndex = Math.max(0, levels.indexOf(selectedLevels[prevIdx]));
 			this.#pendingRoleThinkingChoices = { ...choices, currentRoleIndex: prevIdx, selectedLevels };
 			this.#updateList();
 			return;
 		}
-		if (keyData === "\x1b\x1b[C" || keyData === "\x1bO C") {
+		if (matchesKey(keyData, "right")) {
 			// Right arrow: next role
 			const nextIdx = (currentRoleIndex + 1) % roles.length;
-			this.#selectedThinkingIndex = 0;
+			this.#selectedThinkingIndex = Math.max(0, levels.indexOf(selectedLevels[nextIdx]));
 			this.#pendingRoleThinkingChoices = { ...choices, currentRoleIndex: nextIdx, selectedLevels };
 			this.#updateList();
 			return;
@@ -2382,27 +2392,17 @@ export class ModelSelectorComponent extends Container {
 		for (let i = 0; i < roles.length; i++) {
 			const targetRole = roles[i];
 			const level = selectedLevels[i];
+			if (!targetRole || !level || level === ThinkingLevel.Inherit) continue;
 			const selectorValue = formatModelSelectorValue(item.selector, level);
 			this.#roles[targetRole] = { model: item.model, thinkingLevel: level };
-			if (this.#isTrackedSingleAssignment({ kind: "assignment", model: item.model, role: targetRole } as any)) {
-				await void this.#handleTrackedAssignment({
-					kind: "assignment",
-					model: item.model,
-					role: targetRole,
-					thinkingLevel: level,
-					selector: selectorValue,
-				} as any);
-			} else {
-				await Promise.resolve(
-					this.#onSelectCallback({
-						kind: "assignment",
-						model: item.model,
-						role: targetRole,
-						thinkingLevel: level,
-						selector: selectorValue,
-					} as any),
-				);
-			}
+			const selection: Extract<ModelSelectorSelection, { kind: "assignment" }> = {
+				kind: "assignment",
+				model: item.model,
+				role: targetRole,
+				thinkingLevel: level,
+				selector: selectorValue,
+			};
+			await this.#handleTrackedAssignment(selection);
 		}
 		this.#updateList();
 	}
@@ -2498,6 +2498,10 @@ export class ModelSelectorComponent extends Container {
 			if (this.#pendingRoleThinkingChoices.currentRoleIndex === -1) {
 				this.#pendingRoleThinkingChoices.currentRoleIndex = 0;
 			}
+			this.#selectedThinkingIndex = Math.max(
+				0,
+				levels.indexOf(selectedLevels[this.#pendingRoleThinkingChoices.currentRoleIndex]),
+			);
 			this.#updateList();
 			return;
 		}
