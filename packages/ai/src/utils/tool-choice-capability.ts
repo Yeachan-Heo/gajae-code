@@ -22,7 +22,6 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const EMPTY_CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 256;
 const REGISTRY_MAX_ENTRIES = 256;
-const CACHE_MUTATION_LOCK_WAIT_MS = 3_000;
 const CACHE_MUTATION_LOCK_STALE_MS = 5_000;
 
 let cachePathOverride: string | undefined;
@@ -102,23 +101,16 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 export function markToolChoiceIncapability(model: Model<Api>, maxSupport: ToolChoiceSupport, reason?: string): void {
 	const key = toolChoiceRegistryKey(model);
 	const releaseMutationLock = acquireCapabilityCacheMutationLock();
-	if (releaseMutationLock) {
-		try {
-			hydrateToolChoiceCapability(key);
-			const existing = registry.get(key);
-			const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
-			registry.set(key, next);
-			const persisted = persistToolChoiceCapability(key, next);
-			if (persisted) registry.set(key, persisted.support);
-			registryExpiresAt.set(key, (persisted?.observedAt ?? currentTime()) + CACHE_TTL_MS);
-		} finally {
-			releaseMutationLock();
-		}
-	} else {
+	try {
+		hydrateToolChoiceCapability(key);
 		const existing = registry.get(key);
 		const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
 		registry.set(key, next);
-		registryExpiresAt.set(key, currentTime() + CACHE_TTL_MS);
+		const persisted = persistToolChoiceCapability(key, next);
+		if (persisted) registry.set(key, persisted.support);
+		registryExpiresAt.set(key, (persisted?.observedAt ?? currentTime()) + CACHE_TTL_MS);
+	} finally {
+		releaseMutationLock?.();
 	}
 
 	if (!loggedRegistryKeys.has(key)) {
@@ -138,10 +130,9 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 	if (process.env.NODE_ENV === "test" && cachePathOverride === undefined) return;
 	const cachePath = cachePathOverride ?? getToolChoiceCapabilityCachePath();
 	const lockPath = `${cachePath}.mutation.lock`;
-	const deadline = Date.now() + CACHE_MUTATION_LOCK_WAIT_MS;
 	const sleeper = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 	const owner = `${process.pid}:${crypto.randomUUID()}`;
-	while (Date.now() < deadline) {
+	while (true) {
 		try {
 			fs.mkdirSync(path.dirname(cachePath), { recursive: true, mode: 0o700 });
 			const descriptor = fs.openSync(lockPath, "wx", 0o600);
@@ -160,15 +151,23 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 				const lockOwner = fs.readFileSync(lockPath, "utf8");
 				const ownerPid = Number(lockOwner.split(":", 1)[0]);
 				const ownerIsAlive = Number.isSafeInteger(ownerPid) && ownerPid > 0 && isProcessAlive(ownerPid);
-				if (!ownerIsAlive && Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS)
-					fs.rmSync(lockPath, { force: true });
+				const staleOwner =
+					!ownerIsAlive && Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS;
+				if (staleOwner) {
+					const reapingPath = `${lockPath}.${crypto.randomUUID()}.reaping`;
+					try {
+						fs.renameSync(lockPath, reapingPath);
+						fs.rmSync(reapingPath, { force: true });
+					} catch {
+						// Another waiter won the atomic takeover race.
+					}
+				}
 			} catch {
 				// The lock holder released the file while it was being inspected.
 			}
 			Atomics.wait(sleeper, 0, 0, 10);
 		}
 	}
-	return undefined;
 }
 
 function isProcessAlive(pid: number): boolean {
