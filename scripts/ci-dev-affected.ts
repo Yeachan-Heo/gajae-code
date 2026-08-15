@@ -60,6 +60,10 @@ const CODING_AGENT_SHARD_ONE_COVERAGE_PATHS = [
 // Declared here (before the top-level `await main()`) so it is initialized for
 // every CLI mode despite top-level await halting later module statements.
 const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-linux-x64"]);
+// Full Main CI tasks that run in named, fail-closed workflow jobs rather than
+// the generic matrix. They remain in planFullTasks() so the named job resolves
+// the exact canonical task through --task without duplicating its argv.
+const FULL_PLAN_STANDALONE_TASK_KEYS: ReadonlySet<string> = new Set(["acp-lifecycle-smoke"]);
 
 // Behavioral-owner tests cover entrypoint contracts whose names intentionally do
 // not follow the source-file basename convention. They supplement, rather than
@@ -435,6 +439,10 @@ export function describeTasks(tasks: readonly Task[]): TaskMatrixEntry[] {
 	}));
 }
 
+export function isFullPlanMatrixTask(task: Task): boolean {
+	return !isNativeProducerTask(task) && task.phase !== "python" && !FULL_PLAN_STANDALONE_TASK_KEYS.has(task.key);
+}
+
 // `--matrix-json` prints the planned tasks as a JSON array on stdout (consumed
 // by tests and for debugging). Under GitHub Actions it also appends the dev-ci
 // planner outputs: `matrix`, `has_tasks`, `has_native`, and the canonical Darwin
@@ -517,7 +525,7 @@ async function emitFullMatrix(): Promise<void> {
 	const githubOutput = process.env.GITHUB_OUTPUT;
 	if (!githubOutput) return;
 	const shards = tasks
-		.filter(task => !isNativeProducerTask(task) && task.phase !== "python")
+		.filter(isFullPlanMatrixTask)
 		.map(task => {
 			const entry = describeTasks([task])[0]!;
 			return { key: entry.key, identity: entry.identity, description: entry.description, native: entry.native, rust: entry.rust, nextest: entry.nextest };

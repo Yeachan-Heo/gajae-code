@@ -2,7 +2,7 @@ import { afterAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { BUN_TEST_IGNORE_OVERRIDES, DEDICATED_ONLY_TESTS, dedicatedTestCommand, describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isDedicatedOnlyTest, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
+import { BUN_TEST_IGNORE_OVERRIDES, DEDICATED_ONLY_TESTS, dedicatedTestCommand, describeTasks, expandWithDependents, isDarwinArm64TabWorkerSmokePath, isDedicatedOnlyTest, isFullPlanMatrixTask, isWindowsSessionPathRegressionPath, loadBuildInventory, needsDarwinArm64TabWorkerSmoke, needsWindowsSessionPathRegression, normalizeChangedPaths, packageScriptCommand, planFullTasks, planTargetedTasks, planTasks, requiresCargoWorkspaceEmergency, resolvePackageCwd, runCommand, validateAffectedAggregate, type AffectedAggregateResults, type CargoInventoryUnit, type WorkspacePackage } from "./ci-dev-affected";
 import {
 	runSdkProductionHostIsolated,
 	sdkProductionHostIsolatedSuites,
@@ -1921,11 +1921,13 @@ describe("dedicated-only tests — routing contract", () => {
 		]);
 	});
 
-	test("the Main CI full plan schedules the dedicated-only suite exactly once", () => {
+	test("the Main CI full plan exposes the dedicated suite only to its named job", () => {
 		const tasks = planFullTasks(packages);
 		const dedicated = tasks.filter(task => task.key === "acp-lifecycle-smoke");
 		expect(dedicated).toHaveLength(1);
 		expect(dedicated[0]?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
+		expect(dedicated[0] && isFullPlanMatrixTask(dedicated[0])).toBe(false);
+		expect(tasks.some(task => isFullPlanMatrixTask(task))).toBe(true);
 		expect(tasks.filter(task => task.key === DEDICATED_TASK_KEY)).toHaveLength(0);
 	});
 

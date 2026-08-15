@@ -35,6 +35,8 @@ setDefaultTimeout(180_000);
 const REPO_ROOT = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const FIXTURE_AGENT = path.join(REPO_ROOT, "packages/coding-agent/scripts/acp-conformance-agent.ts");
 const REQUEST_TIMEOUT_MS = 120_000;
+const DISPOSE_REQUEST_TIMEOUT_MS = 5_000;
+const DISPOSE_EXIT_GRACE_MS = 2_000;
 /** Enough fixture stderr to diagnose a startup or broker failure, not enough to flood CI logs. */
 const STDERR_TAIL_LIMIT = 4_000;
 /**
@@ -118,8 +120,8 @@ class AcpStdioClient {
 	#terminalError: Error | undefined;
 	#terminated = false;
 
-	constructor(cwd: string) {
-		this.#child = Bun.spawn(["bun", FIXTURE_AGENT], {
+	constructor(cwd: string, command: readonly string[] = ["bun", FIXTURE_AGENT]) {
+		this.#child = Bun.spawn([...command], {
 			cwd: REPO_ROOT,
 			env: { ...process.env, GJC_ACP_CONFORMANCE_CWD: cwd },
 			stdin: "pipe",
@@ -211,7 +213,7 @@ class AcpStdioClient {
 	}
 
 	/** Resolves the RPC result, or throws with the peer's error attached. */
-	async call(method: string, params: unknown): Promise<unknown> {
+	async call(method: string, params: unknown, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<unknown> {
 		if (this.#terminalError) throw this.#terminalError;
 
 		const id = ++this.#nextId;
@@ -230,8 +232,9 @@ class AcpStdioClient {
 			throw cause;
 		}
 
-		const timeout = Bun.sleep(REQUEST_TIMEOUT_MS).then<RpcFrame>(() => {
-			throw this.#describe(`ACP request timed out after ${REQUEST_TIMEOUT_MS}ms: ${method}`);
+		const timeout = Bun.sleep(timeoutMs).then<RpcFrame>(() => {
+			this.#pending.delete(id);
+			throw this.#describe(`ACP request timed out after ${timeoutMs}ms: ${method}`);
 		});
 		const frame = await Promise.race([promise, timeout]);
 		if (frame.error) throw new AcpPeerRejection(method, frame.error);
@@ -247,15 +250,26 @@ class AcpStdioClient {
 	 * real one.
 	 */
 	async dispose(): Promise<void> {
-		for (const sessionId of this.#opened) {
-			try {
-				await this.call("session/close", { sessionId });
-			} catch {
-				// Already closed, already gone, or the transport is down; the kill below covers it.
-			}
-		}
+		await Promise.all(
+			[...this.#opened].map(async sessionId => {
+				try {
+					await this.call("session/close", { sessionId }, DISPOSE_REQUEST_TIMEOUT_MS);
+				} catch {
+					// Already closed, already gone, timed out, or the transport is down; the kill below covers it.
+				}
+			}),
+		);
+
+		let exited = false;
+		const exit = this.#child.exited.then(() => {
+			exited = true;
+		});
 		this.#child.kill("SIGTERM");
-		await this.#child.exited;
+		await Promise.race([exit, Bun.sleep(DISPOSE_EXIT_GRACE_MS)]);
+		if (!exited) {
+			this.#child.kill("SIGKILL");
+			await exit;
+		}
 	}
 }
 
@@ -469,4 +483,36 @@ test("session/close is idempotent when repeated on the same session", () => {
 
 test("the lifecycle sequence streams session updates", () => {
 	expect(observed.notifications).toContain("session/update");
+});
+
+test("request timeout teardown force-kills a fixture that ignores termination", async () => {
+	const cwd = await makeScratch();
+	const fixture = path.join(cwd, "hung-acp-fixture.ts");
+	await Bun.write(
+		fixture,
+		[
+			'process.on("SIGTERM", () => undefined);',
+			'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "fixture/ready" }) + "\\n");',
+			"await new Promise<void>(() => undefined);",
+		].join("\n"),
+	);
+	const client = new AcpStdioClient(cwd, ["bun", fixture]);
+	let disposed = false;
+
+	try {
+		for (let attempt = 0; attempt < 200 && !client.notifications.includes("fixture/ready"); attempt++) {
+			await Bun.sleep(10);
+		}
+		expect(client.notifications).toContain("fixture/ready");
+		await expect(client.call("initialize", {}, 50)).rejects.toThrow("ACP request timed out after 50ms");
+
+		const disposeStarted = performance.now();
+		await client.dispose();
+		disposed = true;
+		const disposeElapsed = performance.now() - disposeStarted;
+		expect(disposeElapsed).toBeGreaterThanOrEqual(DISPOSE_EXIT_GRACE_MS - 100);
+		expect(disposeElapsed).toBeLessThan(DISPOSE_EXIT_GRACE_MS + 2_000);
+	} finally {
+		if (!disposed) await client.dispose();
+	}
 });
