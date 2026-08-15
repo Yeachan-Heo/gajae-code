@@ -1916,7 +1916,63 @@ function cursorNativeToolName(kindKey: string): string {
 // do not otherwise handle (everything except mcpToolCall / updateTodosToolCall), so
 // without this they are silently dropped and never render. Build a generic toolCall
 // block from whichever *ToolCall field is set so the call (and its result) is shown.
-function buildNativeToolCallBlock(
+
+/** Hard node budget for one native-payload conversion; bounds hostile or cyclic graphs. */
+const CURSOR_JSON_SAFE_MAX_NODES = 10_000;
+
+/**
+ * Total conversion of a Cursor protobuf payload into plain JSON-safe data.
+ *
+ * protobuf-es v2 messages are plain objects, but they carry `$typeName`
+ * markers, `bigint` fields (e.g. `fileSize`, `durationMs`, `timestampMs`,
+ * `fileOutputThresholdBytes`), and `Uint8Array` blobs. None of those may leak
+ * into assistant message content: toolCall `arguments` are staged into managed
+ * snapshots, persisted to the JSONL transcript, and replayed to providers —
+ * all of which require `JSON.stringify`-safe values. Attaching the raw payload
+ * is exactly the local-snapshot producer defect class behind issue #4578.
+ *
+ * Rules: `$typeName` is stripped, safe-range bigints become numbers (decimal
+ * strings beyond `Number.MAX_SAFE_INTEGER`), byte arrays become base64
+ * strings, dates become ISO strings, functions/symbols are dropped, cycles
+ * collapse to null, and everything past the node budget is truncated to null.
+ */
+function cursorJsonSafeValue(value: unknown, path?: Set<object>, budget?: { remaining: number }): unknown {
+	const seen = path ?? new Set<object>();
+	const nodes = budget ?? { remaining: CURSOR_JSON_SAFE_MAX_NODES };
+	if (nodes.remaining-- <= 0) return null;
+	if (typeof value === "bigint") {
+		return value <= BigInt(Number.MAX_SAFE_INTEGER) && value >= BigInt(-Number.MAX_SAFE_INTEGER)
+			? Number(value)
+			: value.toString();
+	}
+	if (typeof value === "function" || typeof value === "symbol" || value === undefined) return null;
+	if (value === null || typeof value !== "object") return value;
+	if (seen.has(value)) return null;
+	if (value instanceof Uint8Array)
+		return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("base64");
+	if (value instanceof Date) return value.toISOString();
+	seen.add(value);
+	try {
+		if (Array.isArray(value)) {
+			return value.map(entry => cursorJsonSafeValue(entry, seen, nodes));
+		}
+		const record: Record<string, unknown> = {};
+		for (const [key, entry] of Object.entries(value)) {
+			if (key === "$typeName") continue;
+			record[key] = cursorJsonSafeValue(entry, seen, nodes);
+		}
+		return record;
+	} finally {
+		seen.delete(value);
+	}
+}
+
+/** Exported for direct regression coverage of the JSON-safety boundary. */
+export function cursorJsonSafeValueForTest(value: unknown): unknown {
+	return cursorJsonSafeValue(value);
+}
+
+export function buildNativeToolCallBlock(
 	toolCall: Record<string, unknown>,
 	callId: string,
 	index: number,
@@ -1925,11 +1981,15 @@ function buildNativeToolCallBlock(
 		if (!/ToolCall$/.test(key) || !payload || typeof payload !== "object") continue;
 		if (key === "mcpToolCall" || key === "updateTodosToolCall") continue;
 		const args = (payload as { args?: unknown }).args;
+		const safeArguments =
+			args && typeof args === "object"
+				? (cursorJsonSafeValue(args) as Record<string, unknown>)
+				: { raw: cursorJsonSafeValue(payload) };
 		return {
 			type: "toolCall",
 			id: callId,
 			name: cursorNativeToolName(key),
-			arguments: args && typeof args === "object" ? (args as Record<string, unknown>) : { raw: payload },
+			arguments: safeArguments,
 			index,
 			kind: "native",
 		};

@@ -1847,6 +1847,94 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		expect(deltas[0]).toMatchObject({ type: "text_delta", delta: "x" });
 	});
 
+	it("repairs payload-class messages and events whose fields live on the prototype", async () => {
+		// A provider payload class keeps its fields as prototype getters:
+		// `message.role === "assistant"` reads fine live, but `structuredClone`
+		// copies only own enumerable properties, so the detached snapshot loses
+		// every field. Before the repair this failed the whole managed run as a
+		// deterministic `shell.role` local snapshot error (issue #4578 class).
+		const mock = createMockModel();
+		const base = assistantMessage(mock.model);
+		base.content.push({ type: "text", text: "prototype accepted" });
+		class PayloadClassAssistantMessage {
+			get role(): "assistant" {
+				return "assistant";
+			}
+			get content(): AssistantMessage["content"] {
+				return base.content;
+			}
+			get api(): AssistantMessage["api"] {
+				return base.api;
+			}
+			get provider(): string {
+				return base.provider;
+			}
+			get model(): string {
+				return base.model;
+			}
+			get usage(): AssistantMessage["usage"] {
+				return base.usage;
+			}
+			get stopReason(): AssistantMessage["stopReason"] {
+				return base.stopReason;
+			}
+			get timestamp(): number {
+				return base.timestamp;
+			}
+		}
+		const partial = new PayloadClassAssistantMessage() as unknown as AssistantMessage;
+		class PayloadClassTextEndEvent {
+			get type(): "text_end" {
+				return "text_end";
+			}
+			get contentIndex(): number {
+				return 0;
+			}
+			get content(): string {
+				return "prototype accepted";
+			}
+			get partial(): AssistantMessage {
+				return partial;
+			}
+		}
+		const eventTypes: string[] = [];
+		let terminalAssistant: AssistantMessage | undefined;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial });
+					stream.push({ type: "text_start", contentIndex: 0, partial });
+					stream.push(new PayloadClassTextEndEvent() as unknown as AssistantMessageEvent);
+					stream.push({ type: "done", reason: "stop", message: partial });
+				});
+				return stream;
+			},
+		});
+		agent.subscribe(event => {
+			eventTypes.push(event.type);
+			if (event.type === "agent_end") {
+				terminalAssistant = event.messages.findLast(
+					(candidate): candidate is AssistantMessage => candidate.role === "assistant",
+				);
+			}
+		});
+		await agent.prompt("run", { fallbackManaged: true });
+		expect(agent.state.error).toBeUndefined();
+		expectManagedRunStart(eventTypes);
+		expect(terminalAssistant).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "prototype accepted" }],
+			stopReason: "stop",
+		});
+		// The repaired shell must be fully detached and JSON-serializable.
+		expect(JSON.parse(JSON.stringify(terminalAssistant))).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "prototype accepted" }],
+		});
+	});
+
 	it("normalizes malformed terminal and unknown-typed events at the staged snapshot boundary", () => {
 		// Terminal done/error events are consumed by streamAssistantResponse
 		// before the staged-event callback fires, so the normalization contract
@@ -1922,8 +2010,16 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		expect(agent.state.error).toBeDefined();
 	});
 
-	it("keeps hostile getOwnPropertyDescriptor-trap events failing fast", async () => {
+	it("repairs descriptor-trap proxy events whose guarded gets stay readable", async () => {
+		// A proxy whose only hostility is a throwing getOwnPropertyDescriptor
+		// trap defeats structuredClone (and the pre-repair `{ ...event }`
+		// spread), but its [[Get]]s deliver a well-formed event. The root
+		// repair reads it through guarded gets, so the run completes instead
+		// of failing as a deterministic local snapshot error. Truly unreadable
+		// proxies (throwing get traps) stay fail-closed — see the
+		// collapsed-root-proxy test above.
 		const mock = createMockModel();
+		const callbacks: AssistantMessageEvent[] = [];
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 			streamFn: () => {
@@ -1942,17 +2038,13 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 				});
 				return stream;
 			},
+			onAssistantMessageEvent: (_message, event) => callbacks.push(event),
 		});
-		let outcomes = 0;
-		await agent.prompt("run", {
-			fallbackManaged: true,
-			onManagedAttemptOutcome: () => {
-				outcomes += 1;
-				return { type: "retry", continuation: () => {} };
-			},
-		});
-		expect(outcomes).toBe(0);
-		expect(agent.state.error).toBeDefined();
+		await agent.prompt("run", { fallbackManaged: true });
+		expect(agent.state.error).toBeUndefined();
+		const deltas = callbacks.filter(event => event.type === "text_delta");
+		expect(deltas).toHaveLength(1);
+		expect(deltas[0]).toMatchObject({ type: "text_delta", delta: "x" });
 	});
 
 	it("keeps non-string event types failing fast as malformed provider output", async () => {

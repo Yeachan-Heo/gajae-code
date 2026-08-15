@@ -923,13 +923,20 @@ function losslessDetachedClone<T>(value: T): T {
  */
 function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]): AssistantMessage {
 	const detailed = managedAttemptSnapshotDetailed(value);
-	const source = isManagedPlainRecord(detailed.snapshot) ? detailed.snapshot : value;
-	// A root that could not be snapshotted into a plain record is a live
-	// Proxy (the sanitizer collapses proxies to a placeholder). Benign
-	// proxy-wrapped provider messages are repaired by reading through the
-	// proxy — the provider's own view — with every read guarded so a hostile
-	// trap can only degrade to undefined, never escape. `managedProperty`
-	// is exactly that guarded read.
+	const snapshotRecord = isManagedPlainRecord(detailed.snapshot) ? detailed.snapshot : undefined;
+	// Two benign root degradations are repaired by reading through the
+	// original object — the provider's own view — with every read guarded so
+	// a hostile trap can only degrade to undefined, never escape
+	// (`managedProperty` is exactly that guarded read):
+	// - a root that could not be snapshotted into a plain record is a live
+	//   Proxy (the sanitizer collapses proxies to a placeholder);
+	// - a plain-record snapshot that lost `role: "assistant"` came from a
+	//   payload class whose fields live on its prototype: `structuredClone`
+	//   copies only own enumerable properties, so the caller's live
+	//   `message.role === "assistant"` check passes while the detached
+	//   snapshot retains none of the message identity.
+	const source =
+		snapshotRecord !== undefined && managedProperty(snapshotRecord, "role") === "assistant" ? snapshotRecord : value;
 	if (managedProperty(source, "role") !== "assistant") throw new ManagedAttemptSnapshotError("shell.role");
 	const rawContent = managedAttemptSnapshot(managedProperty(source, "content"));
 	// Benign providers occasionally deliver a string or missing content value.
@@ -1071,10 +1078,22 @@ export function managedAssistantEventSnapshot(
 	event: AssistantMessageEvent,
 	message: AssistantMessage,
 ): AssistantMessageEvent {
-	const snapshot = managedAttemptSnapshot(event);
-	if (!isManagedPlainRecord(snapshot)) throw new ManagedAttemptSnapshotError("event.snapshot");
-	const type = managedProperty(snapshot, "type");
-	const contentIndex = managedProperty(snapshot, "contentIndex");
+	const detached = managedAttemptSnapshot(event);
+	const record = isManagedPlainRecord(detached) ? detached : undefined;
+	// Root repair, mirroring the shell: two benign degradations are re-read
+	// through the original event with guarded reads (`managedProperty`) —
+	// - a proxy root (structuredClone rejects proxies; the sanitizer collapses
+	//   them to a placeholder) whose gets are readable, and
+	// - a payload class whose event fields live on prototype getters
+	//   (`structuredClone` copies only own enumerable properties).
+	// A hostile trap or throwing getter can only degrade a field to undefined,
+	// which keeps the named fail-fast diagnostics below; a root that is
+	// neither snapshottable nor readable as an event keeps the dedicated root
+	// diagnostic.
+	const source: unknown = record !== undefined && typeof managedProperty(record, "type") === "string" ? record : event;
+	const type = managedProperty(source, "type");
+	if (record === undefined && typeof type !== "string") throw new ManagedAttemptSnapshotError("event.snapshot");
+	const contentIndex = managedProperty(source, "contentIndex");
 	const indexed = () => {
 		if (!Number.isInteger(contentIndex) || (contentIndex as number) < 0) {
 			throw new ManagedAttemptSnapshotError("event.contentIndex");
@@ -1095,29 +1114,29 @@ export function managedAssistantEventSnapshot(
 		type === "reasoning_summary_delta" ||
 		type === "toolcall_delta"
 	) {
-		const delta = managedProperty(snapshot, "delta");
+		const delta = managedProperty(source, "delta");
 		if (typeof delta !== "string") throw new ManagedAttemptSnapshotError("event.delta");
 		return { type, contentIndex: indexed(), delta, partial: message };
 	}
 	if (type === "text_end" || type === "thinking_end" || type === "reasoning_summary_end") {
-		const content = managedProperty(snapshot, "content");
+		const content = managedProperty(source, "content");
 		if (typeof content !== "string") throw new ManagedAttemptSnapshotError("event.content");
 		return { type, contentIndex: indexed(), content, partial: message };
 	}
 	if (type === "toolcall_end") {
-		const toolCall = managedAssistantContent(managedProperty(snapshot, "toolCall"));
+		const toolCall = managedAssistantContent(managedAttemptSnapshot(managedProperty(source, "toolCall")));
 		if (toolCall?.type !== "toolCall") throw new ManagedAttemptSnapshotError("event.toolcall");
 		return { type, contentIndex: indexed(), toolCall, partial: message };
 	}
 	if (type === "done") {
-		const reason = managedProperty(snapshot, "reason");
+		const reason = managedProperty(source, "reason");
 		// Degrade out-of-vocabulary done reasons to "stop", matching the closed
 		// StopReason vocabulary already normalized by managedAssistantShell.
 		const normalized = reason === "stop" || reason === "length" || reason === "toolUse" ? reason : "stop";
 		return { type, reason: normalized, message };
 	}
 	if (type === "error") {
-		const reason = managedProperty(snapshot, "reason");
+		const reason = managedProperty(source, "reason");
 		const normalized = reason === "aborted" || reason === "error" ? reason : "error";
 		return { type, reason: normalized, error: message };
 	}
@@ -2978,7 +2997,16 @@ async function streamAssistantResponse(
 								partialMessage = config.fallbackManaged
 									? managedAssistantShell(event.partial, config.model)
 									: event.partial;
-								const partialEvent = config.fallbackManaged ? { ...event, partial: partialMessage } : event;
+								// Normalize through the managed event snapshot instead of a
+								// naive `{ ...event }` spread: spreading copies only own
+								// enumerable properties, so a payload-class event carrying its
+								// fields on prototype getters would lose `type`/`delta` here and
+								// deterministically fail the whole run as `event.unknownType`
+								// downstream. The snapshot repairs benign class/prototype shapes
+								// and keeps the named fail-fast diagnostics for hostile ones.
+								const partialEvent = config.fallbackManaged
+									? managedAssistantEventSnapshot(event, partialMessage)
+									: event;
 								context.messages[context.messages.length - 1] = partialMessage;
 								if (provisionalToolTransaction) {
 									config.onProvisionalAssistantMessageEvent?.(partialMessage, partialEvent);
