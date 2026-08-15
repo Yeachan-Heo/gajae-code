@@ -1481,6 +1481,131 @@ function getAnthropicCompat(
 
 const PROVIDER_MAX_RETRIES = 3;
 const PROVIDER_BASE_DELAY_MS = 2000;
+const ANTHROPIC_CUSTOM_ENDPOINT_FIRST_EVENT_GRACE_MS = 120_000;
+const ANTHROPIC_LARGE_REQUEST_BYTES = 1_000_000;
+const ANTHROPIC_LARGE_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS = 1;
+const ANTHROPIC_SMALL_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS = 2;
+
+function classifyAnthropicEndpoint(baseUrl: string): "canonical" | "custom" {
+	try {
+		const url = new URL(baseUrl);
+		return url.protocol.toLowerCase() === "https:" &&
+			url.hostname.toLowerCase() === "api.anthropic.com" &&
+			(url.port === "" || url.port === "443") &&
+			url.username === "" &&
+			url.password === "" &&
+			url.search === "" &&
+			url.hash === "" &&
+			(url.pathname === "" || url.pathname === "/")
+			? "canonical"
+			: "custom";
+	} catch {
+		return "custom";
+	}
+}
+
+function resolveAnthropicFirstEventWatchdogMs(
+	firstEventTimeoutMs: number | undefined,
+	endpointClass: "canonical" | "custom",
+	requestBytes: number,
+): number | undefined {
+	if (
+		firstEventTimeoutMs === undefined ||
+		firstEventTimeoutMs <= 0 ||
+		endpointClass === "canonical" ||
+		requestBytes < ANTHROPIC_LARGE_REQUEST_BYTES
+	) {
+		return firstEventTimeoutMs;
+	}
+	return firstEventTimeoutMs + ANTHROPIC_CUSTOM_ENDPOINT_FIRST_EVENT_GRACE_MS;
+}
+
+function resolveAnthropicFirstEventTimeoutMaxAttempts(requestBytes: number): number {
+	return requestBytes >= ANTHROPIC_LARGE_REQUEST_BYTES
+		? ANTHROPIC_LARGE_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS
+		: ANTHROPIC_SMALL_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS;
+}
+
+function normalizeStreamFailure(error: unknown): unknown {
+	if (error instanceof Error) return error;
+	if (error !== null && typeof error === "object") {
+		// Structured rejections (e.g. `{ status, error, headers }` from an SDK or
+		// injected client) carry transport metadata downstream classification
+		// reads; wrap them in a mutable Error but copy every enumerable own
+		// property so status/provider-code/header extraction still works.
+		let message: string;
+		try {
+			message = JSON.stringify(error) || String(error);
+		} catch {
+			message = String(error);
+		}
+		const wrapper = new Error(message);
+		Object.assign(wrapper, error as object);
+		return wrapper;
+	}
+	// Primitive rejections (string/number/boolean/null/undefined): wrap with the
+	// same string form downstream matchers already use (String(error)).
+	return new Error(String(error));
+}
+
+function attachAnthropicGraceFailureFacts(
+	error: unknown,
+	args: {
+		elapsedMs: number;
+		requestBytes: number;
+		firstEventTimeoutMs: number | undefined;
+		endpointClass: "canonical" | "custom";
+		awaitingFirstEvent: boolean;
+	},
+): void {
+	if (
+		!(error instanceof Error) ||
+		!args.awaitingFirstEvent ||
+		args.firstEventTimeoutMs === undefined ||
+		args.firstEventTimeoutMs <= 0 ||
+		args.elapsedMs < args.firstEventTimeoutMs ||
+		args.endpointClass !== "custom" ||
+		args.requestBytes < ANTHROPIC_LARGE_REQUEST_BYTES
+	) {
+		return;
+	}
+	Object.assign(error, {
+		requestBytes: args.requestBytes,
+		firstEventElapsedMs: args.elapsedMs,
+		firstEventTimeoutMs: args.firstEventTimeoutMs,
+		endpointClass: args.endpointClass,
+		retryMaxAttempts: ANTHROPIC_LARGE_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS,
+	});
+}
+
+function createAnthropicFirstEventTimeoutError(args: {
+	elapsedMs: number;
+	requestBytes: number;
+	firstEventTimeoutMs: number | undefined;
+	endpointClass: "canonical" | "custom";
+	/** Uploads this provider invocation already consumed before the timeout. */
+	providerAttemptsConsumed?: number;
+}): FirstEventTimeoutError {
+	const totalCeiling = resolveAnthropicFirstEventTimeoutMaxAttempts(args.requestBytes);
+	// The session counts a whole provider invocation as one attempt, so the
+	// ceiling handed up must bound TOTAL uploads across the invocation: subtract
+	// the provider replays already spent inside this invocation. A small request
+	// whose first upload 529'd and whose replay then timed out has already
+	// consumed two uploads; reporting the full two-attempt ceiling would let the
+	// session upload a third time.
+	const retryMaxAttempts = Math.max(1, totalCeiling - (args.providerAttemptsConsumed ?? 0));
+	const timeoutLabel = args.firstEventTimeoutMs === undefined ? "disabled" : `${args.firstEventTimeoutMs}ms`;
+	return new FirstEventTimeoutError(
+		`Anthropic stream timed out while waiting for the first event (elapsed=${args.elapsedMs}ms request_bytes=${args.requestBytes} endpoint=${args.endpointClass} configured_timeout=${timeoutLabel}; override with PI_STREAM_FIRST_EVENT_TIMEOUT_MS)`,
+		{
+			requestBytes: args.requestBytes,
+			firstEventElapsedMs: args.elapsedMs,
+			firstEventTimeoutMs: args.firstEventTimeoutMs,
+			endpointClass: args.endpointClass,
+			retryMaxAttempts,
+		},
+	);
+}
 
 /**
  * Check if an error from the Anthropic SDK is a rate-limit/transient error that
@@ -1943,26 +2068,49 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const firstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(model.provider);
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs, firstEventFallbackMs);
+			const endpointClass = classifyAnthropicEndpoint(options?.client?.baseURL ?? baseUrl);
 			stream.push({ type: "start", partial: output });
 			// Retry loop for transient errors from the stream.
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
 			// Malformed envelopes/JSON: only before replay-unsafe text/tool events are visible on this stream.
 			let providerRetryAttempt = 0;
+			// Total uploads this invocation has spent, including corrective-policy
+			// replays (strict-tool/forced-tool/fast-mode/thinking/CPA) that reset
+			// providerRetryAttempt before `continue`. The timeout ceiling must bound
+			// TOTAL uploads, so it reads this counter, not the resettable one.
+			let providerUploadCount = 0;
 			while (true) {
+				let firstEventWaitStartedAt: number | undefined;
+				const requestBytes = fingerprintAnthropicPayload(params).bytes;
+				const firstEventWatchdogMs = resolveAnthropicFirstEventWatchdogMs(
+					firstEventTimeoutMs,
+					endpointClass,
+					requestBytes,
+				);
+				const requestUploadCeilingBound =
+					endpointClass === "custom" &&
+					requestBytes >= ANTHROPIC_LARGE_REQUEST_BYTES &&
+					firstEventTimeoutMs !== undefined &&
+					firstEventTimeoutMs > 0;
 				// Retries reset output.content; drop stale block correlations from the aborted attempt.
 				blocksByAnthropicIndex.clear();
 				truncatedToolCalls.clear();
 				sawTerminalStopReason = false;
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
-				const firstEventTimeoutAbortError = new FirstEventTimeoutError(
-					"Anthropic stream timed out while waiting for the first event",
-				);
+				let firstEventTimeoutAbortError: FirstEventTimeoutError | undefined;
 				const idleTimeoutAbortError = new Error("Anthropic stream stalled while waiting for the next event");
 				const { requestSignal } = activeAbortTracker;
 				setRawRequestDump(params);
-				const anthropicRequest = client.messages.create({ ...params, stream: true }, { signal: requestSignal });
+				const anthropicRequest = client.messages.create(
+					{ ...params, stream: true },
+					{
+						signal: requestSignal,
+						...(requestUploadCeilingBound ? { maxRetries: 0 } : {}),
+					},
+				);
 				let streamedReplayUnsafeContent = false;
 				let sawProviderSafetyStop = false;
+				let sawFirstSemanticEvent = false;
 
 				try {
 					const {
@@ -1975,6 +2123,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						options?.client ? event => options?.onSseEvent?.(event, model, options?.attemptScope) : undefined,
 					);
 					await notifyProviderResponse(options, response, model, requestId);
+					firstEventWaitStartedAt = Date.now();
 					let sawEvent = false;
 					let sawMessageStart = false;
 					let sawTerminalEnvelope = false;
@@ -1983,13 +2132,27 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 
 					for await (const event of iterateWithIdleTimeout(anthropicStream, {
 						idleTimeoutMs,
-						firstItemTimeoutMs: firstEventTimeoutMs,
+						firstItemTimeoutMs: firstEventWatchdogMs,
 						errorMessage: idleTimeoutAbortError.message,
-						firstItemErrorMessage: firstEventTimeoutAbortError.message,
+						firstItemErrorMessage: "Anthropic stream timed out while waiting for the first event",
 						onIdle: () => activeAbortTracker.abortLocally(idleTimeoutAbortError),
-						onFirstItemTimeout: () => activeAbortTracker.abortLocally(firstEventTimeoutAbortError),
+						onFirstItemTimeout: () => {
+							firstEventTimeoutAbortError = createAnthropicFirstEventTimeoutError({
+								elapsedMs: Date.now() - (firstEventWaitStartedAt ?? Date.now()),
+								requestBytes,
+								firstEventTimeoutMs,
+								endpointClass,
+								providerAttemptsConsumed: providerUploadCount,
+							});
+							activeAbortTracker.abortLocally(firstEventTimeoutAbortError);
+						},
 						abortSignal: options?.signal,
-						isProgressItem: isProgressEvent,
+						isProgressItem: event => {
+							if (!isRecord(event) || (!sawMessageStart && event.type !== "message_start")) return false;
+							const progress = isProgressEvent(event);
+							if (progress) sawFirstSemanticEvent = true;
+							return progress;
+						},
 					})) {
 						sawEvent = true;
 						if (sawMessageStop) {
@@ -2302,8 +2465,41 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					break;
 				} catch (streamError) {
 					const localAbortReason = activeAbortTracker.getLocalAbortReason();
-					const streamFailure = localAbortReason ?? streamError;
+					// Normalize unknown rejections (a primitive string from an injected
+					// custom client is a supported surface) to a mutable Error. Boxed
+					// primitives silently discard every fact stamped below, which let
+					// a ceiling-bound upload slip past the one-attempt ceiling and
+					// string-matched corrective branches re-upload the body.
+					const streamFailure = localAbortReason ?? normalizeStreamFailure(streamError);
+					attachAnthropicGraceFailureFacts(streamFailure, {
+						elapsedMs: Date.now() - (firstEventWaitStartedAt ?? Date.now()),
+						requestBytes,
+						firstEventTimeoutMs,
+						endpointClass,
+						awaitingFirstEvent: !sawFirstSemanticEvent,
+					});
+					// A ceiling-bound upload failed before stream iteration began (for
+					// example an immediate 529 from withResponse()): the grace clock
+					// never started, so the facts above cannot apply, but the one-attempt
+					// upload ceiling must still bound the outer provider retry loop.
+					// Otherwise the multi-megabyte body is re-uploaded up to the default
+					// streamMaxRetries budget despite the ceiling. Once iteration has
+					// begun, only the grace-clock path above decides.
+					if (requestUploadCeilingBound && firstEventWaitStartedAt === undefined) {
+						Object.assign(streamFailure as Error, {
+							requestBytes,
+							endpointClass,
+							retryMaxAttempts: ANTHROPIC_LARGE_FIRST_EVENT_TIMEOUT_MAX_ATTEMPTS,
+						});
+					}
+					const firstEventRetryMaxAttempts =
+						typeof (streamFailure as { retryMaxAttempts?: unknown }).retryMaxAttempts === "number"
+							? (streamFailure as { retryMaxAttempts: number }).retryMaxAttempts
+							: undefined;
 					if (localAbortReason || sawProviderSafetyStop) {
+						throw streamFailure;
+					}
+					if (firstEventRetryMaxAttempts !== undefined && providerRetryAttempt + 1 >= firstEventRetryMaxAttempts) {
 						throw streamFailure;
 					}
 					if (
@@ -2320,6 +2516,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						disableStrictTools = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
+						providerUploadCount++;
 						resetOutputForRetry();
 						continue;
 					}
@@ -2349,6 +2546,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						droppedForcedToolChoice = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
+						providerUploadCount++;
 						resetOutputForRetry();
 						continue;
 					}
@@ -2426,6 +2624,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							}
 						}
 						params = candidate.params;
+						// The corrective replay uploads the repaired body: count it so the
+						// first-event timeout ceiling bounds TOTAL uploads (issue #4464).
+						providerUploadCount++;
 						// The provider retry budget is deliberately NOT reset here: a repair that
 						// keeps being rejected must run out instead of renewing the budget it is
 						// supposed to consume (issue #4011).
@@ -2506,6 +2707,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						dropFastMode = true;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
+						providerUploadCount++;
 						resetOutputForRetry();
 						continue;
 					}
@@ -2534,6 +2736,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						generatedCacheBudget = nextBudget;
 						params = await prepareParams();
 						providerRetryAttempt = 0;
+						providerUploadCount++;
 						resetOutputForRetry();
 						continue;
 					}
@@ -2598,6 +2801,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							// out instead of renewing the budget it is supposed to consume
 							// (issue #4011), and the recurrence branch below terminalizes
 							// before the generic 5xx retry can re-send the unchanged request.
+							// This corrective replay uploads the steered body: count it so the
+							// first-event timeout ceiling bounds TOTAL uploads (issue #4464).
+							providerUploadCount++;
 							resetOutputForRetry();
 							continue;
 						}
@@ -2613,12 +2819,15 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						firstTokenTime === undefined && isProviderRetryableError(streamFailure, model.provider);
 					if (
 						activeAbortTracker.wasCallerAbort() ||
+						(firstEventRetryMaxAttempts !== undefined &&
+							providerRetryAttempt + 1 >= firstEventRetryMaxAttempts) ||
 						providerRetryAttempt >= resolveRetryBudget(options?.streamMaxRetries, PROVIDER_MAX_RETRIES) ||
 						(!canRetryTransientEnvelopeFailure && !canRetryProviderFailure)
 					) {
 						throw streamFailure;
 					}
 					providerRetryAttempt++;
+					providerUploadCount++;
 					const delayMs = PROVIDER_BASE_DELAY_MS * 2 ** (providerRetryAttempt - 1);
 					if (options?.providerRetryWait) {
 						await options.providerRetryWait(delayMs, options.signal);

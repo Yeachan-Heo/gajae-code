@@ -10,6 +10,7 @@ async function waitForTimerRegistration(): Promise<void> {
 describe("iterateWithIdleTimeout transport facts", () => {
 	afterEach(() => {
 		vi.useRealTimers();
+		vi.restoreAllMocks();
 	});
 
 	it("normalizes the typed first-event timeout fact idempotently", () => {
@@ -24,6 +25,32 @@ describe("iterateWithIdleTimeout transport facts", () => {
 			anthropicErrorType: undefined,
 			openaiErrorCode: undefined,
 			headers: undefined,
+		});
+		expect(transportFailureFacts(facts)).toEqual(facts);
+	});
+
+	it("retains statusless first-event retry ceiling facts idempotently", () => {
+		const error = Object.assign(new Error("socket hang up"), {
+			requestBytes: 1_750_732,
+			firstEventElapsedMs: 300_001,
+			firstEventTimeoutMs: 300_000,
+			endpointClass: "custom" as const,
+			retryMaxAttempts: 1,
+		});
+		const facts = transportFailureFacts(error);
+
+		expect(facts).toEqual({
+			kind: "transport",
+			status: undefined,
+			providerCode: undefined,
+			anthropicErrorType: undefined,
+			openaiErrorCode: undefined,
+			headers: undefined,
+			requestBytes: 1_750_732,
+			firstEventElapsedMs: 300_001,
+			firstEventTimeoutMs: 300_000,
+			endpointClass: "custom",
+			retryMaxAttempts: 1,
 		});
 		expect(transportFailureFacts(facts)).toEqual(facts);
 	});
@@ -88,5 +115,31 @@ describe("iterateWithIdleTimeout transport facts", () => {
 			kind: "transport",
 			providerCode: STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
 		});
+	});
+
+	it("rejects a synchronously buffered non-progress item after the absolute first-event deadline", async () => {
+		let now = 0;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const source: AsyncIterable<string> = {
+			[Symbol.asyncIterator]() {
+				return {
+					async next() {
+						return { done: false as const, value: "ping" };
+					},
+				};
+			},
+		};
+		const iterator = iterateWithIdleTimeout(source, {
+			firstItemTimeoutMs: 2,
+			idleTimeoutMs: 100,
+			errorMessage: "stream idle",
+			firstItemErrorMessage: "first event timed out",
+			isProgressItem: () => false,
+		});
+
+		expect((await iterator.next()).value).toBe("ping");
+		now = 2;
+
+		await expect(iterator.next()).rejects.toBeInstanceOf(FirstEventTimeoutError);
 	});
 });

@@ -49,6 +49,16 @@ export interface TransportFailureFacts {
 	/** OpenAI's typed `error.code`, preserved separately at the transport boundary. */
 	openaiErrorCode?: string;
 	headers?: Record<string, string>;
+	/** Safe request-size observation for retry amplification policy. Never contains body content. */
+	requestBytes?: number;
+	/** Time spent waiting for the first semantic stream event on the failed request. */
+	firstEventElapsedMs?: number;
+	/** Configured first-event window before any bounded endpoint grace. */
+	firstEventTimeoutMs?: number;
+	/** Coarse endpoint class; deliberately excludes host, path, credentials, and query parameters. */
+	endpointClass?: "canonical" | "custom";
+	/** Provider-supplied ceiling for total attempts, including the initial request. */
+	retryMaxAttempts?: number;
 }
 
 /** Opaque per-invocation marker required by managed fallback transport calls. */
@@ -116,6 +126,14 @@ function propertyOf(value: unknown, name: string): unknown {
 
 function finiteStatus(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function finiteNonNegativeInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function finitePositiveInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
 function stringValue(value: unknown): string | undefined {
@@ -207,6 +225,13 @@ export function transportFailureFacts(
 	// (consumers deliberately re-run transportFailureFacts on embedded facts).
 	const headers = retainedHeaderRecord(rawHeaders);
 	const normalizedCode = providerCode?.toLowerCase();
+	const requestBytes = finiteNonNegativeInteger(propertyOf(value, "requestBytes"));
+	const firstEventElapsedMs = finiteNonNegativeInteger(propertyOf(value, "firstEventElapsedMs"));
+	const firstEventTimeoutMs = finiteNonNegativeInteger(propertyOf(value, "firstEventTimeoutMs"));
+	const retryMaxAttempts = finitePositiveInteger(propertyOf(value, "retryMaxAttempts"));
+	const endpointClassValue = propertyOf(value, "endpointClass");
+	const endpointClass =
+		endpointClassValue === "canonical" || endpointClassValue === "custom" ? endpointClassValue : undefined;
 	if (
 		status === undefined &&
 		headers === undefined &&
@@ -215,11 +240,28 @@ export function transportFailureFacts(
 		!isRateLimitCode(normalizedCode) &&
 		!isContextOverflowCode(normalizedCode) &&
 		normalizedCode !== STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE &&
-		normalizedCode !== EMPTY_RESPONSE_PROVIDER_CODE
+		normalizedCode !== EMPTY_RESPONSE_PROVIDER_CODE &&
+		requestBytes === undefined &&
+		firstEventElapsedMs === undefined &&
+		firstEventTimeoutMs === undefined &&
+		endpointClass === undefined &&
+		retryMaxAttempts === undefined
 	) {
 		return undefined;
 	}
-	return { kind: "transport", status, providerCode, anthropicErrorType, openaiErrorCode, headers };
+	return {
+		kind: "transport",
+		status,
+		providerCode,
+		anthropicErrorType,
+		openaiErrorCode,
+		headers,
+		...(requestBytes === undefined ? {} : { requestBytes }),
+		...(firstEventElapsedMs === undefined ? {} : { firstEventElapsedMs }),
+		...(firstEventTimeoutMs === undefined ? {} : { firstEventTimeoutMs }),
+		...(endpointClass === undefined ? {} : { endpointClass }),
+		...(retryMaxAttempts === undefined ? {} : { retryMaxAttempts }),
+	};
 }
 
 function headersOf(headers: TransportHeaders | undefined): Headers | undefined {

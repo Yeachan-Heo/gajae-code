@@ -106,12 +106,30 @@ export function resolveOpenAISdkRequestTimeoutMs(
 }
 
 export type Watchdog = NodeJS.Timeout | undefined;
+export interface FirstEventTimeoutFacts {
+	requestBytes?: number;
+	firstEventElapsedMs?: number;
+	firstEventTimeoutMs?: number;
+	endpointClass?: "canonical" | "custom";
+	retryMaxAttempts?: number;
+}
+
 export class FirstEventTimeoutError extends Error {
 	readonly providerCode = STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;
+	readonly requestBytes?: number;
+	readonly firstEventElapsedMs?: number;
+	readonly firstEventTimeoutMs?: number;
+	readonly endpointClass?: "canonical" | "custom";
+	readonly retryMaxAttempts?: number;
 
-	constructor(message: string) {
+	constructor(message: string, facts: FirstEventTimeoutFacts = {}) {
 		super(message);
 		this.name = "FirstEventTimeoutError";
+		this.requestBytes = facts.requestBytes;
+		this.firstEventElapsedMs = facts.firstEventElapsedMs;
+		this.firstEventTimeoutMs = facts.firstEventTimeoutMs;
+		this.endpointClass = facts.endpointClass;
+		this.retryMaxAttempts = facts.retryMaxAttempts;
 	}
 }
 
@@ -202,6 +220,8 @@ export async function* iterateWithIdleTimeout<T>(
 		}
 	};
 	let lastProgressAt = Date.now();
+	const firstItemDeadlineAt =
+		firstItemTimeoutMs !== undefined && firstItemTimeoutMs > 0 ? Date.now() + firstItemTimeoutMs : undefined;
 
 	const noTimeoutEnforced =
 		(firstItemTimeoutMs === undefined || firstItemTimeoutMs <= 0) &&
@@ -210,7 +230,8 @@ export async function* iterateWithIdleTimeout<T>(
 	while (true) {
 		let activeTimeoutMs: number | undefined;
 		if (awaitingFirstItem) {
-			activeTimeoutMs = firstItemTimeoutMs;
+			activeTimeoutMs =
+				firstItemDeadlineAt === undefined ? undefined : Math.max(0, firstItemDeadlineAt - Date.now());
 		} else if (options.idleTimeoutMs !== undefined && options.idleTimeoutMs > 0) {
 			activeTimeoutMs = options.idleTimeoutMs - (Date.now() - lastProgressAt);
 			// The idle deadline may already have elapsed because the *consumer*
@@ -235,10 +256,7 @@ export async function* iterateWithIdleTimeout<T>(
 
 		let timer: NodeJS.Timeout | undefined;
 		let resolveTimeout: ((value: { kind: "timeout" }) => void) | undefined;
-		const enforceTimeout =
-			!noTimeoutEnforced &&
-			activeTimeoutMs !== undefined &&
-			(awaitingFirstItem ? activeTimeoutMs > 0 : activeTimeoutMs >= 0);
+		const enforceTimeout = !noTimeoutEnforced && activeTimeoutMs !== undefined && activeTimeoutMs >= 0;
 		if (enforceTimeout) {
 			const { promise, resolve } = Promise.withResolvers<{ kind: "timeout" }>();
 			resolveTimeout = resolve;
@@ -282,6 +300,11 @@ export async function* iterateWithIdleTimeout<T>(
 			}
 			if (outcome.kind === "error") {
 				throw outcome.error;
+			}
+			if (awaitingFirstItem && firstItemDeadlineAt !== undefined && Date.now() >= firstItemDeadlineAt) {
+				options.onFirstItemTimeout?.();
+				closeIterator();
+				throw new FirstEventTimeoutError(options.firstItemErrorMessage ?? options.errorMessage);
 			}
 			if (outcome.result.done) {
 				markFirstItemReceived();

@@ -7,6 +7,9 @@
 ### Fixed
 - Bound `apply_patch` transcript metadata so oversized patch payloads cannot bloat managed session transcripts (#4573).
 
+- Automatic session retry now honors the Anthropic transport's first-event attempt ceiling: a full-window request at or above 1 MB stops after the initial upload, while a smaller request can be attempted at most twice even when the global retry setting is higher. Attempt events and terminal elapsed diagnostics use the actual bounded ceiling. Credit: @probepark (#4464).
+- A manual `retry()` after an exhausted provider first-event ceiling now clears that stale ceiling before re-attempting, so a later transient failure on the reissued turn consumes the ordinary retry budget instead of being exhausted by the prior turn's ceiling. Verified by a discriminating regression test that fails when the ceiling is retained (#4464).
+
 ## [0.13.3] - 2026-08-15
 
 ### Added

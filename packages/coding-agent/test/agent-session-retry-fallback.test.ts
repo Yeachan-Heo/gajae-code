@@ -55,6 +55,7 @@ function typedRateLimitStream(
 	model: Model,
 	retryAfterMs: number,
 	errorMessage = "Provider returned error: rate_limit_error: organization quota reached",
+	extraFailure: Partial<NonNullable<AssistantMessage["transportFailure"]>> = {},
 ): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
@@ -79,6 +80,7 @@ function typedRateLimitStream(
 				kind: "transport",
 				status: 429,
 				headers: { "retry-after-ms": String(retryAfterMs) },
+				...extraFailure,
 			},
 			timestamp: Date.now(),
 		};
@@ -659,6 +661,62 @@ describe("AgentSession retry fallback", () => {
 		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
 	});
 
+	it("does not rotate credentials after a large grace failure reaches its retry ceiling", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model");
+		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.set("anthropic", [
+			{ type: "api_key", key: "account-a-key" },
+			{ type: "api_key", key: "account-b-key" },
+		]);
+
+		const providerAffinitySessionId = "large-grace-pool";
+		const requestedKeys: string[] = [];
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, providerAffinitySessionId);
+				if (key) requestedKeys.push(key);
+				return key;
+			},
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: requestedModel => {
+				calls++;
+				return typedRateLimitStream(requestedModel, 60_000, "429 Overloaded during grace", {
+					anthropicErrorType: "rate_limit_error",
+					requestBytes: 1_750_732,
+					firstEventElapsedMs: 305_000,
+					firstEventTimeoutMs: 300_000,
+					endpointClass: "custom",
+					retryMaxAttempts: 1,
+				});
+			},
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: "large-grace-logical",
+			providerCacheSessionId: providerAffinitySessionId,
+			credentialSessionId: providerAffinitySessionId,
+		});
+		const { retryStartEvents } = trackRetryEvents(session);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("do not rotate a bounded large grace request");
+		await session.waitForIdle();
+
+		expect(calls).toBe(1);
+		expect(requestedKeys).toHaveLength(1);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(getLastAssistantMessage(session).errorMessage).toContain(
+			"First-event/grace retry ceiling exhausted after 1 attempts",
+		);
+	});
+
 	it("rotates a single-model credential through an extension-loaded session (#3491 claim 1)", async () => {
 		const model = getBundledModel("openai", "gpt-4o-mini");
 		if (!model) throw new Error("Expected bundled test model");
@@ -792,6 +850,11 @@ describe("AgentSession retry fallback", () => {
 					return canonicalFirstEventTimeoutStream(requestedModel, [], {
 						kind: "transport",
 						providerCode: "stream_first_event_timeout",
+						requestBytes: 1_750_732,
+						firstEventElapsedMs: 420_000,
+						firstEventTimeoutMs: 300_000,
+						endpointClass: "custom",
+						retryMaxAttempts: 1,
 					});
 				}
 				return createMockModel({ responses: [{ content: ["Fallback recovered"] }] }).stream(
@@ -825,13 +888,9 @@ describe("AgentSession retry fallback", () => {
 		await session.prompt("recover canonical timeout through fallback");
 		await session.waitForIdle();
 
-		expect(primaryCalls).toBe(2);
-		expect(requestedModels).toEqual([
-			`${primary.provider}/${primary.id}`,
-			`${primary.provider}/${primary.id}`,
-			`${fallback.provider}/${fallback.id}`,
-		]);
-		expect(retryStartEvents).toHaveLength(2);
+		expect(primaryCalls).toBe(1);
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`]);
+		expect(retryStartEvents).toHaveLength(1);
 		expect(retryStartEvents.every(event => event.maxAttempts === 2 && event.unbounded === false)).toBe(true);
 		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 		expect(switches).toEqual([
@@ -839,11 +898,84 @@ describe("AgentSession retry fallback", () => {
 				from: `${primary.provider}/${primary.id}`,
 				to: `${fallback.provider}/${fallback.id}`,
 				reason: "server",
-				attemptsUsed: 2,
+				attemptsUsed: 1,
 			}),
 		]);
 		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
 		expect(refreshSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("advances managed fallback without mutating credentials after a reached ceiling", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled test models");
+		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.set("anthropic", [
+			{ type: "api_key", key: "account-a-key" },
+			{ type: "api_key", key: "account-b-key" },
+		]);
+		const poolSessionId = "managed-large-grace-pool";
+		const requestedAnthropicKeys: string[] = [];
+		const requestedModels: string[] = [];
+		let primaryCalls = 0;
+		const agent = new Agent({
+			getApiKey: async provider => {
+				const key = await modelRegistry.getApiKeyForProvider(provider, poolSessionId);
+				if (provider === "anthropic" && key) requestedAnthropicKeys.push(key);
+				return key;
+			},
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				if (requestedModel.provider === primary.provider) {
+					primaryCalls++;
+					return typedRateLimitStream(requestedModel, 60_000, "429 Overloaded during grace", {
+						anthropicErrorType: "rate_limit_error",
+						requestBytes: 1_750_732,
+						firstEventElapsedMs: 305_000,
+						firstEventTimeoutMs: 300_000,
+						endpointClass: "custom",
+						retryMaxAttempts: 1,
+					});
+				}
+				return createMockModel({ responses: [{ content: ["Fallback recovered"] }] }).stream(
+					requestedModel,
+					context,
+					options,
+				);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 2,
+			"retry.maxRetries": 9,
+			"retry.baseDelayMs": 1,
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId: "managed-large-grace-logical",
+			providerCacheSessionId: poolSessionId,
+			credentialSessionId: poolSessionId,
+		});
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("advance without rotating bounded credential");
+		await session.waitForIdle();
+
+		expect(primaryCalls).toBe(1);
+		expect(requestedModels).toEqual([`${primary.provider}/${primary.id}`, `${fallback.provider}/${fallback.id}`]);
+		expect(requestedAnthropicKeys).toHaveLength(1);
+		expect(await modelRegistry.getApiKeyForProvider("anthropic", poolSessionId)).toBe(requestedAnthropicKeys[0]);
+		expect(getLastAssistantMessage(session)).toMatchObject({ stopReason: "stop" });
 	});
 
 	it("bounds all-provider canonical timeout exhaustion", async () => {

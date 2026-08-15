@@ -1997,6 +1997,7 @@ export class AgentSession {
 		this.#retryReplayEpoch++;
 		this.#retryReplayUnsafeEpoch = undefined;
 		this.#firstEventTimeoutRetryStartedAt = Date.now();
+		this.#providerRetryMaxAttempts = undefined;
 	}
 
 	#markRetryReplayUnsafe(): void {
@@ -2034,6 +2035,7 @@ export class AgentSession {
 	#retryAbortController: AbortController | undefined = undefined;
 	#retryNowRequested = false;
 	#firstEventTimeoutRetryStartedAt: number | undefined;
+	#providerRetryMaxAttempts: number | undefined;
 	#retryAttempt = 0;
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
@@ -4599,6 +4601,9 @@ export class AgentSession {
 					// #waitForPostPromptRecovery and the session as permanently busy.
 					// #resolveRetry() is idempotent, so the later tail call is a no-op.
 					this.#resolveRetry();
+				}
+				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+					this.#providerRetryMaxAttempts = undefined;
 				}
 			}
 
@@ -16087,6 +16092,14 @@ export class AgentSession {
 		const classification = this.#classifyErrorForRetry(message);
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
+		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
+		if (reportedRetryMaxAttempts !== undefined) {
+			this.#providerRetryMaxAttempts = Math.min(
+				this.#providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY,
+				reportedRetryMaxAttempts,
+			);
+		}
+		const providerRetryMaxAttempts = this.#providerRetryMaxAttempts;
 		// Content-free message-only watchdog prose (wrapped canonical or bare
 		// per-provider variants) is admitted like the typed path: it is
 		// replay-safe, so a bare-default retry may re-issue the request even
@@ -16124,12 +16137,16 @@ export class AgentSession {
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
 				: false;
 		}
+		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const providerRetryCeilingReached =
+			providerRetryMaxAttempts !== undefined && attemptsUsed >= providerRetryMaxAttempts;
 		// Credential rotation: a content-free quota/rate-limit failure has no
 		// observable state to corrupt, so it is replay-safe regardless of
 		// extension lifecycle participation. Mark the failed credential and
 		// retry with the next stored credential of the same provider.
 		let credentialRotated =
 			!managedFallback &&
+			!providerRetryCeilingReached &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit") &&
 			(await this.#markFailedCredential(trigger));
@@ -16137,7 +16154,9 @@ export class AgentSession {
 		// output, no tool calls, no extension-observable streaming state was produced
 		// before the failure. This bypasses #hasCleanRetryReplaySafety because the
 		// content-free check is the replay-safety guarantee for credential rotation.
-		const canReplayRotatedCredential = credentialRotated;
+		// A reached provider ceiling also continues through this gate only so the
+		// bounded exhaustion path can surface its exact diagnostic; it never replays.
+		const canReplayRotatedCredential = credentialRotated || providerRetryCeilingReached;
 		// Universal automatic replay-safety gate (#3791): once the failed attempt
 		// carries observable assistant text, thinking, or tool-call content,
 		// automatic session retry must not re-issue the request. This covers
@@ -16175,17 +16194,30 @@ export class AgentSession {
 			!managedFallback &&
 			classification === "transient" &&
 			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
-		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
-		let outcome = managedFallback
-			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
-				? "retry"
-				: "exhausted";
+		let outcome: "retry" | "advance" | "exhausted";
+		if (managedFallback) {
+			outcome = controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error");
+			if (providerRetryCeilingReached && outcome === "retry") {
+				outcome = controller.advance() ? "advance" : "exhausted";
+			}
+		} else {
+			outcome = providerRetryCeilingReached
+				? "exhausted"
+				: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+					? "retry"
+					: "exhausted";
+		}
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
 		// exhaustion and forces an immediate same-model retry.
-		if (managedFallback && outcome === "advance" && (trigger.class === "quota" || trigger.class === "rate_limit")) {
+		if (
+			managedFallback &&
+			!providerRetryCeilingReached &&
+			outcome === "advance" &&
+			(trigger.class === "quota" || trigger.class === "rate_limit")
+		) {
 			credentialRotated = await this.#markFailedCredential(trigger);
 		}
 		if (credentialRotated) {
@@ -16199,6 +16231,9 @@ export class AgentSession {
 				outcome = "retry";
 			}
 		}
+		if (outcome === "advance") {
+			this.#providerRetryMaxAttempts = undefined;
+		}
 		if (outcome === "exhausted") {
 			if (managedFallback) {
 				const errorMessage = this.#fallbackExhaustionError(controller);
@@ -16207,9 +16242,13 @@ export class AgentSession {
 				controller.resetSticky();
 				return managedOutcome ? this.#managedFallbackExhaustionDecision(message, errorMessage) : false;
 			}
-			if (classification === "first_event_timeout") {
+			if (classification === "first_event_timeout" || providerRetryMaxAttempts !== undefined) {
 				const elapsedMs = Date.now() - (this.#firstEventTimeoutRetryStartedAt ?? Date.now());
-				message.errorMessage = `First-event stream timeout exhausted after ${attemptsUsed} attempts; waited ${elapsedMs}ms total: ${message.errorMessage ?? "Unknown error"}`;
+				const prefix =
+					classification === "first_event_timeout"
+						? "First-event stream timeout exhausted"
+						: "First-event/grace retry ceiling exhausted";
+				message.errorMessage = `${prefix} after ${attemptsUsed} attempts; waited ${elapsedMs}ms total: ${message.errorMessage ?? "Unknown error"}`;
 			}
 			return false;
 		}
@@ -16232,7 +16271,9 @@ export class AgentSession {
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
-			if (managedFallback && !credentialRotated) await this.#markFailedCredential(trigger);
+			if (managedFallback && !credentialRotated && !providerRetryCeilingReached) {
+				await this.#markFailedCredential(trigger);
+			}
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
 			if (outcome === "advance") {
@@ -16276,9 +16317,14 @@ export class AgentSession {
 					type: "auto_retry_start",
 					attempt: this.#retryAttempt,
 					maxAttempts: managedFallback
-						? controller.maxAttempts
-						: firstEventTimeout
-							? retrySettings.maxRetries + 1
+						? firstEventTimeout || this.#providerRetryMaxAttempts !== undefined
+							? Math.min(controller.maxAttempts, this.#providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY)
+							: controller.maxAttempts
+						: firstEventTimeout || this.#providerRetryMaxAttempts !== undefined
+							? Math.min(
+									retrySettings.maxRetries + 1,
+									this.#providerRetryMaxAttempts ?? Number.POSITIVE_INFINITY,
+								)
 							: retrySettings.maxRetries,
 					delayMs,
 					errorMessage,
@@ -16587,6 +16633,7 @@ export class AgentSession {
 		if (lastMsg.role !== "assistant") {
 			if (!this.#isInterruptedRetryTail(lastMsg)) return false;
 			this.#retryAttempt = 0;
+			this.#providerRetryMaxAttempts = undefined;
 			this.#scheduleAgentContinue({ delayMs: 1 });
 			return true;
 		}
@@ -16605,6 +16652,7 @@ export class AgentSession {
 
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
+		this.#providerRetryMaxAttempts = undefined;
 
 		// Re-attempt the turn
 		this.#scheduleAgentContinue({ delayMs: 1 });

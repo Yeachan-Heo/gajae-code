@@ -127,6 +127,11 @@ describe("AgentSession resilient retry", () => {
 		requestedModels?: string[];
 		settingsOverrides?: Record<string, unknown>;
 		onStreamStart?: () => void;
+		failureByCall?: (call: number) => {
+			errorMessage?: string;
+			errorStatus?: number;
+			transportFailure?: AssistantMessage["transportFailure"];
+		};
 	}): AgentSession {
 		const model = options.model ?? getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model to exist");
@@ -138,6 +143,7 @@ describe("AgentSession resilient retry", () => {
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, opts) => {
 				calls++;
+				const callFailure = options.failureByCall?.(calls);
 				options.onStreamStart?.();
 				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
 				if (calls > 1 && options.recoveredContent) {
@@ -164,10 +170,16 @@ describe("AgentSession resilient retry", () => {
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						},
 						stopReason: "error",
-						...(options.errorMessage === undefined ? {} : { errorMessage: options.errorMessage }),
-						...(options.errorStatus === undefined ? {} : { errorStatus: options.errorStatus }),
+						...(callFailure?.errorMessage === undefined && options.errorMessage === undefined
+							? {}
+							: { errorMessage: callFailure?.errorMessage ?? options.errorMessage }),
+						...(callFailure?.errorStatus === undefined && options.errorStatus === undefined
+							? {}
+							: { errorStatus: callFailure?.errorStatus ?? options.errorStatus }),
 						...(options.errorKind === undefined ? {} : { errorKind: options.errorKind }),
-						...(options.transportFailure === undefined ? {} : { transportFailure: options.transportFailure }),
+						...(callFailure?.transportFailure === undefined && options.transportFailure === undefined
+							? {}
+							: { transportFailure: callFailure?.transportFailure ?? options.transportFailure }),
 						timestamp: Date.now(),
 					};
 					stream.push({ type: "start", partial: message });
@@ -1373,6 +1385,265 @@ describe("AgentSession resilient retry", () => {
 		expect(retryStartEvents).toHaveLength(2);
 		expect(retryStartEvents.every(event => event.maxAttempts === 3 && event.unbounded === false)).toBe(true);
 		expect(lastAssistant(session).errorMessage).toMatch(/exhausted after 3 attempts; waited \d+ms total/);
+	});
+	it("honors the provider first-event retry ceiling for a large request", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage:
+				"Anthropic stream timed out while waiting for the first event (elapsed=300000ms request_bytes=1750732 endpoint=custom configured_timeout=300000ms; override with PI_STREAM_FIRST_EVENT_TIMEOUT_MS)",
+			transportFailure: {
+				kind: "transport",
+				providerCode: "stream_first_event_timeout",
+				requestBytes: 1_750_732,
+				firstEventElapsedMs: 300_000,
+				firstEventTimeoutMs: 300_000,
+				endpointClass: "custom",
+				retryMaxAttempts: 1,
+			},
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 3 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("large timeout must not amplify");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(1);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).errorMessage).toContain("exhausted after 1 attempts");
+	});
+	it("honors a large-request grace ceiling on a late 529", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "529 Overloaded",
+			errorStatus: 529,
+			transportFailure: {
+				kind: "transport",
+				status: 529,
+				anthropicErrorType: "overloaded_error",
+				requestBytes: 1_750_732,
+				firstEventElapsedMs: 305_000,
+				firstEventTimeoutMs: 300_000,
+				endpointClass: "custom",
+				retryMaxAttempts: 1,
+			},
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 5 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("late grace failure must not replay");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(1);
+		expect(retryStartEvents).toHaveLength(0);
+		expect(lastAssistant(session).errorMessage).toMatch(
+			/^First-event\/grace retry ceiling exhausted after 1 attempts; waited \d+ms total: 529 Overloaded$/,
+		);
+	});
+	it("honors the provider first-event retry ceiling for a small request", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			errorMessage: "Anthropic stream timed out while waiting for the first event",
+			transportFailure: {
+				kind: "transport",
+				providerCode: "stream_first_event_timeout",
+				requestBytes: 4096,
+				firstEventElapsedMs: 100_000,
+				firstEventTimeoutMs: 100_000,
+				endpointClass: "canonical",
+				retryMaxAttempts: 2,
+			},
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 3 },
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("small timeout gets one replay");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]?.maxAttempts).toBe(2);
+		expect(lastAssistant(session).errorMessage).toContain("exhausted after 2 attempts");
+	});
+	it("keeps the first-event attempt ceiling across a later transient failure", async () => {
+		const requestedModels: string[] = [];
+		session = buildStatusErrorSession({
+			requestedModels,
+			settingsOverrides: { "retry.maxRetries": 5 },
+			failureByCall: call =>
+				call === 1
+					? {
+							errorMessage: "Anthropic stream timed out while waiting for the first event",
+							transportFailure: {
+								kind: "transport",
+								providerCode: "stream_first_event_timeout",
+								requestBytes: 4096,
+								firstEventElapsedMs: 100_000,
+								firstEventTimeoutMs: 100_000,
+								endpointClass: "canonical",
+								retryMaxAttempts: 2,
+							},
+						}
+					: {
+							errorMessage: "529 Overloaded",
+							errorStatus: 529,
+							transportFailure: { kind: "transport", status: 529, anthropicErrorType: "overloaded_error" },
+						},
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt("timeout then overload stays bounded");
+		await session.waitForIdle();
+
+		expect(requestedModels).toHaveLength(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(lastAssistant(session).errorMessage).toMatch(
+			/^First-event\/grace retry ceiling exhausted after 2 attempts; waited \d+ms total: 529 Overloaded$/,
+		);
+	});
+	it("clears a stale provider ceiling when a manual retry begins", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model");
+		const recovered = createMockModel({ responses: [{ content: ["continuation recovered"] }] });
+		let calls = 0;
+		const failureStream = (
+			errorMessage: string,
+			transportFailure: NonNullable<AssistantMessage["transportFailure"]>,
+		): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const failure = assistantMessage(model, [], "error", errorMessage);
+				failure.transportFailure = transportFailure;
+				stream.push({ type: "start", partial: failure });
+				stream.push({ type: "error", reason: "error", error: failure });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls++;
+				if (calls === 1) {
+					return failureStream("Anthropic stream timed out while waiting for the first event", {
+						kind: "transport",
+						providerCode: "stream_first_event_timeout",
+						requestBytes: 4096,
+						firstEventElapsedMs: 100_000,
+						firstEventTimeoutMs: 100_000,
+						endpointClass: "canonical",
+						retryMaxAttempts: 1,
+					});
+				}
+				if (calls === 2) {
+					return failureStream("529 Overloaded", {
+						kind: "transport",
+						status: 529,
+						anthropicErrorType: "overloaded_error",
+					});
+				}
+				return recovered.stream(requestedModel, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxDelayMs": 10,
+			"retry.maxRetries": 5,
+		});
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		await session.prompt("timeout once then fail the turn");
+		await session.waitForIdle();
+		// The one-attempt provider ceiling exhausts the first turn immediately.
+		expect(calls).toBe(1);
+		expect(lastAssistant(session).errorMessage).toContain("exhausted after 1 attempts");
+
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		// Manual retry cleared the prior turn's one-attempt ceiling, so the 529 on
+		// the reissued turn consumes the ordinary retry budget and recovers; a
+		// retained stale ceiling would exhaust the 529 after a single attempt.
+		expect(calls).toBe(3);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "continuation recovered" }]);
+	});
+	it("clears the first-event ceiling after a successful retry before a tool continuation", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model");
+		const tool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo test tool",
+			parameters: z.object({}),
+			execute: async () => ({ content: [{ type: "text", text: "echoed" }] }),
+		};
+		const toolResponse = createMockModel({
+			responses: [{ content: [{ type: "toolCall", name: "echo", arguments: {} }] }],
+		});
+		const successResponse = createMockModel({ responses: [{ content: ["continuation recovered"] }] });
+		let calls = 0;
+		const failureStream = (
+			errorMessage: string,
+			transportFailure: NonNullable<AssistantMessage["transportFailure"]>,
+		): AssistantMessageEventStream => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const failure = assistantMessage(model, [], "error", errorMessage);
+				failure.transportFailure = transportFailure;
+				stream.push({ type: "start", partial: failure });
+				stream.push({ type: "error", reason: "error", error: failure });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				calls++;
+				if (calls === 1) {
+					return failureStream("Anthropic stream timed out while waiting for the first event", {
+						kind: "transport",
+						providerCode: "stream_first_event_timeout",
+						requestBytes: 4096,
+						firstEventElapsedMs: 100_000,
+						firstEventTimeoutMs: 100_000,
+						endpointClass: "canonical",
+						retryMaxAttempts: 2,
+					});
+				}
+				if (calls === 2) return toolResponse.stream(requestedModel, context, options);
+				if (calls === 3 || calls === 4) {
+					return failureStream("529 Overloaded", {
+						kind: "transport",
+						status: 529,
+						anthropicErrorType: "overloaded_error",
+					});
+				}
+				return successResponse.stream(requestedModel, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxDelayMs": 10,
+			"retry.maxRetries": 5,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("recover timeout then run a tool continuation");
+		await session.waitForIdle();
+
+		expect(calls).toBe(5);
+		expect(lastAssistant(session).content).toEqual([{ type: "text", text: "continuation recovered" }]);
 	});
 	it("replays a typed first-event timeout before progress and never after progress", async () => {
 		const noProgressModels: string[] = [];
