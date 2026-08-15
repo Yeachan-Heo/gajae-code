@@ -24,6 +24,10 @@ const CACHE_MAX_ENTRIES = 256;
 const REGISTRY_MAX_ENTRIES = 256;
 const CACHE_MUTATION_LOCK_STALE_MS = 5_000;
 
+type NativeExactUnlinkBindings = Pick<typeof import("@gajae-code/natives"), "exactUnlink">;
+
+let nativeExactUnlinkBindings: NativeExactUnlinkBindings | undefined;
+
 let cachePathOverride: string | undefined;
 let nowForTests: (() => number) | undefined;
 let beforeExpiredDeleteForTests: (() => void) | undefined;
@@ -140,7 +144,7 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 			fs.closeSync(descriptor);
 			return () => {
 				try {
-					if (fs.readFileSync(lockPath, "utf8") === owner) fs.rmSync(lockPath, { force: true });
+					exactUnlinkCapabilityLock(lockPath, owner);
 				} catch {
 					// A crashed owner was already reaped.
 				}
@@ -153,39 +157,36 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 				const ownerIsAlive = Number.isSafeInteger(ownerPid) && ownerPid > 0 && isProcessAlive(ownerPid);
 				const staleOwner =
 					!ownerIsAlive && Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS;
-				if (staleOwner) {
-					const reaperPath = `${lockPath}.reaper`;
-					const reaperOwner = `${process.pid}:${crypto.randomUUID()}`;
-					try {
-						const reaper = fs.openSync(reaperPath, "wx", 0o600);
-						fs.writeFileSync(reaper, reaperOwner);
-						fs.closeSync(reaper);
-						try {
-							if (fs.readFileSync(lockPath, "utf8") === lockOwner) fs.rmSync(lockPath, { force: true });
-						} finally {
-							if (fs.readFileSync(reaperPath, "utf8") === reaperOwner) fs.rmSync(reaperPath, { force: true });
-						}
-					} catch {
-						try {
-							const electionOwner = fs.readFileSync(reaperPath, "utf8");
-							const electionPid = Number(electionOwner.split(":", 1)[0]);
-							if (
-								(!Number.isSafeInteger(electionPid) || electionPid <= 0 || !isProcessAlive(electionPid)) &&
-								Date.now() - fs.statSync(reaperPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS &&
-								fs.readFileSync(reaperPath, "utf8") === electionOwner
-							)
-								fs.rmSync(reaperPath, { force: true });
-						} catch {
-							// Another waiter owns or reclaimed stale-lock election.
-						}
-					}
-				}
+				if (staleOwner) exactUnlinkCapabilityLock(lockPath, lockOwner);
 			} catch {
 				// The lock changed while this waiter was being inspected.
 			}
 			Atomics.wait(sleeper, 0, 0, 10);
 		}
 	}
+}
+
+function exactUnlinkCapabilityLock(lockPath: string, expectedOwner: string): void {
+	const bytes = fs.readFileSync(lockPath);
+	if (bytes.toString("utf8") !== expectedOwner) return;
+	const stat = fs.statSync(lockPath, { bigint: true });
+	if (!stat.isFile()) return;
+	const parent = fs.statSync(path.dirname(lockPath), { bigint: true });
+	if (!parent.isDirectory()) return;
+	if (!nativeExactUnlinkBindings)
+		nativeExactUnlinkBindings = require("@gajae-code/natives") as NativeExactUnlinkBindings;
+	const bindings = nativeExactUnlinkBindings;
+	bindings.exactUnlink(lockPath, {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+		quarantineName: `.tool-choice-capability-lock-${crypto.randomUUID()}`,
+	});
 }
 
 function isProcessAlive(pid: number): boolean {
