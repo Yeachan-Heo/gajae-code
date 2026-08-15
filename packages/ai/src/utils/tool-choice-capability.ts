@@ -157,7 +157,10 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 				const ownerIsAlive = Number.isSafeInteger(ownerPid) && ownerPid > 0 && isProcessAlive(ownerPid);
 				const staleOwner =
 					!ownerIsAlive && Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS;
-				if (staleOwner) exactUnlinkCapabilityLock(lockPath, lockOwner);
+				if (staleOwner && !exactUnlinkCapabilityLock(lockPath, lockOwner)) {
+					Atomics.wait(sleeper, 0, 0, 10);
+					continue;
+				}
 			} catch {
 				// The lock changed while this waiter was being inspected.
 			}
