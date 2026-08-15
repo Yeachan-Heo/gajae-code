@@ -83,6 +83,11 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 		await expect(validate()).rejects.toThrow(/non-JSON body.*status alone/s);
 	});
 
+	it("reports the actual status for another successful dataless response", async () => {
+		stubFetch(() => new Response(null, { status: 204 }));
+		await expect(validate()).rejects.toThrow(/returned 204 with a non-JSON body/);
+	});
+
 	it("rejects a 200 whose JSON carries no recognizable model list", async () => {
 		stubFetch(() => new Response(JSON.stringify({ object: "list" }), { status: 200 }));
 		await expect(validate()).rejects.toThrow(/without a recognizable model list/);

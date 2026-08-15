@@ -116,13 +116,13 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 			parsed = JSON.parse(body);
 		} catch {
 			throw new Error(
-				`${options.provider} API key validation failed: the models endpoint returned 200 with a non-JSON body` +
+				`${options.provider} API key validation failed: the models endpoint returned ${response.status} with a non-JSON body` +
 					`${body.trim() ? ` (${boundedDetails(body)})` : ""}. Refusing to accept the key on status alone.`,
 			);
 		}
 		if (!isModelList(parsed)) {
 			throw new Error(
-				`${options.provider} API key validation failed: the models endpoint returned 200 without a recognizable ` +
+				`${options.provider} API key validation failed: the models endpoint returned ${response.status} without a recognizable ` +
 					`model list. Refusing to accept the key on status alone.`,
 			);
 		}
