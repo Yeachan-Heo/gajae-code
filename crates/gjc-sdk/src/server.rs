@@ -17,7 +17,7 @@ use std::{
 	path::PathBuf,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 	},
 	time::{Duration, Instant},
 };
@@ -103,6 +103,12 @@ const CLIENT_HELLO_GRACE: Duration = Duration::from_secs(1);
 /// forced abort.
 const CONNECTION_JOIN_GRACE: Duration = Duration::from_secs(1);
 
+/// Maximum host-directed frames waiting behind one connection writer. This
+/// matches the positioned-event replay ring: once a subscriber falls farther
+/// behind, rejecting new best-effort live sends keeps memory bounded and lets
+/// replay report the authoritative sequence gap instead of buffering forever.
+const MAX_QUEUED_DIRECTED_FRAMES: usize = 256;
+
 /// Commands serialized through the owning connection task.
 #[derive(Debug)]
 enum DirectCommand {
@@ -113,6 +119,19 @@ enum DirectCommand {
 		requires_tool_activity: bool,
 	},
 	ReevaluateAsk,
+}
+
+fn reserve_directed_frame(counter: &AtomicUsize) -> bool {
+	counter
+		.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+			(queued < MAX_QUEUED_DIRECTED_FRAMES).then_some(queued + 1)
+		})
+		.is_ok()
+}
+
+fn release_directed_frame(counter: &AtomicUsize) {
+	let queued = counter.fetch_sub(1, Ordering::Relaxed);
+	debug_assert!(queued > 0, "directed-frame reservation underflow");
 }
 
 fn prepare_direct_ack(state: &ServerState, message: &ServerMessage) -> bool {
@@ -227,11 +246,12 @@ struct Delivered {
 
 #[derive(Debug, Clone)]
 struct Connection {
-	generation:   String,
-	capabilities: Vec<String>,
-	negotiation:  Negotiation,
-	delivered:    Option<Delivered>,
-	tx:           mpsc::UnboundedSender<DirectCommand>,
+	generation:             String,
+	capabilities:           Vec<String>,
+	negotiation:            Negotiation,
+	delivered:              Option<Delivered>,
+	queued_directed_frames: Arc<AtomicUsize>,
+	tx:                     mpsc::UnboundedSender<DirectCommand>,
 }
 
 /// A rejected workflow-gate registration.
@@ -735,7 +755,8 @@ impl ServerHandle {
 
 	/// Send a validated JSON envelope to one connected v3 SDK client. Returns
 	/// false when the destination is no longer current, the envelope is invalid,
-	/// or it exceeds the transport frame bound.
+	/// it exceeds the transport frame bound, or the connection's bounded writer
+	/// backlog is full.
 	pub fn send_to(&self, connection_id: &str, json: String) -> bool {
 		let Some((json, requires_tool_activity)) = validate_directed_frame(json) else {
 			return false;
@@ -745,15 +766,28 @@ impl ServerHandle {
 			.connections
 			.lock()
 			.get(connection_id)
-			.map(|connection| (connection.tx.clone(), connection.generation.clone()));
-		sender.is_some_and(|(sender, connection_generation)| {
-			sender
+			.map(|connection| {
+				(
+					connection.tx.clone(),
+					connection.generation.clone(),
+					Arc::clone(&connection.queued_directed_frames),
+				)
+			});
+		sender.is_some_and(|(sender, connection_generation, queued_directed_frames)| {
+			if !reserve_directed_frame(&queued_directed_frames) {
+				return false;
+			}
+			let sent = sender
 				.send(DirectCommand::DirectedFrame {
 					json,
 					connection_generation,
 					requires_tool_activity,
 				})
-				.is_ok()
+				.is_ok();
+			if !sent {
+				release_directed_frame(&queued_directed_frames);
+			}
+			sent
 		})
 	}
 
@@ -1288,6 +1322,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 		format!("connection:{}", state.connection_sequence.fetch_add(1, Ordering::Relaxed));
 	let generation = "0".to_owned();
 	let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<DirectCommand>();
+	let queued_directed_frames = Arc::new(AtomicUsize::new(0));
 	let mut rx = state.tx.subscribe();
 	let (mut write, mut read) = ws.split();
 	let hello = ServerMessage::Hello(ServerHello {
@@ -1315,11 +1350,12 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 		.connections
 		.lock()
 		.insert(connection_id.clone(), Connection {
-			generation:   generation.clone(),
-			capabilities: Vec::new(),
-			negotiation:  Negotiation::AwaitingHello,
-			delivered:    None,
-			tx:           direct_tx.clone(),
+			generation:             generation.clone(),
+			capabilities:           Vec::new(),
+			negotiation:            Negotiation::AwaitingHello,
+			delivered:              None,
+			queued_directed_frames: Arc::clone(&queued_directed_frames),
+			tx:                     direct_tx.clone(),
 		});
 
 	// Replay readiness before ask presentation; the ask itself is tailored by the
@@ -1362,6 +1398,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 							connection_generation,
 							requires_tool_activity,
 						} => {
+							release_directed_frame(&queued_directed_frames);
 							may_deliver_directed_frame(
 								&state,
 								&connection_id,
@@ -1445,6 +1482,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 						connection_generation,
 						requires_tool_activity,
 					} => {
+						release_directed_frame(&queued_directed_frames);
 						if may_deliver_directed_frame(
 							&state,
 							&connection_id,
@@ -1875,6 +1913,60 @@ mod tests {
 	// Tokio's mock clock is process-global. Acquire the lock before constructing
 	// a paused runtime so concurrent libtest workers cannot share its clock.
 	static PAUSED_TIME_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+	#[test]
+	fn directed_frame_reservations_are_bounded_and_reusable() {
+		let queued = AtomicUsize::new(0);
+		for _ in 0..MAX_QUEUED_DIRECTED_FRAMES {
+			assert!(reserve_directed_frame(&queued));
+		}
+		assert!(!reserve_directed_frame(&queued));
+		assert_eq!(queued.load(Ordering::Relaxed), MAX_QUEUED_DIRECTED_FRAMES);
+
+		release_directed_frame(&queued);
+		assert!(reserve_directed_frame(&queued));
+		assert_eq!(queued.load(Ordering::Relaxed), MAX_QUEUED_DIRECTED_FRAMES);
+	}
+
+	#[tokio::test]
+	async fn directed_send_rejects_a_full_connection_writer_backlog() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let (tx, mut rx) = mpsc::unbounded_channel::<DirectCommand>();
+		let queued = Arc::new(AtomicUsize::new(0));
+		handle
+			.state
+			.connections
+			.lock()
+			.insert("slow".into(), Connection {
+				generation: "generation".into(),
+				capabilities: Vec::new(),
+				negotiation: Negotiation::Negotiated,
+				delivered: None,
+				queued_directed_frames: Arc::clone(&queued),
+				tx,
+			});
+
+		for id in 0..MAX_QUEUED_DIRECTED_FRAMES {
+			assert!(
+				handle
+					.send_to("slow", format!(r#"{{"type":"query_response","id":"q{id}","ok":true}}"#),)
+			);
+		}
+		assert!(
+			!handle.send_to("slow", r#"{"type":"query_response","id":"overflow","ok":true}"#.into(),)
+		);
+		assert_eq!(queued.load(Ordering::Relaxed), MAX_QUEUED_DIRECTED_FRAMES);
+
+		let DirectCommand::DirectedFrame { .. } = rx.recv().await.expect("queued directed frame")
+		else {
+			panic!("expected directed frame");
+		};
+		release_directed_frame(&queued);
+		assert!(
+			handle.send_to("slow", r#"{"type":"query_response","id":"recovered","ok":true}"#.into(),)
+		);
+		handle.stop();
+	}
 
 	fn run_paused_test(test: impl std::future::Future<Output = ()>) {
 		let _time_guard = PAUSED_TIME_TEST_LOCK.lock();
@@ -3617,6 +3709,7 @@ mod tests {
 				capabilities: vec![capabilities::ASK_SELECTED_ACK_V1.into()],
 				negotiation: Negotiation::Negotiated,
 				delivered: None,
+				queued_directed_frames: Arc::new(AtomicUsize::new(0)),
 				tx,
 			});
 		let task = {

@@ -38,6 +38,7 @@ interface SetupResult {
 	ctx: never;
 	frames: Frame[];
 	ws: WebSocket;
+	url: string;
 	sessionId: string;
 	token: string;
 }
@@ -104,7 +105,7 @@ async function setup(
 	ws.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: ["tool_activity_v2"] }));
 	await sleep(50);
 	await sleep(250);
-	return { handlers, ctx, frames, ws, sessionId, token, settings, controller };
+	return { handlers, ctx, frames, ws, url, sessionId, token, settings, controller };
 }
 
 async function setConfig(
@@ -194,6 +195,126 @@ describe("SDK replay capability filter", () => {
 		]);
 	});
 });
+
+test("live positioned tool events use the same negotiated capability gate as replay", async () => {
+	await withNotifications(async () => {
+		const capable = await setup();
+		const legacyFrames: Frame[] = [];
+		const legacy = new WebSocket(`${capable.url}/?token=${encodeURIComponent(capable.token)}`);
+		sockets.push(legacy);
+		legacy.addEventListener("message", event => legacyFrames.push(JSON.parse(String((event as MessageEvent).data))));
+		await new Promise<void>((resolve, reject) => {
+			legacy.addEventListener("open", () => resolve());
+			legacy.addEventListener("error", () => reject(new Error("websocket error")));
+		});
+		legacy.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [] }));
+		await sleep(50);
+
+		capable.ws.send(JSON.stringify({ type: "event_replay", id: "capable-attach", sinceSeq: 0 }));
+		legacy.send(JSON.stringify({ type: "event_replay", id: "legacy-attach", sinceSeq: 0 }));
+		await waitFor(
+			() => capable.frames.some(frame => frame.type === "event_replay_result" && frame.id === "capable-attach"),
+			"capable attachment replay",
+		);
+		await waitFor(
+			() => legacyFrames.some(frame => frame.type === "event_replay_result" && frame.id === "legacy-attach"),
+			"legacy attachment replay",
+		);
+		const capableReplay = capable.frames.find(
+			frame => frame.type === "event_replay_result" && frame.id === "capable-attach",
+		)!;
+		const legacyReplay = legacyFrames.find(
+			frame => frame.type === "event_replay_result" && frame.id === "legacy-attach",
+		)!;
+
+		await capable.handlers.get("turn_start")!({ type: "turn_start" } as never, capable.ctx);
+		await capable.handlers.get("tool_execution_start")!(
+			{
+				type: "tool_execution_start",
+				toolCallId: "positioned-call",
+				toolName: "apply_patch",
+				args: {},
+			} as never,
+			capable.ctx,
+		);
+		await capable.handlers.get("tool_execution_end")!(
+			{
+				type: "tool_execution_end",
+				toolCallId: "positioned-call",
+				toolName: "apply_patch",
+				result: {},
+				isError: false,
+			} as never,
+			capable.ctx,
+		);
+		await waitFor(
+			() =>
+				capable.frames.filter(
+					frame =>
+						frame.type === "event" &&
+						frame.kind === "tool_activity" &&
+						typeof frame.seq === "number" &&
+						frame.seq > Number(capableReplay.lastSeq),
+				).length === 2,
+			"capability-gated live positioned tool events",
+		);
+		await sleep(100);
+
+		const capableLive = capable.frames.filter(
+			frame =>
+				frame.type === "event" &&
+				frame.kind === "tool_activity" &&
+				typeof frame.seq === "number" &&
+				frame.seq > Number(capableReplay.lastSeq),
+		);
+		expect(capableLive.map(frame => (frame.payload as Record<string, unknown>).phase)).toEqual([
+			"started",
+			"completed",
+		]);
+		expect(
+			legacyFrames.filter(
+				frame =>
+					frame.type === "event" &&
+					frame.kind === "tool_activity" &&
+					typeof frame.seq === "number" &&
+					frame.seq > Number(legacyReplay.lastSeq),
+			),
+		).toHaveLength(0);
+
+		capable.ws.send(
+			JSON.stringify({
+				type: "event_replay",
+				id: "capable-after",
+				sinceGeneration: capableReplay.generation,
+				sinceSeq: capableReplay.lastSeq,
+			}),
+		);
+		legacy.send(
+			JSON.stringify({
+				type: "event_replay",
+				id: "legacy-after",
+				sinceGeneration: legacyReplay.generation,
+				sinceSeq: legacyReplay.lastSeq,
+			}),
+		);
+		await waitFor(
+			() => capable.frames.some(frame => frame.type === "event_replay_result" && frame.id === "capable-after"),
+			"capable parity replay",
+		);
+		await waitFor(
+			() => legacyFrames.some(frame => frame.type === "event_replay_result" && frame.id === "legacy-after"),
+			"legacy parity replay",
+		);
+		const capableAfter = capable.frames.find(
+			frame => frame.type === "event_replay_result" && frame.id === "capable-after",
+		)!;
+		const legacyAfter = legacyFrames.find(
+			frame => frame.type === "event_replay_result" && frame.id === "legacy-after",
+		)!;
+		expect((capableAfter.events as Frame[]).filter(frame => frame.kind === "tool_activity")).toEqual(capableLive);
+		expect((legacyAfter.events as Frame[]).filter(frame => frame.kind === "tool_activity")).toHaveLength(0);
+	});
+}, 30000);
 
 async function withNotifications(run: () => Promise<void>): Promise<void> {
 	const previous = process.env.GJC_NOTIFICATIONS;

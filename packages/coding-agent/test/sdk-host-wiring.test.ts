@@ -1280,30 +1280,67 @@ test("SDK host replays file attachment data as base64 while passing raw bytes to
 			socket.addEventListener("open", () => resolve(), { once: true });
 			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 		});
+		socket.send(JSON.stringify({ type: "event_replay", id: "file-attach", sinceGeneration: 1, sinceSeq: 0 }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "file-attach"),
+			"file attachment subscriber replay",
+		);
+		const attachmentReplay = frames.find(
+			frame => frame.type === "event_replay_result" && frame.id === "file-attach",
+		)!;
+		const attachmentCursor = Number(attachmentReplay.lastSeq);
 
 		await expect(getTelegramFileSink(sessionId)!({ path: attachmentPath })).resolves.toEqual({ ok: true });
 		await waitFor(() => nativeData !== undefined, "raw N-API file attachment");
 		expect(nativeData).toBeInstanceOf(Buffer);
 		expect(nativeData).toEqual(bytes);
+		await waitFor(
+			() =>
+				frames.some(
+					frame =>
+						frame.type === "event" &&
+						(frame.payload as Record<string, unknown> | undefined)?.type === "file_attachment" &&
+						typeof frame.seq === "number" &&
+						frame.seq > attachmentCursor,
+				),
+			"live positioned file attachment",
+		);
+		const liveAttachment = frames.find(
+			frame =>
+				frame.type === "event" &&
+				(frame.payload as Record<string, unknown> | undefined)?.type === "file_attachment" &&
+				typeof frame.seq === "number" &&
+				frame.seq > attachmentCursor,
+		)!;
 
-		socket.send(JSON.stringify({ type: "event_replay", id: "file-replay", sinceGeneration: 1, sinceSeq: 0 }));
+		socket.send(
+			JSON.stringify({
+				type: "event_replay",
+				id: "file-replay",
+				sinceGeneration: attachmentReplay.generation,
+				sinceSeq: attachmentCursor,
+			}),
+		);
 		await waitFor(
 			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "file-replay"),
 			"file replay",
 		);
 		const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "file-replay");
-		expect(replay?.events).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({
-					payload: expect.objectContaining({
-						type: "file_attachment",
-						sessionId,
-						name: "replay.bin",
-						data: bytes.toString("base64"),
-					}),
-				}),
-			]),
+		const replayedAttachment = (replay?.events as Record<string, unknown>[]).find(
+			frame => (frame.payload as Record<string, unknown> | undefined)?.type === "file_attachment",
 		);
+		expect(replayedAttachment).toEqual(liveAttachment);
+		expect(liveAttachment).toMatchObject({
+			type: "event",
+			kind: "file_attachment",
+			generation: attachmentReplay.generation,
+			payload: expect.objectContaining({
+				type: "file_attachment",
+				sessionId,
+				name: "replay.bin",
+				data: bytes.toString("base64"),
+			}),
+		});
 	} finally {
 		if (originalPushFileAttachmentUnchecked) {
 			nativePrototype.pushFileAttachmentUnchecked = originalPushFileAttachmentUnchecked;
@@ -1471,7 +1508,7 @@ test("SDK host replays event frames over direct v3 ingress and routes queries th
 	});
 });
 
-test("SDK host delivers positioned session events live to an attached direct subscriber", async () => {
+test("SDK host preserves positioned live order and replay parity for every attached direct subscriber", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-live-events-"));
 	dirs.push(cwd);
 	const sessionId = `sdk-${Date.now()}`;
@@ -1480,44 +1517,92 @@ test("SDK host delivers positioned session events live to an attached direct sub
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
 	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
-	const client = await SdkClient.connect(endpoint.url, endpoint.token);
+	const clients = await Promise.all([
+		SdkClient.connect(endpoint.url, endpoint.token),
+		SdkClient.connect(endpoint.url, endpoint.token),
+	]);
 	try {
-		const liveEvents: Record<string, unknown>[] = [];
-		client.onFrame(frame => {
-			if (frame.type === "event") liveEvents.push(frame);
-		});
+		const liveEvents: Record<string, unknown>[][] = [[], []];
+		for (const [index, client] of clients.entries()) {
+			client.onFrame(frame => {
+				if (frame.type === "event") liveEvents[index]!.push(frame);
+			});
+		}
 		// Authoritative attachment: replay completes before the terminal event exists.
-		const replay = (await client.request({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 })) as {
-			ok: boolean;
-			generation: number;
-			lastSeq: number;
-		};
-		expect(replay.ok).toBe(true);
-		const attachedSeq = replay.lastSeq;
+		const replays = (await Promise.all(
+			clients.map(client => client.request({ type: "event_replay", sinceGeneration: 1, sinceSeq: 0 })),
+		)) as Array<{ ok: boolean; generation: number; lastSeq: number }>;
+		expect(replays.every(replay => replay.ok)).toBe(true);
+		expect(new Set(replays.map(replay => replay.generation))).toEqual(new Set([replays[0]!.generation]));
+		expect(new Set(replays.map(replay => replay.lastSeq))).toEqual(new Set([replays[0]!.lastSeq]));
 		const sessionContext = context(cwd, sessionId);
 		await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
 		await handlers.get("agent_end")?.({ type: "agent_end" }, sessionContext);
-		// The already-attached subscriber must receive the later positioned terminal
-		// event live — no further query, replay, or reconnect is issued below.
+		// Both already-attached subscribers must receive the later positioned terminal
+		// event live before any further query, replay, or reconnect is issued.
 		await waitFor(
 			() =>
-				liveEvents.some(event => {
-					const payload = event.payload as Record<string, unknown> | undefined;
-					return payload?.type === "agent_end" && typeof event.seq === "number" && event.seq > attachedSeq;
+				liveEvents.every((events, index) =>
+					events.some(event => {
+						const payload = event.payload as Record<string, unknown> | undefined;
+						return (
+							payload?.type === "agent_end" &&
+							typeof event.seq === "number" &&
+							event.seq > replays[index]!.lastSeq
+						);
+					}),
+				),
+			"live positioned terminal events",
+		);
+
+		const liveLifecycle = liveEvents.map((events, index) =>
+			events.filter(event => {
+				const payloadType = (event.payload as Record<string, unknown> | undefined)?.type;
+				return (
+					(payloadType === "agent_start" || payloadType === "agent_end") &&
+					typeof event.seq === "number" &&
+					event.seq > replays[index]!.lastSeq
+				);
+			}),
+		);
+		for (const [index, lifecycle] of liveLifecycle.entries()) {
+			expect(lifecycle.map(event => (event.payload as Record<string, unknown>).type)).toEqual([
+				"agent_start",
+				"agent_end",
+			]);
+			const seqs = lifecycle.map(event => Number(event.seq));
+			expect(seqs).toEqual([...seqs].sort((left, right) => left - right));
+			expect(new Set(seqs).size).toBe(seqs.length);
+			expect(lifecycle).toEqual(
+				lifecycle.map(() =>
+					expect.objectContaining({
+						type: "event",
+						generation: replays[index]!.generation,
+						payload: expect.objectContaining({ sessionId }),
+					}),
+				),
+			);
+		}
+		expect(liveLifecycle[1]).toEqual(liveLifecycle[0]);
+
+		const postLiveReplays = (await Promise.all(
+			clients.map((client, index) =>
+				client.request({
+					type: "event_replay",
+					sinceGeneration: replays[index]!.generation,
+					sinceSeq: replays[index]!.lastSeq,
 				}),
-			"live positioned terminal event",
-		);
-		const terminal = liveEvents.find(
-			event => (event.payload as Record<string, unknown> | undefined)?.type === "agent_end",
-		);
-		expect(terminal).toMatchObject({
-			type: "event",
-			kind: "agent_end",
-			generation: replay.generation,
-			payload: expect.objectContaining({ type: "agent_end", sessionId }),
-		});
+			),
+		)) as Array<{ events: Record<string, unknown>[] }>;
+		for (const [index, replay] of postLiveReplays.entries()) {
+			const replayLifecycle = replay.events.filter(event => {
+				const payloadType = (event.payload as Record<string, unknown> | undefined)?.type;
+				return payloadType === "agent_start" || payloadType === "agent_end";
+			});
+			expect(replayLifecycle).toEqual(liveLifecycle[index]);
+		}
 	} finally {
-		await client.close();
+		await Promise.all(clients.map(client => client.close()));
 	}
 });
 
