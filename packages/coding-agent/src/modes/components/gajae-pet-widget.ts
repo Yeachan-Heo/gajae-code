@@ -1,17 +1,16 @@
 import {
 	type AnimationRegistration,
 	buildGajaePixelFrames,
-	burstTimeline,
 	type CellRect,
 	type Component,
 	type Container,
-	type GajaePixelFrameName,
+	type GajaeGifFrame,
+	type GajaeGifTimeline,
 	type GajaePixelFrames,
 	getCellDimensions,
 	getGajaePetGifCached,
-	idleTimeline,
-	PARA_PARA_STEPS,
 	PET_SKINS,
+	type PetBurst,
 	type PetFrameName,
 	type PetMode,
 	type PetSkinId,
@@ -20,7 +19,6 @@ import {
 	type RasterLeaseToken,
 	registerAnimationCallback,
 	type TUI,
-	workingTimeline,
 	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "./custom-editor";
@@ -82,21 +80,68 @@ type PetOverlayEmission = {
 const petOverlayEmitterOwners = new WeakMap<TUI, GajaePetWidget>();
 const petOverlayOwnershipEpochs = new WeakMap<TUI, number>();
 
-/** Working animation: the shared para-para beats looped end to end. */
-const WORK_LOOP_TOTAL = PARA_PARA_STEPS.reduce((sum, [, ms]) => sum + ms, 0);
 /** Random gap between automatic claw flexes while work is active. */
 const AUTO_FLEX_MIN_GAP_MS = 12_000;
 const AUTO_FLEX_MAX_GAP_MS = 40_000;
-// Deterministic idle loop: gaze around with a rare visor flicker.
-const IDLE_LOOP: Array<[GajaePixelFrameName, number]> = [
-	["base", 1100],
-	["gazeL", 350],
-	["base", 500],
-	["gazeR", 350],
-	["base", 800],
-	["flicker", 150],
-];
-const IDLE_LOOP_TOTAL = IDLE_LOOP.reduce((sum, [, ms]) => sum + ms, 0);
+function animationFrameAt(
+	steps: ReadonlyArray<readonly [PetFrameName, number]>,
+	now: number,
+	fallback: PetFrameName,
+): PetFrameName {
+	const total = steps.reduce((sum, [, ms]) => sum + ms, 0);
+	if (total <= 0) return fallback;
+	let elapsed = now % total;
+	for (const [frame, ms] of steps) {
+		if (elapsed < ms) return frame;
+		elapsed -= ms;
+	}
+	return fallback;
+}
+
+function animationFrameAtElapsed(
+	steps: ReadonlyArray<readonly [PetFrameName, number]>,
+	elapsed: number,
+	fallback: PetFrameName,
+): PetFrameName {
+	for (const [frame, ms] of steps) {
+		if (elapsed < ms) return frame;
+		elapsed -= ms;
+	}
+	return fallback;
+}
+
+function animationDuration(steps: ReadonlyArray<readonly [PetFrameName, number]>): number {
+	return steps.reduce((sum, [, ms]) => sum + ms, 0);
+}
+
+function gifTimeline(steps: ReadonlyArray<readonly [PetFrameName, number]>): GajaeGifFrame[] {
+	return steps.map(([name, delayMs]) => ({ name, delayMs }));
+}
+
+function burstGifTimeline(burst: PetBurst): GajaeGifTimeline {
+	const frames = gifTimeline(burst.intro);
+	const tail = burst.tail;
+	if (!tail || tail.frames.length === 0) return frames;
+	for (let elapsed = 0; elapsed < tail.ms; elapsed += tail.stepMs) {
+		frames.push({
+			name: tail.frames[Math.floor(elapsed / tail.stepMs) % tail.frames.length]!,
+			delayMs: Math.min(tail.stepMs, tail.ms - elapsed),
+		});
+	}
+	return frames;
+}
+
+function timelineSignature(frames: GajaeGifTimeline): string {
+	return frames.map(({ name, delayMs }) => `${name}:${delayMs}`).join(",");
+}
+
+interface WorkTransition {
+	startedAt: number;
+	steps: ReadonlyArray<readonly [PetFrameName, number]>;
+}
+
+const OUROBOROS_WORK_BURST_MIN_GAP_MS = 14_000;
+const OUROBOROS_WORK_BURST_MAX_GAP_MS = 30_000;
 
 /** Selector preview: fire the first burst this soon after a skin is previewed. */
 const PREVIEW_INTRO_MS = 2300;
@@ -142,7 +187,12 @@ export class GajaePetWidget {
 	#frame: PetFrameName = "base";
 	#animation: AnimationRegistration | undefined;
 	#flexUntil = 0;
+	#activeBurst: PetBurst | undefined;
 	#nextAutoFlexAt = 0;
+	#working = false;
+	#workTransition: WorkTransition | undefined;
+	#nextWorkBurstAt = 0;
+	#workBurstIndex = 0;
 	#flexSource: "preview" | "working" | undefined;
 	#previewFlexAt = 0;
 	#autoFlexGapMs: [number, number] | null;
@@ -245,6 +295,9 @@ export class GajaePetWidget {
 			this.#releaseOverlayEmitter();
 			this.#floorContainer.clear();
 			this.#pixel = undefined;
+			this.#activeBurst = undefined;
+			this.#workTransition = undefined;
+			this.#nextWorkBurstAt = 0;
 			this.#framedEditor.setReserve(0);
 			if (mountComposer) this.#mountEditor(false);
 			this.#ui.requestRender(true);
@@ -267,9 +320,14 @@ export class GajaePetWidget {
 			this.#queueImageCleanup(releasesKittyImage);
 		}
 		this.#mode = mode;
-		this.#frame = "base";
+		this.#frame = PET_SKINS[mode].baseFrame;
 		this.#flexUntil = 0;
+		this.#activeBurst = undefined;
 		this.#flexSource = undefined;
+		this.#working = this.#isWorking();
+		this.#workTransition = undefined;
+		this.#nextWorkBurstAt = 0;
+		this.#workBurstIndex = 0;
 		this.#previewFlexAt = 0;
 		this.#nextAutoFlexAt = 0;
 		this.#buildPixel(protocol);
@@ -350,6 +408,9 @@ export class GajaePetWidget {
 		this.#releaseOverlayEmitter();
 		this.#mode = "off";
 		this.#pixel = undefined;
+		this.#activeBurst = undefined;
+		this.#workTransition = undefined;
+		this.#nextWorkBurstAt = 0;
 		if (canMutateSharedUi) {
 			this.#floorContainer.clear();
 			this.#framedEditor.setReserve(0);
@@ -390,28 +451,53 @@ export class GajaePetWidget {
 		if (this.#canMutateSharedUi()) this.#mountEditor(this.#mode !== "off");
 	}
 
+	#syncWorkingState(now: number): PetSkinId | undefined {
+		if (this.#mode === "off") return undefined;
+		const skin = PET_SKINS[this.#mode];
+		const working = this.#isWorking();
+		if (working !== this.#working) {
+			this.#working = working;
+			this.#flexUntil = 0;
+			this.#activeBurst = undefined;
+			this.#nextWorkBurstAt = 0;
+			const steps = working ? skin.workEnter : skin.workExit;
+			this.#workTransition = steps?.length ? { startedAt: now, steps } : undefined;
+		}
+		return this.#mode;
+	}
+
 	#pickFrame(now: number): PetFrameName {
 		const mode = this.#mode;
 		if (mode === "off") return "base";
+		const skin = PET_SKINS[mode];
+		this.#syncWorkingState(now);
+		if (this.#workTransition) {
+			const elapsed = now - this.#workTransition.startedAt;
+			const duration = animationDuration(this.#workTransition.steps);
+			if (elapsed < duration) return animationFrameAtElapsed(this.#workTransition.steps, elapsed, skin.baseFrame);
+			this.#workTransition = undefined;
+		}
 		if (now < this.#flexUntil) {
-			const burst = PET_SKINS[mode].burst;
+			const burst = this.#activeBurst ?? skin.burst;
 			const elapsed = now - (this.#flexUntil - petBurstDurationMs(burst));
 			return petBurstFrame(burst, elapsed, now);
 		}
-		if (this.#isWorking()) {
-			let d = now % WORK_LOOP_TOTAL;
-			for (const [frame, ms] of PARA_PARA_STEPS) {
-				if (d < ms) return frame;
-				d -= ms;
-			}
-			return "base";
+		return this.#isWorking()
+			? animationFrameAt(skin.work, now, skin.baseFrame)
+			: animationFrameAt(skin.idle, now, skin.baseFrame);
+	}
+
+	#itermTimeline(now: number, working: boolean, flexing: boolean): GajaeGifTimeline {
+		if (this.#mode === "off") return gifTimeline([]);
+		this.#syncWorkingState(now);
+		const skin = PET_SKINS[this.#mode];
+		if (flexing) return burstGifTimeline(this.#activeBurst ?? skin.burst);
+		if (this.#workTransition) {
+			const elapsed = now - this.#workTransition.startedAt;
+			if (elapsed < animationDuration(this.#workTransition.steps)) return gifTimeline(this.#workTransition.steps);
+			this.#workTransition = undefined;
 		}
-		let t = now % IDLE_LOOP_TOTAL;
-		for (const [frame, ms] of IDLE_LOOP) {
-			if (t < ms) return frame;
-			t -= ms;
-		}
-		return "base";
+		return gifTimeline(working ? skin.work : skin.idle);
 	}
 
 	#tickIterm(now: number): void {
@@ -467,9 +553,11 @@ export class GajaePetWidget {
 		};
 		const availability = getVerifiedItermPetAvailability();
 		if (!availability?.available || getItermPetUnavailableReason() || !this.#ui.terminalAvailable) return;
+		this.#syncWorkingState(now);
 		const working = this.#isWorking();
 		const flexing = this.#flexUntil > now;
-		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${working}:${flexing}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
+		const frames = this.#itermTimeline(now, working, flexing);
+		const semantic = `${this.#mode}:${availability.mode}:${availability.epoch}:${working}:${flexing}:${timelineSignature(frames)}:${rect.column},${rect.row}:${cell.widthPx},${cell.heightPx}:${this.#ui.terminal.columns},${this.#ui.terminal.rows}`;
 		if (this.#itermSubmitPending || (semantic === this.#itermLastSemantic && this.#itermLease)) return;
 		this.#itermLastSemantic = semantic;
 		this.#itermSubmitPending = true;
@@ -482,6 +570,7 @@ export class GajaePetWidget {
 			semantic,
 			working,
 			flexing,
+			frames,
 			{
 				columns: this.#ui.terminal.columns,
 				rows: terminalRows,
@@ -503,6 +592,7 @@ export class GajaePetWidget {
 		semantic: string,
 		working: boolean,
 		flexing: boolean,
+		frames: GajaeGifTimeline,
 		geometry: Readonly<{ columns: number; rows: number; cellWidthPx: number; cellHeightPx: number }>,
 		composerBottomOffset: number,
 	): Promise<void> {
@@ -529,6 +619,8 @@ export class GajaePetWidget {
 				!this.#ui.manualViewportActive &&
 				this.#isWorking() === working &&
 				flexingNow === flexing &&
+				timelineSignature(this.#itermTimeline(performance.now(), this.#isWorking(), flexingNow)) ===
+					timelineSignature(frames) &&
 				this.#framedEditor.canFit(terminal.columns) &&
 				terminal.columns === geometry.columns &&
 				terminal.rows === geometry.rows &&
@@ -583,11 +675,6 @@ export class GajaePetWidget {
 			this.#itermLease = token;
 		}
 		this.#itermLastSemantic = semantic;
-		const frames = flexing
-			? burstTimeline(this.#mode === "off" ? "red" : this.#mode)
-			: working
-				? workingTimeline()
-				: idleTimeline();
 		const cell = getCellDimensions();
 		const gif = getGajaePetGifCached({
 			skin: this.#mode === "off" ? "red" : this.#mode,
@@ -630,6 +717,13 @@ export class GajaePetWidget {
 		}
 	}
 
+	#scheduleWorkBurst(now: number): void {
+		this.#nextWorkBurstAt =
+			now +
+			OUROBOROS_WORK_BURST_MIN_GAP_MS +
+			Math.random() * (OUROBOROS_WORK_BURST_MAX_GAP_MS - OUROBOROS_WORK_BURST_MIN_GAP_MS);
+	}
+
 	#scheduleAutoFlex(now: number): void {
 		if (!this.#autoFlexGapMs) return;
 		const [min, max] = this.#autoFlexGapMs;
@@ -638,6 +732,8 @@ export class GajaePetWidget {
 
 	#tick(now: number): void {
 		if (!this.#isActiveOwner()) return;
+		const skin = this.#mode === "off" ? undefined : PET_SKINS[this.#mode];
+		this.#syncWorkingState(now);
 		const working = this.#isWorking();
 		if (!working) {
 			this.#nextAutoFlexAt = 0;
@@ -649,20 +745,31 @@ export class GajaePetWidget {
 		if (now >= this.#flexUntil) {
 			this.#flexUntil = 0;
 			this.#flexSource = undefined;
-			if (this.#previewFlexAt !== 0 && now >= this.#previewFlexAt) {
-				const skin = this.#mode === "off" ? "red" : this.#mode;
-				this.#flexUntil = now + petBurstDurationMs(PET_SKINS[skin].burst);
+			if (this.#previewFlexAt !== 0 && now >= this.#previewFlexAt && skin) {
+				this.#activeBurst = skin.burst;
+				this.#flexUntil = now + petBurstDurationMs(skin.burst);
 				this.#flexSource = "preview";
 				this.#previewFlexAt = 0;
-			} else if (this.#autoFlexGapMs && working) {
+			} else if (this.#autoFlexGapMs && working && skin && !skin.workBursts?.length) {
 				if (this.#nextAutoFlexAt === 0) this.#scheduleAutoFlex(now);
 				else if (now >= this.#nextAutoFlexAt) {
-					const skin = this.#mode === "off" ? "red" : this.#mode;
-					const burstMs = petBurstDurationMs(PET_SKINS[skin].burst);
+					this.#activeBurst = skin.burst;
+					const burstMs = petBurstDurationMs(skin.burst);
 					this.#flexUntil = now + burstMs;
 					this.#flexSource = "working";
 					this.#scheduleAutoFlex(now + burstMs);
 				}
+			}
+		}
+		if (working && skin?.workBursts?.length && !this.#workTransition && now >= this.#flexUntil) {
+			if (this.#nextWorkBurstAt === 0) this.#scheduleWorkBurst(now);
+			else if (now >= this.#nextWorkBurstAt) {
+				const burst = skin.workBursts[this.#workBurstIndex % skin.workBursts.length];
+				this.#workBurstIndex++;
+				this.#activeBurst = burst;
+				this.#flexUntil = now + petBurstDurationMs(burst);
+				this.#flexSource = "working";
+				this.#scheduleWorkBurst(this.#flexUntil);
 			}
 		}
 		if (this.#itermProtocol) {

@@ -1681,11 +1681,11 @@ export class InputController {
 	}
 
 	handleTextPaste(text: string, context: PasteTextContext): boolean | Promise<boolean> {
-		if (this.ctx.isBashMode || this.ctx.isPythonMode) return false;
 		if (isItermPetDragPaste(text)) {
 			this.ctx.showStatus("Ignored dragged Gajae Pet image.", { dim: true });
 			return true;
 		}
+		if (this.ctx.isBashMode || this.ctx.isPythonMode) return false;
 		const parsed = parsePastedImagePaths(text, { cwd: this.ctx.sessionManager.getCwd() });
 		if (!parsed) return false;
 		if (parsed.kind === "too-many") {

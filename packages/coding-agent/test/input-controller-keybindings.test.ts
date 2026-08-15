@@ -1209,6 +1209,39 @@ describe("InputController pasted image path transactions", () => {
 		expect(spies.showStatus).toHaveBeenCalledWith("Ignored dragged Gajae Pet image.", { dim: true });
 	});
 
+	it("consumes marked iTerm Pet drag paths in Bash and Python modes but leaves ordinary image paths literal", async () => {
+		const dragPaths = [
+			"/var/folders/cp/9506bhz103gc1rg1k4xq3vcw0000gn/T/iTerm2.d54w3v.gajae-pet.gif\n",
+			"/var/folders/cp/9506bhz103gc1rg1k4xq3vcw0000gn/T/iTerm2.d54w3v.gajae-pet.png\n",
+		];
+		for (const mode of ["bash", "python"] as const) {
+			for (const dragPath of dragPaths) {
+				const { InputController, ctx, editor, spies } = await createContext();
+				ctx.isBashMode = mode === "bash";
+				ctx.isPythonMode = mode === "python";
+				const controller = new InputController(ctx);
+				controller.setupKeyHandlers();
+
+				const handled = await editor.onPasteText?.(dragPath, pasteTextContext());
+
+				expect(handled).toBe(true);
+				expect(editor.getText()).toBe("");
+				expect(ctx.pendingImages).toEqual([]);
+				expect(spies.showStatus).toHaveBeenCalledWith("Ignored dragged Gajae Pet image.", { dim: true });
+			}
+
+			const { InputController, ctx, editor, spies } = await createContext();
+			ctx.isBashMode = mode === "bash";
+			ctx.isPythonMode = mode === "python";
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+			const handled = await editor.onPasteText?.("/tmp/ordinary-image.png\n", pasteTextContext());
+
+			expect(handled).toBe(false);
+			expect(spies.showStatus).not.toHaveBeenCalled();
+		}
+	});
+
 	it("confirms and atomically attaches saved-image batches in source order", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-pasted-images-"));
 		const first = path.join(directory, "first.png");

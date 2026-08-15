@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as tui from "@gajae-code/tui";
 import {
 	__animationSchedulerTestHooks,
+	buildGajaePixelFrames,
 	Container,
 	getCellDimensions,
+	PET_SKINS,
 	setCellDimensions,
 	type TUI,
 	wrapITerm2RecordForTmux,
@@ -1492,6 +1495,58 @@ describe("GajaePetWidget", () => {
 			stubs.widget.dispose();
 		}
 	});
+	it("uses only Ouroboros frames for raster overlays and iTerm GIFs", async () => {
+		vi.useFakeTimers();
+		let working = false;
+		const sixel = makeWidget(80, 30, { protocol: "sixel", isWorking: () => working });
+		const cell = getCellDimensions();
+		const ouroboros = PET_SKINS.ouroboros;
+		const expectedSixel = buildGajaePixelFrames({
+			protocol: "sixel",
+			skin: "ouroboros",
+			cellWidthPx: cell.widthPx,
+			cellHeightPx: cell.heightPx,
+			targetRows: 2,
+			sixelTopPaddingPx: 9,
+		});
+		try {
+			sixel.widget.setMode("ouroboros");
+			expect(sixel.getEmitter()?.()).toContain(expectedSixel.frames.idle);
+
+			working = true;
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+			const workEnterFrame = ouroboros.workEnter?.[0]?.[0];
+			expect(workEnterFrame).toBeDefined();
+			expect(sixel.written.some(chunk => chunk.includes(expectedSixel.frames[workEnterFrame!]))).toBe(true);
+		} finally {
+			sixel.widget.dispose();
+		}
+
+		const iterm = makeWidget(80, 30, { protocol: null, autoFlexGapMs: null });
+		try {
+			setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+			iterm.widget.setMode("ouroboros");
+			vi.advanceTimersByTime(80);
+			await flushAsyncChain();
+
+			const columns = Math.ceil((2 * cell.heightPx) / cell.widthPx);
+			const expectedGif = tui.getGajaePetGifCached({
+				skin: "ouroboros",
+				timeline: ouroboros.idle.map(([name, delayMs]) => ({ name, delayMs })),
+				targetRows: 2,
+				rectangle: { width: columns * cell.widthPx, height: 3 * cell.heightPx },
+				contentInset: { topPx: Math.floor(cell.heightPx / 2), bottomPx: Math.ceil(cell.heightPx / 2) },
+				displaySize: { width: columns, height: 3 },
+			});
+			const records = iterm.getRasterOutputs().map(record => new TextDecoder().decode(record));
+			for (const record of expectedGif.multipart) expect(records).toContain(record);
+		} finally {
+			setVerifiedItermPetAvailability(undefined);
+			iterm.widget.dispose();
+		}
+	});
+
 	it("drops a stale iTerm worker GIF when activity ends during lease acquisition", async () => {
 		vi.useFakeTimers();
 		let working = true;
