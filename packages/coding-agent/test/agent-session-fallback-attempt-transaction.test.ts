@@ -801,16 +801,11 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		expect(session.messages).toHaveLength(2);
 		expect(session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
 	});
-	it("auto-recovers a local snapshot failure with a bounded same-model retry", async () => {
+	it("surfaces a typed local snapshot failure without a same-model retry", async () => {
 		let calls = 0;
-		createSession((model, context, options) => {
+		createSession(model => {
 			calls += 1;
-			if (calls === 1) return collapsedSnapshotStream(model);
-			return createMockModel({ responses: [{ content: ["recovered after snapshot failure"] }] }).stream(
-				model,
-				context,
-				options,
-			);
+			return collapsedSnapshotStream(model);
 		});
 		const events: AgentSessionEvent[] = [];
 		session!.subscribe(event => events.push(event));
@@ -818,15 +813,16 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		await withTimeout(session!.prompt("trigger the local snapshot failure"), "prompt");
 		await withTimeout(session!.waitForIdle(), "waitForIdle");
 
-		expect(calls).toBe(2);
+		expect(calls).toBe(1);
 		expect(session!.isRetrying).toBe(false);
-		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(1);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
 		// A local machinery failure must never advance the provider fallback chain.
 		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
-			stopReason: "stop",
-			content: [{ type: "text", text: "recovered after snapshot failure" }],
+			stopReason: "error",
+			errorKind: "local_snapshot_failure",
+			errorMessage: expect.stringContaining("local snapshot bug"),
 		});
 	});
 	it("honors retry.enabled=false for local snapshot failures on a managed chain", async () => {
@@ -893,21 +889,15 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			tried: [],
 		});
 	});
-	it("auto-recovers a prefix-classified snapshot failure on a single-model session", async () => {
+	it("surfaces a prefix-classified snapshot failure once on a single-model session", async () => {
 		let calls = 0;
 		createSession(
-			(model, context, options) => {
+			model => {
 				calls += 1;
-				if (calls === 1)
-					return localErrorEventStream(
-						model,
-						[],
-						"Managed fallback attempt could not produce a serializable event snapshot (local snapshot bug, not a provider failure)",
-					);
-				return createMockModel({ responses: [{ content: ["single-model recovery"] }] }).stream(
+				return localErrorEventStream(
 					model,
-					context,
-					options,
+					[],
+					"Managed fallback attempt could not produce a serializable event snapshot (local snapshot bug, not a provider failure)",
 				);
 			},
 			3,
@@ -919,17 +909,17 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		await withTimeout(session!.prompt("single-model snapshot failure"), "prompt");
 		await withTimeout(session!.waitForIdle(), "waitForIdle");
 
-		expect(calls).toBe(2);
+		expect(calls).toBe(1);
 		expect(session!.isRetrying).toBe(false);
-		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(1);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
 		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
-			stopReason: "stop",
-			content: [{ type: "text", text: "single-model recovery" }],
+			stopReason: "error",
+			errorMessage: expect.stringContaining("local snapshot bug"),
 		});
 	});
-	it("surfaces the local diagnostic after bounded snapshot-failure retries without provider fallback", async () => {
+	it("surfaces one local diagnostic without deterministic snapshot-failure retries", async () => {
 		let calls = 0;
 		createSession(model => {
 			calls += 1;
@@ -941,10 +931,9 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		await withTimeout(session!.prompt("trigger persistent local snapshot failures"), "prompt");
 		await withTimeout(session!.waitForIdle(), "waitForIdle");
 
-		// Initial attempt + retry.maxRetries (default 3) bounded retries.
-		expect(calls).toBe(4);
+		expect(calls).toBe(1);
 		expect(session!.isRetrying).toBe(false);
-		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(3);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
 		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
@@ -952,7 +941,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			errorKind: "local_snapshot_failure",
 			errorMessage: expect.stringContaining("local snapshot bug"),
 		});
-		// Every bounded local retry must have discharged its provisional charge.
+		// The one local failure must discharge its provisional provider charge.
 		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({
 			activeIndex: 0,
 			attemptsUsed: 0,

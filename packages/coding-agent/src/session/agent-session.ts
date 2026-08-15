@@ -18141,11 +18141,12 @@ export class AgentSession {
 		// charge up front; the discard is a no-op when no attempt is currently
 		// charged.
 		if ((localSnapshot || localBufferOverflow) && managedFallback) controller.discardStartedAttempt();
-		// Local staging-capacity failure: re-streaming the same request
-		// reproduces the same oversized response, so automatic retry only burns
-		// tokens. Surface the explicit local diagnostic immediately without
-		// provider-fallback attribution or credential mutation.
-		if (localBufferOverflow) {
+		// Local snapshot/staging failures are deterministic for the retained
+		// producer shape. Re-streaming the same request only duplicates the same
+		// local defect (and, before #4578, amplified it three times). Surface the
+		// one producer-boundary diagnostic immediately without provider-fallback
+		// attribution or credential mutation.
+		if (localSnapshot || localBufferOverflow) {
 			return managedOutcome
 				? {
 						type: "terminal",
@@ -18155,23 +18156,8 @@ export class AgentSession {
 		}
 		// retry.enabled=false always surfaces immediately, matching the explicit
 		// user opt-out. The managed provider-fallback chain keeps its own
-		// availability policy, but the local-snapshot path is a session retry
-		// governed by retry.* settings, so the opt-out applies to it even when a
-		// managed chain is configured.
-		if (!retrySettings.enabled && (!managedFallback || localSnapshot)) {
-			return managedOutcome
-				? {
-						type: "terminal",
-						terminal: { stopReason: "error", messages: [message] },
-					}
-				: false;
-		}
-		// Local snapshot-machinery failure: the staged attempt was discarded
-		// before anything was published, so a content-free same-model re-issue is
-		// replay-safe. It deliberately carries no transport facts, so it must
-		// never charge the fallback chain, advance models, or mutate credentials
-		// — bounded local retry only, then surface the explicit local diagnostic.
-		if (localSnapshot && assistantMessageHasVisibleOrToolContent(message)) {
+		// availability policy.
+		if (!retrySettings.enabled && !managedFallback) {
 			return managedOutcome
 				? {
 						type: "terminal",
@@ -18214,9 +18200,7 @@ export class AgentSession {
 		}
 		const trigger:
 			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined = localSnapshot
-			? { class: "unknown" }
-			: this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+			| undefined = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		if (!trigger) {
 			return managedOutcome
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
@@ -18251,13 +18235,7 @@ export class AgentSession {
 		// first-event timeout adds the typed, content-free, current-clean-scope
 		// requirement above; other transient watchdogs preserve legacy behavior.
 		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
-		if (
-			!managedFallback &&
-			!legacyRetryConfigured &&
-			!localSnapshot &&
-			!canReplayRotatedCredential &&
-			!canReplayEmptyResponse
-		) {
+		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
@@ -18279,19 +18257,14 @@ export class AgentSession {
 			!managedFallback &&
 			classification === "transient" &&
 			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
-		const attemptsUsed = managedFallback && !localSnapshot ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
 		let outcome: "retry" | "advance" | "exhausted";
-		if (localSnapshot) {
-			// The provisional charge was already discarded at classification time.
-			outcome = attemptsUsed <= retrySettings.maxRetries ? "retry" : "exhausted";
-		} else {
-			outcome = managedFallback
-				? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-				: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
-					? "retry"
-					: "exhausted";
-		}
+		outcome = managedFallback
+			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
+			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+				? "retry"
+				: "exhausted";
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
 		// exhaustion and forces an immediate same-model retry.
@@ -18310,16 +18283,6 @@ export class AgentSession {
 			}
 		}
 		if (outcome === "exhausted") {
-			if (localSnapshot) {
-				// Bounded local retries exhausted: surface the original local
-				// diagnostic without any provider-fallback attribution.
-				return managedOutcome
-					? {
-							type: "terminal",
-							terminal: { stopReason: "error", messages: [message] },
-						}
-					: false;
-			}
 			if (managedFallback) {
 				const errorMessage = this.#fallbackExhaustionError(controller);
 				this.emitNotice("error", errorMessage, "fallback");
