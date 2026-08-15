@@ -14278,9 +14278,25 @@ export class AgentSession {
 	 * @returns New level, or undefined if model doesn't support thinking
 	 */
 	cycleThinkingLevel(): ThinkingLevel | undefined {
-		if (!this.model?.reasoning) return undefined;
+		// Allow cycling if the model advertises reasoning capability OR if the
+		// session already has an active thinking level set via config/selector.
+		const isReasoningCapable = this.model?.reasoning === true || this.thinkingLevel !== undefined;
+		if (!isReasoningCapable) return undefined;
 
-		const levels = [ThinkingLevel.Off, ...this.getAvailableThinkingLevels()];
+		const available = this.getAvailableThinkingLevels();
+		const levels = [
+			ThinkingLevel.Off,
+			...(available.length > 0
+				? available
+				: [
+						ThinkingLevel.Minimal,
+						ThinkingLevel.Low,
+						ThinkingLevel.Medium,
+						ThinkingLevel.High,
+						ThinkingLevel.XHigh,
+						ThinkingLevel.Max,
+					]),
+		];
 		const currentLevel = this.thinkingLevel === ThinkingLevel.Inherit ? ThinkingLevel.Off : this.thinkingLevel;
 		const currentIndex = currentLevel ? levels.indexOf(currentLevel) : -1;
 		const nextIndex = (currentIndex + 1) % levels.length;
@@ -14432,7 +14448,23 @@ export class AgentSession {
 	 */
 	getAvailableThinkingLevels(): ReadonlyArray<Effort> {
 		if (!this.model) return [];
-		return getSupportedEfforts(this.model);
+		try {
+			const supported = getSupportedEfforts(this.model);
+			if (supported.length > 0) return supported;
+		} catch {}
+		// Fallback for models without reasoning metadata (e.g. local omlx, custom proxies)
+		// when an effort is already active or requested.
+		if (this.thinkingLevel !== undefined || this.model.reasoning) {
+			return [
+				ThinkingLevel.Minimal,
+				ThinkingLevel.Low,
+				ThinkingLevel.Medium,
+				ThinkingLevel.High,
+				ThinkingLevel.XHigh,
+				ThinkingLevel.Max,
+			] as unknown as ReadonlyArray<Effort>;
+		}
+		return [];
 	}
 
 	/**

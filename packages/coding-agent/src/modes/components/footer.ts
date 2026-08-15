@@ -196,7 +196,7 @@ export class FooterComponent implements Component {
 
 		// Add thinking level hint when reasoning effort is active
 		let rightSide = modelName;
-		if (state.model?.thinking || state.thinkingLevel) {
+		if (state.model?.thinking || state.thinkingLevel || state.model?.reasoning) {
 			const thinkingLevel = state.thinkingLevel ?? ThinkingLevel.Off;
 			if (thinkingLevel !== ThinkingLevel.Off) {
 				rightSide = `${modelName} • ${thinkingLevel}`;
