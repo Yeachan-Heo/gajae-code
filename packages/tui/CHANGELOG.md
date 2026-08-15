@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Adapt the iTerm pet to terminal geometry so narrow panes render it without clipping (#4579).
+
 ## [0.13.3] - 2026-08-15
 
 ### Added

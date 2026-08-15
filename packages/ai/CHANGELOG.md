@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Release the Codex websocket when the consumer aborts, preventing leaked connections after cancelled turns (#4556).
+
 ## [0.13.3] - 2026-08-15
 
 ### Added

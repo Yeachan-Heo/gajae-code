@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Bound `apply_patch` transcript metadata so oversized patch payloads cannot bloat managed session transcripts (#4573).
+
 ## [0.13.3] - 2026-08-15
 
 ### Added
