@@ -2,6 +2,7 @@
  * Edit tool renderer and LSP batching helpers.
  */
 
+import { createHash } from "node:crypto";
 import type { Component } from "@gajae-code/tui";
 import { Text, visibleWidth, wrapTextWithAnsi } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
@@ -83,6 +84,45 @@ export interface EditToolDetails {
 	oldText?: string;
 	/** Source-of-truth content after the edit; `undefined` for delete operations. */
 	newText?: string;
+}
+
+/**
+ * Bounded durable identity of one edit snapshot (#4566).
+ *
+ * Live edit results carry full `oldText`/`newText` file bodies so in-process
+ * consumers (ACP `diff` ToolCallContent, editors) keep working. Every persisted
+ * transcript entry replaces those bodies with this fixed-size receipt: byte
+ * length plus SHA-256 content digest, enough to detect source drift and to
+ * account for the edit durably without re-writing the whole file per edit.
+ */
+export interface EditSnapshotReceipt {
+	/** UTF-8 byte length of the snapshot (`0` for create/delete-absent sides). */
+	bytes: number;
+	/** SHA-256 hex digest of the exact snapshot text (empty string for length 0). */
+	sha256: string;
+}
+
+/** Per-edit-mode cap on any single persisted edit-result string field (#4566). */
+export const EDIT_PERSIST_FIELD_MAX_CHARS = 16 * 1024;
+
+/** Fixed marker used when a snapshot receipt replaces a full body. */
+export const EDIT_SNAPSHOT_EXTERNALIZED_NOTICE =
+	"[edit snapshot externalized: see oldTextDigest/newTextDigest; full body omitted from transcript]";
+
+function sha256Hex(text: string): string {
+	if (text.length === 0) return "";
+	return createHash("sha256").update(Buffer.from(text, "utf-8")).digest("hex");
+}
+
+/** Build the bounded durable receipt for one snapshot body. */
+export function editSnapshotReceipt(text: string | undefined): EditSnapshotReceipt | undefined {
+	if (text === undefined) return undefined;
+	return { bytes: Buffer.byteLength(text, "utf-8"), sha256: sha256Hex(text) };
+}
+
+/** True when a snapshot body is small enough to persist inline without amplification. */
+export function editSnapshotPersistableInline(text: string | undefined): boolean {
+	return text !== undefined && text.length <= EDIT_PERSIST_FIELD_MAX_CHARS;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

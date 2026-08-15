@@ -465,6 +465,7 @@ import {
 	SessionAppendPersistenceError,
 	SessionContextTooLargeError,
 	SessionManager,
+	SessionNearLimitAppendError,
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
@@ -5015,6 +5016,47 @@ export class AgentSession {
 				try {
 					this.sessionManager.appendMessage(event.message);
 				} catch (error) {
+					// Typed near-limit append (#4566): the transcript hit the managed
+					// per-file cap and even the live-entry rewrite could not hold this
+					// entry. The edit/effect itself may already be committed; surface a
+					// structured tool-result outcome stating that and the exact
+					// continuation path instead of a generic fatal abort. The typed
+					// error already performed deterministic recovery, so the session is
+					// not poisoned and the turn ends with actionable state.
+					if (error instanceof SessionNearLimitAppendError) {
+						this.agent.abort();
+						if (event.message.role === "toolResult") {
+							event.message.isError = true;
+							const committed = error.entryRetained
+								? "The edit committed and its receipt is retained in the live session; it will persist on the next successful write."
+								: "The edit committed on disk but its receipt could not be retained in the live session.";
+							event.message.content = [
+								{
+									type: "text",
+									text: [
+										"Session transcript reached the managed per-file limit; this result could not be recorded durably.",
+										committed,
+										"Continue by compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`); re-verify the edited file before relying on it.",
+									].join("\n"),
+								},
+							];
+							event.message.details = {
+								...(event.message.details && typeof event.message.details === "object"
+									? event.message.details
+									: {}),
+								failureKind: "persistence",
+								nearLimitAppend: {
+									code: error.code,
+									entryBytes: error.entryBytes,
+									liveBytes: error.liveBytes,
+									capBytes: error.capBytes,
+									entryRetained: error.entryRetained,
+								},
+							};
+							this.agent.touchContext();
+						}
+						return;
+					}
 					if (
 						event.message.role !== "toolResult" ||
 						event.message.toolName !== "todo_write" ||

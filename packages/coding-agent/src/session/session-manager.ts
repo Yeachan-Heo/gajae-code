@@ -40,6 +40,7 @@ import {
 	Snowflake,
 	toError,
 } from "@gajae-code/utils";
+import { EDIT_SNAPSHOT_EXTERNALIZED_NOTICE, editSnapshotReceipt } from "../edit/renderer";
 import type { TtsrInjectionRecord } from "../export/ttsr";
 import { assertSafePathComponent } from "../gjc-runtime/session-layout";
 import { writeTextAtomic } from "../gjc-runtime/state-writer";
@@ -2042,6 +2043,49 @@ export class SessionAppendPersistenceError extends Error {
 		this.phase = phase;
 		this.entryId = entryId;
 		this.persistenceError = persistenceError;
+	}
+}
+
+/**
+ * Typed near-limit append outcome (#4566).
+ *
+ * A live managed append that would cross the per-file transcript cap is now
+ * preflighted: when the append alone cannot fit even after a full rewrite of
+ * the live entries, this deterministic error replaces the generic
+ * `SessionAppendPersistenceError: content_too_large` abort. It states whether
+ * the in-memory entry was kept (so the just-committed source mutation keeps
+ * its receipt on the next successful persist) and how to continue.
+ */
+export class SessionNearLimitAppendError extends Error {
+	readonly code = "near_limit_append" as const;
+	/** Serialized size (bytes) of the entry that could not fit. */
+	readonly entryBytes: number;
+	/** Live-entry rewrite size (bytes) the recovery already attempted. */
+	readonly liveBytes: number;
+	/** Managed per-file cap in force when the append was rejected. */
+	readonly capBytes: number;
+	/** True when the entry remains in the resident list awaiting the next persist. */
+	readonly entryRetained: boolean;
+
+	constructor(details: {
+		entryBytes: number;
+		liveBytes: number;
+		capBytes: number;
+		entryRetained: boolean;
+	}) {
+		super(
+			[
+				`near_limit_append: entry (${details.entryBytes} B) plus live transcript (${details.liveBytes} B) exceeds the managed per-file limit (${details.capBytes} B).`,
+				details.entryRetained
+					? "The appended entry is retained in memory; its effect (including any committed source edit) is recorded and will persist on the next successful write. Compact the session (`/compact`) or export to a fresh session (`gjc export <session-file>`) before continuing."
+					: "The appended entry was rolled back from memory; re-issue it after compacting the session (`/compact`) or exporting to a fresh session (`gjc export <session-file>`).",
+			].join(" "),
+		);
+		this.name = "SessionNearLimitAppendError";
+		this.entryBytes = details.entryBytes;
+		this.liveBytes = details.liveBytes;
+		this.capBytes = details.capBytes;
+		this.entryRetained = details.entryRetained;
 	}
 }
 
@@ -4634,6 +4678,12 @@ async function movePathAcrossDevicesSafe(source: string, destination: string): P
 
 const MAX_PERSIST_CHARS = 500_000;
 const TRUNCATION_NOTICE = "\n\n[Session persistence truncated large content]";
+/**
+ * Inline cap for edit-result snapshot bodies (`EditToolDetails.oldText` /
+ * `.newText` and per-file copies). Bodies up to this size persist verbatim;
+ * larger ones persist as a digest receipt (#4566).
+ */
+const EDIT_SNAPSHOT_INLINE_MAX_CHARS = 16 * 1024;
 /** Minimum base64 length to externalize to blob store (skip tiny inline images) */
 const BLOB_EXTERNALIZE_THRESHOLD = 1024;
 const TEXT_CONTENT_KEY = "content";
@@ -4759,6 +4809,77 @@ function truncateString(value: string, maxLength: number): string {
 		}
 	}
 	return truncated;
+}
+
+/**
+ * Bound durable edit-result snapshot bodies (#4566).
+ *
+ * A tiny edit to a large file used to persist the complete pre- and post-edit
+ * file bodies in `EditToolDetails.oldText`/`newText` (and each
+ * `perFileResults[]` copy), so every patch added ~2x file size to the managed
+ * transcript and long sessions hit the 64 MiB per-file append limit mid-turn.
+ *
+ * Persisted edit results keep full bodies only under the inline cap; larger
+ * bodies are replaced by a fixed-size receipt (`oldTextDigest`/`newTextDigest`
+ * = byte length + SHA-256) plus a marker, so rendering, diagnostics, diffs,
+ * paths, and source-change accounting stay intact while the durable cost per
+ * edit is bounded independently of file size. Live in-process results are
+ * untouched — ACP `diff` ToolCallContent still receives full bodies.
+ */
+function boundEditSnapshotFields(value: unknown, visited: WeakSet<object>): unknown {
+	if (typeof value !== "object" || value === null) return value;
+	if (visited.has(value)) return value;
+	visited.add(value);
+
+	const boundOne = (entry: Record<string, unknown>): Record<string, unknown> => {
+		let changed = false;
+		const next: Record<string, unknown> = { ...entry };
+		const pairs: Array<["oldText", "oldTextDigest"] | ["newText", "newTextDigest"]> = [
+			["oldText", "oldTextDigest"],
+			["newText", "newTextDigest"],
+		];
+		for (const [bodyKey, digestKey] of pairs) {
+			const body = entry[bodyKey];
+			if (typeof body !== "string" || body.length <= EDIT_SNAPSHOT_INLINE_MAX_CHARS) continue;
+			const receipt = editSnapshotReceipt(body);
+			if (receipt === undefined) continue;
+			next[digestKey] = receipt;
+			next[bodyKey] = EDIT_SNAPSHOT_EXTERNALIZED_NOTICE;
+			changed = true;
+		}
+		return changed ? next : entry;
+	};
+
+	if (Array.isArray(value)) {
+		let changed = false;
+		const result: unknown[] = new Array(value.length);
+		for (let i = 0; i < value.length; i++) {
+			const item = value[i];
+			const bounded =
+				typeof item === "object" && item !== null && !Array.isArray(item)
+					? boundOne(item as Record<string, unknown>)
+					: item;
+			result[i] = bounded === item ? boundEditSnapshotFields(item, visited) : bounded;
+			if (result[i] !== item) changed = true;
+		}
+		return changed ? result : value;
+	}
+
+	for (const [key, child] of Object.entries(value)) {
+		if (child !== null && typeof child === "object" && !Array.isArray(child)) {
+			const boundedChild = boundOne(child as Record<string, unknown>);
+			if (boundedChild !== child) {
+				return { ...value, [key]: boundedChild };
+			}
+		}
+	}
+	for (const [key, child] of Object.entries(value)) {
+		const bounded = boundEditSnapshotFields(child, visited);
+		if (bounded !== child) {
+			return { ...(value as Record<string, unknown>), [key]: bounded };
+		}
+	}
+	return boundOne(value as Record<string, unknown>);
 }
 
 function isImageBlock(value: unknown): value is { type: "image"; data: string; mimeType?: string } {
@@ -5594,7 +5715,8 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 }
 
 async function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStore): Promise<FileEntry> {
-	return truncateForPersistence(entry, blobStore);
+	const truncated = (await truncateForPersistence(entry, blobStore)) as FileEntry;
+	return boundEditSnapshotFieldsForEntry(truncated);
 }
 
 /**
@@ -5699,7 +5821,25 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 }
 
 function prepareEntryForPersistenceSync(entry: FileEntry, blobStore: BlobStore): FileEntry {
-	return truncateForPersistenceSync(entry, blobStore) as FileEntry;
+	return boundEditSnapshotFieldsForEntry(truncateForPersistenceSync(entry, blobStore) as FileEntry);
+}
+
+/**
+ * Apply {@link boundEditSnapshotFields} to a persisted entry's edit-result
+ * details. Only `message` entries with `role === "toolResult"` and a `details`
+ * object can carry edit snapshots; everything else returns unchanged, so the
+ * walk never touches unrelated entries (#4566).
+ */
+function boundEditSnapshotFieldsForEntry(entry: FileEntry): FileEntry {
+	if (entry.type !== "message") return entry;
+	const message = entry.message;
+	if (message === null || typeof message !== "object" || (message as { role?: unknown }).role !== "toolResult")
+		return entry;
+	const details = (message as { details?: unknown }).details;
+	if (details === null || typeof details !== "object" || Array.isArray(details)) return entry;
+	const bounded = boundEditSnapshotFields(details, new WeakSet());
+	if (bounded === details) return entry;
+	return { ...entry, message: { ...(message as object), details: bounded } } as FileEntry;
 }
 
 class NdjsonFileWriter {
@@ -16076,9 +16216,62 @@ export class SessionManager {
 			// in-memory entries, shrinking the file below the limit. The entry has
 			// already been added to #fileEntries by #appendEntryWithinPersistenceFence.
 			if (err instanceof Error && err.message === "content_too_large") {
-				this.#rewriteFileSync();
+				// Typed near-limit contract (#4566): recover by rewriting only the
+				// live in-memory entries, then verify the recovered file actually
+				// holds the just-appended entry. When even the rewrite cannot fit
+				// the entry (live content alone is at the cap), surface the typed
+				// near-limit outcome instead of silently succeeding without the
+				// receipt for an effect that already committed (e.g. a source edit).
+				const entryBytes = (() => {
+					try {
+						const materialized = materializeResidentEntryForPersistenceSync(
+							entry,
+							this.#residentBlobStores(),
+							new Map(),
+						);
+						return Buffer.byteLength(
+							`${JSON.stringify(prepareEntryForPersistenceSync(materialized, this.#blobStore))}\n`,
+							"utf8",
+						);
+					} catch {
+						return 0;
+					}
+				})();
+				const liveBytesBefore = this.getTranscriptFileBytes();
+				try {
+					this.#rewriteFileSync();
+				} catch (rewriteError) {
+					// The recovery rewrite itself failed. The appended entry stays in
+					// the resident list (its effect, including any committed source
+					// edit, is not lost), but the receipt is not durable yet: report
+					// the typed near-limit outcome instead of an unclassified abort.
+					if (rewriteError instanceof Error && rewriteError.message === "content_too_large") {
+						this.#needsFullRewriteOnNextPersist = true;
+						throw new SessionNearLimitAppendError({
+							entryBytes,
+							liveBytes: liveBytesBefore,
+							capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
+							entryRetained: this.#byId.has(entry.id),
+						});
+					}
+					throw rewriteError;
+				}
 				if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 				this.#readOnlyResume = false;
+				// Post-rewrite verification: a rewrite that still cannot fit the
+				// entry leaves an effect/receipt gap and must be reported, never
+				// silently swallowed as a successful append.
+				const liveBytesAfter = this.getTranscriptFileBytes();
+				const entryRetained = liveBytesAfter <= MANAGED_ARTIFACT_MAX_FILE_BYTES && this.#byId.has(entry.id);
+				if (!entryRetained) {
+					this.#needsFullRewriteOnNextPersist = true;
+					throw new SessionNearLimitAppendError({
+						entryBytes,
+						liveBytes: liveBytesAfter || liveBytesBefore,
+						capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
+						entryRetained: this.#byId.has(entry.id),
+					});
+				}
 				return;
 			}
 			this.#recordPersistError(err);
@@ -16180,6 +16373,16 @@ export class SessionManager {
 				if (sidecarTailCharge > 0) activeRuntime?.tailCache.release(sidecarTailCharge);
 				this.#needsFullRewriteOnNextPersist = true;
 				throw new SessionAppendPersistenceError("current_append", residentEntry.id, this.#persistError ?? error);
+			}
+			// Typed near-limit recovery (#4566) already ran its deterministic
+			// rewrite inside _persist and deliberately kept the entry resident so
+			// the committed effect keeps its receipt. Do not roll it back or wrap
+			// it into a generic SessionAppendPersistenceError: propagate the typed
+			// outcome with its structured fields intact.
+			if (error instanceof SessionNearLimitAppendError) {
+				if (sidecarAppendCharge > 0) activeRuntime?.accountant.release(sidecarAppendCharge);
+				if (sidecarTailCharge > 0) activeRuntime?.tailCache.release(sidecarTailCharge);
+				throw error;
 			}
 			const removed = this.#fileEntries.pop();
 			if (removed !== residentEntry)
