@@ -38,6 +38,8 @@ const KITTY_DROP_FRACTION = 0.45;
 const petKittyDropPx = (cellHeightPx: number): number =>
 	Math.min(Math.max(0, cellHeightPx - 1), Math.floor(cellHeightPx * KITTY_DROP_FRACTION));
 const PET_RAISE_ROWS = 1;
+/** iTerm2 has no sub-cell placement parameter; use transparent padding in a row above. */
+const ITERM2_RAISE_FRACTION = 0.25;
 const allocatedPetKittyImageIds = new Set<number>();
 
 function allocatePetKittyImageId(): number {
@@ -326,7 +328,7 @@ export class GajaePetWidget {
 			kittyImageId: protocol === "kitty" ? this.#kittyImageId : undefined,
 			// iTerm2 receives an explicit 1:1 pixel size; keep its raster inside the
 			// same two-row footprint reserved for Kitty and Sixel.
-			iterm2TopPaddingPx: 0,
+			iterm2TopPaddingPx: Math.round(cell.heightPx * (1 - ITERM2_RAISE_FRACTION)),
 			iterm2BottomPaddingPx: 0,
 		});
 		this.#framedEditor.setReserve(this.#pixel.columns + PET_SIDE_MARGIN);

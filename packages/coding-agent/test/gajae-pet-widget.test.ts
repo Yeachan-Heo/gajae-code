@@ -178,7 +178,7 @@ describe("GajaePetWidget", () => {
 			const payload = getEmitter()?.();
 			expect(payload).toContain("\x1b[28;76H");
 			expect(payload).toContain("\x1b]1337;File=");
-			expect(payload).toContain("width=36px;height=36px;preserveAspectRatio=0");
+			expect(payload).toContain("width=36px;height=50px;preserveAspectRatio=0");
 			expect(payload).toEndWith("\x1b\\");
 		} finally {
 			widget.dispose();
@@ -198,22 +198,22 @@ describe("GajaePetWidget", () => {
 			written.length = 0;
 
 			vi.advanceTimersByTime(1200);
-			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X") && chunk.includes("\x1b]1337;File="))).toBe(
+			expect(written.some(chunk => chunk.includes("\x1b[28;76H") && chunk.includes("\x1b]1337;File="))).toBe(
 				true,
 			);
 
 			setCellDimensions({ widthPx: 12, heightPx: 24 });
 			vi.advanceTimersByTime(100);
-			expect(getEmitter()?.()).toContain("width=48px;height=48px");
+			expect(getEmitter()?.()).toContain("width=48px;height=66px");
 
 			setTerminalSize(12, 30);
-			expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
+			expect(getEmitter()?.()).toContain("\x1b[28;76H");
 			setTerminalSize(80, 30);
 			expect(getEmitter()?.()).toContain("\x1b]1337;File=");
 
 			written.length = 0;
 			widget.setMode("off");
-			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+			expect(written.some(chunk => chunk.includes("\x1b[28;76H"))).toBe(true);
 		} finally {
 			setCellDimensions(original);
 			widget.dispose();
