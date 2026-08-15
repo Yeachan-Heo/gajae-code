@@ -483,7 +483,10 @@ export class GajaePetWidget {
 		this.#frame = frame;
 		// Write directly: a frame swap changes no component line, so the TUI
 		// would skip the render write (and with it the post-render emitter).
-		const payload = this.#overlayPayload(true) ?? "";
+		// iTerm replaces an inline image at the same cell block. Erasing that block
+		// before every animation frame exposes the composer background and makes the
+		// PNG reload visibly flicker; only Sixel requires the explicit frame erase.
+		const payload = this.#overlayPayload(this.#pixel.protocol === "sixel") ?? "";
 		if (payload && this.#ui.terminalAvailable) {
 			this.#ui.terminal.write(`\x1b[?2026h\x1b7${payload}\x1b8\x1b[?2026l`);
 		}

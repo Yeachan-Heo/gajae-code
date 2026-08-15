@@ -211,7 +211,7 @@ describe("GajaePetWidget", () => {
 		});
 	}
 
-	it("clears iTerm2 frames on animation, resize, disable, and dispose", () => {
+	it("replaces iTerm2 animation frames without erasing the composer, then cleans on resize and disable", () => {
 		vi.useFakeTimers();
 		const original = getCellDimensions();
 		const { widget, written, getEmitter, setTerminalSize } = makeWidget(80, 30, {
@@ -224,9 +224,8 @@ describe("GajaePetWidget", () => {
 			written.length = 0;
 
 			vi.advanceTimersByTime(1200);
-			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X") && chunk.includes("\x1b]1337;File="))).toBe(
-				true,
-			);
+			expect(written.some(chunk => chunk.includes("\x1b]1337;File="))).toBe(true);
+			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(false);
 
 			setCellDimensions({ widthPx: 12, heightPx: 24 });
 			vi.advanceTimersByTime(100);
