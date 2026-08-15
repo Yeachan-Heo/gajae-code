@@ -166,6 +166,117 @@ describe("InteractiveMode.setEditorComponent", () => {
 			vi.advanceTimersByTime(1);
 			expect(showStatus).toHaveBeenCalledTimes(1);
 			expect(showStatus.mock.calls[0]?.[0]).toContain("Pets aren’t available");
+			expect(showStatus.mock.calls[0]?.[0]).not.toContain("(unknown)");
+		} finally {
+			mode.stop();
+			setVerifiedItermPetAvailability(undefined);
+			setTerminalImageProtocol(originalProtocol);
+			for (const key of envKeys) {
+				const value = originalEnv.get(key);
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+			vi.useRealTimers();
+		}
+	});
+
+	it("shows the plain pet warning without a reason suffix on non-iTerm terminals", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		const envKeys = [
+			"TERM_PROGRAM",
+			"TERM_PROGRAM_VERSION",
+			"TMUX",
+			"TMUX_PANE",
+			"STY",
+			"ZELLIJ",
+			"GJC_TMUX_LAUNCHED",
+			"GJC_TMUX_ACTIVE_SESSION",
+			"GJC_MANAGED_OWNER_RUN_ID",
+		] as const;
+		const originalEnv = new Map(envKeys.map(key => [key, Bun.env[key]] as const));
+		vi.useFakeTimers();
+		try {
+			mode.stop();
+			setVerifiedItermPetAvailability(undefined);
+			setTerminalImageProtocol(null);
+			for (const key of envKeys) delete Bun.env[key];
+			Bun.env.TERM_PROGRAM = "vscode";
+			Bun.env.TERM = "xterm-256color";
+			settings.set("pet.mode", "red");
+			settings.set("startup.quiet", true);
+			mode = new InteractiveMode(session, "test");
+			const showStatus = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
+			vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+
+			await mode.init();
+			vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS * 2);
+
+			expect(showStatus).toHaveBeenCalledTimes(1);
+			const startupWarning = showStatus.mock.calls[0]?.[0] ?? "";
+			expect(startupWarning).toContain("Pets aren’t available");
+			expect(startupWarning).not.toContain("(");
+
+			showStatus.mockClear();
+			expect(mode.setPetMode("red")).toBe(false);
+			expect(showStatus).toHaveBeenCalledTimes(1);
+			const refusal = showStatus.mock.calls[0]?.[0] ?? "";
+			expect(refusal).toContain("Pets aren’t available");
+			expect(refusal).not.toContain("(");
+		} finally {
+			mode.stop();
+			setVerifiedItermPetAvailability(undefined);
+			setTerminalImageProtocol(originalProtocol);
+			for (const key of envKeys) {
+				const value = originalEnv.get(key);
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+			vi.useRealTimers();
+		}
+	});
+
+	it("appends the concrete iTerm transport reason to the pet warning", async () => {
+		const originalProtocol = TERMINAL.imageProtocol;
+		const envKeys = [
+			"TERM_PROGRAM",
+			"TERM_PROGRAM_VERSION",
+			"TMUX",
+			"TMUX_PANE",
+			"STY",
+			"ZELLIJ",
+			"GJC_TMUX_LAUNCHED",
+			"GJC_TMUX_ACTIVE_SESSION",
+			"GJC_MANAGED_OWNER_RUN_ID",
+		] as const;
+		const originalEnv = new Map(envKeys.map(key => [key, Bun.env[key]] as const));
+		vi.useFakeTimers();
+		try {
+			mode.stop();
+			setVerifiedItermPetAvailability(undefined);
+			setTerminalImageProtocol(null);
+			for (const key of envKeys) delete Bun.env[key];
+			Bun.env.TERM_PROGRAM = "iTerm.app";
+			Bun.env.TERM_PROGRAM_VERSION = "3.6.11";
+			Bun.env.TERM = "xterm-256color";
+			settings.set("pet.mode", "red");
+			settings.set("startup.quiet", true);
+			mode = new InteractiveMode(session, "test");
+			const showStatus = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
+			vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+
+			await mode.init();
+			setVerifiedItermPetAvailability({ available: false, mode: "direct", reason: "probe-timeout", epoch: 1 });
+			vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS * 2);
+
+			expect(showStatus).toHaveBeenCalledTimes(1);
+			const startupWarning = showStatus.mock.calls[0]?.[0] ?? "";
+			expect(startupWarning).toContain("Pets aren’t available");
+			expect(startupWarning).toContain("(probe-timeout)");
+
+			showStatus.mockClear();
+			expect(mode.setPetMode("red")).toBe(false);
+			expect(showStatus).toHaveBeenCalledTimes(1);
+			expect(showStatus.mock.calls[0]?.[0] ?? "").toContain("(probe-timeout)");
 		} finally {
 			mode.stop();
 			setVerifiedItermPetAvailability(undefined);
@@ -888,6 +999,10 @@ describe("InteractiveMode.setEditorComponent", () => {
 			expect(mode.commitPetPreviewMode("red")).toBe(false);
 			expect(settings.get("pet.mode")).toBe("off");
 			expect(showStatus).toHaveBeenCalledTimes(2);
+			for (const call of showStatus.mock.calls) {
+				expect(String(call[0])).toContain("Gajae Pet graphics are unavailable");
+				expect(String(call[0])).not.toContain("(unknown)");
+			}
 
 			// An accepted commit persists only after the widget mutation applies.
 			setTerminalImageProtocol(ImageProtocol.Sixel);

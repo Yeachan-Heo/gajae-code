@@ -71,6 +71,7 @@ import {
 } from "./components/irc-sidebar";
 import { createNativePetTransport, type ItermPetTransport } from "./components/iterm-pet-transport";
 import {
+	getItermPetAvailability,
 	getItermPetUnavailableReason,
 	getPetUnavailableWarning,
 	isPetAvailable,
@@ -438,6 +439,18 @@ export class InteractiveMode implements InteractiveModeContext {
 	#baseReservedSlashCommandNames: Set<string> = new Set();
 	#cleanupUnsubscribe?: () => void;
 	#itermPetTransport?: ItermPetTransport;
+
+	/**
+	 * Pet-unavailable warning text. The iTerm transport reason is parenthesized
+	 * only when a transport actually reported one; non-iTerm terminals and a
+	 * probe still in flight keep the plain warning instead of "(unknown)".
+	 */
+	#petUnavailableStatusText(): string {
+		if (!this.#itermPetTransport || getItermPetAvailability() === undefined) return getPetUnavailableWarning();
+		const reason = getItermPetUnavailableReason();
+		return reason === undefined ? getPetUnavailableWarning() : `${getPetUnavailableWarning()} (${reason})`;
+	}
+
 	#petTransportAvailabilityUnsubscribe?: () => void;
 	#subprocessTeardownUnsubscribe?: () => void;
 	#petProtocolUnsubscribe?: () => void;
@@ -898,10 +911,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#petUnavailableWarningDisposer = warnWhenPetCapabilitySettled({
 				probePending: this.#itermPetTransport !== undefined || isPetCapabilityProbePending(),
 				onUnavailable: () => {
-					this.showStatus(
-						theme.fg("warning", `${getPetUnavailableWarning()} (${getItermPetUnavailableReason() ?? "unknown"})`),
-						{ dim: false },
-					);
+					this.showStatus(theme.fg("warning", this.#petUnavailableStatusText()), { dim: false });
 					this.ui.requestRender();
 				},
 			});
@@ -1350,10 +1360,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#commitPetMode(mode: PetMode, apply: (mode: PetMode) => void): boolean {
 		if (mode !== "off" && !isPetAvailable()) {
 			void this.#itermPetTransport?.retry();
-			this.showStatus(
-				theme.fg("warning", `${getPetUnavailableWarning()} (${getItermPetUnavailableReason() ?? "unknown"})`),
-				{ dim: false },
-			);
+			this.showStatus(theme.fg("warning", this.#petUnavailableStatusText()), { dim: false });
 			this.ui.requestRender();
 			return false;
 		}

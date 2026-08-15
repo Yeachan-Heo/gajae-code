@@ -1111,6 +1111,13 @@ export class TUI extends Container {
 	#rasterPending = 0;
 	#pendingDependentGenericBytes: Array<{ bytes: Uint8Array; rect: CellRect; blockedBy: string[] }> = [];
 	#terminalGeneration = 0;
+	/**
+	 * Raster lifecycle epoch. `stop()` increments it before lease cleanup so a
+	 * queue body captured under a prior running epoch can never write to the
+	 * terminal after restoration; `start()` does not reset it, so work enqueued
+	 * in the new lifecycle carries the new epoch.
+	 */
+	#rasterLifecycle = 0;
 
 	#unsubscribeTabWidthChange?: () => void;
 	static #renderCounters: TuiRenderCounterSnapshot = {
@@ -1832,7 +1839,8 @@ export class TUI extends Container {
 	}
 
 	acquireRasterLease(request: RasterLeaseRequest): Promise<RasterLeaseAcquireResult> {
-		return this.#enqueueRaster(() => {
+		return this.#enqueueRaster(isCurrentLifecycle => {
+			if (!isCurrentLifecycle()) return { status: "rejected", reason: "terminal-unavailable" } as const;
 			if (
 				!request ||
 				typeof request.ownerId !== "string" ||
@@ -1870,8 +1878,18 @@ export class TUI extends Container {
 	submitTerminalOutput(
 		request: Readonly<{ operation: TerminalOutputOperation; token?: RasterLeaseToken }>,
 	): Promise<TerminalOutputAck> {
-		return this.#enqueueRaster(async () => {
+		return this.#enqueueRaster(async isCurrentLifecycle => {
 			const id = ++this.#rasterQueueId;
+			const rawOperation0 =
+				request && typeof request === "object" ? (request as { operation?: unknown }).operation : undefined;
+			const operation0 =
+				rawOperation0 &&
+				typeof rawOperation0 === "object" &&
+				typeof (rawOperation0 as { type?: unknown }).type === "string"
+					? (rawOperation0 as { type: string }).type
+					: "queued-output";
+			if (!isCurrentLifecycle())
+				return { queueId: id, operation: operation0 as TerminalOutputOperation["type"], status: "failed" as const };
 			const rawOperation =
 				request && typeof request === "object" ? (request as { operation?: unknown }).operation : undefined;
 			const operation =
@@ -1946,30 +1964,38 @@ export class TUI extends Container {
 				);
 				if (!prefixWritten) return failed();
 				const abortBarrier = () => {
+					// Abort/cursor-restoration bytes are terminal writes: never emit
+					// them once the running epoch ended (e.g. a user predicate that
+					// itself stops the terminal before throwing or returning false).
+					if (!isCurrentLifecycle()) return;
 					const abortSuffix = op.abortSuffix === undefined ? "" : new TextDecoder().decode(op.abortSuffix);
 					const cursorVisibility = op.restoreCursorVisibility ? this.#cursorVisibilitySequence() : "";
 					if (abortSuffix || cursorVisibility)
 						this.#guardTerminalOperation(() => this.terminal.write(abortSuffix + cursorVisibility));
 				};
 				const flushed = await (this.terminal as Terminal & { flush?: () => Promise<boolean> }).flush?.();
+				// Async boundary: the terminal may have stopped while we awaited.
+				if (!isCurrentLifecycle()) return failed();
 				if (flushed === false) {
-					abortBarrier();
+					if (isCurrentLifecycle()) abortBarrier();
 					return failed();
 				}
 				let afterPrefixSucceeded: boolean;
 				try {
 					afterPrefixSucceeded = await op.afterPrefix();
 				} catch {
-					abortBarrier();
+					if (isCurrentLifecycle()) abortBarrier();
 					return failed();
 				}
 				if (afterPrefixSucceeded !== true) {
-					abortBarrier();
+					if (isCurrentLifecycle()) abortBarrier();
 					return failed();
 				}
+				// Async boundary: afterPrefix awaited external work; re-check epoch.
+				if (!isCurrentLifecycle()) return failed();
 				const currentLease = this.#rasterLeases.get(request.token?.ownerId ?? "");
 				if (!currentLease || currentLease.revoked || currentLease.token !== request.token) {
-					abortBarrier();
+					if (isCurrentLifecycle()) abortBarrier();
 					return { queueId: id, operation: op.type, status: currentLease?.revoked ? "revoked" : "stale-token" };
 				}
 				if (op.shouldWrite !== undefined) {
@@ -1977,15 +2003,17 @@ export class TUI extends Container {
 					try {
 						shouldWrite = op.shouldWrite();
 					} catch {
-						abortBarrier();
+						if (isCurrentLifecycle()) abortBarrier();
 						return failed();
 					}
 					if (!shouldWrite) {
-						abortBarrier();
+						if (isCurrentLifecycle()) abortBarrier();
 						return { queueId: id, operation: op.type, status: "stale-token" };
 					}
 				}
 			}
+			// Final pre-write gate: an async body may have resumed after stop().
+			if (!isCurrentLifecycle()) return failed();
 			const bytes =
 				op.type === "raster-multipart-batch"
 					? op.records.map((b: Uint8Array) => new TextDecoder().decode(b)).join("")
@@ -2012,9 +2040,11 @@ export class TUI extends Container {
 	invalidateRasterLease(
 		request: Readonly<{ token: RasterLeaseToken; cause: RasterLeaseInvalidatedNotification["cause"] }>,
 	): Promise<TerminalOutputAck> {
-		return this.#enqueueRaster(() => {
+		return this.#enqueueRaster(isCurrentLifecycle => {
 			const id = ++this.#rasterQueueId,
 				lease = this.#rasterLeases.get(request.token.ownerId);
+			if (!isCurrentLifecycle())
+				return { queueId: id, operation: "raster-erase" as const, status: "stale-token" as const };
 			if (!lease || lease.token !== request.token)
 				return { queueId: id, operation: "raster-erase", status: "stale-token" as const };
 			lease.revoked = true;
@@ -2060,7 +2090,8 @@ export class TUI extends Container {
 		) {
 			return Promise.reject(new TypeError("invalid terminal lifecycle event"));
 		}
-		return this.#enqueueRaster(() => {
+		return this.#enqueueRaster(isCurrentLifecycle => {
+			if (!isCurrentLifecycle()) return { attempted: 0, written: 0, stillPending: 0 };
 			if (event.terminalGeneration !== this.#terminalGeneration)
 				return { attempted: 0, written: 0, stillPending: 0 };
 			this.flushTerminalCleanup(true);
@@ -2113,9 +2144,15 @@ export class TUI extends Container {
 			};
 		});
 	}
-	#enqueueRaster<T>(fn: () => T | Promise<T>): Promise<T> {
+	#enqueueRaster<T>(fn: (isCurrentLifecycle: () => boolean) => T | Promise<T>): Promise<T> {
+		const lifecycle = this.#rasterLifecycle;
 		this.#rasterPending++;
-		const next: Promise<T> = this.#rasterIngress.then(fn) as Promise<T>;
+		// A queue body captured under a prior running epoch must not write to the
+		// terminal after stop() restored it — captured-epoch equality only,
+		// evaluated lazily at entry AND after every await inside async bodies.
+		// Synchronous stop cleanup writes directly, never through a stale body.
+		const isCurrentLifecycle = () => lifecycle === this.#rasterLifecycle;
+		const next: Promise<T> = this.#rasterIngress.then(() => fn(isCurrentLifecycle)) as Promise<T>;
 		this.#rasterIngress = next.catch(() => undefined);
 		void next.then(
 			() => {
@@ -2590,6 +2627,10 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		// Invalidate every raster-queue body captured under the running epoch
+		// before any teardown: nothing queued before stop may write after
+		// restoration. Synchronous stop cleanup below writes directly.
+		this.#rasterLifecycle++;
 		this.#flushRasterLeasesBeforeStop("terminal-loss");
 		const placementCleanup = this.#kittyPlacementDeletePlan(this.#kittyPlacementSpans, [], [], true).output;
 		if (placementCleanup.length > 0 && this.#writeTerminal(placementCleanup)) this.#kittyPlacementSpans = [];
@@ -5304,11 +5345,13 @@ export class TUI extends Container {
 
 	/** Retain terminal cleanup until a write succeeds, even after its component is disposed. */
 	queueTerminalCleanup(payload: string, onDelivered?: () => void): Promise<void> {
-		return this.#enqueueRaster(() => {
-			if (this.#writeTerminal(payload)) {
+		return this.#enqueueRaster(isCurrentLifecycle => {
+			if (isCurrentLifecycle() && this.#writeTerminal(payload)) {
 				onDelivered?.();
 				return;
 			}
+			// Stale epoch or failed write: retain the payload for a future start()
+			// instead of writing it after terminal restoration.
 			this.#pendingTerminalCleanup.push({ payload, onDelivered });
 		});
 	}
@@ -5384,7 +5427,7 @@ export class TUI extends Container {
 			(preserveRasterLeases || this.#rasterLeases.size === 0)
 		)
 			return write();
-		this.#enqueueRaster(write);
+		this.#enqueueRaster(isCurrentLifecycle => isCurrentLifecycle() && write());
 		return true;
 	}
 

@@ -788,4 +788,121 @@ describe("TUI raster lease public boundary", () => {
 		expect(reacquired.status).toBe("acquired");
 		tui.stop();
 	});
+
+	it("never writes queued raster work after stop and resumes cleanly after start", async () => {
+		const { tui, terminal } = await setup();
+
+		// (a) A multipart body parks inside afterPrefix (blocking the raster
+		// ingress); a cleanup body queues behind it. stop() must complete without
+		// either writing after restoration.
+		const gateLease = await tui.acquireRasterLease(request("gate"));
+		if (gateLease.status !== "acquired") throw new Error("lease not acquired");
+		let releaseIngress: () => void = () => {};
+		const ingressGate = new Promise<void>(resolve => {
+			releaseIngress = resolve;
+		});
+		const blocker = tui.submitTerminalOutput({
+			token: gateLease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("GATE_PREFIX"),
+				afterPrefix: async () => {
+					await ingressGate;
+					return true;
+				},
+				records: [bytes("GATE_GIF")],
+			},
+		});
+		const cleanup = tui.queueTerminalCleanup("PET_ERASE");
+		await Bun.sleep(5);
+		expect(terminal.getWriteLog().join("")).toContain("GATE_PREFIX");
+		terminal.clearWriteLog();
+		tui.stop();
+		// Snapshot immediately after stop: synchronous stop cleanup (lease erase)
+		// is legitimate and happens before terminal restoration.
+		const atStop = terminal.getWriteLog().join("");
+		releaseIngress();
+		const settled = await Promise.allSettled([blocker, cleanup]);
+		expect(settled.every(result => result.status === "fulfilled")).toBe(true);
+		if (settled[0].status === "fulfilled") expect(settled[0].value.status).toBe("failed");
+		await Bun.sleep(10);
+		// Nothing further may be appended while the terminal stays stopped — no
+		// GIF bytes, no retained-cleanup delivery.
+		const whileStopped = terminal.getWriteLog().join("");
+		expect(whileStopped).toBe(atStop);
+		expect(whileStopped).not.toContain("GATE_GIF");
+		expect(whileStopped).not.toContain("PET_ERASE");
+		terminal.clearWriteLog();
+		tui.start();
+		await Bun.sleep(10);
+		// The retained payload is delivered by the first start() after stop.
+		expect(terminal.getWriteLog().join("")).toContain("PET_ERASE");
+
+		// (b) Started body paused at an await when stop occurs: no suffix/abort/GIF
+		// bytes and no cursor restoration may follow stop.
+		const lease = await tui.acquireRasterLease(request("paused"));
+		if (lease.status !== "acquired") throw new Error("lease not acquired");
+		terminal.clearWriteLog();
+		let releaseAfterPrefix: () => void = () => {};
+		const gate = new Promise<void>(resolve => {
+			releaseAfterPrefix = resolve;
+		});
+		const submit = tui.submitTerminalOutput({
+			token: lease.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("PREFIX"),
+				afterPrefix: async () => {
+					await gate;
+					return true;
+				},
+				records: [bytes("GIF")],
+				suffix: bytes("SUFFIX"),
+				abortSuffix: bytes("ABORT_BYTES"),
+				restoreCursorVisibility: true,
+			},
+		});
+		await Bun.sleep(5);
+		expect(terminal.getWriteLog().join("")).toContain("PREFIX");
+		tui.stop();
+		releaseAfterPrefix();
+		const ack = await submit;
+		expect(ack.status).toBe("failed");
+		const after = terminal.getWriteLog().join("");
+		expect(after).not.toContain("SUFFIX");
+		expect(after).not.toContain("ABORT_BYTES");
+		expect(after).not.toContain("GIF");
+
+		// (c) A shouldWrite predicate that stops the terminal mid-operation must
+		// not emit abort or cursor-restoration bytes either.
+		tui.start();
+		const lease2 = await tui.acquireRasterLease(request("predicate-stop"));
+		if (lease2.status !== "acquired") throw new Error("lease not acquired");
+		terminal.clearWriteLog();
+		const ack2 = await tui.submitTerminalOutput({
+			token: lease2.token,
+			operation: {
+				type: "raster-multipart-batch",
+				prefix: bytes("P2"),
+				afterPrefix: async () => true,
+				records: [bytes("R2")],
+				abortSuffix: bytes("ABORT2"),
+				restoreCursorVisibility: true,
+				shouldWrite: () => {
+					tui.stop();
+					throw new Error("predicate boom");
+				},
+			},
+		});
+		expect(ack2.status).toBe("failed");
+		expect(terminal.getWriteLog().join("")).not.toContain("ABORT2");
+
+		// (d) New-lifecycle work after restart writes normally.
+		tui.start();
+		terminal.clearWriteLog();
+		const ack3 = await tui.queueTerminalOutput("POST_RESTART", { shouldWrite: () => true });
+		expect(ack3.status).toBe("written");
+		expect(terminal.getWriteLog()).toContain("POST_RESTART");
+		tui.stop();
+	});
 });
