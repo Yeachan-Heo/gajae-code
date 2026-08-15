@@ -15,6 +15,14 @@ type ModelListValidationOptions = {
 
 const VALIDATION_TIMEOUT_MS = 15_000;
 
+/** Most characters of an upstream body echoed into a validation error. */
+const VALIDATION_DETAILS_LIMIT = 200;
+
+function boundedDetails(text: string): string {
+	const trimmed = text.trim();
+	return trimmed.length > VALIDATION_DETAILS_LIMIT ? `${trimmed.slice(0, VALIDATION_DETAILS_LIMIT)}…` : trimmed;
+}
+
 /**
  * Validate an API key against an OpenAI-compatible chat completions endpoint.
  *
@@ -45,7 +53,7 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 
 	let details = "";
 	try {
-		details = (await response.text()).trim();
+		details = boundedDetails(await response.text());
 	} catch {
 		// ignore body parse errors, status is enough
 	}
@@ -55,15 +63,6 @@ export async function validateOpenAICompatibleApiKey(options: OpenAICompatibleVa
 		: `${options.provider} API key validation failed (${response.status})`;
 	throw new Error(message);
 }
-
-/** Most characters of an upstream body echoed into a validation error. */
-const VALIDATION_DETAILS_LIMIT = 200;
-
-function boundedDetails(text: string): string {
-	const trimmed = text.trim();
-	return trimmed.length > VALIDATION_DETAILS_LIMIT ? `${trimmed.slice(0, VALIDATION_DETAILS_LIMIT)}…` : trimmed;
-}
-
 /**
  * Whether a 200 body is a recognizable model list. OpenAI-compatible endpoints
  * return `{"object":"list","data":[...]}`; some gateways answer with a bare

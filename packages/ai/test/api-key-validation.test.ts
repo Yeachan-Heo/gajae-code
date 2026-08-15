@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { validateApiKeyAgainstModelsEndpoint } from "@gajae-code/ai/utils/oauth/api-key-validation";
+import {
+	validateApiKeyAgainstModelsEndpoint,
+	validateOpenAICompatibleApiKey,
+} from "@gajae-code/ai/utils/oauth/api-key-validation";
 
 const realFetch = globalThis.fetch;
 
@@ -20,6 +23,24 @@ function validate(): Promise<void> {
 		apiKey: "sk-test",
 		modelsUrl: "https://example.invalid/v1/models",
 	});
+}
+
+function validateChatCompletions(): Promise<void> {
+	return validateOpenAICompatibleApiKey({
+		provider: "Cerebras",
+		apiKey: "csk-test",
+		baseUrl: "https://example.invalid/v1",
+		model: "test-model",
+	});
+}
+
+async function validationErrorMessage(validation: () => Promise<void>): Promise<string> {
+	try {
+		await validation();
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+	throw new Error("Expected validation to fail");
 }
 
 describe("validateApiKeyAgainstModelsEndpoint", () => {
@@ -57,6 +78,11 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 		await expect(validate()).rejects.toThrow(/non-JSON body.*status alone/s);
 	});
 
+	it("rejects malformed JSON returned with 200", async () => {
+		stubFetch(() => new Response('{"data":[', { status: 200 }));
+		await expect(validate()).rejects.toThrow(/non-JSON body.*status alone/s);
+	});
+
 	it("rejects a 200 whose JSON carries no recognizable model list", async () => {
 		stubFetch(() => new Response(JSON.stringify({ object: "list" }), { status: 200 }));
 		await expect(validate()).rejects.toThrow(/without a recognizable model list/);
@@ -73,13 +99,23 @@ describe("validateApiKeyAgainstModelsEndpoint", () => {
 
 	it("bounds huge upstream bodies echoed into error messages", async () => {
 		stubFetch(() => new Response("x".repeat(5000), { status: 500 }));
-		let message = "";
-		try {
-			await validate();
-		} catch (error) {
-			message = error instanceof Error ? error.message : String(error);
-		}
+		const message = await validationErrorMessage(validate);
 		expect(message).toContain("(500)");
+		expect(message.length).toBeLessThan(400);
+	});
+
+	it("bounds a huge non-JSON 200 body echoed into the refusal", async () => {
+		stubFetch(() => new Response(`<html>${"x".repeat(5000)}</html>`, { status: 200 }));
+		const message = await validationErrorMessage(validate);
+		expect(message).toContain("non-JSON body");
+		expect(message).toContain("status alone");
+		expect(message.length).toBeLessThan(500);
+	});
+
+	it("bounds upstream bodies echoed by chat-completions validation", async () => {
+		stubFetch(() => new Response("x".repeat(5000), { status: 500 }));
+		const message = await validationErrorMessage(validateChatCompletions);
+		expect(message).toContain("Cerebras API key validation failed (500)");
 		expect(message.length).toBeLessThan(400);
 	});
 
