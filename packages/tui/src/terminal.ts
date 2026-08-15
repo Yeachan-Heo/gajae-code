@@ -846,7 +846,9 @@ export class ProcessTerminal implements Terminal {
 				const timeLeft = endTime - now;
 				if (timeLeft <= 0) break;
 				if (now - lastDataTime >= idleMs) break;
-				await new Promise(resolve => setTimeout(resolve, Math.min(idleMs, timeLeft)));
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, Math.min(idleMs, timeLeft));
+				await promise;
 			}
 		} finally {
 			process.stdin.removeListener("data", onData);
