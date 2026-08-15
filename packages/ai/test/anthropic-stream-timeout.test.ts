@@ -565,6 +565,150 @@ describe("anthropic first-event timeouts", () => {
 		// so the remaining ceiling must be 1 — not the full 2.
 		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
 	});
+	it("counts a thinking-replay repair upload when reporting the timeout attempt ceiling", async () => {
+		// The thinking-replay repair branch does not reset providerRetryAttempt,
+		// so the resettable counter alone cannot see its corrective upload. A
+		// small request whose repaired replay then times out must report the
+		// REMAINING one-attempt ceiling, not the full two-attempt budget.
+		const user = { role: "user" as const, content: "continue", timestamp: Date.now() };
+		const thinkingAssistant = {
+			role: "assistant" as const,
+			content: [
+				{ type: "thinking" as const, thinking: "signed reasoning", thinkingSignature: "sig_repair" },
+				{ type: "text" as const, text: "prior answer" },
+			],
+			api: "anthropic-messages" as const,
+			provider: "anthropic",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop" as const,
+			timestamp: Date.now(),
+		};
+		const repairContext: Context = {
+			messages: [user, thinkingAssistant, { ...user, content: "next prompt", timestamp: Date.now() + 1 }],
+		};
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			if (attempts === 1) {
+				return {
+					async withResponse(): Promise<never> {
+						const error = new Error(
+							"400 invalid_request_error: messages.1.content.0: Invalid `signature` in `thinking` block",
+						);
+						(error as Error & { status: number }).status = 400;
+						throw error;
+					},
+				} as never;
+			}
+			// Repaired request then hangs until the first-event timeout.
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					await new Promise<void>(resolve => {
+						const timer = setTimeout(resolve, 10_000);
+						requestOptions?.signal?.addEventListener(
+							"abort",
+							() => {
+								clearTimeout(timer);
+								resolve();
+							},
+							{ once: true },
+						);
+					});
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), repairContext, {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 30,
+		}).result();
+
+		expect(attempts).toBe(2);
+		expect(result.stopReason).toBe("error");
+		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		// Two uploads consumed (rejected replay + repaired replay); the small
+		// ceiling is 2, so one attempt remains — not the full two.
+		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
+	});
+
+	it("counts a CPA alias-repair upload when reporting the timeout attempt ceiling", async () => {
+		// The CPA alias-repair branch re-uploads the steered body without
+		// touching providerRetryAttempt. Its corrective upload must consume the
+		// timeout ceiling the same way, so the repaired request that then times
+		// out reports the remaining one-attempt ceiling (issue #4464).
+		const alias = "mcp__jzi2uzmxd57z__1olzmojrukyw_find";
+		const findTool = {
+			name: "find",
+			description: "Find files",
+			parameters: { type: "object" as const, properties: { path: { type: "string" } }, required: ["path"] },
+		};
+		const cpaContext: Context = {
+			messages: [{ role: "user", content: "find the config", timestamp: Date.now() }],
+			tools: [findTool],
+		};
+		let attempts = 0;
+		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+			attempts += 1;
+			if (attempts === 1) {
+				return {
+					async withResponse(): Promise<never> {
+						const error = new Error(
+							`500 {"type":"error","error":{"type":"api_error","message":"restore Claude OAuth tool name from streaming response: cannot restore Claude OAuth MCP tool alias \\"${alias}\\": no unique request-local match"}}`,
+						);
+						(error as Error & { status: number }).status = 500;
+						throw error;
+					},
+				} as never;
+			}
+			const response = new Response(null, { status: 200 });
+			const data: MockAnthropicStream = {
+				async *[Symbol.asyncIterator]() {
+					await new Promise<void>(resolve => {
+						const timer = setTimeout(resolve, 10_000);
+						requestOptions?.signal?.addEventListener(
+							"abort",
+							() => {
+								clearTimeout(timer);
+								resolve();
+							},
+							{ once: true },
+						);
+					});
+				},
+			};
+			return {
+				async withResponse() {
+					return { data, response, request_id: null };
+				},
+			} as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const injectedClient = { baseURL: "https://proxy.example", messages: { create } } as unknown as Anthropic;
+
+		const result = await streamAnthropic(customModel("https://proxy.example"), cpaContext, {
+			client: injectedClient,
+			streamFirstEventTimeoutMs: 30,
+		}).result();
+
+		expect(attempts).toBe(2);
+		expect(result.stopReason).toBe("error");
+		expect(result.transportFailure?.providerCode).toBe("stream_first_event_timeout");
+		expect(result.transportFailure?.retryMaxAttempts).toBe(1);
+	});
 
 	it("does not treat a delayed pre-message_start content block as semantic progress", async () => {
 		let attempts = 0;
