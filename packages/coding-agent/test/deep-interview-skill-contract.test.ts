@@ -151,13 +151,39 @@ describe("deep-interview ask clarification contract", () => {
 });
 
 describe("deep-interview ouroboros ooo-interview parity port", () => {
-	it("documents the tiered confirmation cadence while keeping the hard cap (feature B)", () => {
-		expect(skill).toMatch(/Tiered Confirmation Cadence/i);
-		expect(skill).toMatch(/Rounds 1-3 \(auto-continue\)/i);
-		expect(skill).toMatch(/Rounds 4-15 \(ask to continue\)/i);
-		expect(skill).toMatch(/Rounds 16\+ \(diminishing-returns warning\)/i);
-		expect(skill).toMatch(/never removes this hard safety cap/i);
+	it("documents the continuation contract: ordinary answered rounds auto-continue without a generic approval ask (issue #4589)", () => {
+		expect(skill).toMatch(/Step 2f: Check Continuation Contract/i);
+		expect(skill).toMatch(/ordinary answered round NEVER asks for generic continuation approval/i);
+		// The regression this pins: the retired tiered cadence asked
+		// "Continue, or proceed with current clarity" after every ordinary round 4-15
+		// (and 16+), turning the ambiguity gate into per-answer consent friction.
+		expect(skill).not.toMatch(/ask to continue/i);
+		expect(skill).not.toMatch(/Continue, or proceed with current clarity/i);
+		expect(skill).not.toMatch(/Rounds 4-15/i);
+		expect(skill).not.toMatch(/diminishing-returns warning/);
+
+		const steps = extractSection(skill, "Steps");
+		const continuationIndex = steps.indexOf("### Step 2f: Check Continuation Contract");
+		expect(continuationIndex).toBeGreaterThanOrEqual(0);
+		const continuation = steps.slice(continuationIndex, steps.indexOf("## Phase 3:"));
+		// All four legitimate terminal conditions are documented.
+		expect(continuation).toMatch(/Threshold \+ closure gates/);
+		expect(continuation).toMatch(/ambiguity ≤ the resolved threshold/);
+		expect(continuation).toMatch(/Explicit user exit/);
+		expect(continuation).toMatch(/Invocation\/resume suitability ambiguity only/);
+		expect(continuation).toMatch(/Bounded continuation safety recovery/);
+		// The resume choice is invocation-boundary-only and never re-asked mid-interview.
+		expect(continuation).toMatch(/never re-asked inside an active interview/);
+		// Passive exit control is preserved.
+		expect(continuation).toMatch(/any answer, option, or free-text reply can carry an exit intent/);
+	});
+
+	it("keeps the hard cap and explicit early-exit controls after retiring the tiered cadence (issue #4589)", () => {
 		expect(skill).toContain("Round 100");
+		expect(skill).toMatch(/Hard cap at 100 rounds/i);
+		expect(skill).toMatch(/Early exit \(round 3\+\)/i);
+		expect(skill).toMatch(/User says "stop", "cancel", "abort"/i);
+		expect(skill).toMatch(/stop immediately, save state for resume/i);
 	});
 
 	it("documents advisory fanout lanes distinct from the milestone panel (feature C)", () => {
