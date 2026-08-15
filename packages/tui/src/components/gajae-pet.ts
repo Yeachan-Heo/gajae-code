@@ -445,9 +445,12 @@ function validatePngGrid(
 	scale: number,
 	topPaddingPx: number,
 	bottomPaddingPx: number,
+	leftPaddingPx: number,
+	rightPaddingPx: number,
 ): {
 	gridWidth: number;
 	gridHeight: number;
+	spriteWidth: number;
 	width: number;
 	spriteHeight: number;
 	height: number;
@@ -461,19 +464,24 @@ function validatePngGrid(
 	for (const [name, value] of [
 		["top padding", topPaddingPx],
 		["bottom padding", bottomPaddingPx],
+		["left padding", leftPaddingPx],
+		["right padding", rightPaddingPx],
 	] as const) {
 		if (!Number.isSafeInteger(value) || value < 0)
 			throw new Error(`iTerm2 pet ${name} must be a non-negative integer`);
 	}
-	const width = Math.round(gridWidth * scale);
+	const spriteWidth = Math.round(gridWidth * scale);
 	const spriteHeight = Math.round(gridHeight * scale);
+	const width = spriteWidth + leftPaddingPx + rightPaddingPx;
 	const height = spriteHeight + topPaddingPx + bottomPaddingPx;
 	if (
-		!Number.isSafeInteger(width) ||
+		!Number.isSafeInteger(spriteWidth) ||
 		!Number.isSafeInteger(spriteHeight) ||
+		!Number.isSafeInteger(width) ||
 		!Number.isSafeInteger(height) ||
-		width <= 0 ||
+		spriteWidth <= 0 ||
 		spriteHeight <= 0 ||
+		width <= 0 ||
 		height <= 0 ||
 		width > MAX_PET_PNG_DIMENSION ||
 		height > MAX_PET_PNG_DIMENSION
@@ -485,33 +493,57 @@ function validatePngGrid(
 	if (!Number.isSafeInteger(rawBytes) || rawBytes > MAX_PET_PNG_RAW_BYTES) {
 		throw new Error("iTerm2 pet PNG allocation is out of bounds");
 	}
-	return { gridWidth, gridHeight, width, spriteHeight, height };
+	return { gridWidth, gridHeight, spriteWidth, spriteHeight, width, height };
 }
 
-/** Encode a grid as an iTerm2 inline PNG. */
+/**
+ * Encode a grid as an iTerm2 inline PNG spanning a terminal cell block.
+ *
+ * The escape's `width`/`height` are the reserved cell-block footprint in
+ * character cells (unitless numbers per the iTerm2 inline-images protocol).
+ * iTerm2 resolves cells against its own live font metrics, so the sprite
+ * scales with the real terminal geometry — including Retina, where iTerm2
+ * divides `Npx` values by the backing-scale factor and would render a fixed
+ * pixel box at half size.
+ */
 export function encodeGridIterm2(
 	grid: string[],
 	scale: number,
+	columns: number,
+	rows: number,
 	topPaddingPx = 0,
 	bottomPaddingPx = 0,
+	leftPaddingPx = 0,
+	rightPaddingPx = 0,
 	palette: Palette = RED_PALETTE,
 ): string {
-	const { gridWidth, gridHeight, width, spriteHeight, height } = validatePngGrid(
+	for (const [name, value] of [
+		["column count", columns],
+		["row count", rows],
+	] as const) {
+		if (!Number.isSafeInteger(value) || value <= 0) {
+			throw new Error(`iTerm2 pet ${name} must be a positive integer`);
+		}
+	}
+	const { gridWidth, gridHeight, spriteWidth, spriteHeight, width, height } = validatePngGrid(
 		grid,
 		scale,
 		topPaddingPx,
 		bottomPaddingPx,
+		leftPaddingPx,
+		rightPaddingPx,
 	);
 	const raw = Buffer.alloc((width * 4 + 1) * height);
 	for (let y = 0; y < height; y++) {
 		for (let x = 0; x < width; x++) {
+			const sourceX = x - leftPaddingPx;
 			const sourceY = y - topPaddingPx;
 			const rgb =
-				sourceY < 0 || sourceY >= spriteHeight
+				sourceX < 0 || sourceX >= spriteWidth || sourceY < 0 || sourceY >= spriteHeight
 					? null
 					: palette[
 							grid[Math.min(gridHeight - 1, Math.floor(sourceY / scale))][
-								Math.min(gridWidth - 1, Math.floor(x / scale))
+								Math.min(gridWidth - 1, Math.floor(sourceX / scale))
 							]
 						];
 			const offset = y * (width * 4 + 1) + 1 + x * 4;
@@ -534,10 +566,10 @@ export function encodeGridIterm2(
 		pngChunk("IDAT", compressed),
 		pngChunk("IEND", new Uint8Array()),
 	]);
-	// Use explicit pixel dimensions. Cell dimensions are only a layout hint for
-	// the surrounding TUI; asking iTerm2 to fit a small PNG into a cell box makes
-	// it stretch or shrink differently from Kitty/Ghostty.
-	const params = `width=${width}px;height=${height}px;preserveAspectRatio=0;inline=1`;
+	// Size in character cells, not pixels: iTerm2 applies its own cell metrics
+	// (and divides px values by the Retina backing scale), so cells keep the
+	// padded canvas 1:1 with the reserved block at every geometry.
+	const params = `width=${columns};height=${rows};preserveAspectRatio=0;inline=1`;
 	return `\x1b]1337;File=${params}:${png.toString("base64")}\x1b\\`;
 }
 
@@ -602,7 +634,9 @@ export interface GajaePixelFrames {
 	frames: Record<string, string>;
 	/** protocol the frames were encoded for */
 	protocol: "sixel" | "kitty" | "iterm2";
+	/** Scaled sprite width before transparent cell-block padding. */
 	widthPx: number;
+	/** Encoded raster height, including protocol-specific transparent padding. */
 	heightPx: number;
 	columns: number;
 	rows: number;
@@ -614,6 +648,17 @@ export interface GajaePixelFrames {
  * Build overlay pixel frames exactly `targetRows` terminal rows tall when the
  * terminal cells permit it. Each skin owns its source resolution so future
  * additions can opt into denser art without changing the terminal footprint.
+ *
+ * Geometry contract:
+ * - `scale = max(1, targetRows * cellHeightPx / gridHeight)`
+ * - `columns = ceil(scaledSpriteWidthPx / cellWidthPx)`
+ * - `rows = ceil(scaledSpriteHeightPx / cellHeightPx)`
+ * - the square sprite is centered in a `columns * cellWidthPx` PNG canvas
+ *
+ * iTerm2 receives unitless `width=columns;height=rows`, so it resolves the
+ * reserved block with its live cell metrics. The padded PNG has that block's
+ * pixel aspect ratio, allowing `preserveAspectRatio=0` without stretching the
+ * authored square sprite. Kitty and Sixel retain their protocol-specific paths.
  */
 export function buildGajaePixelFrames(options: {
 	protocol: "sixel" | "kitty" | "iterm2";
@@ -625,7 +670,7 @@ export function buildGajaePixelFrames(options: {
 	/** Native sub-cell `Y=` pixel offset that drops the kitty sprite within its first cell. */
 	kittyCellYOffsetPx?: number;
 	kittyImageId?: number;
-	/** Transparent iTerm2-only top padding for half-cell vertical alignment. */
+	/** Additional transparent iTerm2-only top padding for sub-cell vertical alignment. */
 	iterm2TopPaddingPx?: number;
 	/** Transparent iTerm2-only bottom padding inside the two-row canvas. */
 	iterm2BottomPaddingPx?: number;
@@ -666,6 +711,11 @@ export function buildGajaePixelFrames(options: {
 	const leftPaddingPx = Math.floor(horizontalPaddingPx / 2);
 	const rightPaddingPx = horizontalPaddingPx - leftPaddingPx;
 	const canvasWidthPx = widthPx + leftPaddingPx + rightPaddingPx;
+	// When minimum 1x art is taller than targetRows (only possible with tiny
+	// cells), top-pad iTerm2 to the full reserved row block. Its unitless OSC
+	// height then maps the PNG 1:1 without vertically stretching the sprite.
+	const iterm2TopPaddingPx =
+		allocatedHeightPx - visibleHeightPx + (options.protocol === "iterm2" ? (options.iterm2TopPaddingPx ?? 0) : 0);
 	if (
 		widthPx > MAX_PET_FRAME_DIMENSION ||
 		heightPx > MAX_PET_FRAME_DIMENSION ||
@@ -685,8 +735,12 @@ export function buildGajaePixelFrames(options: {
 					? encodeGridIterm2(
 							grid,
 							scale,
-							options.iterm2TopPaddingPx ?? 0,
+							columns,
+							rows,
+							iterm2TopPaddingPx,
 							options.iterm2BottomPaddingPx ?? 0,
+							leftPaddingPx,
+							rightPaddingPx,
 							skin.palette,
 						)
 					: encodeGridKitty(
@@ -705,7 +759,7 @@ export function buildGajaePixelFrames(options: {
 
 	const protocolHeightPx =
 		options.protocol === "iterm2"
-			? visibleHeightPx + (options.iterm2TopPaddingPx ?? 0) + (options.iterm2BottomPaddingPx ?? 0)
+			? visibleHeightPx + iterm2TopPaddingPx + (options.iterm2BottomPaddingPx ?? 0)
 			: heightPx;
 	return {
 		frames,

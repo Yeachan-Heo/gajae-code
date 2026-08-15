@@ -51,6 +51,54 @@ function pngCrc(type: string, data: Uint8Array): number {
 	return (crc ^ 0xffffffff) >>> 0;
 }
 
+const ITERM_PET_GEOMETRY_FIXTURES = [
+	{
+		name: "9x18 cells",
+		cellWidthPx: 9,
+		cellHeightPx: 18,
+		expected: {
+			widthPx: 36,
+			heightPx: 36,
+			canvasWidthPx: 36,
+			columns: 4,
+			rows: 2,
+			leftPaddingPx: 0,
+			rightPaddingPx: 0,
+			topPaddingPx: 0,
+		},
+	},
+	{
+		name: "18x24 cells",
+		cellWidthPx: 18,
+		cellHeightPx: 24,
+		expected: {
+			widthPx: 48,
+			heightPx: 48,
+			canvasWidthPx: 54,
+			columns: 3,
+			rows: 2,
+			leftPaddingPx: 3,
+			rightPaddingPx: 3,
+			topPaddingPx: 0,
+		},
+	},
+	{
+		name: "6x6 cells at minimum art scale",
+		cellWidthPx: 6,
+		cellHeightPx: 6,
+		expected: {
+			widthPx: 16,
+			heightPx: 18,
+			canvasWidthPx: 18,
+			columns: 3,
+			rows: 3,
+			leftPaddingPx: 1,
+			rightPaddingPx: 1,
+			topPaddingPx: 2,
+		},
+	},
+] as const;
+
 describe("gajae pixel frames", () => {
 	it("falls back removed persisted skins to RedGajae without overriding explicit off", () => {
 		expect(resolvePetMode("removed-skin")).toBe("red");
@@ -126,8 +174,8 @@ describe("gajae pixel frames", () => {
 	});
 
 	it("encodes deterministic iTerm2 PNG dimensions, CRCs, colors, and transparent padding", () => {
-		const sequence = encodeGridIterm2(["R."], 2, 1, 1, { R: [12, 34, 56] });
-		expect(sequence).toContain("width=4px;height=4px;preserveAspectRatio=0;inline=1");
+		const sequence = encodeGridIterm2(["R."], 2, 2, 2, 1, 1, 0, 0, { R: [12, 34, 56] });
+		expect(sequence).toContain("width=2;height=2;preserveAspectRatio=0;inline=1");
 		const decoded = decodeIterm2Png(sequence);
 		expect(decoded.width).toBe(4);
 		expect(decoded.height).toBe(4);
@@ -143,12 +191,15 @@ describe("gajae pixel frames", () => {
 	});
 
 	it("rejects malformed or unbounded iTerm2 PNG inputs", () => {
-		expect(() => encodeGridIterm2([], 1)).toThrow("non-empty and rectangular");
-		expect(() => encodeGridIterm2(["R", "RR"], 1)).toThrow("non-empty and rectangular");
-		expect(() => encodeGridIterm2(["R"], 0)).toThrow("finite and positive");
-		expect(() => encodeGridIterm2(["R"], Number.POSITIVE_INFINITY)).toThrow("finite and positive");
-		expect(() => encodeGridIterm2(["R"], 20_000)).toThrow("dimensions are out of bounds");
-		expect(() => encodeGridIterm2(["R"], 1, -1)).toThrow("non-negative integer");
+		expect(() => encodeGridIterm2([], 1, 1, 1)).toThrow("non-empty and rectangular");
+		expect(() => encodeGridIterm2(["R", "RR"], 1, 1, 1)).toThrow("non-empty and rectangular");
+		expect(() => encodeGridIterm2(["R"], 0, 1, 1)).toThrow("finite and positive");
+		expect(() => encodeGridIterm2(["R"], Number.POSITIVE_INFINITY, 1, 1)).toThrow("finite and positive");
+		expect(() => encodeGridIterm2(["R"], 20_000, 1, 1)).toThrow("dimensions are out of bounds");
+		expect(() => encodeGridIterm2(["R"], 1, 0, 1)).toThrow("positive integer");
+		expect(() => encodeGridIterm2(["R"], 1, 2.5, 1)).toThrow("positive integer");
+		expect(() => encodeGridIterm2(["R"], 1, 1, 1, -1)).toThrow("non-negative integer");
+		expect(() => encodeGridIterm2(["R"], 1, 1, 1, 0, 0, 0, -1)).toThrow("non-negative integer");
 		expect(() => buildGajaePixelFrames({ protocol: "iterm2", cellWidthPx: 0, cellHeightPx: 18 })).toThrow(
 			"cell width",
 		);
@@ -157,14 +208,55 @@ describe("gajae pixel frames", () => {
 		);
 	});
 
-	it("keeps existing Kitty and Sixel fixtures unchanged while adding iTerm2", () => {
+	it("keeps Kitty and Sixel fixtures unchanged while iTerm2 uses the reserved cell block", () => {
 		const sixel = buildGajaePixelFrames({ protocol: "sixel", cellWidthPx: 9, cellHeightPx: 18 });
 		const kitty = buildGajaePixelFrames({ protocol: "kitty", cellWidthPx: 9, cellHeightPx: 18 });
-		const iterm2 = buildGajaePixelFrames({ protocol: "iterm2", cellWidthPx: 9, cellHeightPx: 18 });
 		expect(sixel.frames.base).toStartWith('\x1bP0;1;0q"1;1;36;36');
 		expect(kitty.frames.base).toContain("a=T,f=32,s=36,v=36,c=4,r=2");
-		expect(iterm2.frames.base).toContain("width=36px;height=36px");
-		expect(iterm2).toMatchObject({ widthPx: 36, heightPx: 36, columns: 4, rows: 2, rasterRows: 2 });
+
+		for (const fixture of ITERM_PET_GEOMETRY_FIXTURES) {
+			const iterm2 = buildGajaePixelFrames({
+				protocol: "iterm2",
+				cellWidthPx: fixture.cellWidthPx,
+				cellHeightPx: fixture.cellHeightPx,
+			});
+			const decoded = decodeIterm2Png(iterm2.frames.base);
+			expect(iterm2.frames.base, fixture.name).toContain(
+				`width=${fixture.expected.columns};height=${fixture.expected.rows};preserveAspectRatio=0`,
+			);
+			expect(decoded.width, fixture.name).toBe(fixture.expected.canvasWidthPx);
+			expect(decoded.height, fixture.name).toBe(fixture.expected.heightPx);
+			const alpha = (x: number, y: number) => decoded.rgba[(y * decoded.width + x) * 4 + 3];
+			for (let x = 0; x < fixture.expected.leftPaddingPx; x++) {
+				expect(
+					Array.from({ length: decoded.height }, (_, y) => alpha(x, y)),
+					fixture.name,
+				).toEqual(Array(decoded.height).fill(0));
+			}
+			for (let x = decoded.width - fixture.expected.rightPaddingPx; x < decoded.width; x++) {
+				expect(
+					Array.from({ length: decoded.height }, (_, y) => alpha(x, y)),
+					fixture.name,
+				).toEqual(Array(decoded.height).fill(0));
+			}
+			for (let y = 0; y < fixture.expected.topPaddingPx; y++) {
+				expect(
+					Array.from({ length: decoded.width }, (_, x) => alpha(x, y)),
+					fixture.name,
+				).toEqual(Array(decoded.width).fill(0));
+			}
+			expect(
+				decoded.rgba.some((value, index) => index % 4 === 3 && value === 255),
+				fixture.name,
+			).toBe(true);
+			expect(iterm2, fixture.name).toMatchObject({
+				widthPx: fixture.expected.widthPx,
+				heightPx: fixture.expected.heightPx,
+				columns: fixture.expected.columns,
+				rows: fixture.expected.rows,
+				rasterRows: fixture.expected.rows,
+			});
+		}
 	});
 
 	it("registers Ouroboros as a 16x16 skin with authored heart turns and work transitions", () => {

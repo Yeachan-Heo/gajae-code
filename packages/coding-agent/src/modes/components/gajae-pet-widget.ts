@@ -317,15 +317,15 @@ export class GajaePetWidget {
 			skin,
 			cellWidthPx: cell.widthPx,
 			cellHeightPx: cell.heightPx,
-			// Encode iTerm2 at the same two-row pixel size as Kitty/Sixel. The
-			// iTerm2 protocol receives explicit pixel dimensions below, so it must
-			// not be reduced to a fractional cell canvas or it becomes undersized.
+			// Every protocol uses the same two-row geometry contract. iTerm2 emits
+			// the derived cell block rather than fixed pixels so Retina/font changes
+			// cannot shrink the visible footprint.
 			targetRows: 2,
 			sixelTopPaddingPx: protocol === "sixel" ? PET_SIXEL_DROP_PX : 0,
 			kittyCellYOffsetPx: protocol === "kitty" ? petKittyDropPx(cell.heightPx) : 0,
 			kittyImageId: protocol === "kitty" ? this.#kittyImageId : undefined,
-			// iTerm2 receives an explicit 1:1 pixel size; keep its raster inside the
-			// same two-row footprint reserved for Kitty and Sixel.
+			// Keep the iTerm2 raster inside the same two-row footprint reserved for
+			// Kitty and Sixel; horizontal cell rounding is padded by the builder.
 			iterm2TopPaddingPx: 0,
 			iterm2BottomPaddingPx: 0,
 		});
@@ -492,13 +492,9 @@ export class GajaePetWidget {
 		// back onto the composer's bottom border per protocol (sixel via transparent
 		// top padding, kitty via a sub-cell Y offset baked into the frames).
 		const composerBottom = rows - this.#getComposerBottomOffset();
-		// iTerm2 anchors an inline image at the current cursor row. Keep the full
-		// sprite inside the composer rows and leave the HUD boundary below it.
-		// Keep the full-size iTerm2 sprite aligned with the composer like the
-		// cursor-neutral Kitty/Sixel overlays; only the protocol encoding differs.
-		// Nudge the iTerm2 image one terminal row upward while preserving its
-		// explicit 36px size and aspect ratio. Kitty/Sixel keep their established
-		// safety lift.
+		// iTerm2 anchors an inline image at the current cursor row. The shared
+		// safety lift keeps its geometry-derived cell block aligned with the
+		// cursor-neutral Kitty/Sixel overlays and above the HUD boundary.
 		const safetyLift = PET_RAISE_ROWS;
 		const y = composerBottom - pixel.rows - safetyLift;
 		const x = columns - pixel.columns - PET_SIDE_MARGIN;
