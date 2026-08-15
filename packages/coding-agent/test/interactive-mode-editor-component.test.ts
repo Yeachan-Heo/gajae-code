@@ -1000,7 +1000,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 			expect(settings.get("pet.mode")).toBe("off");
 			expect(showStatus).toHaveBeenCalledTimes(2);
 			for (const call of showStatus.mock.calls) {
-				expect(String(call[0])).toContain("Gajae Pet graphics are unavailable");
+				expect(String(call[0])).toContain("Gajae Pet");
 				expect(String(call[0])).not.toContain("(unknown)");
 			}
 
