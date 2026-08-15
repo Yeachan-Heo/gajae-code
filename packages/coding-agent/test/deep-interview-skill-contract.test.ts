@@ -174,8 +174,16 @@ describe("deep-interview ouroboros ooo-interview parity port", () => {
 		expect(continuation).toMatch(/Bounded continuation safety recovery/);
 		// The resume choice is invocation-boundary-only and never re-asked mid-interview.
 		expect(continuation).toMatch(/never re-asked inside an active interview/);
-		// Passive exit control is preserved.
+		// Hard cancellations are never delayed by the pre-round-3 early-proceed guard.
+		expect(continuation).toMatch(/Hard cancellation/);
+		expect(continuation).toMatch(/stops immediately at any round/);
+		expect(continuation).toMatch(/Never turn a hard cancellation into a clarifying question/);
+		expect(continuation).toMatch(/Early proceed/);
+		expect(continuation).toMatch(/Before round 3, ask one targeted clarifying question/);
+		expect(continuation).toMatch(/do not treat that early-proceed intent as a hard cancellation/);
+		// Passive exit control is preserved with the two intent classes kept distinct.
 		expect(continuation).toMatch(/any answer, option, or free-text reply can carry an exit intent/);
+		expect(continuation).toMatch(/Hard cancellations are honored immediately/);
 	});
 
 	it("keeps the hard cap and explicit early-exit controls after retiring the tiered cadence (issue #4589)", () => {

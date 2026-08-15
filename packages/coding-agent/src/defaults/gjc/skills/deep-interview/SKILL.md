@@ -608,11 +608,13 @@ An ordinary answered round NEVER asks for generic continuation approval. After s
 Legitimate terminal conditions — the ONLY places the interview may stop or ask about stopping:
 
 1. **Threshold + closure gates**: ambiguity ≤ the resolved threshold AND the Phase 4 closure audit and one-sentence Restate gate have passed. Then crystallize the spec and present the Phase 5 execution options.
-2. **Explicit user exit**: the user says "stop", "cancel", "abort", "enough", "let's go", "build it", or equivalent in any preserved session language. Stop immediately with the early-exit warning (allowed from round 3+ when ambiguity > threshold; before round 3, ask one targeted clarifying question about what they want changed instead) and save state for resume.
+2. **Explicit user exit**: preserve the two exit-intent classes in any session language:
+   - **Hard cancellation**: "stop", "cancel", "abort", or equivalent stops immediately at any round and saves state for resume. Never turn a hard cancellation into a clarifying question.
+   - **Early proceed**: "enough", "let's go", "build it", or equivalent stops with the early-exit warning from round 3+ when ambiguity > threshold. Before round 3, ask one targeted clarifying question about what the user wants changed instead; do not treat that early-proceed intent as a hard cancellation.
 3. **Invocation/resume suitability ambiguity only**: the Phase 0.5 continue/cancel/clear choice exists solely at the invocation boundary when existing state already contains rounds, topology, spec, or handoff metadata. It is never re-asked inside an active interview.
 4. **Bounded continuation safety recovery**: the Round 100 hard cap ("Maximum interview rounds reached. Proceeding with current clarity level ({score}%).") or the runtime's bounded continuation budget being exhausted. These are safety stops, not consent prompts.
 
-The user always keeps passive exit control: any answer, option, or free-text reply can carry an exit intent, and that intent is honored immediately. Depth control comes from answering the questions themselves or exiting explicitly — not from per-round continue? interruptions.
+The user always keeps passive exit control: any answer, option, or free-text reply can carry an exit intent. Hard cancellations are honored immediately; early-proceed intents follow their round-3 safety rule above. Depth control comes from answering the questions themselves or exiting explicitly — not from per-round continue? interruptions.
 
 ## Phase 3: Lateral Review Panel (milestone-triggered)
 
