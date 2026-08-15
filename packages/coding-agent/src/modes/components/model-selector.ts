@@ -2366,6 +2366,10 @@ export class ModelSelectorComponent extends Container {
 		if (getKeybindings().matches(keyData, "tui.select.cancel")) {
 			this.#pendingRoleThinkingChoices = undefined;
 			this.#selectedThinkingIndex = 0;
+			// Esc returns to the action menu positioned back on the batch row the
+			// user launched from, matching the single-level reasoning menu.
+			this.#pendingActionItem = item;
+			this.#selectedActionIndex = GJC_MODEL_ASSIGNMENT_TARGET_IDS.length + (roles.includes("default") ? 1 : 0);
 			this.#updateList();
 		}
 	}
