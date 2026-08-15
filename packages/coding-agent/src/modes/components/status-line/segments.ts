@@ -111,7 +111,8 @@ const modelSegment: StatusLineSegment = {
 		}
 
 		// Add thinking level with dot separator
-		if (opts.showThinkingLevel !== false && state.model?.thinking) {
+		// Show when model supports reasoning OR session has an explicit effort
+		if (opts.showThinkingLevel !== false && (state.model?.thinking || state.thinkingLevel)) {
 			const level = state.thinkingLevel ?? ThinkingLevel.Off;
 			if (level !== ThinkingLevel.Off) {
 				const thinkingText = theme.thinking[level as keyof typeof theme.thinking];

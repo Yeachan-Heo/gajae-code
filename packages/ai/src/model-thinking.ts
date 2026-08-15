@@ -256,17 +256,19 @@ export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
  * Returns the supported thinking efforts declared on the model metadata.
  *
  * Catalog enrichment is responsible for normalizing bundled model metadata up front.
- * Runtime callers must treat explicit `model.thinking` on custom models as authoritative
- * so proxy-specific overrides from `models.yml` survive request construction.
+ * Runtime callers may use model.thinking on custom models as authoritative
+ * so proxy-specific overrides from models.yml survive request construction.
  *
- * @throws Error when a reasoning-capable model is missing thinking metadata
+ * Returns an empty array when a reasoning-capable model is missing thinking
+ * metadata so that callers (e.g. getAvailableThinkingLevels) can fall back
+ * to the provider-default efforts rather than crashing.
  */
 export function getSupportedEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
 	if (!model.reasoning) {
 		return [];
 	}
 	if (!model.thinking) {
-		throw new Error(`Model ${model.provider}/${model.id} is missing thinking metadata`);
+		return inferFallbackEfforts(model);
 	}
 	return expandEffortRange(model.thinking);
 }
@@ -274,7 +276,11 @@ export function getSupportedEfforts<TApi extends Api>(model: ApiModel<TApi>): re
 /**
  * Clamps a requested thinking level against explicit model metadata.
  *
- * Non-reasoning models always resolve to `undefined`.
+ * Non-reasoning models pass through the requested level as-is so that
+ * explicit per-agent effort suffixes (:low, :high, :max etc.) from
+ * model_mapping survive the clamp, even when the model lacks `thinking`
+ * config. For reasoning models with `thinking` metadata the level is
+ * clamped to the model's supported range.
  */
 export function clampThinkingLevelForModel<TApi extends Api>(
 	model: ApiModel<TApi> | undefined,
@@ -284,28 +290,30 @@ export function clampThinkingLevelForModel<TApi extends Api>(
 		return requested;
 	}
 	if (!model.reasoning || requested === undefined) {
-		return undefined;
-	}
-
-	const levels = getSupportedEfforts(model);
-	if (levels.includes(requested)) {
 		return requested;
 	}
-
-	const requestedIndex = THINKING_EFFORTS.indexOf(requested);
-	if (requestedIndex === -1) {
-		return undefined;
-	}
-
-	let clamped: Effort | undefined;
-	for (const effort of levels) {
-		if (THINKING_EFFORTS.indexOf(effort) > requestedIndex) {
-			break;
+	// When the model has explicit thinking metadata, clamp to its supported range.
+	if (model.thinking) {
+		const levels = expandEffortRange(model.thinking);
+		if (levels.includes(requested)) {
+			return requested;
 		}
-		clamped = effort;
+		const requestedIndex = THINKING_EFFORTS.indexOf(requested);
+		if (requestedIndex === -1) {
+			return requested;
+		}
+		for (const effort of levels) {
+			if (THINKING_EFFORTS.indexOf(effort) > requestedIndex) {
+				break;
+			}
+			requested = effort;
+		}
+		return requested ?? levels[0];
 	}
-
-	return clamped ?? levels[0];
+	// No thinking config on the model — pass through the requested effort
+	// (e.g. from model_override :suffix). The provider will decide if it
+	// supports it.
+	return requested;
 }
 
 export function requireSupportedEffort<TApi extends Api>(model: ApiModel<TApi>, effort: Effort): Effort {
