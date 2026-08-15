@@ -102,16 +102,23 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 export function markToolChoiceIncapability(model: Model<Api>, maxSupport: ToolChoiceSupport, reason?: string): void {
 	const key = toolChoiceRegistryKey(model);
 	const releaseMutationLock = acquireCapabilityCacheMutationLock();
-	try {
-		hydrateToolChoiceCapability(key);
+	if (releaseMutationLock) {
+		try {
+			hydrateToolChoiceCapability(key);
+			const existing = registry.get(key);
+			const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
+			registry.set(key, next);
+			const persisted = persistToolChoiceCapability(key, next);
+			if (persisted) registry.set(key, persisted.support);
+			registryExpiresAt.set(key, (persisted?.observedAt ?? currentTime()) + CACHE_TTL_MS);
+		} finally {
+			releaseMutationLock();
+		}
+	} else {
 		const existing = registry.get(key);
 		const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
 		registry.set(key, next);
-		const persisted = persistToolChoiceCapability(key, next);
-		if (persisted) registry.set(key, persisted.support);
-		registryExpiresAt.set(key, (persisted?.observedAt ?? currentTime()) + CACHE_TTL_MS);
-	} finally {
-		releaseMutationLock?.();
+		registryExpiresAt.set(key, currentTime() + CACHE_TTL_MS);
 	}
 
 	if (!loggedRegistryKeys.has(key)) {
@@ -133,16 +140,27 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 	const lockPath = `${cachePath}.mutation.lock`;
 	const deadline = Date.now() + CACHE_MUTATION_LOCK_WAIT_MS;
 	const sleeper = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+	const owner = `${process.pid}:${crypto.randomUUID()}`;
 	while (Date.now() < deadline) {
 		try {
 			fs.mkdirSync(path.dirname(cachePath), { recursive: true, mode: 0o700 });
 			const descriptor = fs.openSync(lockPath, "wx", 0o600);
+			fs.writeFileSync(descriptor, owner);
 			fs.closeSync(descriptor);
-			return () => fs.rmSync(lockPath, { force: true });
+			return () => {
+				try {
+					if (fs.readFileSync(lockPath, "utf8") === owner) fs.rmSync(lockPath, { force: true });
+				} catch {
+					// A crashed owner was already reaped.
+				}
+			};
 		} catch (error) {
 			if (!(error && typeof error === "object" && (error as { code?: unknown }).code === "EEXIST")) return;
 			try {
-				if (Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS)
+				const lockOwner = fs.readFileSync(lockPath, "utf8");
+				const ownerPid = Number(lockOwner.split(":", 1)[0]);
+				const ownerIsAlive = Number.isSafeInteger(ownerPid) && ownerPid > 0 && isProcessAlive(ownerPid);
+				if (!ownerIsAlive && Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS)
 					fs.rmSync(lockPath, { force: true });
 			} catch {
 				// The lock holder released the file while it was being inspected.
@@ -151,6 +169,15 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 		}
 	}
 	return undefined;
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**
