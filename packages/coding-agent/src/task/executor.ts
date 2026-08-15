@@ -1582,10 +1582,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const forkContextSeed = options.forkContextSeed
 				? trimForkContextSeedForModel(options.forkContextSeed, model)
 				: undefined;
-			// Resolve effective thinking level: model resolution wins, but fall back to
-			// explicit override (from profile model_mapping :effort or frontmatter) when
-			// the resolution produced no level (e.g. omlx models lack `thinking` config).
-			const effectiveThinkingLevel = resolvedThinkingLevel ?? thinkingLevel;
+			// Agent frontmatter wins over a selector suffix. When frontmatter is absent,
+			// TaskTool passes the profile model_mapping suffix through `thinkingLevel`.
+			const effectiveThinkingLevel = thinkingLevel ?? resolvedThinkingLevel;
 			effectiveThinkingLevelForWarning = effectiveThinkingLevel;
 
 			const sessionManager = options.managedPersistence

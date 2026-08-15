@@ -256,19 +256,17 @@ export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
  * Returns the supported thinking efforts declared on the model metadata.
  *
  * Catalog enrichment is responsible for normalizing bundled model metadata up front.
- * Runtime callers may use model.thinking on custom models as authoritative
- * so proxy-specific overrides from models.yml survive request construction.
+ * Runtime callers must treat explicit `model.thinking` on custom models as authoritative
+ * so proxy-specific overrides from `models.yml` survive request construction.
  *
- * Returns an empty array when a reasoning-capable model is missing thinking
- * metadata so that callers (e.g. getAvailableThinkingLevels) can fall back
- * to the provider-default efforts rather than crashing.
+ * @throws Error when a reasoning-capable model is missing thinking metadata
  */
 export function getSupportedEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
 	if (!model.reasoning) {
 		return [];
 	}
 	if (!model.thinking) {
-		return inferFallbackEfforts(model);
+		throw new Error(`Model ${model.provider}/${model.id} is missing thinking metadata`);
 	}
 	return expandEffortRange(model.thinking);
 }
@@ -276,11 +274,7 @@ export function getSupportedEfforts<TApi extends Api>(model: ApiModel<TApi>): re
 /**
  * Clamps a requested thinking level against explicit model metadata.
  *
- * Non-reasoning models pass through the requested level as-is so that
- * explicit per-agent effort suffixes (:low, :high, :max etc.) from
- * model_mapping survive the clamp, even when the model lacks `thinking`
- * config. For reasoning models with `thinking` metadata the level is
- * clamped to the model's supported range.
+ * Non-reasoning models always resolve to `undefined`.
  */
 export function clampThinkingLevelForModel<TApi extends Api>(
 	model: ApiModel<TApi> | undefined,
@@ -290,30 +284,28 @@ export function clampThinkingLevelForModel<TApi extends Api>(
 		return requested;
 	}
 	if (!model.reasoning || requested === undefined) {
+		return undefined;
+	}
+
+	const levels = getSupportedEfforts(model);
+	if (levels.includes(requested)) {
 		return requested;
 	}
-	// When the model has explicit thinking metadata, clamp to its supported range.
-	if (model.thinking) {
-		const levels = expandEffortRange(model.thinking);
-		if (levels.includes(requested)) {
-			return requested;
-		}
-		const requestedIndex = THINKING_EFFORTS.indexOf(requested);
-		if (requestedIndex === -1) {
-			return requested;
-		}
-		for (const effort of levels) {
-			if (THINKING_EFFORTS.indexOf(effort) > requestedIndex) {
-				break;
-			}
-			requested = effort;
-		}
-		return requested ?? levels[0];
+
+	const requestedIndex = THINKING_EFFORTS.indexOf(requested);
+	if (requestedIndex === -1) {
+		return undefined;
 	}
-	// No thinking config on the model — pass through the requested effort
-	// (e.g. from model_override :suffix). The provider will decide if it
-	// supports it.
-	return requested;
+
+	let clamped: Effort | undefined;
+	for (const effort of levels) {
+		if (THINKING_EFFORTS.indexOf(effort) > requestedIndex) {
+			break;
+		}
+		clamped = effort;
+	}
+
+	return clamped ?? levels[0];
 }
 
 export function requireSupportedEffort<TApi extends Api>(model: ApiModel<TApi>, effort: Effort): Effort {
@@ -766,6 +758,9 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 }
 
 function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
+	if (model.provider === "omlx" && isOmlxQwen36ReasoningModelId(model.id)) {
+		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX;
+	}
 	// Meta documents Muse Spark 1.2 as accepting the full minimal..xhigh
 	// reasoning range. Keep that capability provider-independent so runtime
 	// model discovery/merge cannot downgrade the bundled OpenRouter entry to
@@ -794,6 +789,11 @@ function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly
 		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 	}
 	return DEFAULT_REASONING_EFFORTS;
+}
+
+function isOmlxQwen36ReasoningModelId(modelId: string): boolean {
+	const normalized = modelId.toLowerCase();
+	return normalized.includes("qwen3.6-35b-a3b") || normalized.includes("qwen3.6-27b");
 }
 
 function inferThinkingControlMode<TApi extends Api>(

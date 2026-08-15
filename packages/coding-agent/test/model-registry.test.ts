@@ -3696,7 +3696,7 @@ describe("ModelRegistry", () => {
 				const requestedUrls: string[] = [];
 				using _hook = hookFetch(input => {
 					requestedUrls.push(String(input));
-					return new Response(JSON.stringify({ data: [{ id: "omlx-model", max_model_len: 262144 }] }), {
+					return new Response(JSON.stringify({ data: [{ id: "Qwen3.6-35B-A3B-4bit", max_model_len: 262144 }] }), {
 						status: 200,
 						headers: { "Content-Type": "application/json" },
 					});
@@ -3712,9 +3712,17 @@ describe("ModelRegistry", () => {
 				expect(registry.getDiscoverableProviders()).toContain("omlx");
 				// The mapper maps max_model_len -> contextWindow and keeps the id
 				// fallback for name.
-				const model = registry.find("omlx", "omlx-model");
+				const model = registry.find("omlx", "Qwen3.6-35B-A3B-4bit");
 				expect(model?.contextWindow).toBe(262144);
-				expect(model?.name).toBe("omlx-model");
+				expect(model?.name).toBe("Qwen3.6-35B-A3B-4bit");
+				expect(model).toMatchObject({
+					reasoning: true,
+					thinking: { mode: "effort", minLevel: "minimal", maxLevel: "max" },
+					compat: {
+						thinkingFormat: "qwen-chat-template",
+						reasoningEffortMap: { xhigh: "max", max: "max" },
+					},
+				});
 			} finally {
 				restoreBase();
 				restoreLlama();
