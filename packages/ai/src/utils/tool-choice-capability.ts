@@ -166,17 +166,17 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 	}
 }
 
-function exactUnlinkCapabilityLock(lockPath: string, expectedOwner: string): void {
+function exactUnlinkCapabilityLock(lockPath: string, expectedOwner: string): boolean {
 	const bytes = fs.readFileSync(lockPath);
-	if (bytes.toString("utf8") !== expectedOwner) return;
+	if (bytes.toString("utf8") !== expectedOwner) return false;
 	const stat = fs.statSync(lockPath, { bigint: true });
-	if (!stat.isFile()) return;
+	if (!stat.isFile()) return false;
 	const parent = fs.statSync(path.dirname(lockPath), { bigint: true });
-	if (!parent.isDirectory()) return;
+	if (!parent.isDirectory()) return false;
 	if (!nativeExactUnlinkBindings)
 		nativeExactUnlinkBindings = require("@gajae-code/natives") as NativeExactUnlinkBindings;
 	const bindings = nativeExactUnlinkBindings;
-	bindings.exactUnlink(lockPath, {
+	const result = bindings.exactUnlink(lockPath, {
 		dev: stat.dev,
 		ino: stat.ino,
 		nlink: stat.nlink,
@@ -187,6 +187,14 @@ function exactUnlinkCapabilityLock(lockPath: string, expectedOwner: string): voi
 		sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
 		quarantineName: `.tool-choice-capability-lock-${crypto.randomUUID()}`,
 	});
+	return (
+		result.ok ||
+		(result.code === "cleanup_pending" &&
+			result.payloadDurable === true &&
+			result.detachedPath !== undefined &&
+			result.retainedSuccessorPath === undefined &&
+			result.retainedUnknownPath === undefined)
+	);
 }
 
 function isProcessAlive(pid: number): boolean {
