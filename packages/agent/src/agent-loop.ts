@@ -114,6 +114,7 @@ const MANAGED_LOCAL_FAILURE_STAGES = [
 	"staging.losslessSnapshot",
 	"staging.measure",
 	"staging.sanitize",
+	"staging.preMeasure",
 	"staging.overflow",
 	"overflow.preMeasure",
 	"overflow.staged",
@@ -868,7 +869,16 @@ function losslessDetachedClone<T>(value: T): T {
 			} catch {
 				if (key === "transportFailure" && isManagedPlainRecord(descriptor.value)) {
 					const transport: Record<string, unknown> = {};
-					for (const transportKey of ["kind", "status", "code", "providerCode", "retryAfterMs"] as const) {
+					for (const transportKey of [
+						"kind",
+						"status",
+						"code",
+						"providerCode",
+						"openaiErrorCode",
+						"anthropicErrorType",
+						"retryAfterMs",
+						"headers",
+					] as const) {
 						const transportDescriptor = Object.getOwnPropertyDescriptor(descriptor.value, transportKey);
 						if (!transportDescriptor || !("value" in transportDescriptor)) continue;
 						try {
@@ -1147,11 +1157,12 @@ function warnManagedSnapshotFailure(
  * cancelled provider attempt is therefore unobservable to sessions and their
  * side-effect consumers. Non-managed streams bypass this object entirely.
  */
+type ManagedAttemptBatchItem =
+	| { type: "event"; event: AgentEvent }
+	| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent };
+
 class ManagedAttemptTransaction {
-	#batch: Array<
-		| { type: "event"; event: AgentEvent }
-		| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent }
-	> = [];
+	#batch: ManagedAttemptBatchItem[] = [];
 	#stagedEventCount = 0;
 	#stagedBytes = 0;
 	/** Shape snapshot retained across discard() for bounded failure diagnostics. */
@@ -1171,6 +1182,10 @@ class ManagedAttemptTransaction {
 
 	push(event: AgentEvent): void {
 		if (this.#committed) {
+			if (event.type === "message_end" || event.type === "turn_end") {
+				this.#batch.push({ type: "event", event });
+				return;
+			}
 			this.stream.push(event);
 			return;
 		}
@@ -1195,7 +1210,7 @@ class ManagedAttemptTransaction {
 	}
 
 	flush(): void {
-		if (this.#discarded || this.#committed) return;
+		if (this.#discarded) return;
 		for (const item of this.#batch) {
 			if (item.type === "assistant_event") {
 				this.onAssistantMessageEvent?.(item.message, item.event);
@@ -1207,6 +1222,47 @@ class ManagedAttemptTransaction {
 		this.#stagedBytes = 0;
 		this.#stagedEventCount = 0;
 		this.#committed = true;
+	}
+
+	flushNonTerminal(): void {
+		if (this.#discarded || this.#committed) return;
+		const retained: ManagedAttemptBatchItem[] = [];
+		for (const item of this.#batch) {
+			if (this.#isTerminalItem(item)) {
+				retained.push(item);
+			} else if (item.type === "assistant_event") {
+				this.onAssistantMessageEvent?.(item.message, item.event);
+			} else {
+				this.stream.push(item.event);
+			}
+		}
+		this.#batch = retained;
+	}
+
+	commitCallbacksAndUpdates(): void {
+		if (this.#discarded || this.#committed) return;
+		for (const item of this.#batch) {
+			if (item.type === "assistant_event") {
+				this.onAssistantMessageEvent?.(item.message, item.event);
+			} else if (item.event.type !== "message_end" && item.event.type !== "turn_end") {
+				this.stream.push(item.event);
+			}
+		}
+		this.#batch = this.#batch.filter(
+			item => item.type === "event" && (item.event.type === "message_end" || item.event.type === "turn_end"),
+		);
+		this.#committed = true;
+	}
+
+	replacePendingAssistantMessage(message: AssistantMessage): void {
+		this.#batch = this.#batch.map(item => {
+			if (item.type === "assistant_event") {
+				return { ...item, message, event: this.#assistantEventSnapshot(item.event, message) };
+			}
+			if (item.event.type === "message_end") return { ...item, event: { ...item.event, message } };
+			if (item.event.type === "turn_end") return { ...item, event: { ...item.event, message } };
+			return item;
+		});
 	}
 
 	get committed(): boolean {
@@ -1270,9 +1326,19 @@ class ManagedAttemptTransaction {
 	#stage(event: AgentEvent): void {
 		if (this.snapshotMode === "lossless") {
 			const snapshot = this.#repairAssistantEvent(event);
+			let rawBytes: number | undefined;
+			try {
+				rawBytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
+			} catch {
+				rawBytes = undefined;
+			}
+			if (rawBytes !== undefined && this.#wouldOverflow(rawBytes)) {
+				this.discard();
+				throw new ManagedAttemptSnapshotError("staging.preMeasure");
+			}
 			let detached: AgentEvent;
 			try {
-				detached = this.#losslessSnapshot(snapshot);
+				detached = this.#losslessAgentEventSnapshot(snapshot);
 			} catch {
 				this.discard();
 				throw new ManagedAttemptSnapshotError("staging.losslessSnapshot");
@@ -1376,6 +1442,28 @@ class ManagedAttemptTransaction {
 		return losslessDetachedClone(value);
 	}
 
+	#losslessAgentEventSnapshot(event: AgentEvent): AgentEvent {
+		switch (event.type) {
+			case "message_start":
+			case "message_end":
+				return { ...event, message: this.#losslessSnapshot(event.message) };
+			case "message_update": {
+				const message = this.#losslessSnapshot(event.message);
+				if (message.role !== "assistant") return { ...event, message };
+				const assistantMessageEvent = this.#assistantEventSnapshot(event.assistantMessageEvent, message);
+				return { ...event, message, assistantMessageEvent };
+			}
+			case "turn_end":
+				return {
+					...event,
+					message: this.#losslessSnapshot(event.message),
+					toolResults: this.#losslessSnapshot(event.toolResults),
+				};
+			default:
+				return this.#losslessSnapshot(event);
+		}
+	}
+
 	#assistantSnapshot(message: AssistantMessage): AssistantMessage {
 		return this.snapshotMode === "lossless"
 			? this.#losslessSnapshot(message)
@@ -1387,8 +1475,13 @@ class ManagedAttemptTransaction {
 		const snapshot = this.#losslessSnapshot(event);
 		if (snapshot.type === "done") return { ...snapshot, message };
 		if (snapshot.type === "error") return { ...snapshot, error: message };
-		if ("partial" in snapshot) return { ...snapshot, partial: message };
-		return snapshot;
+		if (snapshot.type === "toolChoiceIncapability") return snapshot;
+		return { ...snapshot, partial: message };
+	}
+
+	#isTerminalItem(item: ManagedAttemptBatchItem): boolean {
+		if (item.type === "assistant_event") return item.event.type === "done" || item.event.type === "error";
+		return item.event.type === "message_end" || item.event.type === "turn_end";
 	}
 }
 
@@ -2043,6 +2136,18 @@ async function runLoopBody(
 					}
 					await emitHarmonyAudit(config, err, "truncate_resume", harmonyRetryAttempt);
 				} else {
+					if (escapedToolTransaction?.committed) {
+						const contaminated = currentContext.messages.at(-1);
+						if (contaminated?.role !== "assistant") throw err;
+						const sanitized = escapedToolTransaction.acceptedAssistantSnapshot({
+							...contaminated,
+							content: [],
+							stopReason: "aborted",
+							providerPayload: undefined,
+						});
+						escapedToolTransaction.replacePendingAssistantMessage(sanitized);
+						escapedToolTransaction.flush();
+					}
 					if (harmonyRetryAttempt >= 2) {
 						await emitHarmonyAudit(config, err, "escalated", harmonyRetryAttempt);
 						throw new Error(
@@ -2220,23 +2325,27 @@ async function runLoopBody(
 			}
 
 			// One provider invocation is committed before any tool can run.
-			transaction?.flush();
 			if (escapedToolTransaction) {
 				const acceptedMessage = escapedToolTransaction.acceptedAssistantSnapshot(message);
-				const acceptedIndex = currentContext.messages.lastIndexOf(message);
-				if (acceptedIndex >= 0) currentContext.messages[acceptedIndex] = acceptedMessage;
+				const contextIndex = currentContext.messages.lastIndexOf(message);
+				if (contextIndex >= 0) currentContext.messages[contextIndex] = acceptedMessage;
 				const producedIndex = newMessages.lastIndexOf(message);
 				if (producedIndex >= 0) newMessages[producedIndex] = acceptedMessage;
 				message = acceptedMessage;
+				escapedToolTransaction.flushNonTerminal();
 				// Tool-call updates are staged so an escaped turn can disappear
 				// atomically. Once accepted, drain every published update through the
 				// Agent/AgentSession consumers before dispatch: streaming edit guards
 				// can then abort the run before any tool execute() is entered.
 				if (message.stopReason !== "aborted" && message.stopReason !== "error") {
-					if (loopSignal.aborted) break;
+					if (loopSignal.aborted) message.stopReason = "aborted";
 					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(new AbortController().signal);
-					if (loopSignal.aborted) break;
+					if (loopSignal.aborted) message.stopReason = "aborted";
 				}
+				escapedToolTransaction.replacePendingAssistantMessage(message);
+				escapedToolTransaction.flush();
+			} else {
+				transaction?.flush();
 			}
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
@@ -2860,7 +2969,7 @@ async function streamAssistantResponse(
 								// a later escaped tool call therefore falls through to the
 								// existing terminal per-call rejection instead.
 								if (event.type === "text_start" || event.type === "text_delta" || event.type === "text_end") {
-									provisionalToolTransaction?.flush();
+									provisionalToolTransaction?.commitCallbacksAndUpdates();
 								}
 							}
 							break;

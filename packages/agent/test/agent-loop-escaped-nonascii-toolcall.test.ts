@@ -58,6 +58,10 @@ function literalTurn(id: string) {
 	return { content: [{ type: "toolCall" as const, id, name: "ask", arguments: { question: QUESTION } }] };
 }
 
+function literalTurnWithText(id: string) {
+	return { content: [{ type: "text" as const, text: "I will ask." }, ...literalTurn(id).content] };
+}
+
 const PROVIDER_USAGE = {
 	input: 7,
 	output: 11,
@@ -462,6 +466,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
 		const mock = createMockModel({ responses: [literalTurn("tc-abort")] });
 		const controller = new AbortController();
+		const events: AgentEvent[] = [];
 		const config: AgentLoopConfig = {
 			model: mock.model,
 			convertToLlm: identityConverter,
@@ -471,11 +476,115 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		};
 
 		const stream = agentLoop([createUserMessage("ask me")], context, config, controller.signal, mock.stream);
-		for await (const _event of stream) {
-			// drain
+		for await (const event of stream) events.push(event);
+
+		expect(executions).toBe(0);
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds).toHaveLength(1);
+		expect(assistantEnds[0]?.message.role === "assistant" ? assistantEnds[0].message.stopReason : undefined).toBe(
+			"aborted",
+		);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(1);
+		expect(events.filter(event => event.type === "tool_execution_start")).toHaveLength(1);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds).toHaveLength(1);
+		expect(toolEnds[0]?.isError).toBe(true);
+	});
+
+	it("publishes a retained visible-text terminal exactly once after callback abort", async () => {
+		let executions = 0;
+		const tool: AgentTool<typeof askSchema, Record<string, never>> = {
+			...askTool([]),
+			async execute() {
+				executions += 1;
+				return { content: [{ type: "text", text: "answered" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({ responses: [literalTurnWithText("tc-visible-abort")] });
+		const controller = new AbortController();
+		const callbackTypes: string[] = [];
+		const events: AgentEvent[] = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			onAssistantMessageEvent: (_message, event) => {
+				callbackTypes.push(event.type);
+				if (event.type === "toolcall_end") controller.abort();
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, controller.signal, mock.stream);
+		for await (const event of stream) events.push(event);
+
+		expect(executions).toBe(0);
+		expect(callbackTypes).toEqual([
+			"text_start",
+			"text_delta",
+			"text_end",
+			"toolcall_start",
+			"toolcall_delta",
+			"toolcall_end",
+		]);
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds).toHaveLength(1);
+		expect(assistantEnds[0]?.message.role === "assistant" ? assistantEnds[0].message.stopReason : undefined).toBe(
+			"aborted",
+		);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(1);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds).toHaveLength(1);
+		expect(toolEnds[0]?.isError).toBe(true);
+	});
+
+	it("replaces a retained visible-text terminal when the stream consumer aborts during drain", async () => {
+		let executions = 0;
+		const tool: AgentTool<typeof askSchema, Record<string, never>> = {
+			...askTool([]),
+			async execute() {
+				executions += 1;
+				return { content: [{ type: "text", text: "answered" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({ responses: [literalTurnWithText("tc-consumer-abort")] });
+		const controller = new AbortController();
+		const events: AgentEvent[] = [];
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, controller.signal, mock.stream);
+		for await (const event of stream) {
+			events.push(event);
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_end") {
+				controller.abort();
+			}
 		}
 
 		expect(executions).toBe(0);
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds).toHaveLength(1);
+		expect(assistantEnds[0]?.message.role === "assistant" ? assistantEnds[0].message.stopReason : undefined).toBe(
+			"aborted",
+		);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(1);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds).toHaveLength(1);
+		expect(toolEnds[0]?.isError).toBe(true);
 	});
 
 	it("promotes a detached accepted assistant for execution state and replay", async () => {
