@@ -756,7 +756,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 168 at serving epoch 87", () => {
+test("publishes exact durable authority generation 169 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -783,7 +783,7 @@ test("publishes exact durable authority generation 168 at serving epoch 87", () 
 	// the generator's post-fix manifest check byte-compares the regenerated disk
 	// manifest against the current tree, and pre-registry legacy stray Telegram
 	// daemons are auto-reaped (#4533).
-	expect(DAEMON_GENERATION).toBe(168);
+	expect(DAEMON_GENERATION).toBe(169);
 	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {

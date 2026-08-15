@@ -270,7 +270,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * manifest against the current tree, and auto-reaps pre-registry legacy stray
  * Telegram daemons (#4533).
  */
-export const DAEMON_GENERATION = 168;
+export const DAEMON_GENERATION = 169;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
