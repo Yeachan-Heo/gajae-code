@@ -82,7 +82,9 @@ export interface EditRequestTargetInventory {
 	/** First envelope entry rename target, for free-form modes that carry no structured `edits`. */
 	rename?: string;
 }
-const MISSING_APPLY_PATCH_END_ERROR = `The last line of the patch must be '${END_PATCH_MARKER}'`;
+function missingApplyPatchEndError(): string {
+	return `The last line of the patch must be '${END_PATCH_MARKER}'`;
+}
 
 export function orderedDistinctPaths(paths: readonly (string | undefined)[]): string[] {
 	const seen = new Set<string>();
@@ -181,7 +183,7 @@ export function getEditRequestTargetInventory(
 		} catch (err) {
 			const parseError = err instanceof Error ? err.message : String(err);
 			const inventory = applyPatchEntryInventory(expandApplyPatchToPreviewEntries({ input }));
-			if (options.isPartial && parseError === MISSING_APPLY_PATCH_END_ERROR) return inventory;
+			if (options.isPartial && parseError === missingApplyPatchEndError()) return inventory;
 			return { ...inventory, parseError };
 		}
 	}
