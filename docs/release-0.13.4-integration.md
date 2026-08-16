@@ -89,3 +89,21 @@ Wave 2 (2026-08-16):
 - `check:ts` aggregate fails only in its `check:sdk-closure` receipt:
   `sdk-client.test.ts` 14 pass / 5 fail, reproducing identically on
   `origin/main` in this environment — pre-existing, not wave-2.
+
+Root-cause refinement (2026-08-16, same environment):
+
+- cache-affinity ×3: operator config exports
+  `OPENAI_BASE_URL=http://api.layofflabs.com/v1` (`~/.zshrc`, `~/.gjc/.env`).
+  `$credentialEnv` trusts both by design, the resolved origin is
+  non-canonical, and `shouldSendOpenAIResponsesSessionHeaders` correctly
+  withholds `session_id`/`x-client-request-id` from an unknown relay.
+  Product behavior is correct; the test is not hermetic against
+  user-owned env files. Proven green under `HOME=$(mktemp -d)`.
+  Hermeticity fix needs a resolution seam — dev-side work, not a backport.
+- broker/oauth ×7: pass in file isolation; full-suite-only interference.
+- session-manager ×2 + sdk-client ×5: persist under HOME isolation and a
+  fresh `build:native` from this branch's crates; dev already rewrote these
+  exact tests inside the deferred SDK/storage chains (`sdk-client.test.ts`
+  rewritten ~1,083 lines; resume-readonly moved its spy to
+  `renameNoReplacePathAsync`). They resolve with the 0.14 cluster landings;
+  backporting the test halves alone recreates the mid-chain hazard.
