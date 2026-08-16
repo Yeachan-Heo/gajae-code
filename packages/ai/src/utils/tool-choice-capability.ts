@@ -35,6 +35,7 @@ let beforeMalformedDeleteForTests: (() => void) | undefined;
 let onCacheOpenForTests: (() => void) | undefined;
 let simulateCacheOperationErrorForTests: (() => Error | undefined) | undefined;
 let beforeCorruptRetireForTests: (() => void) | undefined;
+let beforeLockExactUnlinkForTests: ((lockPath: string) => void) | undefined;
 
 /**
  * Claude Mythos accepts tools but rejects forced tool use (Anthropic 400:
@@ -90,6 +91,7 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 	onCacheOpen?: () => void;
 	simulateOperationError?: () => Error | undefined;
 	beforeCorruptRetire?: () => void;
+	beforeLockExactUnlink?: (lockPath: string) => void;
 }): void {
 	cachePathOverride = options?.path;
 	nowForTests = options?.now;
@@ -98,6 +100,7 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 	onCacheOpenForTests = options?.onCacheOpen;
 	simulateCacheOperationErrorForTests = options?.simulateOperationError;
 	beforeCorruptRetireForTests = options?.beforeCorruptRetire;
+	beforeLockExactUnlinkForTests = options?.beforeLockExactUnlink;
 	clearToolChoiceIncapabilityRegistryForTests();
 }
 
@@ -170,10 +173,22 @@ function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
 }
 
 function exactUnlinkCapabilityLock(lockPath: string, expectedOwner: string): boolean {
-	const bytes = fs.readFileSync(lockPath);
-	if (bytes.toString("utf8") !== expectedOwner) return false;
-	const stat = fs.statSync(lockPath, { bigint: true });
-	if (!stat.isFile()) return false;
+	// Open the lock first and read bytes + identity from the SAME descriptor: the
+	// pinned inode cannot be recycled or substituted while the handle is open, so
+	// a replacement owner that lands at the pathname after the read can never be
+	// mistaken for the record whose bytes authorized this removal.
+	const descriptor = fs.openSync(lockPath, "r");
+	let bytes: Buffer;
+	let stat: import("node:fs").BigIntStats;
+	try {
+		bytes = fs.readFileSync(descriptor);
+		if (bytes.toString("utf8") !== expectedOwner) return false;
+		stat = fs.fstatSync(descriptor, { bigint: true });
+		beforeLockExactUnlinkForTests?.(lockPath);
+		if (!stat.isFile()) return false;
+	} finally {
+		fs.closeSync(descriptor);
+	}
 	const parent = fs.statSync(path.dirname(lockPath), { bigint: true });
 	if (!parent.isDirectory()) return false;
 	if (!nativeExactUnlinkBindings)
@@ -204,8 +219,11 @@ function isProcessAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		// EPERM means the process exists but may not be signalable; only ESRCH
+		// proves the pid is gone. Any other outcome is treated as alive so an
+		// uncertain owner is never reaped as stale.
+		return (error as { code?: string }).code !== "ESRCH";
 	}
 }
 

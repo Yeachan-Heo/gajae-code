@@ -386,6 +386,68 @@ describe("durable tool-choice capability cache", () => {
 			database.close();
 		}
 	});
+	it("a stale recovery waiter cannot remove a replacement lock owner", async () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-replacement-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		const lockPath = `${cachePath}.mutation.lock`;
+
+		// A genuinely dead owner's stale lock exists, aged past the stale window.
+		const deadPid = await (async () => {
+			for (let probe = 300000; probe < 300100; probe++) {
+				try {
+					process.kill(probe, 0);
+				} catch (error) {
+					if ((error as { code?: string }).code === "ESRCH") return probe;
+				}
+			}
+			throw new Error("no ESRCH pid available for the stale-owner fixture");
+		})();
+		fsSync.writeFileSync(lockPath, `${deadPid}:dead-owner-token`);
+		const staleTime = new Date(Date.now() - 60_000);
+		fsSync.utimesSync(lockPath, staleTime, staleTime);
+
+		// Deterministic interleaving: a child waiter captures the dead owner's
+		// record, then — after its identity capture but before its identity-bound
+		// unlink — another reclaimer removes that record and THIS live process
+		// (the replacement owner) takes the pathname. The child must refuse the
+		// unlink (pinned identity no longer matches) and then block on the live
+		// replacement owner instead of detaching it.
+		const liveReplacementOwner = `${process.pid}:replacement-owner-token`;
+		const script = `
+		import { configureToolChoiceCapabilityCacheForTests, markToolChoiceIncapability } from ${JSON.stringify(
+			path.resolve(import.meta.dir, "../src/utils/tool-choice-capability.ts"),
+		)};
+		const model = ${JSON.stringify(model("named"))};
+		configureToolChoiceCapabilityCacheForTests({
+			path: process.argv[1],
+			beforeLockExactUnlink: () => {
+				const fs = require("node:fs");
+				if (fs.readFileSync(process.argv[2], "utf8") === ${JSON.stringify(`${deadPid}:dead-owner-token`)}) {
+					fs.rmSync(process.argv[2], { force: true });
+					fs.writeFileSync(process.argv[2], ${JSON.stringify(liveReplacementOwner)});
+				}
+			},
+		});
+		markToolChoiceIncapability(model, "auto");
+	`;
+		const child = Bun.spawn([process.execPath, "-e", script, cachePath, lockPath], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		// The child must remain blocked on the live replacement owner; the lock it
+		// created must still exist untouched after a bounded observation window.
+		await Bun.sleep(2_000);
+		expect(fsSync.existsSync(lockPath)).toBe(true);
+		expect(fsSync.readFileSync(lockPath, "utf8")).toBe(liveReplacementOwner);
+
+		child.kill();
+		await child.exited;
+
+		// The mutation never completed, so no cache row was written.
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+	});
 
 	it("does not retire the cache when a transient SQLITE_ERROR occurs during operation", () => {
 		using tempDir = TempDir.createSync("tool-choice-capability-transient-");
