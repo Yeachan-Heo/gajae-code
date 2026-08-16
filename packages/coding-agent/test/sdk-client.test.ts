@@ -137,14 +137,14 @@ test("SdkClient surfaces malformed transport frames as typed protocol errors", a
 	await client.close();
 });
 
-test("SdkClient reports connection_closed when a sent request loses its response", async () => {
+test("SdkClient attributes a sent request that loses its response as uncertain_after_send", async () => {
 	let accepted: Record<string, unknown> | undefined;
 	const host = start((frame, socket) => {
 		accepted = frame;
 		socket.close(1000, "done");
 	});
 	const client = await SdkClient.connect(host.url, host.token, { timeoutMs: 1_000 });
-	await expectFailure(client.control("close"), { code: "connection_closed" });
+	await expectFailure(client.control("close"), { code: "uncertain_after_send" });
 	expect(accepted).toMatchObject({ type: "control_request", operation: "close" });
 	await client.close();
 });
@@ -178,7 +178,7 @@ test("SdkClient times out and reconnects after a server restart", async () => {
 	};
 	const first = startAtPort();
 	const client = await SdkClient.connect(`ws://127.0.0.1:${port}`, token, { timeoutMs: 30, reconnectBackoffMs: 5 });
-	await expect(client.control("wait")).rejects.toMatchObject({ code: "timeout" });
+	await expect(client.control("wait")).rejects.toMatchObject({ code: "uncertain_after_send" });
 	await first.stop(true);
 	servers.splice(servers.indexOf(first), 1);
 	await Bun.sleep(50);
@@ -303,7 +303,7 @@ test("SdkClient never replays sent work onto a replacement connection", async ()
 	});
 	servers.push(server);
 	const client = await SdkClient.connect(`ws://127.0.0.1:${server.port}`, token);
-	await expectFailure(client.control("mutate", { value: 1 }), { code: "connection_closed" });
+	await expectFailure(client.control("mutate", { value: 1 }), { code: "uncertain_after_send" });
 	await expectResult(client.control("after_close", { value: 2 }), { ok: true });
 	expect(received.filter(entry => entry.frame.operation === "mutate")).toHaveLength(1);
 	expect(received.filter(entry => entry.frame.operation === "after_close")).toHaveLength(1);
@@ -587,7 +587,7 @@ test("SdkClient deterministically owns open, hello, request, and backoff timers"
 			const atDeadlineId = (JSON.parse(requestSocket.sent[1]) as { id: string }).id;
 			expect([...clock.tasks.values()].map(task => task.due - clock.now)).toEqual([50]);
 			clock.advanceBy(50);
-			await expect(atDeadline).rejects.toMatchObject({ code: "timeout" });
+			await expect(atDeadline).rejects.toMatchObject({ code: "uncertain_after_send" });
 			requestSocket.message({ type: "control_response", id: atDeadlineId, ok: true });
 			expect(clock.tasks.size).toBe(0);
 			await requestTimeoutClient.close();
@@ -658,7 +658,7 @@ test("SdkClient settles response-versus-close races exactly once", async () => {
 		const closeFirstId = (JSON.parse(closeFirstSocket.sent[0]) as { id: string }).id;
 		closeFirstSocket.emit("close");
 		closeFirstSocket.message({ type: "control_response", id: closeFirstId, ok: true });
-		await expect(closeFirst).rejects.toMatchObject({ code: "connection_closed" });
+		await expect(closeFirst).rejects.toMatchObject({ code: "uncertain_after_send" });
 		await closeFirstClient.close();
 	});
 });
