@@ -355,7 +355,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				requestBody = replacementPayload as typeof requestBody;
 			}
 			const headers = isAntigravity
-				? getAntigravityRequestHeaders() // Evidence: UA = "antigravity-ide" (disassembly 0x5ecb1dd)
+				? getAntigravityRequestHeaders() // 2.5.5 arm64 0x1018e9a70 fallback "antigravity" len 0xb (0x102472c7b)
 				: getGeminiCliHeaders(model.id);
 
 			const requestHeaders = {

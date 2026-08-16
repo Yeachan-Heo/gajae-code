@@ -78,19 +78,28 @@ The system automatically resumes your execution when:
 This means you do **NOT** need to poll in a loop while waiting for messages or updates. After launching anything that performs work asynchronously, you may continue other work or simply stop by calling no more tools. The system will notify you when there is something to process.
 `;
 /**
- * Antigravity / Cloud Code Assist user agent.
+ * Antigravity / Cloud Code Assist user agent — 2.5.5 arm64 1.107.0 re-decompiled.
  *
- * Disassembly-confirmed: getUserAgentName() @ 0x5ecb1dd loads "antigravity-ide"
- * via LEA RDX, [RIP-0x284fc90] → 0x367b554 = "antigravity-ide"
+ * Prior 2.0.3 x64 claim (LEA RDX,[RIP-0x284fc90]->0x367b554 "antigravity-ide" @0x5ecb1dd,
+ * -override_user_agent @0x5ecbc37) is stale.
  *
- * The LS sets HTTP headers via: fmt.Sprintf("User-Agent: %s", getUserAgentName())
- * So the final header is: User-Agent: antigravity-ide
- *
- * -override_user_agent flag can override this (confirmed at 0x5ecbc37).
+ * 2.5.5 arm64 language_server_macos_arm (126MB Go1.26.5, __lrodata_gopcln 37MB, gosym 126300 funcs):
+ * - IDE GetUserAgentName 0x1018e9a70 sz48, CLI 0x1018ec950 sz48, Hub 0x1018ef450 sz48 identical:
+ *   adrp x27,#0x107b91000; add #0x880 -> bss override (SetUserAgentNameOverride @ override_user_agent_name 0x254cd06)
+ *   ldp x2,x3,[x27]; cmp x3,#0; mov x4,#0xb; csel x1,x3,x4,ne; adrp x3,#0x102472000; add #0xc7b; csel x0,x2,x3,ne; ret
+ *   fallback va 0x102472c7b fileoff 0x2472c7b len 0xb (11) => "antigravity" (616e746967726176697479)
+ *   raw "antigravity-ide" @0x24c59ab va 0x1024c59ab count2 doc "**IDE**: `antigravity-ide/`" only,
+ *   ADRP page 0x1024c5000+0x9ab exact 0 hits; "antigravity/ide" 0; "aidev_client" 1 (log cloudcode-paaidev_client)
+ * - SetHTTPHeaders: IDE 0x1018e9ca0 16 ret, Standalone 0x1018ea350 16 ret, Stubby 0x1018f01d0 16 ret,
+ *   CLI 0x1018ecfc0 704 (X-Goog-User-Project @0x1018ed1b8 only), Hub 0x1018ef6d0 832 (cloudcode-paaidev_client + X-Goog-User-Project)
+ *   no UA / x-goog-api-client ADRP; raw x-goog @0x24ea019 false positive generationConfig.x-goog-api-client,
+ *   google-api-nodejs-client 0, gl-node 0, Client-Metadata 0. loadCodeAssist/onboardUser literals exist
+ *   (0x27a4f5d/0x27a53f5) but ADRP 0 hits — headers not synthesized there.
+ * - Flag renamed: -override_user_agent -> override_user_agent_name @0x254cd06.
  */
 export let getAntigravityUserAgent = () => {
-	const override = process.env.PI_AI_ANTIGRAVITY_USER_AGENT;
-	const userAgent = override || "antigravity-ide";
+	const override = process.env.PI_AI_ANTIGRAVITY_USER_AGENT?.trim() || process.env.GOOGLE_ANTIGRAVITY_USER_AGENT?.trim();
+	const userAgent = override || "antigravity";
 	getAntigravityUserAgent = () => userAgent;
 	return userAgent;
 };
