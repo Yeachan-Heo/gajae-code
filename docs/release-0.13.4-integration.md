@@ -105,10 +105,21 @@ Root-cause refinement (2026-08-16, same environment):
   commits or code paths), grouped only by evidence class; both persist
   under HOME isolation and a fresh `build:native` from this branch's
   crates.
-  - sdk-client ×5: SDK websocket transport tests; dev rewrote
-    `sdk-client.test.ts` (~1,083 lines) in the transport refactor chain
-    (`9feba5daf7` → `3687635541` #4253 → `0d1d94d3fa` #4281). Rides with
-    the deferred SDK cluster.
+  - sdk-client ×5: RESOLVED on this branch. Deeper analysis showed all
+    five reduced to one stale genesis-import contract: assertions of
+    `connection_closed`/`timeout` for sent-frame scenarios that the
+    shipped transport (and dev's rewritten suite, same rewrap logic)
+    deliberately classifies `uncertain_after_send` to keep ambiguous
+    outcomes non-retryable. Test assertions corrected; no product
+    change. The dev transport chain (`9feba5daf7` → #4253 → #4281)
+    stays deferred — it deletes the bridge-client workspace.
+  - Same skew class, fixed alongside: two `DAEMON_GENERATION` pins
+    stuck at 62 while the contract ships 63 (#4200 follow-up).
+    `check:sdk-closure` and the full `check:ts` aggregate are now
+    exit 0 on this branch (neither passes on `origin/main` in this
+    environment). `sdk-host-wiring.test.ts` showed one intra-file
+    timing flake under the gate; passes 95/95 in isolation on HEAD
+    and `origin/main`.
   - session-manager ×2: natives rename/fsync spy-injection seams.
     Dev's resume-readonly repair (6 lines inside `90da036035`) moves the
     spy to `renameNoReplacePathAsync` and is valid only against dev's
