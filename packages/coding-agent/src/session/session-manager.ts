@@ -10249,7 +10249,7 @@ export class SessionManager {
 					parentStore.removeTreeExpected(stagingName, stagingSnapshot);
 			} catch (cleanupError) {
 				const cleanupMessage = toError(cleanupError).message;
-				if (cleanupMessage !== "cleanup_pending") {
+				if (cleanupMessage !== "cleanup_pending" && cleanupMessage !== "not_found") {
 					throw new Error(`Failed to clean up managed fork artifacts: ${cleanupMessage}`, {
 						cause: toError(error),
 					});
