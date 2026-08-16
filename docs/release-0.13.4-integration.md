@@ -16,16 +16,35 @@ Dropped: #4312 — source byte-identical on main since 0.13.2; only its changelo
 Gates at head: full workspace typecheck 0 TS errors; 432 targeted tests 0 fail
 (tui pet, session suites, ai codex); `ci:test:smoke` ok.
 
-## Wave 2 — small hand-work, pending go
+## Wave 2 — landed (this branch)
 
-Anthropic chain (sim: 5 land mechanically, 2 need hand-resolution against the
-0.13.3 escaped-non-ASCII detection hunks):
+Anthropic chain, landed whole in order:
 `597e8e5953` (#4267) → `7538e155fc` (#4339) → `4541baf0ef` → `700d66d045` →
-`ef4ce20a23` (#4416) → HAND: `236de5111f` (#4443) → HAND: `cd51365cc2` (#4557).
-Must land whole or not at all — 5-of-7 recreates the mid-chain hazard.
+`ef4ce20a23` (#4416) → `236de5111f` (#4443) → `cd51365cc2` (#4557).
 
-#4586 (models-endpoint fail-closed validation): awaiting review/merge on dev,
-then a clean backport (`api-key-validation.ts` byte-identical main↔dev).
+Hand-resolution decisions (recorded so the eventual dev merge is mechanical):
+
+- #4443: the cherry-pick conflict in `transform-messages.ts` carried dev's
+  `collapseAdjacentThinking` (#4418, `f1150c6037` — not in this chain) as
+  context. Only the commit's own payload (`hasAdjacentPrivateThinkingBlocks`)
+  was taken; the replay-time collapse stays dev-only, the send-boundary
+  collapse (#4425) covers this base.
+- #4557: dropped the `&& !localSnapshot` guard in the `maxAttempts`
+  resolution — `localSnapshot` comes from deferred #4580, and the commit's
+  own trailers call that guard obsolete/unreachable even on dev.
+- Changelog conflicts resolved payload-only; dev-context entries excluded.
+
+Branch-only reconciliations:
+
+- The #4573 test hard-coded dev's 128 MiB `MANAGED_ARTIFACT_MAX_FILE_BYTES`;
+  main's base is 64 MiB. Assertion now uses the exported constant.
+- `artifacts/issue-3670-anthropic-cache-eval.json` (gitignored evidence)
+  regenerated via `WRITE_ISSUE_3670_EVAL=1` since the chain rewrote
+  `anthropic.ts` and the eval pins its blob identity.
+
+Still pending: #4586 (models-endpoint fail-closed validation) — not yet
+merged on dev as of 2026-08-16; clean backport once it lands
+(`api-key-validation.ts` byte-identical main↔dev).
 
 ## Deferred to 0.14 — with reasons
 
@@ -49,3 +68,24 @@ then a clean backport (`api-key-validation.ts` byte-identical main↔dev).
 
 Updated as groups land. Wave 1: see gates above; commands run in a clean
 worktree with correct workspace linkage and built natives.
+
+Wave 2 (2026-08-16):
+
+- `packages/ai` + `packages/coding-agent` package checks (biome + tsc): clean.
+- Chain-surface tests: agent-session resilient-retry/retry-fallback,
+  adjacent-thinking assertion/detector/diagnostic/collapse, thinking-repair
+  budget/retry, stream-timeout, idle-iterator, fallback-transport,
+  http-inspector, edit-result-persistence-bounding — all pass.
+- Full `packages/ai` suite: 2459 pass / 11 fail. All 11 attributed: the
+  cache-eval identity fail was chain-caused and fixed by the sanctioned
+  artifact regen; the other 10 (openai-responses-cache-affinity ×3,
+  auth-broker/remote-auth-store/oauth-xai ×7) reproduce identically on
+  `origin/main` (accd043c16) and pre-date this branch — the broker seven
+  pass in file isolation and fail only under full-suite interference.
+- session-manager suites: 363 pass / 2 fail; both fails
+  (`session-id.test.ts` fsync identity mismatch, resume-readonly picker-root
+  drift guard) reproduce on `origin/main` — pre-existing base failures.
+- `ci:test:smoke`: ok.
+- `check:ts` aggregate fails only in its `check:sdk-closure` receipt:
+  `sdk-client.test.ts` 14 pass / 5 fail, reproducing identically on
+  `origin/main` in this environment — pre-existing, not wave-2.
