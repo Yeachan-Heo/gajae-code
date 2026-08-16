@@ -435,11 +435,20 @@ describe("durable tool-choice capability cache", () => {
 			stderr: "pipe",
 		});
 
-		// The child must remain blocked on the live replacement owner; the lock it
-		// created must still exist untouched after a bounded observation window.
-		await Bun.sleep(2_000);
-		expect(fsSync.existsSync(lockPath)).toBe(true);
-		expect(fsSync.readFileSync(lockPath, "utf8")).toBe(liveReplacementOwner);
+		// The child must remain blocked on the live replacement owner. Poll with a
+		// bounded deadline (a fixed sleep would flake on slow child startup); once
+		// the substitution is observed, the lock must stay exactly the replacement
+		// owner's record, proving the child refused to detach it.
+		const deadline = Date.now() + 10_000;
+		while (fsSync.readFileSync(lockPath, "utf8") !== liveReplacementOwner) {
+			if (Date.now() > deadline) throw new Error("replacement owner never took the lock path");
+			await Bun.sleep(50);
+		}
+		for (let i = 0; i < 20; i++) {
+			expect(fsSync.existsSync(lockPath)).toBe(true);
+			expect(fsSync.readFileSync(lockPath, "utf8")).toBe(liveReplacementOwner);
+			await Bun.sleep(25);
+		}
 
 		child.kill();
 		await child.exited;
