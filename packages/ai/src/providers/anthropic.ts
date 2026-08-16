@@ -2324,7 +2324,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								const { block } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
 									block.thinkingSignature = block.thinkingSignature || "";
-									block.thinkingSignature += event.delta.signature;
+									if (typeof event.delta.signature === "string") {
+										block.thinkingSignature += event.delta.signature;
+									}
 								}
 							}
 						} else if (event.type === "content_block_stop") {

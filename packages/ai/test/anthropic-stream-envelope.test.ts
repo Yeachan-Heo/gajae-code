@@ -1454,6 +1454,12 @@ describe("anthropic stream envelope handling", () => {
 						index: 0,
 						delta: { type: "thinking_delta", thinking: "later" },
 					},
+					{ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: 7 } },
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "signature_delta", signature: "sig_ok" },
+					},
 					{ type: "content_block_stop", index: 0 },
 					{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
 					{ type: "message_stop" },
@@ -1467,6 +1473,6 @@ describe("anthropic stream envelope handling", () => {
 
 		const deltas = events.filter(event => event.type === "thinking_delta");
 		expect(deltas.map(event => event.delta)).toEqual(["", "", "later"]);
-		expect(result.content).toEqual([{ type: "thinking", thinking: "later", thinkingSignature: "" }]);
+		expect(result.content).toEqual([{ type: "thinking", thinking: "later", thinkingSignature: "sig_ok" }]);
 	});
 });
