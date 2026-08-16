@@ -91,13 +91,13 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 			// Skip comments and blank lines
 			if (!trimmed || trimmed.startsWith("#")) continue;
 
-			const eqIndex = trimmed.indexOf("=");
-			if (eqIndex === -1) continue;
+			const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(trimmed);
+			if (!match) continue;
 
-			const key = trimmed.slice(0, eqIndex).trim();
+			const key = match[1];
 			if (!isValidEnvName(key)) continue;
 
-			let value = trimmed.slice(eqIndex + 1).trim();
+			let value = (match[2] ?? "").trim();
 
 			// Remove surrounding quotes (" or ')
 			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
