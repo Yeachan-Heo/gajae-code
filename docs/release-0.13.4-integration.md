@@ -114,7 +114,8 @@ Root-cause refinement (2026-08-16, same environment):
     spy to `renameNoReplacePathAsync` and is valid only against dev's
     async receipt publication — this branch still publishes via the sync
     native, so the fix does not backport. `session-id.test.ts` is
-    byte-identical main↔dev (no fix exists to take); suspected local
-    mechanism is the generated-ESM natives namespace defeating
-    `vi.spyOn` on a locally built addon, which the sdk-client five
-    cannot share (they never touch natives).
+    byte-identical main↔dev (no fix exists to take). A spy-seam
+    hypothesis (ESM natives namespace vs CJS require view) was tested
+    and falsified — the spy is visible through both views — so the
+    concrete mechanism on this base is unestablished; it reproduces on
+    `origin/main` and is mooted by dev's storage rewrite.
