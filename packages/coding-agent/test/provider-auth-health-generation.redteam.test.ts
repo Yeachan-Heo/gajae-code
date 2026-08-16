@@ -77,6 +77,7 @@ function createModelRegistry(
 		hasConfiguredProviderAuth,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		getModelProfiles: () => new Map(),
 		getApiKeyForProvider: async () => undefined,

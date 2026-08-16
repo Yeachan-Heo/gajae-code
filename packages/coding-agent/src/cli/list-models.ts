@@ -69,17 +69,14 @@ export async function listModels(modelRegistry: ModelRegistry, searchPattern?: s
 	}
 
 	const filteredCanonical = modelRegistry
-		.getCanonicalModels({ availableOnly: true, candidates: filteredModels })
-		.map(record => {
-			const selected = modelRegistry.resolveCanonicalModel(record.id, {
-				availableOnly: true,
-				candidates: filteredModels,
-			});
+		.getCanonicalModelSelections({ availableOnly: true, candidates: filteredModels })
+		.map(selection => {
+			const selected = selection.model;
 			if (!selected) return undefined;
 			return {
-				canonical: record.id,
+				canonical: selection.record.id,
 				selected: `${selected.provider}/${selected.id}`,
-				variants: String(record.variants.length),
+				variants: String(selection.record.variants.length),
 				context: formatNumber(selected.contextWindow),
 				maxOut: formatNumber(selected.maxTokens),
 			} satisfies CanonicalRow;

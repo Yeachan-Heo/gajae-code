@@ -56,6 +56,7 @@ function createSelector(
 		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 	} as unknown as ModelRegistry;
 	const ui = { requestRender: vi.fn() } as unknown as TUI;

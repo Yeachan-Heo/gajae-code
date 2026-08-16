@@ -38,6 +38,7 @@ async function createSelector(state: ProviderDiscoveryState): Promise<ModelSelec
 		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [state.provider],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		getProviderDiscoveryState: () => state,
 	} as unknown as ModelRegistry;

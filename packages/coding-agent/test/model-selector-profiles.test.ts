@@ -59,6 +59,7 @@ function createRegistry(options: { missingCredentials?: boolean } = {}) {
 		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		lookupAliasExists: (alias: string) => alias === "flare-alias",
 		resolveModelByLookupAlias: vi.fn(

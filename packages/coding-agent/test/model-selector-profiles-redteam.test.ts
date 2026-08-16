@@ -51,6 +51,7 @@ function createRegistry(options: { profiles?: ModelProfileDefinition[]; missingC
 		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		getModelProfiles: () => new Map(profiles),
 		getModelProfile: (name: string) => profiles.get(name),

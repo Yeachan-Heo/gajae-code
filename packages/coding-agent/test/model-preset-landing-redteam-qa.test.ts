@@ -133,6 +133,7 @@ function createRegistry(
 		hasConfiguredProviderAuth: (provider: string) => authenticatedProviders.includes(provider),
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		getModelProfiles: () => new Map(profileMap),
 		getModelProfile: (name: string) => profileMap.get(name),

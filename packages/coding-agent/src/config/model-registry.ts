@@ -691,6 +691,12 @@ export interface CanonicalModelQueryOptions {
 	credentialSessionId?: string;
 }
 
+/** One canonical record with its winning variant resolved, from a batch query. */
+export interface CanonicalModelSelection {
+	record: CanonicalModelRecord;
+	model: Model<Api> | undefined;
+}
+
 /** Result of loading custom models from models.json */
 interface CustomModelsResult {
 	models?: CustomModelOverlay[];
@@ -3427,21 +3433,45 @@ export class ModelRegistry {
 		return [...this.#configuredProviderIds];
 	}
 
-	#isModelAvailable(model: Model<Api>, disabledProviders = getDisabledProviderIdsFromSettings()): boolean {
+	#isModelAvailable(
+		model: Model<Api>,
+		disabledProviders: ReadonlySet<string> = getDisabledProviderIdsFromSettings(),
+	): boolean {
 		return (
 			!disabledProviders.has(model.provider) &&
 			(this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider))
 		);
 	}
+	/** Per-query precomputed variant filter inputs; plan fields are authoritative when provided. */
+	#buildCanonicalVariantFilterPlan(options: CanonicalModelQueryOptions | undefined): {
+		candidateKeys: Set<string> | undefined;
+		disabledProviders: ReadonlySet<string> | undefined;
+	} {
+		return {
+			candidateKeys: options?.candidates
+				? new Set(options.candidates.map(candidate => formatCanonicalVariantSelector(candidate)))
+				: undefined,
+			disabledProviders: options?.availableOnly ? getDisabledProviderIdsFromSettings() : undefined,
+		};
+	}
 
 	#filterCanonicalVariants(
 		record: CanonicalModelRecord,
 		options: CanonicalModelQueryOptions | undefined,
+		plan?: { candidateKeys: Set<string> | undefined; disabledProviders: ReadonlySet<string> | undefined },
 	): CanonicalModelVariant[] {
-		const candidateKeys = options?.candidates
-			? new Set(options.candidates.map(candidate => formatCanonicalVariantSelector(candidate)))
-			: undefined;
-		const disabledProviders = options?.availableOnly ? getDisabledProviderIdsFromSettings() : undefined;
+		const candidateKeys =
+			plan !== undefined
+				? plan.candidateKeys
+				: options?.candidates
+					? new Set(options.candidates.map(candidate => formatCanonicalVariantSelector(candidate)))
+					: undefined;
+		const disabledProviders =
+			plan !== undefined
+				? plan.disabledProviders
+				: options?.availableOnly
+					? getDisabledProviderIdsFromSettings()
+					: undefined;
 		return record.variants.filter(variant => {
 			if (candidateKeys && !candidateKeys.has(variant.selector)) return false;
 			if (options?.availableOnly && !this.#isModelAvailable(variant.model, disabledProviders)) return false;
@@ -3540,7 +3570,13 @@ export class ModelRegistry {
 	#resolveCanonicalVariant(
 		variants: readonly CanonicalModelVariant[],
 		sessionId?: string,
-		options: { providerRankFirst?: boolean; exactnessKey?: string; credentialSessionId?: string } = {},
+		options: {
+			providerRankFirst?: boolean;
+			exactnessKey?: string;
+			credentialSessionId?: string;
+			providerRank?: Map<string, number>;
+			modelOrder?: Map<string, number>;
+		} = {},
 	): CanonicalModelVariant | undefined {
 		if (variants.length === 0) return undefined;
 		const normalizedSessionId = sessionId?.trim();
@@ -3553,9 +3589,10 @@ export class ModelRegistry {
 			return stickyVariant;
 		}
 		if (normalizedSessionId && stickySelector) this.#sessionCanonicalVariants.delete(normalizedSessionId);
-		const policy = this.#buildProviderSelectionPolicy(options.credentialSessionId ?? normalizedSessionId);
-		const providerRank = this.#providerRankMap(policy);
-		const modelOrder = this.#catalogModelOrder();
+		const providerRank =
+			options.providerRank ??
+			this.#providerRankMap(this.#buildProviderSelectionPolicy(options.credentialSessionId ?? normalizedSessionId));
+		const modelOrder = options.modelOrder ?? this.#catalogModelOrder();
 		const sourceRank: Record<CanonicalModelVariant["source"], number> = {
 			override: 1,
 			bundled: 1,
@@ -3577,9 +3614,10 @@ export class ModelRegistry {
 	}
 
 	getCanonicalModels(options?: CanonicalModelQueryOptions): CanonicalModelRecord[] {
+		const filterPlan = this.#buildCanonicalVariantFilterPlan(options);
 		const records: CanonicalModelRecord[] = [];
 		for (const record of this.#canonicalIndex.records) {
-			const variants = this.#filterCanonicalVariants(record, options);
+			const variants = this.#filterCanonicalVariants(record, options, filterPlan);
 			if (variants.length === 0) {
 				continue;
 			}
@@ -3590,6 +3628,34 @@ export class ModelRegistry {
 			});
 		}
 		return records;
+	}
+
+	/**
+	 * Batch form of {@link resolveCanonicalModel} over every canonical record:
+	 * one candidate-key set, one provider policy, and one catalog order for the
+	 * whole query instead of per record. `model` is `undefined` only when a
+	 * record has surviving variants but none can win resolution.
+	 */
+	getCanonicalModelSelections(options?: CanonicalModelQueryOptions): CanonicalModelSelection[] {
+		const filterPlan = this.#buildCanonicalVariantFilterPlan(options);
+		const providerRank = this.#providerRankMap(this.#buildProviderSelectionPolicy(options?.credentialSessionId));
+		const modelOrder = this.#catalogModelOrder();
+		const selections: CanonicalModelSelection[] = [];
+		for (const record of this.#canonicalIndex.records) {
+			const variants = this.#filterCanonicalVariants(record, options, filterPlan);
+			if (variants.length === 0) {
+				continue;
+			}
+			const resolved = this.#resolveCanonicalVariant(variants, options?.sessionId, {
+				providerRankFirst: true,
+				credentialSessionId: options?.credentialSessionId,
+				providerRank,
+				modelOrder,
+			});
+			if (resolved && options?.sessionId) this.#rememberCanonicalVariant(options.sessionId, resolved.selector);
+			selections.push({ record: { id: record.id, name: record.name, variants }, model: resolved?.model });
+		}
+		return selections;
 	}
 
 	getCanonicalVariants(canonicalId: string, options?: CanonicalModelQueryOptions): CanonicalModelVariant[] {

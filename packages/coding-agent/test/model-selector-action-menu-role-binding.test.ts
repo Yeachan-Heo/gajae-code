@@ -38,6 +38,7 @@ function createSelector(
 		getDiscoverableProviders: registryOptions.getDiscoverableProviders ?? (() => []),
 		getProviderDiscoveryState: () => undefined,
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		getModelProfile: () => undefined,
 	} as unknown as ModelRegistry;

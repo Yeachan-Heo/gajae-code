@@ -805,17 +805,15 @@ export class ModelSelectorComponent extends Container {
 
 	#materializeModels(models: ModelItem[]): MaterializedCatalog {
 		const candidateModels = models.map(item => item.model);
-		const canonicalRecords = this.#modelRegistry.getCanonicalModels({
+		const canonicalSelections = this.#modelRegistry.getCanonicalModelSelections({
 			availableOnly: this.#scopedModels.length === 0,
 			candidates: candidateModels,
 		});
 		const scopedThinkingBySelector = new Map(models.map(item => [item.selector, item.thinkingLevel]));
-		const canonicalModels = canonicalRecords
-			.map((record): CanonicalModelItem | undefined => {
-				const selectedModel = this.#modelRegistry.resolveCanonicalModel(record.id, {
-					availableOnly: this.#scopedModels.length === 0,
-					candidates: candidateModels,
-				});
+		const canonicalModels = canonicalSelections
+			.map((selection): CanonicalModelItem | undefined => {
+				const record = selection.record;
+				const selectedModel = selection.model;
 				if (!selectedModel) return undefined;
 				const selectedSelector = `${selectedModel.provider}/${selectedModel.id}`;
 				const searchText = [

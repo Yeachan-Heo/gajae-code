@@ -1216,6 +1216,24 @@ describe("ModelRegistry", () => {
 			});
 			expect(resolved).toBe(initial);
 		});
+		test("getCanonicalModelSelections matches per-record resolution across the whole catalog", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = registry.getAll();
+			const selections = registry.getCanonicalModelSelections({ availableOnly: false, candidates });
+			const records = registry.getCanonicalModels({ availableOnly: false, candidates });
+
+			expect(selections.length).toBe(records.length);
+			expect(selections.length).toBeGreaterThan(0);
+			for (let index = 0; index < records.length; index += 1) {
+				const record = records[index]!;
+				const selection = selections[index]!;
+				expect(selection.record.id).toBe(record.id);
+				expect(selection.record.name).toBe(record.name);
+				expect(selection.record.variants).toEqual(record.variants);
+				const resolved = registry.resolveCanonicalModel(record.id, { availableOnly: false, candidates });
+				expect(selection.model).toBe(resolved);
+			}
+		});
 		test("normalizes sticky session IDs when recording canonical variants", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			const resolved = registry.resolveCanonicalModel("claude-sonnet-4-5", {

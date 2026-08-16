@@ -53,6 +53,7 @@ function createControllerContext() {
 			hasConfiguredProviderAuth: () => false,
 			getError: () => undefined,
 			getCanonicalModels: () => [],
+			getCanonicalModelSelections: () => [],
 			getDiscoverableProviders: () => [],
 			getAvailableModelProfileNames: () => [],
 			getModelProfiles: () => new Map(),

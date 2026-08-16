@@ -80,6 +80,7 @@ describe("component escape bindings", () => {
 			hasConfiguredProviderAuth: () => false,
 			getDiscoverableProviders: () => [],
 			getCanonicalModels: () => [],
+			getCanonicalModelSelections: () => [],
 			resolveCanonicalModel: () => undefined,
 		} as unknown as ModelRegistry;
 		const ui = {
