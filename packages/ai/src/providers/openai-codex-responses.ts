@@ -1180,7 +1180,8 @@ function handleReasoningSummaryTextDelta(
 	currentItem.summary = currentItem.summary || [];
 	const lastPart = currentItem.summary[currentItem.summary.length - 1];
 	if (!lastPart) return;
-	const delta = (rawEvent as { delta?: string }).delta || "";
+	const delta =
+		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.thinking += delta;
 	currentBlock.summaryBuffer += delta;
 	lastPart.text += delta;
@@ -1213,7 +1214,8 @@ function handleReasoningTextDelta(
 	blockIndex: () => number,
 ): void {
 	if (currentItem?.type !== "reasoning" || currentBlock?.type !== "thinking") return;
-	const delta = (rawEvent as { delta?: string }).delta || "";
+	const delta =
+		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.thinking += delta;
 	currentBlock.rawBuffer += delta;
 	stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta, partial: output });
@@ -1241,7 +1243,8 @@ function handleMessageTextDelta(
 	if (!currentItem.content || currentItem.content.length === 0) return;
 	const lastPart = currentItem.content[currentItem.content.length - 1];
 	if (!lastPart || lastPart.type !== partType) return;
-	const delta = (rawEvent as { delta?: string }).delta || "";
+	const delta =
+		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.text += delta;
 	if (lastPart.type === "output_text") {
 		lastPart.text += delta;
@@ -1260,7 +1263,8 @@ function handleToolCallArgumentsDelta(
 	blockIndex: () => number,
 ): void {
 	if (currentItem?.type !== "function_call" || currentBlock?.type !== "toolCall") return;
-	const delta = (rawEvent as { delta?: string }).delta || "";
+	const delta =
+		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.partialJson += delta;
 	currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
 	stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta, partial: output });
@@ -1289,7 +1293,8 @@ function handleCustomToolCallInputDelta(
 	blockIndex: () => number,
 ): void {
 	if (currentItem?.type !== "custom_tool_call" || currentBlock?.type !== "toolCall") return;
-	const delta = (rawEvent as { delta?: string }).delta || "";
+	const delta =
+		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.partialJson += delta;
 	currentBlock.arguments = { input: currentBlock.partialJson };
 	stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta, partial: output });

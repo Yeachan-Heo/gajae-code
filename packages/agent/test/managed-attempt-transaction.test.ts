@@ -1360,8 +1360,9 @@ describe("managed attempt transaction", () => {
 			streamFn: () => {
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
-					// A non-array `content` cannot be normalized into the managed
-					// assistant shell, so staging rejects it at the content stage.
+					// A plain-object `content` (e.g. {0:{type:"text"}}) can hide
+					// array-like toolCalls — it stays fail-closed at shell.content.
+					// This is the blocker from the red-team review.
 					const malformed = assistantMessage(mock.model) as unknown as { content: unknown };
 					malformed.content = { 0: { type: "text", text: "not an array" } };
 					stream.push({ type: "start", partial: malformed as unknown as AssistantMessage });
@@ -1422,6 +1423,58 @@ describe("managed attempt transaction", () => {
 		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_snapshot_failure");
 		expect(diagnostics).toHaveLength(1);
 		expect(diagnostics[0]).toMatchObject({ stage: "shell.content", errorKind: "local_snapshot_failure" });
+	});
+	it("degrades benign primitive content to an empty turn (null/number/boolean/string)", async () => {
+		const cases: Array<{ content: unknown; label: string }> = [
+			{ content: null, label: "null" },
+			{ content: 42, label: "number" },
+			{ content: true, label: "boolean true" },
+			{ content: false, label: "boolean false" },
+			{ content: "hello", label: "benign string" },
+			{ content: undefined, label: "undefined" },
+		];
+		for (const { content, label } of cases) {
+			const diagnostics = captureSnapshotDiagnostics();
+			const mock = createMockModel();
+			const base = assistantMessage(mock.model);
+			const malformed: AssistantMessage =
+				content === undefined
+					? (() => {
+							const c = { ...base } as unknown as Record<string, unknown>;
+							delete c.content;
+							return c as unknown as AssistantMessage;
+						})()
+					: ({ ...base, content } as unknown as AssistantMessage);
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+				streamFn: () => {
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: malformed });
+						stream.push({ type: "done", reason: "stop", message: malformed });
+					});
+					return stream;
+				},
+			});
+			let outcomes = 0;
+			await (agent.prompt as (input: string, opts: unknown) => Promise<void>)("run", {
+				fallbackManaged: true,
+				onManagedAttemptOutcome: () => {
+					outcomes += 1;
+					return {
+						type: "retry",
+						continuation: (() => ({})) as unknown as () => AssistantMessage,
+					};
+				},
+			});
+			expect(agent.state.error, label).toBeUndefined();
+			expect(diagnostics, label).toHaveLength(0);
+			const committed = agent.state.messages.at(-1) as AssistantMessage;
+			expect(committed.role, label).toBe("assistant");
+			expect(committed.content, label).toEqual([]);
+			expect(outcomes, label).toBe(0);
+			vi.restoreAllMocks();
+		}
 	});
 	it("ignores a foreign error that self-labels a local failure kind", async () => {
 		const diagnostics = captureSnapshotDiagnostics();
@@ -1558,7 +1611,7 @@ describe("managed attempt transaction", () => {
 		});
 	});
 
-	it("rejects managed events with hidden required fields as local failures", async () => {
+	it("rejects managed events with object-shaped deltas as local failures", async () => {
 		const mock = createMockModel();
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
@@ -1567,12 +1620,15 @@ describe("managed attempt transaction", () => {
 				queueMicrotask(() => {
 					const partial = assistantMessage(mock.model);
 					stream.push({ type: "start", partial });
-					stream.push(
-						new Proxy(
-							{ type: "text_delta", contentIndex: 0, partial },
-							{ get: (target, key) => (key === "delta" ? undefined : Reflect.get(target, key)) },
-						) as AssistantMessageEvent,
-					);
+					// An object-shaped delta can hide real streamed text/thinking
+					// (or a tool-argument fragment). Degrading it to "" would
+					// drop that payload behind a successful empty increment.
+					stream.push({
+						type: "text_delta",
+						contentIndex: 0,
+						delta: { chunks: ["hidden"] } as unknown as string,
+						partial,
+					});
 					stream.push({ type: "done", reason: "stop", message: partial });
 				});
 				return stream;
@@ -1580,6 +1636,72 @@ describe("managed attempt transaction", () => {
 		});
 		await agent.prompt("run", { fallbackManaged: true });
 		expect(agent.state.error).toContain("local snapshot");
+		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_snapshot_failure");
+	});
+	it("degrades missing or primitive deltas to an empty increment instead of killing the turn", async () => {
+		const cases: Array<{ delta: unknown; label: string }> = [
+			{ delta: undefined, label: "undefined" },
+			{ delta: null, label: "null" },
+			{ delta: 42, label: "number" },
+			{ delta: true, label: "boolean" },
+		];
+		for (const { delta, label } of cases) {
+			const diagnostics = captureSnapshotDiagnostics();
+			const mock = createMockModel();
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+				streamFn: () => {
+					const stream = new AssistantMessageEventStream();
+					queueMicrotask(() => {
+						const partial = assistantMessage(mock.model);
+						partial.content.push({ type: "thinking", thinking: "" });
+						stream.push({ type: "start", partial });
+						stream.push({ type: "thinking_start", contentIndex: 0, partial });
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: 0,
+							delta: delta as string,
+							partial,
+						});
+						stream.push({ type: "done", reason: "stop", message: partial });
+					});
+					return stream;
+				},
+			});
+			await agent.prompt("run", { fallbackManaged: true });
+			expect(agent.state.error, label).toBeUndefined();
+			expect(diagnostics, label).toHaveLength(0);
+			const committed = agent.state.messages.at(-1) as AssistantMessage;
+			expect(committed.role, label).toBe("assistant");
+			expect(committed.content, label).toEqual([{ type: "thinking", thinking: "" }]);
+			vi.restoreAllMocks();
+		}
+	});
+	it("keeps sanitizer-sentinel deltas fail-closed instead of treating them as empty increments", async () => {
+		const diagnostics = captureSnapshotDiagnostics();
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const partial = assistantMessage(mock.model);
+					stream.push({ type: "start", partial });
+					stream.push({
+						type: "thinking_delta",
+						contentIndex: 0,
+						delta: "[unserializable]",
+						partial,
+					});
+					stream.push({ type: "done", reason: "stop", message: partial });
+				});
+				return stream;
+			},
+		});
+		await agent.prompt("run", { fallbackManaged: true });
+		expect(agent.state.error).toContain("local snapshot");
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({ stage: "event.delta", errorKind: "local_snapshot_failure" });
 	});
 	it("normalizes invalid stop reasons and rejects invalid event indices", async () => {
 		const mock = createMockModel();

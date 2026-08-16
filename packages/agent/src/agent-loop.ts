@@ -1015,22 +1015,23 @@ function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]):
 		snapshotRecord !== undefined && managedProperty(snapshotRecord, "role") === "assistant" ? snapshotRecord : value;
 	if (managedProperty(source, "role") !== "assistant") throw new ManagedAttemptSnapshotError("shell.role");
 	const rawContent = managedAttemptSnapshot(managedProperty(source, "content"));
-	// Benign providers occasionally deliver a string or missing content value.
-	// Degrade those to an empty content array — an empty assistant turn —
-	// instead of failing the whole managed run: the staged shell must stay
-	// schema-valid, and empty content is the neutral, side-effect-free
-	// degradation. A string is benign ONLY when the provider actually sent a
-	// string: when the whole-message snapshot degraded, the sanitizer replaces
-	// a non-cloneable content value (proxy, function, accessor) with one of
-	// its own sentinel strings, and mistaking that sentinel for provider
-	// variance would silently drop real content (tool calls) behind a
-	// successful empty turn. Sentinel-string content therefore stays
-	// fail-closed, as does every other non-array shape, so the named-site
-	// diagnostic can report shell.content.
+	// Providers may deliver `content` as a string, missing value, or a primitive
+	// scalar — all benign variance that degrades to an empty content array
+	// (an empty, side-effect-free assistant turn). A plain-object `content`
+	// is NOT degraded: it can carry array-like toolCall payloads
+	// (`{0:{type:"toolCall"}}`) and silently dropping them would lose
+	// executable content behind a successful empty turn. Only sentinel
+	// strings produced by the sanitizer itself (`[unserializable]` etc.)
+	// also stay fail-closed for the same reason, plus any plain object.
 	const rawArray = Array.isArray(rawContent) ? rawContent : undefined;
-	const benignContent =
-		rawContent === undefined || (typeof rawContent === "string" && !SANITIZER_SENTINELS.has(rawContent));
-	if (rawArray === undefined && !benignContent) throw new ManagedAttemptSnapshotError("shell.content");
+	if (rawArray === undefined) {
+		if (typeof rawContent === "string" && SANITIZER_SENTINELS.has(rawContent)) {
+			throw new ManagedAttemptSnapshotError("shell.content");
+		}
+		if (rawContent !== null && typeof rawContent === "object") {
+			throw new ManagedAttemptSnapshotError("shell.content");
+		}
+	}
 	const content = rawArray === undefined ? [] : rawArray.flatMap(managedContentBlock);
 	const usage = managedAssistantUsage(managedAttemptSnapshot(managedProperty(source, "usage")));
 	const api = managedProperty(source, "api");
@@ -1191,13 +1192,30 @@ export function managedAssistantEventSnapshot(
 		type === "toolcall_delta"
 	) {
 		const delta = managedProperty(source, "delta");
-		if (typeof delta !== "string") throw new ManagedAttemptSnapshotError("event.delta");
-		return { type, contentIndex: indexed(), delta, partial: message };
+		// Empty/missing deltas are ordinary provider variance (Z.AI/Codex
+		// thinking_delta with undefined, or a numeric token count). A
+		// sentinel-marked delta is a sanitizer collapse of a non-cloneable
+		// original and stays fail-closed. Object-shaped deltas stay
+		// fail-closed for the same reason as object-shaped content.
+		if (typeof delta === "string" && SANITIZER_SENTINELS.has(delta)) {
+			throw new ManagedAttemptSnapshotError("event.delta");
+		}
+		if (delta !== undefined && delta !== null && typeof delta === "object") {
+			throw new ManagedAttemptSnapshotError("event.delta");
+		}
+		const safeDelta = typeof delta === "string" ? delta : "";
+		return { type, contentIndex: indexed(), delta: safeDelta, partial: message };
 	}
 	if (type === "text_end" || type === "thinking_end" || type === "reasoning_summary_end") {
 		const content = managedProperty(source, "content");
-		if (typeof content !== "string") throw new ManagedAttemptSnapshotError("event.content");
-		return { type, contentIndex: indexed(), content, partial: message };
+		if (typeof content === "string" && SANITIZER_SENTINELS.has(content)) {
+			throw new ManagedAttemptSnapshotError("event.content");
+		}
+		if (content !== undefined && content !== null && typeof content === "object") {
+			throw new ManagedAttemptSnapshotError("event.content");
+		}
+		const safeContent = typeof content === "string" ? content : "";
+		return { type, contentIndex: indexed(), content: safeContent, partial: message };
 	}
 	if (type === "toolcall_end") {
 		const toolCall = managedAssistantContent(managedAttemptSnapshot(managedProperty(source, "toolCall")));

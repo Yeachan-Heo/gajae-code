@@ -2275,32 +2275,33 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							if (event.delta.type === "text_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "text") {
-									block.text += event.delta.text;
+									block.text += typeof event.delta.text === "string" ? event.delta.text : "";
 									stream.push({
 										type: "text_delta",
 										contentIndex: index,
-										delta: event.delta.text,
+										delta: typeof event.delta.text === "string" ? event.delta.text : "",
 										partial: output,
 									});
 								}
 							} else if (event.delta.type === "thinking_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
-									block.thinking += event.delta.thinking;
+									const thinkingDelta = typeof event.delta.thinking === "string" ? event.delta.thinking : "";
+									block.thinking += thinkingDelta;
 									if (summarizedThinking) {
-										const summary = (reasoningBuffers.get(block) ?? "") + event.delta.thinking;
+										const summary = (reasoningBuffers.get(block) ?? "") + thinkingDelta;
 										reasoningBuffers.set(block, summary);
 										stream.push({
 											type: "reasoning_summary_delta",
 											contentIndex: index,
-											delta: event.delta.thinking,
+											delta: thinkingDelta,
 											partial: output,
 										});
 									} else {
 										stream.push({
 											type: "thinking_delta",
 											contentIndex: index,
-											delta: event.delta.thinking,
+											delta: thinkingDelta,
 											partial: output,
 										});
 									}
@@ -2308,12 +2309,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							} else if (event.delta.type === "input_json_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "toolCall") {
-									block.partialJson += event.delta.partial_json;
+									const jsonDelta =
+										typeof event.delta.partial_json === "string" ? event.delta.partial_json : "";
+									block.partialJson += jsonDelta;
 									block.arguments = parseStreamingJson(block.partialJson);
 									stream.push({
 										type: "toolcall_delta",
 										contentIndex: index,
-										delta: event.delta.partial_json,
+										delta: jsonDelta,
 										partial: output,
 									});
 								}
