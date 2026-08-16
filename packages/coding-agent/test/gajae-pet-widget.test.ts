@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import type { Component } from "@gajae-code/tui";
 import * as tui from "@gajae-code/tui";
 import {
 	__animationSchedulerTestHooks,
@@ -645,6 +646,60 @@ describe("GajaePetWidget", () => {
 		expect(stubs.editorContainer.children[0]).toBe(successorEditor);
 		expect(stubs.written).toHaveLength(0);
 		second.dispose();
+	});
+	it("remounts the plain editor while never activated so palette close paths cannot leak a modal", () => {
+		const stubs = makeStubs();
+		const widget = new GajaePetWidget({
+			ui: stubs.ui,
+			editor: stubs.editor,
+			editorContainer: stubs.editorContainer,
+			floorContainer: stubs.floorContainer,
+			isWorking: () => false,
+			getComposerBottomOffset: () => stubs.floorContainer.render(80).length,
+			syncManagedItermCursor: async () => true,
+			forcePixelProtocol: "sixel",
+			autoFlexGapMs: null,
+		});
+		try {
+			// Simulate the palette overlay: the host replaces the composer with a
+			// foreign component (pet never activated, so no overlay claim).
+			const overlay = { render: () => [] } as unknown as Component;
+			stubs.editorContainer.clear();
+			stubs.editorContainer.addChild(overlay);
+			widget.remountComposer();
+
+			expect(stubs.editorContainer.children).toEqual([stubs.editor]);
+			expect(stubs.editorContainer.children[0]).not.toBe(overlay);
+			expect(widget.mode).toBe("off");
+		} finally {
+			widget.dispose();
+		}
+	});
+	it("remounts the framed editor while active after a palette overlay replaces it", () => {
+		const stubs = makeStubs();
+		const widget = new GajaePetWidget({
+			ui: stubs.ui,
+			editor: stubs.editor,
+			editorContainer: stubs.editorContainer,
+			floorContainer: stubs.floorContainer,
+			isWorking: () => false,
+			getComposerBottomOffset: () => stubs.floorContainer.render(80).length,
+			syncManagedItermCursor: async () => true,
+			forcePixelProtocol: "sixel",
+			autoFlexGapMs: null,
+		});
+		try {
+			widget.setMode("red");
+			const framed = stubs.editorContainer.children[0];
+			const overlay = { render: () => [] } as unknown as Component;
+			stubs.editorContainer.clear();
+			stubs.editorContainer.addChild(overlay);
+			widget.remountComposer();
+
+			expect(stubs.editorContainer.children).toEqual([framed]);
+		} finally {
+			widget.dispose();
+		}
 	});
 	it("retains emitted predecessor cleanup across an unavailable terminal takeover", () => {
 		const stubs = makeStubs();
