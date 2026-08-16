@@ -3,6 +3,7 @@ import type { ManagedAttemptOutcome } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
 import {
 	agentLoopContinue,
+	MANAGED_ATTEMPT_MAX_STAGED_BYTES,
 	managedAssistantEventSnapshot,
 	sanitizedDetachedClone,
 } from "@gajae-code/agent-core/agent-loop";
@@ -54,6 +55,14 @@ class JsonSafeBigIntEnvelope {
 
 	toJSON(): { sequence: string } {
 		return { sequence: this.sequence.toString() };
+	}
+}
+
+class CompactLargeEnvelope {
+	readonly payload = "x".repeat(MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1);
+
+	toJSON(): { compact: true } {
+		return { compact: true };
 	}
 }
 
@@ -240,6 +249,125 @@ describe("managed attempt transaction", () => {
 			sequence(turnEnd.message),
 			sequence(agentEndAssistant),
 		]).toEqual(["1", "1", "1", "1"]);
+	});
+
+	it("keeps non-managed lossless staging serializable when clone strips a provider payload serializer", async () => {
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).providerPayload = {
+					envelope: new JsonSafeBigIntEnvelope(),
+				};
+				stream.push({ type: "start", partial });
+				partial.content.push({ type: "text", text: "accepted" });
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run");
+
+		const accepted = agent.state.messages.at(-1) as AssistantMessage;
+		expect(agent.state.error).toBeUndefined();
+		expect(accepted.content).toEqual([{ type: "text", text: "accepted" }]);
+		expect(() => JSON.stringify(accepted)).not.toThrow();
+		const providerPayload = accepted.providerPayload as { envelope?: { sequence?: unknown } } | undefined;
+		expect(providerPayload?.envelope?.sequence).toBe("1");
+	});
+
+	it("commits an oversized non-managed lossless batch instead of failing locally", async () => {
+		// Given a reasoning-only response that exceeds the provisional staging
+		// cap before any visible text can commit the lossless transaction.
+		const mock = createMockModel();
+		const oversizedThinking = "x".repeat(MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1);
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			void (async () => {
+				const partial = assistantMessage(mock.model);
+				stream.push({ type: "start", partial });
+				await Bun.sleep(0);
+				partial.content.push({ type: "thinking", thinking: oversizedThinking });
+				stream.push({ type: "thinking_start", contentIndex: 0, partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			})();
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		const lifecycle: string[] = [];
+		agent.subscribe(event => lifecycle.push(event.type));
+
+		// When the ordinary non-managed run consumes the oversized response.
+		await agent.prompt("run");
+
+		// Then the memory guard degrades to pass-through publication while the
+		// accepted assistant message remains intact.
+		expect(agent.state.error).toBeUndefined();
+		const accepted = agent.state.messages.at(-1);
+		expect(accepted?.role).toBe("assistant");
+		if (accepted?.role !== "assistant") throw new Error("Expected an accepted assistant message");
+		const thinking = accepted.content[0];
+		expect(thinking?.type).toBe("thinking");
+		if (thinking?.type !== "thinking") throw new Error("Expected an accepted thinking block");
+		expect(thinking.thinking).toHaveLength(MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1);
+		expect(lifecycle.slice(-5)).toEqual(["message_start", "message_update", "message_end", "turn_end", "agent_end"]);
+	});
+
+	it("preserves lifecycle order when a compact live payload clones above the lossless cap", async () => {
+		// Given a payload whose live serializer is compact but whose detached own
+		// data exceeds the staging cap after structuredClone removes that method.
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).providerPayload = {
+					envelope: new CompactLargeEnvelope(),
+				};
+				stream.push({ type: "start", partial });
+				partial.content.push({ type: "thinking", thinking: "accepted" });
+				stream.push({ type: "thinking_start", contentIndex: 0, partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		const deliveryOrder: string[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+			onAssistantMessageEvent: (_message, event) => deliveryOrder.push(`callback:${event.type}`),
+		});
+		agent.subscribe(event => deliveryOrder.push(`public:${event.type}`));
+
+		// When the detached measurement, rather than the live pre-measurement,
+		// crosses the lossless staging cap.
+		await agent.prompt("run");
+
+		// Then callbacks and the complete public lifecycle remain ordered, and
+		// the accepted detached payload is preserved rather than failed locally.
+		expect(agent.state.error).toBeUndefined();
+		expect(deliveryOrder.slice(-6)).toEqual([
+			"public:message_start",
+			"callback:thinking_start",
+			"public:message_update",
+			"public:message_end",
+			"public:turn_end",
+			"public:agent_end",
+		]);
+		const accepted = agent.state.messages.at(-1);
+		if (accepted?.role !== "assistant") throw new Error("Expected an accepted assistant message");
+		const providerPayload = accepted.providerPayload as { envelope?: { payload?: unknown } } | undefined;
+		expect(providerPayload?.envelope?.payload).toBeString();
+		expect(providerPayload?.envelope?.payload).toHaveLength(MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1);
 	});
 
 	it("replays mutating provider partials as event-time snapshots with callbacks first", async () => {

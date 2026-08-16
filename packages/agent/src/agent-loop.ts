@@ -870,7 +870,13 @@ const LOSSLESS_SNAPSHOT_KEYS = [
  */
 function losslessDetachedClone<T>(value: T): T {
 	try {
-		return structuredClone(value);
+		const snapshot = structuredClone(value);
+		// `structuredClone()` preserves own bigint fields while removing a
+		// payload class's prototype `toJSON()`. The live event may therefore
+		// serialize successfully while its detached clone cannot be staged.
+		// Lossless staging still preserves every JSON-safe clone verbatim; only
+		// the non-serializable detached form is sanitized.
+		return managedSnapshotJsonBytes(snapshot) !== undefined ? snapshot : sanitizedDetachedClone(snapshot);
 	} catch {
 		// The managed sanitizer is explicitly bounded and total. Use it only to
 		// identify which top-level assistant metadata surfaces are cloneable; the
@@ -911,7 +917,7 @@ function losslessDetachedClone<T>(value: T): T {
 				}
 			}
 		}
-		return output as T;
+		return managedSnapshotJsonBytes(output) !== undefined ? (output as T) : sanitizedDetachedClone(output as T);
 	}
 }
 
@@ -1192,9 +1198,10 @@ function warnManagedSnapshotFailure(
 }
 
 /**
- * Holds managed-attempt assistant output above the public event stream. A
- * cancelled provider attempt is therefore unobservable to sessions and their
- * side-effect consumers. Non-managed streams bypass this object entirely.
+ * Holds provisional assistant output above the public event stream. Managed
+ * fallback keeps the whole attempt atomic; non-managed escaped-argument
+ * detection uses lossless snapshots until visible output or the staging cap
+ * commits the transaction.
  */
 type ManagedAttemptBatchItem =
 	| { type: "event"; event: AgentEvent }
@@ -1372,8 +1379,9 @@ class ManagedAttemptTransaction {
 				rawBytes = undefined;
 			}
 			if (rawBytes !== undefined && this.#wouldOverflow(rawBytes)) {
-				this.discard();
-				throw new ManagedAttemptSnapshotError("staging.preMeasure");
+				this.flush();
+				this.push(event);
+				return;
 			}
 			let detached: AgentEvent;
 			try {
@@ -1390,8 +1398,9 @@ class ManagedAttemptTransaction {
 				throw new ManagedAttemptSnapshotError("staging.measure");
 			}
 			if (this.#wouldOverflow(detachedBytes)) {
-				this.discard();
-				throw new ManagedAttemptSnapshotError("staging.overflow");
+				this.flush();
+				this.push(detached);
+				return;
 			}
 			this.#batch.push({ type: "event", event: detached });
 			this.#stagedEventCount++;
