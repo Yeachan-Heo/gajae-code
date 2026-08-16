@@ -3363,7 +3363,13 @@ const UNMERGED_GIT_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "
 // extragoal gate receipts from docs/extragoal-skill-template.md, or the
 // session-root `.session-activity.json` marker) were auto-committed and merged
 // into the leader branch on projects that do not gitignore `.gjc/_session-*/`.
-const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [".gjc/_session-*/"];
+// Worker runtime state under `.gjc/` must never be auto-checkpointed into
+// the leader repo: session roots (`.gjc/_session-*/`) and the SDK/state tree
+// (`.gjc/state/`) are GJC-internal artifacts, not worker work. Without the
+// `.gjc/state/` prefix, a worker session's runtime files (for example
+// `.gjc/state/sdk/<session-id>.json`) are committed and merged into the
+// leader's default branch on the next monitor cycle.
+const PROTECTED_WORKER_CHECKPOINT_PREFIXES = [".gjc/_session-*/", ".gjc/state/"];
 
 function parsePorcelainStatus(stdout: string): { files: string[]; statusCodes: string[] } {
 	const records = stdout.split("\0");

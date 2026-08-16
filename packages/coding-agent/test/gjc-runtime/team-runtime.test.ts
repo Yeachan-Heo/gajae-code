@@ -3994,6 +3994,23 @@ describe("team worker memory guard wiring", () => {
 		}
 	});
 
+	it("protects worker runtime state under .gjc/state from auto-checkpoint commits", async () => {
+		const repo = await createGitRepo();
+		// Worker sessions write runtime state into their worktree's .gjc tree
+		// (e.g. .gjc/state/sdk/<session-id>.json). These must never be treated
+		// as eligible checkpoint content and merged into the leader repo.
+		await Bun.write(path.join(repo, ".gjc/state/sdk/runtime.json"), "{}\n");
+		await Bun.write(path.join(repo, "work.txt"), "eligible\n");
+		const classification = classifyWorkerCheckpointStatus(repo);
+		expect(classification.kind).toBe("eligible");
+		expect(classification.files).toContain("work.txt");
+		expect(classification.files).not.toContain(".gjc/state/sdk/runtime.json");
+		// With only runtime state present there must be nothing to checkpoint.
+		await fs.rm(path.join(repo, "work.txt"));
+		const onlyRuntime = classifyWorkerCheckpointStatus(repo);
+		expect(onlyRuntime.kind).toBe("protected_only");
+	});
+
 	it("selects the hottest Linux worker, checkpoints it, and syncs config and manifest on replacement", async () => {
 		cleanupRoot = await createGitRepo();
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);
