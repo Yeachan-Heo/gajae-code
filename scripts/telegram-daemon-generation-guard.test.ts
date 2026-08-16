@@ -32,6 +32,7 @@ import {
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
 const topicRegistryFixture = "packages/coding-agent/test/notifications-topic-registry.test.ts";
+const repositoryRoot = path.resolve(import.meta.dir, "..");
 const stableEntries = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort());
 
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
@@ -1416,8 +1417,8 @@ test("publishes exact durable authority generation 167 at serving epoch 87", () 
 	});
 
 	test("the committed topic-registry fixture tracks the canonical Telegram generation", async () => {
-		const fixture = await Bun.file(topicRegistryFixture).text();
-		const contract = await Bun.file(telegramContract).text();
+		const fixture = await Bun.file(path.join(repositoryRoot, topicRegistryFixture)).text();
+		const contract = await Bun.file(path.join(repositoryRoot, telegramContract)).text();
 		const declared = declaration(contract, "DAEMON_GENERATION");
 		expect(declared).toBeDefined();
 		const canonical = Number(/DAEMON_GENERATION\s*=\s*(\d+)/.exec(declared!)?.[1]);
