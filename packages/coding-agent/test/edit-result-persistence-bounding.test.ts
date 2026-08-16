@@ -4,7 +4,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
-import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
+import {
+	MANAGED_ARTIFACT_MAX_FILE_BYTES,
+	ManagedSessionDescendantStore,
+} from "../src/session/internal/managed-session-storage";
 import { SessionManager } from "../src/session/session-manager";
 import { makeAssistantMessage } from "./session-manager/helpers";
 
@@ -581,7 +584,7 @@ describe("near-limit edit append after committed mutation (#4566)", () => {
 			// Deterministic, structured fields — not an unclassified
 			// SessionAppendPersistenceError abort.
 			expect(typed.code).toBe("near_limit_append");
-			expect(typed.capBytes).toBe(128 * 1024 * 1024);
+			expect(typed.capBytes).toBe(MANAGED_ARTIFACT_MAX_FILE_BYTES);
 			expect(typed.entryBytes).toBeGreaterThan(0);
 			expect(typed.entryRetained).toBe(true);
 			expect(typed.message).toContain("compact");
