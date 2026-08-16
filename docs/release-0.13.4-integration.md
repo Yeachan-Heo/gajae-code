@@ -101,9 +101,20 @@ Root-cause refinement (2026-08-16, same environment):
   user-owned env files. Proven green under `HOME=$(mktemp -d)`.
   Hermeticity fix needs a resolution seam — dev-side work, not a backport.
 - broker/oauth ×7: pass in file isolation; full-suite-only interference.
-- session-manager ×2 + sdk-client ×5: persist under HOME isolation and a
-  fresh `build:native` from this branch's crates; dev already rewrote these
-  exact tests inside the deferred SDK/storage chains (`sdk-client.test.ts`
-  rewritten ~1,083 lines; resume-readonly moved its spy to
-  `renameNoReplacePathAsync`). They resolve with the 0.14 cluster landings;
-  backporting the test halves alone recreates the mid-chain hazard.
+- session-manager ×2 and sdk-client ×5 are distinct families (no shared
+  commits or code paths), grouped only by evidence class; both persist
+  under HOME isolation and a fresh `build:native` from this branch's
+  crates.
+  - sdk-client ×5: SDK websocket transport tests; dev rewrote
+    `sdk-client.test.ts` (~1,083 lines) in the transport refactor chain
+    (`9feba5daf7` → `3687635541` #4253 → `0d1d94d3fa` #4281). Rides with
+    the deferred SDK cluster.
+  - session-manager ×2: natives rename/fsync spy-injection seams.
+    Dev's resume-readonly repair (6 lines inside `90da036035`) moves the
+    spy to `renameNoReplacePathAsync` and is valid only against dev's
+    async receipt publication — this branch still publishes via the sync
+    native, so the fix does not backport. `session-id.test.ts` is
+    byte-identical main↔dev (no fix exists to take); suspected local
+    mechanism is the generated-ESM natives namespace defeating
+    `vi.spyOn` on a locally built addon, which the sdk-client five
+    cannot share (they never touch natives).
