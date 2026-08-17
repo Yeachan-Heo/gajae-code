@@ -74,9 +74,37 @@ export interface SdkRequestOptions {
 	timeoutMs?: number;
 	idempotencyKey?: string;
 	confirm?: boolean;
+	/**
+	 * Synchronous pre-send observer for one request. Called after the
+	 * connection is live and validated, immediately before the frame is written
+	 * to the socket. Throwing aborts the dispatch: nothing is written, no sent
+	 * record is retained, and the request rejects with the thrown error, so the
+	 * caller may safely retry (pre-send semantics).
+	 */
+	beforeDispatch?: SdkBeforeDispatchHandler;
+	/**
+	 * Synchronous dispatch-boundary observer for one request. Called immediately
+	 * after the frame was handed to the socket — never before — and before any
+	 * other client work. From this point a transport close before the response
+	 * settles the request as `uncertain_after_send`; observer exceptions cannot
+	 * alter that settlement.
+	 */
+	onDispatch?: SdkDispatchHandler;
 }
-
 export type SdkFrame = Record<string, unknown>;
+export type SdkBeforeDispatchHandler = (request: SdkDispatchContext) => void;
+export type SdkDispatchHandler = (request: SdkDispatchContext) => void;
+
+/**
+ * Facts about one request at its dispatch boundary. `frame.id` is the exact
+ * correlated identity a response frame must carry to settle this request.
+ */
+export interface SdkDispatchContext {
+	readonly frame: SdkFrame;
+	/** Transport generation this request was written to. */
+	readonly connectionId: string | undefined;
+	readonly generation: number;
+}
 
 /** Request identity retained after an uncertain send for lifecycle reconciliation. */
 
@@ -255,9 +283,9 @@ export class SdkClient {
 		}
 	}
 
-	request(frame: SdkFrame, timeout?: number | { timeoutMs?: number; idempotencyKey?: string }): Promise<SdkFrame> {
-		const options = typeof timeout === "number" ? { timeoutMs: timeout } : (timeout ?? {});
-		return this.#request(frame, options) as Promise<SdkFrame>;
+	request(frame: SdkFrame, options?: number | SdkRequestOptions): Promise<SdkFrame> {
+		const resolved = typeof options === "number" ? { timeoutMs: options } : (options ?? {});
+		return this.#request(frame, resolved) as Promise<SdkFrame>;
 	}
 
 	close(): Promise<void> {
@@ -397,18 +425,29 @@ export class SdkClient {
 			this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket is not connected"));
 			return await deferred.promise;
 		}
+		if (options.beforeDispatch) {
+			try {
+				options.beforeDispatch({
+					frame: serializedFrame,
+					connectionId: this.connectionId,
+					generation: incarnation.generation,
+				});
+			} catch (error) {
+				// Pre-send abort: the wire never saw this request, so retirement
+				// must not retain a sent record or classify it as uncertain. The
+				// caller's own rejection comes back unchanged so it stays
+				// retryable and distinguishable from transport failure.
+				this.#settlePending(
+					id,
+					pending,
+					error instanceof Error ? error : new SdkClientError("invalid_input", String(error), error),
+					false,
+				);
+				return await deferred.promise;
+			}
+		}
 		try {
 			incarnation.socket.send(serializedRequest);
-			pending.sent = true;
-			this.#rememberSentRecord({
-				id,
-				operation: typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined,
-				idempotencyKey: options.idempotencyKey,
-				fingerprint:
-					typeof serializedFrame.operation === "string"
-						? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
-						: inputFingerprint(serializedFrame.input ?? {}),
-			});
 		} catch (error) {
 			this.#settlePending(
 				id,
@@ -417,6 +456,32 @@ export class SdkClient {
 					? error
 					: new SdkClientError("unavailable", "SDK WebSocket send failed", error),
 			);
+			return await deferred.promise;
+		}
+		pending.sent = true;
+		// Retain reconciliation identity before the boundary callback: a close
+		// fired from inside onDispatch must find the record for its
+		// uncertain_after_send details, and a synchronous response must leave no
+		// resurrected record behind.
+		this.#rememberSentRecord({
+			id,
+			operation: typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined,
+			idempotencyKey: options.idempotencyKey,
+			fingerprint:
+				typeof serializedFrame.operation === "string"
+					? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
+					: inputFingerprint(serializedFrame.input ?? {}),
+		});
+		try {
+			options.onDispatch?.({
+				frame: serializedFrame,
+				connectionId: this.connectionId,
+				generation: incarnation.generation,
+			});
+		} catch {
+			// The frame was already handed to the socket. An observer failure can
+			// neither un-send it nor displace settlement, so the request stays
+			// pending for its response, deadline, or transport-close retirement.
 		}
 		return await deferred.promise;
 	}
