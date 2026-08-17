@@ -318,7 +318,7 @@ three honestly different levels of support.
   <sub><a href="https://github.com/pingdotgg/t3code">repo</a></sub>
 </td>
 <td align="center">★★★☆☆<br/><sub>experimental</sub></td>
-<td>T3 Code ships harnesses for Codex, Claude, Cursor, Grok and OpenCode only — there is no GJC harness upstream yet. Run GJC beside it; the native provider is in flight.</td>
+<td>T3 Code ships harnesses for Codex, Claude, Cursor, Grok and OpenCode only — there is no GJC harness upstream yet. Run GJC beside it; the native provider is <a href="https://github.com/pingdotgg/t3code/discussions/7290">proposed upstream</a>.</td>
 <td><sub>not one-command yet — see the guide</sub></td>
 </tr>
 </table>
@@ -387,7 +387,7 @@ gjc setup defaults --check
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
 | [Paseo](https://paseo.sh) | `gjc setup paseo` | GJC registers itself as an ACP provider and rolls itself back with `--remove`; Paseo owns its own config files. |
 | [Orca](https://onorca.dev) | `gjc` as a custom agent command | Orca launches GJC in its own worktree terminal; GJC keeps its own approval gates. |
-| [T3 Code](https://t3.codes) | none yet — experimental | No GJC harness upstream; run GJC beside it until the native provider lands. |
+| [T3 Code](https://t3.codes) | none yet — experimental | No GJC harness upstream ([proposal](https://github.com/pingdotgg/t3code/discussions/7290)); run GJC beside it until a driver lands. |
 | External controller / bot | Coordinator MCP, `gjc sdk session`, or a configured managed adapter | External controllers use broker-bound, credential-free surfaces rather than scrollback or direct endpoint transports. The host-neutral `gjc-sdk-*` skills compose `gjc sdk session` and install no coordinator integration. |
 
 For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For external-control readiness, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For the wire protocol and machine interfaces, see [`docs/sdk.md`](docs/sdk.md).

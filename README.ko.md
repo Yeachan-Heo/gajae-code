@@ -307,7 +307,7 @@ endpoint records or credentials under .gjc/state/sdk, never open a raw session W
   <sub><a href="https://github.com/pingdotgg/t3code">저장소</a></sub>
 </td>
 <td align="center">★★★☆☆<br/><sub>실험적</sub></td>
-<td>T3 Code는 아직 Codex·Claude·Cursor·Grok·OpenCode 하네스만 제공하고 GJC 하네스가 업스트림에 없다. 지금은 나란히 띄워 쓰고, 네이티브 프로바이더는 작업 중이다.</td>
+<td>T3 Code는 아직 Codex·Claude·Cursor·Grok·OpenCode 하네스만 제공하고 GJC 하네스가 업스트림에 없다. 지금은 나란히 띄워 쓰고, 네이티브 프로바이더는 <a href="https://github.com/pingdotgg/t3code/discussions/7290">업스트림에 제안</a>해 둔 상태다.</td>
 <td><sub>아직 한 줄 설치는 없음 — 가이드 참고</sub></td>
 </tr>
 </table>

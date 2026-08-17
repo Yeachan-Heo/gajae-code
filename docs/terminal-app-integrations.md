@@ -29,6 +29,9 @@ paseo daemon restart        # Paseo caches config in a long-lived daemon
 paseo provider ls           # gjc must read `available`, not `error`
 ```
 
+GJC is also proposed for Paseo's in-app ACP provider catalog ([getpaseo/paseo#3471](https://github.com/getpaseo/paseo/pull/3471)), which
+would make even this command unnecessary for new users.
+
 `gjc setup paseo` writes exactly one provider entry — an absolute `gjc acp` command,
 `GJC_ACP_PERMISSION_MODE=prompt`, and the `acp` base — under `agents.providers.gjc`, and it bridges
 Paseo's orchestration skills into GJC skill discovery. Paseo owns those files, so every write is
@@ -108,7 +111,9 @@ Deeper reading: [ACP local development loop](./acp-local-development.md) ·
 each in its own git worktree, with diff review, a mobile companion, and SSH/remote worktrees. Its agent
 picker "just launches a process in a terminal", so **any** CLI agent works — including `gjc`.
 
-GJC is not (yet) in Orca's preconfigured agent list, so you add it once as a custom agent.
+GJC is not (yet) in Orca's preconfigured agent list, so you add it once as a custom agent. The
+upstream registry entry is proposed in [stablyai/orca#15025](https://github.com/stablyai/orca/pull/15025); until it lands, use the custom
+agent below.
 
 ### Setup
 
@@ -140,7 +145,7 @@ approval record is not.
   splits, the mobile companion, and SSH worktrees — all with GJC running as the agent.
 - **You do not get (yet):** Orca's deep-integration features that require per-agent adapters — usage /
   rate-limit tracking, account hot-swap, agent hooks, and native status. Those need Gajae Code in Orca's
-  built-in registry; the upstream change is in flight.
+  built-in registry ([PR](https://github.com/stablyai/orca/pull/15025)).
 
 ### Driving several GJC worktrees at once
 
@@ -181,8 +186,10 @@ ships first-class remote surfaces that do not depend on T3 Code:
 
 GJC exposes a conformance-tested ACP agent (`gjc acp`) with streaming session updates, spec-shaped
 permission requests, and cancel semantics — the same surface Paseo consumes. A T3 Code provider only has
-to map T3's thread/turn/permission model onto that surface. The upstream provider PR is in flight; until
-it lands, `gjc` in T3 Code is not supported.
+to map T3's thread/turn/permission model onto that surface. That work is proposed upstream in
+[pingdotgg/t3code#7290](https://github.com/pingdotgg/t3code/discussions/7290) — a bespoke driver is a large change in T3 Code's Effect-TS provider
+layer, so the discussion asks whether they want a `gjc` driver or a generic ACP driver first. Until
+something lands there, `gjc` in T3 Code is not supported.
 
 If you are building your own bridge, start from
 [External-control readiness](./external-control-readiness.md) and
