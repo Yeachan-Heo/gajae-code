@@ -5,26 +5,78 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { createSdkSessionRuntimeExtension, type SessionSdkTransport } from "../src/sdk/host/session-runtime";
 
+/**
+ * Safety bound for a single emission to resolve. Far above any real host
+ * dispatch time, but finite so a lost response fails the test instead of
+ * hanging the file to the harness timeout.
+ */
+const RESPONSE_TIMEOUT_MS = 5_000;
+
+interface HarnessOptions {
+	/** Artificial transport delivery delay; models a host that responds slowly. */
+	responseDelayMs?: number;
+	/** Safety timeout for one emission; small values are for race-contract tests. */
+	responseTimeoutMs?: number;
+}
+
 interface Harness {
 	emit(frame: Record<string, unknown>): Promise<Record<string, unknown>>;
+	/** Response frames observed after the emission they belong to already ended. */
+	readonly lateResponses: ReadonlyArray<Record<string, unknown>>;
+	/** Adjust the artificial transport delivery delay between emissions. */
+	setResponseDelay(ms: number): void;
 	start(): Promise<void>;
 	stop(): Promise<void>;
 	dispatches: number;
 	persistedAtDispatch?: string;
 }
 
-function createHarness(cwd: string, sessionId: string, sessionFile: string | undefined): Harness {
+function createHarness(
+	cwd: string,
+	sessionId: string,
+	sessionFile: string | undefined,
+	options: HarnessOptions = {},
+): Harness {
 	const handlers = new Map<string, (event: unknown, context: ExtensionContext) => unknown>();
 	let receive: ((connectionId: string, frame: never) => void) | undefined;
-	let response: Record<string, unknown> | undefined;
 	let dispatches = 0;
 	let persistedAtDispatch: string | undefined;
+	let responseDelayMs = options.responseDelayMs ?? 0;
+	const responseTimeoutMs = options.responseTimeoutMs ?? RESPONSE_TIMEOUT_MS;
+	// Exactly one pending emission at a time (the tests emit sequentially). The
+	// handshake resolves with the frame correlated to the live emission only;
+	// any frame arriving before or after it is fenced as stale and recorded.
+	let pending: { id: string; resolve: (frame: Record<string, unknown>) => void } | undefined;
+	const lateResponses: Array<Record<string, unknown>> = [];
+	const delayedDeliveries = new Set<ReturnType<typeof setTimeout>>();
 	const transport: SessionSdkTransport = {
 		sessionId,
 		stateRoot: path.join(cwd, ".gjc", "state"),
 		token: "test-token",
 		sendFrame: (_connectionId, frame) => {
-			response = frame as Record<string, unknown>;
+			const response = frame as Record<string, unknown>;
+			const deliver = () => {
+				const current = pending;
+				// A response only satisfies the emission whose request id it
+				// carries. Anything else (a late frame from an already ended
+				// emission, or an unsolicited frame) must never resolve a later
+				// await.
+				if (current && response.id === current.id) {
+					pending = undefined;
+					current.resolve(response);
+				} else {
+					lateResponses.push(response);
+				}
+			};
+			if (responseDelayMs <= 0) {
+				deliver();
+				return;
+			}
+			const timer = setTimeout(() => {
+				delayedDeliveries.delete(timer);
+				deliver();
+			}, responseDelayMs);
+			delayedDeliveries.add(timer);
 		},
 		onFrame: handler => {
 			receive = handler;
@@ -33,7 +85,10 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 			};
 		},
 		start: async () => ({ url: "memory://host-steer" }),
-		stop: async () => {},
+		stop: async () => {
+			for (const timer of delayedDeliveries) clearTimeout(timer);
+			delayedDeliveries.clear();
+		},
 	};
 	const api = {
 		on: (event: string, handler: (event: unknown, context: ExtensionContext) => unknown) =>
@@ -79,17 +134,31 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, base);
 		},
 		emit: async frame => {
-			response = undefined;
-			receive?.("client", frame as never);
-			for (let attempts = 0; response === undefined && attempts < 100; attempts++) await Bun.sleep(1);
-			if (!response) throw new Error("host did not respond");
-			return response;
+			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+			pending = { id: String(frame.id), resolve };
+			try {
+				receive?.("client", frame as never);
+				// Deterministic handshake: resolved by the correlated response
+				// frame itself, with a bounded safety timeout. No wall-clock poll
+				// loop and no fixed sleep budget.
+				const response = await Promise.race([promise, Bun.sleep(responseTimeoutMs).then(() => undefined)]);
+				if (!response) throw new Error("host did not respond");
+				return response;
+			} finally {
+				pending = undefined;
+			}
+		},
+		setResponseDelay: ms => {
+			responseDelayMs = ms;
 		},
 		get dispatches() {
 			return dispatches;
 		},
 		get persistedAtDispatch() {
 			return persistedAtDispatch;
+		},
+		get lateResponses() {
+			return lateResponses;
 		},
 	};
 }
@@ -101,6 +170,52 @@ async function control(harness: Harness, id: string, text: string, clientRef: st
 async function query(harness: Harness, id: string, input: Record<string, unknown>) {
 	return await harness.emit({ type: "query_request", id, query: "turn.steer_status", input });
 }
+
+test("harness handshake resolves a host response slower than the retired 100ms poll bound", async () => {
+	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-steer-handshake-"));
+	try {
+		const harness = createHarness(cwd, "handshake-delay", undefined, { responseDelayMs: 250 });
+		await harness.start();
+		// The response arrives well after the retired 100 x Bun.sleep(1) budget
+		// would have expired; the correlated-id handshake still resolves it.
+		const delayed = await control(harness, "delayed", "delayed steer", "delayed-ref");
+		expect(delayed).toMatchObject({ ok: true, result: { accepted: true, clientRef: "delayed-ref" } });
+		expect(harness.dispatches).toBe(1);
+		expect(harness.lateResponses).toEqual([]);
+		await harness.stop();
+	} finally {
+		await fs.rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("harness handshake times out, and a late response never satisfies a later emission", async () => {
+	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-steer-timeout-"));
+	try {
+		const harness = createHarness(cwd, "handshake-timeout", undefined, {
+			responseDelayMs: 150,
+			responseTimeoutMs: 50,
+		});
+		await harness.start();
+		// A response slower than the safety bound must fail the emission
+		// deterministically instead of hanging, and must leave the harness usable.
+		await expect(control(harness, "slow", "slow steer", "slow-ref")).rejects.toThrow("host did not respond");
+		// The stale frame for the timed-out id lands after that emission ended:
+		// it is fenced into lateResponses, never resolving a live await.
+		await Bun.sleep(200);
+		expect(harness.lateResponses.length).toBe(1);
+		expect(harness.lateResponses[0]).toMatchObject({ id: "slow", type: "control_response" });
+		// A fresh emission under a different id resolves only against its own
+		// correlated response.
+		harness.setResponseDelay(0);
+		const accepted = await control(harness, "recovered", "recovering steer", "recovered-ref");
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "recovered-ref" } });
+		expect(harness.dispatches).toBe(2);
+		expect(harness.lateResponses.length).toBe(1);
+		await harness.stop();
+	} finally {
+		await fs.rm(cwd, { recursive: true, force: true });
+	}
+});
 
 test("production SDK host correlates durable steer replay and restart without redispatch", async () => {
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-steer-"));
@@ -136,6 +251,9 @@ test("production SDK host correlates durable steer replay and restart without re
 			ok: true,
 			result: { clientRef: "caller-ref" },
 		});
+		// Sequential controls each resolved against their OWN correlated
+		// response: no stale or unsolicited frame satisfied any later emission.
+		expect(first.lateResponses).toEqual([]);
 		const persisted = await fs.readFile(
 			path.join(path.dirname(sessionFile), ".sdk-reconciliation", `${sessionId}.json`),
 			"utf8",
