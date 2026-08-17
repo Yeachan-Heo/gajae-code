@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Escaped-non-ASCII turn resamples are now steered instead of blind: each unmanaged resample carries a transient synthetic instruction naming the `\uXXXX` defect and demanding literal UTF-8, so a model that escapes deterministically (observed with Hangul-heavy `ask` payloads exhausting the whole resample budget every turn) has a reason to change its spelling on the retry. The instruction never lands in durable history, tools stay enabled, and the captured logical-turn tool choice is still replayed across the steered attempts; a pending one-shot malformed-tool-call recovery is never displaced by the steering.
+
 ## [0.14.0] - 2026-08-17
 
 ### Fixed

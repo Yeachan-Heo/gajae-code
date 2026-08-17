@@ -45,6 +45,7 @@ import {
 	shouldMitigateHarmonyLeak,
 	signalListLabel,
 } from "./harmony-leak";
+import escapedNonAsciiRecoveryPrompt from "./prompts/escaped-nonascii-recovery.md" with { type: "text" };
 import repeatedToolFailureRecoveryPrompt from "./prompts/repeated-tool-failure-recovery.md" with { type: "text" };
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
@@ -2020,7 +2021,7 @@ async function runLoopBody(
 	let escapedNonAsciiToolChoiceCaptured = false;
 	let escapedNonAsciiToolChoice: ToolChoice | undefined;
 	let previousMalformedToolSignatures = new Set<string>();
-	type SyntheticRecoveryKind = "malformed-tool-call" | "composer-bash-policy" | "provider";
+	type SyntheticRecoveryKind = "malformed-tool-call" | "composer-bash-policy" | "provider" | "escaped-nonascii";
 	let pendingRecovery:
 		| {
 				kind: SyntheticRecoveryKind;
@@ -2137,6 +2138,11 @@ async function runLoopBody(
 			const attemptTransaction = managedTransaction;
 			const recoveryAttempt = pendingRecovery;
 			const wasMalformedToolRecoveryAttempt = recoveryAttempt?.kind === "malformed-tool-call";
+			// An escaped-non-ASCII steering resample is a re-request of the SAME
+			// logical turn, not a diagnostic detour: tools stay enabled and the
+			// captured logical-turn tool choice is replayed, so a queue-backed
+			// "required" still lands on the accepted attempt.
+			const wasEscapedNonAsciiRecoveryAttempt = recoveryAttempt?.kind === "escaped-nonascii";
 			try {
 				const getLogicalTurnToolChoice = (): ToolChoice | undefined => {
 					if (escapedNonAsciiToolChoiceCaptured) return escapedNonAsciiToolChoice;
@@ -2157,7 +2163,9 @@ async function runLoopBody(
 							? COMPOSER_BASH_POLICY_RECOVERY_PROMPT
 							: recoveryAttempt.kind === "malformed-tool-call"
 								? repeatedToolFailureRecoveryPrompt
-								: undefined;
+								: recoveryAttempt.kind === "escaped-nonascii"
+									? escapedNonAsciiRecoveryPrompt
+									: undefined;
 					if (recoveryContent) {
 						recoveryAttempt.syntheticMessage = {
 							role: "user",
@@ -2183,11 +2191,13 @@ async function runLoopBody(
 						? {
 								syntheticMessage: recoveryAttempt.syntheticMessage,
 								disableTools: wasMalformedToolRecoveryAttempt,
-								forceAutoToolChoice: !wasMalformedToolRecoveryAttempt,
+								forceAutoToolChoice: !wasMalformedToolRecoveryAttempt && !wasEscapedNonAsciiRecoveryAttempt,
 							}
 						: undefined,
 					escapedToolTransaction,
-					recoveryAttempt ? undefined : { value: getLogicalTurnToolChoice() },
+					recoveryAttempt && !wasEscapedNonAsciiRecoveryAttempt
+						? undefined
+						: { value: getLogicalTurnToolChoice() },
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
@@ -2348,18 +2358,21 @@ async function runLoopBody(
 				}
 			}
 
-			// Escaped-non-ASCII tool arguments: bounded turn resample.
+			// Escaped-non-ASCII tool arguments: bounded steered turn resample.
 			//
 			// Arguments that spell a printable non-ASCII character as `\uXXXX`
-			// instead of literal UTF-8 are a wire-format defect, not a decision the
-			// model needs to be told about. The payload parses cleanly, but one
-			// mistyped nibble decodes to a different, equally valid character, so it
-			// can never be verified or repaired after the fact. Reporting it as a
-			// tool error spends the whole turn and writes the literal escape syntax
-			// back into the context the model samples from next. Drop the defective
-			// turn and re-request instead; the per-call rejection in
-			// `executeToolCalls` stays as the terminal answer once this budget is
-			// spent. Managed fallback reports the discarded attempt through the
+			// instead of literal UTF-8 are a wire-format defect. The payload parses
+			// cleanly, but one mistyped nibble decodes to a different, equally valid
+			// character, so it can never be verified or repaired after the fact.
+			// Reporting it as a tool error spends the whole turn and writes the
+			// literal escape syntax back into the context the model samples from
+			// next. Drop the defective turn and re-request with a transient
+			// steering instruction instead: models that escape deterministically
+			// (rather than as a sampling accident) reproduce the identical defect
+			// on a blind resample, so the retry names the defect without ever
+			// committing the escape syntax — or the instruction — to durable
+			// history. The per-call rejection in `executeToolCalls` stays as the
+			// terminal answer once this budget is spent. Managed fallback reports the discarded attempt through the
 			// typed `escaped_arguments_discarded` outcome so the session policy
 			// owns a bounded same-model retry; the defect is never treated as
 			// provider evidence, so the fallback chain never advances on it.
@@ -2394,6 +2407,16 @@ async function runLoopBody(
 					});
 					stream.end(newMessages);
 					return;
+				}
+				// Steer the in-loop retry: name the defect in a transient synthetic
+				// message so a deterministic escaper has a reason to change its
+				// spelling. Managed runs return above — their retry is a fresh
+				// invocation owned by session policy, so the steering applies only to
+				// the unmanaged same-loop resample. Never displace a different pending
+				// recovery (e.g. the one-shot malformed-tool-call turn): its mode and
+				// one-shot accounting must survive an escaped resample inside it.
+				if (!pendingRecovery || pendingRecovery.kind === "escaped-nonascii") {
+					pendingRecovery = { kind: "escaped-nonascii", inserted: false };
 				}
 				continue;
 			}
@@ -2785,10 +2808,13 @@ async function streamAssistantResponse(
 
 	// Synthetic recovery requests choose their tool mode explicitly below and
 	// must never consume a queued dynamic choice intended for an ordinary turn.
-	const dynamicToolChoice = recoveryMode
-		? undefined
-		: toolChoiceOverride
-			? toolChoiceOverride.value
+	// An explicit toolChoiceOverride is the exception: it carries the already-
+	// captured logical-turn choice for a steering resample of that same turn,
+	// so replaying it never double-consumes the queue.
+	const dynamicToolChoice = toolChoiceOverride
+		? toolChoiceOverride.value
+		: recoveryMode
+			? undefined
 			: config.getToolChoice?.();
 	const dynamicReasoning = config.getReasoning?.();
 	const harmonyMitigationEnabled = isHarmonyLeakMitigationTarget(config.model);

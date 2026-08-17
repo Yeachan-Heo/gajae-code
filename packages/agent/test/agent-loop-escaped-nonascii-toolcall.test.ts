@@ -139,6 +139,56 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(resampleRequest.context.messages.some(message => message.role === "assistant")).toBe(false);
 	});
 
+	it("steers the resample with a transient synthetic instruction and keeps tools enabled", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
+		const mock = createMockModel({
+			responses: [escapedTurn("tc-1"), literalTurn("tc-2"), { content: ["done"] }],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		// The resample request names the defect: a deterministic escaper
+		// reproduces the identical `\uXXXX` spelling on a blind re-request, so
+		// the retry must carry the steering instruction.
+		const resampleRequest = mock.model.calls[1];
+		expect(resampleRequest).toBeDefined();
+		const steering = resampleRequest.context.messages.filter(
+			message =>
+				message.role === "user" && typeof message.content === "string" && message.content.includes("literal UTF-8"),
+		);
+		expect(steering).toHaveLength(1);
+		// Steering is a re-request of the same logical turn, not a diagnostic
+		// detour: tools stay available so the corrected call can execute.
+		expect(resampleRequest.context.tools?.length ?? 0).toBeGreaterThan(0);
+		expect(executed).toEqual([{ question: QUESTION }]);
+
+		// The instruction is transient: it never lands in durable context or in
+		// the request that follows the accepted turn.
+		expect(
+			context.messages.some(
+				message =>
+					message.role === "user" &&
+					typeof message.content === "string" &&
+					message.content.includes("literal UTF-8"),
+			),
+		).toBe(false);
+		const followUpRequest = mock.model.calls[2];
+		expect(followUpRequest).toBeDefined();
+		expect(
+			followUpRequest.context.messages.filter(
+				message =>
+					message.role === "user" &&
+					typeof message.content === "string" &&
+					message.content.includes("literal UTF-8"),
+			),
+		).toHaveLength(0);
+	});
+
 	it("publishes and stores only the accepted assistant lifecycle", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const mock = createMockModel({
