@@ -686,7 +686,7 @@ describe("GajaePetWidget", () => {
 		}
 	});
 	it("remounts the framed editor while active after a palette overlay replaces it", () => {
-		const { widget, editor, editorContainer } = makeWidget(80, 30, { editor: "real" });
+		const { widget, editorContainer } = makeWidget(80, 30, { editor: "real" });
 		try {
 			widget.setMode("red");
 			const framed = editorContainer.children[0];
