@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type { Component } from "@gajae-code/tui";
 import * as tui from "@gajae-code/tui";
 import {
 	__animationSchedulerTestHooks,
@@ -11,7 +10,9 @@ import {
 	type TUI,
 	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
-import type { CustomEditor } from "../src/modes/components/custom-editor";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
+import { defaultEditorTheme } from "../../tui/test/test-themes";
+import { CustomEditor } from "../src/modes/components/custom-editor";
 import { GajaePetWidget, PetFramedEditor } from "../src/modes/components/gajae-pet-widget";
 import { setVerifiedItermPetAvailability } from "../src/modes/components/pet-capability";
 
@@ -193,9 +194,28 @@ function makeWidget(
 		isWorking?: () => boolean;
 		autoFlexGapMs?: [number, number] | null;
 		protocol?: "sixel" | "kitty" | null;
+		/** Mount a real CustomEditor in a real Container so disposal semantics match production. */
+		editor?: "real";
 	} = {},
 ) {
 	const stubs = makeStubs(columns, rows);
+	if (options.editor === "real") {
+		const editor = new CustomEditor(defaultEditorTheme);
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		const widget = new GajaePetWidget({
+			ui: stubs.ui,
+			editor,
+			editorContainer,
+			floorContainer: stubs.floorContainer,
+			isWorking: options.isWorking ?? (() => false),
+			getComposerBottomOffset: () => stubs.floorContainer.render(columns).length + (options.bottomOffset ?? 0),
+			syncManagedItermCursor: async () => true,
+			forcePixelProtocol: options.protocol === null ? undefined : (options.protocol ?? "sixel"),
+			autoFlexGapMs: options.autoFlexGapMs !== undefined ? options.autoFlexGapMs : null,
+		});
+		return { ...stubs, editor, editorContainer, widget };
+	}
 	const widget = new GajaePetWidget({
 		ui: stubs.ui,
 		editor: stubs.editor,
@@ -648,56 +668,91 @@ describe("GajaePetWidget", () => {
 		second.dispose();
 	});
 	it("remounts the plain editor while never activated so palette close paths cannot leak a modal", () => {
-		const stubs = makeStubs();
-		const widget = new GajaePetWidget({
-			ui: stubs.ui,
-			editor: stubs.editor,
-			editorContainer: stubs.editorContainer,
-			floorContainer: stubs.floorContainer,
-			isWorking: () => false,
-			getComposerBottomOffset: () => stubs.floorContainer.render(80).length,
-			syncManagedItermCursor: async () => true,
-			forcePixelProtocol: "sixel",
-			autoFlexGapMs: null,
-		});
+		const { widget, editor, editorContainer } = makeWidget(80, 30, { editor: "real" });
 		try {
-			// Simulate the palette overlay: the host replaces the composer with a
-			// foreign component (pet never activated, so no overlay claim).
-			const overlay = { render: () => [] } as unknown as Component;
-			stubs.editorContainer.clear();
-			stubs.editorContainer.addChild(overlay);
+			// Palette open: host detaches the reusable composer and mounts the
+			// transient overlay (pet never activated, so no overlay claim).
+			const overlay = new Container();
+			editorContainer.detachChild(editor);
+			editorContainer.clear();
+			editorContainer.addChild(overlay);
 			widget.remountComposer();
 
-			expect(stubs.editorContainer.children).toEqual([stubs.editor]);
-			expect(stubs.editorContainer.children[0]).not.toBe(overlay);
+			expect(editorContainer.children).toEqual([editor]);
+			expect(editorContainer.children[0]).not.toBe(overlay);
 			expect(widget.mode).toBe("off");
 		} finally {
 			widget.dispose();
 		}
 	});
 	it("remounts the framed editor while active after a palette overlay replaces it", () => {
-		const stubs = makeStubs();
-		const widget = new GajaePetWidget({
-			ui: stubs.ui,
-			editor: stubs.editor,
-			editorContainer: stubs.editorContainer,
-			floorContainer: stubs.floorContainer,
-			isWorking: () => false,
-			getComposerBottomOffset: () => stubs.floorContainer.render(80).length,
-			syncManagedItermCursor: async () => true,
-			forcePixelProtocol: "sixel",
-			autoFlexGapMs: null,
-		});
+		const { widget, editor, editorContainer } = makeWidget(80, 30, { editor: "real" });
 		try {
 			widget.setMode("red");
-			const framed = stubs.editorContainer.children[0];
-			const overlay = { render: () => [] } as unknown as Component;
-			stubs.editorContainer.clear();
-			stubs.editorContainer.addChild(overlay);
+			const framed = editorContainer.children[0];
+			const overlay = new Container();
+			editorContainer.clear();
+			editorContainer.addChild(overlay);
 			widget.remountComposer();
 
-			expect(stubs.editorContainer.children).toEqual([framed]);
+			expect(editorContainer.children).toEqual([framed]);
 		} finally {
+			widget.dispose();
+		}
+	});
+	it("keeps the composer usable across repeated palette close/remount cycles without disposing it", () => {
+		// Real editor so the disposal contract is observable: Editor.dispose()
+		// tears down the tab-width change listener, and that listener fires
+		// editor.invalidate() on a runtime tab-width change. Counting
+		// invalidations therefore proves the reusable editor was never
+		// disposed across overlay open/close cycles.
+		const { widget, editor, editorContainer } = makeWidget(80, 30, { editor: "real" });
+		const defaultWidth = getDefaultTabWidth();
+		const otherWidth = defaultWidth === 3 ? 4 : 3;
+		const invalidations = { count: 0 };
+		const originalInvalidate = editor.invalidate.bind(editor);
+		editor.invalidate = () => {
+			invalidations.count += 1;
+			originalInvalidate();
+		};
+		try {
+			editor.setText("draft text");
+			const rendersBefore = editor.render(80).length;
+
+			for (let cycle = 0; cycle < 4; cycle += 1) {
+				// Production-shaped open (SelectorController.showSelector):
+				// detach the reusable composer, then clear() disposes only the
+				// transient overlay, then mount it.
+				const overlay = new Container();
+				editorContainer.detachChild(editor);
+				editorContainer.clear();
+				editorContainer.addChild(overlay);
+				// Production-shaped close: pet-aware composer restore.
+				widget.remountComposer();
+				// Tab-width toggle: exactly one invalidate per change while the
+				// editor's listener is live.
+				setDefaultTabWidth(otherWidth);
+				setDefaultTabWidth(defaultWidth);
+			}
+
+			expect(editorContainer.children).toEqual([editor]);
+			expect(editor.getText()).toBe("draft text");
+			// All 4 cycles' tab-width toggles reached a live listener.
+			expect(invalidations.count).toBe(8);
+			expect(editor.render(80).length).toBe(rendersBefore);
+			editor.handleInput("x");
+			expect(editor.getText()).toBe("draft textx");
+
+			// Red control for the probe itself: a genuinely disposed editor's
+			// listener no longer fires, so invalidations stop accruing.
+			const disposedCount = invalidations.count;
+			editorContainer.clear();
+			editorContainer.addChild(editor);
+			setDefaultTabWidth(otherWidth);
+			setDefaultTabWidth(defaultWidth);
+			expect(invalidations.count).toBe(disposedCount);
+		} finally {
+			setDefaultTabWidth(defaultWidth);
 			widget.dispose();
 		}
 	});

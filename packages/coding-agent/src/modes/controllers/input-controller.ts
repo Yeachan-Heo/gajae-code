@@ -1311,6 +1311,9 @@ export class InputController {
 	}
 
 	#restoreEditorFocus(): void {
+		// The composer is reusable across overlays: detach (never dispose)
+		// before clearing so only the transient overlay is torn down.
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.ctx.editor);
 		this.ctx.ui.setFocus(this.ctx.editor);
@@ -1372,6 +1375,9 @@ export class InputController {
 					),
 			},
 		);
+		// Detach the reusable composer before clearing so the terminal clear()
+		// disposes only the selector overlay, not the editor.
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(selector);
 		this.ctx.ui.setFocus(selector);

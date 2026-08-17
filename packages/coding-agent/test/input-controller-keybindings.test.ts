@@ -198,6 +198,10 @@ async function createContext(options?: {
 		clear: vi.fn(() => {
 			editorContainerChildren.length = 0;
 		}),
+		detachChild: vi.fn((child: unknown) => {
+			const index = editorContainerChildren.indexOf(child);
+			if (index !== -1) editorContainerChildren.splice(index, 1);
+		}),
 		addChild: vi.fn((child: unknown) => {
 			editorContainerChildren.push(child);
 		}),

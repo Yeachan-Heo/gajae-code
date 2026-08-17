@@ -443,6 +443,12 @@ export class GajaePetWidget {
 	}
 
 	#mountEditor(framed: boolean): void {
+		// The composer editor is reusable across overlays; disposal is terminal
+		// (Editor.dispose tears down the tab-width listener), so detach the
+		// reusable mounts before clearing. Only transient overlay children
+		// (palette, selectors) are disposed by the clear.
+		this.#editorContainer.detachChild(this.#editor);
+		this.#editorContainer.detachChild(this.#framedEditor);
 		this.#editorContainer.clear();
 		this.#editorContainer.addChild(framed ? this.#framedEditor : this.#editor);
 	}

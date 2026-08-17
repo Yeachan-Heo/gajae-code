@@ -1338,6 +1338,10 @@ export class SelectorController {
 			}
 		};
 		const { component, focus } = create(done);
+		// The composer is reusable across overlays; detach it before clearing so
+		// clear() disposes only the transient overlay, not the editor's
+		// tab-width listener / paste state (disposal is terminal).
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(component);
 		this.ctx.ui.setFocus(focus);
