@@ -179,7 +179,7 @@ import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
-import type { WorkspaceTree } from "../workspace-tree";
+import { buildWorkspaceTree, type WorkspaceTree } from "../workspace-tree";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -1911,7 +1911,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			contextFilesResultPromise,
 			raceWithDeadline("buildWorkspaceTree", workspaceTreePromise),
 		]);
-		const contextFiles = contextFilesResult.contextFiles;
+		// Mutable re-root holders: `AgentSession.moveCwd()` publishes a fresh
+		// post-move snapshot here so later `rebuildSystemPrompt` passes and every
+		// `ToolSession.workspaceTree` consumer (including task subagents) read the
+		// live project root instead of the launch-time one. `undefined` means "no
+		// post-move snapshot yet"; consumers fall back to the startup values.
+		let rerootedContextFiles = contextFilesResult.contextFiles;
+		let rerootedWorkspaceTree = resolvedWorkspaceTree;
+		const contextFiles = () => rerootedContextFiles;
 		const discoveredContextFileWarnings = contextFilesResult.warnings;
 
 		const backgroundJobsEnabled = isBackgroundJobSupportEnabled(settings);
@@ -2033,8 +2040,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return !requestedToolNames || requestedToolNames.includes("edit");
 			},
 			skipPythonPreflight: options.skipPythonPreflight,
-			contextFiles,
-			workspaceTree: resolvedWorkspaceTree,
+			contextFiles: contextFiles(),
+			workspaceTree: rerootedWorkspaceTree,
 			skills,
 			eventBus,
 			outputSchema: options.outputSchema,
@@ -3145,7 +3152,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd,
 				skills,
-				contextFiles,
+				contextFiles: contextFiles(),
 				tools: promptTools,
 				toolNames,
 				rules: rulebookRules,
@@ -3682,6 +3689,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			networkPrewarmService: runtimeServices.networkPrewarm,
 			onWorkspaceTreeReady: async tree => {
 				workspaceTreePromise = Promise.resolve(tree);
+				rerootedWorkspaceTree = tree;
+				await session?.refreshBaseSystemPrompt();
+			},
+			onCwdMoved: async () => {
+				// AgentSession.moveCwd() committed a new cwd: re-discover every
+				// project-scoped input that the launch-time closures captured, then
+				// rebuild the stable prompt prefix from the new root. Discovery
+				// failures degrade to the previous snapshot (mirroring startup's
+				// deadline fallback) instead of failing the already-committed move.
+				const nextCwd = sessionManager.getCwd();
+				try {
+					const [files, tree] = await Promise.all([
+						loadContextFilesResultInternal({ cwd: nextCwd }),
+						buildWorkspaceTree(nextCwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }),
+					]);
+					rerootedContextFiles = files.contextFiles;
+					rerootedWorkspaceTree = tree;
+					workspaceTreePromise = Promise.resolve(tree);
+				} catch {
+					// keep previous snapshots; the volatile context still follows cwd
+				}
 				await session?.refreshBaseSystemPrompt();
 			},
 			reloadSshTool,

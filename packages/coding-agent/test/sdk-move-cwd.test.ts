@@ -35,6 +35,9 @@ describe("createAgentSession cwd after /move", () => {
 		const cwdB = path.join(tempDir, "cwd-b");
 		fs.mkdirSync(cwdA, { recursive: true });
 		fs.mkdirSync(cwdB, { recursive: true });
+		// Distinct context-file trees so the stable-prompt re-root is observable.
+		fs.writeFileSync(path.join(cwdA, "AGENTS.md"), "# Project A\nRun commands from project A.\n");
+		fs.writeFileSync(path.join(cwdB, "AGENTS.md"), "# Project B\nRun commands from project B.\n");
 
 		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
 		const { session } = await createAgentSession({
@@ -49,7 +52,6 @@ describe("createAgentSession cwd after /move", () => {
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
 			skills: [],
-			contextFiles: [],
 			promptTemplates: [],
 			slashCommands: [],
 			enableMCP: false,
@@ -58,7 +60,16 @@ describe("createAgentSession cwd after /move", () => {
 		});
 
 		try {
-			await sessionManager.moveTo(cwdB);
+			const promptBefore = session.systemPrompt.join("\n");
+			expect(promptBefore).toContain("Project A");
+			expect(promptBefore).not.toContain("Project B");
+
+			await session.moveCwd(cwdB);
+
+			// Stable prompt prefix re-rooted to the new project's context files.
+			const promptAfter = session.systemPrompt.join("\n");
+			expect(promptAfter).toContain("Project B");
+			expect(promptAfter).not.toContain("Project A");
 
 			const bashTool = session.getToolByName("bash");
 			if (!bashTool) throw new Error("Expected bash tool");

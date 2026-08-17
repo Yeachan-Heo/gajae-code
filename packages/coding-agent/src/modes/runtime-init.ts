@@ -435,7 +435,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { changed: true, enabled: on };
 					}
 					case "session.cwd.move":
-						await session.sessionManager.moveTo(String(input.path));
+						await session.moveCwd(String(input.path));
 						return { moved: true, cwd: session.sessionManager.getCwd() };
 					default:
 						if (BROKER_LIFECYCLE_OPERATIONS.has(operation)) prohibitBrokerLifecycleOperation(operation);

@@ -1141,26 +1141,19 @@ export class CommandController {
 		const cwd = this.ctx.sessionManager.getCwd();
 		const resolvedPath = resolveToCwd(unquoted, cwd);
 
-		try {
-			const stat = await fs.stat(resolvedPath);
-			if (!stat.isDirectory()) {
-				this.ctx.showError(`Not a directory: ${resolvedPath}`);
-				return;
-			}
-		} catch {
-			this.ctx.showError(`Directory does not exist: ${resolvedPath}`);
-			return;
-		}
+		// Target existence/directory validation happens inside
+		// session.moveCwd(), shared with every other cwd-mutation surface.
 
 		try {
 			await this.ctx.sessionManager.flush();
-			await this.ctx.sessionManager.moveTo(resolvedPath);
+			await this.ctx.session.moveCwd(resolvedPath);
 			setProjectDir(resolvedPath);
 			clearClaudePluginRootsCache(); // re-warms preloadedPluginRoots with new project dir (async)
 			resetCapabilities();
 			await this.ctx.refreshSlashCommandState(resolvedPath);
 			await this.ctx.session.refreshSshTool({ activateIfAvailable: true });
 
+			this.ctx.statusLine.rewatchBranch();
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
 

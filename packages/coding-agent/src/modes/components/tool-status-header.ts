@@ -275,6 +275,11 @@ export class StatusLineComponent implements Component {
 		this.#setupGitWatcher();
 	}
 
+	/** Re-target the git HEAD watcher after the session moved to a new project directory. */
+	rewatchBranch(): void {
+		if (this.#onBranchChange) this.#setupGitWatcher();
+	}
+
 	#setupGitWatcher(): void {
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();

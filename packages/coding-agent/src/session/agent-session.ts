@@ -773,6 +773,8 @@ export interface AgentSessionConfig {
 	workspaceTree?: WorkspaceTree;
 	/** Called after a lazy first-turn scan publishes the resolved tree to the stable prompt builder. */
 	onWorkspaceTreeReady?: (tree: WorkspaceTree) => void | Promise<void>;
+	/** Called after a cwd move commits so project-scoped inputs can re-root to the new directory. */
+	onCwdMoved?: () => void | Promise<void>;
 	/** Rebuild the SSH tool from current capability discovery results. */
 	reloadSshTool?: () => Promise<AgentTool | null>;
 	requestedToolNames?: ReadonlySet<string>;
@@ -2481,10 +2483,13 @@ export class AgentSession {
 	#initialWorkspaceTree: WorkspaceTree | undefined;
 	#workspaceTreeService: LazyService<WorkspaceTreeRuntime> | undefined;
 	#onWorkspaceTreeReady: ((tree: WorkspaceTree) => void | Promise<void>) | undefined;
+	#onCwdMoved: (() => void | Promise<void>) | undefined;
 	#networkPrewarmService: LazyService<NetworkPrewarmRuntime> | undefined;
 	/** Throttle cache for the per-turn volatile workspace-tree scan (see #buildVolatileProjectContextMessage). */
 	#cachedWorkspaceTree: WorkspaceTree | undefined;
 	#cachedWorkspaceTreeAt = 0;
+	/** Serializes cwd moves against volatile-tree scans/refreshes (see moveCwd). */
+	#workspaceTreeOperationQueue: Promise<void> = Promise.resolve();
 	/**
 	 * Signature of the (toolNames, tool descriptions) tuple passed to the most
 	 * recent successful `rebuildSystemPrompt` call. Used to skip redundant rebuilds
@@ -3636,6 +3641,7 @@ export class AgentSession {
 		this.#workspaceTreeService = config.workspaceTreeService;
 		this.#networkPrewarmService = config.networkPrewarmService;
 		this.#onWorkspaceTreeReady = config.onWorkspaceTreeReady;
+		this.#onCwdMoved = config.onCwdMoved;
 		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
 		const configuredDiscoveryMode = config.settings.get("tools.discoveryMode");
 		this.#discoveryMode =
@@ -9896,7 +9902,95 @@ export class AgentSession {
 		};
 	}
 
+	/**
+	 * Move the session working directory and re-root every consumer of the old
+	 * root. The single entry point for every cwd mutation (`/move` in the TUI
+	 * and text/ACP handlers, the public `session.cwd.move` control operation):
+	 * callers must use this instead of calling `sessionManager.moveTo()`
+	 * directly, so the workspace tree can never keep describing the previous
+	 * directory after a move.
+	 *
+	 * Semantics:
+	 * - The target is resolved against the *current* cwd (`~` expanded) and
+	 *   must exist and be a directory; otherwise the move is rejected before
+	 *   anything mutates. This matches what the `/move` handlers always
+	 *   validated and extends it to the control-operation surfaces that used
+	 *   to pass caller input through unchecked.
+	 * - Moving to the current cwd is a no-op (nothing disposed, nothing
+	 *   cleared), so a redundant move cannot degrade startup context.
+	 * - Every fallible re-rooting step runs *before* `sessionManager.moveTo()`
+	 *   commits the new cwd: the lazy service is disposed first (its abort can
+	 *   reject), and only then is cwd published and the caches cleared. A
+	 *   failure therefore leaves the session exactly where it was.
+	 * - The whole operation is serialized against the volatile-tree
+	 *   scan/refresh (`#buildVolatileProjectContextMessage`), so an in-flight
+	 *   old-root refresh can never repopulate the cache after the move clears
+	 *   it.
+	 */
+	async moveCwd(newCwd: string): Promise<void> {
+		const resolvedPath = resolveToCwd(newCwd, this.sessionManager.getCwd());
+		if (resolvedPath === this.sessionManager.getCwd()) return;
+		let stat: Awaited<ReturnType<typeof fs.promises.stat>>;
+		try {
+			stat = await fs.promises.stat(resolvedPath);
+		} catch {
+			throw new Error(`Directory does not exist: ${resolvedPath}`);
+		}
+		if (!stat.isDirectory()) throw new Error(`Not a directory: ${resolvedPath}`);
+		await this.#runExclusiveWorkspaceTreeOperation(() => this.#moveCwdLocked(resolvedPath));
+	}
+
+	/** Caller has already validated; serialize, dispose, commit, clear. */
+	async #moveCwdLocked(resolvedPath: string): Promise<void> {
+		// Fallible work first: disposing an initializing lazy service aborts its
+		// scan and can reject. Do it before the cwd is published so a failure
+		// leaves the session fully unmoved.
+		const service = this.#workspaceTreeService;
+		if (service) {
+			// The service captured the launch cwd at construction; the direct-scan
+			// fallback in #buildVolatileProjectContextMessage reads the live cwd.
+			this.#workspaceTreeService = undefined;
+			await service.dispose();
+		}
+		await this.sessionManager.moveTo(resolvedPath);
+		// Only cache/state clears remain — none of these can throw.
+		this.#initialWorkspaceTree = undefined;
+		this.#cachedWorkspaceTree = undefined;
+		this.#cachedWorkspaceTreeAt = 0;
+		// Re-root every project-scoped consumer (stable prompt inputs, subagent
+		// tree forwarding). Runs last: the cwd is already committed, so a
+		// discovery failure must degrade, not reject the move — the SDK hook
+		// handles that internally.
+		await this.#onCwdMoved?.();
+	}
+
+	/**
+	 * Serialize workspace-tree mutations and scans against each other. The
+	 * volatile-context builder's TTL refresh and a concurrent cwd move both
+	 * read-and-write the same cache fields; without this gate an in-flight
+	 * old-root refresh could resolve after the move cleared the cache and
+	 * republish exactly the stale tree the move was meant to drop.
+	 */
+	async #runExclusiveWorkspaceTreeOperation<T>(operation: () => Promise<T>): Promise<T> {
+		const previous = this.#workspaceTreeOperationQueue;
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#workspaceTreeOperationQueue = promise;
+		await previous;
+		try {
+			return await operation();
+		} finally {
+			resolve();
+		}
+	}
+
 	async #buildVolatileProjectContextMessage(): Promise<CustomMessage> {
+		const message = await this.#runExclusiveWorkspaceTreeOperation(() =>
+			this.#buildVolatileProjectContextMessageLocked(),
+		);
+		return message;
+	}
+
+	async #buildVolatileProjectContextMessageLocked(): Promise<CustomMessage> {
 		const cwd = this.sessionManager.getCwd();
 		// Date + cwd are refreshed every turn (cheap). The mtime-sorted workspace
 		// tree is expensive to scan and large to carry, so throttle it: rebuild at
