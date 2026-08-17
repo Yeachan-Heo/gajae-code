@@ -194,57 +194,84 @@ GJC는 토큰 비용의 양쪽을 모두 최적화합니다:
 
 ---
 
-## OpenClaw / Hermes가 GJC를 부리게 하기
+## OpenClaw / Hermes / Grokbot / 내가 만든 봇이 GJC를 부리게 하기
 
-GJC는 네이티브 Coordinator MCP 브리지를 내장하고 있어 OpenClaw나 Hermes 같은 외부 컨트롤러가 터미널 스크래핑 없이 durable turn으로 실제 GJC 세션을 오케스트레이션합니다.
+외부 컨트롤러는 무엇이든 된다 — OpenClaw, Hermes, Grokbot, 디스코드 봇, 크론 스크립트. 브로커에 바인딩된
+**SDK 세션 CLI**와 번들 [`sdk-skills/`](https://github.com/Yeachan-Heo/gajae-code/tree/main/sdk-skills)
+절차(`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`)로 실제 GJC 세션을 움직인다. durable turn과
+크리덴셜 없는 JSON만 오간다 — 터미널 스크래핑은 없다.
 
-가이드를 읽을 필요 없이, 아래 프롬프트를 OpenClaw/Hermes 컨트롤러에 붙여넣으면 스스로 연결을 구성합니다:
+가이드를 읽을 필요 없이, 아래 프롬프트를 컨트롤러에 붙여넣으면 스스로 연결을 구성한다:
 
 <details>
 <summary><strong>복붙용 컨트롤러 설정 프롬프트</strong></summary>
 
 ```text
-Set up Gajae-Code (gjc) as your coding-agent backend on this machine. gjc is already installed.
+Use Gajae-Code (gjc) as your coding-agent backend on this machine. gjc is already installed.
+Your interface is the broker-bound SDK session CLI. Never scrape terminal output, never read
+endpoint records or credentials under .gjc/state/sdk, never open a raw session WebSocket.
 
-1. Render and install the coordinator MCP setup package (replace the paths):
-   gjc setup hermes --root <ABS_REPO_PATH> --profile <PROFILE_NAME> --repo <REPO_NAME> \
-     --mutation sessions,questions,reports --profile-dir <YOUR_PROFILE_DIR> --install
-   Without --install the command is render-only; re-run with --install to write files.
+1. Load the shipped procedures before acting. Read these skill files from the gjc checkout or
+   from https://github.com/Yeachan-Heo/gajae-code/tree/main/sdk-skills (bundle root
+   `sdk-skills/`, manifest.json formatVersion 1 — if it is missing, malformed, or a different
+   version, stop and report instead of guessing):
+     sdk-skills/gjc-sdk-discover/SKILL.md   -- find and inspect sessions
+     sdk-skills/gjc-sdk-operate/SKILL.md    -- the allowlisted control/lifecycle operations
+     sdk-skills/gjc-sdk-author/SKILL.md     -- TypeScript/Python templates for scripted flows
+   Follow their allowlists exactly. Pass every value as an argv item, never as a shell string.
 
-2. Verify the contract (non-mutating, no LLM call). Both must report ok:
-   gjc setup hermes --root <ABS_REPO_PATH> --smoke
-   gjc mcp-serve coordinator --check --json
+2. Prove the surface works (read-only). Run from inside the target repository:
+     gjc --version
+     gjc sdk session list
+   `list` returns a credential-free JSON DTO of indexed sessions. Fail closed on missing,
+   unavailable, stale, dead, unknown, or ambiguous rows. Exit 2 = usage error, exit 1 =
+   operational failure (broker unavailable, session unavailable, retention gap, wait timeout).
 
-3. Register the MCP server from the installed config. It is equivalent to:
-   command: gjc, args: ["mcp-serve", "coordinator"]
-   env: GJC_COORDINATOR_MCP_WORKDIR_ROOTS=<ABS_REPO_PATH>,
-        GJC_COORDINATOR_MCP_PROFILE=<PROFILE_NAME>,
-        GJC_COORDINATOR_MCP_REPO=<REPO_NAME>,
-        GJC_COORDINATOR_MCP_SESSION_COMMAND="gjc --worktree",
-        GJC_COORDINATOR_MCP_MUTATIONS=sessions,questions,reports
+3. Understand a session before touching it:
+     gjc sdk session inspect <sessionId>
+     gjc sdk session raw query <sessionId> --query session.metadata
+     ... then context.get, goal.list, todo.list, workflow.gates.list, session.stats
+   These reads are not an atomic snapshot: label every reported field confirmed / inferred /
+   stale / unavailable / unknown. Never invent a missing value.
 
-4. To delegate coding work, prefer one call per workflow:
-   gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team
-   with { cwd, task, allow_mutation: true, idempotency_key: <fresh-uuid> }.
-   Each starts an isolated worktree session and returns a durable turn_id and artifacts.
+4. Start work in an isolated session:
+     gjc sdk session raw global --op session.create \
+       --idempotency-key <fresh-uuid> --json-input '{"cwd":"/abs/path/to/repo"}'
+   Lifecycle ops allowed: session.create, session.fork, session.resume, session.close.
+   session.delete is NOT allowed. session.get_endpoint is refused unconditionally.
 
-5. For finer control: gjc_coordinator_start_session -> gjc_coordinator_send_prompt ->
-   poll gjc_coordinator_read_turn or bounded gjc_coordinator_await_turn ->
-   answer gjc_coordinator_list_questions rows via gjc_coordinator_submit_question_answer ->
-   close with gjc_coordinator_report_status.
+5. Drive a turn and reconcile it:
+     gjc sdk session send <sessionId> --text "<task>" --op-ref <fresh-ulid>
+     gjc sdk session status <sessionId> <opRef>        # lossless turn.result lookup
+     gjc sdk session tail <sessionId> --until-idle     # replay + live follow
+   Use `send --wait --timeout-ms <ms>` for a bounded wait; a wait window that elapses reports
+   wait_timeout and never cancels the running turn. One fresh op-ref per logical prompt --
+   `unknown` means uncertainty, never proof of non-execution, so reconcile with `status`
+   instead of replaying a prompt.
 
-Rules: every mutating call needs allow_mutation: true plus a fresh idempotency_key.
-Treat durable turn state as authoritative; never scrape terminal output.
-The session command selector accepts only "gjc" or "gjc --worktree [name]".
+6. Answer what the agent asks you:
+     gjc sdk session raw control <sessionId> --op ask.answer --json-input '{...}'
+     gjc sdk session raw control <sessionId> --op workflow.gate_answer --json-input '{...}'
+   For gate answers use the durable workflow gate ID plus expectedSessionId; a transient
+   action_needed.id is never durable authority. Other allowed per-session controls:
+   turn.prompt, turn.steer, turn.follow_up, todo.replace, session.switch, session.rename.
+
+7. Show the human the exact operation and target before any mutating call, and treat the
+   approval as single-use: if the operation, input, or target changes, ask again.
 ```
 
 </details>
 
-라이브 세션 하나를 직접 다루는 컨트롤러를 위해 모든 세션은 루프백 **SDK WebSocket** 엔드포인트, `gjc sdk session` CLI(`list|inspect|send|status|tail`), 번들 `sdk-skills/`(`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`)를 함께 노출합니다 — 컨트롤러에 올라탄 에이전트가 따라갈 수 있는, 검토되고 승인 게이트가 있는 절차입니다.
+긴 프롬프트를 걸어 두고 나가도 된다: SDK 프롬프트 데드라인은 진행 상황을 반영하는 유휴 리스
+(`sdk.promptDeadlineMs`, 기본 30분)이며 `sdk.promptMaxRuntimeMs`(기본 6시간)로 상한이 잡힌다. 갱신은 해당 턴에
+귀속되는 툴 실행만으로 이루어지고, 하트비트나 스트리밍 텍스트로는 갱신되지 않는다.
 
-- [외부 컨트롤러 통합 가이드](docs/bot-integration.md) · [Coordinator MCP 브리지](docs/hermes-mcp-bridge.md)
-- [외부 컨트롤러 / 봇](docs/bot-integration.md) — 프로바이더 독립 스모크; [`docs/aside-integration.md`](docs/aside-integration.md)는 옵트인 검색/컨텍스트 사이드카를 다룹니다
-- [SDK & 와이어 프로토콜](docs/sdk.md) · [SDK 세션 CLI](docs/sdk-session-cli.md) · [외부 제어 준비도](docs/external-control-readiness.md)
+세션 하나가 아니라 여러 워크트리에 이벤트 기반으로 펼쳐야 한다면, 네이티브
+[Coordinator MCP 브리지](docs/hermes-mcp-bridge.md)(`gjc mcp-serve coordinator`, `gjc setup hermes`로 설치)가
+그 형태의 위임 도구를 제공한다.
+
+- [외부 컨트롤러 / 봇 통합 가이드](docs/bot-integration.md) — 프로바이더 독립 스모크; [`docs/aside-integration.md`](docs/aside-integration.md)는 옵트인 검색/컨텍스트 사이드카를 다룬다
+- [SDK 세션 CLI](docs/sdk-session-cli.md) · [SDK & 와이어 프로토콜](docs/sdk.md) · [SDK 앱 가이드](docs/sdk-app-guide.md) · [외부 제어 준비도](docs/external-control-readiness.md)
 
 ---
 
