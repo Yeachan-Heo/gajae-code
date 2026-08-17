@@ -69,6 +69,7 @@ async function routerFixture(
 		onIndexRefresh?: () => void | Promise<void>;
 		onClientCreated?: () => void | Promise<void>;
 		createBrokerClient?: () => Promise<SessionRouterClient>;
+		indexedRepo?: string;
 	} = {},
 ): Promise<RouterFixture> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-authority-"));
@@ -101,7 +102,7 @@ async function routerFixture(
 				? [
 						{
 							sessionId,
-							locator: { repo, stateRoot },
+							locator: { repo: options.indexedRepo ?? repo, stateRoot },
 							endpointGeneration: authority.generation,
 							pid: authority.pid,
 							endpointMtimeMs: authority.endpointMtimeMs,
@@ -1282,6 +1283,35 @@ describe("SessionRouter dispatch authority", () => {
 			expect(fixture.attachments[0]?.isCurrent()).toBe(false);
 			expect(fixture.clients[0]?.requests).toEqual([]);
 			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("publishes an attachment whose indexed repo is a symlinked spelling of the state root", async () => {
+		// Production shape after reconcileReadyScope: locator.repo carries the
+		// lifecycle caller's lexical cwd while locator.stateRoot stays the host's
+		// physical path, because the host derives it from process.cwd(), which
+		// resolves symlinks. A lexical scope test rejects every symlinked cwd and
+		// the attachment can never be published.
+		const linkParent = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-symlink-"));
+		tempDirs.push(linkParent);
+		let readyCount = 0;
+		const fixture = await routerFixture({
+			start: false,
+			indexedRepo: path.join(linkParent, "linked-workspace"),
+			onAttachmentReady: () => {
+				readyCount += 1;
+			},
+		});
+		fs.symlinkSync(fixture.repo, path.join(linkParent, "linked-workspace"), "dir");
+		try {
+			await fixture.router.start();
+			expect(fixture.clients).toHaveLength(1);
+			expect(readyCount).toBe(1);
+			expect(fixture.attachments).toHaveLength(1);
+			expect(fixture.attachments[0]?.isCurrent()).toBe(true);
+			expect(fixture.router.attachment(fixture.sessionId)).not.toBeNull();
 		} finally {
 			await fixture.router.stop();
 		}

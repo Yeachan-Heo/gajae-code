@@ -1,7 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
+import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import {
 	SessionIndex as DefaultSessionIndex,
 	type IndexedSession,
@@ -837,11 +837,18 @@ export class SessionRouter {
 		if (!isSessionAuthorityEligible(indexed)) return null;
 		const repo = path.resolve(indexed.locator.repo);
 		const defaultStateRoot = path.join(repo, ".gjc", "state");
-		const indexedStateRoot = path.resolve(indexed.locator.stateRoot);
+		// The session index stores the lifecycle caller's lexical cwd in `locator.repo`
+		// (reconcileReadyScope re-scopes only that field) while `locator.stateRoot` is
+		// the host process's physical path, because process.cwd() resolves symlinks.
+		// The scope test therefore compares path identity, not spelling: a lexical
+		// match fails for every symlinked cwd (macOS /var -> /private/var,
+		// /home/jun/desk -> /data/Lina-Desk), the adopted attachment is retired on
+		// reconcile, and session/new surfaces "lost exact Router authority".
+		const indexedStateRoot = resolveEquivalentPath(indexed.locator.stateRoot);
 		const scope =
-			indexedStateRoot === defaultStateRoot
+			indexedStateRoot === resolveEquivalentPath(defaultStateRoot)
 				? "default"
-				: indexedStateRoot === path.join(defaultStateRoot, "chat")
+				: indexedStateRoot === resolveEquivalentPath(path.join(defaultStateRoot, "chat"))
 					? "chat"
 					: undefined;
 		if (!scope || indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
