@@ -1427,6 +1427,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.petWidget) {
 			this.petWidget.remountComposer();
 		} else {
+			// The composer is reusable across overlays: detach (never dispose)
+			// before clearing so only the transient overlay is torn down.
+			this.editorContainer.detachChild(this.editor);
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
 		}

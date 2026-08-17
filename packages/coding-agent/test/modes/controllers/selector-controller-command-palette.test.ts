@@ -6,7 +6,7 @@ import type { SlashCommand } from "@gajae-code/tui";
 
 describe("SelectorController command palette", () => {
 	it("surfaces rejected handlers without an unhandled rejection", async () => {
-		const component = { clear: vi.fn(), addChild: vi.fn() };
+		const component = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
 		const errorShown = Promise.withResolvers<void>();
 		const showError = vi.fn(() => errorShown.resolve());
 		const ctx = {
@@ -37,7 +37,7 @@ describe("SelectorController command palette", () => {
 		}
 	});
 	it("surfaces rejected action handlers", async () => {
-		const component = { clear: vi.fn(), addChild: vi.fn() };
+		const component = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
 		const errorShown = Promise.withResolvers<void>();
 		const showError = vi.fn(() => errorShown.resolve());
 		const ctx = {
@@ -70,7 +70,7 @@ describe("SelectorController command palette", () => {
 		expect(showError).toHaveBeenCalledWith("external editor failed");
 	});
 	it("uses effective display strings and omits unbound action shortcuts", () => {
-		const component = { clear: vi.fn(), addChild: vi.fn() };
+		const component = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
 		const keybindings = {
 			getDisplayString(action: string) {
 				return (

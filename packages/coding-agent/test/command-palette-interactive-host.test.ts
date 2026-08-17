@@ -19,7 +19,7 @@ import { HistoryStorage } from "@gajae-code/coding-agent/session/history-storage
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as titleGenerator from "@gajae-code/coding-agent/utils/title-generator";
 import { setKeybindings } from "@gajae-code/tui";
-import { TempDir } from "@gajae-code/utils";
+import { getDefaultTabWidth, setDefaultTabWidth, TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 
 interface InteractivePaletteHost {
@@ -423,6 +423,45 @@ describe("command palette InteractiveMode host", () => {
 			const palette = await openPalette(host);
 			palette.handleInput("\u001b");
 			expect(host.mode.editorContainer.children).toEqual([host.mode.editor]);
+		}
+	});
+	it("keeps the composer's tab-width listener alive across repeated palette open/close cycles", async () => {
+		// Regression for the editor-lifecycle half of #4604: opening the
+		// palette used to clear() the container with the live editor attached,
+		// and Container.clear() disposes children terminally — Editor.dispose()
+		// tears down the tab-width change listener. Every restore after that
+		// re-mounted a dead editor whose listener was permanently gone.
+		const host = await createHost();
+		const editor = host.mode.editor;
+		const defaultWidth = getDefaultTabWidth();
+		const otherWidth = defaultWidth === 3 ? 4 : 3;
+		const invalidations = { count: 0 };
+		const originalInvalidate = editor.invalidate.bind(editor);
+		editor.invalidate = () => {
+			invalidations.count += 1;
+			originalInvalidate();
+		};
+		try {
+			editor.setText("");
+			await Promise.resolve();
+			let previousCount = 0;
+			for (let index = 0; index < 3; index += 1) {
+				const palette = await openPalette(host);
+				palette.handleInput("\u001b");
+				await waitFor(() => host.mode.editorContainer.children[0] === editor, "the composer to be restored");
+				setDefaultTabWidth(otherWidth);
+				setDefaultTabWidth(defaultWidth);
+				// Each cycle's tab-width toggles reached a live listener. After
+				// the old clear()-dispose bug, cycle 2+ contributed nothing.
+				expect(invalidations.count).toBeGreaterThan(previousCount + 1);
+				previousCount = invalidations.count;
+			}
+
+			// The restored composer still accepts input.
+			editor.handleInput("x");
+			expect(editor.getText()).toBe("x");
+		} finally {
+			setDefaultTabWidth(defaultWidth);
 		}
 	});
 
