@@ -173,4 +173,31 @@ describe("ModelRegistry oMLX Discovery", () => {
 		expect(registry.find("omlx", "valid-model")?.contextWindow).toBe(131072);
 		expect(registry.find("omlx", "valid-model")?.maxTokens).toBe(8192);
 	});
+	test("marks discovered oMLX models as reasoning with low/medium/high effort", async () => {
+		using _hook = hookFetch(input => {
+			if (!String(input).includes(":8080/v1/models")) return new Response(null, { status: 404 });
+			return new Response(
+				JSON.stringify({
+					data: [{ id: "Qwen3.6-35B-A3B-8bit", max_model_len: 262144 }],
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh();
+
+		const model = registry.find("omlx", "Qwen3.6-35B-A3B-8bit");
+		expect(model?.reasoning).toBe(true);
+		expect(model?.thinking).toMatchObject({
+			mode: "effort",
+			minLevel: "low",
+			maxLevel: "high",
+			defaultLevel: "medium",
+		});
+		expect(model?.compat).toMatchObject({
+			supportsReasoningEffort: true,
+			thinkingFormat: "qwen-chat-template",
+		});
+	});
 });

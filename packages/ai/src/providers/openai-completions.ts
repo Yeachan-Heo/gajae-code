@@ -1398,8 +1398,12 @@ function buildParams(
 		// Qwen uses top-level enable_thinking: boolean
 		params.enable_thinking = !!options?.reasoning && !options?.disableReasoning;
 	} else if (supportsReasoningParams && compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
+		const enableThinking = !!options?.reasoning && !options?.disableReasoning;
 		params.chat_template_kwargs = {
-			enable_thinking: !!options?.reasoning && !options?.disableReasoning,
+			enable_thinking: enableThinking,
+			...(enableThinking && options?.reasoning
+				? { reasoning_effort: mapReasoningEffort(options.reasoning, compat.reasoningEffortMap) }
+				: {}),
 		};
 	} else if (supportsReasoningParams && compat.thinkingFormat === "openrouter" && model.reasoning) {
 		// OpenRouter normalizes reasoning across providers via a nested reasoning object.

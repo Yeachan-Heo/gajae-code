@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- oMLX OpenAI-compatible completions now send `chat_template_kwargs.reasoning_effort` with `enable_thinking` when `thinkingFormat` is `qwen-chat-template`. Discovered oMLX models are treated as reasoning models with `low`/`medium`/`high` effort so local Qwen presets can differentiate roles without swapping weights.
 
 ## [0.14.0] - 2026-08-17
 - Cursor native tool calls (shell/read/write/… oneof variants) now convert their protobuf payloads into plain JSON-safe data before attaching them as toolCall `arguments`: `$typeName` markers are stripped, safe-range bigints become numbers (decimal strings beyond `Number.MAX_SAFE_INTEGER`), byte arrays become base64 strings, and cycles/functions collapse to null. Raw protobuf-es payloads carry `bigint` fields (`fileSize`, `durationMs`, `fileOutputThresholdBytes`, …) that defeat `JSON.stringify`, which broke managed snapshot staging, JSONL transcript persistence, and provider replay — the issue #4578 local-snapshot producer defect class fixed at its producer boundary.

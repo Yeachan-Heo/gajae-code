@@ -685,6 +685,13 @@ const commandCodeGoatModels = new Set([
 	"deepseek/deepseek-v4-pro",
 	"moonshotai/Kimi-K3",
 ]);
+const macosOmlxModels = new Set([
+	"Qwen3.6-35B-A3B-4bit",
+	"Qwen3.6-35B-A3B-8bit",
+	"Qwen3.6-35B-A3B-bf16",
+	"Qwen3.8-27B-Abliterated-MLX-4bit",
+	"Qwen3.8-27B-Abliterated-MLX-6bit",
+]);
 
 function selectorExists(selector: string): boolean {
 	const selectorWithoutThinking = splitSelectorThinkingSuffix(selector).selector;
@@ -698,7 +705,7 @@ function selectorExists(selector: string): boolean {
 	if (!parsed) return false;
 	if (parsed.provider === "grok-build") return ["grok-composer-2.5-fast", "grok-build"].includes(parsed.id);
 	if (parsed.provider === "commandcode-goat") return commandCodeGoatModels.has(parsed.id);
-	if (parsed.provider === "omlx") return true;
+	if (parsed.provider === "omlx") return macosOmlxModels.has(parsed.id);
 	return (modelsJson as Record<string, Record<string, unknown>>)[parsed.provider]?.[parsed.id] !== undefined;
 }
 
