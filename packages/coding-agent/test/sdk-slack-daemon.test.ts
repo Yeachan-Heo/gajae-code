@@ -2427,7 +2427,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					expect(
 						await Promise.race([
 							retirement.then(() => "retired" as const),
-							Bun.sleep(100).then(() => "blocked" as const),
+							// Liveness bound, not a latency assertion: the guarded failure mode is
+							// retirement blocking indefinitely on the held journal lock. 100ms was
+							// routinely exceeded by healthy retirement on loaded CI shard runners.
+							Bun.sleep(2000).then(() => "blocked" as const),
 						]),
 					).toBe("retired");
 
