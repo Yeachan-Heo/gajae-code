@@ -2383,9 +2383,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					),
 				};
 				if (Object.keys(mergedConfigs).length > 0) {
-					const owned = new MCPManager(cwd, await openMcpToolCache(agentDir, cwd), {
-						sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
-					});
+					// The session's effective profile, not this scope's `agentDir` default:
+					// an SDK caller can inject Settings for profile B while omitting
+					// `options.agentDir`, and `AgentSession` would then run under B while the
+					// cache read and wrote the default profile's database.
+					const owned = new MCPManager(
+						cwd,
+						await openMcpToolCache(options.agentDir ?? settings.getAgentDir(), cwd),
+						{
+							sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
+						},
+					);
 					owned.setAuthStorage(authStorage);
 					cleanupOwnedMcpManager = () => owned.disconnectAll();
 					try {
@@ -3857,7 +3865,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// the deferred exact-config path below.
 				const ownedManager = mcpManager;
 				let latePublication: Promise<void> = Promise.resolve();
-				ownedManager.setOnToolsChanged(tools => {
+				const publishOwnedTools = (tools: readonly { name: string; mcpServerName?: string }[]): void => {
 					if (session.isDisposed) return;
 					const alwaysOnNames = tools.filter(tool => tool.mcpServerName !== undefined).map(tool => tool.name);
 					// Serialized: two servers landing together must not interleave a
@@ -3865,7 +3873,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					latePublication = latePublication
 						.then(async () => {
 							if (session.isDisposed) return;
-							await session.refreshMCPTools(tools as CustomTool[]);
+							await session.refreshMCPTools(ownedManager.getTools() as CustomTool[]);
 							if (session.isDisposed || alwaysOnNames.length === 0) return;
 							await session.activateDiscoveredTools(alwaysOnNames);
 						})
@@ -3874,7 +3882,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								error: safeErrorForLog(error),
 							});
 						});
-				});
+				};
+				ownedManager.setOnToolsChanged(publishOwnedTools);
+				// Registration only installs a *future* callback. A pending server can
+				// land between `connectServers()` returning and this line, replacing the
+				// manager's tools while nobody is listening; the session would then miss
+				// them permanently even though the manager holds them. Replaying the
+				// current snapshot through the same serialized path closes that window and
+				// is a no-op when nothing landed.
+				publishOwnedTools(ownedManager.getTools());
 			}
 			// Wire prompt refresh → rebuild MCP prompt slash commands.
 			// Unlike the tools callback above this one IS reached for session-owned

@@ -220,6 +220,30 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	// `setOnToolsChanged` only installs a future callback. A server that lands
+	// between `connectServers()` returning and that registration would otherwise
+	// update the manager with nobody listening, and the session would miss it for
+	// good. A very short delay puts the landing inside that window.
+	it("does not lose a server that lands while the tools callback is still being registered", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow",
+			commandArgs: [process.execPath, "-e", delayedMcpServerScript(320)],
+			flags: { project: true, timeout: 10_000 },
+			cwd: projectDir,
+		});
+
+		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+		try {
+			await waitFor(() => mcpManager?.getTools().some(tool => tool.name === "mcp__slow_hello") === true);
+			// Whether the landing beat the registration or not, the session must end up
+			// holding what the manager holds.
+			await waitFor(() => session.getActiveToolNames().includes("mcp__slow_hello"));
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("keeps fast tools active while a slow sibling lands later in the same session", async () => {
 		await runMCPCommand({
 			action: "add",

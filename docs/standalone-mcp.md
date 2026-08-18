@@ -30,9 +30,27 @@ Malformed or unparseable definitions are skipped fail-closed: they are never par
 
 Pass `--no-mcp` to skip conventional autoload for one session (plugin-bundle MCPs and exact-file `--mcp-config` remain governed by their own surfaces). `--no-mcp` and `--mcp-config` are mutually exclusive.
 
+### Startup wait and the declared connection window
+
+Session start never blocks on a slow server: GJC waits a short, fixed budget for the batch and then continues. That budget elapsing is not a verdict on any server.
+
+`gjc mcp add <name> --timeout <ms>` declares how long *that server* may take to connect. A server still inside its declared window keeps connecting in the background under its own timeout and is reported as connecting, not failed; when it lands, its tools are registered in the session that started it. A server that declared no window, or has already spent it, is disconnected and reported as a startup timeout. Exact-file (`--mcp-config`) startup always fails fast instead, because it builds its catalog once.
+
+The declared timeout is the budget for connecting *and* for the server's initial `tools/list`, matching how the same value already bounds every other request to that server.
+
+### Deferred tools and the startup cache
+
+Once a server's tool list has been observed, GJC can surface it at the next start before that server finishes connecting; the first call waits for the connection. The cache behind this is deliberately narrow:
+
+- It is scoped to the session's agent profile **and** its project, so another profile or workspace can never replay a server's tool descriptions.
+- Entries are bound to the credentials the connection actually authenticated with, not to the config template, so rotating a key or changing a resolved header does not reuse the previous identity's catalog. While that identity is still unresolved, GJC surfaces nothing rather than guessing.
+- A catalog the server marks private is never stored, and observing a private result also removes any entry a previous public result left behind.
+- A server-supplied freshness deadline shortens retention below the default.
+- If a deferred server's connection later fails, its tools are withdrawn and its entry dropped rather than left advertising calls that cannot succeed.
+
 ### Subagents and lifecycle
 
-Top-level sessions own their MCP manager and clean up server processes on session end. Subagents inherit the parent session's manager facade: they never spawn duplicate server processes and never take ownership of cleanup.
+Top-level sessions own their MCP manager and clean up server processes on session end, including connections still in flight. Subagents inherit the parent session's manager facade: they never spawn duplicate server processes and never take ownership of cleanup.
 
 ## Use an explicit config
 
