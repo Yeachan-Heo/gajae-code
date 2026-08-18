@@ -11,6 +11,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import type { AssistantMessage, Model } from "@gajae-code/ai/core";
+import { parseModelPattern } from "../src/config/model-resolver";
 import {
 	formatProviderSafetyStopDisplayError,
 	formatProviderSafetyStopHint,
@@ -18,6 +19,7 @@ import {
 	refusingModelSelector,
 	resolveProviderSafetyStopHint,
 	resolveSafetyStopAlternateSelector,
+	sanitizeModelSelectorForDisplay,
 } from "../src/session/provider-safety-stop-hint";
 
 function makeAssistant(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
@@ -178,6 +180,89 @@ describe("resolveSafetyStopAlternateSelector", () => {
 			),
 		).toBeUndefined();
 	});
+	it("reconstructs the selector from the resolved model, never the unresolved entry (#4653 review)", () => {
+		// A bare entry still names its resolved model as a provider-qualified
+		// selector, so the advertised /model command pins exactly the model that
+		// was validated.
+		expect(resolveSafetyStopAlternateSelector("anthropic/claude-fable-5", ["claude-opus-5"], catalog)).toBe(
+			"anthropic/claude-opus-5",
+		);
+		// A substring entry resolves through fuzzy matching onto its dated
+		// variant, and the hint must name that concrete variant.
+		const fuzzyCatalog: Model[] = [
+			{ provider: "openai", id: "gpt-5-turbo", input: ["text"], api: "openai-completions" } as unknown as Model,
+			{
+				provider: "anthropic",
+				id: "claude-fable-5",
+				input: ["text"],
+				api: "anthropic-messages",
+			} as unknown as Model,
+		];
+		expect(resolveSafetyStopAlternateSelector("anthropic/claude-fable-5", ["turbo"], fuzzyCatalog)).toBe(
+			"openai/gpt-5-turbo",
+		);
+	});
+
+	it("never routes an ambiguous cross-provider entry back to the refusing provider (#4653 review)", () => {
+		// The hint resolver runs without usage-preference context; the real
+		// /model command resolves with model usage order. When the same bare ID
+		// exists under two providers, the two resolvers can disagree about which
+		// provider it means: without usage order the deprioritization ranking
+		// picks one, with the refuser's provider first in usage order the real
+		// command picks the other — the refusing provider itself.
+		const ambiguousId = "shared-model";
+		const ambiguousCatalog: Model[] = [
+			{ provider: "anthropic", id: ambiguousId, input: ["text"], api: "anthropic-messages" } as unknown as Model,
+			{
+				provider: "openai",
+				id: ambiguousId,
+				input: ["text", "image"],
+				api: "openai-completions",
+			} as unknown as Model,
+		];
+		// The refusing model is anthropic/shared-model. The ambiguous chain
+		// entry is the bare ID "shared-model".
+		//
+		// 1) What the OLD behavior advertised: the raw entry "shared-model".
+		//    Pasting `/model shared-model` resolves under usage-preference
+		//    context where "anthropic/shared-model" is most recent — straight
+		//    back to the refusing provider.
+		// 2) What the fixed hint advertises: the provider-qualified selector of
+		//    the model validated here, which is NOT the refuser. Pasting that
+		//    command is an exact pin and can never re-select the refuser.
+		const advertised = resolveSafetyStopAlternateSelector(
+			`anthropic/${ambiguousId}`,
+			[ambiguousId],
+			ambiguousCatalog,
+		);
+		expect(advertised).toBeDefined();
+		expect(advertised).not.toBe(ambiguousId);
+
+		// Prove the divergence premise: the entry resolves differently under
+		// the real /model command's usage-preference context (usage order
+		// headed by the refusing provider) than under the hint resolver.
+		const underUsage = parseModelPattern(ambiguousId, ambiguousCatalog, {
+			usageOrder: [`anthropic/${ambiguousId}`, `openai/${ambiguousId}`],
+		});
+		const withoutUsage = parseModelPattern(ambiguousId, ambiguousCatalog, undefined);
+		expect(underUsage.model?.provider).toBe("anthropic");
+		expect(withoutUsage.model?.provider).toBe("openai");
+		expect(withoutUsage.model?.provider).not.toBe(underUsage.model?.provider);
+
+		// The hint must never name the refusing provider's ambiguous twin.
+		expect(advertised).not.toContain("anthropic");
+		// And it must be a provider-qualified exact pin.
+		expect(advertised?.startsWith("openai/")).toBe(true);
+
+		// Re-resolving the advertised selector under the usage-preference
+		// context that favors the refusing provider still pins the validated
+		// model: the advertised command can never route back to the refuser.
+		const reResolved = parseModelPattern(advertised ?? "", ambiguousCatalog, {
+			usageOrder: [`anthropic/${ambiguousId}`, `openai/${ambiguousId}`],
+		});
+		expect(reResolved.model?.provider).toBe("openai");
+		expect(reResolved.model?.provider).not.toBe("anthropic");
+	});
 
 	it("falls back to static guidance when the refuser itself does not resolve", () => {
 		expect(
@@ -260,5 +345,59 @@ describe("formatProviderSafetyStopDisplayError", () => {
 				undefined,
 			),
 		).toBeUndefined();
+	});
+});
+
+describe("sanitizeModelSelectorForDisplay (#4653 review)", () => {
+	it("keeps ordinary selectors unchanged", () => {
+		expect(sanitizeModelSelectorForDisplay("anthropic/claude-opus-5")).toBe("anthropic/claude-opus-5");
+	});
+
+	it("strips ANSI escape sequences from custom model ids", () => {
+		expect(sanitizeModelSelectorForDisplay("\x1b[31mred\x1b[0m/model")).toBe("red/model");
+		expect(sanitizeModelSelectorForDisplay("provider/id\x1b]0;title\x07")).toBe("provider/id");
+	});
+
+	it("removes other control characters", () => {
+		expect(sanitizeModelSelectorForDisplay("pro\x00vider/id")).toBe("provider/id");
+		expect(sanitizeModelSelectorForDisplay("pro\x07vider/id")).toBe("provider/id");
+		expect(sanitizeModelSelectorForDisplay("provider\r/id")).toBe("provider/id");
+	});
+
+	it("replaces tabs with single spaces, never tab-expands", () => {
+		expect(sanitizeModelSelectorForDisplay("pro\tvider/id")).toBe("pro vider/id");
+		expect(sanitizeModelSelectorForDisplay("a\t\tb")).toBe("a  b");
+	});
+
+	it("removes Unicode format controls (bidi overrides, zero-width joiners) from custom model ids (#4653 QA red-team)", () => {
+		const hostile = "safe\u200Dmodel\u202Eroute";
+		const safe = sanitizeModelSelectorForDisplay(hostile);
+		expect(safe).toBe("safemodelroute");
+		expect(safe).not.toMatch(/\p{Cf}/u);
+		const hint = formatProviderSafetyStopHint(hostile);
+		expect(hint).not.toMatch(/\p{Cf}/u);
+		expect(hint).toContain("safemodelroute");
+	});
+
+	it("bounds unbounded custom model ids to the shared display limit", () => {
+		const longId = `${"a".repeat(500)}/model`;
+		const bounded = sanitizeModelSelectorForDisplay(longId);
+		expect(Bun.stringWidth(bounded)).toBeLessThanOrEqual(64);
+		expect(bounded.startsWith("aaa")).toBe(true);
+	});
+
+	it("never emits control characters or tabs for hostile input", () => {
+		const hostile = "\t\x1b[2J\x1b[?25lprovider/id:x\t\b\x0b";
+		const safe = sanitizeModelSelectorForDisplay(hostile);
+		expect(safe).not.toMatch(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/u);
+		expect(safe).not.toContain("\t");
+	});
+
+	it("is applied by the hint formatter so both render surfaces share it", () => {
+		const hostile = "\x1b[1manthropic\x1b[0m/claude-opus-5:x\t";
+		const hint = formatProviderSafetyStopHint(hostile);
+		expect(hint).toContain('"anthropic/claude-opus-5:x" —');
+		expect(hint).toContain("/model anthropic/claude-opus-5:x.");
+		expect(hint).not.toContain("\x1b");
 	});
 });

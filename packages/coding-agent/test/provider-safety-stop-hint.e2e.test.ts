@@ -18,7 +18,7 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import {
-	formatProviderSafetyStopHint,
+	formatProviderSafetyStopDisplayError,
 	resolveProviderSafetyStopHint,
 } from "@gajae-code/coding-agent/session/provider-safety-stop-hint";
 import { TempDir } from "@gajae-code/utils";
@@ -150,9 +150,11 @@ describe("provider safety stop hint e2e (#4650)", () => {
 		expect(hint).toContain("/model openai/gpt-4o-mini");
 		expect(hint).toContain("not guaranteed");
 
-		// And the composed display line keeps the raw refusal first.
-		const display = formatProviderSafetyStopHint("openai/gpt-4o-mini");
-		expect(display.length).toBeGreaterThan(0);
+		// And the composed display error is exactly the raw refusal first,
+		// then the hint — pinned as composition, not mere non-emptiness.
+		const display = formatProviderSafetyStopDisplayError(last as AssistantMessage, "openai/gpt-4o-mini");
+		expect(display).toBe(`${refusal}\n${hint}`);
+		expect(display?.startsWith(refusal)).toBe(true);
 	});
 
 	it("falls back to bounded static guidance when no alternate is configured", async () => {

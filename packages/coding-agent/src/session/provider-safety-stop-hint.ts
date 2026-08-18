@@ -1,4 +1,6 @@
 import type { AssistantMessage, Model } from "@gajae-code/ai/core";
+import { truncateToWidth } from "@gajae-code/tui";
+import { sanitizeText } from "@gajae-code/utils";
 import { resolveSelector } from "../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../config/model-selector-value";
 import { splitSelectorThinkingSuffix } from "../thinking";
@@ -10,6 +12,32 @@ import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
  */
 const MODEL_SWITCH_COMMAND = "/model";
 
+/**
+ * Hard display bound for the model selector interpolated into the hint. Custom
+ * and discovered model IDs are user/config-controlled strings, so the hint must
+ * stay bounded no matter how long or hostile the configured entry is.
+ */
+const MODEL_SELECTOR_MAX_DISPLAY_WIDTH = 64;
+
+/**
+ * Unicode format characters (Cf): zero-width joiners/spaces, bidi overrides,
+ * soft hyphens. `sanitizeText` covers ANSI and C0/C1/DEL but not these, and a
+ * bidi override inside a custom model ID could visually reorder the hint line.
+ */
+const UNICODE_FORMAT_RE = /\p{Cf}/gu;
+
+/**
+ * Normalize a model selector for display: strip ANSI escape sequences and
+ * control characters, remove Unicode format characters, replace tabs with
+ * spaces, and bound the width. One shared implementation so the TUI render and
+ * the print-mode stderr render interpolate the identical safe value (#4653
+ * review: centralize selector sanitization instead of leaving each surface to
+ * bound itself).
+ */
+export function sanitizeModelSelectorForDisplay(selector: string): string {
+	const withoutControl = sanitizeText(selector.replaceAll("\t", " ").trim()).replace(UNICODE_FORMAT_RE, "");
+	return truncateToWidth(withoutControl, MODEL_SELECTOR_MAX_DISPLAY_WIDTH);
+}
 /**
  * Session capabilities the hint resolver reads. Everything is optional so
  * lightweight host/test contexts without model plumbing degrade to the static
@@ -50,8 +78,16 @@ export function refusingModelSelector(message: AssistantMessage): string | undef
  * it (`resolveSelector` with `allowInvalidThinkingSelectorFallback: false`, so
  * malformed suffixes like `:bogus` fail closed while route-suffixed IDs keep
  * their exact-ID semantics) AND the concrete model it resolves to differs from
- * the refuser. The named entry is the chain entry itself, so the suggested
- * `/model` command is one the resolver actually parses.
+ * the refuser.
+ *
+ * The returned selector is RECONSTRUCTED from the resolved model — always
+ * `provider/id` qualified, never the original entry (#4653 review: the hint
+ * resolver runs without usage-preference context, so a bare/fuzzy/glob entry
+ * that resolves here can paste-resolve differently under the real `/model`
+ * command's usage-preference context; a provider-qualified selector pins the
+ * advertised command to exactly the model that was validated). Only a thinking
+ * suffix that itself validated is carried over, so the suggested command is one
+ * the resolver parses with identical semantics.
  */
 export function resolveSafetyStopAlternateSelector(
 	refuserSelector: string | undefined,
@@ -74,17 +110,24 @@ export function resolveSafetyStopAlternateSelector(
 	for (const entry of entries) {
 		const resolved = resolveSelector(entry, candidates, {
 			allowInvalidThinkingSelectorFallback: false,
-		}).model;
+		});
 		// Only offer entries the resolver fully accepts, and never the refuser
 		// itself (a bare thinking-level change is not an alternate model).
-		if (!resolved) continue;
+		const resolvedModel = resolved.model;
+		if (!resolvedModel) continue;
 		if (
-			resolved.provider === refuserParsed.provider &&
-			splitSelectorThinkingSuffix(resolved.id).selector === refuserBaseId
+			resolvedModel.provider === refuserParsed.provider &&
+			splitSelectorThinkingSuffix(resolvedModel.id).selector === refuserBaseId
 		) {
 			continue;
 		}
-		return entry;
+		// Reconstruct from the resolved model: a provider-qualified selector is
+		// exact-pin semantics in every resolver context, so the advertised
+		// command names the model that was actually validated here. The resolved
+		// model's own id is kept verbatim (route suffixes in `id` are legal).
+		return resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined
+			? `${resolvedModel.provider}/${resolvedModel.id}:${resolved.thinkingLevel}`
+			: `${resolvedModel.provider}/${resolvedModel.id}`;
 	}
 	return undefined;
 }
@@ -99,8 +142,9 @@ export function resolveSafetyStopAlternateSelector(
 export function formatProviderSafetyStopHint(alternateSelector: string | undefined): string {
 	const head =
 		"Provider safety stop: the provider refused this request and the turn ended without retry. Such refusals are often specific to the (model, context) pair — this conversation is not necessarily at fault and does not need to be discarded.";
-	const tail = alternateSelector
-		? `The session can continue after a manual model switch. Your default model chain also contains "${alternateSelector}" — to try it, run: ${MODEL_SWITCH_COMMAND} ${alternateSelector}. Success is not guaranteed, but the same context frequently works on a different model.`
+	const safeSelector = alternateSelector ? sanitizeModelSelectorForDisplay(alternateSelector) : undefined;
+	const tail = safeSelector
+		? `The session can continue after a manual model switch. Your default model chain also contains "${safeSelector}" — to try it, run: ${MODEL_SWITCH_COMMAND} ${safeSelector}. Success is not guaranteed, but the same context frequently works on a different model.`
 		: `The session can continue after a manual model switch: run ${MODEL_SWITCH_COMMAND} <provider/model> or open the model selector with ${MODEL_SWITCH_COMMAND}.`;
 	return `${head} ${tail}`;
 }
