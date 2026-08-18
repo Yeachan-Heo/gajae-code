@@ -95,6 +95,38 @@ function cacheKey(serverName: string): string {
 	return `${CACHE_PREFIX}${serverName}`;
 }
 
+/**
+ * Per-row mutation ordering, shared across every `MCPToolCache` over the same
+ * storage object.
+ *
+ * Ordinary sessions each construct their own `MCPManager`, and each manager
+ * serializes only its own writes. An older manager's detached public `set()`
+ * could therefore land after a second manager's `delete()` for a private
+ * result or terminal failure, resurrecting exactly the replayable row the
+ * delete retired. The queue is keyed by the storage instance itself (one
+ * `AgentStorage.open()` per profile database per process), so all managers
+ * over one database share one order.
+ */
+const storageScope = new WeakMap<AgentStorage, Map<string, Promise<void>>>();
+
+/**
+ * Serializes `mutation` against every other mutation for the same
+ * storage+server row, across cache instances and managers.
+ */
+function enqueueCacheMutation(storage: AgentStorage, serverName: string, mutation: () => Promise<void>): Promise<void> {
+	const rows = storageScope.get(storage) ?? new Map<string, Promise<void>>();
+	storageScope.set(storage, rows);
+	const previous = rows.get(serverName) ?? Promise.resolve();
+	const next = previous
+		.catch(() => {})
+		.then(mutation)
+		.finally(() => {
+			if (rows.get(serverName) === next) rows.delete(serverName);
+		});
+	rows.set(serverName, next);
+	return next;
+}
+
 export class MCPToolCache {
 	/**
 	 * `storage` must already be scoped to the caller's effective agent profile;
@@ -147,8 +179,12 @@ export class MCPToolCache {
 
 	/** Drop a server's entry so a dead surface cannot replay until its TTL. */
 	async delete(serverName: string): Promise<void> {
-		// Expiring in the past is the only removal the cache interface exposes.
-		this.storage.setCache(cacheKey(serverName), "", Math.floor(Date.now() / 1000) - 1);
+		// Serialized at the storage boundary so a concurrent public write from any
+		// manager sharing this row cannot land after this retraction.
+		await enqueueCacheMutation(this.storage, serverName, async () => {
+			// Expiring in the past is the only removal the cache interface exposes.
+			this.storage.setCache(cacheKey(serverName), "", Math.floor(Date.now() / 1000) - 1);
+		});
 	}
 
 	/**
@@ -188,6 +224,8 @@ export class MCPToolCache {
 
 		const defaultExpiryMs = Date.now() + CACHE_TTL_MS;
 		const expiresAtSec = Math.floor(Math.min(defaultExpiryMs, freshUntilMs ?? defaultExpiryMs) / 1000);
-		this.storage.setCache(cacheKey(serverName), serialized, expiresAtSec);
+		await enqueueCacheMutation(this.storage, serverName, async () => {
+			this.storage.setCache(cacheKey(serverName), serialized, expiresAtSec);
+		});
 	}
 }

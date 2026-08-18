@@ -242,10 +242,12 @@ setInterval(() => {}, 1000);
 				{},
 			);
 
-			// Startup returned at the short default ceiling rather than waiting for
-			// the 2.2s handshake behind a 5s configured timeout.
 			expect(result.connectedServers).toEqual([]);
-			expect(Date.now() - startedAt).toBeLessThan(2_200);
+			// Startup returned at the short default ceiling (1.75s + scheduling
+			// margin) rather than waiting for the 2.2s handshake behind a 5s
+			// configured timeout. The bound is pinned near the ceiling so a
+			// ceiling regression cannot hide under a loose handshake budget.
+			expect(Date.now() - startedAt).toBeLessThan(1_900);
 			// The 5s window the operator declared has not elapsed, so the gateway is
 			// still connecting rather than reported as a startup failure.
 			expect(result.errors.has("slow-gateway")).toBe(false);

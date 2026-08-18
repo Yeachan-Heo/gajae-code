@@ -3,12 +3,11 @@
  *
  * Integrates MCP tool discovery with the custom tools system.
  */
-import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import { AgentStorage } from "../session/agent-storage";
 import type { AuthStorage } from "../session/auth-storage";
-import { type MCPLoadResult, MCPManager } from "./manager";
+import { canonicalMCPWorkingDirectory, type MCPLoadResult, MCPManager } from "./manager";
 import { MCPToolCache } from "./tool-cache";
 
 /** Result from loading MCP tools */
@@ -69,7 +68,7 @@ async function resolveToolCache(storage: AgentStorage | null | undefined, scope:
  * @returns MCP tools in LoadedCustomTool format for integration
  */
 export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoadOptions): Promise<MCPToolsLoadResult> {
-	const toolCache = await resolveToolCache(options?.cacheStorage, path.resolve(cwd));
+	const toolCache = await resolveToolCache(options?.cacheStorage, canonicalMCPWorkingDirectory(cwd));
 	const manager = new MCPManager(cwd, toolCache, { sharedPoolIdleMs: options?.sharedPoolIdleMs });
 	if (options?.authStorage) {
 		manager.setAuthStorage(options.authStorage);

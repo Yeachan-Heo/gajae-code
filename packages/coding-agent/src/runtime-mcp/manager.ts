@@ -218,7 +218,13 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-function canonicalMCPWorkingDirectory(candidate: string): string {
+/**
+ * Physical project identity: resolved, with symlinks followed. Exported so the
+ * legacy loader derives its cache scope from the same identity `MCPManager`
+ * uses; a lexical path that stays stable across a symlink repoint must not keep
+ * hitting the previous project's cache entries.
+ */
+export function canonicalMCPWorkingDirectory(candidate: string): string {
 	const absolute = path.resolve(candidate);
 	try {
 		return realpathSync.native(absolute);
@@ -1418,11 +1424,14 @@ export class MCPManager {
 	 * replay the same dead surface on the next start until its TTL expires.
 	 */
 	/**
-	 * Cache mutations for one server, in the order they were issued.
+	 * Cache mutations for one server, in issue order within this manager.
 	 *
-	 * Writes are launched detached from the connection that produced them, so an
-	 * older public write could otherwise land after a private result or a terminal
-	 * failure had already deleted the row and resurrect a replayable entry.
+	 * Ordering *across* managers sharing the same cache row is enforced at the
+	 * storage boundary inside `MCPToolCache` itself (keyed by the shared
+	 * `AgentStorage` instance), which is the boundary ordinary sessions actually
+	 * share: each session builds its own manager over the same profile/project
+	 * cache, so per-manager serialization alone cannot stop an older detached
+	 * public write from landing after a newer invalidation.
 	 */
 	#queueCacheOperation(name: string, operation: () => Promise<void>): void {
 		const previous = this.#cacheOperations.get(name) ?? Promise.resolve();

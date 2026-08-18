@@ -370,6 +370,59 @@ describe("MCP startup and the declared connection window", () => {
 		}
 	});
 
+	// The declared window is one budget for the handshake *and* initial
+	// discovery: a server that initializes promptly and then stalls `tools/list`
+	// must be abandoned at that same deadline, not stay pending forever on the
+	// per-request timeout alone.
+	test("abandons a server that finishes its handshake and then stalls tools/list", async () => {
+		const stallServer = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'stalled-discovery', version: '1' } } }) + '\\n');
+  } else if (msg.method === 'tools/list') {
+    // Initialize answered immediately; discovery never answers at all.
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+		const manager = new MCPManager(process.cwd());
+		try {
+			const startedAt = Date.now();
+			const result = await manager.connectServers(
+				{
+					stalled: {
+						command: process.execPath,
+						args: ["-e", stallServer],
+						// Generous handshake budget that discovery alone must consume.
+						timeout: 2_000,
+					},
+				},
+				{},
+			);
+
+			// Startup stays bounded by the short ceiling, the server is left
+			// connecting, and the unspent window bounds the stalled discovery: the
+			// connection is torn down shortly after the declared window closes
+			// rather than hanging on the request timeout.
+			expect(Date.now() - startedAt).toBeLessThan(2_400);
+			expect(result.connectedServers).toEqual([]);
+			expect(result.tools).toEqual([]);
+			const deadline = Date.now() + 6_000;
+			while (Date.now() < deadline && manager.getConnectionStatus("stalled") !== "disconnected") {
+				await Bun.sleep(20);
+			}
+			expect(manager.getConnectionStatus("stalled")).toBe("disconnected");
+			expect(manager.getTools()).toEqual([]);
+		} finally {
+			await manager.disconnectAll();
+		}
+	}, 20_000);
+
 	test("reports a server whose own declared timeout rejects it before the startup wait ends", async () => {
 		const manager = new MCPManager(process.cwd());
 		try {
@@ -392,5 +445,45 @@ describe("MCP startup and the declared connection window", () => {
 		} finally {
 			await manager.disconnectAll();
 		}
+	});
+
+	test("serializes cache mutations across managers sharing one storage row", async () => {
+		const config = { type: "stdio", command: "shared", args: [] } as never;
+		const tools = [{ name: "ping", inputSchema: { type: "object" } }] as never;
+		const order: string[] = [];
+		const rows = new Map<string, string>();
+		// A deferred store: each caller controls when a mutation actually lands.
+		const gates: Array<() => void> = [];
+		const storage = {
+			getCache: (key: string) => rows.get(key) ?? null,
+			setCache: (key: string, value: string, _expiresAtSec: number) => {
+				const index = order.length;
+				order.push(`write:${index}`);
+				gates.push(() => rows.set(key, value));
+			},
+		} as never;
+		// Two cache instances over one storage object, as two sessions produce.
+		const first = new MCPToolCacheClass(storage, "/work/project");
+		const second = new MCPToolCacheClass(storage, "/work/project");
+
+		// Manager A issues a slow public write; manager B invalidates while that
+		// write is still in flight. Per-manager queues would let A's write land
+		// after B's delete and resurrect the retired row.
+		const write = first.set("shared", config, tools, "cred");
+		await Bun.sleep(10);
+		const remove = second.delete("shared");
+		await Bun.sleep(10);
+
+		void write;
+		void remove;
+		// Drain the queue: every enqueued mutation runs in issue order.
+		await Bun.sleep(50);
+		for (const release of gates) release();
+
+		// The set was issued first, the delete second: the tombstone must be the
+		// last mutation for the row, so a read cannot see the resurrected catalog.
+		const raw = (storage as { getCache(key: string): string | null }).getCache("mcp_tools:shared");
+		// The tombstone is an empty string; a resurrected catalog would be JSON.
+		expect(raw === null || raw === "").toBe(true);
 	});
 });
