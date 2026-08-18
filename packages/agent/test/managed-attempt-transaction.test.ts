@@ -1144,6 +1144,75 @@ describe("managed attempt transaction", () => {
 		expect(surfaced[0]?.transportFailure).toBeUndefined();
 	});
 
+	it("completes a long managed stream by reclaiming superseded increments instead of failing", async () => {
+		// Regression: every staged frame carries the WHOLE accumulated partial
+		// (once as `message`, once as `assistantMessageEvent.partial`), so staged
+		// bytes grow quadratically with the streamed length. A reasoning-heavy
+		// turn of a few thousand tokens used to cross the 16 MiB cap and kill the
+		// run with "exceeded the provisional event buffer limit", even though no
+		// single event was anywhere near the cap and the attempt itself was
+		// healthy. 200 increments of 1 KiB stage ~40 MiB uncompacted.
+		const deltaCount = 200;
+		const delta = "x".repeat(1024);
+		const fullText = delta.repeat(deltaCount);
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				stream.push({ type: "start", partial });
+				partial.content.push({ type: "text", text: "" });
+				stream.push({ type: "text_start", contentIndex: 0, partial });
+				for (let index = 0; index < deltaCount; index++) {
+					const block = partial.content[0] as { type: "text"; text: string };
+					block.text += delta;
+					stream.push({ type: "text_delta", contentIndex: 0, delta, partial });
+				}
+				stream.push({ type: "text_end", contentIndex: 0, content: fullText, partial });
+				stream.push({ type: "done", reason: "stop", message: partial });
+			});
+			return stream;
+		};
+		const callbacks: AssistantMessageEvent[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+			onAssistantMessageEvent: (_message, event) => callbacks.push(event),
+		});
+		const replayedUpdates: string[] = [];
+		agent.subscribe(event => {
+			if (event.type !== "message_update") return;
+			replayedUpdates.push(event.assistantMessageEvent.type);
+		});
+		let outcomeCalls = 0;
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: () => {
+				outcomeCalls += 1;
+				return { type: "terminal", terminal: { stopReason: "exhausted" } };
+			},
+		} as any);
+		await agent.waitForIdle();
+
+		// The turn completes and commits its whole response.
+		expect(agent.state.error).toBeUndefined();
+		const committed = agent.state.messages.at(-1) as AssistantMessage;
+		expect(committed.role).toBe("assistant");
+		expect(committed.content).toEqual([{ type: "text", text: fullText }]);
+		// A local staging limit is not provider evidence either way: reclaiming
+		// must not report an outcome or consume the fallback chain.
+		expect(outcomeCalls).toBe(0);
+		// Superseded increments were actually reclaimed rather than all replayed.
+		expect(replayedUpdates.filter(type => type === "text_delta").length).toBeLessThan(deltaCount);
+		// Structural frames survive, so the block's complete content is still
+		// delivered on the retained path.
+		expect(replayedUpdates).toContain("text_start");
+		expect(replayedUpdates).toContain("text_end");
+		const textEnd = callbacks.find(event => event.type === "text_end");
+		expect(textEnd).toMatchObject({ type: "text_end", contentIndex: 0, content: fullText });
+	});
+
 	it("retains queued follow-up input when its managed attempt is discarded for retry", async () => {
 		const mock = createMockModel({ responses: [{ content: ["initial"] }, { content: ["retried"] }] });
 		let calls = 0;

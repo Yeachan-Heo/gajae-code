@@ -4528,7 +4528,7 @@ async function getSortedSessions(
 						)
 							return undefined;
 						if (typeof header.version === "number" && header.version >= 4) {
-							for (const patch of await readSessionListTrailingPatches(candidate.path, storage, buffer)) {
+							for (const patch of await readSessionListTrailingPatches(candidate.path, storage)) {
 								applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
 							}
 						}
@@ -6276,7 +6276,13 @@ function extractTextFromContent(content: Message["content"]): string {
 }
 
 const SESSION_LIST_PREFIX_BYTES = 4096;
-const SESSION_LIST_TRAILING_PATCH_BYTES = 4096;
+// Reverse-scan chunk for trailing header patches. Sized independently of the
+// 4 KiB prefix buffer: the scan walks back to BOF whenever a field stays
+// unresolved (#3633), which is the common case because most transcripts carry
+// no header_patch at all. A 4 KiB chunk turned that walk into one read syscall
+// per 4 KiB of transcript and defeated OS readahead, so listing cost scaled
+// with total transcript bytes on every resume.
+const SESSION_LIST_TRAILING_PATCH_BYTES = 64 * 1024;
 const SESSION_NAME_MAX_CHARS = 1_000;
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
@@ -6299,7 +6305,6 @@ async function readSessionListPrefix(file: string, storage: SessionStorage, buff
 async function readSessionListTrailingPatches(
 	file: string,
 	storage: SessionStorage,
-	buffer: Buffer,
 ): Promise<HeaderPatchRecord["patch"][]> {
 	if (!(storage instanceof FileSessionStorage)) {
 		const content = await storage.readText(file);
@@ -6317,8 +6322,15 @@ async function readSessionListTrailingPatches(
 	// window when a field is still missing so a buried but canonically valid
 	// header_patch remains listable without a full sequential JSONL parse (#3633).
 	// Chunks that cannot contain a header_patch marker skip JSON parsing.
+	//
+	// The scan owns its buffer instead of borrowing the caller's 4 KiB prefix
+	// buffer. A transcript with no header_patch at all — the common case, since
+	// only /rename and workspace moves emit one — cannot be recognized without
+	// reaching BOF, so the chunk size sets how many read syscalls a resume costs
+	// per transcript byte.
 	let trailingFragment = Buffer.alloc(0);
-	const chunkSize = Math.min(buffer.byteLength, SESSION_LIST_TRAILING_PATCH_BYTES);
+	const chunkSize = Math.min(size, SESSION_LIST_TRAILING_PATCH_BYTES);
+	const buffer = Buffer.allocUnsafe(chunkSize);
 	const headerPatchMarker = Buffer.from("header_patch");
 	const handle = await fs.promises.open(file, "r");
 	try {
@@ -6518,7 +6530,7 @@ async function collectSessionFromFile(
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
 		if (typeof header.version === "number" && header.version >= 4 && header.version <= CURRENT_SESSION_VERSION) {
-			for (const patch of await readSessionListTrailingPatches(file, storage, buffer)) {
+			for (const patch of await readSessionListTrailingPatches(file, storage)) {
 				applySessionListHeaderPatch(header, patch);
 			}
 		}
