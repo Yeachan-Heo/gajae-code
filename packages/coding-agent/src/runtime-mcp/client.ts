@@ -677,7 +677,11 @@ export async function listTools(
 				const deadline = Date.now() + hints.ttlMs;
 				freshUntil = freshUntil === undefined ? deadline : Math.min(freshUntil, deadline);
 			}
-			if (hints?.cacheScope !== undefined) cacheScope = hints.cacheScope;
+			// Privacy is aggregated conservatively: one private page makes the whole
+			// catalog private. A later public page must not relabel a mixed result as
+			// shareable, because the catalog is cached and replayed as a unit.
+			if (hints?.cacheScope === "private") cacheScope = "private";
+			else if (hints?.cacheScope !== undefined && cacheScope === undefined) cacheScope = hints.cacheScope;
 		});
 	} catch (error) {
 		if (modern && isModernMethodNotFound(error)) return [];

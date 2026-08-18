@@ -36,7 +36,7 @@ import {
 import type { MCPProtocolObservation } from "./protocol";
 import type { MCPToolDetails } from "./tool-bridge";
 import { DeferredMCPTool, MCPTool } from "./tool-bridge";
-import type { MCPToolCache } from "./tool-cache";
+import { credentialFingerprint, type MCPToolCache } from "./tool-cache";
 import { HttpTransport } from "./transports/http";
 import type {
 	MCPGetPromptResult,
@@ -81,6 +81,12 @@ type ConnectionTask = {
 	 * the attempt starts, which is itself "the window has not opened yet".
 	 */
 	connectStartedAt?: number;
+	/**
+	 * Fingerprint of the credentials this attempt resolved. Undefined until auth
+	 * resolution completes, which is itself "the identity is unknown" and must
+	 * fail a cache read closed rather than replaying another identity's catalog.
+	 */
+	credentialFingerprint?: string;
 };
 
 type ScopedOperation = {
@@ -1017,8 +1023,12 @@ export class MCPManager {
 			this.#pendingConnectionControllers.set(name, connectionAbort);
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			let connectStartedAt: number | undefined;
+			let resolvedCredential: string | undefined;
 			const acquireInitialLease = async (): Promise<MCPPoolLease> => {
 				const resolvedConfig = await this.#resolveAuthConfig(config);
+				// Only meaningful when there is a cache to bind an identity to. Skipping it
+				// otherwise also keeps an extra async hop off the cacheless connect path.
+				resolvedCredential = this.toolCache ? await credentialFingerprint(resolvedConfig) : undefined;
 				// Auth resolution is done; the pool opens (or reuses) the transport next,
 				// which is where `connectToServer` starts charging the declared window.
 				// A retry re-stamps because it begins a new attempt.
@@ -1135,6 +1145,9 @@ export class MCPManager {
 				get connectStartedAt() {
 					return connectStartedAt;
 				},
+				get credentialFingerprint() {
+					return resolvedCredential;
+				},
 			};
 			connectionTasks.push(task);
 
@@ -1155,7 +1168,8 @@ export class MCPManager {
 					});
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
-					if (!this.#toolsOnly) void this.#cacheServerTools(name, config, connection, serverTools);
+					if (!this.#toolsOnly)
+						void this.#cacheServerTools(name, config, connection, serverTools, resolvedCredential);
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
@@ -1224,7 +1238,11 @@ export class MCPManager {
 				if (this.toolCache && !this.#toolsOnly) {
 					await Promise.all(
 						pendingTasks.map(async task => {
-							const cached = await this.toolCache?.get(task.name, task.config);
+							// Fail closed while the identity is still unknown: a hit bound to
+							// another credential must never be surfaced as deferred tools.
+							const credential = task.credentialFingerprint;
+							if (credential === undefined) return;
+							const cached = await this.toolCache?.get(task.name, task.config, credential);
 							if (cached) {
 								cachedTools.set(task.name, cached);
 							}
@@ -1415,13 +1433,19 @@ export class MCPManager {
 		config: MCPServerConfig,
 		connection: MCPServerConnection,
 		serverTools: MCPToolDefinition[],
+		credential: string | undefined,
 	): Promise<void> {
 		if (!this.toolCache) return;
 		if (connection.toolsCacheScope === "private") {
-			logger.debug("Skipped MCP tool cache write for a private result", { path: `mcp:${name}` });
+			// Suppressing the write is not enough: a catalog that used to be public
+			// left a row behind, and that row stays replayable until its TTL. Turning
+			// private must retract what the public phase published.
+			logger.debug("Dropped MCP tool cache entry after a private result", { path: `mcp:${name}` });
+			await this.toolCache.delete(name);
 			return;
 		}
-		await this.toolCache.set(name, config, serverTools, connection.toolsFreshUntil);
+		if (credential === undefined) return;
+		await this.toolCache.set(name, config, serverTools, credential, connection.toolsFreshUntil);
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
@@ -2056,6 +2080,7 @@ export class MCPManager {
 		};
 		assertLifecycle();
 		const resolvedConfig = await this.#resolveAuthConfig(config);
+		const resolvedCredential = this.toolCache ? await credentialFingerprint(resolvedConfig) : undefined;
 		assertLifecycle();
 		const connectionAbort = new AbortController();
 		this.#pendingConnectionControllers.set(name, connectionAbort);
@@ -2123,7 +2148,7 @@ export class MCPManager {
 				noReplay: config.sharing === "shared",
 				inputHandler: () => this.#inputRequestHandler ?? undefined,
 			});
-			void this.#cacheServerTools(name, config, connection, serverTools);
+			void this.#cacheServerTools(name, config, connection, serverTools, resolvedCredential);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
 			void this.#loadServerResourcesAndPrompts(name, connection);
@@ -2191,7 +2216,12 @@ export class MCPManager {
 			noReplay: connection.config.sharing === "shared",
 			inputHandler: () => this.#inputRequestHandler ?? undefined,
 		});
-		void this.#cacheServerTools(name, connection.config, connection, serverTools);
+		// The live connection already authenticated, so its resolved config is the
+		// identity this catalog belongs to.
+		const refreshCredential = this.toolCache
+			? await credentialFingerprint(await this.#resolveAuthConfig(connection.config))
+			: undefined;
+		void this.#cacheServerTools(name, connection.config, connection, serverTools, refreshCredential);
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);

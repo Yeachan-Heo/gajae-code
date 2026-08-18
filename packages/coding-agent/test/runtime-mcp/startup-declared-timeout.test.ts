@@ -3,6 +3,7 @@ import * as configValue from "../../src/config/resolve-config-value";
 import * as mcpClient from "../../src/runtime-mcp/client";
 import { MCPManager, withinDeclaredConnectionWindow } from "../../src/runtime-mcp/manager";
 import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
+import { credentialFingerprint, MCPToolCache as MCPToolCacheClass } from "../../src/runtime-mcp/tool-cache";
 import type { MCPServerConnection } from "../../src/runtime-mcp/types";
 
 // `gjc mcp add --timeout` writes a per-server `timeout`, and `connectToServer`
@@ -180,6 +181,116 @@ describe("MCP startup and the declared connection window", () => {
 			expect(deleted).toEqual(["warm"]);
 		} finally {
 			connect.mockRestore();
+			await manager.disconnectAll();
+		}
+	});
+
+	test("drops an existing cache row when a server turns its catalog private", async () => {
+		const deleted: string[] = [];
+		const written: string[] = [];
+		const toolCache = {
+			get: async () => null,
+			set: async (serverName: string) => {
+				written.push(serverName);
+			},
+			delete: async (serverName: string) => {
+				deleted.push(serverName);
+			},
+		} as unknown as MCPToolCache;
+		const connect = vi.spyOn(mcpClient, "connectToServer").mockImplementation(
+			async (name, config) =>
+				({
+					name,
+					config,
+					transport: {
+						close: async () => {},
+						request: async () => ({}),
+						notify: async () => {},
+					},
+					serverInfo: { name: "private-server", version: "1" },
+					capabilities: { tools: {} },
+					protocol: { era: "modern" },
+					toolsCacheScope: "private",
+				}) as never,
+		);
+		const listTools = vi
+			.spyOn(mcpClient, "listTools")
+			.mockResolvedValue([{ name: "ping", inputSchema: { type: "object" } }] as never);
+		const manager = new MCPManager(process.cwd(), toolCache);
+		try {
+			await manager.connectServers({ secretive: { type: "stdio", command: "secretive" } }, {});
+			await waitFor(() => deleted.length > 0);
+
+			// Suppressing the write is not enough: a previously public row would stay
+			// replayable until its TTL, so turning private must retract it.
+			expect(deleted).toEqual(["secretive"]);
+			expect(written).toEqual([]);
+		} finally {
+			listTools.mockRestore();
+			connect.mockRestore();
+			await manager.disconnectAll();
+		}
+	});
+
+	test("binds cache identity to the resolved credential, not the config template", async () => {
+		const template = { type: "http", url: "https://example.invalid/mcp", headers: { Authorization: "!token" } };
+		const resolve = vi.spyOn(configValue, "resolveConfigValue");
+
+		resolve.mockResolvedValue("secret-one");
+		const first = await credentialFingerprint(
+			(await new MCPManager(process.cwd()).prepareConfig(template as never)) as never,
+		);
+		resolve.mockResolvedValue("secret-two");
+		const second = await credentialFingerprint(
+			(await new MCPManager(process.cwd()).prepareConfig(template as never)) as never,
+		);
+		resolve.mockRestore();
+
+		// The template is byte-identical across the rotation; only the resolved
+		// value differs, and that is exactly what must not collide.
+		expect(first).not.toBe(second);
+		// Non-secret: the digest never contains the material it fingerprints.
+		expect(first).toMatch(/^[0-9a-f]{64}$/);
+		expect(first).not.toContain("secret");
+	});
+
+	test("refuses an unscoped cache rather than sharing entries across projects", async () => {
+		const storage = {} as never;
+		expect(() => new MCPToolCacheClass(storage, "")).toThrow("non-empty project scope");
+		expect(() => new MCPToolCacheClass(storage, "   ")).toThrow("non-empty project scope");
+	});
+
+	test("skips a cached surface while the credential identity is still unresolved", async () => {
+		const reads: string[] = [];
+		const toolCache = {
+			get: async (serverName: string) => {
+				reads.push(serverName);
+				return [{ name: "ping", inputSchema: { type: "object" } }] as never;
+			},
+			set: async () => {},
+			delete: async () => {},
+		} as unknown as MCPToolCache;
+		const resolveValue = vi.spyOn(configValue, "resolveConfigValue").mockImplementation(async () => {
+			await Bun.sleep(1_200);
+			return "resolved-token";
+		});
+		const connect = vi
+			.spyOn(mcpClient, "connectToServer")
+			.mockImplementation(() => new Promise<MCPServerConnection>(() => {}));
+		const manager = new MCPManager(process.cwd(), toolCache, { maxStartupTimeoutMs: 400 });
+		try {
+			const result = await manager.connectServers(
+				{ unresolved: { type: "stdio", command: "unresolved", timeout: 5_000, env: { TOKEN: "!token" } } },
+				{},
+			);
+
+			// Auth is still resolving, so the identity that would own a hit is unknown.
+			// Failing closed means no deferred surface rather than a possibly foreign one.
+			expect(reads).toEqual([]);
+			expect(result.tools).toEqual([]);
+		} finally {
+			connect.mockRestore();
+			resolveValue.mockRestore();
 			await manager.disconnectAll();
 		}
 	});
