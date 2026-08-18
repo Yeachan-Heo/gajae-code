@@ -126,31 +126,42 @@ export const toolChoiceSchema = z.union([
 
 const baseContent = z.union([z.string(), z.array(userContentPartSchema)]);
 
+/**
+ * Clients (Aside, LangChain, LiteLLM, the Vercel AI SDK, …) routinely
+ * serialize an unset optional field as explicit `null` instead of omitting
+ * it, and OpenAI itself accepts that. Collapse `null` back to `undefined` so
+ * every downstream consumer keeps working against the `T | undefined` shape.
+ */
+const nullableOptional = <T extends z.ZodType>(schema: T) => schema.nullish().transform(value => value ?? undefined);
+
+/** Present-but-`null` content is empty text, not a 400. */
+const requiredContent = baseContent.nullable().transform(value => value ?? "");
+
 export const systemMessageSchema = z.object({
 	role: z.literal("system"),
-	content: baseContent,
+	content: requiredContent,
 });
 
 export const developerMessageSchema = z.object({
 	role: z.literal("developer"),
-	content: baseContent,
+	content: requiredContent,
 });
 
 export const userMessageSchema = z.object({
 	role: z.literal("user"),
-	content: baseContent,
+	content: requiredContent,
 });
 
 export const assistantMessageSchema = z.object({
 	role: z.literal("assistant"),
-	content: baseContent.optional(),
-	tool_calls: z.array(toolCallSchema).optional(),
+	content: nullableOptional(baseContent),
+	tool_calls: nullableOptional(z.array(toolCallSchema)),
 });
 
 export const toolMessageSchema = z.object({
 	role: z.literal("tool"),
-	content: baseContent.optional(),
-	tool_call_id: z.string().optional(),
+	content: nullableOptional(baseContent),
+	tool_call_id: nullableOptional(z.string()),
 });
 
 /**
@@ -193,27 +204,27 @@ export const stopSchema = z.union([z.string(), z.array(z.string()).max(4)]);
 export const openaiChatRequestSchema = z.object({
 	model: z.string().min(1),
 	messages: z.array(messageSchema),
-	tools: z.array(toolSchema).optional(),
-	tool_choice: toolChoiceSchema.optional(),
-	max_tokens: z.number().optional(),
-	max_completion_tokens: z.number().optional(),
-	temperature: z.number().optional(),
-	top_p: z.number().optional(),
-	stop: stopSchema.optional(),
-	stream: z.boolean().optional(),
-	stream_options: streamOptionsSchema.optional(),
+	tools: nullableOptional(z.array(toolSchema)),
+	tool_choice: nullableOptional(toolChoiceSchema),
+	max_tokens: nullableOptional(z.number()),
+	max_completion_tokens: nullableOptional(z.number()),
+	temperature: nullableOptional(z.number()),
+	top_p: nullableOptional(z.number()),
+	stop: nullableOptional(stopSchema),
+	stream: nullableOptional(z.boolean()),
+	stream_options: nullableOptional(streamOptionsSchema),
 
 	// ── Typed first-class passthroughs (now consumed by the walker) ────────
 	response_format: z.unknown().optional(),
-	seed: z.number().optional(),
-	presence_penalty: z.number().optional(),
-	frequency_penalty: z.number().optional(),
-	logit_bias: z.record(z.string(), z.number()).optional(),
-	user: z.string().optional(),
-	reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh", "max"]).optional(),
-	parallel_tool_calls: z.boolean().optional(),
-	service_tier: z.enum(["auto", "default", "flex", "scale", "priority"]).optional(),
-	metadata: z.record(z.string(), z.unknown()).optional(),
+	seed: nullableOptional(z.number()),
+	presence_penalty: nullableOptional(z.number()),
+	frequency_penalty: nullableOptional(z.number()),
+	logit_bias: nullableOptional(z.record(z.string(), z.number())),
+	user: nullableOptional(z.string()),
+	reasoning_effort: nullableOptional(z.enum(["minimal", "low", "medium", "high", "xhigh", "max"])),
+	parallel_tool_calls: nullableOptional(z.boolean()),
+	service_tier: nullableOptional(z.enum(["auto", "default", "flex", "scale", "priority"])),
+	metadata: nullableOptional(z.record(z.string(), z.unknown())),
 
 	// ── Accept-and-ignore passthroughs ─────────────────────────────────────
 	// Forward acceptance only: validating these would 400 on shapes the

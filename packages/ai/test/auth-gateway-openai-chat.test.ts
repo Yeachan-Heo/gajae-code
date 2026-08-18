@@ -153,6 +153,53 @@ describe("auth-gateway openai-chat: parseRequest", () => {
 		expect(parsed.options.maxOutputTokens).toBe(256);
 		expect(parsed.stream).toBe(false);
 	});
+
+	it("accepts explicit nulls for unset optional fields", () => {
+		const parsed = parseRequest({
+			model: "m",
+			messages: [
+				{ role: "system", content: null },
+				{ role: "user", content: "hi" },
+				{ role: "assistant", content: null, tool_calls: null },
+			],
+			stop: null,
+			tools: null,
+			tool_choice: null,
+			max_tokens: null,
+			max_completion_tokens: 128,
+			temperature: null,
+			top_p: null,
+			stream: null,
+			stream_options: null,
+			seed: null,
+			user: null,
+			reasoning_effort: null,
+			parallel_tool_calls: null,
+			service_tier: null,
+			metadata: null,
+		});
+		expect(parsed.stream).toBe(false);
+		expect(parsed.options.maxOutputTokens).toBe(128);
+		expect(parsed.context.messages[0]).toMatchObject({ role: "user", content: "hi" });
+		expect(parsed.context.tools).toBeUndefined();
+	});
+
+	it("still rejects invalid values when null collapsing is active", () => {
+		// Null collapsing must not loosen type validation for present values.
+		const rejects = [
+			{ model: "m", messages: [], stop: ["a", "b", "c", "d", "e"] },
+			{ model: "m", messages: [], reasoning_effort: "bogus" },
+			{ model: "m", messages: [], user: 42 },
+			{ model: "m", messages: [], tools: [{ type: "bogus" }] },
+			{ model: "m", messages: [], tool_choice: "sometimes" },
+			{ model: "m", messages: [{ role: "assistant", content: 42 }] },
+		];
+		for (const body of rejects) {
+			expect(() => parseRequest(body as unknown as Parameters<typeof parseRequest>[0])).toThrow();
+		}
+		// Required-key enforcement is untouched by the null collapse.
+		expect(() => parseRequest({ messages: [] })).toThrow(/model/);
+	});
 });
 
 describe("auth-gateway openai-chat: encodeResponse", () => {
