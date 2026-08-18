@@ -117,7 +117,7 @@ import {
 	createOptionalRuntimeServices,
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
-import { loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
+import { loadAllMCPConfigs, MCPManager, MCPToolCache } from "../runtime-mcp";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
 	getNotificationConfig,
@@ -134,6 +134,7 @@ import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
+import { AgentStorage } from "../session/agent-storage";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
@@ -1186,6 +1187,25 @@ function safeReadCleanupDiagnostic(value: unknown): unknown {
 
 function safeErrorForLog(value: unknown): unknown {
 	return safeErrorDescription(value);
+}
+
+/**
+ * Tool cache for the session-owned MCP manager.
+ *
+ * A server that is still connecting when the startup wait ends publishes its
+ * tools here once it lands, so the next session surfaces them immediately as
+ * deferred tools instead of starting from nothing again. Without a cache the
+ * manager can never reach that path and a consistently slow server stays
+ * invisible forever. Cache failures are non-fatal: startup simply falls back to
+ * "no tools from that server yet".
+ */
+async function openMcpToolCache(): Promise<MCPToolCache | null> {
+	try {
+		return new MCPToolCache(await AgentStorage.open());
+	} catch (error) {
+		logger.warn("MCP tool cache unavailable", { error: safeErrorForLog(error) });
+		return null;
+	}
 }
 
 function sanitizeProviderForLog(provider: string): string {
@@ -2357,7 +2377,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					),
 				};
 				if (Object.keys(mergedConfigs).length > 0) {
-					const owned = new MCPManager(cwd, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
+					const owned = new MCPManager(cwd, await openMcpToolCache(), {
+						sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
+					});
 					owned.setAuthStorage(authStorage);
 					cleanupOwnedMcpManager = () => owned.disconnectAll();
 					try {
@@ -2372,15 +2394,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								error: safeErrorForLog(err),
 							});
 						}
-						if (result.connectedServers.length > 0) {
+						// A server that is still connecting surfaces its cached tools as
+						// deferred tools without appearing in `connectedServers`, so the
+						// manager is kept whenever it produced any surface at all.
+						const surfacedServers = new Set([
+							...result.connectedServers,
+							...result.tools.flatMap(tool => (tool.mcpServerName ? [tool.mcpServerName] : [])),
+						]);
+						if (surfacedServers.size > 0) {
 							mcpManager = owned;
 							ownsMcpManager = true;
 							customTools.push(...(result.tools as CustomTool[]));
-							const connectedPluginNames = new Set(
-								result.connectedServers.filter(name => pluginNames.has(name)),
-							);
+							const connectedPluginNames = new Set([...surfacedServers].filter(name => pluginNames.has(name)));
 							pluginMcpManagerServers.set(owned, connectedPluginNames);
-							conventionalMcpManagerServers.set(owned, new Set(result.connectedServers));
+							conventionalMcpManagerServers.set(owned, surfacedServers);
 							for (const tool of result.tools) {
 								const serverName = tool.mcpServerName;
 								if (serverName === undefined) continue;
