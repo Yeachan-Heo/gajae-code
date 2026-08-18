@@ -186,6 +186,20 @@ function parseFrame(value: unknown): Frame {
 	}
 	throw new SdkClientError("protocol_error", "SDK server sent a malformed frame.");
 }
+/**
+ * Recursively freezes the parsed request frame handed to dispatch-boundary
+ * observers. The frame a consumer sees in `beforeDispatch`/`onDispatch` must be
+ * the exact immutable bytes-derived identity that went on the wire, so a
+ * mutating callback can never desynchronize the advertised identity or the
+ * reconciliation fingerprint from the request that was actually sent.
+ */
+function deepFreeze<T>(value: T): T {
+	if (value && typeof value === "object") {
+		for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+		Object.freeze(value);
+	}
+	return value;
+}
 
 function lifecycleFingerprint(operation: string, input: unknown): string {
 	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
@@ -398,7 +412,7 @@ export class SdkClient {
 			...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
 		};
 		const serializedRequest = JSON.stringify(requestFrame);
-		const serializedFrame = JSON.parse(serializedRequest) as Frame;
+		const serializedFrame: Frame = deepFreeze(JSON.parse(serializedRequest) as Frame);
 		const deferred = Promise.withResolvers<unknown>();
 		const pending: Pending = {
 			incarnation,

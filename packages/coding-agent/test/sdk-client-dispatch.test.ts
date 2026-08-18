@@ -285,6 +285,56 @@ test("beforeDispatch throwing aborts before the wire and the request stays retry
 		await client.close();
 	});
 });
+test("mutating the frame inside beforeDispatch cannot desynchronize the sent identity", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		let mutationThrew: unknown;
+		let observedOperation: unknown;
+
+		const request = client.request(
+			{ type: "control_request", operation: "turn.prompt", input: { text: "hi", nested: { keep: true } } },
+			{
+				idempotencyKey: "immutable-boundary",
+				beforeDispatch: context => {
+					observedOperation = context.frame.operation;
+					try {
+						// A hostile or buggy consumer tries to rewrite the frame it
+						// was handed: the advertised identity must stay immutable.
+						(context.frame as { operation?: string }).operation = "tampered.operation";
+						(context.frame as { id?: string }).id = "tampered-id";
+						((context.frame as { input?: { nested?: { keep?: boolean } } }).input ?? {}).nested = {};
+					} catch (error) {
+						mutationThrew = error;
+					}
+				},
+			},
+		);
+		request.catch(() => undefined);
+		await flush();
+
+		// The wire carries the exact serialized request, not a mutated view.
+		const wireFrame = sentFrame(socket);
+		expect(wireFrame.operation).toBe("turn.prompt");
+		expect(wireFrame.id).not.toBe("tampered-id");
+		expect(wireFrame.input).toEqual({ text: "hi", nested: { keep: true } });
+		expect(observedOperation).toBe("turn.prompt");
+		// Frozen in strict mode a mutation throws; in sloppy mode it is a no-op.
+		// Either way the request identity that went out is the serialized bytes.
+		if (mutationThrew !== undefined) expect(mutationThrew).toBeInstanceOf(TypeError);
+
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
+		const record = client.getSentRecord(wireFrame.id as string);
+		if (!record) throw new Error("sent record missing after uncertain dispatch");
+		// Reconciliation identity derives from the exact serialized bytes: the
+		// tampering attempt left no trace on operation or fingerprint inputs.
+		expect(record.operation).toBe("turn.prompt");
+		expect(record.idempotencyKey).toBe("immutable-boundary");
+		await client.close();
+	});
+});
 
 test("synchronous send failure rejects as unavailable without onDispatch firing", async () => {
 	await withFakeTransport(async () => {
