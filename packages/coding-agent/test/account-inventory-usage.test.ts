@@ -195,6 +195,40 @@ describe("account inventory usage", () => {
 		expectRowsRedactKey(snapshot, CODEX_ENV_KEY);
 	});
 
+	it("pins the stored OAuth credential when no environment key resolves", () => {
+		// canPinStoredOAuth must stay true when the resolver returns undefined for
+		// every provider: a regression that permanently disables pinning would
+		// otherwise pass the env-present tests above.
+		const snapshot = buildAccountInventorySnapshot({
+			authStorage: makeAuthStorage(),
+			modelRegistry,
+			nowMs: NOW,
+			envApiKeyResolver: () => undefined,
+		});
+		const stored = storedRow(snapshot);
+
+		expect(stored).toBeDefined();
+		expect(stored?.credentialKind).toBe("oauth");
+		expect(stored?.capabilities.canPin).toBe(true);
+		// No synthetic env row exists for this provider in this invocation.
+		expect(envRow(snapshot)).toBeUndefined();
+	});
+
+	it("redacts a fixture key containing quotes and backslashes from serialized rows", () => {
+		// Exercises the JSON-escaped comparison path with a key whose serialized
+		// form differs from its raw form; failure output stays boolean-only.
+		const quotedKey = 'test-"quoted\\key';
+		const snapshot = buildAccountInventorySnapshot({
+			authStorage: makeAuthStorage(),
+			modelRegistry,
+			nowMs: NOW,
+			envApiKeyResolver: provider => (provider === "openai-codex" ? quotedKey : undefined),
+		});
+
+		expect(envRow(snapshot)).toBeDefined();
+		expectRowsRedactKey(snapshot, quotedKey);
+	});
+
 	it("discovers an environment-only provider absent from stored inventory and the model registry", () => {
 		const snapshot = buildAccountInventorySnapshot({
 			authStorage: makeAuthStorage(),
