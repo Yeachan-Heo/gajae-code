@@ -43,9 +43,18 @@ const ownedResidentCacheInstanceDirs = new Set<string>();
 const activeResidentCacheRootSweeps = new Set<string>();
 let ownResidentCacheProcessStartTimeMs: number | null | undefined;
 
+/** Marks `startTimeMs` as an absolute instant parsed from a UTC-pinned `ps` render. */
+const RESIDENT_CACHE_START_TIME_BASIS = "utc";
+
 interface ResidentCacheOwnerToken {
 	readonly pid: number;
 	readonly startTimeMs: number | null;
+	/**
+	 * Absent on tokens written before the start time was pinned to UTC. Such a
+	 * value is a wall clock in the writer's zone, so comparing it against an
+	 * absolute one proves nothing about PID reuse and must not imply staleness.
+	 */
+	readonly startTimeBasis?: string;
 	readonly nonce: string;
 	readonly createdAt?: number;
 }
@@ -231,17 +240,25 @@ function residentCacheProcessStartTimeMs(pid: number): number | null {
 		return ownResidentCacheProcessStartTimeMs;
 	}
 
-	// Mirror file-lock's `ps`-based process incarnation probe, but pin the
-	// locale so its `lstart` output can be represented as a stable epoch value.
+	// Mirror file-lock's `ps`-based process incarnation probe, but pin the locale
+	// AND the zone. `lstart` is a zoneless local wall clock rendered by `ps` from
+	// /etc/localtime, while `Date.parse` of a zoneless string binds it to the JS
+	// runtime's own zone. Those are two independent resolutions, so a reader whose
+	// runtime resolves UTC while `ps` renders UTC+9 derives an epoch nine hours off
+	// for the very same live process — and this value's only job is to detect PID
+	// reuse, so a disagreeing reader reports every live owner as reused and the GC
+	// reaps a running session's cache. Pinning TZ on the child fixes the rendering
+	// side; the explicit GMT suffix fixes the parsing side.
 	let startTimeMs: number | null = null;
 	try {
 		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
 			stdout: "pipe",
 			stderr: "ignore",
-			env: { ...process.env, LC_ALL: "C", LANG: "C" },
+			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
 		});
 		if (result.exitCode === 0) {
-			const parsed = Date.parse(new TextDecoder().decode(result.stdout).trim());
+			const rendered = new TextDecoder().decode(result.stdout).trim();
+			const parsed = rendered ? Date.parse(`${rendered} GMT`) : Number.NaN;
 			if (Number.isFinite(parsed)) startTimeMs = parsed;
 		}
 	} catch {
@@ -285,9 +302,10 @@ function parseResidentCacheOwnerToken(text: string): ResidentCacheOwnerToken | n
 		return null;
 	}
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-	const { pid, startTimeMs, nonce, createdAt } = parsed as {
+	const { pid, startTimeMs, startTimeBasis, nonce, createdAt } = parsed as {
 		pid?: unknown;
 		startTimeMs?: unknown;
+		startTimeBasis?: unknown;
 		nonce?: unknown;
 		createdAt?: unknown;
 	};
@@ -296,17 +314,30 @@ function parseResidentCacheOwnerToken(text: string): ResidentCacheOwnerToken | n
 		!Number.isInteger(pid) ||
 		pid <= 0 ||
 		(startTimeMs !== null && (typeof startTimeMs !== "number" || !Number.isFinite(startTimeMs))) ||
+		(startTimeBasis !== undefined && typeof startTimeBasis !== "string") ||
 		typeof nonce !== "string" ||
 		nonce.length === 0 ||
 		(createdAt !== undefined && (typeof createdAt !== "number" || !Number.isFinite(createdAt)))
 	) {
 		return null;
 	}
-	return createdAt === undefined ? { pid, startTimeMs, nonce } : { pid, startTimeMs, nonce, createdAt };
+	return {
+		pid,
+		startTimeMs,
+		...(startTimeBasis === undefined ? {} : { startTimeBasis }),
+		nonce,
+		...(createdAt === undefined ? {} : { createdAt }),
+	};
 }
 
 function sameResidentCacheOwnerToken(a: ResidentCacheOwnerToken, b: ResidentCacheOwnerToken): boolean {
-	return a.pid === b.pid && a.startTimeMs === b.startTimeMs && a.nonce === b.nonce && a.createdAt === b.createdAt;
+	return (
+		a.pid === b.pid &&
+		a.startTimeMs === b.startTimeMs &&
+		a.startTimeBasis === b.startTimeBasis &&
+		a.nonce === b.nonce &&
+		a.createdAt === b.createdAt
+	);
 }
 
 function readResidentCacheOwnerSnapshot(instanceDir: string, uid: number): ResidentCacheOwnerSnapshot | null {
@@ -343,6 +374,7 @@ function writeResidentCacheOwnerToken(instanceDir: string, uid: number): void {
 	const owner: ResidentCacheOwnerToken = {
 		pid: process.pid,
 		startTimeMs: residentCacheProcessStartTimeMs(process.pid),
+		startTimeBasis: RESIDENT_CACHE_START_TIME_BASIS,
 		nonce,
 		createdAt: Date.now(),
 	};
@@ -556,6 +588,10 @@ function residentCacheOwnerIsStale(
 	const liveness = residentCacheOwnerLiveness(owner.pid);
 	if (liveness === "dead") return true;
 	if (liveness !== "alive" || owner.startTimeMs === null) return false;
+	// A token from before the UTC pin carries a zone-dependent wall clock. Comparing
+	// it against an absolute instant would read an ordinary timezone offset as PID
+	// reuse and reap a live owner, so an unlabelled basis leaves reuse unproven.
+	if (owner.startTimeBasis !== RESIDENT_CACHE_START_TIME_BASIS) return false;
 	const currentStartTimeMs = cachedResidentCacheProcessStartTimeMs(owner.pid, startTimeCache);
 	return currentStartTimeMs !== null && currentStartTimeMs !== owner.startTimeMs;
 }
