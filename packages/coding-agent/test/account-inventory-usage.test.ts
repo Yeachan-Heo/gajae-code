@@ -90,12 +90,16 @@ function runtimeRow(snapshot: { rows: AccountInventoryRow[] }): AccountInventory
  * Assert that no row payload serializes the provider's resolved credential
  * value. The key is whatever the production resolver returns — fixture token or
  * a host-exported value pinned by the inherited-env snapshot — and the boolean
- * comparison keeps the key itself out of failure output.
+ * comparison keeps the key itself out of failure output. Both the raw and the
+ * JSON-escaped representations are checked, so a key containing quotes or
+ * backslashes cannot evade the comparison when serialized.
  */
 function expectRowsRedactKey(snapshot: { rows: AccountInventoryRow[] }, provider: string): void {
 	const key = getEnvApiKey(provider);
 	if (key === undefined) return;
-	expect(JSON.stringify(snapshot.rows).includes(key)).toBe(false);
+	const serialized = JSON.stringify(snapshot.rows);
+	expect(serialized.includes(key)).toBe(false);
+	expect(serialized.includes(JSON.stringify(key).slice(1, -1))).toBe(false);
 }
 
 /**
@@ -226,7 +230,8 @@ describe("account inventory usage", () => {
 	});
 
 	it("probes the synthetic env row through checkApiKeyCredential and records the source health", async () => {
-		const probed: Array<{ provider: string; key: string; baseUrl?: string }> = [];
+		const probed: Array<{ provider: string; keyMatches: boolean; baseUrl?: string }> = [];
+		const expectedKey = getEnvApiKey("openai-codex");
 		const recorded: Array<{ provider: string; source: string; health: CachedCredentialHealth }> = [];
 		const authStorage = makeAuthStorage({
 			getEffectiveCredentialType: () => "api_key",
@@ -235,7 +240,7 @@ describe("account inventory usage", () => {
 				key: string,
 				options,
 			): Promise<ApiKeyCredentialCheckResult> => {
-				probed.push({ provider, key, baseUrl: options?.baseUrl });
+				probed.push({ provider, keyMatches: key === expectedKey, baseUrl: options?.baseUrl });
 				return { provider, type: "api_key", ok: true };
 			},
 			recordCredentialHealthForSource: (provider, source, health) => {
@@ -249,13 +254,14 @@ describe("account inventory usage", () => {
 
 		// Other env-backed providers may resolve on the host machine; scope the
 		// assertion to this fixture's provider. The expected key comes from the
-		// same resolver the production path uses, so a host-exported value pinned
-		// by the inherited-env snapshot stays consistent with what was probed.
-		const expectedKey = getEnvApiKey("openai-codex");
+		// same resolver the production path uses; only a non-secret boolean match
+		// is recorded and asserted, so an inherited/file-backed key can never
+		// surface in matcher data or failure diagnostics.
 		expect(expectedKey).toBeDefined();
-		expect(probed.filter(entry => entry.provider === "openai-codex" && entry.key === expectedKey)).toEqual([
-			{ provider: "openai-codex", key: expectedKey ?? "", baseUrl: BASE_URL },
-		]);
+		const codexProbes = probed.filter(entry => entry.provider === "openai-codex");
+		expect(codexProbes.length).toBe(1);
+		expect(codexProbes.every(entry => entry.keyMatches)).toBe(true);
+		expect(codexProbes[0]?.baseUrl).toBe(BASE_URL);
 		expect(recorded.filter(entry => entry.provider === "openai-codex" && entry.source === "env")).toEqual([
 			{
 				provider: "openai-codex",
@@ -283,7 +289,9 @@ describe("account inventory usage", () => {
 				provider,
 				type: "api_key",
 				ok: false,
-				reason: "stubbed probe failure",
+				// Secret-like reason exercising asSafeLabel's credential scrubbing on
+				// the row and the recorded source health; the raw value never appears.
+				reason: "probe rejected api_key=sk-test-secret-value-123 (token=ghp_testtoken456)",
 			}),
 			recordCredentialHealthForSource: (provider, source, health) => {
 				recorded.push({ provider, source, health });
@@ -293,39 +301,44 @@ describe("account inventory usage", () => {
 		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
 		const env = envRow(snapshot);
 
+		const sanitizedReason = "probe rejected api_key=[redacted] (token=[redacted]";
 		expect(env?.health.status).toBe("failed");
-		expect(env?.health.reason).toBe("stubbed probe failure");
+		expect(env?.health.reason).toBe(sanitizedReason);
 		expect(recorded.filter(entry => entry.provider === "openai-codex" && entry.source === "env")).toEqual([
 			{
 				provider: "openai-codex",
 				source: "env",
 				health: {
 					status: "failed",
-					reason: "stubbed probe failure",
+					reason: sanitizedReason,
 					checkedAt: expect.any(Number),
 					retainUntil: expect.any(Number),
 				},
 			},
 		]);
+		// The raw secret-like fragments never survive into row payloads.
+		expect(JSON.stringify(snapshot.rows).includes("sk-test-secret-value-123")).toBe(false);
+		expect(JSON.stringify(snapshot.rows).includes("ghp_testtoken456")).toBe(false);
 	});
 
 	it("marks a synthetic runtime row unverifiable when its key source resolves nothing", async () => {
 		// A runtime-source row exists purely through the hasRuntimeApiKey stub, so
 		// this case never consults env files or shell-rc sources that a host
 		// machine may carry. peekApiKey returning undefined drives the
-		// "API-key source is unavailable" fallback in checkAccountInventory.
-		// The env fixture value is dropped first so the runtime row is the only
-		// synthetic row for this provider; a file-backed host value would keep an
-		// env row too, which does not affect the runtime-row assertions below.
+		// "API-key source is unavailable" fallback in checkAccountInventory. The
+		// env fixture value is dropped to keep the common case to one synthetic
+		// row, but a file-backed host token may still add an env row; probes are
+		// recorded with their source so the runtime assertions stay independent
+		// of any unrelated env-row probe.
 		delete process.env.OPENAI_CODEX_OAUTH_TOKEN;
-		const probed: string[] = [];
+		const probed: Array<{ provider: string; source: string }> = [];
 		const recorded: Array<{ provider: string; source: string; health: CachedCredentialHealth }> = [];
 		const authStorage = makeAuthStorage({
 			hasRuntimeApiKey: provider => provider === "openai-codex",
 			getEffectiveCredentialType: () => "api_key",
 			peekApiKey: async () => undefined,
 			checkApiKeyCredential: async (provider: string): Promise<ApiKeyCredentialCheckResult> => {
-				probed.push(provider);
+				probed.push({ provider, source: "env-or-unknown" });
 				return { provider, type: "api_key", ok: null, reason: "stub" };
 			},
 			recordCredentialHealthForSource: (provider, source, health) => {
@@ -338,10 +351,12 @@ describe("account inventory usage", () => {
 
 		expect(runtime).toBeDefined();
 		expect(runtime?.routing).toEqual({ active: false, selected: true, marker: "selected" });
-		// No key could be resolved for the runtime source, so no probe ran for it
-		// and the unavailable fallback applied. Other env-backed providers may
-		// resolve on the host; scope to this fixture's provider.
-		expect(probed.filter(provider => provider === "openai-codex")).toEqual([]);
+		// No key could be resolved for the runtime source, so the unavailable
+		// fallback applied and no probe ran for this provider's runtime row. A
+		// host file-backed token can only produce an env-row probe, which is a
+		// different source and does not satisfy this filter.
+		expect(probed.filter(entry => entry.provider === "openai-codex" && entry.source === "runtime")).toEqual([]);
+		expect(recorded.filter(entry => entry.provider === "openai-codex" && entry.source === "runtime").length).toBe(1);
 		expect(runtime?.health.status).toBe("unverifiable");
 		expect(runtime?.health.reason).toBe("API-key source is unavailable");
 		expect(recorded.filter(entry => entry.provider === "openai-codex" && entry.source === "runtime")).toEqual([
