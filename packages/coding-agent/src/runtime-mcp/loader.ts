@@ -3,6 +3,7 @@
  *
  * Integrates MCP tool discovery with the custom tools system.
  */
+import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import { AgentStorage } from "../session/agent-storage";
@@ -44,11 +45,16 @@ export interface MCPToolsLoadOptions {
 	sharedPoolIdleMs?: number;
 }
 
-async function resolveToolCache(storage: AgentStorage | null | undefined): Promise<MCPToolCache | null> {
+/**
+ * `scope` is mandatory rather than defaulted: a cached entry is replayed as a
+ * deferred tool before its server connects, so an unscoped cache would let one
+ * project publish another project's tool descriptions.
+ */
+async function resolveToolCache(storage: AgentStorage | null | undefined, scope: string): Promise<MCPToolCache | null> {
 	if (storage === null) return null;
 	try {
 		const resolved = storage ?? (await AgentStorage.open());
-		return new MCPToolCache(resolved);
+		return new MCPToolCache(resolved, scope);
 	} catch (error) {
 		logger.warn("MCP tool cache unavailable", { error: String(error) });
 		return null;
@@ -63,7 +69,7 @@ async function resolveToolCache(storage: AgentStorage | null | undefined): Promi
  * @returns MCP tools in LoadedCustomTool format for integration
  */
 export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoadOptions): Promise<MCPToolsLoadResult> {
-	const toolCache = await resolveToolCache(options?.cacheStorage);
+	const toolCache = await resolveToolCache(options?.cacheStorage, path.resolve(cwd));
 	const manager = new MCPManager(cwd, toolCache, { sharedPoolIdleMs: options?.sharedPoolIdleMs });
 	if (options?.authStorage) {
 		manager.setAuthStorage(options.authStorage);

@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "bun:test";
 import * as configValue from "../../src/config/resolve-config-value";
 import * as mcpClient from "../../src/runtime-mcp/client";
 import { MCPManager, withinDeclaredConnectionWindow } from "../../src/runtime-mcp/manager";
+import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
 import type { MCPServerConnection } from "../../src/runtime-mcp/types";
 
 // `gjc mcp add --timeout` writes a per-server `timeout`, and `connectToServer`
@@ -147,6 +148,38 @@ describe("MCP startup and the declared connection window", () => {
 		} finally {
 			connect.mockRestore();
 			resolveValue.mockRestore();
+			await manager.disconnectAll();
+		}
+	});
+
+	// A deferred tool is a promise that the connection is still coming. Once the
+	// background attempt fails terminally that promise is false, and leaving the
+	// tool advertised means every call resolves to a wait that can only fail.
+	test("withdraws deferred tools and drops the cache entry when the background connection fails", async () => {
+		const cached = [{ name: "ping", inputSchema: { type: "object" } }] as never;
+		const deleted: string[] = [];
+		const toolCache = {
+			get: async () => cached,
+			set: async () => {},
+			delete: async (serverName: string) => {
+				deleted.push(serverName);
+			},
+		} as unknown as MCPToolCache;
+		const failure = new Error("transport gave up after the startup wait");
+		const release = Promise.withResolvers<MCPServerConnection>();
+		const connect = vi.spyOn(mcpClient, "connectToServer").mockImplementation(() => release.promise);
+		const manager = new MCPManager(process.cwd(), toolCache);
+		try {
+			const result = await manager.connectServers({ warm: { type: "stdio", command: "warm" } }, {});
+			// Cached surface is published while the connection is still pending.
+			expect(result.tools.map(tool => tool.name)).toEqual(["mcp__warm_ping"]);
+			expect(manager.getTools().map(tool => tool.name)).toEqual(["mcp__warm_ping"]);
+
+			release.reject(failure);
+			await waitFor(() => manager.getTools().length === 0);
+			expect(deleted).toEqual(["warm"]);
+		} finally {
+			connect.mockRestore();
 			await manager.disconnectAll();
 		}
 	});

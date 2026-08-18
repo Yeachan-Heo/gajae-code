@@ -106,7 +106,24 @@ export class MCPToolCache {
 		return parsed.tools as MCPToolDefinition[];
 	}
 
-	async set(serverName: string, config: MCPServerConfig, tools: MCPToolDefinition[]): Promise<void> {
+	/** Drop a server's entry so a dead surface cannot replay until its TTL. */
+	async delete(serverName: string): Promise<void> {
+		// Expiring in the past is the only removal the cache interface exposes.
+		this.storage.setCache(cacheKey(serverName), "", Math.floor(Date.now() / 1000) - 1);
+	}
+
+	/**
+	 * `freshUntilMs` is the server's own freshness hint from `tools/list`. When it
+	 * is shorter than the default retention it wins: a server that declared its
+	 * catalog stale after a minute must not be replayed as deferred tools for a
+	 * month.
+	 */
+	async set(
+		serverName: string,
+		config: MCPServerConfig,
+		tools: MCPToolDefinition[],
+		freshUntilMs?: number,
+	): Promise<void> {
 		let configHash: string;
 		try {
 			configHash = await hashConfig(config, this.scope);
@@ -129,7 +146,8 @@ export class MCPToolCache {
 			return;
 		}
 
-		const expiresAtSec = Math.floor((Date.now() + CACHE_TTL_MS) / 1000);
+		const defaultExpiryMs = Date.now() + CACHE_TTL_MS;
+		const expiresAtSec = Math.floor(Math.min(defaultExpiryMs, freshUntilMs ?? defaultExpiryMs) / 1000);
 		this.storage.setCache(cacheKey(serverName), serialized, expiresAtSec);
 	}
 }

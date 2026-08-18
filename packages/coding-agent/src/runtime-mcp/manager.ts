@@ -1155,13 +1155,19 @@ export class MCPManager {
 					});
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
-					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
+					if (!this.#toolsOnly) void this.#cacheServerTools(name, config, connection, serverTools);
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
 					if (this.#pendingToolLoads.get(name) !== toolsPromise) return;
 					this.#pendingToolLoads.delete(name);
-					if (!allowBackgroundLogging || reportedErrors.has(name) || this.#toolsOnly) return;
+					if (this.#toolsOnly) return;
+					// Terminal failure of a background connection. Any deferred tools this
+					// server published from cache now point at a connection that will never
+					// arrive, so they are withdrawn and the cache entry that produced them
+					// is dropped rather than left to replay the same dead surface until TTL.
+					this.#withdrawUnreachableDeferredTools(name);
+					if (!allowBackgroundLogging || reportedErrors.has(name)) return;
 					const message = error instanceof Error ? error.message : String(error);
 					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
 				});
@@ -1365,6 +1371,57 @@ export class MCPManager {
 			connectedServers: Array.from(connectedServers),
 			exaApiKeys: [], // Will be populated by discoverAndConnect
 		};
+	}
+
+	/**
+	 * Withdraw deferred tools for a server whose background connection failed.
+	 *
+	 * A `DeferredMCPTool` is a promise that the connection is still coming. Once it
+	 * is not, leaving the tool advertised means every call resolves to a
+	 * `waitForConnection` that can only fail, and the cache entry behind it would
+	 * replay the same dead surface on the next start until its TTL expires.
+	 */
+	#withdrawUnreachableDeferredTools(name: string): void {
+		const deferred = this.#tools.filter(tool => tool instanceof DeferredMCPTool && tool.mcpServerName === name);
+		if (deferred.length === 0) return;
+		this.#tools = this.#tools.filter(tool => !(tool instanceof DeferredMCPTool && tool.mcpServerName === name));
+		void this.toolCache?.delete(name).catch(error => {
+			logger.debug("MCP tool cache invalidation failed", { path: `mcp:${name}`, error });
+		});
+		logger.warn("Withdrew deferred MCP tools after the connection failed", {
+			path: `mcp:${name}`,
+			withdrawn: deferred.length,
+		});
+		this.#onToolsChanged?.(this.#tools);
+	}
+
+	/**
+	 * Persist tool definitions only when the server's own cache metadata allows it.
+	 *
+	 * A cached entry is replayed as a deferred tool *before* the next connection
+	 * authenticates, so the protocol's own signals govern what may be written: a
+	 * result the server marked `private` is never persisted, and a server-supplied
+	 * freshness deadline shortens retention instead of the flat default.
+	 *
+	 * Credential identity rides on the cache's config hash rather than a separate
+	 * key: the original config already carries the OAuth `credentialId`, any
+	 * literal header secret, and the env templates, so a different identity does
+	 * not hash to the same entry. Requiring an explicit `public` scope was tried
+	 * and rejected — servers overwhelmingly send no cache metadata at all, so it
+	 * disables deferred startup entirely rather than making it safer.
+	 */
+	async #cacheServerTools(
+		name: string,
+		config: MCPServerConfig,
+		connection: MCPServerConnection,
+		serverTools: MCPToolDefinition[],
+	): Promise<void> {
+		if (!this.toolCache) return;
+		if (connection.toolsCacheScope === "private") {
+			logger.debug("Skipped MCP tool cache write for a private result", { path: `mcp:${name}` });
+			return;
+		}
+		await this.toolCache.set(name, config, serverTools, connection.toolsFreshUntil);
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
@@ -2066,7 +2123,7 @@ export class MCPManager {
 				noReplay: config.sharing === "shared",
 				inputHandler: () => this.#inputRequestHandler ?? undefined,
 			});
-			void this.toolCache?.set(name, config, serverTools);
+			void this.#cacheServerTools(name, config, connection, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
 			void this.#loadServerResourcesAndPrompts(name, connection);
@@ -2134,7 +2191,7 @@ export class MCPManager {
 			noReplay: connection.config.sharing === "shared",
 			inputHandler: () => this.#inputRequestHandler ?? undefined,
 		});
-		void this.toolCache?.set(name, connection.config, serverTools);
+		void this.#cacheServerTools(name, connection.config, connection, serverTools);
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);
