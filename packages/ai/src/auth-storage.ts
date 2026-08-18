@@ -3838,8 +3838,17 @@ export class AuthStorage {
 			}
 		}
 		const entry = this.#getStoredCredentials(storageProvider).find(candidate => candidate.id === credentialId);
-		if (entry?.credential.type !== "oauth") return undefined;
-		const request = this.#buildUsageRequestForOauth(storageProvider, entry.credential, baseUrl);
+		if (!entry) return undefined;
+		// checkCredentials caches reports for api_key rows under the same
+		// provider-level key as OAuth rows; surface both for display instead
+		// of silently dropping every API-key provider (for example z.ai).
+		const request =
+			entry.credential.type === "oauth"
+				? this.#buildUsageRequestForOauth(storageProvider, entry.credential, baseUrl)
+				: entry.credential.type === "api_key"
+					? this.#buildUsageRequest(storageProvider, { type: "api_key", apiKey: entry.credential.key }, baseUrl)
+					: undefined;
+		if (!request) return undefined;
 		const cached = this.#usageCache.getStale<UsageReport | null>(this.#buildUsageReportCacheKey(request));
 		if (!cached || cached.value === null || cached.expiresAt + PRESENTATION_RETENTION_MS < Date.now())
 			return undefined;

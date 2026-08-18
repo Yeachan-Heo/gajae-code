@@ -17,7 +17,7 @@ import {
 	AuthStorage,
 	type StoredAuthCredential,
 } from "../src/auth-storage";
-import type { UsageReport } from "../src/usage";
+import type { UsageProvider, UsageReport } from "../src/usage";
 import * as claudeUsage from "../src/usage/claude";
 
 function anthropicReports(reports: UsageReport[] | null): UsageReport[] {
@@ -339,6 +339,82 @@ describe("AuthStorage usage cache: jitter", () => {
 				expect(delta).toBeGreaterThan(3.5 * 60_000);
 				expect(delta).toBeLessThan(6.5 * 60_000);
 			}
+		} finally {
+			storage.close();
+			vi.restoreAllMocks();
+		}
+	});
+});
+
+describe("AuthStorage usage cache: API-key credential display", () => {
+	const zaiProbe: UsageProvider = {
+		id: "zai",
+		fetchUsage: async () => null,
+	};
+
+	function apiKeyRow(id: number): StoredAuthCredential {
+		return {
+			id,
+			provider: "zai",
+			credential: { type: "api_key", key: `sk-test-zai-${id}` },
+			disabledCause: null,
+		};
+	}
+
+	function zaiReport(): UsageReport {
+		return {
+			provider: "zai",
+			fetchedAt: Date.now(),
+			limits: [
+				{
+					id: "zai-request-quota",
+					label: "ZAI Request Quota",
+					scope: { provider: "zai" },
+					window: { id: "month", label: "Monthly" },
+					amount: { used: 60, limit: 3000, unit: "requests" },
+				},
+			],
+		};
+	}
+
+	it("surfaces the report cached by checkCredentials for API-key rows", async () => {
+		const store = makeStore([apiKeyRow(1)]);
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "zai" ? zaiProbe : undefined),
+		});
+		await storage.reload();
+		try {
+			// Cache-only lookup before any probe: nothing to display yet.
+			expect(storage.getCachedUsageReport("zai", 1)).toBeUndefined();
+
+			vi.spyOn(zaiProbe, "fetchUsage").mockImplementation(async () => zaiReport());
+
+			const results = await storage.checkCredentials({ provider: "zai" });
+			expect(results[0]?.ok).toBe(true);
+
+			const cached = storage.getCachedUsageReport("zai", 1);
+			expect(cached?.freshness).toBe("fresh");
+			expect(cached?.report.limits[0]?.label).toBe("ZAI Request Quota");
+			expect(cached?.report.limits[0]?.amount.used).toBe(60);
+			// The display observation must never leak credential bytes.
+			expect(JSON.stringify(cached)).not.toContain("sk-test-zai-1");
+		} finally {
+			storage.close();
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("stays undefined when the probe returns no data or the row id is unknown", async () => {
+		const store = makeStore([apiKeyRow(1)]);
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "zai" ? zaiProbe : undefined),
+		});
+		await storage.reload();
+		try {
+			const results = await storage.checkCredentials({ provider: "zai" });
+			expect(results[0]?.ok).not.toBe(true);
+			expect(storage.getCachedUsageReport("zai", 1)).toBeUndefined();
+			expect(storage.getCachedUsageReport("zai", 999)).toBeUndefined();
 		} finally {
 			storage.close();
 			vi.restoreAllMocks();
