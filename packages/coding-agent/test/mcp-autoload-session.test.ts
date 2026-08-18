@@ -252,6 +252,41 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	// Deterministic registration-race barrier: spy the registration itself so
+	// the test observes exactly when the session installs its tools callback,
+	// instead of hoping a wall-clock delay lands inside the microsecond window.
+	// The spy delegates to the real registration (so the replay still runs),
+	// and the assertion is the invariant the replay exists to guarantee.
+	it("does not lose a server that lands before the tools callback registration completes", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow",
+			commandArgs: [process.execPath, "-e", delayedMcpServerScript(1_800)],
+			flags: { project: true, timeout: 10_000 },
+			cwd: projectDir,
+		});
+
+		let registrationCount = 0;
+		const original = MCPManager.prototype.setOnToolsChanged;
+		const spy = vi.spyOn(MCPManager.prototype, "setOnToolsChanged").mockImplementation(function (
+			this: MCPManager,
+			handler: (tools: never) => void,
+		) {
+			registrationCount += 1;
+			return original.call(this, handler as never);
+		});
+
+		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(registrationCount).toBeGreaterThan(0);
+			await waitFor(() => mcpManager?.getTools().some(tool => tool.name === "mcp__slow_hello") === true);
+			await waitFor(() => session.getActiveToolNames().includes("mcp__slow_hello"));
+		} finally {
+			spy.mockRestore();
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("keeps fast tools active while a slow sibling lands later in the same session", async () => {
 		await runMCPCommand({
 			action: "add",

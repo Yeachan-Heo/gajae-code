@@ -1295,11 +1295,21 @@ export class MCPManager {
 				// too: `connectToServer` has given up by now, so replaying cached tools as
 				// deferred would advertise a connection that can never arrive and fail on
 				// first call. A cached task that declared no window keeps the existing
-				// deferred contract, which never depended on a declared timeout.
+				// deferred contract, which never depended on a declared timeout: the cache
+				// hit is itself the operator's statement that this server exists and is
+				// merely slow, so it stays connecting behind its deferred tools instead of
+				// being torn down by a window it never declared.
 				const declaredWindowSpent = (task: ConnectionTask): boolean =>
 					hasDeclaredConnectionWindow(task.config) && !declaredWindowOpen(task);
 				for (const task of pendingTasks) {
-					if (!this.#toolsOnly && declaredWindowOpen(task)) {
+					// A cached surface keeps the task alive whether or not a window was
+					// declared (see `declaredWindowSpent`): the hit itself says the server
+					// exists, so its deferred tools back a connection still worth waiting
+					// for instead of a default-timeout teardown.
+					if (
+						!this.#toolsOnly &&
+						(declaredWindowOpen(task) || (cachedTools.has(task.name) && !declaredWindowSpent(task)))
+					) {
 						logger.warn("MCP server still connecting after the startup wait", {
 							path: `mcp:${task.name}`,
 							startupWaitMs: startupTimeoutMs,
@@ -1309,7 +1319,6 @@ export class MCPManager {
 						});
 						continue;
 					}
-					if (cachedTools.has(task.name) && !declaredWindowSpent(task)) continue;
 					cachedTools.delete(task.name);
 					const message = `MCP server connection timed out during startup: ${task.name}`;
 					errors.set(task.name, this.#serverError(message));

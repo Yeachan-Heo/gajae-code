@@ -15,6 +15,12 @@ type MCPToolCachePayload = {
 	version: number;
 	configHash: string;
 	tools: MCPToolDefinition[];
+	/**
+	 * Generation of the invalidation fence this write was issued under. A write
+	 * whose generation is older than the row's current fence generation is a
+	 * stale write racing a completed invalidation and must not land.
+	 */
+	generation: number;
 };
 
 function stableClone(value: unknown): unknown {
@@ -108,6 +114,25 @@ function cacheKey(serverName: string): string {
  * over one database share one order.
  */
 const storageScope = new WeakMap<AgentStorage, Map<string, Promise<void>>>();
+/**
+ * Invalidation fence generation per storage+row. Every completed `delete()`
+ * bumps the row's generation; a `set()` captures the generation at issue time
+ * and is dropped if the row moved past it by the time the write would land.
+ * This is the conditional-write half of the ordering above: even a set that
+ * somehow bypassed the queue (a future caller, a different process on the
+ * same database) cannot resurrect a row an invalidation retired.
+ */
+const rowGenerations = new WeakMap<AgentStorage, Map<string, number>>();
+
+function currentGeneration(storage: AgentStorage, serverName: string): number {
+	return rowGenerations.get(storage)?.get(serverName) ?? 0;
+}
+
+function bumpGeneration(storage: AgentStorage, serverName: string): void {
+	const rows = rowGenerations.get(storage) ?? new Map<string, number>();
+	rowGenerations.set(storage, rows);
+	rows.set(serverName, (rows.get(serverName) ?? 0) + 1);
+}
 
 /**
  * Serializes `mutation` against every other mutation for the same
@@ -184,6 +209,10 @@ export class MCPToolCache {
 		await enqueueCacheMutation(this.storage, serverName, async () => {
 			// Expiring in the past is the only removal the cache interface exposes.
 			this.storage.setCache(cacheKey(serverName), "", Math.floor(Date.now() / 1000) - 1);
+			// Fence any write that was issued before this invalidation: once the
+			// generation moves, those writes must lose even if they were already
+			// queued behind this one.
+			bumpGeneration(this.storage, serverName);
 		});
 	}
 
@@ -200,6 +229,10 @@ export class MCPToolCache {
 		credential: string,
 		freshUntilMs?: number,
 	): Promise<void> {
+		// Captured at issue time: if an invalidation completes while this write is
+		// still queued/in flight, the row's generation moves past this value and
+		// the write is dropped instead of resurrecting the retired entry.
+		const issuedGeneration = currentGeneration(this.storage, serverName);
 		let configHash: string;
 		try {
 			configHash = await hashConfig(config, this.scope, credential);
@@ -212,6 +245,7 @@ export class MCPToolCache {
 			version: CACHE_VERSION,
 			configHash,
 			tools,
+			generation: issuedGeneration,
 		};
 
 		let serialized: string;
@@ -225,6 +259,10 @@ export class MCPToolCache {
 		const defaultExpiryMs = Date.now() + CACHE_TTL_MS;
 		const expiresAtSec = Math.floor(Math.min(defaultExpiryMs, freshUntilMs ?? defaultExpiryMs) / 1000);
 		await enqueueCacheMutation(this.storage, serverName, async () => {
+			if (currentGeneration(this.storage, serverName) !== issuedGeneration) {
+				logger.debug("Dropped stale MCP tool cache write behind an invalidation", { serverName });
+				return;
+			}
 			this.storage.setCache(cacheKey(serverName), serialized, expiresAtSec);
 		});
 	}

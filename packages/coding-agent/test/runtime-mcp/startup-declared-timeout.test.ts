@@ -486,4 +486,67 @@ setInterval(() => {}, 1000);
 		// The tombstone is an empty string; a resurrected catalog would be JSON.
 		expect(raw === null || raw === "").toBe(true);
 	});
+
+	test("a stale write issued before an invalidation cannot resurrect the row", async () => {
+		const config = { type: "stdio", command: "shared", args: [] } as never;
+		const tools = [{ name: "ping", inputSchema: { type: "object" } }] as never;
+		const rows = new Map<string, string>();
+		const storage = {
+			getCache: (key: string) => rows.get(key) ?? null,
+			setCache: (key: string, value: string, expiresAtSec: number) => {
+				rows.set(key, value);
+				void expiresAtSec;
+			},
+		} as never;
+		const first = new MCPToolCacheClass(storage, "/work/project");
+		const second = new MCPToolCacheClass(storage, "/work/project");
+
+		// A write is issued, then an invalidation for the same row completes
+		// while that write is still queued (the queue holds it behind the delete).
+		// The generation fence must drop the stale write even though it was
+		// serialized in issue order.
+		const write = first.set("shared", config, tools, "cred");
+		await Bun.sleep(10);
+		await second.delete("shared");
+		await write;
+		await Bun.sleep(20);
+
+		const raw = (storage as { getCache(key: string): string | null }).getCache("mcp_tools:shared");
+		// The tombstone (empty string) is the final state; the catalog did not return.
+		expect(raw === null || raw === "").toBe(true);
+	});
+
+	test("a cached surface is not kept alive after its declared window elapsed", async () => {
+		const deleted: string[] = [];
+		const toolCache = {
+			get: async () => [{ name: "ping", inputSchema: { type: "object" } }] as never,
+			set: async () => {},
+			delete: async (serverName: string) => {
+				deleted.push(serverName);
+			},
+		} as unknown as MCPToolCache;
+		// Connect never resolves: the only thing that can retire this task is the
+		// manager's own elapsed-window decision, not a transport timeout.
+		const connect = vi
+			.spyOn(mcpClient, "connectToServer")
+			.mockImplementation((_name, _config, options?: { signal?: AbortSignal }) => {
+				// Stamp the attempt immediately so the window is being charged.
+				void options?.signal?.addEventListener("abort", () => {});
+				return new Promise<MCPServerConnection>(() => {});
+			});
+		const manager = new MCPManager(process.cwd(), toolCache, { maxStartupTimeoutMs: 1_200 });
+		try {
+			// Declared window closes before the startup wait: the cached deferred
+			// surface must be withdrawn and the task torn down, not kept alive by
+			// the cache hit.
+			const result = await manager.connectServers({ spent: { type: "stdio", command: "spent", timeout: 400 } }, {});
+
+			expect(result.connectedServers).toEqual([]);
+			expect(result.errors.get("spent")).toContain("timed out");
+			expect(manager.getConnectionStatus("spent")).toBe("disconnected");
+		} finally {
+			connect.mockRestore();
+			await manager.disconnectAll();
+		}
+	});
 });

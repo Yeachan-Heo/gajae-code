@@ -117,7 +117,7 @@ import {
 	createOptionalRuntimeServices,
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
-import { loadAllMCPConfigs, MCPManager, MCPToolCache } from "../runtime-mcp";
+import { canonicalMCPWorkingDirectory, loadAllMCPConfigs, MCPManager, MCPToolCache } from "../runtime-mcp";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
 	getNotificationConfig,
@@ -1207,7 +1207,7 @@ function safeErrorForLog(value: unknown): unknown {
  */
 async function openMcpToolCache(agentDir: string, cwd: string): Promise<MCPToolCache | null> {
 	try {
-		return new MCPToolCache(await AgentStorage.open(getAgentDbPath(agentDir)), path.resolve(cwd));
+		return new MCPToolCache(await AgentStorage.open(getAgentDbPath(agentDir)), canonicalMCPWorkingDirectory(cwd));
 	} catch (error) {
 		logger.warn("MCP tool cache unavailable", { error: safeErrorForLog(error) });
 		return null;
@@ -3859,23 +3859,41 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// that never became callable in the session that started it.
 				//
 				// `refreshMCPTools` alone is not enough here: it recomputes the active
-				// set from the MCP *selection*, which is how always-on conventional and
-				// plugin tools would silently be re-gated. Re-activating this manager's
-				// tools right after the refresh restores that classification, mirroring
-				// the deferred exact-config path below.
+				// set from the MCP *selection*, which is how plugin tools (mandatory)
+				// would silently be re-gated. Re-activating exactly the plugin-owned
+				// subset after the refresh restores that classification, mirroring the
+				// deferred exact-config path below, while conventional tools keep
+				// honoring the persisted selection.
 				const ownedManager = mcpManager;
 				let latePublication: Promise<void> = Promise.resolve();
+				// Ownership snapshot: which of this manager's servers are plugin-owned
+				// (mandatory regardless of selection) versus conventional (default-
+				// selected, still respecting a persisted exclusion). A late landing
+				// must inherit the same classification the startup path used, or a
+				// pending plugin's tools would arrive as merely-conventional and a
+				// deselected conventional's would arrive as mandatory.
+				const ownedPluginServers = pluginMcpManagerServers.get(ownedManager) ?? new Set<string>();
 				const publishOwnedTools = (tools: readonly { name: string; mcpServerName?: string }[]): void => {
 					if (session.isDisposed) return;
-					const alwaysOnNames = tools.filter(tool => tool.mcpServerName !== undefined).map(tool => tool.name);
+					// Plugin-owned servers are mandatory regardless of selection. A
+					// conventional server the user explicitly deselected (persisted
+					// selection) must NOT be re-activated by a late landing: the refresh
+					// recomputed its activity from that selection. Without a persisted
+					// selection conventional tools are default-selected, so a late
+					// landing activates them exactly as startup would have.
+					const persistedSelection = session.buildDisplaySessionContext().hasPersistedMCPToolSelection;
+					const autoActivateNames = tools
+						.filter(tool => tool.mcpServerName !== undefined)
+						.filter(tool => ownedPluginServers.has(tool.mcpServerName!) || !persistedSelection)
+						.map(tool => tool.name);
 					// Serialized: two servers landing together must not interleave a
 					// refresh with another refresh's activation.
 					latePublication = latePublication
 						.then(async () => {
 							if (session.isDisposed) return;
 							await session.refreshMCPTools(ownedManager.getTools() as CustomTool[]);
-							if (session.isDisposed || alwaysOnNames.length === 0) return;
-							await session.activateDiscoveredTools(alwaysOnNames);
+							if (session.isDisposed || autoActivateNames.length === 0) return;
+							await session.activateDiscoveredTools(autoActivateNames);
 						})
 						.catch(error => {
 							logger.warn("Failed to publish late MCP tools into the session", {
