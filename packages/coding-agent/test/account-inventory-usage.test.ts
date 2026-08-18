@@ -5,7 +5,11 @@ import type {
 	CredentialHealthResult,
 	CredentialInventoryRecord,
 } from "@gajae-code/ai/core";
-import { buildAccountInventorySnapshot, checkAccountInventory } from "../src/session/account-inventory";
+import {
+	type AccountInventoryRow,
+	buildAccountInventorySnapshot,
+	checkAccountInventory,
+} from "../src/session/account-inventory";
 
 const NOW = 1_700_000_000_000;
 const BASE_URL = "https://chatgpt.com/backend-api";
@@ -49,8 +53,20 @@ function makeAuthStorage(overrides: Partial<AuthStorage> = {}): AuthStorage {
 		hasConfigApiKey: () => false,
 		getEffectiveCredentialType: () => "oauth",
 		getGeneration: () => 1,
+		// An exported provider key in the operator's shell makes the inventory add a
+		// synthetic env row, which exercises these hooks. Stubbing them keeps the
+		// test hermetic instead of passing only in a key-free environment.
+		peekCachedCredentialHealthForSource: () => ({ status: "unknown", reason: null }),
+		recordCredentialHealthForSource: () => undefined,
+		peekApiKey: async () => undefined,
+		checkApiKeyCredential: async (provider: string) => ({ provider, type: "api_key", ok: null, reason: "stub" }),
 		...overrides,
 	} as unknown as AuthStorage;
+}
+
+/** Address the stored credential by identity: synthetic env rows shift indexes. */
+function storedRow(snapshot: { rows: AccountInventoryRow[] }): AccountInventoryRow | undefined {
+	return snapshot.rows.find(row => row.source === "stored" && row.provider === "openai-codex");
 }
 
 const modelRegistry = {
@@ -76,9 +92,10 @@ describe("account inventory usage", () => {
 		});
 
 		const snapshot = buildAccountInventorySnapshot({ authStorage, modelRegistry, nowMs: NOW });
+		const stored = storedRow(snapshot);
 
 		expect(receivedBaseUrl).toBe(BASE_URL);
-		expect(snapshot.rows[0]?.usage?.report.limits[0]?.label).toBe("7 days");
+		expect(stored?.usage?.report.limits[0]?.label).toBe("7 days");
 	});
 
 	it("attaches a fresh check report directly when the persistent cache cannot be read back", async () => {
@@ -95,9 +112,10 @@ describe("account inventory usage", () => {
 		});
 
 		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
+		const stored = storedRow(snapshot);
 
-		expect(snapshot.rows[0]?.health.status).toBe("ok");
-		expect(snapshot.rows[0]?.capabilities.hasCachedUsage).toBe(true);
-		expect(snapshot.rows[0]?.usage?.report.limits[0]?.amount.used).toBe(24);
+		expect(stored?.health.status).toBe("ok");
+		expect(stored?.capabilities.hasCachedUsage).toBe(true);
+		expect(stored?.usage?.report.limits[0]?.amount.used).toBe(24);
 	});
 });
