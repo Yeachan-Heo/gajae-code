@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import type { UsageLimit, UsageReport } from "@gajae-code/ai";
 import { renderUsageReports } from "@gajae-code/coding-agent/modes/controllers/command-controller";
 import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { formatLimitDetail } from "@gajae-code/coding-agent/slash-commands/helpers/usage-report";
 
 function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");
@@ -173,5 +174,23 @@ describe("usage report reset visibility", () => {
 
 		expect(labels).toHaveLength(crowded.length);
 		expect(new Set(labels).size).toBe(crowded.length);
+	});
+});
+
+describe("usage text rows", () => {
+	test("limit lines carry the reset countdown and an absolute reset time", () => {
+		const weekly = limit("7d", "Claude 7 Day", "7 Day", 6 * 86_400_000 + 14 * 3_600_000, 0.24);
+		const detail = formatLimitDetail(weekly, NOW);
+
+		expect(detail).toContain("24.00% used");
+		expect(detail).toContain("resets in 6d 14h");
+	});
+
+	test("expired or missing reset windows add no reset text", () => {
+		const past = limit("5h", "Claude 5 Hour", "5 Hour", -3_600_000, 0.5);
+		const windowless = { ...past, window: undefined } as UsageLimit;
+
+		expect(formatLimitDetail(past, NOW)).not.toContain("resets in");
+		expect(formatLimitDetail(windowless, NOW)).not.toContain("resets in");
 	});
 });

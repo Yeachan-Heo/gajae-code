@@ -50,7 +50,7 @@ import { buildFastStatusReport } from "./helpers/fast-status-report";
 import { formatDuration } from "./helpers/format";
 import { commandConsumed, errorMessage, parseSlashCommand, parseSubcommand, usage } from "./helpers/parse";
 import { handleSshAcp } from "./helpers/ssh";
-import { buildUsageReportText } from "./helpers/usage-report";
+import { buildUsageReportText, collectCachedUsageReports } from "./helpers/usage-report";
 import type {
 	BuiltinSlashCommand,
 	ParsedSlashCommand,
@@ -1348,7 +1348,16 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.showError("Usage: /usage [check]");
 			} else {
 				const adapted = toSlashCommandRuntime(runtime);
-				await adapted.output(await buildUsageReportText(adapted, { check: args === "check" }));
+				// Plain `/usage` renders the graphical panel from the cache-only
+				// inventory snapshot — same data the text view reads, no fetch or
+				// probe. `/usage check` stays on the text path because its value is
+				// the per-credential health verdict, not the bars.
+				const cached = args === "" ? collectCachedUsageReports(adapted) : [];
+				if (cached.length > 0) {
+					await runtime.ctx.handleUsageCommand(cached);
+				} else {
+					await adapted.output(await buildUsageReportText(adapted, { check: args === "check" }));
+				}
 			}
 			runtime.ctx.editor.setText("");
 		},
