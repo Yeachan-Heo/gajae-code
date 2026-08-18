@@ -220,15 +220,19 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
-	// `setOnToolsChanged` only installs a future callback. A server that lands
-	// between `connectServers()` returning and that registration would otherwise
-	// update the manager with nobody listening, and the session would miss it for
-	// good. A very short delay puts the landing inside that window.
-	it("does not lose a server that lands while the tools callback is still being registered", async () => {
+	// `setOnToolsChanged` installs a *future* callback, so a server that lands
+	// between `connectServers()` returning and that registration would update the
+	// manager with nobody listening. The registration therefore also replays the
+	// current snapshot. The window is microseconds wide in production and cannot be
+	// hit reliably from a fixture, so this asserts the invariant the replay exists
+	// to guarantee -- the session ends up holding whatever the manager holds -- with
+	// a delay chosen to land just past the startup wait, i.e. during the rest of
+	// session construction rather than before `connectServers()` even returns.
+	it("ends up holding whatever the manager holds when a server lands during session construction", async () => {
 		await runMCPCommand({
 			action: "add",
 			name: "slow",
-			commandArgs: [process.execPath, "-e", delayedMcpServerScript(320)],
+			commandArgs: [process.execPath, "-e", delayedMcpServerScript(1_800)],
 			flags: { project: true, timeout: 10_000 },
 			cwd: projectDir,
 		});
@@ -236,9 +240,13 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
 		try {
 			await waitFor(() => mcpManager?.getTools().some(tool => tool.name === "mcp__slow_hello") === true);
-			// Whether the landing beat the registration or not, the session must end up
-			// holding what the manager holds.
 			await waitFor(() => session.getActiveToolNames().includes("mcp__slow_hello"));
+
+			const managerMcpTools = (mcpManager?.getTools() ?? [])
+				.filter(tool => tool.mcpServerName !== undefined)
+				.map(tool => tool.name);
+			expect(managerMcpTools.length).toBeGreaterThan(0);
+			for (const name of managerMcpTools) expect(session.getActiveToolNames()).toContain(name);
 		} finally {
 			await session.dispose();
 		}
