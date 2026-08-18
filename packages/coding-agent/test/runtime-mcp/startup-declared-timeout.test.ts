@@ -482,9 +482,7 @@ setInterval(() => {}, 1000);
 
 		// The set was issued first, the delete second: the tombstone must be the
 		// last mutation for the row, so a read cannot see the resurrected catalog.
-		const raw = (storage as { getCache(key: string): string | null }).getCache("mcp_tools:shared");
-		// The tombstone is an empty string; a resurrected catalog would be JSON.
-		expect(raw === null || raw === "").toBe(true);
+		expect(await first.get("shared", config, "cred")).toBeNull();
 	});
 
 	test("a stale write issued before an invalidation cannot resurrect the row", async () => {
@@ -501,19 +499,62 @@ setInterval(() => {}, 1000);
 		const first = new MCPToolCacheClass(storage, "/work/project");
 		const second = new MCPToolCacheClass(storage, "/work/project");
 
-		// A write is issued, then an invalidation for the same row completes
-		// while that write is still queued (the queue holds it behind the delete).
-		// The generation fence must drop the stale write even though it was
-		// serialized in issue order.
+		// Within one process the queue already orders these, so the delete cannot
+		// complete before the write commits and the fence never has to arbitrate.
+		// This pins the outcome that ordering is responsible for; the fence's own
+		// scenario is the cross-process case below, where no queue is shared.
 		const write = first.set("shared", config, tools, "cred");
-		await Bun.sleep(10);
 		await second.delete("shared");
 		await write;
-		await Bun.sleep(20);
 
-		const raw = (storage as { getCache(key: string): string | null }).getCache("mcp_tools:shared");
-		// The tombstone (empty string) is the final state; the catalog did not return.
-		expect(raw === null || raw === "").toBe(true);
+		expect(await first.get("shared", config, "cred")).toBeNull();
+	});
+
+	test("keeps the invalidation fence across processes that share one profile database", async () => {
+		const config = { type: "stdio", command: "shared", args: [] } as never;
+		const tools = [{ name: "ping", inputSchema: { type: "object" } }] as never;
+		const rows = new Map<string, string>();
+		const makeStorage = () =>
+			({
+				getCache: (key: string, options?: { includeExpired?: boolean }) => {
+					const entry = rows.get(key);
+					if (entry === undefined) return null;
+					const [expiresAtSec, value] = entry.split("|", 2) as [string, string];
+					if (options?.includeExpired !== true && Number(expiresAtSec) * 1000 <= Date.now()) return null;
+					return value;
+				},
+				setCache: (key: string, value: string, expiresAtSec: number) => {
+					rows.set(key, `${expiresAtSec}|${value}`);
+				},
+			}) as never;
+
+		// Three processes over one database: separate storage objects, so nothing in
+		// memory is shared. A write issued *after* an invalidation is legitimately
+		// new data and must be admitted; what must not happen is the fence resetting,
+		// which is what lets a write issued *before* an invalidation be admitted as
+		// current. That reset is observable directly in the persisted generation.
+		const processA = new MCPToolCacheClass(makeStorage(), "/work/project");
+		const processB = new MCPToolCacheClass(makeStorage(), "/work/project");
+		const processC = new MCPToolCacheClass(makeStorage(), "/work/project");
+
+		await processA.set("shared", config, tools, "cred");
+		expect(await processB.get("shared", config, "cred")).not.toBeNull();
+
+		const generationOf = (): number => {
+			const entry = rows.get("mcp_tools:shared");
+			if (entry === undefined) return -1;
+			return (JSON.parse(entry.slice(entry.indexOf("|") + 1)) as { generation?: number }).generation ?? -1;
+		};
+
+		await processB.delete("shared");
+		expect(generationOf()).toBe(1);
+		expect(await processA.get("shared", config, "cred")).toBeNull();
+
+		// A third process that never saw either prior mutation still advances the
+		// fence. With a process-local generation it would restart at zero and hand
+		// out a value an earlier write already holds.
+		await processC.delete("shared");
+		expect(generationOf()).toBe(2);
 	});
 
 	test("a cached surface is not kept alive after its declared window elapsed", async () => {

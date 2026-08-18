@@ -447,8 +447,13 @@ FROM model_usage_legacy
 	/**
 	 * Gets a cached value by key. Returns null if not found or expired.
 	 */
-	getCache(key: string): string | null {
-		return this.#authStore.getCache(key);
+	/**
+	 * `includeExpired` reads a row past its expiry. Callers that keep fence or
+	 * tombstone state in the value itself need it: an expired row is invisible to
+	 * an ordinary read, which would silently reset that state to its default.
+	 */
+	getCache(key: string, options?: { includeExpired?: boolean }): string | null {
+		return this.#authStore.getCache(key, options);
 	}
 
 	/**

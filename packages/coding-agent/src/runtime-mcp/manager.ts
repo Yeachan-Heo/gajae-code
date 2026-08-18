@@ -370,8 +370,13 @@ export class MCPManager {
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingConnectionControllers = new Map<string, AbortController>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
-	/** Serializes cache writes and invalidations per server (see `#queueCacheOperation`). */
-	#cacheOperations = new Map<string, Promise<void>>();
+	/**
+	 * Credential fingerprint of the identity each live connection authenticated
+	 * with. A later refresh reuses the tools of *this* connection, so it must cache
+	 * them under the identity that fetched them; re-resolving the template at
+	 * refresh time would attribute them to whatever credential is current now.
+	 */
+	#connectionCredentials = new WeakMap<MCPServerConnection, string>();
 	#sources = new Map<string, SourceMeta>();
 	#authStorage: AuthStorage | null = null;
 	#inputRequestHandler: MCPInputRequestHandler | null = null;
@@ -1101,6 +1106,7 @@ export class MCPManager {
 						this.#pendingConnectionControllers.delete(name);
 						this.#connections.set(name, connection);
 						this.#registerLease(name, connection);
+						if (resolvedCredential !== undefined) this.#connectionCredentials.set(connection, resolvedCredential);
 						this.#serverConfigs.set(name, config);
 
 						// Wire auth refresh for HTTP transports, and reconnect for any transport.
@@ -1433,27 +1439,18 @@ export class MCPManager {
 	 * replay the same dead surface on the next start until its TTL expires.
 	 */
 	/**
-	 * Cache mutations for one server, in issue order within this manager.
+	 * Start a cache mutation now, and never surface its failure to the caller.
 	 *
-	 * Ordering *across* managers sharing the same cache row is enforced at the
-	 * storage boundary inside `MCPToolCache` itself (keyed by the shared
-	 * `AgentStorage` instance), which is the boundary ordinary sessions actually
-	 * share: each session builds its own manager over the same profile/project
-	 * cache, so per-manager serialization alone cannot stop an older detached
-	 * public write from landing after a newer invalidation.
+	 * Ordering belongs to `MCPToolCache`, which serializes per storage+row across
+	 * every manager sharing the database and captures its invalidation fence when
+	 * the call is made. Queuing here as well would defer that capture to whenever
+	 * this manager's turn arrived, which is exactly the window in which an older
+	 * write reads a generation newer than its own and is admitted as current.
 	 */
-	#queueCacheOperation(name: string, operation: () => Promise<void>): void {
-		const previous = this.#cacheOperations.get(name) ?? Promise.resolve();
-		const next = previous
-			.catch(() => {})
-			.then(operation)
-			.catch(error => {
-				logger.debug("MCP tool cache operation failed", { path: `mcp:${name}`, error });
-			})
-			.finally(() => {
-				if (this.#cacheOperations.get(name) === next) this.#cacheOperations.delete(name);
-			});
-		this.#cacheOperations.set(name, next);
+	#startCacheOperation(name: string, operation: () => Promise<void>): void {
+		void operation().catch(error => {
+			logger.debug("MCP tool cache operation failed", { path: `mcp:${name}`, error });
+		});
 	}
 
 	#withdrawUnreachableDeferredTools(name: string): void {
@@ -1461,7 +1458,7 @@ export class MCPManager {
 		if (deferred.length === 0) return;
 		this.#tools = this.#tools.filter(tool => !(tool instanceof DeferredMCPTool && tool.mcpServerName === name));
 		const cache = this.toolCache;
-		if (cache) this.#queueCacheOperation(name, () => cache.delete(name));
+		if (cache) this.#startCacheOperation(name, () => cache.delete(name));
 		logger.warn("Withdrew deferred MCP tools after the connection failed", {
 			path: `mcp:${name}`,
 			withdrawn: deferred.length,
@@ -1498,12 +1495,12 @@ export class MCPManager {
 			// left a row behind, and that row stays replayable until its TTL. Turning
 			// private must retract what the public phase published.
 			logger.debug("Dropped MCP tool cache entry after a private result", { path: `mcp:${name}` });
-			this.#queueCacheOperation(name, () => cache.delete(name));
+			this.#startCacheOperation(name, () => cache.delete(name));
 			return;
 		}
 		if (credential === undefined) return;
 		const freshUntil = connection.toolsFreshUntil;
-		this.#queueCacheOperation(name, () => cache.set(name, config, serverTools, credential, freshUntil));
+		this.#startCacheOperation(name, () => cache.set(name, config, serverTools, credential, freshUntil));
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
@@ -2183,6 +2180,7 @@ export class MCPManager {
 
 		this.#connections.set(name, connection);
 		this.#registerLease(name, connection);
+		if (resolvedCredential !== undefined) this.#connectionCredentials.set(connection, resolvedCredential);
 
 		// Wire auth refresh for HTTP transports, and reconnect for any transport.
 		if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
@@ -2274,11 +2272,15 @@ export class MCPManager {
 			noReplay: connection.config.sharing === "shared",
 			inputHandler: () => this.#inputRequestHandler ?? undefined,
 		});
-		// The live connection already authenticated, so its resolved config is the
-		// identity this catalog belongs to.
-		const refreshCredential = this.toolCache
-			? await credentialFingerprint(await this.#resolveAuthConfig(connection.config))
-			: undefined;
+		// These tools came over *this* connection, so they belong to the identity it
+		// authenticated with. Re-resolving the template here would attribute them to
+		// whatever credential is current now: a token that rotated since the connect
+		// would file a catalog fetched under the old identity under the new one.
+		const refreshCredential = this.#connectionCredentials.get(connection);
+		// Re-check immediately before publishing: `listTools` was awaited above, and a
+		// disconnect, reload, or reconnect inside that window must not publish this
+		// connection's catalog or emit a tools-changed for a connection that is gone.
+		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 		void this.#cacheServerTools(name, connection.config, connection, serverTools, refreshCredential);
 
 		// Replace tools from this server

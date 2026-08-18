@@ -122,16 +122,33 @@ const storageScope = new WeakMap<AgentStorage, Map<string, Promise<void>>>();
  * somehow bypassed the queue (a future caller, a different process on the
  * same database) cannot resurrect a row an invalidation retired.
  */
-const rowGenerations = new WeakMap<AgentStorage, Map<string, number>>();
 
+/**
+ * Read the row's fence generation from durable storage.
+ *
+ * The generation lives in the row itself rather than in process memory: two
+ * standalone or SDK processes over one profile database would otherwise both
+ * start at zero, and a public write from the first could be admitted after the
+ * second had already invalidated the row for a private result. An invalidation
+ * leaves a tombstone carrying the bumped generation, so it is still readable
+ * after the row has expired.
+ *
+ * A residual interleaving remains: this is a read-modify-write, not a compare
+ * and swap, so two processes racing between the read and the write can still
+ * settle on the same generation. Closing that needs a conditional write the
+ * cache interface does not expose; the durable fence removes the systematic
+ * always-zero case rather than every race.
+ */
 function currentGeneration(storage: AgentStorage, serverName: string): number {
-	return rowGenerations.get(storage)?.get(serverName) ?? 0;
-}
-
-function bumpGeneration(storage: AgentStorage, serverName: string): void {
-	const rows = rowGenerations.get(storage) ?? new Map<string, number>();
-	rowGenerations.set(storage, rows);
-	rows.set(serverName, (rows.get(serverName) ?? 0) + 1);
+	const raw = storage.getCache(cacheKey(serverName), { includeExpired: true });
+	if (!raw) return 0;
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (!isRecord(parsed) || typeof parsed.generation !== "number" || !Number.isFinite(parsed.generation)) return 0;
+		return parsed.generation;
+	} catch {
+		return 0;
+	}
 }
 
 /**
@@ -187,6 +204,9 @@ export class MCPToolCache {
 		if (!isRecord(parsed)) return null;
 		if (parsed.version !== CACHE_VERSION) return null;
 		if (typeof parsed.configHash !== "string") return null;
+		// An invalidation tombstone carries no hash, so it can never satisfy the
+		// comparison below; rejecting it here states that rather than relying on it.
+		if (parsed.configHash.length === 0) return null;
 		if (!Array.isArray(parsed.tools)) return null;
 
 		let currentHash: string;
@@ -207,12 +227,17 @@ export class MCPToolCache {
 		// Serialized at the storage boundary so a concurrent public write from any
 		// manager sharing this row cannot land after this retraction.
 		await enqueueCacheMutation(this.storage, serverName, async () => {
-			// Expiring in the past is the only removal the cache interface exposes.
-			this.storage.setCache(cacheKey(serverName), "", Math.floor(Date.now() / 1000) - 1);
-			// Fence any write that was issued before this invalidation: once the
-			// generation moves, those writes must lose even if they were already
-			// queued behind this one.
-			bumpGeneration(this.storage, serverName);
+			// A tombstone rather than an empty value: it carries the bumped generation
+			// so the fence survives this process, and its empty `configHash` can never
+			// match a real one, so a reader treats it as a miss. It is written already
+			// expired so ordinary reads skip it entirely.
+			const tombstone: MCPToolCachePayload = {
+				version: CACHE_VERSION,
+				configHash: "",
+				tools: [],
+				generation: currentGeneration(this.storage, serverName) + 1,
+			};
+			this.storage.setCache(cacheKey(serverName), JSON.stringify(tombstone), Math.floor(Date.now() / 1000) - 1);
 		});
 	}
 
