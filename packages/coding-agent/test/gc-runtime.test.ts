@@ -248,11 +248,11 @@ describe("collectGcReport", () => {
 	});
 
 	test("non-removable records are kept (action none) and never pruned", async () => {
-		const adapter = fakeAdapter("team_workers", [
-			record("team_workers", { removable: false, status: "alive", stale: false }),
+		const adapter = fakeAdapter("registry_entries", [
+			record("registry_entries", { removable: false, status: "alive", stale: false }),
 		]);
 		const report = await collectGcReport([adapter], ctx(), true);
-		expect(report.stores.team_workers[0]?.action).toBe("none");
+		expect(report.stores.registry_entries[0]?.action).toBe("none");
 		expect(report.counts.removed).toBe(0);
 	});
 

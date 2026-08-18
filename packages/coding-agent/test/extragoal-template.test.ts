@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
-const expectedWorkflowSkills = ["deep-interview", "ralplan", "team", "ultragoal"];
+const expectedWorkflowSkills = ["autoresearch", "deep-interview", "ralplan", "ultragoal"];
 
 describe("Extragoal skill template", () => {
 	it("documents local override installation without changing the default workflow surface", async () => {

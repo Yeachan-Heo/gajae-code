@@ -734,7 +734,7 @@ function toolSchema(name: CoordinatorToolName): {
 	return { name, description: "List known scoped GJC coordinator bridge sessions.", inputSchema: common };
 }
 
-type DelegateWorkflow = "plan" | "execute" | "team";
+type DelegateWorkflow = "plan" | "execute";
 
 function workflowForDelegateTool(name: string): DelegateWorkflow | null {
 	switch (name) {
@@ -742,21 +742,17 @@ function workflowForDelegateTool(name: string): DelegateWorkflow | null {
 			return "plan";
 		case "gjc_delegate_execute":
 			return "execute";
-		case "gjc_delegate_team":
-			return "team";
 		default:
 			return null;
 	}
 }
 
-function workflowSkill(workflow: DelegateWorkflow): "ralplan" | "ultragoal" | "team" {
+function workflowSkill(workflow: DelegateWorkflow): "ralplan" | "ultragoal" {
 	switch (workflow) {
 		case "plan":
 			return "ralplan";
 		case "execute":
 			return "ultragoal";
-		case "team":
-			return "team";
 	}
 }
 
@@ -766,8 +762,6 @@ function delegateToolDescription(workflow: DelegateWorkflow): string {
 			return "Delegate consensus planning to GJC: start a session and run /skill:ralplan to completion, returning durable turn status and artifact references.";
 		case "execute":
 			return "Delegate execution to GJC: start a session and run /skill:ultragoal to completion, returning durable turn status and artifact references.";
-		case "team":
-			return "Delegate parallel team execution to GJC: start a session and run /skill:team to completion, returning durable turn status and artifact references.";
 	}
 }
 

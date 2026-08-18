@@ -158,7 +158,7 @@ A deliberately small workflow surface — four skills, four role agents, nothing
 
 ```text
 deep-interview -> ralplan -> ultragoal
-                         └─ optional team execution when parallel tmux workers help
+               └─ optional autoresearch mission when research must ground the plan
 ```
 
 | Surface | What it does |
@@ -166,10 +166,10 @@ deep-interview -> ralplan -> ultragoal
 | `deep-interview` | Turns vague requests into concrete requirements. |
 | `ralplan` | Builds and critiques the implementation plan before code changes. |
 | `ultragoal` | Tracks goals through execution, revision, verification, and evidence. |
-| `team` | Coordinates tmux-backed workers when parallelism is worth it. |
+| `autoresearch` | Runs goal-directed research missions and ends on a structured verdict. |
 | `executor` / `architect` / `planner` / `critic` | Bundled role agents for implementation and read-only review lanes. |
 
-Also included, opt-in: **`gjc rlm`** (a Jupyter-style research/REPL mode that synthesizes a notebook and report) and **`computer-use`** (experimental desktop control). See [Python REPL](docs/python-repl.md) and [docs/tools/computer.md](docs/tools/computer.md).
+Also included, opt-in: **`computer-use`** (experimental desktop control). See [Python REPL](docs/python-repl.md) and [docs/tools/computer.md](docs/tools/computer.md).
 
 ## Custom skills
 

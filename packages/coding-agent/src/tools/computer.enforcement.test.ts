@@ -153,7 +153,15 @@ describe("computer enforcement red-team probes", () => {
 				observed: `code=${resultCode(permission)} message=${resultMessage(permission)} nativeScreenshotCalls=${permissionCalls}`,
 				verdict:
 					resultCode(permission) === "COMPUTER_PERMISSION_REQUIRED" &&
-					resultMessage(permission).includes("Screen & System Audio Recording or Accessibility")
+					// Assert the substance of the guidance contract -- the hint must name
+					// both required macOS permissions -- rather than one exact sentence.
+					// A literal pin is what rotted here before: the previous literal
+					// ("screen-recording or accessibility permission") went stale when the
+					// hint was reworded, silently failing this probe. Matching on the two
+					// permission names still fails if either is dropped, without
+					// re-arming that trap on the next rewording.
+					/recording/i.test(resultMessage(permission)) &&
+					/accessibility/i.test(resultMessage(permission))
 						? "passed"
 						: "failed",
 			});

@@ -5,8 +5,8 @@ import {
 } from "./workflow-intent-report";
 
 export const WORKFLOW_INTENT_DIFF_CUSTOM_TYPE = "workflow-intent-diff";
-export const WORKFLOW_INTENT_ROUTES = ["direct", "deep-interview", "ralplan", "ultragoal", "team"] as const;
-export const WORKFLOW_ESCALATION_ROUTES = ["deep-interview", "ralplan", "ultragoal", "team"] as const;
+export const WORKFLOW_INTENT_ROUTES = ["direct", "deep-interview", "ralplan", "ultragoal", "autoresearch"] as const;
+export const WORKFLOW_ESCALATION_ROUTES = ["deep-interview", "ralplan", "ultragoal", "autoresearch"] as const;
 
 export type WorkflowIntentRoute = (typeof WORKFLOW_INTENT_ROUTES)[number];
 export type WorkflowEscalationRoute = (typeof WORKFLOW_ESCALATION_ROUTES)[number];
@@ -77,11 +77,12 @@ const ARCHITECTURE_SEQUENCE_PATTERNS = [
 	/\bdestructive\b/i,
 ] as const;
 
-const TEAM_PATTERNS = [
-	/\buse (?:a )?team\b/i,
-	/\bcoordinated (?:persistent )?workers\b/i,
-	/\bpersistent workers\b/i,
-	/\bworker coordination\b/i,
+const AUTORESEARCH_PATTERNS = [
+	/\buse (?:a )?autoresearch\b/i,
+	/\b(?:research|investigate|experiment|benchmark|measure)\b[^.!?\n]{0,60}\b(?:mission|finding|evidence|verdict|dataset|against|compare|hypothesis)\b/i,
+	/\b(?:mission|finding|evidence|verdict|dataset|against|compare|hypothesis)\b[^.!?\n]{0,60}\b(?:research|investigate|experiment|benchmark|measure)\b/i,
+	/\brun (?:a |the )?(?:bounded )?research (?:mission|task|investigation)\b/i,
+	/\b(?:benchmark|experiment)\b[^.!?\n]{0,40}\b(?:and|then|to)\b[^.!?\n]{0,40}\b(?:report|measure|compare)\b/i,
 ] as const;
 
 const ROOT_CAUSE_TRIGGERS = [
@@ -172,12 +173,12 @@ function classifyRoute(text: string): RouteMatch {
 		};
 	}
 
-	if (matchesAny(text, TEAM_PATTERNS)) {
+	if (matchesAny(text, AUTORESEARCH_PATTERNS)) {
 		return {
-			route: "team",
-			reason: "coordinated persistent workers requested",
-			recommendedInvocation: "/skill:team",
-			triggers: ["coordinated workers"],
+			route: "autoresearch",
+			reason: "goal-directed research mission requested",
+			recommendedInvocation: "/skill:autoresearch",
+			triggers: ["research mission"],
 		};
 	}
 

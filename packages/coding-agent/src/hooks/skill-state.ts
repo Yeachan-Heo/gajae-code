@@ -71,7 +71,7 @@ function formatBoolean(name: string, value: boolean | undefined): string {
 export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillConfigInput | undefined): string {
 	if (!input || input.unavailableReason) {
 		const reason = input?.unavailableReason ? sanitizeConfigValue(input.unavailableReason) : "not available";
-		return `Sanitized effective skill config unavailable (${reason}); bundled GJC workflow activation remains available for deep-interview, ralplan, ultragoal, team.`;
+		return `Sanitized effective skill config unavailable (${reason}); bundled GJC workflow activation remains available for deep-interview, ralplan, ultragoal, autoresearch.`;
 	}
 
 	const settings = input.skillsSettings ?? {};
@@ -85,7 +85,7 @@ export function buildSanitizedEffectiveSkillConfigContext(input: EffectiveSkillC
 	const userTrusted = resolveSkillScopeTrust(settings, "user");
 
 	return [
-		"Sanitized effective skill config for filesystem/custom skill discovery; bundled GJC workflow activation remains available for exactly deep-interview, ralplan, ultragoal, team.",
+		"Sanitized effective skill config for filesystem/custom skill discovery; bundled GJC workflow activation remains available for exactly deep-interview, ralplan, ultragoal, autoresearch.",
 		`Skill discovery booleans: ${[
 			formatBoolean("enabled", settings.enabled),
 			formatBoolean("enableSkillCommands", settings.enableSkillCommands),

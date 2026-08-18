@@ -1,8 +1,22 @@
-import type { ExtensionAPI } from "../extensibility/extensions";
+/**
+ * Autoresearch branch isolation (ported from the deleted extension's `git.ts`).
+ *
+ * Every mission is meant to run on a dedicated `autoresearch/*` branch created
+ * from a slugified goal. On that branch `keep` auto-commits the iteration and
+ * `discard` resets the worktree to HEAD; off-branch (no repo, or a dirty tree
+ * that prevents branch creation) we degrade: `keep` skips auto-commits and
+ * `discard` reverts only run-modified paths instead of resetting to baseline.
+ *
+ * Dirty-worktree behavior is faithful to the extension contract: when the tree
+ * is dirty and we are NOT already on an autoresearch branch, we return a
+ * warning and continue on the current branch rather than failing.
+ */
+import * as fs from "node:fs";
+import * as path from "node:path";
 import * as git from "../utils/git";
-import { normalizePathSpec } from "./helpers";
+import { HARNESS_FILENAME, normalizePathSpec } from "./harness";
 
-const AUTORESEARCH_BRANCH_PREFIX = "autoresearch/";
+export const AUTORESEARCH_BRANCH_PREFIX = "autoresearch/";
 const BRANCH_NAME_MAX_LENGTH = 48;
 
 export interface EnsureAutoresearchBranchFailure {
@@ -19,21 +33,38 @@ export interface EnsureAutoresearchBranchSuccess {
 
 export type EnsureAutoresearchBranchResult = EnsureAutoresearchBranchFailure | EnsureAutoresearchBranchSuccess;
 
-export async function getCurrentAutoresearchBranch(_api: ExtensionAPI, workDir: string): Promise<string | null> {
-	const currentBranch = (await git.branch.current(workDir)) ?? "";
-	return currentBranch.startsWith(AUTORESEARCH_BRANCH_PREFIX) ? currentBranch : null;
+export function getCurrentAutoresearchBranch(workDir: string): Promise<string | null> {
+	return git.branch.current(workDir).then(currentBranch => {
+		return currentBranch?.startsWith(AUTORESEARCH_BRANCH_PREFIX) ? currentBranch : null;
+	});
+}
+
+/**
+ * True when `rawPath` is one of the mission's own research artifacts: the
+ * `autoresearch.sh` harness at the working-directory root. This is the complete
+ * agent-writable surface for an active mission — product code, manifests,
+ * dependencies, and every other path stay blocked by the research-only
+ * mutation guard regardless of branch name.
+ *
+ * Mission state under `.gjc/**` is intentionally NOT listed here: it is
+ * runtime-owned and only the sanctioned `gjc autoresearch` CLI writes it.
+ */
+export function isAutoresearchAuthorizedResearchPath(_cwd: string, rawPath: string): boolean {
+	const normalized = normalizePathSpec(rawPath);
+	if (normalized === ".") return false;
+	return normalized === HARNESS_FILENAME;
 }
 
 /**
  * Ensure the working tree is on an `autoresearch/*` branch when possible.
  *
- * If the worktree is dirty and we're not already on an autoresearch branch, this returns
- * `{ ok: true, branchName: null, warning }` rather than failing. The caller surfaces the
- * warning and continues on the current branch — `keep` will skip auto-commits and `discard`
- * will revert only run-modified paths instead of resetting to baseline.
+ * When the worktree is dirty and we are not already on an autoresearch branch,
+ * this returns `{ ok: true, branchName: null, warning }` rather than failing:
+ * the caller surfaces the warning and continues on the current branch — `keep`
+ * will skip auto-commits and `discard` will revert only run-modified paths
+ * instead of resetting to baseline.
  */
 export async function ensureAutoresearchBranch(
-	api: ExtensionAPI,
 	workDir: string,
 	goal: string | null,
 ): Promise<EnsureAutoresearchBranchResult> {
@@ -58,21 +89,27 @@ export async function ensureAutoresearchBranch(
 		};
 	}
 
-	const workDirPrefix = await readGitWorkDirPrefix(api, workDir);
+	const workDirPrefix = await readGitWorkDirPrefix(workDir);
 	const dirtyPaths = collectRelativeDirtyPaths(dirtyPathsOutput, workDirPrefix);
-	const currentBranch = await getCurrentAutoresearchBranch(api, workDir);
+	const currentBranch = await getCurrentAutoresearchBranch(workDir);
 	if (currentBranch) {
 		return { ok: true, branchName: currentBranch, created: false };
 	}
 	if (dirtyPaths.length > 0) {
 		const preview = formatDirtyPaths(dirtyPaths);
 		return {
-			ok: false,
-			error: `Worktree is dirty (${preview}). Commit or stash these changes before starting autoresearch — a fresh autoresearch/* branch needs a clean baseline.`,
+			ok: true,
+			branchName: null,
+			created: false,
+			warning:
+				`Worktree is dirty (${preview}). Continuing autoresearch on the current branch without a dedicated ` +
+				"`autoresearch/*` branch: `keep` will skip auto-commits and `discard` will revert only run-modified " +
+				"files instead of resetting to baseline. Commit or stash these changes and re-run to get full branch " +
+				"isolation.",
 		};
 	}
 
-	const branchName = await allocateBranchName(api, workDir, goal);
+	const branchName = await allocateBranchName(workDir, goal);
 	try {
 		await git.branch.checkoutNew(workDir, branchName);
 	} catch (err) {
@@ -109,8 +146,7 @@ export function relativizeGitPathToWorkDir(repoRelativePath: string, workDirPref
 	return normalizePathSpec(normalizedPath.slice(normalizedPrefix.length + 1));
 }
 
-async function readGitWorkDirPrefix(api: ExtensionAPI, workDir: string): Promise<string> {
-	void api;
+async function readGitWorkDirPrefix(workDir: string): Promise<string> {
 	try {
 		return await git.show.prefix(workDir);
 	} catch {
@@ -170,23 +206,18 @@ export function normalizeStatusPath(rawPath: string): string {
 	return normalizePathSpec(normalized);
 }
 
-async function allocateBranchName(api: ExtensionAPI, workDir: string, goal: string | null): Promise<string> {
+async function allocateBranchName(workDir: string, goal: string | null): Promise<string> {
 	const baseName = `${AUTORESEARCH_BRANCH_PREFIX}${slugifyGoal(goal)}-${currentDateStamp()}`;
 	let candidate = baseName;
 	let suffix = 2;
-	while (await branchExists(api, workDir, candidate)) {
+	while (await git.ref.exists(workDir, `refs/heads/${candidate}`)) {
 		candidate = `${baseName}-${suffix}`;
 		suffix += 1;
 	}
 	return candidate;
 }
 
-async function branchExists(api: ExtensionAPI, workDir: string, branchName: string): Promise<boolean> {
-	void api;
-	return git.ref.exists(workDir, `refs/heads/${branchName}`);
-}
-
-function slugifyGoal(goal: string | null): string {
+export function slugifyGoal(goal: string | null): string {
 	const normalized = (goal ?? "")
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-")
@@ -316,4 +347,133 @@ export function computeRunModifiedPaths(
 		}
 	}
 	return { tracked, untracked };
+}
+
+// ---------------------------------------------------------------------------
+// keep / discard
+// ---------------------------------------------------------------------------
+
+export interface KeepAutoresearchRunInput {
+	cwd: string;
+	description: string;
+	status: string;
+	metric: number;
+	metrics: { [key: string]: number };
+	/** Paths modified by this run (workdir-relative). */
+	files: string[];
+	/** True when on a dedicated `autoresearch/*` branch. */
+	onAutoresearchBranch: boolean;
+	primaryMetric: string;
+}
+
+export interface KeepAutoresearchRunResult {
+	/** Error text when the commit failed; `ok` is false. */
+	error?: string;
+	/** Human note for the caller (e.g. "nothing to commit", "committed", "skipped"). */
+	note?: string;
+	/** Commit SHA after the keep (null when nothing was committed). */
+	commitHash?: string | null;
+}
+
+/**
+ * Keep an iteration: commit the modified files on a dedicated autoresearch
+ * branch. Off-branch (degraded mode) auto-commit is skipped and the files stay
+ * in the worktree, matching the extension contract.
+ */
+export async function keepAutoresearchRun(input: KeepAutoresearchRunInput): Promise<KeepAutoresearchRunResult> {
+	if (!input.onAutoresearchBranch) {
+		return {
+			note: "Auto-commit skipped: not on a dedicated autoresearch branch. Modified files remain in the worktree.",
+			commitHash: null,
+		};
+	}
+	if (input.files.length === 0) {
+		return { note: "nothing to commit", commitHash: null };
+	}
+	try {
+		await git.stage.files(input.cwd, input.files);
+	} catch (err) {
+		return { error: `git add failed: ${err instanceof Error ? err.message : String(err)}` };
+	}
+	if (!(await git.diff.has(input.cwd, { cached: true, files: input.files }))) {
+		return { note: "nothing to commit", commitHash: null };
+	}
+	const payload: { [key: string]: string | number } = {
+		status: input.status,
+		[input.primaryMetric]: input.metric,
+	};
+	for (const [name, value] of Object.entries(input.metrics)) {
+		payload[name] = value;
+	}
+	const commitMessage = `${input.description}\n\nResult: ${JSON.stringify(payload)}`;
+	try {
+		await git.commit(input.cwd, commitMessage, { files: input.files });
+		const commitHash = await git.head.sha(input.cwd);
+		return { note: `committed at ${(commitHash ?? "").slice(0, 12)}`, commitHash };
+	} catch (err) {
+		return { error: `git commit failed: ${err instanceof Error ? err.message : String(err)}` };
+	}
+}
+
+export interface DiscardAutoresearchRunInput {
+	cwd: string;
+	/** Paths that were already dirty before the run started (workdir-relative). */
+	preRunDirtyPaths: string[];
+	/** True when on a dedicated `autoresearch/*` branch. */
+	onAutoresearchBranch: boolean;
+}
+
+export interface DiscardAutoresearchRunResult {
+	error?: string;
+	note?: string;
+}
+
+/**
+ * Discard a failed/crashed iteration. On a dedicated autoresearch branch the
+ * worktree resets to HEAD (never rewinding prior `keep` commits); off-branch
+ * only run-modified paths are reverted so pre-existing user dirt survives.
+ */
+export async function discardAutoresearchRun(
+	input: DiscardAutoresearchRunInput,
+): Promise<DiscardAutoresearchRunResult> {
+	if (input.onAutoresearchBranch) {
+		try {
+			await git.reset(input.cwd, { hard: true, target: "HEAD" });
+			await git.clean(input.cwd);
+			return { note: "worktree reset to HEAD" };
+		} catch (err) {
+			return { error: `git reset/clean failed: ${err instanceof Error ? err.message : String(err)}` };
+		}
+	}
+
+	let statusText: string;
+	try {
+		statusText = await git.status(input.cwd, { porcelainV1: true, untrackedFiles: "all", z: true });
+	} catch (err) {
+		return { error: `git status failed: ${err instanceof Error ? err.message : String(err)}` };
+	}
+	let workDirPrefix: string;
+	try {
+		workDirPrefix = await git.show.prefix(input.cwd);
+	} catch {
+		workDirPrefix = "";
+	}
+	const { tracked, untracked } = computeRunModifiedPaths(input.preRunDirtyPaths, statusText, workDirPrefix);
+	const total = tracked.length + untracked.length;
+	if (total === 0) return { note: "nothing to revert" };
+	if (tracked.length > 0) {
+		try {
+			await git.restore(input.cwd, { files: tracked, source: "HEAD", staged: true, worktree: true });
+		} catch (err) {
+			return { error: `git restore failed: ${err instanceof Error ? err.message : String(err)}` };
+		}
+	}
+	for (const filePath of untracked) {
+		try {
+			fs.rmSync(path.join(input.cwd, filePath), { force: true, recursive: true });
+		} catch {
+			// best effort
+		}
+	}
+	return { note: `reverted ${total} file${total === 1 ? "" : "s"}` };
 }

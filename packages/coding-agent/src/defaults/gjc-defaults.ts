@@ -1,9 +1,10 @@
 import { readFileSync } from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isEnoent } from "@gajae-code/utils";
 import { BUNDLED_GJC_SKILL_CATALOG, type BundledGjcSkillCatalogEntry } from "./gjc-skills.generated";
 
-export const DEFAULT_GJC_DEFINITION_NAMES = ["deep-interview", "ralplan", "team", "ultragoal"] as const;
+export const DEFAULT_GJC_DEFINITION_NAMES = ["autoresearch", "deep-interview", "ralplan", "ultragoal"] as const;
 export type DefaultGjcDefinitionName = (typeof DEFAULT_GJC_DEFINITION_NAMES)[number];
 export type DefaultGjcDefinitionKind = "skill" | "skill-fragment";
 export type EmbeddedDefaultGjcSkill = {
@@ -64,6 +65,32 @@ export type DefaultGjcDefinitionInstallFile =
 			status: DefaultGjcInstallStatus;
 	  };
 
+/**
+ * Bundled workflow definitions that GJC used to ship and no longer does.
+ *
+ * Installing defaults only ever wrote the CURRENT set, so a definition dropped
+ * from the bundle stayed on disk under the agent dir forever — where
+ * filesystem skill discovery still found it and `/skill:<name>` still resolved.
+ * `team` was the first removal, so it was the first to expose that gap.
+ *
+ * Retirement QUARANTINES rather than deletes: the directory is moved aside to
+ * `<targetRoot>/retired/<name>.<timestamp>/`. A user who customized the skill
+ * keeps their content, and nothing is destroyed to satisfy a rename.
+ */
+export const RETIRED_GJC_DEFINITION_NAMES = ["team"] as const;
+export type RetiredGjcDefinitionName = (typeof RETIRED_GJC_DEFINITION_NAMES)[number];
+
+export type RetiredGjcDefinitionStatus = "absent" | "quarantined";
+
+export interface RetiredGjcDefinitionFile {
+	name: RetiredGjcDefinitionName;
+	/** Directory that held the retired definition. */
+	path: string;
+	/** Where it was moved, when quarantined. */
+	quarantinedTo?: string;
+	status: RetiredGjcDefinitionStatus;
+}
+
 export interface DefaultGjcDefinitionInstallResult {
 	targetRoot: string;
 	total: number;
@@ -73,6 +100,8 @@ export interface DefaultGjcDefinitionInstallResult {
 	missing: number;
 	different: number;
 	files: DefaultGjcDefinitionInstallFile[];
+	/** Retired bundled definitions found under `targetRoot`, and what happened to them. */
+	retired: RetiredGjcDefinitionFile[];
 }
 function sourcePathForBundledEntry(entry: BundledGjcSkillCatalogEntry): string {
 	const relative = entry.kind === "skill" ? entry.relativePath : entry.relativePath.replace(/^skill-fragments\//, "");
@@ -236,7 +265,63 @@ export async function installDefaultGjcDefinitions(
 		}
 	}
 
-	return summarizeInstallResult(targetRoot, files);
+	const retired = await retireRemovedGjcDefinitions(targetRoot, { check: options.check === true });
+	return summarizeInstallResult(targetRoot, files, retired);
+}
+
+/**
+ * Quarantine any retired bundled definition still present under `targetRoot`.
+ *
+ * `check` reports what WOULD move without touching the filesystem, so
+ * `--check` callers stay read-only.
+ */
+export async function retireRemovedGjcDefinitions(
+	targetRoot: string,
+	options: { check?: boolean } = {},
+): Promise<RetiredGjcDefinitionFile[]> {
+	const results: RetiredGjcDefinitionFile[] = [];
+	for (const name of RETIRED_GJC_DEFINITION_NAMES) {
+		const directory = path.join(targetRoot, "skills", name);
+		if (!(await directoryExists(directory))) {
+			results.push({ name, path: directory, status: "absent" });
+			continue;
+		}
+		if (options.check) {
+			results.push({ name, path: directory, status: "quarantined" });
+			continue;
+		}
+		const quarantinedTo = await reserveQuarantinePath(path.join(targetRoot, "retired"), name);
+		await fs.rename(directory, quarantinedTo);
+		results.push({ name, path: directory, quarantinedTo, status: "quarantined" });
+	}
+	return results;
+}
+
+/**
+ * Reserve a unique quarantine directory.
+ *
+ * A timestamp alone is not enough: two retirements inside the same millisecond
+ * resolve to the same path, which would silently overwrite the earlier
+ * quarantine. Disambiguate with a counter until an unused path is found.
+ */
+async function reserveQuarantinePath(retiredRoot: string, name: string): Promise<string> {
+	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+	await fs.mkdir(retiredRoot, { recursive: true });
+	const base = path.join(retiredRoot, `${name}.${stamp}`);
+	if (!(await directoryExists(base))) return base;
+	for (let attempt = 2; ; attempt += 1) {
+		const candidate = `${base}-${attempt}`;
+		if (!(await directoryExists(candidate))) return candidate;
+	}
+}
+
+async function directoryExists(candidate: string): Promise<boolean> {
+	try {
+		return (await fs.stat(candidate)).isDirectory();
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
 }
 
 async function readExistingText(filePath: string): Promise<string | undefined> {
@@ -251,6 +336,7 @@ async function readExistingText(filePath: string): Promise<string | undefined> {
 function summarizeInstallResult(
 	targetRoot: string,
 	files: DefaultGjcDefinitionInstallFile[],
+	retired: RetiredGjcDefinitionFile[],
 ): DefaultGjcDefinitionInstallResult {
 	return {
 		targetRoot,
@@ -261,6 +347,7 @@ function summarizeInstallResult(
 		missing: countStatus(files, "missing"),
 		different: countStatus(files, "different"),
 		files,
+		retired,
 	};
 }
 

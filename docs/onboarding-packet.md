@@ -4,17 +4,17 @@ This packet is a docs-only, public-safe context seed for the `gajae-code` reposi
 
 ## Purpose in one paragraph
 
-Gajae-Code is the `gjc` coding-agent CLI and supporting monorepo. The product centers on a small public workflow loop: clarify with `deep-interview`, plan with `ralplan`, execute and verify through `ultragoal`, and use `team` only when parallel tmux workers are useful. The main product package is `packages/coding-agent/`; supporting packages provide LLM/provider access, agent runtime, TUI rendering, native helpers, stats, utilities, benchmarks, and SDK machine interfaces.
+Gajae-Code is the `gjc` coding-agent CLI and supporting monorepo. The product centers on a small public workflow loop: clarify with `deep-interview`, plan with `ralplan`, execute and verify through `ultragoal`, and run goal-directed research missions with `autoresearch`. The main product package is `packages/coding-agent/`; supporting packages provide LLM/provider access, agent runtime, TUI rendering, native helpers, stats, utilities, benchmarks, and SDK machine interfaces.
 
 ## Fixed public surface
 
 Keep this invariant front-and-center when onboarding to the repo:
 
-- Default workflow skills: `deep-interview`, `ralplan`, `team`, `ultragoal`.
+- Default workflow skills: `autoresearch`, `deep-interview`, `ralplan`, `ultragoal`.
 - Public role agents: `executor`, `architect`, `planner`, `critic`.
 - Bundled default workflow skill sources live under `packages/coding-agent/src/defaults/gjc/skills/`.
 - Bundled role-agent prompt sources live under `packages/coding-agent/src/prompts/agents/`.
-- Runtime state, specs, plans, goals, team state, and local overrides belong under `.gjc/` for the product and `.omx/` only for this agent-run orchestration.
+- Runtime state, specs, plans, goals, research missions, and local overrides belong under `.gjc/` for the product and `.omx/` only for this agent-run orchestration.
 
 Do not add a fifth default skill, fifth public role agent, new command, new config surface, or feature-intake behavior unless that product decision has already been made and the default-surface gates are updated.
 

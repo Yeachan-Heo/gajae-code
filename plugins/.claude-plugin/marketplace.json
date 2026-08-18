@@ -11,7 +11,7 @@
     {
       "name": "gajae-code",
       "source": "./gajae-code",
-      "description": "Delegate GJC planning/execution/team workflows via coordinator MCP, plus advisory SDK session CLI and guide skills.",
+      "description": "Delegate GJC planning/execution workflows via coordinator MCP, plus advisory SDK session CLI and guide skills.",
       "version": "0.14.0",
       "author": {
         "name": "Gajae Code"

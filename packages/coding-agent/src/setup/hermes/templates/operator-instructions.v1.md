@@ -21,7 +21,6 @@ When the goal is to hand GJC a whole workflow rather than micro-manage one promp
 
 - `gjc_delegate_plan` — run consensus planning (`/skill:ralplan`) to a pending-approval plan.
 - `gjc_delegate_execute` — run execution (`/skill:ultragoal`) to completion with verification.
-- `gjc_delegate_team` — run parallel team execution (`/skill:team`) with internal tmux workers.
 
 Each delegate starts (or reuses) a session, sends one workflow-tagged turn, and returns a durable `turn_id`. Pass `cwd` and `task`; set `allow_mutation: true` only when the bridge startup mutation class is enabled and the user has approved changes. Poll the returned `turn_id` with `{{TOOL_PREFIX}}_await_turn` or watch for the `delegation.started` event, exactly as with `send_prompt`. Drop to the manual start/send tools only for fine-grained control the delegate tools do not cover.
 

@@ -1478,12 +1478,15 @@ describe("config-root workflow settings migration", () => {
 		// key); the edited source also adds an UNRECORDED threshold (processed
 		// even earlier, so its SET is queued) - the strict abort must commit the
 		// autoHandoff repair but NOT the unrecorded threshold.
-		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { autoHandoff: "team" } } }, null, 2));
+		await fs.writeFile(target, YAML.stringify({ gjc: { ralplan: { autoHandoff: "ultragoal" } } }, null, 2));
 		await fs.writeFile(
 			source,
 			'{"gjc.deepInterview.ambiguityThreshold":0.8,"gjc.ralplan.autoHandoff":"off","gjc.ralplan.maxIterations":"bad"}',
 		);
-		const oldSourceHash = nodeCrypto.createHash("sha256").update('{"gjc.ralplan.autoHandoff":"team"}').digest("hex");
+		const oldSourceHash = nodeCrypto
+			.createHash("sha256")
+			.update('{"gjc.ralplan.autoHandoff":"ultragoal"}')
+			.digest("hex");
 		await fs.writeFile(
 			path.join(home, ".myconfig", "settings.json.migrated"),
 			JSON.stringify({
@@ -1505,7 +1508,7 @@ describe("config-root workflow settings migration", () => {
 		const parsed = YAML.parse(await fs.readFile(target, "utf8")) as Record<string, unknown>;
 		const gjc = parsed.gjc as Record<string, unknown> | undefined;
 		const ralplan = gjc?.ralplan as Record<string, unknown> | undefined;
-		expect(ralplan?.autoHandoff).toBe("team"); // unverifiable without a backup: kept
+		expect(ralplan?.autoHandoff).toBe("ultragoal"); // unverifiable without a backup: kept
 		expect(ralplan?.maxIterations).toBeUndefined();
 		const deepInterview = gjc?.deepInterview as Record<string, unknown> | undefined;
 		expect(deepInterview?.ambiguityThreshold).toBeUndefined(); // unrecorded key NOT committed

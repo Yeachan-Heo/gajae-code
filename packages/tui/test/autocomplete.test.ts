@@ -385,41 +385,41 @@ describe("trySyncSlashCompletion", () => {
 	it("uses priority as a tie-breaker within the same slash match tier", () => {
 		const provider = new CombinedAutocompleteProvider(
 			[
-				{ name: "skill:team", description: "Team orchestration", value: "skill:team", priority: 100 },
-				{ name: "slash:team", description: "Alternate team command", value: "slash:team" },
+				{ name: "skill:probe", description: "Probe orchestration", value: "skill:probe", priority: 100 },
+				{ name: "slash:probe", description: "Alternate probe command", value: "slash:probe" },
 			],
 			"/tmp",
 		);
-		const result = provider.trySyncSlashCompletion("/team");
+		const result = provider.trySyncSlashCompletion("/probe");
 		expect(result).not.toBeNull();
-		expect(result!.items.map(i => i.value)).toEqual(["skill:team", "slash:team"]);
+		expect(result!.items.map(i => i.value)).toEqual(["skill:probe", "slash:probe"]);
 	});
 
 	it("ranks stronger slash text matches above higher-priority fallback matches", () => {
 		const provider = new CombinedAutocompleteProvider(
 			[
-				{ name: "init", description: "Generate team files", value: "init", priority: 100 },
-				{ name: "skill:team", description: "Team orchestration", value: "skill:team" },
+				{ name: "init", description: "Generate autoresearch files", value: "init", priority: 100 },
+				{ name: "skill:autoresearch", description: "Autoresearch missions", value: "skill:autoresearch" },
 			],
 			"/tmp",
 		);
-		const result = provider.trySyncSlashCompletion("/team");
+		const result = provider.trySyncSlashCompletion("/autoresearch");
 		expect(result).not.toBeNull();
-		expect(result!.items.map(i => i.value)).toEqual(["skill:team", "init"]);
+		expect(result!.items.map(i => i.value)).toEqual(["skill:autoresearch", "init"]);
 	});
 
 	it("normalizes separators for structured slash command prefixes", () => {
 		const provider = new CombinedAutocompleteProvider(
 			[
 				{ name: "init", description: "Initialize skill template", value: "init", priority: 100 },
-				{ name: "skill:team", description: "Team orchestration", value: "skill:team" },
+				{ name: "skill:autoresearch", description: "Autoresearch missions", value: "skill:autoresearch" },
 			],
 			"/tmp",
 		);
-		const dashed = provider.trySyncSlashCompletion("/skill-te");
-		const colon = provider.trySyncSlashCompletion("/skill:te");
-		expect(dashed?.items[0]?.value).toBe("skill:team");
-		expect(colon?.items[0]?.value).toBe("skill:team");
+		const dashed = provider.trySyncSlashCompletion("/skill-auto");
+		const colon = provider.trySyncSlashCompletion("/skill:auto");
+		expect(dashed?.items[0]?.value).toBe("skill:autoresearch");
+		expect(colon?.items[0]?.value).toBe("skill:autoresearch");
 	});
 });
 

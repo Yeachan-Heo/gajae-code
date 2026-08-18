@@ -15,6 +15,7 @@ import {
 	WorkflowGateBrokerError,
 } from "../src/modes/shared/agent-wire/workflow-gate-broker";
 import type { WorkflowGate } from "../src/modes/shared/agent-wire/workflow-gate-types";
+import { RESERVED_WORKFLOW_STAGES } from "../src/modes/shared/agent-wire/workflow-gate-types";
 
 function liveContinuation(): GateContinuation {
 	let live = true;
@@ -67,7 +68,12 @@ describe("WorkflowGateBroker", () => {
 	});
 
 	it("rejects reserved/unknown stages", () => {
+		expect(RESERVED_WORKFLOW_STAGES).toEqual(["autoresearch"]);
+		expect(RESERVED_WORKFLOW_STAGES).not.toContain("team");
 		const { broker } = makeBroker();
+		expect(() =>
+			broker.openGate({ stage: "autoresearch" as never, kind: "question", schema: { type: "string" } }),
+		).toThrow(WorkflowGateBrokerError);
 		expect(() => broker.openGate({ stage: "team" as never, kind: "question", schema: { type: "string" } })).toThrow(
 			WorkflowGateBrokerError,
 		);

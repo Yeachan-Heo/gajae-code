@@ -495,7 +495,7 @@
 							"enum": [
 								"off",
 								"ultragoal",
-								"team"
+								"autoresearch"
 							],
 							"default": "off"
 						},

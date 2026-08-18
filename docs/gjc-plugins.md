@@ -5,7 +5,7 @@ GJC supports two distinct plugin families. Do not confuse them:
 1. **Legacy marketplace / npm plugins** (`packages/coding-agent/src/extensibility/plugins`) — installed through the existing `gjc plugin install <marketplace-ref|npm-spec>` marketplace/npm flows. Unchanged by this system.
 2. **GJC plugin bundles** — directories whose root contains a **`gajae-plugin.json`** manifest (`kind: "gajae-code-plugin"`). These *extend* existing GJC capabilities and are the subject of this document.
 
-A GJC plugin bundle may only **extend** existing skills/agents — it can never register a new top-level skill, slash-command, command, or agent. GJC exposes exactly four default workflow skills (`deep-interview`, `ralplan`, `team`, `ultragoal`) and four role agents (`executor`, `architect`, `planner`, `critic`); bundles add sub-skills/appendices/tools/hooks/MCPs to those existing parents only.
+A GJC plugin bundle may only **extend** existing skills/agents — it can never register a new top-level skill, slash-command, command, or agent. GJC exposes exactly four default workflow skills (`autoresearch`, `deep-interview`, `ralplan`, `ultragoal`) and four role agents (`executor`, `architect`, `planner`, `critic`); bundles add sub-skills/appendices/tools/hooks/MCPs to those existing parents only.
 
 ## Loose customization vs plugin bundles
 

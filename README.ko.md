@@ -168,7 +168,7 @@ API 키 프로바이더, 로컬 런타임(Ollama, LM Studio, vLLM), 게이트웨
 
 ```text
 deep-interview -> ralplan -> ultragoal
-                         └─ 병렬 tmux 워커가 도움이 될 때만 선택적 team 실행
+               └─ 리서치가 계획을 뒷받침해야 할 때 선택적 autoresearch 미션
 ```
 
 | 표면 | 역할 |
@@ -176,10 +176,10 @@ deep-interview -> ralplan -> ultragoal
 | `deep-interview` | 모호한 요청을 구체적인 요구사항으로 바꿉니다. |
 | `ralplan` | 코드 변경 전에 구현 계획을 세우고 비평합니다. |
 | `ultragoal` | 실행·수정·검증·증거까지 목표를 추적합니다. |
-| `team` | 병렬화가 가치 있을 때 tmux 기반 워커를 조율합니다. |
+| `autoresearch` | 목표 지향 리서치 미션을 수행하고 구조화된 판정으로 마무리합니다. |
 | `executor` / `architect` / `planner` / `critic` | 구현 및 읽기 전용 리뷰 레인을 위한 번들 역할 에이전트. |
 
-옵트인 기능: **`gjc rlm`** (노트북과 리포트를 합성하는 Jupyter 스타일 리서치/REPL 모드), **`computer-use`** (실험적 데스크톱 제어). [Python REPL](docs/python-repl.md), [docs/tools/computer.md](docs/tools/computer.md) 참고.
+옵트인 기능: **`computer-use`** (실험적 데스크톱 제어). [Python REPL](docs/python-repl.md), [docs/tools/computer.md](docs/tools/computer.md) 참고.
 
 ---
 

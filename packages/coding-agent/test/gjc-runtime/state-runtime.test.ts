@@ -143,15 +143,15 @@ describe("native gjc state runtime", () => {
 		expect(seed.status).toBe(0);
 
 		const repeated = await runNativeStateCommand(
-			["write", "--mode", "", "--mode", "team", "--input", JSON.stringify({ marker: "runtime-first" })],
+			["write", "--mode", "", "--mode", "autoresearch", "--input", JSON.stringify({ marker: "runtime-first" })],
 			root,
 		);
 		expect(repeated.status).toBe(0);
 
 		const ralplan = await runNativeStateCommand(["read", "--mode", "ralplan", "--json"], root);
-		const team = await runNativeStateCommand(["read", "--mode", "team", "--json"], root);
+		const autoresearch = await runNativeStateCommand(["read", "--mode", "autoresearch", "--json"], root);
 		expect(envelopeState(ralplan.stdout).marker).toBe("runtime-first");
-		expect(envelopeState(team.stdout)).toEqual({});
+		expect(envelopeState(autoresearch.stdout)).toEqual({});
 	});
 
 	it("preserves first-occurrence selector precedence for repeated input flags", async () => {

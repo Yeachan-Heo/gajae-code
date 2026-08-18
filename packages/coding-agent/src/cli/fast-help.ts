@@ -12,9 +12,9 @@ export function getExtraHelpText(): string {
   ${APP_NAME} auth-gateway        - Run an auth-gateway forward proxy
   ${APP_NAME} harness              - Run harness control-plane commands
   ${APP_NAME} coordinator          - Manage coordinator/runtime coordination helpers
-  ${APP_NAME} team                 - Run tmux-backed coordinated execution
   ${APP_NAME} ultragoal            - Run durable goal execution workflow
   ${APP_NAME} ralplan              - Run consensus planning workflow
+  ${APP_NAME} autoresearch         - Run autonomous research workflow
   ${APP_NAME} deep-interview       - Run requirements interview workflow
   ${APP_NAME} skills               - List/read embedded workflow skills
   ${APP_NAME} config               - List, get, and set configuration values
@@ -25,7 +25,6 @@ export function getExtraHelpText(): string {
   ${APP_NAME} mcp-serve            - Serve the MCP integration endpoint
   ${APP_NAME} contribute-pr        - Prepare contribution/PR workflow artifacts
   ${APP_NAME} migrate              - Run migration helpers
-  ${APP_NAME} rlm                  - Run RLM helpers
   ${APP_NAME} update               - Update GJC installation artifacts
   ${APP_NAME} plugin               - Install, remove, and list plugins
   ${APP_NAME} web-search           - Search the web from the CLI (alias: q)

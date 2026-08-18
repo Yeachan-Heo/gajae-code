@@ -210,7 +210,6 @@ describe("CLI help load order", () => {
 		expect(stdout).toContain("gjc config");
 		expect(stdout).toContain("gjc ralplan");
 		expect(stdout).toContain("gjc ultragoal");
-		expect(stdout).toContain("gjc team");
 		expect(stdout).toContain("gjc mcp");
 		expect(stdout).toContain("gjc mcp-serve");
 		expect(stdout).toContain("gjc contribute-pr");

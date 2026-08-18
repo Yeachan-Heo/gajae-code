@@ -402,7 +402,7 @@ export function applyGjcTmuxProfile(context: GjcTmuxProfileContext): GjcTmuxProf
 	const branchSlug = context.branch ? buildGjcTmuxSessionSlug(context.branch) : (context.branchSlug ?? null);
 	// The psmux UX filter (mouse / set-clipboard / mode-style /
 	// set-window-option) now lives in buildGjcTmuxProfileCommands so every
-	// caller — gjc --tmux planning, gjc session create, gjc team bootstrap —
+	// caller — gjc --tmux planning, gjc session create —
 	// applies the same drop set when the active multiplexer is psmux. We pass
 	// the resolved tmuxCommand through the new opts seam so the filter
 	// engages for this exact command, not whatever the resolver returns at
@@ -1027,8 +1027,8 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 			extraEnv: {
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
-				// Carry the GJC-managed session name into the child so `gjc team`
-				// can target the correct leader session by name. Under psmux on
+				// Carry the GJC-managed session name into the child so tmux-backed
+				// flows can target the correct leader session by name. Under psmux on
 				// Windows the inherited TMUX_PANE can resolve to the wrong/default
 				// session, which would split/send workers into the wrong session.
 				[GJC_TMUX_ACTIVE_SESSION_ENV]: sessionName,

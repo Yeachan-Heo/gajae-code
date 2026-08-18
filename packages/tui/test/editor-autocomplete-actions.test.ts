@@ -179,19 +179,19 @@ class InlineSkillProvider implements AutocompleteProvider {
 		const match = textBeforeCursor.match(/(?:^|\s)(\/[^\s]*)$/);
 		const prefix = match?.[1];
 		if (!prefix) return null;
-		if (prefix !== "/" && !"/skill:team".startsWith(prefix) && !"/skill-team".startsWith(prefix)) {
+		if (prefix !== "/" && !"/skill:autoresearch".startsWith(prefix) && !"/skill-autoresearch".startsWith(prefix)) {
 			return null;
 		}
 		return {
 			prefix,
-			items: [{ value: "skill:team", label: "skill:team" }],
+			items: [{ value: "skill:autoresearch", label: "skill:autoresearch" }],
 		};
 	}
 	trySyncSlashCompletion(textBeforeCursor: string): { items: AutocompleteItem[]; prefix: string } | null {
 		this.syncCallCount += 1;
 		const prefix = textBeforeCursor.slice(textBeforeCursor.lastIndexOf("/"));
 		if (!prefix.startsWith("/skill")) return null;
-		return { prefix, items: [{ value: "skill:team", label: "skill:team" }] };
+		return { prefix, items: [{ value: "skill:autoresearch", label: "skill:autoresearch" }] };
 	}
 
 	applyCompletion(

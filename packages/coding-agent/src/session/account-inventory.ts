@@ -204,8 +204,12 @@ function storedHealth(authStorage: AuthStorage, row: CredentialInventoryRecord):
 	};
 }
 
-function storedUsage(authStorage: AuthStorage, row: CredentialInventoryRecord): AccountUsageCache | undefined {
-	return authStorage.getCachedUsageReport(row.provider as Provider, row.id);
+function storedUsage(
+	authStorage: AuthStorage,
+	row: CredentialInventoryRecord,
+	baseUrl?: string,
+): AccountUsageCache | undefined {
+	return authStorage.getCachedUsageReport(row.provider as Provider, row.id, baseUrl);
 }
 
 function safeUsageUnit(value: unknown): UsageUnit {
@@ -308,6 +312,17 @@ function redactUsageCache(usage: CachedUsageReport | undefined): AccountUsageCac
 	};
 }
 
+function freshUsageCache(report: CachedUsageReport["report"]): AccountUsageCache {
+	const now = Date.now();
+	return {
+		report: redactUsageReport(report),
+		fetchedAt: finiteNumber(report.fetchedAt) ?? now,
+		freshUntil: now + 15 * 60_000,
+		retainUntil: now + 24 * 60 * 60_000,
+		freshness: "fresh",
+	};
+}
+
 function canPinStoredOAuth(authStorage: AuthStorage, provider: string): boolean {
 	if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasConfigApiKey(provider)) return false;
 	return !getEnvApiKey(provider);
@@ -352,6 +367,7 @@ function addStoredRows(
 	authStorage: AuthStorage,
 	inventory: CredentialInventoryRecord[],
 	sessionId: string | undefined,
+	baseUrlResolver?: (provider: string) => string | undefined,
 ): void {
 	const removalTargetIds = new Set(
 		(typeof authStorage.listCredentialRemovalTargets === "function"
@@ -361,7 +377,7 @@ function addStoredRows(
 	);
 	for (const record of inventory) {
 		const identityLabel = asSafeLabel(record.identityLabel);
-		const safeUsage = redactUsageCache(storedUsage(authStorage, record));
+		const safeUsage = redactUsageCache(storedUsage(authStorage, record, baseUrlResolver?.(record.provider)));
 		const active =
 			typeof record.provider === "string" &&
 			authStorage.getSessionCredentialRowId(record.provider, sessionId) === record.id;
@@ -453,7 +469,9 @@ export function buildAccountInventorySnapshot(input: AccountInventoryInput): Acc
 	const nowMs = input.nowMs ?? Date.now();
 	const inventory = input.authStorage.listCredentialInventory();
 	const rows: AccountInventoryRow[] = [];
-	addStoredRows(rows, input.authStorage, inventory, input.sessionId);
+	addStoredRows(rows, input.authStorage, inventory, input.sessionId, provider =>
+		input.modelRegistry?.getProviderBaseUrl?.(provider),
+	);
 	addSyntheticRows(rows, input.authStorage, providerSet(input, inventory), input.sessionId);
 	rows.sort((left, right) => left.id.localeCompare(right.id));
 	return { generatedAt: nowMs, generation: input.authStorage.getGeneration(), rows };
@@ -464,7 +482,6 @@ export const buildAccountInventory = buildAccountInventorySnapshot;
 
 function applyStoredCheck(
 	rows: AccountInventoryRow[],
-	authStorage: AuthStorage,
 	results: CredentialHealthResult[],
 ): AccountInventoryCheckResult[] {
 	const byId = new Map(rows.filter(row => row.credentialId !== undefined).map(row => [row.credentialId!, row]));
@@ -477,14 +494,8 @@ function applyStoredCheck(
 			reason: asSafeLabel(result.reason),
 		};
 		if (result.report) {
-			const cached =
-				row.credentialId === undefined
-					? undefined
-					: authStorage.getCachedUsageReport(row.provider as Provider, row.credentialId);
-			if (cached) {
-				row.usage = redactUsageCache(cached);
-				row.capabilities.hasCachedUsage = true;
-			}
+			row.usage = freshUsageCache(result.report);
+			row.capabilities.hasCachedUsage = true;
 		}
 		checked.push({
 			rowId: row.id,
@@ -509,7 +520,6 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 	const authStorage = input.authStorage;
 	applyStoredCheck(
 		rows,
-		authStorage,
 		await authStorage.checkCredentials({
 			provider: input.provider,
 			baseUrlResolver: provider => input.modelRegistry?.getProviderBaseUrl?.(provider),
@@ -539,13 +549,7 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 		};
 		recordSourceHealth(authStorage, row.provider, row.source as SyntheticAccountSource, result.ok, result.reason);
 		if (result.report) {
-			row.usage = {
-				report: redactUsageReport(result.report),
-				fetchedAt: finiteNumber(result.report.fetchedAt) ?? 0,
-				freshUntil: Date.now() + 15 * 60_000,
-				retainUntil: Date.now() + 24 * 60 * 60_000,
-				freshness: "fresh",
-			};
+			row.usage = freshUsageCache(result.report);
 			row.capabilities.hasCachedUsage = true;
 		}
 	}

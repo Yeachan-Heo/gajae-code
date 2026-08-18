@@ -78,7 +78,7 @@ export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetu
 			installGuidance: [
 				`Add the local marketplace: /plugin marketplace add ${marketplaceRoot}`,
 				"Install the plugin: /plugin install gajae-code",
-				"Then call gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team from Claude Code.",
+				"Then call gjc_delegate_plan / gjc_delegate_execute from Claude Code.",
 			],
 			coordinatorConfigPreview: { command: "gjc", args: ["mcp-serve", "coordinator"], env },
 			mutationPolicy:
@@ -104,7 +104,7 @@ export function buildHostPluginSetup(host: HostPluginKind, flags: HostPluginSetu
 		installGuidance: [
 			`Add the local marketplace: codex plugin marketplace add ${marketplaceRoot}`,
 			"Install the plugin: codex plugin add gajae-code@gajae-code-local",
-			"Then call gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team from Codex.",
+			"Then call gjc_delegate_plan / gjc_delegate_execute from Codex.",
 		],
 		coordinatorConfigPreview: { command: "gjc", args: ["mcp-serve", "coordinator"], env },
 		mutationPolicy:

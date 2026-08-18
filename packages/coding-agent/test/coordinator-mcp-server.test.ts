@@ -2183,7 +2183,6 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		for (const [tool, key] of [
 			["gjc_delegate_plan", "plan"],
 			["gjc_delegate_execute", "execute"],
-			["gjc_delegate_team", "team"],
 		] as const) {
 			const result = await server.callTool(tool, {
 				cwd: root,
@@ -2213,11 +2212,6 @@ describe("Coordinator MCP canonical SDK controls", () => {
 					operation: "turn.prompt",
 					input: { text: expect.stringContaining("/skill:ultragoal") },
 					idempotencyKey: "execute",
-				},
-				{
-					operation: "turn.prompt",
-					input: { text: expect.stringContaining("/skill:team") },
-					idempotencyKey: "team",
 				},
 			]),
 		);

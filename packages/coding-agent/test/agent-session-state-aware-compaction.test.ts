@@ -456,16 +456,4 @@ describe("AgentSession state-aware compaction", () => {
 		expect(promptSpy).not.toHaveBeenCalled();
 		expect(notices).toContain("Auto-continue skipped: no unfinished work detected");
 	});
-
-	it("skips synthetic auto-continue for a team workflow awaiting integration", async () => {
-		await seedActiveSkillState("awaiting_integration", "team");
-		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
-		const notices: string[] = [];
-		session.subscribe(event => {
-			if (event.type === "notice") notices.push(event.message);
-		});
-		await compact();
-		expect(promptSpy).not.toHaveBeenCalled();
-		expect(notices).toContain("Auto-continue skipped: no unfinished work detected");
-	});
 });

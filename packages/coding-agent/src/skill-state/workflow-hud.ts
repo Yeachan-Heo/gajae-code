@@ -53,21 +53,6 @@ interface UltragoalHudState extends WorkflowGateHudState {
 	updatedAt?: string;
 }
 
-interface TeamHudWorker {
-	id: string;
-	status?: string;
-}
-
-interface TeamHudState extends WorkflowGateHudState {
-	phase: string;
-	task_total: number;
-	task_counts: Record<string, number>;
-	workers: TeamHudWorker[];
-	updated_at?: string;
-	latestEvent?: { type?: string; worker?: string; message?: string };
-	latestMessage?: { from_worker?: string; body?: string };
-}
-
 function percent(value: number | undefined): string | undefined {
 	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
 	return `${Math.round(value * 100)}%`;
@@ -286,31 +271,5 @@ export function buildUltragoalHudSummary(state: UltragoalHudState): WorkflowHudS
 			...gateChips(state, 40),
 		]),
 		...(state.updatedAt ? { updated_at: state.updatedAt } : {}),
-	};
-}
-
-export function buildTeamHudSummary(state: TeamHudState): WorkflowHudSummary {
-	const failedWorkers = state.workers.filter(
-		worker => worker.status === "failed" || worker.status === "blocked",
-	).length;
-	const stoppedWorkers = state.workers.filter(worker => worker.status === "stopped").length;
-	const completed = state.task_counts.completed ?? 0;
-	const failedTasks = (state.task_counts.failed ?? 0) + (state.task_counts.blocked ?? 0);
-	const latest = state.latestEvent?.message ?? state.latestEvent?.type ?? state.latestMessage?.body;
-	return {
-		version: 1,
-		chips: compactChips([
-			failedWorkers > 0 || failedTasks > 0
-				? { label: "blocked", value: String(failedWorkers + failedTasks), priority: 5, severity: "blocked" }
-				: stoppedWorkers > 0
-					? { label: "stopped", value: String(stoppedWorkers), priority: 5, severity: "warning" }
-					: null,
-			chip("phase", state.phase, 10),
-			chip("workers", `${state.workers.length - failedWorkers}/${state.workers.length}`, 20),
-			chip("tasks", `${completed}/${state.task_total}`, 30),
-			...gateChips(state, 40),
-			chip("latest", latest, 70),
-		]),
-		...(state.updated_at ? { updated_at: state.updated_at } : {}),
 	};
 }

@@ -159,7 +159,7 @@ API key 提供商、本地运行时（Ollama、LM Studio、vLLM）与网关（Cl
 
 ```text
 deep-interview -> ralplan -> ultragoal
-                         └─ 并行 tmux worker 有价值时可选 team 执行
+               └─ 研究必须为计划奠基时可选 autoresearch 任务
 ```
 
 | 表面 | 作用 |
@@ -167,10 +167,10 @@ deep-interview -> ralplan -> ultragoal
 | `deep-interview` | 把模糊请求变成具体需求。 |
 | `ralplan` | 在改代码之前制定并评审实现计划。 |
 | `ultragoal` | 跟踪目标贯穿执行、修订、验证与证据。 |
-| `team` | 并行值得时协调 tmux worker。 |
+| `autoresearch` | 执行目标导向的研究任务，并以结构化结论收尾。 |
 | `executor` / `architect` / `planner` / `critic` | 内置角色代理，覆盖实现与只读评审通道。 |
 
-可选启用：**`gjc rlm`**（合成 notebook 与报告的 Jupyter 风格研究/REPL 模式）与 **`computer-use`**（实验性桌面控制）。见 [Python REPL](docs/python-repl.md) 与 [docs/tools/computer.md](docs/tools/computer.md)。
+可选启用：**`computer-use`**（实验性桌面控制）。见 [Python REPL](docs/python-repl.md) 与 [docs/tools/computer.md](docs/tools/computer.md)。
 
 ---
 
@@ -215,7 +215,7 @@ Set up Gajae-Code (gjc) as your coding-agent backend on this machine. gjc is alr
         GJC_COORDINATOR_MCP_MUTATIONS=sessions,questions,reports
 
 4. To delegate coding work, prefer one call per workflow:
-   gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team
+   gjc_delegate_plan / gjc_delegate_execute
    with { cwd, task, allow_mutation: true, idempotency_key: <fresh-uuid> }.
    Each starts an isolated worktree session and returns a durable turn_id and artifacts.
 

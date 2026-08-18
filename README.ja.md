@@ -159,7 +159,7 @@ API キーのプロバイダ、ローカルランタイム（Ollama、LM Studio�
 
 ```text
 deep-interview -> ralplan -> ultragoal
-                         └─ 並列 tmux ワーカーが有効な場合のみ任意の team 実行
+               └─ リサーチが計画を裏付ける必要がある場合の任意の autoresearch ミッション
 ```
 
 | 表面 | 役割 |
@@ -167,10 +167,10 @@ deep-interview -> ralplan -> ultragoal
 | `deep-interview` | 曖昧な依頼を具体的な要件に変える。 |
 | `ralplan` | コード変更の前に実装計画を立てて批評する。 |
 | `ultragoal` | 実行・修正・検証・証拠まで目標を追跡する。 |
-| `team` | 並列化に価値があるとき tmux ワーカーを調整する。 |
+| `autoresearch` | 目標指向のリサーチミッションを実行し、構造化された判定で締めくくる。 |
 | `executor` / `architect` / `planner` / `critic` | 実装と読み取り専用レビューのための同梱ロールエージェント。 |
 
-オプトインで利用可能: **`gjc rlm`**（ノートブックとレポートを合成する Jupyter スタイルのリサーチ/REPL モード）と **`computer-use`**（実験的なデスクトップ制御）。[Python REPL](docs/python-repl.md) と [docs/tools/computer.md](docs/tools/computer.md) を参照。
+オプトインで利用可能: **`computer-use`**（実験的なデスクトップ制御）。[Python REPL](docs/python-repl.md) と [docs/tools/computer.md](docs/tools/computer.md) を参照。
 
 ---
 
@@ -215,7 +215,7 @@ Set up Gajae-Code (gjc) as your coding-agent backend on this machine. gjc is alr
         GJC_COORDINATOR_MCP_MUTATIONS=sessions,questions,reports
 
 4. To delegate coding work, prefer one call per workflow:
-   gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team
+   gjc_delegate_plan / gjc_delegate_execute
    with { cwd, task, allow_mutation: true, idempotency_key: <fresh-uuid> }.
    Each starts an isolated worktree session and returns a durable turn_id and artifacts.
 

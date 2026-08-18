@@ -126,7 +126,7 @@ describe("checkBashAllowedPrefixes", () => {
 			"gjc state deep-interview",
 			"gjc state read --mode ralplan --json",
 			'gjc state ultragoal write --input \'{"current_phase":"handoff"}\' --json',
-			"gjc state team contract",
+			"gjc state autoresearch contract",
 		];
 
 		for (const command of commands) {

@@ -351,7 +351,7 @@ export function isCanonicalGjcWorkflowSkill(skill: string): skill is CanonicalGj
  * rather than a generic synthetic compaction continuation.
  */
 const CONTINUATION_INERT_WORKFLOW_PHASES: Readonly<Partial<Record<CanonicalGjcWorkflowSkill, ReadonlySet<string>>>> = {
-	team: new Set(["awaiting_integration"]),
+	autoresearch: new Set(["verdict"]),
 };
 
 /**
@@ -624,7 +624,7 @@ function dedupeVisibleBySkill(entries: SkillActiveEntry[], sessionId?: string): 
  * The planning pipeline advances one stage at a time: `deep-interview →
  * ralplan → ultragoal`. Activating a downstream stage supersedes upstream
  * stages so stale rows cannot keep owning the HUD, gate, or primary active
- * snapshot. `team` is intentionally excluded — it runs alongside ultragoal —
+ * snapshot. `autoresearch` is intentionally excluded — it runs alongside ultragoal —
  * and every non-pipeline skill is left untouched.
  */
 const PLANNING_PIPELINE_SKILLS = new Set<string>(["deep-interview", "ralplan", "ultragoal"]);
