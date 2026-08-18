@@ -6,7 +6,7 @@
  * byte passed the single outbound sanitizer before it reaches the relay.
  */
 import { randomUUID } from "node:crypto";
-import { CRASH_BODY_MAX_BYTES, sanitizeExternalCrashV1 } from "../sanitize";
+import { CRASH_BODY_MAX_BYTES, type SanitizeVerdict, sanitizeExternalCrashV1 } from "../sanitize";
 import { type SentryDsn, toDsnString } from "./dsn";
 
 export interface CrashEventFrame {
@@ -32,6 +32,20 @@ export interface BuildCrashEnvelopeInput {
 export type BuildCrashEnvelopeResult = { ok: true; body: string; eventId: string } | { ok: false; reason: string };
 
 const EVENT_ID = /^[0-9a-f]{32}$/;
+const CREDENTIAL_LIKE_PATTERNS: readonly RegExp[] = [
+	/\bAIza[0-9A-Za-z_-]{20,}\b/,
+	/\bnpm_[A-Za-z0-9]{20,}\b/,
+	/\bglpat-[A-Za-z0-9_-]{20,}\b/,
+	/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/,
+	/\bhf_[A-Za-z0-9]{20,}\b/,
+	/-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+];
+
+function sanitizeEgressField(value: string): SanitizeVerdict {
+	if (CREDENTIAL_LIKE_PATTERNS.some(pattern => pattern.test(value)))
+		return { ok: false, reason: "credential-like content" };
+	return sanitizeExternalCrashV1(value, CRASH_BODY_MAX_BYTES);
+}
 
 function coarseDate(epochMs: number): string | undefined {
 	const date = new Date(epochMs);
@@ -79,16 +93,16 @@ export function buildCrashEnvelope(input: BuildCrashEnvelopeInput): BuildCrashEn
 	const lastSeen = coarseDate(input.lastSeen);
 	if (!firstSeen || !lastSeen) return reject("invalid timestamp");
 
-	const errorName = sanitizeExternalCrashV1(input.errorName, CRASH_BODY_MAX_BYTES);
+	const errorName = sanitizeEgressField(input.errorName);
 	if (!errorName.ok) return reject(errorName.reason);
-	const messageClass = sanitizeExternalCrashV1(input.messageClass, CRASH_BODY_MAX_BYTES);
+	const messageClass = sanitizeEgressField(input.messageClass);
 	if (!messageClass.ok) return reject(messageClass.reason);
 
 	const frames: { filename: string; function: string; in_app: true }[] = [];
 	for (const frame of input.frames) {
-		const filename = sanitizeExternalCrashV1(frame.filename, CRASH_BODY_MAX_BYTES);
+		const filename = sanitizeEgressField(frame.filename);
 		if (!filename.ok) return reject(filename.reason);
-		const functionName = sanitizeExternalCrashV1(frame.function, CRASH_BODY_MAX_BYTES);
+		const functionName = sanitizeEgressField(frame.function);
 		if (!functionName.ok) return reject(functionName.reason);
 		frames.push({ filename: filename.value, function: functionName.value, in_app: true });
 	}

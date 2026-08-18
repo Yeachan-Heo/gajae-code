@@ -321,6 +321,8 @@ function getByPath(obj: RawSettings, segments: string[]): unknown {
 }
 
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
+/** Settings which authorize automatic network egress and must never be workspace-controlled. */
+const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>(["crashReport.upstream", "crashReport.upstreamDsn"]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
 	light: "blue-crab",
@@ -5857,8 +5859,15 @@ export class Settings implements NotificationSettingsReader {
 		}
 	}
 	#rebuildMerged(): void {
-		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), this.#project);
-		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
+		const project = structuredClone(this.#project);
+		const overrides = structuredClone(this.#overrides);
+		for (const settingPath of GLOBAL_ONLY_SETTINGS) {
+			const segments = settingPath.split(".");
+			deleteByPath(project, segments);
+			deleteByPath(overrides, segments);
+		}
+		this.#merged = this.#deepMerge(this.#deepMerge({}, this.#global), project);
+		this.#merged = this.#deepMerge(this.#merged, overrides);
 	}
 
 	#fireAllHooks(): void {

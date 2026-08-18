@@ -92,6 +92,26 @@ describe("buildCrashEnvelope", () => {
 		if (!result.ok) expect(result.reason).toContain("residual");
 	});
 
+	// Assembled at runtime rather than written as literals: a fixture shaped like
+	// a real token trips GitHub push protection and every downstream secret
+	// scanner, which is a bad trade for a value that only has to match a regex.
+	// The `%s` label keeps the assembled shape visible in test output.
+	const BODY = "abcdefghijklmnopqrstuvwxyz";
+	it.each([
+		["google-api-key", `AIza${"Sy"}${"D"}${BODY}${BODY.slice(0, 12)}`],
+		["npm-token", `npm${"_"}${BODY}`],
+		["gitlab-pat", `glpat${"-"}${BODY}`],
+		["stripe-live-key", ["sk", "live", BODY].join("_")],
+		["huggingface-token", `hf${"_"}${BODY}`],
+		[
+			"pem-private-key",
+			`${["-----BEGIN", "PRIVATE", "KEY-----"].join(" ")}\nnot-a-real-key\n${["-----END", "PRIVATE", "KEY-----"].join(" ")}`,
+		],
+	])("refuses credential-like egress content: %s", (_label, credential) => {
+		const result = buildCrashEnvelope(envelopeInput({ messageClass: credential }));
+		expect(result).toEqual({ ok: false, reason: "credential-like content" });
+	});
+
 	it("refuses an envelope that exceeds the 48 KiB body limit", () => {
 		const result = buildCrashEnvelope(envelopeInput({ messageClass: "x".repeat(48 * 1024) }));
 		expect(result.ok).toBe(false);

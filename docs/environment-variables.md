@@ -8,6 +8,12 @@ This reference is derived from current code paths in:
 
 It documents only active behavior.
 
+## Crash relay
+
+| Variable | Used for | Trusted-source behavior |
+| --- | --- | --- |
+| `GJC_CRASH_SENTRY_DSN` | Sentry destination for the opt-in crash relay when `crashReport.upstreamDsn` is empty and global `crashReport.upstream` is `sentry` | Resolved through `$credentialEnv`; a project `.env` cannot provide it. A configured global DSN takes precedence. |
+
 ## Resolution model and precedence
 
 Most runtime lookups use `$env` from `@gajae-code/utils` (`packages/utils/src/env.ts`).

@@ -73,12 +73,12 @@ describe("isRelayDue", () => {
 		expect(isRelayDue(signature())).toBe(true);
 	});
 
-	test("a signature relayed after its last occurrence is not due", () => {
-		expect(isRelayDue(signature({ relayedAt: 1_700_000_900_001 }))).toBe(false);
+	test("a signature relayed for its latest record is not due", () => {
+		expect(isRelayDue(signature({ relayedRecordId: "rec-1" }))).toBe(false);
 	});
 
-	test("new occurrences since the last relay make it due again", () => {
-		expect(isRelayDue(signature({ relayedAt: 1_700_000_800_000 }))).toBe(true);
+	test("a same-millisecond or backdated newer record remains due", () => {
+		expect(isRelayDue(signature({ relayedAt: 1_700_000_900_000, relayedRecordId: "other-record" }))).toBe(true);
 	});
 });
 
@@ -238,6 +238,7 @@ describe("relayCrashSignatures", () => {
 
 		const index = await compactCrashIndex({ paths });
 		expect(listCrashSignatures(index)[0]?.relayedAt).toBe(1_700_000_900_000);
+		expect(listCrashSignatures(index)[0]?.relayedRecordId).toBe(RECORD_ID);
 	});
 
 	test("a rerun with no new occurrences sends nothing", async () => {
@@ -328,6 +329,46 @@ describe("relayCrashSignatures", () => {
 		expect(outcome).toEqual({ status: "ran", sent: 0, refused: 0, failed: 1 });
 	});
 
+	test.each([307, 308])("refuses %i redirects without issuing a follow-up request", async status => {
+		await seed();
+		let requests = 0;
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async (_url, init) => {
+				requests++;
+				expect(init.redirect).toBe("error");
+				expect(init.credentials).toBe("omit");
+				return new Response("", { status, headers: { Location: "https://attacker.invalid/envelope" } });
+			},
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 0, refused: 0, failed: 1 });
+		expect(requests).toBe(1);
+	});
+
+	test("retries a failed post after releasing its claim", async () => {
+		await seed();
+		let requests = 0;
+		const fetchImpl: CrashRelayFetch = async () => {
+			requests++;
+			return new Response("", { status: requests === 1 ? 429 : 200 });
+		};
+		expect(await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl })).toEqual({
+			status: "ran",
+			sent: 0,
+			refused: 0,
+			failed: 1,
+		});
+		expect(await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl })).toEqual({
+			status: "ran",
+			sent: 1,
+			refused: 0,
+			failed: 0,
+		});
+		expect(requests).toBe(2);
+	});
+
 	test("a signature with no recoverable record is refused, not sent", async () => {
 		// Journal the occurrence but never write the crash-log record it names.
 		appendCrashEvent(
@@ -378,5 +419,76 @@ describe("relayCrashSignatures", () => {
 		await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
 		const payload = JSON.parse(bodies[0]?.split("\n")[2] ?? "{}") as { timestamp: number };
 		expect(payload.timestamp % 86_400).toBe(0);
+	});
+});
+
+/**
+ * The relay's trust boundary is enforced at module import: `$credentialEnv`
+ * excludes the checkout's `.env` overlay, and the default state root is the
+ * agent dir rather than anything `XDG_STATE_HOME` can move. Both properties are
+ * therefore only observable in a fresh process whose cwd/environment is the
+ * hostile one, so these regressions spawn one (review: snowykr P1 #2/#3).
+ */
+describe("relay trust boundary against a hostile checkout", () => {
+	let dir = "";
+
+	beforeEach(async () => {
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-relay-trust-"));
+	});
+
+	afterEach(async () => {
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	async function runInCheckout(source: string, env: Record<string, string> = {}): Promise<string> {
+		const script = path.join(dir, "probe.ts");
+		await Bun.write(script, source);
+		const child = Bun.spawn(["bun", script], {
+			cwd: dir,
+			env: { ...Bun.env, ...env },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
+		return stdout.trim();
+	}
+
+	test("a DSN present only in the checkout's .env cannot select the relay destination", async () => {
+		const hostile = "https://attacker@evil.example/999";
+		await Bun.write(path.join(dir, ".env"), `${CRASH_UPSTREAM_DSN_ENV}=${hostile}\n`);
+		const resolverPath = path.resolve(import.meta.dir, "../src/crash/upstream/relay.ts");
+		const out = await runInCheckout(
+			`import { resolveRelayDsn } from ${JSON.stringify(resolverPath)};\n` +
+				`const r = resolveRelayDsn({ upstream: "sentry", dsn: "" });\n` +
+				`console.log(JSON.stringify(r.ok ? { ok: true, host: r.dsn.envelopeUrl } : r));\n`,
+		);
+		const result = JSON.parse(out);
+		expect(result.ok).toBe(false);
+		expect(result.reason).toBe("no-dsn");
+		expect(out).not.toContain("evil.example");
+	});
+
+	test("a project-controlled XDG_STATE_HOME cannot move the relay's state root", async () => {
+		const hostileState = path.join(dir, "hostile-state");
+		await fs.mkdir(hostileState, { recursive: true });
+		const dirsPath = path.resolve(import.meta.dir, "../../utils/src/dirs.ts");
+		const storePath = path.resolve(import.meta.dir, "../src/crash/index-store.ts");
+		const out = await runInCheckout(
+			`import { getAgentDir } from ${JSON.stringify(dirsPath)};\n` +
+				`import { resolveCrashStatePaths } from ${JSON.stringify(storePath)};\n` +
+				`const paths = resolveCrashStatePaths(getAgentDir());\n` +
+				`console.log(JSON.stringify(paths));\n`,
+			{ XDG_STATE_HOME: hostileState },
+		);
+		const paths = JSON.parse(out);
+		for (const key of ["index", "events", "crashLog"]) {
+			expect(typeof paths[key]).toBe("string");
+			expect(paths[key].startsWith(hostileState)).toBe(false);
+		}
 	});
 });

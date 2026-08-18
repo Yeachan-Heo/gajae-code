@@ -1618,9 +1618,9 @@ export const SETTINGS_SCHEMA = {
 		default: "off",
 		ui: {
 			tab: "interaction",
-			label: "Crash Report Upstream",
+			label: "Crash Report Upstream (Global)",
 			description:
-				"Opt in to transmit sanitized crash signatures to an aggregation service for cross-install counting. Off sends nothing. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
+				"Global-only opt-in to transmit sanitized crash signatures to an aggregation service for cross-install counting. Off sends nothing. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
 		},
 	},
 	"crashReport.upstreamDsn": {
@@ -1628,9 +1628,9 @@ export const SETTINGS_SCHEMA = {
 		default: "",
 		ui: {
 			tab: "interaction",
-			label: "Crash Report Upstream DSN",
+			label: "Crash Report Upstream DSN (Global)",
 			description:
-				"Sentry DSN for the opted-in upstream; ignored while Crash Report Upstream is off, and no default destination exists. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
+				"Global-only Sentry DSN for the opted-in upstream; ignored while Crash Report Upstream is off, and no default destination exists. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
 		},
 	},
 

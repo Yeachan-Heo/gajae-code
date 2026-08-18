@@ -580,9 +580,10 @@ describe("relayed crash events", () => {
 	const eventId = "0123456789abcdef0123456789abcdef";
 
 	it("round-trips all relayed fields through the journal format", () => {
-		const line = formatCrashEventLine({ kind: "relayed", fingerprint, at: NOW, eventId });
+		const recordId = "1".repeat(16);
+		const line = formatCrashEventLine({ kind: "relayed", fingerprint, at: NOW, eventId, recordId });
 
-		expect(parseCrashEventLine(line)).toEqual({ kind: "relayed", fingerprint, at: NOW, eventId });
+		expect(parseCrashEventLine(line)).toEqual({ kind: "relayed", fingerprint, at: NOW, eventId, recordId });
 	});
 
 	it.each([
@@ -621,7 +622,7 @@ describe("relayed crash events", () => {
 		expect(index).toBeDefined();
 		if (!index) return;
 
-		const relay = { kind: "relayed" as const, fingerprint, at: NOW, eventId };
+		const relay = { kind: "relayed" as const, fingerprint, at: NOW, eventId, recordId: recordId(1) };
 		expect(applyCrashEvent(index, relay, NOW)).toBe(true);
 		expect(index.signatures[fingerprint]?.relayedAt).toBe(NOW);
 		expect(applyCrashEvent(index, relay, NOW)).toBe(false);
@@ -644,7 +645,9 @@ describe("relayed crash events", () => {
 		expect(index).toBeDefined();
 		if (!index) return;
 
-		expect(applyCrashEvent(index, { kind: "relayed", fingerprint, at: NOW, eventId }, NOW)).toBe(false);
+		expect(
+			applyCrashEvent(index, { kind: "relayed", fingerprint, at: NOW, eventId, recordId: recordId(1) }, NOW),
+		).toBe(false);
 		expect(index.signatures[fingerprint]).toBeUndefined();
 	});
 

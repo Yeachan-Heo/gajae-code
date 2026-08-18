@@ -1,7 +1,8 @@
 /**
  * `gjc crash` — inspect local crash signatures and file an assisted, fully
- * consented bug report. Nothing leaves the machine without an explicit,
- * digest-confirmed confirmation for that exact invocation.
+ * consented bug report. `gjc crash report` requires an explicit,
+ * digest-confirmed confirmation for that exact invocation; `gjc crash relay`
+ * uses separately configured standing consent.
  */
 import { Args, Command, Flags } from "@gajae-code/utils/cli";
 import { runCrashListCommand, runCrashRelayCommand, runCrashReportCommand } from "../cli/crash-cli";

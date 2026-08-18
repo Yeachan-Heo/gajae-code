@@ -74,6 +74,8 @@ export interface CrashSignatureEntry {
 	acknowledgedAt?: number;
 	/** Epoch ms this signature was last accepted by the configured upstream. */
 	relayedAt?: number;
+	/** Occurrence record represented by the durable upstream watermark. */
+	relayedRecordId?: string;
 	/** Issues this install already "+1"ed, so re-invocations cannot spam comments. */
 	commentedIssues?: string[];
 }
@@ -145,6 +147,7 @@ const ENTRY_KEYS = new Set([
 	"reportedIssueUrl",
 	"acknowledgedAt",
 	"relayedAt",
+	"relayedRecordId",
 	"commentedIssues",
 ]);
 const INDEX_KEYS = new Set([
@@ -232,6 +235,11 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 	if (raw.reportedAt !== undefined && !isTimestamp(raw.reportedAt, now)) return undefined;
 	if (raw.acknowledgedAt !== undefined && !isTimestamp(raw.acknowledgedAt, now)) return undefined;
 	if (raw.relayedAt !== undefined && !isTimestamp(raw.relayedAt, now)) return undefined;
+	if (
+		raw.relayedRecordId !== undefined &&
+		(typeof raw.relayedRecordId !== "string" || !/^[0-9a-f]{8,32}$/.test(raw.relayedRecordId))
+	)
+		return undefined;
 	if (raw.reportedIssueUrl !== undefined && !isCleanString(raw.reportedIssueUrl, 256)) return undefined;
 	if (raw.commentedIssues !== undefined) {
 		if (!Array.isArray(raw.commentedIssues) || raw.commentedIssues.length > 32) return undefined;
@@ -251,6 +259,7 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 	if (raw.reportedIssueUrl !== undefined) entry.reportedIssueUrl = raw.reportedIssueUrl;
 	if (raw.acknowledgedAt !== undefined) entry.acknowledgedAt = raw.acknowledgedAt;
 	if (raw.relayedAt !== undefined) entry.relayedAt = raw.relayedAt;
+	if (raw.relayedRecordId !== undefined) entry.relayedRecordId = raw.relayedRecordId;
 	if (raw.commentedIssues !== undefined) entry.commentedIssues = [...(raw.commentedIssues as string[])];
 	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) return undefined;
 	return entry;
@@ -473,8 +482,9 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	}
 	if (event.kind === "relayed") {
 		if (!existing) return false;
-		if (existing.relayedAt !== undefined && existing.relayedAt >= event.at) return false;
+		if (existing.relayedRecordId === event.recordId) return false;
 		existing.relayedAt = event.at;
+		existing.relayedRecordId = event.recordId;
 		return true;
 	}
 	if (event.kind === "acknowledged") {
@@ -719,7 +729,7 @@ export async function recordCrashStateEvent(
 ): Promise<CrashIndex> {
 	const paths = options.paths ?? resolveCrashStatePaths();
 	await fs.mkdir(path.dirname(paths.events), { recursive: true, mode: 0o700 });
-	appendCrashEvent(event, paths.events);
+	if (!appendCrashEvent(event, paths.events)) throw new Error("Crash state journal append failed");
 	return compactCrashIndex({ paths, now: options.now });
 }
 
