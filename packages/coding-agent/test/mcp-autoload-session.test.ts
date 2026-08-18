@@ -197,6 +197,59 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		expect(mcpManager?.getTools()).toEqual([]);
 	}, 30_000);
 
+	// The point of keeping the connection alive is that the operator who waited
+	// for the server can call it. Asserting the manager only would pass while the
+	// session registry, the surface the model actually sees, stayed empty.
+	it("registers a late-connecting server's tools in the session that started it", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow",
+			commandArgs: [process.execPath, "-e", delayedMcpServerScript(2_400)],
+			flags: { project: true, timeout: 10_000 },
+			cwd: projectDir,
+		});
+
+		const { session } = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(session.getAllToolNames()).not.toContain("mcp__slow_hello");
+
+			await waitFor(() => session.getAllToolNames().includes("mcp__slow_hello"));
+			await waitFor(() => session.getActiveToolNames().includes("mcp__slow_hello"));
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("keeps fast tools active while a slow sibling lands later in the same session", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "demo",
+			commandArgs: [process.execPath, "-e", DEMO_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 5_000 },
+			cwd: projectDir,
+		});
+		await runMCPCommand({
+			action: "add",
+			name: "slow",
+			commandArgs: [process.execPath, "-e", delayedMcpServerScript(2_400)],
+			flags: { project: true, timeout: 10_000 },
+			cwd: projectDir,
+		});
+
+		const { session } = await createAgentSession(isolatedSessionOptions());
+		try {
+			// The fast server is registered during bootstrap...
+			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+			expect(session.getAllToolNames()).not.toContain("mcp__slow_hello");
+
+			// ...and the slow one joins it without displacing it.
+			await waitFor(() => session.getActiveToolNames().includes("mcp__slow_hello"));
+			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
 	it("caches a late-connecting server so the next cold-start session surfaces it immediately", async () => {
 		await runMCPCommand({
 			action: "add",

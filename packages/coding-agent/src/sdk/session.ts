@@ -2414,8 +2414,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// next cold session would repeat it forever. The manager is retained
 						// while any server is still connecting and is disposed by
 						// `AgentSession.dispose` through `ownedMcpManager`.
+						// `connecting` is not the only in-flight state: a server whose
+						// transport is up while `tools/list` is still running reports
+						// `connected` and contributes no tools to the snapshot, so keying
+						// retention on `connecting` alone would disconnect a live server
+						// mid-handoff.
 						const pendingServers = Object.keys(mergedConfigs).filter(
-							name => owned.getConnectionStatus(name) === "connecting",
+							name => owned.getConnectionStatus(name) !== "disconnected",
 						);
 						if (surfacedServers.size > 0 || pendingServers.length > 0) {
 							mcpManager = owned;
@@ -2438,8 +2443,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// Plugin-bundle connections are fixed for the session lifetime
 							// (existing plugin contract). Sessions without plugin MCPs keep
 							// a mutable connection set so `/mcp reload` can re-discover
-							// conventional registrations.
-							if ([...surfacedServers].some(name => pluginNames.has(name))) owned.sealConnectionSet();
+							// conventional registrations. A plugin that is still connecting is
+							// owned by this session just as firmly as one that already landed:
+							// leaving the set mutable would let `/mcp reload` re-discover native
+							// configs without the bundle and drop that fixed surface.
+							if (connectedPluginNames.size > 0) owned.sealConnectionSet();
 						} else {
 							try {
 								await owned.disconnectAll();
@@ -3828,13 +3836,44 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// ownedMcpManager; only externally supplied managers wire reactive
 			// refreshMCPTools (the owned always-on path must not, or it would
 			// deactivate the plugin tools).
+			// A declared-window connection can still be pending when this session
+			// ends, and a caller-owned manager outlives it, so no late publication may
+			// reach a disposed session's tool registry.
 			if (!ownsMcpManager) {
-				// A declared-window connection can still be pending when this session
-				// ends, and a caller-owned manager outlives it, so the late publication
-				// must not reach a disposed session's tool registry.
 				mcpManager.setOnToolsChanged(tools => {
 					if (session.isDisposed) return;
 					void session.refreshMCPTools(tools);
+				});
+			} else {
+				// Owned managers now outlive startup on purpose: a server inside its
+				// declared window connects after the session is built. Registering its
+				// tools only in the manager would mean the operator waited for a server
+				// that never became callable in the session that started it.
+				//
+				// `refreshMCPTools` alone is not enough here: it recomputes the active
+				// set from the MCP *selection*, which is how always-on conventional and
+				// plugin tools would silently be re-gated. Re-activating this manager's
+				// tools right after the refresh restores that classification, mirroring
+				// the deferred exact-config path below.
+				const ownedManager = mcpManager;
+				let latePublication: Promise<void> = Promise.resolve();
+				ownedManager.setOnToolsChanged(tools => {
+					if (session.isDisposed) return;
+					const alwaysOnNames = tools.filter(tool => tool.mcpServerName !== undefined).map(tool => tool.name);
+					// Serialized: two servers landing together must not interleave a
+					// refresh with another refresh's activation.
+					latePublication = latePublication
+						.then(async () => {
+							if (session.isDisposed) return;
+							await session.refreshMCPTools(tools as CustomTool[]);
+							if (session.isDisposed || alwaysOnNames.length === 0) return;
+							await session.activateDiscoveredTools(alwaysOnNames);
+						})
+						.catch(error => {
+							logger.warn("Failed to publish late MCP tools into the session", {
+								error: safeErrorForLog(error),
+							});
+						});
 				});
 			}
 			// Wire prompt refresh → rebuild MCP prompt slash commands.
