@@ -82,26 +82,53 @@ function envRow(snapshot: { rows: AccountInventoryRow[] }): AccountInventoryRow 
 	return snapshot.rows.find(row => row.source === "env" && row.provider === "openai-codex");
 }
 
+function runtimeRow(snapshot: { rows: AccountInventoryRow[] }): AccountInventoryRow | undefined {
+	return snapshot.rows.find(row => row.source === "runtime" && row.provider === "openai-codex");
+}
+
 /**
- * Deterministic synthetic env-row coverage (review 4958546910). Export a
- * repository-recognized provider variable (OPENAI_CODEX_OAUTH_TOKEN maps to
- * "openai-codex" in packages/ai/src/stream.ts) so every test below sees the
- * synthetic env row regardless of the host machine's real credentials, and
- * restore the prior value so the fixture cannot leak into other tests. The
- * value is a synthetic constant, never a host credential.
+ * Assert that no row payload serializes the provider's resolved credential
+ * value. The key is whatever the production resolver returns — fixture token or
+ * a host-exported value pinned by the inherited-env snapshot — and the boolean
+ * comparison keeps the key itself out of failure output.
  */
-const ENV_ROW_PROVIDER_VAR = "OPENAI_CODEX_OAUTH_TOKEN";
+function expectRowsRedactKey(snapshot: { rows: AccountInventoryRow[] }, provider: string): void {
+	const key = getEnvApiKey(provider);
+	if (key === undefined) return;
+	expect(JSON.stringify(snapshot.rows).includes(key)).toBe(false);
+}
+
+/**
+ * Deterministic synthetic env-row coverage (reviews 4958546910, 4960174075).
+ * Export repository-recognized provider variables — OPENAI_CODEX_OAUTH_TOKEN
+ * maps to "openai-codex" and GROQ_API_KEY to "groq" in
+ * packages/ai/src/stream.ts — around each test with save/restore so the
+ * synthetic rows are built deterministically on credential-free CI runners.
+ * Values are synthetic constants, never host credentials, and cleanup restores
+ * the prior value (or deletes it) so the fixture cannot leak into other tests.
+ * Cases that must NOT depend on env resolution use runtime-source stubs
+ * instead, because getEnvApiKey also reads agent/user .env and shell-rc files
+ * that a host machine may carry.
+ */
+const ENV_FIXTURES = {
+	OPENAI_CODEX_OAUTH_TOKEN: "test-env-row-token",
+	GROQ_API_KEY: "test-groq-row-token",
+} as const;
 const savedEnv = new Map<string, string | undefined>();
 
 beforeEach(() => {
-	savedEnv.set(ENV_ROW_PROVIDER_VAR, process.env[ENV_ROW_PROVIDER_VAR]);
-	process.env[ENV_ROW_PROVIDER_VAR] = "test-env-row-token";
+	for (const [name, value] of Object.entries(ENV_FIXTURES)) {
+		savedEnv.set(name, process.env[name]);
+		process.env[name] = value;
+	}
 });
 
 afterEach(() => {
-	const value = savedEnv.get(ENV_ROW_PROVIDER_VAR);
-	if (value === undefined) delete process.env[ENV_ROW_PROVIDER_VAR];
-	else process.env[ENV_ROW_PROVIDER_VAR] = value;
+	for (const name of Object.keys(ENV_FIXTURES)) {
+		const value = savedEnv.get(name);
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+	}
 	savedEnv.clear();
 });
 
@@ -179,8 +206,23 @@ describe("account inventory usage", () => {
 		// getEffectiveCredentialType stubs "oauth", so the env row is available but
 		// not selected.
 		expect(env?.routing).toEqual({ active: false, selected: false, marker: "available" });
-		// Snapshot rows carry no API-key bytes.
-		expect(JSON.stringify(snapshot.rows)).not.toContain("test-env-row-token");
+		expectRowsRedactKey(snapshot, "openai-codex");
+	});
+
+	it("discovers an environment-only provider absent from stored inventory and the model registry", () => {
+		const snapshot = buildAccountInventorySnapshot({
+			authStorage: makeAuthStorage(),
+			modelRegistry,
+			nowMs: NOW,
+		});
+		const groq = snapshot.rows.find(row => row.source === "env" && row.provider === "groq");
+
+		// "groq" is in neither the stored inventory nor modelRegistry.getAvailable,
+		// so this row can only come from listProvidersWithEnvKey() + getEnvApiKey.
+		expect(groq).toBeDefined();
+		expect(groq?.credentialKind).toBe("api_key");
+		expect(snapshot.rows.some(row => row.source === "stored" && row.provider === "groq")).toBe(false);
+		expectRowsRedactKey(snapshot, "groq");
 	});
 
 	it("probes the synthetic env row through checkApiKeyCredential and records the source health", async () => {
@@ -211,7 +253,7 @@ describe("account inventory usage", () => {
 		// by the inherited-env snapshot stays consistent with what was probed.
 		const expectedKey = getEnvApiKey("openai-codex");
 		expect(expectedKey).toBeDefined();
-		expect(probed.filter(entry => entry.provider === "openai-codex")).toEqual([
+		expect(probed.filter(entry => entry.provider === "openai-codex" && entry.key === expectedKey)).toEqual([
 			{ provider: "openai-codex", key: expectedKey ?? "", baseUrl: BASE_URL },
 		]);
 		expect(recorded.filter(entry => entry.provider === "openai-codex" && entry.source === "env")).toEqual([
@@ -230,22 +272,58 @@ describe("account inventory usage", () => {
 		expect(env?.health.reason).toBeNull();
 		// The stored credential keeps its own identity-based row.
 		expect(stored).toBeDefined();
-		// Row payloads never carry the key bytes.
-		expect(JSON.stringify(snapshot.rows)).not.toContain("test-env-row-token");
+		expectRowsRedactKey(snapshot, "openai-codex");
 	});
 
-	it("marks an unavailable synthetic source unverifiable without probing it", async () => {
-		// The env variable resolves (beforeEach set it), but the check-path key
-		// resolution is exercised through getEnvApiKey, which reads the same
-		// variable. Remove it for this test to force the unavailable path.
-		delete process.env[ENV_ROW_PROVIDER_VAR];
-
-		const probed: string[] = [];
+	it("marks a failed API-key probe as failed health and records the sanitized reason", async () => {
 		const recorded: Array<{ provider: string; source: string; health: CachedCredentialHealth }> = [];
 		const authStorage = makeAuthStorage({
 			getEffectiveCredentialType: () => "api_key",
-			hasRuntimeApiKey: () => false,
-			hasConfigApiKey: () => false,
+			checkApiKeyCredential: async (provider: string): Promise<ApiKeyCredentialCheckResult> => ({
+				provider,
+				type: "api_key",
+				ok: false,
+				reason: "stubbed probe failure",
+			}),
+			recordCredentialHealthForSource: (provider, source, health) => {
+				recorded.push({ provider, source, health });
+			},
+		});
+
+		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
+		const env = envRow(snapshot);
+
+		expect(env?.health.status).toBe("failed");
+		expect(env?.health.reason).toBe("stubbed probe failure");
+		expect(recorded.filter(entry => entry.provider === "openai-codex" && entry.source === "env")).toEqual([
+			{
+				provider: "openai-codex",
+				source: "env",
+				health: {
+					status: "failed",
+					reason: "stubbed probe failure",
+					checkedAt: expect.any(Number),
+					retainUntil: expect.any(Number),
+				},
+			},
+		]);
+	});
+
+	it("marks a synthetic runtime row unverifiable when its key source resolves nothing", async () => {
+		// A runtime-source row exists purely through the hasRuntimeApiKey stub, so
+		// this case never consults env files or shell-rc sources that a host
+		// machine may carry. peekApiKey returning undefined drives the
+		// "API-key source is unavailable" fallback in checkAccountInventory.
+		// The env fixture value is dropped first so the runtime row is the only
+		// synthetic row for this provider; a file-backed host value would keep an
+		// env row too, which does not affect the runtime-row assertions below.
+		delete process.env.OPENAI_CODEX_OAUTH_TOKEN;
+		const probed: string[] = [];
+		const recorded: Array<{ provider: string; source: string; health: CachedCredentialHealth }> = [];
+		const authStorage = makeAuthStorage({
+			hasRuntimeApiKey: provider => provider === "openai-codex",
+			getEffectiveCredentialType: () => "api_key",
+			peekApiKey: async () => undefined,
 			checkApiKeyCredential: async (provider: string): Promise<ApiKeyCredentialCheckResult> => {
 				probed.push(provider);
 				return { provider, type: "api_key", ok: null, reason: "stub" };
@@ -255,18 +333,28 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		// The provider stays in providerSet via the model registry, but the env
-		// row must not appear because the mapped variable does not resolve.
 		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
-		const env = envRow(snapshot);
+		const runtime = runtimeRow(snapshot);
 
-		// buildAccountInventorySnapshot's addSyntheticRows skips the env row when
-		// getEnvApiKey does not resolve, so no env row and no probe happen here.
-		expect(env).toBeUndefined();
-		// Other env-backed providers may resolve on the host; this fixture's
-		// provider must contribute no env row and no probe.
+		expect(runtime).toBeDefined();
+		expect(runtime?.routing).toEqual({ active: false, selected: true, marker: "selected" });
+		// No key could be resolved for the runtime source, so no probe ran for it
+		// and the unavailable fallback applied. Other env-backed providers may
+		// resolve on the host; scope to this fixture's provider.
 		expect(probed.filter(provider => provider === "openai-codex")).toEqual([]);
-		expect(recorded.filter(entry => entry.provider === "openai-codex")).toEqual([]);
-		expect(storedRow(snapshot)).toBeDefined();
+		expect(runtime?.health.status).toBe("unverifiable");
+		expect(runtime?.health.reason).toBe("API-key source is unavailable");
+		expect(recorded.filter(entry => entry.provider === "openai-codex" && entry.source === "runtime")).toEqual([
+			{
+				provider: "openai-codex",
+				source: "runtime",
+				health: {
+					status: "unverifiable",
+					reason: "API-key source is unavailable",
+					checkedAt: expect.any(Number),
+					retainUntil: expect.any(Number),
+				},
+			},
+		]);
 	});
 });
