@@ -15,6 +15,21 @@ import {
 import type { RawSettings, Settings, SettingsAtomicPatch } from "../config/settings";
 import { parsePersistedCredentialSelector } from "./startup-auth-config";
 
+/** Resolves a provider's environment-sourced API key. */
+export type EnvApiKeyResolver = (provider: string) => string | undefined;
+
+const DEFAULT_ENV_API_KEY_RESOLVER: EnvApiKeyResolver = getEnvApiKey;
+let envApiKeyResolverForTest: EnvApiKeyResolver | null = null;
+
+function resolveEnvApiKey(provider: string): string | undefined {
+	return (envApiKeyResolverForTest ?? DEFAULT_ENV_API_KEY_RESOLVER)(provider);
+}
+
+/** @internal Test-only seam; production resolution always reads the live credential env. */
+export function __setEnvApiKeyResolverForTests(resolver: EnvApiKeyResolver | null): void {
+	envApiKeyResolverForTest = resolver;
+}
+
 /** A redacted usage observation attached to an account row. */
 export interface AccountUsageCache extends CachedUsageReport {}
 
@@ -181,7 +196,7 @@ function providerSet(input: AccountInventoryInput, inventory: CredentialInventor
 	// This only asks whether a known env-backed provider is present. The key value
 	// never enters the snapshot or any renderer.
 	for (const provider of listProvidersWithEnvKey()) {
-		if (getEnvApiKey(provider)) providers.add(provider);
+		if (resolveEnvApiKey(provider)) providers.add(provider);
 	}
 	return providers;
 }
@@ -325,7 +340,7 @@ function freshUsageCache(report: CachedUsageReport["report"]): AccountUsageCache
 
 function canPinStoredOAuth(authStorage: AuthStorage, provider: string): boolean {
 	if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasConfigApiKey(provider)) return false;
-	return !getEnvApiKey(provider);
+	return !resolveEnvApiKey(provider);
 }
 
 function sourceHealth(authStorage: AuthStorage, provider: string, source: SyntheticAccountSource): AccountHealthCache {
@@ -421,7 +436,7 @@ function addSyntheticRows(
 	for (const provider of [...providers].sort((a, b) => a.localeCompare(b))) {
 		const runtime = authStorage.hasRuntimeApiKey(provider);
 		const config = authStorage.hasConfigApiKey(provider);
-		const env = Boolean(getEnvApiKey(provider));
+		const env = Boolean(resolveEnvApiKey(provider));
 		const effectiveType = authStorage.getEffectiveCredentialType(provider, sessionId);
 
 		const add = (source: AccountInventorySource): void => {
@@ -528,7 +543,7 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 	const syntheticRows = rows.filter(row => row.source !== "stored");
 	for (const row of syntheticRows) {
 		let key: string | undefined;
-		if (row.source === "env") key = getEnvApiKey(row.provider);
+		if (row.source === "env") key = resolveEnvApiKey(row.provider);
 		else if (row.source === "runtime" && authStorage.hasRuntimeApiKey(row.provider))
 			key = await authStorage.peekApiKey(row.provider);
 		else if (
