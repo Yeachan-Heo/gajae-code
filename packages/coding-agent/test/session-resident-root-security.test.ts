@@ -269,11 +269,14 @@ describe.skipIf(process.platform === "win32")("resident cache root trust boundar
 		}
 	});
 
+	// `expectedCauseCode` is the discriminator `reason` cannot provide: ELOOP and
+	// ENOENT both demote as `blob_create_failed`, so a demotion that reports only
+	// the reason cannot tell a hostile path from a cache directory that vanished.
 	it.each([
-		["foreign EEXIST symlink", "blob_untrusted"],
-		["injected ELOOP", "blob_create_failed"],
-		["injected ENOENT", "blob_create_failed"],
-	] as const)("demotes the whole resident store after %s, preserves old content, and retries the triggering append once", async (injection, expectedReason) => {
+		["foreign EEXIST symlink", "blob_untrusted", undefined],
+		["injected ELOOP", "blob_create_failed", "ELOOP"],
+		["injected ENOENT", "blob_create_failed", "ENOENT"],
+	] as const)("demotes the whole resident store after %s, preserves old content, and retries the triggering append once", async (injection, expectedReason, expectedCauseCode) => {
 		const root = makeTempDir();
 		const manager = createManager(root);
 		const preDemotionText = `pre-demotion ${"a".repeat(4096)}`;
@@ -325,10 +328,52 @@ describe.skipIf(process.platform === "win32")("resident cache root trust boundar
 			expect(manager.getObservabilityStatsForTests()).toMatchObject({
 				residentCacheTrustRejectCount: 1,
 				residentCacheDegradedReason: expectedReason,
+				residentCacheDegradedCauseCode: expectedCauseCode,
 			});
 			expect(residentInstanceDirs()).toEqual([]);
 		} finally {
 			await manager.close().catch(() => {});
 		}
+	});
+});
+
+describe("ResidentCacheTrustError cause exposure", () => {
+	it("lifts the wrapped errno so a demotion names why the step failed, not just which step", () => {
+		const cause = Object.assign(new Error("ENOENT: no such file or directory, open '/gone/blob'"), {
+			code: "ENOENT",
+		});
+		const error = new ResidentCacheTrustError("blob_create_failed", "/gone/blob", { cause });
+
+		expect(error.causeCode).toBe("ENOENT");
+		expect(error.causeSummary).toBe("Error: ENOENT: no such file or directory, open '/gone/blob'");
+	});
+
+	it("reports no cause fields for a policy rejection that wrapped nothing", () => {
+		const error = new ResidentCacheTrustError("blob_untrusted", "/tmp/blob");
+
+		expect(error.causeCode).toBeUndefined();
+		expect(error.causeSummary).toBeUndefined();
+	});
+
+	it("bounds and single-lines a cause so a log record cannot inherit an unbounded thrown value", () => {
+		const error = new ResidentCacheTrustError("blob_write_failed", "/tmp/blob", {
+			cause: new Error(`line one\n${"z".repeat(4096)}`),
+		});
+
+		expect(error.causeSummary).toHaveLength(200);
+		expect(error.causeSummary?.endsWith("…")).toBe(true);
+		expect(error.causeSummary).not.toContain("\n");
+		expect(error.causeCode).toBeUndefined();
+	});
+
+	it("survives a cause whose own stringification throws", () => {
+		const hostile = {
+			toString() {
+				throw new Error("nope");
+			},
+		};
+		const error = new ResidentCacheTrustError("blob_close_failed", "/tmp/blob", { cause: hostile });
+
+		expect(error.causeSummary).toBe("<uninspectable cause>");
 	});
 });

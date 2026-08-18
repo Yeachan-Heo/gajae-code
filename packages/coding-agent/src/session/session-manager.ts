@@ -33,6 +33,7 @@ import {
 	getTerminalSessionsDir,
 	hasFsCode,
 	isEnoent,
+	isFsError,
 	logger,
 	parseJsonlLenient,
 	pathIsWithin,
@@ -371,7 +372,7 @@ interface FreshSessionState {
 	readonly adoptsLifecycleId: boolean;
 }
 
-type ResidentCacheDegradedStore = BlobStore & { degradedReason?: string };
+type ResidentCacheDegradedStore = BlobStore & { degradedReason?: string; degradedCauseCode?: string };
 
 const RESIDENT_CACHE_WRITE_FAILURE_REASONS = new Set([
 	"root_create_failed",
@@ -452,6 +453,7 @@ export interface SessionManagerObservabilityStats {
 	residentCacheTrustRejectCount: number;
 	residentCacheWin32FallbackCount: number;
 	residentCacheDegradedReason?: string;
+	residentCacheDegradedCauseCode?: string;
 	publicMaterializerCallCount: number;
 	getEntryMaterializerCallCount: number;
 	getBranchMaterializerCallCount: number;
@@ -7645,11 +7647,14 @@ export class SessionManager {
 	#demoteResidentTextStoreAfterTrustReject(error: ResidentCacheTrustError): void {
 		const predecessor = this.#residentTextBlobStore;
 		(predecessor as ResidentCacheDegradedStore).degradedReason = error.reason;
+		(predecessor as ResidentCacheDegradedStore).degradedCauseCode = error.causeCode;
 		this.#residentCacheTrustRejectCount++;
 		logger.warn("Resident cache trust rejection; demoting resident text store", {
 			sessionId: this.#sessionId,
 			sessionFile: this.#sessionFile,
 			reason: error.reason,
+			causeCode: error.causeCode,
+			cause: error.causeSummary,
 		});
 		const persistedTextFallback =
 			predecessor instanceof EphemeralBlobStore ? this.#createPersistedResidentTextFallback() : undefined;
@@ -7674,6 +7679,7 @@ export class SessionManager {
 			"memory-only",
 		);
 		(prepared.store as ResidentCacheDegradedStore).degradedReason = error.reason;
+		(prepared.store as ResidentCacheDegradedStore).degradedCauseCode = error.causeCode;
 		this.#commitResidentTextStoreTransition(prepared);
 	}
 
@@ -11115,9 +11121,16 @@ export class SessionManager {
 				pending.dispose();
 				this.#managedSidecarCleanupStores.delete(pending);
 			} catch (error) {
-				const candidate = error instanceof ResidentCacheTrustError ? error.reason : "";
+				const trustError = error instanceof ResidentCacheTrustError ? error : undefined;
+				const candidate = trustError?.reason ?? "";
 				const reason = /^[a-z0-9_]{1,64}$/.test(candidate) ? candidate : "cleanup_failed";
-				logger.warn("Failed to dispose the managed sidecar resident cache; retained for retry", { reason });
+				// An errno is path-free, so it can join `reason` here; the cause *summary*
+				// cannot, because fs messages embed the sidecar cache path this record withholds.
+				const causeCode = trustError?.causeCode ?? (isFsError(error) ? error.code : undefined);
+				logger.warn("Failed to dispose the managed sidecar resident cache; retained for retry", {
+					reason,
+					...(causeCode === undefined ? {} : { causeCode }),
+				});
 			}
 		}
 	}
@@ -17171,6 +17184,7 @@ export class SessionManager {
 			residentCacheTrustRejectCount: this.#residentCacheTrustRejectCount,
 			residentCacheWin32FallbackCount: this.#residentCacheWin32FallbackCount,
 			residentCacheDegradedReason: (this.#residentTextBlobStore as ResidentCacheDegradedStore).degradedReason,
+			residentCacheDegradedCauseCode: (this.#residentTextBlobStore as ResidentCacheDegradedStore).degradedCauseCode,
 			publicMaterializerCallCount: this.#publicMaterializerCallCount,
 			getEntryMaterializerCallCount: this.#getEntryMaterializerCallCount,
 			getBranchMaterializerCallCount: this.#getBranchMaterializerCallCount,

@@ -128,4 +128,47 @@ describe("managed sidecar resident-cache release", () => {
 		},
 		60_000,
 	);
+
+	itPosix(
+		"reports the disposal errno alongside the reason while still withholding the cache path",
+		async () => {
+			const fixture = createManagedSidecarSession("@pi-managed-sidecar-errno-");
+			const originalDispose = EphemeralBlobStore.prototype.dispose;
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			let rejectDisposal = true;
+			const dispose = vi.spyOn(EphemeralBlobStore.prototype, "dispose").mockImplementation(function (
+				this: EphemeralBlobStore,
+			) {
+				if (!rejectDisposal) return originalDispose.call(this);
+				throw new ResidentCacheTrustError("blob_close_failed", this.dir, {
+					cause: Object.assign(new Error(`EBUSY: resource busy or locked, rmdir '${this.dir}'`), {
+						code: "EBUSY",
+					}),
+				});
+			});
+			try {
+				expect(fixture.sidecarCacheDirs).not.toHaveLength(0);
+
+				await fixture.manager.close();
+
+				const warnings = warn.mock.calls.filter(([message]) =>
+					String(message).includes("managed sidecar resident cache"),
+				);
+				expect(warnings.length).toBeGreaterThan(0);
+				for (const warning of warnings)
+					expect(warning[1]).toEqual({ reason: "blob_close_failed", causeCode: "EBUSY" });
+				const warningPayload = JSON.stringify(warnings);
+				for (const directory of fixture.sidecarCacheDirs) expect(warningPayload).not.toContain(directory);
+
+				rejectDisposal = false;
+				await fixture.manager.close();
+			} finally {
+				dispose.mockRestore();
+				warn.mockRestore();
+				for (const directory of fixture.sidecarCacheDirs) fs.rmSync(directory, { recursive: true, force: true });
+				fixture.cleanup();
+			}
+		},
+		60_000,
+	);
 });

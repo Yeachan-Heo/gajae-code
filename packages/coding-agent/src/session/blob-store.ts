@@ -87,6 +87,16 @@ export class BlobCorruptError extends Error {
  * memory before retrying the triggering write.
  */
 export class ResidentCacheTrustError extends Error {
+	/**
+	 * errno of the OS failure this rejection wrapped (`ENOENT`, `EMFILE`, `EACCES`, …),
+	 * or `undefined` when the rejection was a pure policy decision with no cause.
+	 * `reason` alone names the *step* that failed; only this names *why*, so a
+	 * demotion is diagnosable from a log line instead of requiring a debugger.
+	 */
+	readonly causeCode: string | undefined;
+	/** Bounded one-line rendering of the wrapped cause for logs that must not serialize an arbitrary thrown value. */
+	readonly causeSummary: string | undefined;
+
 	constructor(
 		readonly reason: string,
 		readonly path: string,
@@ -94,7 +104,27 @@ export class ResidentCacheTrustError extends Error {
 	) {
 		super(`Resident cache trust validation failed (${reason}): ${path}`, options);
 		this.name = "ResidentCacheTrustError";
+		this.causeCode = errorCode(options?.cause);
+		this.causeSummary = summarizeResidentCacheTrustCause(options?.cause);
 	}
+}
+
+const RESIDENT_CACHE_CAUSE_SUMMARY_MAX_CHARS = 200;
+
+function summarizeResidentCacheTrustCause(cause: unknown): string | undefined {
+	if (cause === undefined) return undefined;
+	let text: string;
+	try {
+		text = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+	} catch {
+		// A cause whose own stringification throws must not turn a demotion into a crash.
+		return "<uninspectable cause>";
+	}
+	text = text.replace(/\s+/g, " ").trim();
+	if (!text) return undefined;
+	return text.length > RESIDENT_CACHE_CAUSE_SUMMARY_MAX_CHARS
+		? `${text.slice(0, RESIDENT_CACHE_CAUSE_SUMMARY_MAX_CHARS - 1)}…`
+		: text;
 }
 
 function residentCacheTrustError(reason: string, pathname: string, cause?: unknown): ResidentCacheTrustError {
