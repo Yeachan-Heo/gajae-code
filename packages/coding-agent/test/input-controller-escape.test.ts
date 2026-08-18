@@ -69,7 +69,7 @@ function createSubmission(input: {
 	};
 }
 
-function createContext(): {
+function createContext(options: { interruptKeys?: string[]; clearKeys?: string[] } = {}): {
 	ctx: InteractiveModeContext;
 	editor: FakeEditor;
 	inputListeners: FakeInputListener[];
@@ -89,6 +89,7 @@ function createContext(): {
 		requestRender: ReturnType<typeof vi.fn>;
 		startPendingSubmission: ReturnType<typeof vi.fn>;
 		clearEditor: ReturnType<typeof vi.fn>;
+		shutdown: ReturnType<typeof vi.fn>;
 		abortCompaction: ReturnType<typeof vi.fn>;
 		abortHandoff: ReturnType<typeof vi.fn>;
 		abortRetry: ReturnType<typeof vi.fn>;
@@ -158,6 +159,7 @@ function createContext(): {
 		editor.setText("");
 		ctx.pendingImages = [];
 	});
+	const shutdown = vi.fn(() => Promise.resolve());
 	const ensureLoadingAnimation = vi.fn(() => {
 		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
 	});
@@ -197,13 +199,19 @@ function createContext(): {
 			getSessionName: () => "existing session",
 		} as unknown as InteractiveModeContext["sessionManager"],
 		keybindings: {
-			getKeys: (action: string) => (action === "app.interrupt" ? ["escape"] : []),
+			getKeys: (action: string) =>
+				action === "app.interrupt"
+					? (options.interruptKeys ?? ["escape"])
+					: action === "app.clear"
+						? (options.clearKeys ?? ["ctrl+c"])
+						: [],
 			getDisplayString: () => "",
 		} as unknown as InteractiveModeContext["keybindings"],
 		pendingImages: [],
 		lastEscapeTime: 0,
 		lastComposerClearEscapeTime: 0,
 		clearEditor,
+		shutdown,
 		isBashMode: false,
 		isPythonMode: false,
 		optimisticUserMessageSignature: undefined,
@@ -255,6 +263,7 @@ function createContext(): {
 			requestRender,
 			startPendingSubmission,
 			clearEditor,
+			shutdown,
 			showStatus,
 		},
 	};
@@ -513,6 +522,120 @@ describe("InputController escape behavior", () => {
 		expect(result).toEqual({ consume: true });
 		expect(spies.abort).toHaveBeenCalledTimes(1);
 		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt" }));
+	});
+	it("globally aborts an active workflow stream on Ctrl+C without clearing the composer", () => {
+		const { ctx, editor, inputListeners, spies } = createContext();
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
+		editor.setText("draft message");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const result = inputListeners[0]?.("\x03");
+
+		expect(result).toEqual({ consume: true });
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt" }));
+		expect(spies.clearEditor).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("draft message");
+	});
+	it("falls through to the editor for idle Ctrl+C clear and double-press shutdown", async () => {
+		const { ctx, editor, inputListeners, spies } = createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("draft message");
+		const first = inputListeners[0]?.("\x03");
+		if (!first?.consume) editor.onClear?.();
+		await Bun.sleep(0);
+		expect(first).toBeUndefined();
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(spies.shutdown).not.toHaveBeenCalled();
+
+		const second = inputListeners[0]?.("\x03");
+		if (!second?.consume) editor.onClear?.();
+		await Bun.sleep(0);
+		expect(second).toBeUndefined();
+		expect(spies.shutdown).toHaveBeenCalledTimes(1);
+	});
+	it("honors remapped and multiple clear bindings at the listener boundary", () => {
+		const { ctx, inputListeners, spies } = createContext({ clearKeys: ["ctrl+x", "ctrl+c"] });
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		expect(inputListeners[0]?.("\x18")).toEqual({ consume: true });
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+	});
+	it("uses clear cancellation for loading, process, mode, maintenance, and retry states", () => {
+		const cases = [
+			{
+				name: "loading",
+				setup: (ctx: InteractiveModeContext) => {
+					ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+				},
+				assert: (spies: ReturnType<typeof createContext>["spies"]) => expect(spies.clearQueue).toHaveBeenCalled(),
+			},
+			{
+				name: "bash process",
+				setup: (ctx: InteractiveModeContext) => {
+					(ctx.session as { isBashRunning: boolean }).isBashRunning = true;
+				},
+				assert: (spies: ReturnType<typeof createContext>["spies"]) =>
+					expect(spies.abortBash).toHaveBeenCalledTimes(1),
+			},
+			{
+				name: "bash mode",
+				setup: (ctx: InteractiveModeContext) => {
+					ctx.isBashMode = true;
+				},
+				assert: (spies: ReturnType<typeof createContext>["spies"]) =>
+					expect(spies.clearEditor).not.toHaveBeenCalled(),
+			},
+			{
+				name: "maintenance",
+				setup: (ctx: InteractiveModeContext) => {
+					(ctx.session as { isCompacting: boolean }).isCompacting = true;
+				},
+				assert: (spies: ReturnType<typeof createContext>["spies"]) =>
+					expect(spies.abortCompaction).toHaveBeenCalledTimes(1),
+			},
+			{
+				name: "retry",
+				setup: (ctx: InteractiveModeContext) => {
+					ctx.retryLoader = {} as InteractiveModeContext["retryLoader"];
+				},
+				assert: (spies: ReturnType<typeof createContext>["spies"]) => {
+					expect(spies.abortRetry).toHaveBeenCalledTimes(1);
+					expect(spies.retryNow).not.toHaveBeenCalled();
+				},
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			const { ctx, inputListeners, spies } = createContext();
+			testCase.setup(ctx);
+			new InputController(ctx).setupKeyHandlers();
+			expect(inputListeners[0]?.("\x03"), testCase.name).toEqual({ consume: true });
+			testCase.assert(spies);
+		}
+	});
+	it("preserves BTW precedence and queued-steer first/second Ctrl+C semantics", () => {
+		const overlay = createContext();
+		overlay.spies.hasActiveBtw.mockReturnValue(true);
+		new InputController(overlay.ctx).setupKeyHandlers();
+		expect(overlay.inputListeners[0]?.("\x03")).toEqual({ consume: true });
+		expect(overlay.spies.handleBtwEscape).toHaveBeenCalledTimes(1);
+		expect(overlay.spies.abort).not.toHaveBeenCalled();
+
+		const queued = createContext();
+		(queued.ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(queued.ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		new InputController(queued.ctx).setupKeyHandlers();
+		expect(queued.inputListeners[0]?.("\x03")).toEqual({ consume: true });
+		expect(queued.spies.abort).toHaveBeenCalledWith(expect.objectContaining({ silent: true }));
+		expect(queued.inputListeners[0]?.("\x03")).toEqual({ consume: true });
+		expect(queued.spies.clearQueue).toHaveBeenCalledTimes(1);
+		expect(queued.spies.abort).toHaveBeenCalledTimes(2);
 	});
 	it("lets hook selector inline input handle Esc locally during a workflow stream", () => {
 		const { ctx, inputListeners, spies } = createContext();

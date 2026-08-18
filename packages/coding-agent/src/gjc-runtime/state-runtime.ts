@@ -14,12 +14,7 @@ import {
 	syncSkillActiveState,
 } from "../skill-state/active-state";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
-import {
-	buildRalplanHudSummary,
-	buildTeamHudSummary,
-	buildUltragoalHudSummary,
-	deriveDeepInterviewHud,
-} from "../skill-state/workflow-hud";
+import { buildRalplanHudSummary, buildUltragoalHudSummary, deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import {
 	type AuditEntry,
 	buildWorkflowStateReceipt,
@@ -923,28 +918,44 @@ function buildHudForMode(
 				updatedAt,
 			});
 		}
-		case "team": {
-			const teamPhase = typeof payload.phase === "string" ? (payload.phase as string) : (phase ?? "running");
-			const taskCounts =
-				typeof payload.task_counts === "object" && payload.task_counts && !Array.isArray(payload.task_counts)
-					? (payload.task_counts as Record<string, number>)
-					: {};
-			const taskTotal = typeof payload.task_total === "number" ? (payload.task_total as number) : 0;
-			const workers = Array.isArray(payload.workers)
-				? (payload.workers as Array<{ id?: string; status?: string }>)
-						.filter(w => w && typeof w.id === "string")
-						.map(w => ({
-							id: w.id as string,
-							status: typeof w.status === "string" ? (w.status as string) : undefined,
-						}))
-				: [];
-			return buildTeamHudSummary({
-				phase: teamPhase,
-				task_total: taskTotal,
-				task_counts: taskCounts,
-				workers,
+		case "autoresearch": {
+			const missionPhase =
+				typeof payload.current_phase === "string" ? (payload.current_phase as string) : (phase ?? "intake");
+			const mode = typeof payload.mode === "string" ? (payload.mode as string) : undefined;
+			const intake = typeof payload.intake === "string" ? (payload.intake as string) : undefined;
+			const slug = typeof payload.slug === "string" ? (payload.slug as string) : undefined;
+			const specPath =
+				typeof payload.spec_path === "string"
+					? (payload.spec_path as string)
+					: typeof payload.specPath === "string"
+						? (payload.specPath as string)
+						: undefined;
+			const verdict =
+				payload.verdict && typeof payload.verdict === "object" && !Array.isArray(payload.verdict)
+					? (payload.verdict as { status?: unknown })
+					: undefined;
+			const verdictValue = verdict
+				? typeof verdict.status === "string"
+					? verdict.status
+					: verdict.status && typeof verdict.status === "object"
+						? JSON.stringify(verdict.status).slice(0, 40)
+						: undefined
+				: undefined;
+			const chips: WorkflowHudSummary["chips"] = [
+				...(missionPhase === "verdict"
+					? [{ label: "verdict", value: verdictValue ?? "issued", priority: 5, severity: "success" as const }]
+					: []),
+				{ label: "phase", value: missionPhase, priority: 10 },
+				...(mode ? [{ label: "mode", value: mode, priority: 20 }] : []),
+				...(intake ? [{ label: "intake", value: intake, priority: 30 }] : []),
+				...(specPath ? [{ label: "spec", value: specPath, priority: 40 }] : []),
+			];
+			return {
+				version: 1,
+				...(slug ? { summary: `autoresearch mission ${slug}` } : {}),
+				chips,
 				updated_at: updatedAt,
-			});
+			};
 		}
 		default:
 			return undefined;

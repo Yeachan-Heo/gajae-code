@@ -18,6 +18,7 @@ import {
 	deriveLifecycleDeadlines,
 	executeLifecycle,
 	hasValidLifecycleDeadlines,
+	observeProcessForTest,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
 	reapDeadSessionRegistrations,
@@ -829,6 +830,30 @@ test("broker reads Windows process incarnations as canonical FILETIME ticks with
 			runCommand: () => ({ exitCode: 0, stdout: "4242\t133830291061234568\n" }),
 		}),
 	).toBe("windows:133830291061234568");
+});
+test("Windows lifecycle readiness uses the native process handle instead of signal-zero", () => {
+	const originalPlatform = process.platform;
+	const originalKill = process.kill;
+	const processRef = {
+		incarnation: "windows:133830291061234567",
+		status: () => "running" as const,
+	};
+	const fromPid = vi.spyOn(native.Process, "fromPid").mockReturnValue(processRef as never);
+	process.kill = (() => {
+		throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
+	}) as typeof process.kill;
+	Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+	try {
+		expect(observeProcessForTest(4_242, processRef.incarnation, () => processRef.incarnation)).toBe("alive");
+		fromPid.mockReturnValue(null);
+		expect(observeProcessForTest(4_242, processRef.incarnation, () => processRef.incarnation)).toBe("exited");
+		fromPid.mockReturnValue({ ...processRef, status: () => "exited" as const } as never);
+		expect(observeProcessForTest(4_242, processRef.incarnation, () => processRef.incarnation)).toBe("exited");
+	} finally {
+		Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		process.kill = originalKill;
+		fromPid.mockRestore();
+	}
 });
 test("native absent-process null skips PowerShell on native Windows without repeated spawns (#4362, #4367)", () => {
 	// The native binding returns null as the authoritative absent-process result.

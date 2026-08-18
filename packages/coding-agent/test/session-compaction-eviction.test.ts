@@ -1094,4 +1094,65 @@ describe("SessionManager compacted cold-spill eviction", () => {
 		expect(after).toBeLessThan(ONE_MIB_CHARS);
 		expect(after).toBeLessThan(before * 0.05);
 	});
+	it("degrades an unrecoverable cold-spilled tool argument to malformed instead of emitting a non-object", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cold-spill-missing-blob-"));
+		let reopened: SessionManager | undefined;
+		try {
+			const session = SessionManager.create(root, SessionManager.getDefaultSessionDir(root, root));
+			const payload = Array.from({ length: 180 }, (_, index) => ({
+				index,
+				text: `missing-blob-payload-${index}`,
+			}));
+			const toolEntryId = session.appendMessage({
+				...assistantMessage("missing-blob"),
+				content: [{ type: "toolCall", id: "missing-blob", name: "missing_blob", arguments: { payload } }],
+			});
+			const firstKeptEntryId = session.appendMessage({ role: "user", content: "kept", timestamp: Date.now() });
+			const compactionEntryId = session.appendCompaction("summary", "short", firstKeptEntryId, 123);
+			session.evictCompactedContent(firstKeptEntryId, compactionEntryId);
+
+			const evicted = session.getCanonicalEntryForTests(toolEntryId) as SessionMessageEntry;
+			const ref = evicted.evictedContent?.payloads["message.content.0.arguments"] as ColdSpillRef;
+			expect(ref).toBeDefined();
+
+			await session.ensureOnDisk();
+			await session.rewriteEntries();
+			await session.flush();
+			const sessionFile = session.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted session file");
+			await session.close();
+
+			// Make the payload unrecoverable the way a pruned cache, partial restore
+			// or bit-rot does: the marker stays well-formed but no longer resolves.
+			// Repointing the marker's hash inside this session's own file keeps the
+			// process-wide blob directory (`getBlobsDir()`) untouched, so this test
+			// cannot delete a blob that a sibling test — or a real user — still owns.
+			const rewritten = fs.readFileSync(sessionFile, "utf8").replaceAll(ref.sha256, "0".repeat(64));
+			fs.writeFileSync(sessionFile, rewritten);
+
+			reopened = await SessionManager.open(sessionFile);
+			reopened.branch(toolEntryId);
+			const [toolCall] = reopened
+				.buildSessionContext()
+				.messages.flatMap(message =>
+					"content" in message && Array.isArray(message.content)
+						? message.content.filter((block): block is ToolCall => block.type === "toolCall")
+						: [],
+				);
+
+			// The provider contract: `arguments` must be an object, or Anthropic
+			// rejects the entire request with
+			// `tool_use.input: Input should be a valid dictionary`.
+			expect(toolCall).toBeDefined();
+			expect(toolCall.arguments).toBeObject();
+			// And the call must be flagged so the agent loop refuses to execute it
+			// rather than running a tool on recovered prose.
+			expect(toolCall.incompleteArguments).toBe(true);
+			expect(toolCall.incompleteArgumentsReason).toBe("malformed");
+			expect(JSON.stringify(toolCall.arguments)).toContain("Cold-spill blob unavailable");
+		} finally {
+			await reopened?.close();
+			await fs.promises.rm(root, { recursive: true, force: true });
+		}
+	});
 });

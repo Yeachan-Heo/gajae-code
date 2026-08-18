@@ -1,6 +1,6 @@
 ---
 name: ralplan
-description: Consensus planning entrypoint that auto-gates vague team/ultragoal requests before execution
+description: Consensus planning entrypoint that auto-gates vague ultragoal requests before execution
 argument-hint: "[--interactive] [--deliberate] [--architect openai-code] [--critic openai-code] <task description>"
 level: 4
 
@@ -22,7 +22,7 @@ Ralplan is the consensus planning workflow. It triggers iterative planning with 
 - `--interactive`: Adds draft-review prompts and one-at-a-time reconciliation. When the final receipt resolves `auto_handoff.effectiveTarget` to `off` without `degradationReason: "planning_stuck"`, final approval uses an `ask` workflow gate; a configured automatic admission is handled by step 8.
 - `--deliberate`: Forces high-risk deliberation: pre-mortem plus expanded test planning. It may also auto-enable for explicit auth/security, migration, destructive, incident, compliance/PII, or public-API-breakage risk.
 - `--architect openai-code` / `--critic openai-code`: Use OpenAI code for that review pass when available; otherwise note the fallback and use default GJC review.
-- `gjc.ralplan.autoHandoff`: Selects final-plan admission: `off` (default), `ultragoal`, or `team`. A `team` target degrades to `off` when tmux is unavailable or no current tmux session is usable; the final receipt reports the `team_unavailable:<reason>` degradation. `PLANNING-STUCK` also resolves every target to `off`. Invalid settings reject the final write before any final artifact is persisted. The final receipt's ledger-backed runtime-owned `auto_handoff.effectiveTarget` is authoritative across state loss and run switching.
+- `gjc.ralplan.autoHandoff`: Selects final-plan admission: `off` (default), `ultragoal`, or `autoresearch`. An `autoresearch` target admits `/skill:autoresearch` to continue research from the approved plan rather than implement it; it needs no availability probe. `PLANNING-STUCK` also resolves every target to `off`. Invalid settings reject the final write before any final artifact is persisted. The final receipt's ledger-backed runtime-owned `auto_handoff.effectiveTarget` is authoritative across state loss and run switching.
 - `--write --stage <type> --stage_n <N> --artifact <markdown file path or markdown string>`: Native writer for Planner/Architect/Critic/revision/ADR/final pending-approval markdown under `.gjc/_session-{sessionid}/plans/ralplan/<run-id>/`; do not edit `.gjc/` directly.
 
 ## Corrupt current-session state recovery
@@ -35,7 +35,7 @@ For corrupt, tampered, unreadable, or stale current-session ralplan state, run `
 
 Ralplan is planning only. It may inspect context and draft plan/spec/proposal artifacts, but those remain `pending approval` until explicit current-turn or structured-UI execution approval, or a valid non-off final receipt's runtime-owned `auto_handoff.effectiveTarget` admits the existing handoff chain. Before either admission, do not mutate product source, run mutation-oriented shell, commit, push, open PRs, invoke execution skills, or delegate implementation.
 
-Except for a terminal `planning_stuck` final receipt, explicitly naming `ultragoal` or `team` (including `/skill:` and `gjc` forms) counts as opting into execution for that skill — do not re-ask for the same consent.
+Except for a terminal `planning_stuck` final receipt, explicitly naming `ultragoal` (including `/skill:` and `gjc` forms) counts as opting into execution for that skill — do not re-ask for the same consent.
 
 Persist planning artifacts and handoffs through the ralplan CLI writer, never direct `.gjc/` edits:
 Direct `write`, `edit`, or `ast_edit` calls against `.gjc/_session-{sessionid}/specs`, `.gjc/_session-{sessionid}/plans`, `.gjc/_session-{sessionid}/state`, or any other `.gjc/` path are forbidden unless an explicit force override is active.
@@ -101,29 +101,28 @@ The consensus workflow:
       - For every confirmed open item, embed the resolved outcome into the final plan under an **## Intent Reconciliation** section so the `pending approval` artifact records each decision; record any item the user explicitly defers as an open confirmation under that same section.
    d. Persist the reconciliation with `gjc ralplan --write --stage post-interview --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`, then return the receipt/path plus a compact status (reconciled-clean / reconciled-with-revision / open-confirmations-pending) instead of pasting the full body.
 7. On reconciliation completion, re-check the review join gate (Critic `OKAY` plus Architect `CLEAR`/`APPROVE` for the same Planner artifact/pass), mark the plan `pending approval` unless execution is already authorized by the resolved handoff admission, then persist the ADR/final plan via `gjc ralplan --write --stage final --stage_n <N> --artifact-env GJC_RALPLAN_ARTIFACT --json`. Read the successful receipt's `auto_handoff` object; its ledger-backed `effectiveTarget` is runtime-owned and is the only automatic-routing decision; do not directly edit `.gjc/_session-{sessionid}/plans`. Final plan must include ADR (Decision, Drivers, Alternatives considered, Why chosen, Consequences, Follow-ups) and, when present, the **## Intent Reconciliation** section.
-8. **Final admission and approval gate:** Reconciliation must first reach the successful final receipt from step 7. If that receipt has `auto_handoff.degradationReason: "planning_stuck"`, it is terminal: retain the `pending approval` artifact and **never dispatch**, including for an explicitly named execution skill; do not issue an approval `ask`. Otherwise, if its runtime-owned `auto_handoff.effectiveTarget` is `ultragoal` or `team`, that valid non-off receipt is explicit operator admission for same-turn execution through that target; proceed to step 9 without an `ask`. If it is `off`, including ordinary `off` or a runtime degradation such as `team_unavailable:<reason>`, preserve the ordinary approval flow: if the user already explicitly named an execution skill in the current turn or via the structured approval UI (`ultragoal`, `/skill:ultragoal`, `gjc ultragoal`, `team`, `/skill:team`, `gjc team`, or "Approve execution via ultragoal/team"), that is execution approval — skip the re-ask and proceed to step 9 with that skill. Otherwise, present the finalized plan via the `ask` tool (regardless of `--interactive`) with `workflowGate: { stage: "ralplan", kind: "approval" }` on the final question so RPC/headless clients receive a `ralplan`/`approval` workflow gate, not a deep-interview question gate. Use these options:
+8. **Final admission and approval gate:** Reconciliation must first reach the successful final receipt from step 7. If that receipt has `auto_handoff.degradationReason: "planning_stuck"`, it is terminal: retain the `pending approval` artifact and **never dispatch**, including for an explicitly named execution skill; do not issue an approval `ask`. Otherwise, if its runtime-owned `auto_handoff.effectiveTarget` is `ultragoal`, that valid non-off receipt is explicit operator admission for same-turn execution through that target; proceed to step 9 without an `ask`. If it is `off`, including ordinary `off`, preserve the ordinary approval flow: if the user already explicitly named an execution skill in the current turn or via the structured approval UI (`ultragoal`, `/skill:ultragoal`, `gjc ultragoal`, or "Approve execution via ultragoal"), that is execution approval — skip the re-ask and proceed to step 9 with that skill. Otherwise, present the finalized plan via the `ask` tool (regardless of `--interactive`) with `workflowGate: { stage: "ralplan", kind: "approval" }` on the final question so RPC/headless clients receive a `ralplan`/`approval` workflow gate, not a deep-interview question gate. Use these options:
    - **Refine further** — re-run the consensus loop / request changes, then return here
    - **Approve execution via ultragoal (Recommended)** — goal-tracked autonomous execution
-   - **Approve execution via team** — only when tmux-based interactive worker parallelization is required
    - **Stop here** — keep the plan as `pending approval` and make no further changes
 
-   Always include a free-text option for the ordinary `off`/degraded approval flow. Do not stop with plain text and no `ask` in that flow; its terminal action is this `ask`.
-9. On valid automatic admission or explicit approval, invoke the admitted/approved `/skill:ultragoal` target by default; invoke `/skill:team` only when the admitted/approved target is `team`. On **Refine further**, return to the step 5 re-review loop. On **Stop here**, leave the `pending approval` artifact and stop. A `planning_stuck` final receipt never reaches this step. Never implement directly.
+   Always include a free-text option for the ordinary `off` approval flow. Do not stop with plain text and no `ask` in that flow; its terminal action is this `ask`.
+9. On valid automatic admission or explicit approval, invoke the admitted/approved `/skill:ultragoal` target by default. On **Refine further**, return to the step 5 re-review loop. On **Stop here**, leave the `pending approval` artifact and stop. A `planning_stuck` final receipt never reaches this step. Never implement directly.
 
-   Before invoking `/skill:team` or `/skill:ultragoal`, mark ralplan ready for handoff so the skill tool's chain guard permits the transition:
+   Before invoking `/skill:ultragoal`, mark ralplan ready for handoff so the skill tool's chain guard permits the transition:
 
    ```
    gjc state ralplan write --input '{"current_phase":"handoff"}' --json
    ```
 
-   The skill tool then dispatches the execution skill same-turn and runs `gjc state ralplan handoff --to <team|ultragoal> --json` in-process to atomically demote ralplan, promote the callee, and sync `.gjc/_session-{sessionid}/state/skill-active-state.json`. You do not need to run the handoff verb yourself.
+   The skill tool then dispatches the execution skill same-turn and runs `gjc state ralplan handoff --to ultragoal --json` in-process to atomically demote ralplan, promote the callee, and sync `.gjc/_session-{sessionid}/state/skill-active-state.json`. You do not need to run the handoff verb yourself.
 
 > **Important:** Architect and Critic MAY run in the same parallel batch only for the plan-only Critic lane after Planner persistence (review pass 1). Pass 2+ re-reviews MUST run sequentially Architect -> Critic: await Architect before issuing Critic, pass the current-pass Architect receipt/path to Critic for the rule-5 counter-review, then apply the same review join gate before consensus.
 
 ## Consensus iteration cap (operator contract)
 
 - Default max consensus iterations: **5** (`gjc.ralplan.maxIterations`).
-- On cap: exit code **3**, marker **`PLANNING-STUCK`** (stdout), no silent re-loop, no automatic or explicit ultragoal/team dispatch. Opener budget is `max(index.jsonl openers, on-disk stage-*-{planner,revision}.md count)` so a missing/empty/malformed ledger cannot fail open after prior openers.
+- On cap: exit code **3**, marker **`PLANNING-STUCK`** (stdout), no silent re-loop, no automatic or explicit ultragoal dispatch. Opener budget is `max(index.jsonl openers, on-disk stage-*-{planner,revision}.md count)` so a missing/empty/malformed ledger cannot fail open after prior openers.
 - Headless/CI: treat `PLANNING-STUCK` / exit 3 as terminal planning failure for orchestration/watchdogs.
 - Interactive: retain the best existing plan as a terminal planning result; residual critic findings stay as caveats.
 - **Workflow settings precedence** — ralplan reads all of its settings
@@ -205,16 +204,15 @@ The existing fallback flags ride the same role's normal write: `--fallback-reaso
 
 ## Pre-Execution Gate
 
-Execution skills (`ultragoal`, `team`) implement bounded work; they are not scope-discovery lanes. Vague execution requests such as `team improve the app` are routed through ralplan so scope, acceptance criteria, consensus, and verification exist before code changes.
+Execution skills (`ultragoal`) implement bounded work; they are not scope-discovery lanes. Vague execution requests are routed through ralplan so scope, acceptance criteria, consensus, and verification exist before code changes.
 
-**Passes the gate** (specific enough for direct execution): file paths, issue/PR numbers, named symbols, explicit tests, numbered steps, acceptance criteria, error references, code blocks, or escape prefixes (`force:` / `!`). Examples: `team fix src/hooks/bridge.ts`, `team implement #42`, `team add validation to processKeywordDetector`, `team do:\n1. Add input validation\n2. Write tests`.
+**Passes the gate** (specific enough for direct execution): file paths, issue/PR numbers, named symbols, explicit tests, numbered steps, acceptance criteria, error references, code blocks, or escape prefixes (`force:` / `!`). Examples: `fix src/hooks/bridge.ts`, `implement #42`, `add validation to processKeywordDetector`, `do:\n1. Add input validation\n2. Write tests`.
 
-**Gated — redirected to ralplan**: `team fix this`, `team build the app`, `team improve performance`, `team add authentication`, `team make it better`.
+**Gated — redirected to ralplan**: `fix this`, `build the app`, `improve performance`, `add authentication`, `make it better`.
 
 Gate auto-pass signals: file path, issue/PR number, camelCase/PascalCase/snake_case symbol, test runner, numbered steps, acceptance criteria, error reference, code block, or escape prefix. If it fires on a well-specified prompt, add one concrete anchor; if you intentionally bypass, prefix `force:` or `!`.
 
 On consensus approval, choose:
 - **ultragoal**: goal-tracked autonomous execution with verification (recommended default)
-- **team**: tmux-based coordinated workers only when interactive worker parallelization is required
 
 A redirected request proceeds only through the structured approval option or an explicit execution-skill choice; `just do it` / `skip planning` alone leaves the plan `pending approval`.

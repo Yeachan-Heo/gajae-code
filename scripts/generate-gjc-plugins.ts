@@ -28,8 +28,8 @@ const NAMESPACE_LABEL = "gajae-code-plugin";
 
 interface DelegateMeta {
 	tool: string;
-	workflow: "plan" | "execute" | "team";
-	skill: "ralplan" | "ultragoal" | "team";
+	workflow: "plan" | "execute";
+	skill: "ralplan" | "ultragoal";
 	summary: string;
 }
 
@@ -45,12 +45,6 @@ const DELEGATE_META: DelegateMeta[] = [
 		workflow: "execute",
 		skill: "ultragoal",
 		summary: "Delegate execution to GJC (runs /skill:ultragoal to completion with verification).",
-	},
-	{
-		tool: "gjc_delegate_team",
-		workflow: "team",
-		skill: "team",
-		summary: "Delegate parallel team execution to GJC (runs /skill:team with internal tmux workers).",
 	},
 ];
 /**
@@ -137,7 +131,7 @@ function skillDoc(): string {
 	).join("\n");
 	return `---
 name: gjc-delegation
-description: Delegate planning, execution, and team workflows to gajae-code via the coordinator MCP server.
+description: Delegate planning and execution workflows to gajae-code via the coordinator MCP server.
 ---
 
 # GJC delegation
@@ -325,7 +319,7 @@ export function renderPluginFiles(): Map<string, string> {
 					name: PLUGIN_NAME,
 					source: `./${dir}`,
 					description:
-						"Delegate GJC planning/execution/team workflows via coordinator MCP, plus advisory SDK session CLI and guide skills.",
+						"Delegate GJC planning/execution workflows via coordinator MCP, plus advisory SDK session CLI and guide skills.",
 					version,
 					author: { name: "Gajae Code" },
 					keywords: ["gjc", "delegation", "mcp", "planning", "agents", "sdk"],
@@ -340,7 +334,7 @@ export function renderPluginFiles(): Map<string, string> {
 		json({
 			name: PLUGIN_NAME,
 			description:
-				"Delegate planning, execution, and team workflows to GJC through the coordinator MCP server, plus advisory SDK session CLI and guide skills.",
+				"Delegate planning and execution workflows to GJC through the coordinator MCP server, plus advisory SDK session CLI and guide skills.",
 			version,
 			commands: "./commands",
 			skills: "./skills",
@@ -473,8 +467,8 @@ function runSelfTest(): void {
 export { DELEGATE_TOOLS };
 
 if (import.meta.main) {
-	if (DELEGATE_TOOLS.length !== 3) {
-		process.stderr.write(`Expected 3 delegate tools in the coordinator contract, found ${DELEGATE_TOOLS.length}.\n`);
+	if (DELEGATE_TOOLS.length !== 2) {
+		process.stderr.write(`Expected 2 delegate tools in the coordinator contract, found ${DELEGATE_TOOLS.length}.\n`);
 		process.exit(1);
 	}
 	if (process.argv.includes("--self-test")) {

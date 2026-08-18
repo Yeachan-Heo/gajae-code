@@ -43,7 +43,7 @@ Inspect relevant files, classify the task, identify resources/constraints/depend
 - Codebase facts are backed by inspected files.
 - Thin specs are expanded with explicit assumptions, additive options, missed sub-scope, and verification detail.
 - Risks and verification commands are concrete.
-- Handoff identifies when to use executor, architect, critic, team, or ultragoal.
+- Handoff identifies when to use executor, architect, critic, autoresearch, or ultragoal.
 </success_criteria>
 
 <output_contract>

@@ -33,6 +33,12 @@ function getNestedBoolean(value: unknown, key: string): boolean | undefined {
 	const property = Reflect.get(obj, key);
 	return typeof property === "boolean" ? property : undefined;
 }
+function getNestedString(value: unknown, key: string): string | undefined {
+	const obj = toObject(value);
+	if (!obj) return undefined;
+	const property = Reflect.get(obj, key);
+	return typeof property === "string" ? property : undefined;
+}
 
 function createSseResponse(events: unknown[]): Response {
 	const payload = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
@@ -429,6 +435,30 @@ describe("openai-completions compatibility", () => {
 		const payload = await promise;
 		const chatTemplateArgs = getNestedObject(payload, "chat_template_kwargs");
 		expect(getNestedBoolean(chatTemplateArgs, "enable_thinking")).toBe(true);
+	});
+	it("maps oMLX reasoning effort into chat_template_kwargs.reasoning_effort", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "omlx",
+			id: "Qwen3.6-35B-A3B-8bit",
+			reasoning: true,
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				supportsReasoningEffort: true,
+			},
+		};
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			reasoning: "high",
+			signal: createAbortedSignal(),
+			onPayload: payload => resolve(payload),
+		});
+		const payload = await promise;
+		const chatTemplateArgs = getNestedObject(payload, "chat_template_kwargs");
+		expect(getNestedBoolean(chatTemplateArgs, "enable_thinking")).toBe(true);
+		expect(getNestedString(chatTemplateArgs, "reasoning_effort")).toBe("high");
 	});
 
 	it("treats finish_reason end as stop", async () => {

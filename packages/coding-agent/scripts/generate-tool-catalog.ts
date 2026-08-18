@@ -1,3 +1,5 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { toolWireSchema } from "@gajae-code/ai/utils/schema";
 import { TaskTool } from "../src/task";
@@ -80,7 +82,8 @@ function makeSettings() {
 		"task.isolation.mode": "none",
 		"task.simpleMode": "off",
 		"task.simple": "default",
-		"task.parentSpawns": "*",
+		"task.parentSpawns": "executor,architect,planner,critic",
+		"task.allowedAgents": ["executor", "architect", "planner", "critic"],
 		disabledExtensions: [],
 		"memory.backend": "off",
 		"edit.fuzzyMatch": true,
@@ -94,14 +97,14 @@ function makeSettings() {
 		getGroup: (group: string) => {
 			if (group === "skills")
 				return { enabled: true, enablePiUser: true, enablePiProject: true, customDirectories: [] };
-			if (group === "task") return { disabledAgents: [] };
+			if (group === "task") return { disabledAgents: [], agents: [], allowedAgents: values["task.allowedAgents"] };
 			return {};
 		},
 		getNotificationSettingsSnapshot: () => ({ enabled: false, telegram: {}, discord: {}, slack: {} }),
 	};
 }
 
-function makeSession(cwd: string = path.resolve(import.meta.dir, "../..")): any {
+function makeSession(cwd: string): any {
 	const settings = makeSettings();
 	return {
 		cwd,
@@ -316,7 +319,21 @@ export async function generateToolCatalogData(
 	options: ToolCatalogGenerationOptions = {},
 ): Promise<Record<string, GeneratedToolCatalogEntry>> {
 	const previousEditVariant = process.env.GJC_EDIT_VARIANT;
+	const previousHome = process.env.HOME;
+	const previousGjcConfigDir = process.env.GJC_CONFIG_DIR;
+	const previousPiConfigDir = process.env.PI_CONFIG_DIR;
+	const previousGjcCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
+	const previousPiCodingAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const isolatedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tool-catalog-"));
+	const gitInit = Bun.spawnSync(["git", "init", "--quiet", isolatedRoot]);
+	if (gitInit.exitCode !== 0)
+		throw new Error(`Failed to initialize isolated tool-catalog repository: ${gitInit.stderr}`);
 	process.env.GJC_EDIT_VARIANT = "replace";
+	process.env.HOME = path.join(isolatedRoot, "home");
+	process.env.GJC_CONFIG_DIR = ".gjc-catalog";
+	process.env.PI_CONFIG_DIR = ".gjc-catalog";
+	process.env.GJC_CODING_AGENT_DIR = path.join(isolatedRoot, "agent");
+	process.env.PI_CODING_AGENT_DIR = path.join(isolatedRoot, "agent");
 	const platform = options.platform ?? process.platform;
 	const arch = options.arch ?? process.arch;
 	try {
@@ -328,7 +345,7 @@ export async function generateToolCatalogData(
 			...HIDDEN_TOOL_DESCRIPTORS,
 			...PLATFORM_EXCLUDED_TOOL_DESCRIPTORS,
 		} as Record<string, any>;
-		const session = makeSession(options.cwd);
+		const session = makeSession(isolatedRoot);
 		const output: Record<string, GeneratedToolCatalogEntry> = {};
 		for (const [name, descriptor] of Object.entries(all)) {
 			let fallback: AuditedFallback | undefined;
@@ -432,10 +449,14 @@ export async function generateToolCatalogData(
 			const choose = <T>(key: string, descriptorValue: T | undefined): T | undefined =>
 				fallback ? (read(key) as T | undefined) : ((read(key) as T | undefined) ?? descriptorValue);
 			const intent = choose("intent", descriptor.metadata.intent);
+			const description = choose("description", descriptor.metadata.description);
 			const entry: GeneratedToolCatalogEntry = {
 				name,
 				label: choose("label", descriptor.presentation.label),
-				description: choose("description", descriptor.metadata.description),
+				description:
+					name === "task" && typeof description === "string"
+						? description.replace(/\n# reviewer\n[^\n]*\n\n/g, "")
+						: description,
 				parameters: serializeCatalogValue(name, "parameters", parameters) as Record<string, unknown>,
 				strict: choose("strict", descriptor.metadata.strict),
 				hidden: choose("hidden", descriptor.metadata.hidden),
@@ -465,6 +486,17 @@ export async function generateToolCatalogData(
 	} finally {
 		if (previousEditVariant === undefined) delete process.env.GJC_EDIT_VARIANT;
 		else process.env.GJC_EDIT_VARIANT = previousEditVariant;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+		else process.env.GJC_CONFIG_DIR = previousGjcConfigDir;
+		if (previousPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+		else process.env.PI_CONFIG_DIR = previousPiConfigDir;
+		if (previousGjcCodingAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+		else process.env.GJC_CODING_AGENT_DIR = previousGjcCodingAgentDir;
+		if (previousPiCodingAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousPiCodingAgentDir;
+		await fs.rm(isolatedRoot, { recursive: true, force: true });
 	}
 }
 

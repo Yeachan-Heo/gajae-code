@@ -29,7 +29,7 @@ The prompt is designed to be repeatable: it tells GJC what local artifacts to in
    - 작업 디렉터리 / 레포지토리 분포
    - 자주 등장하는 주제어
    - 짧은 명령과 긴 프롬프트의 비율
-   - /skill:ultragoal, /skill:ralplan, /skill:deep-interview, /skill:team 사용 빈도
+   - /skill:ultragoal, /skill:ralplan, /skill:deep-interview, /skill:autoresearch 사용 빈도
    - continue, fix, review, merge, PR, CI, test, verify, implement, delegate 같은 실행/검증 관련 단어 빈도
 4. sessions jsonl에서는 가능하면 다음을 봐줘:
    - 메인 세션 수
@@ -144,7 +144,7 @@ A meetup host can also turn the same analysis into a playful, MBTI-like “Gajae
 
 3. C / D — Craft vs Delegate
    - C: 직접 구현/수정/탐색 중심.
-   - D: subagent, executor, architect, critic, team, parallel delegation 사용이 강함.
+   - D: subagent, executor, architect, critic, autoresearch, parallel delegation 사용이 강함.
 
 4. X / O — Explore vs Operate
    - X: 새로운 모델/provider/tool/research/실험 주제가 많음.

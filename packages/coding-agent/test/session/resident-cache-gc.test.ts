@@ -24,6 +24,7 @@ afterEach(async () => {
 interface ResidentCacheOwner {
 	pid: number;
 	startTimeMs: number | null;
+	startTimeBasis?: string;
 	nonce: string;
 	createdAt?: number;
 }
@@ -60,14 +61,16 @@ function instanceDirectories(root: string): string[] {
 		.filter(directory => fs.lstatSync(directory).isDirectory() && !fs.lstatSync(directory).isSymbolicLink());
 }
 
+/** Mirrors the production probe: UTC-pinned render, explicitly absolute parse. */
 function currentProcessStartTimeMs(): number | null {
 	const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(process.pid)], {
 		stdout: "pipe",
 		stderr: "ignore",
-		env: { ...process.env, LC_ALL: "C", LANG: "C" },
+		env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
 	});
 	if (result.exitCode !== 0) return null;
-	const startTimeMs = Date.parse(new TextDecoder().decode(result.stdout).trim());
+	const rendered = new TextDecoder().decode(result.stdout).trim();
+	const startTimeMs = rendered ? Date.parse(`${rendered} GMT`) : Number.NaN;
 	return Number.isFinite(startTimeMs) ? startTimeMs : null;
 }
 
@@ -147,6 +150,7 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 		const live = createInstance(cacheRoot, "i-live-owner", {
 			pid: process.pid,
 			startTimeMs: currentProcessStartTimeMs(),
+			startTimeBasis: "utc",
 			nonce: "live-owner",
 		});
 
@@ -163,12 +167,47 @@ describe.skipIf(process.platform === "win32")("resident-cache lease-aware GC", (
 		const stale = createInstance(cacheRoot, "i-reused-pid", {
 			pid: process.pid,
 			startTimeMs: startTimeMs + 60_000,
+			startTimeBasis: "utc",
 			nonce: "reused-pid",
 		});
 
 		await sweepResidentCacheRoot(cacheRoot);
 
 		expect(fs.existsSync(stale)).toBe(false);
+	});
+
+	// `lstart` is a zoneless wall clock rendered by `ps` and bound to a zone by the
+	// reader, so a token written before the UTC pin can sit a whole timezone offset
+	// away from what this reader computes for the very same live process. Reading
+	// that as PID reuse reaps a running session's cache, which is how live sessions
+	// lost their resident blobs and began aborting every turn.
+	it("keeps a live owner whose unlabelled start time disagrees by a timezone offset", async () => {
+		const startTimeMs = currentProcessStartTimeMs();
+		if (startTimeMs === null) throw new Error("The host did not provide a process start time.");
+		const cacheRoot = path.join(makeTempDir(), "resident-cache");
+		makeVerifiedRoot(cacheRoot);
+		const live = createInstance(cacheRoot, "i-zone-skewed", {
+			pid: process.pid,
+			startTimeMs: startTimeMs + 9 * 60 * 60 * 1000,
+			nonce: "zone-skewed",
+		});
+
+		await sweepResidentCacheRoot(cacheRoot);
+
+		expect(fs.existsSync(live)).toBe(true);
+	});
+
+	it("labels a freshly written owner lease as an absolute start time", () => {
+		const cacheRoot = path.join(makeTempDir(), "resident-cache");
+		const instanceDir = openVerifiedResidentCacheInstanceDir(cacheRoot);
+		try {
+			const owner = JSON.parse(fs.readFileSync(path.join(instanceDir, "owner.json"), "utf8")) as ResidentCacheOwner;
+
+			expect(owner.startTimeBasis).toBe("utc");
+			expect(owner.startTimeMs).toBe(currentProcessStartTimeMs());
+		} finally {
+			disposeVerifiedResidentCacheInstanceDir(instanceDir);
+		}
 	});
 
 	it("refuses a reap when the owner token changes after the stale observation", async () => {

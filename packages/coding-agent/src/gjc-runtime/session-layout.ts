@@ -125,8 +125,11 @@ export function sessionLogsDir(cwd: string, gjcSessionId: string): string {
 export function sessionRuntimeDir(cwd: string, gjcSessionId: string): string {
 	return path.join(sessionRoot(cwd, gjcSessionId), "runtime");
 }
-export function sessionRlmDir(cwd: string, gjcSessionId: string): string {
-	return path.join(sessionRoot(cwd, gjcSessionId), "rlm");
+export function sessionAutoresearchDir(cwd: string, gjcSessionId: string): string {
+	return path.join(sessionRoot(cwd, gjcSessionId), "autoresearch");
+}
+export function sessionAutoresearchRunsDir(cwd: string, gjcSessionId: string): string {
+	return path.join(sessionAutoresearchDir(cwd, gjcSessionId), "runs");
 }
 
 // ---- Nested resolvers under <sessionRoot>/state ----
@@ -153,9 +156,6 @@ export function auditPath(cwd: string, gjcSessionId: string): string {
 export function transactionJournalPath(cwd: string, gjcSessionId: string, mutationId: string): string {
 	return path.join(sessionStateDir(cwd, gjcSessionId), "transactions", `${encodeSessionSegment(mutationId)}.json`);
 }
-export function teamStateRoot(cwd: string, gjcSessionId: string): string {
-	return path.join(sessionStateDir(cwd, gjcSessionId), "team");
-}
 export function workflowGatePath(cwd: string, gjcSessionId: string, gateId: string): string {
 	return path.join(sessionStateDir(cwd, gjcSessionId), "workflow-gates", `${encodeSessionSegment(gateId)}.json`);
 }
@@ -173,8 +173,8 @@ export function tmuxRuntimeSessionPath(cwd: string, gjcSessionId: string, slug: 
 	assertSafePathComponent(normalized, "slug");
 	return path.join(sessionRuntimeDir(cwd, gjcSessionId), "tmux-sessions", `${normalized}.json`);
 }
-export function rlmArtifactRoot(cwd: string, gjcSessionId: string, rlmSessionId: string): string {
+export function autoresearchRlmArtifactRoot(cwd: string, gjcSessionId: string, rlmSessionId: string): string {
 	const normalized = rlmSessionId.trim();
 	if (normalized === "") throw new Error("rlmSessionId is required");
-	return path.join(sessionRlmDir(cwd, gjcSessionId), encodeSessionSegment(normalized));
+	return path.join(sessionAutoresearchRunsDir(cwd, gjcSessionId), encodeSessionSegment(normalized));
 }

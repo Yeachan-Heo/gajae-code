@@ -1798,7 +1798,7 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 		await fs.writeFile(projectPath, YAML.stringify({ gjc: { ralplan: { autoHandoff: "later" } } }, null, 2), "utf-8");
 
 		await expect(resolveRalplanAutoHandoff(root)).rejects.toThrow(
-			`invalid ralplan settings at ${projectPath}: expected gjc.ralplan.autoHandoff to be one of off, ultragoal, team`,
+			`invalid ralplan settings at ${projectPath}: expected gjc.ralplan.autoHandoff to be one of off, ultragoal`,
 		);
 	});
 	it("rejects invalid final admission config before writing final artifacts", async () => {
@@ -1828,34 +1828,6 @@ describe("ralplan automatic handoff admission (#3398)", () => {
 			configuredTarget: "ultragoal",
 			effectiveTarget: "ultragoal",
 			source: path.join(root, ".gjc", "config.yml"),
-		});
-
-		await fs.writeFile(
-			path.join(root, ".gjc", "config.yml"),
-			YAML.stringify({ gjc: { ralplan: { autoHandoff: "team" } } }, null, 2),
-			"utf-8",
-		);
-		expect(
-			await resolveRalplanAutoHandoff(root, { teamAvailabilityProbe: () => ({ available: true }) }),
-		).toMatchObject({ configuredTarget: "team", effectiveTarget: "team" });
-	});
-
-	it("degrades an unavailable team target without changing tmux state", async () => {
-		const root = await tempDir();
-		await fs.mkdir(path.join(root, ".gjc"), { recursive: true });
-		await fs.writeFile(
-			path.join(root, ".gjc", "config.yml"),
-			YAML.stringify({ gjc: { ralplan: { autoHandoff: "team" } } }, null, 2),
-			"utf-8",
-		);
-		expect(
-			await resolveRalplanAutoHandoff(root, {
-				teamAvailabilityProbe: () => ({ available: false, reason: "no_tmux_leader" }),
-			}),
-		).toMatchObject({
-			configuredTarget: "team",
-			effectiveTarget: "off",
-			degradationReason: "team_unavailable:no_tmux_leader",
 		});
 	});
 

@@ -42,10 +42,10 @@ export const commands: CommandEntry[] = [
 	{ name: "accounts", load: () => import("./commands/accounts").then(m => m.default) },
 	{ name: "harness", load: () => import("./commands/harness").then(m => m.default) },
 	{ name: "coordinator", load: () => import("./commands/coordinator").then(m => m.default) },
-	{ name: "team", load: () => import("./commands/team").then(m => m.default) },
 	{ name: "ultragoal", load: () => import("./commands/ultragoal").then(m => m.default) },
 	{ name: "gc", load: () => import("./commands/gc").then(m => m.default) },
 	{ name: "crash", load: () => import("./commands/crash").then(m => m.default) },
+	{ name: "autoresearch", load: () => import("./commands/autoresearch").then(m => m.default) },
 	{ name: "ralplan", load: () => import("./commands/ralplan").then(m => m.default) },
 	{ name: "config", load: () => import("./commands/config").then(m => m.default) },
 	{ name: "stats", load: () => import("./commands/stats").then(m => m.default) },
@@ -63,7 +63,6 @@ export const commands: CommandEntry[] = [
 	},
 	{ name: "deep-interview", load: () => import("./commands/deep-interview").then(m => m.default) },
 	{ name: "migrate", load: () => import("./commands/migrate").then(m => m.default) },
-	{ name: "rlm", load: () => import("./commands/rlm").then(m => m.default) },
 	{ name: "update", load: () => import("./commands/update").then(m => m.default) },
 	{ name: "read", load: () => import("./commands/read").then(m => m.default) },
 	{ name: "customize", load: () => import("./commands/customize").then(m => m.default) },
@@ -350,25 +349,7 @@ export function normalizeResumeAlias(argv: readonly string[]): string[] {
 
 function routeLegacyRootArgv(argv: readonly string[]): string[] | undefined {
 	if (argv[0] === "coordinator-mcp") return ["mcp-serve", "coordinator", ...argv.slice(1)];
-	if (argv[0] !== "--team") return undefined;
-	const sizeValues: string[] = [];
-	const remaining: string[] = [];
-	for (let index = 1; index < argv.length; index++) {
-		const arg = argv[index] ?? "";
-		if (arg === "--team-size") {
-			sizeValues.push(argv[index + 1] ?? "");
-			index++;
-		} else if (arg.startsWith("--team-size=")) {
-			sizeValues.push(arg.slice("--team-size=".length));
-		} else {
-			remaining.push(arg);
-		}
-	}
-	const size = sizeValues[0];
-	if (sizeValues.length !== 1 || !size || !/^[1-9]\d*$/.test(size)) {
-		return ["team", "0", "invalid legacy --team-size"];
-	}
-	return ["team", size, ...remaining];
+	return undefined;
 }
 
 /**

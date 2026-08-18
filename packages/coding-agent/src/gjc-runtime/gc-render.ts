@@ -8,7 +8,6 @@ import { GC_STORES } from "./gc-runtime";
 
 const STORE_HEADINGS: Record<GcStore, string> = {
 	harness_leases: "Harness owner leases",
-	team_workers: "Team workers",
 	file_locks: "Config file-locks",
 	tmux_sessions: "Tmux sessions",
 	registry_entries: "Harness-root registry entries",

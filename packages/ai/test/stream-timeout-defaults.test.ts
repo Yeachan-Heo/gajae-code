@@ -5,6 +5,7 @@ import {
 	getProviderStreamIdleTimeoutFallbackMs,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
+	resolveAnthropicSdkRequestTimeoutMs,
 	resolveOpenAISdkRequestTimeoutMs,
 } from "../src/utils/idle-iterator";
 
@@ -160,5 +161,40 @@ describe("resolveOpenAISdkRequestTimeoutMs(provider, override)", () => {
 	it("lets PI_STREAM_FIRST_EVENT_TIMEOUT_MS pin Azure setup bounds", () => {
 		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "5000";
 		expect(resolveOpenAISdkRequestTimeoutMs("azure")).toBe(5_000);
+	});
+});
+
+describe("resolveAnthropicSdkRequestTimeoutMs(provider, override, idleOverride)", () => {
+	it("bounds the Anthropic connect/headers phase at the 300s idle-floored first-event window", () => {
+		// The Anthropic first-event watchdog arms only after headers arrive, so
+		// without an SDK timeout a connection that dies before headers hangs for
+		// the SDK's 10-minute default per attempt times its internal retries —
+		// the "stuck after a completed tool call" spinner.
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic")).toBe(300_000);
+	});
+
+	it("floors an explicit short first-event override at the env/default window", () => {
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic", 5_000)).toBe(300_000);
+	});
+
+	it("lets a longer explicit first-event override widen the setup bound", () => {
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic", 900_000)).toBe(900_000);
+	});
+
+	it("tracks a caller idle-timeout override through the first-event floor", () => {
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic", undefined, 500_000)).toBe(500_000);
+	});
+
+	it("disables the SDK request timeout when the first-event watchdog is explicitly off", () => {
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic", 0)).toBeUndefined();
+	});
+
+	it("lets PI_STREAM_FIRST_EVENT_TIMEOUT_MS pin the setup bound", () => {
+		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "5000";
+		expect(resolveAnthropicSdkRequestTimeoutMs("anthropic")).toBe(5_000);
+	});
+
+	it("uses the 120s idle-floored default for non-Anthropic providers on this API", () => {
+		expect(resolveAnthropicSdkRequestTimeoutMs("zai")).toBe(120_000);
 	});
 });

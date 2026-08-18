@@ -15,7 +15,7 @@ export interface WorkflowRouteCounts {
 	readonly "deep-interview": number;
 	readonly ralplan: number;
 	readonly ultragoal: number;
-	readonly team: number;
+	readonly autoresearch: number;
 }
 
 export interface WorkflowIntentReportEntry {
@@ -66,7 +66,7 @@ function emptyRouteCounts(): WorkflowRouteCounts {
 		"deep-interview": 0,
 		ralplan: 0,
 		ultragoal: 0,
-		team: 0,
+		autoresearch: 0,
 	};
 }
 
@@ -87,8 +87,8 @@ function incrementRoute(counts: WorkflowRouteCounts, route: WorkflowIntentRoute)
 			return { ...counts, ralplan: counts.ralplan + 1 };
 		case "ultragoal":
 			return { ...counts, ultragoal: counts.ultragoal + 1 };
-		case "team":
-			return { ...counts, team: counts.team + 1 };
+		case "autoresearch":
+			return { ...counts, autoresearch: counts.autoresearch + 1 };
 	}
 }
 
@@ -102,8 +102,8 @@ function routeCount(counts: WorkflowRouteCounts, route: WorkflowIntentRoute): nu
 			return counts.ralplan;
 		case "ultragoal":
 			return counts.ultragoal;
-		case "team":
-			return counts.team;
+		case "autoresearch":
+			return counts.autoresearch;
 	}
 }
 

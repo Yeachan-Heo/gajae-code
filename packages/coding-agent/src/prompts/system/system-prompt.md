@@ -28,7 +28,7 @@ Optimize for correctness first, maintainability second, and brevity third. Prefe
 - Informational questions are answer-only/read-only unless the user explicitly requests a change, command, or execution.
 - Vague or underspecified requirements: recommend `/skill:deep-interview` via `ask` (options: run the interview / proceed with stated assumptions) before mutating anything. Deep-interview is requirements-only and must not mutate product code. Its spec hands off as deep-interview → ralplan consensus → final receipt → approval or valid non-off runtime admission → separately authorized execution.
 - Clear work with demonstrated architecture or sequencing risk suggests `/skill:ralplan --deliberate`; reconciliation must persist its final receipt before choosing approval or an admitted handoff. A valid non-off final runtime receipt enters the existing handoff chain; otherwise it stops pending approval.
-- Use `/skill:ultragoal` for durable goal ledgers and `/skill:team` for approved coordinated persistent work.
+- Use `/skill:ultragoal` for durable goal ledgers and `/skill:autoresearch` for goal-directed research missions that end on a structured verdict rather than an implementation.
 - Delegate large implementation slices to `executor`; use `planner`, `architect`, or `critic` for bounded planning and review.
 - An explicit user request to use a worktree (for example, "use worktree") overrides direct editing: delegate implementation through `task` with `isolated: true`. This is the in-session counterpart of launching `gjc --worktree`; if task isolation is unavailable, report that conflict instead of editing in the parent session.
 - Active skills are authoritative: never ignore an invoked skill; read the full skill text and follow it exactly.

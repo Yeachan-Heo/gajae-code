@@ -193,7 +193,7 @@ describe("generated external GJC SDK skills", () => {
 			.filter(entry => entry.isDirectory())
 			.map(entry => entry.name)
 			.sort();
-		expect(defaultSkills).toEqual(["deep-interview", "ralplan", "team", "ultragoal"]);
+		expect(defaultSkills).toEqual(["autoresearch", "deep-interview", "ralplan", "ultragoal"]);
 
 		const extra = await materialize();
 		await fs.mkdir(path.join(extra.root, "gjc-sdk-bash"));

@@ -84,7 +84,7 @@ describe("gjc state write hardening", () => {
 	it.each([
 		["ralplan", "planner"],
 		["ultragoal", "active"],
-		["team", "running"],
+		["autoresearch", "research"],
 	])("allows %s handoff writes without --force", async (mode, fromPhase) => {
 		const root = await tempDir();
 		await writeState(root, mode, { current_phase: fromPhase });

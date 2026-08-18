@@ -288,44 +288,6 @@ export function renderUltragoalStatusMarkdown(summary: {
 	return `${lines.join("\n")}\n`;
 }
 
-export function renderTeamStatusMarkdown(snapshot: {
-	team_name: string;
-	phase: string;
-	tmux_target?: string;
-	tmux_session?: string;
-	state_dir: string;
-	task_total: number;
-	task_counts: Record<string, number>;
-	workers: Array<{ id: string; status: string }>;
-	notification_summary?: { total: number; replay_eligible: number; by_state: Record<string, number> };
-	integration_by_worker?: Record<string, { status?: string; conflict_files?: string[] }>;
-}): string {
-	const counts = Object.entries(snapshot.task_counts)
-		.map(([key, value]) => `${key}=${value}`)
-		.join(" ");
-	const lines = [
-		"# team status",
-		"",
-		`- team: ${snapshot.team_name}`,
-		`- phase: ${snapshot.phase}`,
-		`- tmux: ${snapshot.tmux_target || snapshot.tmux_session || "none"}`,
-		`- state: ${snapshot.state_dir}`,
-		`- tasks: ${snapshot.task_total} (${counts})`,
-		`- workers: ${snapshot.workers.length} (${snapshot.workers.map(worker => `${worker.id}:${worker.status}`).join(" ")})`,
-	];
-	if (snapshot.notification_summary) {
-		lines.push(
-			`- notifications: total=${snapshot.notification_summary.total} replay_eligible=${snapshot.notification_summary.replay_eligible}`,
-		);
-	}
-	const integrations = Object.entries(snapshot.integration_by_worker ?? {});
-	if (integrations.length)
-		lines.push(
-			`- integrations: ${integrations.map(([worker, state]) => `${worker}:${state.status ?? "unknown"}`).join(" ")}`,
-		);
-	return `${lines.join("\n")}\n`;
-}
-
 export function renderStateMarkdown(
 	skill: CanonicalGjcWorkflowSkill,
 	stateJson: Record<string, unknown>,

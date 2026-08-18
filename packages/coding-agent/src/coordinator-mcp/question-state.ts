@@ -234,7 +234,7 @@ export type CanonicalCreateIntentV1 =
 	  }
 	| {
 			kind: "delegate";
-			workflow: "plan" | "execute" | "team";
+			workflow: "plan" | "execute";
 			session: CanonicalSessionSnapshotV1;
 			remote_create_key: string;
 			initial_state: CoordinatorSessionState;

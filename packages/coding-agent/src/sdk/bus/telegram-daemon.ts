@@ -6841,7 +6841,11 @@ export class TelegramNotificationDaemon {
 		if (timer !== undefined) (this.opts.clearTimeoutImpl ?? clearTimeout)(timer);
 		this.#rejectedTopicCleanupTimers.delete(sessionId);
 	}
-	#leaseAllows(session: AttachmentSession, logicalSessionId = this.#logicalSessionId(session)): boolean {
+	#leaseAllows(
+		session: AttachmentSession,
+		logicalSessionId = this.#logicalSessionId(session),
+		options?: { allowLeaseRearm?: boolean },
+	): boolean {
 		if (this.#droppedSessions.has(session)) return false;
 		if (!this.#topicAdmissionAllows(session)) return false;
 		const closedBinding = this.closedEndpointKeys.get(logicalSessionId);
@@ -6853,13 +6857,22 @@ export class TelegramNotificationDaemon {
 		if (lease?.state !== "authorized" || lease.logicalSessionId !== logicalSessionId) return false;
 		if (this.#logicalSessionOwners.get(logicalSessionId) !== session) return false;
 		const record = this.topics.get(logicalSessionId);
+		// Lease re-arm mirrors `acquireLease` admission: an expired-but-still-owned
+		// active lease, or a same-owner grace-window resume. Every other authority
+		// state (archive/inactive/quarantine/malformed) stays fenced.
+		const authorityResumable =
+			options?.allowLeaseRearm !== true
+				? record?.authorityState === "active"
+				: record?.authorityState === "active" ||
+					(record?.authorityState === "disconnect_grace" &&
+						(record.disconnectGraceExpiresAt ?? 0) > this.runtime.now());
 		return (
 			lease.binding.logicalSessionId === logicalSessionId &&
 			(!record ||
-				(record.authorityState === "active" &&
+				(authorityResumable &&
 					!record.bindingMalformed &&
 					record.leaseOwner === this.installationHostId &&
-					(record.leaseExpiresAt ?? 0) > this.runtime.now() &&
+					(options?.allowLeaseRearm === true || (record.leaseExpiresAt ?? 0) > this.runtime.now()) &&
 					record.chatId === lease.binding.chatId))
 		);
 	}
@@ -9807,7 +9820,10 @@ export class TelegramNotificationDaemon {
 			)
 				continue;
 			const sessionId = this.#logicalSessionId(session);
-			if (renewed.has(sessionId) || !this.#leaseAllows(session, sessionId)) continue;
+			// A live trusted attachment may re-arm its own expired host lease: the
+			// authority above (owner, binding, state) is what makes renewal safe, and
+			// gating renewal on an unexpired lease made expiry permanent (#4647).
+			if (renewed.has(sessionId) || !this.#leaseAllows(session, sessionId, { allowLeaseRearm: true })) continue;
 			renewed.add(sessionId);
 			if (!(await this.#renewTopicLease(sessionId, session)))
 				logger.warn(`notifications: Telegram topic lease renewal was not admitted for session ${sessionId}`);
@@ -10280,8 +10296,15 @@ export class TelegramNotificationDaemon {
 		if (msg?.type === "event_replay_result") return;
 		if (!this.#topicAdmissionAllows(session)) return;
 		if (msg && typeof msg === "object") await this.#updateLogicalSessionForThreadedFrame(session, msg);
-		if (session.logicalSessionIdTrusted && !this.#leaseAllows(session))
-			await this.#failPublicationPreSend(publicationId, "trusted attachment lease is stale");
+		if (session.logicalSessionIdTrusted && !this.#leaseAllows(session)) {
+			// A still-owned live attachment re-arms its own expired host lease before
+			// the gate so slow turns do not permanently strand the topic (#4647);
+			// every other authority failure still fails closed below.
+			if (this.#leaseAllows(session, undefined, { allowLeaseRearm: true }))
+				await this.#renewTopicLease(this.#logicalSessionId(session), session);
+			if (!this.#leaseAllows(session))
+				await this.#failPublicationPreSend(publicationId, "trusted attachment lease is stale");
+		}
 		session.activePublicationId = publicationId;
 		try {
 			if (await this.#frameRouter.dispatch(session, msg as Record<string, unknown>)) return;

@@ -39,6 +39,30 @@ function stripInlineShellComment(value: string): string {
 }
 
 /**
+ * Strips an unquoted trailing `# comment` from a dotenv value the way Bun's
+ * dotenv loader does: an unescaped `#` starts a comment regardless of the
+ * preceding character (`a#b` loads as `a`), while `#` inside quotes or after a
+ * backslash escape survives. Used only by `parseEnvFile`; shell files use
+ * `stripInlineShellComment`, whose POSIX rule requires whitespace before `#`.
+ */
+function stripInlineDotenvComment(value: string): string {
+	let quote: '"' | "'" | undefined;
+	for (let i = 0; i < value.length; i++) {
+		const char = value[i];
+		if (char === "\\") {
+			i++;
+			continue;
+		}
+		if ((char === '"' || char === "'") && (!quote || quote === char)) {
+			quote = quote ? undefined : char;
+			continue;
+		}
+		if (char === "#" && !quote) return value.slice(0, i).trimEnd();
+	}
+	return value.trimEnd();
+}
+
+/**
  * Parses simple POSIX shell environment assignments from files such as
  * ~/.zshrc without executing user shell code. Supports `export KEY=value` and
  * `KEY=value`, including single/double quoted literal values. Dynamic shell
@@ -81,6 +105,17 @@ export function parseShellEnvFile(filePath: string): Record<string, string> {
  * Ignores lines that are empty or start with '#'. Trims whitespace.
  * Allows values to be quoted with single or double quotes.
  * Returns an object of key-value pairs.
+ *
+ * The trust guards (`trustedAgentDirOverrideFor`, `trustedConfigDirName`,
+ * `filterCredentialInheritedEnv`) decide provenance by comparing
+ * `process.env` against this parse, so the accepted syntax must be a superset
+ * of what Bun's own dotenv loader honors in `cwd/.env`: `export KEY=value`,
+ * whitespace around `=`, and `#` comments after unquoted values (quotes keep
+ * their `#`). Values that Bun would expand (`$VAR`, `${VAR}`, backticks,
+ * command substitution) are kept as their literal text: the trust rule only
+ * needs the parser to see the key at all, and an operator environment value
+ * cannot equal attacker-written expansion text, so a literal parse stays
+ * conservative.
  */
 export function parseEnvFile(filePath: string): Record<string, string> {
 	const result: Record<string, string> = {};
@@ -91,13 +126,15 @@ export function parseEnvFile(filePath: string): Record<string, string> {
 			// Skip comments and blank lines
 			if (!trimmed || trimmed.startsWith("#")) continue;
 
-			const eqIndex = trimmed.indexOf("=");
-			if (eqIndex === -1) continue;
+			const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(trimmed);
+			if (!match) continue;
 
-			const key = trimmed.slice(0, eqIndex).trim();
+			const key = match[1];
 			if (!isValidEnvName(key)) continue;
 
-			let value = trimmed.slice(eqIndex + 1).trim();
+			// Strip an unquoted trailing `# comment` the way Bun's dotenv loader
+			// does (`KEY=v#note` loads as `v`); quoted `#` survives.
+			let value = stripInlineDotenvComment(match[2] ?? "").trim();
 
 			// Remove surrounding quotes (" or ')
 			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {

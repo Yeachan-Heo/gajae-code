@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { withFileLock } from "../../config/file-lock";
 import { processIncarnation } from "./process-incarnation";
 import {
@@ -754,6 +755,18 @@ async function replaceAtomically(file: string, contents: Buffer | string): Promi
 }
 
 function alive(pid: number): boolean {
+	if (process.platform === "win32") {
+		try {
+			// Bun's signal-0 probe is not a reliable Windows liveness authority for a
+			// detached child: it can report a non-live process even while the child
+			// has already published its endpoint. Use the native process handle, which
+			// is also the source of the process-incarnation fence, and fail closed when
+			// the handle cannot be opened.
+			return nativeProcessBindings().Process.fromPid(pid)?.status() === "running";
+		} catch {
+			return false;
+		}
+	}
 	try {
 		process.kill(pid, 0);
 		return true;

@@ -1234,16 +1234,6 @@ async function buildSessionOptions(
 	return { options };
 }
 
-/**
- * Research-mode (RLM) preset hook. Lets `gjc rlm` augment the session options
- * (system prompt, restricted toolset, custom python tool) and assert the tool
- * boundary once the session's tool registry is fully assembled.
- */
-export interface RlmPreset {
-	applyOptions: (options: CreateAgentSessionOptions, settings: Settings) => void;
-	onSessionCreated?: (session: AgentSession) => void | Promise<void>;
-}
-
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<void>;
 
 export interface RunRootCommandDependencies {
@@ -1252,7 +1242,6 @@ export interface RunRootCommandDependencies {
 	discoverAuthStorage?: typeof discoverAuthStorage;
 	runAcpMode?: (options?: { agentDir?: string }) => Promise<void>;
 	settings?: Settings;
-	rlmPreset?: RlmPreset;
 	suppressProcessExit?: boolean;
 	startupUpdate?: { check: () => Promise<string | undefined> };
 	initTheme?: typeof initTheme;
@@ -1685,8 +1674,6 @@ export async function runRootCommand(
 	const deferMemoryBackendStartup = hasRootStartupProfile && !(parsedArgs.authBootstrap === true && isInteractive);
 	sessionOptions.deferMemoryBackendStartup = deferMemoryBackendStartup;
 
-	// Research-mode (RLM) preset: augment session options before session creation.
-	deps.rlmPreset?.applyOptions(sessionOptions, settingsInstance);
 	const acpStartupOptions = mode === "acp" ? resolveAcpStartupOptions(parsedArgs, sessionOptions) : undefined;
 
 	// Handle CLI credential selection and --api-key as runtime overrides (not persisted).
@@ -1821,20 +1808,6 @@ export async function runRootCommand(
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
 		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
 		installHerdrReporter(listener => session.subscribe(listener));
-
-		// Research-mode (RLM) preset: hard tool-boundary assertion after the registry is assembled.
-		if (deps.rlmPreset?.onSessionCreated) {
-			try {
-				await deps.rlmPreset.onSessionCreated(session);
-			} catch (error) {
-				try {
-					await session.dispose();
-				} catch {
-					logger.warn("Failed to dispose session after RLM post-create error");
-				}
-				throw error;
-			}
-		}
 
 		let startDeferredModelProfiles: DeferredModelProfileStartup | undefined;
 		if (!(parsedArgs.authBootstrap === true && isInteractive)) {

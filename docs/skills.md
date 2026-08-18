@@ -6,7 +6,7 @@ discovery is **on by default** — a valid skill placed in a canonical `.gjc`
 location is advertised in a normal session (listed in the session's `<skills>`
 catalog and invokable via `/skill:<name>`) with no configuration ceremony.
 
-The four bundled GJC workflow skills — `deep-interview`, `ralplan`, `team`, and
+The four bundled GJC workflow skills — `autoresearch`, `deep-interview`, `ralplan`, and
 `ultragoal` — are always available and can never be replaced by a filesystem
 skill with the same name.
 
@@ -110,7 +110,7 @@ Duplicate names resolve deterministically, first location wins:
    legacy `~/.gjc/skills`.
 
 Shadowed duplicates are diagnosed rather than silent. Bundled workflow skill
-names are reserved: a project skill named `deep-interview`, `ralplan`, `team`,
+names are reserved: a project skill named `autoresearch`, `deep-interview`, `ralplan`,
 or `ultragoal` produces a protected-name collision warning, and the bundled
 definition always wins in sessions.
 

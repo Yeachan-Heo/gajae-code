@@ -66,10 +66,8 @@ const delegateTools = COORDINATOR_MCP_TOOL_NAMES.filter(name => name.startsWith(
 const delegateToolSet = new Set<string>(delegateTools);
 gate(
 	"delegate tools in contract",
-	delegateTools.length === 3 &&
-		["gjc_delegate_plan", "gjc_delegate_execute", "gjc_delegate_team"].every(tool =>
-			delegateToolSet.has(tool),
-		),
+	delegateTools.length === 2 &&
+		["gjc_delegate_plan", "gjc_delegate_execute"].every(tool => delegateToolSet.has(tool)),
 	`found: ${delegateTools.join(", ") || "none"}`,
 );
 

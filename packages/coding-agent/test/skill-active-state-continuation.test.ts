@@ -12,14 +12,14 @@ describe("isWorkflowContinuationInert", () => {
 		expect(isWorkflowContinuationInert("ralplan", "final")).toBe(true);
 		expect(isWorkflowContinuationInert("ralplan", "handoff")).toBe(true);
 		expect(isWorkflowContinuationInert("deep-interview", "complete")).toBe(true);
-		expect(isWorkflowContinuationInert("team", "complete")).toBe(true);
-		expect(isWorkflowContinuationInert("team", "failed")).toBe(true);
+		expect(isWorkflowContinuationInert("autoresearch", "complete")).toBe(true);
+		expect(isWorkflowContinuationInert("autoresearch", "failed")).toBe(true);
 		expect(isWorkflowContinuationInert("ultragoal", "complete")).toBe(true);
 		expect(isWorkflowContinuationInert("ultragoal", "failed")).toBe(true);
 	});
 
 	test("explicit nonterminal integration phases are inert", () => {
-		expect(isWorkflowContinuationInert("team", "awaiting_integration")).toBe(true);
+		expect(isWorkflowContinuationInert("autoresearch", "verdict")).toBe(true);
 	});
 
 	test("known active nonterminal phases are not inert", () => {
@@ -27,7 +27,7 @@ describe("isWorkflowContinuationInert", () => {
 		expect(isWorkflowContinuationInert("ultragoal", "blocked")).toBe(false);
 		expect(isWorkflowContinuationInert("deep-interview", "interviewing")).toBe(false);
 		expect(isWorkflowContinuationInert("ralplan", "planner")).toBe(false);
-		expect(isWorkflowContinuationInert("team", "running")).toBe(false);
+		expect(isWorkflowContinuationInert("autoresearch", "research")).toBe(false);
 	});
 
 	test("phase matching is case-insensitive", () => {

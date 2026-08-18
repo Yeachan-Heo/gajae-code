@@ -37,13 +37,28 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
 const MAX_PANE_TITLE_CHARS = 120;
 
 /**
+ * Herdr records the highest sequence it has accepted per source and drops any
+ * later report that does not exceed it. That watermark belongs to the pane's
+ * terminal, so it outlives the gjc process that set it: a counter restarting at
+ * zero makes every report of the next session in that pane look stale, and the
+ * session stays invisible in the sidebar until it happens to out-count its
+ * predecessor. Seeding from wall-clock milliseconds keeps sequences rising
+ * across processes, which is also what Herdr's own bundled integrations do.
+ * The multiplier leaves 1000 sequence slots per millisecond, so a chatty
+ * session cannot count past the seed of the process that replaces it.
+ */
+function initialSeq(): number {
+	return Date.now() * 1000;
+}
+
+/**
  * Metadata reports carry their own per-source sequence in Herdr, independent of
  * the lifecycle-state sequence, so title updates need a counter of their own.
  * Module scope because the title is a property of the process, not of one
  * reporter instance: `setSessionTerminalTitle` is called from controllers that
  * never see the reporter.
  */
-let metadataSeq = 0;
+let metadataSeq = initialSeq();
 
 function nextMetadataSeq(): number {
 	metadataSeq += 1;
@@ -263,7 +278,7 @@ export function createHerdrReporter(
 	subscribe: (listener: (event: HerdrSessionEvent) => void) => () => void,
 	options: HerdrReporterOptions = {},
 ): HerdrReporter {
-	let seq = 0;
+	let seq = initialSeq();
 	let currentState: HerdrAgentState | null = null;
 	let released = false;
 	/** Nesting depth of blocking ask calls; a nested ask must not unblock early. */

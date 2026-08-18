@@ -35,10 +35,9 @@ const boundedGateGroups: Record<string, readonly (readonly string[])[]> = {
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-schema-corpus.test.ts"],
 	],
 	runtime: [
-	// NOTE: state-writer-drift.test.ts imports recordSkillActivation (hooks) and
-	// persistGjcTeamModeStateSummary (team-runtime), which load the @gajae-code/natives
-	// addon transitively, so it runs in the heavier "Affected path validation" job, not
-	// this native-free gate.
+	// NOTE: state-writer-drift.test.ts imports recordSkillActivation (hooks),
+	// which loads the @gajae-code/natives addon transitively, so it runs in the
+	// heavier "Affected path validation" job, not this native-free gate.
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-runtime.test.ts"],
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-handoff.test.ts"],
 	["bun", "test", "packages/coding-agent/test/gjc-runtime/state-receipts.test.ts"],

@@ -525,51 +525,6 @@ describe("startup update contract", () => {
 			authStorage.close();
 		}
 	});
-	it("disposes the session before propagating an RLM post-create error", async () => {
-		using tempDir = TempDir.createSync("@gjc-rlm-post-create-failure-");
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-		const hookFailure = new Error("RLM post-create failed");
-		const sessionResult = fakeSessionResult();
-		const events: string[] = [];
-		let disposeCalls = 0;
-		sessionResult.session.dispose = async () => {
-			events.push("dispose");
-			disposeCalls += 1;
-			throw new Error("cleanup failure");
-		};
-
-		try {
-			await runRootCommand(rootArgs({ mode: "text" }), [], {
-				createAgentSession: async () => sessionResult,
-				discoverAuthStorage: async () => authStorage,
-				settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
-				initTheme: async () => {},
-				readPipedInput: async () => undefined,
-				runStartupCredentialAutoImportIfNeeded: async () => undefined,
-				rlmPreset: {
-					applyOptions: () => {},
-					onSessionCreated: async () => {
-						events.push("hook");
-						throw hookFailure;
-					},
-				},
-			}).then(
-				() => {
-					throw new Error("Expected RLM post-create hook to reject");
-				},
-				error => {
-					events.push("observed");
-					expect(error).toBe(hookFailure);
-				},
-			);
-
-			expect(events).toEqual(["hook", "dispose", "observed"]);
-			expect(disposeCalls).toBe(1);
-		} finally {
-			authStorage.close();
-		}
-	});
-
 	it("disposes the interactive session before PI_TIMING=x exits", async () => {
 		using tempDir = TempDir.createSync("@gjc-interactive-timing-exit-");
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));

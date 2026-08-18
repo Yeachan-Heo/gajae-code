@@ -221,6 +221,9 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
 			source.reasoning = true;
 		}
+		if (source.provider === "omlx") {
+			source.reasoning = true;
+		}
 		const model = refreshModelThinking(source);
 		applyGeneratedModelPolicy(model);
 		models[index] = model;
@@ -430,6 +433,16 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 		};
 		delete model.compat.thinkingFormat;
 	}
+	if (model.provider === "omlx" && model.api === "openai-completions") {
+		model.compat = {
+			...(model.compat ?? {}),
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			thinkingFormat: "qwen-chat-template",
+			reasoningContentField: "reasoning_content",
+		};
+	}
 	model.name = scrubGeneratedModelName(model.name);
 	if (
 		model.api === "openai-completions" &&
@@ -621,6 +634,9 @@ function inferDefaultEffort<TApi extends Api>(model: ApiModel<TApi>, parsedModel
 	) {
 		return GPT_5_5_DEFAULT_EFFORT;
 	}
+	if (model.provider === "omlx") {
+		return Effort.Medium;
+	}
 	return undefined;
 }
 
@@ -784,6 +800,9 @@ function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly
 		return DEFAULT_REASONING_EFFORTS;
 	}
 	if (model.api === "openai-completions") {
+		if (model.provider === "omlx") {
+			return [Effort.Low, Effort.Medium, Effort.High];
+		}
 		const compat = resolveOpenAICompat(model as ApiModel<"openai-completions">);
 		if (compat.thinkingFormat === "openai" && compat.supportsReasoningEffort) {
 			return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;

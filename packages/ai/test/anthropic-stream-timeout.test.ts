@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type Anthropic from "@anthropic-ai/sdk";
-import { streamAnthropic } from "../src/providers/anthropic";
+import { buildAnthropicClientOptions, streamAnthropic } from "../src/providers/anthropic";
 import type { Context, FetchImpl, Model } from "../src/types";
 import { waitForDelayOrAbort } from "./helpers";
 
@@ -1312,5 +1312,65 @@ describe("anthropic first-event timeouts", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("timed out while waiting for the first event");
+	});
+});
+
+describe("anthropic SDK request timeout (stalled before headers)", () => {
+	// The first-event watchdog deliberately arms only after response headers
+	// arrive, so a connection that dies before headers used to be bounded only
+	// by the Anthropic SDK's 10-minute default per attempt times its internal
+	// retry budget — observable as an endless "Working…" spinner right after a
+	// completed tool call. The SDK client `timeout` closes that gap.
+	const ENV_KEYS = ["PI_STREAM_IDLE_TIMEOUT_MS", "PI_STREAM_FIRST_EVENT_TIMEOUT_MS"] as const;
+	const savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
+
+	beforeEach(() => {
+		for (const key of ENV_KEYS) {
+			savedEnv[key] = Bun.env[key];
+			delete Bun.env[key];
+		}
+	});
+
+	afterEach(() => {
+		for (const key of ENV_KEYS) {
+			const prior = savedEnv[key];
+			if (prior === undefined) {
+				delete Bun.env[key];
+			} else {
+				Bun.env[key] = prior;
+			}
+		}
+	});
+
+	it("bounds the connect/headers phase at the 300s Anthropic first-event window by default", () => {
+		const options = buildAnthropicClientOptions({ model, apiKey: "sk-ant-test" });
+		expect(options.timeout).toBe(300_000);
+	});
+
+	it("floors a short caller first-event override so slow setup is not killed", () => {
+		const options = buildAnthropicClientOptions({
+			model,
+			apiKey: "sk-ant-test",
+			streamFirstEventTimeoutMs: 1,
+		});
+		expect(options.timeout).toBe(300_000);
+	});
+
+	it("omits the SDK timeout when the first-event watchdog is explicitly disabled", () => {
+		const options = buildAnthropicClientOptions({
+			model,
+			apiKey: "sk-ant-test",
+			streamFirstEventTimeoutMs: 0,
+		});
+		expect(options.timeout).toBeUndefined();
+	});
+
+	it("widens the SDK timeout with a caller idle-timeout override", () => {
+		const options = buildAnthropicClientOptions({
+			model,
+			apiKey: "sk-ant-test",
+			streamIdleTimeoutMs: 500_000,
+		});
+		expect(options.timeout).toBe(500_000);
 	});
 });

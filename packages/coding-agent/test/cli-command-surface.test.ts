@@ -17,21 +17,10 @@ function extractRegisteredCommands(source: string): string[] {
 }
 
 describe("GJC public CLI command surface", () => {
-	it("routes legacy coordinator MCP and team launch invocations to native commands", () => {
+	it("routes legacy coordinator MCP invocations to native commands", () => {
 		expect(routeRootArgv(["coordinator-mcp"])).toEqual(["mcp-serve", "coordinator"]);
-		expect(routeRootArgv(["--team", "--team-size", "2", "team smoke"])).toEqual(["team", "2", "team smoke"]);
-		expect(routeRootArgv(["--team", "--team-size=2", "team smoke"])).toEqual(["team", "2", "team smoke"]);
-		expect(routeRootArgv(["team discussion", "--team"])).toEqual(["launch", "team discussion", "--team"]);
-		expect(routeRootArgv(["--team", "--team-size", "shutdown", "victim"])).toEqual([
-			"team",
-			"0",
-			"invalid legacy --team-size",
-		]);
-		expect(routeRootArgv(["--team", "--team-size", "2", "--team-size=3", "team smoke"])).toEqual([
-			"team",
-			"0",
-			"invalid legacy --team-size",
-		]);
+		// The legacy `--team` launch shim is gone: it is an ordinary launch prompt now.
+		expect(routeRootArgv(["--team"])).toEqual(["launch", "--team"]);
 	});
 
 	it("routes bare models to --list-models instead of a launch prompt (#3857)", () => {
@@ -159,10 +148,10 @@ process.exitCode = await child.exited;`;
 			"accounts",
 			"harness",
 			"coordinator",
-			"team",
 			"ultragoal",
 			"gc",
 			"crash",
+			"autoresearch",
 			"ralplan",
 			"config",
 			"stats",
@@ -176,7 +165,6 @@ process.exitCode = await child.exited;`;
 			"contribute-pr",
 			"deep-interview",
 			"migrate",
-			"rlm",
 			"update",
 			"read",
 			"customize",
@@ -267,7 +255,7 @@ process.exitCode = await child.exited;`;
 	}, 30_000);
 
 	it("documents the native CLI surface in command help", async () => {
-		for (const command of ["ralplan", "deep-interview", "state"]) {
+		for (const command of ["ralplan", "deep-interview", "state", "autoresearch"]) {
 			const result = Bun.spawnSync(["bun", cliEntry, command, "--help"], {
 				cwd: repoRoot,
 				stderr: "pipe",
@@ -281,36 +269,7 @@ process.exitCode = await child.exited;`;
 		}
 	}, 30_000);
 
-	it("documents team dry-run state behavior in command help", async () => {
-		const result = Bun.spawnSync(["bun", cliEntry, "team", "--help"], {
-			cwd: repoRoot,
-			stderr: "pipe",
-			stdout: "pipe",
-		});
-		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
-
-		expect(result.exitCode, output).toBe(0);
-		expect(output).toContain("--dry-run");
-		expect(output).toContain(".gjc/_session-{sessionid}/state/team");
-		expect(output).toContain("do not commit");
-		expect(output).toContain("existing tmux/GJC --tmux session");
-		expect(output).toContain("gjc --tmux");
-	}, 30_000);
-
-	it("routes legacy team help before root help fast paths", () => {
-		const result = Bun.spawnSync(["bun", cliEntry, "--team", "--team-size", "2", "--help"], {
-			cwd: repoRoot,
-			stderr: "pipe",
-			stdout: "pipe",
-		});
-		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
-
-		expect(result.exitCode, output).toBe(0);
-		expect(output).toContain("--dry-run");
-		expect(output).toContain(".gjc/_session-{sessionid}/state/team");
-	}, 30_000);
-
-	it("preserves root fast-path and legacy team-help precedence", () => {
+	it("preserves root fast-path precedence", () => {
 		const cases = [
 			{ args: ["--tmux", "--version"], output: /^gjc\/\d+\.\d+\.\d+\n$/ },
 			{ args: ["--tmux", "-v"], output: /^gjc\/\d+\.\d+\.\d+\n$/ },
@@ -319,9 +278,6 @@ process.exitCode = await child.exited;`;
 			{ args: ["--help"], output: "USAGE" },
 			{ args: ["--tmux", "--help"], output: "USAGE" },
 			{ args: ["--resume", "--help"], output: "USAGE" },
-			{ args: ["--team", "--team-size", "2", "--help"], output: "--dry-run" },
-			{ args: ["--team", "--team-size=2", "--help"], output: "--dry-run" },
-			{ args: ["--team", "--team-size", "2", "-h"], output: "--dry-run" },
 		];
 
 		for (const { args, output } of cases) {
@@ -454,7 +410,7 @@ process.exitCode = await child.exited;`;
 
 			expect(result.exitCode, stderr).toBe(0);
 			const payload = JSON.parse(stdout) as { written?: number; targetRoot?: string };
-			expect(payload.written).toBe(9);
+			expect(payload.written).toBe(10);
 			expect(payload.targetRoot).toContain(path.join(home, ".gjc", "agent"));
 		} finally {
 			await fs.rm(home, { recursive: true, force: true });

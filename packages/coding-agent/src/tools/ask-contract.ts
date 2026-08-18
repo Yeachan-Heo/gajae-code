@@ -99,7 +99,7 @@ const DeepInterviewMetadata = z.object({
 });
 
 const DeepInterviewTopologyMeta = DeepInterviewMetadata.extend({
-	round: z.literal(0).describe("Round 0 topology confirmation"),
+	round: z.number().int().min(0).max(0).describe("Round 0 topology confirmation"),
 	component: z.literal("review-topology"),
 	dimension: z.literal("topology"),
 	intent_contract: DeepInterviewIntentContract.describe("required Round 0 locked-intent contract"),

@@ -2,7 +2,6 @@ import { describe, expect, it } from "bun:test";
 import {
 	buildDeepInterviewHudSummary,
 	buildRalplanHudSummary,
-	buildTeamHudSummary,
 	buildUltragoalHudSummary,
 } from "../src/skill-state/workflow-hud";
 
@@ -184,20 +183,5 @@ describe("workflow HUD summary builders", () => {
 			goals: [{ id: "G001", title: "Build HUD", status: "active" }],
 		});
 		expect(hud.chips?.some(chip => chip.label === "ledger")).toBe(false);
-	});
-
-	it("prioritizes team blockers before progress and latest activity", () => {
-		const hud = buildTeamHudSummary({
-			phase: "running",
-			task_total: 3,
-			task_counts: { completed: 1, failed: 1, blocked: 0 },
-			workers: [
-				{ id: "worker-1", status: "busy" },
-				{ id: "worker-2", status: "failed" },
-			],
-			latestEvent: { type: "message", message: "working" },
-		});
-		expect(hud.chips?.[0]).toEqual({ label: "blocked", value: "2", priority: 5, severity: "blocked" });
-		expect(hud.chips?.map(chip => chip.label)).toEqual(["blocked", "phase", "workers", "tasks", "latest"]);
 	});
 });

@@ -99,13 +99,13 @@ Required rebrand/default-surface gates after workflow-definition changes:
 
 ## Public workflow surface
 
-GJC exposes exactly four default workflow skills (`deep-interview`, `ralplan`, `ultragoal`, `team`; bundled at `packages/coding-agent/src/defaults/gjc/skills/`) and exactly four role agents (`executor`, `architect`, `planner`, `critic`; bundled at `packages/coding-agent/src/prompts/agents/`). Do not add, document, install, or route to additional defaults without an explicit product decision and gate update.
+GJC exposes exactly four default workflow skills (`deep-interview`, `ralplan`, `ultragoal`, `autoresearch`; bundled at `packages/coding-agent/src/defaults/gjc/skills/`) and exactly four role agents (`executor`, `architect`, `planner`, `critic`; bundled at `packages/coding-agent/src/prompts/agents/`). Do not add, document, install, or route to additional defaults without an explicit product decision and gate update.
 
 - Do not commit repo-visible `.gjc` default definitions; runtime `.gjc` discovery covers local overrides.
 - Runtime state, plans, specs, and ledgers belong under `.gjc/`.
 - Public commands, paths, and examples must use `gjc` and `.gjc`; preserve upstream attribution in source comments where appropriate.
 - Keep source-bundled skills/agents in sync with tests/gates; do not rely on committed `.gjc` copies.
-- Planning workflows (`deep-interview`, `ralplan`) never execute implementation without explicit user approval; artifacts stay `pending approval` until then.
+- Planning workflows (`deep-interview`, `ralplan`) never execute implementation without explicit user approval; artifacts stay `pending approval` until then. `autoresearch` is a research workflow: it produces findings and a verdict, never an implementation.
 - Subagent await timeouts are observation windows, not failure signals; inspect before cancelling.
 
 ## Code quality

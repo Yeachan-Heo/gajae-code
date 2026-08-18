@@ -4,7 +4,7 @@
  * Keep this module metadata-only: skill bodies are loaded through literal
  * dynamic imports only when a caller asks for their content.
  */
-export type BundledGjcSkillName = "deep-interview" | "ralplan" | "team" | "ultragoal";
+export type BundledGjcSkillName = "autoresearch" | "deep-interview" | "ralplan" | "ultragoal";
 
 export interface BundledGjcSkillCatalogEntry {
 	readonly kind: "skill" | "skill-fragment";
@@ -19,15 +19,12 @@ const deepInterview = () =>
 	import("./gjc/skills/deep-interview/SKILL.md", { with: { type: "text" } }).then(module => module.default);
 const ralplan = () =>
 	import("./gjc/skills/ralplan/SKILL.md", { with: { type: "text" } }).then(module => module.default);
-const team = () => import("./gjc/skills/team/SKILL.md", { with: { type: "text" } }).then(module => module.default);
+const autoresearch = () =>
+	import("./gjc/skills/autoresearch/SKILL.md", { with: { type: "text" } }).then(module => module.default);
 const ultragoal = () =>
 	import("./gjc/skills/ultragoal/SKILL.md", { with: { type: "text" } }).then(module => module.default);
 const autoAnswerUncertain = () =>
 	import("./gjc/skills/deep-interview/auto-answer-uncertain.md", { with: { type: "text" } }).then(
-		module => module.default,
-	);
-const autoResearchGreenfield = () =>
-	import("./gjc/skills/deep-interview/auto-research-greenfield.md", { with: { type: "text" } }).then(
 		module => module.default,
 	);
 const lateralReviewPanel = () =>
@@ -40,6 +37,10 @@ const validationBatchContracts = () =>
 	import("./gjc/skills/ultragoal/validation-batch-contracts.md", { with: { type: "text" } }).then(
 		module => module.default,
 	);
+const autoresearchIterate = () =>
+	import("./gjc/skills/autoresearch/auto-iterate.md", { with: { type: "text" } }).then(module => module.default);
+const autoresearchCritic = () =>
+	import("./gjc/skills/autoresearch/auto-critic.md", { with: { type: "text" } }).then(module => module.default);
 
 export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] = [
 	{
@@ -53,15 +54,15 @@ export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] =
 		kind: "skill",
 		name: "ralplan",
 		relativePath: "skills/ralplan/SKILL.md",
-		description: "Consensus planning entrypoint that auto-gates vague team/ultragoal requests before execution",
+		description: "Consensus planning entrypoint that auto-gates vague ultragoal requests before execution",
 		loadContent: ralplan,
 	},
 	{
 		kind: "skill",
-		name: "team",
-		relativePath: "skills/team/SKILL.md",
-		description: "Multi-worker GJC tmux team orchestration",
-		loadContent: team,
+		name: "autoresearch",
+		relativePath: "skills/autoresearch/SKILL.md",
+		description: "Goal-directed research missions interleaving web and data evidence into a structured verdict",
+		loadContent: autoresearch,
 	},
 	{
 		kind: "skill",
@@ -69,12 +70,6 @@ export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] =
 		relativePath: "skills/ultragoal/SKILL.md",
 		description: "Create and execute durable repo-native multi-goal plans over GJC goal mode artifacts.",
 		loadContent: ultragoal,
-	},
-	{
-		kind: "skill-fragment",
-		parentSkillName: "deep-interview",
-		relativePath: "skill-fragments/deep-interview/auto-research-greenfield.md",
-		loadContent: autoResearchGreenfield,
 	},
 	{
 		kind: "skill-fragment",
@@ -99,5 +94,17 @@ export const BUNDLED_GJC_SKILL_CATALOG: readonly BundledGjcSkillCatalogEntry[] =
 		parentSkillName: "ultragoal",
 		relativePath: "skill-fragments/ultragoal/validation-batch-contracts.md",
 		loadContent: validationBatchContracts,
+	},
+	{
+		kind: "skill-fragment",
+		parentSkillName: "autoresearch",
+		relativePath: "skill-fragments/autoresearch/auto-iterate.md",
+		loadContent: autoresearchIterate,
+	},
+	{
+		kind: "skill-fragment",
+		parentSkillName: "autoresearch",
+		relativePath: "skill-fragments/autoresearch/auto-critic.md",
+		loadContent: autoresearchCritic,
 	},
 ];

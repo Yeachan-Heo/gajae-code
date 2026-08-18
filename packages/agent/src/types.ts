@@ -777,3 +777,37 @@ export type AgentEvent =
 			isError?: boolean;
 			scope?: AttemptScope;
 	  };
+
+/**
+ * Why a tool call failed when the loop — not the tool — produced the result.
+ *
+ * `argument_validation` means the call never dispatched: the arguments were
+ * rejected before `execute` ran. `execution` means `execute` threw.
+ */
+export type ToolFailureKind = "argument_validation" | "execution";
+
+/**
+ * The result details the loop attaches when a tool call fails without the tool
+ * returning its own details. It carries no tool-owned field, so a consumer that
+ * dereferences a tool's own detail shape must recognise it first.
+ */
+export interface ToolFailureEnvelope {
+	failureKind: ToolFailureKind;
+}
+
+export function toolFailureEnvelope(kind: ToolFailureKind): ToolFailureEnvelope {
+	return { failureKind: kind };
+}
+
+/**
+ * True only for the loop's own envelope. Tools that report a `failureKind`
+ * alongside their own details (`todo_write`, todo persistence) keep those fields,
+ * so their renderers still own the result and are left alone.
+ */
+export function isToolFailureEnvelope(value: unknown): value is ToolFailureEnvelope {
+	if (!value || typeof value !== "object") return false;
+	const keys = Object.keys(value);
+	if (keys.length !== 1 || keys[0] !== "failureKind") return false;
+	const kind = (value as ToolFailureEnvelope).failureKind;
+	return kind === "argument_validation" || kind === "execution";
+}

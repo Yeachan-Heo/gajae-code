@@ -315,6 +315,10 @@ export class InputController {
 		return this.ctx.keybindings.getKeys("app.interrupt").some(key => matchesKey(data, key));
 	}
 
+	#matchesClearKey(data: string): boolean {
+		return this.ctx.keybindings.getKeys("app.clear").some(key => matchesKey(data, key));
+	}
+
 	#hasHookDialog(): boolean {
 		return Boolean(this.ctx.hookSelector || this.ctx.hookInput || this.ctx.hookEditor);
 	}
@@ -327,12 +331,25 @@ export class InputController {
 		);
 	}
 
+	#handlePendingSteerInterrupt(): boolean {
+		if (!this.#steerConsumePending) return false;
+		this.#resetEscapeGestures();
+		if (!this.ctx.session.hasQueuedSteering) {
+			this.#steerConsumePending = false;
+			return false;
+		}
+
+		this.#steerConsumePending = false;
+		this.restoreQueuedMessagesToEditor({ abort: true });
+		return true;
+	}
+
 	#handleCancellableWorkEscape(options: {
 		loading?: boolean;
 		processes?: boolean;
 		modes?: boolean;
 		maintenance?: boolean;
-		retry?: boolean;
+		retry?: "escape" | "clear";
 		streaming?: boolean;
 	}): boolean {
 		if (options.loading && this.ctx.loadingAnimation) {
@@ -376,7 +393,7 @@ export class InputController {
 		}
 		if (options.retry) {
 			if (this.#isRetryBackoffActive()) {
-				if (this.ctx.retryEscapePrimed) {
+				if (options.retry === "clear" || this.ctx.retryEscapePrimed) {
 					this.ctx.session.abortRetry();
 				} else {
 					this.ctx.retryEscapePrimed = true;
@@ -407,8 +424,35 @@ export class InputController {
 		}
 		this.#globalInterruptUnsubscribe?.();
 		this.#globalInterruptUnsubscribe = this.ctx.ui.addInputListener(data => {
-			if (!this.#matchesInterruptKey(data)) {
+			const isInterruptKey = this.#matchesInterruptKey(data);
+			const isClearKey = this.#matchesClearKey(data);
+			if (!isInterruptKey && !isClearKey) {
 				return undefined;
+			}
+			if (isClearKey && !isInterruptKey && this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
+				this.#resetEscapeGestures();
+				return { consume: true };
+			}
+			if (isClearKey && !isInterruptKey && this.ctx.hookSelector?.hasActiveInlineInput?.() === true) {
+				this.#resetEscapeGestures();
+				return undefined;
+			}
+			if (isClearKey && !isInterruptKey) {
+				if (this.#handlePendingSteerInterrupt()) return { consume: true };
+				if (
+					!this.#handleCancellableWorkEscape({
+						loading: true,
+						processes: true,
+						modes: true,
+						maintenance: true,
+						retry: "clear",
+						streaming: true,
+					})
+				) {
+					return undefined;
+				}
+				this.#resetEscapeGestures();
+				return { consume: true };
 			}
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				this.#resetEscapeGestures();
@@ -428,7 +472,7 @@ export class InputController {
 					processes: hookDialogActive,
 					modes: false,
 					maintenance: true,
-					retry: true,
+					retry: "escape",
 					streaming: hookDialogActive,
 				})
 			) {
@@ -492,19 +536,8 @@ export class InputController {
 				this.#resetEscapeGestures();
 				return;
 			}
-			if (this.#steerConsumePending) {
-				this.#resetEscapeGestures();
-				if (this.ctx.session.hasQueuedSteering) {
-					// Second Esc before the scheduled steer continuation drains the
-					// queue: restore/drop the queued steer and perform a real abort,
-					// even if abort cleanup already made the session look idle.
-					this.#steerConsumePending = false;
-					this.restoreQueuedMessagesToEditor({ abort: true });
-					return;
-				}
-				this.#steerConsumePending = false;
-			}
-			if (this.#handleCancellableWorkEscape({ maintenance: true, retry: true })) {
+			if (this.#handlePendingSteerInterrupt()) return;
+			if (this.#handleCancellableWorkEscape({ maintenance: true, retry: "escape" })) {
 				this.#resetEscapeGestures();
 				return;
 			}
@@ -514,7 +547,7 @@ export class InputController {
 					processes: true,
 					modes: true,
 					maintenance: true,
-					retry: true,
+					retry: "escape",
 					streaming: true,
 				})
 			) {

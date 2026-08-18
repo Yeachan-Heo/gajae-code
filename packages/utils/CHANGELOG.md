@@ -7,6 +7,9 @@
 ### Added
 - Fatal crash records now end with a machine-readable identity line (`gjc-crash-record.v1 fp:<32hex> fpv:1 id:<random>`) whose 128-bit fingerprint is computed from the already-captured diagnostic text with typed normalization (paths/home/uuid/hex/long-digit placeholders, `404` and `500` kept distinct, no line/column numbers in frames). The fatal path also appends one bounded (≤512 B) `O_APPEND` line to a new crash event journal beside the crash log; failures are swallowed and a latch makes a crash-during-crash skip journal work. New `getCrashEventsPath()` / `getCrashIndexPath()` resolvers, and `redactCrashSecrets` is now exported.
 
+### Fixed
+- Project `.env` trust guards now recognize the full assignment syntax Bun's dotenv loader accepts: `export NAME=value`, whitespace around `=`, and unquoted trailing `#` comments (`NAME=value # note`), so exported or spaced directory overrides cannot redirect trusted configuration sources.
+
 ## [0.13.3] - 2026-08-15
 
 ### Fixed

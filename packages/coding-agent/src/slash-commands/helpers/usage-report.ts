@@ -1,4 +1,4 @@
-import type { UsageLimit } from "@gajae-code/ai/core";
+import type { UsageLimit, UsageReport } from "@gajae-code/ai/core";
 import { sanitizeText } from "@gajae-code/utils";
 import {
 	type AccountInventoryRow,
@@ -34,6 +34,60 @@ function healthLabel(row: AccountInventoryRow): string {
 	return "unknown";
 }
 
+/**
+ * Reset detail for one limit. The account rows dropped every reset signal when
+ * the panel was replaced, which left `/usage` unable to answer the question it
+ * exists for: how long until the quota comes back. Two-unit precision, because
+ * a single rounded unit reads `7d` at both 6.6 and 7.4 days remaining.
+ */
+function formatLimitReset(limit: UsageLimit, nowMs: number): string {
+	const resetsAt = limit.window?.resetsAt;
+	if (resetsAt === undefined || !Number.isFinite(resetsAt) || resetsAt <= nowMs) return "";
+	const totalMinutes = Math.floor((resetsAt - nowMs) / 60_000);
+	const totalHours = Math.floor(totalMinutes / 60);
+	let countdown: string;
+	if (totalMinutes < 1) countdown = "<1m";
+	else if (totalMinutes < 60) countdown = `${totalMinutes}m`;
+	else if (totalHours < 48) {
+		const minutes = totalMinutes % 60;
+		countdown = minutes > 0 ? `${totalHours}h ${minutes}m` : `${totalHours}h`;
+	} else {
+		const days = Math.floor(totalHours / 24);
+		const hours = totalHours % 24;
+		countdown = hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+	}
+	const withinADay = resetsAt - nowMs < 24 * 3_600_000;
+	const at = new Date(resetsAt).toLocaleString(undefined, {
+		month: withinADay ? undefined : "short",
+		day: withinADay ? undefined : "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+	});
+	return `, resets in ${countdown} (${at})`;
+}
+
+/** One limit line: how much is left, and when it comes back. */
+export function formatLimitDetail(limit: UsageLimit, nowMs: number): string {
+	return `${formatUsageAmount(limit)}${formatLimitReset(limit, nowMs)}`;
+}
+
+/**
+ * Cache-only usage reports for the interactive panel. Mirrors the plain
+ * `/usage` contract exactly — reads the account inventory snapshot, never
+ * fetches or probes — so the graphical view can be restored without
+ * reintroducing the network call that motivated replacing it.
+ */
+export function collectCachedUsageReports(runtime: SlashCommandRuntime): UsageReport[] {
+	const session = runtime.session;
+	const modelRegistry = session.modelRegistry;
+	const snapshot = buildAccountInventorySnapshot({
+		authStorage: modelRegistry.authStorage,
+		modelRegistry,
+		sessionId: session.credentialSessionId ?? session.sessionId,
+	});
+	return snapshot.rows.flatMap(row => (row.usage ? [row.usage.report] : []));
+}
+
 function renderAccountRows(rows: AccountInventoryRow[], nowMs: number, checked: boolean): string {
 	const lines = [`Accounts${checked ? " (checked)" : " (cache only)"}`];
 	if (rows.length === 0) {
@@ -52,7 +106,7 @@ function renderAccountRows(rows: AccountInventoryRow[], nowMs: number, checked: 
 		);
 		if (row.usage?.report.limits.length) {
 			for (const limit of row.usage.report.limits.slice(0, 8)) {
-				lines.push(`  ${sanitizeText(limit.label)}: ${formatUsageAmount(limit)}`);
+				lines.push(`  ${sanitizeText(limit.label)}: ${formatLimitDetail(limit, nowMs)}`);
 			}
 		}
 	}

@@ -72,6 +72,7 @@ import {
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
+	resolveAnthropicSdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
 import {
 	findUnnecessaryUnicodeEscape,
@@ -1117,6 +1118,8 @@ export type AnthropicClientOptionsArgs = {
 	fetch?: FetchImpl;
 	requestMaxRetries?: number;
 	maxRetryDelayMs?: number;
+	streamFirstEventTimeoutMs?: number;
+	streamIdleTimeoutMs?: number;
 };
 
 export type AnthropicClientOptionsResult = {
@@ -1125,6 +1128,7 @@ export type AnthropicClientOptionsResult = {
 	authToken?: string | null;
 	baseURL?: string;
 	maxRetries: number;
+	timeout?: number;
 	dangerouslyAllowBrowser: boolean;
 	defaultHeaders: Record<string, string>;
 	logLevel: AnthropicSdkClientOptions["logLevel"];
@@ -1907,6 +1911,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					fetch: options?.fetch,
 					requestMaxRetries: options?.requestMaxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
+					streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
+					streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
 				});
 				client = created.client;
 				isOAuthToken = created.isOAuthToken;
@@ -2996,6 +3002,16 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const baseFetch = args.fetch ?? fetch;
 	const boundedFetch = wrapAnthropicFetchForBoundedRateLimits(baseFetch, args.maxRetryDelayMs);
 	const debugFetch = onSseEvent ? wrapFetchForSseDebug(boundedFetch, event => onSseEvent(event, model)) : boundedFetch;
+	// Bound the connect/headers phase. The first-event watchdog arms only after
+	// response headers arrive, so a request whose connection dies before headers
+	// was previously governed only by the Anthropic SDK's 10-minute default per
+	// attempt times its internal retry budget — observable as an endless spinner
+	// right after a completed tool call.
+	const sdkTimeoutMs = resolveAnthropicSdkRequestTimeoutMs(
+		model.provider,
+		args.streamFirstEventTimeoutMs,
+		args.streamIdleTimeoutMs,
+	);
 	if (model.provider === "github-copilot") {
 		const copilotApiKey = parseGitHubCopilotApiKey(apiKey).accessToken;
 		const betaFeatures = [...extraBetas];
@@ -3020,6 +3036,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			authToken: copilotApiKey,
 			baseURL: baseUrl,
 			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
+			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
@@ -3054,6 +3071,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			authToken: null,
 			baseURL: baseUrl,
 			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
+			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
@@ -3072,6 +3090,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 			authToken: null,
 			baseURL: baseUrl,
 			maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
+			...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 			dangerouslyAllowBrowser: true,
 			defaultHeaders,
 			logLevel: ANTHROPIC_SDK_LOG_LEVEL,
@@ -3086,6 +3105,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		authToken: oauthToken ? apiKey : undefined,
 		baseURL: baseUrl,
 		maxRetries: resolveRetryBudget(args.requestMaxRetries, 5),
+		...(sdkTimeoutMs !== undefined ? { timeout: sdkTimeoutMs } : {}),
 		dangerouslyAllowBrowser: true,
 		defaultHeaders,
 		logLevel: ANTHROPIC_SDK_LOG_LEVEL,

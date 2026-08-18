@@ -416,10 +416,11 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 }
 
 // Paths whose Windows drive-letter vs Volume-GUID canonicalization, Bun
-// `node:fs` resident-cache write semantics, or session-index snapshot fsync
-// semantics the fix governs. On Ubuntu the windows-canonical-path regression
-// suite is skipped by `describe.skipIf`, so a Linux shard cannot verify those
-// fixes; dev-ci consumes this emitted flag to run and require the
+// `node:fs` resident-cache write semantics, session-index snapshot fsync
+// semantics, or native-loader Windows capability probing the fix governs. On
+// Ubuntu the windows-canonical-path regression suite and the live win32 AVX2
+// probe suite are skipped by `describe.skipIf`, so a Linux shard cannot verify
+// those fixes; dev-ci consumes this emitted flag to run and require the
 // windows-latest job whenever any of these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
 	return (
@@ -435,7 +436,9 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-session-index-lock-contention.test.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/broker/process-incarnation.ts" ||
-		changedPath === "packages/coding-agent/src/config/file-lock.ts"
+		changedPath === "packages/coding-agent/src/config/file-lock.ts" ||
+		changedPath === "packages/natives/native/loader-state.js" ||
+		changedPath === "scripts/host-detect.ts"
 	);
 }
 

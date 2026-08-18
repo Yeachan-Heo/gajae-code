@@ -26,7 +26,7 @@ export default class QuickLane extends Command {
 	static examples = [
 		`$ gjc quick-lane classify "add validation to processKeywordDetector"`,
 		`$ gjc quick-lane classify --json "fix src/hooks/bridge.ts"`,
-		`$ gjc quick-lane classify "team make it better"`,
+		`$ gjc quick-lane classify "autoresearch the caching layer"`,
 	];
 
 	async run(): Promise<void> {

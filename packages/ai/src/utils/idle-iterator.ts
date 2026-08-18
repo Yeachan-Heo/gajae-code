@@ -105,6 +105,39 @@ export function resolveOpenAISdkRequestTimeoutMs(
 	return envSdkTimeoutMs;
 }
 
+/**
+ * Resolves the Anthropic SDK client `timeout` so stalled-before-headers requests
+ * are bounded. The Anthropic first-event watchdog deliberately arms only once
+ * response headers have arrived (setup latency must not consume the first-event
+ * budget), which left the connect/headers phase governed solely by the SDK
+ * default of 10 minutes per attempt — multiplied by SDK-internal retries, a
+ * connection that silently died right after a completed tool call could spin
+ * with no user-visible error for the better part of an hour.
+ *
+ * - Explicit `0` disables the request timeout, matching a disabled first-event
+ *   watchdog.
+ * - An explicit nonzero override is floored at the env/default first-event
+ *   window (which itself never undershoots the provider idle window) so a short
+ *   post-connect first-event budget cannot kill legitimate slow setup.
+ */
+export function resolveAnthropicSdkRequestTimeoutMs(
+	provider: string,
+	streamFirstEventTimeoutOverride?: number,
+	streamIdleTimeoutOverride?: number,
+): number | undefined {
+	const idleTimeoutMs =
+		streamIdleTimeoutOverride ?? getStreamIdleTimeoutMs(getProviderStreamIdleTimeoutFallbackMs(provider));
+	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(
+		idleTimeoutMs,
+		getProviderFirstEventTimeoutFallbackMs(provider),
+	);
+	if (streamFirstEventTimeoutOverride === 0) return undefined;
+	if (streamFirstEventTimeoutOverride !== undefined) {
+		return Math.max(envSdkTimeoutMs ?? 0, streamFirstEventTimeoutOverride);
+	}
+	return envSdkTimeoutMs;
+}
+
 export type Watchdog = NodeJS.Timeout | undefined;
 export interface FirstEventTimeoutFacts {
 	requestBytes?: number;

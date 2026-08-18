@@ -33,6 +33,7 @@ import {
 	getTerminalSessionsDir,
 	hasFsCode,
 	isEnoent,
+	isFsError,
 	logger,
 	parseJsonlLenient,
 	pathIsWithin,
@@ -288,6 +289,7 @@ type ResidentTransitionSource =
 				textStore: BlobStore | null;
 				imageStore: BlobStore;
 				textFallback?: (hash: string) => Buffer | null;
+				onResidentBlobMissing?: (kind: ResidentBlobKind, hash: string) => void;
 			};
 			missingPolicy?: ResidentBlobMissingPolicy;
 	  }
@@ -371,7 +373,7 @@ interface FreshSessionState {
 	readonly adoptsLifecycleId: boolean;
 }
 
-type ResidentCacheDegradedStore = BlobStore & { degradedReason?: string };
+type ResidentCacheDegradedStore = BlobStore & { degradedReason?: string; degradedCauseCode?: string };
 
 const RESIDENT_CACHE_WRITE_FAILURE_REASONS = new Set([
 	"root_create_failed",
@@ -452,6 +454,8 @@ export interface SessionManagerObservabilityStats {
 	residentCacheTrustRejectCount: number;
 	residentCacheWin32FallbackCount: number;
 	residentCacheDegradedReason?: string;
+	residentCacheDegradedCauseCode?: string;
+	residentBlobPlaceholderCount: number;
 	publicMaterializerCallCount: number;
 	getEntryMaterializerCallCount: number;
 	getBranchMaterializerCallCount: number;
@@ -4528,7 +4532,7 @@ async function getSortedSessions(
 						)
 							return undefined;
 						if (typeof header.version === "number" && header.version >= 4) {
-							for (const patch of await readSessionListTrailingPatches(candidate.path, storage, buffer)) {
+							for (const patch of await readSessionListTrailingPatches(candidate.path, storage)) {
 								applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
 							}
 						}
@@ -4964,6 +4968,8 @@ interface ResidentBlobStores {
 	sessionId?: string;
 	sessionFile?: string;
 	onResidentBlobRead?: (kind: ResidentBlobKind) => void;
+	/** Fired when `missingPolicy: "placeholder"` substitutes for content that is gone for good. */
+	onResidentBlobMissing?: (kind: ResidentBlobKind, hash: string) => void;
 }
 
 function residentBlobMissingPlaceholder(error: ResidentBlobMissingError): string {
@@ -5048,6 +5054,7 @@ function materializeResidentValueSync(
 		} catch (err) {
 			if (missingPolicy === "placeholder" && err instanceof ResidentBlobMissingError) {
 				resolved = residentBlobMissingPlaceholder(err);
+				stores.onResidentBlobMissing?.(err.kind, err.hash);
 			} else {
 				throw err;
 			}
@@ -5569,6 +5576,48 @@ function rehydrateColdSpillValue(
 	return Object.fromEntries(entries);
 }
 
+/**
+ * Enforce the provider-facing invariant that a tool call's `arguments` is an
+ * object, after cold-spill rehydration has had its say.
+ *
+ * `rehydrateColdSpillRef` reports an unrecoverable payload by returning the
+ * human-readable `coldSpillUnavailable(...)` sentence, and a blob holding a
+ * non-object JSON value rehydrates as that value. Either outcome lands a
+ * non-object on `toolCall.arguments`, which every provider then forwards
+ * verbatim — Anthropic serializes it straight into `tool_use.input` and the
+ * request fails with `tool_use.input: Input should be a valid dictionary`.
+ * That rejection is fatal for the whole transcript, so one missing blob makes
+ * a session permanently unresumable with no actionable diagnostic.
+ *
+ * Degrade to the existing malformed-arguments contract instead: the recovered
+ * text is preserved under `recoveryNotice` for the reader, and the agent loop
+ * rejects just that call with reason-specific, retryable guidance rather than
+ * letting the provider reject the entire request.
+ */
+function enforceToolCallArgumentObjects(message: AgentMessage): AgentMessage {
+	if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
+	let changed = false;
+	const content = message.content.map(block => {
+		if (block.type !== "toolCall" || isRecord(block.arguments)) return block;
+		changed = true;
+		const recovered = block.arguments;
+		return {
+			...block,
+			arguments: {
+				recoveryNotice:
+					typeof recovered === "string"
+						? recovered
+						: `[Cold-spill payload for this tool call rehydrated as ${
+								recovered === null ? "null" : typeof recovered
+							}, not an object]`,
+			},
+			incompleteArguments: true,
+			incompleteArgumentsReason: "malformed" as const,
+		};
+	});
+	return changed ? ({ ...message, content } as AgentMessage) : message;
+}
+
 function rehydrateColdSpillEntry(
 	entry: SessionEntry,
 	blobStore: BlobStore,
@@ -5576,13 +5625,9 @@ function rehydrateColdSpillEntry(
 ): SessionEntry {
 	if (entry.type === "message") {
 		const marker = entry.evictedContent;
-		const message = rehydrateColdSpillValue(
-			entry.message,
-			marker,
-			blobStore,
-			"message",
-			residentStores,
-		) as AgentMessage;
+		const message = enforceToolCallArgumentObjects(
+			rehydrateColdSpillValue(entry.message, marker, blobStore, "message", residentStores) as AgentMessage,
+		);
 		return { ...entry, message };
 	}
 	if (entry.type === "custom_message") {
@@ -6276,7 +6321,13 @@ function extractTextFromContent(content: Message["content"]): string {
 }
 
 const SESSION_LIST_PREFIX_BYTES = 4096;
-const SESSION_LIST_TRAILING_PATCH_BYTES = 4096;
+// Reverse-scan chunk for trailing header patches. Sized independently of the
+// 4 KiB prefix buffer: the scan walks back to BOF whenever a field stays
+// unresolved (#3633), which is the common case because most transcripts carry
+// no header_patch at all. A 4 KiB chunk turned that walk into one read syscall
+// per 4 KiB of transcript and defeated OS readahead, so listing cost scaled
+// with total transcript bytes on every resume.
+const SESSION_LIST_TRAILING_PATCH_BYTES = 64 * 1024;
 const SESSION_NAME_MAX_CHARS = 1_000;
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
@@ -6299,7 +6350,6 @@ async function readSessionListPrefix(file: string, storage: SessionStorage, buff
 async function readSessionListTrailingPatches(
 	file: string,
 	storage: SessionStorage,
-	buffer: Buffer,
 ): Promise<HeaderPatchRecord["patch"][]> {
 	if (!(storage instanceof FileSessionStorage)) {
 		const content = await storage.readText(file);
@@ -6317,8 +6367,15 @@ async function readSessionListTrailingPatches(
 	// window when a field is still missing so a buried but canonically valid
 	// header_patch remains listable without a full sequential JSONL parse (#3633).
 	// Chunks that cannot contain a header_patch marker skip JSON parsing.
+	//
+	// The scan owns its buffer instead of borrowing the caller's 4 KiB prefix
+	// buffer. A transcript with no header_patch at all — the common case, since
+	// only /rename and workspace moves emit one — cannot be recognized without
+	// reaching BOF, so the chunk size sets how many read syscalls a resume costs
+	// per transcript byte.
 	let trailingFragment = Buffer.alloc(0);
-	const chunkSize = Math.min(buffer.byteLength, SESSION_LIST_TRAILING_PATCH_BYTES);
+	const chunkSize = Math.min(size, SESSION_LIST_TRAILING_PATCH_BYTES);
+	const buffer = Buffer.allocUnsafe(chunkSize);
 	const headerPatchMarker = Buffer.from("header_patch");
 	const handle = await fs.promises.open(file, "r");
 	try {
@@ -6518,7 +6575,7 @@ async function collectSessionFromFile(
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
 		if (typeof header.version === "number" && header.version >= 4 && header.version <= CURRENT_SESSION_VERSION) {
-			for (const patch of await readSessionListTrailingPatches(file, storage, buffer)) {
+			for (const patch of await readSessionListTrailingPatches(file, storage)) {
 				applySessionListHeaderPatch(header, patch);
 			}
 		}
@@ -7089,6 +7146,7 @@ export class SessionManager {
 	#residentImageReadCount = 0;
 	#residentCacheAdoptFallbackCount = 0;
 	#residentCacheTrustRejectCount = 0;
+	#residentBlobPlaceholderCount = 0;
 	#residentCacheWin32FallbackCount = 0;
 	#publicMaterializerCallCount = 0;
 	#getEntryMaterializerCallCount = 0;
@@ -7337,6 +7395,7 @@ export class SessionManager {
 				textStore: sourceTextStore,
 				imageStore: source.sourceStores.imageStore,
 				textFallback: source.sourceStores.textFallback,
+				onResidentBlobMissing: source.sourceStores.onResidentBlobMissing,
 			},
 
 			source.missingPolicy,
@@ -7595,11 +7654,14 @@ export class SessionManager {
 	#demoteResidentTextStoreAfterTrustReject(error: ResidentCacheTrustError): void {
 		const predecessor = this.#residentTextBlobStore;
 		(predecessor as ResidentCacheDegradedStore).degradedReason = error.reason;
+		(predecessor as ResidentCacheDegradedStore).degradedCauseCode = error.causeCode;
 		this.#residentCacheTrustRejectCount++;
 		logger.warn("Resident cache trust rejection; demoting resident text store", {
 			sessionId: this.#sessionId,
 			sessionFile: this.#sessionFile,
 			reason: error.reason,
+			causeCode: error.causeCode,
+			cause: error.causeSummary,
 		});
 		const persistedTextFallback =
 			predecessor instanceof EphemeralBlobStore ? this.#createPersistedResidentTextFallback() : undefined;
@@ -7618,12 +7680,30 @@ export class SessionManager {
 							predecessor instanceof EphemeralBlobStore
 								? hash => predecessor.getBufferedSync(hash) ?? persistedTextFallback?.(hash) ?? null
 								: undefined,
+						onResidentBlobMissing: (kind, hash) => {
+							this.#residentBlobPlaceholderCount++;
+							logger.warn("Resident blob unrecoverable; substituted a placeholder", {
+								sessionId: this.#sessionId,
+								kind,
+								hash,
+								reason: error.reason,
+								causeCode: error.causeCode,
+							});
+						},
 					},
+					// This transition IS the salvage after the cache already failed, so it runs
+					// against a store that is by definition missing blobs. Inheriting the default
+					// fail-closed policy makes the recovery throw on the very entry it exists to
+					// rescue, which leaves the demotion uncommitted and repeats it every turn.
+					// The placeholder never emits a `blob:sha256:` ref, so the fail-closed
+					// invariant that policy protects is preserved.
+					missingPolicy: "placeholder",
 				},
 			},
 			"memory-only",
 		);
 		(prepared.store as ResidentCacheDegradedStore).degradedReason = error.reason;
+		(prepared.store as ResidentCacheDegradedStore).degradedCauseCode = error.causeCode;
 		this.#commitResidentTextStoreTransition(prepared);
 	}
 
@@ -11065,9 +11145,16 @@ export class SessionManager {
 				pending.dispose();
 				this.#managedSidecarCleanupStores.delete(pending);
 			} catch (error) {
-				const candidate = error instanceof ResidentCacheTrustError ? error.reason : "";
+				const trustError = error instanceof ResidentCacheTrustError ? error : undefined;
+				const candidate = trustError?.reason ?? "";
 				const reason = /^[a-z0-9_]{1,64}$/.test(candidate) ? candidate : "cleanup_failed";
-				logger.warn("Failed to dispose the managed sidecar resident cache; retained for retry", { reason });
+				// An errno is path-free, so it can join `reason` here; the cause *summary*
+				// cannot, because fs messages embed the sidecar cache path this record withholds.
+				const causeCode = trustError?.causeCode ?? (isFsError(error) ? error.code : undefined);
+				logger.warn("Failed to dispose the managed sidecar resident cache; retained for retry", {
+					reason,
+					...(causeCode === undefined ? {} : { causeCode }),
+				});
 			}
 		}
 	}
@@ -17121,6 +17208,8 @@ export class SessionManager {
 			residentCacheTrustRejectCount: this.#residentCacheTrustRejectCount,
 			residentCacheWin32FallbackCount: this.#residentCacheWin32FallbackCount,
 			residentCacheDegradedReason: (this.#residentTextBlobStore as ResidentCacheDegradedStore).degradedReason,
+			residentCacheDegradedCauseCode: (this.#residentTextBlobStore as ResidentCacheDegradedStore).degradedCauseCode,
+			residentBlobPlaceholderCount: this.#residentBlobPlaceholderCount,
 			publicMaterializerCallCount: this.#publicMaterializerCallCount,
 			getEntryMaterializerCallCount: this.#getEntryMaterializerCallCount,
 			getBranchMaterializerCallCount: this.#getBranchMaterializerCallCount,
