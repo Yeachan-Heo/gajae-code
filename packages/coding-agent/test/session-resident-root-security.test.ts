@@ -377,3 +377,67 @@ describe("ResidentCacheTrustError cause exposure", () => {
 		expect(error.causeSummary).toBe("<uninspectable cause>");
 	});
 });
+
+// The demotion is the salvage that runs *because* the cache already failed, so it
+// reads a store that is by definition missing blobs. It used to inherit the default
+// fail-closed policy and throw on the very entry it exists to rescue, which left the
+// transition uncommitted — the store stayed broken and every later turn repeated the
+// same throw out of the `message_end` handler, surfacing as a bare `Operation aborted`.
+describe.skipIf(process.platform === "win32")("resident demotion salvages an unrecoverable blob", () => {
+	it("keeps the session usable and substitutes a placeholder instead of throwing", () => {
+		const root = makeTempDir();
+		const manager = createManager(root);
+		const lostText = `lost body ${"L".repeat(8192)}`;
+		const keptText = `kept body ${"K".repeat(8192)}`;
+		const triggerText = `trigger ${"T".repeat(8192)}`;
+		try {
+			const lostId = appendLargeUserText(manager, lostText);
+			const keptId = appendLargeUserText(manager, keptText);
+			const instanceDir = activeResidentInstanceDir();
+			const lostHash = sha256(Buffer.from(lostText, "utf8"));
+
+			// The externalized body is gone for good: the blob file is deleted, and neither
+			// the in-process buffer nor the persisted transcript can produce it again.
+			fs.rmSync(path.join(instanceDir, lostHash), { force: true });
+			const realGetBuffered = EphemeralBlobStore.prototype.getBufferedSync;
+			vi.spyOn(EphemeralBlobStore.prototype, "getBufferedSync").mockImplementation(function (
+				this: EphemeralBlobStore,
+				hash: string,
+			) {
+				return hash === lostHash ? null : realGetBuffered.call(this, hash);
+			});
+
+			// Force the trust rejection that drives the demotion.
+			const realOpenSync = fs.openSync.bind(fs);
+			const triggerTarget = path.join(instanceDir, sha256(Buffer.from(triggerText, "utf8")));
+			vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+				if (path.resolve(asPathname(file)) === triggerTarget) throw makeFsError("ENOENT");
+				return realOpenSync(file, flags as never, mode as never);
+			}) as typeof fs.openSync);
+
+			const triggerId = appendLargeUserText(manager, triggerText);
+
+			// The turn survives: the append lands, unaffected entries are byte-intact, and
+			// only the unrecoverable one degrades — to explanatory text, never a blob ref.
+			expect(userText(manager, keptId)).toBe(keptText);
+			expect(userText(manager, triggerId)).toBe(triggerText);
+			const lost = userText(manager, lostId);
+			expect(lost).toBe(`[Session resident text blob missing: sha256:${lostHash}; original content unavailable]`);
+			expect(lost).not.toContain("blob:sha256:");
+
+			const stats = manager.getObservabilityStatsForTests();
+			expect(stats.residentCacheTrustRejectCount).toBe(1);
+			expect(stats.residentCacheDegradedReason).toBe("blob_create_failed");
+			expect(stats.residentBlobPlaceholderCount).toBe(1);
+
+			// The session keeps accepting work rather than repeating the failure every turn.
+			vi.restoreAllMocks();
+			const afterId = appendLargeUserText(manager, "after the demotion");
+			expect(userText(manager, afterId)).toBe("after the demotion");
+			expect(manager.getObservabilityStatsForTests().residentCacheTrustRejectCount).toBe(1);
+		} finally {
+			vi.restoreAllMocks();
+			manager.close().catch(() => {});
+		}
+	});
+});

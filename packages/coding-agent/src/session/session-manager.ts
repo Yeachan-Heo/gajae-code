@@ -289,6 +289,7 @@ type ResidentTransitionSource =
 				textStore: BlobStore | null;
 				imageStore: BlobStore;
 				textFallback?: (hash: string) => Buffer | null;
+				onResidentBlobMissing?: (kind: ResidentBlobKind, hash: string) => void;
 			};
 			missingPolicy?: ResidentBlobMissingPolicy;
 	  }
@@ -454,6 +455,7 @@ export interface SessionManagerObservabilityStats {
 	residentCacheWin32FallbackCount: number;
 	residentCacheDegradedReason?: string;
 	residentCacheDegradedCauseCode?: string;
+	residentBlobPlaceholderCount: number;
 	publicMaterializerCallCount: number;
 	getEntryMaterializerCallCount: number;
 	getBranchMaterializerCallCount: number;
@@ -4966,6 +4968,8 @@ interface ResidentBlobStores {
 	sessionId?: string;
 	sessionFile?: string;
 	onResidentBlobRead?: (kind: ResidentBlobKind) => void;
+	/** Fired when `missingPolicy: "placeholder"` substitutes for content that is gone for good. */
+	onResidentBlobMissing?: (kind: ResidentBlobKind, hash: string) => void;
 }
 
 function residentBlobMissingPlaceholder(error: ResidentBlobMissingError): string {
@@ -5050,6 +5054,7 @@ function materializeResidentValueSync(
 		} catch (err) {
 			if (missingPolicy === "placeholder" && err instanceof ResidentBlobMissingError) {
 				resolved = residentBlobMissingPlaceholder(err);
+				stores.onResidentBlobMissing?.(err.kind, err.hash);
 			} else {
 				throw err;
 			}
@@ -7141,6 +7146,7 @@ export class SessionManager {
 	#residentImageReadCount = 0;
 	#residentCacheAdoptFallbackCount = 0;
 	#residentCacheTrustRejectCount = 0;
+	#residentBlobPlaceholderCount = 0;
 	#residentCacheWin32FallbackCount = 0;
 	#publicMaterializerCallCount = 0;
 	#getEntryMaterializerCallCount = 0;
@@ -7389,6 +7395,7 @@ export class SessionManager {
 				textStore: sourceTextStore,
 				imageStore: source.sourceStores.imageStore,
 				textFallback: source.sourceStores.textFallback,
+				onResidentBlobMissing: source.sourceStores.onResidentBlobMissing,
 			},
 
 			source.missingPolicy,
@@ -7673,7 +7680,24 @@ export class SessionManager {
 							predecessor instanceof EphemeralBlobStore
 								? hash => predecessor.getBufferedSync(hash) ?? persistedTextFallback?.(hash) ?? null
 								: undefined,
+						onResidentBlobMissing: (kind, hash) => {
+							this.#residentBlobPlaceholderCount++;
+							logger.warn("Resident blob unrecoverable; substituted a placeholder", {
+								sessionId: this.#sessionId,
+								kind,
+								hash,
+								reason: error.reason,
+								causeCode: error.causeCode,
+							});
+						},
 					},
+					// This transition IS the salvage after the cache already failed, so it runs
+					// against a store that is by definition missing blobs. Inheriting the default
+					// fail-closed policy makes the recovery throw on the very entry it exists to
+					// rescue, which leaves the demotion uncommitted and repeats it every turn.
+					// The placeholder never emits a `blob:sha256:` ref, so the fail-closed
+					// invariant that policy protects is preserved.
+					missingPolicy: "placeholder",
 				},
 			},
 			"memory-only",
@@ -17185,6 +17209,7 @@ export class SessionManager {
 			residentCacheWin32FallbackCount: this.#residentCacheWin32FallbackCount,
 			residentCacheDegradedReason: (this.#residentTextBlobStore as ResidentCacheDegradedStore).degradedReason,
 			residentCacheDegradedCauseCode: (this.#residentTextBlobStore as ResidentCacheDegradedStore).degradedCauseCode,
+			residentBlobPlaceholderCount: this.#residentBlobPlaceholderCount,
 			publicMaterializerCallCount: this.#publicMaterializerCallCount,
 			getEntryMaterializerCallCount: this.#getEntryMaterializerCallCount,
 			getBranchMaterializerCallCount: this.#getBranchMaterializerCallCount,
