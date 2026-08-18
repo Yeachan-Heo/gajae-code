@@ -5,6 +5,8 @@ import {
 	fingerprintFromTagPayload,
 	issueBody,
 	issueTitle,
+	main,
+	type MainDependencies,
 	type Options,
 	parseArgs,
 	partitionTriageRows,
@@ -54,6 +56,8 @@ describe("parseArgs", () => {
 		expect(parseArgs(["--limit", "0"])).toMatchObject({ error: expect.stringContaining("--limit") });
 		expect(parseArgs(["--limit", "101"])).toMatchObject({ error: expect.stringContaining("--limit") });
 		expect(parseArgs(["--limit", "abc"])).toMatchObject({ error: expect.stringContaining("--limit") });
+		expect(parseArgs(["--limit", "25oops"])).toMatchObject({ error: expect.stringContaining("--limit") });
+		expect(parseArgs(["--limit", "1.5"])).toMatchObject({ error: expect.stringContaining("--limit") });
 	});
 
 	test("accepts a limit at both bounds", () => {
@@ -80,7 +84,7 @@ describe("parseArgs", () => {
 });
 
 describe("fingerprintFromTagPayload", () => {
-	test("reads the top value of the gjc.fingerprint tag", () => {
+	test("reads the sole gjc.fingerprint tag value", () => {
 		expect(fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [{ value: FINGERPRINT }] })).toBe(
 			FINGERPRINT,
 		);
@@ -99,6 +103,12 @@ describe("fingerprintFromTagPayload", () => {
 		expect(fingerprintFromTagPayload({ key: "gjc.fingerprint" })).toBeUndefined();
 		expect(fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [] })).toBeUndefined();
 		expect(fingerprintFromTagPayload(null)).toBeUndefined();
+	});
+
+	test("quarantines multi-valued tags instead of selecting one", () => {
+		expect(
+			fingerprintFromTagPayload({ key: "gjc.fingerprint", topValues: [{ value: FINGERPRINT }, { value: FORGED_FINGERPRINT }] }),
+		).toBeUndefined();
 	});
 });
 
@@ -163,6 +173,18 @@ describe("issue rendering", () => {
 		expect(issueTitle({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: hostile }) })).not.toContain("@everyone");
 	});
 
+	test.each(["\u200b", "\u200d", "\u202e"])("removes a marker reconstituted by normalization through %j", separator => {
+		const hostile = `gjc-crash-fp.v1:${FORGED_FINGERPRINT.slice(0, 16)}${separator}${FORGED_FINGERPRINT.slice(16)}`;
+		const body = issueBody({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: hostile }) }, options());
+		expect(body).not.toContain(`${CRASH_ISSUE_MARKER_PREFIX}${FORGED_FINGERPRINT}`);
+		expect(body.match(new RegExp(CRASH_ISSUE_MARKER_PREFIX, "g"))).toHaveLength(2);
+	});
+
+	test("does not strip a marker prefix that has a word-character suffix", () => {
+		const hostile = `${CRASH_ISSUE_MARKER_PREFIX}${FORGED_FINGERPRINT}x`;
+		expect(issueTitle({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: hostile }) })).toContain(hostile);
+	});
+
 	test("de-fangs mentions and backticks in the culprit so a forged group cannot notify or escape rendering", () => {
 		const body = issueBody(
 			{ fingerprint: FINGERPRINT, sentry: sentryIssue({ culprit: "readFile`@everyone /etc/x" }) },
@@ -205,5 +227,87 @@ describe("batch safety", () => {
 
 	test("sanitizes the dry-run culprit with the same renderer as issue bodies", () => {
 		expect(previewCulprit("readFile`@everyone /private/secret")).toBe("readFile'(at)everyone <path>");
+	});
+});
+
+describe("main orchestration", () => {
+	function mainDependencies(
+		trusted: boolean,
+		overrides: Partial<MainDependencies> = {},
+	): { dependencies: MainDependencies; stdout: string[]; stderr: string[]; ghCalls: readonly string[][] } {
+		const stdout: string[] = [];
+		const stderr: string[] = [];
+		const ghCalls: string[][] = [];
+		return {
+			stdout,
+			stderr,
+			ghCalls,
+			dependencies: {
+				sentryGet: async () => [sentryIssue()],
+				fingerprintOf: async () => ({ fingerprint: FINGERPRINT, trusted }),
+				findExistingIssue: async () => ({ kind: "none" }),
+				gh: async args => {
+					ghCalls.push([...args]);
+					return { ok: true, stdout: "https://github.com/Yeachan-Heo/gajae-code/issues/1\n", stderr: "" };
+				},
+				token: () => "token",
+				writeStdout: message => stdout.push(message),
+				writeStderr: message => stderr.push(message),
+				...overrides,
+			},
+		};
+	}
+
+	test("reports unverified public-DSN fingerprints and refuses --apply", async () => {
+		const { dependencies, stderr, ghCalls } = mainDependencies(false);
+		await expect(main(["--apply"], dependencies)).resolves.toBe(1);
+		expect(stderr.join("")).toContain("unverified");
+		expect(ghCalls).toHaveLength(0);
+	});
+
+	test("keeps dry runs read-only and applies trusted rows only with --apply", async () => {
+		const dryRun = mainDependencies(true);
+		await expect(main([], dryRun.dependencies)).resolves.toBe(0);
+		expect(dryRun.ghCalls).toHaveLength(0);
+		expect(dryRun.stdout.join("")).toContain("would file");
+
+		const apply = mainDependencies(true);
+		await expect(main(["--apply"], apply.dependencies)).resolves.toBe(0);
+		expect(apply.ghCalls).toHaveLength(1);
+		expect(apply.ghCalls[0]).toContain("create");
+	});
+
+	test("fails a mixed batch when a collision needs manual reconciliation", async () => {
+		const { dependencies } = mainDependencies(true, {
+			sentryGet: async () => [sentryIssue({ id: "1" }), sentryIssue({ id: "2" }), sentryIssue({ id: "3" })],
+			fingerprintOf: async issueId => ({
+				fingerprint: issueId === "3" ? FORGED_FINGERPRINT : FINGERPRINT,
+				trusted: true,
+			}),
+		});
+		await expect(main([], dependencies)).resolves.toBe(1);
+	});
+
+	test("fails closed when a body-marker search is uncertain or a create fails", async () => {
+		const bodyMarker = mainDependencies(true, {
+			findExistingIssue: async () => ({ kind: "untrusted", url: "https://github.com/Yeachan-Heo/gajae-code/issues/1" }),
+		});
+		await expect(main(["--apply"], bodyMarker.dependencies)).resolves.toBe(1);
+		expect(bodyMarker.stderr.join("")).toContain("explicit operator confirmation");
+		expect(bodyMarker.ghCalls).toHaveLength(0);
+
+		const duplicate = mainDependencies(true, {
+			findExistingIssue: async () => {
+				throw new Error("gh issue list returned multiple marker candidates");
+			},
+		});
+		await expect(main(["--apply"], duplicate.dependencies)).resolves.toBe(1);
+		expect(duplicate.ghCalls).toHaveLength(0);
+
+		const failedCreate = mainDependencies(true, {
+			gh: async () => ({ ok: false, stdout: "", stderr: "forbidden" }),
+		});
+		await expect(main(["--apply"], failedCreate.dependencies)).resolves.toBe(1);
+		expect(failedCreate.stderr.join("")).toContain("failed");
 	});
 });

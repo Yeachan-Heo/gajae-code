@@ -40,7 +40,7 @@ const DEFAULT_PROJECT = "gajae-code";
 const SENTRY_API = "https://sentry.io/api/0";
 const GH_TIMEOUT_MS = 20_000;
 const FINGERPRINT = /^[0-9a-f]{32}$/;
-const CRASH_MARKER_PATTERN = /gjc-crash-fp\.v1:[0-9a-f]{32}/gi;
+const CRASH_MARKER_PATTERN = /gjc-crash-fp\.v1:(?:[0-9a-f]{32}|<hex>)(?![a-z0-9_])/gi;
 /** Sentry paginates at 100; a triage batch larger than this wants a saved search, not a bigger flag. */
 const MAX_LIMIT = 100;
 
@@ -67,10 +67,11 @@ interface SentryIssue {
 interface TriageRow {
 	fingerprint: string;
 	sentry: SentryIssue;
+	trustedFingerprint?: boolean;
 	existingIssueUrl?: string;
 }
 
-function parseArgs(argv: readonly string[]): Options | { error: string } {
+export function parseArgs(argv: readonly string[]): Options | { error: string } {
 	const options: Options = {
 		apply: false,
 		limit: 25,
@@ -88,7 +89,8 @@ function parseArgs(argv: readonly string[]): Options | { error: string } {
 		if (value === undefined || value.startsWith("--")) return { error: `Flag ${arg} requires a value.` };
 		index++;
 		if (arg === "--limit") {
-			const parsed = Number.parseInt(value, 10);
+			if (!/^[0-9]+$/.test(value)) return { error: `--limit must be an integer in 1..${MAX_LIMIT}.` };
+			const parsed = Number(value);
 			if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_LIMIT)
 				return { error: `--limit must be an integer in 1..${MAX_LIMIT}.` };
 			options.limit = parsed;
@@ -158,7 +160,7 @@ function sanitizeField(value: string, fallback: string): string {
  * literal dedup marker must only be emitted by this script at its fixed sites.
  */
 function renderCrashText(value: string, fallback: string): string {
-	return fenceCrashText(sanitizeField(value.replace(CRASH_MARKER_PATTERN, "<crash marker removed>"), fallback));
+	return fenceCrashText(sanitizeField(value, fallback).replace(CRASH_MARKER_PATTERN, "<marker removed>"));
 }
 
 function toSentryIssue(raw: unknown): SentryIssue | undefined {
@@ -193,14 +195,21 @@ export function fingerprintFromTagPayload(raw: unknown): string | undefined {
 	const record = raw as Record<string, unknown>;
 	if (asString(record.key) !== "gjc.fingerprint") return undefined;
 	const top = record.topValues;
-	if (!Array.isArray(top) || top.length === 0) return undefined;
+	if (!Array.isArray(top) || top.length !== 1) return undefined;
 	const value = asString((top[0] as { value?: unknown }).value);
 	return FINGERPRINT.test(value) ? value : undefined;
 }
 
-export async function fingerprintOf(issueId: string, token: string): Promise<string | undefined> {
+interface FingerprintObservation {
+	fingerprint: string;
+	trusted: boolean;
+}
+
+export async function fingerprintOf(issueId: string, token: string): Promise<FingerprintObservation | undefined> {
 	try {
-		return fingerprintFromTagPayload(await sentryGet(`/issues/${issueId}/tags/gjc.fingerprint/`, token));
+		const fingerprint = fingerprintFromTagPayload(await sentryGet(`/issues/${issueId}/tags/gjc.fingerprint/`, token));
+		// Public-DSN tags are never sufficient authority to create a GitHub issue.
+		return fingerprint ? { fingerprint, trusted: false } : undefined;
 	} catch (error) {
 		// Only "the tag is absent" means "not a gjc group". Auth failures, rate
 		// limits, timeouts and 5xx must not be laundered into that answer: doing so
@@ -230,7 +239,12 @@ async function gh(args: readonly string[]): Promise<{ ok: boolean; stdout: strin
  * Reuse the interactive flow's dedup contract verbatim so an issue filed by
  * either surface suppresses the other.
  */
-async function findExistingIssue(repo: string, fingerprint: string): Promise<string | undefined> {
+interface ExistingIssueSearch {
+	kind: "none" | "untrusted";
+	url?: string;
+}
+
+async function findExistingIssue(repo: string, fingerprint: string): Promise<ExistingIssueSearch> {
 	const marker = `${CRASH_ISSUE_MARKER_PREFIX}${fingerprint}`;
 	const result = await gh([
 		"issue",
@@ -248,9 +262,16 @@ async function findExistingIssue(repo: string, fingerprint: string): Promise<str
 	]);
 	if (!result.ok) throw new Error(`gh issue list failed: ${result.stderr.trim() || "unknown error"}`);
 	const parsed: unknown = JSON.parse(result.stdout);
-	if (!Array.isArray(parsed) || parsed.length === 0) return undefined;
+	if (!Array.isArray(parsed)) throw new Error("gh issue list returned a non-array JSON payload");
+	if (parsed.length === 0) return { kind: "none" };
+	if (parsed.length !== 1) throw new Error("gh issue list returned multiple marker candidates");
 	const url = (parsed[0] as { url?: unknown }).url;
-	return typeof url === "string" ? url : undefined;
+	const expectedUrl = new RegExp(`^https://github\\.com/${repo.replace("/", "\\/")}/issues/[0-9]+$`);
+	if (typeof url !== "string" || !expectedUrl.test(url))
+		throw new Error("gh issue list returned a malformed or non-canonical issue URL");
+	// A marker in an arbitrary issue body is not provenance and cannot suppress
+	// a crash class without an explicit operator decision.
+	return { kind: "untrusted", url };
 }
 
 function issueTitle(row: TriageRow): string {
@@ -260,7 +281,7 @@ function issueTitle(row: TriageRow): string {
 /**
  * Every field here survived the relay's outbound sanitizer before it reached
  * Sentry, and crash-derived fields are re-sanitized locally anyway: the
- * `gjc.fingerprint` tag that proves provenance is stamped client-side with the
+ * `gjc.fingerprint` tag that identifies the crash class is stamped client-side with the
  * public DSN key, so trusting it blindly would let a forged group smuggle raw
  * text into an issue. The marker sits outside any fenced block, matching
  * `report.ts`, so a forged marker inside crash text cannot impersonate one.
@@ -317,31 +338,51 @@ export function previewCulprit(culprit: string): string {
 	return renderCrashText(culprit, "<unsanitizable culprit>") || "<unknown>";
 }
 
-async function main(argv: readonly string[]): Promise<number> {
+interface MainDependencies {
+	sentryGet(pathname: string, token: string): Promise<unknown>;
+	fingerprintOf(issueId: string, token: string): Promise<FingerprintObservation | undefined>;
+	findExistingIssue(repo: string, fingerprint: string): Promise<ExistingIssueSearch>;
+	gh(args: readonly string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
+	token(): string | undefined;
+	writeStdout(message: string): void;
+	writeStderr(message: string): void;
+}
+
+const defaultDependencies: MainDependencies = {
+	sentryGet,
+	fingerprintOf,
+	findExistingIssue,
+	gh,
+	token: sentryToken,
+	writeStdout: message => process.stdout.write(message),
+	writeStderr: message => process.stderr.write(message),
+};
+
+export async function main(argv: readonly string[], dependencies: MainDependencies = defaultDependencies): Promise<number> {
 	const parsed = parseArgs(argv);
 	if ("error" in parsed) {
-		process.stderr.write(`${parsed.error}\n`);
+		dependencies.writeStderr(`${parsed.error}\n`);
 		return 2;
 	}
 	const options = parsed;
-	const token = sentryToken();
+	const token = dependencies.token();
 	if (!token) {
-		process.stderr.write("Set SENTRY_AUTH_TOKEN (or SENTRY_DEVNOGARI_AUTH_TOKEN) to read the upstream project.\n");
+		dependencies.writeStderr("Set SENTRY_AUTH_TOKEN (or SENTRY_DEVNOGARI_AUTH_TOKEN) to read the upstream project.\n");
 		return 2;
 	}
 
 	let raw: unknown;
 	try {
-		raw = await sentryGet(
+		raw = await dependencies.sentryGet(
 			`/projects/${options.org}/${options.project}/issues/?query=is:unresolved&limit=${options.limit}`,
 			token,
 		);
 	} catch (error) {
-		process.stderr.write(`Sentry read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+		dependencies.writeStderr(`Sentry read failed: ${error instanceof Error ? error.message : String(error)}\n`);
 		return 1;
 	}
 	if (!Array.isArray(raw)) {
-		process.stderr.write("Sentry returned an unexpected issue list shape.\n");
+		dependencies.writeStderr("Sentry returned an unexpected issue list shape.\n");
 		return 1;
 	}
 
@@ -350,15 +391,15 @@ async function main(argv: readonly string[]): Promise<number> {
 	try {
 		for (const entry of raw) {
 			const sentry = toSentryIssue(entry);
-			const fingerprint = sentry ? await fingerprintOf(sentry.id, token) : undefined;
+			const fingerprint = sentry ? await dependencies.fingerprintOf(sentry.id, token) : undefined;
 			if (!sentry || !fingerprint) {
 				skippedNoFingerprint++;
 				continue;
 			}
-			candidates.push({ fingerprint, sentry });
+			candidates.push({ fingerprint: fingerprint.fingerprint, trustedFingerprint: fingerprint.trusted, sentry });
 		}
 	} catch (error) {
-		process.stderr.write(`Sentry tag read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+		dependencies.writeStderr(`Sentry tag read failed: ${error instanceof Error ? error.message : String(error)}\n`);
 		return 1;
 	}
 
@@ -372,60 +413,74 @@ async function main(argv: readonly string[]): Promise<number> {
 	// group is withheld and reported for manual reconciliation.
 	const { rows, collisions } = partitionTriageRows(candidates);
 
-	let existingTotal = 0;
-	for (const row of rows) {
-		let existing: string | undefined;
+	const unverified = rows.filter(row => !row.trustedFingerprint);
+	const trustedRows = rows.filter(row => row.trustedFingerprint);
+	const untrustedBodyMarkers: TriageRow[] = [];
+	for (const row of trustedRows) {
+		let existing: ExistingIssueSearch;
 		try {
-			existing = await findExistingIssue(options.repo, row.fingerprint);
+			existing = await dependencies.findExistingIssue(options.repo, row.fingerprint);
 		} catch (error) {
-			process.stderr.write(
+			dependencies.writeStderr(
 				`duplicate search failed for ${row.fingerprint}: ${error instanceof Error ? error.message : String(error)}\n`,
 			);
 			return 1;
 		}
-		row.existingIssueUrl = existing;
-		if (existing !== undefined) existingTotal++;
+		if (existing.kind === "untrusted") {
+			row.existingIssueUrl = existing.url;
+			untrustedBodyMarkers.push(row);
+		}
 	}
 
-	const pending = rows.filter(row => row.existingIssueUrl === undefined);
-	const already = existingTotal;
+	const pending = trustedRows.filter(row => row.existingIssueUrl === undefined);
+	const already = 0;
 
-	process.stdout.write(
+	dependencies.writeStdout(
 		`${rows.length} gjc signature(s) upstream; ${already} already filed, ${pending.length} pending` +
 			(skippedNoFingerprint > 0 ? `; ${skippedNoFingerprint} upstream group(s) skipped (no gjc.fingerprint tag)` : "") +
+			(unverified.length > 0 ? `; ${unverified.length} unverified fingerprint(s) withheld` : "") +
+			(untrustedBodyMarkers.length > 0 ? `; ${untrustedBodyMarkers.length} untrusted issue marker(s) withheld` : "") +
 			(collisions.length > 0 ? `; ${collisions.length} fingerprint collision(s) withheld` : "") +
 			"\n\n",
 	);
 
 	if (collisions.length > 0) {
-		process.stderr.write(`\n${collisions.length} fingerprint collision(s) withheld; reconcile these upstream first:\n`);
+		dependencies.writeStderr(`\n${collisions.length} fingerprint collision(s) withheld; reconcile these upstream first:\n`);
 		for (const collision of collisions) {
-			process.stderr.write(`  ${collision.fingerprint}\n`);
+			dependencies.writeStderr(`  ${collision.fingerprint}\n`);
 			for (const row of collision.groups)
-				process.stderr.write(`    ${row.sentry.shortId}  ${row.sentry.permalink}\n`);
+				dependencies.writeStderr(`    ${row.sentry.shortId}  ${row.sentry.permalink}\n`);
 		}
 	}
+	if (unverified.length > 0)
+		dependencies.writeStderr(
+			`\n${unverified.length} fingerprint(s) withheld: public-DSN tags are unverified and cannot authorize --apply.\n`,
+		);
+	if (untrustedBodyMarkers.length > 0)
+		dependencies.writeStderr(
+			`\n${untrustedBodyMarkers.length} issue-body marker(s) withheld; require explicit operator confirmation.\n`,
+		);
 
 	if (pending.length === 0) {
-		process.stdout.write("Nothing to file.\n");
-		return collisions.length > 0 ? 1 : 0;
+		dependencies.writeStdout("Nothing to file.\n");
+		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
 	}
 
 	if (!options.apply) {
 		for (const row of pending)
-			process.stdout.write(
+			dependencies.writeStdout(
 				`would file  ${row.fingerprint}  ${row.sentry.count}x  ${issueTitle(row)}\n` +
 					`    culprit: ${previewCulprit(row.sentry.culprit)}\n` +
 					`    ${row.sentry.permalink}\n`,
 			);
-		process.stdout.write(`\nDry run. Re-run with --apply to create ${pending.length} issue(s) in ${options.repo}.\n`);
-		return 0;
+		dependencies.writeStdout(`\nDry run. Re-run with --apply to create ${pending.length} issue(s) in ${options.repo}.\n`);
+		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
 	}
 
 	let created = 0;
 	let failed = 0;
 	for (const row of pending) {
-		const result = await gh([
+		const result = await dependencies.gh([
 			"issue",
 			"create",
 			"--repo",
@@ -437,17 +492,17 @@ async function main(argv: readonly string[]): Promise<number> {
 		]);
 		if (result.ok) {
 			created++;
-			process.stdout.write(`filed  ${row.fingerprint}  ${result.stdout.trim()}\n`);
+			dependencies.writeStdout(`filed  ${row.fingerprint}  ${result.stdout.trim()}\n`);
 			continue;
 		}
 		failed++;
-		process.stderr.write(`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}\n`);
+		dependencies.writeStderr(`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}\n`);
 	}
-	process.stdout.write(`\ncreated ${created}, failed ${failed}\n`);
-	return failed > 0 || collisions.length > 0 ? 1 : 0;
+	dependencies.writeStdout(`\ncreated ${created}, failed ${failed}\n`);
+	return failed > 0 || collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
 }
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));
 
-export { issueBody, issueTitle, parseArgs, toSentryIssue };
-export type { Options, SentryIssue, TriageRow };
+export { issueBody, issueTitle, toSentryIssue };
+export type { FingerprintObservation, MainDependencies, Options, SentryIssue, TriageRow };
