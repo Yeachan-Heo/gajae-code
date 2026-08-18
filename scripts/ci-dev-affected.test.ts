@@ -1960,18 +1960,36 @@ describe("dedicated-only tests — routing contract", () => {
 		expect(tasks.find(task => task.key === DEDICATED_TASK_KEY)?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
 	});
 
-	test("ACP adapter and broker lifecycle changes schedule the lifecycle smoke through their behavioral owners", () => {
+	test("every audited ACP lifecycle owner boundary routes to the dedicated smoke with canonical args", () => {
+		// Table-tested boundary (review round 3): every path imported by
+		// acp-agent.ts for lifecycle transport, plus the fixture. A change in any
+		// of these must emit the dedicated lifecycle task with the canonical
+		// override argv — ordinary shards exclude the smoke by design.
 		for (const changedPath of [
 			"packages/coding-agent/src/modes/acp/acp-agent.ts",
+			"packages/coding-agent/src/modes/acp/abort-scope.ts",
+			"packages/coding-agent/src/sdk/acp/adapter.ts",
+			"packages/coding-agent/src/sdk/acp/final-text.ts",
+			"packages/coding-agent/src/sdk/acp/mcp.ts",
+			"packages/coding-agent/src/sdk/router/session-router.ts",
+			"packages/coding-agent/src/sdk/session-list.ts",
 			"packages/coding-agent/src/sdk/broker/lifecycle.ts",
+			"packages/coding-agent/src/sdk/broker/ensure.ts",
+			"packages/coding-agent/src/sdk/client/index.ts",
+			"packages/coding-agent/src/sdk/host/control/operations.ts",
+			"packages/coding-agent/src/config/settings-schema.ts",
 		]) {
-			const tasks = planTargetedTasks(
-				[changedPath],
-				packages,
-				[ACP_LIFECYCLE],
-			);
-			expect(tasks.find(task => task.key === DEDICATED_TASK_KEY)?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
+			const tasks = planTargetedTasks([changedPath], packages, [ACP_LIFECYCLE]);
+			const dedicated = tasks.find(task => task.key === DEDICATED_TASK_KEY);
+			expect(dedicated).toBeDefined();
+			expect(dedicated?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
+			// The plain `bun test <file>` form can never run a pruned file.
+			expect(dedicated?.command).not.toEqual(["bun", "test", ACP_LIFECYCLE]);
 		}
+		// Boundary negative: a neighboring SDK path with no lifecycle role must
+		// NOT pull the dedicated smoke into its targeted plan.
+		const unrelated = planTargetedTasks(["packages/coding-agent/src/sdk/bus/index.ts"], packages, [ACP_LIFECYCLE]);
+		expect(unrelated.find(task => task.key === DEDICATED_TASK_KEY)).toBeUndefined();
 	});
 
 	test("dedicated-only tests never run through fresh-process shard inventory", async () => {

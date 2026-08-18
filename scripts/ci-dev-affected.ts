@@ -88,6 +88,9 @@ const ACP_LIFECYCLE_SMOKE_TEST = "packages/coding-agent/test/acp/acp-lifecycle-s
 const ACP_LIFECYCLE_OWNER_PATHS = [
 	"packages/coding-agent/scripts/acp-conformance-agent.ts",
 	"packages/coding-agent/src/modes/acp/",
+	"packages/coding-agent/src/sdk/acp/",
+	"packages/coding-agent/src/sdk/router/",
+	"packages/coding-agent/src/sdk/session-list.ts",
 	"packages/coding-agent/src/sdk/broker/",
 	"packages/coding-agent/src/sdk/client/",
 	"packages/coding-agent/src/sdk/host/",

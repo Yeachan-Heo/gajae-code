@@ -29,7 +29,6 @@ import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { logger } from "@gajae-code/utils";
 
 setDefaultTimeout(180_000);
 
@@ -291,31 +290,68 @@ class AcpStdioClient {
 			throw cause;
 		}
 
-		const timeout = Bun.sleep(timeoutMs).then<RpcFrame>(() => {
-			this.#pending.delete(id);
-			throw this.#describe(`ACP request timed out after ${timeoutMs}ms: ${method}`);
+		// Cancelable deadline: a successful response must not leave its losing
+		// timeout pending. With REQUEST_TIMEOUT_MS = 120_000 and a dozen calls per
+		// run, orphaned deadlines would keep the dedicated job alive (and the child
+		// event loop referenced) for up to the full timeout after the work finished.
+		let deadline: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<RpcFrame>((_, rejectTimeout) => {
+			const arm = setTimeout(() => {
+				this.#deadlines.delete(arm);
+				this.#pending.delete(id);
+				rejectTimeout(this.#describe(`ACP request timed out after ${timeoutMs}ms: ${method}`));
+			}, timeoutMs);
+			deadline = arm;
+			this.#deadlines.add(arm);
 		});
-		const frame = await Promise.race([promise, timeout]);
-		if (frame.error) throw new AcpPeerRejection(method, frame.error);
-		return frame.result;
+		try {
+			const frame = await Promise.race([promise, timeout]);
+			if (frame.error) throw new AcpPeerRejection(method, frame.error);
+			return frame.result;
+		} finally {
+			// Fires on success, timeout, and transport settlement alike; Bun's
+			// setTimeout returns a Timer that clearTimeout accepts.
+			if (deadline !== undefined) {
+				clearTimeout(deadline);
+				this.#deadlines.delete(deadline);
+			}
+			// The losing promise is observed so an exit-race rejection (transport died
+			// after success settled the race) never becomes an unhandled rejection.
+			promise.catch(() => undefined);
+		}
 	}
+
+	/** Number of request deadlines still armed; zero after every settled call. */
+	get pendingDeadlineCount(): number {
+		return this.#deadlines.size;
+	}
+	/** Armed request deadlines, so the cancel path can prove nothing leaks. */
+	readonly #deadlines = new Set<ReturnType<typeof setTimeout>>();
 
 	/**
 	 * Killing the ACP client does not close broker-owned session hosts: the broker
 	 * spawns one `sdk session-host-internal` per session and outlives this process.
 	 * Anything still open must be closed explicitly or every run leaks a host, which
-	 * accumulates permanently on a long-lived CI runner. Close is best-effort:
-	 * transport failure must never prevent reaping the fixture process tree or mask
-	 * the test failure that triggered cleanup.
+	 * accumulates permanently on a long-lived CI runner.
+	 *
+	 * Ordering contract (review round 3, P1): the fixture is ALWAYS terminated and
+	 * reaped — termination runs in `finally`, so a failed `session/close` can never
+	 * skip it — and cleanup failures are AGGREGATED and re-thrown after reaping,
+	 * never silently logged away, because a broken close path leaving a host alive
+	 * while this gate stays green is exactly the regression the gate exists to
+	 * catch. The `preserve` helper exists so `finally`-block callers can surface
+	 * their original failure first and still report the cleanup failure after it.
 	 */
+	readonly cleanupFailures: string[] = [];
+
 	async dispose(): Promise<void> {
 		const sessions = [...this.#opened];
-		const closeFailures: string[] = [];
+		const failures: string[] = [];
 		try {
 			const closeResults = await Promise.allSettled(
 				sessions.map(sessionId => this.call("session/close", { sessionId }, DISPOSE_REQUEST_TIMEOUT_MS)),
 			);
-			closeFailures.push(
+			failures.push(
 				...closeResults.flatMap((result, index) =>
 					result.status === "rejected"
 						? [
@@ -327,7 +363,7 @@ class AcpStdioClient {
 				),
 			);
 		} catch (cause) {
-			closeFailures.push(`session cleanup failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+			failures.push(`session cleanup failed: ${cause instanceof Error ? cause.message : String(cause)}`);
 		} finally {
 			try {
 				let exited = false;
@@ -344,12 +380,30 @@ class AcpStdioClient {
 					}
 				}
 			} catch (cause) {
-				closeFailures.push(`fixture termination failed: ${cause instanceof Error ? cause.message : String(cause)}`);
-			} finally {
-				if (closeFailures.length > 0)
-					logger.warn(`ACP lifecycle smoke cleanup diagnostics: ${closeFailures.join("; ")}`);
+				failures.push(`fixture termination failed: ${cause instanceof Error ? cause.message : String(cause)}`);
 			}
 		}
+		this.cleanupFailures.push(...failures);
+		if (failures.length > 0) {
+			throw new Error(`ACP lifecycle cleanup failed (broker-owned hosts may have leaked):\n${failures.join("\n")}`);
+		}
+	}
+
+	/**
+	 * Runs `dispose()` from a failure path without masking the primary error: the
+	 * primary failure is rethrown first, with the cleanup failure chained as the
+	 * cause so both remain visible in the report. Success-path callers await
+	 * `dispose()` directly so cleanup failures still fail the run.
+	 */
+	async disposePreserving(cause: unknown): Promise<never> {
+		try {
+			await this.dispose();
+		} catch (cleanupFailure) {
+			if (cause instanceof Error) {
+				cause.cause = cleanupFailure;
+			}
+		}
+		throw cause;
 	}
 }
 
@@ -507,9 +561,12 @@ beforeAll(async () => {
 			closeAfterResume,
 			notifications: client.notifications,
 		};
-	} finally {
-		await client.dispose();
+	} catch (cause) {
+		// Failure path: the primary error leads, the cleanup failure rides as its
+		// cause; success path falls through so a cleanup failure fails the run.
+		await client.disposePreserving(cause);
 	}
+	await client.dispose();
 });
 
 test("initialize advertises every session lifecycle capability", () => {
@@ -609,7 +666,7 @@ test("request timeout teardown force-kills a fixture that ignores termination", 
 	}
 });
 
-test("a failed session close still reaps the fixture without masking the primary failure", async () => {
+test("a failed session close still reaps the fixture, fails the run, and preserves the primary failure", async () => {
 	const cwd = await makeScratch();
 	const fixture = path.join(cwd, "close-failure-acp-fixture.ts");
 	const terminated = path.join(cwd, "terminated");
@@ -630,16 +687,24 @@ test("a failed session close still reaps the fixture without masking the primary
 	try {
 		await client.waitForNotification("fixture/ready");
 		client.track("session-that-cannot-close");
-		await expect(
-			(async () => {
-				try {
-					await client.call("initialize", {}, 50);
-				} finally {
-					await client.dispose();
-					disposed = true;
-				}
-			})(),
-		).rejects.toThrow("ACP request timed out after 50ms: initialize");
+		// The primary failure (request timeout) must lead, with the aggregated
+		// cleanup failure chained as its cause — never silently dropped, and never
+		// replacing the timeout as the top-level error.
+		const primary = (await (async () => {
+			try {
+				return await client.call("initialize", {}, 50);
+			} catch (cause) {
+				return await client.disposePreserving(cause);
+			} finally {
+				disposed = true;
+			}
+		})().catch((cause: unknown) => cause as Error)) as Error;
+		expect(primary).toBeInstanceOf(Error);
+		expect(primary.message).toContain("ACP request timed out after 50ms: initialize");
+		const cleanup = primary.cause;
+		expect(cleanup).toBeInstanceOf(Error);
+		expect((cleanup as Error).message).toContain("session/close session-that-cannot-close failed");
+		// Termination is unconditional: the fixture wrote its SIGTERM marker.
 		expect(await Bun.file(terminated).exists()).toBe(true);
 	} finally {
 		if (!disposed) await client.dispose();
@@ -687,4 +752,32 @@ test("fixture child environment excludes ambient credentials", async () => {
 	expect(environment.HOME).toBe(path.join(cwd, ".acp-fixture-home"));
 	expect(environment.XDG_CONFIG_HOME).toBe(path.join(cwd, ".acp-fixture-home", "config"));
 	expect(environment.TMPDIR).toBe(cwd);
+});
+
+test("a fast successful RPC leaves no pending request deadline", async () => {
+	const cwd = await makeScratch();
+	const fixture = path.join(cwd, "fast-acp-fixture.ts");
+	await Bun.write(
+		fixture,
+		[
+			'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "fixture/ready" }) + "\\n");',
+			"for await (const line of process.stdin) {",
+			"  const request = JSON.parse(line);",
+			'  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n");',
+			"}",
+		].join("\n"),
+	);
+	const client = new AcpStdioClient(cwd, ["bun", fixture]);
+	try {
+		await client.waitForNotification("fixture/ready");
+		// A long timeout that would visibly extend the job if it stayed armed:
+		// several fast successes must all cancel their deadlines.
+		for (let attempt = 0; attempt < 5; attempt++) {
+			await client.call("initialize", {}, 120_000);
+			expect(client.pendingDeadlineCount).toBe(0);
+		}
+		expect(client.pendingDeadlineCount).toBe(0);
+	} finally {
+		await client.dispose();
+	}
 });
