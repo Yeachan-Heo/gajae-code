@@ -31,6 +31,36 @@ rl.on('line', line => {
 setInterval(() => {}, 1000);
 `;
 
+/** Stalls `initialize` past the short startup ceiling, then serves one tool. */
+function delayedMcpServerScript(initializeDelayMs: number): string {
+	return `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow', version: '1' } } }) + '\\n');
+    }, ${initializeDelayMs});
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'hello', description: 'Demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(25);
+	}
+	throw new Error("waitFor timed out");
+}
+
 const originalAgentDir = getAgentDir();
 
 describe("conventional MCP autoload in standalone sessions", () => {
@@ -103,6 +133,40 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		} finally {
 			await session.dispose();
 		}
+	}, 30_000);
+
+	// The startup wait deliberately stops blocking on a server that declared a
+	// longer connection window, but the session must not then dispose the manager
+	// underneath it. On a cold cache that server has NO surface at return time —
+	// no connection, no cached tools — so disposing here would abort the very
+	// connection startup left running, and the cache would never populate.
+	it("keeps a cold-cache server inside its declared window connecting instead of disposing the manager", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow",
+			commandArgs: [process.execPath, "-e", delayedMcpServerScript(2_400)],
+			flags: { project: true, timeout: 10_000 },
+			cwd: projectDir,
+		});
+
+		const startedAt = Date.now();
+		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+		try {
+			// Session start is still bounded by the short ceiling.
+			expect(Date.now() - startedAt).toBeLessThan(2_400);
+			// The manager survives with no surface at all: the connection is live.
+			expect(mcpManager).toBeDefined();
+			expect(mcpManager?.getConnectedServers()).toEqual([]);
+			expect(mcpManager?.getConnectionStatus("slow")).toBe("connecting");
+
+			// It lands on its own and publishes its tools through the background load.
+			await waitFor(() => mcpManager?.getConnectedServers().includes("slow") === true);
+			await waitFor(() => mcpManager?.getTools().some(tool => tool.name === "mcp__slow_hello") === true);
+		} finally {
+			await session.dispose();
+		}
+		// Session disposal still owns teardown of the retained manager.
+		expect(mcpManager?.getConnectedServers()).toEqual([]);
 	}, 30_000);
 
 	it("opts out with enableMcpAutoload: false (CLI --no-mcp) without loading conventional registrations", async () => {

@@ -2401,7 +2401,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							...result.connectedServers,
 							...result.tools.flatMap(tool => (tool.mcpServerName ? [tool.mcpServerName] : [])),
 						]);
-						if (surfacedServers.size > 0) {
+						// On a cold cache a server still inside its declared window has no
+						// surface yet: no connection, no cached tools. Disposing here would
+						// abort the very connection the startup wait deliberately left
+						// running, so it could never land, never populate the cache, and the
+						// next cold session would repeat it forever. The manager is retained
+						// while any server is still connecting and is disposed by
+						// `AgentSession.dispose` through `ownedMcpManager`.
+						const pendingServers = Object.keys(mergedConfigs).filter(
+							name => owned.getConnectionStatus(name) === "connecting",
+						);
+						if (surfacedServers.size > 0 || pendingServers.length > 0) {
 							mcpManager = owned;
 							ownsMcpManager = true;
 							customTools.push(...(result.tools as CustomTool[]));
