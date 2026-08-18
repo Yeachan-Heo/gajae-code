@@ -683,10 +683,11 @@ describe("GajaePetWidget", () => {
 			expect(widget.mode).toBe("off");
 		} finally {
 			widget.dispose();
+			editor.dispose();
 		}
 	});
 	it("remounts the framed editor while active after a palette overlay replaces it", () => {
-		const { widget, editorContainer } = makeWidget(80, 30, { editor: "real" });
+		const { widget, editor, editorContainer } = makeWidget(80, 30, { editor: "real" });
 		try {
 			widget.setMode("red");
 			const framed = editorContainer.children[0];
@@ -698,6 +699,7 @@ describe("GajaePetWidget", () => {
 			expect(editorContainer.children).toEqual([framed]);
 		} finally {
 			widget.dispose();
+			editor.dispose();
 		}
 	});
 	it("keeps the composer usable across repeated palette close/remount cycles without disposing it", () => {
@@ -754,6 +756,10 @@ describe("GajaePetWidget", () => {
 		} finally {
 			setDefaultTabWidth(defaultWidth);
 			widget.dispose();
+			// The red control above disposes the editor through clear(); call
+			// dispose() again so the fixture's tab-width listener is always
+			// torn down (dispose is terminal and idempotent).
+			editor.dispose();
 		}
 	});
 	it("retains emitted predecessor cleanup across an unavailable terminal takeover", () => {
