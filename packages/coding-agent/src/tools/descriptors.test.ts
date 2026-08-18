@@ -600,6 +600,78 @@ describe("tool descriptor compatibility gate", () => {
 		expect(recovered.questions[0].deepInterview.intent_review).toBeUndefined();
 	});
 
+	test("deferred ask rejects an incomplete Round-0 topology object with the targeted correction (#4649)", async () => {
+		const session = makeSession({ "tools.discoveryMode": "all" });
+		session.hasUI = true;
+		session.getDeepInterviewAskStage = () => "topology";
+		const [ask] = (await createTools(session)).filter(tool => tool.name === "ask");
+		if (!ask) throw new Error("expected deferred ask tool");
+		// The incident shape: deepInterview present with Round-0 topology identity
+		// but ambiguity and intent_contract omitted. The cold registry must reject
+		// it with the same targeted correction as the loaded tool, not generic
+		// pre-coercion validation errors.
+		const incomplete = {
+			questions: [
+				{
+					id: "round-0-topology",
+					question: "I'm reading this as 2 top-level components. Does this match your intent?",
+					options: [{ label: "Looks right" }, { label: "Revise" }],
+					deepInterview: {
+						round: 0,
+						component: "review-topology",
+						dimension: "topology",
+					},
+				},
+			],
+		};
+		const capture = (): string => {
+			try {
+				validateToolArguments(ask, {
+					id: "call-4649",
+					type: "toolCall",
+					name: "ask",
+					arguments: incomplete,
+				});
+			} catch (error) {
+				return error instanceof Error ? error.message : String(error);
+			}
+			throw new Error("expected a raw-argument rejection");
+		};
+		const message = capture();
+		expect(message).toContain("raw arguments rejected before coercion");
+		expect(message).toContain("requires every topology field");
+		expect(message).toContain('rejected keys: "deepInterview.ambiguity", "deepInterview.intent_contract"');
+		expect(message).not.toContain("Received arguments:");
+
+		// A complete Round-0 contract-only payload keeps validating unchanged.
+		const complete = {
+			questions: [
+				{
+					id: "round-0-topology",
+					question: "Confirm",
+					options: [{ label: "Looks right" }, { label: "Approve" }],
+					deepInterview: {
+						round: 0,
+						component: "review-topology",
+						dimension: "topology",
+						ambiguity: 1,
+						intent_contract: {
+							items: [{ id: "artifact:report", category: "artifact", statement: "Produce report" }],
+							confirmation_options: ["Looks right"],
+						},
+					},
+				},
+			],
+		};
+		const recovered = validateToolArguments(ask, {
+			id: "call-4649-complete",
+			type: "toolCall",
+			name: "ask",
+			arguments: complete,
+		});
+		expect(recovered.questions[0].deepInterview.intent_contract).toBeDefined();
+	});
+
 	test("deferred ask recovery tolerates the injected intent field at the root", async () => {
 		const session = makeSession({ "tools.discoveryMode": "all" });
 		session.hasUI = true;

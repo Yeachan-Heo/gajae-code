@@ -1094,6 +1094,25 @@ describe("Tool argument coercion", () => {
 				),
 			),
 		).toBe(`${base}; todo_write root accepts only an ops array of operation entries; rejected keys: "alpha", "beta"`);
+		// The #4649 Round-0 topology correction names the omitted required fields
+		// alongside the fixed guidance, and its hint stays within the clamp.
+		expect(
+			captureMessage(() =>
+				validateToolArguments(
+					tool({
+						outcome: "reject",
+						code: "ask-round-zero-metadata-requires-full-topology-fields",
+						detail: {
+							rejectedKeys: ["deepInterview.ambiguity", "deepInterview.intent_contract"],
+							hint: "ambiguity is the observed 0..1 score at ask time (1 before Round 1), never a guess; intent_contract = { items: [{ id, category, statement }], confirmation_options } of displayed items/labels",
+						},
+					}),
+					toolCall,
+				),
+			),
+		).toBe(
+			`${base}; Round 0 review-topology deepInterview metadata requires every topology field; retry once with the named fields instead of re-sending the incomplete object; rejected keys: "deepInterview.ambiguity", "deepInterview.intent_contract" (ambiguity is the observed 0..1 score at ask time (1 before Round 1), never a guess; intent_contract = { items: [{ id, category, statement }], confirmation_options } of displayed items/labels)`,
+		);
 
 		// An empty key list adds nothing, and detail on an unrecognized code is
 		// dropped along with the code itself.

@@ -3566,4 +3566,115 @@ describe("AskTool Round-0 intent recovery", () => {
 			deepInterview: { intent_review: expect.any(Object) },
 		});
 	});
+
+	it("rejects an incomplete Round-0 topology object with a targeted correction, not generic coercion errors (#4649)", () => {
+		const incomplete = roundZeroPair();
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_contract");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "ambiguity");
+		// The incident shape: the deepInterview object is present with Round-0
+		// topology identity, but ambiguity and intent_contract are omitted. Before
+		// the fix this passthrough into generic Zod validation, whose message named
+		// no contract and no correction, and a metadata-only retry repeated the
+		// invalid shape.
+		let message = "";
+		try {
+			validateAsk(incomplete);
+			throw new Error("expected a raw-argument rejection");
+		} catch (error) {
+			message = (error as Error).message;
+		}
+		expect(message).toContain("raw arguments rejected before coercion");
+		expect(message).toContain("Round 0 review-topology deepInterview metadata requires every topology field");
+		expect(message).toContain('rejected keys: "deepInterview.ambiguity", "deepInterview.intent_contract"');
+		expect(message).toContain("intent_contract = { items: [{ id, category, statement }], confirmation_options }");
+		expect(message).not.toContain("Received arguments:");
+	});
+
+	it("names only the actually-missing Round-0 topology fields", () => {
+		const missingContractOnly = roundZeroPair();
+		Reflect.deleteProperty(missingContractOnly.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(missingContractOnly.questions[0].deepInterview, "intent_contract");
+		expect(() => validateAsk(missingContractOnly)).toThrow('rejected key: "deepInterview.intent_contract"');
+
+		const missingAmbiguityOnly = roundZeroPair();
+		Reflect.deleteProperty(missingAmbiguityOnly.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(missingAmbiguityOnly.questions[0].deepInterview, "ambiguity");
+		expect(() => validateAsk(missingAmbiguityOnly)).toThrow('rejected key: "deepInterview.ambiguity"');
+	});
+
+	it("keeps the Round-0 topology-field rejection scoped to the topology stage and topology identity", () => {
+		const incomplete = roundZeroPair();
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_contract");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "ambiguity");
+		// Outside the topology stage the targeted rejection does not fire; the
+		// ordinary stage schema (no deepInterview key at all) reports it instead.
+		expect(() => validateAsk(incomplete, "post-topology")).toThrow('Validation failed for tool "ask"');
+		// A positive-round deepInterview object is not the Round-0 topology shape;
+		// it keeps its existing ordinary validation behavior.
+		const positiveRound = {
+			questions: [
+				{
+					id: "round-1",
+					question: "Clarify scope",
+					options: [{ label: "A" }],
+					deepInterview: { round: 1, component: "scope", dimension: "constraints" },
+				},
+			],
+		};
+		expect(() => validateAsk(positiveRound)).toThrow('Validation failed for tool "ask"');
+		expect(() => validateAsk(positiveRound, "post-topology")).toThrow('Validation failed for tool "ask"');
+		// Round 0 with a wrong component or wrong dimension is not the incident
+		// topology identity; the targeted rejection must not broaden to it, and
+		// those payloads keep their ordinary validation behavior.
+		const wrongComponent = {
+			questions: [
+				{
+					id: "round-0-wrong-component",
+					question: "Clarify scope",
+					options: [{ label: "A" }],
+					deepInterview: { round: 0, component: "scope", dimension: "topology" },
+				},
+			],
+		};
+		expect(() => validateAsk(wrongComponent)).toThrow('Validation failed for tool "ask"');
+		const wrongDimension = {
+			questions: [
+				{
+					id: "round-0-wrong-dimension",
+					question: "Clarify scope",
+					options: [{ label: "A" }],
+					deepInterview: { round: 0, component: "review-topology", dimension: "constraints" },
+				},
+			],
+		};
+		expect(() => validateAsk(wrongDimension)).toThrow('Validation failed for tool "ask"');
+	});
+
+	it("rejects an incomplete Round-0 topology object before the deferred registry loads the tool", () => {
+		const recorder = spyOn(deepInterviewRecorder, "appendOrMergeDeepInterviewRound");
+		const gateEmitter = { supportsRemoteGateAnswers: () => true, emitGate: vi.fn() };
+		const tool = new AskTool(
+			createSession({
+				hasUI: false,
+				getWorkflowGateEmitter: () => gateEmitter,
+				getDeepInterviewAskStage: () => "topology",
+			} as Partial<ToolSession>),
+		);
+		const incomplete = roundZeroPair();
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_review");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "intent_contract");
+		Reflect.deleteProperty(incomplete.questions[0].deepInterview, "ambiguity");
+		expect(() =>
+			validateToolArguments(tool, {
+				type: "toolCall",
+				id: "ask-round-0-incomplete",
+				name: "ask",
+				arguments: incomplete,
+			}),
+		).toThrow("requires every topology field");
+		expect(gateEmitter.emitGate).not.toHaveBeenCalled();
+		expect(recorder).not.toHaveBeenCalled();
+	});
 });

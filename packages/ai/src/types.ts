@@ -799,6 +799,7 @@ export type RawArgumentRejectionCode =
 	| "ask-intent-review-requires-positive-round"
 	| "ask-intent-contract-requires-non-empty-authority"
 	| "ask-deep-interview-metadata-requires-deep-interview-gate"
+	| "ask-round-zero-metadata-requires-full-topology-fields"
 	| "todo-write-unknown-root-key"
 	| "todo-write-unknown-op-entry-key"
 	| "todo-write-unknown-op-value"

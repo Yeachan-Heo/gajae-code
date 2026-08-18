@@ -333,6 +333,66 @@ function isRoundZeroRecoveryCandidate(value: unknown): boolean {
 		return encoded ? hasContract && hasReview : hasContract || hasReview;
 	});
 }
+/**
+ * Detect the incident-#4649 shape: a Round-0 topology `deepInterview` object is
+ * present but omits required topology metadata. Without this check the payload
+ * passthroughs (it is not a retired-pair recovery candidate) and dies in generic
+ * Zod validation, whose message names neither the contract nor what a corrected
+ * retry must contain — the model re-sends a still-incomplete object and loops.
+ *
+ * Only the exact incident topology is detected: `round === 0` with the
+ * `review-topology`/`topology` component/dimension pair. Recovery is limited to
+ * the ambiguity score (an observed 0..1 measurement whose absence carries no
+ * intent-lock meaning); `intent_contract` is never derivable — items and the
+ * affirmative option set are the locked-intent evidence — so it is always
+ * demanded explicitly.
+ */
+function isRoundZeroTopologyMetadata(deepInterview: Record<string, unknown>): boolean {
+	return (
+		deepInterview.round === 0 &&
+		deepInterview.component === "review-topology" &&
+		deepInterview.dimension === "topology"
+	);
+}
+
+/** Names the fields an incident-shaped retry must carry, in the contract's own terms. */
+function roundZeroTopologyCorrection(fields: readonly string[]): string {
+	const hints = [
+		...(fields.includes("ambiguity")
+			? ["ambiguity is the observed 0..1 score at ask time (1 before Round 1), never a guess"]
+			: []),
+		...(fields.includes("intent_contract")
+			? [
+					"intent_contract = { items: [{ id, category, statement }], confirmation_options } of displayed items/labels",
+				]
+			: []),
+	];
+	return hints.join("; ");
+}
+
+/** Targeted rejection for Round-0 topology metadata missing required fields (#4649). */
+function roundZeroMetadataRejection(
+	arguments_: Record<string, unknown>,
+	stage: "topology" | "post-topology" | undefined,
+): RawArgumentValidationResult | undefined {
+	if (stage !== "topology") return undefined;
+	if (!isPlainRecord(arguments_) || !Array.isArray(arguments_.questions) || arguments_.questions.length !== 1)
+		return undefined;
+	const question = arguments_.questions[0];
+	if (!isPlainRecord(question) || !isPlainRecord(question.deepInterview)) return undefined;
+	const deepInterview: Record<string, unknown> = question.deepInterview;
+	if (!isRoundZeroTopologyMetadata(deepInterview)) return undefined;
+	const missing = ["ambiguity", "intent_contract"].filter(field => deepInterview[field] === undefined);
+	if (missing.length === 0) return undefined;
+	return {
+		outcome: "reject",
+		code: "ask-round-zero-metadata-requires-full-topology-fields",
+		detail: {
+			rejectedKeys: missing.map(field => `deepInterview.${field}`),
+			hint: roundZeroTopologyCorrection(missing),
+		},
+	};
+}
 
 /** Remove only strict-provider null placeholders for fields optional in the canonical Ask contract. */
 function normalizeRoundZeroOptionalNulls(arguments_: Record<string, unknown>): Record<string, unknown> {
@@ -403,10 +463,19 @@ export function recoverRoundZeroIntentContract(
 	arguments_: Record<string, unknown>,
 	stage?: "topology" | "post-topology",
 ): RawArgumentValidationResult {
-	if (!isRoundZeroRecoveryCandidate(arguments_)) return { outcome: "passthrough" };
+	// #4649: an incomplete Round-0 topology object (deepInterview present,
+	// required fields omitted) is NOT a retired-pair recovery candidate, so it
+	// would passthrough into generic Zod validation whose error names no contract
+	// and no correction — the repeat-invalid-bisect loop. Non-candidates get the
+	// targeted correction here; candidates get it only after the stricter known
+	// intent rejections below, so every previously-covered verdict is unchanged.
+	if (!isRoundZeroRecoveryCandidate(arguments_))
+		return roundZeroMetadataRejection(arguments_, stage) ?? { outcome: "passthrough" };
 	const normalizedArguments = normalizeRoundZeroOptionalNulls(arguments_);
 	const knownRejection = knownIntentRejection(normalizedArguments);
 	if (knownRejection) return knownRejection;
+	const missingTopologyFields = roundZeroMetadataRejection(normalizedArguments, stage);
+	if (missingTopologyFields) return missingTopologyFields;
 	if (!isOnlyPlainData(normalizedArguments) || !isPlainRecord(normalizedArguments)) return { outcome: "reject" };
 	// `_i` is the intent field the agent loop injects into every tool schema. The
 	// loop strips it before validation, but replayed and directly validated calls
