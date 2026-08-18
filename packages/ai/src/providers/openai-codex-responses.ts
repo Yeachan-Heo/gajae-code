@@ -282,6 +282,8 @@ interface CodexStreamRuntime {
 	canSafelyReplayWebsocketOverSse: boolean;
 	/** Ids of tool calls that received their terminal `output_item.done`. */
 	finalizedToolCallIds: Set<string>;
+	/** Event types whose degraded non-string increment was already diagnosed. */
+	degradedIncrementDiagnostics: Set<string>;
 }
 
 interface CodexStreamProcessingContext {
@@ -965,6 +967,7 @@ function createCodexStreamRuntime(initial: {
 		sawTerminalEvent: false,
 		canSafelyReplayWebsocketOverSse: true,
 		finalizedToolCallIds: new Set<string>(),
+		degradedIncrementDiagnostics: new Set<string>(),
 	};
 }
 
@@ -1034,6 +1037,12 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.reasoning_summary_text.delta") {
+		noteCodexDegradedIncrement(
+			rawEvent,
+			"response.reasoning_summary_text.delta",
+			model,
+			runtime.degradedIncrementDiagnostics,
+		);
 		handleReasoningSummaryTextDelta(runtime.currentItem, runtime.currentBlock, rawEvent, stream, output, blockIndex);
 		return firstTokenTime;
 	}
@@ -1044,6 +1053,12 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.reasoning_text.delta") {
+		noteCodexDegradedIncrement(
+			rawEvent,
+			"response.reasoning_text.delta",
+			model,
+			runtime.degradedIncrementDiagnostics,
+		);
 		handleReasoningTextDelta(runtime.currentItem, runtime.currentBlock, rawEvent, stream, output, blockIndex);
 		return firstTokenTime;
 	}
@@ -1054,6 +1069,7 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.output_text.delta") {
+		noteCodexDegradedIncrement(rawEvent, "response.output_text.delta", model, runtime.degradedIncrementDiagnostics);
 		handleMessageTextDelta(
 			runtime.currentItem,
 			runtime.currentBlock,
@@ -1067,6 +1083,7 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.refusal.delta") {
+		noteCodexDegradedIncrement(rawEvent, "response.refusal.delta", model, runtime.degradedIncrementDiagnostics);
 		handleMessageTextDelta(
 			runtime.currentItem,
 			runtime.currentBlock,
@@ -1080,6 +1097,13 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.function_call_arguments.delta") {
+		assertPrimitiveToolArgumentIncrement(rawEvent, "response.function_call_arguments.delta");
+		noteCodexDegradedIncrement(
+			rawEvent,
+			"response.function_call_arguments.delta",
+			model,
+			runtime.degradedIncrementDiagnostics,
+		);
 		handleToolCallArgumentsDelta(runtime.currentItem, runtime.currentBlock, rawEvent, stream, output, blockIndex);
 		return firstTokenTime;
 	}
@@ -1090,6 +1114,13 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.custom_tool_call_input.delta") {
+		assertPrimitiveToolArgumentIncrement(rawEvent, "response.custom_tool_call_input.delta");
+		noteCodexDegradedIncrement(
+			rawEvent,
+			"response.custom_tool_call_input.delta",
+			model,
+			runtime.degradedIncrementDiagnostics,
+		);
 		handleCustomToolCallInputDelta(runtime.currentItem, runtime.currentBlock, rawEvent, stream, output, blockIndex);
 		return firstTokenTime;
 	}
@@ -1162,6 +1193,44 @@ function handleReasoningSummaryPartAdded(currentItem: CodexEventItem | null, raw
 	if (currentItem?.type !== "reasoning") return;
 	currentItem.summary = currentItem.summary || [];
 	currentItem.summary.push((rawEvent as { part: ResponseReasoningItem["summary"][number] }).part);
+}
+
+/**
+ * Primitive anomalies (undefined, null, numbers, booleans) stay coerced to
+ * an empty string by the increment handlers. Diagnose at most once per event
+ * type per stream, naming only the envelope shape — never the payload.
+ */
+function noteCodexDegradedIncrement(
+	rawEvent: Record<string, unknown>,
+	eventType: string,
+	model: Model<"openai-codex-responses">,
+	degradedIncrementDiagnostics: Set<string>,
+): void {
+	const raw = (rawEvent as { delta?: unknown }).delta;
+	if (typeof raw === "string") return;
+	if (degradedIncrementDiagnostics.has(eventType)) return;
+	degradedIncrementDiagnostics.add(eventType);
+	logger.warn("codex: degraded non-string stream increment to empty string", {
+		model: model.id,
+		provider: model.provider,
+		eventType,
+		receivedType: raw === null ? "null" : typeof raw,
+	});
+}
+
+/**
+ * A non-primitive tool-argument increment means the upstream producer emitted
+ * a live value instead of streamed JSON text. Coercing it to "" would silently
+ * corrupt the tool call, so the turn fails closed. The payload never enters
+ * the error message.
+ */
+function assertPrimitiveToolArgumentIncrement(rawEvent: Record<string, unknown>, eventType: string): void {
+	const raw = (rawEvent as { delta?: unknown }).delta;
+	if ((typeof raw === "object" && raw !== null) || typeof raw === "function") {
+		throw new Error(
+			`Codex stream sent a non-primitive ${eventType} tool-argument increment; failing the turn instead of silently dropping tool arguments`,
+		);
+	}
 }
 
 function handleReasoningSummaryTextDelta(

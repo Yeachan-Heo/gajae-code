@@ -2023,6 +2023,20 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const blocks = output.content as Block[];
 			const blocksByAnthropicIndex = new Map<number, Block>();
 			const truncatedToolCalls = new Set<ToolCall>();
+			// Bounded diagnostic for degraded primitive increments: at most one
+			// warning per delta type per stream invocation, naming only the
+			// envelope shape (delta type and received typeof) — never the payload.
+			const degradedIncrementDiagnostics = new Set<string>();
+			const noteDegradedIncrement = (deltaType: string, received: unknown): void => {
+				if (degradedIncrementDiagnostics.has(deltaType)) return;
+				degradedIncrementDiagnostics.add(deltaType);
+				logger.warn("anthropic: degraded non-string stream increment to empty string", {
+					model: model.id,
+					provider: model.provider,
+					deltaType,
+					receivedType: received === null ? "null" : typeof received,
+				});
+			};
 			let sawTerminalStopReason = false;
 			// Derive from the ACTUAL request shape, not the option default: the request
 			// only sends `display: "summarized"` on specific paths (adaptive display is
@@ -2275,17 +2289,24 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							if (event.delta.type === "text_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "text") {
-									block.text += typeof event.delta.text === "string" ? event.delta.text : "";
+									if (typeof event.delta.text !== "string") {
+										noteDegradedIncrement("text_delta", event.delta.text);
+									}
+									const textDelta = typeof event.delta.text === "string" ? event.delta.text : "";
+									block.text += textDelta;
 									stream.push({
 										type: "text_delta",
 										contentIndex: index,
-										delta: typeof event.delta.text === "string" ? event.delta.text : "",
+										delta: textDelta,
 										partial: output,
 									});
 								}
 							} else if (event.delta.type === "thinking_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
+									if (typeof event.delta.thinking !== "string") {
+										noteDegradedIncrement("thinking_delta", event.delta.thinking);
+									}
 									const thinkingDelta = typeof event.delta.thinking === "string" ? event.delta.thinking : "";
 									block.thinking += thinkingDelta;
 									if (summarizedThinking) {
@@ -2309,8 +2330,23 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							} else if (event.delta.type === "input_json_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "toolCall") {
-									const jsonDelta =
-										typeof event.delta.partial_json === "string" ? event.delta.partial_json : "";
+									const rawJsonDelta: unknown = event.delta.partial_json;
+									if (
+										(typeof rawJsonDelta === "object" && rawJsonDelta !== null) ||
+										typeof rawJsonDelta === "function"
+									) {
+										// A non-primitive tool-argument increment means the upstream
+										// producer emitted a live value instead of streamed JSON text.
+										// Coercing it to "" would silently corrupt the tool call, so
+										// the turn fails closed. The payload never enters the error.
+										throw new Error(
+											"Anthropic stream sent a non-primitive input_json_delta tool-argument increment; failing the turn instead of silently dropping tool arguments",
+										);
+									}
+									if (typeof rawJsonDelta !== "string") {
+										noteDegradedIncrement("input_json_delta", rawJsonDelta);
+									}
+									const jsonDelta = typeof rawJsonDelta === "string" ? rawJsonDelta : "";
 									block.partialJson += jsonDelta;
 									block.arguments = parseStreamingJson(block.partialJson);
 									stream.push({
@@ -2326,6 +2362,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									block.thinkingSignature = block.thinkingSignature || "";
 									if (typeof event.delta.signature === "string") {
 										block.thinkingSignature += event.delta.signature;
+									} else {
+										noteDegradedIncrement("signature_delta", event.delta.signature);
 									}
 								}
 							}
