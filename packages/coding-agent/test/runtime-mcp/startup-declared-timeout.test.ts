@@ -232,6 +232,36 @@ describe("MCP startup and the declared connection window", () => {
 		}
 	});
 
+	// The decoder keeps only `tools`/`nextCursor`, so reading hints off the decoded
+	// page saw none and silently disabled every privacy and freshness decision.
+	test("carries cache hints from the raw tools/list envelope, and lets one private page win", async () => {
+		const pages = [
+			{
+				tools: [{ name: "first", inputSchema: { type: "object" } }],
+				nextCursor: "p2",
+				cacheScope: "public",
+				ttlMs: 60_000,
+			},
+			{ tools: [{ name: "second", inputSchema: { type: "object" } }], cacheScope: "private", ttlMs: 5_000 },
+		];
+		let page = 0;
+		const connection = {
+			name: "paged",
+			config: { type: "stdio", command: "paged" },
+			capabilities: { tools: {} },
+			protocol: { era: "modern" },
+			transport: { request: async () => pages[page++] },
+		} as never as MCPServerConnection;
+
+		const tools = await mcpClient.listTools(connection);
+
+		expect(tools.map(tool => tool.name)).toEqual(["first", "second"]);
+		// A later public page must not relabel a mixed catalog as shareable...
+		expect(connection.toolsCacheScope).toBe("private");
+		// ...and the shortest freshness deadline across pages wins.
+		expect(connection.toolsFreshUntil).toBeLessThanOrEqual(Date.now() + 5_000);
+	});
+
 	test("binds cache identity to the resolved credential, not the config template", async () => {
 		const template = { type: "http", url: "https://example.invalid/mcp", headers: { Authorization: "!token" } };
 		const resolve = vi.spyOn(configValue, "resolveConfigValue");
@@ -252,6 +282,51 @@ describe("MCP startup and the declared connection window", () => {
 		// Non-secret: the digest never contains the material it fingerprints.
 		expect(first).toMatch(/^[0-9a-f]{64}$/);
 		expect(first).not.toContain("secret");
+	});
+
+	test("gives the same server a different identity in a different project", async () => {
+		const config = { type: "stdio", command: "same", args: [] } as never;
+		const tools = [{ name: "ping", inputSchema: { type: "object" } }] as never;
+		const rows = new Map<string, string>();
+		const storage = {
+			getCache: (key: string) => rows.get(key) ?? null,
+			setCache: (key: string, value: string) => {
+				rows.set(key, value);
+			},
+		} as never;
+
+		const projectA = new MCPToolCacheClass(storage, "/work/project-a");
+		const projectB = new MCPToolCacheClass(storage, "/work/project-b");
+		await projectA.set("same", config, tools, "cred-1");
+
+		// Same profile database, same server name, same config: only the project
+		// differs, and that alone must not hit.
+		expect(await projectA.get("same", config, "cred-1")).not.toBeNull();
+		expect(await projectB.get("same", config, "cred-1")).toBeNull();
+		// A rotated credential in the owning project also misses.
+		expect(await projectA.get("same", config, "cred-2")).toBeNull();
+	});
+
+	test("honors a server freshness deadline shorter than the default retention", async () => {
+		const config = { type: "stdio", command: "fresh", args: [] } as never;
+		const tools = [{ name: "ping", inputSchema: { type: "object" } }] as never;
+		const expiries: number[] = [];
+		const storage = {
+			getCache: () => null,
+			setCache: (_key: string, _value: string, expiresAtSec: number) => {
+				expiries.push(expiresAtSec);
+			},
+		} as never;
+		const cache = new MCPToolCacheClass(storage, "/work/project");
+
+		await cache.set("fresh", config, tools, "cred", Date.now() + 60_000);
+		await cache.set("stale-default", config, tools, "cred");
+
+		const nowSec = Math.floor(Date.now() / 1000);
+		expect(expiries[0]!).toBeLessThanOrEqual(nowSec + 61);
+		// Without a hint the flat retention still applies, so the hint is what
+		// shortened the first one rather than a coincidence of the default.
+		expect(expiries[1]!).toBeGreaterThan(nowSec + 60);
 	});
 
 	test("refuses an unscoped cache rather than sharing entries across projects", async () => {

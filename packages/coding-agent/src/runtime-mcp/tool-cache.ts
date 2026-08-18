@@ -74,7 +74,19 @@ export async function credentialFingerprint(resolved: MCPServerConfig): Promise<
 	const material =
 		resolved.type === "http" || resolved.type === "sse"
 			? { headers: resolved.headers ?? {}, url: resolved.url ?? "" }
-			: { env: resolved.env ?? {}, command: resolved.command ?? "", args: resolved.args ?? [] };
+			: {
+					env: resolved.env ?? {},
+					command: resolved.command ?? "",
+					args: resolved.args ?? [],
+					// A stdio child inherits the parent environment unless the config opts
+					// out, so a host-provided token can rotate without any declared field
+					// changing. Folding the effective inherited environment in means such a
+					// rotation misses instead of replaying the previous identity's catalog.
+					// It also misses on unrelated environment churn, which is the safe
+					// direction: a redundant reconnect costs a startup, a wrong hit does not
+					// announce itself.
+					inherited: resolved.noInheritEnv === true ? null : { ...Bun.env },
+				};
 	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableStringify(material)));
 	return toHex(digest);
 }

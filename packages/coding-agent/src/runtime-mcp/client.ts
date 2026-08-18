@@ -135,7 +135,10 @@ async function collectPaginated<T>(
 	itemKey: string,
 	items: T[],
 	decode?: (value: unknown) => unknown,
-	onPage?: (result: Record<string, unknown>) => void,
+	// `raw` is the untouched envelope. `decode` is a validation boundary that keeps
+	// only the fields it validates, so metadata living beside the items (cache
+	// hints) is gone by the time the decoded result is observed.
+	onPage?: (result: Record<string, unknown>, raw: unknown) => void,
 ): Promise<void> {
 	const seenCursors = new Set<string>();
 	const failure = (detail: string) => new MCPExpectedFailure(new Error(`MCP ${method} pagination ${detail}`));
@@ -149,6 +152,7 @@ async function collectPaginated<T>(
 			(result.nextCursor !== undefined && typeof result.nextCursor !== "string")
 		)
 			throw new MCPExpectedFailure();
+		const rawPage = value;
 		const nextCursor = result.nextCursor as string | undefined;
 		if (nextCursor && seenCursors.has(nextCursor)) throw failure("repeated a cursor");
 		const pageItems = result[itemKey] as T[];
@@ -156,7 +160,7 @@ async function collectPaginated<T>(
 		if (itemCount > MAX_PAGINATION_ITEMS || (itemCount === MAX_PAGINATION_ITEMS && nextCursor))
 			throw failure("did not complete within the 10000-item budget");
 		items.push(...pageItems);
-		onPage?.(result as Record<string, unknown>);
+		onPage?.(result as Record<string, unknown>, rawPage);
 		if (!nextCursor) return;
 		if (page === MAX_PAGINATION_PAGES) throw failure("did not complete within the 100-page budget");
 		seenCursors.add(nextCursor);
@@ -671,18 +675,29 @@ export async function listTools(
 	let cacheScope: "public" | "private" | undefined;
 	const allTools: MCPToolDefinition[] = [];
 	try {
-		await collectPaginated(connection, options, "tools/list", "tools", allTools, decodeToolsListResult, page => {
-			const hints = normalizeMcpCacheHints(page);
-			if (hints?.ttlMs !== undefined) {
-				const deadline = Date.now() + hints.ttlMs;
-				freshUntil = freshUntil === undefined ? deadline : Math.min(freshUntil, deadline);
-			}
-			// Privacy is aggregated conservatively: one private page makes the whole
-			// catalog private. A later public page must not relabel a mixed result as
-			// shareable, because the catalog is cached and replayed as a unit.
-			if (hints?.cacheScope === "private") cacheScope = "private";
-			else if (hints?.cacheScope !== undefined && cacheScope === undefined) cacheScope = hints.cacheScope;
-		});
+		await collectPaginated(
+			connection,
+			options,
+			"tools/list",
+			"tools",
+			allTools,
+			decodeToolsListResult,
+			(_page, raw) => {
+				// Read hints from the untouched envelope: the decoder keeps only `tools`
+				// and `nextCursor`, so reading them off the decoded page always saw none
+				// and silently disabled every cache-privacy and freshness decision.
+				const hints = normalizeMcpCacheHints(raw);
+				if (hints?.ttlMs !== undefined) {
+					const deadline = Date.now() + hints.ttlMs;
+					freshUntil = freshUntil === undefined ? deadline : Math.min(freshUntil, deadline);
+				}
+				// Privacy is aggregated conservatively: one private page makes the whole
+				// catalog private. A later public page must not relabel a mixed result as
+				// shareable, because the catalog is cached and replayed as a unit.
+				if (hints?.cacheScope === "private") cacheScope = "private";
+				else if (hints?.cacheScope !== undefined && cacheScope === undefined) cacheScope = hints.cacheScope;
+			},
+		);
 	} catch (error) {
 		if (modern && isModernMethodNotFound(error)) return [];
 		throw error;

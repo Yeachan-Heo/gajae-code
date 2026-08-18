@@ -364,6 +364,8 @@ export class MCPManager {
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingConnectionControllers = new Map<string, AbortController>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
+	/** Serializes cache writes and invalidations per server (see `#queueCacheOperation`). */
+	#cacheOperations = new Map<string, Promise<void>>();
 	#sources = new Map<string, SourceMeta>();
 	#authStorage: AuthStorage | null = null;
 	#inputRequestHandler: MCPInputRequestHandler | null = null;
@@ -1024,6 +1026,15 @@ export class MCPManager {
 			// Resolve auth config before connecting, but do so per-server in parallel.
 			let connectStartedAt: number | undefined;
 			let resolvedCredential: string | undefined;
+			/**
+			 * Abort signal for initial discovery: the unspent remainder of this
+			 * attempt's declared window, or plain cancellation when none was declared.
+			 */
+			const declaredDiscoverySignal = (): AbortSignal => {
+				if (!hasDeclaredConnectionWindow(config) || connectStartedAt === undefined) return connectionAbort.signal;
+				const remaining = connectStartedAt + (config.timeout as number) - Date.now();
+				return AbortSignal.any([connectionAbort.signal, AbortSignal.timeout(Math.max(0, remaining))]);
+			};
 			const acquireInitialLease = async (): Promise<MCPPoolLease> => {
 				const resolvedConfig = await this.#resolveAuthConfig(config);
 				// Only meaningful when there is a cache to bind an identity to. Skipping it
@@ -1114,7 +1125,14 @@ export class MCPManager {
 			const toolsPromise = connectionPromise.then(async connection => {
 				let serverTools: Awaited<ReturnType<typeof listTools>>;
 				try {
-					serverTools = await listTools(this.#connectionForLease(connection));
+					// The declared window is one budget for connecting *and* the initial
+					// discovery. `connectToServer` bounds the handshake, but every later
+					// `tools/list` request carries only its own request timeout, so a server
+					// that initializes and then stalls discovery could stay pending past the
+					// window its operator declared. The remainder of that window bounds it.
+					serverTools = await listTools(this.#connectionForLease(connection), {
+						signal: declaredDiscoverySignal(),
+					});
 				} catch (error) {
 					if (this.#connections.get(name) === connection) this.#connections.delete(name);
 					await this.#releaseLeasePreservingPrimary(name, connection);
@@ -1399,13 +1417,33 @@ export class MCPManager {
 	 * `waitForConnection` that can only fail, and the cache entry behind it would
 	 * replay the same dead surface on the next start until its TTL expires.
 	 */
+	/**
+	 * Cache mutations for one server, in the order they were issued.
+	 *
+	 * Writes are launched detached from the connection that produced them, so an
+	 * older public write could otherwise land after a private result or a terminal
+	 * failure had already deleted the row and resurrect a replayable entry.
+	 */
+	#queueCacheOperation(name: string, operation: () => Promise<void>): void {
+		const previous = this.#cacheOperations.get(name) ?? Promise.resolve();
+		const next = previous
+			.catch(() => {})
+			.then(operation)
+			.catch(error => {
+				logger.debug("MCP tool cache operation failed", { path: `mcp:${name}`, error });
+			})
+			.finally(() => {
+				if (this.#cacheOperations.get(name) === next) this.#cacheOperations.delete(name);
+			});
+		this.#cacheOperations.set(name, next);
+	}
+
 	#withdrawUnreachableDeferredTools(name: string): void {
 		const deferred = this.#tools.filter(tool => tool instanceof DeferredMCPTool && tool.mcpServerName === name);
 		if (deferred.length === 0) return;
 		this.#tools = this.#tools.filter(tool => !(tool instanceof DeferredMCPTool && tool.mcpServerName === name));
-		void this.toolCache?.delete(name).catch(error => {
-			logger.debug("MCP tool cache invalidation failed", { path: `mcp:${name}`, error });
-		});
+		const cache = this.toolCache;
+		if (cache) this.#queueCacheOperation(name, () => cache.delete(name));
 		logger.warn("Withdrew deferred MCP tools after the connection failed", {
 			path: `mcp:${name}`,
 			withdrawn: deferred.length,
@@ -1435,17 +1473,19 @@ export class MCPManager {
 		serverTools: MCPToolDefinition[],
 		credential: string | undefined,
 	): Promise<void> {
-		if (!this.toolCache) return;
+		const cache = this.toolCache;
+		if (!cache) return;
 		if (connection.toolsCacheScope === "private") {
 			// Suppressing the write is not enough: a catalog that used to be public
 			// left a row behind, and that row stays replayable until its TTL. Turning
 			// private must retract what the public phase published.
 			logger.debug("Dropped MCP tool cache entry after a private result", { path: `mcp:${name}` });
-			await this.toolCache.delete(name);
+			this.#queueCacheOperation(name, () => cache.delete(name));
 			return;
 		}
 		if (credential === undefined) return;
-		await this.toolCache.set(name, config, serverTools, credential, connection.toolsFreshUntil);
+		const freshUntil = connection.toolsFreshUntil;
+		this.#queueCacheOperation(name, () => cache.set(name, config, serverTools, credential, freshUntil));
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {

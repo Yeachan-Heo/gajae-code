@@ -34,9 +34,9 @@ Pass `--no-mcp` to skip conventional autoload for one session (plugin-bundle MCP
 
 Session start never blocks on a slow server: GJC waits a short, fixed budget for the batch and then continues. That budget elapsing is not a verdict on any server.
 
-`gjc mcp add <name> --timeout <ms>` declares how long *that server* may take to connect. A server still inside its declared window keeps connecting in the background under its own timeout and is reported as connecting, not failed; when it lands, its tools are registered in the session that started it. A server that declared no window, or has already spent it, is disconnected and reported as a startup timeout. Exact-file (`--mcp-config`) startup always fails fast instead, because it builds its catalog once.
+`gjc mcp add <name> --timeout <ms>` declares how long *that server* may take to connect. A server still inside its declared window keeps connecting in the background under its own timeout and is reported as connecting, not failed; when it lands, its tools are registered in the session that started it. A server that declared no window, or has already spent it, is disconnected and reported as a startup timeout. The one exception is a server with a cached catalog: it stays connecting behind its deferred tools whether or not it declared a window, which is the pre-existing behavior of that cache rather than something the declared timeout grants. Exact-file (`--mcp-config`) startup always fails fast instead, because it builds its catalog once.
 
-The declared timeout is the budget for connecting *and* for the server's initial `tools/list`, matching how the same value already bounds every other request to that server.
+The declared timeout is one budget for connecting *and* for the server's initial `tools/list`: a server that finishes its handshake and then stalls discovery is abandoned at the same deadline, and any deferred tools it had published are withdrawn.
 
 ### Deferred tools and the startup cache
 
