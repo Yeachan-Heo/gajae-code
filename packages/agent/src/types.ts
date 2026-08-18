@@ -186,6 +186,14 @@ export type ManagedAttemptOutcome =
 			type: "escaped_arguments_discarded";
 			/** The defective assistant turn; already removed from usable history by the loop. */
 			message: AssistantMessage;
+			/**
+			 * True when this discarded attempt had no transient steering instruction
+			 * attached yet. A managed retry continuation should carry the escaped
+			 * non-ASCII recovery instruction exactly once, so a deterministic
+			 * escaper has a reason to change its spelling; the instruction never
+			 * lands in durable history. Absent/false means steering already ran.
+			 */
+			steeringPending?: boolean;
 			scope?: AttemptScope;
 	  }
 	| { type: "context_overflow_discarded"; message: AssistantMessage; scope?: AttemptScope }
@@ -334,10 +342,17 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Invoked with the follow-up messages the loop dequeues for the next turn
 	 * (right after {@link getFollowUpMessages}). The consumer may use this to
-	 * attach per-turn state (e.g. a fresh owned-completion lineage) at actual
+	 * attach per-turn state (e.g., a fresh owned-completion lineage) at actual
 	 * resume admission rather than when the message was merely queued.
 	 */
 	onFollowUpConsumed?: (messages: AgentMessage[]) => void;
+	/**
+	 * One-shot transient recovery instruction attached to the first assistant
+	 * request of this loop invocation. Sent only to the provider (never committed
+	 * to durable agent message history) so a caller-owned retry of a discarded
+	 * attempt can name the defect it is retrying around.
+	 */
+	transientRecoveryMessage?: UserMessage;
 	/**
 	 * Supplies one bounded synthetic recovery instruction before the loop would
 	 * otherwise yield. Unlike a follow-up, it is sent only to the provider and

@@ -19,6 +19,7 @@ import {
 	type ThinkingBudgets,
 	type ToolChoice,
 	type ToolResultMessage,
+	type UserMessage,
 } from "@gajae-code/ai";
 import {
 	CURSOR_COMPOSER_BASH_POLICY_RECOVERY_PROMPT,
@@ -318,6 +319,8 @@ export interface AgentOptions {
 }
 
 export interface AgentPromptOptions {
+	/** One-shot transient recovery instruction sent only to the provider for the next assistant request; never committed to durable history. */
+	transientRecoveryMessage?: UserMessage;
 	toolChoice?: ToolChoice;
 	/** Disable transport replay; fallback accounting is owned by the caller. */
 	fallbackManaged?: boolean;
@@ -1838,6 +1841,7 @@ export class Agent {
 						return (await this.#maintainContext?.(context, lifecycle)) ?? "not-needed";
 					}
 				: undefined,
+			transientRecoveryMessage: options?.transientRecoveryMessage,
 			telemetry: this.#telemetry,
 		};
 

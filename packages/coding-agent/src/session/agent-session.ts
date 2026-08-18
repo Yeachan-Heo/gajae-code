@@ -48,7 +48,7 @@ import {
 	type StablePrefixSnapshot,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
-import { normalizeMessagesForProvider } from "@gajae-code/agent-core/agent-loop";
+import { ESCAPED_NONASCII_RECOVERY_PROMPT, normalizeMessagesForProvider } from "@gajae-code/agent-core/agent-loop";
 import type { AttemptRunHandle, AttemptScope, AttemptScopeAuthority } from "@gajae-code/agent-core/attempt-scope";
 import {
 	AUTO_HANDOFF_THRESHOLD_FOCUS,
@@ -104,6 +104,7 @@ import type {
 	TransportFailureFacts,
 	Usage,
 	UsageReport,
+	UserMessage,
 } from "@gajae-code/ai/core";
 import {
 	classifyContextOverflow,
@@ -1914,6 +1915,15 @@ export interface DefaultFallbackRuntimeState {
 const AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS = 100;
 const AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS = 5_000;
 const AGENT_CONTINUE_BUSY_MAX_RESCHEDULES = 50;
+/**
+ * Maximum un-charged managed-fallback retries for escaped-non-ASCII tool-call
+ * turns within one logical run. Each retry is a fresh loop with its own
+ * in-loop resample budget, so without this cap a deterministic escaper loops
+ * forever: the fallback chain never sees a charge to exhaust on. Matching the
+ * agent loop's own per-loop budget (MAX_ESCAPED_NONASCII_RESAMPLES + 1 wire
+ * attempts) keeps one steering retry plus one blind retry before the run ends.
+ */
+const MAX_ESCAPED_NONASCII_MANAGED_RETRIES = 2;
 
 function agentContinueBusyRescheduleDelayMs(attempt: number): number {
 	const exponential = AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1);
@@ -2221,6 +2231,8 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#defaultFallbackController: FallbackChainController | undefined;
+	/** Managed escaped-non-ASCII retries issued for the current logical run. Bounded so a deterministic escaper cannot loop forever through un-charged fallback retries. */
+	#escapedNonAsciiManagedRetries = 0;
 	#overflowMaintenanceAttempts = 0;
 	#defaultFallbackExhaustedLastTurn = false;
 	#fallbackInvocationId = 0;
@@ -17727,6 +17739,15 @@ export class AgentSession {
 		return undefined;
 	}
 
+	#escapedNonAsciiRecoveryMessage(): UserMessage {
+		return {
+			role: "user",
+			content: ESCAPED_NONASCII_RECOVERY_PROMPT,
+			synthetic: true,
+			timestamp: Date.now(),
+		};
+	}
+
 	#managedFallbackPromptOptions(): {
 		fallbackManaged?: boolean;
 		nextFallbackAttempt?: (model: Model) => FallbackAttemptToken;
@@ -17752,6 +17773,9 @@ export class AgentSession {
 	}
 
 	async #resetDefaultFallbackForNewTurn(): Promise<void> {
+		// A fresh user turn gets a fresh escaped-non-ASCII retry budget: the
+		// defect is per-turn wire luck, not a sticky model property.
+		this.#escapedNonAsciiManagedRetries = 0;
 		const controller = this.#defaultFallbackChain();
 		if (this.#defaultFallbackExhaustedLastTurn) {
 			this.#defaultFallbackExhaustedLastTurn = false;
@@ -17840,15 +17864,35 @@ export class AgentSession {
 			// evidence: never charge the attempt, advance the chain, or suppress the
 			// selector. The loop already removed the defective turn from history and
 			// bounded its own resample budget, so this decision just re-issues the
-			// same request on the same model. Once the loop declines (budget spent),
-			// it falls through to the terminal per-call rejection, so the retry here
-			// is a continuation of the same logical run rather than a new prompt.
+			// same request on the same model. The re-issue carries the transient
+			// steering instruction exactly once (when the discarded attempt did not
+			// already have one), so a deterministic escaper has a reason to change
+			// its spelling; the instruction never lands in durable history.
+			//
+			// The retries are un-charged by design, so a deterministic escaper
+			// would otherwise loop forever: each continuation is a fresh loop with
+			// a fresh in-loop resample budget, and the fallback chain never sees a
+			// charge to exhaust on. Bound them per logical run and fail closed to
+			// the terminal exhaustion message once the budget is spent — the same
+			// fail-closed answer the unmanaged path gives via the per-call
+			// rejection. New user turns reset the budget in #resetDefaultFallbackForNewTurn.
+			this.#escapedNonAsciiManagedRetries += 1;
+			if (this.#escapedNonAsciiManagedRetries > MAX_ESCAPED_NONASCII_MANAGED_RETRIES) {
+				return this.#managedFallbackExhaustionDecision(
+					outcome.message,
+					`Managed fallback retried the escaped non-ASCII tool-call turn ${MAX_ESCAPED_NONASCII_MANAGED_RETRIES} times without a literal-UTF-8 re-issue; giving up so the run fails closed instead of looping.`,
+				);
+			}
 			this.#defaultFallbackChain().discardStartedAttempt();
+			const steering = outcome.steeringPending === true;
 			return {
 				type: "retry",
 				continuation: async ownership => {
 					if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
-					await this.agent.continue(this.#managedFallbackPromptOptions());
+					await this.agent.continue({
+						...this.#managedFallbackPromptOptions(),
+						...(steering ? { transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage() } : {}),
+					});
 				},
 			};
 		}

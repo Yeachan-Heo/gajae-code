@@ -188,6 +188,8 @@ const MAX_CONSECUTIVE_MALFORMED_TURNS = 5;
  * budget recovers the overwhelming majority of turns; past it the terminal
  * per-call rejection takes over rather than spending the run on retries.
  */
+export const ESCAPED_NONASCII_RECOVERY_PROMPT = escapedNonAsciiRecoveryPrompt;
+
 const MAX_ESCAPED_NONASCII_RESAMPLES = 2;
 
 /** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
@@ -2028,7 +2030,9 @@ async function runLoopBody(
 				inserted: boolean;
 				syntheticMessage?: UserMessage;
 		  }
-		| undefined;
+		| undefined = config.transientRecoveryMessage
+		? { kind: "escaped-nonascii", inserted: true, syntheticMessage: config.transientRecoveryMessage }
+		: undefined;
 	let malformedToolRecoveryAttempted = false;
 	let composerBashPolicyRecoveryAttempted = false;
 	// Deterministic terminal circuit breaker for argument-validation loops.
@@ -2395,7 +2399,10 @@ async function runLoopBody(
 				// outcome below; the policy owns the same-model bounded retry and
 				// only falls back once it declines. The wire defect is not provider
 				// evidence, so the outcome deliberately carries no transport facts
-				// and the fallback chain never advances on it.
+				// and the fallback chain never advances on it. The outcome names
+				// whether a steering instruction already rode this attempt, so the
+				// policy's retry continuation can carry it exactly once instead of
+				// blindly re-requesting the same defective spelling.
 				if (config.fallbackManaged) {
 					transaction?.discard();
 					currentContext.messages.splice(contextMessageCount);
@@ -2403,6 +2410,7 @@ async function runLoopBody(
 					await config.onManagedAttemptOutcome?.({
 						type: "escaped_arguments_discarded",
 						message,
+						steeringPending: recoveryAttempt?.kind !== "escaped-nonascii",
 						scope: transaction?.scope,
 					});
 					stream.end(newMessages);
@@ -2410,11 +2418,9 @@ async function runLoopBody(
 				}
 				// Steer the in-loop retry: name the defect in a transient synthetic
 				// message so a deterministic escaper has a reason to change its
-				// spelling. Managed runs return above — their retry is a fresh
-				// invocation owned by session policy, so the steering applies only to
-				// the unmanaged same-loop resample. Never displace a different pending
-				// recovery (e.g. the one-shot malformed-tool-call turn): its mode and
-				// one-shot accounting must survive an escaped resample inside it.
+				// spelling. Never displace a different pending recovery (e.g. the
+				// one-shot malformed-tool-call turn): its mode and one-shot
+				// accounting must survive an escaped resample inside it.
 				if (!pendingRecovery || pendingRecovery.kind === "escaped-nonascii") {
 					pendingRecovery = { kind: "escaped-nonascii", inserted: false };
 				}
