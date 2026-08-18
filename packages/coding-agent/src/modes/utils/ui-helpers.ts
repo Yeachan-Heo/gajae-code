@@ -691,6 +691,8 @@ export class UiHelpers {
 					this.ctx.hideThinkingBlock,
 					() => this.ctx.ui.requestRender(),
 					this.assistantViewportAnchorId(message),
+					undefined,
+					this.ctx.session,
 				);
 				addChatChild(this.ctx, assistantComponent);
 				break;

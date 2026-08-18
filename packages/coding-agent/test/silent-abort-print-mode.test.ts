@@ -236,6 +236,53 @@ describe("Print mode", () => {
 		expect(process.exitCode).toBe(1);
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
+	it("prints the safety-stop hint after the raw refusal for provider safety stops (#4650)", async () => {
+		const { runPrintMode } = await import("../src/modes/print-mode");
+		const stderrOutput: string[] = [];
+		installImmediateStderrMock(stderrOutput);
+		installImmediateStdoutMock();
+
+		await runPrintMode(
+			createMockSession([
+				makeAssistantMessage({
+					stopReason: "error",
+					errorKind: "provider_safety_stop",
+					errorMessage: "Refusal (no details provided)",
+					content: [],
+				}),
+			]),
+			{ mode: "text" },
+		);
+
+		const stderr = stderrOutput.join("");
+		expect(stderr).toContain("Refusal (no details provided)");
+		expect(stderr.indexOf("Refusal (no details provided)")).toBeLessThan(stderr.indexOf("Provider safety stop"));
+		expect(stderr).toContain("manual model switch");
+		expect(process.exitCode).toBe(1);
+	});
+
+	it("prints no safety-stop hint for unrelated terminal errors", async () => {
+		const { runPrintMode } = await import("../src/modes/print-mode");
+		const stderrOutput: string[] = [];
+		installImmediateStderrMock(stderrOutput);
+		installImmediateStdoutMock();
+
+		await runPrintMode(
+			createMockSession([
+				makeAssistantMessage({
+					stopReason: "error",
+					errorKind: undefined,
+					errorMessage: "429 rate limit exceeded",
+					content: [],
+				}),
+			]),
+			{ mode: "text" },
+		);
+
+		const stderr = stderrOutput.join("");
+		expect(stderr).toContain("429 rate limit exceeded");
+		expect(stderr).not.toContain("Provider safety stop");
+	});
 
 	it("leaves terminal status unchanged when the caller suppresses print-mode status handling", async () => {
 		const { runPrintMode } = await import("../src/modes/print-mode");

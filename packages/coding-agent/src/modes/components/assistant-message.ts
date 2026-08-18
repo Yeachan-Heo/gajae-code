@@ -16,6 +16,11 @@ import { settings } from "../../config/settings";
 import { renderDeepInterviewAssistantText } from "../../deep-interview/render-middleware";
 import { getMarkdownTheme, theme } from "../../modes/theme/theme";
 import { isSilentAbort } from "../../session/messages";
+import {
+	isProviderSafetyStop,
+	type ProviderSafetyStopHintSession,
+	resolveProviderSafetyStopHint,
+} from "../../session/provider-safety-stop-hint";
 import { resolveImageOptions } from "../../tools/render-utils";
 
 const THINKING_REPETITION_ELIDE_MIN_RUN = 24;
@@ -107,6 +112,7 @@ export class AssistantMessageComponent extends Container {
 		private readonly onImageUpdate?: () => void,
 		viewportAnchorId?: string,
 		private readonly onVisibleMutation?: () => void,
+		private readonly hintSession?: ProviderSafetyStopHintSession,
 	) {
 		super();
 		this.#viewportAnchorId = viewportAnchorId;
@@ -153,6 +159,9 @@ export class AssistantMessageComponent extends Container {
 			message.stopReason !== "error"
 		) {
 			content.push(`message-error:${message.errorMessage}`);
+		}
+		if (message && !hasToolCalls && isProviderSafetyStop(message)) {
+			content.push(`safety-hint:${resolveProviderSafetyStopHint(message, this.hintSession) ?? ""}`);
 		}
 		if (settings.get("display.showTokenUsage") && this.#usageInfo) {
 			const usage = this.#usageInfo;
@@ -536,6 +545,21 @@ export class AssistantMessageComponent extends Container {
 							() => new Text(theme.fg("error", `Error: ${errorMsg}`), 1, 0),
 						),
 					});
+					// Provider safety stops stay terminal (no retry, no second
+					// dispatch); append bounded, presentation-only guidance after
+					// the raw provider refusal (#4650). Never replaces the refusal.
+					const safetyStopHint = isProviderSafetyStop(message)
+						? resolveProviderSafetyStopHint(message, this.hintSession)
+						: undefined;
+					if (safetyStopHint) {
+						descriptors.push({
+							key: `error:safety-hint:${safetyStopHint}`,
+							component: this.#cachedChild(
+								`error:safety-hint:${safetyStopHint}`,
+								() => new Text(theme.fg("dim", safetyStopHint), 1, 0),
+							),
+						});
+					}
 				}
 			}
 			if (

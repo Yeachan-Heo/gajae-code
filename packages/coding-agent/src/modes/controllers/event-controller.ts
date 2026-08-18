@@ -460,6 +460,7 @@ export class EventController {
 				() => this.ctx.ui.requestRender(),
 				this.ctx.getAssistantViewportAnchorId?.(event.message),
 				() => this.#observeVisibleTranscriptMutation(),
+				this.ctx.session,
 			);
 			this.ctx.streamingMessage = event.message;
 			addChatChild(this.ctx, this.ctx.streamingComponent);

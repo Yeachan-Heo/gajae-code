@@ -10,6 +10,7 @@ import { isKnownSinkPeerClosedError, logger, sanitizeText } from "@gajae-code/ut
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { AgentSession } from "../session/agent-session";
 import { isSilentAbort } from "../session/messages";
+import { resolveProviderSafetyStopHint } from "../session/provider-safety-stop-hint";
 import { executeLocalHeadlessBuiltinSlashCommand } from "../slash-commands/builtin-registry";
 import { initializeExtensions } from "./runtime-init";
 
@@ -297,6 +298,10 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 
 					if (!options.suppressProcessExit) process.exitCode = exitCode;
 					await writeStderrAndQuiesce(`${errorLine}\n`);
+					if (!isOverflow) {
+						const safetyStopHint = resolveProviderSafetyStopHint(assistantMsg, session);
+						if (safetyStopHint) await writeStderrAndQuiesce(`${sanitizeText(safetyStopHint)}\n`);
+					}
 					printContent = false;
 				}
 
