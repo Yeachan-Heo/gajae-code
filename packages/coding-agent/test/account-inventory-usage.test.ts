@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
 import type {
 	ApiKeyCredentialCheckResult,
 	AuthStorage,
@@ -11,8 +11,9 @@ import {
 	type AccountInventoryRow,
 	buildAccountInventorySnapshot,
 	checkAccountInventory,
-	type EnvApiKeyResolver,
 } from "../src/session/account-inventory";
+
+const REAL_AI_CORE = { ...(await import("@gajae-code/ai/core")) };
 
 const NOW = 1_700_000_000_000;
 const BASE_URL = "https://chatgpt.com/backend-api";
@@ -92,19 +93,30 @@ const GROQ_ENV_KEY = "test-groq-row-token";
 
 /**
  * Deterministic synthetic env-row coverage (reviews 4958546910, 4960174075,
- * 4961320650, and the per-invocation injection round). The env-key resolver is
- * passed per snapshot/check invocation, so no test reads the inherited
- * credential snapshot, agent/user `.env` files, or shell startup files, no test
- * mutates process.env, and no module-global state can leak between concurrent
- * tests. The production default remains the live getEnvApiKey.
+ * 4961320650, 4963222404, 4964349179). The suite mocks only getEnvApiKey at
+ * the @gajae-code/ai/core boundary — the resolution boundary review 4958546910
+ * named as the sanctioned seam — with a fixed synthetic map, so no test reads
+ * the inherited credential snapshot, agent/user `.env` files, or shell startup
+ * files, and no test mutates process.env or ships any production resolver
+ * override. The mock is restored after every test.
  */
 const envKeys = new Map<string, string>([
 	["openai-codex", CODEX_ENV_KEY],
 	["groq", GROQ_ENV_KEY],
 ]);
 
-/** Default per-invocation resolver used by every test below. */
-const envApiKeyResolver: EnvApiKeyResolver = provider => envKeys.get(provider);
+afterEach(() => {
+	mock.module("@gajae-code/ai/core", () => REAL_AI_CORE);
+	mock.restore();
+});
+
+/** Install the fixed synthetic env-key map on the ai/core resolution boundary. */
+function mockEnvKeys(map: Map<string, string> = envKeys): void {
+	mock.module("@gajae-code/ai/core", () => ({
+		...REAL_AI_CORE,
+		getEnvApiKey: (provider: string) => map.get(provider),
+	}));
+}
 
 /**
  * Assert that no row payload serializes the fixture's synthetic key. The
@@ -124,6 +136,7 @@ const modelRegistry = {
 
 describe("account inventory usage", () => {
 	it("uses the provider base URL to retrieve cached usage for a stored credential", () => {
+		mockEnvKeys();
 		let receivedBaseUrl: string | undefined;
 		const cached: CachedUsageReport = {
 			report: usageReport(),
@@ -139,7 +152,7 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshot = buildAccountInventorySnapshot({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
+		const snapshot = buildAccountInventorySnapshot({ authStorage, modelRegistry, nowMs: NOW });
 		const stored = storedRow(snapshot);
 
 		expect(receivedBaseUrl).toBe(BASE_URL);
@@ -147,6 +160,7 @@ describe("account inventory usage", () => {
 	});
 
 	it("attaches a fresh check report directly when the persistent cache cannot be read back", async () => {
+		mockEnvKeys();
 		const result: CredentialHealthResult = {
 			id: 1,
 			provider: "openai-codex",
@@ -159,7 +173,7 @@ describe("account inventory usage", () => {
 			getCachedUsageReport: () => undefined,
 		});
 
-		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
+		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
 		const stored = storedRow(snapshot);
 
 		expect(stored?.health.status).toBe("ok");
@@ -168,11 +182,11 @@ describe("account inventory usage", () => {
 	});
 
 	it("adds a synthetic env row for a provider whose mapped environment variable resolves", () => {
+		mockEnvKeys();
 		const snapshot = buildAccountInventorySnapshot({
 			authStorage: makeAuthStorage(),
 			modelRegistry,
 			nowMs: NOW,
-			envApiKeyResolver,
 		});
 		const stored = storedRow(snapshot);
 		const env = envRow(snapshot);
@@ -196,14 +210,14 @@ describe("account inventory usage", () => {
 	});
 
 	it("pins the stored OAuth credential when no environment key resolves", () => {
-		// canPinStoredOAuth must stay true when the resolver returns undefined for
-		// every provider: a regression that permanently disables pinning would
-		// otherwise pass the env-present tests above.
+		mockEnvKeys(new Map());
+		// canPinStoredOAuth must stay true when no provider env key resolves: a
+		// regression that permanently disables pinning would otherwise pass the
+		// env-present tests above.
 		const snapshot = buildAccountInventorySnapshot({
 			authStorage: makeAuthStorage(),
 			modelRegistry,
 			nowMs: NOW,
-			envApiKeyResolver: () => undefined,
 		});
 		const stored = storedRow(snapshot);
 
@@ -218,11 +232,11 @@ describe("account inventory usage", () => {
 		// Exercises the JSON-escaped comparison path with a key whose serialized
 		// form differs from its raw form; failure output stays boolean-only.
 		const quotedKey = 'test-"quoted\\key';
+		mockEnvKeys(new Map([["openai-codex", quotedKey]]));
 		const snapshot = buildAccountInventorySnapshot({
 			authStorage: makeAuthStorage(),
 			modelRegistry,
 			nowMs: NOW,
-			envApiKeyResolver: provider => (provider === "openai-codex" ? quotedKey : undefined),
 		});
 
 		expect(envRow(snapshot)).toBeDefined();
@@ -230,11 +244,11 @@ describe("account inventory usage", () => {
 	});
 
 	it("discovers an environment-only provider absent from stored inventory and the model registry", () => {
+		mockEnvKeys();
 		const snapshot = buildAccountInventorySnapshot({
 			authStorage: makeAuthStorage(),
 			modelRegistry,
 			nowMs: NOW,
-			envApiKeyResolver,
 		});
 		const groq = snapshot.rows.find(row => row.source === "env" && row.provider === "groq");
 
@@ -248,6 +262,7 @@ describe("account inventory usage", () => {
 	});
 
 	it("probes the synthetic env row through checkApiKeyCredential and records the source health", async () => {
+		mockEnvKeys();
 		const probed: Array<{ provider: string; keyMatches: boolean; baseUrl?: string }> = [];
 		const recorded: Array<{ provider: string; source: string; health: CachedCredentialHealth }> = [];
 		const authStorage = makeAuthStorage({
@@ -265,11 +280,11 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
+		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
 		const env = envRow(snapshot);
 		const stored = storedRow(snapshot);
 
-		// The injected resolver supplies exactly the synthetic fixture key; only a
+		// The mocked resolver supplies exactly the synthetic fixture key; only a
 		// non-secret boolean match is recorded, so no key material can appear in
 		// matcher data or failure diagnostics, and a wrong-key or duplicate call
 		// fails the count/match assertions.
@@ -297,6 +312,7 @@ describe("account inventory usage", () => {
 	});
 
 	it("marks a failed API-key probe as failed health and records the sanitized reason", async () => {
+		mockEnvKeys();
 		const recorded: Array<{ provider: string; source: string; health: CachedCredentialHealth }> = [];
 		const authStorage = makeAuthStorage({
 			getEffectiveCredentialType: () => "api_key",
@@ -313,7 +329,7 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
+		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
 		const env = envRow(snapshot);
 
 		const sanitizedReason = "probe rejected api_key=[redacted] (token=[redacted]";
@@ -337,22 +353,24 @@ describe("account inventory usage", () => {
 	});
 
 	it("marks an env row unverifiable when its key becomes unresolvable at check time", async () => {
-		// The env row is built while the per-invocation resolver resolves the
-		// fixture key, then the resolver stops resolving it before the checker's
-		// synthetic-row loop runs. This reaches the production key-undefined
-		// fallback for an existing env row — the exact branch a stale-credential
-		// regression would break — without deleting any environment variable and
-		// without depending on host credential files.
+		// The env row is built while the mocked resolver resolves the fixture key,
+		// then the mock stops resolving before the checker's synthetic-row loop
+		// runs. This reaches the production key-undefined fallback for an existing
+		// env row — the exact branch a stale-credential regression would break —
+		// without deleting any environment variable and without depending on host
+		// credential files.
 		let resolveKey = true;
-		const flipResolver: EnvApiKeyResolver = provider => (resolveKey ? envKeys.get(provider) : undefined);
-		const probed: Array<{ provider: string; source: string }> = [];
+		mock.module("@gajae-code/ai/core", () => ({
+			...REAL_AI_CORE,
+			getEnvApiKey: (provider: string) => (resolveKey ? envKeys.get(provider) : undefined),
+		}));
+
+		const probed: Array<{ provider: string }> = [];
 		const recorded: Array<{ provider: string; source: string; health: CachedCredentialHealth }> = [];
 		const authStorage = makeAuthStorage({
 			getEffectiveCredentialType: () => "api_key",
-			checkApiKeyCredential: async (provider: string, _key: string): Promise<ApiKeyCredentialCheckResult> => {
-				// checkApiKeyCredential is only invoked from the synthetic-row loop;
-				// every call in this fixture is an env-source call for this provider.
-				probed.push({ provider, source: "env" });
+			checkApiKeyCredential: async (provider: string): Promise<ApiKeyCredentialCheckResult> => {
+				probed.push({ provider });
 				return { provider, type: "api_key", ok: null, reason: "stub" };
 			},
 			recordCredentialHealthForSource: (provider, source, health) => {
@@ -360,12 +378,7 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshotPromise = checkAccountInventory({
-			authStorage,
-			modelRegistry,
-			nowMs: NOW,
-			envApiKeyResolver: flipResolver,
-		});
+		const snapshotPromise = checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
 		// The checker resolves env keys synchronously inside its synthetic-row
 		// loop after building the snapshot; flip before awaiting so the env row
 		// exists but its key no longer resolves.
@@ -393,20 +406,18 @@ describe("account inventory usage", () => {
 	});
 
 	it("marks a synthetic runtime row unverifiable when its key source resolves nothing", async () => {
+		mockEnvKeys();
 		// A runtime-source row exists purely through the hasRuntimeApiKey stub, so
 		// this case never consults env resolution. peekApiKey returning undefined
 		// drives the "API-key source is unavailable" fallback for the runtime row.
-		const probed: Array<{ provider: string; source: string }> = [];
+		const probed: Array<{ provider: string }> = [];
 		const recorded: Array<{ provider: string; source: string; health: CachedCredentialHealth }> = [];
 		const authStorage = makeAuthStorage({
 			hasRuntimeApiKey: provider => provider === "openai-codex",
 			getEffectiveCredentialType: () => "api_key",
 			peekApiKey: async () => undefined,
 			checkApiKeyCredential: async (provider: string): Promise<ApiKeyCredentialCheckResult> => {
-				// checkApiKeyCredential is never reached for the runtime row here;
-				// any call would be an env-row probe for this provider, which must
-				// not happen while the env key resolves.
-				probed.push({ provider, source: "env" });
+				probed.push({ provider });
 				return { provider, type: "api_key", ok: null, reason: "stub" };
 			},
 			recordCredentialHealthForSource: (provider, source, health) => {
@@ -414,18 +425,17 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
+		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
 		const runtime = runtimeRow(snapshot);
 
 		expect(runtime).toBeDefined();
 		expect(runtime?.routing).toEqual({ active: false, selected: true, marker: "selected" });
 		// The runtime row produced no probe (its peekApiKey resolved nothing); the
-		// env row for this provider is the only other synthetic row and its probe
-		// is permitted, so assert on the recorded source-health contract instead:
-		// exactly one runtime record with the unavailable fallback.
-		expect(
-			probed.filter(entry => entry.provider === "openai-codex" && entry.source === "env").length,
-		).toBeLessThanOrEqual(1);
+		// env row for this provider is the only other synthetic row and its single
+		// probe is permitted. The production contract asserted below is the
+		// recorded source health: exactly one runtime record with the unavailable
+		// fallback reason.
+		expect(probed.filter(entry => entry.provider === "openai-codex").length).toBeLessThanOrEqual(1);
 		expect(runtime?.health.status).toBe("unverifiable");
 		expect(runtime?.health.reason).toBe("API-key source is unavailable");
 		expect(recorded.filter(entry => entry.provider === "openai-codex" && entry.source === "runtime")).toEqual([
