@@ -295,6 +295,8 @@ jobs:
       needs: [main_plan, main_native]
       runs-on: ubuntu-22.04
       timeout-minutes: 15
+      env:
+         CI_FORCE_FULL: "1"
       steps:
          - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
          - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4

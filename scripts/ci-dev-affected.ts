@@ -84,6 +84,8 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
 };
+const ACP_LIFECYCLE_SOURCE_PREFIX = "packages/coding-agent/src/modes/acp/";
+const ACP_LIFECYCLE_SMOKE_TEST = "packages/coding-agent/test/acp/acp-lifecycle-smoke.test.ts";
 
 export interface PackageManifest {
 	name?: string;
@@ -1137,7 +1139,10 @@ function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage
 // are additive because an entrypoint's package-level check and smoke coverage
 // remain necessary even when it owns a dedicated contract test.
 function behavioralTestsFor(changedPath: string): readonly string[] {
-	return BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
+	const direct = BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
+	return changedPath.startsWith(ACP_LIFECYCLE_SOURCE_PREFIX)
+		? [...direct, ACP_LIFECYCLE_SMOKE_TEST]
+		: direct;
 }
 
 function isCodingAgentShardOneCoveragePath(changedPath: string): boolean {

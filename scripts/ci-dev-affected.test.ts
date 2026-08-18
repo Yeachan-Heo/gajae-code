@@ -1941,10 +1941,23 @@ describe("dedicated-only tests — routing contract", () => {
 
 	test("Main CI invokes the dedicated task through the planner, not a duplicated ignore list", async () => {
 		const workflow = await Bun.file(".github/workflows/ci.yml").text();
-		expect(workflow).toContain("bun scripts/ci-dev-affected.ts --task=acp-lifecycle-smoke");
+		const jobStart = workflow.indexOf("   acp_lifecycle_smoke:");
+		const jobEnd = workflow.indexOf("\n   # Branch protection", jobStart);
+		const job = workflow.slice(jobStart, jobEnd);
+		expect(job).toContain('CI_FORCE_FULL: "1"');
+		expect(job).toContain("bun scripts/ci-dev-affected.ts --task=acp-lifecycle-smoke");
 		// The workflow must not restate the override patterns itself; that would
 		// fork the contract away from BUN_TEST_IGNORE_OVERRIDES.
-		expect(workflow).not.toContain('--path-ignore-patterns="**/node_modules/**"');
+		expect(job).not.toContain('--path-ignore-patterns="**/node_modules/**"');
+	});
+
+	test("ACP implementation changes schedule the lifecycle smoke through its behavioral owner", () => {
+		const tasks = planTargetedTasks(
+			["packages/coding-agent/src/modes/acp/acp-agent.ts"],
+			packages,
+			["packages/coding-agent/test/acp/acp-agent.test.ts", ACP_LIFECYCLE],
+		);
+		expect(tasks.find(task => task.key === DEDICATED_TASK_KEY)?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
 	});
 
 	test("dedicated-only tests never run through fresh-process shard inventory", async () => {

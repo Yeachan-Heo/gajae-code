@@ -95,6 +95,9 @@ server = Bun.serve({
 				.map(message => textOf(message.content))
 				.find(text => text.length > 0) ?? "";
 		const hasToolResult = messages.some(message => message.role === "tool");
+		const hasForkSourceState = messages.some(
+			message => message.role === "user" && textOf(message.content).includes("lifecycle-fork-source-state"),
+		);
 		const isRead = /^\s*read\b/m.test(prompt);
 		const isWrite = /^\s*write\b/m.test(prompt);
 		const isLateTool = prompt.includes("late-tool 40 follow-up");
@@ -155,7 +158,11 @@ server = Bun.serve({
 			.map(message => textOf(message.content))
 			.join("\n");
 		const toolDenied = /rejected by user|permission denied|not permitted/i.test(toolText);
-		const reply = toolDenied
+		const reply = prompt.includes("fork transcript probe")
+			? hasForkSourceState
+				? "fork-state-preserved"
+				: "fork-state-missing"
+			: toolDenied
 			? `permission denied: ${toolText.slice(0, 200)}`
 			: isRead
 				? `read README.md: ${toolText.trim().slice(0, 200)}`
@@ -202,7 +209,16 @@ child = Bun.spawn(
 	],
 	{
 		cwd: root,
-		env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_DIR: agentDir },
+		env: {
+			PATH: process.env.PATH ?? "",
+			HOME: path.join(agentDir, "home"),
+			XDG_CONFIG_HOME: path.join(agentDir, "config"),
+			XDG_CACHE_HOME: path.join(agentDir, "cache"),
+			XDG_STATE_HOME: path.join(agentDir, "state"),
+			TMPDIR: agentDir,
+			GJC_CODING_AGENT_DIR: agentDir,
+			PI_CODING_AGENT_DIR: agentDir,
+		},
 		stdin: "inherit",
 		stdout: "inherit",
 		stderr: "inherit",
