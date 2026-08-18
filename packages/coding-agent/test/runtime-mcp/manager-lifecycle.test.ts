@@ -208,8 +208,10 @@ setInterval(() => {}, 1000);
 
 	// The same slow gateway must NOT be able to hang an ordinary consumer for
 	// ~30s: without an ACP budget the short default ceiling applies and startup
-	// gives up quickly instead of waiting out the configured `timeout`.
-	test("does not grant the long startup window to a non-ACP consumer", async () => {
+	// stops waiting instead of blocking out the configured `timeout`. It stops
+	// *waiting* only — the declared window is the operator's, so the connection
+	// keeps running and lands in the background.
+	test("does not block a non-ACP consumer for the configured window", async () => {
 		const manager = new MCPManager(process.cwd());
 		const delayedServer = `
 const readline = require('node:readline');
@@ -240,11 +242,15 @@ setInterval(() => {}, 1000);
 				{},
 			);
 
-			// Startup gave up at the short default ceiling rather than waiting for
+			// Startup returned at the short default ceiling rather than waiting for
 			// the 2.2s handshake behind a 5s configured timeout.
 			expect(result.connectedServers).toEqual([]);
-			expect(result.errors.get("slow-gateway")).toContain("timed out");
 			expect(Date.now() - startedAt).toBeLessThan(2_200);
+			// The 5s window the operator declared has not elapsed, so the gateway is
+			// still connecting rather than reported as a startup failure.
+			expect(result.errors.has("slow-gateway")).toBe(false);
+			expect(manager.getConnectionStatus("slow-gateway")).toBe("connecting");
+			await waitFor(() => manager.getConnectedServers().includes("slow-gateway"));
 		} finally {
 			await manager.disconnectAll();
 		}

@@ -108,7 +108,7 @@ describe("MCP lifecycle cleanup", () => {
 		expect(manager.getConnection("slow")).toBeUndefined();
 	});
 
-	it("connectServers fails fast when an uncached MCP startup ignores abort", async () => {
+	it("connectServers returns fast without tearing down a server still inside its declared window", async () => {
 		let capturedSignal: AbortSignal | undefined;
 		mock.module("../src/runtime-mcp/client", () => ({
 			...mcpClient,
@@ -124,6 +124,40 @@ describe("MCP lifecycle cleanup", () => {
 		const startedAt = Date.now();
 		const result = await manager.connectServers(
 			{ stuck: { type: "stdio", command: "stuck", timeout: 10_000 } },
+			{ stuck: { provider: "test", providerName: "Test", path: "test", level: "project" } },
+		);
+
+		// Session start is never held hostage by a slow server...
+		expect(Date.now() - startedAt).toBeLessThan(2_000);
+		expect(result.tools).toHaveLength(0);
+		// ...but the declared 10s window is the operator's, so the connection is
+		// left running rather than killed and mislabelled as a startup timeout.
+		expect(capturedSignal?.aborted).toBe(false);
+		expect(result.errors.get("stuck")).toBeUndefined();
+		expect(manager.getConnectionStatus("stuck")).toBe("connecting");
+
+		// Shutdown still reclaims it: nothing is leaked by staying pending.
+		await manager.disconnectAll();
+		expect(capturedSignal?.aborted).toBe(true);
+		expect(manager.getConnectionStatus("stuck")).toBe("disconnected");
+	});
+
+	it("connectServers still fails fast for a server that declared no connection window", async () => {
+		let capturedSignal: AbortSignal | undefined;
+		mock.module("../src/runtime-mcp/client", () => ({
+			...mcpClient,
+			connectToServer: (_name: string, _config: MCPServerConfig, options?: { signal?: AbortSignal }) => {
+				capturedSignal = options?.signal;
+				return new Promise<MCPServerConnection>(() => {});
+			},
+			listTools: async () => [],
+		}));
+		const { MCPManager: MockedManager } = await import("../src/runtime-mcp/manager");
+		const manager = new MockedManager(process.cwd());
+
+		const startedAt = Date.now();
+		const result = await manager.connectServers(
+			{ stuck: { type: "stdio", command: "stuck" } },
 			{ stuck: { provider: "test", providerName: "Test", path: "test", level: "project" } },
 		);
 

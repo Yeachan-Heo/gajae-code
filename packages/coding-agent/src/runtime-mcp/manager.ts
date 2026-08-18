@@ -134,6 +134,21 @@ export function resolveExactConfigStartupTimeoutMs(configs: MCPServerConfig[]): 
 	return Math.max(...effectiveTimeouts) + STARTUP_TIMEOUT_GRACE_MS;
 }
 
+/**
+ * Whether `config` declared a connection window that is still open `elapsedMs`
+ * into startup.
+ *
+ * The startup wait bounds how long session start blocks; a declared `timeout`
+ * bounds how long the server itself may take to come up (`connectToServer`
+ * enforces it). Those are different budgets: the wait elapsing says nothing
+ * about whether the operator's declared window has been spent.
+ */
+export function withinDeclaredConnectionWindow(config: MCPServerConfig, elapsedMs: number): boolean {
+	const timeout = config.timeout;
+	if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) return false;
+	return elapsedMs < timeout;
+}
+
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
 	const tracked: TrackedPromise<T> = { promise, status: "pending" };
 	promise.then(
@@ -1155,6 +1170,7 @@ export class MCPManager {
 					});
 				}
 			}
+			const startupStartedAt = Date.now();
 			const startupOutcome = await Promise.race([
 				Promise.allSettled(connectionTasks.map(task => task.tracked.promise)).then(() => undefined),
 				delay(startupTimeoutMs).then(() => undefined),
@@ -1190,7 +1206,24 @@ export class MCPManager {
 
 				const pendingWithoutCache = pendingTasks.filter(task => !cachedTools.has(task.name));
 				if (pendingWithoutCache.length > 0) {
+					// The startup wait elapsing means "stop blocking session start", not
+					// "this server failed". A server whose operator declared a `timeout`
+					// (`gjc mcp add --timeout`) asked to wait that long for it, so while it
+					// is still inside that window it keeps connecting in the background
+					// under `connectToServer`'s own timeout, and the background tool load
+					// adopts it. Only a server that declared no window, or already spent it,
+					// is torn down and reported. Exact-config (`toolsOnly`) startup still
+					// fails fast: it builds a catalog once, so a missing server is an error.
+					const startupElapsedMs = Date.now() - startupStartedAt;
 					for (const task of pendingWithoutCache) {
+						if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
+							logger.warn("MCP server still connecting after the startup wait", {
+								path: `mcp:${task.name}`,
+								startupWaitMs: startupTimeoutMs,
+								declaredTimeoutMs: task.config.timeout,
+							});
+							continue;
+						}
 						const message = `MCP server connection timed out during startup: ${task.name}`;
 						errors.set(task.name, this.#serverError(message));
 						reportedErrors.add(task.name);
