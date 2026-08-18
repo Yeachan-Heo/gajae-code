@@ -3837,8 +3837,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					void session.refreshMCPTools(tools);
 				});
 			}
-			// Wire prompt refresh → rebuild MCP prompt slash commands
+			// Wire prompt refresh → rebuild MCP prompt slash commands.
+			// Unlike the tools callback above this one IS reached for session-owned
+			// managers, and a declared-window connection that lands late runs its
+			// resource/prompt load after the abort check, so disposal can win that race.
 			mcpManager.setOnPromptsChanged(serverName => {
+				if (session.isDisposed) return;
 				const promptCommands = buildMCPPromptCommands(mcpManager);
 				session.setMCPPromptCommands(promptCommands);
 				logger.debug("MCP prompt commands refreshed", { path: `mcp:${serverName}` });
@@ -3851,6 +3855,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			postmortem.register("mcp-notification-cleanup", clearDebounceTimers);
 			mcpManager.setOnResourcesChanged((serverName, uri) => {
 				logger.debug("MCP resources changed", { path: `mcp:${serverName}`, uri });
+				if (session.isDisposed) return;
 				if (!settings.get("mcp.notifications")) return;
 				const debounceMs = settings.get("mcp.notificationDebounceMs");
 				const key = `${serverName}:${uri}`;
@@ -3860,8 +3865,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					key,
 					setTimeout(() => {
 						notificationDebounceTimers.delete(key);
-						// Re-check: user may have disabled notifications during the debounce window
-						if (!settings.get("mcp.notifications")) return;
+						// Re-check: the user may have disabled notifications during the debounce
+						// window, and the session may have ended inside it — the timer outlives
+						// disposal, which only a process-level postmortem clears.
+						if (session.isDisposed || !settings.get("mcp.notifications")) return;
 						session.yieldQueue.enqueue<McpNotificationEntry>("mcp-notification", { serverName, uri });
 					}, debounceMs),
 				);
