@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import type {
 	ApiKeyCredentialCheckResult,
 	AuthStorage,
@@ -8,10 +8,10 @@ import type {
 	CredentialInventoryRecord,
 } from "@gajae-code/ai/core";
 import {
-	__setEnvApiKeyResolverForTests,
 	type AccountInventoryRow,
 	buildAccountInventorySnapshot,
 	checkAccountInventory,
+	type EnvApiKeyResolver,
 } from "../src/session/account-inventory";
 
 const NOW = 1_700_000_000_000;
@@ -92,24 +92,19 @@ const GROQ_ENV_KEY = "test-groq-row-token";
 
 /**
  * Deterministic synthetic env-row coverage (reviews 4958546910, 4960174075,
- * 4961320650). The env-key resolver is injected through the account-inventory
- * test seam, so no test reads the inherited credential snapshot, agent/user
- * `.env` files, or shell startup files, and no test mutates process.env. The
- * production default remains the live getEnvApiKey; only these tests override
- * it, and afterEach restores it.
+ * 4961320650, and the per-invocation injection round). The env-key resolver is
+ * passed per snapshot/check invocation, so no test reads the inherited
+ * credential snapshot, agent/user `.env` files, or shell startup files, no test
+ * mutates process.env, and no module-global state can leak between concurrent
+ * tests. The production default remains the live getEnvApiKey.
  */
 const envKeys = new Map<string, string>([
 	["openai-codex", CODEX_ENV_KEY],
 	["groq", GROQ_ENV_KEY],
 ]);
 
-beforeEach(() => {
-	__setEnvApiKeyResolverForTests(provider => envKeys.get(provider));
-});
-
-afterEach(() => {
-	__setEnvApiKeyResolverForTests(null);
-});
+/** Default per-invocation resolver used by every test below. */
+const envApiKeyResolver: EnvApiKeyResolver = provider => envKeys.get(provider);
 
 /**
  * Assert that no row payload serializes the fixture's synthetic key. The
@@ -144,7 +139,7 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshot = buildAccountInventorySnapshot({ authStorage, modelRegistry, nowMs: NOW });
+		const snapshot = buildAccountInventorySnapshot({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
 		const stored = storedRow(snapshot);
 
 		expect(receivedBaseUrl).toBe(BASE_URL);
@@ -164,7 +159,7 @@ describe("account inventory usage", () => {
 			getCachedUsageReport: () => undefined,
 		});
 
-		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
+		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
 		const stored = storedRow(snapshot);
 
 		expect(stored?.health.status).toBe("ok");
@@ -177,6 +172,7 @@ describe("account inventory usage", () => {
 			authStorage: makeAuthStorage(),
 			modelRegistry,
 			nowMs: NOW,
+			envApiKeyResolver,
 		});
 		const stored = storedRow(snapshot);
 		const env = envRow(snapshot);
@@ -204,6 +200,7 @@ describe("account inventory usage", () => {
 			authStorage: makeAuthStorage(),
 			modelRegistry,
 			nowMs: NOW,
+			envApiKeyResolver,
 		});
 		const groq = snapshot.rows.find(row => row.source === "env" && row.provider === "groq");
 
@@ -234,7 +231,7 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
+		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
 		const env = envRow(snapshot);
 		const stored = storedRow(snapshot);
 
@@ -282,7 +279,7 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
+		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
 		const env = envRow(snapshot);
 
 		const sanitizedReason = "probe rejected api_key=[redacted] (token=[redacted]";
@@ -306,14 +303,14 @@ describe("account inventory usage", () => {
 	});
 
 	it("marks an env row unverifiable when its key becomes unresolvable at check time", async () => {
-		// The env row is built while the resolver resolves the fixture key, then the
-		// resolver stops resolving it before the checker runs. This reaches the
-		// production key-undefined fallback for an existing env row — the exact
-		// branch a stale-credential regression would break — without deleting any
-		// environment variable and without depending on host credential files.
+		// The env row is built while the per-invocation resolver resolves the
+		// fixture key, then the resolver stops resolving it before the checker's
+		// synthetic-row loop runs. This reaches the production key-undefined
+		// fallback for an existing env row — the exact branch a stale-credential
+		// regression would break — without deleting any environment variable and
+		// without depending on host credential files.
 		let resolveKey = true;
-		__setEnvApiKeyResolverForTests(provider => (resolveKey ? envKeys.get(provider) : undefined));
-
+		const flipResolver: EnvApiKeyResolver = provider => (resolveKey ? envKeys.get(provider) : undefined);
 		const probed: Array<{ provider: string; source: string }> = [];
 		const recorded: Array<{ provider: string; source: string; health: CachedCredentialHealth }> = [];
 		const authStorage = makeAuthStorage({
@@ -329,7 +326,12 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshotPromise = checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
+		const snapshotPromise = checkAccountInventory({
+			authStorage,
+			modelRegistry,
+			nowMs: NOW,
+			envApiKeyResolver: flipResolver,
+		});
 		// The checker resolves env keys synchronously inside its synthetic-row
 		// loop after building the snapshot; flip before awaiting so the env row
 		// exists but its key no longer resolves.
@@ -378,7 +380,7 @@ describe("account inventory usage", () => {
 			},
 		});
 
-		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW });
+		const snapshot = await checkAccountInventory({ authStorage, modelRegistry, nowMs: NOW, envApiKeyResolver });
 		const runtime = runtimeRow(snapshot);
 
 		expect(runtime).toBeDefined();

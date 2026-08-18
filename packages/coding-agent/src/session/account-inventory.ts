@@ -19,15 +19,9 @@ import { parsePersistedCredentialSelector } from "./startup-auth-config";
 export type EnvApiKeyResolver = (provider: string) => string | undefined;
 
 const DEFAULT_ENV_API_KEY_RESOLVER: EnvApiKeyResolver = getEnvApiKey;
-let envApiKeyResolverForTest: EnvApiKeyResolver | null = null;
 
-function resolveEnvApiKey(provider: string): string | undefined {
-	return (envApiKeyResolverForTest ?? DEFAULT_ENV_API_KEY_RESOLVER)(provider);
-}
-
-/** @internal Test-only seam; production resolution always reads the live credential env. */
-export function __setEnvApiKeyResolverForTests(resolver: EnvApiKeyResolver | null): void {
-	envApiKeyResolverForTest = resolver;
+function resolveEnvApiKey(resolver: EnvApiKeyResolver | undefined, provider: string): string | undefined {
+	return (resolver ?? DEFAULT_ENV_API_KEY_RESOLVER)(provider);
 }
 
 /** A redacted usage observation attached to an account row. */
@@ -95,6 +89,8 @@ export interface AccountInventoryInput {
 	sessionId?: string;
 	provider?: string;
 	nowMs?: number;
+	/** Overrides env-key resolution for this snapshot/check invocation only. */
+	envApiKeyResolver?: EnvApiKeyResolver;
 }
 
 type SyntheticAccountSource = Exclude<AccountInventorySource, "stored">;
@@ -196,7 +192,7 @@ function providerSet(input: AccountInventoryInput, inventory: CredentialInventor
 	// This only asks whether a known env-backed provider is present. The key value
 	// never enters the snapshot or any renderer.
 	for (const provider of listProvidersWithEnvKey()) {
-		if (resolveEnvApiKey(provider)) providers.add(provider);
+		if (resolveEnvApiKey(input.envApiKeyResolver, provider)) providers.add(provider);
 	}
 	return providers;
 }
@@ -338,9 +334,13 @@ function freshUsageCache(report: CachedUsageReport["report"]): AccountUsageCache
 	};
 }
 
-function canPinStoredOAuth(authStorage: AuthStorage, provider: string): boolean {
+function canPinStoredOAuth(
+	authStorage: AuthStorage,
+	envApiKeyResolver: EnvApiKeyResolver | undefined,
+	provider: string,
+): boolean {
 	if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasConfigApiKey(provider)) return false;
-	return !resolveEnvApiKey(provider);
+	return !resolveEnvApiKey(envApiKeyResolver, provider);
 }
 
 function sourceHealth(authStorage: AuthStorage, provider: string, source: SyntheticAccountSource): AccountHealthCache {
@@ -383,6 +383,7 @@ function addStoredRows(
 	inventory: CredentialInventoryRecord[],
 	sessionId: string | undefined,
 	baseUrlResolver?: (provider: string) => string | undefined,
+	envApiKeyResolver?: EnvApiKeyResolver,
 ): void {
 	const removalTargetIds = new Set(
 		(typeof authStorage.listCredentialRemovalTargets === "function"
@@ -397,7 +398,9 @@ function addStoredRows(
 			typeof record.provider === "string" &&
 			authStorage.getSessionCredentialRowId(record.provider, sessionId) === record.id;
 		const canPin =
-			record.credentialKind === "oauth" && !record.disabled && canPinStoredOAuth(authStorage, record.provider);
+			record.credentialKind === "oauth" &&
+			!record.disabled &&
+			canPinStoredOAuth(authStorage, envApiKeyResolver, record.provider);
 		const canRemove = record.credentialKind === "oauth" && removalTargetIds.has(record.id);
 		rows.push({
 			id: sourceId(record.provider, "stored", record.id),
@@ -432,11 +435,12 @@ function addSyntheticRows(
 	authStorage: AuthStorage,
 	providers: Set<string>,
 	sessionId: string | undefined,
+	envApiKeyResolver: EnvApiKeyResolver | undefined,
 ): void {
 	for (const provider of [...providers].sort((a, b) => a.localeCompare(b))) {
 		const runtime = authStorage.hasRuntimeApiKey(provider);
 		const config = authStorage.hasConfigApiKey(provider);
-		const env = Boolean(resolveEnvApiKey(provider));
+		const env = Boolean(resolveEnvApiKey(envApiKeyResolver, provider));
 		const effectiveType = authStorage.getEffectiveCredentialType(provider, sessionId);
 
 		const add = (source: AccountInventorySource): void => {
@@ -484,10 +488,15 @@ export function buildAccountInventorySnapshot(input: AccountInventoryInput): Acc
 	const nowMs = input.nowMs ?? Date.now();
 	const inventory = input.authStorage.listCredentialInventory();
 	const rows: AccountInventoryRow[] = [];
-	addStoredRows(rows, input.authStorage, inventory, input.sessionId, provider =>
-		input.modelRegistry?.getProviderBaseUrl?.(provider),
+	addStoredRows(
+		rows,
+		input.authStorage,
+		inventory,
+		input.sessionId,
+		provider => input.modelRegistry?.getProviderBaseUrl?.(provider),
+		input.envApiKeyResolver,
 	);
-	addSyntheticRows(rows, input.authStorage, providerSet(input, inventory), input.sessionId);
+	addSyntheticRows(rows, input.authStorage, providerSet(input, inventory), input.sessionId, input.envApiKeyResolver);
 	rows.sort((left, right) => left.id.localeCompare(right.id));
 	return { generatedAt: nowMs, generation: input.authStorage.getGeneration(), rows };
 }
@@ -543,7 +552,7 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 	const syntheticRows = rows.filter(row => row.source !== "stored");
 	for (const row of syntheticRows) {
 		let key: string | undefined;
-		if (row.source === "env") key = resolveEnvApiKey(row.provider);
+		if (row.source === "env") key = resolveEnvApiKey(input.envApiKeyResolver, row.provider);
 		else if (row.source === "runtime" && authStorage.hasRuntimeApiKey(row.provider))
 			key = await authStorage.peekApiKey(row.provider);
 		else if (
