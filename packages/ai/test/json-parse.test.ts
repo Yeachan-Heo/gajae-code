@@ -84,6 +84,18 @@ describe("findUnnecessaryUnicodeEscape", () => {
 		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"\uzz11"}`)).toBeUndefined();
 	});
 
+	it("still flags em-dash and every other punctuation/symbol/separator escape — the bounded exemption lives in the agent loop, not the scanner", () => {
+		// The scanner stays strictly evidence-based: any non-ASCII escape flags.
+		// The display-safe-tool carve-out for benign typographic punctuation is
+		// decided at execution time against the DECODED arguments (agent-loop
+		// isDisplaySafeEscapedArguments), never by widening this detector.
+		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"sessions \u2014 in-process?"}`)).toBe(String.raw`\u2014`);
+		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"\u201cquoted\u201d"}`)).toBe(String.raw`\u201c`);
+		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"a\u00a0b"}`)).toBe(String.raw`\u00a0`);
+		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"\u20a9"}`)).toBe(String.raw`\u20a9`);
+		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"\uff01"}`)).toBe(String.raw`\uff01`);
+	});
+
 	it("does not flag a truncated escape at the end of a streaming buffer", () => {
 		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"\ubc`)).toBeUndefined();
 	});

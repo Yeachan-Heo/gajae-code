@@ -7,6 +7,9 @@
 
 - `toolFailureEnvelope` / `isToolFailureEnvelope` / `ToolFailureEnvelope` name the result details the loop attaches when a tool call fails without the tool returning details of its own. The guard matches only that envelope, so a consumer can tell it apart from a tool that reports a `failureKind` alongside its own details before dereferencing a tool-owned detail shape.
 
+### Fixed
+
+- The escaped-non-ASCII argument guard keeps its fail-closed terminal rejection and its unconditional two-resample budget for every tool and every field. After the budget is spent, a tool that enumerated its user-facing display fields (`displaySafeEscapedArgFields`; `ask` exempts only `questions.question` and `questions.options.label`) executes when every non-ASCII character lives inside those fields and is benign typographic punctuation (curated set: U+2014 em-dash). Escaped non-ASCII anywhere else — ids, deep-interview metadata, persisted records, non-ASCII object keys — and every other tool stays rejected terminally (#4627, reduced per both maintainer reviews: guard retained, exemption after budget and field-scoped).
 ## [0.14.0] - 2026-08-17
 
 ### Fixed

@@ -38,6 +38,38 @@ function askTool(executed: Array<Record<string, unknown>>): AgentTool<typeof ask
 	};
 }
 
+/** A display-safe variant of the ask tool: opts its display field (question text) into the bounded exemption. */
+function displaySafeAskTool(
+	executed: Array<Record<string, unknown>>,
+): AgentTool<typeof askSchema, Record<string, never>> {
+	return {
+		...askTool(executed),
+		displaySafeEscapedArgFields: ["question"],
+	};
+}
+
+/** A stand-in for any mutating tool (write/edit/bash): never display-safe. */
+function mutatingTool(executed: Array<Record<string, unknown>>): AgentTool<typeof askSchema, Record<string, never>> {
+	return {
+		...askTool(executed),
+		name: "write",
+	};
+}
+
+/** A display-safe escaped turn whose only non-ASCII is an em-dash. */
+function emDashEscapedTurn(id: string, name = "ask") {
+	return {
+		content: [
+			{
+				type: "toolCall" as const,
+				id,
+				name,
+				arguments: { question: "How should the daemon drive sessions — in-process?" },
+				escapedNonAsciiArguments: true,
+			},
+		],
+	};
+}
 /** A turn whose raw arguments arrived spelled as `\uXXXX` instead of literal UTF-8. */
 function escapedTurn(id: string, stopReason?: "aborted" | "error") {
 	return {
@@ -918,6 +950,190 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(lastAssistant?.role === "assistant" ? lastAssistant.errorMessage : undefined).toContain(
 			"consecutive turns of malformed tool calls",
 		);
+	});
+
+	it("executes the benign em-dash ask case AFTER the resample budget on a display-safe tool", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+		// Three escaped wire attempts consume the budget (1 original + 2
+		// resamples); the third reaches terminal execution, where the
+		// field-scoped display-safe exemption lets the benign payload run.
+		const mock = createMockModel({
+			responses: [
+				emDashEscapedTurn("tc-1"),
+				emDashEscapedTurn("tc-2"),
+				emDashEscapedTurn("tc-3"),
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const toolResults: Array<{ isError?: boolean; text: string }> = [];
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+
+		// The full budget ran before execution: 1 original + 2 resamples + the
+		// follow-up elicited by the executed tool result.
+		expect(mock.calls).toHaveLength(4);
+		expect(executed).toEqual([{ question: "How should the daemon drive sessions — in-process?" }]);
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0].isError).toBeFalsy();
+	});
+
+	it("never exempts escaped non-ASCII outside the declared display fields", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+		// An em-dash in the QUESTION is benign; the same em-dash in a metadata
+		// field the tool did NOT enumerate (here: `deepInterview.dimension`)
+		// keeps the fail-closed rejection — the exemption is field-scoped.
+		const metaTurn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					arguments: {
+						question: "ok — fine",
+						deepInterview: { round: 1, component: "daemon", dimension: "스케줄 — 라우팅", ambiguity: 0.2 },
+					},
+					escapedNonAsciiArguments: true,
+				},
+			],
+		});
+		const mock = createMockModel({
+			responses: [metaTurn("tc-1"), metaTurn("tc-2"), metaTurn("tc-3"), { content: ["done"] }],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const toolResults: Array<{ isError?: boolean; text: string }> = [];
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+
+		expect(executed).toHaveLength(0);
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0].isError).toBe(true);
+		expect(toolResults[0].text).toContain("\\uXXXX");
+	});
+
+	it("never executes the same em-dash payload when the tool is not display-safe", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [mutatingTool(executed)] };
+		const mock = createMockModel({
+			responses: [
+				emDashEscapedTurn("tc-1", "write"),
+				emDashEscapedTurn("tc-2", "write"),
+				emDashEscapedTurn("tc-3", "write"),
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const toolResults: Array<{ isError?: boolean; text: string }> = [];
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+
+		// Mutating tools stay fail-closed: budget spent, then terminal rejection.
+		expect(executed).toHaveLength(0);
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0].isError).toBe(true);
+		expect(toolResults[0].text).toContain("\\uXXXX");
+	});
+
+	it("rejects a nibble-adjacent symbol escape even on a display-safe tool", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+		const enDashTurn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					// U+2013 EN DASH — one nibble from the exempted U+2014.
+					arguments: { question: "range 0–1 inclusive?" },
+					escapedNonAsciiArguments: true,
+				},
+			],
+		});
+		const mock = createMockModel({
+			responses: [enDashTurn("tc-1"), enDashTurn("tc-2"), enDashTurn("tc-3"), { content: ["done"] }],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const toolResults: Array<{ isError?: boolean; text: string }> = [];
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+
+		// The curated set admits only U+2014; every other symbol — including the
+		// nibble-adjacent en-dash — keeps the fail-closed rejection.
+		expect(executed).toHaveLength(0);
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0].isError).toBe(true);
+		expect(toolResults[0].text).toContain("\\uXXXX");
+	});
+
+	it("rejects currency, math, full-width, separator, letter, and emoji escapes on a display-safe tool", async () => {
+		const redTeam: Array<[string, string]> = [
+			["currency ₩", "price ₩1,000?"],
+			["math ≈", "is x ≈ y?"],
+			["full-width ！", "really！sure?"],
+			["ideographic space 　", "a　b?"],
+			["hangul letter 안", "이름이 안 무엇인가?"],
+			["emoji 😀", "feeling 😀 today?"],
+		];
+		for (const [label, question] of redTeam) {
+			const executed: Array<Record<string, unknown>> = [];
+			const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+			const turn = (id: string) => ({
+				content: [
+					{
+						type: "toolCall" as const,
+						id,
+						name: "ask",
+						arguments: { question },
+						escapedNonAsciiArguments: true,
+					},
+				],
+			});
+			const mock = createMockModel({
+				responses: [turn("tc-1"), turn("tc-2"), turn("tc-3"), { content: ["done"] }],
+			});
+			const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+			const toolResults: Array<{ isError?: boolean; text: string }> = [];
+			const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+			for await (const event of stream) {
+				if (event.type === "tool_execution_end") {
+					const first = event.result.content?.[0];
+					toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+				}
+			}
+
+			expect(executed).toHaveLength(0);
+			expect(toolResults).toHaveLength(1);
+			expect(toolResults[0].isError).toBe(true);
+			expect(toolResults[0].text).toContain("\\uXXXX");
+			expect(label).toBeTruthy();
+		}
 	});
 
 	it("executes literal UTF-8 arguments untouched", async () => {

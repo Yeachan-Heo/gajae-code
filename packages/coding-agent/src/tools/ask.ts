@@ -734,6 +734,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		recoverRoundZeroIntentContract(arguments_, this.session.getDeepInterviewAskStage?.());
 	readonly strict = true;
 	readonly loadMode = "discoverable";
+	/**
+	 * The only ask argument fields rendered to the user as display text: the
+	 * question wording and the option labels. Everything else — ids,
+	 * deep-interview metadata (intent contracts/reviews, references), workflow
+	 * gate metadata — is structured or durable and stays subject to the
+	 * fail-closed escaped-non-ASCII rejection even after the resample budget.
+	 */
+	readonly displaySafeEscapedArgFields = ["questions.question", "questions.options.label"] as const;
 
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(askDescription);
