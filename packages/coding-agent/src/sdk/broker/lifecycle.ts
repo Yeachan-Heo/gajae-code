@@ -827,6 +827,18 @@ function observeProcess(
 	expectedIncarnation: string | undefined,
 	readIncarnation: (pid: number) => string | undefined = processIncarnation,
 ): ProcessObservation {
+	if (process.platform === "win32") {
+		try {
+			const reference = nativeLifecycle().Process.fromPid(pid);
+			if (reference?.status() !== "running") return "exited";
+		} catch {
+			return "uncertain";
+		}
+		if (!expectedIncarnation) return "uncertain";
+		const actualIncarnation = readIncarnation(pid);
+		if (!actualIncarnation) return "uncertain";
+		return actualIncarnation === expectedIncarnation ? "alive" : "exited";
+	}
 	try {
 		process.kill(pid, 0);
 	} catch (error) {
@@ -841,6 +853,15 @@ function observeProcess(
 	const actualIncarnation = readIncarnation(pid);
 	if (!actualIncarnation) return "uncertain";
 	return actualIncarnation === expectedIncarnation ? "alive" : "exited";
+}
+
+/** Test seam for the lifecycle-owned process observation boundary. */
+export function observeProcessForTest(
+	pid: number,
+	expectedIncarnation: string | undefined,
+	readIncarnation: (pid: number) => string | undefined = processIncarnation,
+): ProcessObservation {
+	return observeProcess(pid, expectedIncarnation, readIncarnation);
 }
 
 function hasObservedProcessExit(pid: number): boolean {
