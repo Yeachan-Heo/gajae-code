@@ -629,7 +629,9 @@ export class CommandController {
 		if (!usageReports) {
 			const provider = this.ctx.session as { fetchUsageReports?: () => Promise<UsageReport[] | null> };
 			if (!provider.fetchUsageReports) {
-				this.ctx.showWarning("Usage reporting is not configured for this session.");
+				this.ctx.showWarning(
+					"Usage reporting is not configured for this session: no provider exposes usage limits here.",
+				);
 				return;
 			}
 			try {
@@ -641,7 +643,9 @@ export class CommandController {
 		}
 
 		if (!usageReports || usageReports.length === 0) {
-			this.ctx.showWarning("No usage data available.");
+			this.ctx.showWarning(
+				"No usage data available: the configured providers reported no limits. Subscription/OAuth credentials report limits; plain API keys usually do not.",
+			);
 			return;
 		}
 
@@ -1604,11 +1608,99 @@ function formatUnlimitedReportLabel(report: UsageReport, reportIndex: number): s
 	return `account ${reportIndex + 1}`;
 }
 
+/**
+ * Two-unit countdown for usage windows. `formatDuration` collapses everything
+ * past 48h to a single rounded unit, so a weekly window reads `7d` whether 6.6
+ * or 7.4 days remain — useless when the question is "how long until I get my
+ * quota back". Kept local to the usage panel so job/elapsed rendering keeps the
+ * coarse label.
+ */
+function formatResetCountdown(ms: number): string {
+	const totalMinutes = Math.max(0, Math.floor(ms / 60_000));
+	if (totalMinutes < 1) return "<1m";
+	if (totalMinutes < 60) return `${totalMinutes}m`;
+	const totalHours = Math.floor(totalMinutes / 60);
+	if (totalHours < 48) {
+		const minutes = totalMinutes % 60;
+		return minutes > 0 ? `${totalHours}h ${minutes}m` : `${totalHours}h`;
+	}
+	const days = Math.floor(totalHours / 24);
+	const hours = totalHours % 24;
+	return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+}
+
+/** Absolute local reset time, so a long countdown maps onto a real calendar day. */
+function formatResetAt(resetsAt: number, nowMs: number): string {
+	const date = new Date(resetsAt);
+	const withinADay = resetsAt - nowMs < 24 * 3_600_000;
+	return date.toLocaleString(undefined, {
+		month: withinADay ? undefined : "short",
+		day: withinADay ? undefined : "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+	});
+}
+
 function formatResetShort(limit: UsageLimit, nowMs: number): string | undefined {
 	if (limit.window?.resetsAt !== undefined) {
 		return formatDuration(limit.window.resetsAt - nowMs);
 	}
 	return undefined;
+}
+
+/** Squeeze a label from the middle, keeping both ends. */
+function squeezeMiddle(label: string, maxWidth: number): string {
+	if (visibleWidth(label) <= maxWidth) return label;
+	if (maxWidth <= 3) return truncateJobLabel(label, maxWidth);
+	const chars = [...label];
+	const headBudget = Math.ceil((maxWidth - 1) / 2);
+	const tailBudget = maxWidth - 1 - headBudget;
+	let head = "";
+	for (const char of chars) {
+		if (visibleWidth(head + char) > headBudget) break;
+		head += char;
+	}
+	let tail = "";
+	for (let index = chars.length - 1; index >= 0; index--) {
+		const next = chars[index]! + tail;
+		if (visibleWidth(next) > tailBudget) break;
+		tail = next;
+	}
+	return `${head}…${tail}`;
+}
+
+function accountLocalPart(label: string): string {
+	const at = label.lastIndexOf("@");
+	return at > 0 ? label.slice(0, at) : label;
+}
+
+/**
+ * Fit account labels into `maxWidth` while keeping them mutually
+ * distinguishable. Credentials pooled on one provider share a domain and often
+ * a prefix, so truncating each label in isolation collapses every column into
+ * the same stub — which defeats the only reason the panel shows accounts at
+ * all. Try progressively cheaper representations and keep the first one that is
+ * still unique; if nothing is, tag the columns with an index so the rows can at
+ * least be told apart.
+ */
+function truncateAccountLabels(labels: string[], maxWidth: number): string[] {
+	const distinctInput = new Set(labels).size;
+	const strategies: ((label: string) => string)[] = [
+		label => label,
+		label => accountLocalPart(label),
+		label => truncateJobLabel(accountLocalPart(label), maxWidth),
+		label => squeezeMiddle(accountLocalPart(label), maxWidth),
+	];
+	for (const strategy of strategies) {
+		const candidate = labels.map(strategy);
+		const fits = candidate.every(entry => visibleWidth(entry) <= maxWidth);
+		if (fits && new Set(candidate).size === distinctInput) return candidate;
+	}
+	return labels.map((label, index) => {
+		const tag = `#${index + 1}`;
+		const budget = Math.max(1, maxWidth - visibleWidth(tag));
+		return `${truncateJobLabel(accountLocalPart(label), budget)}${tag}`;
+	});
 }
 
 function formatAccountHeaderRow(
@@ -1638,9 +1730,13 @@ function formatAccountHeaderRow(
 		});
 	}
 
-	return parts.map(p => {
-		const prefix = truncateJobLabel(p.label, prefixBudget);
-		const prefixCell = prefix + " ".repeat(prefixBudget - visibleWidth(prefix));
+	const prefixes = truncateAccountLabels(
+		parts.map(p => p.label),
+		prefixBudget,
+	);
+	return parts.map((p, index) => {
+		const prefix = prefixes[index]!;
+		const prefixCell = prefix + " ".repeat(Math.max(0, prefixBudget - visibleWidth(prefix)));
 		if (!p.suffix) return prefixCell + " ".repeat(maxSuffixWidth + gap);
 		const suffixPad = " ".repeat(maxSuffixWidth - visibleWidth(p.suffix));
 		return `${prefixCell} ${suffixPad}${uiTheme.fg("dim", p.suffix)}`;
@@ -1688,18 +1784,24 @@ function formatAggregateAmount(limits: UsageLimit[]): string {
 	return `${limits.length} accts`;
 }
 
+/**
+ * Reset line for one window. Renders a range when the accounts in the window
+ * reset at materially different times, and pins the earliest reset to an
+ * absolute local time so "when do I get my quota back" is answerable without
+ * doing date arithmetic in your head.
+ */
 function resolveResetRange(limits: UsageLimit[], nowMs: number): string | null {
 	const absolute = limits
 		.map(limit => limit.window?.resetsAt)
 		.filter((value): value is number => value !== undefined && Number.isFinite(value) && value > nowMs);
 	if (absolute.length === 0) return null;
-	const offsets = absolute.map(value => value - nowMs);
-	const minReset = Math.min(...offsets);
-	const maxReset = Math.max(...offsets);
-	if (maxReset - minReset > 60_000) {
-		return `resets in ${formatDuration(minReset)}–${formatDuration(maxReset)}`;
+	const earliest = Math.min(...absolute);
+	const latest = Math.max(...absolute);
+	const at = formatResetAt(earliest, nowMs);
+	if (latest - earliest > 60_000) {
+		return `resets in ${formatResetCountdown(earliest - nowMs)}–${formatResetCountdown(latest - nowMs)} (first ${at})`;
 	}
-	return `resets in ${formatDuration(minReset)}`;
+	return `resets in ${formatResetCountdown(earliest - nowMs)} (${at})`;
 }
 
 function resolveStatusIcon(status: UsageLimit["status"], uiTheme: typeof theme): string {
@@ -1868,7 +1970,7 @@ export function renderUsageReports(
 				padColumn(renderUsageBar(limit, uiTheme, sectionColumnWidth), sectionColumnWidth),
 			);
 			lines.push(`  ${bars.join(" ")} ${amountText}`.trimEnd());
-			const resetText = sortedLimits.length <= 1 ? resolveResetRange(sortedLimits, nowMs) : null;
+			const resetText = resolveResetRange(sortedLimits, nowMs);
 			if (resetText) {
 				lines.push(`  ${uiTheme.fg("dim", resetText)}`.trimEnd());
 			}
