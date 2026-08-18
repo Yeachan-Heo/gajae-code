@@ -169,7 +169,11 @@ describe("herdr reporter state machine", () => {
 
 		expect(reporter.state).toBe("idle");
 		expect(calls).toHaveLength(1);
-		expect(calls[0]?.command).toEqual(["/usr/bin/herdr", ...buildHerdrReportArgs("pane-7", "idle", 1)]);
+		const command = calls[0]?.command ?? [];
+		expect(command.slice(0, -1)).toEqual([
+			"/usr/bin/herdr",
+			...buildHerdrReportArgs("pane-7", "idle", 0).slice(0, -1),
+		]);
 		expect(unrefCount()).toBe(1);
 	});
 
@@ -245,7 +249,33 @@ describe("herdr reporter state machine", () => {
 		const seqs = calls
 			.filter(call => !call.command.includes("report-metadata"))
 			.map(call => Number(call.command.at(-1)));
-		expect(seqs).toEqual([1, 2, 3, 4]);
+		expect(seqs).toHaveLength(4);
+		expect(seqs).toEqual([...seqs].sort((left, right) => left - right));
+		expect(new Set(seqs).size).toBe(4);
+	});
+
+	it("starts sequences above the ones a previous session in the pane used", async () => {
+		// Herdr keeps the accepted sequence watermark on the terminal, so a second
+		// gjc process in the same pane must not restart the count: its reports
+		// would be dropped and the session would be missing from the sidebar.
+		const first = recordingSpawn();
+		const firstSource = eventSource();
+		const firstReporter = createHerdrReporter(PANE, firstSource.subscribe, { env: paneEnv(), spawn: first.spawn });
+		firstSource.emit({ type: "agent_start" });
+		firstSource.emit({ type: "agent_end" });
+		firstReporter.release();
+
+		await Bun.sleep(2);
+		const second = recordingSpawn();
+		createHerdrReporter(PANE, eventSource().subscribe, { env: paneEnv(), spawn: second.spawn });
+
+		const lastOfFirst = Math.max(
+			...first.calls
+				.filter(call => !call.command.includes("report-metadata"))
+				.map(call => Number(call.command.at(-1))),
+		);
+		const firstOfSecond = Number(second.calls[0]?.command.at(-1));
+		expect(firstOfSecond).toBeGreaterThan(lastOfFirst);
 	});
 
 	it("releases the authority exactly once and unsubscribes", () => {
@@ -259,7 +289,10 @@ describe("herdr reporter state machine", () => {
 		expect(source.attached).toBe(false);
 		expect(source.unsubscribeCount).toBe(1);
 		expect(calls).toHaveLength(3);
-		expect(calls[1]?.command).toEqual(["/usr/bin/herdr", ...buildHerdrReleaseArgs("pane-7", 2)]);
+		expect(calls[1]?.command.slice(0, -1)).toEqual([
+			"/usr/bin/herdr",
+			...buildHerdrReleaseArgs("pane-7", 0).slice(0, -1),
+		]);
 		expect(calls[2]?.command.slice(0, -1)).toEqual([
 			"/usr/bin/herdr",
 			...buildHerdrClearTitleArgs("pane-7", 0).slice(0, -1),
