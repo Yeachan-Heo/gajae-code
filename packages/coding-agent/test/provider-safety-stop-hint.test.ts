@@ -134,6 +134,60 @@ describe("resolveSafetyStopAlternateSelector", () => {
 			resolveSafetyStopAlternateSelector("anthropic/claude-fable-5", ["anthropic/", "/x"], catalog),
 		).toBeUndefined();
 	});
+
+	it("never names a malformed thinking-suffix selector as an alternate (#4653 review)", () => {
+		// `:bogus` is not a thinking level; the resolver must reject the entry
+		// instead of stripping the suffix and offering the base model.
+		expect(
+			resolveSafetyStopAlternateSelector(
+				"anthropic/claude-fable-5",
+				["anthropic/claude-fable-5", "anthropic/claude-opus-5:bogus"],
+				catalog,
+			),
+		).toBeUndefined();
+		// Same guard when the malformed entry is the only chain tail.
+		expect(
+			resolveSafetyStopAlternateSelector("anthropic/claude-fable-5", ["anthropic/claude-opus-5:bogus"], catalog),
+		).toBeUndefined();
+	});
+
+	it("resolves route-suffixed IDs through the authoritative resolver (#4653 review)", () => {
+		// OpenRouter-style route suffixes are legal model IDs, not thinking
+		// levels. A route-suffixed alternate that exists in the catalog is
+		// nameable, and one that does not exist is skipped.
+		const routedCatalog: Model[] = [
+			{
+				provider: "openrouter",
+				id: "anthropic/claude-opus-5:extended",
+				api: "openai-completions",
+			} as unknown as Model,
+			{ provider: "openrouter", id: "anthropic/claude-fable-5", api: "openai-completions" } as unknown as Model,
+		];
+		expect(
+			resolveSafetyStopAlternateSelector(
+				"openrouter/anthropic/claude-fable-5",
+				["openrouter/anthropic/claude-fable-5", "openrouter/anthropic/claude-opus-5:extended"],
+				routedCatalog,
+			),
+		).toBe("openrouter/anthropic/claude-opus-5:extended");
+		expect(
+			resolveSafetyStopAlternateSelector(
+				"openrouter/anthropic/claude-fable-5",
+				["openrouter/anthropic/claude-fable-5", "openrouter/anthropic/claude-opus-5:novel-route"],
+				routedCatalog,
+			),
+		).toBeUndefined();
+	});
+
+	it("falls back to static guidance when the refuser itself does not resolve", () => {
+		expect(
+			resolveSafetyStopAlternateSelector(
+				"anthropic/claude-fable-5",
+				["anthropic/claude-fable-5", "anthropic/claude-opus-5"],
+				[], // empty catalog: identity comparison is unsafe
+			),
+		).toBeUndefined();
+	});
 });
 
 describe("formatProviderSafetyStopHint", () => {

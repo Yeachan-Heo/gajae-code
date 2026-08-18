@@ -1,5 +1,7 @@
 import type { AssistantMessage, Model } from "@gajae-code/ai/core";
+import { resolveSelector } from "../config/model-resolver";
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../config/model-selector-value";
+import { splitSelectorThinkingSuffix } from "../thinking";
 import { isLegacyProviderSafetyStopMessage } from "./provider-safety-stop";
 
 /**
@@ -44,9 +46,12 @@ export function refusingModelSelector(message: AssistantMessage): string | undef
  * configured chain — one that is NOT the model that refused. Presentation-only:
  * reads configured intent, dispatches nothing, and mutates nothing (#4650).
  *
- * An entry is named only when it parses as `provider/model[:thinking]` and
- * resolves to a model currently present in the available catalog; anything
- * else risks stale, private, or invalid guidance, so it is skipped.
+ * An entry is named only when the authoritative model selector resolver accepts
+ * it (`resolveSelector` with `allowInvalidThinkingSelectorFallback: false`, so
+ * malformed suffixes like `:bogus` fail closed while route-suffixed IDs keep
+ * their exact-ID semantics) AND the concrete model it resolves to differs from
+ * the refuser. The named entry is the chain entry itself, so the suggested
+ * `/model` command is one the resolver actually parses.
  */
 export function resolveSafetyStopAlternateSelector(
 	refuserSelector: string | undefined,
@@ -58,20 +63,27 @@ export function resolveSafetyStopAlternateSelector(
 		? chain.map(entry => String(entry))
 		: normalizeModelSelectorValue(chain as ModelSelectorValue | undefined);
 	if (entries.length === 0) return undefined;
-	// Strip any `:thinking` / route suffix so re-listing the same concrete model
-	// under a different thinking level is not offered as an "alternate".
-	const refuserIdentity = refuserSelector.split(":")[0] ?? refuserSelector;
+	const candidates = [...availableModels];
+	const refuserParsed = resolveSelector(refuserSelector, candidates, {
+		allowInvalidThinkingSelectorFallback: false,
+	}).model;
+	// The refuser must itself resolve; otherwise identity comparison is unsafe
+	// and only static guidance is honest.
+	if (!refuserParsed) return undefined;
+	const refuserBaseId = splitSelectorThinkingSuffix(refuserParsed.id).selector;
 	for (const entry of entries) {
-		if (entry.split(":")[0] === refuserIdentity) continue;
-		const slashIndex = entry.indexOf("/");
-		if (slashIndex <= 0 || slashIndex === entry.length - 1) continue;
-		const provider = entry.slice(0, slashIndex);
-		const modelId = (entry.slice(slashIndex + 1).split(":")[0] ?? "").trim();
-		if (!modelId) continue;
-		const exists = availableModels.some(
-			model => model.provider === provider && (model.id === modelId || model.wireModelId === modelId),
-		);
-		if (!exists) continue;
+		const resolved = resolveSelector(entry, candidates, {
+			allowInvalidThinkingSelectorFallback: false,
+		}).model;
+		// Only offer entries the resolver fully accepts, and never the refuser
+		// itself (a bare thinking-level change is not an alternate model).
+		if (!resolved) continue;
+		if (
+			resolved.provider === refuserParsed.provider &&
+			splitSelectorThinkingSuffix(resolved.id).selector === refuserBaseId
+		) {
+			continue;
+		}
 		return entry;
 	}
 	return undefined;
