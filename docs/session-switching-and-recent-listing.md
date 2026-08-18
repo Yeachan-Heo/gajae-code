@@ -37,8 +37,9 @@ There are two different listing pipelines:
    - Sorts by file `mtime` descending.
 
 2. `SessionManager.list(...)` / `SessionManager.listAll()` (resume pickers and ID matching)
-   - Reads a bounded 4KB prefix, then reverse-scans for the latest strict `header_patch` values (cwd/title) in 4KB chunks, stopping once both fields resolve.
+   - Reads a bounded 4KB prefix, then reverse-scans for the latest strict `header_patch` values (cwd/title) in 64KB chunks, stopping once both fields resolve.
    - Recent patches near EOF stay cheap; when a field is still missing the scan continues past the historical 16KB window so a buried but still-canonical title remains listable without a full sequential JSONL parse of multi-MB message bodies.
+   - A transcript that never emitted a `header_patch` cannot be recognized as such without reaching BOF, so its whole file is walked. The scan therefore uses its own 64KB buffer rather than the 4KB prefix buffer: chunk size sets how many `read` syscalls a listing costs per transcript byte, and listings run on every resume, continue, and picker open.
    - Builds `SessionInfo` objects from that projection plus prefix preview extraction.
    - Drops sessions with zero `message` entries and sorts by `modified` descending.
 
