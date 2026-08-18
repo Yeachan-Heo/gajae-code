@@ -3,6 +3,8 @@ import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:t
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Container } from "@gajae-code/tui";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { formatKeyHint as formatKeyHintForPlatform } from "../src/config/keybindings";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
@@ -834,6 +836,63 @@ describe("InputController keybinding setup", () => {
 
 		expect(queues.editorContainerChildren).toEqual([editor]);
 		expect(ctx.ui.setFocus).toHaveBeenCalledWith(editor);
+	});
+
+	it("keeps a real composer alive across queued-message selector open/restore with real disposal semantics", async () => {
+		// Real Container + CustomEditor (not the array-double): Container.clear()
+		// disposes attached children terminally, so this regression proves the
+		// queued-message open path detaches the reusable editor before clear()
+		// and the restored composer keeps its tab-width listener and input state.
+		const { InputController, ctx, queues } = await createContext();
+		const editor = new CustomEditor(defaultEditorTheme);
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		ctx.editor = editor;
+		ctx.editorContainer = editorContainer as unknown as InteractiveModeContext["editorContainer"];
+		queues.editorContainerChildren = editorContainer.children as unknown[];
+		const restoreComposer = vi.fn(() => {
+			editorContainer.detachChild(editor);
+			editorContainer.clear();
+			editorContainer.addChild(editor);
+		});
+		Object.assign(ctx, { restoreComposer });
+		const defaultWidth = getDefaultTabWidth();
+		const otherWidth = defaultWidth === 3 ? 4 : 3;
+		const invalidations = { count: 0 };
+		const originalInvalidate = editor.invalidate.bind(editor);
+		editor.invalidate = () => {
+			invalidations.count += 1;
+			originalInvalidate();
+		};
+		try {
+			editor.setText("current draft");
+			queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+			const controller = new InputController(ctx);
+
+			for (let cycle = 0; cycle < 3; cycle += 1) {
+				controller.handleDequeue();
+				const selector = editorContainer.children[0];
+				if (!(selector instanceof QueuedMessageSelectorComponent)) {
+					throw new Error("Expected queued message selector to be shown");
+				}
+				expect(editorContainer.children).toEqual([selector]);
+				selector.handleInput("\x1b");
+
+				expect(restoreComposer).toHaveBeenCalledTimes(cycle + 1);
+				expect(editorContainer.children).toEqual([editor]);
+				setDefaultTabWidth(otherWidth);
+				setDefaultTabWidth(defaultWidth);
+			}
+
+			// Every cycle's tab-width toggles reached a live listener; under the
+			// old clear()-with-editor-attached bug, cycle 2+ would add nothing.
+			expect(invalidations.count).toBeGreaterThan(3);
+			editor.handleInput("x");
+			expect(editor.getText()).toBe("current draftx");
+		} finally {
+			setDefaultTabWidth(defaultWidth);
+			editor.dispose();
+		}
 	});
 
 	it("deletes the selected queued message from the selector", async () => {
