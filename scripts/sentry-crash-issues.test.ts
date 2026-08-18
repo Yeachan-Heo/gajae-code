@@ -118,4 +118,37 @@ describe("issue rendering", () => {
 		const title = issueTitle({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: "x".repeat(500) }) });
 		expect(title.length).toBe(200);
 	});
+
+	test("re-sanitizes crash-derived title text locally instead of trusting the relay provenance", () => {
+		const hostile = "TypeError: sk-abcdefghijklmnop1234 leaked /home/secret/path in https://evil.example/x?token=abc";
+		const body = issueBody({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: hostile }) }, options());
+		expect(body).not.toContain("sk-abcdefghijklmnop1234");
+		expect(body).not.toContain("/home/secret/path");
+		expect(body).toContain("«url evil.example/x»");
+		const title = issueTitle({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: hostile }) });
+		expect(title).toBe("crash: TypeError: «redacted-api-key» leaked <path> in «url evil.example/x»");
+	});
+
+	test("de-fangs mentions and backticks in the culprit so a forged group cannot notify or escape rendering", () => {
+		const body = issueBody(
+			{ fingerprint: FINGERPRINT, sentry: sentryIssue({ culprit: "readFile`@everyone /etc/x" }) },
+			options(),
+		);
+		expect(body).not.toContain("@everyone");
+		expect(body).toContain("(at)everyone");
+		// The field's own backticks are neutralized; the only remaining backticks
+		// around the culprit are the wrapper this script renders.
+		expect(body).toContain("Culprit: `readFile'(at)everyone <path>`");
+	});
+
+	test("drops a field the residual scanner refuses instead of passing it through", () => {
+		const body = issueBody({ fingerprint: FINGERPRINT, sentry: sentryIssue({ culprit: "a://b data:x;base64,AAAA" }) }, options());
+		expect(body).toContain("<unsanitizable culprit>");
+		expect(body).not.toContain("base64");
+	});
+
+	test("bounds the body so a huge upstream title cannot blow past the issue size budget", () => {
+		const body = issueBody({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: "y".repeat(90_000) }) }, options());
+		expect(Buffer.byteLength(body, "utf8")).toBeLessThan(48 * 1024);
+	});
 });

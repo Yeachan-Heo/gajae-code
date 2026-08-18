@@ -29,6 +29,8 @@
  */
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
 
+import { fenceCrashText, sanitizeExternalCrashV1 } from "../packages/coding-agent/src/crash/sanitize";
+
 const DEFAULT_REPO = "Yeachan-Heo/gajae-code";
 const DEFAULT_ORG = "probe";
 const DEFAULT_PROJECT = "gajae-code";
@@ -112,6 +114,19 @@ async function sentryGet(pathname: string, token: string): Promise<unknown> {
 
 function asString(value: unknown): string {
 	return typeof value === "string" ? value : "";
+}
+
+/**
+ * Sanitize one crash-derived field for local rendering. The upstream relay
+ * sanitized these fields on egress, but the `gjc.fingerprint` tag that gates
+ * provenance here is stamped client-side with the public DSN key and is
+ * therefore forgeable, so the egress contract is re-applied before anything
+ * reaches a GitHub issue rather than assumed. A field the scanner cannot vouch
+ * for is dropped to a fixed placeholder, never passed through.
+ */
+function sanitizeField(value: string, fallback: string): string {
+	const verdict = sanitizeExternalCrashV1(value, 2048);
+	return verdict.ok ? verdict.value : fallback;
 }
 
 function toSentryIssue(raw: unknown): SentryIssue | undefined {
@@ -204,26 +219,32 @@ async function findExistingIssue(repo: string, fingerprint: string): Promise<str
 }
 
 function issueTitle(row: TriageRow): string {
-	return `crash: ${row.sentry.title}`.slice(0, 200);
+	return `crash: ${sanitizeField(row.sentry.title, "<unsanitizable title>")}`.slice(0, 200);
 }
 
 /**
- * Every field here already survived the relay's outbound sanitizer before it
- * reached Sentry, so this renders upstream aggregates and adds no new local
- * data. The marker sits outside any fenced block, matching `report.ts`, so a
- * forged marker inside crash text cannot impersonate one.
+ * Every field here survived the relay's outbound sanitizer before it reached
+ * Sentry, and crash-derived fields are re-sanitized locally anyway: the
+ * `gjc.fingerprint` tag that proves provenance is stamped client-side with the
+ * public DSN key, so trusting it blindly would let a forged group smuggle raw
+ * text into an issue. The marker sits outside any fenced block, matching
+ * `report.ts`, so a forged marker inside crash text cannot impersonate one.
  */
 function issueBody(row: TriageRow, options: Options): string {
 	const { sentry, fingerprint } = row;
+	const title = sanitizeField(sentry.title, "<unsanitizable title>");
+	const culprit = fenceCrashText(sanitizeField(sentry.culprit, "<unsanitizable culprit>") || "<unknown>");
 	return (
 		`Filed from aggregated upstream crash data by \`scripts/sentry-crash-issues.ts\`. ` +
-		`Every field below passed the \`sanitizeExternalCrashV1\` egress contract before leaving any install.\n\n` +
+		`Every field below passed the \`sanitizeExternalCrashV1\` egress contract before leaving any install, ` +
+		`and is re-sanitized locally before rendering.\n\n` +
 		`- Signature: \`${CRASH_ISSUE_MARKER_PREFIX}${fingerprint}\` (algorithm v1)\n` +
 		`- Upstream events: ${sentry.count}\n` +
 		`- First seen: ${sentry.firstSeen} — last seen: ${sentry.lastSeen}\n` +
-		`- Level: ${sentry.level}\n` +
-		`- Culprit: \`${sentry.culprit || "<unknown>"}\`\n` +
-		`- Upstream group: ${sentry.permalink} (${options.org}/${options.project}, ${sentry.shortId})\n\n` +
+		`- Level: ${fenceCrashText(sanitizeField(sentry.level, "")) || "unknown"}\n` +
+		`- Culprit: \`${culprit}\`\n` +
+		`- Upstream group: ${sentry.permalink} (${options.org}/${options.project}, ${fenceCrashText(sentry.shortId)})\n\n` +
+		`Grouped crash class: ${title}\n\n` +
 		`Grouping is driven by the gjc fingerprint, not Sentry heuristics, so this group is exactly one gjc crash class.\n\n` +
 		`Reproduction steps and environment are not captured upstream; see \`docs/crash-reporting.md\` for what the relay ` +
 		`does and does not transmit.\n\n` +
@@ -244,10 +265,16 @@ async function main(argv: readonly string[]): Promise<number> {
 		return 2;
 	}
 
-	const raw = await sentryGet(
-		`/projects/${options.org}/${options.project}/issues/?query=is:unresolved&limit=${options.limit}`,
-		token,
-	);
+	let raw: unknown;
+	try {
+		raw = await sentryGet(
+			`/projects/${options.org}/${options.project}/issues/?query=is:unresolved&limit=${options.limit}`,
+			token,
+		);
+	} catch (error) {
+		process.stderr.write(`Sentry read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+		return 1;
+	}
 	if (!Array.isArray(raw)) {
 		process.stderr.write("Sentry returned an unexpected issue list shape.\n");
 		return 1;
@@ -255,6 +282,8 @@ async function main(argv: readonly string[]): Promise<number> {
 
 	const rows: TriageRow[] = [];
 	let skippedNoFingerprint = 0;
+	let skippedDuplicateFingerprint = 0;
+	const seenFingerprints = new Set<string>();
 	for (const entry of raw) {
 		const sentry = toSentryIssue(entry);
 		const fingerprint = sentry ? await fingerprintOf(sentry.id, token) : undefined;
@@ -262,17 +291,42 @@ async function main(argv: readonly string[]): Promise<number> {
 			skippedNoFingerprint++;
 			continue;
 		}
+		// Two upstream groups can carry the same gjc.fingerprint tag value (for
+		// example after a Sentry group merge). The marker is the dedup key, so a
+		// second row for an already-seen fingerprint would file a duplicate in
+		// this same batch; keep the first group only.
+		if (seenFingerprints.has(fingerprint)) {
+			skippedDuplicateFingerprint++;
+			continue;
+		}
+		seenFingerprints.add(fingerprint);
 		rows.push({ fingerprint, sentry });
 	}
 
-	for (const row of rows) row.existingIssueUrl = await findExistingIssue(options.repo, row.fingerprint);
+	let existingTotal = 0;
+	for (const row of rows) {
+		let existing: string | undefined;
+		try {
+			existing = await findExistingIssue(options.repo, row.fingerprint);
+		} catch (error) {
+			process.stderr.write(
+				`duplicate search failed for ${row.fingerprint}: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
+			return 1;
+		}
+		row.existingIssueUrl = existing;
+		if (existing !== undefined) existingTotal++;
+	}
 
 	const pending = rows.filter(row => row.existingIssueUrl === undefined);
-	const already = rows.length - pending.length;
+	const already = existingTotal;
 
 	process.stdout.write(
 		`${rows.length} gjc signature(s) upstream; ${already} already filed, ${pending.length} pending` +
 			(skippedNoFingerprint > 0 ? `; ${skippedNoFingerprint} upstream group(s) skipped (no gjc.fingerprint tag)` : "") +
+			(skippedDuplicateFingerprint > 0
+				? `; ${skippedDuplicateFingerprint} duplicate group(s) skipped (same gjc fingerprint earlier in batch)`
+				: "") +
 			"\n\n",
 	);
 
@@ -284,7 +338,9 @@ async function main(argv: readonly string[]): Promise<number> {
 	if (!options.apply) {
 		for (const row of pending)
 			process.stdout.write(
-				`would file  ${row.fingerprint}  ${row.sentry.count}x  ${issueTitle(row)}\n    ${row.sentry.permalink}\n`,
+				`would file  ${row.fingerprint}  ${row.sentry.count}x  ${issueTitle(row)}\n` +
+					`    culprit: ${row.sentry.culprit || "<unknown>"}\n` +
+					`    ${row.sentry.permalink}\n`,
 			);
 		process.stdout.write(`\nDry run. Re-run with --apply to create ${pending.length} issue(s) in ${options.repo}.\n`);
 		return 0;
