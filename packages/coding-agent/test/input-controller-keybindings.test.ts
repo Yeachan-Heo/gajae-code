@@ -714,6 +714,128 @@ describe("InputController keybinding setup", () => {
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
 
+	it("restores the pet-aware composer after closing the queued-message selector", async () => {
+		// Active pet session: the mounted composer child is PetFramedEditor, so
+		// the queued-message close must route through ctx.restoreComposer()
+		// (pet-aware) instead of re-adding the raw editor. This pins the
+		// reserve/frame contract for the queue selector close path.
+		const { InputController, ctx, editor, queues } = await createContext();
+		const restoreComposer = vi.fn(() => {
+			// Pet-aware stand-in: InteractiveMode.restoreComposer remounts the
+			// composer (the framed wrapper in an active pet session).
+			queues.editorContainerChildren.length = 0;
+			queues.editorContainerChildren.push(editor);
+		});
+		Object.assign(ctx, { restoreComposer });
+		queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+		expect(restoreComposer).not.toHaveBeenCalled();
+		expect(queues.editorContainerChildren[0]).toBeInstanceOf(QueuedMessageSelectorComponent);
+
+		const selector = queues.editorContainerChildren[0];
+		if (!(selector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to be shown");
+		}
+		selector.handleInput("\x1b");
+
+		expect(restoreComposer).toHaveBeenCalledTimes(1);
+		expect(queues.editorContainerChildren).toEqual([editor]);
+	});
+
+	it("restores the pet-aware composer after deleting the last queued message through the selector", async () => {
+		const { InputController, ctx, editor, queues } = await createContext();
+		const restoreComposer = vi.fn(() => {
+			queues.editorContainerChildren.length = 0;
+			queues.editorContainerChildren.push(editor);
+		});
+		Object.assign(ctx, { restoreComposer });
+		queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		const selector = queues.editorContainerChildren[0];
+		if (!(selector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to be shown");
+		}
+		// Delete re-opens with the remaining entry; capture the re-opened
+		// selector (ids are re-derived from the live queue) before deleting it.
+		selector.handleInput("\x1b[3~");
+		const reopened = queues.editorContainerChildren[0];
+		if (!(reopened instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected the queued message selector to re-open");
+		}
+		reopened.handleInput("\x1b[3~");
+
+		// Deleting the last remaining entry closes the selector through the
+		// pet-aware restore, not the raw editor swap.
+		expect(restoreComposer).toHaveBeenCalledTimes(1);
+		expect(queues.editorContainerChildren).toEqual([editor]);
+		expect(queues.sessionQueuedMessages).toEqual([]);
+	});
+
+	it("restores the pet-aware composer after moving the last queued message out through the selector", async () => {
+		const { InputController, ctx, editor, queues } = await createContext();
+		const restoreComposer = vi.fn(() => {
+			queues.editorContainerChildren.length = 0;
+			queues.editorContainerChildren.push(editor);
+		});
+		Object.assign(ctx, { restoreComposer });
+		queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		const selector = queues.editorContainerChildren[0];
+		if (!(selector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to be shown");
+		}
+		// Move the newest entry down (a real reorder); the selector re-opens
+		// with the reordered queue, and deleting the last entry then closes
+		// through the pet-aware restore.
+		selector.handleInput("\x1b[1;5B");
+		const reopened = queues.editorContainerChildren[0];
+		if (!(reopened instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected the queued message selector to re-open");
+		}
+		reopened.handleInput("\x1b[3~");
+		const reopenedAgain = queues.editorContainerChildren[0];
+		if (!(reopenedAgain instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected the queued message selector to re-open");
+		}
+		reopenedAgain.handleInput("\x1b[3~");
+
+		expect(restoreComposer).toHaveBeenCalledTimes(1);
+		expect(queues.editorContainerChildren).toEqual([editor]);
+		expect(queues.sessionQueuedMessages).toEqual([]);
+	});
+
+	it("falls back to the plain editor swap when restoreComposer is absent", async () => {
+		// Off mode / lightweight doubles: ctx.restoreComposer is absent, so the
+		// close falls back to the plain detach/clear/re-add swap and still
+		// restores focus on the raw editor.
+		const { InputController, ctx, editor, queues } = await createContext();
+		queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		const selector = queues.editorContainerChildren[0];
+		if (!(selector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to be shown");
+		}
+		selector.handleInput("\x1b");
+
+		expect(queues.editorContainerChildren).toEqual([editor]);
+		expect(ctx.ui.setFocus).toHaveBeenCalledWith(editor);
+	});
+
 	it("deletes the selected queued message from the selector", async () => {
 		const { InputController, ctx, editor, spies, queues } = await createContext();
 		queues.sessionQueuedMessages.push("older session queue", "newest session queue");

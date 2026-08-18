@@ -853,6 +853,7 @@ describe("custom model preset creation", () => {
 			ui: { setFocus: () => {}, requestRender: () => {} },
 			editorContainer: {
 				clear: () => {},
+				detachChild: () => {},
 				addChild: (child: unknown) => {
 					if (child instanceof ModelSelectorComponent) selector = child;
 				},

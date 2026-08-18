@@ -1311,6 +1311,15 @@ export class InputController {
 	}
 
 	#restoreEditorFocus(): void {
+		// Prefer the pet-aware composer restore (InteractiveMode.restoreComposer):
+		// in an active pet session the mounted child is PetFramedEditor, and
+		// mounting the raw editor would drop the pet reserve beside the composer.
+		// Fall back to a plain editor swap for contexts that predate it (e.g.
+		// lightweight test doubles).
+		if (typeof this.ctx.restoreComposer === "function") {
+			this.ctx.restoreComposer();
+			return;
+		}
 		// The composer is reusable across overlays: detach (never dispose)
 		// before clearing so only the transient overlay is torn down.
 		this.ctx.editorContainer.detachChild(this.ctx.editor);

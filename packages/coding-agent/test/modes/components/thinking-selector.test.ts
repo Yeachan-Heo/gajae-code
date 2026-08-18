@@ -87,6 +87,10 @@ describe("SelectorController effort selector", () => {
 			clear() {
 				this.children = [];
 			},
+			detachChild(child: unknown) {
+				const index = this.children.indexOf(child);
+				if (index !== -1) this.children.splice(index, 1);
+			},
 			addChild(child: unknown) {
 				this.children.push(child);
 			},
@@ -148,6 +152,10 @@ describe("SelectorController effort selector", () => {
 			clear() {
 				this.children = [];
 			},
+			detachChild(child: unknown) {
+				const index = this.children.indexOf(child);
+				if (index !== -1) this.children.splice(index, 1);
+			},
 			addChild(child: unknown) {
 				this.children.push(child);
 			},
@@ -205,6 +213,10 @@ describe("SelectorController effort selector", () => {
 			clear() {
 				this.children = [];
 			},
+			detachChild(child: unknown) {
+				const index = this.children.indexOf(child);
+				if (index !== -1) this.children.splice(index, 1);
+			},
 			addChild(child: unknown) {
 				this.children.push(child);
 			},
@@ -244,6 +256,10 @@ describe("SelectorController effort selector", () => {
 			children: [] as unknown[],
 			clear() {
 				this.children = [];
+			},
+			detachChild(child: unknown) {
+				const index = this.children.indexOf(child);
+				if (index !== -1) this.children.splice(index, 1);
 			},
 			addChild(child: unknown) {
 				this.children.push(child);

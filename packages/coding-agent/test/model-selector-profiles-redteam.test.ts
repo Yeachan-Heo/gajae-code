@@ -124,7 +124,7 @@ function createControllerContext(options: { missingCredentials?: boolean } = {})
 	};
 	const ctx = {
 		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
-		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
+		editorContainer: { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() },
 		editor: {},
 		settings,
 		session,
@@ -353,7 +353,7 @@ test("delete action restores the profile when post-delete notification fails", a
 	const settings = Settings.isolated({ "modelProfile.default": "unrelated" });
 	const ctx = {
 		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
-		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
+		editorContainer: { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() },
 		editor: {},
 		settings,
 		session: {

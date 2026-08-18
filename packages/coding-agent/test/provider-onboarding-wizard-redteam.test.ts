@@ -321,6 +321,10 @@ function createControllerContext(
 			clear: () => {
 				children.length = 0;
 			},
+			detachChild: (child: unknown) => {
+				const index = children.indexOf(child);
+				if (index !== -1) children.splice(index, 1);
+			},
 			addChild: (child: unknown) => {
 				children.push(child);
 			},

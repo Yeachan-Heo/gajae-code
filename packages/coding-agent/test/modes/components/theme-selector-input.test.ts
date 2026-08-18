@@ -120,6 +120,10 @@ describe("ThemeSelectorComponent input handling", () => {
 			clear() {
 				this.children = [];
 			},
+			detachChild(child: unknown) {
+				const index = this.children.indexOf(child);
+				if (index !== -1) this.children.splice(index, 1);
+			},
 			addChild(child: unknown) {
 				this.children.push(child);
 			},
@@ -169,6 +173,10 @@ describe("ThemeSelectorComponent input handling", () => {
 			children: [] as unknown[],
 			clear() {
 				this.children = [];
+			},
+			detachChild(child: unknown) {
+				const index = this.children.indexOf(child);
+				if (index !== -1) this.children.splice(index, 1);
 			},
 			addChild(child: unknown) {
 				this.children.push(child);
