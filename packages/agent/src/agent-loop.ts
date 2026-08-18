@@ -68,17 +68,18 @@ import {
 	bindDispatchedToolIdentity,
 	markNonDispatchedToolEvent,
 } from "./tool-dispatch-identity";
-import type {
-	AgentContext,
-	AgentEvent,
-	AgentLoopConfig,
-	AgentMessage,
-	AgentTool,
-	AgentToolContext,
-	AgentToolResult,
-	ManagedAttemptOutcome,
-	StandaloneRunOwnership,
-	StreamFn,
+import {
+	type AgentContext,
+	type AgentEvent,
+	type AgentLoopConfig,
+	type AgentMessage,
+	type AgentTool,
+	type AgentToolContext,
+	type AgentToolResult,
+	type ManagedAttemptOutcome,
+	type StandaloneRunOwnership,
+	type StreamFn,
+	toolFailureEnvelope,
 } from "./types";
 
 // Capture the intrinsic before any tool/hook can replace `Reflect.apply`. Calling this
@@ -3590,9 +3591,7 @@ async function executeToolCalls(
 				caughtError = e;
 				result = {
 					content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
-					details: {
-						failureKind: record.argumentValidationFailed ? "argument_validation" : "execution",
-					},
+					details: toolFailureEnvelope(record.argumentValidationFailed ? "argument_validation" : "execution"),
 				};
 				isError = true;
 			}

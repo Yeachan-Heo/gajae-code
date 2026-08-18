@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `toolFailureEnvelope` / `isToolFailureEnvelope` / `ToolFailureEnvelope` name the result details the loop attaches when a tool call fails without the tool returning details of its own. The guard matches only that envelope, so a consumer can tell it apart from a tool that reports a `failureKind` alongside its own details before dereferencing a tool-owned detail shape.
+
 ## [0.14.0] - 2026-08-17
 
 ### Fixed

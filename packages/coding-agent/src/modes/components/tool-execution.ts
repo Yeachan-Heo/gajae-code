@@ -1,4 +1,4 @@
-import type { AgentTool } from "@gajae-code/agent-core";
+import { type AgentTool, isToolFailureEnvelope } from "@gajae-code/agent-core";
 import {
 	type AnimationRegistration,
 	Box,
@@ -201,6 +201,7 @@ export interface ToolExecutionHandle {
 export class ToolExecutionComponent extends Container {
 	#contentBox: Box; // Used for custom tools and bash visual truncation
 	#contentText: Text; // For built-in tools (with its own padding/bg)
+	#usesContentBox: boolean; // Which of the two the constructor put in the tree
 	#multiFileBoxes: (Box | Spacer)[] = []; // Extra boxes for multi-file edit results
 	#imageComponents: Image[] = [];
 	#imageSpacers: Spacer[] = [];
@@ -299,7 +300,8 @@ export class ToolExecutionComponent extends Container {
 		// Use Box for custom tools or built-in tools that have renderers
 		const hasRenderer = toolName in toolRenderers;
 		const hasCustomRenderer = !!(tool?.renderCall || tool?.renderResult);
-		if (hasCustomRenderer || hasRenderer) {
+		this.#usesContentBox = hasCustomRenderer || hasRenderer;
+		if (this.#usesContentBox) {
 			this.addChild(this.#contentBox);
 		} else {
 			this.addChild(this.#contentText);
@@ -639,8 +641,26 @@ export class ToolExecutionComponent extends Container {
 		this.#renderState.isPartial = this.#isPartial;
 		this.#renderState.spinnerFrame = this.#spinnerFrame;
 
-		// Check for custom tool rendering
-		if (this.#tool && (this.#tool.renderCall || this.#tool.renderResult)) {
+		// A call the loop rejected carries the loop's failure envelope in place of the
+		// tool's own details. A renderer owns only its own detail shape, so handing it
+		// the envelope either throws — leaving the TUI's bare `[render error: Box]`
+		// fallback line — or paints the tool's own card while the rejection reason is
+		// dropped. The reason is the only content left, so render it the way a tool
+		// without a renderer already reports failure.
+		if (this.#usesContentBox && this.#result?.isError && isToolFailureEnvelope(this.#result.details)) {
+			for (const box of this.#multiFileBoxes) {
+				this.removeChild(box);
+			}
+			this.#multiFileBoxes = [];
+			this.#contentBox.setBgFn(bgFn);
+			this.#contentBox.clear();
+			this.#contentBox.addChild(new Text(renderStatusLine({ icon: "error", title: this.#toolLabel }, theme), 0, 0));
+			const reason = this.#getTextOutput().trimEnd();
+			if (reason) {
+				this.#contentBox.addChild(new Text(theme.fg("toolOutput", replaceTabs(reason)), 0, 0));
+			}
+		} else if (this.#tool && (this.#tool.renderCall || this.#tool.renderResult)) {
+			// Custom tool rendering
 			const tool = this.#tool;
 			const mergeCallAndResult = Boolean((tool as { mergeCallAndResult?: boolean }).mergeCallAndResult);
 			// Custom tools use Box for flexible component rendering
