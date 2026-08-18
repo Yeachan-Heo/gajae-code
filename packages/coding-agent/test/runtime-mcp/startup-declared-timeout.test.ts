@@ -1,5 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import * as mcpClient from "../../src/runtime-mcp/client";
 import { MCPManager, withinDeclaredConnectionWindow } from "../../src/runtime-mcp/manager";
+import type { MCPServerConnection } from "../../src/runtime-mcp/types";
 
 // `gjc mcp add --timeout` writes a per-server `timeout`, and `connectToServer`
 // honors it. Startup used to discard it anyway: one batch-wide timer decided
@@ -91,7 +93,35 @@ describe("MCP startup and the declared connection window", () => {
 		}
 	}, 15_000);
 
-	test("gives up on a server once its declared window has actually elapsed", async () => {
+	// A real stdio fixture cannot reach this branch: `connectToServer` enforces the
+	// declared timeout itself, so the task rejects before the startup race sees it
+	// still pending. Holding the connect open past its declared window is the only
+	// way to assert the manager's own elapsed-window teardown and its abort mapping.
+	test("tears down a task still pending after its declared window elapsed", async () => {
+		let capturedSignal: AbortSignal | undefined;
+		const connect = vi
+			.spyOn(mcpClient, "connectToServer")
+			.mockImplementation((_name, _config, options?: { signal?: AbortSignal }) => {
+				capturedSignal = options?.signal;
+				return new Promise<MCPServerConnection>(() => {});
+			});
+		// The startup wait outlives the declared window: budget is declared + grace,
+		// so by the deadline the 300ms window is spent while the task is still pending.
+		const manager = new MCPManager(process.cwd(), null, { maxStartupTimeoutMs: 800 });
+		try {
+			const result = await manager.connectServers({ spent: { type: "stdio", command: "spent", timeout: 300 } }, {});
+
+			expect(result.connectedServers).toEqual([]);
+			expect(result.errors.get("spent")).toBe("MCP server connection timed out during startup: spent");
+			expect(manager.getConnectionStatus("spent")).toBe("disconnected");
+			expect(capturedSignal?.aborted).toBe(true);
+		} finally {
+			connect.mockRestore();
+			await manager.disconnectAll();
+		}
+	});
+
+	test("reports a server whose own declared timeout rejects it before the startup wait ends", async () => {
 		const manager = new MCPManager(process.cwd());
 		try {
 			const result = await manager.connectServers(
@@ -99,8 +129,8 @@ describe("MCP startup and the declared connection window", () => {
 					brief: {
 						command: process.execPath,
 						args: ["-e", delayedStdioServer("ping", 5_000)],
-						// Declared window closes before the startup wait ends, so this
-						// server is torn down and reported exactly as before.
+						// `connectToServer` enforces this window itself and rejects at 900ms,
+						// well inside the 1400ms startup wait.
 						timeout: 900,
 					},
 				},

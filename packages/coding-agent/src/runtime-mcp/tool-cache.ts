@@ -44,8 +44,19 @@ function toHex(buffer: ArrayBuffer): string {
 	return output;
 }
 
-async function hashConfig(config: MCPServerConfig): Promise<string> {
-	const stable = stableStringify(config);
+/**
+ * Cache identity.
+ *
+ * A cached entry is replayed as a `DeferredMCPTool` *before* the server it came
+ * from has connected, so identity must cover every input that decides which
+ * server the name refers to. Server name plus raw config is not enough: the
+ * effective project scope selects the config in the first place, and the same
+ * name/config in another project can describe a different server. `scope` binds
+ * the entry to that project so a cross-project hit can never surface another
+ * workspace's tool descriptions.
+ */
+async function hashConfig(config: MCPServerConfig, scope: string): Promise<string> {
+	const stable = stableStringify({ scope, config });
 	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stable));
 	return toHex(digest);
 }
@@ -55,11 +66,27 @@ function cacheKey(serverName: string): string {
 }
 
 export class MCPToolCache {
-	constructor(private storage: AgentStorage) {}
+	/**
+	 * `storage` must already be scoped to the caller's effective agent profile;
+	 * `scope` additionally binds entries to the effective project.
+	 */
+	constructor(
+		private storage: AgentStorage,
+		private scope = "",
+	) {}
 
 	async get(serverName: string, config: MCPServerConfig): Promise<MCPToolDefinition[] | null> {
 		const key = cacheKey(serverName);
-		const raw = this.storage.getCache(key);
+		// A miss and an unreadable cache are the same thing to the caller: startup
+		// connects the server normally. A locked, closed, or corrupt database must
+		// never reject the batch and abort session startup.
+		let raw: string | null | undefined;
+		try {
+			raw = this.storage.getCache(key);
+		} catch (error) {
+			logger.warn("MCP tool cache read failed", { serverName, error: String(error) });
+			return null;
+		}
 		if (!raw) return null;
 
 		let parsed: unknown;
@@ -77,7 +104,7 @@ export class MCPToolCache {
 
 		let currentHash: string;
 		try {
-			currentHash = await hashConfig(config);
+			currentHash = await hashConfig(config, this.scope);
 		} catch (error) {
 			logger.warn("MCP tool cache hash failed", { serverName, error: String(error) });
 			return null;
@@ -91,7 +118,7 @@ export class MCPToolCache {
 	async set(serverName: string, config: MCPServerConfig, tools: MCPToolDefinition[]): Promise<void> {
 		let configHash: string;
 		try {
-			configHash = await hashConfig(config);
+			configHash = await hashConfig(config, this.scope);
 		} catch (error) {
 			logger.warn("MCP tool cache hash failed", { serverName, error: String(error) });
 			return;
@@ -112,6 +139,13 @@ export class MCPToolCache {
 		}
 
 		const expiresAtSec = Math.floor((Date.now() + CACHE_TTL_MS) / 1000);
-		this.storage.setCache(cacheKey(serverName), serialized, expiresAtSec);
+		// Writes run detached from the connection that produced them, so a failed
+		// write degrades the next startup at worst and must never surface as a
+		// rejected background task.
+		try {
+			this.storage.setCache(cacheKey(serverName), serialized, expiresAtSec);
+		} catch (error) {
+			logger.warn("MCP tool cache write failed", { serverName, error: String(error) });
+		}
 	}
 }

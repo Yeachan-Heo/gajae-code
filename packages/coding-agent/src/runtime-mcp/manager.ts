@@ -1132,7 +1132,9 @@ export class MCPManager {
 					});
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
-					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
+					// Detached from the connection that produced it: a cache write can only
+					// degrade the next startup, never fail this one.
+					if (!this.#toolsOnly) void this.#writeToolCache(name, config, serverTools);
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
@@ -1194,52 +1196,65 @@ export class MCPManager {
 
 			if (pendingTasks.length > 0) {
 				if (this.toolCache && !this.#toolsOnly) {
+					// An unreadable cache is a miss, never a startup failure: the batch
+					// must not reject because the cache database is locked or corrupt.
 					await Promise.all(
 						pendingTasks.map(async task => {
-							const cached = await this.toolCache?.get(task.name, task.config);
-							if (cached) {
-								cachedTools.set(task.name, cached);
+							try {
+								const cached = await this.toolCache?.get(task.name, task.config);
+								if (cached) cachedTools.set(task.name, cached);
+							} catch (error) {
+								logger.warn("MCP tool cache lookup failed", { path: `mcp:${task.name}`, error });
 							}
 						}),
 					);
 				}
 
-				const pendingWithoutCache = pendingTasks.filter(task => !cachedTools.has(task.name));
-				if (pendingWithoutCache.length > 0) {
-					// The startup wait elapsing means "stop blocking session start", not
-					// "this server failed". A server whose operator declared a `timeout`
-					// (`gjc mcp add --timeout`) asked to wait that long for it, so while it
-					// is still inside that window it keeps connecting in the background
-					// under `connectToServer`'s own timeout, and the background tool load
-					// adopts it. Only a server that declared no window, or already spent it,
-					// is torn down and reported. Exact-config (`toolsOnly`) startup still
-					// fails fast: it builds a catalog once, so a missing server is an error.
-					const startupElapsedMs = Date.now() - startupStartedAt;
-					for (const task of pendingWithoutCache) {
-						if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
-							logger.warn("MCP server still connecting after the startup wait", {
-								path: `mcp:${task.name}`,
-								startupWaitMs: startupTimeoutMs,
-								declaredTimeoutMs: task.config.timeout,
-							});
-							continue;
-						}
-						const message = `MCP server connection timed out during startup: ${task.name}`;
-						errors.set(task.name, this.#serverError(message));
-						reportedErrors.add(task.name);
-						task.connectionAbort.abort(new Error(message));
-						if (this.#pendingConnections.has(task.name)) this.#pendingConnections.delete(task.name);
-						if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
-							this.#pendingToolLoads.delete(task.name);
-						this.#pendingConnectionControllers.delete(task.name);
-						void this.#disconnectServer(task.name).catch(error => {
-							this.#logLeaseReleaseFailure(task.name, undefined, error);
+				// The startup wait elapsing means "stop blocking session start", not
+				// "this server failed". A server whose operator declared a `timeout`
+				// (`gjc mcp add --timeout`) asked to wait that long for it, so while it
+				// is still inside that window it keeps connecting in the background
+				// under `connectToServer`'s own timeout, and the background tool load
+				// adopts it. Exact-config (`toolsOnly`) startup still fails fast: it
+				// builds a catalog once, so a missing server is an error.
+				const startupElapsedMs = Date.now() - startupStartedAt;
+				// A declared window that has already elapsed is spent for a cached task
+				// too: `connectToServer` has given up by now, so replaying cached tools as
+				// deferred would advertise a connection that can never arrive and fail on
+				// first call. A cached task that declared no window keeps the existing
+				// deferred contract, which never depended on a declared timeout.
+				const declaredWindowSpent = (config: MCPServerConfig): boolean =>
+					typeof config.timeout === "number" &&
+					Number.isFinite(config.timeout) &&
+					config.timeout > 0 &&
+					!withinDeclaredConnectionWindow(config, startupElapsedMs);
+				for (const task of pendingTasks) {
+					if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
+						logger.warn("MCP server still connecting after the startup wait", {
+							path: `mcp:${task.name}`,
+							startupWaitMs: startupTimeoutMs,
+							declaredTimeoutMs: task.config.timeout,
+							deferredFromCache: cachedTools.has(task.name),
 						});
+						continue;
 					}
-					// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
-					// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
-					// registered if it eventually connects.
+					if (cachedTools.has(task.name) && !declaredWindowSpent(task.config)) continue;
+					cachedTools.delete(task.name);
+					const message = `MCP server connection timed out during startup: ${task.name}`;
+					errors.set(task.name, this.#serverError(message));
+					reportedErrors.add(task.name);
+					task.connectionAbort.abort(new Error(message));
+					if (this.#pendingConnections.has(task.name)) this.#pendingConnections.delete(task.name);
+					if (this.#pendingToolLoads.get(task.name) === task.toolsPromise)
+						this.#pendingToolLoads.delete(task.name);
+					this.#pendingConnectionControllers.delete(task.name);
+					void this.#disconnectServer(task.name).catch(error => {
+						this.#logLeaseReleaseFailure(task.name, undefined, error);
+					});
 				}
+				// Abort and disconnect in the background: a misbehaving stdio/MCP transport can
+				// ignore AbortSignal and keep startup blocked indefinitely, but it must not remain
+				// registered if it eventually connects.
 			}
 
 			for (const task of connectionTasks) {
@@ -1327,6 +1342,15 @@ export class MCPManager {
 			connectedServers: Array.from(connectedServers),
 			exaApiKeys: [], // Will be populated by discoverAndConnect
 		};
+	}
+
+	/** Cache tool definitions without ever surfacing a write failure to the caller. */
+	async #writeToolCache(name: string, config: MCPServerConfig, tools: MCPToolDefinition[]): Promise<void> {
+		try {
+			await this.toolCache?.set(name, config, tools);
+		} catch (error) {
+			logger.warn("MCP tool cache store failed", { path: `mcp:${name}`, error });
+		}
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
@@ -2028,7 +2052,7 @@ export class MCPManager {
 				noReplay: config.sharing === "shared",
 				inputHandler: () => this.#inputRequestHandler ?? undefined,
 			});
-			void this.toolCache?.set(name, config, serverTools);
+			void this.#writeToolCache(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
 			void this.#loadServerResourcesAndPrompts(name, connection);
@@ -2096,7 +2120,7 @@ export class MCPManager {
 			noReplay: connection.config.sharing === "shared",
 			inputHandler: () => this.#inputRequestHandler ?? undefined,
 		});
-		void this.toolCache?.set(name, connection.config, serverTools);
+		void this.#writeToolCache(name, connection.config, serverTools);
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);

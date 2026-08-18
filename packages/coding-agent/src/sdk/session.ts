@@ -1198,10 +1198,16 @@ function safeErrorForLog(value: unknown): unknown {
  * manager can never reach that path and a consistently slow server stays
  * invisible forever. Cache failures are non-fatal: startup simply falls back to
  * "no tools from that server yet".
+ *
+ * Storage is opened against the session's effective `agentDir`, like the rest of
+ * session and auth storage. A cached entry is replayed as a deferred tool before
+ * its server has connected, so a cache shared across profiles would let one
+ * profile publish tool descriptions into another; `cwd` scopes the entries again
+ * inside that database so the same server name in another project cannot hit.
  */
-async function openMcpToolCache(): Promise<MCPToolCache | null> {
+async function openMcpToolCache(agentDir: string, cwd: string): Promise<MCPToolCache | null> {
 	try {
-		return new MCPToolCache(await AgentStorage.open());
+		return new MCPToolCache(await AgentStorage.open(getAgentDbPath(agentDir)), path.resolve(cwd));
 	} catch (error) {
 		logger.warn("MCP tool cache unavailable", { error: safeErrorForLog(error) });
 		return null;
@@ -2377,7 +2383,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					),
 				};
 				if (Object.keys(mergedConfigs).length > 0) {
-					const owned = new MCPManager(cwd, await openMcpToolCache(), {
+					const owned = new MCPManager(cwd, await openMcpToolCache(agentDir, cwd), {
 						sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs"),
 					});
 					owned.setAuthStorage(authStorage);
@@ -2415,9 +2421,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							mcpManager = owned;
 							ownsMcpManager = true;
 							customTools.push(...(result.tools as CustomTool[]));
-							const connectedPluginNames = new Set([...surfacedServers].filter(name => pluginNames.has(name)));
+							// Ownership covers pending servers too. A plugin MCP that lands after
+							// startup must still be classified as a mandatory plugin surface, or a
+							// sub-session inheriting this manager would later read its tools as
+							// neither plugin nor conventional and drop them from both sets.
+							const ownedServers = new Set([...surfacedServers, ...pendingServers]);
+							const connectedPluginNames = new Set([...ownedServers].filter(name => pluginNames.has(name)));
 							pluginMcpManagerServers.set(owned, connectedPluginNames);
-							conventionalMcpManagerServers.set(owned, surfacedServers);
+							conventionalMcpManagerServers.set(owned, ownedServers);
 							for (const tool of result.tools) {
 								const serverName = tool.mcpServerName;
 								if (serverName === undefined) continue;
@@ -2428,7 +2439,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// (existing plugin contract). Sessions without plugin MCPs keep
 							// a mutable connection set so `/mcp reload` can re-discover
 							// conventional registrations.
-							if (connectedPluginNames.size > 0) owned.sealConnectionSet();
+							if ([...surfacedServers].some(name => pluginNames.has(name))) owned.sealConnectionSet();
 						} else {
 							try {
 								await owned.disconnectAll();

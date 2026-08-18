@@ -169,6 +169,74 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		expect(mcpManager?.getConnectedServers()).toEqual([]);
 	}, 30_000);
 
+	// Second session must inherit what the first one learned. The cache is what
+	// turns "the connection survived" into "the user has the tools", so it is
+	// asserted end to end rather than through the cache class.
+	it("caches a late-connecting server so the next cold-start session surfaces it immediately", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow",
+			commandArgs: [process.execPath, "-e", delayedMcpServerScript(2_400)],
+			flags: { project: true, timeout: 10_000 },
+			cwd: projectDir,
+		});
+
+		const first = await createAgentSession(isolatedSessionOptions());
+		try {
+			// Cold cache: nothing to surface at startup, connection kept alive.
+			expect(first.session.getAllToolNames()).not.toContain("mcp__slow_hello");
+			await waitFor(() => first.mcpManager?.getConnectedServers().includes("slow") === true);
+			await waitFor(() => first.mcpManager?.getTools().some(tool => tool.name === "mcp__slow_hello") === true);
+		} finally {
+			await first.session.dispose();
+		}
+
+		// Warm cache: the same delayed server is surfaced as a deferred tool before
+		// it has connected, so the session starts with it already available.
+		const second = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(second.mcpManager?.getConnectionStatus("slow")).toBe("connecting");
+			expect(second.session.getAllToolNames()).toContain("mcp__slow_hello");
+			expect(second.session.getActiveToolNames()).toContain("mcp__slow_hello");
+			// The deferred surface still resolves to a real connection.
+			await waitFor(() => second.mcpManager?.getConnectedServers().includes("slow") === true);
+		} finally {
+			await second.session.dispose();
+		}
+	}, 30_000);
+
+	it("does not reuse another agent profile's cached MCP tools", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow",
+			commandArgs: [process.execPath, "-e", delayedMcpServerScript(2_400)],
+			flags: { project: true, timeout: 10_000 },
+			cwd: projectDir,
+		});
+
+		const warm = await createAgentSession(isolatedSessionOptions());
+		try {
+			await waitFor(() => warm.mcpManager?.getTools().some(tool => tool.name === "mcp__slow_hello") === true);
+		} finally {
+			await warm.session.dispose();
+		}
+
+		// A different agent profile must not read the first profile's cache: cached
+		// definitions become deferred tools before the server connects, so a shared
+		// cache would let one profile publish tool descriptions into another.
+		const otherAgentDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-autoload-agent-b-"));
+		try {
+			const other = await createAgentSession({ ...isolatedSessionOptions(), agentDir: otherAgentDir });
+			try {
+				expect(other.session.getAllToolNames()).not.toContain("mcp__slow_hello");
+			} finally {
+				await other.session.dispose();
+			}
+		} finally {
+			await fs.promises.rm(otherAgentDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
 	it("opts out with enableMcpAutoload: false (CLI --no-mcp) without loading conventional registrations", async () => {
 		await runMCPCommand({
 			action: "add",
