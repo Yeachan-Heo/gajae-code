@@ -13,7 +13,7 @@
  *     (a wrong constant or bad FFI signature would disagree);
  *   - the whole default detection chain spawns zero subprocesses.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as childProcess from "node:child_process";
 import { detectWin32Avx2Support } from "../native/loader-state.js";
 
@@ -29,12 +29,12 @@ describe("windows AVX2 probe live execution (#4652)", () => {
 	});
 
 	it.skipIf(!isWindows)("default detection chain spawns no subprocess on a real Windows host", () => {
-		const spawnSync = Bun.spy(childProcess.spawnSync);
+		const spawnSync = vi.spyOn(childProcess, "spawnSync");
 		try {
 			const result = detectWin32Avx2Support();
 			expect(typeof result).toBe("boolean");
 			// The in-process probe decided; no PowerShell was spawned.
-			expect(spawnSync.calls.length).toBe(0);
+			expect(spawnSync).not.toHaveBeenCalled();
 		} finally {
 			spawnSync.mockRestore();
 		}
