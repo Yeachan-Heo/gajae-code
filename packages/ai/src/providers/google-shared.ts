@@ -257,11 +257,23 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 					// Otherwise convert to plain text (no tags to avoid model mimicking them)
 					if (isSameProviderAndModel) {
 						const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, block.thinkingSignature);
-						parts.push({
-							thought: true,
-							text: block.thinking.toWellFormed(),
-							...(thoughtSignature && { thoughtSignature }),
-						});
+						// An unsigned `thought: true` part cannot be replayed: Cloud Code Assist
+						// maps it to an Anthropic `thinking` block and rejects the whole request
+						// with `thinking.signature: Field required` (#4630). Persisted signatures
+						// can be missing entirely or cleared to "" (oversized-signature
+						// persistence), so degrade those blocks to the same plain-text treatment
+						// cross-model reasoning already gets. Signed thinking still replays natively.
+						if (!thoughtSignature) {
+							parts.push({
+								text: block.thinking.toWellFormed(),
+							});
+						} else {
+							parts.push({
+								thought: true,
+								text: block.thinking.toWellFormed(),
+								thoughtSignature,
+							});
+						}
 					} else {
 						parts.push({
 							text: block.thinking.toWellFormed(),

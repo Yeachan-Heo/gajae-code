@@ -564,6 +564,79 @@ describe("AgentSession deep-interview continuation", () => {
 			),
 		);
 	});
+	it("auto-continues an ordinary answered round past the retired tier boundary without a generic continuation approval ask (#4589)", async () => {
+		await activateWorkflow("deep-interview");
+		// Round 6 sits inside the retired "rounds 4-15 ask to continue" band; an
+		// ordinary answered round there must still auto-continue the interview
+		// (score, persist, next weakest-dimension question) instead of surfacing a
+		// generic continue/cancel/clear choice.
+		const ask = new AskTool({
+			cwd: tempDir.path(),
+			hasUI: true,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getSessionId: () => sessionManager.getSessionId(),
+			getDeepInterviewAskStage: () => "post-topology",
+		} as ToolSession);
+		const context = {
+			hasUI: true,
+			ui: {
+				select: async (_prompt: string, options: string[]) => options.find(option => option.includes("Timeline")),
+			},
+			abort: () => {},
+		} as unknown as AgentToolContext;
+		await ask.execute(
+			"ordinary-answered-round",
+			{
+				questions: [
+					{
+						id: "goal-clarity",
+						question: "Which outcome does the first release target?",
+						options: [{ label: "Budget" }, { label: "Timeline" }],
+						deepInterview: { round: 6, component: "Scope", dimension: "Goal", ambiguity: 0.58 },
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+		const state = JSON.parse(
+			await Bun.file(modeStatePath(tempDir.path(), sessionManager.getSessionId(), "deep-interview")).text(),
+		);
+		expect(state.state.rounds).toEqual([
+			expect.objectContaining({ round: 6, question_id: "goal-clarity", selected_options: ["Timeline"] }),
+		]);
+
+		const continued = Promise.withResolvers<void>();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => continued.resolve());
+		const assistant = {
+			...createAssistantMessage("Round 6 complete. Ambiguity 58% -> 44%. Next: Constraints."),
+			timestamp: 2,
+		};
+		session.agent.emitExternalEvent({ type: "turn_start" });
+		session.agent.emitExternalEvent({ type: "message_end", message: assistant });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistant] });
+		await continued.promise;
+
+		// The stop gate continued the interview contract: score/persist, then the
+		// next weakest-dimension question via the ask tool.
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		const [reminder] = developerReminders();
+		expect(reminder).toContain("score and persist the answered round");
+		expect(reminder).toContain("use the ask tool for the next question");
+		// The continuation reminder must be the interview contract itself, never a
+		// generic continue/cancel/clear approval surface.
+		expect(reminder).not.toMatch(/continue, or proceed with current clarity/i);
+		expect(reminder).not.toMatch(/ask(?:ing)? to continue/i);
+		// No generic continue/cancel/clear choice surface: the only stop exits the
+		// reminder names are the legitimate terminals (crystallize, handoff, or an
+		// explicit user cancellation), not a mid-interview consent ask.
+		expect(reminder).not.toMatch(/continue\?/i);
+		expect(reminder).not.toMatch(/clear the workflow/i);
+		expect(reminder).not.toMatch(/whether to continue/i);
+	});
 
 	it("atomically commits only two overlapping ordinary-stop reservations", async () => {
 		await activateWorkflow("deep-interview");

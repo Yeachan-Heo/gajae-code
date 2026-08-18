@@ -3355,9 +3355,55 @@ describe("native gjc team runtime", () => {
 		expect((await Bun.file(path.join(cleanupRoot, "semantic.txt")).text()).replaceAll("\r\n", "\n")).toBe(
 			"semantic\n",
 		);
-		expect(await Bun.file(path.join(teamStateRoot(cleanupRoot, TEST_SESSION_ID), "runtime.json")).exists()).toBe(
-			false,
-		);
+		// The pollution path this test guards is a merged worker auto-checkpoint
+		// depositing root-level runtime state into the LEADER repo. Assert absence
+		// at the actual merge target `.gjc/state/team/runtime.json` (the worker
+		// wrote it into its worktree at that root path), not at the unrelated
+		// session-scoped `teamStateRoot(cleanupRoot, TEST_SESSION_ID)` path.
+		expect(await Bun.file(path.join(cleanupRoot, ".gjc", "state", "team", "runtime.json")).exists()).toBe(false);
+		// The leader's own working tree may hold fake-tmux fixtures; no protected
+		// runtime-root path may appear in its status (nothing was auto-committed
+		// or merged from the protected roots).
+		const leaderStatus = classifyWorkerCheckpointStatus(cleanupRoot);
+		if (leaderStatus.kind === "clean" || leaderStatus.kind === "protected_only") {
+			expect(leaderStatus.files).toEqual([]);
+		} else {
+			expect(classifyGjcTeamCheckpointFiles(leaderStatus.files).protected).toEqual([]);
+		}
+	});
+
+	it("protects worker runtime state under .gjc/state from auto-checkpoint commits", async () => {
+		const repo = await createGitRepo();
+		// Worker sessions write root-level runtime state into their worktree's
+		// .gjc tree (e.g. SDK broker endpoints at .gjc/state/sdk/<session-id>.json
+		// and settings migration markers under .gjc/state/). These must never be
+		// treated as eligible checkpoint content and merged into the leader repo.
+		await Bun.write(path.join(repo, ".gjc/state/sdk/runtime.json"), "{}\n");
+		await Bun.write(path.join(repo, "work.txt"), "eligible\n");
+		const classification = classifyWorkerCheckpointStatus(repo);
+		expect(classification.kind).toBe("eligible");
+		expect(classification.files).toContain("work.txt");
+		expect(classification.files).not.toContain(".gjc/state/sdk/runtime.json");
+		// With only runtime state present there must be nothing to checkpoint.
+		await fs.rm(path.join(repo, "work.txt"));
+		const onlyRuntime = classifyWorkerCheckpointStatus(repo);
+		expect(onlyRuntime.kind).toBe("protected_only");
+
+		// Matcher boundaries: the ".gjc/state/" prefix protects everything under
+		// the root state tree and the bare entry itself, but must not swallow
+		// sibling user paths that merely start with the same characters.
+		expect(
+			classifyGjcTeamCheckpointFiles([
+				".gjc/state",
+				".gjc/state/sdk/session-1.json",
+				".gjc/state-deep/x.md",
+				".gjc/statement.txt",
+				"src/main.ts",
+			]),
+		).toEqual({
+			eligible: [".gjc/state-deep/x.md", ".gjc/statement.txt", "src/main.ts"],
+			protected: [".gjc/state", ".gjc/state/sdk/session-1.json"],
+		});
 	});
 
 	it("worker turn-end integration requests notify the leader once per fingerprint", async () => {
@@ -3993,7 +4039,6 @@ describe("team worker memory guard wiring", () => {
 			);
 		}
 	});
-
 	it("selects the hottest Linux worker, checkpoints it, and syncs config and manifest on replacement", async () => {
 		cleanupRoot = await createGitRepo();
 		const fakeTmux = await createFakeTmuxBin(cleanupRoot);

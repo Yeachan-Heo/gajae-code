@@ -11,6 +11,9 @@ const CURSOR_GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
+/** Tokens represented by a Cursor display-name "1M" window. */
+export const CURSOR_NAMED_MILLION_CONTEXT_WINDOW = 1_000_000;
+const CURSOR_NAMED_MILLION_WINDOW_RE = /\b(\d+(?:\.\d+)?)M\b/i;
 
 const OptionalDisplayNameSchema = z.string().optional().catch(undefined);
 const CursorAliasesSchema = z
@@ -78,8 +81,9 @@ export async function fetchCursorUsableModels(
 			return null;
 		}
 
-		const references = createCursorReferenceMap();
-		return normalizeCursorModels(parsedDecoded.data.models, options.baseUrl, references);
+		return normalizeCursorDiscoveryModels(parsedDecoded.data.models, {
+			baseUrl: options.baseUrl,
+		});
 	} catch {
 		return null;
 	}
@@ -227,6 +231,74 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
 	return null;
 }
 
+export interface CursorLiveContextWindowInput {
+	id: string;
+	name?: string;
+	displayName?: string;
+	displayNameShort?: string;
+	displayModelId?: string;
+	aliases?: readonly string[];
+	fallback: number;
+}
+
+/**
+ * Cursor `GetUsableModels` does not send numeric context-window metadata.
+ * The live million-token window is advertised in display names and aliases
+ * (for example "Claude Opus 5 1M Thinking"). Never shrink a larger bundled
+ * fallback such as Gemini's 1048576-token window.
+ */
+export function resolveCursorLiveContextWindow(input: CursorLiveContextWindowInput): number {
+	const fallback = Number.isFinite(input.fallback) && input.fallback > 0 ? input.fallback : DEFAULT_CONTEXT_WINDOW;
+	const named = parseCursorNamedMillionWindow([
+		input.displayName,
+		input.displayNameShort,
+		input.name,
+		input.displayModelId,
+		input.id,
+		...(input.aliases ?? []),
+	]);
+	if (named === undefined) {
+		return fallback;
+	}
+	return Math.max(named, fallback);
+}
+
+function parseCursorNamedMillionWindow(texts: Array<string | undefined>): number | undefined {
+	for (const text of texts) {
+		if (typeof text !== "string" || text.length === 0) {
+			continue;
+		}
+		const match = CURSOR_NAMED_MILLION_WINDOW_RE.exec(text);
+		if (!match) {
+			continue;
+		}
+		const millions = Number(match[1]);
+		if (!Number.isFinite(millions) || millions <= 0) {
+			continue;
+		}
+		const tokens = Math.round(millions * CURSOR_NAMED_MILLION_CONTEXT_WINDOW);
+		if (Number.isFinite(tokens) && tokens > 0) {
+			return tokens;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Normalize `GetUsableModels` payloads into canonical Cursor model entries.
+ * Tests inject `references` so the overlay can be verified without HTTP/2.
+ */
+export function normalizeCursorDiscoveryModels(
+	models: readonly unknown[] | undefined,
+	options: {
+		baseUrl?: string;
+		references?: ReadonlyMap<string, Model<"cursor-agent">>;
+	} = {},
+): Model<"cursor-agent">[] {
+	const references = options.references ? new Map(options.references) : createCursorReferenceMap();
+	return normalizeCursorModels(models, options.baseUrl, references);
+}
+
 function normalizeCursorModels(
 	models: readonly unknown[] | undefined,
 	baseUrlOverride: string | undefined,
@@ -267,6 +339,15 @@ function normalizeCursorModel(
 	const name = pickModelDisplayName(details, id);
 	const reference = references.get(id);
 	const reasoning = Boolean(details.thinkingDetails) || reference?.reasoning === true;
+	const contextWindow = resolveCursorLiveContextWindow({
+		id,
+		name,
+		displayName: details.displayName,
+		displayNameShort: details.displayNameShort,
+		displayModelId: details.displayModelId,
+		aliases: details.aliases,
+		fallback: reference?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+	});
 
 	if (reference) {
 		return {
@@ -275,6 +356,7 @@ function normalizeCursorModel(
 			name,
 			baseUrl: baseUrlOverride ?? reference.baseUrl,
 			reasoning,
+			contextWindow,
 		};
 	}
 	return {
@@ -286,7 +368,7 @@ function normalizeCursorModel(
 		reasoning,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: DEFAULT_CONTEXT_WINDOW,
+		contextWindow,
 		maxTokens: DEFAULT_MAX_TOKENS,
 	};
 }

@@ -601,15 +601,20 @@ To dispute: send `{ "id": "<fact-id>", "disputed": true }`. To supersede: send `
 
 **`write --input`** — same `{"state":{…}}` shape and same merge semantics as a staged `merge-state` apply, committed in one step. `write --reset --input` replaces the whole `state` with the payload (the locked `intent_contract` is re-attached automatically); use it only for deliberate re-initialization.
 
-### Step 2f: Check Tiered Confirmation Cadence
+### Step 2f: Check Continuation Contract (issue #4589)
 
-Confirmation cadence is tiered by round, adopted from ouroboros's ooo interview, while the hard safety cap is retained:
+An ordinary answered round NEVER asks for generic continuation approval. After scoring, persisting the round, and reporting progress, continue directly to the next weakest-dimension question until a legitimate terminal condition occurs. Generic "continue?"-style or continue/cancel/clear choices are NOT interview-round prompts; surfacing a generic continuation ask after an ordinary answered round converts the ambiguity gate into per-answer consent friction and is a contract violation.
 
-- **Rounds 1-3 (auto-continue)**: minimum context gathering — proceed to the next question without a "continue?" prompt.
-- **Rounds 4-15 (ask to continue)**: after each round, ask "Continue, or proceed with current clarity ({score}%)?" so the user controls depth.
-- **Rounds 16+ (diminishing-returns warning)**: keep asking "Continue?" but prefix a diminishing-returns warning: "We're at {n} rounds (ambiguity: {score}%); each further round yields less. Continue or proceed?"
-- **Round 3+ early exit**: still allow immediate exit if the user says "enough", "let's go", "build it".
-- **Round 100 (hard cap)**: "Maximum interview rounds reached. Proceeding with current clarity level ({score}%)." The tiered cadence never removes this hard safety cap.
+Legitimate terminal conditions — the ONLY places the interview may stop or ask about stopping:
+
+1. **Threshold + closure gates**: ambiguity ≤ the resolved threshold AND the Phase 4 closure audit and one-sentence Restate gate have passed. Then crystallize the spec and present the Phase 5 execution options.
+2. **Explicit user exit**: preserve the two exit-intent classes in any session language:
+   - **Hard cancellation**: "stop", "cancel", "abort", or equivalent stops immediately at any round and saves state for resume. Never turn a hard cancellation into a clarifying question.
+   - **Early proceed**: "enough", "let's go", "build it", or equivalent stops with the early-exit warning from round 3+ when ambiguity > threshold. Before round 3, ask one targeted clarifying question about what the user wants changed instead; do not treat that early-proceed intent as a hard cancellation.
+3. **Invocation/resume suitability ambiguity only**: the Phase 0.5 continue/cancel/clear choice exists solely at the invocation boundary when existing state already contains rounds, topology, spec, or handoff metadata. It is never re-asked inside an active interview.
+4. **Bounded continuation safety recovery**: the Round 100 hard cap ("Maximum interview rounds reached. Proceeding with current clarity level ({score}%).") or the runtime's bounded continuation budget being exhausted. These are safety stops, not consent prompts.
+
+The user always keeps passive exit control: any answer, option, or free-text reply can carry an exit intent. Hard cancellations are honored immediately; early-proceed intents follow their round-3 safety rule above. Depth control comes from answering the questions themselves or exiting explicitly — not from per-round continue? interruptions.
 
 ## Phase 3: Lateral Review Panel (milestone-triggered)
 
@@ -957,7 +962,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 
 <Escalation_And_Stop_Conditions>
 - **Hard cap at 100 rounds**: Proceed with whatever clarity exists, noting the risk
-- **Tiered confirmation cadence**: rounds 1-3 auto-continue, rounds 4-15 ask to continue, rounds 16+ ask with a diminishing-returns warning
+- **Continuation contract**: ordinary answered rounds auto-continue to the next weakest-dimension question with no generic continue/cancel/clear ask; stopping is reserved for threshold + closure gates, explicit user exit, invocation/resume suitability, or bounded safety recovery
 - **Early exit (round 3+)**: Allow with warning if ambiguity > threshold
 - **User says "stop", "cancel", "abort"**: Stop immediately, save state for resume
 - **Ambiguity stalls** (same score +-0.05 for 3 rounds): Activate Ontologist mode to reframe
@@ -976,6 +981,7 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 - [ ] Free-text answers passed the Refine gate; dialectic rhythm guard forced a user question after 3 agent-resolved answers; any auto-answer threshold crossing explicitly confirmed
 - [ ] Closure / Acceptance Guard and the one-sentence Restate gate both passed before crystallization
 - [ ] Interview reached ambiguity ≤ threshold OR an explicit early exit with warning
+- [ ] Ordinary answered rounds auto-continued to the next weakest-dimension question with no generic continue/cancel/clear ask; any stop matched a legitimate terminal condition (threshold + closure gates, explicit user exit, invocation/resume suitability, or bounded safety recovery)
 - [ ] Spec persisted to `.gjc/_session-{sessionid}/specs/deep-interview-{slug}.md` exactly via the GJC CLI (no direct `.gjc/` edits without force override), covering every active topology component plus goal/constraints/acceptance criteria/clarity/ontology/transcript
 - [ ] Spec metadata includes the auto/lateral counters (`auto_researched_rounds`, `auto_answered_rounds`, `lateral_reviews`, `refined_rounds`, `architect_failures`, `lateral_panel_failures`)
 - [ ] Execution bridge presented via `ask`; execution invoked only after explicit approval through a public workflow entrypoint (never direct implementation); state cleaned up after handoff
