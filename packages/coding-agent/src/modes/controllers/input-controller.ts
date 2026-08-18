@@ -315,6 +315,10 @@ export class InputController {
 		return this.ctx.keybindings.getKeys("app.interrupt").some(key => matchesKey(data, key));
 	}
 
+	#matchesClearKey(data: string): boolean {
+		return this.ctx.keybindings.getKeys("app.clear").some(key => matchesKey(data, key));
+	}
+
 	#hasHookDialog(): boolean {
 		return Boolean(this.ctx.hookSelector || this.ctx.hookInput || this.ctx.hookEditor);
 	}
@@ -407,8 +411,26 @@ export class InputController {
 		}
 		this.#globalInterruptUnsubscribe?.();
 		this.#globalInterruptUnsubscribe = this.ctx.ui.addInputListener(data => {
-			if (!this.#matchesInterruptKey(data)) {
+			const isInterruptKey = this.#matchesInterruptKey(data);
+			const isClearKey = this.#matchesClearKey(data);
+			if (!isInterruptKey && !isClearKey) {
 				return undefined;
+			}
+			if (isClearKey && !isInterruptKey) {
+				if (
+					!this.#handleCancellableWorkEscape({
+						loading: true,
+						processes: true,
+						modes: true,
+						maintenance: true,
+						retry: true,
+						streaming: true,
+					})
+				) {
+					return undefined;
+				}
+				this.#resetEscapeGestures();
+				return { consume: true };
 			}
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				this.#resetEscapeGestures();

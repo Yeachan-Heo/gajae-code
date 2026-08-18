@@ -197,7 +197,8 @@ function createContext(): {
 			getSessionName: () => "existing session",
 		} as unknown as InteractiveModeContext["sessionManager"],
 		keybindings: {
-			getKeys: (action: string) => (action === "app.interrupt" ? ["escape"] : []),
+			getKeys: (action: string) =>
+				action === "app.interrupt" ? ["escape"] : action === "app.clear" ? ["ctrl+c"] : [],
 			getDisplayString: () => "",
 		} as unknown as InteractiveModeContext["keybindings"],
 		pendingImages: [],
@@ -513,6 +514,21 @@ describe("InputController escape behavior", () => {
 		expect(result).toEqual({ consume: true });
 		expect(spies.abort).toHaveBeenCalledTimes(1);
 		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt" }));
+	});
+	it("globally aborts an active workflow stream on Ctrl+C without clearing the composer", () => {
+		const { ctx, editor, inputListeners, spies } = createContext();
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
+		editor.setText("draft message");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const result = inputListeners[0]?.("\x03");
+
+		expect(result).toEqual({ consume: true });
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt" }));
+		expect(spies.clearEditor).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("draft message");
 	});
 	it("lets hook selector inline input handle Esc locally during a workflow stream", () => {
 		const { ctx, inputListeners, spies } = createContext();
