@@ -1204,8 +1204,27 @@ function warnManagedSnapshotFailure(
  * commits the transaction.
  */
 type ManagedAttemptBatchItem =
-	| { type: "event"; event: AgentEvent }
+	| { type: "event"; event: AgentEvent; bytes?: number }
 	| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent };
+
+/**
+ * Streaming increments whose complete value is re-published by the block's own
+ * `*_end` frame and by the terminal `message_end` / `done` frames. Those
+ * terminal frames are never reclaimed, so dropping the increments loses no
+ * content — only the intermediate frames that carried it on the way there.
+ */
+const MANAGED_SUPERSEDED_DELTA_EVENT_TYPES: ReadonlySet<string> = new Set([
+	"text_delta",
+	"thinking_delta",
+	"reasoning_summary_delta",
+	"toolcall_delta",
+]);
+
+function isSupersededStreamingDelta(item: ManagedAttemptBatchItem): boolean {
+	if (item.type === "assistant_event") return MANAGED_SUPERSEDED_DELTA_EVENT_TYPES.has(item.event.type);
+	if (item.event.type !== "message_update") return false;
+	return MANAGED_SUPERSEDED_DELTA_EVENT_TYPES.has(item.event.assistantMessageEvent.type);
+}
 
 class ManagedAttemptTransaction {
 	#batch: ManagedAttemptBatchItem[] = [];
@@ -1369,6 +1388,48 @@ class ManagedAttemptTransaction {
 		);
 	}
 
+	/**
+	 * Reclaim staged frames that later staged frames already supersede.
+	 *
+	 * Every staged streaming frame carries the WHOLE accumulated partial (once as
+	 * `message`, once as `assistantMessageEvent.partial`), so a turn that streams
+	 * N increments stages ~N * length bytes: quadratic in the response length. A
+	 * reasoning-heavy turn of a few thousand tokens therefore used to exhaust the
+	 * provisional cap and kill the whole run, even though the attempt itself was
+	 * healthy and the cap exists only to bound memory.
+	 *
+	 * Each `*_delta` increment is re-published in full by its block's `*_end`
+	 * frame and by the terminal `message_end` / `done` frames, and those are
+	 * retained, so dropping the increments reclaims the growth without inventing
+	 * or losing content. Nothing is published here: the batch stays
+	 * all-or-nothing, so a discarded attempt remains unobservable and the
+	 * fallback chain is still untouched.
+	 *
+	 * Returns whether anything was reclaimed, so the caller can re-test the cap
+	 * and keep failing fast on a single payload that cannot fit on its own.
+	 */
+	#compactSupersededFrames(): boolean {
+		if (this.#batch.length === 0) return false;
+		const retained: ManagedAttemptBatchItem[] = [];
+		let reclaimedBytes = 0;
+		let reclaimedEvents = 0;
+		for (const item of this.#batch) {
+			if (!isSupersededStreamingDelta(item)) {
+				retained.push(item);
+				continue;
+			}
+			if (item.type === "event") {
+				reclaimedBytes += item.bytes ?? 0;
+				reclaimedEvents += 1;
+			}
+		}
+		if (retained.length === this.#batch.length) return false;
+		this.#batch = retained;
+		this.#stagedBytes -= reclaimedBytes;
+		this.#stagedEventCount -= reclaimedEvents;
+		return true;
+	}
+
 	#stage(event: AgentEvent): void {
 		if (this.snapshotMode === "lossless") {
 			const snapshot = this.#repairAssistantEvent(event);
@@ -1402,7 +1463,7 @@ class ManagedAttemptTransaction {
 				this.push(detached);
 				return;
 			}
-			this.#batch.push({ type: "event", event: detached });
+			this.#batch.push({ type: "event", event: detached, bytes: detachedBytes });
 			this.#stagedEventCount++;
 			this.#stagedBytes += detachedBytes;
 			return;
@@ -1420,8 +1481,14 @@ class ManagedAttemptTransaction {
 			bytes = undefined;
 		}
 		if (bytes !== undefined && this.#wouldOverflow(bytes)) {
-			this.discard();
-			throw new ManagedAttemptBufferOverflowError("overflow.preMeasure");
+			// A long turn reaches the cap through accumulated streaming increments,
+			// not through one oversized payload. Reclaim the superseded increments
+			// first; only a batch that still cannot fit is a real local overflow.
+			this.#compactSupersededFrames();
+			if (this.#wouldOverflow(bytes)) {
+				this.discard();
+				throw new ManagedAttemptBufferOverflowError("overflow.preMeasure");
+			}
 		}
 		const repaired = this.#repairAssistantEvent(event);
 		const detailed = managedAttemptSnapshotDetailed(repaired);
@@ -1441,10 +1508,15 @@ class ManagedAttemptTransaction {
 			throw new ManagedAttemptSnapshotError("staging.sanitize");
 		}
 		if (this.#wouldOverflow(bytes)) {
-			this.discard();
-			throw new ManagedAttemptBufferOverflowError("overflow.staged");
+			this.#compactSupersededFrames();
+			if (this.#wouldOverflow(bytes)) {
+				this.discard();
+				throw new ManagedAttemptBufferOverflowError("overflow.staged");
+			}
 		}
-		this.#batch.push({ type: "event", event: snapshot });
+		// Retain each frame's accounted size so compaction can debit exactly what
+		// it reclaims instead of re-measuring the whole batch.
+		this.#batch.push({ type: "event", event: snapshot, bytes });
 		this.#stagedEventCount += 1;
 
 		this.#stagedBytes += bytes;
