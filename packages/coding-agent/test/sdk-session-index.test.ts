@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import * as native from "@gajae-code/natives";
 import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 
@@ -97,6 +98,36 @@ describe("SDK session index", () => {
 			await first;
 		} finally {
 			spy.mockRestore();
+		}
+	});
+	it("uses the native Windows process handle when signal-zero misreports a detached host", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-windows-live-"));
+		const originalPlatform = process.platform;
+		const originalKill = process.kill;
+		const processRef = {
+			incarnation: "windows:133830291061234567",
+			status: () => "running" as const,
+		};
+		const fromPid = vi.spyOn(native.Process, "fromPid").mockReturnValue(processRef as never);
+		process.kill = (() => {
+			throw Object.assign(new Error("signal zero unavailable"), { code: "EINVAL" });
+		}) as typeof process.kill;
+		Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+		try {
+			const index = await new SessionIndex(dir).open();
+			await index.append({
+				...event("windows-detached"),
+				hostIncarnation: processRef.incarnation,
+			});
+			expect(index.listSessions().sessions).toMatchObject([
+				{ sessionId: "windows-detached", live: true, identityProvenance: "composite" },
+			]);
+			expect(fromPid).toHaveBeenCalled();
+		} finally {
+			Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			process.kill = originalKill;
+			fromPid.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 	it("replays only rows after the snapshotted prefix", async () => {
