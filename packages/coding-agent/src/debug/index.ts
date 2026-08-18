@@ -345,6 +345,9 @@ export class DebugSelectorComponent extends Container {
 				logSource,
 			});
 
+			// Detach the reusable composer before clearing so the terminal
+			// clear() disposes nothing the session still owns.
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
 			this.ctx.editorContainer.clear();
 			this.ctx.editorContainer.addChild(viewer);
 			this.ctx.ui.setFocus(viewer);
@@ -364,6 +367,9 @@ export class DebugSelectorComponent extends Container {
 			onUpdate: () => this.ctx.ui.requestRender(),
 		});
 
+		// Detach the reusable composer before clearing so the terminal clear()
+		// disposes nothing the session still owns.
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(viewer);
 		this.ctx.ui.setFocus(viewer);

@@ -503,7 +503,9 @@ export class MCPCommandController {
 			parsed.initialName,
 		);
 
-		// Replace editor with wizard
+		// Replace editor with wizard. Detach the reusable composer first so the
+		// terminal clear() disposes nothing the session still owns.
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(wizard);
 		this.ctx.ui.setFocus(wizard);
