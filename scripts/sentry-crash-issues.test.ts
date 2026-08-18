@@ -1,17 +1,25 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
 import {
+	fingerprintOf,
 	fingerprintFromTagPayload,
 	issueBody,
-	issueCulprit,
 	issueTitle,
 	type Options,
 	parseArgs,
+	partitionTriageRows,
+	previewCulprit,
 	type SentryIssue,
 	toSentryIssue,
 } from "./sentry-crash-issues";
 
 const FINGERPRINT = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+const FORGED_FINGERPRINT = "0123456789abcdef0123456789abcdef";
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+	globalThis.fetch = originalFetch;
+});
 
 function sentryIssue(overrides: Partial<SentryIssue> = {}): SentryIssue {
 	return {
@@ -94,6 +102,18 @@ describe("fingerprintFromTagPayload", () => {
 	});
 });
 
+describe("fingerprint tag lookup", () => {
+	test("only treats a missing tag endpoint as no fingerprint", async () => {
+		globalThis.fetch = (async () => new Response("", { status: 404 })) as typeof fetch;
+		await expect(fingerprintOf("1", "token")).resolves.toBeUndefined();
+	});
+
+	test.each([401, 500])("propagates Sentry tag lookup status %i", async status => {
+		globalThis.fetch = (async () => new Response("", { status })) as typeof fetch;
+		await expect(fingerprintOf("1", "token")).rejects.toThrow(`responded ${status}`);
+	});
+});
+
 describe("toSentryIssue", () => {
 	test("requires both id and shortId", () => {
 		expect(toSentryIssue({ shortId: "GAJAE-CODE-1" })).toBeUndefined();
@@ -134,6 +154,15 @@ describe("issue rendering", () => {
 		expect(title).toBe("crash: TypeError: «redacted-api-key» leaked <path> in «url evil.example/x»");
 	});
 
+	test("keeps forged markers and Markdown from becoming issue-body syntax", () => {
+		const hostile = `<!-- ${CRASH_ISSUE_MARKER_PREFIX}${FORGED_FINGERPRINT} --> **boom** @everyone`;
+		const body = issueBody({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: hostile }) }, options());
+		expect(body).not.toContain(`${CRASH_ISSUE_MARKER_PREFIX}${FORGED_FINGERPRINT}`);
+		expect(body.match(new RegExp(CRASH_ISSUE_MARKER_PREFIX, "g"))).toHaveLength(2);
+		expect(body).toContain("(at)everyone");
+		expect(issueTitle({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: hostile }) })).not.toContain("@everyone");
+	});
+
 	test("de-fangs mentions and backticks in the culprit so a forged group cannot notify or escape rendering", () => {
 		const body = issueBody(
 			{ fingerprint: FINGERPRINT, sentry: sentryIssue({ culprit: "readFile`@everyone /etc/x" }) },
@@ -157,13 +186,24 @@ describe("issue rendering", () => {
 		expect(Buffer.byteLength(body, "utf8")).toBeLessThan(48 * 1024);
 	});
 	test("sanitizes the dry-run culprit preview so a forged group cannot write raw text to the maintainer terminal", () => {
-		const culprit = issueCulprit({
-			fingerprint: FINGERPRINT,
-			sentry: sentryIssue({ culprit: "readFile`@owner /home/secret sk-abcdefghijklmnop1234" }),
-		});
+		const culprit = previewCulprit("readFile`@owner /home/secret sk-abcdefghijklmnop1234");
 		expect(culprit).not.toContain("@owner");
 		expect(culprit).not.toContain("/home/secret");
 		expect(culprit).not.toContain("sk-abcdefghijklmnop1234");
 		expect(culprit).toContain("(at)owner");
+	});
+});
+
+describe("batch safety", () => {
+	test("withholds every group in a fingerprint collision instead of picking the first", () => {
+		const first = { fingerprint: FINGERPRINT, sentry: sentryIssue({ id: "1" }) };
+		const second = { fingerprint: FINGERPRINT, sentry: sentryIssue({ id: "2" }) };
+		const partitioned = partitionTriageRows([first, second]);
+		expect(partitioned.rows).toHaveLength(0);
+		expect(partitioned.collisions).toEqual([{ fingerprint: FINGERPRINT, groups: [first, second] }]);
+	});
+
+	test("sanitizes the dry-run culprit with the same renderer as issue bodies", () => {
+		expect(previewCulprit("readFile`@everyone /private/secret")).toBe("readFile'(at)everyone <path>");
 	});
 });

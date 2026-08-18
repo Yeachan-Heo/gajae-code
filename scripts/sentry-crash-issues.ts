@@ -40,6 +40,7 @@ const DEFAULT_PROJECT = "gajae-code";
 const SENTRY_API = "https://sentry.io/api/0";
 const GH_TIMEOUT_MS = 20_000;
 const FINGERPRINT = /^[0-9a-f]{32}$/;
+const CRASH_MARKER_PATTERN = /gjc-crash-fp\.v1:[0-9a-f]{32}/gi;
 /** Sentry paginates at 100; a triage batch larger than this wants a saved search, not a bigger flag. */
 const MAX_LIMIT = 100;
 
@@ -150,6 +151,16 @@ function sanitizeField(value: string, fallback: string): string {
 	return verdict.ok ? verdict.value : fallback;
 }
 
+/**
+ * Render crash-derived text that will be interpolated into Markdown or a
+ * terminal. Sanitizing secrets and controls alone is insufficient here:
+ * Markdown delimiters and mentions can alter the surrounding document, and a
+ * literal dedup marker must only be emitted by this script at its fixed sites.
+ */
+function renderCrashText(value: string, fallback: string): string {
+	return fenceCrashText(sanitizeField(value.replace(CRASH_MARKER_PATTERN, "<crash marker removed>"), fallback));
+}
+
 function toSentryIssue(raw: unknown): SentryIssue | undefined {
 	if (typeof raw !== "object" || raw === null) return undefined;
 	const record = raw as Record<string, unknown>;
@@ -187,7 +198,7 @@ export function fingerprintFromTagPayload(raw: unknown): string | undefined {
 	return FINGERPRINT.test(value) ? value : undefined;
 }
 
-async function fingerprintOf(issueId: string, token: string): Promise<string | undefined> {
+export async function fingerprintOf(issueId: string, token: string): Promise<string | undefined> {
 	try {
 		return fingerprintFromTagPayload(await sentryGet(`/issues/${issueId}/tags/gjc.fingerprint/`, token));
 	} catch (error) {
@@ -243,19 +254,7 @@ async function findExistingIssue(repo: string, fingerprint: string): Promise<str
 }
 
 function issueTitle(row: TriageRow): string {
-	return `crash: ${sanitizeField(row.sentry.title, "<unsanitizable title>")}`.slice(0, 200);
-}
-
-/**
- * The culprit rendered in any surface, including the dry-run preview: the
- * terminal is as much an output channel as the issue body, so the same
- * egress sanitizer plus mention/backtick de-fanging applies. Without this,
- * a forged upstream group could push control sequences, secrets or mentions
- * into maintainer terminals and redirected logs via the default no-`--apply`
- * run.
- */
-function issueCulprit(row: TriageRow): string {
-	return fenceCrashText(sanitizeField(row.sentry.culprit, "<unsanitizable culprit>") || "<unknown>");
+	return `crash: ${renderCrashText(row.sentry.title, "<unsanitizable title>")}`.slice(0, 200);
 }
 
 /**
@@ -268,8 +267,8 @@ function issueCulprit(row: TriageRow): string {
  */
 function issueBody(row: TriageRow, options: Options): string {
 	const { sentry, fingerprint } = row;
-	const title = sanitizeField(sentry.title, "<unsanitizable title>");
-	const culprit = issueCulprit(row);
+	const title = renderCrashText(sentry.title, "<unsanitizable title>");
+	const culprit = renderCrashText(sentry.culprit, "<unsanitizable culprit>") || "<unknown>";
 	return (
 		`Filed from aggregated upstream crash data by \`scripts/sentry-crash-issues.ts\`. ` +
 		`Every field below passed the \`sanitizeExternalCrashV1\` egress contract before leaving any install, ` +
@@ -280,12 +279,42 @@ function issueBody(row: TriageRow, options: Options): string {
 		`- Level: ${fenceCrashText(sanitizeField(sentry.level, "")) || "unknown"}\n` +
 		`- Culprit: \`${culprit}\`\n` +
 		`- Upstream group: ${sentry.permalink} (${options.org}/${options.project}, ${fenceCrashText(sentry.shortId)})\n\n` +
-		`Grouped crash class: ${title}\n\n` +
+		`Grouped crash class: \`${title}\`\n\n` +
 		`Grouping is driven by the gjc fingerprint, not Sentry heuristics, so this group is exactly one gjc crash class.\n\n` +
 		`Reproduction steps and environment are not captured upstream; see \`docs/crash-reporting.md\` for what the relay ` +
 		`does and does not transmit.\n\n` +
 		`<!-- ${CRASH_ISSUE_MARKER_PREFIX}${fingerprint} -->\n`
 	);
+}
+
+export function partitionTriageRows(candidates: readonly TriageRow[]): {
+	rows: TriageRow[];
+	collisions: { fingerprint: string; groups: TriageRow[] }[];
+} {
+	const byFingerprint = new Map<string, TriageRow[]>();
+	for (const row of candidates) {
+		const bucket = byFingerprint.get(row.fingerprint);
+		if (bucket) bucket.push(row);
+		else byFingerprint.set(row.fingerprint, [row]);
+	}
+	const rows: TriageRow[] = [];
+	const collisions: { fingerprint: string; groups: TriageRow[] }[] = [];
+	for (const [fingerprint, bucket] of byFingerprint) {
+		if (bucket.length === 1 && bucket[0]) rows.push(bucket[0]);
+		else collisions.push({ fingerprint, groups: bucket });
+	}
+	return { rows, collisions };
+}
+
+/**
+ * The culprit rendered for the dry-run preview, through the same renderer the
+ * issue body uses. A maintainer terminal (and any redirected log) is as much an
+ * output channel as the issue itself, so a forged upstream group must not be
+ * able to push control sequences, secrets, mentions, or a dedup marker there
+ * via the default no-`--apply` run.
+ */
+export function previewCulprit(culprit: string): string {
+	return renderCrashText(culprit, "<unsanitizable culprit>") || "<unknown>";
 }
 
 async function main(argv: readonly string[]): Promise<number> {
@@ -341,18 +370,7 @@ async function main(argv: readonly string[]): Promise<number> {
 	// files makes the real group look already-filed. There is no authenticated
 	// discriminator available here, so a collision fails closed: every colliding
 	// group is withheld and reported for manual reconciliation.
-	const byFingerprint = new Map<string, TriageRow[]>();
-	for (const row of candidates) {
-		const bucket = byFingerprint.get(row.fingerprint);
-		if (bucket) bucket.push(row);
-		else byFingerprint.set(row.fingerprint, [row]);
-	}
-	const rows: TriageRow[] = [];
-	const collisions: { fingerprint: string; groups: TriageRow[] }[] = [];
-	for (const [fingerprint, bucket] of byFingerprint) {
-		if (bucket.length === 1 && bucket[0]) rows.push(bucket[0]);
-		else collisions.push({ fingerprint, groups: bucket });
-	}
+	const { rows, collisions } = partitionTriageRows(candidates);
 
 	let existingTotal = 0;
 	for (const row of rows) {
@@ -397,7 +415,7 @@ async function main(argv: readonly string[]): Promise<number> {
 		for (const row of pending)
 			process.stdout.write(
 				`would file  ${row.fingerprint}  ${row.sentry.count}x  ${issueTitle(row)}\n` +
-					`    culprit: ${issueCulprit(row)}\n` +
+					`    culprit: ${previewCulprit(row.sentry.culprit)}\n` +
 					`    ${row.sentry.permalink}\n`,
 			);
 		process.stdout.write(`\nDry run. Re-run with --apply to create ${pending.length} issue(s) in ${options.repo}.\n`);
@@ -431,5 +449,5 @@ async function main(argv: readonly string[]): Promise<number> {
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));
 
-export { issueBody, issueCulprit, issueTitle, parseArgs, toSentryIssue };
+export { issueBody, issueTitle, parseArgs, toSentryIssue };
 export type { Options, SentryIssue, TriageRow };
