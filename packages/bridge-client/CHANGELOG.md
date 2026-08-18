@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-08-18
+
 ## [0.14.0] - 2026-08-17
 
 - **Retired:** This package was retired in the SDK-owned session lifecycle refactor. There is no public replacement transport; use `gjc sdk session` or managed adapters.

@@ -30,7 +30,7 @@ export const Shell = nativeBindings.Shell;
 
 // functions
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_14_0 = nativeBindings.__piNativesV0_14_0;
+export const __piNativesV0_14_1 = nativeBindings.__piNativesV0_14_1;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
