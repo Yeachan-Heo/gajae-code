@@ -3,6 +3,7 @@ import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
 import {
 	fingerprintFromTagPayload,
 	issueBody,
+	issueCulprit,
 	issueTitle,
 	type Options,
 	parseArgs,
@@ -154,5 +155,15 @@ describe("issue rendering", () => {
 	test("bounds the body so a huge upstream title cannot blow past the issue size budget", () => {
 		const body = issueBody({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: "y".repeat(90_000) }) }, options());
 		expect(Buffer.byteLength(body, "utf8")).toBeLessThan(48 * 1024);
+	});
+	test("sanitizes the dry-run culprit preview so a forged group cannot write raw text to the maintainer terminal", () => {
+		const culprit = issueCulprit({
+			fingerprint: FINGERPRINT,
+			sentry: sentryIssue({ culprit: "readFile`@owner /home/secret sk-abcdefghijklmnop1234" }),
+		});
+		expect(culprit).not.toContain("@owner");
+		expect(culprit).not.toContain("/home/secret");
+		expect(culprit).not.toContain("sk-abcdefghijklmnop1234");
+		expect(culprit).toContain("(at)owner");
 	});
 });

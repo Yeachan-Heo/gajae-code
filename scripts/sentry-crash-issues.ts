@@ -247,6 +247,18 @@ function issueTitle(row: TriageRow): string {
 }
 
 /**
+ * The culprit rendered in any surface, including the dry-run preview: the
+ * terminal is as much an output channel as the issue body, so the same
+ * egress sanitizer plus mention/backtick de-fanging applies. Without this,
+ * a forged upstream group could push control sequences, secrets or mentions
+ * into maintainer terminals and redirected logs via the default no-`--apply`
+ * run.
+ */
+function issueCulprit(row: TriageRow): string {
+	return fenceCrashText(sanitizeField(row.sentry.culprit, "<unsanitizable culprit>") || "<unknown>");
+}
+
+/**
  * Every field here survived the relay's outbound sanitizer before it reached
  * Sentry, and crash-derived fields are re-sanitized locally anyway: the
  * `gjc.fingerprint` tag that proves provenance is stamped client-side with the
@@ -257,7 +269,7 @@ function issueTitle(row: TriageRow): string {
 function issueBody(row: TriageRow, options: Options): string {
 	const { sentry, fingerprint } = row;
 	const title = sanitizeField(sentry.title, "<unsanitizable title>");
-	const culprit = fenceCrashText(sanitizeField(sentry.culprit, "<unsanitizable culprit>") || "<unknown>");
+	const culprit = issueCulprit(row);
 	return (
 		`Filed from aggregated upstream crash data by \`scripts/sentry-crash-issues.ts\`. ` +
 		`Every field below passed the \`sanitizeExternalCrashV1\` egress contract before leaving any install, ` +
@@ -385,7 +397,7 @@ async function main(argv: readonly string[]): Promise<number> {
 		for (const row of pending)
 			process.stdout.write(
 				`would file  ${row.fingerprint}  ${row.sentry.count}x  ${issueTitle(row)}\n` +
-					`    culprit: ${row.sentry.culprit || "<unknown>"}\n` +
+					`    culprit: ${issueCulprit(row)}\n` +
 					`    ${row.sentry.permalink}\n`,
 			);
 		process.stdout.write(`\nDry run. Re-run with --apply to create ${pending.length} issue(s) in ${options.repo}.\n`);
@@ -419,5 +431,5 @@ async function main(argv: readonly string[]): Promise<number> {
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));
 
-export { issueBody, issueTitle, parseArgs, toSentryIssue };
+export { issueBody, issueCulprit, issueTitle, parseArgs, toSentryIssue };
 export type { Options, SentryIssue, TriageRow };
