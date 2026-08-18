@@ -37,7 +37,7 @@ interface RouterFixtureAuthority {
 interface RouterFixtureClient {
 	sent: Record<string, unknown>[];
 	requests: Record<string, unknown>[];
-	requestOptions: ({ timeoutMs?: number } | undefined)[];
+	requestOptions: Parameters<SessionRouterClient["request"]>[1][];
 	client: SessionRouterClient;
 	emit: (frame: Record<string, unknown>) => void;
 	reconnect: () => void;
@@ -126,7 +126,7 @@ async function routerFixture(
 			createClient: async () => {
 				const sent: Record<string, unknown>[] = [];
 				const requests: Record<string, unknown>[] = [];
-				const requestOptions: ({ timeoutMs?: number } | undefined)[] = [];
+				const requestOptions: Parameters<SessionRouterClient["request"]>[1][] = [];
 				let handler: ((frame: Record<string, unknown>) => void) | undefined;
 				let reconnectHandler: (() => void) | undefined;
 				const client: SessionRouterClient = {
@@ -797,6 +797,42 @@ describe("SessionRouter dispatch authority", () => {
 			const index = dispatched.requests.findIndex(frame => frame.type === "control_request");
 			expect(index).toBeGreaterThanOrEqual(0);
 			expect(dispatched.requestOptions[index]?.timeoutMs).toBe(1_500);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+	test("threads dispatch-boundary callbacks through the supported router surface", async () => {
+		const fixture = await routerFixture();
+		try {
+			const boundaries: string[] = [];
+			await fixture.router.request(
+				fixture.sessionId,
+				{ type: "control_request", id: "boundary", operation: "turn.prompt", input: {} },
+				1,
+				undefined,
+				{
+					timeoutMs: 1_500,
+					beforeDispatch: context => {
+						boundaries.push(`before:${String(context.frame.operation)}`);
+					},
+					onDispatch: context => {
+						boundaries.push(`after:${String(context.frame.operation)}:${context.generation > 0}`);
+					},
+				},
+			);
+			const dispatched = fixture.clients[0]!;
+			const index = dispatched.requests.findIndex(frame => frame.type === "control_request");
+			expect(index).toBeGreaterThanOrEqual(0);
+			// The capability-scoped managed surface carries the observers down to
+			// the private transport without exposing it or its credentials.
+			const options = dispatched.requestOptions[index];
+			expect(options?.timeoutMs).toBe(1_500);
+			expect(typeof options?.beforeDispatch).toBe("function");
+			expect(typeof options?.onDispatch).toBe("function");
+			const context = { frame: { operation: "turn.prompt" }, connectionId: "c", generation: 1 };
+			options?.beforeDispatch?.(context);
+			options?.onDispatch?.(context);
+			expect(boundaries).toEqual(["before:turn.prompt", "after:turn.prompt:true"]);
 		} finally {
 			await fixture.router.stop();
 		}

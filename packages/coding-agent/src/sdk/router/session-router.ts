@@ -9,7 +9,7 @@ import {
 	type SessionIndex,
 } from "../broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClient } from "../client/client";
+import { SdkClient, type SdkDispatchContext, type SdkDispatchHandler } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
 import {
 	type ActivatedPreparedSession,
@@ -93,7 +93,16 @@ export interface SessionRouterClient {
 	onFrame(handler: (frame: Record<string, unknown>) => void): () => void;
 	onReconnect?(handler: () => void): () => void;
 	connect?(): Promise<void>;
-	request(frame: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<Record<string, unknown>>;
+	request(
+		frame: Record<string, unknown>,
+		options?: {
+			timeoutMs?: number;
+			/** Synchronous pre-send observer; a throw aborts the dispatch before the wire. */
+			beforeDispatch?: (context: SdkDispatchContext) => void;
+			/** Synchronous post-send boundary observer for transport-close-aware consumers. */
+			onDispatch?: (context: SdkDispatchContext) => void;
+		},
+	): Promise<Record<string, unknown>>;
 	/** Current private transport connection identity, surfaced only through its exact attachment. */
 	readonly connectionId?: string;
 
@@ -553,7 +562,11 @@ export class SessionRouter {
 		frame: Record<string, unknown>,
 		expectedGeneration?: number,
 		expectedAttachment?: SessionAttachment,
-		options?: { timeoutMs?: number },
+		options?: {
+			timeoutMs?: number;
+			beforeDispatch?: (context: SdkDispatchContext) => void;
+			onDispatch?: SdkDispatchHandler;
+		},
 	): Promise<Record<string, unknown>> {
 		const publishing = this.#sessions.get(sessionId);
 		if (!expectedAttachment || publishing?.capability !== expectedAttachment || !publishing.initializingPublication)

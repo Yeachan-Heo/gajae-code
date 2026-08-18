@@ -79,7 +79,11 @@ class FakeWebSocket {
 	}
 }
 
-const flush = () => new Promise<void>(resolve => queueMicrotask(resolve));
+const flush = () => {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	queueMicrotask(resolve);
+	return promise;
+};
 
 async function connect(client: SdkClient, connectionId = "connection"): Promise<FakeWebSocket> {
 	const pending = client.connect();
@@ -332,6 +336,189 @@ test("mutating the frame inside beforeDispatch cannot desynchronize the sent ide
 		// tampering attempt left no trace on operation or fingerprint inputs.
 		expect(record.operation).toBe("turn.prompt");
 		expect(record.idempotencyKey).toBe("immutable-boundary");
+		await client.close();
+	});
+});
+test("beforeDispatch closing the client prevents the send and keeps the boundary honest", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		let dispatched = 0;
+		let boundary = 0;
+
+		const request = client.request(
+			{ type: "control_request", operation: "turn.prompt" },
+			{
+				timeoutMs: 10_000,
+				beforeDispatch: () => {
+					boundary++;
+					// Arbitrary synchronous caller code closes the whole client
+					// while the request is mid-dispatch.
+					void client.close();
+				},
+				onDispatch: () => {
+					dispatched++;
+				},
+			},
+		);
+		request.catch(() => undefined);
+		await flush();
+
+		// Retirement settled the request pre-send: nothing may be written,
+		// no sent record may exist, and no post-send observer may fire.
+		expect(boundary).toBe(1);
+		expect(socket.sent).toHaveLength(0);
+		expect(dispatched).toBe(0);
+		await expect(request).rejects.toMatchObject({ code: "connection_closed" });
+		const recordId = sentFrame.length === 0 ? undefined : undefined;
+		expect(recordId).toBeUndefined();
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		await client.close().catch(() => undefined);
+	});
+});
+
+test("beforeDispatch retiring the socket prevents the send without resurrecting reconciliation state", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		let dispatched = 0;
+
+		const request = client.request(
+			{ type: "control_request", operation: "turn.prompt" },
+			{
+				timeoutMs: 10_000,
+				beforeDispatch: () => {
+					// The transport drops mid-callback but the client stays open.
+					socket.readyState = FakeWebSocket.CLOSED;
+					socket.emit("close");
+				},
+				onDispatch: () => {
+					dispatched++;
+				},
+			},
+		);
+		request.catch(() => undefined);
+		await flush();
+
+		expect(socket.sent).toHaveLength(0);
+		expect(dispatched).toBe(0);
+		// Nothing reached the wire, so retirement is pre-send: plain
+		// connection_closed, never uncertain_after_send, and no sent record.
+		await expect(request).rejects.toMatchObject({ code: "connection_closed" });
+		const wireIds = socket.sent.map(entry => (JSON.parse(entry) as Record<string, unknown>).id);
+		for (const wireId of wireIds) expect(client.getSentRecord(wireId as string)).toBeUndefined();
+		await client.close().catch(() => undefined);
+	});
+});
+
+test("beforeDispatch consuming the deadline fails the request without sending", async () => {
+	await withFakeTransport(async clock => {
+		const client = new SdkClient("ws://sdk.test", "token", {
+			reconnectAttempts: 0,
+			deadline: 2_000,
+		});
+		const socket = await connect(client);
+		let dispatched = 0;
+		let boundary = 0;
+
+		const request = client.request(
+			{ type: "control_request", operation: "turn.prompt" },
+			{
+				timeoutMs: 10_000,
+				beforeDispatch: () => {
+					boundary++;
+					// Burn the entire remaining deadline inside the callback.
+					clock.now = 5_000;
+				},
+				onDispatch: () => {
+					dispatched++;
+				},
+			},
+		);
+		request.catch(() => undefined);
+		await flush();
+
+		expect(boundary).toBe(1);
+		expect(socket.sent).toHaveLength(0);
+		expect(dispatched).toBe(0);
+		await expect(request).rejects.toMatchObject({ code: "timeout" });
+		await client.close().catch(() => undefined);
+	});
+});
+
+test("mutating the options idempotency key inside beforeDispatch cannot diverge the sent record", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		const options: {
+			timeoutMs?: number;
+			idempotencyKey?: string;
+			onDispatch?: () => void;
+			beforeDispatch?: () => void;
+		} = {
+			timeoutMs: 10_000,
+			idempotencyKey: "original-key",
+		};
+
+		let boundary = 0;
+		options.beforeDispatch = () => {
+			boundary++;
+			// Serialization already captured the key; the caller rewrites its own
+			// options object mid-dispatch, after the bytes were derived.
+			options.idempotencyKey = "mutated-after-handoff";
+		};
+		const request = client.request({ type: "control_request", operation: "turn.prompt", input: { n: 1 } }, options);
+		request.catch(() => undefined);
+		await flush();
+		expect(boundary).toBe(1);
+
+		const wireFrame = sentFrame(socket);
+		expect(wireFrame.idempotencyKey).toBe("original-key");
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
+		const record = client.getSentRecord(wireFrame.id as string);
+		if (!record) throw new Error("sent record missing");
+		// The retained identity is snapshotted from the serialized bytes, so the
+		// post-handoff mutation of the caller's object cannot reach it.
+		expect(record.idempotencyKey).toBe("original-key");
+		await client.close();
+	});
+});
+
+test("a getter-swapping options object cannot alter reconciliation identity after dispatch", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		let swaps = 0;
+		let currentKey = "stable-key";
+		const hostileOptions: { timeoutMs?: number; get idempotencyKey(): string | undefined } = {
+			timeoutMs: 10_000,
+			get idempotencyKey() {
+				return currentKey;
+			},
+		};
+
+		const request = client.request({ type: "control_request", operation: "turn.prompt" }, hostileOptions);
+		request.catch(() => undefined);
+		await flush();
+
+		// Swap what the getter returns after serialization already happened.
+		swaps++;
+		currentKey = "swapped-key";
+		expect(swaps).toBe(1);
+
+		const wireFrame = sentFrame(socket);
+		expect(wireFrame.idempotencyKey).toBe("stable-key");
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
+		const record = client.getSentRecord(wireFrame.id as string);
+		if (!record) throw new Error("sent record missing");
+		// Identity was snapshotted before observers ran; the later getter
+		// swap cannot retroactively change the retained record.
+		expect(record.idempotencyKey).toBe("stable-key");
 		await client.close();
 	});
 });

@@ -413,6 +413,17 @@ export class SdkClient {
 		};
 		const serializedRequest = JSON.stringify(requestFrame);
 		const serializedFrame: Frame = deepFreeze(JSON.parse(serializedRequest) as Frame);
+		// Snapshot reconciliation identity from the exact serialized bytes BEFORE any
+		// observer runs. Callers own `options`, so rereading `options.idempotencyKey`
+		// or recomputing the fingerprint after a callback would let a mutating or
+		// getter-swapping observer diverge the retained record from the wire request.
+		const sentOperation = typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined;
+		const sentIdempotencyKey =
+			typeof serializedFrame.idempotencyKey === "string" ? serializedFrame.idempotencyKey : undefined;
+		const sentFingerprint =
+			typeof serializedFrame.operation === "string"
+				? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
+				: inputFingerprint(serializedFrame.input ?? {});
 		const deferred = Promise.withResolvers<unknown>();
 		const pending: Pending = {
 			incarnation,
@@ -460,6 +471,27 @@ export class SdkClient {
 				return await deferred.promise;
 			}
 		}
+		// `beforeDispatch` is arbitrary synchronous caller code: it may have closed
+		// the client, retired this incarnation, settled this pending entry, or run
+		// the deadline past its end. Nothing about the pre-call validation still
+		// holds, so revalidate all of it before the wire write and bookkeeping.
+		if (this.#closed || this.#pending.get(id) !== pending || !this.#isActive(incarnation)) {
+			if (this.#pending.get(id) === pending)
+				this.#settlePending(
+					id,
+					pending,
+					new SdkClientError("connection_closed", "SDK client closed during dispatch"),
+				);
+			return await deferred.promise;
+		}
+		if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
+			this.#settlePending(id, pending, this.#deadlineError());
+			return await deferred.promise;
+		}
+		if (incarnation.socket.readyState !== WebSocket.OPEN) {
+			this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket is not connected"));
+			return await deferred.promise;
+		}
 		try {
 			incarnation.socket.send(serializedRequest);
 		} catch (error) {
@@ -479,12 +511,9 @@ export class SdkClient {
 		// resurrected record behind.
 		this.#rememberSentRecord({
 			id,
-			operation: typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined,
-			idempotencyKey: options.idempotencyKey,
-			fingerprint:
-				typeof serializedFrame.operation === "string"
-					? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
-					: inputFingerprint(serializedFrame.input ?? {}),
+			operation: sentOperation,
+			idempotencyKey: sentIdempotencyKey,
+			fingerprint: sentFingerprint,
 		});
 		try {
 			options.onDispatch?.({
