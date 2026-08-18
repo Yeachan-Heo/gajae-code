@@ -248,13 +248,60 @@ export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, size
 
 function runCommand(command, args) {
 	try {
-		const result = childProcess.spawnSync(command, args, { encoding: "utf-8" });
+		// `windowsHide` keeps probes console-less: from a detached, console-less
+		// parent (e.g. the SDK broker) spawning a console app like powershell.exe
+		// would otherwise allocate and flash a visible console window per call
+		// (#4652). It is ignored on POSIX.
+		const result = childProcess.spawnSync(command, args, { encoding: "utf-8", windowsHide: true });
 		if (result.error) return null;
 		if (result.status !== 0) return null;
 		return (result.stdout || "").trim();
 	} catch {
 		return null;
 	}
+}
+
+// `IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)` — the kernel's
+// authoritative AVX2 answer (also honors OS emulation policy), usable without
+// a subprocess on every supported Windows build.
+const WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE = 40;
+
+// In-process `kernel32.dll!IsProcessorFeaturePresent` probe. Returns undefined
+// when it cannot run (non-Bun runtime, FFI unavailable, or call failure) so the
+// caller can fall back to a hidden PowerShell probe.
+function probeWin32Avx2InProcess() {
+	if (typeof Bun === "undefined") return undefined;
+	try {
+		// Not a static import: loader-state is plain JS that must also parse
+		// under Node, where "bun:ffi" does not exist.
+		const { dlopen } = createRequire(import.meta.url)("bun:ffi");
+		const kernel32 = dlopen("kernel32.dll", {
+			IsProcessorFeaturePresent: { args: ["i32"], returns: "bool" },
+		});
+		return Boolean(kernel32.symbols.IsProcessorFeaturePresent(WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE));
+	} catch {
+		return undefined;
+	}
+}
+
+// Hidden PowerShell fallback. `Add-Type` P/Invoke works on both stock Windows
+// PowerShell 5.1 (.NET Framework, which has no System.Runtime.Intrinsics) and
+// pwsh 7+. Any probe failure fails safe to `false` (baseline variant).
+function probeWin32Avx2ViaPowerShell(run = runCommand) {
+	const output = run("powershell.exe", [
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		"Add-Type -Namespace GjcNative -Name Cpu -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern bool IsProcessorFeaturePresent(int feature);'; " +
+			`[GjcNative.Cpu]::IsProcessorFeaturePresent(${WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE})`,
+	]);
+	return output !== null && output.toLowerCase() === "true";
+}
+
+export function detectWin32Avx2Support(probe = probeWin32Avx2InProcess, run = runCommand) {
+	const probed = probe();
+	if (probed !== undefined) return probed;
+	return probeWin32Avx2ViaPowerShell(run);
 }
 
 function getVariantOverride() {
@@ -288,13 +335,7 @@ function detectAvx2Support() {
 	}
 
 	if (process.platform === "win32") {
-		const output = runCommand("powershell.exe", [
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			"[System.Runtime.Intrinsics.X86.Avx2]::IsSupported",
-		]);
-		return output && output.toLowerCase() === "true";
+		return detectWin32Avx2Support();
 	}
 
 	return false;
