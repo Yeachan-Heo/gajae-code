@@ -250,8 +250,16 @@ class AcpStdioClient {
 			const hasResult = Object.hasOwn(frame, "result");
 			const hasError = Object.hasOwn(frame, "error");
 			if (hasResult === hasError)
-				throw new Error(`ACP response for ${request.method} must contain exactly one of result or error: ${line.slice(0, 200)}`);
-			if (hasError && (frame.error === null || typeof frame.error !== "object" || typeof frame.error.code !== "number" || typeof frame.error.message !== "string"))
+				throw new Error(
+					`ACP response for ${request.method} must contain exactly one of result or error: ${line.slice(0, 200)}`,
+				);
+			if (
+				hasError &&
+				(frame.error === null ||
+					typeof frame.error !== "object" ||
+					typeof frame.error.code !== "number" ||
+					typeof frame.error.message !== "string")
+			)
 				throw new Error(`ACP response for ${request.method} has invalid error: ${line.slice(0, 200)}`);
 			this.#pending.delete(frame.id);
 			request.resolve(frame);
@@ -301,7 +309,9 @@ class AcpStdioClient {
 	 * cleanup protocol and must succeed before the fixture can be terminated.
 	 */
 	async dispose(): Promise<void> {
-		await Promise.all([...this.#opened].map(sessionId => this.call("session/close", { sessionId }, DISPOSE_REQUEST_TIMEOUT_MS)));
+		await Promise.all(
+			[...this.#opened].map(sessionId => this.call("session/close", { sessionId }, DISPOSE_REQUEST_TIMEOUT_MS)),
+		);
 
 		let exited = false;
 		const exit = this.#child.exited.then(() => {
@@ -477,7 +487,13 @@ beforeAll(async () => {
 
 test("initialize advertises every session lifecycle capability", () => {
 	expect(observed.sessionCapabilities).toEqual(
-		expect.objectContaining({ list: expect.anything(), fork: expect.anything(), resume: expect.anything(), close: expect.anything(), delete: expect.anything() }),
+		expect.objectContaining({
+			list: expect.anything(),
+			fork: expect.anything(),
+			resume: expect.anything(),
+			close: expect.anything(),
+			delete: expect.anything(),
+		}),
 	);
 });
 

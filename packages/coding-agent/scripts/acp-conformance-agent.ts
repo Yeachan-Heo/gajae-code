@@ -163,14 +163,14 @@ server = Bun.serve({
 				? "fork-state-preserved"
 				: "fork-state-missing"
 			: toolDenied
-			? `permission denied: ${toolText.slice(0, 200)}`
-			: isRead
-				? `read README.md: ${toolText.trim().slice(0, 200)}`
-				: isWrite
-					? `wrote ${/write\s+(\S+)/.exec(prompt)?.[1] ?? "file"}: ${toolText.trim().slice(0, 120)}`
-					: isLateTool
-						? `writing now: ${toolText.trim().slice(0, 120)}`
-						: response(prompt);
+				? `permission denied: ${toolText.slice(0, 200)}`
+				: isRead
+					? `read README.md: ${toolText.trim().slice(0, 200)}`
+					: isWrite
+						? `wrote ${/write\s+(\S+)/.exec(prompt)?.[1] ?? "file"}: ${toolText.trim().slice(0, 120)}`
+						: isLateTool
+							? `writing now: ${toolText.trim().slice(0, 120)}`
+							: response(prompt);
 		return new Response(textCompletion(reply), { headers: { "content-type": "text/event-stream" } });
 	},
 });
