@@ -97,7 +97,7 @@
     "clean:native": "bun scripts/clean.ts --native",
     "test": "bun run --parallel test:ts test:rs",
     "test:ts": "bun run test:release && bun run --workspaces --if-present test",
-    "test:release": "bun test scripts/clean.test.ts scripts/generate-gjc-sdk-skills.test.ts scripts/nightly-release.test.ts scripts/release-evidence.test.ts scripts/release-policy.test.ts scripts/release-publish-order.test.ts scripts/restart-sdk-broker.test.ts",
+    "test:release": "bun test scripts/clean.test.ts scripts/generate-gjc-sdk-skills.test.ts scripts/nightly-release.test.ts scripts/release-evidence.test.ts scripts/release-policy.test.ts scripts/release-publish-order.test.ts scripts/restart-sdk-broker.test.ts scripts/sentry-crash-issues.test.ts",
     "generate-schemas": "bun scripts/generate-json-schemas.ts",
     "check:schemas": "bun scripts/generate-json-schemas.ts --check",
     "check:public-sync": "bun run generate-docs-index && bun scripts/check-public-version-sync.ts",

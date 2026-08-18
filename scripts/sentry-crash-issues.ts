@@ -20,8 +20,11 @@
  * it would do and exits without touching the repository.
  *
  * Usage:
- *   bun scripts/sentry-crash-issues.ts [--apply] [--limit N]
- *                                      [--org SLUG] [--project SLUG] [--repo OWNER/NAME]
+ *   bun scripts/sentry-crash-issues.ts [--apply] [--limit N] [--org SLUG] [--project SLUG]
+ *
+ * `--repo` exists only to make the target explicit; it is pinned to the same
+ * repository `gjc crash report` searches, because the shared marker is the
+ * dedup contract and a marker filed anywhere else is invisible to it.
  *
  * Auth:
  *   SENTRY_AUTH_TOKEN (or SENTRY_DEVNOGARI_AUTH_TOKEN) for the Sentry read side.
@@ -92,10 +95,17 @@ function parseArgs(argv: readonly string[]): Options | { error: string } {
 		}
 		if (arg === "--org") options.org = value;
 		else if (arg === "--project") options.project = value;
-		else if (arg === "--repo") options.repo = value;
+		else if (arg === "--repo") {
+			// The cross-surface dedup contract only holds against one repository:
+			// `checkForDuplicateIssue` in report.ts searches CRASH_REPORT_REPO and
+			// nothing else, so a marker filed elsewhere is one the interactive flow
+			// will never find. Allowing an arbitrary target would silently break the
+			// guarantee this script exists to uphold.
+			if (value !== DEFAULT_REPO) return { error: `--repo is pinned to ${DEFAULT_REPO}; got ${value}.` };
+			options.repo = value;
+		}
 		else return { error: `Unknown flag ${arg}.` };
 	}
-	if (!/^[\w.-]+\/[\w.-]+$/.test(options.repo)) return { error: `--repo must be OWNER/NAME, got ${options.repo}.` };
 	return options;
 }
 
@@ -103,12 +113,23 @@ function sentryToken(): string | undefined {
 	return Bun.env.SENTRY_AUTH_TOKEN ?? Bun.env.SENTRY_DEVNOGARI_AUTH_TOKEN;
 }
 
+/** Thrown for a Sentry response that was reached but refused. */
+class SentryHttpError extends Error {
+	readonly status: number;
+
+	constructor(pathname: string, status: number) {
+		super(`Sentry ${pathname} responded ${status}`);
+		this.name = "SentryHttpError";
+		this.status = status;
+	}
+}
+
 async function sentryGet(pathname: string, token: string): Promise<unknown> {
 	const response = await fetch(`${SENTRY_API}${pathname}`, {
 		headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
 		signal: AbortSignal.timeout(GH_TIMEOUT_MS),
 	});
-	if (!response.ok) throw new Error(`Sentry ${pathname} responded ${response.status}`);
+	if (!response.ok) throw new SentryHttpError(pathname, response.status);
 	return response.json();
 }
 
@@ -169,10 +190,13 @@ export function fingerprintFromTagPayload(raw: unknown): string | undefined {
 async function fingerprintOf(issueId: string, token: string): Promise<string | undefined> {
 	try {
 		return fingerprintFromTagPayload(await sentryGet(`/issues/${issueId}/tags/gjc.fingerprint/`, token));
-	} catch {
-		// A 404 is the normal answer for a non-gjc group; treat any lookup
-		// failure as "not ours" rather than aborting the whole batch.
-		return undefined;
+	} catch (error) {
+		// Only "the tag is absent" means "not a gjc group". Auth failures, rate
+		// limits, timeouts and 5xx must not be laundered into that answer: doing so
+		// silently drops triage coverage and lets the run exit successfully with
+		// "Nothing to file." while it in fact saw nothing.
+		if (error instanceof SentryHttpError && error.status === 404) return undefined;
+		throw error;
 	}
 }
 
@@ -280,27 +304,42 @@ async function main(argv: readonly string[]): Promise<number> {
 		return 1;
 	}
 
-	const rows: TriageRow[] = [];
+	const candidates: TriageRow[] = [];
 	let skippedNoFingerprint = 0;
-	let skippedDuplicateFingerprint = 0;
-	const seenFingerprints = new Set<string>();
-	for (const entry of raw) {
-		const sentry = toSentryIssue(entry);
-		const fingerprint = sentry ? await fingerprintOf(sentry.id, token) : undefined;
-		if (!sentry || !fingerprint) {
-			skippedNoFingerprint++;
-			continue;
+	try {
+		for (const entry of raw) {
+			const sentry = toSentryIssue(entry);
+			const fingerprint = sentry ? await fingerprintOf(sentry.id, token) : undefined;
+			if (!sentry || !fingerprint) {
+				skippedNoFingerprint++;
+				continue;
+			}
+			candidates.push({ fingerprint, sentry });
 		}
-		// Two upstream groups can carry the same gjc.fingerprint tag value (for
-		// example after a Sentry group merge). The marker is the dedup key, so a
-		// second row for an already-seen fingerprint would file a duplicate in
-		// this same batch; keep the first group only.
-		if (seenFingerprints.has(fingerprint)) {
-			skippedDuplicateFingerprint++;
-			continue;
-		}
-		seenFingerprints.add(fingerprint);
-		rows.push({ fingerprint, sentry });
+	} catch (error) {
+		process.stderr.write(`Sentry tag read failed: ${error instanceof Error ? error.message : String(error)}\n`);
+		return 1;
+	}
+
+	// The fingerprint is client-stamped and the DSN that stamps it is a public
+	// ingestion key, so a collision is not necessarily a benign group merge -- it
+	// can be an attacker-controlled group claiming a real crash's identity.
+	// Picking whichever arrived first would let that group replace the legitimate
+	// one's metadata and suppress it from triage forever, because the marker it
+	// files makes the real group look already-filed. There is no authenticated
+	// discriminator available here, so a collision fails closed: every colliding
+	// group is withheld and reported for manual reconciliation.
+	const byFingerprint = new Map<string, TriageRow[]>();
+	for (const row of candidates) {
+		const bucket = byFingerprint.get(row.fingerprint);
+		if (bucket) bucket.push(row);
+		else byFingerprint.set(row.fingerprint, [row]);
+	}
+	const rows: TriageRow[] = [];
+	const collisions: { fingerprint: string; groups: TriageRow[] }[] = [];
+	for (const [fingerprint, bucket] of byFingerprint) {
+		if (bucket.length === 1 && bucket[0]) rows.push(bucket[0]);
+		else collisions.push({ fingerprint, groups: bucket });
 	}
 
 	let existingTotal = 0;
@@ -324,15 +363,22 @@ async function main(argv: readonly string[]): Promise<number> {
 	process.stdout.write(
 		`${rows.length} gjc signature(s) upstream; ${already} already filed, ${pending.length} pending` +
 			(skippedNoFingerprint > 0 ? `; ${skippedNoFingerprint} upstream group(s) skipped (no gjc.fingerprint tag)` : "") +
-			(skippedDuplicateFingerprint > 0
-				? `; ${skippedDuplicateFingerprint} duplicate group(s) skipped (same gjc fingerprint earlier in batch)`
-				: "") +
+			(collisions.length > 0 ? `; ${collisions.length} fingerprint collision(s) withheld` : "") +
 			"\n\n",
 	);
 
+	if (collisions.length > 0) {
+		process.stderr.write(`\n${collisions.length} fingerprint collision(s) withheld; reconcile these upstream first:\n`);
+		for (const collision of collisions) {
+			process.stderr.write(`  ${collision.fingerprint}\n`);
+			for (const row of collision.groups)
+				process.stderr.write(`    ${row.sentry.shortId}  ${row.sentry.permalink}\n`);
+		}
+	}
+
 	if (pending.length === 0) {
 		process.stdout.write("Nothing to file.\n");
-		return 0;
+		return collisions.length > 0 ? 1 : 0;
 	}
 
 	if (!options.apply) {
@@ -368,7 +414,7 @@ async function main(argv: readonly string[]): Promise<number> {
 		process.stderr.write(`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}\n`);
 	}
 	process.stdout.write(`\ncreated ${created}, failed ${failed}\n`);
-	return failed > 0 ? 1 : 0;
+	return failed > 0 || collisions.length > 0 ? 1 : 0;
 }
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));

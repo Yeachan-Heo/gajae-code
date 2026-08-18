@@ -52,8 +52,12 @@ describe("parseArgs", () => {
 		expect(parseArgs(["--limit", "100"])).toMatchObject({ limit: 100 });
 	});
 
-	test("rejects a repo that is not OWNER/NAME", () => {
-		expect(parseArgs(["--repo", "not-a-repo"])).toMatchObject({ error: expect.stringContaining("OWNER/NAME") });
+	test("pins --repo to the one repository the interactive flow searches", () => {
+		// A marker filed anywhere else is invisible to checkForDuplicateIssue, so
+		// the shared dedup contract would silently stop holding.
+		expect(parseArgs(["--repo", "someone/else"])).toMatchObject({ error: expect.stringContaining("pinned") });
+		expect(parseArgs(["--repo", "not-a-repo"])).toMatchObject({ error: expect.stringContaining("pinned") });
+		expect(parseArgs(["--repo", "Yeachan-Heo/gajae-code"])).toMatchObject({ repo: "Yeachan-Heo/gajae-code" });
 	});
 
 	test("rejects an unknown flag rather than ignoring it", () => {
