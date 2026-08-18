@@ -39,7 +39,15 @@ function sentryIssue(overrides: Partial<SentryIssue> = {}): SentryIssue {
 }
 
 function options(overrides: Partial<Options> = {}): Options {
-	return { apply: false, limit: 25, org: "probe", project: "gajae-code", repo: "Yeachan-Heo/gajae-code", ...overrides };
+	return {
+		apply: false,
+		approve: undefined,
+		limit: 25,
+		org: "probe",
+		project: "gajae-code",
+		repo: "Yeachan-Heo/gajae-code",
+		...overrides,
+	};
 }
 
 describe("parseArgs", () => {
@@ -113,13 +121,20 @@ describe("fingerprintFromTagPayload", () => {
 });
 
 describe("fingerprint tag lookup", () => {
+	// A fetch-shaped mock matching the repo's notify-setup idiom: the async
+	// body accepts the real (input, init) parameters so the single `as
+	// typeof fetch` cast is structurally sound (a bare () => Promise<Response>
+	// is not assignable and previously forced an unsafe double cast).
+	const stubFetch = (status: number): typeof fetch =>
+		(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) => new Response("", { status })) as typeof fetch;
+
 	test("only treats a missing tag endpoint as no fingerprint", async () => {
-		globalThis.fetch = (async () => new Response("", { status: 404 })) as typeof fetch;
+		globalThis.fetch = stubFetch(404);
 		await expect(fingerprintOf("1", "token")).resolves.toBeUndefined();
 	});
 
 	test.each([401, 500])("propagates Sentry tag lookup status %i", async status => {
-		globalThis.fetch = (async () => new Response("", { status })) as typeof fetch;
+		globalThis.fetch = stubFetch(status);
 		await expect(fingerprintOf("1", "token")).rejects.toThrow(`responded ${status}`);
 	});
 });
@@ -133,6 +148,27 @@ describe("toSentryIssue", () => {
 	test("truncates timestamps to a date, matching the report flow's coarse dates", () => {
 		const issue = toSentryIssue({ id: "1", shortId: "S-1", firstSeen: "2026-08-17T04:05:06.789Z" });
 		expect(issue?.firstSeen).toBe("2026-08-17");
+	});
+
+	test("drops rows whose metadata fails the ingestion bounds instead of repairing them", () => {
+		const valid = { id: "1", shortId: "GAJAE-CODE-1" };
+		// numeric/shortId/date/permalink bounds
+		expect(toSentryIssue({ ...valid, count: "12abc" })).toBeUndefined();
+		expect(toSentryIssue({ ...valid, count: "-1" })).toBeUndefined();
+		expect(toSentryIssue({ ...valid, shortId: "bad id!" })).toBeUndefined();
+		expect(toSentryIssue({ ...valid, shortId: "x".repeat(33) })).toBeUndefined();
+		expect(toSentryIssue({ ...valid, firstSeen: "garbage-day!" })).toBeUndefined();
+		expect(toSentryIssue({ ...valid, permalink: "https://evil.example/i?token=1" })).toBeUndefined();
+		expect(toSentryIssue({ ...valid, permalink: "javascript:alert(1)" })).toBeUndefined();
+	});
+
+	test("reduces a sentry permalink to origin+path with query and fragment stripped", () => {
+		const issue = toSentryIssue({
+			id: "1",
+			shortId: "S-1",
+			permalink: "https://probe.sentry.io/issues/1/?query=x#frag",
+		});
+		expect(issue?.permalink).toBe("https://probe.sentry.io/issues/1/");
 	});
 });
 
@@ -251,6 +287,10 @@ describe("main orchestration", () => {
 					return { ok: true, stdout: "https://github.com/Yeachan-Heo/gajae-code/issues/1\n", stderr: "" };
 				},
 				token: () => "token",
+				approvals: {
+					load: () => new Set<string>(trusted ? [FINGERPRINT] : []),
+					record: () => {},
+				},
 				writeStdout: message => stdout.push(message),
 				writeStderr: message => stderr.push(message),
 				...overrides,
@@ -288,13 +328,43 @@ describe("main orchestration", () => {
 		await expect(main([], dependencies)).resolves.toBe(1);
 	});
 
+
+	test("missing token, non-array list, and tag-read rejection each fail with no writes", async () => {
+		const noToken = mainDependencies(true, { token: () => undefined });
+		await expect(main([], noToken.dependencies)).resolves.toBe(2);
+		expect(noToken.stderr.join("")).toContain("SENTRY_AUTH_TOKEN");
+
+		const badList = mainDependencies(true, { sentryGet: async () => ({ not: "an array" }) });
+		await expect(main([], badList.dependencies)).resolves.toBe(1);
+		expect(badList.stderr.join("")).toContain("unexpected issue list shape");
+
+		const tagFailure = mainDependencies(true, {
+			fingerprintOf: async () => {
+				throw new Error("responded 500");
+			},
+		});
+		await expect(main([], tagFailure.dependencies)).resolves.toBe(1);
+		expect(tagFailure.stderr.join("")).toContain("Sentry tag read failed");
+		expect(tagFailure.ghCalls).toHaveLength(0);
+	});
+
 	test("fails closed when a body-marker search is uncertain or a create fails", async () => {
-		const bodyMarker = mainDependencies(true, {
+		// An UNAPPROVED fingerprint with a planted marker stays withheld.
+		const bodyMarker = mainDependencies(false, {
 			findExistingIssue: async () => ({ kind: "untrusted", url: "https://github.com/Yeachan-Heo/gajae-code/issues/1" }),
 		});
 		await expect(main(["--apply"], bodyMarker.dependencies)).resolves.toBe(1);
 		expect(bodyMarker.stderr.join("")).toContain("explicit operator confirmation");
 		expect(bodyMarker.ghCalls).toHaveLength(0);
+
+		// An APPROVED fingerprint with the same marker is the documented
+		// cross-surface dedup contract: recognized as already filed, zero writes.
+		const approvedMarker = mainDependencies(true, {
+			findExistingIssue: async () => ({ kind: "untrusted", url: "https://github.com/Yeachan-Heo/gajae-code/issues/1" }),
+		});
+		await expect(main(["--apply"], approvedMarker.dependencies)).resolves.toBe(0);
+		expect(approvedMarker.stdout.join("")).toContain("1 already filed");
+		expect(approvedMarker.ghCalls).toHaveLength(0);
 
 		const duplicate = mainDependencies(true, {
 			findExistingIssue: async () => {
@@ -309,5 +379,29 @@ describe("main orchestration", () => {
 		});
 		await expect(main(["--apply"], failedCreate.dependencies)).resolves.toBe(1);
 		expect(failedCreate.stderr.join("")).toContain("failed");
+	});
+
+	test("--approve records the reviewed pending set and makes --apply reachable end-to-end", async () => {
+		const unapproved = mainDependencies(false);
+		const dry = await main([], unapproved.dependencies);
+		expect(dry).toBe(1); // unverified: nothing approved yet
+		expect(unapproved.stdout.join("")).toContain("--approve ");
+		const digestMatch = /--approve ([0-9a-f]{16})/.exec(unapproved.stdout.join(""));
+		expect(digestMatch).not.toBeNull();
+
+		const recorded: string[][] = [];
+		const approving = mainDependencies(false, {
+			approvals: {
+				load: () => new Set<string>(),
+				record: fingerprints => recorded.push([...fingerprints]),
+			},
+		});
+		await expect(main(["--approve", digestMatch![1]!], approving.dependencies)).resolves.toBe(1);
+		expect(recorded).toEqual([[FINGERPRINT]]);
+
+		// After approval, the same batch is fileable and idempotent on rerun.
+		const postApproval = mainDependencies(true);
+		await expect(main(["--apply"], postApproval.dependencies)).resolves.toBe(0);
+		expect(postApproval.ghCalls.length).toBeGreaterThan(0);
 	});
 });

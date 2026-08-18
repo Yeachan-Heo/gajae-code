@@ -31,6 +31,9 @@
  *   `gh` must already be authenticated for the GitHub write side.
  */
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import { fenceCrashText, sanitizeExternalCrashV1 } from "../packages/coding-agent/src/crash/sanitize";
 
@@ -46,6 +49,8 @@ const MAX_LIMIT = 100;
 
 interface Options {
 	apply: boolean;
+	/** Record the reviewed pending set into the local approval store instead of writing. */
+	approve: string | undefined;
 	limit: number;
 	org: string;
 	project: string;
@@ -74,6 +79,7 @@ interface TriageRow {
 export function parseArgs(argv: readonly string[]): Options | { error: string } {
 	const options: Options = {
 		apply: false,
+		approve: undefined,
 		limit: 25,
 		org: DEFAULT_ORG,
 		project: DEFAULT_PROJECT,
@@ -96,7 +102,8 @@ export function parseArgs(argv: readonly string[]): Options | { error: string } 
 			options.limit = parsed;
 			continue;
 		}
-		if (arg === "--org") options.org = value;
+		if (arg === "--approve") options.approve = value;
+		else if (arg === "--org") options.org = value;
 		else if (arg === "--project") options.project = value;
 		else if (arg === "--repo") {
 			// The cross-surface dedup contract only holds against one repository:
@@ -163,21 +170,50 @@ function renderCrashText(value: string, fallback: string): string {
 	return fenceCrashText(sanitizeField(value, fallback).replace(CRASH_MARKER_PATTERN, "<marker removed>"));
 }
 
-function toSentryIssue(raw: unknown): SentryIssue | undefined {
+const COARSE_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const SHORT_ID = /^[\w.-]{1,32}$/;
+
+/**
+ * Ingestion-time validation of every Sentry field that reaches maintainer
+ * output. Hostile upstream metadata must not be able to smuggle Markdown,
+ * markers, mentions, terminal controls, URL userinfo, or unbounded content
+ * into an issue body or terminal line via fields the crash-text renderer
+ * never covered (count, dates, shortId, permalink). A row failing any bound
+ * is dropped entirely (undefined), never partially repaired.
+ */
+export function toSentryIssue(raw: unknown): SentryIssue | undefined {
 	if (typeof raw !== "object" || raw === null) return undefined;
 	const record = raw as Record<string, unknown>;
 	const shortId = asString(record.shortId);
 	const id = asString(record.id);
-	if (!shortId || !id) return undefined;
+	if (!shortId || !id || !SHORT_ID.test(shortId) || !/^\d{1,20}$/.test(id)) return undefined;
+	const count = asString(record.count);
+	if (count !== "" && !/^\d{1,12}$/.test(count)) return undefined;
+	const firstSeen = asString(record.firstSeen).slice(0, 10);
+	const lastSeen = asString(record.lastSeen).slice(0, 10);
+	if ((firstSeen && !COARSE_DATE.test(firstSeen)) || (lastSeen && !COARSE_DATE.test(lastSeen))) return undefined;
+	const permalinkRaw = asString(record.permalink);
+	let permalink = "";
+	if (permalinkRaw) {
+		try {
+			const url = new URL(permalinkRaw);
+			if (url.protocol !== "https:" || !/^[\w.-]+\.sentry\.io$/i.test(url.hostname)) return undefined;
+			url.search = "";
+			url.hash = "";
+			permalink = `${url.origin}${url.pathname}`;
+		} catch {
+			return undefined;
+		}
+	}
 	return {
 		id,
 		shortId,
 		title: asString(record.title),
 		culprit: asString(record.culprit),
-		count: asString(record.count) || "0",
-		firstSeen: asString(record.firstSeen).slice(0, 10),
-		lastSeen: asString(record.lastSeen).slice(0, 10),
-		permalink: asString(record.permalink),
+		count: count || "0",
+		firstSeen,
+		lastSeen,
+		permalink,
 		level: asString(record.level),
 	};
 }
@@ -338,12 +374,66 @@ export function previewCulprit(culprit: string): string {
 	return renderCrashText(culprit, "<unsanitizable culprit>") || "<unknown>";
 }
 
+/**
+ * Operator approval store: the explicit human confirmation that makes batch
+ * filing reachable. The public-DSN fingerprint tag can never authorize `--apply`
+ * by itself; instead the operator reviews the dry-run listing and records the
+ * exact pending set (keyed by a batch digest) into a local 0600 JSON file.
+ * A later `--apply` trusts only fingerprints recorded this way, and reruns
+ * recognize already-filed markers for approved fingerprints, keeping the batch
+ * flow idempotent without promoting any forgeable signal to authority.
+ *
+ * The store is deliberately per-host (`~/.gjc/sentry-triage-approvals.json`):
+ * approval is an operator act, not a repo artifact.
+ */
+export interface ApprovalStore {
+	load(): Set<string>;
+	record(fingerprints: readonly string[]): void;
+}
+
+/** Stable digest over an ordered fingerprint set; printed by the dry run, confirmed by --approve. */
+export function batchDigest(fingerprints: readonly string[]): string {
+	const hasher = new Bun.CryptoHasher("sha256");
+	for (const fingerprint of [...fingerprints].sort()) {
+		hasher.update(fingerprint);
+		hasher.update("\n");
+	}
+	return hasher.digest("hex").slice(0, 16);
+}
+
+function approvalStorePath(): string {
+	return path.join(os.homedir(), ".gjc", "sentry-triage-approvals.json");
+}
+
+const fileApprovalStore: ApprovalStore = {
+	load(): Set<string> {
+		try {
+			const parsed = JSON.parse(fs.readFileSync(approvalStorePath(), "utf8")) as unknown;
+			if (typeof parsed !== "object" || parsed === null) return new Set();
+			const list = (parsed as { fingerprints?: unknown }).fingerprints;
+			if (!Array.isArray(list)) return new Set();
+			return new Set(list.filter((v): v is string => typeof v === "string" && /^[0-9a-f]{32}$/.test(v)));
+		} catch {
+			return new Set();
+		}
+	},
+	record(fingerprints: readonly string[]): void {
+		const merged = new Set([...this.load(), ...fingerprints]);
+		const target = approvalStorePath();
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(target, `${JSON.stringify({ fingerprints: [...merged].sort() }, null, "\t")}\n`, {
+			mode: 0o600,
+		});
+	},
+};
+
 interface MainDependencies {
 	sentryGet(pathname: string, token: string): Promise<unknown>;
 	fingerprintOf(issueId: string, token: string): Promise<FingerprintObservation | undefined>;
 	findExistingIssue(repo: string, fingerprint: string): Promise<ExistingIssueSearch>;
 	gh(args: readonly string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
 	token(): string | undefined;
+	approvals: ApprovalStore;
 	writeStdout(message: string): void;
 	writeStderr(message: string): void;
 }
@@ -354,6 +444,7 @@ const defaultDependencies: MainDependencies = {
 	findExistingIssue,
 	gh,
 	token: sentryToken,
+	approvals: fileApprovalStore,
 	writeStdout: message => process.stdout.write(message),
 	writeStderr: message => process.stderr.write(message),
 };
@@ -413,10 +504,13 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 	// group is withheld and reported for manual reconciliation.
 	const { rows, collisions } = partitionTriageRows(candidates);
 
-	const unverified = rows.filter(row => !row.trustedFingerprint);
-	const trustedRows = rows.filter(row => row.trustedFingerprint);
+	// Trust comes only from the operator approval store, never from the tag
+	// itself: the dry run lists every resolvable group for review, and only
+	// fingerprints recorded via `--approve <digest>` may reach `--apply`.
+	const approved = dependencies.approvals.load();
 	const untrustedBodyMarkers: TriageRow[] = [];
-	for (const row of trustedRows) {
+	let already = 0;
+	for (const row of rows) {
 		let existing: ExistingIssueSearch;
 		try {
 			existing = await dependencies.findExistingIssue(options.repo, row.fingerprint);
@@ -428,12 +522,20 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		}
 		if (existing.kind === "untrusted") {
 			row.existingIssueUrl = existing.url;
-			untrustedBodyMarkers.push(row);
+			// A marker hit alone is an untrusted candidate. For a fingerprint
+			// this operator already approved, marker + prior approval is the
+			// documented cross-surface dedup contract (issues filed
+			// interactively or by this script carry the marker), so the class
+			// is recognized as already filed and the run stays idempotent.
+			if (approved.has(row.fingerprint)) already++;
+			else untrustedBodyMarkers.push(row);
 		}
 	}
 
-	const pending = trustedRows.filter(row => row.existingIssueUrl === undefined);
-	const already = 0;
+	// Pending is the reviewable set: every group not already filed. Approval
+	// decides fileability at --apply time; the dry run shows all of it.
+	const pending = rows.filter(row => row.existingIssueUrl === undefined);
+	const unverified = pending.filter(row => !approved.has(row.fingerprint));
 
 	dependencies.writeStdout(
 		`${rows.length} gjc signature(s) upstream; ${already} already filed, ${pending.length} pending` +
@@ -466,6 +568,22 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
 	}
 
+	if (options.approve !== undefined) {
+		// Operator confirmation: record exactly the pending set reviewed in
+		// this dry run. The digest binds the approval to the batch contents;
+		// a mismatch means upstream moved between review and approval.
+		const digest = batchDigest(pending.map(row => row.fingerprint));
+		if (options.approve !== digest) {
+			dependencies.writeStderr(
+				`--approve does not match this batch. Re-run the dry run to print the current digest.\nexpected ${digest}\n`,
+			);
+			return 2;
+		}
+		dependencies.approvals.record(pending.map(row => row.fingerprint));
+		dependencies.writeStdout(`recorded ${pending.length} fingerprint(s) as operator-approved. --apply may now file them.\n`);
+		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
+	}
+
 	if (!options.apply) {
 		for (const row of pending)
 			dependencies.writeStdout(
@@ -473,13 +591,25 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 					`    culprit: ${previewCulprit(row.sentry.culprit)}\n` +
 					`    ${row.sentry.permalink}\n`,
 			);
-		dependencies.writeStdout(`\nDry run. Re-run with --apply to create ${pending.length} issue(s) in ${options.repo}.\n`);
+		dependencies.writeStdout(
+			`\nDry run. Review the ${pending.length} issue(s) above, then record them with ` +
+				`--approve ${batchDigest(pending.map(row => row.fingerprint))} and file with --apply.\n`,
+		);
+		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
+	}
+
+	// --apply files only the approved subset; unapproved rows stay withheld.
+	const fileable = pending.filter(row => approved.has(row.fingerprint));
+	if (fileable.length === 0) {
+		dependencies.writeStdout(
+			`\nNo operator-approved fingerprints in this batch. Review the dry run and record them with --approve <digest>.\n`,
+		);
 		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
 	}
 
 	let created = 0;
 	let failed = 0;
-	for (const row of pending) {
+	for (const row of fileable) {
 		const result = await dependencies.gh([
 			"issue",
 			"create",
@@ -504,5 +634,5 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));
 
-export { issueBody, issueTitle, toSentryIssue };
+export { issueBody, issueTitle };
 export type { FingerprintObservation, MainDependencies, Options, SentryIssue, TriageRow };
