@@ -1951,13 +1951,27 @@ describe("dedicated-only tests — routing contract", () => {
 		expect(job).not.toContain('--path-ignore-patterns="**/node_modules/**"');
 	});
 
-	test("ACP implementation changes schedule the lifecycle smoke through its behavioral owner", () => {
+	test("ACP lifecycle fixture changes schedule the lifecycle smoke through its behavioral owner", () => {
 		const tasks = planTargetedTasks(
-			["packages/coding-agent/src/modes/acp/acp-agent.ts"],
+			["packages/coding-agent/scripts/acp-conformance-agent.ts"],
 			packages,
-			["packages/coding-agent/test/acp/acp-agent.test.ts", ACP_LIFECYCLE],
+			[ACP_LIFECYCLE],
 		);
 		expect(tasks.find(task => task.key === DEDICATED_TASK_KEY)?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
+	});
+
+	test("ACP adapter and broker lifecycle changes schedule the lifecycle smoke through their behavioral owners", () => {
+		for (const changedPath of [
+			"packages/coding-agent/src/modes/acp/acp-agent.ts",
+			"packages/coding-agent/src/sdk/broker/lifecycle.ts",
+		]) {
+			const tasks = planTargetedTasks(
+				[changedPath],
+				packages,
+				[ACP_LIFECYCLE],
+			);
+			expect(tasks.find(task => task.key === DEDICATED_TASK_KEY)?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
+		}
 	});
 
 	test("dedicated-only tests never run through fresh-process shard inventory", async () => {

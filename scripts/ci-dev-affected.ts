@@ -84,8 +84,15 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
 };
-const ACP_LIFECYCLE_SOURCE_PREFIX = "packages/coding-agent/src/modes/acp/";
 const ACP_LIFECYCLE_SMOKE_TEST = "packages/coding-agent/test/acp/acp-lifecycle-smoke.test.ts";
+const ACP_LIFECYCLE_OWNER_PATHS = [
+	"packages/coding-agent/scripts/acp-conformance-agent.ts",
+	"packages/coding-agent/src/modes/acp/",
+	"packages/coding-agent/src/sdk/broker/",
+	"packages/coding-agent/src/sdk/client/",
+	"packages/coding-agent/src/sdk/host/",
+	"packages/coding-agent/src/config/",
+] as const;
 
 export interface PackageManifest {
 	name?: string;
@@ -1140,7 +1147,9 @@ function mappedTestsFor(changedPath: string, packages: readonly WorkspacePackage
 // remain necessary even when it owns a dedicated contract test.
 function behavioralTestsFor(changedPath: string): readonly string[] {
 	const direct = BEHAVIORAL_OWNER_TESTS[changedPath] ?? [];
-	return changedPath.startsWith(ACP_LIFECYCLE_SOURCE_PREFIX)
+	return ACP_LIFECYCLE_OWNER_PATHS.some(owner =>
+		owner.endsWith("/") ? changedPath.startsWith(owner) : changedPath === owner,
+	)
 		? [...direct, ACP_LIFECYCLE_SMOKE_TEST]
 		: direct;
 }

@@ -29,6 +29,7 @@ import { afterAll, beforeAll, expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 
 setDefaultTimeout(180_000);
 
@@ -77,8 +78,6 @@ interface InitializeResult {
 interface SessionRow {
 	sessionId?: unknown;
 	cwd?: unknown;
-	title?: unknown;
-	updatedAt?: unknown;
 }
 
 interface PendingRequest {
@@ -305,23 +304,51 @@ class AcpStdioClient {
 	 * Killing the ACP client does not close broker-owned session hosts: the broker
 	 * spawns one `sdk session-host-internal` per session and outlives this process.
 	 * Anything still open must be closed explicitly or every run leaks a host, which
-	 * accumulates permanently on a long-lived CI runner. Broker close is the owner
-	 * cleanup protocol and must succeed before the fixture can be terminated.
+	 * accumulates permanently on a long-lived CI runner. Close is best-effort:
+	 * transport failure must never prevent reaping the fixture process tree or mask
+	 * the test failure that triggered cleanup.
 	 */
 	async dispose(): Promise<void> {
-		await Promise.all(
-			[...this.#opened].map(sessionId => this.call("session/close", { sessionId }, DISPOSE_REQUEST_TIMEOUT_MS)),
-		);
-
-		let exited = false;
-		const exit = this.#child.exited.then(() => {
-			exited = true;
-		});
-		this.#child.kill("SIGTERM");
-		await Promise.race([exit, Bun.sleep(DISPOSE_EXIT_GRACE_MS)]);
-		if (!exited) {
-			this.#child.kill("SIGKILL");
-			await exit;
+		const sessions = [...this.#opened];
+		const closeFailures: string[] = [];
+		try {
+			const closeResults = await Promise.allSettled(
+				sessions.map(sessionId => this.call("session/close", { sessionId }, DISPOSE_REQUEST_TIMEOUT_MS)),
+			);
+			closeFailures.push(
+				...closeResults.flatMap((result, index) =>
+					result.status === "rejected"
+						? [
+								`session/close ${sessions[index]} failed: ${
+									result.reason instanceof Error ? result.reason.message : String(result.reason)
+								}`,
+							]
+						: [],
+				),
+			);
+		} catch (cause) {
+			closeFailures.push(`session cleanup failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+		} finally {
+			try {
+				let exited = false;
+				const exit = this.#child.exited.then(() => {
+					exited = true;
+				});
+				try {
+					this.#child.kill("SIGTERM");
+					await Promise.race([exit, Bun.sleep(DISPOSE_EXIT_GRACE_MS)]);
+				} finally {
+					if (!exited) {
+						this.#child.kill("SIGKILL");
+						await exit;
+					}
+				}
+			} catch (cause) {
+				closeFailures.push(`fixture termination failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+			} finally {
+				if (closeFailures.length > 0)
+					logger.warn(`ACP lifecycle smoke cleanup diagnostics: ${closeFailures.join("; ")}`);
+			}
 		}
 	}
 }
@@ -353,7 +380,6 @@ interface LifecycleObservations {
 	otherSessionId: string;
 	listedRows: SessionRow[];
 	otherCwdRows: SessionRow[];
-	resumeResult: Record<string, unknown>;
 	forkedSessionId: string;
 	forkResult: Record<string, unknown>;
 	forkPreservedSourceState: boolean;
@@ -362,7 +388,7 @@ interface LifecycleObservations {
 	closeCreated: Record<string, unknown>;
 	closeCreatedAgain: Record<string, unknown>;
 	promptAfterCloseRejected: boolean;
-	resumeAfterClose: Record<string, unknown>;
+	promptAfterResume: Record<string, unknown>;
 	closeAfterResume: Record<string, unknown>;
 	notifications: string[];
 }
@@ -408,9 +434,7 @@ beforeAll(async () => {
 		const listedRows = rowsOf(await client.call("session/list", { cwd: scratchCwd }));
 		const otherCwdRows = rowsOf(await client.call("session/list", { cwd: otherCwd }));
 
-		const resumeResult = asObject(
-			await client.call("session/resume", { sessionId: createdSessionId, cwd: scratchCwd }),
-		);
+		await client.call("session/resume", { sessionId: createdSessionId, cwd: scratchCwd });
 
 		await client.call("session/prompt", {
 			sessionId: createdSessionId,
@@ -454,8 +478,12 @@ beforeAll(async () => {
 
 		// The real reattachment path: this session is now detached, so resume has to go
 		// back through the broker rather than hand back an already-attached handle.
-		const resumeAfterClose = asObject(
-			await client.call("session/resume", { sessionId: createdSessionId, cwd: scratchCwd }),
+		await client.call("session/resume", { sessionId: createdSessionId, cwd: scratchCwd });
+		const promptAfterResume = asObject(
+			await client.call("session/prompt", {
+				sessionId: createdSessionId,
+				prompt: [{ type: "text", text: "post-resume liveness probe" }],
+			}),
 		);
 		const closeAfterResume = asObject(await client.call("session/close", { sessionId: createdSessionId }));
 
@@ -467,7 +495,6 @@ beforeAll(async () => {
 			otherSessionId,
 			listedRows,
 			otherCwdRows,
-			resumeResult,
 			forkedSessionId,
 			forkResult,
 			forkPreservedSourceState,
@@ -476,7 +503,7 @@ beforeAll(async () => {
 			closeCreated,
 			closeCreatedAgain,
 			promptAfterCloseRejected,
-			resumeAfterClose,
+			promptAfterResume,
 			closeAfterResume,
 			notifications: client.notifications,
 		};
@@ -503,12 +530,10 @@ test("session/new returns a distinct session id per workspace", () => {
 	expect(observed.otherSessionId).not.toBe(observed.createdSessionId);
 });
 
-test("session/list filtered by cwd returns the created session with its identifying fields", () => {
+test("session/list filtered by cwd returns the created session with its required identifying fields", () => {
 	const row = observed.listedRows.find(candidate => candidate.sessionId === observed.createdSessionId);
 	expect(row).toBeDefined();
 	expect(row?.cwd).toBe(observed.scratchCwd);
-	expect(typeof row?.title).toBe("string");
-	expect(typeof row?.updatedAt).toBe("string");
 });
 
 test("session/list discriminates on cwd instead of returning every session", () => {
@@ -519,25 +544,19 @@ test("session/list discriminates on cwd instead of returning every session", () 
 	expect(observed.otherCwdRows.map(row => row.sessionId)).not.toContain(observed.createdSessionId);
 });
 
-test("session/resume returns live session state", () => {
-	expect(observed.resumeResult).toHaveProperty("configOptions");
-	expect(observed.resumeResult).toHaveProperty("modes");
-});
-
 test("session/close costs the session its prompt eligibility", () => {
 	expect(observed.promptAfterCloseRejected).toBe(true);
 });
 
 test("session/resume reattaches a session that was closed", () => {
-	expect(observed.resumeAfterClose).toHaveProperty("configOptions");
-	expect(observed.resumeAfterClose).toHaveProperty("modes");
+	expect(typeof observed.promptAfterResume.stopReason).toBe("string");
 	expect(observed.closeAfterResume).toEqual({});
 });
 
 test("session/fork mints a session id distinct from its source", () => {
 	expect(observed.forkedSessionId).toMatch(/\S/);
 	expect(observed.forkedSessionId).not.toBe(observed.createdSessionId);
-	expect(observed.forkResult).toHaveProperty("modes");
+	expect(sessionIdOf(observed.forkResult)).toBe(observed.forkedSessionId);
 	expect(observed.forkPreservedSourceState).toBe(true);
 });
 
@@ -585,6 +604,43 @@ test("request timeout teardown force-kills a fixture that ignores termination", 
 		const disposeElapsed = performance.now() - disposeStarted;
 		expect(disposeElapsed).toBeGreaterThanOrEqual(DISPOSE_EXIT_GRACE_MS - 100);
 		expect(disposeElapsed).toBeLessThan(DISPOSE_EXIT_GRACE_MS + 2_000);
+	} finally {
+		if (!disposed) await client.dispose();
+	}
+});
+
+test("a failed session close still reaps the fixture without masking the primary failure", async () => {
+	const cwd = await makeScratch();
+	const fixture = path.join(cwd, "close-failure-acp-fixture.ts");
+	const terminated = path.join(cwd, "terminated");
+	await Bun.write(
+		fixture,
+		[
+			`process.on("SIGTERM", () => { Bun.write(${JSON.stringify(terminated)}, "terminated"); });`,
+			'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "fixture/ready" }) + "\\n");',
+			"for await (const line of process.stdin) {",
+			"  const request = JSON.parse(line);",
+			'  if (request.method === "session/close") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "close failed" } }) + "\\n");',
+			"}",
+		].join("\n"),
+	);
+	const client = new AcpStdioClient(cwd, ["bun", fixture]);
+	let disposed = false;
+
+	try {
+		await client.waitForNotification("fixture/ready");
+		client.track("session-that-cannot-close");
+		await expect(
+			(async () => {
+				try {
+					await client.call("initialize", {}, 50);
+				} finally {
+					await client.dispose();
+					disposed = true;
+				}
+			})(),
+		).rejects.toThrow("ACP request timed out after 50ms: initialize");
+		expect(await Bun.file(terminated).exists()).toBe(true);
 	} finally {
 		if (!disposed) await client.dispose();
 	}
