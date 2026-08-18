@@ -388,6 +388,24 @@ function handleGet(key: string | undefined, flags: { json?: boolean; showSecrets
 	console.log(formatValue(displayValue));
 }
 
+/**
+ * `settings.set`/`unset` are synchronous in-memory writes whose persistence runs in the
+ * background, so a mutating command that returns without flushing reports success from the
+ * merged in-memory view even when the durable save later fails. On filesystems where the
+ * native exact replacement is unavailable (NFS answers `atomic_unavailable`), `config.yml`
+ * is refused a fallback and never updated, yet the command still printed a success line and
+ * exited 0 -- the setting silently reverts on the next process. Await the durable save and
+ * fail loudly instead.
+ */
+async function persistOrExit(): Promise<void> {
+	try {
+		await settings.flushOrThrow();
+	} catch (err) {
+		console.error(chalk.red(`Failed to persist setting: ${err instanceof Error ? err.message : String(err)}`));
+		process.exit(1);
+	}
+}
+
 async function handleSet(
 	key: string | undefined,
 	value: string | undefined,
@@ -412,6 +430,8 @@ async function handleSet(
 		console.error(chalk.red(String(err)));
 		process.exit(1);
 	}
+
+	await persistOrExit();
 
 	const newValue = settings.get(def.path);
 	const displayValue = redactConfigValue(def.path, newValue, flags.showSecrets);
@@ -441,6 +461,8 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 	const defaultValue = getDefault(path);
 	if (defaultValue === undefined) settings.unset(path);
 	else settings.set(path, defaultValue as SettingValue<typeof path>);
+
+	await persistOrExit();
 
 	if (flags.json) {
 		console.log(JSON.stringify({ key: def.path, value: defaultValue }));
