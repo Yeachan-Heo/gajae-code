@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "bun:test";
+import * as configValue from "../../src/config/resolve-config-value";
 import * as mcpClient from "../../src/runtime-mcp/client";
 import { MCPManager, withinDeclaredConnectionWindow } from "../../src/runtime-mcp/manager";
 import type { MCPServerConnection } from "../../src/runtime-mcp/types";
@@ -117,6 +118,35 @@ describe("MCP startup and the declared connection window", () => {
 			expect(capturedSignal?.aborted).toBe(true);
 		} finally {
 			connect.mockRestore();
+			await manager.disconnectAll();
+		}
+	});
+
+	// The declared window is `connectToServer`'s budget, so it opens when the
+	// connect attempt does. Charging it from the batch clock would bill a task for
+	// time its transport never saw and tear it down before it had begun.
+	test("does not charge the declared window while a task is still resolving auth", async () => {
+		const resolveValue = vi.spyOn(configValue, "resolveConfigValue").mockImplementation(async () => {
+			await Bun.sleep(1_200);
+			return "resolved-token";
+		});
+		const connect = vi
+			.spyOn(mcpClient, "connectToServer")
+			.mockImplementation(() => new Promise<MCPServerConnection>(() => {}));
+		// Budget 800ms; the 300ms window would look long spent on the batch clock,
+		// but auth resolution has not finished so no connect has started.
+		const manager = new MCPManager(process.cwd(), null, { maxStartupTimeoutMs: 800 });
+		try {
+			const result = await manager.connectServers(
+				{ slowauth: { type: "stdio", command: "slowauth", timeout: 300, env: { TOKEN: "!token" } } },
+				{},
+			);
+
+			expect(result.errors.has("slowauth")).toBe(false);
+			expect(manager.getConnectionStatus("slowauth")).toBe("connecting");
+		} finally {
+			connect.mockRestore();
+			resolveValue.mockRestore();
 			await manager.disconnectAll();
 		}
 	});

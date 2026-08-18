@@ -72,6 +72,15 @@ type ConnectionTask = {
 	connectionAbort: AbortController;
 	connectionEpoch: number;
 	disconnectEpoch: number;
+	/**
+	 * When this task's connection attempt actually began, i.e. after auth
+	 * resolution and immediately before the pool opens the transport. The
+	 * declared connection window is `connectToServer`'s budget and starts here,
+	 * not when the batch started waiting, so charging it from the batch clock
+	 * could tear a server down before its connect had begun. `undefined` until
+	 * the attempt starts, which is itself "the window has not opened yet".
+	 */
+	connectStartedAt?: number;
 };
 
 type ScopedOperation = {
@@ -144,9 +153,14 @@ export function resolveExactConfigStartupTimeoutMs(configs: MCPServerConfig[]): 
  * about whether the operator's declared window has been spent.
  */
 export function withinDeclaredConnectionWindow(config: MCPServerConfig, elapsedMs: number): boolean {
+	if (!hasDeclaredConnectionWindow(config)) return false;
+	return elapsedMs < (config.timeout as number);
+}
+
+/** Whether `config` declared a usable connection window at all. */
+export function hasDeclaredConnectionWindow(config: MCPServerConfig): boolean {
 	const timeout = config.timeout;
-	if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) return false;
-	return elapsedMs < timeout;
+	return typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0;
 }
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
@@ -1002,8 +1016,13 @@ export class MCPManager {
 			const connectionAbort = new AbortController();
 			this.#pendingConnectionControllers.set(name, connectionAbort);
 			// Resolve auth config before connecting, but do so per-server in parallel.
+			let connectStartedAt: number | undefined;
 			const acquireInitialLease = async (): Promise<MCPPoolLease> => {
 				const resolvedConfig = await this.#resolveAuthConfig(config);
+				// Auth resolution is done; the pool opens (or reuses) the transport next,
+				// which is where `connectToServer` starts charging the declared window.
+				// A retry re-stamps because it begins a new attempt.
+				connectStartedAt = Date.now();
 				let lease: MCPPoolLease | undefined;
 				try {
 					lease = await this.#acquireLease(name, resolvedConfig, config, connectionAbort);
@@ -1104,7 +1123,7 @@ export class MCPManager {
 			this.#pendingToolLoads.set(name, toolsPromise);
 
 			const tracked = trackPromise(toolsPromise);
-			connectionTasks.push({
+			const task: ConnectionTask = {
 				name,
 				config,
 				tracked,
@@ -1113,7 +1132,11 @@ export class MCPManager {
 				connectionAbort,
 				connectionEpoch,
 				disconnectEpoch,
-			});
+				get connectStartedAt() {
+					return connectStartedAt;
+				},
+			};
+			connectionTasks.push(task);
 
 			void toolsPromise
 				.then(async ({ connection, serverTools }) => {
@@ -1132,9 +1155,7 @@ export class MCPManager {
 					});
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
-					// Detached from the connection that produced it: a cache write can only
-					// degrade the next startup, never fail this one.
-					if (!this.#toolsOnly) void this.#writeToolCache(name, config, serverTools);
+					if (!this.#toolsOnly) void this.toolCache?.set(name, config, serverTools);
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
@@ -1172,7 +1193,6 @@ export class MCPManager {
 					});
 				}
 			}
-			const startupStartedAt = Date.now();
 			const startupOutcome = await Promise.race([
 				Promise.allSettled(connectionTasks.map(task => task.tracked.promise)).then(() => undefined),
 				delay(startupTimeoutMs).then(() => undefined),
@@ -1196,15 +1216,11 @@ export class MCPManager {
 
 			if (pendingTasks.length > 0) {
 				if (this.toolCache && !this.#toolsOnly) {
-					// An unreadable cache is a miss, never a startup failure: the batch
-					// must not reject because the cache database is locked or corrupt.
 					await Promise.all(
 						pendingTasks.map(async task => {
-							try {
-								const cached = await this.toolCache?.get(task.name, task.config);
-								if (cached) cachedTools.set(task.name, cached);
-							} catch (error) {
-								logger.warn("MCP tool cache lookup failed", { path: `mcp:${task.name}`, error });
+							const cached = await this.toolCache?.get(task.name, task.config);
+							if (cached) {
+								cachedTools.set(task.name, cached);
 							}
 						}),
 					);
@@ -1217,28 +1233,35 @@ export class MCPManager {
 				// under `connectToServer`'s own timeout, and the background tool load
 				// adopts it. Exact-config (`toolsOnly`) startup still fails fast: it
 				// builds a catalog once, so a missing server is an error.
-				const startupElapsedMs = Date.now() - startupStartedAt;
+				const decidedAt = Date.now();
+				// Each task is judged against its own connect clock: a task that spent the
+				// wait in auth resolution or pool acquisition has not opened its window
+				// yet, and the batch clock would charge it for time its transport never
+				// saw. A task that has not started connecting is therefore always inside
+				// its declared window.
+				const declaredWindowOpen = (task: ConnectionTask): boolean =>
+					task.connectStartedAt === undefined
+						? hasDeclaredConnectionWindow(task.config)
+						: withinDeclaredConnectionWindow(task.config, decidedAt - task.connectStartedAt);
 				// A declared window that has already elapsed is spent for a cached task
 				// too: `connectToServer` has given up by now, so replaying cached tools as
 				// deferred would advertise a connection that can never arrive and fail on
 				// first call. A cached task that declared no window keeps the existing
 				// deferred contract, which never depended on a declared timeout.
-				const declaredWindowSpent = (config: MCPServerConfig): boolean =>
-					typeof config.timeout === "number" &&
-					Number.isFinite(config.timeout) &&
-					config.timeout > 0 &&
-					!withinDeclaredConnectionWindow(config, startupElapsedMs);
+				const declaredWindowSpent = (task: ConnectionTask): boolean =>
+					hasDeclaredConnectionWindow(task.config) && !declaredWindowOpen(task);
 				for (const task of pendingTasks) {
-					if (!this.#toolsOnly && withinDeclaredConnectionWindow(task.config, startupElapsedMs)) {
+					if (!this.#toolsOnly && declaredWindowOpen(task)) {
 						logger.warn("MCP server still connecting after the startup wait", {
 							path: `mcp:${task.name}`,
 							startupWaitMs: startupTimeoutMs,
 							declaredTimeoutMs: task.config.timeout,
+							connectElapsedMs: task.connectStartedAt === undefined ? null : decidedAt - task.connectStartedAt,
 							deferredFromCache: cachedTools.has(task.name),
 						});
 						continue;
 					}
-					if (cachedTools.has(task.name) && !declaredWindowSpent(task.config)) continue;
+					if (cachedTools.has(task.name) && !declaredWindowSpent(task)) continue;
 					cachedTools.delete(task.name);
 					const message = `MCP server connection timed out during startup: ${task.name}`;
 					errors.set(task.name, this.#serverError(message));
@@ -1342,15 +1365,6 @@ export class MCPManager {
 			connectedServers: Array.from(connectedServers),
 			exaApiKeys: [], // Will be populated by discoverAndConnect
 		};
-	}
-
-	/** Cache tool definitions without ever surfacing a write failure to the caller. */
-	async #writeToolCache(name: string, config: MCPServerConfig, tools: MCPToolDefinition[]): Promise<void> {
-		try {
-			await this.toolCache?.set(name, config, tools);
-		} catch (error) {
-			logger.warn("MCP tool cache store failed", { path: `mcp:${name}`, error });
-		}
 	}
 
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
@@ -2052,7 +2066,7 @@ export class MCPManager {
 				noReplay: config.sharing === "shared",
 				inputHandler: () => this.#inputRequestHandler ?? undefined,
 			});
-			void this.#writeToolCache(name, config, serverTools);
+			void this.toolCache?.set(name, config, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
 			void this.#loadServerResourcesAndPrompts(name, connection);
@@ -2120,7 +2134,7 @@ export class MCPManager {
 			noReplay: connection.config.sharing === "shared",
 			inputHandler: () => this.#inputRequestHandler ?? undefined,
 		});
-		void this.#writeToolCache(name, connection.config, serverTools);
+		void this.toolCache?.set(name, connection.config, serverTools);
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);

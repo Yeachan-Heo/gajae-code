@@ -3829,7 +3829,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// refreshMCPTools (the owned always-on path must not, or it would
 			// deactivate the plugin tools).
 			if (!ownsMcpManager) {
+				// A declared-window connection can still be pending when this session
+				// ends, and a caller-owned manager outlives it, so the late publication
+				// must not reach a disposed session's tool registry.
 				mcpManager.setOnToolsChanged(tools => {
+					if (session.isDisposed) return;
 					void session.refreshMCPTools(tools);
 				});
 			}

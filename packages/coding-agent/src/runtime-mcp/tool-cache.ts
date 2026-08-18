@@ -77,16 +77,7 @@ export class MCPToolCache {
 
 	async get(serverName: string, config: MCPServerConfig): Promise<MCPToolDefinition[] | null> {
 		const key = cacheKey(serverName);
-		// A miss and an unreadable cache are the same thing to the caller: startup
-		// connects the server normally. A locked, closed, or corrupt database must
-		// never reject the batch and abort session startup.
-		let raw: string | null | undefined;
-		try {
-			raw = this.storage.getCache(key);
-		} catch (error) {
-			logger.warn("MCP tool cache read failed", { serverName, error: String(error) });
-			return null;
-		}
+		const raw = this.storage.getCache(key);
 		if (!raw) return null;
 
 		let parsed: unknown;
@@ -139,13 +130,6 @@ export class MCPToolCache {
 		}
 
 		const expiresAtSec = Math.floor((Date.now() + CACHE_TTL_MS) / 1000);
-		// Writes run detached from the connection that produced them, so a failed
-		// write degrades the next startup at worst and must never surface as a
-		// rejected background task.
-		try {
-			this.storage.setCache(cacheKey(serverName), serialized, expiresAtSec);
-		} catch (error) {
-			logger.warn("MCP tool cache write failed", { serverName, error: String(error) });
-		}
+		this.storage.setCache(cacheKey(serverName), serialized, expiresAtSec);
 	}
 }

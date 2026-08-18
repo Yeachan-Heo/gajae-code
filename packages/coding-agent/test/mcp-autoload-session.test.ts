@@ -172,6 +172,31 @@ describe("conventional MCP autoload in standalone sessions", () => {
 	// Second session must inherit what the first one learned. The cache is what
 	// turns "the connection survived" into "the user has the tools", so it is
 	// asserted end to end rather than through the cache class.
+	// A declared-window connection outlives `connectServers()` by design, so the
+	// session ending first must abort it rather than let it publish tools into a
+	// registry that is already gone.
+	it("aborts a pending declared-window connection when the session is disposed first", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow",
+			commandArgs: [process.execPath, "-e", delayedMcpServerScript(2_400)],
+			flags: { project: true, timeout: 10_000 },
+			cwd: projectDir,
+		});
+
+		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+		expect(mcpManager?.getConnectionStatus("slow")).toBe("connecting");
+
+		await session.dispose();
+		expect(mcpManager?.getConnectionStatus("slow")).toBe("disconnected");
+
+		// Past the point the server would have finished its handshake: nothing is
+		// published after disposal.
+		await Bun.sleep(3_000);
+		expect(mcpManager?.getConnectedServers()).toEqual([]);
+		expect(mcpManager?.getTools()).toEqual([]);
+	}, 30_000);
+
 	it("caches a late-connecting server so the next cold-start session surfaces it immediately", async () => {
 		await runMCPCommand({
 			action: "add",
