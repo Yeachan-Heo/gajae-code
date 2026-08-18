@@ -110,6 +110,27 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-inbound-acceptance.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-inbound-production-path.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/notifications-inbound-reaction-ordering.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-lifecycle-command-routing.test.ts"
 			]
 		},

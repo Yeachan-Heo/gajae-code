@@ -28,7 +28,8 @@
   <a href="#answer-from-your-phone">Phone</a> ·
   <a href="#plan-before-mutation">Workflow</a> ·
   <a href="#spend-fewer-tokens">Token Diet</a> ·
-  <a href="#let-openclaw--hermes-drive-gjc">Controllers</a> ·
+  <a href="#let-openclaw--hermes--grokbot--your-own-bot-drive-gjc">Controllers</a> ·
+  <a href="#run-gjc-inside-paseo-orca-or-t3-code">Agent Shells</a> ·
   <a href="#documentation">Docs</a>
 </p>
 
@@ -202,57 +203,144 @@ GJC optimizes both sides of the token bill:
 
 The default dark TUI identity is the GJC red-claw theme; light-appearance terminals default to the bundled blue-crab theme. See [docs/theme.md](docs/theme.md) for the full catalog and `theme.dark` / `theme.light` settings.
 
-## Let OpenClaw / Hermes drive GJC
+## Let OpenClaw / Hermes / Grokbot / your own bot drive GJC
 
-GJC ships a native Coordinator MCP bridge, so an external controller like OpenClaw or Hermes orchestrates real GJC sessions through durable turns — never terminal scraping.
+Any external controller — OpenClaw, Hermes, Grokbot, a Discord bot, a cron script — drives real GJC
+sessions through the broker-bound **SDK session CLI** and the bundled
+[`sdk-skills/`](https://github.com/Yeachan-Heo/gajae-code/tree/main/sdk-skills) procedures
+(`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`). Durable
+turns and credential-free JSON, never terminal scraping.
 
-Don't read a guide — paste this prompt into your OpenClaw/Hermes controller and let it wire itself up:
+Don't read a guide — paste this prompt into your controller and let it wire itself up:
 
 <details>
 <summary><strong>Copy-paste controller setup prompt</strong></summary>
 
 ```text
-Set up Gajae-Code (gjc) as your coding-agent backend on this machine. gjc is already installed.
+Use Gajae-Code (gjc) as your coding-agent backend on this machine. gjc is already installed.
+Your interface is the broker-bound SDK session CLI. Never scrape terminal output, never read
+endpoint records or credentials under .gjc/state/sdk, never open a raw session WebSocket.
 
-1. Render and install the coordinator MCP setup package (replace the paths):
-   gjc setup hermes --root <ABS_REPO_PATH> --profile <PROFILE_NAME> --repo <REPO_NAME> \
-     --mutation sessions,questions,reports --profile-dir <YOUR_PROFILE_DIR> --install
-   Without --install the command is render-only; re-run with --install to write files.
+1. Load the shipped procedures before acting. Read these skill files from the gjc checkout or
+   from https://github.com/Yeachan-Heo/gajae-code/tree/main/sdk-skills (bundle root
+   `sdk-skills/`, manifest.json formatVersion 1 — if it is missing, malformed, or a different
+   version, stop and report instead of guessing):
+     sdk-skills/gjc-sdk-discover/SKILL.md   -- find and inspect sessions
+     sdk-skills/gjc-sdk-operate/SKILL.md    -- the allowlisted control/lifecycle operations
+     sdk-skills/gjc-sdk-author/SKILL.md     -- TypeScript/Python templates for scripted flows
+   Follow their allowlists exactly. Pass every value as an argv item, never as a shell string.
 
-2. Verify the contract (non-mutating, no LLM call). Both must report ok:
-   gjc setup hermes --root <ABS_REPO_PATH> --smoke
-   gjc mcp-serve coordinator --check --json
+2. Prove the surface works (read-only). Run from inside the target repository:
+     gjc --version
+     gjc sdk session list
+   `list` returns a credential-free JSON DTO of indexed sessions. Fail closed on missing,
+   unavailable, stale, dead, unknown, or ambiguous rows. Exit 2 = usage error, exit 1 =
+   operational failure (broker unavailable, session unavailable, retention gap, wait timeout).
 
-3. Register the MCP server from the installed config. It is equivalent to:
-   command: gjc, args: ["mcp-serve", "coordinator"]
-   env: GJC_COORDINATOR_MCP_WORKDIR_ROOTS=<ABS_REPO_PATH>,
-        GJC_COORDINATOR_MCP_PROFILE=<PROFILE_NAME>,
-        GJC_COORDINATOR_MCP_REPO=<REPO_NAME>,
-        GJC_COORDINATOR_MCP_SESSION_COMMAND="gjc --worktree",
-        GJC_COORDINATOR_MCP_MUTATIONS=sessions,questions,reports
+3. Understand a session before touching it:
+     gjc sdk session inspect <sessionId>
+     gjc sdk session raw query <sessionId> --query session.metadata
+     ... then context.get, goal.list, todo.list, workflow.gates.list, session.stats
+   These reads are not an atomic snapshot: label every reported field confirmed / inferred /
+   stale / unavailable / unknown. Never invent a missing value.
 
-4. To delegate coding work, prefer one call per workflow:
-   gjc_delegate_plan / gjc_delegate_execute / gjc_delegate_team
-   with { cwd, task, allow_mutation: true, idempotency_key: <fresh-uuid> }.
-   Each starts an isolated worktree session and returns a durable turn_id and artifacts.
+4. Start work in an isolated session:
+     gjc sdk session raw global --op session.create \
+       --idempotency-key <fresh-uuid> --json-input '{"cwd":"/abs/path/to/repo"}'
+   Lifecycle ops allowed: session.create, session.fork, session.resume, session.close.
+   session.delete is NOT allowed. session.get_endpoint is refused unconditionally.
 
-5. For finer control: gjc_coordinator_start_session -> gjc_coordinator_send_prompt ->
-   poll gjc_coordinator_read_turn or bounded gjc_coordinator_await_turn ->
-   answer gjc_coordinator_list_questions rows via gjc_coordinator_submit_question_answer ->
-   close with gjc_coordinator_report_status.
+5. Drive a turn and reconcile it:
+     gjc sdk session send <sessionId> --text "<task>" --op-ref <fresh-ulid>
+     gjc sdk session status <sessionId> <opRef>        # lossless turn.result lookup
+     gjc sdk session tail <sessionId> --until-idle     # replay + live follow
+   Use `send --wait --timeout-ms <ms>` for a bounded wait; a wait window that elapses reports
+   wait_timeout and never cancels the running turn. One fresh op-ref per logical prompt --
+   `unknown` means uncertainty, never proof of non-execution, so reconcile with `status`
+   instead of replaying a prompt.
 
-Rules: every mutating call needs allow_mutation: true plus a fresh idempotency_key.
-Treat durable turn state as authoritative; never scrape terminal output.
-The session command selector accepts only "gjc" or "gjc --worktree [name]".
+6. Answer what the agent asks you:
+     gjc sdk session raw control <sessionId> --op ask.answer --json-input '{...}'
+     gjc sdk session raw control <sessionId> --op workflow.gate_answer --json-input '{...}'
+   For gate answers use the durable workflow gate ID plus expectedSessionId; a transient
+   action_needed.id is never durable authority. Other allowed per-session controls:
+   turn.prompt, turn.steer, turn.follow_up, todo.replace, session.switch, session.rename.
+
+7. Show the human the exact operation and target before any mutating call, and treat the
+   approval as single-use: if the operation, input, or target changes, ask again.
 ```
 
 </details>
 
-For a controller that drives one live session directly, every session also exposes a loopback **SDK WebSocket** endpoint, the `gjc sdk session` CLI (`list|inspect|send|status|tail`), and the bundled `sdk-skills/` (`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`) — reviewed, approval-gated procedures any controller-hosted agent can follow.
+Long prompts are safe to leave running: the SDK prompt deadline is a progress-aware inactivity lease
+(`sdk.promptDeadlineMs`, 30 min default) bounded by `sdk.promptMaxRuntimeMs` (6 h default), renewed only
+by attributable tool execution for the accepted turn — not by heartbeats or streaming text.
 
-- [External controller integration guide](docs/bot-integration.md) · [Coordinator MCP bridge](docs/hermes-mcp-bridge.md)
-- [External controller / bot](docs/bot-integration.md) — provider-independent smokes; [`docs/aside-integration.md`](docs/aside-integration.md) covers the opt-in search/context sidecar
-- [SDK & wire protocol](docs/sdk.md) · [SDK session CLI](docs/sdk-session-cli.md) · [External-control readiness](docs/external-control-readiness.md)
+Need event-driven fan-out across many worktrees instead of one session at a time? The native
+[Coordinator MCP bridge](docs/hermes-mcp-bridge.md) (`gjc mcp-serve coordinator`, installed by
+`gjc setup hermes`) exposes the delegation tools for that shape.
+
+- [External controller / bot integration guide](docs/bot-integration.md) — provider-independent smokes; [`docs/aside-integration.md`](docs/aside-integration.md) covers the opt-in search/context sidecar
+- [SDK session CLI](docs/sdk-session-cli.md) · [SDK & wire protocol](docs/sdk.md) · [SDK app guide](docs/sdk-app-guide.md) · [External-control readiness](docs/external-control-readiness.md)
+
+---
+
+## Run GJC inside Paseo, Orca, or T3 Code
+
+Prefer a desktop/mobile agent shell over a bare terminal? GJC plugs into the three popular ones — at
+three honestly different levels of support.
+
+<table>
+<tr>
+<th width="120">Host</th><th width="110">Support</th><th>What you get</th><th>Setup</th>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://paseo.sh"><img src="https://www.google.com/s2/favicons?domain=paseo.sh&sz=64" width="28" alt="Paseo logo" /><br/><strong>Paseo</strong></a><br/>
+  <sub><a href="https://github.com/getpaseo/paseo">repo</a></sub>
+</td>
+<td align="center">★★★★★<br/><sub>first-class</sub></td>
+<td>Native ACP provider installed by GJC itself. Model catalog, Default/Plan modes, thinking levels, real permission prompts, cancel that can terminate owned subagents, mobile control.</td>
+<td><code>gjc setup paseo</code><br/><sub>then <code>paseo daemon restart</code></sub></td>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://onorca.dev"><img src="https://www.google.com/s2/favicons?domain=onorca.dev&sz=64" width="28" alt="Orca logo" /><br/><strong>Orca</strong></a><br/>
+  <sub><a href="https://github.com/stablyai/orca">repo</a></sub>
+</td>
+<td align="center">★★★★☆<br/><sub>works, one field</sub></td>
+<td>GJC runs as a custom CLI agent, one worktree per session, with Orca's diff review, terminal splits, SSH worktrees, and mobile companion. No usage tracking or account hot-swap yet.</td>
+<td><strong>Settings → Agents</strong><br/>add command <code>gjc</code></td>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://t3.codes"><img src="https://www.google.com/s2/favicons?domain=t3.codes&sz=64" width="28" alt="T3 Code logo" /><br/><strong>T3 Code</strong></a><br/>
+  <sub><a href="https://github.com/pingdotgg/t3code">repo</a></sub>
+</td>
+<td align="center">★★★☆☆<br/><sub>experimental</sub></td>
+<td>T3 Code ships harnesses for Codex, Claude, Cursor, Grok and OpenCode only — there is no GJC harness upstream yet. Run GJC beside it; the native provider is <a href="https://github.com/pingdotgg/t3code/discussions/7290">proposed upstream</a>.</td>
+<td><sub>not one-command yet — see the guide</sub></td>
+</tr>
+</table>
+
+Paseo, in one paste:
+
+```sh
+gjc setup paseo            # writes the ACP provider entry, backs up, never restarts your daemon
+paseo daemon restart
+paseo provider ls          # gjc must read `available`
+paseo run --provider gjc --cwd /path/to/repo "your prompt"
+
+gjc setup paseo --check    # pass / stale / drift, with a machine-readable --json
+gjc setup paseo --remove   # rolls back only the keys GJC itself created
+```
+
+Orca, in one field: install GJC (`bun install -g @gajae-code/coding-agent`), then add a custom agent
+with command `gjc` and no arguments. Orca pre-fills a permission-bypass flag for agents that expose
+one — GJC has none by design, so leave the arguments empty and keep GJC's own approval gates.
+
+**[Full integration guide → docs/terminal-app-integrations.md](docs/terminal-app-integrations.md)** —
+per-host setup, verification, cancel semantics, troubleshooting tables, and what each host cannot reach yet.
 
 ---
 
@@ -263,6 +351,7 @@ Start at **[gajae-code.com](https://gajae-code.com)** or `docs/`:
 - [Install & updates](docs/install.md) · [Environment variables](docs/environment-variables.md) · [Keybindings](docs/keybindings.md) · [Themes](docs/theme.md)
 - [Models & providers](docs/models.md) · [Custom providers & multi-account routing](docs/custom-providers-and-multi-account.md) · [Multi-vendor profiles](docs/multi-vendor-profiles.md) · [Auth broker](docs/auth-broker-gateway.md)
 - [Customization authority, import, and trust](docs/customization.md) · [Skills](docs/skills.md) · [Hooks](docs/hooks.md) · [Standalone MCP](docs/standalone-mcp.md) · [Plugin bundles](docs/gjc-plugins.md)
+- [Terminal app integrations: Paseo · Orca · T3 Code](docs/terminal-app-integrations.md)
 - [Telegram](docs/telegram-onboarding.md) · [Bot integration](docs/bot-integration.md) · [SDK](docs/sdk.md) · [SDK session CLI](docs/sdk-session-cli.md)
 - [Sessions](docs/session.md) · [Compaction](docs/compaction.md) · [Memory](docs/memory.md) · [Secrets](docs/secrets.md)
 - [Codebase overview](docs/codebase-overview.md) · [Contributing / dev setup](CONTRIBUTING.md)
@@ -296,6 +385,9 @@ gjc setup defaults --check
 | Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
 | OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
+| [Paseo](https://paseo.sh) | `gjc setup paseo` | GJC registers itself as an ACP provider and rolls itself back with `--remove`; Paseo owns its own config files. |
+| [Orca](https://onorca.dev) | `gjc` as a custom agent command | Orca launches GJC in its own worktree terminal; GJC keeps its own approval gates. |
+| [T3 Code](https://t3.codes) | none yet — experimental | No GJC harness upstream ([proposal](https://github.com/pingdotgg/t3code/discussions/7290)); run GJC beside it until a driver lands. |
 | External controller / bot | Coordinator MCP, `gjc sdk session`, or a configured managed adapter | External controllers use broker-bound, credential-free surfaces rather than scrollback or direct endpoint transports. The host-neutral `gjc-sdk-*` skills compose `gjc sdk session` and install no coordinator integration. |
 
 For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For external-control readiness, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For the wire protocol and machine interfaces, see [`docs/sdk.md`](docs/sdk.md).
@@ -372,7 +464,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/codebase-overview.md](docs/code
 
 ## Contributors & lineage
 
-Thanks to [Yeachan-Heo](https://github.com/Yeachan-Heo), [IYENTeam](https://github.com/IYENTeam), [HaD0Yun](https://github.com/HaD0Yun), and [probepark](https://github.com/probepark). GJC builds on lessons from a small family of agent harnesses; historical attribution lives in [NOTICE.md](NOTICE.md).
+Thanks to [Yeachan-Heo](https://github.com/Yeachan-Heo), [IYENTeam](https://github.com/IYENTeam), [HaD0Yun](https://github.com/HaD0Yun), [probepark](https://github.com/probepark), and [snowykr](https://github.com/snowykr). Repository maintainers and their GitHub access are listed in [MAINTAINERS.md](MAINTAINERS.md). GJC builds on lessons from a small family of agent harnesses; historical attribution lives in [NOTICE.md](NOTICE.md).
 
 ## License
 

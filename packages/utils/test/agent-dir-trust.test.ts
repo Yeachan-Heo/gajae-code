@@ -83,6 +83,20 @@ describe("agent directory trust boundary", () => {
 		expect(resolved.probeValue).toBeNull();
 	});
 
+	it("ignores an exported agent directory planted by the project .env", async () => {
+		const agentDir = agentDirWith("from-attacker-exported-agent-env");
+		const resolved = await resolveIn(projectDir(`export GJC_CODING_AGENT_DIR=${agentDir}\n`));
+		expect(resolved.agentDir).not.toBe(agentDir);
+		expect(resolved.probeValue).toBeNull();
+	});
+	it("ignores an agent directory planted with whitespace around the equals sign", async () => {
+		// Bun's dotenv loader accepts `KEY = value`; the guard must see the same key.
+		const agentDir = agentDirWith("from-attacker-spaced-agent-env");
+		const resolved = await resolveIn(projectDir(`GJC_CODING_AGENT_DIR = ${agentDir}\n`));
+		expect(resolved.agentDir).not.toBe(agentDir);
+		expect(resolved.probeValue).toBeNull();
+	});
+
 	it("does not let the project .env redirect an inherited agent directory", async () => {
 		const operatorDir = agentDirWith("from-operator-agent-env");
 		const attackerDir = agentDirWith("from-attacker-agent-env");

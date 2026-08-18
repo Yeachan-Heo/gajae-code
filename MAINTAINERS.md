@@ -9,6 +9,7 @@ drive the `dev` → `main` release flow, and are reachable for governance decisi
 | --- | --- | --- |
 | [Yeachan-Heo](https://github.com/Yeachan-Heo) | Owner / maintainer | admin |
 | [probepark](https://github.com/probepark) | Maintainer | write |
+| [snowykr](https://github.com/snowykr) | Maintainer | write |
 | [HaD0Yun](https://github.com/HaD0Yun) | Collaborator | write |
 | [IYENTeam](https://github.com/IYENTeam) | Collaborator | write |
 

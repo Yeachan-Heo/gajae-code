@@ -11,6 +11,7 @@ import {
 	type Context,
 	codexContextOverrideKey,
 	createModelManager,
+	Effort,
 	enrichModelThinking,
 	getBundledModels,
 	getBundledProviders,
@@ -3042,7 +3043,7 @@ export class ModelRegistry {
 					api,
 					provider: providerConfig.provider,
 					baseUrl: requestBaseUrl,
-					reasoning: referenceModel?.reasoning ?? false,
+					reasoning: providerConfig.provider === "omlx" ? true : (referenceModel?.reasoning ?? false),
 					thinking: referenceModel?.thinking,
 					input: referenceModel?.input ?? ["text"],
 					output: referenceModel?.output,
@@ -3069,8 +3070,25 @@ export class ModelRegistry {
 						...referenceModel?.compat,
 						supportsStore: false,
 						supportsDeveloperRole: false,
-						supportsReasoningEffort: false,
+						supportsReasoningEffort: providerConfig.provider === "omlx",
+						...(providerConfig.provider === "omlx"
+							? {
+									thinkingFormat: "qwen-chat-template" as const,
+									reasoningContentField: "reasoning_content" as const,
+								}
+							: {}),
 					},
+					...(providerConfig.provider === "omlx"
+						? {
+								reasoning: true,
+								thinking: {
+									mode: "effort" as const,
+									minLevel: Effort.Low,
+									maxLevel: Effort.High,
+									defaultLevel: Effort.Medium,
+								},
+							}
+						: {}),
 				}),
 			);
 		}

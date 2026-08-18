@@ -6,7 +6,7 @@ import type { AssistantMessage } from "@gajae-code/ai/core";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
-import { PLATFORM_EXCLUDED_TOOL_DESCRIPTORS, TOOL_DESCRIPTORS } from "../tools/descriptors";
+import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
 import {
@@ -71,11 +71,7 @@ export const UNPROVEN_TOOL_LABEL = "custom";
  * stays readable on another; the writer still only ever produces labels for the tools it
  * actually resolved.
  */
-const RUNTIME_TOOL_LABELS: ReadonlySet<string> = new Set([
-	UNPROVEN_TOOL_LABEL,
-	...Object.keys(TOOL_DESCRIPTORS),
-	...Object.keys(PLATFORM_EXCLUDED_TOOL_DESCRIPTORS),
-]);
+const RUNTIME_TOOL_LABELS: ReadonlySet<string> = new Set([UNPROVEN_TOOL_LABEL, ...Object.keys(TOOL_CATALOG)]);
 
 const stateFileWriteChains = new Map<string, Promise<void>>();
 

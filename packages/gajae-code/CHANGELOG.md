@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-17
+
 ### Added
 - `가재씨` is now installed alongside `gjc` as a Korean launcher alias, running Gajae-Code identically to `gjc` (#4363).
 

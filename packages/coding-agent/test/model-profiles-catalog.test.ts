@@ -68,6 +68,61 @@ const expectedProfiles: Array<{
 		},
 	},
 	{
+		name: "macos-omlx-fast",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.6-35B-A3B-4bit:low",
+			executor: "omlx/Qwen3.6-35B-A3B-4bit:low",
+			architect: "omlx/Qwen3.6-35B-A3B-4bit:medium",
+			planner: "omlx/Qwen3.6-35B-A3B-4bit:medium",
+			critic: "omlx/Qwen3.6-35B-A3B-4bit:low",
+		},
+	},
+	{
+		name: "macos-omlx-balanced",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+			executor: "omlx/Qwen3.6-35B-A3B-8bit:low",
+			architect: "omlx/Qwen3.6-35B-A3B-8bit:high",
+			planner: "omlx/Qwen3.6-35B-A3B-8bit:high",
+			critic: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+		},
+	},
+	{
+		name: "macos-omlx-quality",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.6-35B-A3B-bf16:high",
+			executor: "omlx/Qwen3.6-35B-A3B-bf16:medium",
+			architect: "omlx/Qwen3.6-35B-A3B-bf16:high",
+			planner: "omlx/Qwen3.6-35B-A3B-bf16:high",
+			critic: "omlx/Qwen3.6-35B-A3B-bf16:high",
+		},
+	},
+	{
+		name: "macos-omlx-abliterated-fast",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:medium",
+			executor: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:low",
+			architect: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:high",
+			planner: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:high",
+			critic: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:medium",
+		},
+	},
+	{
+		name: "macos-omlx-abliterated-balanced",
+		requiredProviders: ["omlx"],
+		mapping: {
+			default: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:medium",
+			executor: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:low",
+			architect: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:high",
+			planner: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:high",
+			critic: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:medium",
+		},
+	},
+	{
 		name: "opencodego",
 		requiredProviders: ["opencode-go"],
 		mapping: {
@@ -630,6 +685,13 @@ const commandCodeGoatModels = new Set([
 	"deepseek/deepseek-v4-pro",
 	"moonshotai/Kimi-K3",
 ]);
+const macosOmlxModels = new Set([
+	"Qwen3.6-35B-A3B-4bit",
+	"Qwen3.6-35B-A3B-8bit",
+	"Qwen3.6-35B-A3B-bf16",
+	"Qwen3.8-27B-Abliterated-MLX-4bit",
+	"Qwen3.8-27B-Abliterated-MLX-6bit",
+]);
 
 function selectorExists(selector: string): boolean {
 	const selectorWithoutThinking = splitSelectorThinkingSuffix(selector).selector;
@@ -643,6 +705,7 @@ function selectorExists(selector: string): boolean {
 	if (!parsed) return false;
 	if (parsed.provider === "grok-build") return ["grok-composer-2.5-fast", "grok-build"].includes(parsed.id);
 	if (parsed.provider === "commandcode-goat") return commandCodeGoatModels.has(parsed.id);
+	if (parsed.provider === "omlx") return macosOmlxModels.has(parsed.id);
 	return (modelsJson as Record<string, Record<string, unknown>>)[parsed.provider]?.[parsed.id] !== undefined;
 }
 
@@ -856,6 +919,15 @@ describe("built-in model profile catalog", () => {
 			providerGroup: "COMMAND CODE GOAT",
 		});
 		for (const [name, displayName] of Object.entries({
+			"macos-omlx-fast": "4-bit Fast (24GB~36GB+ / Default Ctx)",
+			"macos-omlx-balanced": "8-bit Balanced (64GB~128GB / Default Ctx)",
+			"macos-omlx-quality": "BF16 Max Quality (M5 Max 128GB / Default Ctx)",
+			"macos-omlx-abliterated-fast": "4-bit Abliterated Fast (Qwen3.8 27B / Default Ctx)",
+			"macos-omlx-abliterated-balanced": "6-bit Abliterated Balanced (Qwen3.8 27B / Default Ctx)",
+		})) {
+			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "MACOS LOCAL (OMLX)" });
+		}
+		for (const [name, displayName] of Object.entries({
 			"grok-45-eco": "Grok 4.5 Eco",
 			"grok-45-medium": "Grok 4.5 Medium",
 			"grok-45-pro": "Grok 4.5 Pro",
@@ -869,6 +941,7 @@ describe("built-in model profile catalog", () => {
 			"CODEX",
 			"OPENCODEGO",
 			"COMMAND CODE GOAT",
+			"MACOS LOCAL (OMLX)",
 			"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 			"CLAUDE",
 			"GLM",
@@ -879,6 +952,17 @@ describe("built-in model profile catalog", () => {
 			"MINIMAX",
 			"ALIBABA TOKEN PLAN",
 			"COMBOS",
+		]);
+		expect(
+			groupModelProfilesForPresetLanding(profiles)
+				.get("MACOS LOCAL (OMLX)")
+				?.map(profile => profile.name),
+		).toEqual([
+			"macos-omlx-fast",
+			"macos-omlx-balanced",
+			"macos-omlx-quality",
+			"macos-omlx-abliterated-fast",
+			"macos-omlx-abliterated-balanced",
 		]);
 		expect(
 			groupModelProfilesForPresetLanding(profiles)
@@ -909,6 +993,7 @@ describe("built-in model profile catalog", () => {
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-ams", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-cn", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-46-medium");
+		expect(recommendModelProfileForProvider("omlx", profiles)?.name).toBe("macos-omlx-balanced");
 		expect(recommendModelProfileForProvider("grok-build", profiles)?.name).toBe("grok-build-pro");
 		expect(recommendModelProfileForProvider("cursor", profiles)?.name).toBe("cursor-medium");
 		expect(recommendModelProfileForProvider("alibaba-token-plan", profiles)?.name).toBe(

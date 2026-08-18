@@ -1418,6 +1418,24 @@ export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelM
 				provider: "omlx",
 				baseUrl,
 				apiKey,
+				mapModel: (_entry, defaults) => ({
+					...defaults,
+					reasoning: true,
+					thinking: {
+						mode: "effort",
+						minLevel: Effort.Low,
+						maxLevel: Effort.High,
+						defaultLevel: Effort.Medium,
+						levels: [Effort.Low, Effort.Medium, Effort.High],
+					},
+					compat: {
+						supportsStore: false,
+						supportsDeveloperRole: false,
+						supportsReasoningEffort: true,
+						thinkingFormat: "qwen-chat-template",
+						reasoningContentField: "reasoning_content",
+					},
+				}),
 			}),
 	};
 }

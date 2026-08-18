@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -7,6 +8,7 @@ import type { GateContinuation } from "../src/modes/shared/agent-wire/workflow-g
 import {
 	FileGateStore,
 	type GateAuditEvent,
+	GateStoreWriteError,
 	isUnsupportedWindowsDirectorySyncError,
 	MemoryGateStore,
 	WorkflowGateBroker,
@@ -491,7 +493,7 @@ describe("WorkflowGateBroker", () => {
 		let syncs = 0;
 		const store = new FileGateStore(file, () => {
 			syncs++;
-			if (syncs === 8) throw new Error("parent fsync failed after accepted rename");
+			if (syncs === 6) throw new Error("parent fsync failed after accepted rename");
 		});
 		const broker = new WorkflowGateBroker("run-uncertain-accepted", store, { advance: () => {} });
 		const gate = broker.openGate(
@@ -506,5 +508,84 @@ describe("WorkflowGateBroker", () => {
 			status: "quarantined",
 			lifecycle: { reason: "continuation_owner_lost" },
 		});
+	});
+	it("does not mkdir at construction on a fresh empty store under a non-writable cwd (#4568)", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "gate-unwritable-fresh-"));
+		const storePath = path.join(dir, "workspace", ".gjc", "_session-s1", "state", "workflow-gates.json");
+		const broker = new WorkflowGateBroker(
+			"run-4568-fresh",
+			new FileGateStore(storePath),
+			{},
+			"8184568a-0000-4000-8000-000000000001",
+		);
+		expect(broker.listPendingGates()).toEqual([]);
+		expect(fs.existsSync(path.dirname(storePath))).toBe(false);
+
+		// The instance id rides along with the first real mutation.
+		const gate = broker.openGate({ stage: "ralplan", kind: "approval", schema: { type: "string" } });
+		expect(fs.existsSync(storePath)).toBe(true);
+		const persisted = JSON.parse(readFileSync(storePath, "utf8")) as { runtimeInstanceId?: string };
+		expect(persisted.runtimeInstanceId).toBe("8184568a-0000-4000-8000-000000000001");
+		expect(new FileGateStore(storePath).get(gate.gate_id)).toMatchObject({
+			status: "quarantined",
+			ownerInstanceId: "8184568a-0000-4000-8000-000000000001",
+		});
+	});
+	it("surfaces an unwritable directory as a typed GateStoreWriteError instead of a raw errno (#4568)", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "gate-unwritable-write-"));
+		const storePath = path.join(dir, "workspace", ".gjc", "_session-s2", "state", "workflow-gates.json");
+		const broker = new WorkflowGateBroker(
+			"run-4568-write",
+			new FileGateStore(storePath),
+			{},
+			"8184568b-0000-4000-8000-000000000002",
+		);
+		const eperm = new Error("EPERM: operation not permitted, mkdir") as NodeJS.ErrnoException;
+		eperm.code = "EPERM";
+		const mkdirSync = vi.spyOn(fs, "mkdirSync").mockImplementation((() => {
+			throw eperm;
+		}) as typeof fs.mkdirSync);
+		try {
+			expect(() => broker.openGate({ stage: "ralplan", kind: "approval", schema: { type: "string" } })).toThrow(
+				GateStoreWriteError,
+			);
+		} finally {
+			mkdirSync.mockRestore();
+		}
+		// After the typed failure nothing was committed: the first real write retries cleanly.
+		expect(fs.existsSync(storePath)).toBe(false);
+		const gate = broker.openGate({ stage: "ralplan", kind: "approval", schema: { type: "string" } });
+		expect(new FileGateStore(storePath).get(gate.gate_id)).toMatchObject({ status: "quarantined" });
+	});
+	it("keeps quarantining prior-instance records at construction once state exists (#4568)", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "gate-unwritable-restart-"));
+		const file = path.join(dir, "gates.json");
+		const first = new WorkflowGateBroker(
+			"run-4568-restart",
+			new FileGateStore(file),
+			{},
+			"8184568c-0000-4000-8000-000000000003",
+		);
+		const gate = first.openGate(
+			{ stage: "ralplan", kind: "approval", schema: { type: "string" } },
+			liveContinuation(),
+		);
+		const before = JSON.parse(readFileSync(file, "utf8")) as { counters: Record<string, number> };
+		const second = new WorkflowGateBroker(
+			"run-4568-restart",
+			new FileGateStore(file),
+			{},
+			"8184568d-0000-4000-8000-000000000004",
+		);
+		expect(second.listGateDiagnostics()).toMatchObject([
+			{ gate_id: gate.gate_id, lifecycle: { reason: "orphaned_after_process_restart" } },
+		]);
+		// The restart rewrite keeps the committed counter and stamps the new instance id.
+		const after = JSON.parse(readFileSync(file, "utf8")) as {
+			counters: Record<string, number>;
+			runtimeInstanceId: string;
+		};
+		expect(after.counters.ralplan).toBe(before.counters.ralplan);
+		expect(after.runtimeInstanceId).toBe("8184568d-0000-4000-8000-000000000004");
 	});
 });

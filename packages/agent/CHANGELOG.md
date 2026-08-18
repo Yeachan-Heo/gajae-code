@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-17
+
 ### Fixed
 
 - Managed fallback no longer kills a long turn with `Managed fallback attempt exceeded the provisional event buffer limit`. Every staged streaming frame carries the whole accumulated partial (once as `message`, once as `assistantMessageEvent.partial`), so staged bytes grew quadratically with the response length and a reasoning-heavy turn of a few thousand tokens crossed the 16 MiB cap even though no single event came close to it. Reaching the cap now first reclaims the staged `*_delta` increments, whose complete value is re-published by the retained `*_end` and terminal `message_end`/`done` frames, and only a batch that still cannot fit fails. Attempt atomicity is unchanged: nothing is published early, so a discarded attempt stays unobservable, and a single oversized event keeps its pre-clone rejection with no provider-fallback authority.

@@ -1416,8 +1416,9 @@ test("publishes exact durable authority generation 167 at serving epoch 87", () 
 	});
 
 	test("the committed topic-registry fixture tracks the canonical Telegram generation", async () => {
-		const fixture = await Bun.file(topicRegistryFixture).text();
-		const contract = await Bun.file(telegramContract).text();
+		const repoRoot = path.join(import.meta.dir, "..");
+		const fixture = await Bun.file(path.join(repoRoot, topicRegistryFixture)).text()
+		const contract = await Bun.file(path.join(repoRoot, telegramContract)).text()
 		const declared = declaration(contract, "DAEMON_GENERATION");
 		expect(declared).toBeDefined();
 		const canonical = Number(/DAEMON_GENERATION\s*=\s*(\d+)/.exec(declared!)?.[1]);

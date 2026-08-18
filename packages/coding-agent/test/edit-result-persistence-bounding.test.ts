@@ -496,7 +496,7 @@ describe("near-limit edit append after committed mutation (#4566)", () => {
 		const { SessionNearLimitAppendError: SessionNearLimitAppendErrorValue } = await import(
 			"../src/session/session-manager"
 		);
-		type SessionNearLimitAppendError = InstanceType<typeof SessionNearLimitAppendErrorValue>;
+
 		const editTool = new EditTool(makeEditToolSession(cwd) as never);
 
 		const destination = SessionManager.managedDestination(cwd, agentDir);
@@ -540,19 +540,19 @@ describe("near-limit edit append after committed mutation (#4566)", () => {
 				...r: unknown[]
 			) => unknown;
 			let appendCalls = 0;
-			proto.appendExpectedIdentitySync = function (this: unknown, p: string, b: Uint8Array, ...r: unknown[]) {
+			proto.appendExpectedIdentitySync = function (this: unknown, _p: string, _b: Uint8Array, ..._r: unknown[]) {
 				appendCalls++;
 				throw new Error("content_too_large");
 			};
-			proto.appendSync = function (this: unknown, p: string, b: Uint8Array) {
+			proto.appendSync = function (this: unknown, _p: string, _b: Uint8Array) {
 				appendCalls++;
 				throw new Error("content_too_large");
 			};
-			proto.replaceSync = function (this: unknown, p: string, b: Uint8Array) {
+			proto.replaceSync = function (this: unknown, _p: string, _b: Uint8Array) {
 				appendCalls++;
 				throw new Error("content_too_large");
 			};
-			proto.replaceExpectedIdentitySync = function (this: unknown, p: string, b: Uint8Array, ...r: unknown[]) {
+			proto.replaceExpectedIdentitySync = function (this: unknown, _p: string, _b: Uint8Array, ..._r: unknown[]) {
 				appendCalls++;
 				throw new Error("content_too_large");
 			};

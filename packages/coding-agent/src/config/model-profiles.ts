@@ -99,6 +99,41 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "openai-codex/gpt-5.6-luna:max",
 		architect: "openai-codex/gpt-5.6-luna:max",
 	}),
+	profile("macos-omlx-fast", ["omlx"], {
+		default: "omlx/Qwen3.6-35B-A3B-4bit:low",
+		executor: "omlx/Qwen3.6-35B-A3B-4bit:low",
+		architect: "omlx/Qwen3.6-35B-A3B-4bit:medium",
+		planner: "omlx/Qwen3.6-35B-A3B-4bit:medium",
+		critic: "omlx/Qwen3.6-35B-A3B-4bit:low",
+	}),
+	profile("macos-omlx-balanced", ["omlx"], {
+		default: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+		executor: "omlx/Qwen3.6-35B-A3B-8bit:low",
+		architect: "omlx/Qwen3.6-35B-A3B-8bit:high",
+		planner: "omlx/Qwen3.6-35B-A3B-8bit:high",
+		critic: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+	}),
+	profile("macos-omlx-quality", ["omlx"], {
+		default: "omlx/Qwen3.6-35B-A3B-bf16:high",
+		executor: "omlx/Qwen3.6-35B-A3B-bf16:medium",
+		architect: "omlx/Qwen3.6-35B-A3B-bf16:high",
+		planner: "omlx/Qwen3.6-35B-A3B-bf16:high",
+		critic: "omlx/Qwen3.6-35B-A3B-bf16:high",
+	}),
+	profile("macos-omlx-abliterated-fast", ["omlx"], {
+		default: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:medium",
+		executor: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:low",
+		architect: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:high",
+		planner: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:high",
+		critic: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:medium",
+	}),
+	profile("macos-omlx-abliterated-balanced", ["omlx"], {
+		default: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:medium",
+		executor: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:low",
+		architect: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:high",
+		planner: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:high",
+		critic: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:medium",
+	}),
 	profile("opencodego", ["opencode-go"], {
 		default: "opencode-go/kimi-k3",
 		executor: "opencode-go/deepseek-v4-flash",
@@ -558,12 +593,30 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
 	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
+	"macos-omlx-fast": { displayName: "4-bit Fast (24GB~36GB+ / Default Ctx)", providerGroup: "MACOS LOCAL (OMLX)" },
+	"macos-omlx-balanced": {
+		displayName: "8-bit Balanced (64GB~128GB / Default Ctx)",
+		providerGroup: "MACOS LOCAL (OMLX)",
+	},
+	"macos-omlx-quality": {
+		displayName: "BF16 Max Quality (M5 Max 128GB / Default Ctx)",
+		providerGroup: "MACOS LOCAL (OMLX)",
+	},
+	"macos-omlx-abliterated-fast": {
+		displayName: "4-bit Abliterated Fast (Qwen3.8 27B / Default Ctx)",
+		providerGroup: "MACOS LOCAL (OMLX)",
+	},
+	"macos-omlx-abliterated-balanced": {
+		displayName: "6-bit Abliterated Balanced (Qwen3.8 27B / Default Ctx)",
+		providerGroup: "MACOS LOCAL (OMLX)",
+	},
 };
 
 const PROFILE_GROUP_ORDER = [
 	"CODEX",
 	"OPENCODEGO",
 	"COMMAND CODE GOAT",
+	"MACOS LOCAL (OMLX)",
 	"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 	"CLAUDE",
 	"GLM",
@@ -591,6 +644,14 @@ const OPEN_WEIGHT_PROFILE_ORDER = [
 	"open-weights-all",
 ] as const;
 const OPEN_WEIGHT_PROFILE_RANK = new Map<string, number>(OPEN_WEIGHT_PROFILE_ORDER.map((name, index) => [name, index]));
+const MACOS_OMLX_PROFILE_ORDER = [
+	"macos-omlx-fast",
+	"macos-omlx-balanced",
+	"macos-omlx-quality",
+	"macos-omlx-abliterated-fast",
+	"macos-omlx-abliterated-balanced",
+] as const;
+const MACOS_OMLX_PROFILE_RANK = new Map<string, number>(MACOS_OMLX_PROFILE_ORDER.map((name, index) => [name, index]));
 
 const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	"openai-codex": "codex-medium",
@@ -606,6 +667,7 @@ const PROFILE_RECOMMENDATIONS: Record<string, string> = {
 	xai: "grok-46-medium",
 	"grok-build": "grok-build-pro",
 	cursor: "cursor-medium",
+	omlx: "macos-omlx-balanced",
 	"minimax-code": "minimax-medium",
 	"alibaba-token-plan": "alibaba-token-plan-balanced",
 };
@@ -648,6 +710,12 @@ export function groupModelProfilesForPresetLanding(
 				(a, b) =>
 					(OPEN_WEIGHT_PROFILE_RANK.get(a.name) ?? Number.MAX_SAFE_INTEGER) -
 					(OPEN_WEIGHT_PROFILE_RANK.get(b.name) ?? Number.MAX_SAFE_INTEGER),
+			);
+		} else if (group === "MACOS LOCAL (OMLX)") {
+			entries.sort(
+				(a, b) =>
+					(MACOS_OMLX_PROFILE_RANK.get(a.name) ?? Number.MAX_SAFE_INTEGER) -
+					(MACOS_OMLX_PROFILE_RANK.get(b.name) ?? Number.MAX_SAFE_INTEGER),
 			);
 		} else {
 			entries.sort((a, b) => a.name.localeCompare(b.name));

@@ -1041,10 +1041,10 @@ export class FileGateStore implements GateStore {
 		}
 	}
 	private flushState(next: FileState): void {
-		mkdirSync(path.dirname(this.filePath), { recursive: true });
 		const tmp = `${this.filePath}.tmp-${process.pid}-${Date.now()}`;
 		let renamed = false;
 		try {
+			mkdirSync(path.dirname(this.filePath), { recursive: true });
 			const fd = openSync(tmp, "w");
 			try {
 				writeFileSync(fd, JSON.stringify(next, null, 2));
@@ -1125,6 +1125,15 @@ export class FileGateStore implements GateStore {
 			}
 		}
 		next.runtimeInstanceId = instanceId;
+		// Nothing to persist yet: an empty store carries no gates or counters a
+		// later process could recover or quarantine, so stamping the runtime
+		// instance id now would mkdir under the cwd at construction time and
+		// defeat the lazy first-write contract (#4568). Adopt it in memory so it
+		// rides along with the first real mutation instead.
+		if (Object.keys(next.gates).length === 0 && Object.keys(next.counters).length === 0) {
+			this.state = next;
+			return;
+		}
 		this.commit(next);
 	}
 	list(): PersistedGate[] {

@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.14.0] - 2026-08-17
 ### Changed
 
 - Managed session files may now be up to 128 MiB, keeping retained-tree validation aligned with large resumable session transcripts and checkpoints.

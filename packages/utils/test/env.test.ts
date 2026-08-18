@@ -73,6 +73,33 @@ describe("parseEnvFile", () => {
 			GJC_FEATURE: "enabled",
 		});
 	});
+	it("accepts every assignment shape Bun's dotenv loader accepts", () => {
+		const filePath = writeTempEnv(
+			[
+				"PLAIN=value",
+				"export EXPORTED=exported-value",
+				"export\tTABBED=tabbed-value",
+				"SPACED_AROUND = spaced-value",
+				"export SPACED_EXPORT = spaced-export-value",
+				"INLINE_COMMENT=value # note",
+				"INLINE_COMMENT_TIGHT=value#note",
+				'QUOTED_HASH="value # kept"',
+				"MULTI_WORD=a b",
+			].join("\n"),
+		);
+
+		expect(parseEnvFile(filePath)).toEqual({
+			PLAIN: "value",
+			EXPORTED: "exported-value",
+			TABBED: "tabbed-value",
+			SPACED_AROUND: "spaced-value",
+			SPACED_EXPORT: "spaced-export-value",
+			INLINE_COMMENT: "value",
+			INLINE_COMMENT_TIGHT: "value",
+			QUOTED_HASH: "value # kept",
+			MULTI_WORD: "a b",
+		});
+	});
 });
 
 describe("parseShellEnvFile", () => {

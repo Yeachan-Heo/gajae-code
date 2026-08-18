@@ -23,8 +23,8 @@ const ALLOWED_PRIVATE_PACKAGE_VERSIONS = new Map<string, string>([
 const ALLOWED_UNSCOPED_PACKAGE_NAMES = new Set<string>(["gajae-code"]);
 const ALLOWED_PACKAGE_BINARIES = new Map<string, readonly string[]>([
 	["@gajae-code/ai", ["pi-ai"]],
-	["@gajae-code/coding-agent", ["gjc"]],
-	["gajae-code", ["gjc"]],
+	["@gajae-code/coding-agent", ["gjc", "가재씨"]],
+	["gajae-code", ["gjc", "가재씨"]],
 	["@gajae-code/stats", ["gjc-stats"]],
 	["@gajae-code/typescript-edit-benchmark", ["typescript-edit-benchmark"]],
 ]);
@@ -37,12 +37,12 @@ const LEGACY_NAME_PATTERNS: readonly RegExp[] = [
 	new RegExp("qa\." + ("om" + "p") + String.raw`\.sh`, "u"),
 ];
 const FORBIDDEN_PUBLIC_DOC_PATTERNS: readonly RegExp[] = [
+	// MCP is a public product surface since #4283/#4284 (`gjc mcp`, `/extensions`,
+	// docs/standalone-mcp.md); only removed-doc names stay forbidden in public docs.
 	...LEGACY_NAME_PATTERNS,
-	/MCP/u,
-	/\/mcp/u,
 	/mcp-config/u,
-	/mcp-server/u,
-];
+	/mcp-server\.md/u,
+]
 const FORBIDDEN_EXA_MCP_DOC_PATTERNS: readonly RegExp[] = [
 	/Exa MCP/u,
 	/web_search_exa/u,

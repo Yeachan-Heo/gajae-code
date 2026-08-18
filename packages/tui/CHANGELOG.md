@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-17
+
 ### Fixed
 - iTerm2 pet capability probes now wait for pending input without disabling Kitty keyboard mode, disabling `modifyOtherKeys`, or detaching the live input handler.
 - iTerm2 Gajae Pet frames now carry a dedicated filename, so dragging one retains iTerm's native drag behavior while the coding agent can discard only the temporary pet pathname pasted back into its composer.
