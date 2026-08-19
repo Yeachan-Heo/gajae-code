@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as url from "node:url";
 import {
 	canonicalDiffSha256,
+	parseBodyRisk,
 	parseGhPrCreate,
 	parsePrVerdict,
 	parseSelfReview,
@@ -12,6 +13,7 @@ import {
 	selfReviewSignedPayload,
 	validatePrContract,
 } from "./verify-pr-verdict";
+import type { IndependentReviewerEvidence } from "./verify-pr-verdict";
 
 const base = "a".repeat(40);
 const head = "b".repeat(40);
@@ -191,14 +193,24 @@ describe("maintainer self-review comment gate (issue #4703)", () => {
 		const outsider = selfReviewComment({ login: "attacker", association: "NONE" });
 		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: outsider }));
 		expect(result.ok).toBe(false);
-		expect(result.diagnostics.join("\n")).toContain("not an authorized maintainer");
+		expect(result.diagnostics.join("\n")).toContain("not the repository owner");
+	});
+
+	test("comment from a non-owner maintainer (MEMBER/COLLABORATOR) fails closed: only the owner may self-review", () => {
+		const collaborator = selfReviewComment({ login: "collab", association: "COLLABORATOR" });
+		const record = `gajae.pr-self-review.v1 verdict:merge-approved base:${base} head:${head} sha256:${digest} reviewer-id:collab risk:low-risk extra:none evidence:collaborator attempt`;
+		const payload = selfReviewSignedPayload({ verdict: "merge-approved", baseSha: base, headSha: head, diffSha256: digest, reviewerId: "collab", risk: "low-risk", extra: { kind: "none" }, evidence: "collaborator attempt" });
+		const body = `${record}\nself-review-signature: sha256:${selfReviewSignature(payload)}\nSigned-off-by: gaebal-gajae (clawdbot) 🦞`;
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: { login: "collab", authorAssociation: "COLLABORATOR", body } }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("not the repository owner");
 	});
 
 	test("comment from a first-time contributor with MEMBER-less association fails even with a forged reviewer-id", () => {
 		const forged = selfReviewComment({ login: "attacker", association: "CONTRIBUTOR" });
 		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: forged }));
 		expect(result.ok).toBe(false);
-		expect(result.diagnostics.join("\n")).toContain("not an authorized maintainer");
+		expect(result.diagnostics.join("\n")).toContain("not the repository owner");
 	});
 
 	test("self-review reviewer-id must match the PR author", () => {
@@ -227,21 +239,48 @@ describe("maintainer self-review comment gate (issue #4703)", () => {
 		expect(result.diagnostics.join("\n")).toContain("does not authorize merge");
 	});
 
-	test("regression-risk fix requires the OR gate: gpt-heavy or independent reviewer", () => {
+	test("regression-risk fix requires the OR gate: gpt-heavy or an authenticated independent reviewer", () => {
 		const withNone = buildRiskComment("regression-risk", "none");
 		const withGptHeavy = buildRiskComment("regression-risk", "gpt-heavy");
 		const withIndependent = buildRiskComment("regression-risk", "independent:domain-expert");
+		const approvedEvidence: IndependentReviewerEvidence = { permission: "write", approvedHead: true, approvedLogin: "domain-expert" };
 		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withNone })).ok).toBe(false);
 		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withGptHeavy })).ok).toBe(true);
-		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withIndependent })).ok).toBe(true);
+		// The independent token alone (no authenticated approval evidence) fails closed.
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withIndependent })).ok).toBe(false);
+		// With trusted exact-head approval + write permission from that exact reviewer it passes.
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withIndependent, independentReviewer: approvedEvidence })).ok).toBe(true);
 		const noneDiagnostics = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withNone })).diagnostics.join("\n");
 		expect(noneDiagnostics).toContain("risk regression-risk requires");
 	});
 
+	test("independent reviewer evidence must match the login, target the exact head, and hold write+ permission", () => {
+		const withIndependent = buildRiskComment("regression-risk", "independent:domain-expert");
+		const mismatchedLogin: IndependentReviewerEvidence = { permission: "write", approvedHead: true, approvedLogin: "someone-else" };
+		const staleApproval: IndependentReviewerEvidence = { permission: "write", approvedHead: false, approvedLogin: "domain-expert" };
+		const readOnly: IndependentReviewerEvidence = { permission: "read", approvedHead: true, approvedLogin: "domain-expert" };
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withIndependent, independentReviewer: mismatchedLogin })).ok).toBe(false);
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withIndependent, independentReviewer: staleApproval })).ok).toBe(false);
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withIndependent, independentReviewer: readOnly })).ok).toBe(false);
+	});
+
+	test("extra:independent cannot name the PR author as the independent reviewer", () => {
+		const comment = buildRiskComment("regression-risk", "independent:author");
+		const result = validatePrContract(validInput({
+			body: selfApprovedBody,
+			selfReviewComment: comment,
+			independentReviewer: { permission: "admin", approvedHead: true, approvedLogin: "author" },
+		}));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("names the PR author");
+	});
+
 	test("high-risk change requires an assigned independent reviewer", () => {
+		const approvedEvidence: IndependentReviewerEvidence = { permission: "write", approvedHead: true, approvedLogin: "domain-expert" };
 		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: buildRiskComment("high-risk", "none") })).ok).toBe(false);
 		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: buildRiskComment("high-risk", "gpt-heavy") })).ok).toBe(false);
-		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: buildRiskComment("high-risk", "independent:domain-expert") })).ok).toBe(true);
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: buildRiskComment("high-risk", "independent:domain-expert") })).ok).toBe(false);
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: buildRiskComment("high-risk", "independent:domain-expert"), independentReviewer: approvedEvidence })).ok).toBe(true);
 	});
 
 	test("low-risk fix passes with no extra review", () => {
@@ -268,12 +307,42 @@ describe("maintainer self-review comment gate (issue #4703)", () => {
 	});
 
 	test("policy matrix is explicit for every risk class", () => {
+		const approved: IndependentReviewerEvidence = { permission: "write", approvedHead: true, approvedLogin: "x" };
+		const rejected: IndependentReviewerEvidence = { permission: "read", approvedHead: false, approvedLogin: "x" };
 		expect(selfReviewSatisfiesPolicy({ risk: "low-risk", extra: { kind: "none" } } as never)).toBe(true);
 		expect(selfReviewSatisfiesPolicy({ risk: "regression-risk", extra: { kind: "none" } } as never)).toBe(false);
 		expect(selfReviewSatisfiesPolicy({ risk: "regression-risk", extra: { kind: "gpt-heavy" } } as never)).toBe(true);
-		expect(selfReviewSatisfiesPolicy({ risk: "regression-risk", extra: { kind: "independent", login: "x" } } as never)).toBe(true);
+		expect(selfReviewSatisfiesPolicy({ risk: "regression-risk", extra: { kind: "independent", login: "x" } } as never)).toBe(false);
+		expect(selfReviewSatisfiesPolicy({ risk: "regression-risk", extra: { kind: "independent", login: "x" } } as never, approved)).toBe(true);
+		expect(selfReviewSatisfiesPolicy({ risk: "regression-risk", extra: { kind: "independent", login: "x" } } as never, rejected)).toBe(false);
 		expect(selfReviewSatisfiesPolicy({ risk: "high-risk", extra: { kind: "none" } } as never)).toBe(false);
-		expect(selfReviewSatisfiesPolicy({ risk: "high-risk", extra: { kind: "independent", login: "x" } } as never)).toBe(true);
+		expect(selfReviewSatisfiesPolicy({ risk: "high-risk", extra: { kind: "gpt-heavy" } } as never)).toBe(false);
+		expect(selfReviewSatisfiesPolicy({ risk: "high-risk", extra: { kind: "independent", login: "x" } } as never)).toBe(false);
+		expect(selfReviewSatisfiesPolicy({ risk: "high-risk", extra: { kind: "independent", login: "x" } } as never, approved)).toBe(true);
+	});
+
+	test("self-review risk must match the PR body risk classification", () => {
+		const bodyLowRisk = "## Risk classification\n\n- [x] `low-risk`\n";
+		const commentRegressionRisk = buildRiskComment("regression-risk", "gpt-heavy");
+		const mismatch = validatePrContract(validInput({ body: `${bodyLowRisk}\n${selfApproved}`, selfReviewComment: commentRegressionRisk, bodyRisk: "low-risk" }));
+		expect(mismatch.ok).toBe(false);
+		expect(mismatch.diagnostics.join("\n")).toContain("does not match the PR body risk classification");
+		const agreement = validatePrContract(validInput({ body: `${bodyLowRisk}\n${selfApproved}`, selfReviewComment: buildRiskComment("low-risk", "none"), bodyRisk: "low-risk" }));
+		expect(agreement.ok).toBe(true);
+	});
+
+	test("body verdict reviewer-id must equal the validated self-review identity", () => {
+		const bodyNamingOther = `## GJC verdict\n\n${approved}\n`;
+		const result = validatePrContract(validInput({ body: bodyNamingOther, selfReviewComment: selfReviewComment() }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("does not match the validated self-review identity");
+	});
+
+	test("parseBodyRisk extracts the checked risk classification from the PR body", () => {
+		const body = "## Risk classification\n\n- [ ] `low-risk`\n- [x] `regression-risk` — note\n- [ ] `high-risk`\n";
+		expect(parseBodyRisk(body)).toBe("regression-risk");
+		expect(parseBodyRisk("no checkboxes here")).toBeNull();
+		expect(parseBodyRisk("- [ ] `low-risk`\n- [ ] `high-risk`\n")).toBeNull();
 	});
 
 	function buildRiskComment(risk: "low-risk" | "regression-risk" | "high-risk", extra: string) {
@@ -440,7 +509,7 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("Expected exactly one verdict line");
 	expect(workflow).toContain("effective exact-head approval");
 	expect(workflow).toContain("lacks repository review authority");
-	expect(workflow).toContain("/collaborators/${encodeURIComponent(reviewerId)}/permission");
+	expect(workflow).toContain("reviewPermission(reviewerId)");
 	expect(workflow).toContain('review.state !== "COMMENTED" && review.commit_id === head');
 	expect(workflow).not.toContain("pr-head/scripts/verify-pr-verdict.ts");
 	// Bootstrap job mirrors the trusted-base self-review contract (issue #4703).
@@ -448,7 +517,9 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("gajae.pr-self-review.v1.signature-domain");
 	expect(workflow).toContain("risk-fix OR gate is not satisfied");
 	expect(workflow).toContain("Self-review is stale: base/head/digest do not match this exact PR");
-	expect(workflow).toContain("not an authorized maintainer");
+	expect(workflow).toContain("not the repository owner");
+	expect(workflow).toContain("does not match the PR body risk classification");
+	expect(workflow).toContain("names the PR author; the independent reviewer must be a distinct maintainer");
 });
 
 test("review events cannot launch or cancel the affected Dev CI pipeline", async () => {

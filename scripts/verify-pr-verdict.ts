@@ -50,6 +50,16 @@ export interface PrValidationInput {
 	requireMergeApproved?: boolean;
 	/** Trusted GitHub issue-comment data backing a maintainer self-review. */
 	selfReviewComment?: AuthenticatedSelfReviewComment | null;
+	/** Risk declaration from the PR body (must match the self-review comment; issue #4703). */
+	bodyRisk?: string | null;
+	/** Trusted GitHub evidence about the independent reviewer named by extra:independent:<login>. */
+	independentReviewer?: IndependentReviewerEvidence | null;
+}
+
+export interface IndependentReviewerEvidence {
+	permission: string;
+	approvedHead: boolean;
+	approvedLogin?: string;
 }
 
 export interface AuthenticatedSelfReviewComment {
@@ -184,15 +194,26 @@ export function selfReviewSignature(payload: string): string {
 	return new Bun.CryptoHasher("sha256").update(SELF_REVIEW_SIGNATURE_DOMAIN).update(payload).digest("hex");
 }
 
-/** Risk-classified review policy (issue #4703 final owner decision). */
-export function selfReviewSatisfiesPolicy(review: ParsedSelfReview): boolean {
+/**
+ * Risk-classified review policy (issue #4703 final owner decision).
+ * An extra:independent:<login> token only satisfies the gate when the named reviewer is a
+ * distinct maintainer with admin/maintain/write permission and an authenticated APPROVED
+ * review on the exact head; the token shape alone never satisfies the policy.
+ */
+export function selfReviewSatisfiesPolicy(review: ParsedSelfReview, independentReviewer: IndependentReviewerEvidence | null = null): boolean {
+	const independentApproved = (extra: { login: string }): boolean => {
+		if (!independentReviewer) return false;
+		if (independentReviewer.approvedLogin?.toLowerCase() !== extra.login.toLowerCase()) return false;
+		if (!independentReviewer.approvedHead) return false;
+		return new Set(["admin", "maintain", "write"]).has(independentReviewer.permission);
+	};
 	switch (review.risk) {
 		case "low-risk":
 			return review.extra.kind === "none";
 		case "regression-risk":
-			return review.extra.kind === "gpt-heavy" || review.extra.kind === "independent";
+			return review.extra.kind === "gpt-heavy" || (review.extra.kind === "independent" && independentApproved(review.extra));
 		case "high-risk":
-			return review.extra.kind === "independent";
+			return review.extra.kind === "independent" && independentApproved(review.extra);
 	}
 }
 export function validatePrContract(input: PrValidationInput): PrValidationResult {
@@ -217,6 +238,12 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 		}
 		if (parsed.verdict.verdict === "merge-approved" && parsed.verdict.reviewerId.toLowerCase() === input.authorLogin.toLowerCase() && !selfReview.ok) {
 			diagnostics.push(`merge-approved cannot be self-approved: reviewer-id ${parsed.verdict.reviewerId} matches PR author ${input.authorLogin}. Record a signed gajae.pr-self-review.v1 maintainer comment for the exact head, or obtain independent review.`);
+		}
+		// The self-review comment can only authorize the identity it validated: the PR-body
+		// verdict must name exactly that reviewer (issue #4703 hardening).
+		if (parsed.verdict.verdict === "merge-approved" && selfReview.ok && selfReview.reviewerId
+			&& parsed.verdict.reviewerId.toLowerCase() !== selfReview.reviewerId.toLowerCase()) {
+			diagnostics.push(`merge-approved reviewer-id ${parsed.verdict.reviewerId} does not match the validated self-review identity ${selfReview.reviewerId}; the self-review comment cannot authorize a different reviewer.`);
 		}
 		if (input.requireMergeApproved && parsed.verdict.verdict !== "merge-approved") {
 			diagnostics.push(`Verdict ${parsed.verdict.verdict} intentionally blocks merge. Obtain independent review, update the exact-head verdict to merge-approved, and rerun this check.`);
@@ -245,16 +272,17 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
  * The PR body can never supply this record: evaluateSelfReviewComment reads only the
  * trusted comment data fetched from the GitHub API under workflow permissions.
  */
-function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; diagnostics: string[] } {
+function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; reviewerId?: string; diagnostics: string[] } {
 	const comment = input.selfReviewComment;
 	if (!comment) return { ok: false, diagnostics: [] };
 	const diagnostics: string[] = [];
 	const parsedComment = parseSelfReview(comment.body);
 	if (!parsedComment.selfReview) return { ok: false, diagnostics: parsedComment.diagnostics };
 	const review = parsedComment.selfReview;
-	const authorized = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-	if (!authorized.has(comment.authorAssociation) || comment.login.toLowerCase() !== review.reviewerId.toLowerCase()) {
-		diagnostics.push(`Self-review comment identity ${comment.login} (${comment.authorAssociation}) is not an authorized maintainer matching reviewer-id ${review.reviewerId}.`);
+	// Delegated maintainer identity (issue #4703): only the repository owner account may
+	// use the self-review path; ordinary collaborators cannot self-approve.
+	if (comment.authorAssociation !== "OWNER" || comment.login.toLowerCase() !== review.reviewerId.toLowerCase()) {
+		diagnostics.push(`Self-review comment identity ${comment.login} (${comment.authorAssociation}) is not the repository owner matching reviewer-id ${review.reviewerId}.`);
 	}
 	if (review.verdict !== "merge-approved") {
 		diagnostics.push(`Self-review verdict ${review.verdict} does not authorize merge.`);
@@ -275,10 +303,17 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; dia
 	if (review.reviewerId.toLowerCase() !== input.authorLogin.toLowerCase()) {
 		diagnostics.push(`Self-review reviewer-id ${review.reviewerId} must match the PR author ${input.authorLogin} for a maintainer self-review.`);
 	}
-	if (!selfReviewSatisfiesPolicy(review)) {
-		diagnostics.push(`Self-review risk ${review.risk} requires ${review.risk === "regression-risk" ? "gpt-heavy validation or an assigned independent reviewer" : "an assigned independent reviewer"} (extra:${review.extra.kind}); the risk-fix OR gate is not satisfied.`);
+	if (input.bodyRisk !== undefined && input.bodyRisk !== null && input.bodyRisk !== review.risk) {
+		diagnostics.push(`Self-review risk ${review.risk} does not match the PR body risk classification ${input.bodyRisk}; the classifications must agree.`);
 	}
-	return { ok: diagnostics.length === 0, diagnostics };
+	if (!selfReviewSatisfiesPolicy(review, input.independentReviewer ?? null)) {
+		const required = review.risk === "regression-risk" ? "gpt-heavy validation or an authenticated exact-head approval from an assigned independent reviewer" : "an authenticated exact-head approval from an assigned independent reviewer";
+		diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${review.extra.kind}); the risk-fix OR gate is not satisfied.`);
+	}
+	if (review.extra.kind === "independent" && review.extra.login.toLowerCase() === input.authorLogin.toLowerCase()) {
+		diagnostics.push(`Self-review extra:independent:${review.extra.login} names the PR author; the independent reviewer must be a distinct maintainer.`);
+	}
+	return { ok: diagnostics.length === 0, reviewerId: review.reviewerId, diagnostics };
 }
 
 export function canonicalDiffSha256(diff: Uint8Array | string): string {
@@ -318,12 +353,15 @@ interface IssueComment {
  * Fetch every issue comment on the PR through the trusted workflow token and return the
  * newest comment that carries a self-review record. Only GitHub API data is trusted:
  * the PR body and head-controlled code are never parsed as a self-review source.
+ * All pages are scanned before selecting the newest candidate so an old stale record
+ * can never shadow a newer one, and any API failure fails closed (issue #4703).
  */
 async function fetchSelfReviewComment(event: PullRequestEvent): Promise<AuthenticatedSelfReviewComment | null> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
 	const token = Bun.env.GITHUB_TOKEN;
 	if (!repository || !number || !token) return null;
+	let newest: IssueComment | null = null;
 	for (let page = 1; ; page++) {
 		const response = await fetch(`https://api.github.com/repos/${repository}/issues/${number}/comments?per_page=100&page=${page}`, {
 			headers: {
@@ -332,15 +370,14 @@ async function fetchSelfReviewComment(event: PullRequestEvent): Promise<Authenti
 				"X-GitHub-Api-Version": "2022-11-28",
 			},
 		});
-		if (!response.ok) return null;
+		if (!response.ok) throw new Error(`Issue comments API failed: ${response.status}; failing closed instead of skipping the self-review gate.`);
 		const comments = await response.json() as IssueComment[];
-		const matches = comments.filter(comment =>
-			(comment.body ?? "").split(/\r?\n/u).some(line => line.trim().startsWith(SELF_REVIEW_PREFIX))
-		);
-		if (matches.length > 0) return issueCommentToSelfReview(matches.at(-1)!);
+		for (const comment of comments) {
+			if ((comment.body ?? "").split(/\r?\n/u).some(line => line.trim().startsWith(SELF_REVIEW_PREFIX))) newest = comment;
+		}
 		if (comments.length < 100) break;
 	}
-	return null;
+	return newest ? issueCommentToSelfReview(newest) : null;
 }
 
 function issueCommentToSelfReview(comment: IssueComment): AuthenticatedSelfReviewComment | null {
@@ -386,6 +423,41 @@ async function authenticatedApproval(event: PullRequestEvent, reviewerId: string
 	const collaborator = await permissionResponse.json() as CollaboratorPermission;
 	if (!new Set(["admin", "maintain", "write"]).has(collaborator.permission ?? "")) return {};
 	return approval ? { login: approval.user!.login, headSha: approval.commit_id } : {};
+}
+
+/**
+ * Resolve trusted GitHub evidence for the independent reviewer named by a self-review
+ * extra:independent:<login> token: collaborator permission plus an authenticated APPROVED
+ * review on the exact PR head (issue #4703 hardening — the token shape alone never
+ * satisfies the risk gate).
+ */
+async function fetchIndependentReviewerEvidence(event: PullRequestEvent, login: string, headSha: string): Promise<IndependentReviewerEvidence> {
+	const repository = event.repository?.full_name;
+	const number = event.pull_request?.number;
+	const token = Bun.env.GITHUB_TOKEN;
+	if (!repository || !number || !token) return { permission: "none", approvedHead: false };
+	const headers = {
+		Accept: "application/vnd.github+json",
+		Authorization: `Bearer ${token}`,
+		"X-GitHub-Api-Version": "2022-11-28",
+	};
+	const reviews: PullRequestReview[] = [];
+	for (let page = 1; ; page++) {
+		const response = await fetch(`https://api.github.com/repos/${repository}/pulls/${number}/reviews?per_page=100&page=${page}`, { headers });
+		if (!response.ok) throw new Error(`Reviews API failed for the independent reviewer: ${response.status}; failing closed.`);
+		const pageReviews = await response.json() as PullRequestReview[];
+		reviews.push(...pageReviews);
+		if (pageReviews.length < 100) break;
+	}
+	const approved = reviews.some(review =>
+		review.user?.login?.toLowerCase() === login.toLowerCase()
+		&& review.state === "APPROVED"
+		&& review.commit_id === headSha,
+	);
+	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(login)}/permission`, { headers });
+	if (!permissionResponse.ok) throw new Error(`Independent reviewer permission lookup failed: ${permissionResponse.status}; failing closed.`);
+	const collaborator = await permissionResponse.json() as CollaboratorPermission;
+	return { permission: collaborator.permission ?? "none", approvedHead: approved, approvedLogin: login };
 }
 
 async function git(args: string[], cwd: string): Promise<{ exitCode: number; stdout: Uint8Array; stderr: string }> {
@@ -481,6 +553,11 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 		? await authenticatedApproval(event, parsed.verdict.reviewerId, headSha)
 		: {};
 	const selfReviewComment = await fetchSelfReviewComment(event);
+	const bodyRisk = parseBodyRisk(body);
+	const independentLogin = selfReviewComment ? independentReviewerLogin(selfReviewComment.body) : null;
+	const independentReviewer = independentLogin && selfReviewComment?.login.toLowerCase() === authorLogin.toLowerCase()
+		? await fetchIndependentReviewerEvidence(event, independentLogin, headSha)
+		: null;
 	return validatePrContract({
 		body,
 		baseRef,
@@ -494,7 +571,29 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 		authenticatedReviewHeadSha: approval.headSha,
 		requireMergeApproved: true,
 		selfReviewComment,
+		bodyRisk,
+		independentReviewer,
 	});
+}
+
+/**
+ * Parse the risk classification declared in the PR body's Risk classification section.
+ * The self-review comment must declare the same risk (issue #4703 hardening).
+ */
+export function parseBodyRisk(body: string): string | null {
+	const selected = body
+		.split(/\r?\n/u)
+		.map(line => line.trim())
+		.find(line => /^-\s*\[(x|X)\]\s*`(low-risk|regression-risk|high-risk)`/u.test(line));
+	if (!selected) return null;
+	const match = /`(low-risk|regression-risk|high-risk)`/u.exec(selected);
+	return match?.[1] ?? null;
+}
+
+/** Extract the independent reviewer login from a self-review comment, if any. */
+function independentReviewerLogin(commentBody: string): string | null {
+	const parsedComment = parseSelfReview(commentBody);
+	return parsedComment.selfReview?.extra.kind === "independent" ? parsedComment.selfReview.extra.login : null;
 }
 
 function shellWords(command: string): string[] | null {
