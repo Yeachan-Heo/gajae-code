@@ -142,12 +142,17 @@ class AcpStdioClient {
 
 	constructor(cwd: string, command: readonly string[] = ["bun", FIXTURE_AGENT], frameDrainDelayMs = 0) {
 		this.#frameDrainDelayMs = frameDrainDelayMs;
+		// Detached so the fixture leads its own process group. The broker and the
+		// session hosts it spawns are separate processes that outlive the ACP
+		// client, so signalling only `#child` leaks them; owning the group lets
+		// teardown reap the whole subtree in one call.
 		this.#child = Bun.spawn([...command], {
 			cwd: REPO_ROOT,
 			env: fixtureEnvironment(cwd),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
+			detached: true,
 		});
 		this.#scopeCwds.add(cwd);
 		this.#stderrDone = this.#readStderr();
@@ -182,6 +187,26 @@ class AcpStdioClient {
 	#describe(summary: string): Error {
 		const tail = this.#stderr.trim();
 		return new Error(tail.length > 0 ? `${summary}\n--- fixture stderr ---\n${tail}` : summary);
+	}
+
+	/**
+	 * Signal the fixture's whole process group, not just the client. Mirrors
+	 * `signalReplayProcessTree` in `src/gjc-runtime/ultragoal-evidence.ts`: a
+	 * negative pid targets the group, `ESRCH` means it is already gone, and any
+	 * other failure falls back to signalling the direct child so teardown still
+	 * makes progress.
+	 */
+	#signalTree(signal: NodeJS.Signals): void {
+		const pid = this.#child.pid;
+		if (process.platform !== "win32" && Number.isInteger(pid) && pid > 0) {
+			try {
+				process.kill(-pid, signal);
+				return;
+			} catch (cause) {
+				if ((cause as NodeJS.ErrnoException).code === "ESRCH") return;
+			}
+		}
+		this.#child.kill(signal);
 	}
 
 	/** First terminal cause wins; later ones are consequences of it. */
@@ -416,11 +441,11 @@ class AcpStdioClient {
 					exited = true;
 				});
 				try {
-					this.#child.kill("SIGTERM");
+					this.#signalTree("SIGTERM");
 					await Promise.race([exit, Bun.sleep(DISPOSE_EXIT_GRACE_MS)]);
 				} finally {
 					if (!exited) {
-						this.#child.kill("SIGKILL");
+						this.#signalTree("SIGKILL");
 						await exit;
 					}
 				}
@@ -770,6 +795,49 @@ test("a failed session close still reaps the fixture, fails the run, and preserv
 	} finally {
 		if (!disposed) await client.dispose();
 	}
+});
+
+test("disposal reaps a grandchild the fixture spawned, not just the fixture", async () => {
+	const cwd = await makeScratch();
+	const fixture = path.join(cwd, "grandchild-acp-fixture.ts");
+	const grandchildPid = path.join(cwd, "grandchild.pid");
+	// The broker and its session hosts are the real leak: they are grandchildren
+	// of the ACP client, so signalling only the direct child leaves them running
+	// after the run. This fixture stands in for one -- it spawns a child that
+	// ignores nothing and simply outlives its parent unless the whole process
+	// group is signalled.
+	await Bun.write(
+		fixture,
+		[
+			'const child = Bun.spawn(["bun", "-e", "await Bun.sleep(120000)"], { stdout: "ignore", stderr: "ignore" });',
+			`await Bun.write(${JSON.stringify(grandchildPid)}, String(child.pid));`,
+			'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "fixture/ready" }) + "\\n");',
+			"for await (const _line of process.stdin) {",
+			"}",
+		].join("\n"),
+	);
+	const client = new AcpStdioClient(cwd, ["bun", fixture]);
+	await client.waitForNotification("fixture/ready");
+	const pid = Number(await Bun.file(grandchildPid).text());
+	expect(Number.isInteger(pid)).toBe(true);
+	expect(() => process.kill(pid, 0)).not.toThrow();
+
+	await client.dispose();
+
+	// Signal 0 probes liveness without delivering anything: ESRCH is the proof
+	// the grandchild is gone. Poll briefly because reaping is asynchronous.
+	const deadline = Date.now() + 5_000;
+	let alive = true;
+	while (alive && Date.now() < deadline) {
+		try {
+			process.kill(pid, 0);
+			await Bun.sleep(50);
+		} catch (cause) {
+			alive = (cause as NodeJS.ErrnoException).code !== "ESRCH";
+		}
+	}
+	if (alive) process.kill(pid, "SIGKILL");
+	expect(alive).toBe(false);
 });
 
 test("a final stdout response settles before a one-shot fixture exit", async () => {
