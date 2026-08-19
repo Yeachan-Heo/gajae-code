@@ -126,8 +126,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * cannot retain the earlier SessionRouter attachment contract.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 65,
-	slack: 68,
+	discord: 66,
+	slack: 69,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

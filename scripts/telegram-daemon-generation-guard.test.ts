@@ -120,9 +120,9 @@ const chatConfigHelpers = {
 } as const;
 const chatEndpointHelpers = {
 	[sessionRouter]: [
-		"SessionRouter.#attach",
-		"SessionRouter.#createAttachedClient",
-		"SessionRouter.#publishAttachment",
+		"SessionRouter.#attachDirect",
+		"SessionRouter.#createClient",
+		"SessionRouter.#readEndpoint",
 	],
 	[sdkDiscovery]: ["readSdkSessionEndpoint"],
 } as const;
