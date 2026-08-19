@@ -13,6 +13,11 @@ const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-acp-conformance-")
 let child: ReturnType<typeof Bun.spawn> | undefined;
 let server: ReturnType<typeof Bun.serve> | undefined;
 
+// The lifecycle smoke test reads the broker-owned index after `session/close`.
+// This is fixture metadata, not an ACP extension: the production child inherits
+// the same stdio and sees no special request surface.
+process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", method: "fixture/agent-dir", params: { agentDir } })}\n`);
+
 /**
  * Deterministic replies for the pinned `acp-core-v1` corpus. Each branch mirrors one
  * upstream case expectation; nothing here reaches the network.

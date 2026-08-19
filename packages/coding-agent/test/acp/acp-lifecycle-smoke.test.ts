@@ -79,6 +79,11 @@ interface SessionRow {
 	cwd?: unknown;
 }
 
+interface BrokerIndexEvent {
+	type?: unknown;
+	sessionId?: unknown;
+}
+
 interface PendingRequest {
 	method: string;
 	resolve(frame: RpcFrame): void;
@@ -142,10 +147,10 @@ class AcpStdioClient {
 
 	constructor(cwd: string, command: readonly string[] = ["bun", FIXTURE_AGENT], frameDrainDelayMs = 0) {
 		this.#frameDrainDelayMs = frameDrainDelayMs;
-		// Detached so the fixture leads its own process group. The broker and the
-		// session hosts it spawns are separate processes that outlive the ACP
-		// client, so signalling only `#child` leaks them; owning the group lets
-		// teardown reap the whole subtree in one call.
+		// On POSIX, detached makes the fixture lead its own process group. The
+		// broker and session hosts it spawns are separate processes that outlive
+		// the ACP client, so group signalling reaps that subtree. Windows has no
+		// equivalent here: disposal terminates only the direct fixture child.
 		this.#child = Bun.spawn([...command], {
 			cwd: REPO_ROOT,
 			env: fixtureEnvironment(cwd),
@@ -190,11 +195,12 @@ class AcpStdioClient {
 	}
 
 	/**
-	 * Signal the fixture's whole process group, not just the client. Mirrors
+	 * On POSIX, signal the fixture's process group, not just the client. Mirrors
 	 * `signalReplayProcessTree` in `src/gjc-runtime/ultragoal-evidence.ts`: a
 	 * negative pid targets the group, `ESRCH` means it is already gone, and any
-	 * other failure falls back to signalling the direct child so teardown still
-	 * makes progress.
+	 * other failure falls back to signalling the direct child. Windows has no
+	 * process-group signal mechanism in this fixture, so it intentionally takes
+	 * that direct-child fallback only.
 	 */
 	#signalTree(signal: NodeJS.Signals): void {
 		const pid = this.#child.pid;
@@ -502,6 +508,18 @@ function rowsOf(value: unknown): SessionRow[] {
 	return Array.isArray(sessions) ? (sessions as SessionRow[]) : [];
 }
 
+async function brokerRecordedHostUnregistration(agentDir: string, sessionId: string): Promise<boolean> {
+	const index = Bun.file(path.join(agentDir, "sdk", "sessions", "index.jsonl"));
+	if (!(await index.exists())) return false;
+	return (await index.text())
+		.split("\n")
+		.filter(Boolean)
+		.some(line => {
+			const event = JSON.parse(line) as BrokerIndexEvent;
+			return event.type === "host_unregistered" && event.sessionId === sessionId;
+		});
+}
+
 /** Everything the lifecycle sequence observed, captured once and asserted per criterion. */
 interface LifecycleObservations {
 	sessionCapabilities: SessionCapabilities;
@@ -519,6 +537,7 @@ interface LifecycleObservations {
 	rowsAfterDelete: SessionRow[];
 	closeCreated: Record<string, unknown>;
 	closeCreatedAgain: Record<string, unknown>;
+	brokerRecordedHostUnregistrationAfterClose: boolean;
 	promptAfterCloseRejected: boolean;
 	promptAfterResume: Record<string, unknown>;
 	closeAfterResume: Record<string, unknown>;
@@ -595,6 +614,18 @@ beforeAll(async () => {
 		const rowsAfterDelete = rowsOf(await client.call("session/list", { cwd: scratchCwd }));
 
 		const closeCreated = asObject(await client.call("session/close", { sessionId: createdSessionId }));
+		const agentDir = notificationParams(
+			client.notificationFrames.find(frame => frame.method === "fixture/agent-dir") ?? {},
+		)?.agentDir;
+		if (typeof agentDir !== "string") throw new Error("ACP fixture did not publish its agent directory.");
+		// The prompt rejection below only proves local detachment. The broker
+		// writes this host-unregistration event only after its session.close
+		// lifecycle operation has driven the host to exit, so it distinguishes a
+		// real remote close before resume from a client that merely forgets locally.
+		const brokerRecordedHostUnregistrationAfterClose = await brokerRecordedHostUnregistration(
+			agentDir,
+			createdSessionId,
+		);
 		const closeCreatedAgain = asObject(await client.call("session/close", { sessionId: createdSessionId }));
 
 		// `session/list` still returns a closed session, so it cannot witness the close.
@@ -641,6 +672,7 @@ beforeAll(async () => {
 			rowsAfterDelete,
 			closeCreated,
 			closeCreatedAgain,
+			brokerRecordedHostUnregistrationAfterClose,
 			promptAfterCloseRejected,
 			promptAfterResume,
 			closeAfterResume,
@@ -688,6 +720,10 @@ test("session/list discriminates on cwd instead of returning every session", () 
 
 test("session/close costs the session its prompt eligibility", () => {
 	expect(observed.promptAfterCloseRejected).toBe(true);
+});
+
+test("the first session/close reaches the broker and shuts down its host before resume", () => {
+	expect(observed.brokerRecordedHostUnregistrationAfterClose).toBe(true);
 });
 
 test("session/resume reattaches a session that was closed", () => {
@@ -797,48 +833,50 @@ test("a failed session close still reaps the fixture, fails the run, and preserv
 	}
 });
 
-test("disposal reaps a grandchild the fixture spawned, not just the fixture", async () => {
-	const cwd = await makeScratch();
-	const fixture = path.join(cwd, "grandchild-acp-fixture.ts");
-	const grandchildPid = path.join(cwd, "grandchild.pid");
-	// The broker and its session hosts are the real leak: they are grandchildren
-	// of the ACP client, so signalling only the direct child leaves them running
-	// after the run. This fixture stands in for one -- it spawns a child that
-	// ignores nothing and simply outlives its parent unless the whole process
-	// group is signalled.
-	await Bun.write(
-		fixture,
-		[
-			'const child = Bun.spawn(["bun", "-e", "await Bun.sleep(120000)"], { stdout: "ignore", stderr: "ignore" });',
-			`await Bun.write(${JSON.stringify(grandchildPid)}, String(child.pid));`,
-			'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "fixture/ready" }) + "\\n");',
-			"for await (const _line of process.stdin) {",
-			"}",
-		].join("\n"),
-	);
-	const client = new AcpStdioClient(cwd, ["bun", fixture]);
-	await client.waitForNotification("fixture/ready");
-	const pid = Number(await Bun.file(grandchildPid).text());
-	expect(Number.isInteger(pid)).toBe(true);
-	expect(() => process.kill(pid, 0)).not.toThrow();
+test.skipIf(process.platform === "win32")(
+	"POSIX disposal reaps a grandchild the fixture spawned, not just the fixture",
+	async () => {
+		const cwd = await makeScratch();
+		const fixture = path.join(cwd, "grandchild-acp-fixture.ts");
+		const grandchildPid = path.join(cwd, "grandchild.pid");
+		// POSIX process-group signalling covers the broker and session-host
+		// grandchildren that would outlive the ACP client if teardown signalled only
+		// the direct child. Windows intentionally has no subtree-reaping contract in
+		// this fixture, so this assertion is not run there.
+		await Bun.write(
+			fixture,
+			[
+				'const child = Bun.spawn(["bun", "-e", "await Bun.sleep(120000)"], { stdout: "ignore", stderr: "ignore" });',
+				`await Bun.write(${JSON.stringify(grandchildPid)}, String(child.pid));`,
+				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "fixture/ready" }) + "\\n");',
+				"for await (const _line of process.stdin) {",
+				"}",
+			].join("\n"),
+		);
+		const client = new AcpStdioClient(cwd, ["bun", fixture]);
+		await client.waitForNotification("fixture/ready");
+		const pid = Number(await Bun.file(grandchildPid).text());
+		expect(Number.isInteger(pid)).toBe(true);
+		expect(() => process.kill(pid, 0)).not.toThrow();
 
-	await client.dispose();
+		await client.dispose();
 
-	// Signal 0 probes liveness without delivering anything: ESRCH is the proof
-	// the grandchild is gone. Poll briefly because reaping is asynchronous.
-	const deadline = Date.now() + 5_000;
-	let alive = true;
-	while (alive && Date.now() < deadline) {
-		try {
-			process.kill(pid, 0);
-			await Bun.sleep(50);
-		} catch (cause) {
-			alive = (cause as NodeJS.ErrnoException).code !== "ESRCH";
+		// Signal 0 probes liveness without delivering anything: ESRCH is the proof
+		// the grandchild is gone. Poll briefly because reaping is asynchronous.
+		const deadline = Date.now() + 5_000;
+		let alive = true;
+		while (alive && Date.now() < deadline) {
+			try {
+				process.kill(pid, 0);
+				await Bun.sleep(50);
+			} catch (cause) {
+				alive = (cause as NodeJS.ErrnoException).code !== "ESRCH";
+			}
 		}
-	}
-	if (alive) process.kill(pid, "SIGKILL");
-	expect(alive).toBe(false);
-});
+		if (alive) process.kill(pid, "SIGKILL");
+		expect(alive).toBe(false);
+	},
+);
 
 test("a final stdout response settles before a one-shot fixture exit", async () => {
 	const cwd = await makeScratch();
