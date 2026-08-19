@@ -50,7 +50,7 @@ import type {
 	MCPServerConnection,
 	MCPToolDefinition,
 } from "./types";
-import { MCPExpectedFailure, MCPNotificationMethods } from "./types";
+import { MCPExpectedFailure, MCPNotificationMethods, redactedMCPFailure } from "./types";
 
 type ToolLoadResult = {
 	connection: MCPServerConnection;
@@ -1227,8 +1227,10 @@ export class MCPManager {
 					// is dropped rather than left to replay the same dead surface until TTL.
 					this.#withdrawUnreachableDeferredTools(name);
 					if (!allowBackgroundLogging || reportedErrors.has(name)) return;
-					const message = error instanceof Error ? error.message : String(error);
-					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: message });
+					// Redacted: a remote MCP can reflect credentials in a non-2xx body or
+					// auth header, and this is the late-background twin of the initial
+					// connect failure, so both must cross the log boundary sanitized.
+					logger.error("MCP tool load failed", { path: `mcp:${name}`, error: redactedMCPFailure(error) });
 				});
 		}
 
@@ -1386,8 +1388,7 @@ export class MCPManager {
 					}
 				} else if (task.tracked.status === "rejected") {
 					const reason = task.tracked.reason;
-					const message = reason instanceof Error ? reason.message : String(reason);
-					errors.set(name, this.#serverError(message));
+					errors.set(name, this.#serverError(redactedMCPFailure(reason)));
 					reportedErrors.add(name);
 					if (this.#toolsOnly && reason instanceof MCPExpectedFailure) {
 						await this.#disconnectServer(name).catch(error => {

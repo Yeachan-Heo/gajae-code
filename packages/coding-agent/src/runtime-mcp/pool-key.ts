@@ -70,6 +70,17 @@ export interface MCPPoolKeyIdentity {
 	capabilityProfile: MCPPoolCapabilityProfile;
 	/** Resolved protocol preference (auto | 2026-07-28 | legacy); partitions protocol generations. */
 	protocolPreference: string;
+	/**
+	 * Declared connection timeout, in ms, or 0 when none was declared.
+	 *
+	 * The physical open is created with the first waiter's config, so its own
+	 * `withTimeout` is charged against that waiter's declared window. Sharing one
+	 * pending open across consumers with different windows therefore lets the
+	 * shortest one close a transport another consumer is still legitimately
+	 * waiting for. Partitioning by the declared window keeps the advertised
+	 * per-server semantics; identical configs, the common case, still share.
+	 */
+	declaredTimeoutMs: number;
 	sessionId?: string;
 }
 
@@ -265,11 +276,15 @@ export function buildMCPPoolKeyIdentity(
 	}
 	const headers = headerIdentity(source, options, auth.kind, auth.scope);
 	const identity: MCPPoolKeyIdentity = {
-		schemaVersion: 2,
+		schemaVersion: 3,
 		serverName,
 		sharingMode,
 		transport,
 		protocolPreference: resolveMCPProtocolPreference(source.protocol),
+		declaredTimeoutMs:
+			typeof source.timeout === "number" && Number.isFinite(source.timeout) && source.timeout > 0
+				? source.timeout
+				: 0,
 		command: source.type === "http" || source.type === "sse" ? "" : source.command,
 		argsNormalized: source.type === "http" || source.type === "sse" ? [] : [...(source.args ?? [])],
 		effectiveCwdRealpath: effectiveCwd(config, options),

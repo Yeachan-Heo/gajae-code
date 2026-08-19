@@ -329,10 +329,15 @@ export class HttpTransport implements MCPTransport {
 					.filter(Boolean)
 					.join("; ");
 				const suffix = authHints ? ` [${authHints}]` : "";
+				// Body and auth hints are server-controlled and may reflect credentials
+				// back at us. They stay on the error for protocol classification; the
+				// endpoint rides along so diagnostics can name a redacted origin
+				// instead of serializing any of this.
 				throw new MCPHttpRequestError(
 					response.status,
 					`HTTP ${response.status}: ${text}${suffix}`,
 					tryParseJsonBody(text),
+					this.config.url,
 				);
 			}
 

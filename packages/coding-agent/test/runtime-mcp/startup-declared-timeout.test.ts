@@ -2,9 +2,14 @@ import { describe, expect, test, vi } from "bun:test";
 import * as configValue from "../../src/config/resolve-config-value";
 import * as mcpClient from "../../src/runtime-mcp/client";
 import { MCPManager, withinDeclaredConnectionWindow } from "../../src/runtime-mcp/manager";
+import { computeMCPPoolKey } from "../../src/runtime-mcp/pool-key";
 import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
 import { credentialFingerprint, MCPToolCache as MCPToolCacheClass } from "../../src/runtime-mcp/tool-cache";
 import type { MCPServerConnection } from "../../src/runtime-mcp/types";
+import {
+	MCPHttpRequestError as MCPHttpRequestErrorClass,
+	redactedMCPFailure as redactedMCPFailureFn,
+} from "../../src/runtime-mcp/types";
 
 // `gjc mcp add --timeout` writes a per-server `timeout`, and `connectToServer`
 // honors it. Startup used to discard it anyway: one batch-wide timer decided
@@ -468,6 +473,48 @@ describe("MCP startup and the declared connection window", () => {
 			connect.mockRestore();
 			await manager.disconnectAll();
 		}
+	});
+
+	// A pending shared open is created with the first waiter's config, so its own
+	// `withTimeout` is charged against that waiter's declared window. Sharing one
+	// open across unequal windows therefore lets the shortest consumer close a
+	// transport a longer-window consumer is still legitimately waiting for.
+	test("does not let a short declared window own a shared open a longer one still needs", () => {
+		const base = { type: "http", url: "https://example.invalid/mcp", sharing: "shared" } as never;
+		const short = computeMCPPoolKey("shared", { ...(base as object), timeout: 500 } as never);
+		const long = computeMCPPoolKey("shared", { ...(base as object), timeout: 30_000 } as never);
+		const alsoShort = computeMCPPoolKey("shared", { ...(base as object), timeout: 500 } as never);
+		const undeclared = computeMCPPoolKey("shared", base);
+
+		// Different declared windows never share a pending physical open...
+		expect(short).not.toBe(long);
+		expect(short).not.toBe(undeclared);
+		expect(long).not.toBe(undeclared);
+		// ...while identical configs, the common case, still do.
+		expect(short).toBe(alsoShort);
+	});
+
+	test("keeps a remote server's HTTP failure body out of anything loggable", () => {
+		const leaked = "Bearer sk-live-supersecret-token";
+		const error = new MCPHttpRequestErrorClass(
+			401,
+			`HTTP 401: {"error":"bad token ${leaked}"} [WWW-Authenticate: Bearer realm="${leaked}"]`,
+			{ error: leaked },
+			`https://mcp.example.invalid/v1/mcp?key=${leaked}`,
+		);
+
+		const redacted = redactedMCPFailureFn(error);
+
+		// Status and a coarse category survive; server-controlled bytes do not.
+		expect(redacted).toContain("401");
+		expect(redacted).toContain("authorization");
+		expect(redacted).toContain("https://mcp.example.invalid");
+		expect(redacted).not.toContain("sk-live");
+		expect(redacted).not.toContain("WWW-Authenticate");
+		// The path and query are dropped with the rest of the request-derived data.
+		expect(redacted).not.toContain("/v1/mcp");
+		// A GJC-produced error keeps its own message, which we author.
+		expect(redactedMCPFailureFn(new Error("MCP server not connected: demo"))).toBe("MCP server not connected: demo");
 	});
 
 	test("binds cache identity to the resolved credential, not the config template", async () => {

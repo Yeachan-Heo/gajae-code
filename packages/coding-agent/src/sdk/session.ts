@@ -117,7 +117,13 @@ import {
 	createOptionalRuntimeServices,
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
-import { canonicalMCPWorkingDirectory, loadAllMCPConfigs, MCPManager, MCPToolCache } from "../runtime-mcp";
+import {
+	canonicalMCPWorkingDirectory,
+	loadAllMCPConfigs,
+	MCPManager,
+	MCPToolCache,
+	redactedMCPFailure,
+} from "../runtime-mcp";
 import type { MCPServerConfig } from "../runtime-mcp/types";
 import {
 	getNotificationConfig,
@@ -2403,9 +2409,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// incomplete: its surfaces produced no evidence, so publishing
 							// would present a partial pass as a clear one.
 							gjcProducersComplete = false;
+							// `err` is already the manager's redacted server error; keep the
+							// sanitizer here too so a future raw value cannot slip through.
 							logger.warn("GJC plugin MCP connect failed", {
 								path: `mcp:${server}`,
-								error: safeErrorForLog(err),
+								error: redactedMCPFailure(err),
 							});
 						}
 						// A server that is still connecting surfaces its cached tools as

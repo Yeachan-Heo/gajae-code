@@ -250,18 +250,67 @@ export class MCPExpectedFailure extends Error {
 	}
 }
 
-/** HTTP-level request failure carrying structured detail for era classification. */
+/**
+ * HTTP-level request failure carrying structured detail for era classification.
+ *
+ * `message` and `body` hold server-controlled bytes: a remote MCP can reflect a
+ * credential, a bearer token, or other request-derived data in a non-2xx body or
+ * in `WWW-Authenticate`/`Mcp-Auth-Server`. They exist for internal protocol
+ * classification only. Anything that reaches a log, a diagnostic, or a user
+ * surface must go through {@link redactedDescription} instead.
+ */
 export class MCPHttpRequestError extends Error {
 	/** HTTP status code. */
 	readonly status: number;
 	/** Parsed JSON body when the error payload was JSON; undefined otherwise. */
 	readonly body: unknown;
-	constructor(status: number, message: string, body?: unknown) {
+	/** Request endpoint, retained only to derive a redacted origin for diagnostics. */
+	readonly endpoint?: string;
+	constructor(status: number, message: string, body?: unknown, endpoint?: string) {
 		super(message);
 		this.name = "MCPHttpRequestError";
 		this.status = status;
 		this.body = body;
+		this.endpoint = endpoint;
 	}
+
+	/**
+	 * Bounded, server-content-free description: status, coarse category, and the
+	 * endpoint origin without path, query, or fragment.
+	 */
+	redactedDescription(): string {
+		const category =
+			this.status === 401 || this.status === 403
+				? "authorization"
+				: this.status === 404
+					? "not-found"
+					: this.status === 429
+						? "rate-limited"
+						: this.status >= 500
+							? "server-error"
+							: "request-rejected";
+		let origin = "unknown-endpoint";
+		if (this.endpoint) {
+			try {
+				origin = new URL(this.endpoint).origin;
+			} catch {
+				origin = "unparseable-endpoint";
+			}
+		}
+		return `MCP HTTP ${this.status} (${category}) from ${origin}`;
+	}
+}
+
+/**
+ * Redacted, loggable description of an MCP failure.
+ *
+ * Non-HTTP errors keep their own message, which GJC produces; only remote HTTP
+ * responses carry server-controlled bytes worth withholding.
+ */
+export function redactedMCPFailure(error: unknown): string {
+	if (error instanceof MCPHttpRequestError) return error.redactedDescription();
+	if (error instanceof Error) return error.message;
+	return String(error);
 }
 
 /** JSON-RPC error response failure carrying the protocol error code. */
