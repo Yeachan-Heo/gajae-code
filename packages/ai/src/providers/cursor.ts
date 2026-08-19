@@ -2316,6 +2316,14 @@ export function buildNativeToolCallBlock(
 			arguments: safeArguments,
 			index,
 			kind: "native",
+			// Cursor already ran this call: native kinds are executed during
+			// streaming over the exec channel (shellArgs -> CursorExecHandlers.shell
+			// -> local bash, readArgs -> read, and so on). This block exists only so
+			// the call is visible. Without the flag the agent loop cannot tell it
+			// apart from a model-issued call and dispatches it again, re-running the
+			// command; kinds whose display label is not a registered tool (glob,
+			// grep, ls, read_lints, ...) abort the turn with "Tool <name> not found".
+			providerExecuted: true,
 		};
 	}
 	return null;

@@ -1263,6 +1263,7 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const thoughtSignature = managedProperty(value, "thoughtSignature");
 	const intent = managedProperty(value, "intent");
 	const customWireName = managedProperty(value, "customWireName");
+	const providerExecuted = managedProperty(value, "providerExecuted");
 	const incompleteArguments = managedProperty(value, "incompleteArguments");
 	const incompleteArgumentsReason = managedProperty(value, "incompleteArgumentsReason");
 	const escapedNonAsciiArguments = managedProperty(value, "escapedNonAsciiArguments");
@@ -1274,6 +1275,7 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 		...(typeof thoughtSignature === "string" ? { thoughtSignature } : {}),
 		...(typeof intent === "string" ? { intent } : {}),
 		...(typeof customWireName === "string" ? { customWireName } : {}),
+		...(typeof providerExecuted === "boolean" ? { providerExecuted } : {}),
 		...(typeof incompleteArguments === "boolean" ? { incompleteArguments } : {}),
 		...(typeof incompleteArgumentsReason === "string"
 			? {
@@ -3856,6 +3858,28 @@ async function executeToolCalls(
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
+				if (toolCall.providerExecuted) {
+					// The provider already ran this call itself; it is in assistant
+					// content only so the user can see it. Dispatching it locally would
+					// repeat a side effect that already happened (Cursor's
+					// `shellToolCall` renders as `bash` with the same command, which the
+					// exec channel ran during streaming), or abort the turn outright
+					// when the rendered display label is not a registered tool name
+					// (`glob`, `grep`, `ls`, `read_lints`, ...). Record a success result
+					// so call/result pairing stays intact and execute nothing.
+					result = {
+						content: [
+							{
+								type: "text",
+								text:
+									`Tool call "${toolCall.name}" was executed by the provider during streaming; ` +
+									`its result is already part of the provider-side conversation. No local execution was performed.`,
+							},
+						],
+						details: {},
+					};
+					return;
+				}
 				if (toolCall.incompleteArguments) {
 					record.argumentValidationFailed = true;
 					// The provider flagged this call's arguments as unsafe to execute.

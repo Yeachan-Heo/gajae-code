@@ -596,6 +596,26 @@ export interface ToolCall {
 	 */
 	customWireName?: string;
 	/**
+	 * Set when the provider already executed this call itself, so the agent loop
+	 * MUST NOT dispatch it locally.
+	 *
+	 * Cursor is the motivating case. Its model calls its own native tools
+	 * (shell/read/write/grep/ls/...) rather than the advertised MCP tools, and
+	 * those are executed during streaming over the exec channel — `shellArgs`
+	 * reaches `CursorExecHandlers.shell`, which runs the command through the
+	 * local `bash` tool before the stream ends. The provider still renders the
+	 * call into assistant content so the user can see it, and that rendered
+	 * block is indistinguishable from a model-issued call, so the agent loop
+	 * dispatches it a second time: `shellToolCall{command}` renders as
+	 * `{name:"bash", arguments:{command}}` and the command runs twice. Native
+	 * kinds whose display label is not a registered tool (`glob`, `grep`, `ls`,
+	 * `read_lints`, ...) instead abort the turn with `Tool <name> not found`.
+	 *
+	 * Flagged calls are recorded in history with a synthetic success result so
+	 * call/result pairing stays intact, without executing anything locally.
+	 */
+	providerExecuted?: boolean;
+	/**
 	 * Set when the provider detected the argument JSON was not safely executable —
 	 * the model hit its output-token limit (or the response was otherwise cut short)
 	 * before emitting a complete arguments object, the terminal payload was malformed,
