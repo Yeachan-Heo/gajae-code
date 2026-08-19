@@ -94,6 +94,14 @@ jobs:
             if (Bun.env.PR_BASE_REF !== "dev") throw new Error(`PR base must be dev, not ${Bun.env.PR_BASE_REF}.`);
             const [verdict, declaredDigest, , reviewerId] = match.slice(1);
             if (verdict !== "merge-approved") throw new Error(`Verdict ${verdict} intentionally blocks merge.`);
+            const run = async argv => { const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" }); const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).bytes(), new Response(child.stderr).text(), child.exited]); if (exitCode !== 0) throw new Error(`${argv.join(" ")} failed: ${stderr}`); return stdout; };
+            const head = new TextDecoder().decode(await run(["git", "rev-parse", "HEAD"])).trim();
+            if (head !== Bun.env.PR_HEAD_SHA) throw new Error(`Checked-out head ${head} != event head ${Bun.env.PR_HEAD_SHA}.`);
+            await run(["git", "fetch", "--no-tags", "origin", Bun.env.PR_BASE_SHA]);
+            await run(["git", "merge-base", "--is-ancestor", Bun.env.PR_BASE_SHA, head]);
+            const diff = await run(["git", "diff", "--binary", "--full-index", "--no-ext-diff", `${Bun.env.PR_BASE_SHA}...${head}`]);
+            const digest = new Bun.CryptoHasher("sha256").update(diff).digest("hex");
+            if (digest !== declaredDigest) throw new Error(`Stale verdict digest ${declaredDigest}; exact digest is ${digest}.`);
             // Maintainer self-review (issue #4703): a signed gajae.pr-self-review.v1 PR comment
             // bound to the exact base/head/digest authorizes merge for the author of the PR
             // under the risk-classified policy; otherwise the author cannot self-approve.
@@ -110,8 +118,7 @@ jobs:
                 const signatureMatch = signaturePattern.exec(lines.find(line => signaturePattern.test(line)) ?? "");
                 if (!recordMatch || !signatureMatch) throw new Error("Self-review comment present but malformed or unsigned; refusing self-approval.");
                 const [, sVerdict, sBase, sHead, sDigest, sReviewer, sRisk, sExtra, sEvidence] = recordMatch;
-                const extraToken = sExtra === "none" ? "none" : sExtra === "gpt-heavy" ? "gpt-heavy" : sExtra;
-                const payload = [`gajae.pr-self-review.v1 verdict:${sVerdict}`, `base:${sBase}`, `head:${sHead}`, `sha256:${sDigest}`, `reviewer-id:${sReviewer}`, `risk:${sRisk}`, `extra:${extraToken}`, `evidence:${sEvidence}`].join("\n");
+                const payload = [`gajae.pr-self-review.v1 verdict:${sVerdict}`, `base:${sBase}`, `head:${sHead}`, `sha256:${sDigest}`, `reviewer-id:${sReviewer}`, `risk:${sRisk}`, `extra:${sExtra}`, `evidence:${sEvidence}`].join("\n");
                 const expected = new Bun.CryptoHasher("sha256").update("gajae.pr-self-review.v1.signature-domain").update(payload).digest("hex");
                 if (signatureMatch[1] !== expected) throw new Error("Self-review signature does not match the signed payload.");
                 const authorized = ["OWNER", "MEMBER", "COLLABORATOR"].includes(comment.author_association ?? "");
@@ -135,7 +142,7 @@ jobs:
               const permission = (await permissionResponse.json()).permission;
               if (!["admin", "maintain", "write"].includes(permission)) throw new Error(`Reviewer ${reviewerId} lacks repository review authority.`);
             }
-            console.log(`Bootstrap PR contract valid: ${digest}`);
+            console.log(`Bootstrap PR contract valid: ${digest}${selfReviewOk ? " (maintainer self-review)" : ""}`);
           '
       - name: Run bootstrap G1 writer gate
         run: bun scripts/verify-gjc-state-writers.ts --fail --root .
