@@ -742,6 +742,37 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("names an unreadable publication object when authority is withheld", async () => {
+		if (process.platform === "win32") return;
+		const dir = await temp();
+		const owner = path.join(dir, "sdk", "broker.lock", "owner.json");
+		const discovery = {
+			version: 1 as const,
+			protocolVersion: 3 as const,
+			packageGeneration: "unreadable-owner",
+			ownerId: "unreadable-owner",
+			pid: process.pid,
+			host: "127.0.0.1" as const,
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "unreadable-token",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+			incarnation: "unreadable-incarnation",
+		};
+		try {
+			await fs.mkdir(path.dirname(owner), { recursive: true, mode: 0o700 });
+			await fs.writeFile(owner, "owner", { mode: 0o600 });
+			await writeBrokerDiscovery(dir, discovery);
+			await fs.chmod(owner, 0o000);
+			await expect(publishBrokerDiscovery(dir, discovery)).rejects.toThrow(
+				/owner\.json could not be opened \(EACCES\)/,
+			);
+		} finally {
+			await fs.chmod(owner, 0o600).catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("leaves a withheld-authority failure unexplained when every precondition holds", async () => {
 		// Naming a condition must never invent one: with all four publication
 		// objects intact the native message is surfaced verbatim.

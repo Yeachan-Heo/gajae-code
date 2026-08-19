@@ -70,6 +70,22 @@ function describeWithheldPublicationAuthority(agentDir: string): string | undefi
 			return `${object.relative} is a symlink; every publication object is opened no-follow`;
 		if (object.directory && !named.isDirectory()) return `${object.relative} is not a directory`;
 		if (!object.directory && !named.isFile()) return `${object.relative} is not a regular file`;
+		const flags = object.directory
+			? fsSync.constants.O_RDONLY | fsSync.constants.O_DIRECTORY | fsSync.constants.O_NOFOLLOW
+			: fsSync.constants.O_RDWR | fsSync.constants.O_NOFOLLOW;
+		let descriptor: number;
+		try {
+			descriptor = fsSync.openSync(pathname, flags);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			return `${object.relative} could not be opened (${code ?? "unknown error"})`;
+		}
+		try {
+			fsSync.closeSync(descriptor);
+		} catch {
+			// Closing a diagnostic-only descriptor is best effort; the native refusal
+			// remains the authoritative error when this probe itself is inconclusive.
+		}
 	}
 	// The published record is the last precondition: the native layer edits the
 	// heartbeat in place and therefore requires a fixed-width field.
