@@ -466,6 +466,11 @@ export async function classifyNotificationEndpoint(
 	file: string,
 	pidAlive: (pid: number) => boolean,
 ): Promise<NotificationEndpointClassification> {
+	// A native exchange debris path is never an endpoint publication. Routing a
+	// quarantine target into the exact-unlink exchange would re-quarantine it and
+	// manufacture fresh debris, and could re-attack a live successor that reused
+	// the pathname. Leave it for the identity-bound debris sweep.
+	if (isNativeExchangeDebrisName(path.basename(file))) return { kind: "non-endpoint" };
 	let endpoint: NotificationEndpointFile;
 	let raw: string;
 	try {
@@ -574,9 +579,42 @@ function isSharedSdkArtifact(name: string): boolean {
 	return name === "broker.json";
 }
 
+// --- native exchange debris patterns ---------------------------------------
+//
+// The native exact-unlink exchange always detaches a target into a fresh
+// quarantine destination (e.g. `.gjc-delete-notification-endpoint-<uuid>.json`)
+// and, on the durable-failure paths, leaves `.gjc-exact-unlink-placeholder-*`
+// retained records behind. These names are DEBRIS owned by the exact-unlink
+// exchange's cleanup, never live notification publications, and must never be
+// routed back through the exchange (each exchange pass manufactures fresh
+// quarantine/placeholder debris and can re-attack a live successor). Recovery
+// therefore excludes them from the endpoint scan, and the debris sweep removes
+// them directly instead of re-quarantining them.
+
+const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+/** Quarantine target of a detached daemon transition marker (telegram-daemon exact unlink). */
+const DEBRIS_TRANSITION_QUARANTINE = new RegExp(`^transition-${UUID_PATTERN}$`);
+/** Quarantine target of a detached notification endpoint file. */
+const DEBRIS_ENDPOINT_QUARANTINE = new RegExp(`^\\.gjc-delete-notification-endpoint-${UUID_PATTERN}\\.json$`);
+/** Native exact-unlink exchange placeholder left behind by a failed verified cleanup. */
+const DEBRIS_UNLINK_PLACEHOLDER = /^\.gjc-exact-unlink-placeholder-/;
+/** Atomic-write staging file: `<canonical>.<pid>.<epochMs>.<random>.tmp`. */
+const DEBRIS_STAGING_TMP = /\.([0-9]{1,10})\.[0-9]{1,16}\.[a-z0-9]{1,24}\.tmp$/;
+
+/**
+ * True when a basename is a native exact-unlink exchange artifact (a detached
+ * quarantine target or a retained exchange placeholder). These are never live
+ * endpoint publications: recovery must not classify or re-quarantine them.
+ */
+function isNativeExchangeDebrisName(name: string): boolean {
+	return DEBRIS_ENDPOINT_QUARANTINE.test(name) || DEBRIS_UNLINK_PLACEHOLDER.test(name);
+}
+
 async function listEndpointFiles(fs: NotificationServiceFs, dir: string): Promise<string[]> {
 	try {
-		return (await fs.readdir(dir)).filter(name => name.endsWith(".json") && !isSharedSdkArtifact(name));
+		return (await fs.readdir(dir)).filter(
+			name => name.endsWith(".json") && !isSharedSdkArtifact(name) && !isNativeExchangeDebrisName(name),
+		);
 	} catch {
 		return [];
 	}
@@ -1495,16 +1533,6 @@ async function detachStaleTransitionMarker(input: {
  */
 export const NOTIFICATION_DEBRIS_MIN_AGE_MS = 60 * 60 * 1_000;
 
-const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-/** Quarantine target of a detached daemon transition marker (telegram-daemon exact unlink). */
-const DEBRIS_TRANSITION_QUARANTINE = new RegExp(`^transition-${UUID_PATTERN}$`);
-/** Quarantine target of a detached notification endpoint file. */
-const DEBRIS_ENDPOINT_QUARANTINE = new RegExp(`^\\.gjc-delete-notification-endpoint-${UUID_PATTERN}\\.json$`);
-/** Native exact-unlink exchange placeholder left behind by a failed verified cleanup. */
-const DEBRIS_UNLINK_PLACEHOLDER = /^\.gjc-exact-unlink-placeholder-/;
-/** Atomic-write staging file: `<canonical>.<pid>.<epochMs>.<random>.tmp`. */
-const DEBRIS_STAGING_TMP = /\.([0-9]{1,10})\.[0-9]{1,16}\.[a-z0-9]{1,24}\.tmp$/;
-
 export interface NotificationDebrisSweepReport {
 	/** Basenames removed from the swept directory. */
 	removed: string[];
@@ -1596,21 +1624,31 @@ export async function sweepNotificationDebris(input: {
 			kept += 1;
 			continue;
 		}
+		// Never re-run the exact-unlink exchange on a native debris object: the
+		// exchange would detach it into a fresh quarantine destination and leave a
+		// new retained placeholder, re-manufacturing the very debris being
+		// reconciled and re-attacking a live successor. A positively-stale inert
+		// scrub remnant is removed directly, bound to the single snapshot identity
+		// and re-verified at mutation time so a live object that replaced the
+		// pathname is retained, not unlinked.
 		try {
-			const result = await fs.exactUnlink(file, candidate.identity);
-			if (result.ok) {
-				removed.push(name);
+			const recheck = await fs.readEndpointFile(file).catch(() => undefined);
+			if (
+				!recheck ||
+				recheck.identity.dev !== candidate.identity.dev ||
+				recheck.identity.ino !== candidate.identity.ino ||
+				recheck.identity.size !== candidate.identity.size ||
+				recheck.identity.mtimeNs !== candidate.identity.mtimeNs ||
+				recheck.identity.sha256 !== candidate.identity.sha256
+			) {
+				// The pathname now names different bytes/a different inode — a successor
+				// replaced the aged debris (or it became unreadable). Retain it as a
+				// failure; never unlink a live object.
+				failures += 1;
 				continue;
 			}
-			// A typed retained cleanup with the canonical path proven absent is a
-			// completed removal; anything else keeps the file.
-			const retainedRemoved =
-				result.code === "cleanup_pending" &&
-				typeof result.detachedPath === "string" &&
-				result.detachedPath.length > 0 &&
-				(await fs.readFile(file, "utf8").catch(() => undefined)) === undefined;
-			if (retainedRemoved) removed.push(name);
-			else failures += 1;
+			await fs.unlink(file);
+			removed.push(name);
 		} catch {
 			failures += 1;
 		}

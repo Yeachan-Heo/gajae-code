@@ -46,6 +46,13 @@ function mockFs(
 		rejectEndpointFiles?: Set<string>;
 		/** Per-file mtimeMs for the optional `stat` capability; absent files throw ENOENT. */
 		mtimes?: Record<string, number>;
+		/**
+		 * Fires inside `readEndpointFile` with the zero-based per-file read index
+		 * (the first read of a file is `0`). Lets a test replace a debris object's
+		 * bytes between the sweep's staleness snapshot and its before-unlink
+		 * identity re-check, proving a successor is retained, not unlinked.
+		 */
+		onReadEndpointFile?: (file: string, store: Map<string, string>, readIndex: number) => void;
 	} = {},
 ): { fs: NotificationServiceFs; unlinked: string[]; created: string[]; store: Map<string, string> } {
 	const store = new Map(Object.entries(files));
@@ -68,6 +75,7 @@ function mockFs(
 			);
 	}
 	const revisions = new Map<string, number>([...store.keys()].map(file => [file, 1]));
+	const readEndpointCounts = new Map<string, number>();
 	const unlinked: string[] = [];
 	const created: string[] = [];
 	const enoent = (): NodeJS.ErrnoException => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
@@ -101,6 +109,11 @@ function mockFs(
 		},
 		async readEndpointFile(file) {
 			if (opts.rejectEndpointFiles?.has(file)) throw new Error("Endpoint changed while it was read");
+			const original = store.get(file);
+			if (original === undefined) throw enoent();
+			const readIndex = readEndpointCounts.get(file) ?? 0;
+			readEndpointCounts.set(file, readIndex + 1);
+			opts.onReadEndpointFile?.(file, store, readIndex);
 			const value = store.get(file);
 			if (value === undefined) throw enoent();
 			const bytes = Buffer.from(value);
@@ -1322,8 +1335,10 @@ describe("notification-service stale debris sweep", () => {
 			{ [debris]: "stale-quarantine" },
 			{
 				mtimes: { [debris]: OLD },
-				onExactUnlink: (file, files) => {
-					if (file === debris) files.set(file, "live-successor-content");
+				onReadEndpointFile: (file, files, readIndex) => {
+					// The removal re-checks identity right before unlink; replace the
+					// aged debris on that re-read so the live successor is retained.
+					if (file === debris && readIndex === 1) files.set(file, "live-successor-content");
 				},
 			},
 		);
@@ -1400,8 +1415,8 @@ describe("notification-service stale debris sweep", () => {
 			{ [debris]: "aged-quarantine" },
 			{
 				mtimes: { [debris]: OLD },
-				onExactUnlink: (file, files) => {
-					if (file === debris) files.set(file, "fresh-live-successor");
+				onReadEndpointFile: (file, files, readIndex) => {
+					if (file === debris && readIndex === 1) files.set(file, "fresh-live-successor");
 				},
 			},
 		);
@@ -1474,6 +1489,205 @@ describe("notification-service stale debris sweep", () => {
 		});
 		expect(report.debrisRemoved?.sort()).toEqual([path.basename(daemonDebris), path.basename(endpointDebris)].sort());
 		expect(formatNotificationRecoveryReport(report)).toContain("debris: removed 2, kept 0");
+	});
+});
+
+describe("notification-service bounded notify recovery (#4701)", () => {
+	const settings = Settings.isolated({
+		"notifications.enabled": true,
+		"notifications.telegram.botToken": TOKEN,
+		"notifications.telegram.chatId": "12345",
+	});
+	const stateRoot = "/tmp/gjc-4701";
+	const epDir = path.join(stateRoot, "sdk");
+	const NOW = 10 * NOTIFICATION_DEBRIS_MIN_AGE_MS;
+	const OLD = NOW - NOTIFICATION_DEBRIS_MIN_AGE_MS - 1;
+
+	const liveEndpoint = path.join(epDir, "01a01743-2dd0-7000-8552-27f75f298517.json");
+	const liveEndpointBody = JSON.stringify({
+		version: 1,
+		sessionId: "01a01743-2dd0-7000-8552-27f75f298517",
+		pid: 1000,
+		host: "127.0.0.1",
+		port: 32975,
+		url: "ws://127.0.0.1:32975",
+		token: "endpoint-token",
+		stale: false,
+	});
+	const quarantineA = path.join(epDir, ".gjc-delete-notification-endpoint-005aa822-3f0b-45c9-bd39-e7047b1d3be4.json");
+	const quarantineB = path.join(epDir, ".gjc-delete-notification-endpoint-11111111-2222-4333-8444-555555555555.json");
+	const placeholder = path.join(epDir, ".gjc-exact-unlink-placeholder-1-1");
+	const DEBRIS_BASENAME = /^\.gjc-(?:delete-notification-endpoint-[0-9a-f-]{36}\.json|exact-unlink-placeholder-)/;
+
+	function debrisCount(store: Map<string, string>): number {
+		let count = 0;
+		for (const key of store.keys()) {
+			if (key.startsWith(epDir + path.sep) && DEBRIS_BASENAME.test(path.basename(key))) count += 1;
+		}
+		return count;
+	}
+
+	test("a live endpoint is never removed or quarantined while adjacent debris is swept", async () => {
+		const { fs, store, unlinked } = mockFs(
+			{
+				[liveEndpoint]: liveEndpointBody,
+				// A failed first scrub left a quarantine target still holding the
+				// detached endpoint's bytes and a scrubbed zero-length remnant, plus
+				// a retained exchange placeholder.
+				[quarantineA]: JSON.stringify({ sessionId: "q1", url: "ws://x", token: "t", pid: 999 }),
+				[quarantineB]: "",
+				[placeholder]: "",
+			},
+			{ mtimes: { [quarantineA]: OLD, [quarantineB]: OLD, [placeholder]: OLD } },
+		);
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, now: () => NOW, pidAlive: pid => pid === 1000 },
+		});
+
+		// The live owner's canonical endpoint is still matchable/usable and was not
+		// detached to a quarantine path.
+		expect(store.get(liveEndpoint)).toBe(liveEndpointBody);
+		expect(unlinked).not.toContain(liveEndpoint);
+		expect(report.endpointsKept).toBe(1);
+		// The three inert debris objects were removed in place, not re-quarantined
+		// (no fresh quarantine/placeholder debris is created).
+		expect(report.debrisRemoved?.sort()).toEqual(
+			[path.basename(quarantineA), path.basename(quarantineB), path.basename(placeholder)].sort(),
+		);
+		expect(debrisCount(store)).toBe(0);
+	});
+
+	test("unreadable/unknown endpoint handling is bounded and not inflated by debris", async () => {
+		const unreadable = path.join(epDir, "broken.json");
+		const pidless = path.join(epDir, "pidless.json");
+		const quarantineB = path.join(
+			epDir,
+			".gjc-delete-notification-endpoint-11111111-2222-4333-8444-555555555555.json",
+		);
+		const { fs, unlinked } = mockFs(
+			{
+				// A debris quarantine target must never count as an unreadable endpoint
+				// that health flags as "run recovery".
+				[unreadable]: "{",
+				[pidless]: JSON.stringify({ url: "ws://x", token: "t" }),
+				[quarantineB]: "",
+			},
+			{ rejectEndpointFiles: new Set([unreadable]) },
+		);
+		const health = await checkNotificationHealth({
+			settings,
+			stateRoot,
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		// Debris is excluded from the endpoint census: only the genuine unreadable
+		// and unknown endpoint count, each exactly once (a debris quarantine target
+		// no longer inflates unreadable). Health still flags the one real unreadable.
+		expect(health.endpoints.unreadable).toBe(1);
+		expect(health.endpoints.unknown).toBe(1);
+		expect(health.endpoints.total).toBe(2);
+		expect(health.checks.find(check => check.name === "endpoints")?.detail).toContain("1 unreadable of 2");
+
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, now: () => NOW, pidAlive: () => false },
+		});
+		expect(report.endpointsUnreadable).toBe(1);
+		expect(report.endpointsKept).toBe(1);
+		expect(report.endpointsRemoved).toEqual([]);
+		// Only the inert debris object is swept; the unreadable and unknown endpoints
+		// are left untouched (the mock records full paths in `unlinked`).
+		expect(unlinked).toEqual([quarantineB]);
+		expect(unlinked).not.toContain(unreadable);
+		expect(unlinked).not.toContain(pidless);
+		expect(report.debrisRemoved).toEqual([path.basename(quarantineB)]);
+	});
+
+	test("repeated recovery does not increase the quarantine/placeholder count", async () => {
+		// Model the native exact-unlink exchange re-manufacturing debris: any time
+		// recovery routes a debris path back through `exactUnlink`, the native
+		// exchange would detach it into a fresh quarantine destination and leave a
+		// fresh retained placeholder.
+		let debrisExactUnlinkCalls = 0;
+		const seeds: Record<string, string> = {
+			[liveEndpoint]: liveEndpointBody,
+			[quarantineA]: JSON.stringify({ sessionId: "q1", url: "ws://x", token: "t", pid: 999 }),
+			[quarantineB]: "",
+			[placeholder]: "",
+		};
+		const { fs, store, unlinked } = mockFs(seeds, {
+			mtimes: { [quarantineA]: OLD, [quarantineB]: OLD, [placeholder]: OLD },
+			onExactUnlink: (file, files) => {
+				if (DEBRIS_BASENAME.test(path.basename(file))) {
+					debrisExactUnlinkCalls += 1;
+					const uuid = crypto.randomUUID();
+					files.set(path.join(epDir, `.gjc-delete-notification-endpoint-${uuid}.json`), "");
+					files.set(path.join(epDir, `.gjc-exact-unlink-placeholder-${uuid}`), "");
+				}
+			},
+		});
+
+		let lastCount = debrisCount(store);
+		let lastCountAfterFirst = -1;
+		for (let run = 1; run <= 5; run += 1) {
+			const report = await recoverNotifications({
+				settings,
+				stateRoot,
+				deps: { fs, now: () => NOW, pidAlive: pid => pid === 1000 },
+			});
+			const count = debrisCount(store);
+			// The count never increases across repeated recovery; after the first pass
+			// it is a fixed point.
+			expect(count).toBeLessThanOrEqual(lastCount);
+			expect(count).toBeLessThanOrEqual(seedsDebrisCount());
+			if (run === 1) lastCountAfterFirst = count;
+			expect(count).toBe(lastCountAfterFirst);
+			lastCount = count;
+			expect(report.endpointsRemoved).toEqual([]);
+		}
+		// The live endpoint stayed published and matchable across every pass.
+		expect(store.get(liveEndpoint)).toBe(liveEndpointBody);
+		expect(unlinked).not.toContain(liveEndpoint);
+		// Recovery never routed a debris object back through the re-quarantining
+		// exchange, so it could not regenerate quarantine/placeholder artifacts.
+		expect(debrisExactUnlinkCalls).toBe(0);
+
+		function seedsDebrisCount(): number {
+			return Object.keys(seeds).filter(key => DEBRIS_BASENAME.test(path.basename(key))).length;
+		}
+	});
+
+	test("startup ensure recovery terminates and reaches a fixed point without a spin", async () => {
+		// A single bounded recovery run against a noisy dir must terminate and, on
+		// repeat, do no further work — the resident daemon's startup ensure cannot
+		// re-arm a never-settling reconciliation loop.
+		const { fs, store } = mockFs(
+			{
+				[liveEndpoint]: liveEndpointBody,
+				[quarantineA]: JSON.stringify({ sessionId: "q1", url: "ws://x", token: "t", pid: 999 }),
+				[quarantineB]: "",
+				[placeholder]: "",
+			},
+			{ mtimes: { [quarantineA]: OLD, [quarantineB]: OLD, [placeholder]: OLD } },
+		);
+		const first = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, now: () => NOW, pidAlive: pid => pid === 1000 },
+		});
+		expect(first.debrisRemoved?.length).toBe(3);
+		for (let run = 0; run < 5; run += 1) {
+			const again = await recoverNotifications({
+				settings,
+				stateRoot,
+				deps: { fs, now: () => NOW, pidAlive: pid => pid === 1000 },
+			});
+			expect(again.debrisRemoved ?? []).toEqual([]);
+			expect(again.endpointsRemoved).toEqual([]);
+			expect(store.get(liveEndpoint)).toBe(liveEndpointBody);
+		}
 	});
 });
 
