@@ -2444,28 +2444,28 @@ async function terminateSpawnedChild(
 				observeProcess(pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) === "exited";
 			const endpointGone = await endpointRemoved(root, id);
 			try {
-				await writeSessionLifecycleFailure(
-					root,
-					id,
-					expected.effectMarker,
-					{
-						phase: "startup",
-						reason: "failed",
-						message: publishedReady
-							? `Session ${id} ${READY_THEN_EXIT_MESSAGE}.`
-							: `Session ${id} exited before registering readiness.`,
-					},
-					{
-						endpointGeneration: registered?.endpointGeneration ?? null,
-						fenced: stillExited && registrationReleased,
-						runtimeRemoved: artifactsRemoved && endpointGone,
-						hostStopped: stillExited,
-						brokerRegistrationReleased: registrationReleased,
-					},
-					undefined,
-					expected.incarnation,
-					expected.pid,
-				);
+				if (publishedReady && !failure) {
+					await writeSessionLifecycleFailure(
+						root,
+						id,
+						expected.effectMarker,
+						{
+							phase: "startup",
+							reason: "failed",
+							message: `Session ${id} ${READY_THEN_EXIT_MESSAGE}.`,
+						},
+						{
+							endpointGeneration: registered?.endpointGeneration ?? null,
+							fenced: stillExited && registrationReleased,
+							runtimeRemoved: artifactsRemoved && endpointGone,
+							hostStopped: stillExited,
+							brokerRegistrationReleased: registrationReleased,
+						},
+						undefined,
+						expected.incarnation,
+						expected.pid,
+					);
+				}
 			} catch {
 				// A missing broker-authored receipt must not hide a proven dead child.
 			}
