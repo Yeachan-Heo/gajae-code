@@ -7,6 +7,7 @@ import type { MCPToolCache } from "../../src/runtime-mcp/tool-cache";
 import { credentialFingerprint, MCPToolCache as MCPToolCacheClass } from "../../src/runtime-mcp/tool-cache";
 import type { MCPServerConnection } from "../../src/runtime-mcp/types";
 import {
+	MCPExpectedFailure as MCPExpectedFailureClass,
 	MCPHttpRequestError as MCPHttpRequestErrorClass,
 	redactedMCPFailure as redactedMCPFailureFn,
 } from "../../src/runtime-mcp/types";
@@ -504,15 +505,19 @@ describe("MCP startup and the declared connection window", () => {
 		);
 
 		const redacted = redactedMCPFailureFn(error);
+		// Production wraps the HTTP error before the manager sees it.
+		const wrapped = redactedMCPFailureFn(new MCPExpectedFailureClass(error));
 
 		// Status and a coarse category survive; server-controlled bytes do not.
-		expect(redacted).toContain("401");
-		expect(redacted).toContain("authorization");
-		expect(redacted).toContain("https://mcp.example.invalid");
-		expect(redacted).not.toContain("sk-live");
-		expect(redacted).not.toContain("WWW-Authenticate");
-		// The path and query are dropped with the rest of the request-derived data.
-		expect(redacted).not.toContain("/v1/mcp");
+		for (const value of [redacted, wrapped]) {
+			expect(value).toContain("401");
+			expect(value).toContain("authorization");
+			expect(value).toContain("https://mcp.example.invalid");
+			expect(value).not.toContain("sk-live");
+			expect(value).not.toContain("WWW-Authenticate");
+			// The path and query are dropped with the rest of the request-derived data.
+			expect(value).not.toContain("/v1/mcp");
+		}
 		// A GJC-produced error keeps its own message, which we author.
 		expect(redactedMCPFailureFn(new Error("MCP server not connected: demo"))).toBe("MCP server not connected: demo");
 	});

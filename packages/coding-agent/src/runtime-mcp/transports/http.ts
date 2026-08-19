@@ -579,7 +579,21 @@ export class HttpTransport implements MCPTransport {
 			// 202 Accepted is success for notifications
 			if (!response.ok && response.status !== 202) {
 				const text = await readMCPResponseText(response, MCP_MAX_ERROR_BYTES, true, abortController.signal);
-				throw new Error(`HTTP ${response.status}: ${text}`);
+				const wwwAuthenticate = response.headers.get("WWW-Authenticate");
+				const mcpAuthServer = response.headers.get("Mcp-Auth-Server");
+				const authHints = [
+					wwwAuthenticate ? `WWW-Authenticate: ${wwwAuthenticate}` : null,
+					mcpAuthServer ? `Mcp-Auth-Server: ${mcpAuthServer}` : null,
+				]
+					.filter(Boolean)
+					.join("; ");
+				const suffix = authHints ? ` [${authHints}]` : "";
+				throw new MCPHttpRequestError(
+					response.status,
+					`HTTP ${response.status}: ${text}${suffix}`,
+					tryParseJsonBody(text),
+					this.config.url,
+				);
 			}
 
 			// The server may piggyback server-to-client requests or notifications

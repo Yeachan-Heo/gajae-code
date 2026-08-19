@@ -2174,8 +2174,7 @@ export class MCPManager {
 						});
 						return null;
 					}
-
-					const msg = error instanceof Error ? error.message : String(error);
+					const msg = redactedMCPFailure(error);
 					if (attempt < delays.length) {
 						logger.debug("MCP reconnect attempt failed, retrying", {
 							path: `mcp:${name}`,

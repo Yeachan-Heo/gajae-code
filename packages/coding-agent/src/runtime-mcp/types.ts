@@ -304,11 +304,23 @@ export class MCPHttpRequestError extends Error {
 /**
  * Redacted, loggable description of an MCP failure.
  *
- * Non-HTTP errors keep their own message, which GJC produces; only remote HTTP
- * responses carry server-controlled bytes worth withholding.
+ * Remote HTTP responses carry server-controlled bytes. The transport wraps
+ * those in {@link MCPExpectedFailure} before they reach the manager, so this
+ * walks the cause chain for {@link MCPHttpRequestError} instead of treating
+ * the wrapper's copied message as GJC-authored.
  */
 export function redactedMCPFailure(error: unknown): string {
-	if (error instanceof MCPHttpRequestError) return error.redactedDescription();
+	const seen = new Set<unknown>();
+	let current: unknown = error;
+	while (current !== undefined && current !== null && !seen.has(current)) {
+		seen.add(current);
+		if (current instanceof MCPHttpRequestError) return current.redactedDescription();
+		if (typeof current === "object" && current !== null && "cause" in current) {
+			current = (current as { cause: unknown }).cause;
+			continue;
+		}
+		break;
+	}
 	if (error instanceof Error) return error.message;
 	return String(error);
 }
