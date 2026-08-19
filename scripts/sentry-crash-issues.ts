@@ -1,29 +1,15 @@
 #!/usr/bin/env bun
 /**
- * Batch-triage aggregated crash signatures from a Sentry project into GitHub
- * issues.
+ * Report aggregated crash signatures from a Sentry project for maintainer triage.
+ * This is read-only: filing is not implemented yet.
  *
  * This is a maintainer tool, not part of the shipped CLI. `gjc crash report`
- * deliberately files one signature at a time behind a per-invocation,
- * digest-confirmed consent boundary, because a field host running it in a loop
- * would have filed hundreds of duplicates for a single bug. Once signatures are
- * already aggregated upstream, the opposite is true: triage wants the whole set
- * at once, and the dedup key is the fingerprint rather than a human reading a
- * digest.
- *
- * The two surfaces therefore share exactly one contract — the
- * `gjc-crash-fp.v1:<fp>` marker — and nothing else. An issue this script files
- * is indistinguishable to `checkForDuplicateIssue` from one filed interactively,
- * so the interactive flow keeps recognizing it as a duplicate afterwards.
- *
- * Safety: `--apply` is required to create anything. The default run reports what
- * it would do and exits without touching the repository.
+ * deliberately files one signature at a time behind a per-invocation consent
+ * boundary. This batch script only collects the upstream set and renders the
+ * exact issue content that a future filing flow could use.
  *
  * Usage:
  *   bun scripts/sentry-crash-issues.ts [--limit N] [--org SLUG] [--project SLUG]
- *   bun scripts/sentry-crash-issues.ts --approve DIGEST [--limit N] [--org SLUG] [--project SLUG]
- *   bun scripts/sentry-crash-issues.ts --apply [--limit N] [--org SLUG] [--project SLUG]
- *   bun scripts/sentry-crash-issues.ts --acknowledge ISSUE_URL [--limit N] [--org SLUG] [--project SLUG]
  *
  * `--repo` exists only to make the target explicit; it is pinned to the same
  * repository `gjc crash report` searches, because the shared marker is the
@@ -31,15 +17,9 @@
  *
  * Auth:
  *   SENTRY_AUTH_TOKEN (or SENTRY_DEVNOGARI_AUTH_TOKEN) for the Sentry read side.
- *   `gh` must already be authenticated for the GitHub write side.
- *
- * Run a dry run, review its digest, run `--approve DIGEST`, then run
- * `--apply`. The repository is pinned to the interactive report repository.
+ *   `gh` must already be authenticated for GitHub's read-only duplicate search.
  */
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
 
 import { fenceCrashText, sanitizeExternalCrashV1 } from "../packages/coding-agent/src/crash/sanitize";
 
@@ -57,10 +37,6 @@ const MAX_ISSUE_BODY_BYTES = 48 * 1024;
 const SENTRY_LEVELS = new Set(["fatal", "error", "warning", "info", "debug"]);
 
 interface Options {
-	apply: boolean;
-	/** Record the reviewed pending set into the local approval store instead of writing. */
-	approve: string | undefined;
-	acknowledge?: string | undefined;
 	help?: boolean;
 	limit: number;
 	org: string;
@@ -83,15 +59,11 @@ interface SentryIssue {
 interface TriageRow {
 	fingerprint: string;
 	sentry: SentryIssue;
-	trustedFingerprint?: boolean;
 	existingIssueUrl?: string;
 }
 
 export function parseArgs(argv: readonly string[]): Options | { error: string } {
 	const options: Options = {
-		apply: false,
-		approve: undefined,
-		acknowledge: undefined,
 		help: false,
 		limit: 25,
 		org: DEFAULT_ORG,
@@ -100,10 +72,6 @@ export function parseArgs(argv: readonly string[]): Options | { error: string } 
 	};
 	for (let index = 0; index < argv.length; index++) {
 		const arg = argv[index];
-		if (arg === "--apply") {
-			options.apply = true;
-			continue;
-		}
 		if (arg === "--help" || arg === "-h") {
 			options.help = true;
 			continue;
@@ -120,9 +88,7 @@ export function parseArgs(argv: readonly string[]): Options | { error: string } 
 			options.limit = parsed;
 			continue;
 		}
-		if (arg === "--approve") options.approve = value;
-		else if (arg === "--acknowledge") options.acknowledge = value;
-		else if (arg === "--org") options.org = value;
+		if (arg === "--org") options.org = value;
 		else if (arg === "--project") options.project = value;
 		else if (arg === "--repo") {
 			// The cross-surface dedup contract only holds against one repository:
@@ -258,14 +224,12 @@ export function fingerprintFromTagPayload(raw: unknown): string | undefined {
 
 interface FingerprintObservation {
 	fingerprint: string;
-	trusted: boolean;
 }
 
 export async function fingerprintOf(issueId: string, token: string): Promise<FingerprintObservation | undefined> {
 	try {
 		const fingerprint = fingerprintFromTagPayload(await sentryGet(`/issues/${issueId}/tags/gjc.fingerprint/`, token));
-		// Public-DSN tags are never sufficient authority to create a GitHub issue.
-		return fingerprint ? { fingerprint, trusted: false } : undefined;
+		return fingerprint ? { fingerprint } : undefined;
 	} catch (error) {
 		// Only "the tag is absent" means "not a gjc group". Auth failures, rate
 		// limits, timeouts and 5xx must not be laundered into that answer: doing so
@@ -291,10 +255,6 @@ async function gh(args: readonly string[]): Promise<{ ok: boolean; stdout: strin
 	}
 }
 
-/**
- * Reuse the interactive flow's dedup contract verbatim so an issue filed by
- * either surface suppresses the other.
- */
 interface ExistingIssueSearch {
 	kind: "none" | "untrusted";
 	url?: string;
@@ -325,8 +285,8 @@ async function findExistingIssue(repo: string, fingerprint: string): Promise<Exi
 	const expectedUrl = new RegExp(`^https://github\\.com/${repo.replace("/", "\\/")}/issues/[0-9]+$`);
 	if (typeof url !== "string" || !expectedUrl.test(url))
 		throw new Error("gh issue list returned a malformed or non-canonical issue URL");
-	// A marker in an arbitrary issue body is not provenance and cannot suppress
-	// a crash class without an explicit operator decision.
+	// This report never files or suppresses anything, so a marker is only
+	// informational and cannot affect triage.
 	return { kind: "untrusted", url };
 }
 
@@ -390,192 +350,21 @@ export function partitionTriageRows(candidates: readonly TriageRow[]): {
  * issue body uses. A maintainer terminal (and any redirected log) is as much an
  * output channel as the issue itself, so a forged upstream group must not be
  * able to push control sequences, secrets, mentions, or a dedup marker there
- * via the default no-`--apply` run.
+ * via this read-only report.
  */
 export function previewCulprit(culprit: string): string {
 	return renderCrashText(culprit, "<unsanitizable culprit>") || "<unknown>";
 }
 
-/**
- * Operator approval store: the explicit human confirmation that makes batch
- * filing reachable. The public-DSN fingerprint tag can never authorize `--apply`
- * by itself; instead the operator reviews the dry-run listing and records the
- * exact pending set (keyed by a batch digest) into a local 0600 JSON file.
- * A later `--apply` trusts only fingerprints recorded this way, and reruns
- * recognize already-filed markers for approved fingerprints, keeping the batch
- * flow idempotent without promoting any forgeable signal to authority.
- *
- * The store is deliberately per-host (`~/.gjc/sentry-triage-approvals.json`):
- * approval is an operator act, not a repo artifact.
- */
-export interface ApprovalStore {
-	loadApprovals(): Promise<readonly ApprovalManifest[]>;
-	recordApprovals(manifests: readonly ApprovalManifest[]): Promise<void>;
-	consume(manifest: ApprovalManifest): Promise<void>;
-	hasFiled(manifest: ApprovalManifest, url: string): Promise<boolean>;
-	recordFiled(manifest: ApprovalManifest, url: string): Promise<void>;
-}
-
-export interface ApprovalManifest {
-	repo: string;
-	org: string;
-	project: string;
-	groupId: string;
-	fingerprint: string;
-	contentDigest: string;
-}
-
-interface StoredApprovals {
-	approvals: ApprovalManifest[];
-	filed: { manifest: ApprovalManifest; url: string }[];
-}
-
-function digest(parts: readonly string[]): string {
-	const hasher = new Bun.CryptoHasher("sha256");
-	for (const part of parts) {
-		hasher.update(part);
-		hasher.update("\n");
-	}
-	return hasher.digest("hex");
-}
-
-export function approvalManifest(row: TriageRow, options: Options): ApprovalManifest {
-	return {
-		repo: options.repo,
-		org: options.org,
-		project: options.project,
-		groupId: row.sentry.id,
-		fingerprint: row.fingerprint,
-		contentDigest: digest([issueTitle(row), issueBody(row, options)]),
-	};
-}
-
-function sameManifest(left: ApprovalManifest, right: ApprovalManifest): boolean {
-	return (
-		left.repo === right.repo &&
-		left.org === right.org &&
-		left.project === right.project &&
-		left.groupId === right.groupId &&
-		left.fingerprint === right.fingerprint &&
-		left.contentDigest === right.contentDigest
-	);
-}
-
-/** Stable digest over the reviewed manifests; printed by dry run and confirmed by --approve. */
-export function batchDigest(manifests: readonly ApprovalManifest[]): string {
-	const serialized = manifests.map(manifest => JSON.stringify(manifest)).sort();
-	return digest(serialized).slice(0, 16);
-}
-
-function isManifest(value: unknown): value is ApprovalManifest {
-	if (typeof value !== "object" || value === null) return false;
-	const record = value as Record<string, unknown>;
-	return (
-		typeof record.repo === "string" &&
-		typeof record.org === "string" &&
-		typeof record.project === "string" &&
-		typeof record.groupId === "string" &&
-		typeof record.fingerprint === "string" &&
-		FINGERPRINT.test(record.fingerprint) &&
-		typeof record.contentDigest === "string" &&
-		/^[0-9a-f]{64}$/.test(record.contentDigest)
-	);
-}
-
-async function loadStoredApprovals(): Promise<StoredApprovals> {
-	try {
-		const parsed: unknown = await Bun.file(approvalStorePath()).json();
-		if (typeof parsed !== "object" || parsed === null) return { approvals: [], filed: [] };
-		const record = parsed as { approvals?: unknown; filed?: unknown };
-		return {
-			approvals: Array.isArray(record.approvals) ? record.approvals.filter(isManifest) : [],
-			filed: Array.isArray(record.filed)
-				? record.filed.filter(
-						(value): value is { manifest: ApprovalManifest; url: string } =>
-							typeof value === "object" &&
-							value !== null &&
-							isManifest((value as { manifest?: unknown }).manifest) &&
-							typeof (value as { url?: unknown }).url === "string",
-					)
-				: [],
-		};
-	} catch {
-		return { approvals: [], filed: [] };
-	}
-}
-
-async function writeStoredApprovals(stored: StoredApprovals): Promise<void> {
-	const target = approvalStorePath();
-	await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-	await Bun.write(target, `${JSON.stringify(stored, null, "\t")}\n`);
-	await fs.chmod(target, 0o600);
-}
-
-async function withCreationLock<T>(action: () => Promise<T>): Promise<T> {
-	const lockPath = `${approvalStorePath()}.create.lock`;
-	for (let attempt = 0; attempt < 200; attempt++) {
-		try {
-			await fs.mkdir(lockPath, { mode: 0o700 });
-			try {
-				return await action();
-			} finally {
-				await fs.rmdir(lockPath);
-			}
-		} catch (error) {
-			if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
-			await Bun.sleep(25);
-		}
-	}
-	throw new Error("timed out waiting for the crash issue creation lock");
-}
-
-function issueUrlFromCreateOutput(output: string): string | undefined {
-	const url = output.trim();
-	const expectedUrl = new RegExp(`^https://github\\.com/${DEFAULT_REPO.replace("/", "\\/")}/issues/[0-9]+$`);
-	return expectedUrl.test(url) ? url : undefined;
-}
-
 function usage(): string {
-	return "Usage: bun scripts/sentry-crash-issues.ts [--apply] [--approve DIGEST] [--acknowledge ISSUE_URL] [--limit N] [--org SLUG] [--project SLUG]\n";
+	return "Usage: bun scripts/sentry-crash-issues.ts [--limit N] [--org SLUG] [--project SLUG]\n";
 }
-
-function approvalStorePath(): string {
-	return path.join(os.homedir(), ".gjc", "sentry-triage-approvals.json");
-}
-
-const fileApprovalStore: ApprovalStore = {
-	async loadApprovals(): Promise<readonly ApprovalManifest[]> {
-		return (await loadStoredApprovals()).approvals;
-	},
-	async recordApprovals(manifests: readonly ApprovalManifest[]): Promise<void> {
-		const stored = await loadStoredApprovals();
-		stored.approvals = [...stored.approvals, ...manifests.filter(manifest => !stored.approvals.some(saved => sameManifest(saved, manifest)))];
-		await writeStoredApprovals(stored);
-	},
-	async consume(manifest: ApprovalManifest): Promise<void> {
-		const stored = await loadStoredApprovals();
-		stored.approvals = stored.approvals.filter(saved => !sameManifest(saved, manifest));
-		await writeStoredApprovals(stored);
-	},
-	async hasFiled(manifest: ApprovalManifest, url: string): Promise<boolean> {
-		return (await loadStoredApprovals()).filed.some(entry => entry.url === url && sameManifest(entry.manifest, manifest));
-	},
-	async recordFiled(manifest: ApprovalManifest, url: string): Promise<void> {
-		const stored = await loadStoredApprovals();
-		if (!stored.filed.some(entry => entry.url === url && sameManifest(entry.manifest, manifest)))
-			stored.filed.push({ manifest, url });
-		await writeStoredApprovals(stored);
-	},
-};
 
 interface MainDependencies {
 	sentryGet(pathname: string, token: string): Promise<unknown>;
 	fingerprintOf(issueId: string, token: string): Promise<FingerprintObservation | undefined>;
 	findExistingIssue(repo: string, fingerprint: string): Promise<ExistingIssueSearch>;
-	gh(args: readonly string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
 	token(): string | undefined;
-	approvals: ApprovalStore;
-	withCreationLock<T>(action: () => Promise<T>): Promise<T>;
 	writeStdout(message: string): void;
 	writeStderr(message: string): void;
 }
@@ -584,10 +373,7 @@ const defaultDependencies: MainDependencies = {
 	sentryGet,
 	fingerprintOf,
 	findExistingIssue,
-	gh,
 	token: sentryToken,
-	approvals: fileApprovalStore,
-	withCreationLock,
 	writeStdout: message => process.stdout.write(message),
 	writeStderr: message => process.stderr.write(message),
 };
@@ -634,65 +420,43 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 				skippedNoFingerprint++;
 				continue;
 			}
-			candidates.push({ fingerprint: fingerprint.fingerprint, trustedFingerprint: fingerprint.trusted, sentry });
+			candidates.push({ fingerprint: fingerprint.fingerprint, sentry });
 		}
 	} catch (error) {
 		dependencies.writeStderr(`Sentry tag read failed: ${error instanceof Error ? error.message : String(error)}\n`);
 		return 1;
 	}
 
-	// The fingerprint is client-stamped and the DSN that stamps it is a public
-	// ingestion key, so a collision is not necessarily a benign group merge -- it
-	// can be an attacker-controlled group claiming a real crash's identity.
-	// Picking whichever arrived first would let that group replace the legitimate
-	// one's metadata and suppress it from triage forever, because the marker it
-	// files makes the real group look already-filed. There is no authenticated
-	// discriminator available here, so a collision fails closed: every colliding
-	// group is withheld and reported for manual reconciliation.
+	// The client-stamped fingerprint can collide across upstream groups. Withhold
+	// every collision rather than choosing attacker-controlled metadata.
 	const { rows, collisions } = partitionTriageRows(candidates);
-
-	// Trust comes only from the operator approval store, never from the tag
-	// itself: the dry run lists every resolvable group for review, and only
-	// fingerprints recorded via `--approve <digest>` may reach `--apply`.
-	const approvals = await dependencies.approvals.loadApprovals();
-	const manifests = new Map(rows.map(row => [row, approvalManifest(row, options)]));
-	const untrustedBodyMarkers: TriageRow[] = [];
-	let already = 0;
 	for (const row of rows) {
-		let existing: ExistingIssueSearch;
 		try {
-			existing = await dependencies.findExistingIssue(options.repo, row.fingerprint);
+			const existing = await dependencies.findExistingIssue(options.repo, row.fingerprint);
+			if (existing.kind === "untrusted") row.existingIssueUrl = existing.url;
 		} catch (error) {
 			dependencies.writeStderr(
 				`duplicate search failed for ${row.fingerprint}: ${error instanceof Error ? error.message : String(error)}\n`,
 			);
 			return 1;
 		}
-		if (existing.kind === "untrusted") {
-			row.existingIssueUrl = existing.url;
-			const manifest = manifests.get(row);
-			if (manifest && existing.url && (await dependencies.approvals.hasFiled(manifest, existing.url))) already++;
-			else untrustedBodyMarkers.push(row);
-		}
 	}
 
-	// Pending is the reviewable set: every group not already filed. Approval
-	// decides fileability at --apply time; the dry run shows all of it.
-	const pending = rows.filter(row => row.existingIssueUrl === undefined);
-	const unverified = pending.filter(row => {
-		const manifest = manifests.get(row);
-		return !manifest || !approvals.some(approval => sameManifest(approval, manifest));
-	});
-
+	const marked = rows.filter(row => row.existingIssueUrl !== undefined);
 	dependencies.writeStdout(
-		`${rows.length} gjc signature(s) upstream; ${already} already filed, ${pending.length} pending` +
+		`${rows.length} gjc signature(s) upstream; ${marked.length} existing marker(s) reported informationally` +
 			(skippedNoFingerprint > 0 ? `; ${skippedNoFingerprint} upstream group(s) skipped (no gjc.fingerprint tag)` : "") +
-			(unverified.length > 0 ? `; ${unverified.length} unverified fingerprint(s) withheld` : "") +
-			(untrustedBodyMarkers.length > 0 ? `; ${untrustedBodyMarkers.length} untrusted issue marker(s) withheld` : "") +
 			(collisions.length > 0 ? `; ${collisions.length} fingerprint collision(s) withheld` : "") +
 			"\n\n",
 	);
-
+	for (const row of rows) {
+		dependencies.writeStdout(
+			`would file  ${row.fingerprint}  ${row.sentry.count}x  ${issueTitle(row)}\n` +
+				`    culprit: ${previewCulprit(row.sentry.culprit)}\n` +
+				(row.existingIssueUrl ? `    existing marker (informational): ${row.existingIssueUrl}\n` : "") +
+				`    issue body:\n${issueBody(row, options)}\n`,
+		);
+	}
 	if (collisions.length > 0) {
 		dependencies.writeStderr(`\n${collisions.length} fingerprint collision(s) withheld; reconcile these upstream first:\n`);
 		for (const collision of collisions) {
@@ -701,129 +465,8 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 				dependencies.writeStderr(`    ${row.sentry.shortId}  ${row.sentry.permalink}\n`);
 		}
 	}
-	if (unverified.length > 0)
-		dependencies.writeStderr(
-			`\n${unverified.length} fingerprint(s) withheld: public-DSN tags are unverified and cannot authorize --apply.\n`,
-		);
-	if (untrustedBodyMarkers.length > 0)
-		dependencies.writeStderr(
-			`\n${untrustedBodyMarkers.length} issue-body marker(s) withheld; acknowledge the exact issue URL explicitly.\n`,
-		);
-
-	if (options.acknowledge !== undefined) {
-		const match = untrustedBodyMarkers.find(row => row.existingIssueUrl === options.acknowledge);
-		if (!match) {
-			dependencies.writeStderr("--acknowledge must exactly match one currently withheld issue URL.\n");
-			return 2;
-		}
-		const manifest = manifests.get(match);
-		if (!manifest) return 1;
-		await dependencies.approvals.recordFiled(manifest, options.acknowledge);
-		await dependencies.approvals.consume(manifest);
-		dependencies.writeStdout(`acknowledged ${match.fingerprint} at ${options.acknowledge}\n`);
-		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 1 ? 1 : 0;
-	}
-
-	if (pending.length === 0) {
-		dependencies.writeStdout("Nothing to file.\n");
-		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
-	}
-
-	if (options.approve !== undefined) {
-		// Operator confirmation: record exactly the pending set reviewed in
-		// this dry run. The digest binds the approval to the batch contents;
-		// a mismatch means upstream moved between review and approval.
-		const pendingManifests = pending.map(row => manifests.get(row)).filter((manifest): manifest is ApprovalManifest => manifest !== undefined);
-		const digest = batchDigest(pendingManifests);
-		if (options.approve !== digest) {
-			dependencies.writeStderr(
-				`--approve does not match this batch. Re-run the dry run to print the current digest.\nexpected ${digest}\n`,
-			);
-			return 2;
-		}
-		await dependencies.approvals.recordApprovals(pendingManifests);
-		dependencies.writeStdout(`recorded ${pending.length} fingerprint(s) as operator-approved. --apply may now file them.\n`);
-		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
-	}
-
-	if (!options.apply) {
-		for (const row of pending)
-			dependencies.writeStdout(
-				`would file  ${row.fingerprint}  ${row.sentry.count}x  ${issueTitle(row)}\n` +
-					`    culprit: ${previewCulprit(row.sentry.culprit)}\n` +
-					`    ${row.sentry.permalink}\n`,
-			);
-		dependencies.writeStdout(
-			`\nDry run. Review the ${pending.length} issue(s) above, then record them with ` +
-				`--approve ${batchDigest(pending.map(row => manifests.get(row)).filter((manifest): manifest is ApprovalManifest => manifest !== undefined))} and file with --apply.\n`,
-		);
-		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
-	}
-
-	// --apply files only the approved subset; unapproved rows stay withheld.
-	const fileable = pending.filter(row => {
-		const manifest = manifests.get(row);
-		return manifest && approvals.some(approval => sameManifest(approval, manifest));
-	});
-	if (fileable.length === 0) {
-		dependencies.writeStdout(
-			`\nNo operator-approved fingerprints in this batch. Review the dry run and record them with --approve <digest>.\n`,
-		);
-		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
-	}
-
-	let created = 0;
-	let failed = 0;
-	for (const row of fileable) {
-		const manifest = manifests.get(row);
-		if (!manifest) continue;
-		let result: { ok: boolean; stdout: string; stderr: string } | undefined;
-		try {
-			result = await dependencies.withCreationLock(async () => {
-				const existing = await dependencies.findExistingIssue(options.repo, row.fingerprint);
-				if (existing.kind === "untrusted" && existing.url && (await dependencies.approvals.hasFiled(manifest, existing.url)))
-					return undefined;
-				if (existing.kind === "untrusted") throw new Error(`untrusted marker at ${existing.url ?? "unknown URL"}`);
-				const created = await dependencies.gh([
-					"issue",
-					"create",
-					"--repo",
-					options.repo,
-					"--title",
-					issueTitle(row),
-					"--body",
-					issueBody(row, options),
-				]);
-				if (created.ok) {
-					const url = issueUrlFromCreateOutput(created.stdout);
-					if (!url) throw new Error("gh issue create returned a malformed or non-canonical issue URL");
-					await dependencies.approvals.recordFiled(manifest, url);
-				}
-				return created;
-			});
-		} catch (error) {
-			failed++;
-			await dependencies.approvals.consume(manifest);
-			dependencies.writeStderr(`failed ${row.fingerprint}: ${error instanceof Error ? error.message : String(error)}\n`);
-			continue;
-		}
-		if (result === undefined) {
-			already++;
-			await dependencies.approvals.consume(manifest);
-			continue;
-		}
-		if (result.ok) {
-			created++;
-			await dependencies.approvals.consume(manifest);
-			dependencies.writeStdout(`filed  ${row.fingerprint}  ${result.stdout.trim()}\n`);
-			continue;
-		}
-		failed++;
-		await dependencies.approvals.consume(manifest);
-		dependencies.writeStderr(`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}\n`);
-	}
-	dependencies.writeStdout(`\ncreated ${created}, failed ${failed}\n`);
-	return failed > 0 || collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
+	dependencies.writeStdout("\nDry run only. Filing is not implemented yet.\n");
+	return collisions.length > 0 ? 1 : 0;
 }
 
 if (import.meta.main) process.exit(await main(process.argv.slice(2)));
