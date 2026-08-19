@@ -412,11 +412,16 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 
 	const candidates: TriageRow[] = [];
 	let skippedNoFingerprint = 0;
+	let skippedMalformed = 0;
 	try {
 		for (const entry of raw) {
 			const sentry = toSentryIssue(entry);
-			const fingerprint = sentry ? await dependencies.fingerprintOf(sentry.id, token) : undefined;
-			if (!sentry || !fingerprint) {
+			if (!sentry) {
+				skippedMalformed++;
+				continue;
+			}
+			const fingerprint = await dependencies.fingerprintOf(sentry.id, token);
+			if (!fingerprint) {
 				skippedNoFingerprint++;
 				continue;
 			}
@@ -446,6 +451,7 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 	dependencies.writeStdout(
 		`${rows.length} gjc signature(s) upstream; ${marked.length} existing marker(s) reported informationally` +
 			(skippedNoFingerprint > 0 ? `; ${skippedNoFingerprint} upstream group(s) skipped (no gjc.fingerprint tag)` : "") +
+			(skippedMalformed > 0 ? `; ${skippedMalformed} malformed upstream group(s) skipped` : "") +
 			(collisions.length > 0 ? `; ${collisions.length} fingerprint collision(s) withheld` : "") +
 			"\n\n",
 	);

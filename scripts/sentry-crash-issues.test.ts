@@ -161,6 +161,49 @@ describe("main", () => {
 		expect(run.stderr.join("")).toContain("collision(s) withheld");
 	});
 
+	test("reports malformed rows separately from groups without a fingerprint tag", async () => {
+		let fingerprintLookups = 0;
+		const run = dependencies({
+			sentryGet: async () => [{ id: "malformed" }, sentryIssue()],
+			fingerprintOf: async () => {
+				fingerprintLookups++;
+				return undefined;
+			},
+		});
+		await expect(main([], run.dependencies)).resolves.toBe(0);
+		expect(fingerprintLookups).toBe(1);
+		expect(run.stdout.join("")).toContain("1 malformed upstream group(s) skipped");
+		expect(run.stdout.join("")).toContain("1 upstream group(s) skipped (no gjc.fingerprint tag)");
+	});
+
+	test("rejects malformed Sentry issue lists through the public flow", async () => {
+		const run = dependencies({ sentryGet: async () => ({ detail: "unexpected" }) });
+		await expect(main([], run.dependencies)).resolves.toBe(1);
+		expect(run.stderr.join("")).toContain("Sentry returned an unexpected issue list shape.");
+	});
+
+	test("uses the canonical repository for duplicate searches and rejects overrides", async () => {
+		const searchedRepos: string[] = [];
+		const run = dependencies({
+			findExistingIssue: async (repo: string) => {
+				searchedRepos.push(repo);
+				return { kind: "none" };
+			},
+		});
+		await expect(main([], run.dependencies)).resolves.toBe(0);
+		expect(searchedRepos).toEqual(["Yeachan-Heo/gajae-code"]);
+
+		const override = dependencies({
+			findExistingIssue: async (repo: string) => {
+				searchedRepos.push(repo);
+				return { kind: "none" };
+			},
+		});
+		await expect(main(["--repo", "attacker/other-repo"], override.dependencies)).resolves.toBe(2);
+		expect(override.stderr.join("")).toContain("--repo is pinned to Yeachan-Heo/gajae-code");
+		expect(searchedRepos).toEqual(["Yeachan-Heo/gajae-code"]);
+	});
+
 	test("fails when a tag read or duplicate search fails", async () => {
 		const tagFailure = dependencies({ fingerprintOf: async () => { throw new Error("responded 500"); } });
 		await expect(main([], tagFailure.dependencies)).resolves.toBe(1);
