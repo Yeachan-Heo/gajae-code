@@ -728,6 +728,10 @@ export async function runSessionHost(
 	// Readiness is published; the session is live. Memory startup issues one LLM
 	// request per queued rollout, so it must run outside the readiness window and
 	// its failure must never take the session down.
+	if (process.env.GJC_SDK_TEST_EXIT_AFTER_READY === cwd) {
+		process.stderr.write("GJC_SDK_TEST_EXIT_AFTER_READY\n");
+		process.exit(7);
+	}
 	startMemoryBackendAfterReadiness(startDeferredMemoryBackend);
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);
@@ -736,13 +740,19 @@ export async function runSessionHost(
 	// that is gone for good; the second covers the opposite case, a perfectly
 	// healthy broker whose host nobody is attached to any more and for which no
 	// `session.close` will ever arrive.
-	await Promise.race([
-		watchSessionHostBrokerLiveness({ agentDir }),
-		watchSessionHostClientAttachment({
-			readAttachedClients: sessionHostAttachedClients,
-			readWorkInFlight: sessionHostWorkInFlight,
-		}),
-	]);
+	try {
+		await Promise.race([
+			watchSessionHostBrokerLiveness({ agentDir }),
+			watchSessionHostClientAttachment({
+				readAttachedClients: sessionHostAttachedClients,
+				readWorkInFlight: sessionHostWorkInFlight,
+			}),
+		]);
+	} catch (error) {
+		const failure = capability.normalizeFailure("startup", "failed", error);
+		await writeFailure(failure, rollback.result).catch(() => {});
+		throw error;
+	}
 	stop();
 	await new Promise<void>(() => {});
 }

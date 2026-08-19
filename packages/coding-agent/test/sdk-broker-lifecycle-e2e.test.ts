@@ -1066,7 +1066,7 @@ setInterval(()=>{},1000);
 			path.join(stateRoot, "sdk", `${request.sessionId}.lifecycle.ready.json`),
 			JSON.stringify({ pid: fixturePid, effectMarker: request.effectMarker, incarnation }),
 		);
-		expect(await lifecycle).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		expect(await lifecycle).toMatchObject({ ok: false, error: { code: "readiness_timeout" } });
 		expect(Date.now() - started).toBeLessThan(5_000);
 		expect(() => process.kill(fixturePid!, 0)).toThrow();
 	} finally {
@@ -1124,8 +1124,8 @@ setInterval(()=>{},1000);
 				"create-2",
 			),
 		]);
-		expect(first).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
-		expect(second).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		expect(first).toMatchObject({ ok: false, error: { code: "readiness_timeout" } });
+		expect(second).toMatchObject({ ok: false, error: { code: "readiness_timeout" } });
 		expect(Date.now() - started).toBeGreaterThanOrEqual(500);
 		const fixturePid = Number(await fs.readFile(path.join(agentDir, "fixture.pid"), "utf8"));
 		expect(() => process.kill(fixturePid, 0)).toThrow();
@@ -1133,13 +1133,10 @@ setInterval(()=>{},1000);
 			cwd: agentDir,
 			modelPreset: "codex-eco",
 		});
-		expect(
-			(await fs.readdir(path.join(stateRoot, "sdk"))).filter(name => name.endsWith(".json")).length,
-		).toBeGreaterThan(0);
 		const listed = await broker.handleRequest("session.list", {});
 		expect(listed.ok).toBe(true);
 		if (!listed.ok) throw new Error(listed.error.message);
-		expect(JSON.stringify(listed.result)).toContain('"terminalUncertain":true');
+		expect(JSON.stringify(listed.result)).not.toContain('"terminalUncertain":true');
 	} finally {
 		await broker.stop();
 		if (previous === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
@@ -2469,7 +2466,8 @@ test("broker propagates an owned lifecycle startup failure without semantic read
 			{ cwd: agentDir, readinessTimeoutMs: 4_000 },
 			"child-exits",
 		);
-		expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain", message: expect.any(String) } });
+		expect(response).toMatchObject({ ok: false, error: { code: "spawn_failed", message: expect.any(String) } });
+		expect(response).not.toMatchObject({ error: { code: "terminal_uncertain" } });
 		expect(response).not.toMatchObject({ error: { code: "readiness_timeout" } });
 		expect(Date.now() - started).toBeLessThan(1_000);
 		const sessionId = await fs.readFile(sessionIdPath, "utf8");
@@ -2479,7 +2477,7 @@ test("broker propagates an owned lifecycle startup failure without semantic read
 		await expect(fs.stat(path.join(agentDir, ".gjc", "state", "sdk", `${sessionId}.json`))).rejects.toThrow();
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
-			result: { sessions: [{ sessionId, terminalUncertain: true }] },
+			result: { sessions: expect.not.arrayContaining([expect.objectContaining({ terminalUncertain: true })]) },
 		});
 	} finally {
 		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
