@@ -115,7 +115,9 @@ describe("MCP startup and the declared connection window", () => {
 			const result = await manager.connectServers({ spent: { type: "stdio", command: "spent", timeout: 300 } }, {});
 
 			expect(result.connectedServers).toEqual([]);
-			expect(result.errors.get("spent")).toBe("MCP server connection timed out during startup: spent");
+			// The declared window now also bounds transport acquisition, so the abort
+			// can come from there; the operator-visible classification is the same.
+			expect(result.errors.get("spent")).toContain("timed out during startup: spent");
 			expect(manager.getConnectionStatus("spent")).toBe("disconnected");
 			expect(capturedSignal?.aborted).toBe(true);
 		} finally {
@@ -260,6 +262,111 @@ describe("MCP startup and the declared connection window", () => {
 		expect(connection.toolsCacheScope).toBe("private");
 		// ...and the shortest freshness deadline across pages wins.
 		expect(connection.toolsFreshUntil).toBeLessThanOrEqual(Date.now() + 5_000);
+	});
+
+	// MCP treats an absent TTL as already stale. Retaining such a catalog for the
+	// flat default is how a server whose authorization changed replays withdrawn or
+	// user-specific schemas before the next connection re-authenticates.
+	test("refuses to persist a catalog whose pages did not all carry a TTL", async () => {
+		const pages = [
+			{ tools: [{ name: "first", inputSchema: { type: "object" } }], nextCursor: "p2", ttlMs: 60_000 },
+			{ tools: [{ name: "second", inputSchema: { type: "object" } }] },
+		];
+		let page = 0;
+		const connection = {
+			name: "nottl",
+			config: { type: "stdio", command: "nottl" },
+			capabilities: { tools: {} },
+			protocol: { era: "modern" },
+			transport: { request: async () => pages[page++] },
+		} as never as MCPServerConnection;
+
+		await mcpClient.listTools(connection);
+
+		// One page without a TTL makes the aggregate non-persistable, because the
+		// catalog is cached and replayed as a unit.
+		expect(connection.toolsPersistable).toBe(false);
+	});
+
+	test("marks a catalog persistable only when every page carried a positive TTL", async () => {
+		const connection = {
+			name: "ttl",
+			config: { type: "stdio", command: "ttl" },
+			capabilities: { tools: {} },
+			protocol: { era: "modern" },
+			transport: {
+				request: async () => ({ tools: [{ name: "ping", inputSchema: { type: "object" } }], ttlMs: 60_000 }),
+			},
+		} as never as MCPServerConnection;
+
+		await mcpClient.listTools(connection);
+
+		expect(connection.toolsPersistable).toBe(true);
+		expect(connection.toolsFreshUntil).toBeLessThanOrEqual(Date.now() + 60_000);
+	});
+
+	test("retracts an existing row when a later catalog is not persistable", async () => {
+		const deleted: string[] = [];
+		const written: string[] = [];
+		const toolCache = {
+			get: async () => null,
+			set: async (serverName: string) => {
+				written.push(serverName);
+			},
+			delete: async (serverName: string) => {
+				deleted.push(serverName);
+			},
+		} as unknown as MCPToolCache;
+		const connect = vi.spyOn(mcpClient, "connectToServer").mockImplementation(
+			async (name, config) =>
+				({
+					name,
+					config,
+					transport: { close: async () => {}, request: async () => ({}), notify: async () => {} },
+					serverInfo: { name: "nottl", version: "1" },
+					capabilities: { tools: {} },
+					protocol: { era: "modern" },
+					toolsPersistable: false,
+				}) as never,
+		);
+		const listTools = vi
+			.spyOn(mcpClient, "listTools")
+			.mockResolvedValue([{ name: "ping", inputSchema: { type: "object" } }] as never);
+		const manager = new MCPManager(process.cwd(), toolCache);
+		try {
+			await manager.connectServers({ nottl: { type: "stdio", command: "nottl" } }, {});
+			await waitFor(() => deleted.length > 0);
+
+			expect(deleted).toEqual(["nottl"]);
+			expect(written).toEqual([]);
+		} finally {
+			listTools.mockRestore();
+			connect.mockRestore();
+			await manager.disconnectAll();
+		}
+	});
+
+	test("reuses each project's own warmed row instead of overwriting one shared row", async () => {
+		const config = { type: "stdio", command: "same", args: [] } as never;
+		const toolsA = [{ name: "a", inputSchema: { type: "object" } }] as never;
+		const toolsB = [{ name: "b", inputSchema: { type: "object" } }] as never;
+		const rows = new Map<string, string>();
+		const storage = {
+			getCache: (key: string) => rows.get(key) ?? null,
+			setCache: (key: string, value: string) => {
+				rows.set(key, value);
+			},
+		} as never;
+		const projectA = new MCPToolCacheClass(storage, "/work/project-a");
+		const projectB = new MCPToolCacheClass(storage, "/work/project-b");
+
+		// A warms, then B warms the same server name, then A returns. Sharing one
+		// physical row made A's return a cold miss every time.
+		await projectA.set("same", config, toolsA, "cred");
+		await projectB.set("same", config, toolsB, "cred");
+
+		expect((await projectA.get("same", config, "cred"))?.map(tool => tool.name)).toEqual(["a"]);
+		expect((await projectB.get("same", config, "cred"))?.map(tool => tool.name)).toEqual(["b"]);
 	});
 
 	test("binds cache identity to the resolved credential, not the config template", async () => {
@@ -541,7 +648,10 @@ setInterval(() => {}, 1000);
 		expect(await processB.get("shared", config, "cred")).not.toBeNull();
 
 		const generationOf = (): number => {
-			const entry = rows.get("mcp_tools:shared");
+			// Rows are namespaced by project scope, so find this scope's row rather
+			// than assuming a bare `mcp_tools:<server>` key.
+			const key = [...rows.keys()].find(candidate => candidate.endsWith(":shared"));
+			const entry = key === undefined ? undefined : rows.get(key);
 			if (entry === undefined) return -1;
 			return (JSON.parse(entry.slice(entry.indexOf("|") + 1)) as { generation?: number }).generation ?? -1;
 		};

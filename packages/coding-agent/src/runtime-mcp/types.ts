@@ -390,6 +390,12 @@ export interface MCPServerConnection {
 	toolsFreshUntil?: number;
 	/** Cache scope of the cached tool catalog; private entries never cross credential identities. */
 	toolsCacheScope?: "public" | "private";
+	/**
+	 * Whether the catalog may be written to durable storage at all. False when any
+	 * page omitted a TTL or declared zero: an absent TTL means "already stale", so
+	 * retaining it would replay schemas the server no longer serves.
+	 */
+	toolsPersistable?: boolean;
 }
 
 /** MCP tool with server context */

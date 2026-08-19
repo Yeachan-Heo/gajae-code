@@ -673,6 +673,9 @@ export async function listTools(
 
 	let freshUntil: number | undefined;
 	let cacheScope: "public" | "private" | undefined;
+	// Fail closed: only a catalog whose every page carried a positive TTL may be
+	// written to durable storage.
+	let persistable = true;
 	const allTools: MCPToolDefinition[] = [];
 	try {
 		await collectPaginated(
@@ -687,9 +690,16 @@ export async function listTools(
 				// and `nextCursor`, so reading them off the decoded page always saw none
 				// and silently disabled every cache-privacy and freshness decision.
 				const hints = normalizeMcpCacheHints(raw);
-				if (hints?.ttlMs !== undefined) {
+				if (hints?.ttlMs !== undefined && hints.ttlMs > 0) {
 					const deadline = Date.now() + hints.ttlMs;
 					freshUntil = freshUntil === undefined ? deadline : Math.min(freshUntil, deadline);
+				} else {
+					// An absent or zero TTL means "already stale", not "keep it as long as
+					// you like". Retaining such a page for the flat default is how a server
+					// whose authorization changed replays withdrawn or user-specific
+					// schemas before the next connection re-authenticates. One such page
+					// makes the whole catalog non-persistable, since it is cached as a unit.
+					persistable = false;
 				}
 				// Privacy is aggregated conservatively: one private page makes the whole
 				// catalog private. A later public page must not relabel a mixed result as
@@ -721,6 +731,7 @@ export async function listTools(
 	connection.tools = validTools;
 	connection.toolsFreshUntil = freshUntil;
 	connection.toolsCacheScope = cacheScope;
+	connection.toolsPersistable = persistable;
 
 	return validTools;
 }

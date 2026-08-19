@@ -97,8 +97,22 @@ export async function credentialFingerprint(resolved: MCPServerConfig): Promise<
 	return toHex(digest);
 }
 
-function cacheKey(serverName: string): string {
-	return `${CACHE_PREFIX}${serverName}`;
+/**
+ * Physical row identity.
+ *
+ * The payload hash already binds project scope, but the row key did not: two
+ * workspaces sharing one agent-profile database and a server name wrote the same
+ * physical row, so each return to the other workspace found a row whose hash
+ * could not match and cold-missed its own warmed catalog. The scope is folded in
+ * as a digest so an arbitrarily long path cannot distort the key.
+ */
+function cacheKey(serverName: string, scopeDigest: string): string {
+	return `${CACHE_PREFIX}${scopeDigest}:${serverName}`;
+}
+
+/** Stable short digest of a project scope, used only for row identity. */
+function scopeDigestOf(scope: string): string {
+	return new Bun.CryptoHasher("sha256").update(scope, "utf8").digest("hex").slice(0, 16);
 }
 
 /**
@@ -139,8 +153,8 @@ const storageScope = new WeakMap<AgentStorage, Map<string, Promise<void>>>();
  * cache interface does not expose; the durable fence removes the systematic
  * always-zero case rather than every race.
  */
-function currentGeneration(storage: AgentStorage, serverName: string): number {
-	const raw = storage.getCache(cacheKey(serverName), { includeExpired: true });
+function currentGeneration(storage: AgentStorage, key: string): number {
+	const raw = storage.getCache(key, { includeExpired: true });
 	if (!raw) return 0;
 	try {
 		const parsed: unknown = JSON.parse(raw);
@@ -176,11 +190,19 @@ export class MCPToolCache {
 	 * required rather than defaulted: an empty scope is a cross-project replay,
 	 * so a caller that cannot name its project must not get a cache at all.
 	 */
+	#rowKeyPrefix: string;
+
 	constructor(
 		private storage: AgentStorage,
 		private scope: string,
 	) {
 		if (scope.trim().length === 0) throw new Error("MCPToolCache requires a non-empty project scope");
+		this.#rowKeyPrefix = scopeDigestOf(scope);
+	}
+
+	/** Physical row for `serverName` in this cache's project scope. */
+	#key(serverName: string): string {
+		return cacheKey(serverName, this.#rowKeyPrefix);
 	}
 
 	/**
@@ -189,7 +211,7 @@ export class MCPToolCache {
 	 * replay another identity's catalog.
 	 */
 	async get(serverName: string, config: MCPServerConfig, credential: string): Promise<MCPToolDefinition[] | null> {
-		const key = cacheKey(serverName);
+		const key = this.#key(serverName);
 		const raw = this.storage.getCache(key);
 		if (!raw) return null;
 
@@ -226,7 +248,7 @@ export class MCPToolCache {
 	async delete(serverName: string): Promise<void> {
 		// Serialized at the storage boundary so a concurrent public write from any
 		// manager sharing this row cannot land after this retraction.
-		await enqueueCacheMutation(this.storage, serverName, async () => {
+		await enqueueCacheMutation(this.storage, this.#key(serverName), async () => {
 			// A tombstone rather than an empty value: it carries the bumped generation
 			// so the fence survives this process, and its empty `configHash` can never
 			// match a real one, so a reader treats it as a miss. It is written already
@@ -235,9 +257,9 @@ export class MCPToolCache {
 				version: CACHE_VERSION,
 				configHash: "",
 				tools: [],
-				generation: currentGeneration(this.storage, serverName) + 1,
+				generation: currentGeneration(this.storage, this.#key(serverName)) + 1,
 			};
-			this.storage.setCache(cacheKey(serverName), JSON.stringify(tombstone), Math.floor(Date.now() / 1000) - 1);
+			this.storage.setCache(this.#key(serverName), JSON.stringify(tombstone), Math.floor(Date.now() / 1000) - 1);
 		});
 	}
 
@@ -257,7 +279,7 @@ export class MCPToolCache {
 		// Captured at issue time: if an invalidation completes while this write is
 		// still queued/in flight, the row's generation moves past this value and
 		// the write is dropped instead of resurrecting the retired entry.
-		const issuedGeneration = currentGeneration(this.storage, serverName);
+		const issuedGeneration = currentGeneration(this.storage, this.#key(serverName));
 		let configHash: string;
 		try {
 			configHash = await hashConfig(config, this.scope, credential);
@@ -283,12 +305,12 @@ export class MCPToolCache {
 
 		const defaultExpiryMs = Date.now() + CACHE_TTL_MS;
 		const expiresAtSec = Math.floor(Math.min(defaultExpiryMs, freshUntilMs ?? defaultExpiryMs) / 1000);
-		await enqueueCacheMutation(this.storage, serverName, async () => {
-			if (currentGeneration(this.storage, serverName) !== issuedGeneration) {
+		await enqueueCacheMutation(this.storage, this.#key(serverName), async () => {
+			if (currentGeneration(this.storage, this.#key(serverName)) !== issuedGeneration) {
 				logger.debug("Dropped stale MCP tool cache write behind an invalidation", { serverName });
 				return;
 			}
-			this.storage.setCache(cacheKey(serverName), serialized, expiresAtSec);
+			this.storage.setCache(this.#key(serverName), serialized, expiresAtSec);
 		});
 	}
 }

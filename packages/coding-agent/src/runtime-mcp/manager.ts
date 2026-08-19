@@ -1055,14 +1055,25 @@ export class MCPManager {
 				// which is where `connectToServer` starts charging the declared window.
 				// A retry re-stamps because it begins a new attempt.
 				connectStartedAt = Date.now();
+				// The declared window covers acquisition too, not just discovery. A second
+				// consumer can join a pooled acquisition that a first consumer began under
+				// a longer timeout, and without its own deadline it would sit `connecting`
+				// past the window it declared. The pool drops an aborted waiter and only
+				// cancels the shared attempt once no waiters remain, so expiring here
+				// never tears down another session's transport.
+				const acquireAbort = new AbortController();
+				const acquireDeadline = this.#declaredWindowRemainingMs(config, connectStartedAt);
+				const stopDeadline = this.#bindAcquireDeadline(acquireAbort, connectionAbort, acquireDeadline, name);
 				let lease: MCPPoolLease | undefined;
 				try {
-					lease = await this.#acquireLease(name, resolvedConfig, config, connectionAbort);
+					lease = await this.#acquireLease(name, resolvedConfig, config, acquireAbort);
 					await this.#afterLeaseAcquiredForTests?.(name, lease);
 					return lease;
 				} catch (error) {
 					if (lease) await this.#releaseLeasePreservingPrimary(name, lease.connection);
 					throw error;
+				} finally {
+					stopDeadline();
 				}
 			};
 			let connectionPromise!: Promise<MCPServerConnection>;
@@ -1113,6 +1124,11 @@ export class MCPManager {
 						if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
 							connection.transport.onAuthError = async () => {
 								const refreshed = await this.#resolveAuthConfig(config, true);
+								// The connection now authenticates as a different identity, so the
+								// fingerprint it was registered under is stale. A catalog fetched
+								// after this retry would otherwise be filed under the credential
+								// that had just been rejected.
+								await this.#rebindConnectionCredential(connection, refreshed);
 								if (refreshed.type === "http" || refreshed.type === "sse") {
 									return refreshed.headers ?? null;
 								}
@@ -1453,6 +1469,61 @@ export class MCPManager {
 		});
 	}
 
+	/**
+	 * Re-fingerprint a live connection after it re-authenticated.
+	 *
+	 * The fingerprint recorded at connect time names the identity that was in use
+	 * then. After a 401/403 retry swaps the authorization, tools fetched over this
+	 * same connection belong to the new identity, and caching them under the old
+	 * one is exactly the cross-identity replay the fingerprint exists to prevent.
+	 */
+	async #rebindConnectionCredential(connection: MCPServerConnection, resolved: MCPServerConfig): Promise<void> {
+		if (!this.toolCache) return;
+		try {
+			this.#connectionCredentials.set(connection, await credentialFingerprint(resolved));
+		} catch (error) {
+			// Without a current identity the connection must not be able to write:
+			// dropping the binding makes `#cacheServerTools` skip rather than guess.
+			this.#connectionCredentials.delete(connection);
+			logger.debug("MCP credential re-fingerprint failed after auth retry", { error });
+		}
+	}
+
+	/** Unspent remainder of `config`'s declared window, or undefined when none. */
+	#declaredWindowRemainingMs(config: MCPServerConfig, startedAt: number): number | undefined {
+		if (!hasDeclaredConnectionWindow(config)) return undefined;
+		return Math.max(0, startedAt + (config.timeout as number) - Date.now());
+	}
+
+	/**
+	 * Abort `target` when the task is cancelled or the declared window expires.
+	 * Returns a disposer so the timer never outlives the acquisition it bounds.
+	 */
+	#bindAcquireDeadline(
+		target: AbortController,
+		taskAbort: AbortController,
+		remainingMs: number | undefined,
+		name: string,
+	): () => void {
+		const onTaskAbort = () => target.abort(taskAbort.signal.reason);
+		if (taskAbort.signal.aborted) onTaskAbort();
+		else taskAbort.signal.addEventListener("abort", onTaskAbort, { once: true });
+		const timer =
+			remainingMs === undefined
+				? undefined
+				: setTimeout(() => {
+						// The canonical startup-timeout phrasing: a spent declared window is
+						// one operator-visible condition, whether acquisition or the startup
+						// verdict noticed it first. The pool wraps this reason with its own
+						// context, so the specific cause stays recoverable from the message.
+						target.abort(new Error(`MCP server connection timed out during startup: ${name}`));
+					}, remainingMs);
+		return () => {
+			if (timer !== undefined) clearTimeout(timer);
+			taskAbort.signal.removeEventListener("abort", onTaskAbort);
+		};
+	}
+
 	#withdrawUnreachableDeferredTools(name: string): void {
 		const deferred = this.#tools.filter(tool => tool instanceof DeferredMCPTool && tool.mcpServerName === name);
 		if (deferred.length === 0) return;
@@ -1490,11 +1561,18 @@ export class MCPManager {
 	): Promise<void> {
 		const cache = this.toolCache;
 		if (!cache) return;
-		if (connection.toolsCacheScope === "private") {
-			// Suppressing the write is not enough: a catalog that used to be public
-			// left a row behind, and that row stays replayable until its TTL. Turning
-			// private must retract what the public phase published.
-			logger.debug("Dropped MCP tool cache entry after a private result", { path: `mcp:${name}` });
+		// Both a private result and a catalog the server declined to make cacheable
+		// (no TTL, or zero) must retract what an earlier persistable result left
+		// behind: suppressing only the write leaves that row replayable until it
+		// expires on its own.
+		const retractOnly =
+			connection.toolsCacheScope === "private"
+				? "private result"
+				: connection.toolsPersistable === false
+					? "absent TTL"
+					: undefined;
+		if (retractOnly !== undefined) {
+			logger.debug("Dropped MCP tool cache entry", { path: `mcp:${name}`, reason: retractOnly });
 			this.#startCacheOperation(name, () => cache.delete(name));
 			return;
 		}
@@ -2186,6 +2264,9 @@ export class MCPManager {
 		if (connection.transport instanceof HttpTransport && config.auth?.type === "oauth") {
 			connection.transport.onAuthError = async () => {
 				const refreshed = await this.#resolveAuthConfig(config, true);
+				// See the connect path: a retry re-authenticates as a new identity, and
+				// the cache fingerprint must move with it.
+				await this.#rebindConnectionCredential(connection, refreshed);
 				if (refreshed.type === "http" || refreshed.type === "sse") {
 					return refreshed.headers ?? null;
 				}
