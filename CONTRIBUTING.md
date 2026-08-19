@@ -65,9 +65,39 @@ The `CI` workflow publishes a scheduled nightly prerelease from `main` at 04:23 
 
 ## Exact-head PR verdict gate
 
-Every pull request to `dev` must keep exactly one `gajae.pr-review-verdict.v1` line from the pull request template. The `PR contract / Validate exact-head PR contract` status is produced by a narrowly scoped `pull_request_target` workflow loaded from the trusted default branch. It has read-only permissions, receives no secrets, consumes no caches or artifacts, and executes only the base-owned validator while inspecting the event's immutable base and exact head. The validator recomputes the binary diff digest, requires the head to contain the base, runs the fast GJC state-writer scan against the PR-head bytes, and rejects self-approved `merge-approved` verdicts. `needs-human` and `merge-blocked` are valid review states but intentionally keep the status red until an independent reviewer records `merge-approved` for the current head.
+Every pull request to `dev` must keep exactly one `gajae.pr-review-verdict.v1` line from the pull request template. The `PR contract / Validate exact-head PR contract` status is produced by a narrowly scoped `pull_request_target` workflow loaded from the trusted default branch. It has read-only permissions, receives no secrets, consumes no caches or artifacts, and executes only the base-owned validator while inspecting the event's immutable base and exact head. The validator recomputes the binary diff digest, requires the head to contain the base, runs the fast GJC state-writer scan against the PR-head bytes, and rejects self-approved `merge-approved` verdicts unless a valid signed maintainer self-review comment backs them (below). `needs-human` and `merge-blocked` are valid review states but intentionally keep the status red until an independent reviewer records `merge-approved` for the current head or a valid self-review comment is posted.
 
-The first PR that introduces this workflow uses a trusted two-phase bootstrap. Phase 1 landed `Dev CI / PR contract bootstrap` directly on `dev`, so its inline validation exists in the immutable event base before the implementation PR is evaluated. Phase 2 enables the isolated `PR contract` consumer in this implementation PR. Review events run only that cheap, read-only contract workflow; they never launch or cancel the affected Dev CI pipeline. The validator still executes exclusively from the immutable event-base checkout and treats PR-head bytes as data.
+### Risk-classified review policy (issue #4703, final owner decision)
+
+The review requirement is classified by the change's real risk; not every fix is low risk, and routine fixes are not burdened with mandatory independent review.
+
+- **Low-risk fix / ordinary maintenance** — a signed `gajae.pr-self-review.v1` exact-head maintainer self-review comment plus green CI is sufficient to merge. The comment must be posted by the delegated maintainer identity (gaebal-gajae operating the owner account) and bound to the exact base, head, and diff digest.
+- **Fix with material regression risk** — the signed self-review comment must additionally record **either** (a) an exact-head `gpt-heavy` profile validation/review with recorded evidence, **or** (b) one assigned independent domain reviewer selected from recent merged PR/commit ownership and demonstrated expertise in the touched files/contracts, with the selection evidence and the exact-head review recorded. This OR gate is mandatory; a risk-classified fix cannot pass with `extra:none`.
+- **Large refactors, features, and materially high-risk changes** (security, auth, install, remove, public API, destructive lifecycle, architecture) — exactly one assigned independent domain reviewer is required, selected the same way (recent merged ownership plus demonstrated expertise in the touched surface), not two-person review and not a static hardcoded reviewer.
+
+External contributor PRs continue to require an ordinary authenticated GitHub `APPROVED` review from a repository maintainer; the self-review comment path exists only for owner-authored maintainer PRs.
+
+### Maintainer self-review comment format
+
+For an owner-authored maintainer PR, post the exact-head self-review as a **PR comment** (never in the PR body — body text cannot authorize anything):
+
+```text
+gajae.pr-self-review.v1 verdict:merge-approved base:<40-hex event base> head:<40-hex exact head> sha256:<64-hex base...head diff digest> reviewer-id:<PR author login> risk:<low-risk|regression-risk|high-risk> extra:<none|gpt-heavy|independent:<login>> evidence:<review evidence>
+self-review-signature: sha256:<signature over the record above>
+Signed-off-by: gaebal-gajae (clawdbot) 🦞
+```
+
+The signature is `sha256("gajae.pr-self-review.v1.signature-domain" + canonical record lines)`; generate it with `bun scripts/verify-pr-verdict.ts --self-review-sign <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>`. The validator accepts the comment only when all of the following hold; otherwise it fails closed:
+
+- the comment is fetched through the trusted workflow token from the GitHub issue-comments API (comment bytes are data; head-controlled code is never executed);
+- the comment author is the repository owner/a member/a collaborator (`author_association`) and matches `reviewer-id`, which must equal the PR author;
+- base, head, and digest match the immutable event base, the exact PR head, and the recomputed `base...head` diff digest (stale values never authorize a newer head);
+- the signature verifies over the exact canonical record, so any post-hoc edit of verdict, head, digest, risk, extra, or evidence invalidates the comment;
+- the risk classification satisfies the policy gate above (`low-risk` + `extra:none`; `regression-risk` + `extra:gpt-heavy` or `extra:independent:<login>`; `high-risk` + `extra:independent:<login>`).
+
+Comment events (`issue_comment: [created, edited]`) re-run the trusted-base validator, so posting or editing the self-review comment re-evaluates the contract server-side. Editing a comment invalidates its signature only when a bound field changed; editing is still safe because every field is re-verified against the immutable event data.
+
+The first PR that introduces this workflow uses a trusted two-phase bootstrap. Phase 1 landed `Dev CI / PR contract bootstrap` directly on `dev`, so its inline validation exists in the immutable event base before the implementation PR is evaluated. Phase 2 enables the isolated `PR contract` consumer in this implementation PR. Review events run only that cheap, read-only contract workflow; they never launch or cancel the affected Dev CI pipeline. The validator still executes exclusively from the immutable event-base checkout and treats PR-head bytes as data. The same bootstrap ordering applies to the self-review comment path: a PR whose immutable base predates the comment-aware validator cannot be authorized by a self-review comment on that base; the introducing PR relies on the Dev CI bootstrap job and merges before the comment path becomes active for later PRs.
 
 After the final commit and rebase, compute the digest with:
 
@@ -78,7 +108,7 @@ git diff --binary --full-index --no-ext-diff origin/dev...HEAD | sha256sum
 bun scripts/verify-gjc-state-writers.ts --fail
 ```
 
-The verdict line must use the resulting lowercase digest and name the independent GitHub reviewer whose effective `APPROVED` review targets the exact PR head:
+The verdict line must use the resulting lowercase digest and name the GitHub reviewer whose effective `APPROVED` review targets the exact PR head, or the PR author when a valid signed self-review comment exists:
 
 ```text
 gajae.pr-review-verdict.v1 merge-approved sha256:<64-hex-digest> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<review-or-CI-reference>

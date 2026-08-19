@@ -2,12 +2,45 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as url from "node:url";
-import { canonicalDiffSha256, parseGhPrCreate, parsePrVerdict, validatePrContract } from "./verify-pr-verdict";
+import {
+	canonicalDiffSha256,
+	parseGhPrCreate,
+	parsePrVerdict,
+	parseSelfReview,
+	selfReviewSatisfiesPolicy,
+	selfReviewSignature,
+	selfReviewSignedPayload,
+	validatePrContract,
+} from "./verify-pr-verdict";
 
 const base = "a".repeat(40);
 const head = "b".repeat(40);
 const digest = "c".repeat(64);
 const approved = `gajae.pr-review-verdict.v1 merge-approved sha256:${digest} reviewer:architect reviewer-id:review-agent evidence:bun test scripts/verify-pr-verdict.test.ts`;
+
+function selfReviewComment(overrides: {
+	body?: string;
+	login?: string;
+	association?: string;
+} = {}) {
+	const record = `gajae.pr-self-review.v1 verdict:merge-approved base:${base} head:${head} sha256:${digest} reviewer-id:author risk:low-risk extra:none evidence:adversarial exact-head review of the final tree`;
+	const payload = selfReviewSignedPayload({
+		verdict: "merge-approved",
+		baseSha: base,
+		headSha: head,
+		diffSha256: digest,
+		reviewerId: "author",
+		risk: "low-risk",
+		extra: { kind: "none" },
+		evidence: "adversarial exact-head review of the final tree",
+	});
+	const signature = selfReviewSignature(payload);
+	return {
+		login: overrides.login ?? "author",
+		authorAssociation: overrides.association ?? "OWNER",
+		body: overrides.body ?? `${record}\nself-review-signature: sha256:${signature}\nSigned-off-by: gaebal-gajae (clawdbot) 🦞`,
+	};
+}
 
 function validInput(overrides: Partial<Parameters<typeof validatePrContract>[0]> = {}) {
 	return {
@@ -100,6 +133,170 @@ describe("parseGhPrCreate", () => {
 	});
 });
 
+describe("maintainer self-review comment gate (issue #4703)", () => {
+	const selfApproved = approved.replace("reviewer-id:review-agent", "reviewer-id:author");
+	const selfApprovedBody = `## GJC verdict\n\n${selfApproved}\n`;
+
+	test("valid signed owner self-review comment authorizes merge without an independent GitHub review", () => {
+		const result = validatePrContract(validInput({
+			body: selfApprovedBody,
+			selfReviewComment: selfReviewComment(),
+		}));
+		expect(result.ok).toBe(true);
+		expect(result.diagnostics).toEqual([]);
+	});
+
+	test("missing self-review comment keeps the ordinary independent-review requirement", () => {
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: null }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("cannot be self-approved");
+		expect(result.diagnostics.join("\n")).toContain("not backed by an authenticated");
+	});
+
+	test("stale head, base, and digest in the comment each fail closed", () => {
+		const staleHead = selfReviewComment().body.replace(`head:${head}`, `head:${"d".repeat(40)}`);
+		const staleBase = selfReviewComment().body.replace(`base:${base}`, `base:${"e".repeat(40)}`);
+		const staleDigest = selfReviewComment().body.replace(`sha256:${digest}`, `sha256:${"f".repeat(64)}`);
+		for (const body of [staleHead, staleBase, staleDigest]) {
+			const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: selfReviewComment({ body }) }));
+			expect(result.ok).toBe(false);
+		}
+		const headDiagnostics = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: selfReviewComment({ body: staleHead }) })).diagnostics.join("\n");
+		expect(headDiagnostics).toContain("stale");
+		expect(headDiagnostics).toContain("signature does not match");
+	});
+
+	test("malformed comment fails closed with a parse diagnostic", () => {
+		const malformed = selfReviewComment().body.replace("verdict:merge-approved", "verdict:approved");
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: selfReviewComment({ body: malformed }) }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("Malformed gajae.pr-self-review.v1");
+	});
+
+	test("unsigned comment fails closed", () => {
+		const unsigned = selfReviewComment().body.replace(/\nself-review-signature: sha256:[0-9a-f]{64}\n/u, "\nbogus-signature\n");
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: selfReviewComment({ body: unsigned }) }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("self-review-signature");
+	});
+
+	test("tampered evidence invalidates the signature", () => {
+		const tampered = selfReviewComment().body.replace("adversarial exact-head review", "lazy rubber stamp");
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: selfReviewComment({ body: tampered }) }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("signature does not match");
+	});
+
+	test("unauthorized commenter identity fails closed", () => {
+		const outsider = selfReviewComment({ login: "attacker", association: "NONE" });
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: outsider }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("not an authorized maintainer");
+	});
+
+	test("comment from a first-time contributor with MEMBER-less association fails even with a forged reviewer-id", () => {
+		const forged = selfReviewComment({ login: "attacker", association: "CONTRIBUTOR" });
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: forged }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("not an authorized maintainer");
+	});
+
+	test("self-review reviewer-id must match the PR author", () => {
+		const record = `gajae.pr-self-review.v1 verdict:merge-approved base:${base} head:${head} sha256:${digest} reviewer-id:review-agent risk:low-risk extra:none evidence:wrong identity`;
+		const payload = selfReviewSignedPayload({ verdict: "merge-approved", baseSha: base, headSha: head, diffSha256: digest, reviewerId: "review-agent", risk: "low-risk", extra: { kind: "none" }, evidence: "wrong identity" });
+		const body = `${record}\nself-review-signature: sha256:${selfReviewSignature(payload)}\nSigned-off-by: gaebal-gajae (clawdbot) 🦞`;
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: { login: "author", authorAssociation: "OWNER", body } }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("must match the PR author");
+	});
+
+	test("PR-body-embedded self-review record is never accepted as the comment", () => {
+		const commentRecord = selfReviewComment().body;
+		const forgedBody = `## GJC verdict\n\n${selfApproved}\n\n${commentRecord}\n`;
+		const result = validatePrContract(validInput({ body: forgedBody, selfReviewComment: null }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("cannot be self-approved");
+	});
+
+	test("merge-blocked self-review verdict does not authorize merge", () => {
+		const record = `gajae.pr-self-review.v1 verdict:merge-blocked base:${base} head:${head} sha256:${digest} reviewer-id:author risk:low-risk extra:none evidence:blocked after adversarial review`;
+		const payload = selfReviewSignedPayload({ verdict: "merge-blocked", baseSha: base, headSha: head, diffSha256: digest, reviewerId: "author", risk: "low-risk", extra: { kind: "none" }, evidence: "blocked after adversarial review" });
+		const body = `${record}\nself-review-signature: sha256:${selfReviewSignature(payload)}\nSigned-off-by: gaebal-gajae (clawdbot) 🦞`;
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: { login: "author", authorAssociation: "OWNER", body } }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("does not authorize merge");
+	});
+
+	test("regression-risk fix requires the OR gate: gpt-heavy or independent reviewer", () => {
+		const withNone = buildRiskComment("regression-risk", "none");
+		const withGptHeavy = buildRiskComment("regression-risk", "gpt-heavy");
+		const withIndependent = buildRiskComment("regression-risk", "independent:domain-expert");
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withNone })).ok).toBe(false);
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withGptHeavy })).ok).toBe(true);
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withIndependent })).ok).toBe(true);
+		const noneDiagnostics = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: withNone })).diagnostics.join("\n");
+		expect(noneDiagnostics).toContain("risk regression-risk requires");
+	});
+
+	test("high-risk change requires an assigned independent reviewer", () => {
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: buildRiskComment("high-risk", "none") })).ok).toBe(false);
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: buildRiskComment("high-risk", "gpt-heavy") })).ok).toBe(false);
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: buildRiskComment("high-risk", "independent:domain-expert") })).ok).toBe(true);
+	});
+
+	test("low-risk fix passes with no extra review", () => {
+		expect(validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: buildRiskComment("low-risk", "none") })).ok).toBe(true);
+	});
+
+	test("external PR keeps requiring an authenticated independent review; self-review comment from the author cannot replace it", () => {
+		// The comment reviewer-id must equal the PR author; an external author's comment
+		// with their own identity would pass identity checks but the PR-body verdict
+		// still needs merge-approved from a distinct reviewer or the self-review path.
+		// Here the body names a different reviewer without an authenticated review.
+		const result = validatePrContract(validInput({ body: selfApprovedBody, selfReviewComment: null }));
+		expect(result.ok).toBe(false);
+		expect(result.diagnostics.join("\n")).toContain("not backed by an authenticated");
+	});
+
+	test("parseSelfReview rejects duplicate records and missing footer", () => {
+		const comment = selfReviewComment().body;
+		expect(parseSelfReview(`${comment}\n${comment}`).diagnostics.join("\n")).toContain("keep exactly one");
+		const noFooter = comment.replace("\nSigned-off-by: gaebal-gajae (clawdbot) 🦞", "");
+		expect(parseSelfReview(noFooter).diagnostics.join("\n")).toContain("Signed-off-by: gaebal-gajae (clawdbot) 🦞");
+		const noSignature = comment.replace(/\nself-review-signature: sha256:[0-9a-f]{64}/u, "");
+		expect(parseSelfReview(noSignature).diagnostics.join("\n")).toContain("self-review-signature");
+	});
+
+	test("policy matrix is explicit for every risk class", () => {
+		expect(selfReviewSatisfiesPolicy({ risk: "low-risk", extra: { kind: "none" } } as never)).toBe(true);
+		expect(selfReviewSatisfiesPolicy({ risk: "regression-risk", extra: { kind: "none" } } as never)).toBe(false);
+		expect(selfReviewSatisfiesPolicy({ risk: "regression-risk", extra: { kind: "gpt-heavy" } } as never)).toBe(true);
+		expect(selfReviewSatisfiesPolicy({ risk: "regression-risk", extra: { kind: "independent", login: "x" } } as never)).toBe(true);
+		expect(selfReviewSatisfiesPolicy({ risk: "high-risk", extra: { kind: "none" } } as never)).toBe(false);
+		expect(selfReviewSatisfiesPolicy({ risk: "high-risk", extra: { kind: "independent", login: "x" } } as never)).toBe(true);
+	});
+
+	function buildRiskComment(risk: "low-risk" | "regression-risk" | "high-risk", extra: string) {
+		const record = `gajae.pr-self-review.v1 verdict:merge-approved base:${base} head:${head} sha256:${digest} reviewer-id:author risk:${risk} extra:${extra} evidence:risk-classified exact-head review`;
+		const parsedExtra = extra === "none"
+			? { kind: "none" as const }
+			: extra === "gpt-heavy"
+				? { kind: "gpt-heavy" as const }
+				: { kind: "independent" as const, login: extra.slice("independent:".length) };
+		const payload = selfReviewSignedPayload({
+			verdict: "merge-approved",
+			baseSha: base,
+			headSha: head,
+			diffSha256: digest,
+			reviewerId: "author",
+			risk,
+			extra: parsedExtra,
+			evidence: "risk-classified exact-head review",
+		});
+		return { login: "author", authorAssociation: "OWNER", body: `${record}\nself-review-signature: sha256:${selfReviewSignature(payload)}\nSigned-off-by: gaebal-gajae (clawdbot) 🦞` };
+	}
+});
+
 test("canonicalDiffSha256 hashes exact bytes", () => {
 	expect(canonicalDiffSha256("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 });
@@ -138,9 +335,9 @@ test("workflow is trusted-default-branch-controlled, read-only, exact-head, and 
 	expect(workflow).toContain("permissions:\n  contents: read\n  pull-requests: read");
 	expect(workflow).toContain("name: PR contract");
 	expect(workflow).toContain("name: Validate exact-head PR contract");
-	expect(workflow).toContain("repository: ${{ github.event.pull_request.head.repo.full_name }}");
-	expect(workflow).toContain("ref: ${{ github.event.pull_request.head.sha }}");
-	expect(workflow).toContain("ref: ${{ github.event.pull_request.base.sha }}");
+	expect(workflow).toContain("repository: ${{ steps.pr.outputs.head_repo }}");
+	expect(workflow).toContain("ref: ${{ steps.pr.outputs.head_sha }}");
+	expect(workflow).toContain("ref: ${{ steps.pr.outputs.base_sha }}");
 	expect(workflow.match(/persist-credentials: false/gu)).toHaveLength(2);
 	expect(workflow).toContain("unset BUN_OPTIONS");
 	expect(workflow).toContain("empty_bunfig=\"$RUNNER_TEMP/gjc-pr-contract-empty-bunfig.toml\"");
@@ -157,6 +354,25 @@ test("workflow is trusted-default-branch-controlled, read-only, exact-head, and 
 	expect(workflow).not.toContain("upload-artifact");
 	expect(workflow).not.toContain("download-artifact");
 	expect(workflow).not.toContain("continue-on-error");
+});
+
+test("workflow re-runs the trusted validator on maintainer self-review comment events", async () => {
+	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
+	expect(workflow).toContain("issue_comment:");
+	expect(workflow).toContain("types: [created, edited]");
+	// Comment bytes are workflow input only; the validator still runs from the immutable
+	// base checkout and never executes head-controlled code.
+	expect(workflow).toContain('bun --no-env-file --config="$empty_bunfig" "$trusted_root/scripts/verify-pr-verdict.ts"');
+	// The issue_comment event payload has no pull_request object; the validator must
+	// resolve the PR from the comment (issue number) and revalidate from event data.
+	const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+	expect(source).toContain("/issues/${number}/comments");
+	expect(source).toContain("author_association");
+});
+
+test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
+	const devCi = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
+	expect(devCi).not.toContain("issue_comment:");
 });
 
 test("trusted Bun launch cannot load an untrusted repo bunfig preload", async () => {
@@ -200,10 +416,16 @@ test("a PR-authored workflow cannot become the trusted enforcement authority", a
 	expect(workflow).not.toContain('"$repo_root/scripts/verify-pr-verdict.ts"');
 });
 
-test("template pins reviewer identity and exact diff digest", async () => {
+test("template pins reviewer identity, exact diff digest, and risk classification", async () => {
 	const template = await Bun.file(new URL("../.github/PULL_REQUEST_TEMPLATE.md", import.meta.url)).text();
 	expect(template).toContain("reviewer-id:<identity>");
 	expect(template).toContain("sha256:<exact-base...head-diff-hash>");
+	expect(template).toContain("## Risk classification");
+	expect(template).toContain("`low-risk`");
+	expect(template).toContain("`regression-risk`");
+	expect(template).toContain("`high-risk`");
+	expect(template).toContain("extra:gpt-heavy");
+	expect(template).toContain("extra:independent:<login>");
 });
 
 test("dev CI carries immutable inline first-landing bootstrap validation", async () => {
@@ -221,6 +443,12 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("/collaborators/${encodeURIComponent(reviewerId)}/permission");
 	expect(workflow).toContain('review.state !== "COMMENTED" && review.commit_id === head');
 	expect(workflow).not.toContain("pr-head/scripts/verify-pr-verdict.ts");
+	// Bootstrap job mirrors the trusted-base self-review contract (issue #4703).
+	expect(workflow).toContain("/issues/${Bun.env.PR_NUMBER}/comments");
+	expect(workflow).toContain("gajae.pr-self-review.v1.signature-domain");
+	expect(workflow).toContain("risk-fix OR gate is not satisfied");
+	expect(workflow).toContain("Self-review is stale: base/head/digest do not match this exact PR");
+	expect(workflow).toContain("not an authorized maintainer");
 });
 
 test("review events cannot launch or cancel the affected Dev CI pipeline", async () => {
