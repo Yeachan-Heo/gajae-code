@@ -1568,11 +1568,16 @@ export class MCPManager {
 		// (no TTL, or zero) must retract what an earlier persistable result left
 		// behind: suppressing only the write leaves that row replayable until it
 		// expires on its own.
+		// Admission is strictly opt-in: only a discovery that positively declared
+		// itself cacheable may be written. An undefined flag means no discovery
+		// licensed a durable row -- a legacy server without tool capability, a
+		// modern server without `tools/list` -- and persisting that empty catalog
+		// would hand a later startup a cache hit it never earned.
 		const retractOnly =
 			connection.toolsCacheScope === "private"
 				? "private result"
-				: connection.toolsPersistable === false
-					? "absent TTL"
+				: connection.toolsPersistable !== true
+					? "no positive TTL"
 					: undefined;
 		if (retractOnly !== undefined) {
 			logger.debug("Dropped MCP tool cache entry", { path: `mcp:${name}`, reason: retractOnly });

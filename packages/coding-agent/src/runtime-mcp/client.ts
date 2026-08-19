@@ -657,6 +657,9 @@ export async function listTools(
 	// Legacy gating uses the negotiated capabilities; modern servers without
 	// server/discover learn capability lazily (method-not-found means no tools).
 	if (!modern && !connection.capabilities.tools) {
+		// No discovery happened, so nothing licensed a durable write. Saying so
+		// explicitly keeps "we never asked" from reading as "the server allowed it".
+		connection.toolsPersistable = false;
 		return [];
 	}
 
@@ -709,7 +712,11 @@ export async function listTools(
 			},
 		);
 	} catch (error) {
-		if (modern && isModernMethodNotFound(error)) return [];
+		if (modern && isModernMethodNotFound(error)) {
+			// A server without `tools/list` never supplied cache metadata either.
+			connection.toolsPersistable = false;
+			return [];
+		}
 		throw error;
 	}
 

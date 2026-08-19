@@ -3888,11 +3888,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						.map(tool => tool.name);
 					// Serialized: two servers landing together must not interleave a
 					// refresh with another refresh's activation.
+					// Plugin-bundle tools are always-on, not selection-controlled. Their
+					// names could not be in the mandatory set at construction because the
+					// server had not connected yet, so adopt them as the refresh installs
+					// them; activation alone would leave the next selection
+					// recomputation free to drop them.
+					const latePluginNames = tools
+						.filter(tool => tool.mcpServerName !== undefined && ownedPluginServers.has(tool.mcpServerName))
+						.map(tool => tool.name);
 					latePublication = latePublication
 						.then(async () => {
 							if (session.isDisposed) return;
 							await session.refreshMCPTools(ownedManager.getTools() as CustomTool[]);
-							if (session.isDisposed || autoActivateNames.length === 0) return;
+							if (session.isDisposed) return;
+							if (latePluginNames.length > 0) session.registerMandatoryMCPToolNames(latePluginNames);
+							if (autoActivateNames.length === 0) return;
 							await session.activateDiscoveredTools(autoActivateNames);
 						})
 						.catch(error => {

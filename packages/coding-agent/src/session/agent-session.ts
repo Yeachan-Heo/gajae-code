@@ -2393,6 +2393,22 @@ export class AgentSession {
 	#defaultSelectedMCPServerNames = new Set<string>();
 	#defaultSelectedMCPToolNames = new Set<string>();
 	#mandatoryMCPToolNames = new Set<string>();
+
+	/**
+	 * Adopt MCP tool names that became mandatory after construction.
+	 *
+	 * The constructor filters the mandatory set against the tool registry, so a
+	 * plugin-bundle server that only connects after the startup wait has no names
+	 * to contribute yet. Without adopting them later, the next selection
+	 * recomputation treats those tools as selection-controlled and can drop an
+	 * always-on plugin surface.
+	 */
+	registerMandatoryMCPToolNames(names: readonly string[]): void {
+		for (const name of names) {
+			const normalized = name.toLowerCase();
+			if (this.#toolRegistry.has(normalized)) this.#mandatoryMCPToolNames.add(normalized);
+		}
+	}
 	/** Constructor authority applies only while this AgentSession instance remains alive. */
 	#constructorMCPToolSelection: string[] | undefined;
 	#constructorDiscoveredBuiltinToolSelection: string[] | undefined;

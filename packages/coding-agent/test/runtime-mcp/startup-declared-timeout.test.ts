@@ -412,6 +412,64 @@ describe("MCP startup and the declared connection window", () => {
 		expect(await writer.get("shared", config, "cred")).toBeNull();
 	});
 
+	// `listTools` writes cache-admission metadata through the lease facade, while
+	// the manager decides persistence from the physical connection. A field the
+	// facade does not forward silently reverts a shared server's catalog to
+	// "public, unlimited, persistable", so this drives a real shared lease rather
+	// than a stubbed standalone connection.
+	test("carries cache admission metadata from a shared lease to the physical connection", async () => {
+		const written: string[] = [];
+		const deleted: string[] = [];
+		const toolCache = {
+			get: async () => null,
+			set: async (serverName: string) => {
+				written.push(serverName);
+			},
+			delete: async (serverName: string) => {
+				deleted.push(serverName);
+			},
+		} as unknown as MCPToolCache;
+
+		let physical: MCPServerConnection | undefined;
+		const connect = vi.spyOn(mcpClient, "connectToServer").mockImplementation(async (name, config) => {
+			physical = {
+				name,
+				config,
+				transport: {
+					close: async () => {},
+					notify: async () => {},
+					// A private catalog with no TTL: neither admissible.
+					request: async () => ({
+						tools: [{ name: "ping", inputSchema: { type: "object" } }],
+						cacheScope: "private",
+					}),
+				},
+				serverInfo: { name: "shared", version: "1" },
+				capabilities: { tools: {} },
+				protocol: { era: "modern" },
+			} as never as MCPServerConnection;
+			return physical as never;
+		});
+		const manager = new MCPManager(process.cwd(), toolCache);
+		try {
+			await manager.connectServers(
+				{ shared: { type: "http", url: "https://example.invalid/mcp", sharing: "shared" } },
+				{},
+			);
+			await waitFor(() => deleted.length > 0);
+
+			// The metadata reached the connection the manager reads...
+			expect(physical?.toolsCacheScope).toBe("private");
+			expect(physical?.toolsPersistable).toBe(false);
+			// ...so the catalog is retracted rather than persisted.
+			expect(deleted).toEqual(["shared"]);
+			expect(written).toEqual([]);
+		} finally {
+			connect.mockRestore();
+			await manager.disconnectAll();
+		}
+	});
+
 	test("binds cache identity to the resolved credential, not the config template", async () => {
 		const template = { type: "http", url: "https://example.invalid/mcp", headers: { Authorization: "!token" } };
 		const resolve = vi.spyOn(configValue, "resolveConfigValue");
