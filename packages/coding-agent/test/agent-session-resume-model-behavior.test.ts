@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
-import { getBundledModel } from "@gajae-code/ai";
+import { Effort, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -27,6 +27,7 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		if (session) {
 			await session.dispose();
 		}
@@ -93,5 +94,61 @@ describe("AgentSession switchSession resumeModelBehavior", () => {
 		expect(await session.switchSession(sessionFile)).toBe(true);
 		expect(session.model?.id).toBe(opus.id);
 		expect(session.getActiveModelProfile()).toBe("codex-medium");
+	});
+	it("restore shares one thinking-level rule: no stray thinking_level_change, recompute from defaultThinkingLevel", async () => {
+		const sonnet = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const settings = Settings.isolated({ "compaction.enabled": false, defaultThinkingLevel: Effort.Medium });
+
+		// Session A persists a default chain whose selector carries an explicit
+		// `:low` suffix. Its branch has no thinking_level_change entry of its own.
+		const sessionA = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: sonnet,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+					thinkingLevel: Effort.High,
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		sessionA.setConfiguredModelChain("default", [`${sonnet.provider}/${sonnet.id}:low`], "test");
+		const sessionFileA = sessionA.sessionManager.getSessionFile();
+		if (!sessionFileA) throw new Error("Expected session file");
+		await sessionA.sessionManager.ensureOnDisk();
+		await sessionA.sessionManager.flush();
+		await sessionA.dispose();
+
+		// A different session restores A's file.
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: sonnet,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+					thinkingLevel: Effort.Minimal,
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings,
+			modelRegistry,
+		});
+		const setThinkingLevel = vi.spyOn(AgentSession.prototype, "setThinkingLevel");
+		const appendThinkingLevelChange = vi.spyOn(SessionManager.prototype, "appendThinkingLevelChange");
+
+		expect(await session.switchSession(sessionFileA)).toBe(true);
+
+		// Restore applies one rule at all chain-resolution sites: the unconditional
+		// recompute from defaultThinkingLevel. The resolved `:low` suffix must not
+		// be written through setThinkingLevel — that appended a stray
+		// thinking_level_change entry, flipped the recompute's hasThinkingEntry,
+		// and restored the wrong level (observed: `minimal` instead of `medium`).
+		expect(setThinkingLevel).not.toHaveBeenCalled();
+		expect(appendThinkingLevelChange).not.toHaveBeenCalled();
+		expect(session.thinkingLevel).toBe(Effort.Medium);
 	});
 });

@@ -20028,9 +20028,10 @@ export class AgentSession {
 						this.#setModelAuthoritatively(resolution.model, "restore");
 					}
 					await this.#syncEditToolModeAfterModelChange(previousEditMode);
-					if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
-						this.setThinkingLevel(resolution.thinkingLevel);
-					}
+					// No thinking-level write here: the recompute below is the single
+					// chain-resolution restore rule. Writing the resolved suffix level
+					// would append a stray thinking_level_change entry that flips
+					// hasThinkingEntry and changes what the recompute restores.
 				}
 
 				const hasThinkingEntry = this.sessionManager
