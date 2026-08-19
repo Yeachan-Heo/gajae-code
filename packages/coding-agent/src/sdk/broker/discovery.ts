@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 
@@ -24,12 +25,86 @@ export interface RetainedBrokerDiscovery {
 	close(): void;
 }
 
+/**
+ * Objects retained broker publication authority opens, in the order the native
+ * layer opens them. Every one is opened no-follow, so a symlink, a wrong file
+ * kind, or a missing entry withholds authority.
+ */
+const BROKER_PUBLICATION_OBJECTS = [
+	{ relative: "sdk", directory: true },
+	{ relative: path.join("sdk", "broker.lock"), directory: true },
+	{ relative: path.join("sdk", "broker.lock", "owner.json"), directory: false },
+	{ relative: path.join("sdk", "broker.json"), directory: false },
+] as const;
+
+/** Width the native layer requires of the published `heartbeatAt` field. */
+const FIXED_WIDTH_HEARTBEAT_DIGITS = 13;
+
+/**
+ * Name the first condition that withholds retained publication authority.
+ *
+ * The native layer reports withheld authority as one opaque failure, so a
+ * broker that cannot retain its own publication dies without naming the object
+ * responsible. Operators then cannot distinguish a missing lock record from a
+ * redirected `sdk` directory (a symlinked agent-directory entry is refused by
+ * the no-follow open, which is how shared multi-account layouts fail), and the
+ * only way to learn the precondition is to read the native source.
+ *
+ * This inspects the same objects in the same order and returns a description of
+ * the first obstruction, or `undefined` when every precondition holds and the
+ * refusal came from a race the caller must still fail closed on.
+ */
+function describeWithheldPublicationAuthority(agentDir: string): string | undefined {
+	for (const object of BROKER_PUBLICATION_OBJECTS) {
+		const pathname = path.join(agentDir, object.relative);
+		let named: fsSync.Stats;
+		try {
+			named = fsSync.lstatSync(pathname);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			return code === "ENOENT"
+				? `${object.relative} is missing`
+				: `${object.relative} could not be inspected (${code ?? "unknown error"})`;
+		}
+		if (named.isSymbolicLink())
+			return `${object.relative} is a symlink; every publication object is opened no-follow`;
+		if (object.directory && !named.isDirectory()) return `${object.relative} is not a directory`;
+		if (!object.directory && !named.isFile()) return `${object.relative} is not a regular file`;
+	}
+	// The published record is the last precondition: the native layer edits the
+	// heartbeat in place and therefore requires a fixed-width field.
+	const discoveryFile = path.join(agentDir, "sdk", "broker.json");
+	let published: string;
+	try {
+		published = fsSync.readFileSync(discoveryFile, "utf8");
+	} catch (error) {
+		return `sdk/broker.json could not be read (${(error as NodeJS.ErrnoException).code ?? "unknown error"})`;
+	}
+	const needle = '"heartbeatAt":';
+	const at = published.indexOf(needle);
+	if (at < 0) return "sdk/broker.json has no heartbeatAt field";
+	const digits = published.slice(at + needle.length, at + needle.length + FIXED_WIDTH_HEARTBEAT_DIGITS);
+	const next = published.charAt(at + needle.length + FIXED_WIDTH_HEARTBEAT_DIGITS);
+	if (!/^[0-9]{13}$/.test(digits) || /^[0-9]$/.test(next))
+		return `sdk/broker.json heartbeatAt is not a fixed-width ${FIXED_WIDTH_HEARTBEAT_DIGITS}-digit timestamp`;
+	return undefined;
+}
+
 function requireRetainedBrokerPublication(agentDir: string): NativeRetainedBrokerPublication {
 	const retainBrokerPublication = nativeBrokerDiscovery().retainBrokerPublication;
 	if (typeof retainBrokerPublication !== "function") {
 		throw new Error("Loaded native bindings do not expose retained broker publication authority.");
 	}
-	return retainBrokerPublication(agentDir);
+	try {
+		return retainBrokerPublication(agentDir);
+	} catch (error) {
+		// Fail closed exactly as before; only name the condition on the way out.
+		const obstruction = describeWithheldPublicationAuthority(agentDir);
+		if (!obstruction) throw error;
+		throw new Error(`${error instanceof Error ? error.message : String(error)} (${agentDir}: ${obstruction})`, {
+			cause: error,
+		});
+	}
 }
 
 async function rollbackPublishedBrokerDiscovery(agentDir: string, discovery: BrokerDiscovery): Promise<void> {

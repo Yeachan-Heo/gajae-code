@@ -687,6 +687,94 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("names the redirected publication object when authority is withheld", async () => {
+		// A shared multi-account layout that symlinks the agent directory's `sdk`
+		// entry is refused by the no-follow open, and the native layer reports only
+		// one opaque failure. The broker must still fail closed, but the operator
+		// needs the responsible object named.
+		const host = await temp();
+		const dir = await temp();
+		try {
+			await fs.mkdir(path.join(host, "sdk"), { recursive: true, mode: 0o700 });
+			await fs.symlink(path.join(host, "sdk"), path.join(dir, "sdk"));
+			await expect(
+				publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "test",
+					ownerId: "redirected-owner",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "redirected-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}),
+			).rejects.toThrow(/sdk is a symlink/);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+			await fs.rm(host, { recursive: true, force: true });
+		}
+	});
+	it("names a missing publication object when authority is withheld", async () => {
+		// Exercises the real native refusal (no mock) for an object other than the
+		// redirected-directory case, so the naming path is pinned end to end.
+		const dir = await temp();
+		try {
+			await fs.mkdir(path.join(dir, "sdk", "broker.lock"), { recursive: true, mode: 0o700 });
+			await expect(
+				publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "test",
+					ownerId: "recordless-owner",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "recordless-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}),
+			).rejects.toThrow(/owner\.json is missing/);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("leaves a withheld-authority failure unexplained when every precondition holds", async () => {
+		// Naming a condition must never invent one: with all four publication
+		// objects intact the native message is surfaced verbatim.
+		const dir = await temp();
+		const lock = path.join(dir, "sdk", "broker.lock");
+		await fs.mkdir(lock, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(lock, "owner.json"), JSON.stringify({ version: 1, pid: process.pid }), {
+			mode: 0o600,
+		});
+		const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+			throw new Error("retain failed");
+		});
+		try {
+			await expect(
+				publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "test",
+					ownerId: "intact-owner",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "intact-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}),
+			).rejects.toThrow(/^retain failed$/);
+		} finally {
+			retain.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("fences failed heartbeats until a later retained heartbeat succeeds", async () => {
 		const dir = await temp();
 		let watchdog: (() => void) | undefined;
