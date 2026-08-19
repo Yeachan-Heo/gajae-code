@@ -9,7 +9,10 @@ const KIMI_CODE_FIRST_EVENT_TIMEOUT_MS = 300_000;
 const ANTHROPIC_STREAM_IDLE_TIMEOUT_MS = 300_000;
 
 export function getProviderStreamIdleTimeoutFallbackMs(provider: string): number | undefined {
-	return provider === "anthropic" ? ANTHROPIC_STREAM_IDLE_TIMEOUT_MS : undefined;
+	if (provider === "anthropic" || provider === "xai" || provider === "grok-build") {
+		return ANTHROPIC_STREAM_IDLE_TIMEOUT_MS;
+	}
+	return undefined;
 }
 
 export function getProviderFirstEventTimeoutFallbackMs(provider: string): number | undefined {
@@ -46,11 +49,12 @@ export function getStreamIdleTimeoutMs(fallbackMs: number = DEFAULT_STREAM_IDLE_
  * Returns the idle timeout used for OpenAI-family streaming transports.
  *
  * Honors `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS` first (`PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` is the legacy alias). Set `=0` to disable.
+ * When `provider` is given, long-reasoning hosts (xAI Grok and Grok Build) use that floor instead of the 120s default.
  */
-export function getOpenAIStreamIdleTimeoutMs(): number | undefined {
+export function getOpenAIStreamIdleTimeoutMs(provider?: string): number | undefined {
 	return normalizeIdleTimeoutMs(
 		$env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_STREAM_IDLE_TIMEOUT_MS,
-		DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+		getProviderStreamIdleTimeoutFallbackMs(provider ?? "") ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
 	);
 }
 
@@ -95,7 +99,10 @@ export function resolveOpenAISdkRequestTimeoutMs(
 	streamFirstEventTimeoutOverride?: number,
 ): number | undefined {
 	const providerFirstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(provider);
-	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(getOpenAIStreamIdleTimeoutMs(), providerFirstEventFallbackMs);
+	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(
+		getOpenAIStreamIdleTimeoutMs(provider),
+		providerFirstEventFallbackMs,
+	);
 	if (streamFirstEventTimeoutOverride === 0) return undefined;
 	if (streamFirstEventTimeoutOverride !== undefined) {
 		return providerFirstEventFallbackMs !== undefined

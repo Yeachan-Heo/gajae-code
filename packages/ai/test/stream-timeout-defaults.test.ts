@@ -50,8 +50,14 @@ describe("getProviderStreamIdleTimeoutFallbackMs(provider)", () => {
 		expect(getProviderStreamIdleTimeoutFallbackMs("anthropic")).toBe(300_000);
 	});
 
+	it("gives xAI Grok and Grok Build the same 300-second idle window as Anthropic", () => {
+		expect(getProviderStreamIdleTimeoutFallbackMs("xai")).toBe(300_000);
+		expect(getProviderStreamIdleTimeoutFallbackMs("grok-build")).toBe(300_000);
+	});
+
 	it("does not widen unrelated providers", () => {
 		expect(getProviderStreamIdleTimeoutFallbackMs("kimi-code")).toBeUndefined();
+		expect(getProviderStreamIdleTimeoutFallbackMs("openai")).toBeUndefined();
 	});
 });
 describe("getProviderFirstEventTimeoutFallbackMs(provider)", () => {
@@ -104,6 +110,12 @@ describe("getOpenAIStreamIdleTimeoutMs()", () => {
 		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "88";
 		Bun.env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS = "42";
 		expect(getOpenAIStreamIdleTimeoutMs()).toBe(88);
+	});
+	it("widens the default idle window for xAI and Grok Build without an env override", () => {
+		expect(getOpenAIStreamIdleTimeoutMs("xai")).toBe(300_000);
+		expect(getOpenAIStreamIdleTimeoutMs("grok-build")).toBe(300_000);
+		expect(getOpenAIStreamIdleTimeoutMs("openai")).toBe(120_000);
+		expect(getOpenAIStreamIdleTimeoutMs()).toBe(120_000);
 	});
 
 	it("falls back to the legacy PI_OPENAI_STREAM_IDLE_TIMEOUT_MS alias", () => {

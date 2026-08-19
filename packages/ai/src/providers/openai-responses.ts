@@ -389,7 +389,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 			const premiumRequestsTotal = copilotPremiumRequests;
 			const providerSessionState = getOpenAIResponsesProviderSessionState(model, options?.providerSessionState);
 			const { params } = buildParams(model, context, options, providerSessionState, cacheRetention, baseUrl);
-			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
+			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs(model.provider);
 			options?.onPayload?.(params, undefined, options?.attemptScope);
 			rawRequestDump = {
 				provider: model.provider,
