@@ -299,6 +299,13 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/notifications-telegram-topic-lease-renewal.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/notifications-threaded-inbound.test.ts"
 			]
 		},
