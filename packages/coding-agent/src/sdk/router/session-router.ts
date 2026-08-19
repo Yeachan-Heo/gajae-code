@@ -301,6 +301,7 @@ export class SessionRouter {
 	#scanTail: Promise<void> = Promise.resolve();
 	#ready = false;
 	#started = false;
+	#runEpoch = 0;
 
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
@@ -318,31 +319,53 @@ export class SessionRouter {
 		return this.#ready;
 	}
 
+	#running(runEpoch: number): boolean {
+		return this.#started && runEpoch === this.#runEpoch;
+	}
+
+	async #scanSerialized(): Promise<void> {
+		if (!this.#started) return;
+		const task = this.#scanTail.catch(() => undefined).then(() => this.#scan());
+		this.#scanTail = task;
+		await task;
+	}
+
+	async #joinAttachmentTails(): Promise<void> {
+		await Promise.all([...this.#sessions.values()].map(attached => attached.frameTail.catch(() => undefined)));
+	}
+
 	/** Attaches the currently indexed live sessions and keeps watching for changes. */
 	async start(): Promise<void> {
 		if (this.#started) return;
 		this.#started = true;
+		const runEpoch = ++this.#runEpoch;
 		try {
-			await this.reconcile();
-			if (!this.#started) return;
+			await this.#scanSerialized();
+			if (!this.#running(runEpoch)) return;
+			await this.#joinAttachmentTails();
+			if (!this.#running(runEpoch)) return;
 			const timer = (this.#deps.setInterval ?? setInterval)(() => {
-				void this.reconcile().catch(error =>
+				void this.#scanSerialized().catch(error =>
 					logger.warn(`SDK session scan failed: ${error instanceof Error ? error.message : String(error)}`),
 				);
 			}, 2_000);
 			this.#stopTimer = () => (this.#deps.clearInterval ?? clearInterval)(timer);
 		} catch (error) {
-			if (this.#started) await this.stop();
+			if (this.#running(runEpoch)) await this.stop();
 			throw error;
 		}
 	}
 
-	/** Re-scans the session index once, attaching new live sessions and retiring gone ones. */
+	/**
+	 * Re-scans the session index once, attaching new live sessions and retiring gone ones.
+	 * Explicit callers still join each attachment's replay tail after the scan; the
+	 * periodic timer uses `#scanSerialized` only so a wedged `event_replay` cannot
+	 * freeze fleet convergence (#4527).
+	 */
 	async reconcile(): Promise<void> {
 		if (!this.#started) return;
-		const task = this.#scanTail.catch(() => undefined).then(() => this.#scan());
-		this.#scanTail = task;
-		await task;
+		await this.#scanSerialized();
+		await this.#joinAttachmentTails();
 	}
 
 	/** Ingests a credential-bearing Broker lifecycle result directly into Router custody. */
@@ -350,6 +373,7 @@ export class SessionRouter {
 		value: unknown,
 		fallback: { sessionId: string; cwd: string },
 	): Promise<SessionAttachment> {
+		if (!this.#started) throw new SessionRouterError("pre_send", "SDK session router is stopped.");
 		const outer =
 			value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 		const result =
@@ -399,6 +423,7 @@ export class SessionRouter {
 	async stop(): Promise<void> {
 		if (this.#stopTimer) this.#stopTimer();
 		this.#stopTimer = undefined;
+		this.#runEpoch++;
 		this.#started = false;
 		this.#ready = false;
 		const attached = [...this.#sessions.values()];
@@ -454,6 +479,13 @@ export class SessionRouter {
 		expectedAttachment?: SessionAttachment,
 		options?: { timeoutMs?: number },
 	): Promise<Record<string, unknown>> {
+		const publishing = this.#sessions.get(sessionId);
+		const callerPinnedCurrent =
+			!!publishing &&
+			!publishing.disposed &&
+			((expectedGeneration !== undefined && expectedGeneration === publishing.generation) ||
+				(expectedAttachment !== undefined && expectedAttachment === publishing.capability));
+		if (!callerPinnedCurrent) await this.#scanSerialized();
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || attached.disposed)
 			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not attached.");
@@ -488,7 +520,12 @@ export class SessionRouter {
 	/** Activates a prepared session through one Router-owned, one-shot SDK client. */
 	async activatePreparedSession(sessionId: string): Promise<ActivatedPreparedSession> {
 		const indexed = await this.#indexedLiveSession(sessionId);
-		if (!indexed)
+		if (
+			!indexed ||
+			indexed.pid === undefined ||
+			indexed.endpointMtimeMs === undefined ||
+			!Number.isFinite(indexed.endpointMtimeMs)
+		)
 			throw new SessionActivationError(
 				"session_not_live",
 				"Session activation requires an exact live session endpoint.",
@@ -506,8 +543,8 @@ export class SessionRouter {
 				? this.#deps.createClient({
 						sessionId: indexed.sessionId,
 						generation: indexed.endpointGeneration,
-						pid: indexed.pid ?? 0,
-						endpointMtimeMs: indexed.endpointMtimeMs ?? 0,
+						pid: indexed.pid,
+						endpointMtimeMs: indexed.endpointMtimeMs,
 					})
 				: connectPreparedSession(endpoint));
 		} catch {
@@ -584,23 +621,43 @@ export class SessionRouter {
 					? "chat"
 					: undefined;
 		if (!scope) return null;
+		if (indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
 		const endpoint = await readSdkSessionEndpoint(repo, indexed.sessionId, scope).catch(() => null);
 		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
 		// A discovery record rewritten after broker registration is not the indexed
-		// authority: the file's mtime must match the indexed endpoint mtime exactly.
-		if (indexed.endpointMtimeMs !== undefined) {
-			const stat = await fs.stat(endpoint.path).catch(() => undefined);
-			if (!stat || stat.mtimeMs !== indexed.endpointMtimeMs) return null;
+		// authority: the file's mtime must match the indexed endpoint mtime exactly,
+		// including a post-read re-stat so a rewrite during the first stat is refused.
+		const endpointStat = await fs.stat(endpoint.path).catch(() => undefined);
+		if (!endpointStat || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return null;
+		let raw: Record<string, unknown>;
+		try {
+			const parsed = JSON.parse(await Bun.file(endpoint.path).text());
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+			raw = parsed as Record<string, unknown>;
+		} catch {
+			return null;
 		}
+		if (
+			raw.sessionId !== indexed.sessionId ||
+			raw.pid !== indexed.pid ||
+			raw.stale === true ||
+			raw.url !== endpoint.url ||
+			raw.token !== endpoint.token
+		)
+			return null;
+		const endpointStatAfterRead = await fs.stat(endpoint.path).catch(() => undefined);
+		if (!endpointStatAfterRead || endpointStatAfterRead.mtimeMs !== indexed.endpointMtimeMs) return null;
 		return endpoint;
 	}
 
 	async #scan(): Promise<void> {
-		if (!this.#started) return;
+		const runEpoch = this.#runEpoch;
+		if (!this.#running(runEpoch)) return;
 		let live: IndexedSession[] = [];
 		try {
 			await this.#index.open();
 			await this.#index.refresh();
+			if (!this.#running(runEpoch)) return;
 			const listing = this.#index.listSessions();
 			if (listing.warnings.length === 0)
 				live = listing.sessions.filter(
@@ -610,9 +667,10 @@ export class SessionRouter {
 			this.#ready = false;
 			throw error;
 		}
+		if (!this.#running(runEpoch)) return;
 		const liveIds = new Set(live.map(session => session.sessionId));
 		for (const session of live) {
-			if (!this.#started) return;
+			if (!this.#running(runEpoch)) return;
 			const existing = this.#sessions.get(session.sessionId);
 			if (
 				existing &&
@@ -634,7 +692,7 @@ export class SessionRouter {
 			if (existing && !existing.disposed) await this.#retire(existing, "replaced");
 			if (session.endpointMtimeMs === undefined || session.pid === undefined) continue;
 			const endpoint = await this.#readEndpoint(session);
-			if (!endpoint) continue;
+			if (!this.#running(runEpoch) || !endpoint) continue;
 			try {
 				await this.#attachDirect({
 					sessionId: session.sessionId,
@@ -656,6 +714,7 @@ export class SessionRouter {
 			if (liveIds.has(sessionId) || attached.disposed || attached.source === "adopted") continue;
 			await this.#retire(attached, "removed");
 		}
+		if (!this.#running(runEpoch)) return;
 		this.#ready = true;
 		this.#deps.onReconciled?.();
 	}
@@ -668,9 +727,15 @@ export class SessionRouter {
 		endpoint: SdkSessionEndpoint;
 		source: "index" | "adopted";
 	}): Promise<SessionAttachment> {
+		const runEpoch = this.#runEpoch;
+		if (!this.#running(runEpoch)) throw new SessionRouterError("pre_send", "SDK session router is stopped.");
 		const existing = this.#sessions.get(input.sessionId);
 		if (existing && !existing.disposed) await this.#retire(existing, "replaced");
 		const client = await this.#createClient(input);
+		if (!this.#running(runEpoch)) {
+			await client.close().catch(() => undefined);
+			throw new SessionRouterError("pre_send", "SDK session router is stopped.");
+		}
 		let attached: AttachedSession | undefined;
 		const capability: SessionAttachment = Object.freeze({
 			authorityId: sessionAttachmentAuthorityId({
@@ -744,6 +809,16 @@ export class SessionRouter {
 				.catch(() => undefined)
 				.then(async () => {
 					if (current.disposed || this.#sessions.get(input.sessionId) !== current) return;
+					await Promise.resolve()
+						.then(() => this.#deps.onNotificationSubscriptionReady?.(current.notificationSubscription))
+						.catch(error => {
+							this.#detachNotification(current, "cancelled");
+							logger.warn(
+								`SDK notification subscription reconnect hook failed locally: ${
+									error instanceof Error ? error.message : String(error)
+								}`,
+							);
+						});
 					try {
 						await this.#deps.onAttachmentReady?.(capability);
 					} catch (error) {
@@ -810,14 +885,12 @@ export class SessionRouter {
 			void Promise.resolve(this.#deps.onSessionRemoved?.(capability, "removed")).catch(() => undefined);
 			throw error;
 		}
-		// The initial event replay is serialized on the attachment's frame tail, so
-		// any live frame emitted after the handler registration lands behind it.
-		// Attachment publication awaits its completion: daemons reconstruct their
-		// session state from these events and must observe a settled replay before
-		// `start()` returns. There is deliberately no barrier/fencing machinery —
-		// a replay failure is logged and live delivery continues (issue #4530).
+		// Initial event_replay is serialized on the attachment's own frame tail so
+		// live frames land behind it. Publication does not await that tail: start()
+		// still joins it for bootstrap callers, while periodic scan/request stay
+		// off the wedged-replay path (#4527).
 		attached.frameTail = attached.frameTail.then(() => this.#replayAttached(attached));
-		await attached.frameTail.catch(() => undefined);
+		void attached.frameTail;
 		return capability;
 	}
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
@@ -582,6 +583,30 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.stop();
 		}
 	});
+	test("reruns Telegram notification-ready handshake before replay after reconnect", async () => {
+		let readyCount = 0;
+		const fixture = await routerFixture({
+			onNotificationSubscriptionReady: async subscription => {
+				readyCount++;
+				subscription.send({ type: "hello", readyCount });
+				subscription.send({ type: "event_replay", id: `telegram-replay-${readyCount}` });
+			},
+		});
+		try {
+			expect(readyCount).toBe(1);
+			fixture.clients[0]?.reconnect();
+			for (let attempt = 0; readyCount < 2 && attempt < 50; attempt++) await Bun.sleep(10);
+			expect(readyCount).toBe(2);
+			expect(fixture.clients[0]?.sent.map(frame => frame.type)).toEqual([
+				"hello",
+				"event_replay",
+				"hello",
+				"event_replay",
+			]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
 
 	test("publishes an attachment whose indexed repo is a symlinked spelling of the state root", async () => {
 		// Production shape after reconcileReadyScope: locator.repo carries the
@@ -862,5 +887,140 @@ describe("SessionRouter direct-attachment stub contract (#4530)", () => {
 		expect(closed).toBe(1);
 		expect(removed).toEqual(["removed"]);
 		expect(fixture.router.notificationCleanupReceipts().length).toBeGreaterThan(0);
+	});
+
+	test("rejects an endpoint rewritten after its indexed stat", async () => {
+		const fixture = await routerFixture({ start: false });
+		const realStat = fsPromises.stat;
+		let rewritten = false;
+		const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (file, options) => {
+			const stat = await realStat(file, options);
+			if (!rewritten && file === fixture.endpointFile) {
+				rewritten = true;
+				fs.writeFileSync(
+					fixture.endpointFile,
+					JSON.stringify({
+						sessionId: fixture.sessionId,
+						url: "ws://router.test",
+						token: "replacement",
+						pid: 42,
+					}),
+				);
+			}
+			return stat;
+		}) as typeof fsPromises.stat);
+		try {
+			await fixture.router.start();
+			expect(rewritten).toBe(true);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			expect(fixture.clients).toEqual([]);
+		} finally {
+			statSpy.mockRestore();
+			await fixture.router.stop();
+		}
+	});
+
+	test("periodic reconcile converges while a rehosted attachment's replay is wedged (#4527)", async () => {
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4527-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "wedge";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://wedge.test", token: "v1", pid: 42 }));
+		let generation = 1;
+		let wedgeReplay = false;
+		const wedgedGate = Promise.withResolvers<void>();
+		let reconcileCount = 0;
+		let tick: (() => void) | undefined;
+
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			listSessions: () => ({
+				indexSeq: generation,
+				sessions: [
+					{
+						sessionId,
+						locator: { repo, stateRoot },
+						endpointGeneration: generation,
+						pid: 42,
+						endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+						live: true,
+						indexSeq: generation,
+						ambiguous: false,
+						terminal: false,
+					},
+				],
+				warnings: [],
+			}),
+		} as unknown as SessionIndex;
+
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async () => ({
+					onFrame: () => () => {},
+					request: async (frame: Record<string, unknown>) => {
+						if (wedgeReplay && frame.type === "event_replay") await wedgedGate.promise;
+						return { events: [] };
+					},
+					close: async () => {},
+					send: () => {},
+				}),
+				onReconciled: () => {
+					reconcileCount++;
+				},
+				setInterval: ((callback: () => void) => {
+					tick = callback;
+					return 0;
+				}) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+
+		try {
+			await router.start();
+			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
+			const baseline = reconcileCount;
+
+			generation = 2;
+			await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://wedge.test", token: "v2", pid: 42 }));
+			wedgeReplay = true;
+
+			const requestSettled = await Promise.race([
+				Bun.sleep(500).then(() => false),
+				router.request(sessionId, { type: "test" }).then(() => true),
+			]);
+			expect(requestSettled).toBe(true);
+			expect(reconcileCount).toBeGreaterThan(baseline);
+
+			const beforeSecond = reconcileCount;
+			tick!();
+			const secondSettled = await Promise.race([
+				Bun.sleep(500).then(() => false),
+				(async () => {
+					for (let i = 0; i < 500 && reconcileCount <= beforeSecond; i++) await Bun.sleep(1);
+					return reconcileCount > beforeSecond;
+				})(),
+			]);
+			expect(secondSettled).toBe(true);
+
+			let explicitSettled = false;
+			const explicitReconcile = router.reconcile().then(() => {
+				explicitSettled = true;
+			});
+			await Bun.sleep(10);
+			expect(explicitSettled).toBe(false);
+			wedgedGate.resolve();
+			await explicitReconcile;
+			expect(explicitSettled).toBe(true);
+		} finally {
+			wedgedGate.resolve();
+			await router.stop();
+		}
 	});
 });
