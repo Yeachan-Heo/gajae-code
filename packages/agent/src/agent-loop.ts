@@ -3348,6 +3348,7 @@ async function executeToolCalls(
 	const tools = currentContext.tools;
 	const {
 		getSteeringMessages,
+		waitForSteeringMessage,
 		interruptMode = "immediate",
 		getToolContext,
 		transformToolCallArguments,
@@ -3818,24 +3819,35 @@ async function executeToolCalls(
 	}
 
 	const allTasks = Promise.allSettled(tasks);
-	if (!signal) {
-		await allTasks;
-	} else {
-		const abortPromise = Promise.withResolvers<boolean>();
-		const onAbort = () => abortPromise.resolve(true);
-		signal.addEventListener("abort", onAbort, { once: true });
-		try {
-			const aborted = signal.aborted || (await Promise.race([allTasks.then(() => false), abortPromise.promise]));
-			if (aborted) {
-				for (const record of records) {
-					if (record.toolResultMessage) continue;
-					record.skipped = true;
-					emitToolResult(record, createAbortedToolExecutionResult(), true);
+	const steeringWaitAbort = new AbortController();
+	const steeringWaitSignal = signal ? AbortSignal.any([signal, steeringWaitAbort.signal]) : steeringWaitAbort.signal;
+	const steeringWait =
+		shouldInterruptImmediately && waitForSteeringMessage
+			? waitForSteeringMessage(steeringWaitSignal).then(checkSteering)
+			: undefined;
+	try {
+		if (!signal) {
+			await allTasks;
+		} else {
+			const abortPromise = Promise.withResolvers<boolean>();
+			const onAbort = () => abortPromise.resolve(true);
+			signal.addEventListener("abort", onAbort, { once: true });
+			try {
+				const aborted = signal.aborted || (await Promise.race([allTasks.then(() => false), abortPromise.promise]));
+				if (aborted) {
+					for (const record of records) {
+						if (record.toolResultMessage) continue;
+						record.skipped = true;
+						emitToolResult(record, createAbortedToolExecutionResult(), true);
+					}
 				}
+			} finally {
+				signal.removeEventListener("abort", onAbort);
 			}
-		} finally {
-			signal.removeEventListener("abort", onAbort);
 		}
+	} finally {
+		steeringWaitAbort.abort();
+		await steeringWait;
 	}
 
 	for (const record of records) {

@@ -317,11 +317,21 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
-	 * Called after each tool execution to check for user interruptions unless interruptMode is "wait".
+	 * Called when steering arrives and after each tool execution to check for user
+	 * interruptions unless interruptMode is "wait".
 	 * If messages are returned, remaining tool calls are skipped and
 	 * these messages are added to the context before the next LLM call.
 	 */
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
+
+	/**
+	 * Resolves when a steering message is queued for the active run.
+	 *
+	 * Tool execution uses this notification in immediate interrupt mode so a
+	 * signal-aware long-running tool can unwind without waiting for another tool
+	 * in the batch to finish first.
+	 */
+	waitForSteeringMessage?: (signal: AbortSignal) => Promise<void>;
 
 	/**
 	 * Returns steering messages that were dequeued for this run but cannot be

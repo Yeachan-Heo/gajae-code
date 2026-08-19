@@ -162,7 +162,7 @@ export interface AgentOptions {
 
 	/**
 	 * When to interrupt tool execution for steering messages.
-	 * - "immediate": check after each tool call (default)
+	 * - "immediate": interrupt signal-aware in-flight tools when steering arrives (default)
 	 * - "wait": defer steering until the current turn completes
 	 */
 	interruptMode?: "immediate" | "wait";
@@ -369,6 +369,7 @@ export class Agent {
 		scope?: AttemptScope,
 	) => Promise<AgentMessage[]>;
 	#steeringQueue: AgentMessage[] = [];
+	#steeringWaiters = new Set<() => void>();
 	#followUpQueue: AgentMessage[] = [];
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
 	#steeringMode: "all" | "one-at-a-time";
@@ -1046,11 +1047,32 @@ export class Agent {
 
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
-	 * Delivered after current tool execution, skips remaining tools.
+	 * In immediate mode, signal-aware in-flight tools are interrupted and remaining
+	 * tools are skipped. Wait mode delivers the message after the current turn.
 	 */
 	steer(m: AgentMessage) {
 		assertUserImagePlaceholdersHavePayload([m]);
 		this.#steeringQueue.push(m);
+		for (const notify of [...this.#steeringWaiters]) notify();
+	}
+
+	#waitForSteeringMessage(runId: number | ManagedLogicalRunId, signal: AbortSignal): Promise<void> {
+		if (this.#activeRunId !== runId || this.#steeringQueue.length > 0 || signal.aborted) {
+			return Promise.resolve();
+		}
+		const { promise, resolve } = Promise.withResolvers<void>();
+		let settled = false;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			this.#steeringWaiters.delete(settle);
+			signal.removeEventListener("abort", settle);
+			resolve();
+		};
+		this.#steeringWaiters.add(settle);
+		signal.addEventListener("abort", settle, { once: true });
+		if (this.#activeRunId !== runId || this.#steeringQueue.length > 0 || signal.aborted) settle();
+		return promise;
 	}
 
 	/**
@@ -1793,6 +1815,7 @@ export class Agent {
 				}
 				return queued;
 			},
+			waitForSteeringMessage: signal => this.#waitForSteeringMessage(runId, signal),
 			requeueSteeringMessages: (messages: AgentMessage[]) => {
 				if (messages.length === 0) return;
 				this.#steeringQueue = [...messages, ...this.#steeringQueue];

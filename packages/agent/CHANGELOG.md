@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Immediate steering now interrupts a signal-aware tool while it is still running instead of waiting for that tool to return before checking the steering queue. Long observation tools such as `subagent await` no longer hold a busy user message until their full wait window expires; `interruptMode: "wait"` remains unchanged.
 - The escaped-non-ASCII argument guard keeps its fail-closed terminal rejection and its unconditional two-resample budget for every tool and every field. After the budget is spent, a tool that enumerated its user-facing display fields (`displaySafeEscapedArgFields`; `ask` exempts only `questions.question` and `questions.options.label`) executes when every non-ASCII character lives inside those fields and is benign typographic punctuation (curated set: U+2014 em-dash). Escaped non-ASCII anywhere else — ids, deep-interview metadata, persisted records, non-ASCII object keys — and every other tool stays rejected terminally (#4627, reduced per both maintainer reviews: guard retained, exemption after budget and field-scoped).
 
 ## [0.14.1] - 2026-08-18

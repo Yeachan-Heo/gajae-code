@@ -112,6 +112,86 @@ describe("AgentSession steer-on-interrupt", () => {
 		).toBe(true);
 	});
 
+	it("interrupts only an await-like tool when a busy user steer arrives", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const awaitStarted = Promise.withResolvers<void>();
+		const releaseAwait = Promise.withResolvers<void>();
+		let awaitInterrupted = false;
+		const awaitLikeTool = {
+			name: "await_like",
+			description: "Waits until its observation window completes or the parent turn is interrupted.",
+			parameters: { type: "object" as const, properties: {} },
+			execute: async (_toolCallId: string, _params: unknown, signal?: AbortSignal) => {
+				awaitStarted.resolve();
+				const onAbort = () => {
+					awaitInterrupted = true;
+					releaseAwait.resolve();
+				};
+				if (signal?.aborted) onAbort();
+				else signal?.addEventListener("abort", onAbort, { once: true });
+				await releaseAwait.promise;
+				signal?.removeEventListener("abort", onAbort);
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: awaitInterrupted ? "Parent wait interrupted; child continues." : "Await completed.",
+						},
+					],
+				};
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", name: "await_like", arguments: {} }] },
+				{ content: ["handled busy user steer"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [awaitLikeTool as never],
+				messages: [],
+			},
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const running = session.prompt("wait for the child");
+		await awaitStarted.promise;
+		await session.prompt("new user question", { streamingBehavior: "steer" });
+		await new Promise<void>(resolve => setImmediate(resolve));
+		const interruptedBeforeManualRelease = awaitInterrupted;
+		releaseAwait.resolve();
+		await running;
+		await session.waitForIdle();
+
+		expect({
+			awaitInterrupted,
+			interruptedBeforeManualRelease,
+			assistantCount: assistantCount(session),
+			hasQueuedSteering: session.agent.hasQueuedSteering(),
+			hasUserMessage: session.agent.state.messages.some(
+				m => m.role === "user" && JSON.stringify(m.content).includes("new user question"),
+			),
+			stopReasons: session.agent.state.messages
+				.filter(m => m.role === "assistant")
+				.map(m => (m as { stopReason?: string }).stopReason),
+		}).toEqual({
+			awaitInterrupted: true,
+			interruptedBeforeManualRelease: true,
+			assistantCount: 2,
+			hasQueuedSteering: false,
+			hasUserMessage: true,
+			stopReasons: ["toolUse", "stop"],
+		});
+	});
+
 	// Execution-drain path: the steer is queued while two shared tools run. Tool A
 	// completing lets the tool-execution steering check consume the steer
 	// (steeringMessagesFromExecution) and interrupt the remaining tools; tool B's
