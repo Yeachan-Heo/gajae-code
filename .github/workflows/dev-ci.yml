@@ -94,9 +94,8 @@ jobs:
             if (Bun.env.PR_BASE_REF !== "dev") throw new Error(`PR base must be dev, not ${Bun.env.PR_BASE_REF}.`);
             const [verdict, declaredDigest, , reviewerId] = match.slice(1);
             if (verdict !== "merge-approved") throw new Error(`Verdict ${verdict} intentionally blocks merge.`);
-            if (verdict !== "merge-approved") throw new Error(`Verdict ${verdict} intentionally blocks merge.`);
             // Maintainer self-review (issue #4703): a signed gajae.pr-self-review.v1 PR comment
-            // bound to the exact base/head/digest authorizes merge for the author's own PR
+            // bound to the exact base/head/digest authorizes merge for the author of the PR
             // under the risk-classified policy; otherwise the author cannot self-approve.
             let selfReviewOk = false;
             if (reviewerId.toLowerCase() === (Bun.env.PR_AUTHOR ?? "").toLowerCase()) {
