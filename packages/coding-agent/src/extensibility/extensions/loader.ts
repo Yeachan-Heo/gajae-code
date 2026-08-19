@@ -165,6 +165,11 @@ export class ExtensionActivationScope {
 	}> = [];
 	#closed = false;
 
+	/** True while staged writes may still be added or committed. */
+	get open(): boolean {
+		return !this.#closed;
+	}
+
 	constructor(runtime: IExtensionRuntime) {
 		this.#runtime = runtime;
 	}
@@ -203,16 +208,10 @@ export class ExtensionActivationScope {
  * Registration methods write to the extension object.
  * Action methods delegate to the shared runtime.
  */
-class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
+class ConcreteExtensionAPI implements ExtensionAPI {
 	readonly logger = logger;
 	readonly typebox = TypeBox;
 	readonly zod = Zod;
-	readonly flagValues = new Map<string, boolean | string>();
-	readonly pendingProviderRegistrations: Array<{
-		name: string;
-		config: import("./types").ProviderConfig;
-		sourceId: string;
-	}> = [];
 
 	constructor(
 		public readonly pi: typeof import("@gajae-code/coding-agent"),
@@ -280,6 +279,13 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	getFlag(name: string): boolean | string | undefined {
 		if (!this.extension.flags.has(name)) return undefined;
+		if (!this.activation.open) {
+			// Post-commit: the shared runtime is authoritative, so runtime-side
+			// writes (CLI flag overrides, later extensions) stay observable.
+			return this.runtime.flagValues.get(name);
+		}
+		// Activation in flight: prefer this factory's staged default so the
+		// extension reads back what it just registered.
 		return this.activation.flagValues.get(name) ?? this.runtime.flagValues.get(name);
 	}
 

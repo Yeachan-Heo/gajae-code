@@ -281,4 +281,49 @@ describe("issue #4718: loader activation transaction", () => {
 		expect(result.runtime.flagValues.size).toBe(0);
 		expect(result.runtime.pendingProviderRegistrations).toHaveLength(0);
 	});
+
+	test("a retained pi observes post-commit runtime flag overrides (CLI setFlagValue parity)", async () => {
+		const runtime = {
+			flagValues: new Map<string, boolean | string>(),
+			pendingProviderRegistrations: [] as { name: string; config: unknown; sourceId: string }[],
+		} as never;
+
+		let retainedGetFlag: ((name: string) => boolean | string | undefined) | undefined;
+		await loadExtensionFromFactory(
+			pi => {
+				pi.registerFlag("--post-commit", { type: "string", default: "default-value" });
+				retainedGetFlag = (name: string) => pi.getFlag(name);
+			},
+			tmp,
+			new EventBus(),
+			runtime,
+			"<retained>",
+		);
+
+		// After commit the shared runtime is authoritative.
+		expect(retainedGetFlag?.("--post-commit")).toBe("default-value");
+
+		// Runtime-side override after commit — e.g. applyExtensionFlagValues /
+		// runner.setFlagValue from parsed CLI args.
+		(runtime as { flagValues: Map<string, string> }).flagValues.set("--post-commit", "cli-override");
+		expect(retainedGetFlag?.("--post-commit")).toBe("cli-override");
+
+		// A later extension's committed default for the same name is also visible
+		// to the earlier extension's retained pi (last-write-wins, base parity).
+		await loadExtensionFromFactory(
+			pi => {
+				pi.registerFlag("--post-commit", { type: "string", default: "second-default" });
+			},
+			tmp,
+			new EventBus(),
+			runtime,
+			"<second>",
+		);
+		expect(retainedGetFlag?.("--post-commit")).toBe("second-default");
+
+		// With no committed value at all, the retained pi reports undefined —
+		// the closed scope's staged default is not resurrected.
+		(runtime as { flagValues: Map<string, string> }).flagValues.delete("--post-commit");
+		expect(retainedGetFlag?.("--post-commit")).toBeUndefined();
+	});
 });
