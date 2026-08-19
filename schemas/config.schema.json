@@ -1232,12 +1232,12 @@
 						"off",
 						"sentry"
 					],
-					"description": "Opt in to transmit sanitized crash signatures to an aggregation service for cross-install counting. Off sends nothing. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
+					"description": "Global-only opt-in to transmit sanitized crash signatures to an aggregation service for cross-install counting. Off sends nothing. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
 					"default": "off"
 				},
 				"upstreamDsn": {
 					"type": "string",
-					"description": "Sentry DSN for the opted-in upstream; ignored while Crash Report Upstream is off, and no default destination exists. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
+					"description": "Global-only Sentry DSN for the opted-in upstream; ignored while Crash Report Upstream is off, and no default destination exists. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
 					"default": ""
 				}
 			},
