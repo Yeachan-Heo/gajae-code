@@ -180,45 +180,31 @@ export class SessionRouterError extends Error {
 	}
 }
 
-type HeldFrame = Readonly<{ seq: number; frame: Record<string, unknown> }>;
-type FrameOrigin = "live" | "ordered";
-type ReplayBarrier = {
-	held: HeldFrame[] | undefined;
-	detached: boolean;
-	failed: boolean;
-};
-
+/**
+ * One directly attached session. The stub-and-preserve extraction (issue #4530)
+ * removed the #4098 broker-index authority machinery (replay barriers, generation
+ * and endpoint-mtime fencing, adoption deferral, retirement versioning, delivery
+ * concession bookkeeping); an attachment is now exactly a Router-owned client plus
+ * the opaque provider capabilities derived from it.
+ */
 type AttachedSession = {
-	readonly id: string;
 	readonly sessionId: string;
 	readonly endpoint: SdkSessionEndpoint;
 	readonly generation: number;
 	readonly pid: number;
 	readonly endpointMtimeMs: number;
-	readonly runEpoch: number;
+	readonly source: "index" | "adopted";
 	readonly client: SessionRouterClient;
-	readonly indexed: IndexedSession;
-	readonly cursor: { seq: number };
-	readonly barrier: ReplayBarrier;
 	readonly capability: SessionAttachment;
 	readonly notificationSubscription: NotificationSubscription;
 	notificationCancelled: boolean;
 	readonly notificationCursor: { generation: number; seq: number };
-	published: boolean;
-	initializingPublication: boolean;
-	readyTail: Promise<void>;
-	readonly publication: { promise: Promise<void>; resolve: () => void; reject: (reason?: unknown) => void };
+	frameTail: Promise<void>;
+	disposed: boolean;
 	dispose: () => void;
 };
 
-const REPLAY_BARRIER_LIMIT = 1_024;
-const REPLAY_RETRY_ATTEMPTS = 3;
-const REPLAY_RETRY_BACKOFF_MS = 100;
-const DELIVERY_ATTEMPT_LIMIT = 3;
-const ATTACH_CONCURRENCY = 4;
 const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
-const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
-const NOTIFICATION_WORK_TIMEOUT = Symbol("notification_work_timeout");
 /**
  * Client-message types the native session server authorizes with the
  * per-session endpoint token (`tokens_match` in crates/gjc-sdk server.rs).
@@ -295,47 +281,14 @@ function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame
 	};
 }
 
-function readReplayGap(
-	value: unknown,
-):
-	| Readonly<{ kind: "generation_reset"; toGeneration: number }>
-	| Readonly<{ kind: "sequence_gap"; fromSeq: number; toSeq: number }>
-	| undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const gap = value as Record<string, unknown>;
-	if (gap.kind === "generation_reset") {
-		const toGeneration = readGeneration(gap.toGeneration);
-		return toGeneration === undefined ? undefined : { kind: "generation_reset", toGeneration };
-	}
-	if (gap.kind !== "sequence_gap") return undefined;
-	const fromSeq = readSequence(gap.fromSeq);
-	const toSeq = readSequence(gap.toSeq);
-	if (fromSeq === undefined || toSeq === undefined || toSeq < fromSeq) return undefined;
-	return { kind: "sequence_gap", fromSeq, toSeq };
-}
-
-function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession): boolean {
-	return (
-		current.sessionId === expected.sessionId &&
-		current.live &&
-		isSessionAuthorityEligible(current) &&
-		!current.terminalUncertain &&
-		current.endpointGeneration === expected.endpointGeneration &&
-		current.pid === expected.pid &&
-		current.endpointMtimeMs === expected.endpointMtimeMs
-	);
-}
-
-type AdoptedSession = {
-	readonly generation: number;
-	readonly pid: number;
-	readonly endpointMtimeMs: number;
-	readonly attachment: SessionAttachment;
-};
-
 /**
- * Broker-index-backed SDK attachment authority. Providers receive only opaque
- * attachment capabilities; endpoint records and SDK clients remain here.
+ * Direct-attachment SDK session router. Providers receive only opaque attachment
+ * capabilities; endpoint records and SDK clients remain here. This is the
+ * stub-and-preserve replacement for the removed #4098 broker-index attachment
+ * authority (issue #4530): attachments are established directly from the session
+ * index or an ingested lifecycle result, frames are correlated and delivered in
+ * arrival order, and revocation is a plain client close. The coherent #4098
+ * authority implementation is preserved on the owner-controlled extraction refs.
  */
 export class SessionRouter {
 	readonly #agentDir: string;
@@ -343,25 +296,11 @@ export class SessionRouter {
 	readonly #correlateFrame: SessionRouterFrameCorrelator;
 	readonly #index: SessionIndex;
 	readonly #sessions = new Map<string, AttachedSession>();
-	readonly #adopted = new Map<string, AdoptedSession>();
-	readonly #retirements = new Map<string, Promise<void>>();
-	readonly #retirementVersions = new Map<string, number>();
-	readonly #pending = new Set<Promise<void>>();
-	readonly #frameTails = new Map<string, Promise<void>>();
-	readonly #undelivered = new Map<string, { generation: number; seq: number; attempts: number }>();
-	readonly #recoveredFrames = new Map<
-		string,
-		{ generation: number; frames: Array<{ seq: number; frame: Record<string, unknown> }> }
-	>();
-	readonly #reviving = new Set<string>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
 	#stopTimer: (() => void) | undefined;
-	#reconcileTail: Promise<void> = Promise.resolve();
-	#reconcilePending: { readonly runEpoch: number } | undefined;
+	#scanTail: Promise<void> = Promise.resolve();
 	#ready = false;
 	#started = false;
-	#stopController = new AbortController();
-	#runEpoch = 0;
 
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
@@ -370,7 +309,7 @@ export class SessionRouter {
 		this.#index = this.#deps.createIndex?.(options.agentDir) ?? new DefaultSessionIndex(options.agentDir);
 	}
 
-	/** Provider-local cleanup outcomes; core authority never depends on these. */
+	/** Provider-local cleanup outcomes; core routing never depends on these. */
 	notificationCleanupReceipts(): NotificationCleanupReceipt[] {
 		return [...this.#notificationReceipts.values()].map(receipt => ({ ...receipt }));
 	}
@@ -379,40 +318,33 @@ export class SessionRouter {
 		return this.#ready;
 	}
 
-	/** Starts reconciliation and the index watcher. */
+	/** Attaches the currently indexed live sessions and keeps watching for changes. */
 	async start(): Promise<void> {
 		if (this.#started) return;
 		this.#started = true;
-		const runEpoch = ++this.#runEpoch;
-		if (this.#stopController.signal.aborted) {
-			this.#stopController = new AbortController();
-			this.#reconcileTail = Promise.resolve();
-			this.#reconcilePending = undefined;
-			this.#frameTails.clear();
-		}
 		try {
-			await this.#serialReconcile(runEpoch);
-			if (!this.#running(runEpoch)) return;
-			const timer = (this.#deps.setInterval ?? setInterval)(
-				() => this.#schedule(this.#serialReconcile(runEpoch, true)),
-				2_000,
-			);
+			await this.reconcile();
+			if (!this.#started) return;
+			const timer = (this.#deps.setInterval ?? setInterval)(() => {
+				void this.reconcile().catch(error =>
+					logger.warn(`SDK session scan failed: ${error instanceof Error ? error.message : String(error)}`),
+				);
+			}, 2_000);
 			this.#stopTimer = () => (this.#deps.clearInterval ?? clearInterval)(timer);
 		} catch (error) {
-			if (this.#running(runEpoch)) await this.stop();
+			if (this.#started) await this.stop();
 			throw error;
 		}
 	}
 
-	/** Exposed for deterministic callers and reconciliation tests. */
+	/** Re-scans the session index once, attaching new live sessions and retiring gone ones. */
 	async reconcile(): Promise<void> {
-		await this.#serialReconcile(this.#runEpoch, true);
-		// Periodic reconciliation may have published an attachment while its
-		// initial replay continues on that attachment's isolated ready tail.
-		// Explicit callers retain the historical synchronous contract without
-		// putting any ready tail back onto the fleet-wide reconcile tail.
-		await Promise.all([...this.#sessions.values()].map(attached => attached.readyTail));
+		if (!this.#started) return;
+		const task = this.#scanTail.catch(() => undefined).then(() => this.#scan());
+		this.#scanTail = task;
+		await task;
 	}
+
 	/** Ingests a credential-bearing Broker lifecycle result directly into Router custody. */
 	async adoptLifecycleResult(
 		value: unknown,
@@ -447,84 +379,55 @@ export class SessionRouter {
 				"pre_send",
 				"Broker lifecycle result omitted an exact session endpoint authority.",
 			);
-		const repo = path.resolve(fallback.cwd);
-		const stateRoot = path.join(repo, ".gjc", "state");
-		const indexed: IndexedSession = {
-			sessionId,
-			locator: { repo, stateRoot },
-			endpointGeneration,
-			pid,
-			endpointMtimeMs,
-			live: true,
-			indexSeq: 0,
-			identityProvenance: "legacy",
-			ambiguous: false,
-			terminal: false,
-		};
 		const endpoint: SdkSessionEndpoint = {
 			sessionId,
 			url: endpointRecord.url,
 			token: endpointRecord.token,
 			pid,
-			path: path.join(stateRoot, "sdk", `${sessionId}.json`),
+			path: path.join(path.resolve(fallback.cwd), ".gjc", "state", "sdk", `${sessionId}.json`),
 		};
-		const attached = await this.#attach(indexed, this.#runEpoch, endpoint, true, true);
-		const current = this.#sessions.get(sessionId);
-		const capability = current?.capability;
-		if (!attached || !current || !capability)
-			throw new SessionRouterError("pre_send", "Broker session endpoint could not be attached.");
-		const listing = this.#index.listSessions();
-		const indexedCurrent =
-			listing.warnings.length === 0 ? listing.sessions.find(item => item.sessionId === sessionId) : undefined;
-		if (indexedCurrent && sameIndexedAuthority(indexed, indexedCurrent))
-			await this.#serialReconcile(this.#runEpoch, true);
-		return capability;
+		return await this.#attachDirect({
+			sessionId,
+			generation: endpointGeneration,
+			pid,
+			endpointMtimeMs,
+			endpoint,
+			source: "adopted",
+		});
 	}
 
 	async stop(): Promise<void> {
 		if (this.#stopTimer) this.#stopTimer();
 		this.#stopTimer = undefined;
 		this.#started = false;
-		this.#runEpoch += 1;
-		this.#stopController.abort();
 		this.#ready = false;
-		const shutdownTasks: Promise<void>[] = [];
-		for (const [sessionId, attached] of this.#sessions) {
-			this.#sessions.delete(sessionId);
-			attached.dispose();
-			this.#detachNotification(attached, "removed");
-			shutdownTasks.push((async () => await attached.client.close())());
-			void Promise.resolve(this.#deps.onSessionRemoved?.(attached.capability)).catch(error =>
+		const attached = [...this.#sessions.values()];
+		this.#sessions.clear();
+		const errors: unknown[] = [];
+		for (const session of attached) {
+			session.dispose();
+			this.#detachNotification(session, "removed");
+			try {
+				await session.client.close();
+			} catch (error) {
+				errors.push(error);
+			}
+			void Promise.resolve(this.#deps.onSessionRemoved?.(session.capability, "removed")).catch(error =>
 				logger.warn(`SDK provider cleanup failed during router stop: ${String(error)}`),
 			);
 		}
-		this.#adopted.clear();
-		// Provider notification work is detached and bounded independently; core
-		// shutdown waits only for Router reconciliation and client close.
-		const pending = Promise.allSettled([this.#reconcileTail, ...shutdownTasks]);
-		const outcome = await Promise.race([
-			pending.then(results => ({ kind: "settled" as const, results })),
-			Bun.sleep(5_000).then(() => ({ kind: "timeout" as const })),
-		]);
-		if (outcome.kind === "timeout") {
-			logger.warn(
-				"SessionRouter shutdown exceeded 5000ms; authority is revoked and cleanup continues in background.",
-			);
-			return;
-		}
-		const errors = outcome.results
-			.filter((result): result is PromiseRejectedResult => result.status === "rejected")
-			.map(result => result.reason);
+		await this.#scanTail.catch(() => undefined);
 		if (errors.length > 0) throw new AggregateError(errors, "SessionRouter shutdown failed.");
 	}
 
 	/** Returns an opaque lease only while the exact attachment generation is live. */
 	attachment(sessionId: string, expectedGeneration?: number): SessionAttachment | null {
 		const attached = this.#sessions.get(sessionId);
-		if (!attached || !this.#attachmentPublished(attached)) return null;
+		if (!attached || attached.disposed) return null;
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation) return null;
 		return attached.capability;
 	}
+
 	#prepareFrame(attached: AttachedSession, frame: Record<string, unknown>): Record<string, unknown> {
 		// The native session server authorizes these client-message types with
 		// the per-session endpoint token and silently drops frames whose token
@@ -551,28 +454,13 @@ export class SessionRouter {
 		expectedAttachment?: SessionAttachment,
 		options?: { timeoutMs?: number },
 	): Promise<Record<string, unknown>> {
-		const publishing = this.#sessions.get(sessionId);
-		if (!expectedAttachment || publishing?.capability !== expectedAttachment || !publishing.initializingPublication)
-			await this.#serialReconcile(this.#runEpoch, true);
 		const attached = this.#sessions.get(sessionId);
-		if (!attached || !this.#attachmentPublished(attached))
-			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not published.");
+		if (!attached || attached.disposed)
+			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not attached.");
 		if (expectedGeneration !== undefined && expectedGeneration !== attached.generation)
 			throw new SessionRouterError("pre_send", "SDK session endpoint changed before command dispatch.");
 		if (expectedAttachment !== undefined && attached.capability !== expectedAttachment)
 			throw new SessionRouterError("pre_send", "SDK session attachment changed before command dispatch.");
-		if (attached.initializingPublication) {
-			const endpoint = await this.#readEndpoint(attached.indexed);
-			if (
-				!endpoint ||
-				endpoint.url !== attached.endpoint.url ||
-				endpoint.token !== attached.endpoint.token ||
-				endpoint.pid !== attached.pid
-			) {
-				await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
-				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
-			}
-		}
 		// A caller that sized its own budget keeps it; everything else gets the
 		// long-lived session budget instead of the transport's one-shot default,
 		// which a cold host's first credential-collecting query outruns (#4258).
@@ -581,7 +469,8 @@ export class SessionRouter {
 			timeoutMs: options?.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
 		});
 		if (
-			!this.#attachmentPublished(attached) ||
+			this.#sessions.get(sessionId) !== attached ||
+			attached.disposed ||
 			(expectedGeneration !== undefined && attached.generation !== expectedGeneration) ||
 			(expectedAttachment !== undefined && attached.capability !== expectedAttachment)
 		)
@@ -589,72 +478,23 @@ export class SessionRouter {
 		return response;
 	}
 
-	/** Resolves the exact provider-neutral binding authority for operator adoption. */
+	/** Resolves the provider-neutral binding authority for an attached session. */
 	async bindingAuthority(sessionId: string): Promise<{ sessionId: string; endpointGeneration: number } | undefined> {
 		const attached = this.#sessions.get(sessionId);
-		if (!attached || !this.#attachmentPublished(attached)) return undefined;
-		let indexed: IndexedSession | undefined;
-		try {
-			await this.#index.refresh();
-			const listing = this.#index.listSessions();
-			if (listing.warnings.length > 0) return undefined;
-			indexed = listing.sessions.find(candidate => candidate.sessionId === sessionId);
-		} catch {
-			return undefined;
-		}
-		if (!indexed?.live || !isSessionAuthorityEligible(indexed) || indexed.terminalUncertain) return undefined;
-		if (
-			!Number.isSafeInteger(indexed.endpointGeneration) ||
-			indexed.endpointGeneration <= 0 ||
-			indexed.endpointGeneration !== attached.generation ||
-			indexed.endpointMtimeMs === undefined
-		)
-			return undefined;
-		if (!Number.isSafeInteger(indexed.pid) || indexed.pid <= 0) return undefined;
-		const endpoint = await this.#readEndpoint(indexed).catch(() => null);
-		if (!endpoint || endpoint.stale === true || endpoint.pid !== indexed.pid || !endpoint.token) return undefined;
-		if (this.#sessions.get(sessionId) !== attached || !this.#attachmentPublished(attached)) return undefined;
+		if (!attached || attached.disposed) return undefined;
 		return { sessionId, endpointGeneration: attached.generation };
 	}
 
 	/** Activates a prepared session through one Router-owned, one-shot SDK client. */
 	async activatePreparedSession(sessionId: string): Promise<ActivatedPreparedSession> {
-		let indexed: IndexedSession | undefined;
-		try {
-			await this.#index.open();
-			await this.#index.refresh();
-			const listing = this.#index.listSessions();
-			if (listing.warnings.length > 0)
-				throw new SessionActivationError(
-					"session_not_live",
-					"Session activation requires an intact session index.",
-				);
-			indexed = listing.sessions.find(candidate => candidate.sessionId === sessionId);
-		} catch (error) {
-			if (error instanceof SessionActivationError) throw error;
+		const indexed = await this.#indexedLiveSession(sessionId);
+		if (!indexed)
 			throw new SessionActivationError(
 				"session_not_live",
 				"Session activation requires an exact live session endpoint.",
 			);
-		}
-		if (
-			!indexed?.live ||
-			!isSessionAuthorityEligible(indexed) ||
-			indexed.terminalUncertain ||
-			!Number.isSafeInteger(indexed.endpointGeneration) ||
-			indexed.endpointGeneration <= 0 ||
-			!Number.isSafeInteger(indexed.pid) ||
-			indexed.pid <= 0 ||
-			typeof indexed.endpointMtimeMs !== "number" ||
-			!Number.isFinite(indexed.endpointMtimeMs) ||
-			indexed.endpointMtimeMs <= 0
-		)
-			throw new SessionActivationError(
-				"session_not_live",
-				"Session activation requires an exact live session endpoint.",
-			);
-		const endpoint = await this.#readEndpoint(indexed).catch(() => null);
-		if (!endpoint || endpoint.stale === true || !endpoint.url || !endpoint.token || endpoint.pid !== indexed.pid)
+		const endpoint = await this.#readEndpoint(indexed);
+		if (!endpoint?.url || !endpoint.token)
 			throw new SessionActivationError(
 				"session_not_live",
 				"Session activation requires a readable session discovery endpoint.",
@@ -666,25 +506,14 @@ export class SessionRouter {
 				? this.#deps.createClient({
 						sessionId: indexed.sessionId,
 						generation: indexed.endpointGeneration,
-						pid: indexed.pid,
-						endpointMtimeMs: indexed.endpointMtimeMs,
+						pid: indexed.pid ?? 0,
+						endpointMtimeMs: indexed.endpointMtimeMs ?? 0,
 					})
 				: connectPreparedSession(endpoint));
 		} catch {
 			throw new SessionActivationError("activation_unavailable", "The session endpoint could not be reached.");
 		}
 		try {
-			const currentEndpoint = await this.#readEndpoint(indexed).catch(() => null);
-			if (
-				!currentEndpoint ||
-				currentEndpoint.url !== endpoint.url ||
-				currentEndpoint.token !== endpoint.token ||
-				currentEndpoint.pid !== endpoint.pid
-			)
-				throw new SessionActivationError(
-					"session_not_live",
-					"The session endpoint changed before activation could be dispatched.",
-				);
 			return await requestPreparedSessionActivation(client, sessionId, indexed.endpointGeneration);
 		} finally {
 			await client.close().catch(() => undefined);
@@ -717,133 +546,36 @@ export class SessionRouter {
 		}
 	}
 
-	#serialReconcile(runEpoch: number, deferReplay = false): Promise<void> {
-		if (!this.#running(runEpoch)) return Promise.resolve();
-		const pending = this.#reconcilePending;
-		if (pending?.runEpoch === runEpoch) return this.#reconcileTail;
-		const queued = { runEpoch };
-		this.#reconcilePending = queued;
-		const task = this.#reconcileTail
-			.catch(() => undefined)
-			.then(async () => {
-				if (this.#reconcilePending === queued) this.#reconcilePending = undefined;
-				try {
-					await this.#reconcile(runEpoch, deferReplay);
-					if (!this.#running(runEpoch)) return;
-					this.#ready = true;
-					this.#deps.onReconciled?.();
-				} catch (error) {
-					if (this.#running(runEpoch)) this.#ready = false;
-					throw error;
-				}
-			});
-		this.#reconcileTail = task;
-		return task;
+	async #indexedLiveSession(sessionId: string): Promise<IndexedSession | undefined> {
+		try {
+			await this.#index.open();
+			await this.#index.refresh();
+			const listing = this.#index.listSessions();
+			if (listing.warnings.length > 0) return undefined;
+			const indexed = listing.sessions.find(candidate => candidate.sessionId === sessionId);
+			if (
+				!indexed?.live ||
+				!isSessionAuthorityEligible(indexed) ||
+				indexed.terminalUncertain ||
+				!Number.isSafeInteger(indexed.endpointGeneration) ||
+				indexed.endpointGeneration <= 0
+			)
+				return undefined;
+			return indexed;
+		} catch {
+			return undefined;
+		}
 	}
 
-	async #reconcile(runEpoch: number, deferReplay = false): Promise<void> {
-		if (!this.#running(runEpoch)) return;
-		await this.#index.open();
-		if (!this.#running(runEpoch)) return;
-		await this.#index.refresh();
-		if (!this.#running(runEpoch)) return;
-		const indexed = this.#index.listSessions();
-		const live =
-			indexed.warnings.length === 0
-				? indexed.sessions.filter(
-						session => session.live && isSessionAuthorityEligible(session) && !session.terminalUncertain,
-					)
-				: [];
-		const liveIds = new Set(live.map(session => session.sessionId));
-		const attachedIds = new Set<string>();
-		if (indexed.warnings.length === 0) {
-			for (const [sessionId, adopted] of [...this.#adopted]) {
-				const attached = this.#sessions.get(sessionId);
-				const indexedSession = indexed.sessions.find(session => session.sessionId === sessionId);
-				if (!attached || attached.capability !== adopted.attachment) {
-					this.#adopted.delete(sessionId);
-					continue;
-				}
-				const exactIndex =
-					indexedSession?.live === true &&
-					isSessionAuthorityEligible(indexedSession) &&
-					!indexedSession.terminalUncertain &&
-					indexedSession.endpointGeneration === adopted.generation &&
-					indexedSession.pid === adopted.pid &&
-					indexedSession.endpointMtimeMs === adopted.endpointMtimeMs;
-				const endpoint = exactIndex ? await this.#readEndpoint(indexedSession).catch(() => null) : null;
-				if (
-					!exactIndex ||
-					!endpoint ||
-					endpoint.pid !== adopted.pid ||
-					endpoint.url !== attached.endpoint.url ||
-					endpoint.token !== attached.endpoint.token
-				) {
-					this.#adopted.delete(sessionId);
-					await this.#retireAttachment(attached);
-					continue;
-				}
-				try {
-					if (await this.#publishAttachment(attached, true)) {
-						this.#adopted.delete(sessionId);
-						attachedIds.add(sessionId);
-					}
-				} catch {
-					this.#adopted.delete(sessionId);
-					await this.#retireAttachment(attached);
-				}
-			}
-		}
-		let nextAttachment = 0;
-		const attachWorkers = Array.from({ length: Math.min(ATTACH_CONCURRENCY, live.length) }, async () => {
-			for (;;) {
-				if (!this.#running(runEpoch)) return;
-				const session = live[nextAttachment++];
-				if (!session) return;
-				try {
-					if (await this.#attach(session, runEpoch, undefined, false, false, deferReplay))
-						attachedIds.add(session.sessionId);
-				} catch {
-					const failed = this.#sessions.get(session.sessionId);
-					if (failed?.runEpoch === runEpoch)
-						await this.#retireAttachment(failed, liveIds.has(session.sessionId) ? "replaced" : "removed");
-					if (this.#running(runEpoch))
-						logger.warn(
-							`SDK session attachment failed for indexed session ${session.sessionId} at generation ${session.endpointGeneration}; the endpoint remains unauthorized.`,
-						);
-				}
-			}
-		});
-		await Promise.all(attachWorkers);
-		if (!this.#running(runEpoch)) return;
-		const cleanupErrors: unknown[] = [];
-		for (const [sessionId, attached] of [...this.#sessions]) {
-			if (attachedIds.has(sessionId)) continue;
-			if (!this.#running(runEpoch) || this.#sessions.get(sessionId) !== attached) continue;
-			if (!liveIds.has(sessionId)) {
-				this.#undelivered.delete(sessionId);
-				this.#recoveredFrames.delete(sessionId);
-			}
-			try {
-				await this.#retireAttachment(attached, liveIds.has(sessionId) ? "replaced" : "removed");
-			} catch (error) {
-				cleanupErrors.push(error);
-			}
-		}
-		if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "SessionRouter stale cleanup failed.");
-	}
-
+	/**
+	 * Reads the discovery endpoint for an indexed session. The scope test compares
+	 * path identity, not spelling, so symlinked cwds (macOS /var -> /private/var)
+	 * keep resolving (#4645).
+	 */
 	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
-		if (!isSessionAuthorityEligible(indexed)) return null;
+		if (indexed.pid === undefined) return null;
 		const repo = path.resolve(indexed.locator.repo);
 		const defaultStateRoot = path.join(repo, ".gjc", "state");
-		// The session index stores the lifecycle caller's lexical cwd in `locator.repo`
-		// (reconcileReadyScope re-scopes only that field) while `locator.stateRoot` is
-		// the host process's physical path, because process.cwd() resolves symlinks.
-		// The scope test therefore compares path identity, not spelling: a lexical
-		// match fails for every symlinked cwd (macOS /var -> /private/var,
-		// /home/jun/desk -> /data/Lina-Desk), the adopted attachment is retired on
-		// reconcile, and session/new surfaces "lost exact Router authority".
 		const indexedStateRoot = resolveEquivalentPath(indexed.locator.stateRoot);
 		const scope =
 			indexedStateRoot === resolveEquivalentPath(defaultStateRoot)
@@ -851,213 +583,132 @@ export class SessionRouter {
 				: indexedStateRoot === resolveEquivalentPath(path.join(defaultStateRoot, "chat"))
 					? "chat"
 					: undefined;
-		if (!scope || indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
-		const endpoint = await readSdkSessionEndpoint(repo, indexed.sessionId, scope);
+		if (!scope) return null;
+		const endpoint = await readSdkSessionEndpoint(repo, indexed.sessionId, scope).catch(() => null);
 		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
-		const endpointStat = await fs.stat(endpoint.path).catch(() => undefined);
-		if (!endpointStat || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return null;
-		let raw: Record<string, unknown>;
-		try {
-			const parsed = JSON.parse(await Bun.file(endpoint.path).text());
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-			raw = parsed as Record<string, unknown>;
-		} catch {
-			return null;
+		// A discovery record rewritten after broker registration is not the indexed
+		// authority: the file's mtime must match the indexed endpoint mtime exactly.
+		if (indexed.endpointMtimeMs !== undefined) {
+			const stat = await fs.stat(endpoint.path).catch(() => undefined);
+			if (!stat || stat.mtimeMs !== indexed.endpointMtimeMs) return null;
 		}
-		if (
-			raw.sessionId !== indexed.sessionId ||
-			raw.pid !== indexed.pid ||
-			raw.stale === true ||
-			raw.url !== endpoint.url ||
-			raw.token !== endpoint.token
-		)
-			return null;
-		const endpointStatAfterRead = await fs.stat(endpoint.path).catch(() => undefined);
-		if (!endpointStatAfterRead || endpointStatAfterRead.mtimeMs !== indexed.endpointMtimeMs) return null;
-		await this.#index.refresh();
-		const listing = this.#index.listSessions();
-		if (listing.warnings.length > 0) return null;
-		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
-		if (!current || !sameIndexedAuthority(indexed, current)) return null;
 		return endpoint;
 	}
 
-	async #createAttachedClient(
-		indexed: IndexedSession,
-		endpoint: SdkSessionEndpoint,
-		runEpoch: number,
-	): Promise<SessionRouterClient | undefined> {
-		const endpointMtimeMs = indexed.endpointMtimeMs;
-		if (endpointMtimeMs === undefined) return undefined;
-		const createClient = this.#deps.createClient;
-		let transport: SdkClient | undefined;
-		let connection: Promise<SessionRouterClient>;
-		if (createClient) {
-			connection = createClient({
-				sessionId: indexed.sessionId,
-				generation: indexed.endpointGeneration,
-				pid: indexed.pid,
-				endpointMtimeMs,
-			});
-		} else {
-			const defaultClient = new SdkClient(endpoint.url, endpoint.token, { ...ACP_SESSION_RECONNECT });
-			transport = defaultClient;
-			connection = defaultClient.connect().then(() => defaultClient);
-		}
-		const stopped = Promise.withResolvers<void>();
-		const timeout = Promise.withResolvers<void>();
-		const signal = this.#stopController.signal;
-		const onStop = (): void => stopped.resolve();
-		if (!this.#running(runEpoch) || signal.aborted) onStop();
-		else signal.addEventListener("abort", onStop, { once: true });
-		const timer = (this.#deps.setTimeout ?? setTimeout)(() => timeout.resolve(), ATTACH_CONNECT_TIMEOUT_MS);
-		timer.unref?.();
+	async #scan(): Promise<void> {
+		if (!this.#started) return;
+		let live: IndexedSession[] = [];
 		try {
-			const outcome = await Promise.race([
-				connection.then(client => ({ kind: "client" as const, client })),
-				stopped.promise.then(() => ({ kind: "stopped" as const })),
-				timeout.promise.then(() => ({ kind: "timeout" as const })),
-			]);
-			if (outcome.kind === "client") return outcome.client;
-			if (transport) void transport.close().catch(() => undefined);
-			void connection.then(client => client.close().catch(() => undefined)).catch(() => undefined);
-			if (outcome.kind === "stopped") return undefined;
-			throw new SessionRouterError("pre_send", "SDK session attachment connection timed out.");
-		} finally {
-			(this.#deps.clearTimeout ?? clearTimeout)(timer);
-			signal.removeEventListener("abort", onStop);
+			await this.#index.open();
+			await this.#index.refresh();
+			const listing = this.#index.listSessions();
+			if (listing.warnings.length === 0)
+				live = listing.sessions.filter(
+					session => session.live && isSessionAuthorityEligible(session) && !session.terminalUncertain,
+				);
+		} catch (error) {
+			this.#ready = false;
+			throw error;
 		}
-	}
-
-	async #attach(
-		indexed: IndexedSession,
-		runEpoch: number,
-		resolvedEndpoint?: SdkSessionEndpoint,
-		skipReplay = false,
-		deferPublication = false,
-		deferReplay = false,
-	): Promise<boolean> {
-		const retirementVersion = this.#retirementVersions.get(indexed.sessionId) ?? 0;
-		const retirement = this.#retirements.get(indexed.sessionId);
-		if (retirement) await retirement;
-		if (!this.#running(runEpoch)) return false;
-		if (indexed.endpointMtimeMs === undefined) return false;
-		const endpoint = resolvedEndpoint ?? (await this.#readEndpoint(indexed));
-		const retirementAfterValidation = this.#retirements.get(indexed.sessionId);
-		if (retirementAfterValidation) await retirementAfterValidation;
-		if ((this.#retirementVersions.get(indexed.sessionId) ?? 0) !== retirementVersion)
-			return await this.#attach(indexed, runEpoch, undefined, skipReplay, deferPublication, deferReplay);
-		if (!this.#running(runEpoch)) return false;
-		if (!endpoint) return false;
-		const existing = this.#sessions.get(indexed.sessionId);
-		const resumable =
-			existing !== undefined &&
-			existing.endpoint.url === endpoint.url &&
-			existing.endpoint.token === endpoint.token &&
-			existing.generation === indexed.endpointGeneration &&
-			existing.pid === indexed.pid &&
-			existing.endpointMtimeMs === indexed.endpointMtimeMs;
-		if (existing && resumable && !existing.barrier.failed) {
-			this.#reviveTransport(existing);
-			return true;
-		}
-		const resumeSeq = existing && resumable ? existing.cursor.seq : 0;
-		if (existing) {
-			this.#adopted.delete(indexed.sessionId);
-
-			this.#sessions.delete(indexed.sessionId);
-			existing.dispose();
-			this.#detachNotification(
-				existing,
-				existing.generation === indexed.endpointGeneration ? "replaced_same_generation" : "replaced",
-			);
+		const liveIds = new Set(live.map(session => session.sessionId));
+		for (const session of live) {
+			if (!this.#started) return;
+			const existing = this.#sessions.get(session.sessionId);
+			if (
+				existing &&
+				!existing.disposed &&
+				existing.generation === session.endpointGeneration &&
+				existing.pid === session.pid &&
+				existing.endpointMtimeMs === session.endpointMtimeMs
+			) {
+				// An unchanged index tuple is not enough: the discovery endpoint the
+				// attachment was built from may have been removed or rewritten since.
+				// Re-prove it and revoke the attachment when it no longer resolves.
+				if (await this.#readEndpoint(session)) {
+					this.#reviveTransport(existing);
+					continue;
+				}
+				await this.#retire(existing, "removed");
+				continue;
+			}
+			if (existing && !existing.disposed) await this.#retire(existing, "replaced");
+			if (session.endpointMtimeMs === undefined || session.pid === undefined) continue;
+			const endpoint = await this.#readEndpoint(session);
+			if (!endpoint) continue;
 			try {
-				await existing.client.close();
+				await this.#attachDirect({
+					sessionId: session.sessionId,
+					generation: session.endpointGeneration,
+					pid: session.pid,
+					endpointMtimeMs: session.endpointMtimeMs,
+					endpoint,
+					source: "index",
+				});
 			} catch (error) {
 				logger.warn(
-					`SDK session replacement transport cleanup failed for ${indexed.sessionId}; authority remains revoked (${String(error)}).`,
+					`SDK session attachment failed for indexed session ${session.sessionId} at generation ${session.endpointGeneration}: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
 				);
 			}
-			void Promise.resolve(
-				this.#deps.onSessionRemoved?.(
-					existing.capability,
-					existing.generation === indexed.endpointGeneration &&
-						(existing.endpoint.url !== endpoint.url ||
-							existing.endpoint.token !== endpoint.token ||
-							existing.pid !== indexed.pid ||
-							existing.endpointMtimeMs !== indexed.endpointMtimeMs)
-						? "replaced_same_generation"
-						: "replaced",
-				),
-			).catch(error => logger.warn(`SDK provider cleanup failed after replacement: ${String(error)}`));
-			if (!resumable) {
-				this.#undelivered.delete(indexed.sessionId);
-				this.#recoveredFrames.delete(indexed.sessionId);
-			}
 		}
-		const client = await this.#createAttachedClient(indexed, endpoint, runEpoch);
-		if (!client) return false;
+		for (const [sessionId, attached] of [...this.#sessions]) {
+			if (liveIds.has(sessionId) || attached.disposed || attached.source === "adopted") continue;
+			await this.#retire(attached, "removed");
+		}
+		this.#ready = true;
+		this.#deps.onReconciled?.();
+	}
 
-		if (!this.#running(runEpoch)) {
-			await client.close().catch(() => undefined);
-			return false;
-		}
-		if ((this.#retirementVersions.get(indexed.sessionId) ?? 0) !== retirementVersion) {
-			await client.close().catch(() => undefined);
-			const currentRetirement = this.#retirements.get(indexed.sessionId);
-			if (currentRetirement) await currentRetirement;
-			return await this.#attach(indexed, runEpoch, undefined, skipReplay, deferPublication, deferReplay);
-		}
+	async #attachDirect(input: {
+		sessionId: string;
+		generation: number;
+		pid: number;
+		endpointMtimeMs: number;
+		endpoint: SdkSessionEndpoint;
+		source: "index" | "adopted";
+	}): Promise<SessionAttachment> {
+		const existing = this.#sessions.get(input.sessionId);
+		if (existing && !existing.disposed) await this.#retire(existing, "replaced");
+		const client = await this.#createClient(input);
 		let attached: AttachedSession | undefined;
-		const barrier: ReplayBarrier = { held: undefined, detached: false, failed: false };
-		const publication = Promise.withResolvers<void>();
-		void publication.promise.catch(() => undefined);
 		const capability: SessionAttachment = Object.freeze({
 			authorityId: sessionAttachmentAuthorityId({
-				sessionId: indexed.sessionId,
-				generation: indexed.endpointGeneration,
-				pid: indexed.pid,
-				endpointMtimeMs: indexed.endpointMtimeMs,
-				url: endpoint.url,
-				token: endpoint.token,
+				sessionId: input.sessionId,
+				generation: input.generation,
+				pid: input.pid,
+				endpointMtimeMs: input.endpointMtimeMs,
+				url: input.endpoint.url,
+				token: input.endpoint.token,
 			}),
-			sessionId: indexed.sessionId,
-			generation: indexed.endpointGeneration,
+			sessionId: input.sessionId,
+			generation: input.generation,
 			get connectionId(): string | undefined {
 				return attached?.client.connectionId;
 			},
-			isCurrent: () => attached !== undefined && this.#attachmentPublished(attached),
+			isCurrent: () =>
+				attached !== undefined && !attached.disposed && this.#sessions.get(input.sessionId) === attached,
 			send: async (frame: Record<string, unknown>) => {
-				if (!attached || !this.#attachmentPublished(attached))
-					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
-				if (attached.initializingPublication) {
-					const endpoint = await this.#readEndpoint(attached.indexed);
-					if (
-						!endpoint ||
-						endpoint.url !== attached.endpoint.url ||
-						endpoint.token !== attached.endpoint.token ||
-						endpoint.pid !== attached.pid
-					) {
-						await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
-						throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
-					}
-				} else await this.#serialReconcile(runEpoch, true);
-				if (!attached || !this.#attachmentPublished(attached))
+				if (!attached || attached.disposed || this.#sessions.get(input.sessionId) !== attached)
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(this.#prepareFrame(attached, frame));
 			},
 			retire: async () => {
-				if (attached) await this.#retireAttachment(attached);
+				if (attached && !attached.disposed) await this.#retire(attached);
 			},
 		});
-		const notificationCursor = { generation: indexed.endpointGeneration, seq: resumeSeq };
+		const notificationCursor = { generation: input.generation, seq: 0 };
 		const notificationSubscription: NotificationSubscription = Object.freeze({
-			sessionId: indexed.sessionId,
-			subscriptionId: `notification:${indexed.sessionId}:${crypto.randomUUID()}`,
+			sessionId: input.sessionId,
+			subscriptionId: `notification:${input.sessionId}:${crypto.randomUUID()}`,
 			cursor: notificationCursor,
-			isActive: () => attached !== undefined && !attached.notificationCancelled && this.#attachmentLive(attached),
+			isActive: () =>
+				attached !== undefined &&
+				!attached.disposed &&
+				!attached.notificationCancelled &&
+				this.#sessions.get(input.sessionId) === attached,
 			send: (frame: Record<string, unknown>) => {
-				if (!attached || attached.notificationCancelled || !this.#attachmentLive(attached))
+				if (!attached || attached.disposed || attached.notificationCancelled)
 					throw new SessionRouterError("pre_send", "Notification subscription is cancelled.");
 				attached.client.send(this.#prepareFrame(attached, frame));
 			},
@@ -1072,216 +723,190 @@ export class SessionRouter {
 				}
 			},
 			cancel: (reason?: string) => {
-				if (attached) this.#detachNotification(attached, "cancelled");
+				if (attached && !attached.notificationCancelled) this.#detachNotification(attached, "cancelled");
 				if (reason) this.#recordNotificationReceipt(notificationSubscription, "pending", reason);
 			},
 		});
 		const disposeFrames = client.onFrame(frame => {
-			if (!attached) return;
-			const task =
-				frame.type === "event_replay_result" && frame.seq === undefined
-					? this.#deliverOutOfBandFrame(attached, frame)
-					: this.#enqueueFrame(attached, frame, "live");
-			this.#schedule(task);
+			const current = attached;
+			if (!current || current.disposed) return;
+			current.frameTail = current.frameTail.catch(() => undefined).then(() => this.#deliverFrame(current, frame));
+			void current.frameTail;
 		});
 		const disposeReconnect = client.onReconnect?.(() => {
-			if (attached) {
-				attached.barrier.held ??= [];
-				this.#schedule(this.#reinitializeAttachment(attached));
-			}
+			const current = attached;
+			if (!current || current.disposed) return;
+			// The provider handshake is re-run before the catch-up replay, and both
+			// are serialized on the attachment's frame tail so live frames emitted
+			// during the reconnect land behind the replay. A rejecting handshake
+			// revokes the attachment, exactly like initial publication.
+			current.frameTail = current.frameTail
+				.catch(() => undefined)
+				.then(async () => {
+					if (current.disposed || this.#sessions.get(input.sessionId) !== current) return;
+					try {
+						await this.#deps.onAttachmentReady?.(capability);
+					} catch (error) {
+						logger.warn(
+							`SDK provider reconnect hook failed; revoking the attachment: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						);
+						await this.#retire(current);
+						return;
+					}
+					await this.#replayAttached(current);
+				});
+			void current.frameTail;
 		});
 		attached = {
-			initializingPublication: false,
-			id: crypto.randomUUID(),
-			sessionId: indexed.sessionId,
-			endpoint,
-			pid: indexed.pid,
-			endpointMtimeMs: indexed.endpointMtimeMs,
-			generation: indexed.endpointGeneration,
-			runEpoch,
+			sessionId: input.sessionId,
+			endpoint: input.endpoint,
+			generation: input.generation,
+			pid: input.pid,
+			endpointMtimeMs: input.endpointMtimeMs,
+			source: input.source,
 			client,
-			indexed,
-			readyTail: Promise.resolve(),
-			cursor: { seq: resumeSeq },
-			barrier,
 			capability,
 			notificationSubscription,
 			notificationCancelled: false,
 			notificationCursor,
-			published: false,
-			publication,
+			frameTail: Promise.resolve(),
+			disposed: false,
 			dispose: () => {
+				if (!attached || attached.disposed) return;
+				attached.disposed = true;
 				disposeFrames();
 				disposeReconnect?.();
-				barrier.detached = true;
-				if (!attached?.published)
-					publication.reject(
-						new SessionRouterError("pre_send", "SDK session publication was detached before completion."),
-					);
-				barrier.held = undefined;
 			},
 		};
-		this.#sessions.set(indexed.sessionId, attached);
-		if (deferPublication)
-			this.#adopted.set(indexed.sessionId, {
-				generation: indexed.endpointGeneration,
-				pid: indexed.pid,
-				endpointMtimeMs: indexed.endpointMtimeMs,
-				attachment: capability,
-			});
+		this.#sessions.set(input.sessionId, attached);
 		try {
 			await this.#deps.onAttachment?.(capability);
 			this.#recordNotificationReceipt(notificationSubscription, "pending");
-			void Promise.resolve()
+			await Promise.resolve()
 				.then(() => this.#deps.onNotificationSubscription?.(notificationSubscription))
 				.catch(error => {
-					this.#detachNotification(attached!, "cancelled");
-					logger.warn(`SDK notification subscription admission failed: ${String(error)}`);
+					if (attached) this.#detachNotification(attached, "cancelled");
+					logger.warn(
+						`SDK notification subscription admission failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
 				});
+			await Promise.resolve()
+				.then(() => this.#deps.onNotificationSubscriptionReady?.(notificationSubscription))
+				.catch(error => {
+					if (attached) this.#detachNotification(attached, "cancelled");
+					logger.warn(
+						`SDK notification subscription ready hook failed locally: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					);
+				});
+			await this.#deps.onAttachmentReady?.(capability);
 		} catch (error) {
-			const failedStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
-			this.#adopted.delete(indexed.sessionId);
-			if (failedStillCurrent) this.#sessions.delete(indexed.sessionId);
+			if (this.#sessions.get(input.sessionId) === attached) this.#sessions.delete(input.sessionId);
 			attached.dispose();
-			await attached.client.close().catch(() => undefined);
-			if (failedStillCurrent)
-				try {
-					await this.#deps.onSessionRemoved?.(capability);
-				} catch {
-					// Attachment publication failed closed; provider cleanup remains best effort.
-				}
+			await client.close().catch(() => undefined);
+			void Promise.resolve(this.#deps.onSessionRemoved?.(capability, "removed")).catch(() => undefined);
 			throw error;
 		}
-		if (deferPublication) return true;
-		return await this.#publishAttachment(attached, skipReplay, deferReplay);
+		// The initial event replay is serialized on the attachment's frame tail, so
+		// any live frame emitted after the handler registration lands behind it.
+		// Attachment publication awaits its completion: daemons reconstruct their
+		// session state from these events and must observe a settled replay before
+		// `start()` returns. There is deliberately no barrier/fencing machinery —
+		// a replay failure is logged and live delivery continues (issue #4530).
+		attached.frameTail = attached.frameTail.then(() => this.#replayAttached(attached));
+		await attached.frameTail.catch(() => undefined);
+		return capability;
 	}
 
-	async #publishAttachment(attached: AttachedSession, skipReplay: boolean, deferReplay = false): Promise<boolean> {
-		if (attached.published) return this.#attachmentPublished(attached);
-		if (!this.#attachmentLive(attached)) return false;
-		const endpoint = await this.#readEndpoint(attached.indexed).catch(() => null);
-		if (!this.#attachmentLive(attached)) return false;
-		if (
-			!endpoint ||
-			endpoint.url !== attached.endpoint.url ||
-			endpoint.token !== attached.endpoint.token ||
-			endpoint.pid !== attached.pid
-		) {
-			await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
-			return false;
-		}
-		if (!skipReplay) attached.barrier.held ??= [];
-		attached.published = true;
-		attached.publication.resolve();
-		attached.initializingPublication = true;
+	async #replayAttached(attached: AttachedSession): Promise<void> {
+		if (attached.disposed || this.#sessions.get(attached.sessionId) !== attached) return;
+		let replay: Record<string, unknown>;
 		try {
-			void Promise.resolve()
-				.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
-				.catch(error => {
-					this.#detachNotification(attached, "cancelled");
-					logger.warn(`SDK notification subscription ready hook failed locally: ${String(error)}`);
-				});
-			await this.#deps.onAttachmentReady?.(attached.capability);
+			replay = await attached.client.request({
+				type: "event_replay",
+				sinceGeneration: attached.generation,
+				sinceSeq: attached.notificationCursor.seq,
+			});
 		} catch (error) {
-			const stillCurrent = this.#sessions.get(attached.sessionId) === attached;
-			attached.published = false;
-			this.#adopted.delete(attached.sessionId);
-			if (stillCurrent) this.#sessions.delete(attached.sessionId);
-			attached.dispose();
-			await attached.client.close().catch(() => undefined);
-			if (stillCurrent)
-				try {
-					await this.#deps.onSessionRemoved?.(attached.capability);
-				} catch {
-					// Ready publication failed closed; provider cleanup remains best effort.
-				}
+			logger.warn(
+				`SDK session ${attached.sessionId} event replay failed; live delivery continues (${String(error)}).`,
+			);
+			return;
+		}
+		if (attached.disposed || this.#sessions.get(attached.sessionId) !== attached) return;
+		const events = Array.isArray(replay.events)
+			? replay.events.filter(
+					(event): event is Record<string, unknown> =>
+						!!event && typeof event === "object" && !Array.isArray(event),
+				)
+			: [];
+		for (const event of events) {
+			if (attached.disposed || this.#sessions.get(attached.sessionId) !== attached) return;
+			await this.#deliverFrame(attached, event);
+		}
+	}
+
+	async #createClient(input: {
+		sessionId: string;
+		generation: number;
+		pid: number;
+		endpointMtimeMs: number;
+		endpoint: SdkSessionEndpoint;
+	}): Promise<SessionRouterClient> {
+		const createClient = this.#deps.createClient;
+		if (createClient)
+			return await createClient({
+				sessionId: input.sessionId,
+				generation: input.generation,
+				pid: input.pid,
+				endpointMtimeMs: input.endpointMtimeMs,
+			});
+		const client = new SdkClient(input.endpoint.url, input.endpoint.token, { ...ACP_SESSION_RECONNECT });
+		const timeout = Promise.withResolvers<never>();
+		const timer = (this.#deps.setTimeout ?? setTimeout)(
+			() => timeout.reject(new SessionRouterError("pre_send", "SDK session attachment connection timed out.")),
+			ATTACH_CONNECT_TIMEOUT_MS,
+		);
+		timer.unref?.();
+		try {
+			await Promise.race([client.connect(), timeout.promise]);
+			return client;
+		} catch (error) {
+			void client.close().catch(() => undefined);
 			throw error;
 		} finally {
-			attached.initializingPublication = false;
+			(this.#deps.clearTimeout ?? clearTimeout)(timer);
 		}
-		if (skipReplay) return true;
-		// When the caller drives the serialized reconcile tail (periodic
-		// re-attachment after a rehost), initial replay must not hold it: each
-		// replay owns its own retry budget, so awaiting it here wedges all later
-		// reconciles (and the sends that funnel through them) until the budget
-		// expires. The barrier still holds live frames, so ordering and
-		// generation fences are unchanged; replay just runs on the attachment's
-		// ready tail like the reconnect path (#4527).
-		if (deferReplay) {
-			attached.readyTail = attached.readyTail
-				.catch(() => undefined)
-				.then(async () => {
-					if (!this.#attachmentLive(attached)) return;
-					if (!(await this.#deliverRecoveredFrames(attached))) return;
-					await this.#replayAttachment(attached, attached.cursor.seq);
-				});
-			return true;
+	}
+
+	async #deliverFrame(attached: AttachedSession, frame: Record<string, unknown>): Promise<void> {
+		if (attached.disposed || this.#sessions.get(attached.sessionId) !== attached) return;
+		const correlated = this.#correlateFrame(frame);
+		if (!correlated) return;
+		if (correlated.sessionId !== undefined && correlated.sessionId !== attached.sessionId) return;
+		if (correlated.generation !== undefined && correlated.generation !== attached.generation) return;
+		const seq = correlated.seq;
+		if (seq !== undefined) {
+			if (correlated.generation === undefined) return;
+			if (seq <= attached.notificationCursor.seq && correlated.generation === attached.notificationCursor.generation)
+				return;
 		}
-		if (!(await this.#deliverRecoveredFrames(attached))) return false;
-		await this.#replayAttachment(attached, attached.cursor.seq);
-		return true;
-	}
-
-	async #reinitializeAttachment(attached: AttachedSession): Promise<void> {
-		const previous = attached.readyTail;
-		const current = previous
-			.catch(() => undefined)
-			.then(async () => {
-				if (!this.#attachmentLive(attached)) return;
-				const endpoint = await this.#readEndpoint(attached.indexed);
-				if (
-					!endpoint ||
-					endpoint.url !== attached.endpoint.url ||
-					endpoint.token !== attached.endpoint.token ||
-					endpoint.pid !== attached.pid
-				) {
-					await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
-					return;
-				}
-				attached.initializingPublication = true;
-				try {
-					void Promise.resolve()
-						.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
-						.catch(error => {
-							this.#detachNotification(attached, "cancelled");
-							logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
-						});
-					await this.#deps.onAttachmentReady?.(attached.capability);
-				} catch {
-					await this.#retireAttachment(attached);
-					return;
-				} finally {
-					attached.initializingPublication = false;
-				}
-				if (this.#attachmentLive(attached)) await this.#replayAttachment(attached, attached.cursor.seq);
-			});
-		attached.readyTail = current;
-		await current;
-	}
-	#reviveTransport(attached: AttachedSession): void {
-		const connect = attached.client.connect?.bind(attached.client);
-		if (!connect || this.#reviving.has(attached.id)) return;
-		this.#reviving.add(attached.id);
-		void connect()
-			.catch(() => undefined)
-			.finally(() => this.#reviving.delete(attached.id));
-	}
-
-	#running(runEpoch: number): boolean {
-		return this.#started && runEpoch === this.#runEpoch;
-	}
-
-	#attachmentLive(attached: AttachedSession): boolean {
-		return (
-			this.#running(attached.runEpoch) &&
-			!attached.barrier.detached &&
-			!attached.barrier.failed &&
-			this.#sessions.get(attached.sessionId) === attached
-		);
-	}
-
-	#attachmentPublished(attached: AttachedSession): boolean {
-		return attached.published && this.#attachmentLive(attached);
+		const publicationId =
+			seq !== undefined && correlated.generation === attached.generation
+				? `${attached.sessionId}:${attached.generation}:${seq}`
+				: undefined;
+		const delivered = publicationId === undefined ? correlated : { ...correlated, publicationId };
+		this.#dispatchNotificationFrame(attached, delivered);
+		await Promise.resolve()
+			.then(() => this.#deps.onFrame?.(attached.capability, delivered))
+			.catch(error =>
+				logger.warn(`SDK provider frame hook failed: ${error instanceof Error ? error.message : String(error)}`),
+			);
+		if (seq !== undefined && !attached.disposed)
+			attached.notificationCursor.seq = Math.max(attached.notificationCursor.seq, seq);
 	}
 
 	#recordNotificationReceipt(
@@ -1297,13 +922,6 @@ export class SessionRouter {
 		});
 	}
 
-	async #boundedNotificationWork<T>(work: () => Promise<T> | T): Promise<T | typeof NOTIFICATION_WORK_TIMEOUT> {
-		const timeout: Promise<typeof NOTIFICATION_WORK_TIMEOUT> = Bun.sleep(NOTIFICATION_WORK_TIMEOUT_MS).then(
-			() => NOTIFICATION_WORK_TIMEOUT,
-		);
-		return await Promise.race([Promise.resolve().then(work), timeout]);
-	}
-
 	#detachNotification(
 		attached: AttachedSession,
 		reason: "removed" | "replaced" | "replaced_same_generation" | "cancelled",
@@ -1311,345 +929,73 @@ export class SessionRouter {
 		if (attached.notificationCancelled) return;
 		attached.notificationCancelled = true;
 		this.#recordNotificationReceipt(attached.notificationSubscription, "pending", reason);
-		const work = this.#boundedNotificationWork(() =>
-			this.#deps.onNotificationSubscriptionRemoved?.(attached.notificationSubscription, reason),
-		)
+		void Promise.resolve()
+			.then(() => this.#deps.onNotificationSubscriptionRemoved?.(attached.notificationSubscription, reason))
 			.then(
-				result =>
-					this.#recordNotificationReceipt(
-						attached.notificationSubscription,
-						result === NOTIFICATION_WORK_TIMEOUT ? "failed" : "completed",
-						reason,
-					),
+				() => this.#recordNotificationReceipt(attached.notificationSubscription, "completed", reason),
 				(error: unknown) =>
 					this.#recordNotificationReceipt(
 						attached.notificationSubscription,
 						"failed",
 						error instanceof Error ? error.message : String(error),
 					),
-			)
-			.catch(() => undefined);
-		void work;
+			);
 	}
 
 	#dispatchNotificationFrame(attached: AttachedSession, frame: SessionRouterFrame): void {
-		if (attached.notificationCancelled || !this.#attachmentLive(attached)) return;
+		if (attached.notificationCancelled || attached.disposed) return;
 		const callback = this.#deps.onNotificationFrame;
 		if (!callback) return;
-		const work = this.#boundedNotificationWork(async () => {
-			await callback(attached.notificationSubscription, frame);
-			return true;
-		}).then(
-			result => {
-				if (result === NOTIFICATION_WORK_TIMEOUT) {
-					this.#detachNotification(attached, "cancelled");
-					return;
-				}
+		void Promise.resolve()
+			.then(() => callback(attached.notificationSubscription, frame))
+			.then(() => {
 				if (frame.seq !== undefined)
 					attached.notificationSubscription.advanceCursor(frame.generation ?? attached.generation, frame.seq);
-			},
-			(error: unknown) => {
-				this.#detachNotification(attached, "cancelled");
+			})
+			.catch((error: unknown) => {
+				if (!attached.disposed) this.#detachNotification(attached, "cancelled");
 				logger.warn(
 					`SDK notification subscription ${attached.notificationSubscription.subscriptionId} failed locally: ${
 						error instanceof Error ? error.message : String(error)
 					}`,
 				);
-			},
-		);
-		void work;
-	}
-
-	async #retireAttachment(
-		attached: AttachedSession,
-		explicitReason?: "removed" | "replaced" | "replaced_same_generation",
-	): Promise<void> {
-		this.#adopted.delete(attached.sessionId);
-		if (this.#sessions.get(attached.sessionId) !== attached) return;
-		this.#retirementVersions.set(attached.sessionId, (this.#retirementVersions.get(attached.sessionId) ?? 0) + 1);
-		this.#sessions.delete(attached.sessionId);
-		attached.dispose();
-		const gate = Promise.withResolvers<void>();
-		this.#retirements.set(attached.sessionId, gate.promise);
-		try {
-			let reason = explicitReason;
-			if (reason === undefined) {
-				try {
-					await this.#index.refresh();
-					const current = this.#index
-						.listSessions()
-						.sessions.find(session => session.sessionId === attached.sessionId);
-					if (
-						current?.live &&
-						(current.endpointGeneration !== attached.generation ||
-							current.pid !== attached.pid ||
-							current.endpointMtimeMs !== attached.endpointMtimeMs)
-					)
-						reason = current.endpointGeneration === attached.generation ? "replaced_same_generation" : "replaced";
-				} catch {
-					// Revocation remains terminal when current Broker authority cannot be proven.
-				}
-			}
-			reason ??= "removed";
-			void Promise.resolve(this.#deps.onSessionRemoved?.(attached.capability, reason)).catch(error =>
-				logger.warn(`SDK provider cleanup failed after authority revocation: ${String(error)}`),
-			);
-			this.#detachNotification(attached, reason);
-			await attached.client.close().catch(() => undefined);
-		} finally {
-			gate.resolve();
-			if (this.#retirements.get(attached.sessionId) === gate.promise) this.#retirements.delete(attached.sessionId);
-		}
-	}
-
-	#failBarrier(attached: AttachedSession, reason: string): void {
-		if (attached.barrier.detached || attached.barrier.failed) return;
-		attached.barrier.failed = true;
-		attached.barrier.held = undefined;
-		logger.warn(
-			`chat daemon replay barrier failed (${reason}); rebuilding session ${attached.sessionId} at generation ${attached.generation} from seq ${attached.cursor.seq}.`,
-		);
-	}
-	#failDelivery(attached: AttachedSession, seq: number, error: unknown): void {
-		const previous = this.#undelivered.get(attached.sessionId);
-		const attempts = previous?.generation === attached.generation && previous.seq === seq ? previous.attempts + 1 : 1;
-		const reason = error instanceof Error ? error.message : String(error);
-		if (attempts >= DELIVERY_ATTEMPT_LIMIT) {
-			this.#undelivered.delete(attached.sessionId);
-			this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
-			attached.cursor.seq = seq;
-			logger.warn(
-				`chat daemon conceded seq ${seq} of session ${attached.sessionId} at generation ${attached.generation} after ${attempts} refused publications (${reason}); delivery resumes above it.`,
-			);
-			return;
-		}
-		this.#undelivered.set(attached.sessionId, { generation: attached.generation, seq, attempts });
-		this.#failBarrier(attached, `publication failed at seq ${seq} (${reason})`);
-	}
-
-	#rememberRecoveredFrame(attached: AttachedSession, seq: number, frame: Record<string, unknown>): void {
-		let pending = this.#recoveredFrames.get(attached.sessionId);
-		if (!pending || pending.generation !== attached.generation) {
-			pending = { generation: attached.generation, frames: [] };
-			this.#recoveredFrames.set(attached.sessionId, pending);
-		}
-		const existing = pending.frames.find(item => item.seq === seq);
-		if (existing) existing.frame = frame;
-		else {
-			pending.frames.push({ seq, frame });
-			pending.frames.sort((left, right) => left.seq - right.seq);
-		}
-	}
-
-	#removeRecoveredFrame(sessionId: string, generation: number, seq: number): void {
-		const pending = this.#recoveredFrames.get(sessionId);
-		if (!pending || pending.generation !== generation) return;
-		pending.frames = pending.frames.filter(item => item.seq !== seq);
-		if (pending.frames.length === 0) this.#recoveredFrames.delete(sessionId);
-	}
-
-	async #deliverRecoveredFrames(attached: AttachedSession): Promise<boolean> {
-		const pending = this.#recoveredFrames.get(attached.sessionId);
-		if (!pending || pending.generation !== attached.generation) return true;
-		for (const item of [...pending.frames]) {
-			if (item.seq <= attached.cursor.seq) {
-				this.#removeRecoveredFrame(attached.sessionId, attached.generation, item.seq);
-				continue;
-			}
-			await this.#enqueueFrame(attached, item.frame, "ordered");
-			if (attached.barrier.detached || attached.barrier.failed) return false;
-		}
-		return true;
-	}
-
-	#schedule(task: Promise<void>): void {
-		this.#pending.add(task);
-		void task.then(
-			() => this.#pending.delete(task),
-			() => this.#pending.delete(task),
-		);
-	}
-
-	async #deliverOutOfBandFrame(attached: AttachedSession, frame: Record<string, unknown>): Promise<void> {
-		if (!this.#attachmentLive(attached)) return;
-		if (!attached.published) {
-			await attached.publication.promise.catch(() => undefined);
-			if (!this.#attachmentPublished(attached)) return;
-		}
-		const correlated = this.#correlateFrame(frame);
-		if (!correlated) return;
-		if (correlated.sessionId !== undefined && correlated.sessionId !== attached.sessionId) return;
-		if (correlated.generation !== undefined && correlated.generation !== attached.generation) return;
-		this.#dispatchNotificationFrame(attached, correlated);
-		void Promise.resolve(this.#deps.onFrame?.(attached.capability, correlated)).catch(error =>
-			logger.warn(`SDK provider frame hook failed: ${String(error)}`),
-		);
-	}
-	#enqueueFrame(attached: AttachedSession, frame: Record<string, unknown>, origin: FrameOrigin): Promise<void> {
-		const previous = this.#frameTails.get(attached.id) ?? Promise.resolve();
-		const current = previous
-			.catch(() => undefined)
-			.then(async () => {
-				if (!this.#attachmentLive(attached)) return;
-				if (!attached.published) {
-					await attached.publication.promise.catch(() => undefined);
-					if (!this.#attachmentPublished(attached)) return;
-				}
-				const correlated = this.#correlateFrame(frame);
-				if (!correlated) return;
-				const seq = typeof frame.seq === "number" && Number.isSafeInteger(frame.seq) ? frame.seq : undefined;
-				if (correlated.sessionId !== undefined && correlated.sessionId !== attached.sessionId) return;
-				if (correlated.generation !== undefined && correlated.generation !== attached.generation) return;
-				if (seq !== undefined && correlated.generation === undefined) return;
-				const ownsSequence =
-					correlated.generation === attached.generation &&
-					(correlated.sessionId === undefined || correlated.sessionId === attached.sessionId);
-				if (seq !== undefined && ownsSequence) {
-					if (seq <= attached.cursor.seq) return;
-					const held = attached.barrier.held;
-					if (held && origin === "live") {
-						if (held.length >= REPLAY_BARRIER_LIMIT) {
-							this.#failBarrier(attached, `hold buffer overflowed at ${REPLAY_BARRIER_LIMIT} frames`);
-							return;
-						}
-						held.push({ seq, frame });
-						return;
-					}
-				}
-				const publicationId =
-					seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
-				try {
-					const notificationFrame = publicationId === undefined ? correlated : { ...correlated, publicationId };
-					this.#dispatchNotificationFrame(attached, notificationFrame);
-					await this.#deps.onFrame?.(attached.capability, notificationFrame);
-				} catch (error) {
-					if (!this.#attachmentLive(attached)) return;
-					if (seq === undefined || !ownsSequence) throw error;
-					this.#failDelivery(attached, seq, error);
-					return;
-				}
-				if (!this.#attachmentLive(attached)) return;
-				if (seq !== undefined && ownsSequence) {
-					this.#undelivered.delete(attached.sessionId);
-					this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
-					if (seq > attached.cursor.seq) attached.cursor.seq = seq;
-				}
 			});
-		this.#frameTails.set(attached.id, current);
-		void current.then(
-			() => {
-				if (this.#frameTails.get(attached.id) === current) this.#frameTails.delete(attached.id);
-			},
-			() => {
-				if (this.#frameTails.get(attached.id) === current) this.#frameTails.delete(attached.id);
-			},
+	}
+
+	readonly #reviving = new Set<string>();
+
+	/**
+	 * Re-establishes a dropped transport in the background. `connect()` is a
+	 * no-op on a healthy client and triggers the client's reconnect hook on a
+	 * dropped one; concurrent revivals for the same attachment are coalesced.
+	 */
+	#reviveTransport(attached: AttachedSession): void {
+		const connect = attached.client.connect?.bind(attached.client);
+		if (!connect || this.#reviving.has(attached.capability.authorityId ?? attached.sessionId)) return;
+		this.#reviving.add(attached.capability.authorityId ?? attached.sessionId);
+		void connect()
+			.catch(() => undefined)
+			.finally(() => this.#reviving.delete(attached.capability.authorityId ?? attached.sessionId));
+	}
+
+	async #retire(
+		attached: AttachedSession,
+		reason: "removed" | "replaced" | "replaced_same_generation" = "removed",
+	): Promise<void> {
+		if (this.#sessions.get(attached.sessionId) === attached) this.#sessions.delete(attached.sessionId);
+		if (attached.disposed) return;
+		attached.dispose();
+		this.#detachNotification(attached, reason);
+		void Promise.resolve(this.#deps.onSessionRemoved?.(attached.capability, reason)).catch(error =>
+			logger.warn(`SDK provider cleanup failed after attachment revocation: ${String(error)}`),
 		);
-		return current;
-	}
-
-	async #drainHeldFrames(attached: AttachedSession, held: HeldFrame[]): Promise<void> {
-		for (;;) {
-			if (attached.barrier.held !== held || !this.#attachmentLive(attached)) return;
-			if (held.length === 0) {
-				attached.barrier.held = undefined;
-				return;
-			}
-			const batch = held.splice(0, held.length).sort((left, right) => left.seq - right.seq);
-			for (const entry of batch) await this.#enqueueFrame(attached, entry.frame, "ordered");
-		}
-	}
-
-	async #replayAttachment(attached: AttachedSession, sinceSeq: number): Promise<void> {
-		if (!this.#attachmentLive(attached)) return;
-		const held: HeldFrame[] = attached.barrier.held ?? [];
-		attached.barrier.held = held;
-		try {
-			let replay: Record<string, unknown>;
-			for (let attempt = 0; ; attempt++) {
-				try {
-					const stopped = Promise.withResolvers<void>();
-					const onStop = (): void => stopped.resolve();
-					if (this.#stopController.signal.aborted) stopped.resolve();
-					else this.#stopController.signal.addEventListener("abort", onStop, { once: true });
-					const replayRequest = attached.client.request({
-						type: "event_replay",
-						sinceGeneration: attached.generation,
-						sinceSeq,
-					});
-					let outcome: { kind: "response"; value: Record<string, unknown> } | { kind: "stopped" };
-					try {
-						outcome = await Promise.race([
-							replayRequest.then(value => ({ kind: "response" as const, value })),
-							stopped.promise.then(() => ({ kind: "stopped" as const })),
-						]);
-					} finally {
-						this.#stopController.signal.removeEventListener("abort", onStop);
-					}
-					if (outcome.kind === "stopped") return;
-					replay = outcome.value;
-					break;
-				} catch {
-					if (attempt >= REPLAY_RETRY_ATTEMPTS) {
-						this.#failBarrier(attached, "replay went unanswered");
-						return;
-					}
-					await Bun.sleep(REPLAY_RETRY_BACKOFF_MS * 2 ** attempt);
-					if (attached.barrier.held !== held || !this.#attachmentLive(attached)) return;
-				}
-			}
-			if (attached.barrier.held !== held || !this.#attachmentLive(attached)) return;
-			await this.#frameTails.get(attached.id)?.catch(() => undefined);
-			if (attached.barrier.held !== held || !this.#attachmentLive(attached)) return;
-			const events = Array.isArray(replay.events)
-				? replay.events.filter(
-						(event): event is Record<string, unknown> =>
-							!!event && typeof event === "object" && !Array.isArray(event),
-					)
-				: [];
-			if (replay.gap !== undefined) {
-				const gap = readReplayGap(replay.gap);
-				if (!gap) {
-					this.#failBarrier(attached, "replay reported a gap it did not state");
-					return;
-				}
-				if (gap.kind === "generation_reset") {
-					this.#failBarrier(attached, `replay reported a generation reset to ${gap.toGeneration}`);
-					return;
-				}
-				if (gap.fromSeq !== sinceSeq + 1) {
-					this.#failBarrier(
-						attached,
-						`replay conceded sequences ${gap.fromSeq}-${gap.toSeq} for a request that resumed from seq ${sinceSeq}`,
-					);
-					return;
-				}
-				const retained = events
-					.map(event => readSequence(event.seq))
-					.find(seq => seq !== undefined && seq <= gap.toSeq);
-				if (retained !== undefined) {
-					this.#failBarrier(
-						attached,
-						`replay conceded sequences ${gap.fromSeq}-${gap.toSeq} while returning seq ${retained}`,
-					);
-					return;
-				}
-				const recovered = held.filter(entry => entry.seq <= gap.toSeq).sort((left, right) => left.seq - right.seq);
-				const carried = held.filter(entry => entry.seq > gap.toSeq);
-				held.splice(0, held.length, ...carried);
-				const recoveredNote =
-					recovered.length > 0 ? `, ${recovered.length} of them recovered from live delivery` : "";
+		await attached.client
+			.close()
+			.catch(error =>
 				logger.warn(
-					`chat daemon replay conceded a retention gap (sequences ${gap.fromSeq}-${gap.toSeq} are gone from the host${recoveredNote}); session ${attached.sessionId} generation ${attached.generation} resumes at seq ${gap.toSeq + 1}.`,
-				);
-				for (const entry of recovered) this.#rememberRecoveredFrame(attached, entry.seq, entry.frame);
-				if (!(await this.#deliverRecoveredFrames(attached))) return;
-				if (gap.toSeq > attached.cursor.seq) attached.cursor.seq = gap.toSeq;
-			}
-			for (const event of events) await this.#enqueueFrame(attached, event, "ordered");
-			await this.#drainHeldFrames(attached, held);
-		} finally {
-			if (attached.barrier.held === held) attached.barrier.held = undefined;
-		}
+					`SDK session transport cleanup failed for ${attached.sessionId}; authority remains revoked (${String(error)}).`,
+				),
+			);
 	}
 }
 

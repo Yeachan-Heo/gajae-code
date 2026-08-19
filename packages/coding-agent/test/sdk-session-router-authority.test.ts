@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
@@ -187,140 +186,12 @@ async function routerFixture(
 	};
 }
 
-interface ManualTimeouts {
-	readonly clearTimeout: typeof clearTimeout;
-	readonly fire: () => void;
-	readonly pending: () => number;
-	readonly setTimeout: typeof setTimeout;
-}
-
-function manualTimeouts(): ManualTimeouts {
-	const timers = new Map<number, () => void>();
-	let nextTimer = 0;
-	return {
-		setTimeout: ((callback: () => void) => {
-			const timer = ++nextTimer;
-			timers.set(timer, callback);
-			return timer;
-		}) as unknown as typeof setTimeout,
-		clearTimeout: ((timer: number) => {
-			timers.delete(timer);
-		}) as unknown as typeof clearTimeout,
-		pending: () => timers.size,
-		fire: () => {
-			const timer = timers.entries().next().value;
-			if (!timer || timers.size !== 1) throw new Error("Expected exactly one pending attach deadline.");
-			const [id, callback] = timer;
-			timers.delete(id);
-			callback();
-		},
-	};
-}
-
 async function waitFor(condition: () => boolean, message: string): Promise<void> {
 	for (let attempt = 0; attempt < 50; attempt++) {
 		if (condition()) return;
 		await Bun.sleep(10);
 	}
 	throw new Error(message);
-}
-
-interface HungRouterFixture {
-	readonly deadlines: ManualTimeouts;
-	readonly healthyPublished: Promise<void>;
-	readonly healthySent: Record<string, unknown>[];
-	readonly hungConnections: () => number;
-	readonly reconciliations: () => number;
-	readonly router: SessionRouter;
-	readonly tick: () => void;
-}
-
-function hungRouterFixture(): HungRouterFixture {
-	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-hung-"));
-	tempDirs.push(repo);
-	const agentDir = path.join(repo, ".gjc", "agent");
-	const stateRoot = path.join(repo, ".gjc", "state");
-	const endpointDir = path.join(stateRoot, "sdk");
-	fs.mkdirSync(endpointDir, { recursive: true });
-	const indexed = [
-		{ sessionId: "router-hung", url: "ws://hung.test", token: "hung-secret" },
-		{ sessionId: "router-healthy", url: "ws://healthy.test", token: "healthy-secret" },
-	] as const;
-	const endpointMtimeMs = new Map<string, number>();
-	for (const session of indexed) {
-		const endpointFile = path.join(endpointDir, `${session.sessionId}.json`);
-		fs.writeFileSync(endpointFile, `${JSON.stringify({ ...session, pid: 42 })}\n`);
-		endpointMtimeMs.set(session.sessionId, fs.statSync(endpointFile).mtimeMs);
-	}
-	const index = {
-		open: async () => {},
-		refresh: async () => {},
-		listSessions: () => ({
-			indexSeq: 1,
-			sessions: indexed.map(session => ({
-				sessionId: session.sessionId,
-				locator: { repo, stateRoot },
-				endpointGeneration: 1,
-				pid: 42,
-				endpointMtimeMs: endpointMtimeMs.get(session.sessionId),
-				live: true,
-				indexSeq: 1,
-				ambiguous: false,
-				terminal: false,
-			})),
-			warnings: [],
-		}),
-	} as unknown as SessionIndex;
-	const deadlines = manualTimeouts();
-	const healthyPublished = Promise.withResolvers<void>();
-	const healthySent: Record<string, unknown>[] = [];
-	let hungConnections = 0;
-	let reconciliations = 0;
-	let reconcileTick: (() => void) | undefined;
-	const router = new SessionRouter({
-		agentDir,
-		deps: {
-			createIndex: () => index,
-			createClient: async authority => {
-				if (authority.sessionId === "router-hung") {
-					hungConnections++;
-					const connection = Promise.withResolvers<SessionRouterClient>();
-					return await connection.promise;
-				}
-				return {
-					onFrame: () => () => {},
-					request: async () => ({ events: [] }),
-					close: async () => {},
-					send: frame => healthySent.push(frame),
-				};
-			},
-			onAttachmentReady: attachment => {
-				if (attachment.sessionId === "router-healthy") healthyPublished.resolve();
-			},
-			onReconciled: () => {
-				reconciliations++;
-			},
-			setInterval: ((callback: () => void) => {
-				reconcileTick = callback;
-				return 0;
-			}) as unknown as typeof setInterval,
-			clearInterval: (() => {}) as unknown as typeof clearInterval,
-			setTimeout: deadlines.setTimeout,
-			clearTimeout: deadlines.clearTimeout,
-		},
-	});
-	return {
-		deadlines,
-		healthyPublished: healthyPublished.promise,
-		healthySent,
-		hungConnections: () => hungConnections,
-		reconciliations: () => reconciliations,
-		router,
-		tick: () => {
-			if (!reconcileTick) throw new Error("SessionRouter interval was not installed.");
-			reconcileTick();
-		},
-	};
 }
 
 describe("SessionRouter dispatch authority", () => {
@@ -577,71 +448,6 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
-	test("bounds a never-settling attachment without stopping the router", async () => {
-		const fixture = hungRouterFixture();
-		const starting = fixture.router.start();
-		try {
-			await fixture.healthyPublished;
-			const healthy = fixture.router.attachment("router-healthy");
-			if (!healthy) throw new Error("Healthy attachment was not published.");
-			expect(healthy.isCurrent()).toBe(true);
-			expect(fixture.router.attachment("router-hung")).toBeNull();
-			expect(fixture.hungConnections()).toBe(1);
-			expect(fixture.deadlines.pending()).toBe(1);
-
-			fixture.deadlines.fire();
-			await starting;
-			expect(fixture.router.isReady()).toBe(true);
-			expect(fixture.reconciliations()).toBe(1);
-			expect(fixture.router.attachment("router-healthy")).toBe(healthy);
-			expect(healthy.isCurrent()).toBe(true);
-
-			fixture.tick();
-			await waitFor(() => fixture.hungConnections() === 2, "Hung endpoint was not retried.");
-			expect(fixture.deadlines.pending()).toBe(1);
-			fixture.deadlines.fire();
-			await waitFor(() => fixture.reconciliations() === 2, "Reconciliation did not continue after the deadline.");
-			expect(fixture.router.attachment("router-hung")).toBeNull();
-			expect(fixture.router.attachment("router-healthy")).toBe(healthy);
-			expect(healthy.isCurrent()).toBe(true);
-		} finally {
-			await fixture.router.stop();
-			await starting;
-		}
-	});
-
-	test("coalesces hung-endpoint poll ticks while keeping a healthy attachment dispatchable", async () => {
-		const fixture = hungRouterFixture();
-		const starting = fixture.router.start();
-		try {
-			await fixture.healthyPublished;
-			fixture.deadlines.fire();
-			await starting;
-			const healthy = fixture.router.attachment("router-healthy");
-			if (!healthy) throw new Error("Healthy attachment was not published.");
-
-			fixture.tick();
-			await waitFor(() => fixture.hungConnections() === 2, "Hung endpoint did not begin reconciliation.");
-			for (let tick = 0; tick < 6; tick++) fixture.tick();
-			const dispatched = Promise.resolve(healthy.send({ type: "healthy-dispatch" }));
-
-			fixture.deadlines.fire();
-			await waitFor(() => fixture.hungConnections() === 3, "Coalesced reconciliation did not begin.");
-			expect(fixture.deadlines.pending()).toBe(1);
-			fixture.deadlines.fire();
-			const settled = await Promise.race([dispatched.then(() => true), Bun.sleep(250).then(() => false)]);
-			expect(settled).toBe(true);
-			expect(fixture.hungConnections()).toBe(3);
-			expect(fixture.reconciliations()).toBe(3);
-			expect(fixture.router.attachment("router-healthy")).toBe(healthy);
-			expect(healthy.isCurrent()).toBe(true);
-			expect(fixture.healthySent).toEqual([{ type: "healthy-dispatch" }]);
-		} finally {
-			await fixture.router.stop();
-			await starting;
-		}
-	});
-
 	test("revokes attachment authority when provider publication rejects", async () => {
 		let removed: SessionAttachment | undefined;
 		const fixture = await routerFixture({
@@ -693,56 +499,6 @@ describe("SessionRouter dispatch authority", () => {
 		} finally {
 			await fixture.router.stop();
 		}
-	});
-
-	test("keeps a rejecting provider publication provisional", async () => {
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const fixture = await routerFixture({
-			start: false,
-			onAttachment: async () => {
-				entered.resolve();
-				await release.promise;
-				throw new Error("provider publication rejected");
-			},
-		});
-		const starting = fixture.router.start();
-		await entered.promise;
-		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-		const request = fixture.router.request(fixture.sessionId, { type: "query_request" });
-		await Bun.sleep(10);
-		expect(fixture.clients[0]?.requests.filter(frame => frame.type === "query_request")).toEqual([]);
-		release.resolve();
-		await expect(request).rejects.toBeInstanceOf(SessionRouterError);
-		await starting;
-		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-		await fixture.router.stop();
-	});
-
-	test("holds live frames until provider publication succeeds", async () => {
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const frames: SessionRouterFrame[] = [];
-		const fixture = await routerFixture({
-			start: false,
-			onAttachment: async () => {
-				entered.resolve();
-				await release.promise;
-			},
-			onFrame: (_attachment, frame) => {
-				frames.push(frame);
-			},
-		});
-		const starting = fixture.router.start();
-		await entered.promise;
-		fixture.clients[0]?.emit({ type: "notification", sessionId: fixture.sessionId });
-		await Bun.sleep(10);
-		expect(frames).toEqual([]);
-		release.resolve();
-		await starting;
-		await Bun.sleep(10);
-		expect(frames).toHaveLength(1);
-		await fixture.router.stop();
 	});
 
 	test("rejects a command carrying a different same-generation attachment", async () => {
@@ -802,164 +558,6 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
-	test("publishes readiness only after capability authority becomes current", async () => {
-		const phases: string[] = [];
-		const fixture = await routerFixture({
-			onAttachment: attachment => {
-				phases.push(`attachment:${attachment.isCurrent()}`);
-			},
-			onAttachmentReady: attachment => {
-				phases.push(`ready:${attachment.isCurrent()}`);
-			},
-		});
-		try {
-			expect(phases).toEqual(["attachment:false", "ready:true"]);
-		} finally {
-			await fixture.router.stop();
-		}
-	});
-
-	test("allows an awaited attachment handshake to send before Router replay", async () => {
-		const phases: string[] = [];
-		const fixture = await routerFixture({
-			onAttachmentReady: async attachment => {
-				phases.push("ready");
-				await attachment.send({ type: "hello" });
-				await attachment.send({ type: "event_replay", id: "provider-replay" });
-				phases.push("handshake-sent");
-			},
-		});
-		try {
-			expect(phases).toEqual(["ready", "handshake-sent"]);
-			expect(fixture.clients[0]?.sent.map(frame => frame.type)).toEqual(["hello", "event_replay"]);
-			expect(fixture.clients[0]?.requests.map(frame => frame.type)).toEqual(["event_replay"]);
-		} finally {
-			await fixture.router.stop();
-		}
-	});
-
-	test("allows exact publication-time requests before Router replay", async () => {
-		let router: SessionRouter | undefined;
-		const phases: string[] = [];
-		const fixture = await routerFixture({
-			start: false,
-			onAttachmentReady: async attachment => {
-				phases.push("ready");
-				await router?.request(
-					attachment.sessionId,
-					{ type: "register_provider", capability: "ui" },
-					attachment.generation,
-					attachment,
-				);
-				phases.push("registered");
-			},
-		});
-		router = fixture.router;
-		try {
-			await router.start();
-			expect(phases).toEqual(["ready", "registered"]);
-			expect(fixture.clients[0]?.requests.map(frame => frame.type)).toEqual(["register_provider", "event_replay"]);
-		} finally {
-			await router.stop();
-		}
-	});
-
-	test("rejects an exact publication-time request after endpoint replacement", async () => {
-		let router: SessionRouter | undefined;
-		let endpointFile = "";
-		let sessionId = "";
-		const fixture = await routerFixture({
-			start: false,
-			onAttachmentReady: async attachment => {
-				fs.writeFileSync(
-					endpointFile,
-					JSON.stringify({ sessionId, url: "ws://router.test", token: "replacement", pid: 42 }),
-				);
-				if (!router) throw new Error("Router fixture unavailable");
-				await expect(
-					router.request(
-						attachment.sessionId,
-						{ type: "register_provider", capability: "ui" },
-						attachment.generation,
-						attachment,
-					),
-				).rejects.toMatchObject({ phase: "pre_send" });
-			},
-		});
-		router = fixture.router;
-		endpointFile = fixture.endpointFile;
-		sessionId = fixture.sessionId;
-		try {
-			await router.start();
-			expect(fixture.clients[0]?.requests.map(frame => frame.type)).toEqual([]);
-		} finally {
-			await router.stop();
-		}
-	});
-
-	test("revalidates exact endpoint authority before publication handshake sends", async () => {
-		let authority: { pid: number; endpointMtimeMs: number } | undefined;
-		let endpointFile = "";
-		let sessionId = "";
-		const fixture = await routerFixture({
-			start: false,
-			onAttachmentReady: async attachment => {
-				if (!authority) throw new Error("test authority unavailable");
-				authority.pid = 43;
-				fs.writeFileSync(
-					endpointFile,
-					JSON.stringify({ sessionId, url: "ws://router.test", token: "replacement", pid: 43 }),
-				);
-				authority.endpointMtimeMs = fs.statSync(endpointFile).mtimeMs;
-				await attachment.send({ type: "hello" });
-			},
-		});
-		authority = fixture.authority;
-		endpointFile = fixture.endpointFile;
-		sessionId = fixture.sessionId;
-		await fixture.router.start();
-		expect(fixture.clients[0]?.sent).toEqual([]);
-		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-		await fixture.router.stop();
-	});
-
-	test("publishes reconnect successor without awaiting predecessor provider retirement", async () => {
-		const entered = Promise.withResolvers<"replaced_same_generation">();
-		const release = Promise.withResolvers<void>();
-		const fixture = await routerFixture({
-			onSessionRemoved: async (_attachment, reason) => {
-				if (reason !== "replaced_same_generation") return;
-				entered.resolve(reason);
-				await release.promise;
-			},
-		});
-		try {
-			fs.writeFileSync(
-				fixture.endpointFile,
-				JSON.stringify({
-					sessionId: fixture.sessionId,
-					url: "ws://router.test",
-					token: "replacement",
-					pid: 43,
-				}),
-			);
-			fixture.authority.pid = 43;
-			fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-			fixture.clients[0]?.reconnect();
-			await entered.promise;
-			const reconciliation = fixture.router.reconcile();
-			await Bun.sleep(25);
-			expect(fixture.clients).toHaveLength(2);
-			expect(fixture.router.attachment(fixture.sessionId)).not.toBeNull();
-			release.resolve();
-			await reconciliation;
-			expect(fixture.clients).toHaveLength(2);
-		} finally {
-			release.resolve();
-			await fixture.router.stop();
-		}
-	});
-
 	test("reruns the provider handshake before replay after reconnect", async () => {
 		let readyCount = 0;
 		const fixture = await routerFixture({
@@ -980,309 +578,6 @@ describe("SessionRouter dispatch authority", () => {
 				"hello",
 				"event_replay",
 			]);
-		} finally {
-			await fixture.router.stop();
-		}
-	});
-
-	test("delivers an unsequenced replay response ahead of a blocked sequenced event", async () => {
-		const eventEntered = Promise.withResolvers<void>();
-		const replayDelivered = Promise.withResolvers<void>();
-		const releaseEvent = Promise.withResolvers<void>();
-		const order: string[] = [];
-		const fixture = await routerFixture({
-			onFrame: async (_attachment, frame) => {
-				if (frame.name === "event") {
-					order.push("event-entered");
-					eventEntered.resolve();
-					await releaseEvent.promise;
-					order.push("event-settled");
-					return;
-				}
-				if (frame.name === "event_replay_result") {
-					order.push("replay-response");
-					replayDelivered.resolve();
-					releaseEvent.resolve();
-				}
-			},
-		});
-		try {
-			fixture.clients[0]?.emit({
-				type: "event",
-				sessionId: fixture.sessionId,
-				generation: 1,
-				seq: 1,
-			});
-			await eventEntered.promise;
-			fixture.clients[0]?.emit({ type: "event_replay_result", id: "provider-replay", events: [] });
-			const delivered = await Promise.race([
-				replayDelivered.promise.then(() => true),
-				Bun.sleep(250).then(() => false),
-			]);
-			expect(delivered).toBe(true);
-			await Bun.sleep(10);
-			expect(order).toEqual(["event-entered", "replay-response", "event-settled"]);
-		} finally {
-			releaseEvent.resolve();
-			await fixture.router.stop();
-		}
-	});
-
-	test("keeps lifecycle adoption provisional until a delayed index proves the exact authority", async () => {
-		const fixture = await routerFixture({ initiallyIndexed: false });
-		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
-		const adopted = await fixture.router.adoptLifecycleResult(
-			{
-				ok: true,
-				result: {
-					sessionId: fixture.sessionId,
-					endpointGeneration: fixture.authority.generation,
-					pid: fixture.authority.pid,
-					endpointMtimeMs: fixture.authority.endpointMtimeMs,
-					endpoint,
-				},
-			},
-			{ sessionId: fixture.sessionId, cwd: fixture.repo },
-		);
-		try {
-			expect(adopted.isCurrent()).toBe(false);
-			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-			fixture.authority.indexed = true;
-			await fixture.router.reconcile();
-			expect(adopted.isCurrent()).toBe(true);
-			expect(fixture.router.attachment(fixture.sessionId)).toBe(adopted);
-		} finally {
-			await fixture.router.stop();
-		}
-	});
-
-	test("revokes lifecycle adoption when the index remains missing or terminal", async () => {
-		const fixture = await routerFixture({ initiallyIndexed: false });
-		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
-		const adopted = await fixture.router.adoptLifecycleResult(
-			{
-				ok: true,
-				result: {
-					sessionId: fixture.sessionId,
-					endpointGeneration: fixture.authority.generation,
-					pid: fixture.authority.pid,
-					endpointMtimeMs: fixture.authority.endpointMtimeMs,
-					endpoint,
-				},
-			},
-			{ sessionId: fixture.sessionId, cwd: fixture.repo },
-		);
-		try {
-			await fixture.router.reconcile();
-			expect(adopted.isCurrent()).toBe(false);
-			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-		} finally {
-			await fixture.router.stop();
-		}
-
-		const terminal = await routerFixture();
-		const terminalEndpoint = JSON.parse(fs.readFileSync(terminal.endpointFile, "utf8")) as Record<string, unknown>;
-		const terminalAdopted = await terminal.router.adoptLifecycleResult(
-			{
-				ok: true,
-				result: {
-					sessionId: terminal.sessionId,
-					endpointGeneration: terminal.authority.generation,
-					pid: terminal.authority.pid,
-					endpointMtimeMs: terminal.authority.endpointMtimeMs,
-					endpoint: terminalEndpoint,
-				},
-			},
-			{ sessionId: terminal.sessionId, cwd: terminal.repo },
-		);
-		try {
-			terminal.authority.terminalUncertain = true;
-			await terminal.router.reconcile();
-			expect(terminalAdopted.isCurrent()).toBe(false);
-			expect(terminal.router.attachment(terminal.sessionId)).toBeNull();
-		} finally {
-			await terminal.router.stop();
-		}
-	});
-	test("revokes an old attachment at send time before the periodic reconciliation tick", async () => {
-		const fixture = await routerFixture();
-		const firstAttachment = fixture.attachments[0]!;
-		expect(firstAttachment.generation).toBe(1);
-		fixture.authority.generation = 2;
-
-		await expect(firstAttachment.send({ type: "reply", id: "ask", answer: "yes" })).rejects.toBeInstanceOf(
-			SessionRouterError,
-		);
-		expect(fixture.clients).toHaveLength(2);
-		expect(fixture.clients[0]?.sent).toEqual([]);
-		expect(fixture.router.attachment(fixture.sessionId)?.generation).toBe(2);
-		await fixture.router.stop();
-	});
-	test("revokes a same-generation predecessor when successor pid and mtime replace the endpoint", async () => {
-		const fixture = await routerFixture();
-		const predecessor = fixture.attachments[0]!;
-		fs.writeFileSync(
-			fixture.endpointFile,
-			JSON.stringify({ sessionId: fixture.sessionId, url: "ws://router-successor", token: "successor", pid: 43 }),
-		);
-		fixture.authority.pid = 43;
-		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-
-		await expect(predecessor.send({ type: "reply", id: "ask", answer: "yes" })).rejects.toBeInstanceOf(
-			SessionRouterError,
-		);
-		expect(predecessor.isCurrent()).toBe(false);
-		expect(fixture.router.attachment(fixture.sessionId)?.generation).toBe(1);
-		expect(fixture.clients[0]?.sent).toEqual([]);
-		await fixture.router.stop();
-	});
-	test("revokes an attachment when the endpoint pid disagrees with the indexed process", async () => {
-		const fixture = await routerFixture();
-		const attachment = fixture.attachments[0]!;
-		fs.writeFileSync(
-			fixture.endpointFile,
-			JSON.stringify({ sessionId: fixture.sessionId, url: "ws://router.test", token: "secret", pid: 43 }),
-		);
-
-		await expect(attachment.send({ type: "reply", id: "ask", answer: "yes" })).rejects.toBeInstanceOf(
-			SessionRouterError,
-		);
-		expect(attachment.isCurrent()).toBe(false);
-		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-		await fixture.router.stop();
-	});
-	test("rejects an endpoint when the Broker index rotates during endpoint validation", async () => {
-		let refreshCount = 0;
-		let fixture!: RouterFixture;
-		fixture = await routerFixture({
-			start: false,
-			onIndexRefresh: () => {
-				refreshCount += 1;
-				if (refreshCount !== 2) return;
-				fs.writeFileSync(
-					fixture.endpointFile,
-					JSON.stringify({ sessionId: fixture.sessionId, url: "ws://router-race", token: "race", pid: 43 }),
-				);
-				fixture.authority.pid = 43;
-				fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-			},
-		});
-		await fixture.router.start();
-		try {
-			expect(refreshCount).toBeGreaterThanOrEqual(2);
-			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-		} finally {
-			await fixture.router.stop();
-		}
-	});
-
-	test("revokes attachments when Broker terminal authority is uncertain", async () => {
-		const fixture = await routerFixture();
-		const attachment = fixture.attachments[0]!;
-		fixture.authority.terminalUncertain = true;
-
-		await expect(attachment.send({ type: "reply", id: "ask", answer: "yes" })).rejects.toBeInstanceOf(
-			SessionRouterError,
-		);
-		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-		expect(fixture.clients[0]?.sent).toEqual([]);
-		await fixture.router.stop();
-	});
-
-	test("revokes an attachment when exact endpoint revalidation fails for a still-live index row", async () => {
-		const fixture = await routerFixture();
-		const attachment = fixture.attachments[0]!;
-		fs.rmSync(fixture.endpointFile);
-
-		await expect(attachment.send({ type: "reply", id: "ask", answer: "yes" })).rejects.toBeInstanceOf(
-			SessionRouterError,
-		);
-		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-		expect(fixture.clients[0]?.sent).toEqual([]);
-		await fixture.router.stop();
-	});
-	test("detaches and rejects requests while the Broker index has corruption warnings", async () => {
-		const fixture = await routerFixture();
-		fixture.authority.warnings = ["corrupt index suffix"];
-
-		await expect(
-			fixture.router.request(
-				fixture.sessionId,
-				{
-					type: "control_request",
-					id: "state",
-					operation: "session.state",
-					input: {},
-				},
-				1,
-			),
-		).rejects.toBeInstanceOf(SessionRouterError);
-		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-		expect(fixture.clients[0]?.requests).toEqual([{ type: "event_replay", sinceSeq: 0, sinceGeneration: 1 }]);
-		await fixture.router.stop();
-	});
-	test("rejects activation when the exact endpoint rotates after connecting", async () => {
-		let fixture!: RouterFixture;
-		fixture = await routerFixture({
-			start: false,
-			onClientCreated: () => {
-				fs.writeFileSync(
-					fixture.endpointFile,
-					JSON.stringify({
-						sessionId: fixture.sessionId,
-						url: "ws://router-successor",
-						token: "successor",
-						pid: 43,
-					}),
-				);
-				fixture.authority.pid = 43;
-				fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-			},
-		});
-		try {
-			await expect(fixture.router.activatePreparedSession(fixture.sessionId)).rejects.toMatchObject({
-				code: "session_not_live",
-			});
-			expect(fixture.clients).toHaveLength(1);
-			expect(fixture.clients[0]?.requests).toEqual([]);
-		} finally {
-			await fixture.router.stop();
-		}
-	});
-
-	test("does not publish an attachment when its endpoint rotates after the client connects", async () => {
-		const preservedTimestamp = new Date(1_700_000_000_000);
-		let readyCount = 0;
-		let fixture!: RouterFixture;
-		fixture = await routerFixture({
-			start: false,
-			onClientCreated: () => {
-				fs.writeFileSync(
-					fixture.endpointFile,
-					JSON.stringify({
-						sessionId: fixture.sessionId,
-						url: "ws://router.test",
-						token: "successor",
-						pid: 42,
-					}),
-				);
-				fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
-				expect(fs.statSync(fixture.endpointFile).mtimeMs).toBe(fixture.authority.endpointMtimeMs);
-			},
-			onAttachmentReady: () => {
-				readyCount += 1;
-			},
-		});
-		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
-		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-		try {
-			await fixture.router.start();
-			expect(fixture.clients).toHaveLength(1);
-			expect(readyCount).toBe(0);
-			expect(fixture.attachments).toHaveLength(1);
-			expect(fixture.attachments[0]?.isCurrent()).toBe(false);
-			expect(fixture.clients[0]?.requests).toEqual([]);
-			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
 		} finally {
 			await fixture.router.stop();
 		}
@@ -1374,179 +669,6 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
-	test("rejects an endpoint rewritten after its indexed stat", async () => {
-		const fixture = await routerFixture({ start: false });
-		const realStat = fsPromises.stat;
-		let rewritten = false;
-		const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (file, options) => {
-			const stat = await realStat(file, options);
-			if (!rewritten && file === fixture.endpointFile) {
-				rewritten = true;
-				fs.writeFileSync(
-					fixture.endpointFile,
-					JSON.stringify({
-						sessionId: fixture.sessionId,
-						url: "ws://router.test",
-						token: "replacement",
-						pid: 42,
-					}),
-				);
-			}
-			return stat;
-		}) as typeof fsPromises.stat);
-		try {
-			await fixture.router.start();
-			expect(rewritten).toBe(true);
-			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-			expect(fixture.clients).toEqual([]);
-		} finally {
-			statSpy.mockRestore();
-			await fixture.router.stop();
-		}
-	});
-
-	test("does not hold successor endpoint validation behind provider retirement", async () => {
-		const endpointValidationEntered = Promise.withResolvers<void>();
-		const releaseEndpointValidation = Promise.withResolvers<void>();
-		const retirementEntered = Promise.withResolvers<void>();
-		const releaseRetirement = Promise.withResolvers<void>();
-		const fixture = await routerFixture({
-			onSessionRemoved: async (_attachment, reason) => {
-				if (reason !== "replaced_same_generation") return;
-				retirementEntered.resolve();
-				await releaseRetirement.promise;
-			},
-		});
-		fs.writeFileSync(
-			fixture.endpointFile,
-			JSON.stringify({
-				sessionId: fixture.sessionId,
-				url: "ws://router.test",
-				token: "replacement",
-				pid: 43,
-			}),
-		);
-		fixture.authority.pid = 43;
-		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-		const realStat = fsPromises.stat;
-		let blockedValidation = false;
-		const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (file, options) => {
-			const stat = await realStat(file, options);
-			if (!blockedValidation && file === fixture.endpointFile) {
-				blockedValidation = true;
-				endpointValidationEntered.resolve();
-				await releaseEndpointValidation.promise;
-			}
-			return stat;
-		}) as typeof fsPromises.stat);
-		try {
-			const reconciliation = fixture.router.reconcile();
-			await endpointValidationEntered.promise;
-			fixture.clients[0]?.reconnect();
-			await retirementEntered.promise;
-			releaseEndpointValidation.resolve();
-			await Bun.sleep(25);
-			expect(fixture.clients).toHaveLength(2);
-			expect(fixture.router.attachment(fixture.sessionId)).not.toBeNull();
-			releaseRetirement.resolve();
-			await reconciliation;
-			expect(fixture.clients).toHaveLength(2);
-		} finally {
-			releaseEndpointValidation.resolve();
-			releaseRetirement.resolve();
-			statSpy.mockRestore();
-			await fixture.router.stop();
-		}
-	});
-
-	test("classifies token-only and URL-only same-generation rotations as successors", async () => {
-		const reasons: Array<"removed" | "replaced" | "replaced_same_generation" | undefined> = [];
-		const fixture = await routerFixture({
-			start: false,
-			onSessionRemoved: (_attachment, reason) => {
-				reasons.push(reason);
-			},
-		});
-		const preservedTimestamp = new Date(1_700_000_000_000);
-		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
-		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-		const replaceEndpoint = (url: string, token: string): void => {
-			fs.writeFileSync(fixture.endpointFile, JSON.stringify({ sessionId: fixture.sessionId, url, token, pid: 42 }));
-			fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
-			expect(fs.statSync(fixture.endpointFile).mtimeMs).toBe(fixture.authority.endpointMtimeMs);
-		};
-		try {
-			await fixture.router.start();
-			replaceEndpoint("ws://router.test", "rotated-token");
-			await fixture.router.reconcile();
-			replaceEndpoint("ws://router-successor", "rotated-token");
-			await fixture.router.reconcile();
-			expect(reasons).toEqual(["replaced_same_generation", "replaced_same_generation"]);
-		} finally {
-			await fixture.router.stop();
-		}
-	});
-
-	test("classifies a reconnect token rotation as a same-generation successor", async () => {
-		const reasons: Array<"removed" | "replaced" | "replaced_same_generation" | undefined> = [];
-		const fixture = await routerFixture({
-			start: false,
-			onSessionRemoved: (_attachment, reason) => {
-				reasons.push(reason);
-			},
-		});
-		const preservedTimestamp = new Date(1_700_000_000_000);
-		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
-		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-		try {
-			await fixture.router.start();
-			fs.writeFileSync(
-				fixture.endpointFile,
-				JSON.stringify({
-					sessionId: fixture.sessionId,
-					url: "ws://router.test",
-					token: "rotated-token",
-					pid: 42,
-				}),
-			);
-			fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
-			expect(fs.statSync(fixture.endpointFile).mtimeMs).toBe(fixture.authority.endpointMtimeMs);
-			fixture.clients[0]?.reconnect();
-			for (let attempt = 0; reasons.length === 0 && attempt < 50; attempt++) await Bun.sleep(10);
-			expect(reasons).toEqual(["replaced_same_generation"]);
-		} finally {
-			await fixture.router.stop();
-		}
-	});
-	test("derives distinct durable authority IDs for token and URL rotations", async () => {
-		const fixture = await routerFixture({ start: false });
-		const preservedTimestamp = new Date(1_700_000_000_000);
-		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
-		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
-		const replaceEndpoint = (url: string, token: string): void => {
-			fs.writeFileSync(fixture.endpointFile, JSON.stringify({ sessionId: fixture.sessionId, url, token, pid: 42 }));
-			fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
-			expect(fs.statSync(fixture.endpointFile).mtimeMs).toBe(fixture.authority.endpointMtimeMs);
-		};
-		try {
-			await fixture.router.start();
-			const initialAuthorityId = fixture.router.attachment(fixture.sessionId)?.authorityId;
-			replaceEndpoint("ws://router.test", "rotated-token");
-			await fixture.router.reconcile();
-			const tokenAuthorityId = fixture.router.attachment(fixture.sessionId)?.authorityId;
-			replaceEndpoint("ws://router-successor", "rotated-token");
-			await fixture.router.reconcile();
-			const urlAuthorityId = fixture.router.attachment(fixture.sessionId)?.authorityId;
-			expect(initialAuthorityId).toBeDefined();
-			expect(tokenAuthorityId).toBeDefined();
-			expect(urlAuthorityId).toBeDefined();
-			expect(tokenAuthorityId).not.toBe(initialAuthorityId);
-			expect(urlAuthorityId).not.toBe(tokenAuthorityId);
-			expect(urlAuthorityId).not.toBe(initialAuthorityId);
-		} finally {
-			await fixture.router.stop();
-		}
-	});
 	test("stamps the endpoint token onto token-authorized inbound frames", async () => {
 		// The native session server silently drops user_message/reply/control
 		// frames whose embedded token is missing or wrong; providers never see
@@ -1576,125 +698,169 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.stop();
 		}
 	});
+});
 
-	test("periodic reconcile converges while a rehosted attachment's replay is wedged (#4527)", async () => {
-		// Reproduces the production wedge: a session-host rehost bumps
-		// endpointGeneration, and the periodic reconcile replaces the attachment
-		// with one whose event_replay never settles. Before the fix, that replay
-		// was awaited inside the serialized reconcile tail, so every later tick
-		// froze until the replay budget expired; publications died while leases
-		// and inbound stayed green (#4527).
-		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-4527-"));
-		tempDirs.push(repo);
-		const agentDir = path.join(repo, ".gjc", "agent");
-		const stateRoot = path.join(repo, ".gjc", "state");
-		const endpointDir = path.join(stateRoot, "sdk");
-		await fsPromises.mkdir(endpointDir, { recursive: true });
-		const sessionId = "wedge";
-		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
-		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://wedge.test", token: "v1", pid: 42 }));
-		let generation = 1;
-		let wedgeReplay = false;
-		const wedgedGate = Promise.withResolvers<void>();
-		let reconcileCount = 0;
-		let tick: (() => void) | undefined;
-
-		const index = {
-			open: async () => {},
-			refresh: async () => {},
-			listSessions: () => ({
-				indexSeq: generation,
-				sessions: [
-					{
-						sessionId,
-						locator: { repo, stateRoot },
-						endpointGeneration: generation,
-						pid: 42,
-						endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
-						live: true,
-						indexSeq: generation,
-						ambiguous: false,
-						terminal: false,
-					},
-				],
-				warnings: [],
-			}),
-		} as unknown as SessionIndex;
-
-		const router = new SessionRouter({
-			agentDir,
-			deps: {
-				createIndex: () => index,
-				createClient: async () => ({
-					onFrame: () => () => {},
-					request: async (frame: Record<string, unknown>) => {
-						if (wedgeReplay && frame.type === "event_replay") await wedgedGate.promise;
-						return { events: [] };
-					},
-					close: async () => {},
-					send: () => {},
-				}),
-				onReconciled: () => {
-					reconcileCount++;
-				},
-				setInterval: ((callback: () => void) => {
-					tick = callback;
-					return 0;
-				}) as unknown as typeof setInterval,
-				clearInterval: (() => {}) as unknown as typeof clearInterval,
+describe("SessionRouter direct-attachment stub contract (#4530)", () => {
+	test("attaches indexed sessions and delivers correlated frames in order with publication ids", async () => {
+		const frames: SessionRouterFrame[] = [];
+		const fixture = await routerFixture({
+			onFrame: (_attachment, frame) => {
+				frames.push(frame);
 			},
 		});
-
 		try {
-			await router.start();
-			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
-			const baseline = reconcileCount;
-
-			// Bump generation and rewrite the endpoint file: the periodic
-			// reconcile must replace the attachment. After the replacement,
-			// the new host's event_replay never settles.
-			generation = 2;
-			await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://wedge.test", token: "v2", pid: 42 }));
-			wedgeReplay = true;
-
-			// A publication-driven reconcile can observe the rehost before the
-			// periodic timer. It must publish and dispatch without awaiting the
-			// replacement attachment's wedged replay on the shared tail.
-			const requestSettled = await Promise.race([
-				Bun.sleep(500).then(() => false),
-				router.request(sessionId, { type: "test" }).then(() => true),
+			const attachment = fixture.router.attachment(fixture.sessionId);
+			expect(attachment?.isCurrent()).toBe(true);
+			fixture.clients[0]?.emit({ type: "event", sessionId: fixture.sessionId, generation: 1, seq: 1 });
+			fixture.clients[0]?.emit({ type: "event", sessionId: fixture.sessionId, generation: 1, seq: 2 });
+			fixture.clients[0]?.emit({ type: "event", sessionId: fixture.sessionId, generation: 1, seq: 2 });
+			await waitFor(() => frames.length === 2, "Router did not deliver the sequenced frames.");
+			expect(frames.map(frame => frame.seq)).toEqual([1, 2]);
+			expect(frames.map(frame => frame.publicationId)).toEqual([
+				`${fixture.sessionId}:1:1`,
+				`${fixture.sessionId}:1:2`,
 			]);
-			expect(requestSettled).toBe(true);
-			expect(reconcileCount).toBeGreaterThan(baseline);
-
-			// A later periodic tick must also converge: the reconcile tail is not
-			// held by the wedged replay living on the attachment's ready tail.
-			const beforeSecond = reconcileCount;
-			tick!();
-			const secondSettled = await Promise.race([
-				Bun.sleep(500).then(() => false),
-				(async () => {
-					for (let i = 0; i < 500 && reconcileCount <= beforeSecond; i++) await Bun.sleep(1);
-					return reconcileCount > beforeSecond;
-				})(),
-			]);
-			expect(secondSettled).toBe(true);
-
-			// Explicit reconciliation preserves its synchronous replay contract,
-			// but joins the per-attachment tail outside the serialized reconcile
-			// tail so periodic fleet convergence remains independent.
-			let explicitSettled = false;
-			const explicitReconcile = router.reconcile().then(() => {
-				explicitSettled = true;
-			});
-			await Bun.sleep(10);
-			expect(explicitSettled).toBe(false);
-			wedgedGate.resolve();
-			await explicitReconcile;
-			expect(explicitSettled).toBe(true);
 		} finally {
-			wedgedGate.resolve();
+			await fixture.router.stop();
+		}
+	});
+
+	test("drops frames correlated to a different session or generation", async () => {
+		const frames: SessionRouterFrame[] = [];
+		const fixture = await routerFixture({
+			onFrame: (_attachment, frame) => {
+				frames.push(frame);
+			},
+		});
+		try {
+			fixture.clients[0]?.emit({ type: "event", sessionId: "someone-else", generation: 1, seq: 1 });
+			fixture.clients[0]?.emit({ type: "event", sessionId: fixture.sessionId, generation: 9, seq: 1 });
+			fixture.clients[0]?.emit({ type: "event", sessionId: fixture.sessionId, generation: 1, seq: 1 });
+			await waitFor(() => frames.length === 1, "Router did not deliver the owned frame.");
+			expect(frames[0]?.sessionId).toBe(fixture.sessionId);
+			expect(frames[0]?.generation).toBe(1);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("retires attachments whose session disappears from the index on reconcile", async () => {
+		const reasons: Array<string | undefined> = [];
+		const fixture = await routerFixture({
+			onSessionRemoved: (_attachment, reason) => {
+				reasons.push(reason);
+			},
+		});
+		try {
+			const attachment = fixture.router.attachment(fixture.sessionId);
+			expect(attachment?.isCurrent()).toBe(true);
+			fixture.authority.indexed = false;
+			await fixture.router.reconcile();
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			expect(attachment?.isCurrent()).toBe(false);
+			expect(reasons).toEqual(["removed"]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("replaces attachments whose indexed pid or endpoint mtime changes", async () => {
+		const fixture = await routerFixture();
+		try {
+			const predecessor = fixture.router.attachment(fixture.sessionId);
+			expect(predecessor?.isCurrent()).toBe(true);
+			fs.writeFileSync(
+				fixture.endpointFile,
+				JSON.stringify({ sessionId: fixture.sessionId, url: "ws://router.test", token: "secret", pid: 43 }),
+			);
+			fixture.authority.pid = 43;
+			fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+			await fixture.router.reconcile();
+			const successor = fixture.router.attachment(fixture.sessionId);
+			expect(successor).not.toBeNull();
+			expect(successor).not.toBe(predecessor);
+			expect(predecessor?.isCurrent()).toBe(false);
+			expect(fixture.clients).toHaveLength(2);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("rejects in-flight requests as ambiguous when the attachment changes mid-request", async () => {
+		const release = Promise.withResolvers<void>();
+		const fixture = await routerFixture();
+		const router = fixture.router;
+		const client = fixture.clients[0]!.client;
+		const originalRequest = client.request.bind(client);
+		client.request = async (frame, options) => {
+			await release.promise;
+			return await originalRequest(frame, options);
+		};
+		try {
+			const pending = router.request(fixture.sessionId, { type: "query_request" }, 1);
+			fixture.authority.generation = 2;
+			fixture.authority.endpointMtimeMs = fixture.authority.endpointMtimeMs + 1;
+			await router.reconcile();
+			release.resolve();
+			await expect(pending).rejects.toMatchObject({ phase: "ambiguous" });
+		} finally {
+			release.resolve();
 			await router.stop();
 		}
+	});
+
+	test("adoptLifecycleResult validates the exact endpoint authority and publishes the attachment", async () => {
+		const fixture = await routerFixture({ initiallyIndexed: false, start: false });
+		const router = fixture.router;
+		await router.start();
+		try {
+			await expect(
+				router.adoptLifecycleResult(
+					{ ok: true, result: { sessionId: fixture.sessionId, endpointGeneration: 1, pid: 42 } },
+					{ sessionId: fixture.sessionId, cwd: fixture.repo },
+				),
+			).rejects.toBeInstanceOf(SessionRouterError);
+			const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
+			const adopted = await router.adoptLifecycleResult(
+				{
+					ok: true,
+					result: {
+						sessionId: fixture.sessionId,
+						endpointGeneration: fixture.authority.generation,
+						pid: fixture.authority.pid,
+						endpointMtimeMs: fixture.authority.endpointMtimeMs,
+						endpoint,
+					},
+				},
+				{ sessionId: fixture.sessionId, cwd: fixture.repo },
+			);
+			expect(adopted.isCurrent()).toBe(true);
+			expect(router.attachment(fixture.sessionId)).toBe(adopted);
+		} finally {
+			await router.stop();
+		}
+	});
+
+	test("stop revokes every attachment, closes clients, and detaches notifications", async () => {
+		let closed = 0;
+		const removed: Array<string | undefined> = [];
+		const fixture = await routerFixture({
+			onClientCreated: () => {},
+			onSessionRemoved: (_attachment, reason) => {
+				removed.push(reason);
+			},
+		});
+		const originalClose = fixture.clients[0]!.client.close;
+		fixture.clients[0]!.client.close = async () => {
+			closed += 1;
+			await originalClose();
+		};
+		const attachment = fixture.router.attachment(fixture.sessionId);
+		await fixture.router.stop();
+		expect(attachment?.isCurrent()).toBe(false);
+		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+		expect(closed).toBe(1);
+		expect(removed).toEqual(["removed"]);
+		expect(fixture.router.notificationCleanupReceipts().length).toBeGreaterThan(0);
 	});
 });

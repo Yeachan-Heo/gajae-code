@@ -2,6 +2,13 @@
 
 ## Status
 
+**Superseded (2026-08-19, issue #4530).** The SDK-owned lifecycle/attachment authority described below was extracted from `dev` under owner contract A (stub-and-preserve): `SessionRouter` is now a direct-attachment router without the broker-index attachment authority machinery, behind the identical exported surface. The coherent implementation is preserved on the durable ref `preserve/issue-4530-dev-06f0d4d` and is re-presented against post-revert `dev` as an owner-controlled Draft PR. This document remains as the historical record of the extracted design.
+
+- Extraction issue: #4530
+- Preservation ref: `preserve/issue-4530-dev-06f0d4d` (at `06f0d4d67eeaa5ea7a8a2a0976afdfa8c1eaf155`)
+
+Historical status at authoring:
+
 - Branch: `refactor/sdk-owned-session-lifecycle`
 - Worktree: `../gajae-code.gajae-code-worktrees/refactor-sdk-owned-session-lifecycle`
 - Base: `origin/dev` at `31c00c2d5bb462464046208a94a4597c27260a4c`
