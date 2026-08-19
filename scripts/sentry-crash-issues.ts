@@ -20,7 +20,10 @@
  * it would do and exits without touching the repository.
  *
  * Usage:
- *   bun scripts/sentry-crash-issues.ts [--apply] [--limit N] [--org SLUG] [--project SLUG]
+ *   bun scripts/sentry-crash-issues.ts [--limit N] [--org SLUG] [--project SLUG]
+ *   bun scripts/sentry-crash-issues.ts --approve DIGEST [--limit N] [--org SLUG] [--project SLUG]
+ *   bun scripts/sentry-crash-issues.ts --apply [--limit N] [--org SLUG] [--project SLUG]
+ *   bun scripts/sentry-crash-issues.ts --acknowledge ISSUE_URL [--limit N] [--org SLUG] [--project SLUG]
  *
  * `--repo` exists only to make the target explicit; it is pinned to the same
  * repository `gjc crash report` searches, because the shared marker is the
@@ -29,9 +32,12 @@
  * Auth:
  *   SENTRY_AUTH_TOKEN (or SENTRY_DEVNOGARI_AUTH_TOKEN) for the Sentry read side.
  *   `gh` must already be authenticated for the GitHub write side.
+ *
+ * Run a dry run, review its digest, run `--approve DIGEST`, then run
+ * `--apply`. The repository is pinned to the interactive report repository.
  */
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -46,11 +52,16 @@ const FINGERPRINT = /^[0-9a-f]{32}$/;
 const CRASH_MARKER_PATTERN = /gjc-crash-fp\.v1:(?:[0-9a-f]{32}|<hex>)(?![a-z0-9_])/gi;
 /** Sentry paginates at 100; a triage batch larger than this wants a saved search, not a bigger flag. */
 const MAX_LIMIT = 100;
+const MAX_PERMALINK_PATH_LENGTH = 2048;
+const MAX_ISSUE_BODY_BYTES = 48 * 1024;
+const SENTRY_LEVELS = new Set(["fatal", "error", "warning", "info", "debug"]);
 
 interface Options {
 	apply: boolean;
 	/** Record the reviewed pending set into the local approval store instead of writing. */
 	approve: string | undefined;
+	acknowledge?: string | undefined;
+	help?: boolean;
 	limit: number;
 	org: string;
 	project: string;
@@ -80,6 +91,8 @@ export function parseArgs(argv: readonly string[]): Options | { error: string } 
 	const options: Options = {
 		apply: false,
 		approve: undefined,
+		acknowledge: undefined,
+		help: false,
 		limit: 25,
 		org: DEFAULT_ORG,
 		project: DEFAULT_PROJECT,
@@ -91,6 +104,11 @@ export function parseArgs(argv: readonly string[]): Options | { error: string } 
 			options.apply = true;
 			continue;
 		}
+		if (arg === "--help" || arg === "-h") {
+			options.help = true;
+			continue;
+		}
+
 		const value = argv[index + 1];
 		if (value === undefined || value.startsWith("--")) return { error: `Flag ${arg} requires a value.` };
 		index++;
@@ -103,6 +121,7 @@ export function parseArgs(argv: readonly string[]): Options | { error: string } 
 			continue;
 		}
 		if (arg === "--approve") options.approve = value;
+		else if (arg === "--acknowledge") options.acknowledge = value;
 		else if (arg === "--org") options.org = value;
 		else if (arg === "--project") options.project = value;
 		else if (arg === "--repo") {
@@ -201,6 +220,7 @@ export function toSentryIssue(raw: unknown): SentryIssue | undefined {
 			url.search = "";
 			url.hash = "";
 			permalink = `${url.origin}${url.pathname}`;
+			if (url.pathname.length > MAX_PERMALINK_PATH_LENGTH) return undefined;
 		} catch {
 			return undefined;
 		}
@@ -214,7 +234,7 @@ export function toSentryIssue(raw: unknown): SentryIssue | undefined {
 		firstSeen,
 		lastSeen,
 		permalink,
-		level: asString(record.level),
+		level: SENTRY_LEVELS.has(asString(record.level)) ? asString(record.level) : "",
 	};
 }
 
@@ -326,22 +346,24 @@ function issueBody(row: TriageRow, options: Options): string {
 	const { sentry, fingerprint } = row;
 	const title = renderCrashText(sentry.title, "<unsanitizable title>");
 	const culprit = renderCrashText(sentry.culprit, "<unsanitizable culprit>") || "<unknown>";
-	return (
+	const level = SENTRY_LEVELS.has(sentry.level) ? sentry.level : "unknown";
+	const body =
 		`Filed from aggregated upstream crash data by \`scripts/sentry-crash-issues.ts\`. ` +
 		`Every field below passed the \`sanitizeExternalCrashV1\` egress contract before leaving any install, ` +
 		`and is re-sanitized locally before rendering.\n\n` +
 		`- Signature: \`${CRASH_ISSUE_MARKER_PREFIX}${fingerprint}\` (algorithm v1)\n` +
 		`- Upstream events: ${sentry.count}\n` +
 		`- First seen: ${sentry.firstSeen} — last seen: ${sentry.lastSeen}\n` +
-		`- Level: ${fenceCrashText(sanitizeField(sentry.level, "")) || "unknown"}\n` +
+		`- Level: ${level}\n` +
 		`- Culprit: \`${culprit}\`\n` +
 		`- Upstream group: ${sentry.permalink} (${options.org}/${options.project}, ${fenceCrashText(sentry.shortId)})\n\n` +
 		`Grouped crash class: \`${title}\`\n\n` +
 		`Grouping is driven by the gjc fingerprint, not Sentry heuristics, so this group is exactly one gjc crash class.\n\n` +
 		`Reproduction steps and environment are not captured upstream; see \`docs/crash-reporting.md\` for what the relay ` +
 		`does and does not transmit.\n\n` +
-		`<!-- ${CRASH_ISSUE_MARKER_PREFIX}${fingerprint} -->\n`
-	);
+		`<!-- ${CRASH_ISSUE_MARKER_PREFIX}${fingerprint} -->\n`;
+	if (Buffer.byteLength(body, "utf8") > MAX_ISSUE_BODY_BYTES) throw new Error("issue body exceeds the GitHub size limit");
+	return body;
 }
 
 export function partitionTriageRows(candidates: readonly TriageRow[]): {
@@ -387,18 +409,134 @@ export function previewCulprit(culprit: string): string {
  * approval is an operator act, not a repo artifact.
  */
 export interface ApprovalStore {
-	load(): Set<string>;
-	record(fingerprints: readonly string[]): void;
+	loadApprovals(): Promise<readonly ApprovalManifest[]>;
+	recordApprovals(manifests: readonly ApprovalManifest[]): Promise<void>;
+	consume(manifest: ApprovalManifest): Promise<void>;
+	hasFiled(manifest: ApprovalManifest, url: string): Promise<boolean>;
+	recordFiled(manifest: ApprovalManifest, url: string): Promise<void>;
 }
 
-/** Stable digest over an ordered fingerprint set; printed by the dry run, confirmed by --approve. */
-export function batchDigest(fingerprints: readonly string[]): string {
+export interface ApprovalManifest {
+	repo: string;
+	org: string;
+	project: string;
+	groupId: string;
+	fingerprint: string;
+	contentDigest: string;
+}
+
+interface StoredApprovals {
+	approvals: ApprovalManifest[];
+	filed: { manifest: ApprovalManifest; url: string }[];
+}
+
+function digest(parts: readonly string[]): string {
 	const hasher = new Bun.CryptoHasher("sha256");
-	for (const fingerprint of [...fingerprints].sort()) {
-		hasher.update(fingerprint);
+	for (const part of parts) {
+		hasher.update(part);
 		hasher.update("\n");
 	}
-	return hasher.digest("hex").slice(0, 16);
+	return hasher.digest("hex");
+}
+
+export function approvalManifest(row: TriageRow, options: Options): ApprovalManifest {
+	return {
+		repo: options.repo,
+		org: options.org,
+		project: options.project,
+		groupId: row.sentry.id,
+		fingerprint: row.fingerprint,
+		contentDigest: digest([issueTitle(row), issueBody(row, options)]),
+	};
+}
+
+function sameManifest(left: ApprovalManifest, right: ApprovalManifest): boolean {
+	return (
+		left.repo === right.repo &&
+		left.org === right.org &&
+		left.project === right.project &&
+		left.groupId === right.groupId &&
+		left.fingerprint === right.fingerprint &&
+		left.contentDigest === right.contentDigest
+	);
+}
+
+/** Stable digest over the reviewed manifests; printed by dry run and confirmed by --approve. */
+export function batchDigest(manifests: readonly ApprovalManifest[]): string {
+	const serialized = manifests.map(manifest => JSON.stringify(manifest)).sort();
+	return digest(serialized).slice(0, 16);
+}
+
+function isManifest(value: unknown): value is ApprovalManifest {
+	if (typeof value !== "object" || value === null) return false;
+	const record = value as Record<string, unknown>;
+	return (
+		typeof record.repo === "string" &&
+		typeof record.org === "string" &&
+		typeof record.project === "string" &&
+		typeof record.groupId === "string" &&
+		typeof record.fingerprint === "string" &&
+		FINGERPRINT.test(record.fingerprint) &&
+		typeof record.contentDigest === "string" &&
+		/^[0-9a-f]{64}$/.test(record.contentDigest)
+	);
+}
+
+async function loadStoredApprovals(): Promise<StoredApprovals> {
+	try {
+		const parsed: unknown = await Bun.file(approvalStorePath()).json();
+		if (typeof parsed !== "object" || parsed === null) return { approvals: [], filed: [] };
+		const record = parsed as { approvals?: unknown; filed?: unknown };
+		return {
+			approvals: Array.isArray(record.approvals) ? record.approvals.filter(isManifest) : [],
+			filed: Array.isArray(record.filed)
+				? record.filed.filter(
+						(value): value is { manifest: ApprovalManifest; url: string } =>
+							typeof value === "object" &&
+							value !== null &&
+							isManifest((value as { manifest?: unknown }).manifest) &&
+							typeof (value as { url?: unknown }).url === "string",
+					)
+				: [],
+		};
+	} catch {
+		return { approvals: [], filed: [] };
+	}
+}
+
+async function writeStoredApprovals(stored: StoredApprovals): Promise<void> {
+	const target = approvalStorePath();
+	await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+	await Bun.write(target, `${JSON.stringify(stored, null, "\t")}\n`);
+	await fs.chmod(target, 0o600);
+}
+
+async function withCreationLock<T>(action: () => Promise<T>): Promise<T> {
+	const lockPath = `${approvalStorePath()}.create.lock`;
+	for (let attempt = 0; attempt < 200; attempt++) {
+		try {
+			await fs.mkdir(lockPath, { mode: 0o700 });
+			try {
+				return await action();
+			} finally {
+				await fs.rmdir(lockPath);
+			}
+		} catch (error) {
+			if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+			await Bun.sleep(25);
+		}
+	}
+	throw new Error("timed out waiting for the crash issue creation lock");
+}
+
+function issueUrlFromCreateOutput(output: string): string | undefined {
+	const url = output.trim();
+	const expectedUrl = new RegExp(`^https://github\\.com/${DEFAULT_REPO.replace("/", "\\/")}/issues/[0-9]+$`);
+	return expectedUrl.test(url) ? url : undefined;
+}
+
+function usage(): string {
+	return "Usage: bun scripts/sentry-crash-issues.ts [--apply] [--approve DIGEST] [--acknowledge ISSUE_URL] [--limit N] [--org SLUG] [--project SLUG]\n";
 }
 
 function approvalStorePath(): string {
@@ -406,24 +544,27 @@ function approvalStorePath(): string {
 }
 
 const fileApprovalStore: ApprovalStore = {
-	load(): Set<string> {
-		try {
-			const parsed = JSON.parse(fs.readFileSync(approvalStorePath(), "utf8")) as unknown;
-			if (typeof parsed !== "object" || parsed === null) return new Set();
-			const list = (parsed as { fingerprints?: unknown }).fingerprints;
-			if (!Array.isArray(list)) return new Set();
-			return new Set(list.filter((v): v is string => typeof v === "string" && /^[0-9a-f]{32}$/.test(v)));
-		} catch {
-			return new Set();
-		}
+	async loadApprovals(): Promise<readonly ApprovalManifest[]> {
+		return (await loadStoredApprovals()).approvals;
 	},
-	record(fingerprints: readonly string[]): void {
-		const merged = new Set([...this.load(), ...fingerprints]);
-		const target = approvalStorePath();
-		fs.mkdirSync(path.dirname(target), { recursive: true });
-		fs.writeFileSync(target, `${JSON.stringify({ fingerprints: [...merged].sort() }, null, "\t")}\n`, {
-			mode: 0o600,
-		});
+	async recordApprovals(manifests: readonly ApprovalManifest[]): Promise<void> {
+		const stored = await loadStoredApprovals();
+		stored.approvals = [...stored.approvals, ...manifests.filter(manifest => !stored.approvals.some(saved => sameManifest(saved, manifest)))];
+		await writeStoredApprovals(stored);
+	},
+	async consume(manifest: ApprovalManifest): Promise<void> {
+		const stored = await loadStoredApprovals();
+		stored.approvals = stored.approvals.filter(saved => !sameManifest(saved, manifest));
+		await writeStoredApprovals(stored);
+	},
+	async hasFiled(manifest: ApprovalManifest, url: string): Promise<boolean> {
+		return (await loadStoredApprovals()).filed.some(entry => entry.url === url && sameManifest(entry.manifest, manifest));
+	},
+	async recordFiled(manifest: ApprovalManifest, url: string): Promise<void> {
+		const stored = await loadStoredApprovals();
+		if (!stored.filed.some(entry => entry.url === url && sameManifest(entry.manifest, manifest)))
+			stored.filed.push({ manifest, url });
+		await writeStoredApprovals(stored);
 	},
 };
 
@@ -434,6 +575,7 @@ interface MainDependencies {
 	gh(args: readonly string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
 	token(): string | undefined;
 	approvals: ApprovalStore;
+	withCreationLock<T>(action: () => Promise<T>): Promise<T>;
 	writeStdout(message: string): void;
 	writeStderr(message: string): void;
 }
@@ -445,6 +587,7 @@ const defaultDependencies: MainDependencies = {
 	gh,
 	token: sentryToken,
 	approvals: fileApprovalStore,
+	withCreationLock,
 	writeStdout: message => process.stdout.write(message),
 	writeStderr: message => process.stderr.write(message),
 };
@@ -456,6 +599,10 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		return 2;
 	}
 	const options = parsed;
+	if (options.help) {
+		dependencies.writeStdout(usage());
+		return 0;
+	}
 	const token = dependencies.token();
 	if (!token) {
 		dependencies.writeStderr("Set SENTRY_AUTH_TOKEN (or SENTRY_DEVNOGARI_AUTH_TOKEN) to read the upstream project.\n");
@@ -507,7 +654,8 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 	// Trust comes only from the operator approval store, never from the tag
 	// itself: the dry run lists every resolvable group for review, and only
 	// fingerprints recorded via `--approve <digest>` may reach `--apply`.
-	const approved = dependencies.approvals.load();
+	const approvals = await dependencies.approvals.loadApprovals();
+	const manifests = new Map(rows.map(row => [row, approvalManifest(row, options)]));
 	const untrustedBodyMarkers: TriageRow[] = [];
 	let already = 0;
 	for (const row of rows) {
@@ -522,12 +670,8 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		}
 		if (existing.kind === "untrusted") {
 			row.existingIssueUrl = existing.url;
-			// A marker hit alone is an untrusted candidate. For a fingerprint
-			// this operator already approved, marker + prior approval is the
-			// documented cross-surface dedup contract (issues filed
-			// interactively or by this script carry the marker), so the class
-			// is recognized as already filed and the run stays idempotent.
-			if (approved.has(row.fingerprint)) already++;
+			const manifest = manifests.get(row);
+			if (manifest && existing.url && (await dependencies.approvals.hasFiled(manifest, existing.url))) already++;
 			else untrustedBodyMarkers.push(row);
 		}
 	}
@@ -535,7 +679,10 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 	// Pending is the reviewable set: every group not already filed. Approval
 	// decides fileability at --apply time; the dry run shows all of it.
 	const pending = rows.filter(row => row.existingIssueUrl === undefined);
-	const unverified = pending.filter(row => !approved.has(row.fingerprint));
+	const unverified = pending.filter(row => {
+		const manifest = manifests.get(row);
+		return !manifest || !approvals.some(approval => sameManifest(approval, manifest));
+	});
 
 	dependencies.writeStdout(
 		`${rows.length} gjc signature(s) upstream; ${already} already filed, ${pending.length} pending` +
@@ -560,8 +707,22 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		);
 	if (untrustedBodyMarkers.length > 0)
 		dependencies.writeStderr(
-			`\n${untrustedBodyMarkers.length} issue-body marker(s) withheld; require explicit operator confirmation.\n`,
+			`\n${untrustedBodyMarkers.length} issue-body marker(s) withheld; acknowledge the exact issue URL explicitly.\n`,
 		);
+
+	if (options.acknowledge !== undefined) {
+		const match = untrustedBodyMarkers.find(row => row.existingIssueUrl === options.acknowledge);
+		if (!match) {
+			dependencies.writeStderr("--acknowledge must exactly match one currently withheld issue URL.\n");
+			return 2;
+		}
+		const manifest = manifests.get(match);
+		if (!manifest) return 1;
+		await dependencies.approvals.recordFiled(manifest, options.acknowledge);
+		await dependencies.approvals.consume(manifest);
+		dependencies.writeStdout(`acknowledged ${match.fingerprint} at ${options.acknowledge}\n`);
+		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 1 ? 1 : 0;
+	}
 
 	if (pending.length === 0) {
 		dependencies.writeStdout("Nothing to file.\n");
@@ -572,14 +733,15 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 		// Operator confirmation: record exactly the pending set reviewed in
 		// this dry run. The digest binds the approval to the batch contents;
 		// a mismatch means upstream moved between review and approval.
-		const digest = batchDigest(pending.map(row => row.fingerprint));
+		const pendingManifests = pending.map(row => manifests.get(row)).filter((manifest): manifest is ApprovalManifest => manifest !== undefined);
+		const digest = batchDigest(pendingManifests);
 		if (options.approve !== digest) {
 			dependencies.writeStderr(
 				`--approve does not match this batch. Re-run the dry run to print the current digest.\nexpected ${digest}\n`,
 			);
 			return 2;
 		}
-		dependencies.approvals.record(pending.map(row => row.fingerprint));
+		await dependencies.approvals.recordApprovals(pendingManifests);
 		dependencies.writeStdout(`recorded ${pending.length} fingerprint(s) as operator-approved. --apply may now file them.\n`);
 		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
 	}
@@ -593,13 +755,16 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 			);
 		dependencies.writeStdout(
 			`\nDry run. Review the ${pending.length} issue(s) above, then record them with ` +
-				`--approve ${batchDigest(pending.map(row => row.fingerprint))} and file with --apply.\n`,
+				`--approve ${batchDigest(pending.map(row => manifests.get(row)).filter((manifest): manifest is ApprovalManifest => manifest !== undefined))} and file with --apply.\n`,
 		);
 		return collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 0 ? 1 : 0;
 	}
 
 	// --apply files only the approved subset; unapproved rows stay withheld.
-	const fileable = pending.filter(row => approved.has(row.fingerprint));
+	const fileable = pending.filter(row => {
+		const manifest = manifests.get(row);
+		return manifest && approvals.some(approval => sameManifest(approval, manifest));
+	});
 	if (fileable.length === 0) {
 		dependencies.writeStdout(
 			`\nNo operator-approved fingerprints in this batch. Review the dry run and record them with --approve <digest>.\n`,
@@ -610,22 +775,51 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 	let created = 0;
 	let failed = 0;
 	for (const row of fileable) {
-		const result = await dependencies.gh([
-			"issue",
-			"create",
-			"--repo",
-			options.repo,
-			"--title",
-			issueTitle(row),
-			"--body",
-			issueBody(row, options),
-		]);
+		const manifest = manifests.get(row);
+		if (!manifest) continue;
+		let result: { ok: boolean; stdout: string; stderr: string } | undefined;
+		try {
+			result = await dependencies.withCreationLock(async () => {
+				const existing = await dependencies.findExistingIssue(options.repo, row.fingerprint);
+				if (existing.kind === "untrusted" && existing.url && (await dependencies.approvals.hasFiled(manifest, existing.url)))
+					return undefined;
+				if (existing.kind === "untrusted") throw new Error(`untrusted marker at ${existing.url ?? "unknown URL"}`);
+				const created = await dependencies.gh([
+					"issue",
+					"create",
+					"--repo",
+					options.repo,
+					"--title",
+					issueTitle(row),
+					"--body",
+					issueBody(row, options),
+				]);
+				if (created.ok) {
+					const url = issueUrlFromCreateOutput(created.stdout);
+					if (!url) throw new Error("gh issue create returned a malformed or non-canonical issue URL");
+					await dependencies.approvals.recordFiled(manifest, url);
+				}
+				return created;
+			});
+		} catch (error) {
+			failed++;
+			await dependencies.approvals.consume(manifest);
+			dependencies.writeStderr(`failed ${row.fingerprint}: ${error instanceof Error ? error.message : String(error)}\n`);
+			continue;
+		}
+		if (result === undefined) {
+			already++;
+			await dependencies.approvals.consume(manifest);
+			continue;
+		}
 		if (result.ok) {
 			created++;
+			await dependencies.approvals.consume(manifest);
 			dependencies.writeStdout(`filed  ${row.fingerprint}  ${result.stdout.trim()}\n`);
 			continue;
 		}
 		failed++;
+		await dependencies.approvals.consume(manifest);
 		dependencies.writeStderr(`failed ${row.fingerprint}: ${result.stderr.trim() || "unknown error"}\n`);
 	}
 	dependencies.writeStdout(`\ncreated ${created}, failed ${failed}\n`);

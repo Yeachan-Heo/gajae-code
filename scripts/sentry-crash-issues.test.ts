@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
 import {
+	approvalManifest,
 	fingerprintOf,
 	fingerprintFromTagPayload,
 	issueBody,
 	issueTitle,
 	main,
+	type ApprovalManifest,
 	type MainDependencies,
 	type Options,
 	parseArgs,
@@ -89,6 +91,10 @@ describe("parseArgs", () => {
 		expect(parseArgs(["--org"])).toMatchObject({ error: expect.stringContaining("--org") });
 		expect(parseArgs(["--org", "--apply"])).toMatchObject({ error: expect.stringContaining("--org") });
 	});
+
+	test("supports a normal help path", () => {
+		expect(parseArgs(["--help"])).toMatchObject({ help: true });
+	});
 });
 
 describe("fingerprintFromTagPayload", () => {
@@ -170,6 +176,12 @@ describe("toSentryIssue", () => {
 		});
 		expect(issue?.permalink).toBe("https://probe.sentry.io/issues/1/");
 	});
+
+	test("rejects a valid-but-oversized Sentry permalink path", () => {
+		expect(
+			toSentryIssue({ id: "1", shortId: "S-1", permalink: `https://probe.sentry.io/${"x".repeat(2049)}` }),
+		).toBeUndefined();
+	});
 });
 
 describe("issue rendering", () => {
@@ -243,6 +255,19 @@ describe("issue rendering", () => {
 		const body = issueBody({ fingerprint: FINGERPRINT, sentry: sentryIssue({ title: "y".repeat(90_000) }) }, options());
 		expect(Buffer.byteLength(body, "utf8")).toBeLessThan(48 * 1024);
 	});
+	test("fails closed when a rendered body would exceed GitHub's byte limit", () => {
+		expect(() =>
+			issueBody(
+				{ fingerprint: FINGERPRINT, sentry: sentryIssue({ permalink: `https://probe.sentry.io/${"x".repeat(90_000)}` }) },
+				options(),
+			),
+		).toThrow("issue body exceeds");
+	});
+	test("does not let a newline-bearing Sentry level restructure Markdown", () => {
+		const body = issueBody({ fingerprint: FINGERPRINT, sentry: sentryIssue({ level: "fatal\n# forged" }) }, options());
+		expect(body).toContain("- Level: unknown");
+		expect(body).not.toContain("# forged");
+	});
 	test("sanitizes the dry-run culprit preview so a forged group cannot write raw text to the maintainer terminal", () => {
 		const culprit = previewCulprit("readFile`@owner /home/secret sk-abcdefghijklmnop1234");
 		expect(culprit).not.toContain("@owner");
@@ -274,6 +299,10 @@ describe("main orchestration", () => {
 		const stdout: string[] = [];
 		const stderr: string[] = [];
 		const ghCalls: string[][] = [];
+		const approvals: ApprovalManifest[] = trusted
+			? [approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options())]
+			: [];
+		const filed: { manifest: ApprovalManifest; url: string }[] = [];
 		return {
 			stdout,
 			stderr,
@@ -288,9 +317,21 @@ describe("main orchestration", () => {
 				},
 				token: () => "token",
 				approvals: {
-					load: () => new Set<string>(trusted ? [FINGERPRINT] : []),
-					record: () => {},
+					loadApprovals: async () => approvals,
+					recordApprovals: async manifests => {
+						approvals.push(...manifests);
+					},
+					consume: async manifest => {
+						const index = approvals.findIndex(candidate => JSON.stringify(candidate) === JSON.stringify(manifest));
+						if (index >= 0) approvals.splice(index, 1);
+					},
+					hasFiled: async (manifest, url) =>
+						filed.some(candidate => candidate.url === url && JSON.stringify(candidate.manifest) === JSON.stringify(manifest)),
+					recordFiled: async (manifest, url) => {
+						filed.push({ manifest, url });
+					},
 				},
+				withCreationLock: async action => action(),
 				writeStdout: message => stdout.push(message),
 				writeStderr: message => stderr.push(message),
 				...overrides,
@@ -303,6 +344,12 @@ describe("main orchestration", () => {
 		await expect(main(["--apply"], dependencies)).resolves.toBe(1);
 		expect(stderr.join("")).toContain("unverified");
 		expect(ghCalls).toHaveLength(0);
+	});
+
+	test("prints usage for --help without requiring Sentry credentials", async () => {
+		const { dependencies, stdout } = mainDependencies(false, { token: () => undefined });
+		await expect(main(["--help"], dependencies)).resolves.toBe(0);
+		expect(stdout.join("")).toContain("--approve DIGEST");
 	});
 
 	test("keeps dry runs read-only and applies trusted rows only with --apply", async () => {
@@ -354,16 +401,15 @@ describe("main orchestration", () => {
 			findExistingIssue: async () => ({ kind: "untrusted", url: "https://github.com/Yeachan-Heo/gajae-code/issues/1" }),
 		});
 		await expect(main(["--apply"], bodyMarker.dependencies)).resolves.toBe(1);
-		expect(bodyMarker.stderr.join("")).toContain("explicit operator confirmation");
+		expect(bodyMarker.stderr.join("")).toContain("acknowledge the exact issue URL");
 		expect(bodyMarker.ghCalls).toHaveLength(0);
 
-		// An APPROVED fingerprint with the same marker is the documented
-		// cross-surface dedup contract: recognized as already filed, zero writes.
+		// Approval never upgrades an arbitrary body marker into provenance.
 		const approvedMarker = mainDependencies(true, {
 			findExistingIssue: async () => ({ kind: "untrusted", url: "https://github.com/Yeachan-Heo/gajae-code/issues/1" }),
 		});
-		await expect(main(["--apply"], approvedMarker.dependencies)).resolves.toBe(0);
-		expect(approvedMarker.stdout.join("")).toContain("1 already filed");
+		await expect(main(["--apply"], approvedMarker.dependencies)).resolves.toBe(1);
+		expect(approvedMarker.stderr.join("")).toContain("acknowledge the exact issue URL");
 		expect(approvedMarker.ghCalls).toHaveLength(0);
 
 		const duplicate = mainDependencies(true, {
@@ -389,19 +435,81 @@ describe("main orchestration", () => {
 		const digestMatch = /--approve ([0-9a-f]{16})/.exec(unapproved.stdout.join(""));
 		expect(digestMatch).not.toBeNull();
 
-		const recorded: string[][] = [];
+		const recorded: ApprovalManifest[][] = [];
 		const approving = mainDependencies(false, {
 			approvals: {
-				load: () => new Set<string>(),
-				record: fingerprints => recorded.push([...fingerprints]),
+				loadApprovals: async () => [],
+				recordApprovals: async manifests => {
+					recorded.push([...manifests]);
+				},
+				consume: async () => {},
+				hasFiled: async () => false,
+				recordFiled: async () => {},
 			},
 		});
 		await expect(main(["--approve", digestMatch![1]!], approving.dependencies)).resolves.toBe(1);
-		expect(recorded).toEqual([[FINGERPRINT]]);
+		expect(recorded).toHaveLength(1);
+		expect(recorded[0]?.[0]?.fingerprint).toBe(FINGERPRINT);
 
 		// After approval, the same batch is fileable and idempotent on rerun.
 		const postApproval = mainDependencies(true);
 		await expect(main(["--apply"], postApproval.dependencies)).resolves.toBe(0);
 		expect(postApproval.ghCalls.length).toBeGreaterThan(0);
+	});
+
+	test("rejects an approval when the same fingerprint is replaced with a different reviewed row", async () => {
+		const changed = mainDependencies(true, {
+			sentryGet: async () => [sentryIssue({ id: "999", title: "replacement group" })],
+		});
+		await expect(main(["--apply"], changed.dependencies)).resolves.toBe(1);
+		expect(changed.ghCalls).toHaveLength(0);
+		expect(changed.stderr.join("")).toContain("unverified");
+	});
+
+	test("requires URL-bound acknowledgement before a planted marker becomes locally filed", async () => {
+		const markerUrl = "https://github.com/Yeachan-Heo/gajae-code/issues/1";
+		const setup = mainDependencies(true, {
+			findExistingIssue: async () => ({ kind: "untrusted", url: markerUrl }),
+		});
+		await expect(main(["--acknowledge", markerUrl], setup.dependencies)).resolves.toBe(0);
+		await expect(main(["--apply"], setup.dependencies)).resolves.toBe(0);
+		expect(setup.ghCalls).toHaveLength(0);
+		expect(setup.stdout.join("")).toContain("1 already filed");
+	});
+
+	test("serializes the final duplicate check and create across concurrent applies", async () => {
+		let locked = false;
+		const waiters: { resolve: () => void }[] = [];
+		let created = false;
+		let creates = 0;
+		const shared = mainDependencies(true, {
+			findExistingIssue: async () =>
+				created
+					? { kind: "untrusted", url: "https://github.com/Yeachan-Heo/gajae-code/issues/1" }
+					: { kind: "none" },
+			gh: async args => {
+				expect(args).toContain("create");
+				creates++;
+				created = true;
+				return { ok: true, stdout: "https://github.com/Yeachan-Heo/gajae-code/issues/1\n", stderr: "" };
+			},
+			withCreationLock: async action => {
+				while (locked) {
+					const waiter = Promise.withResolvers<void>();
+					waiters.push(waiter);
+					await waiter.promise;
+				}
+				locked = true;
+				try {
+					return await action();
+				} finally {
+					locked = false;
+					waiters.shift()?.resolve();
+				}
+			},
+		});
+		const results = await Promise.all([main(["--apply"], shared.dependencies), main(["--apply"], shared.dependencies)]);
+		expect(results).toEqual([0, 0]);
+		expect(creates).toBe(1);
 	});
 });
