@@ -101,6 +101,14 @@ const MAX_PROCESS_INCARNATION_LENGTH = 256;
 const SESSION_HOST_SPAWN_LOG_TAIL_BYTES = 1_024;
 const READY_THEN_EXIT_MESSAGE = "became ready then exited before live admission";
 
+function readyThenExitedResponse(id: string, child?: ChildProcess, excerpt = ""): BrokerResponse {
+	const parts = [`Session ${id} ${READY_THEN_EXIT_MESSAGE}.`];
+	if (child && child.exitCode !== null) parts.push(`exit=${child.exitCode}`);
+	if (child?.signalCode) parts.push(`signal=${child.signalCode}`);
+	if (excerpt) parts.push(`Host stderr: ${excerpt}`);
+	return fail("ready_then_exited", parts.join(" "));
+}
+
 export interface LifecycleDeadlines {
 	receivedAt: number;
 	requestedReadinessTimeoutMs: number;
@@ -163,6 +171,25 @@ export function setLifecycleCommandResolverForTest(
 export function setLifecycleTimingForTest(broker: Broker, timing: LifecycleTiming | undefined): void {
 	if (timing) lifecycleTimingsForTest.set(broker, timing);
 	else lifecycleTimingsForTest.delete(broker);
+}
+
+let lifecycleHostPlatformForTest: NodeJS.Platform | undefined;
+
+/** Deterministic platform seam for Windows-only ready-then-exit tolerance. */
+export function setLifecycleHostPlatformForTest(platform: NodeJS.Platform | undefined): void {
+	lifecycleHostPlatformForTest = platform;
+}
+
+function lifecycleHostPlatform(): NodeJS.Platform {
+	return lifecycleHostPlatformForTest ?? process.platform;
+}
+
+function readyThenExitToleranceEnabled(): boolean {
+	return lifecycleHostPlatform() === "win32";
+}
+
+export function readyThenExitToleranceEnabledForTest(): boolean {
+	return readyThenExitToleranceEnabled();
 }
 
 function lifecycleTiming(broker: Broker): LifecycleTiming {
@@ -2135,12 +2162,23 @@ async function readSessionHostSpawnLogTail(spawnLogPath: string): Promise<string
 		const file = Bun.file(spawnLogPath);
 		const size = file.size;
 		if (!Number.isFinite(size) || size <= 0) return "";
-		const tail =
-			size > SESSION_HOST_SPAWN_LOG_TAIL_BYTES ? file.slice(size - SESSION_HOST_SPAWN_LOG_TAIL_BYTES) : file;
-		return sanitizeSdkStartupMessage(await tail.text());
+		const overlap = 512;
+		const windowBytes =
+			size > SESSION_HOST_SPAWN_LOG_TAIL_BYTES + overlap ? SESSION_HOST_SPAWN_LOG_TAIL_BYTES + overlap : size;
+		const window = size > windowBytes ? file.slice(size - windowBytes) : file;
+		const sanitized = sanitizeSdkStartupMessage(await window.text());
+		if (Buffer.byteLength(sanitized) <= SESSION_HOST_SPAWN_LOG_TAIL_BYTES) return sanitized;
+		let start = 0;
+		while (start < sanitized.length && Buffer.byteLength(sanitized.slice(start)) > SESSION_HOST_SPAWN_LOG_TAIL_BYTES)
+			start += 1;
+		return sanitized.slice(start);
 	} catch {
 		return "";
 	}
+}
+
+export async function readSessionHostSpawnLogTailForTest(spawnLogPath: string): Promise<string> {
+	return await readSessionHostSpawnLogTail(spawnLogPath);
 }
 
 async function removeSessionHostSpawnLog(spawnLogPath: string): Promise<void> {
@@ -2427,6 +2465,10 @@ async function terminateSpawnedChild(
 			failure.artifact.rollback.hostStopped &&
 			failure.artifact.rollback.brokerRegistrationReleased;
 		if (!rollbackComplete) {
+			if (!readyThenExitToleranceEnabled()) {
+				await recordTerminalUncertain(broker, id, root, pid);
+				return false;
+			}
 			const publishedReady = await hasPublishedReadyAuthority(root, id, expected);
 			const artifactsRemoved = await removeOwnedLifecycleArtifacts(root, id, expected);
 			await broker.index.refresh();
@@ -2860,7 +2902,7 @@ async function waitForReady(
 		) {
 			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
 			if (finalStartupFailure) return { kind: "startup_failed", failure: finalStartupFailure };
-			return (await hasPublishedReadyAuthority(root, id, expected))
+			return (await hasPublishedReadyAuthority(root, id, expected)) && readyThenExitToleranceEnabled()
 				? { kind: "ready_then_exited" }
 				: { kind: "child_exited" };
 		}
@@ -3923,7 +3965,7 @@ async function executeLifecycleResponse(
 						readiness.failure.details,
 					)
 				: readiness.kind === "ready_then_exited"
-					? fail("spawn_failed", `Session ${launch.id} ${READY_THEN_EXIT_MESSAGE}.${excerpt}`)
+					? readyThenExitedResponse(launch.id, child, excerpt)
 					: readiness.kind === "child_exited"
 						? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.${excerpt}`)
 						: fail(
@@ -3950,9 +3992,9 @@ async function executeLifecycleResponse(
 				spawnedAuthority,
 				timing,
 			);
-			if (exited)
+			if (exited && readyThenExitToleranceEnabled())
 				return terminated
-					? fail("spawn_failed", `Session ${launch.id} ${READY_THEN_EXIT_MESSAGE}.`)
+					? readyThenExitedResponse(launch.id, child)
 					: fail(
 							"terminal_uncertain",
 							`Session ${launch.id} ${READY_THEN_EXIT_MESSAGE} and cleanup could not be proven.`,
@@ -5057,36 +5099,42 @@ export async function executeLifecycle(
 		(operation === "session.create" || operation === "session.fork" || operation === "session.resume")
 			? entry.effectIntent?.childOwnershipEstablished === false
 				? response
-				: startupFailure && cleanupProof
+				: response.error.code === "ready_then_exited" && (cleanupProof || provenDeadCleanup)
 					? {
-							ok: false,
-							error: startupFailure.code
-								? {
-										code: startupFailure.code,
-										message: startupFailure.message,
-										details: startupFailure.details!,
-										endpoint: "unavailable" as const,
-									}
-								: {
-										code: "spawn_failed",
-										message: startupFailure.message,
-										endpoint: "unavailable" as const,
-									},
+							...response,
 							...(durableEffects ? { durableEffects } : {}),
-							startupFailure,
+							...(startupFailure ? { startupFailure } : {}),
 						}
-					: provenDeadCleanup && response.error.code !== "terminal_uncertain"
-						? response
-						: {
+					: startupFailure && cleanupProof
+						? {
 								ok: false,
-								error: {
-									code: "terminal_uncertain",
-									message:
-										"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
-								},
+								error: startupFailure.code
+									? {
+											code: startupFailure.code,
+											message: startupFailure.message,
+											details: startupFailure.details!,
+											endpoint: "unavailable" as const,
+										}
+									: {
+											code: "spawn_failed",
+											message: startupFailure.message,
+											endpoint: "unavailable" as const,
+										},
 								...(durableEffects ? { durableEffects } : {}),
-								...(startupFailure ? { startupFailure } : {}),
+								startupFailure,
 							}
+						: provenDeadCleanup && response.error.code !== "terminal_uncertain"
+							? response
+							: {
+									ok: false,
+									error: {
+										code: "terminal_uncertain",
+										message:
+											"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+									},
+									...(durableEffects ? { durableEffects } : {}),
+									...(startupFailure ? { startupFailure } : {}),
+								}
 			: response;
 	return {
 		response: terminalResponse,

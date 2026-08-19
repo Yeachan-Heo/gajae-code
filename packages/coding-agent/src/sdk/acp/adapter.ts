@@ -73,6 +73,7 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"model_profile_registry_error",
 	"startup_admission_refused",
 	"startup_admission_timeout",
+	"ready_then_exited",
 ]);
 
 /**

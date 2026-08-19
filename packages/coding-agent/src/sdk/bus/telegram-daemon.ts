@@ -4981,7 +4981,9 @@ export class TelegramNotificationDaemon {
 		const reason =
 			outcome.certainty === "uncertain" || outcome.certainty === "cleanup_pending"
 				? "terminal_uncertain"
-				: outcome.error.code;
+				: outcome.error.code === "ready_then_exited"
+					? "spawn_failed"
+					: outcome.error.code;
 		return formatLifecycleOutcome(
 			{
 				type: "session_lifecycle_error",

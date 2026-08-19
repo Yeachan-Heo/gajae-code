@@ -633,6 +633,12 @@ test("the ACP MCP launch wrapper reports broker refusal and re-attributes spawn 
 
 	const bare = new SdkClientError("spawn_failed", "child exited");
 	expect(acpMcpLaunchFailure(bare, [])).toBe(bare);
+	const readyThenExited = new SdkClientError(
+		"ready_then_exited",
+		"Session s became ready then exited before live admission.",
+	);
+	expect(acpMcpLaunchFailure(readyThenExited, mcpServers)).toBe(readyThenExited);
+	expect(acpMcpLaunchFailure(readyThenExited, [])).toBe(readyThenExited);
 });
 test("the production ACP MCP launch path preserves broker admission timeout failures", async () => {
 	const root = await fs.mkdtemp(path.join(tmpdir(), "gjc-acp-mcp-admission-timeout-"));
