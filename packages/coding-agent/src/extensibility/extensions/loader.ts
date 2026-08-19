@@ -148,6 +148,57 @@ export class ExtensionRuntime implements IExtensionRuntime {
 }
 
 /**
+ * Per-extension activation transaction over the shared runtime state.
+ *
+ * Registration writes from a factory are staged here (stage); the factory
+ * completing without throwing is the validation step; commit copies the
+ * staged mutations into the shared runtime; rollback discards them, so a
+ * factory that fails midway leaves no registration behind (issue #4718).
+ */
+export class ExtensionActivationScope {
+	readonly #runtime: IExtensionRuntime;
+	readonly #stagedFlagDefaults = new Map<string, boolean | string>();
+	readonly #stagedProviderRegistrations: Array<{
+		name: string;
+		config: import("./types").ProviderConfig;
+		sourceId: string;
+	}> = [];
+	#closed = false;
+
+	constructor(runtime: IExtensionRuntime) {
+		this.#runtime = runtime;
+	}
+
+	get flagValues(): Map<string, boolean | string> {
+		return this.#stagedFlagDefaults;
+	}
+
+	get pendingProviderRegistrations(): Array<{
+		name: string;
+		config: import("./types").ProviderConfig;
+		sourceId: string;
+	}> {
+		return this.#stagedProviderRegistrations;
+	}
+
+	commit(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		for (const [name, value] of this.#stagedFlagDefaults) {
+			this.#runtime.flagValues.set(name, value);
+		}
+		this.#runtime.pendingProviderRegistrations.push(...this.#stagedProviderRegistrations);
+	}
+
+	rollback(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#stagedFlagDefaults.clear();
+		this.#stagedProviderRegistrations.length = 0;
+	}
+}
+
+/**
  * ExtensionAPI implementation for an extension.
  * Registration methods write to the extension object.
  * Action methods delegate to the shared runtime.
@@ -167,6 +218,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		public readonly pi: typeof import("@gajae-code/coding-agent"),
 		private readonly extension: Extension,
 		private readonly runtime: IExtensionRuntime,
+		private readonly activation: ExtensionActivationScope,
 		private readonly cwd: string,
 		public readonly events: EventBus,
 	) {}
@@ -218,7 +270,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	): void {
 		this.extension.flags.set(name, { name, extensionPath: this.extension.path, ...options });
 		if (options.default !== undefined) {
-			this.runtime.flagValues.set(name, options.default);
+			this.activation.flagValues.set(name, options.default);
 		}
 	}
 
@@ -228,7 +280,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	getFlag(name: string): boolean | string | undefined {
 		if (!this.extension.flags.has(name)) return undefined;
-		return this.runtime.flagValues.get(name);
+		return this.activation.flagValues.get(name) ?? this.runtime.flagValues.get(name);
 	}
 
 	sendMessage<T = unknown>(
@@ -338,7 +390,7 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	}
 
 	registerProvider(name: string, config: import("./types").ProviderConfig): void {
-		this.runtime.pendingProviderRegistrations.push({ name, config, sourceId: this.extension.path });
+		this.activation.pendingProviderRegistrations.push({ name, config, sourceId: this.extension.path });
 	}
 }
 
@@ -365,6 +417,7 @@ async function loadExtension(
 	runtime: IExtensionRuntime,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
+	let activation: ExtensionActivationScope | undefined;
 	try {
 		const module = (await loadLegacyPiModule(resolvedPath)) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
@@ -377,11 +430,21 @@ async function loadExtension(
 		}
 
 		const extension = createExtension(extensionPath, resolvedPath);
-		const api = new ConcreteExtensionAPI(await import("@gajae-code/coding-agent"), extension, runtime, cwd, eventBus);
+		activation = new ExtensionActivationScope(runtime);
+		const api = new ConcreteExtensionAPI(
+			await import("@gajae-code/coding-agent"),
+			extension,
+			runtime,
+			activation,
+			cwd,
+			eventBus,
+		);
 		await factory(api);
+		activation.commit();
 
 		return { extension, error: null };
 	} catch (err) {
+		activation?.rollback();
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
@@ -398,8 +461,22 @@ export async function loadExtensionFromFactory(
 	name = "<inline>",
 ): Promise<Extension> {
 	const extension = createExtension(name, name);
-	const api = new ConcreteExtensionAPI(await import("@gajae-code/coding-agent"), extension, runtime, cwd, eventBus);
-	await factory(api);
+	const activation = new ExtensionActivationScope(runtime);
+	const api = new ConcreteExtensionAPI(
+		await import("@gajae-code/coding-agent"),
+		extension,
+		runtime,
+		activation,
+		cwd,
+		eventBus,
+	);
+	try {
+		await factory(api);
+	} catch (err) {
+		activation.rollback();
+		throw err;
+	}
+	activation.commit();
 	return extension;
 }
 
