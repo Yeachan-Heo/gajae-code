@@ -1214,8 +1214,7 @@ export class MCPManager {
 					});
 					this.#replaceServerTools(name, customTools);
 					if (!this.#toolsOnly) this.#onToolsChanged?.(this.#tools);
-					if (!this.#toolsOnly)
-						void this.#cacheServerTools(name, config, connection, serverTools, resolvedCredential);
+					if (!this.#toolsOnly) void this.#cacheServerTools(name, config, connection, serverTools);
 					if (!this.#toolsOnly) await this.#loadServerResourcesAndPrompts(name, connection);
 				})
 				.catch(error => {
@@ -1557,8 +1556,12 @@ export class MCPManager {
 		config: MCPServerConfig,
 		connection: MCPServerConnection,
 		serverTools: MCPToolDefinition[],
-		credential: string | undefined,
 	): Promise<void> {
+		// Read the binding now rather than accepting one captured before the
+		// transport was used: a 401/403 retry re-authenticates mid-`tools/list`,
+		// and the catalog that finally arrives belongs to the identity that
+		// succeeded, not the one that was rejected.
+		const credential = this.#connectionCredentials.get(connection);
 		const cache = this.toolCache;
 		if (!cache) return;
 		// Both a private result and a catalog the server declined to make cacheable
@@ -2285,7 +2288,7 @@ export class MCPManager {
 				noReplay: config.sharing === "shared",
 				inputHandler: () => this.#inputRequestHandler ?? undefined,
 			});
-			void this.#cacheServerTools(name, config, connection, serverTools, resolvedCredential);
+			void this.#cacheServerTools(name, config, connection, serverTools);
 			this.#replaceServerTools(name, customTools);
 			this.#onToolsChanged?.(this.#tools);
 			void this.#loadServerResourcesAndPrompts(name, connection);
@@ -2353,16 +2356,11 @@ export class MCPManager {
 			noReplay: connection.config.sharing === "shared",
 			inputHandler: () => this.#inputRequestHandler ?? undefined,
 		});
-		// These tools came over *this* connection, so they belong to the identity it
-		// authenticated with. Re-resolving the template here would attribute them to
-		// whatever credential is current now: a token that rotated since the connect
-		// would file a catalog fetched under the old identity under the new one.
-		const refreshCredential = this.#connectionCredentials.get(connection);
 		// Re-check immediately before publishing: `listTools` was awaited above, and a
 		// disconnect, reload, or reconnect inside that window must not publish this
 		// connection's catalog or emit a tools-changed for a connection that is gone.
 		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
-		void this.#cacheServerTools(name, connection.config, connection, serverTools, refreshCredential);
+		void this.#cacheServerTools(name, connection.config, connection, serverTools);
 
 		// Replace tools from this server
 		this.#replaceServerTools(name, customTools);

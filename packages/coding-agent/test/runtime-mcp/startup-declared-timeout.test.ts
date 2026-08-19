@@ -369,6 +369,49 @@ describe("MCP startup and the declared connection window", () => {
 		expect((await projectB.get("same", config, "cred"))?.map(tool => tool.name)).toEqual(["b"]);
 	});
 
+	// The fence is only as good as its commit: without a conditional write, a
+	// writer from another process can decide against one row state and land on a
+	// different one, resurrecting a catalog an invalidation already retracted.
+	test("drops a cross-process write whose row changed between decision and commit", async () => {
+		const config = { type: "stdio", command: "shared", args: [] } as never;
+		const tools = [{ name: "ping", inputSchema: { type: "object" } }] as never;
+		const rows = new Map<string, string>();
+		// One database, two independent storage handles: nothing in memory is shared,
+		// exactly as two CLI/SDK processes on one profile see it.
+		const makeStorage = () =>
+			({
+				getCache: (key: string) => rows.get(key) ?? null,
+				setCache: (key: string, value: string) => {
+					rows.set(key, value);
+				},
+				setCacheIfMatches: (key: string, expected: string | null, value: string) => {
+					const current = rows.get(key) ?? null;
+					if (current !== expected) return false;
+					rows.set(key, value);
+					return true;
+				},
+			}) as never;
+		const writer = new MCPToolCacheClass(makeStorage(), "/work/project");
+		const invalidator = new MCPToolCacheClass(makeStorage(), "/work/project");
+
+		await writer.set("shared", config, tools, "cred", Date.now() + 600_000);
+		expect(await writer.get("shared", config, "cred")).not.toBeNull();
+
+		// The invalidation lands, then a writer that decided against the pre-
+		// invalidation row tries to commit. Its CAS must fail.
+		const key = [...rows.keys()].find(candidate => candidate.endsWith(":shared"))!;
+		const preInvalidationRow = rows.get(key)!;
+		await invalidator.delete("shared");
+		const stalePost = makeStorage() as unknown as {
+			setCacheIfMatches(key: string, expected: string | null, value: string, exp: number): boolean;
+		};
+
+		const admitted = stalePost.setCacheIfMatches(key, preInvalidationRow, preInvalidationRow, 2 ** 31);
+
+		expect(admitted).toBe(false);
+		expect(await writer.get("shared", config, "cred")).toBeNull();
+	});
+
 	test("binds cache identity to the resolved credential, not the config template", async () => {
 		const template = { type: "http", url: "https://example.invalid/mcp", headers: { Authorization: "!token" } };
 		const resolve = vi.spyOn(configValue, "resolveConfigValue");

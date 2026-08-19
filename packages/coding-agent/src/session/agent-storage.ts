@@ -457,6 +457,20 @@ FROM model_usage_legacy
 	}
 
 	/**
+	 * Atomic compare-and-set on a cache row, when the backing store offers one.
+	 * Returns `undefined` if it does not, so a caller can tell "the write lost"
+	 * apart from "this backend cannot fence writes at all".
+	 */
+	setCacheIfMatches(
+		key: string,
+		expectedValue: string | null,
+		value: string,
+		expiresAtSec: number,
+	): boolean | undefined {
+		return this.#authStore.setCacheIfMatches?.(key, expectedValue, value, expiresAtSec);
+	}
+
+	/**
 	 * Sets a cached value with expiry time (unix seconds).
 	 */
 	setCache(key: string, value: string, expiresAtSec: number): void {

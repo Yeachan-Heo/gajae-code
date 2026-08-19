@@ -154,7 +154,7 @@ const storageScope = new WeakMap<AgentStorage, Map<string, Promise<void>>>();
  * always-zero case rather than every race.
  */
 function currentGeneration(storage: AgentStorage, key: string): number {
-	const raw = storage.getCache(key, { includeExpired: true });
+	const raw = storage.getCache(key, { includeExpired: true }) ?? null;
 	if (!raw) return 0;
 	try {
 		const parsed: unknown = JSON.parse(raw);
@@ -259,7 +259,15 @@ export class MCPToolCache {
 				tools: [],
 				generation: currentGeneration(this.storage, this.#key(serverName)) + 1,
 			};
-			this.storage.setCache(this.#key(serverName), JSON.stringify(tombstone), Math.floor(Date.now() / 1000) - 1);
+			// Retained, not written already-expired: `cleanExpiredCache()` reclaims
+			// expired rows, and dropping the tombstone would reset the fence and let
+			// a stale writer resurrect the catalog. `get()` rejects it on its empty
+			// configHash, so retention costs one row and leaks nothing.
+			this.storage.setCache(
+				this.#key(serverName),
+				JSON.stringify(tombstone),
+				Math.floor((Date.now() + CACHE_TTL_MS) / 1000),
+			);
 		});
 	}
 
@@ -280,6 +288,9 @@ export class MCPToolCache {
 		// still queued/in flight, the row's generation moves past this value and
 		// the write is dropped instead of resurrecting the retired entry.
 		const issuedGeneration = currentGeneration(this.storage, this.#key(serverName));
+		// The exact bytes this decision was made against; the commit is fenced on
+		// them so any intervening mutation, in this process or another, wins.
+		const issuedRow = this.storage.getCache(this.#key(serverName), { includeExpired: true });
 		let configHash: string;
 		try {
 			configHash = await hashConfig(config, this.scope, credential);
@@ -306,11 +317,21 @@ export class MCPToolCache {
 		const defaultExpiryMs = Date.now() + CACHE_TTL_MS;
 		const expiresAtSec = Math.floor(Math.min(defaultExpiryMs, freshUntilMs ?? defaultExpiryMs) / 1000);
 		await enqueueCacheMutation(this.storage, this.#key(serverName), async () => {
-			if (currentGeneration(this.storage, this.#key(serverName)) !== issuedGeneration) {
+			const key = this.#key(serverName);
+			// Compare against the exact row observed when this write was issued, so a
+			// mutation from any process in between makes it lose. Falls back to a
+			// generation re-read when the backend offers no conditional write.
+			const committed = this.storage.setCacheIfMatches?.(key, issuedRow, serialized, expiresAtSec);
+			if (committed === true) return;
+			if (committed === false) {
+				logger.debug("Dropped stale MCP tool cache write behind a concurrent mutation", { serverName });
+				return;
+			}
+			if (currentGeneration(this.storage, key) !== issuedGeneration) {
 				logger.debug("Dropped stale MCP tool cache write behind an invalidation", { serverName });
 				return;
 			}
-			this.storage.setCache(this.#key(serverName), serialized, expiresAtSec);
+			this.storage.setCache(key, serialized, expiresAtSec);
 		});
 	}
 }

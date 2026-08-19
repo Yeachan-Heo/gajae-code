@@ -23,7 +23,10 @@ rl.on('line', line => {
   if (msg.method === 'initialize') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'demo', version: '1' } } }) + '\\n');
   } else if (msg.method === 'tools/list') {
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'hello', description: 'Demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
+    // A positive ttlMs is what makes the catalog admissible to the durable cache;
+    // without it the fail-closed retention policy refuses to persist and the
+    // warm-cache assertions below would be testing nothing.
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'hello', description: 'Demo tool', inputSchema: { type: 'object', properties: {} } }], ttlMs: 600000 } }) + '\\n');
   } else if (msg.id !== undefined) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
   }
@@ -43,7 +46,10 @@ rl.on('line', line => {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow', version: '1' } } }) + '\\n');
     }, ${initializeDelayMs});
   } else if (msg.method === 'tools/list') {
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'hello', description: 'Demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
+    // A positive ttlMs is what makes the catalog admissible to the durable cache;
+    // without it the fail-closed retention policy refuses to persist and the
+    // warm-cache assertions below would be testing nothing.
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'hello', description: 'Demo tool', inputSchema: { type: 'object', properties: {} } }], ttlMs: 600000 } }) + '\\n');
   } else if (msg.id !== undefined) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
   }

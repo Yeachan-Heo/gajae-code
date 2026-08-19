@@ -451,6 +451,13 @@ export interface AuthCredentialStore {
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
+	/**
+	 * Atomic compare-and-set on a cache row. Writes only when the row's current
+	 * stored value still equals `expectedValue` (`null` meaning "no row"), and
+	 * reports whether the write happened. Optional: a backend that cannot offer
+	 * a transaction simply omits it, and callers fall back to a non-atomic path.
+	 */
+	setCacheIfMatches?(key: string, expectedValue: string | null, value: string, expiresAtSec: number): boolean;
 	deleteCachePrefix?(prefix: string): void;
 	cleanExpiredCache(): void;
 	/**
@@ -5814,6 +5821,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#getCacheStmt: Statement;
 	#getCacheIncludingExpiredStmt: Statement;
 	#upsertCacheStmt: Statement;
+	#casCacheTxn: (key: string, expectedValue: string | null, value: string, expiresAtSec: number) => boolean;
 	#deleteCachePrefixStmt: Statement;
 	#deleteExpiredCacheStmt: Statement;
 	#closed = false;
@@ -5861,6 +5869,17 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			"INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at",
 		);
 		this.#deleteCachePrefixStmt = this.#db.prepare("DELETE FROM cache WHERE substr(key, 1, ?) = ?");
+		// One transaction so the read and the conditional write cannot interleave
+		// with another process operating on the same row.
+		this.#casCacheTxn = this.#db.transaction(
+			(key: string, expectedValue: string | null, value: string, expiresAtSec: number): boolean => {
+				const row = this.#getCacheIncludingExpiredStmt.get(key) as { value?: string } | undefined;
+				const current = row?.value ?? null;
+				if (current !== expectedValue) return false;
+				this.#upsertCacheStmt.run(key, value, expiresAtSec);
+				return true;
+			},
+		);
 		this.#deleteExpiredCacheStmt = this.#db.prepare(`DELETE FROM cache WHERE expires_at <= ${SQLITE_NOW_EPOCH}`);
 	}
 
@@ -6560,6 +6579,19 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			this.#upsertCacheStmt.run(key, value, expiresAtSec);
 		} catch {
 			// Ignore cache set failures
+		}
+	}
+
+	/**
+	 * Compare-and-set a cache row inside one transaction, so a concurrent writer
+	 * in another process cannot land between the read and the write. Callers use
+	 * this to fence a write behind the exact row state they decided against.
+	 */
+	setCacheIfMatches(key: string, expectedValue: string | null, value: string, expiresAtSec: number): boolean {
+		try {
+			return this.#casCacheTxn(key, expectedValue, value, expiresAtSec) === true;
+		} catch {
+			return false;
 		}
 	}
 

@@ -279,7 +279,20 @@ class MCPPoolLeaseImpl implements MCPPoolLease {
 				closeBeforeReconnect: physical.transport.closeBeforeReconnect,
 			};
 			const facade = { ...physical, transport };
-			for (const property of ["tools", "resources", "resourceTemplates", "prompts"] as const) {
+			// Everything `listTools`/`listResources`/`listPrompts` write through this
+			// facade must reach the physical connection, cache-admission metadata
+			// included: the manager decides persistence from the physical connection,
+			// so a field left on the spread copy silently reverts a shared server's
+			// catalog to "public, no freshness limit, persistable".
+			for (const property of [
+				"tools",
+				"resources",
+				"resourceTemplates",
+				"prompts",
+				"toolsFreshUntil",
+				"toolsCacheScope",
+				"toolsPersistable",
+			] as const) {
 				Object.defineProperty(facade, property, {
 					configurable: true,
 					enumerable: true,

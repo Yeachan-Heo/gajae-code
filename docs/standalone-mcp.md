@@ -47,7 +47,8 @@ Once a server's tool list has been observed, GJC can surface it at the next star
 - It is scoped to the session's agent profile **and** its project, so another profile or workspace can never replay a server's tool descriptions.
 - Entries are bound to the credentials the connection actually authenticated with, not to the config template, so rotating a key or changing a resolved header does not reuse the previous identity's catalog. While that identity is still unresolved, GJC surfaces nothing rather than guessing.
 - A catalog the server marks private is never stored, and observing a private result also removes any entry a previous public result left behind.
-- A server-supplied freshness deadline shortens retention below the default.
+- A catalog is admitted to durable storage **only when every `tools/list` page supplied a positive TTL**. An absent or zero TTL means the server considers the result already stale, so GJC does not persist it and retracts any entry an earlier persistable result left behind. A server that never sends a TTL therefore never gets deferred startup: it is connected normally on every session.
+- When a TTL is supplied it also shortens retention below the default.
 - If a deferred server's connection later fails, its tools are withdrawn and its entry dropped rather than left advertising calls that cannot succeed.
 
 ### Subagents and lifecycle
