@@ -131,12 +131,17 @@ class AcpStdioClient {
 	/** Every session this client opened, so teardown can close broker-owned hosts it created. */
 	readonly #opened = new Set<string>();
 	readonly #stderrDone: Promise<void>;
+	readonly #framesDone: Promise<void>;
+	readonly #scopeCwds = new Set<string>();
 	#stderr = "";
 	#nextId = 0;
+	#unreconciledCreations = 0;
+	readonly #frameDrainDelayMs: number;
 	#terminalError: Error | undefined;
 	#terminated = false;
 
-	constructor(cwd: string, command: readonly string[] = ["bun", FIXTURE_AGENT]) {
+	constructor(cwd: string, command: readonly string[] = ["bun", FIXTURE_AGENT], frameDrainDelayMs = 0) {
+		this.#frameDrainDelayMs = frameDrainDelayMs;
 		this.#child = Bun.spawn([...command], {
 			cwd: REPO_ROOT,
 			env: fixtureEnvironment(cwd),
@@ -144,8 +149,9 @@ class AcpStdioClient {
 			stdout: "pipe",
 			stderr: "pipe",
 		});
+		this.#scopeCwds.add(cwd);
 		this.#stderrDone = this.#readStderr();
-		void this.#readFrames();
+		this.#framesDone = this.#readFrames();
 		void this.#watchExit();
 	}
 
@@ -170,6 +176,7 @@ class AcpStdioClient {
 	/** Records a session so `dispose` can reap it; ids already closed may be re-recorded harmlessly. */
 	track(sessionId: string): void {
 		this.#opened.add(sessionId);
+		if (this.#unreconciledCreations > 0) this.#unreconciledCreations--;
 	}
 
 	#describe(summary: string): Error {
@@ -204,6 +211,10 @@ class AcpStdioClient {
 
 	async #watchExit(): Promise<void> {
 		const code = await this.#child.exited;
+		// A process exit and stdout EOF are distinct async signals. Wait for the
+		// reader to drain every queued frame before rejecting pending requests: a
+		// one-shot fixture may write its final response immediately before exit.
+		await this.#framesDone;
 		await this.#terminate(`ACP fixture exited with code ${code} before the request settled`);
 	}
 
@@ -219,7 +230,16 @@ class AcpStdioClient {
 					buffer = buffer.slice(newline + 1);
 					newline = buffer.indexOf("\n");
 					if (!line) continue;
-					this.#dispatch(line);
+					try {
+						this.#dispatch(line);
+						if (this.#frameDrainDelayMs > 0) await Bun.sleep(this.#frameDrainDelayMs);
+					} catch (cause) {
+						// Keep draining after a bad frame so dispose() can reconcile a
+						// side-effecting request whose response was lost or malformed.
+						await this.#terminate(
+							`ACP framing failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+						);
+					}
 				}
 			}
 			await this.#terminate("ACP fixture closed stdout before the request settled");
@@ -271,8 +291,19 @@ class AcpStdioClient {
 	}
 
 	/** Resolves the RPC result, or throws with the peer's error attached. */
-	async call(method: string, params: unknown, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<unknown> {
-		if (this.#terminalError) throw this.#terminalError;
+	async call(
+		method: string,
+		params: unknown,
+		timeoutMs: number = REQUEST_TIMEOUT_MS,
+		allowTerminal = false,
+	): Promise<unknown> {
+		if (this.#terminalError && !allowTerminal) throw this.#terminalError;
+		const creationRequest = method === "session/new" || method === "session/fork";
+		if (creationRequest) this.#unreconciledCreations++;
+		if (method === "session/new" && params !== null && typeof params === "object" && !Array.isArray(params)) {
+			const cwd = (params as Record<string, unknown>).cwd;
+			if (typeof cwd === "string") this.#scopeCwds.add(cwd);
+		}
 
 		const id = ++this.#nextId;
 		const { promise, resolve, reject } = Promise.withResolvers<RpcFrame>();
@@ -285,6 +316,7 @@ class AcpStdioClient {
 			// and observe its promise before rethrowing, or it becomes an exit-race
 			// unhandled rejection.
 			this.#pending.delete(id);
+			if (creationRequest) this.#unreconciledCreations--;
 			promise.catch(() => undefined);
 			reject(new Error(`ACP request could not be sent: ${method}`));
 			throw cause;
@@ -345,17 +377,30 @@ class AcpStdioClient {
 	readonly cleanupFailures: string[] = [];
 
 	async dispose(): Promise<void> {
-		const sessions = [...this.#opened];
+		const sessions = new Set(this.#opened);
 		const failures: string[] = [];
 		try {
+			// A successful session/new or session/fork response is not the ownership
+			// boundary: either request can create a broker host before its response is
+			// lost. Reconcile every session in each test-owned cwd before terminating
+			// the fixture, including after a terminal framing failure.
+			if (this.#unreconciledCreations > 0) {
+				for (const cwd of this.#scopeCwds) {
+					const listed = rowsOf(await this.call("session/list", { cwd }, DISPOSE_REQUEST_TIMEOUT_MS, true));
+					for (const row of listed) {
+						if (typeof row.sessionId === "string" && row.sessionId.length > 0) sessions.add(row.sessionId);
+					}
+				}
+			}
+			const sessionIds = [...sessions];
 			const closeResults = await Promise.allSettled(
-				sessions.map(sessionId => this.call("session/close", { sessionId }, DISPOSE_REQUEST_TIMEOUT_MS)),
+				sessionIds.map(sessionId => this.call("session/close", { sessionId }, DISPOSE_REQUEST_TIMEOUT_MS, true)),
 			);
 			failures.push(
 				...closeResults.flatMap((result, index) =>
 					result.status === "rejected"
 						? [
-								`session/close ${sessions[index]} failed: ${
+								`session/close ${sessionIds[index]} failed: ${
 									result.reason instanceof Error ? result.reason.message : String(result.reason)
 								}`,
 							]
@@ -413,6 +458,13 @@ function asObject(value: unknown): Record<string, unknown> {
 	return value as Record<string, unknown>;
 }
 
+function notificationParams(frame: RpcFrame): Record<string, unknown> | undefined {
+	const value = frame.params;
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
 function sessionIdOf(value: unknown): string {
 	const id = asObject(value).sessionId;
 	if (typeof id !== "string" || id.length === 0)
@@ -437,6 +489,7 @@ interface LifecycleObservations {
 	forkedSessionId: string;
 	forkResult: Record<string, unknown>;
 	forkPreservedSourceState: boolean;
+	forkSessionUpdateObserved: boolean;
 	deleteForked: Record<string, unknown>;
 	rowsAfterDelete: SessionRow[];
 	closeCreated: Record<string, unknown>;
@@ -490,6 +543,7 @@ beforeAll(async () => {
 
 		await client.call("session/resume", { sessionId: createdSessionId, cwd: scratchCwd });
 
+		const notificationBaseline = client.notificationFrames.length;
 		await client.call("session/prompt", {
 			sessionId: createdSessionId,
 			prompt: [{ type: "text", text: "echo lifecycle-fork-source-state" }],
@@ -501,9 +555,14 @@ beforeAll(async () => {
 			sessionId: forkedSessionId,
 			prompt: [{ type: "text", text: "fork transcript probe" }],
 		});
-		const forkPreservedSourceState = client.notificationFrames.some(frame =>
-			JSON.stringify(frame.params).includes("fork-state-preserved"),
+		const forkUpdates = client.notificationFrames.slice(notificationBaseline).filter(frame => {
+			const params = notificationParams(frame);
+			return frame.method === "session/update" && params?.sessionId === forkedSessionId;
+		});
+		const forkPreservedSourceState = forkUpdates.some(frame =>
+			JSON.stringify(notificationParams(frame)).includes("fork-state-preserved"),
 		);
+		const forkSessionUpdateObserved = forkUpdates.length > 0;
 
 		const deleteForked = asObject(await client.call("session/delete", { sessionId: forkedSessionId }));
 		// Re-list so delete is proven by its external postcondition rather than only
@@ -552,6 +611,7 @@ beforeAll(async () => {
 			forkedSessionId,
 			forkResult,
 			forkPreservedSourceState,
+			forkSessionUpdateObserved,
 			deleteForked,
 			rowsAfterDelete,
 			closeCreated,
@@ -572,11 +632,11 @@ beforeAll(async () => {
 test("initialize advertises every session lifecycle capability", () => {
 	expect(observed.sessionCapabilities).toEqual(
 		expect.objectContaining({
-			list: expect.anything(),
-			fork: expect.anything(),
-			resume: expect.anything(),
-			close: expect.anything(),
-			delete: expect.anything(),
+			list: expect.any(Object),
+			fork: expect.any(Object),
+			resume: expect.any(Object),
+			close: expect.any(Object),
+			delete: expect.any(Object),
 		}),
 	);
 });
@@ -606,7 +666,7 @@ test("session/close costs the session its prompt eligibility", () => {
 });
 
 test("session/resume reattaches a session that was closed", () => {
-	expect(typeof observed.promptAfterResume.stopReason).toBe("string");
+	expect(observed.promptAfterResume.stopReason).toBe("end_turn");
 	expect(observed.closeAfterResume).toEqual({});
 });
 
@@ -632,8 +692,9 @@ test("session/close is idempotent when repeated on the same session", () => {
 	expect(observed.closeCreatedAgain).toEqual({});
 });
 
-test("the lifecycle sequence streams session updates", () => {
+test("the fork operation streams a session update for the forked session", () => {
 	expect(observed.notifications).toContain("session/update");
+	expect(observed.forkSessionUpdateObserved).toBe(true);
 });
 
 test("request timeout teardown force-kills a fixture that ignores termination", async () => {
@@ -709,6 +770,55 @@ test("a failed session close still reaps the fixture, fails the run, and preserv
 	} finally {
 		if (!disposed) await client.dispose();
 	}
+});
+
+test("a final stdout response settles before a one-shot fixture exit", async () => {
+	const cwd = await makeScratch();
+	const fixture = path.join(cwd, "one-shot-acp-fixture.ts");
+	await Bun.write(
+		fixture,
+		[
+			"for await (const line of process.stdin) {",
+			"  const request = JSON.parse(line);",
+			'  for (let index = 0; index < 10; index++) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "fixture/progress", params: { index } }) + "\\n");',
+			'  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { drained: true } }) + "\\n");',
+			"  break;",
+			"}",
+		].join("\n"),
+	);
+	const client = new AcpStdioClient(cwd, ["bun", fixture], 1);
+	try {
+		await expect(client.call("initialize", {})).resolves.toEqual({ drained: true });
+	} finally {
+		await client.dispose();
+	}
+});
+
+test("a malformed creation response still reaps every session in the test-owned scope", async () => {
+	const cwd = await makeScratch();
+	const fixture = path.join(cwd, "lost-creation-acp-fixture.ts");
+	const reaped = path.join(cwd, "reaped");
+	await Bun.write(
+		fixture,
+		[
+			"let created = false;",
+			"for await (const line of process.stdin) {",
+			"  const request = JSON.parse(line);",
+			'  if (request.method === "session/new") { created = true; process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: true }) + "\\n"); continue; }',
+			'  if (request.method === "session/list") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { sessions: created ? [{ sessionId: "lost-session", cwd: request.params.cwd }] : [] } }) + "\\n");',
+			`  if (request.method === "session/close" && request.params.sessionId === "lost-session") { Bun.write(${JSON.stringify(reaped)}, "reaped"); process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {} }) + "\\n"); }`,
+			"}",
+		].join("\n"),
+	);
+	const client = new AcpStdioClient(cwd, ["bun", fixture]);
+	try {
+		await expect(client.call("session/new", { cwd })).rejects.toThrow(
+			"ACP response for session/new has invalid error",
+		);
+	} finally {
+		await client.dispose();
+	}
+	expect(await Bun.file(reaped).text()).toBe("reaped");
 });
 
 test("malformed JSON-RPC responses cannot settle lifecycle requests", async () => {

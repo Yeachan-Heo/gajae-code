@@ -1901,6 +1901,11 @@ describe("dedicated-only tests — routing contract", () => {
 		}
 	});
 
+	test("package-cwd Bun discovery excludes dedicated-only tests too", async () => {
+		const bunfig = await Bun.file("packages/coding-agent/bunfig.toml").text();
+		expect(bunfig).toContain('"**/test/acp/acp-lifecycle-smoke.test.ts"');
+	});
+
 	test("a changed dedicated-only test plans exactly one runnable dedicated task with the override argv", () => {
 		const tasks = planTargetedTasks([ACP_LIFECYCLE], packages, [ACP_LIFECYCLE, "packages/coding-agent/test/edit/foo.test.ts"]);
 		const dedicated = tasks.find(task => task.key === DEDICATED_TASK_KEY);
@@ -1960,7 +1965,7 @@ describe("dedicated-only tests — routing contract", () => {
 		expect(tasks.find(task => task.key === DEDICATED_TASK_KEY)?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
 	});
 
-	test("every audited ACP lifecycle owner boundary routes to the dedicated smoke with canonical args", () => {
+	test("every audited ACP lifecycle owner boundary routes to the dedicated smoke with canonical args in PR and push plans", () => {
 		// Table-tested boundary (review round 3): every path imported by
 		// acp-agent.ts for lifecycle transport, plus the fixture. A change in any
 		// of these must emit the dedicated lifecycle task with the canonical
@@ -1972,7 +1977,9 @@ describe("dedicated-only tests — routing contract", () => {
 			"packages/coding-agent/src/sdk/acp/final-text.ts",
 			"packages/coding-agent/src/sdk/acp/mcp.ts",
 			"packages/coding-agent/src/sdk/router/session-router.ts",
+			"packages/coding-agent/src/sdk/session-directory.ts",
 			"packages/coding-agent/src/sdk/session-list.ts",
+			"packages/coding-agent/src/sdk/session-reconnect.ts",
 			"packages/coding-agent/src/sdk/broker/lifecycle.ts",
 			"packages/coding-agent/src/sdk/broker/ensure.ts",
 			"packages/coding-agent/src/sdk/client/index.ts",
@@ -1985,6 +1992,8 @@ describe("dedicated-only tests — routing contract", () => {
 			expect(dedicated?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
 			// The plain `bun test <file>` form can never run a pruned file.
 			expect(dedicated?.command).not.toEqual(["bun", "test", ACP_LIFECYCLE]);
+			const pushDedicated = planTasks([changedPath], packages).find(task => task.key === DEDICATED_TASK_KEY);
+			expect(pushDedicated?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
 		}
 		// Boundary negative: a neighboring SDK path with no lifecycle role must
 		// NOT pull the dedicated smoke into its targeted plan.

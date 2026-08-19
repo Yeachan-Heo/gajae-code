@@ -90,7 +90,9 @@ const ACP_LIFECYCLE_OWNER_PATHS = [
 	"packages/coding-agent/src/modes/acp/",
 	"packages/coding-agent/src/sdk/acp/",
 	"packages/coding-agent/src/sdk/router/",
+	"packages/coding-agent/src/sdk/session-directory.ts",
 	"packages/coding-agent/src/sdk/session-list.ts",
+	"packages/coding-agent/src/sdk/session-reconnect.ts",
 	"packages/coding-agent/src/sdk/broker/",
 	"packages/coding-agent/src/sdk/client/",
 	"packages/coding-agent/src/sdk/host/",
@@ -889,6 +891,15 @@ export function planTasks(
 	}
 	for (const canary of selectCanaryTests(paths.filter(changedPath => !isDocOrChangelogPath(changedPath)))) {
 		addTestFileTask(tasks, canary);
+	}
+	// Push-mode uses this broad planner rather than planTargetedTasks(). The
+	// lifecycle smoke is pruned from ordinary coding-agent shards, so its
+	// behavioral owners must be escalated here as well or post-merge Dev CI
+	// never runs the advertised lifecycle gate.
+	for (const changedPath of paths) {
+		for (const testFile of behavioralTestsFor(changedPath)) {
+			addTestFileTask(tasks, testFile);
+		}
 	}
 
 	return Array.from(tasks.values());
