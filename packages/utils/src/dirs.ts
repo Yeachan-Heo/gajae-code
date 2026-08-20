@@ -284,13 +284,17 @@ class DirResolver {
 		// dotenv value overlaid into it) redirect user state when this is absent.
 		const runtimeHome = process.env[authoritativeHomeKey];
 		const accountHome = accountHomeFromSystem();
+		// The account home is independent evidence only when it does not merely
+		// echo the runtime home. Bun resolves `os.userInfo().homedir` from `$HOME`
+		// on macOS (unlike Node, which reads the passwd database), so a
+		// project-declared home would otherwise come back as its own justification
+		// and re-enter the trusted set. Only the Linux `/etc/passwd` lookup is
+		// genuinely env-independent.
+		const independentAccountHome = accountHome !== undefined && accountHome !== runtimeHome ? accountHome : undefined;
 		const ambiguousHome =
 			declaredHome !== undefined && (snapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
 		this.#trustedHome = ambiguousHome
-			? (accountHome ??
-				(() => {
-					throw new Error("Unable to determine a trustworthy account home directory");
-				})())
+			? (independentAccountHome ?? path.parse(process.cwd()).root)
 			: (runtimeHome ??
 				accountHome ??
 				(() => {
