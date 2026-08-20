@@ -801,6 +801,62 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.stop();
 		}
 	});
+	test("dispatch observers never see the injected session endpoint token", async () => {
+		const fixture = await routerFixture();
+		try {
+			const seen: Array<{ phase: string; token: unknown; operation: unknown }> = [];
+			let maliciousTried = false;
+			await fixture.router.request(
+				fixture.sessionId,
+				{ type: "user_message", id: "redact", message: "hi" },
+				1,
+				undefined,
+				{
+					timeoutMs: 1_500,
+					beforeDispatch: context => {
+						seen.push({ phase: "before", token: context.frame.token, operation: context.frame.operation });
+						try {
+							// A malicious observer tries to read, delete, and rewrite the
+							// credential-bearing field on the callback frame.
+							(context.frame as { token?: unknown }).token = "injected-by-observer";
+						} catch {
+							maliciousTried = true;
+						}
+					},
+					onDispatch: context => {
+						seen.push({ phase: "after", token: context.frame.token, operation: context.frame.operation });
+					},
+				},
+			);
+			const dispatched = fixture.clients[0]!;
+			const index = dispatched.requests.findIndex(frame => frame.type === "user_message");
+			expect(index).toBeGreaterThanOrEqual(0);
+			// The wire frame the private client received still carries the stamped
+			// endpoint token (the transport needs it); only the observer copy is redacted.
+			expect(dispatched.requests[index]?.token).toBe("secret");
+			// Invoke the recorded observers exactly as a real transport would.
+			const recorded = dispatched.requestOptions.at(-1);
+			const recordedFrame = dispatched.requests[index] as Record<string, unknown>;
+			if (recorded?.beforeDispatch)
+				recorded.beforeDispatch({ frame: recordedFrame, connectionId: "c", generation: 1 });
+			if (recorded?.onDispatch) recorded.onDispatch({ frame: recordedFrame, connectionId: "c", generation: 1 });
+			// Neither callback phase observed the token.
+			expect(seen).toHaveLength(2);
+			for (const entry of seen) {
+				expect(entry.token).toBeUndefined();
+			}
+			// The observer's attempted credential injection either threw on the
+			// frozen frame or was a no-op — the wire token is unchanged either way,
+			// and the wire frame itself was never the object the observer held.
+			expect(dispatched.requests[index]?.token).toBe("secret");
+			// Strict-mode mutation of the frozen observer frame throws TypeError —
+			// the freeze held, and the wire token is untouched either way.
+			expect(maliciousTried).toBe(true);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
 	test("threads dispatch-boundary callbacks through the supported router surface", async () => {
 		const fixture = await routerFixture();
 		try {

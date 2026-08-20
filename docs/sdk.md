@@ -747,6 +747,31 @@ SDK core exposes two related provider-neutral capabilities:
    rotation, and revokes stale capabilities. Provider-facing attachments expose
    only `sessionId`, `generation`, `isCurrent()`, and `send()`.
 
+### Dispatch-boundary observers (managed router path)
+
+`SessionRouter.request(sessionId, frame, expectedGeneration?, expectedAttachment?, options)`
+accepts two optional synchronous observers in `options` — the supported
+dispatch-boundary surface for transport-close-aware consumers (#4640):
+
+- **`beforeDispatch(context)`** — fires immediately before the wire write.
+  Throwing (or any synchronous failure) aborts the dispatch with nothing on the
+  wire, no sent record, and a retryable rejection carrying the caller's own
+  error. Returning a thenable (e.g. an `async` function) is a contract
+  violation: the dispatch aborts pre-send and the eventual rejection is sunk.
+- **`onDispatch(context)`** — fires synchronously immediately after the frame is
+  handed to the socket, never before. `context.frame.id` is the exact correlated
+  identity a response must carry; from this point a transport close before the
+  response settles the request as `uncertain_after_send`. Observer throws and
+  returned-thenable rejections are sunk; they can neither displace settlement
+  nor reach the process unhandled-rejection channel.
+
+The observer `context.frame` is a **deep-frozen, credential-redacted copy**: the
+injected session endpoint `token` (and any other credential field) exists only
+on the internal wire frame and is never handed to observer code, and mutation
+attempts throw in strict mode. The raw credential-bearing `SdkClient` remains
+unexported (`./sdk/client` is blocked in the package export map); the router is
+the only supported path to this boundary.
+
 There is no daemon-owned lifecycle control endpoint, provider lifecycle ledger,
 notification-root scanner, or provider-created SessionId. Telegram `/session_*`
 commands call the SDK lifecycle service directly. A Telegram update or topic

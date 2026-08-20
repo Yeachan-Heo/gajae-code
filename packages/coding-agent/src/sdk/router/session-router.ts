@@ -179,6 +179,28 @@ export interface SessionRouterOptions {
 	correlateFrame?: SessionRouterFrameCorrelator;
 }
 
+/**
+ * Builds the observer-facing frame for router dispatch callbacks: the injected
+ * session endpoint token (and any other credential-shaped field) is removed,
+ * and the result is deep-frozen so a malicious observer can neither read
+ * credentials nor mutate what the wire carries. The internal wire frame keeps
+ * the token; only the callback copy is redacted.
+ */
+function redactDispatchFrame(frame: Record<string, unknown>): Record<string, unknown> {
+	const redacted: Record<string, unknown> = { ...frame };
+	delete redacted.token;
+	const frozen = deepFreeze(redacted);
+	return frozen as Record<string, unknown>;
+}
+
+function deepFreeze<T>(value: T): T {
+	if (value && typeof value === "object") {
+		for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+		Object.freeze(value);
+	}
+	return value;
+}
+
 export type SessionRouterErrorPhase = "pre_send" | "ambiguous";
 
 export class SessionRouterError extends Error {
@@ -590,12 +612,33 @@ export class SessionRouter {
 				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 			}
 		}
-		// A caller that sized its own budget keeps it; everything else gets the
-		// long-lived session budget instead of the transport's one-shot default,
-		// which a cold host's first credential-collecting query outruns (#4258).
-		const response = await attached.client.request(this.#prepareFrame(attached, frame), {
-			...options,
-			timeoutMs: options?.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+		// A caller that sized its own budget keeps its own; everything else gets
+		// the long-lived session budget instead of the transport's one-shot
+		// default, which a cold host's first credential-collecting query
+		// outruns (#4258).
+		// Dispatch observers must never see the injected session endpoint
+		// token: the wire frame alone carries credentials, and the observer
+		// context is a deep-frozen, token-redacted copy (#4640 review).
+		const wireFrame = this.#prepareFrame(attached, frame);
+		const observerFrame = wireFrame.token === undefined ? wireFrame : redactDispatchFrame(wireFrame);
+		const { beforeDispatch, onDispatch, ...requestOptions } = options ?? {};
+		const response = await attached.client.request(wireFrame, {
+			...requestOptions,
+			timeoutMs: requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+			...(beforeDispatch
+				? {
+						beforeDispatch: (context: SdkDispatchContext) => {
+							beforeDispatch({ ...context, frame: observerFrame });
+						},
+					}
+				: {}),
+			...(onDispatch
+				? {
+						onDispatch: (context: SdkDispatchContext) => {
+							onDispatch({ ...context, frame: observerFrame });
+						},
+					}
+				: {}),
 		});
 		if (
 			!this.#attachmentPublished(attached) ||

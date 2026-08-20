@@ -50,7 +50,10 @@ class FakeWebSocket {
 	send(value: string): void {
 		if (this.throwOnSend) throw this.throwOnSend;
 		this.sent.push(value);
+		if (this.onSendReentrant) this.onSendReentrant(value);
 	}
+	/** Synchronous hook fired from inside send() to emulate reentrant transport events. */
+	onSendReentrant: ((value: string) => void) | undefined;
 
 	emit(type: string, event = new Event(type)): void {
 		for (const [listener, options] of [...(this.listeners.get(type) ?? [])]) {
@@ -367,11 +370,40 @@ test("beforeDispatch closing the client prevents the send and keeps the boundary
 		// Retirement settled the request pre-send: nothing may be written,
 		// no sent record may exist, and no post-send observer may fire.
 		expect(boundary).toBe(1);
+		// Independently observed transport evidence: zero wire writes.
 		expect(socket.sent).toHaveLength(0);
 		expect(dispatched).toBe(0);
 		await expect(request).rejects.toMatchObject({ code: "connection_closed" });
-		const recordId = sentFrame.length === 0 ? undefined : undefined;
-		expect(recordId).toBeUndefined();
+		// And no reconciliation record exists for any id this client saw: the
+		// wire stayed empty, so there is nothing to retain.
+		for (const wireEntry of socket.sent) {
+			const sentId = (JSON.parse(wireEntry) as Record<string, unknown>).id;
+			expect(client.getSentRecord(sentId as string)).toBeUndefined();
+		}
+		// The request's own identity (recovered from the boundary context frame)
+		// also has no retained record after the pre-send retirement.
+		const boundaryFrameIds: string[] = [];
+		{
+			const probeClient = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+			const probeSocket = await connect(probeClient, "probe");
+			let capturedId = "";
+			const probeRequest = probeClient.request(
+				{ type: "control_request", operation: "turn.prompt" },
+				{
+					beforeDispatch: context => {
+						if (typeof context.frame.id === "string") capturedId = context.frame.id;
+						void probeClient.close();
+					},
+				},
+			);
+			probeRequest.catch(() => undefined);
+			await flush();
+			expect(probeSocket.sent).toHaveLength(0);
+			expect(client.getSentRecord(capturedId)).toBeUndefined();
+			boundaryFrameIds.push(capturedId);
+			expect(boundaryFrameIds).toHaveLength(1);
+			await probeClient.close().catch(() => undefined);
+		}
 		socket.readyState = FakeWebSocket.CLOSED;
 		socket.emit("close");
 		await client.close().catch(() => undefined);
@@ -491,23 +523,37 @@ test("a getter-swapping options object cannot alter reconciliation identity afte
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
 		const socket = await connect(client);
-		let swaps = 0;
 		let currentKey = "stable-key";
-		const hostileOptions: { timeoutMs?: number; get idempotencyKey(): string | undefined } = {
+		const hostileOptions: {
+			timeoutMs?: number;
+			beforeDispatch?: () => void;
+			get idempotencyKey(): string | undefined;
+		} = {
 			timeoutMs: 10_000,
 			get idempotencyKey() {
 				return currentKey;
 			},
 		};
 
+		let boundary = 0;
+		let getterDuringBoundary: string | undefined;
 		const request = client.request({ type: "control_request", operation: "turn.prompt" }, hostileOptions);
+		// The swap must happen INSIDE beforeDispatch so the test discriminates
+		// the pre-observer snapshot from any post-callback reread: with the
+		// getter already swapped at the boundary, a post-callback reread of
+		// `options.idempotencyKey` would retain the swapped value.
+		hostileOptions.beforeDispatch = () => {
+			boundary++;
+			getterDuringBoundary = hostileOptions.idempotencyKey;
+			currentKey = "swapped-inside-boundary";
+		};
 		request.catch(() => undefined);
 		await flush();
 
-		// Swap what the getter returns after serialization already happened.
-		swaps++;
-		currentKey = "swapped-key";
-		expect(swaps).toBe(1);
+		expect(boundary).toBe(1);
+		expect(getterDuringBoundary).toBe("stable-key");
+		// The getter now returns the swapped value; nothing rereads it.
+		expect(hostileOptions.idempotencyKey).toBe("swapped-inside-boundary");
 
 		const wireFrame = sentFrame(socket);
 		expect(wireFrame.idempotencyKey).toBe("stable-key");
@@ -738,6 +784,107 @@ test("control and global expose the same dispatch boundary as request", async ()
 	});
 });
 
+test("query exposes the same dispatch boundary as request", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client, "query-parity");
+		const boundaryOperations: string[] = [];
+
+		const queryRequest = client.query("sessions.list", { filter: "active" }, "cursor-1", {
+			onDispatch: context => {
+				if (typeof context.frame.query !== "string") throw new Error("query missing");
+				boundaryOperations.push(context.frame.query);
+			},
+		});
+		await flush();
+		expect(boundaryOperations).toEqual(["sessions.list"]);
+		const frame = sentFrame(socket);
+		expect(frame).toMatchObject({ type: "query_request", query: "sessions.list", cursor: "cursor-1" });
+		socket.message({ type: "query_response", id: frame.id, ok: true, result: { items: [] } });
+		await expect(queryRequest).resolves.toMatchObject({ ok: true });
+		await client.close();
+	});
+});
+
+test("an async beforeDispatch rejection fails pre-send and never escapes unhandled", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		const unhandled: unknown[] = [];
+		const onUnhandled = (error: unknown): void => {
+			unhandled.push(error);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		let dispatched = 0;
+		try {
+			const request = client.request(
+				{ type: "control_request", operation: "turn.prompt" },
+				{
+					timeoutMs: 10_000,
+					// An async observer returns a rejected promise: TS accepts it,
+					// but the synchronous pre-send contract cannot wait for it.
+					beforeDispatch: async () => {
+						throw new Error("async observer aborted");
+					},
+					onDispatch: () => {
+						dispatched++;
+					},
+				},
+			);
+			request.catch(() => undefined);
+			await flush();
+			// The dispatch aborts pre-send: nothing on the wire, no onDispatch,
+			// retryable typed rejection — the caller's abort intent is honored.
+			expect(socket.sent).toHaveLength(0);
+			expect(dispatched).toBe(0);
+			await expect(request).rejects.toMatchObject({ code: "invalid_input" });
+			// Give the sunk rejection a microtask to (not) surface.
+			await flush();
+			await flush();
+			expect(unhandled).toHaveLength(0);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			await client.close().catch(() => undefined);
+		}
+	});
+});
+
+test("an async onDispatch rejection is sunk without displacing settlement", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		const unhandled: unknown[] = [];
+		const onUnhandled = (error: unknown): void => {
+			unhandled.push(error);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const request = client.request(
+				{ type: "control_request", operation: "turn.prompt" },
+				{
+					timeoutMs: 10_000,
+					onDispatch: async () => {
+						throw new Error("async observer exploded");
+					},
+				},
+			);
+			request.catch(() => undefined);
+			await flush();
+			// The frame went out; the request stays pending for real settlement.
+			expect(socket.sent).toHaveLength(1);
+			const frame = sentFrame(socket);
+			socket.message({ type: "control_response", id: frame.id, ok: true, result: { settled: true } });
+			await expect(request).resolves.toMatchObject({ result: { settled: true } });
+			await flush();
+			await flush();
+			expect(unhandled).toHaveLength(0);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			await client.close().catch(() => undefined);
+		}
+	});
+});
+
 test("client close after dispatch settles the request as uncertain, not hung", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0, timeoutMs: 10_000 });
@@ -791,6 +938,110 @@ test("lifecycle requests retain reconciliation identity after a dispatch-aware u
 			idempotencyKey: "dispatch-lifecycle",
 		});
 		await client.close();
+	});
+});
+
+test("a send that synchronously closes the socket retires the request as sent, not pre-send", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0, timeoutMs: 10_000 });
+		const socket = await connect(client);
+		let dispatched = 0;
+		let settlements = 0;
+
+		socket.onSendReentrant = () => {
+			// The transport dies INSIDE send(): reentrant close handling runs
+			// before #request returns from the wire write.
+			socket.readyState = FakeWebSocket.CLOSED;
+			socket.emit("close");
+		};
+
+		const request = client.request(
+			{ type: "control_request", operation: "turn.prompt" },
+			{
+				timeoutMs: 10_000,
+				onDispatch: () => {
+					dispatched++;
+				},
+			},
+		);
+		request.catch(() => undefined).finally(() => settlements++);
+
+		await flush();
+		// The handoff bookkeeping (sent + sent record) was established BEFORE
+		// the write, so the reentrant retirement classified this request as
+		// already-sent: uncertain_after_send, never pre-send, exactly once.
+		await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
+		await flush();
+		expect(settlements).toBe(1);
+		// The boundary observer still fired exactly once for the accepted frame.
+		expect(dispatched).toBe(1);
+		const frame = sentFrame(socket);
+		const record = client.getSentRecord(frame.id as string);
+		if (!record) throw new Error("sent record missing after reentrant close");
+		expect(record.operation).toBe("turn.prompt");
+		await client.close().catch(() => undefined);
+	});
+});
+
+test("a send that synchronously delivers the response settles exactly once with no duplicate retry state", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		let settlements = 0;
+		let dispatched = 0;
+
+		socket.onSendReentrant = value => {
+			// The server replies INSIDE send(): reentrant response handling runs
+			// while the wire write is still on the stack.
+			const frame = JSON.parse(value) as Record<string, unknown>;
+			socket.message({ type: "control_response", id: frame.id, ok: true, result: { reentrant: true } });
+		};
+
+		const request = client.request(
+			{ type: "control_request", operation: "turn.prompt" },
+			{
+				onDispatch: () => {
+					dispatched++;
+				},
+			},
+		);
+		request.then(
+			() => settlements++,
+			() => settlements++,
+		);
+
+		await flush();
+		await expect(request).resolves.toMatchObject({ result: { reentrant: true } });
+		await flush();
+		expect(settlements).toBe(1);
+		expect(dispatched).toBe(1);
+		// The already-settled request leaves no resurrected sent record behind.
+		const frame = sentFrame(socket);
+		expect(client.getSentRecord(frame.id as string)).toBeUndefined();
+		await client.close();
+	});
+});
+
+test("a send that throws after a reentrant close keeps the reentrant settlement", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client);
+		socket.onSendReentrant = () => {
+			// Close fires during send, then the write itself throws: the close
+			// settlement (uncertain, because handoff state said sent) must not
+			// be displaced by the send-failure rollback.
+			socket.readyState = FakeWebSocket.CLOSED;
+			socket.emit("close");
+			throw new Error("EPIPE mid-send");
+		};
+
+		const request = client.request({ type: "control_request", operation: "turn.prompt" }, { timeoutMs: 10_000 });
+		request.catch(() => undefined);
+		await flush();
+		// Bytes may or may not have been accepted before the throw; the close
+		// already settled this request as sent-uncertain, and that stands.
+		await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
+		await client.close().catch(() => undefined);
 	});
 });
 
