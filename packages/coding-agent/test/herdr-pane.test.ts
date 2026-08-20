@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	buildHerdrClearTitleArgs,
 	buildHerdrReleaseArgs,
@@ -761,5 +764,169 @@ describe("herdr pane title", () => {
 		expect(sanitized).toHaveLength(119);
 		const last = sanitized!.charCodeAt(sanitized!.length - 1);
 		expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+	});
+});
+
+describe("herdr server replacement", () => {
+	/** Stand-in for the socket watch; the test drives replacement directly. */
+	function fakeWatch() {
+		let onReplaced: (() => void) | null = null;
+		let closed = 0;
+		return {
+			watch(_socketPath: string, next: () => void) {
+				onReplaced = next;
+				return () => {
+					closed += 1;
+					onReplaced = null;
+				};
+			},
+			replace() {
+				onReplaced?.();
+			},
+			get watching() {
+				return onReplaced !== null;
+			},
+			get closeCount() {
+				return closed;
+			},
+		};
+	}
+
+	const SOCKET_PANE = { paneId: "pane-7", binPath: "/usr/bin/herdr", socketPath: "/tmp/herdr/herdr.sock" };
+
+	it("re-reports the current state when the server is replaced", () => {
+		const { calls, spawn } = recordingSpawn();
+		const events = eventSource();
+		const watcher = fakeWatch();
+		const reporter = createHerdrReporter(SOCKET_PANE, events.subscribe, {
+			env: paneEnv(),
+			spawn,
+			watchServerReplacement: watcher.watch,
+		});
+		events.emit({ type: "agent_start" });
+		const beforeReplacement = calls.length;
+
+		watcher.replace();
+
+		const stateReports = calls
+			.slice(beforeReplacement)
+			.map(call => call.command)
+			.filter(command => command.includes("report-agent"));
+		expect(stateReports).toHaveLength(1);
+		expect(stateReports[0]?.slice(0, -1)).toEqual([
+			"/usr/bin/herdr",
+			...buildHerdrReportArgs("pane-7", "working", 0).slice(0, -1),
+		]);
+		// The state memo must survive the re-assert, or the next real transition
+		// would be deduplicated against a cleared value.
+		expect(reporter.state).toBe("working");
+	});
+
+	it("raises the sequence so the replaced server accepts the re-report", () => {
+		const { calls, spawn } = recordingSpawn();
+		const events = eventSource();
+		const watcher = fakeWatch();
+		createHerdrReporter(SOCKET_PANE, events.subscribe, {
+			env: paneEnv(),
+			spawn,
+			watchServerReplacement: watcher.watch,
+		});
+		watcher.replace();
+
+		const [initial, reasserted] = calls
+			.filter(call => call.command.includes("report-agent"))
+			.map(call => Number(call.command.at(-1)));
+		expect(reasserted).toBeGreaterThan(initial as number);
+	});
+
+	it("re-sends the last reported title so the pane is not left unlabeled", () => {
+		const { calls, spawn } = recordingSpawn();
+		const events = eventSource();
+		const watcher = fakeWatch();
+		const options = { env: paneEnv(), which: () => "/usr/bin/herdr", spawn };
+		createHerdrReporter(SOCKET_PANE, events.subscribe, {
+			...options,
+			watchServerReplacement: watcher.watch,
+		});
+		syncHerdrPaneTitle("Ship the release", options);
+		const beforeReplacement = calls.length;
+
+		watcher.replace();
+
+		const commands = calls.slice(beforeReplacement).map(call => call.command);
+		const title = commands.find(command => command.includes("report-metadata"));
+		expect(title?.slice(0, -1)).toEqual([
+			"/usr/bin/herdr",
+			...buildHerdrTitleArgs("pane-7", "Ship the release", 0).slice(0, -1),
+		]);
+	});
+
+	it("stops watching once the pane authority is released", () => {
+		const { spawn } = recordingSpawn();
+		const events = eventSource();
+		const watcher = fakeWatch();
+		const reporter = createHerdrReporter(SOCKET_PANE, events.subscribe, {
+			env: paneEnv(),
+			spawn,
+			watchServerReplacement: watcher.watch,
+		});
+		expect(watcher.watching).toBe(true);
+
+		reporter.release();
+
+		expect(watcher.closeCount).toBe(1);
+		expect(watcher.watching).toBe(false);
+	});
+
+	it("does not watch when the pane environment names no socket", () => {
+		const { spawn } = recordingSpawn();
+		const events = eventSource();
+		const watcher = fakeWatch();
+		createHerdrReporter(PANE, events.subscribe, {
+			env: paneEnv(),
+			spawn,
+			watchServerReplacement: watcher.watch,
+		});
+
+		expect(watcher.watching).toBe(false);
+	});
+
+	it("carries the socket path from the pane environment", () => {
+		const resolved = resolveHerdrPaneEnvironment({
+			env: paneEnv({ HERDR_BIN_PATH: "/usr/bin/herdr", HERDR_SOCKET_PATH: "/tmp/herdr/herdr.sock" }),
+		});
+
+		expect(resolved).toEqual({ paneId: "pane-7", binPath: "/usr/bin/herdr", socketPath: "/tmp/herdr/herdr.sock" });
+	});
+	it("detects a real socket being unlinked and rebound", async () => {
+		// The production watch is the whole point of the feature: a server
+		// replacement is unlink-then-bind on the same path, which arrives as a
+		// single event while the path momentarily has no inode.
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-socket-"));
+		const socketPath = path.join(directory, "herdr.sock");
+		fs.writeFileSync(socketPath, "");
+		const { calls, spawn } = recordingSpawn();
+		const reporter = createHerdrReporter(
+			{ paneId: "pane-7", binPath: "/usr/bin/herdr", socketPath },
+			eventSource().subscribe,
+			{ env: paneEnv(), spawn },
+		);
+		const before = calls.filter(call => call.command.includes("report-agent")).length;
+
+		try {
+			fs.unlinkSync(socketPath);
+			fs.writeFileSync(socketPath, "");
+
+			const deadline = Date.now() + 5_000;
+			while (calls.filter(call => call.command.includes("report-agent")).length === before) {
+				if (Date.now() > deadline) break;
+				await Bun.sleep(50);
+			}
+
+			expect(calls.filter(call => call.command.includes("report-agent")).length).toBe(before + 1);
+		} finally {
+			reporter.release();
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });
