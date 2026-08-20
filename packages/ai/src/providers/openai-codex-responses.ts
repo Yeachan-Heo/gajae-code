@@ -116,6 +116,12 @@ const CODEX_WEBSOCKET_IDLE_TIMEOUT_MS = 300000;
 const CODEX_WEBSOCKET_RETRY_BUDGET = CODEX_MAX_RETRIES;
 const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error";
 const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_found", "codex_previous_response_stale"]);
+// Some Codex deployments reject a stale continuation anchor with a generic
+// `invalid_request_error` code and only name the anchor in the message
+// (`Invalid \`previous_response_id\`.`). Classify by message so the anchor is
+// cleared and the turn retried with full context instead of killing the session.
+const CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE =
+	/(?:invalid|expired|unknown|stale|not[ _-]?found|no longer)[^\n]{0,48}previous[ _`-]*response[ _`-]*id|previous[ _`-]*response[ _`-]*id[^\n]{0,48}(?:invalid|expired|unknown|stale|not[ _-]?found|no longer)/i;
 const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
 const CODEX_NON_RETRYABLE_EVENT_CODES = new Set([
 	"invalid_function_parameters",
@@ -1807,11 +1813,9 @@ async function tryReconnectCodexWebSocketOnConnectionLimit(
 }
 
 function isCodexPreviousResponseNotFound(error: unknown): boolean {
-	return (
-		error instanceof CodexProviderStreamError &&
-		typeof error.code === "string" &&
-		CODEX_PREVIOUS_RESPONSE_STALE_CODES.has(error.code)
-	);
+	if (!(error instanceof CodexProviderStreamError)) return false;
+	if (typeof error.code === "string" && CODEX_PREVIOUS_RESPONSE_STALE_CODES.has(error.code)) return true;
+	return CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE.test(error.message);
 }
 
 async function tryRecoverCodexPreviousResponseNotFound(

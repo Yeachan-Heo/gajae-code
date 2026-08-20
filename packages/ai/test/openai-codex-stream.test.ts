@@ -2210,6 +2210,158 @@ describe("openai-codex streaming", () => {
 		expect(JSON.stringify(retryInput)).toContain("Second question");
 	});
 
+	it("retries websocket continuations when Codex rejects the anchor as a generic invalid_request_error", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-invalid-anchor-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class InvalidPreviousResponseIdWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				const requestIndex = sentRequests.length;
+
+				if (requestIndex === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_1",
+						responseId: "resp_1",
+						text: "First answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				if (requestIndex === 2) {
+					expect(request.previous_response_id).toBe("resp_1");
+					this.sendJson({
+						type: "error",
+						error: {
+							type: "invalid_request_error",
+							code: "invalid_request_error",
+							message: "Invalid `previous_response_id`.",
+						},
+					});
+					return;
+				}
+
+				if (requestIndex === 3) {
+					expect(request.previous_response_id).toBeUndefined();
+					this.emitCodexResponse({
+						messageId: "msg_3",
+						responseId: "resp_3",
+						text: "Second answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				throw new Error(`Unexpected websocket request index: ${requestIndex}`);
+			}
+		}
+
+		global.WebSocket = InvalidPreviousResponseIdWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: token,
+			sessionId: "ws-invalid-previous-response-session",
+			providerSessionState,
+		}).result();
+		const secondContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [
+				...firstContext.messages,
+				firstResponse,
+				{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+			],
+		};
+
+		const secondResponse = await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: token,
+			sessionId: "ws-invalid-previous-response-session",
+			providerSessionState,
+		}).result();
+
+		expect(secondResponse.stopReason).toBe("stop");
+		expect(JSON.stringify(secondResponse.content)).toContain("Second answer");
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests).toHaveLength(3);
+		const retryInput = sentRequests[2]?.input;
+		expect(Array.isArray(retryInput)).toBe(true);
+		expect(JSON.stringify(retryInput)).toContain("First question");
+		expect(JSON.stringify(retryInput)).toContain("Second question");
+
+		const stats = getOpenAICodexWebSocketDebugStats(model, {
+			sessionId: "ws-invalid-previous-response-session",
+			providerSessionState,
+		});
+		expect(stats?.lastPreviousResponseId).toBeUndefined();
+	});
+
+	it("keeps a genuine invalid_request_error fatal when no continuation anchor is implicated", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-invalid-request-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class InvalidRequestWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				this.sendJson({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						code: "invalid_request_error",
+						message: "Invalid value for 'model'.",
+					},
+				});
+			}
+		}
+
+		global.WebSocket = InvalidRequestWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const response = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+			},
+			{
+				apiKey: token,
+				sessionId: "ws-invalid-request-session",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+
+		expect(response.stopReason).toBe("error");
+		expect(sentRequests).toHaveLength(1);
+	});
+
 	it("uses low Codex text verbosity by default while preserving explicit overrides", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-verbosity-");
 		setAgentDir(tempDir.path());
