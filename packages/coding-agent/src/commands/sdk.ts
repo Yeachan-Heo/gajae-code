@@ -732,6 +732,14 @@ export async function runSessionHost(
 		process.stderr.write("GJC_SDK_TEST_EXIT_AFTER_READY\n");
 		process.exit(7);
 	}
+	if (process.env.GJC_SDK_TEST_REJECT_AFTER_READY === cwd) {
+		// Simulates the post-readiness liveness watcher rejecting. With the
+		// post-ready startup receipt removed, this unhandled rejection kills the
+		// host without writing any startup receipt; the broker must classify the
+		// death from published ready authority plus proven exit.
+		void Promise.reject(new Error("GJC_SDK_TEST_REJECT_AFTER_READY"));
+		await Bun.sleep(5_000);
+	}
 	startMemoryBackendAfterReadiness(startDeferredMemoryBackend);
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);
@@ -740,19 +748,13 @@ export async function runSessionHost(
 	// that is gone for good; the second covers the opposite case, a perfectly
 	// healthy broker whose host nobody is attached to any more and for which no
 	// `session.close` will ever arrive.
-	try {
-		await Promise.race([
-			watchSessionHostBrokerLiveness({ agentDir }),
-			watchSessionHostClientAttachment({
-				readAttachedClients: sessionHostAttachedClients,
-				readWorkInFlight: sessionHostWorkInFlight,
-			}),
-		]);
-	} catch (error) {
-		const failure = capability.normalizeFailure("startup", "failed", error);
-		await writeFailure(failure, rollback.result).catch(() => {});
-		throw error;
-	}
+	await Promise.race([
+		watchSessionHostBrokerLiveness({ agentDir }),
+		watchSessionHostClientAttachment({
+			readAttachedClients: sessionHostAttachedClients,
+			readWorkInFlight: sessionHostWorkInFlight,
+		}),
+	]);
 	stop();
 	await new Promise<void>(() => {});
 }

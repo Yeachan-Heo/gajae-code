@@ -2123,7 +2123,19 @@ async function hasOwnedReadinessEvidence(
 	);
 }
 
-async function hasPublishedReadyAuthority(root: string, id: string, expected: EffectMarker): Promise<boolean> {
+/**
+ * Ready-then-exit probe for a dead child. A host that died hard leaves its
+ * endpoint file on disk; a host that tore down gracefully removed it first.
+ * Both are provably ready when the owned marker + ready marker match and
+ * either the endpoint file still names the dead child or the broker's own
+ * session index recorded a host registration for exactly this incarnation.
+ */
+async function hasPublishedReadyAuthority(
+	root: string,
+	id: string,
+	expected: EffectMarker,
+	index?: BrokerIndex,
+): Promise<boolean> {
 	const [effect, ready] = await Promise.all([
 		readEffectMarker(lifecycleMarkerPath(root, id)),
 		readEffectMarker(lifecycleReadyPath(root, id)),
@@ -2136,7 +2148,17 @@ async function hasPublishedReadyAuthority(root: string, id: string, expected: Ef
 		};
 		return endpoint.pid === expected.pid && endpoint.sessionId === id;
 	} catch {
-		return false;
+		if (!index) return false;
+		const sessionIndex = index.index;
+		await sessionIndex.refresh();
+		return sessionIndex
+			.listSessions()
+			.sessions.some(
+				session =>
+					session.sessionId === id &&
+					session.pid === expected.pid &&
+					(session.hostIncarnation ?? session.processIncarnation) === expected.incarnation,
+			);
 	}
 }
 
@@ -2162,11 +2184,10 @@ async function readSessionHostSpawnLogTail(spawnLogPath: string): Promise<string
 		const file = Bun.file(spawnLogPath);
 		const size = file.size;
 		if (!Number.isFinite(size) || size <= 0) return "";
-		const overlap = 512;
-		const windowBytes =
-			size > SESSION_HOST_SPAWN_LOG_TAIL_BYTES + overlap ? SESSION_HOST_SPAWN_LOG_TAIL_BYTES + overlap : size;
-		const window = size > windowBytes ? file.slice(size - windowBytes) : file;
-		const sanitized = sanitizeSdkStartupMessage(await window.text());
+		// Sanitize the whole log before any byte-window selection: slicing first
+		// could cut into the middle of a credential, destroying the recognizable
+		// prefix the sanitizer needs and leaking the surviving suffix.
+		const sanitized = sanitizeSdkStartupMessage(await file.text());
 		if (Buffer.byteLength(sanitized) <= SESSION_HOST_SPAWN_LOG_TAIL_BYTES) return sanitized;
 		let start = 0;
 		while (start < sanitized.length && Buffer.byteLength(sanitized.slice(start)) > SESSION_HOST_SPAWN_LOG_TAIL_BYTES)
@@ -2475,7 +2496,9 @@ async function terminateSpawnedChild(
 			const registered = broker.index
 				.listSessions()
 				.sessions.find(session => session.sessionId === id && session.pid === pid);
-			let registrationReleased = !broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker);
+			const registeredRowTerminal = registered?.terminal === true || registered?.terminalUncertain === true;
+			let registrationReleased =
+				!broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker) || registeredRowTerminal;
 			if (registered && !registrationReleased) {
 				registrationReleased = await broker.index.unregisterIfCurrent(registered);
 				await broker.index.refresh();
@@ -2902,7 +2925,7 @@ async function waitForReady(
 		) {
 			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
 			if (finalStartupFailure) return { kind: "startup_failed", failure: finalStartupFailure };
-			return (await hasPublishedReadyAuthority(root, id, expected)) && readyThenExitToleranceEnabled()
+			return (await hasPublishedReadyAuthority(root, id, expected, broker)) && readyThenExitToleranceEnabled()
 				? { kind: "ready_then_exited" }
 				: { kind: "child_exited" };
 		}
@@ -3965,7 +3988,7 @@ async function executeLifecycleResponse(
 						readiness.failure.details,
 					)
 				: readiness.kind === "ready_then_exited"
-					? readyThenExitedResponse(launch.id, child, excerpt)
+					? readyThenExitedResponse(launch.id, child, spawnLogExcerpt)
 					: readiness.kind === "child_exited"
 						? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.${excerpt}`)
 						: fail(

@@ -68,14 +68,18 @@ test("session-host spawn-log sanitation redacts secrets and URLs", () => {
 	expect(clean).toMatch(/redacted/i);
 });
 
-test("spawn-log tail sanitizes a secret that spans the 1024-byte bound", async () => {
+test("spawn-log tail sanitizes the whole log before cutting, even when the cut lands inside a secret", async () => {
 	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-spawn-log-"));
 	const logPath = path.join(dir, "spawn.log");
-	const secret = "token=supersecret-boundary-value";
-	await Bun.write(logPath, `${"x".repeat(1010)}${secret}`);
+	// Padding longer than the 1024-byte tail bound plus the prior 512 overlap, so
+	// the retained window provably starts *inside* the secret's value and any
+	// slice-before-sanitize implementation leaks its surviving suffix.
+	const secret = "token=supersecret-boundary-value-with-a-long-suffix";
+	await Bun.write(logPath, `${"x".repeat(2200)}${secret}`);
 	try {
 		const tail = await readSessionHostSpawnLogTailForTest(logPath);
-		expect(tail).not.toContain("supersecret-boundary-value");
+		expect(tail).not.toContain("supersecret-boundary-value-with-a-long-suffix");
+		expect(tail).not.toContain("boundary-value");
 		expect(tail).toMatch(/redacted/i);
 	} finally {
 		await fs.rm(dir, { recursive: true, force: true });
@@ -166,6 +170,32 @@ test("win32 production host exit after ready is ready_then_exited, not spawn_fai
 	} finally {
 		if (previous === undefined) delete process.env.GJC_SDK_TEST_EXIT_AFTER_READY;
 		else process.env.GJC_SDK_TEST_EXIT_AFTER_READY = previous;
+		setLifecycleHostPlatformForTest(undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
+test("win32 host that rejects after ready is ready_then_exited, never spawn_failed via a post-ready receipt", async () => {
+	const { root, cwd, agentDir } = await tempRoot("host-reject-after-ready");
+	const broker = new Broker({ agentDir });
+	const previous = process.env.GJC_SDK_TEST_REJECT_AFTER_READY;
+	process.env.GJC_SDK_TEST_REJECT_AFTER_READY = cwd;
+	setLifecycleHostPlatformForTest("win32");
+	try {
+		await broker.start();
+		const input = { cwd, readinessTimeoutMs: 12_000 };
+		const response = await broker.handleRequest("session.create", input, "host-reject-after-ready");
+		expect(response.ok).toBe(false);
+		if (response.ok) throw new Error("expected failure");
+		expect(response.error.code).toBe("ready_then_exited");
+		expect(response.error.code).not.toBe("spawn_failed");
+		expect(response.error.message).toMatch(/became ready then exited before live admission/i);
+		// The user-visible message must carry the stderr excerpt exactly once.
+		expect(response.error.message.match(/Host stderr:/g)?.length ?? 0).toBeLessThanOrEqual(1);
+		expect(await broker.handleRequest("session.create", input, "host-reject-after-ready")).toEqual(response);
+	} finally {
+		if (previous === undefined) delete process.env.GJC_SDK_TEST_REJECT_AFTER_READY;
+		else process.env.GJC_SDK_TEST_REJECT_AFTER_READY = previous;
 		setLifecycleHostPlatformForTest(undefined);
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
