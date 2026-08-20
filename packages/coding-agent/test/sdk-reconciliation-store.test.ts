@@ -1021,3 +1021,48 @@ test("drain resolves only after an in-flight publication's atomic rename settles
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+test("drain surfaces a failed publication in its awaited window instead of reporting drained (#4743)", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-drain-failure-"));
+	try {
+		const sessionFile = path.join(root, "session.jsonl");
+		const sessionId = "drain-failure";
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		await store.load();
+		// Block persistence exactly like the wiring failure harness: a FILE sits at
+		// the .sdk-reconciliation directory path, so mkdir/write/rename cannot
+		// succeed.
+		const storeDirectory = path.dirname(reconciliationStorePath(sessionFile, sessionId));
+		await fs.writeFile(storeDirectory, "block reconciliation persistence");
+		// A first drain with NO failure in its window must still resolve cleanly.
+		await store.drain?.();
+		const transactionFailure = store
+			.transact(() => [
+				{
+					kind: "prompt",
+					commandId: "command-drain-failure",
+					turnId: "turn-drain-failure",
+					createdAt: 1,
+					acceptedAt: 1,
+					status: "terminal_ok",
+					terminalAt: 2,
+					terminalOutcome: { kind: "success" },
+				},
+			])
+			.then(
+				() => undefined,
+				(error: NodeJS.ErrnoException) => error,
+			);
+		// Drain while the failing transaction is still in its window (teardown
+		// shape): the neutralized chain tail must not hide the failure evidence.
+		const drainedFailure = await store.drain?.().then(
+			() => undefined,
+			(error: NodeJS.ErrnoException) => error,
+		);
+		expect(drainedFailure?.code).toBe("reconciliation_persist_failed");
+		expect((await transactionFailure)?.code).toBe("reconciliation_persist_failed");
+		// A later clean window is not poisoned by the already-surfaced failure.
+		await store.drain?.();
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

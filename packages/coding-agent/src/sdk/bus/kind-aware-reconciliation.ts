@@ -89,6 +89,8 @@ export interface KindAwareReconciliation {
 	activeCount(kind: ReconciliationKind): number;
 	/** Hydrate from durable store (call once at session host start). */
 	hydrateFromStore(): Promise<void>;
+	/** Await quiescence of every admitted mutation and the durable store (#4743). */
+	drain(): Promise<void>;
 }
 
 export function createKindAwareReconciliation(
@@ -534,6 +536,19 @@ export function createKindAwareReconciliation(
 		);
 		await pending;
 	};
+	const drain = async (): Promise<void> => {
+		while (true) {
+			const observed = mutationChain;
+			await observed;
+			// A noteTransition/noteAccepted admitted in a later microtask must still
+			// be joined before teardown reports durable quiescence (#4743).
+			await Bun.sleep(0);
+			if (mutationChain === observed) {
+				await store?.drain?.();
+				return;
+			}
+		}
+	};
 
 	return {
 		admit,
@@ -551,6 +566,7 @@ export function createKindAwareReconciliation(
 		reserveSteer,
 		settleSteer,
 		lookupSteer,
+		drain,
 	};
 }
 

@@ -3025,6 +3025,164 @@ test("session_shutdown awaits a late reconciliation publication before teardown 
 	expect(persisted.records.some(record => record.kind === "skill")).toBe(true);
 	pausedCommit.restore();
 }, 60_000);
+test("session_shutdown joins a still-executing skill before teardown can race its publication (#4743)", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-skill-teardown-join-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-skill-teardown-join-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	// The skill is ACCEPTED and still executing when shutdown begins; nothing has
+	// been resolved yet, so an empty-queue drain would return immediately and the
+	// late agent_end publication would race teardown (#4743 major 1).
+	const resumeExecution = Promise.withResolvers<void>();
+	sessionContext.invokeSkill = async (
+		_name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name: "fixture-skill", path: "/fixture/SKILL.md", cleanedArgs: args });
+		await options?.onPreflightAcceptCommit?.();
+		await resumeExecution.promise;
+		return { name: "fixture-skill", path: "/fixture/SKILL.md", args };
+	};
+	const storePath = reconciliationStorePath(sessionFile, sessionId);
+	const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+	await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	socket.send(
+		JSON.stringify({
+			type: "control_request",
+			id: "skill-teardown-join",
+			operation: "skill.invoke",
+			input: { name: "fixture-skill", args: "hold", clientRef: "skill-teardown-join-ref" },
+		}),
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-teardown-join"),
+		"accepted skill response",
+	);
+	expect(frames.find(frame => frame.type === "control_response" && frame.id === "skill-teardown-join")).toMatchObject({
+		ok: true,
+		result: { accepted: true },
+	});
+	// Shutdown begins while the execution is still pending: it must NOT settle
+	// before the skill (and its terminal publication) settles.
+	let shutdownSettled = false;
+	const shutdown = Promise.resolve(
+		handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext),
+	).finally(() => {
+		shutdownSettled = true;
+	});
+	await Bun.sleep(500);
+	expect(shutdownSettled).toBe(false);
+	resumeExecution.resolve();
+	await shutdown;
+	expect(shutdownSettled).toBe(true);
+	// The terminal publication won the race: the durable document carries the
+	// skill record, and teardown never removed the publication's destination.
+	const persisted = JSON.parse(fs.readFileSync(storePath, "utf8")) as {
+		records: Array<{ kind: string; status?: string }>;
+	};
+	expect(persisted.records.some(record => record.kind === "skill")).toBe(true);
+}, 60_000);
+test("session_shutdown bounds a hung reconciliation publication and reports the drain timeout (#4743)", async () => {
+	process.env.GJC_SDK_RECONCILIATION_DRAIN_TIMEOUT_MS = "250";
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-drain-deadline-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-drain-deadline-${Date.now()}`;
+	const sessionFile = path.join(cwd, "session.jsonl");
+	const sessionContext = context(cwd, sessionId);
+	const sessionManager = sessionContext.sessionManager as Record<string, unknown>;
+	sessionContext.sessionManager = {
+		...sessionManager,
+		getSessionFile: () => sessionFile,
+	};
+	const baseBindings = sessionContext.sdkBindings as () => string[];
+	sessionContext.sdkBindings = () => [...baseBindings(), "invokeSkill"];
+	const resumeExecution = Promise.withResolvers<void>();
+	sessionContext.invokeSkill = async (
+		_name: string,
+		args: string | undefined,
+		options?: {
+			onSkillPrepared?: (meta: { name: string; path: string; cleanedArgs?: string }) => void;
+			onPreflightAcceptCommit?: () => void | Promise<void>;
+		},
+	) => {
+		options?.onSkillPrepared?.({ name: "fixture-skill", path: "/fixture/SKILL.md", cleanedArgs: args });
+		await options?.onPreflightAcceptCommit?.();
+		await resumeExecution.promise;
+		return { name: "fixture-skill", path: "/fixture/SKILL.md", args };
+	};
+	// Hold the terminal publication's rename FOREVER: an unbounded drain would
+	// hang session_shutdown indefinitely (#4743 major 2).
+	const pausedCommit = pauseNextReconciliationCommit(sessionFile, sessionId);
+	const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+	try {
+		const handlers = start(sessionContext, undefined, () => {}, false, new Map(), undefined, false);
+		await handlers.get("session_start")?.({ type: "session_start" }, sessionContext);
+		const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+		await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+		const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+		const frames: Record<string, unknown>[] = [];
+		const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+		sockets.push(socket);
+		socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+		await new Promise<void>((resolve, reject) => {
+			socket.addEventListener("open", () => resolve(), { once: true });
+			socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+		});
+		socket.send(
+			JSON.stringify({
+				type: "control_request",
+				id: "skill-drain-deadline",
+				operation: "skill.invoke",
+				input: { name: "fixture-skill", args: "hold", clientRef: "skill-drain-deadline-ref" },
+			}),
+		);
+		await waitFor(
+			() => frames.some(frame => frame.type === "control_response" && frame.id === "skill-drain-deadline"),
+			"accepted skill response",
+		);
+		// The publication is armed and held mid-rename; shutdown begins with the
+		// rename still never released.
+		pausedCommit.arm();
+		resumeExecution.resolve();
+		await pausedCommit.started;
+		const shutdownStarted = Date.now();
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+		const elapsed = Date.now() - shutdownStarted;
+		// Bounded: the 250ms deadline (not an infinite hang) released teardown.
+		expect(elapsed).toBeLessThan(5_000);
+		// Observable: the expiry surfaced as a drain-timeout warning rather than a
+		// silent pretend-drain.
+		expect(warnSpy.mock.calls.some(call => String(call[0]).includes("reconciliation drain timed out"))).toBe(true);
+	} finally {
+		warnSpy.mockRestore();
+		pausedCommit.release();
+		pausedCommit.restore();
+		delete process.env.GJC_SDK_RECONCILIATION_DRAIN_TIMEOUT_MS;
+	}
+}, 60_000);
 
 test("SDK host terminalizes a never-resolving preflight on abort and fences late acceptance", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-prompt-preflight-never-"));

@@ -625,13 +625,20 @@ export function createReconciliationStore(options: {
 	let terminalMemory: DurableTerminalScopeRecord[] = [];
 	let terminalKeyMemory: EvictedTerminalKeyEntry[] = [];
 	let chain: Promise<void> = Promise.resolve();
+	// #4743: transaction tails neutralize rejection on the serialization chain, so
+	// a failed publication is invisible to a plain tail await. Record the failure
+	// sequence here so drain() can surface evidence for exactly the window it
+	// awaited instead of reporting a failed write as drained.
+	let persistFailureCount = 0;
+	let lastPersistFailure: unknown;
 
 	const writeAtomic = async (document: ReconciliationStoreDocument): Promise<void> => {
 		if (!filePath) return;
 		const directory = path.dirname(filePath);
-		await fileFs.mkdir(directory, { recursive: true, mode: 0o700 });
-		const temporary = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+		let temporary: string | undefined;
 		try {
+			await fileFs.mkdir(directory, { recursive: true, mode: 0o700 });
+			temporary = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
 			await fileFs.writeFile(temporary, `${JSON.stringify(document)}\n`, { mode: 0o600 });
 			try {
 				const handle = await fileFs.open(temporary, "r+");
@@ -645,10 +652,15 @@ export function createReconciliationStore(options: {
 			}
 			await fileFs.rename(temporary, filePath);
 		} catch (error) {
-			await fileFs.unlink(temporary).catch(() => {});
-			throw Object.assign(error instanceof Error ? error : new Error("reconciliation persist failed"), {
+			// Every persistence-path failure (mkdir included) is evidence a drained
+			// window must surface, never silently treat as quiescent (#4743).
+			if (temporary !== undefined) await fileFs.unlink(temporary).catch(() => {});
+			const coded = Object.assign(error instanceof Error ? error : new Error("reconciliation persist failed"), {
 				code: "reconciliation_persist_failed",
 			});
+			persistFailureCount += 1;
+			lastPersistFailure = coded;
+			throw coded;
 		}
 	};
 
@@ -827,6 +839,9 @@ export function createReconciliationStore(options: {
 		transactTerminalState,
 		transactTerminalKeys,
 		drain: async () => {
+			// Snapshot the failure sequence first: only failures recorded after this
+			// point belong to the window this drain awaits (#4743).
+			const observedFailures = persistFailureCount;
 			while (true) {
 				const observed = chain;
 				await observed;
@@ -834,7 +849,14 @@ export function createReconciliationStore(options: {
 				// a later microtask. Yield once and require the queue tail to remain
 				// stable before reporting durable quiescence.
 				await Bun.sleep(0);
-				if (chain === observed) return;
+				if (chain === observed) {
+					// Transaction tails neutralize rejections on `chain`, so a failed
+					// publication would otherwise be indistinguishable from a completed
+					// one: surface the recorded failure instead of claiming quiescence
+					// (#4743).
+					if (persistFailureCount > observedFailures) throw lastPersistFailure;
+					return;
+				}
 			}
 		},
 		loadTerminalScopes: async () => {
