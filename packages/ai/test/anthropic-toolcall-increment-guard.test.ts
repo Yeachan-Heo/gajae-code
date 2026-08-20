@@ -4,13 +4,13 @@ import * as utils from "@gajae-code/utils";
 import { Effort } from "../src/model-thinking";
 import { streamAnthropic } from "../src/providers/anthropic";
 import type { AssistantMessageEvent, Context, Model } from "../src/types";
+import type { AssistantMessageEventStream } from "../src/utils/event-stream";
 
 // Review follow-up for the primitive-increment degradation (PR #4612):
 // tool-argument increments carry executable intent, so a malformed
-// object/function-shaped `input_json_delta.partial_json` must fail the turn
-// closed instead of being silently erased to "". Primitive anomalies still
-// degrade to an empty string, but now emit a bounded diagnostic instead of
-// disappearing silently.
+// every non-string `input_json_delta.partial_json` must fail the turn closed
+// instead of being silently erased to "". Primitive prose/thinking anomalies
+// still degrade with a bounded diagnostic; executable fragments never do.
 
 const model: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -75,7 +75,7 @@ function toolUseStreamEvents(jsonDeltas: unknown[]): MockEvent[] {
 	];
 }
 
-async function drain(stream: ReturnType<typeof streamAnthropic>): Promise<AssistantMessageEvent[]> {
+async function drain(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {
 	const events: AssistantMessageEvent[] = [];
 	for await (const event of stream) events.push(event);
 	return events;
@@ -121,36 +121,77 @@ describe("anthropic tool-argument increment guard", () => {
 		expect(result.errorMessage ?? "").toMatch(/tool-argument|input_json_delta/i);
 	});
 
-	it("degrades primitive input_json_delta anomalies to empty strings with one bounded warning", async () => {
-		const warnSpy = vi.spyOn(utils.logger, "warn").mockImplementation(() => {});
-		// Two primitive anomalies (number, missing) on one stream: the string
-		// increments still assemble the tool call and the diagnostic fires once.
+	it("fails the turn closed when an input_json_delta increment is a primitive (valid-but-wrong assembly)", async () => {
+		vi.spyOn(utils.logger, "warn").mockImplementation(() => {});
+		// `{"n":1` + numeric primitive + `3}` would assemble as {"n":13} if the
+		// primitive were erased to "" — a silently different tool call. The turn
+		// must fail closed instead of executing assembled-wrong arguments.
 		vi.spyOn(Messages.prototype, "create").mockImplementation(
-			() => mockRequest(toolUseStreamEvents(['{"path":"a.ts",', 42, undefined, '"content":"ok"}'])) as never,
+			() => mockRequest(toolUseStreamEvents(['{"n":1', 2, "3}"])) as never,
 		);
 
 		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events = await drain(stream);
 		const result = await stream.result();
 
-		expect(result.stopReason).toBe("toolUse");
-		const toolCall = result.content.find(block => block.type === "toolCall");
-		expect(toolCall?.type).toBe("toolCall");
-		if (toolCall?.type !== "toolCall") throw new Error("expected toolCall block");
-		expect(toolCall.arguments).toEqual({ path: "a.ts", content: "ok" });
-		const deltas = events.filter(event => event.type === "toolcall_delta");
-		expect(deltas.map(event => event.delta)).toEqual(['{"path":"a.ts",', "", "", '"content":"ok"}']);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage ?? "").toMatch(/non-string input_json_delta tool-argument/i);
+		expect(result.errorMessage ?? "").not.toContain('{"n":1');
+		expect(events.find(event => event.type === "done")).toBeUndefined();
+	});
 
-		const degradeWarns = warnSpy.mock.calls.filter(
-			([message]) => typeof message === "string" && message.includes("degraded non-string stream increment"),
+	it("fails the turn closed when an input_json_delta increment is missing", async () => {
+		vi.spyOn(utils.logger, "warn").mockImplementation(() => {});
+		vi.spyOn(Messages.prototype, "create").mockImplementation(
+			() => mockRequest(toolUseStreamEvents(['{"path":"a.ts",', undefined])) as never,
 		);
-		expect(degradeWarns).toHaveLength(1);
-		const metadata = degradeWarns[0]?.[1] as Record<string, unknown>;
-		expect(metadata).toHaveProperty("model");
-		expect(metadata).toHaveProperty("provider");
-		expect(metadata).toHaveProperty("deltaType", "input_json_delta");
-		// Envelope shape only: the diagnostic never carries argument payloads.
-		expect(JSON.stringify(metadata)).not.toContain("a.ts");
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		await drain(stream);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage ?? "").toMatch(/non-string input_json_delta tool-argument/i);
+	});
+
+	it("marks a tool call incomplete when message_stop arrives without content_block_stop", async () => {
+		vi.spyOn(Messages.prototype, "create").mockImplementation(
+			() =>
+				mockRequest([
+					{
+						type: "message_start",
+						message: { id: "msg_unfinalized", usage: { input_tokens: 1, output_tokens: 0 } },
+					},
+					{
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "tool_use", id: "tool_unfinalized", name: "write_file", input: {} },
+					},
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "input_json_delta", partial_json: '{"path":"a"}' },
+					},
+					{ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } },
+					{ type: "message_stop" },
+				]) as never,
+		);
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		await drain(stream);
+		const result = await stream.result();
+		const tool = result.content.find(block => block.type === "toolCall");
+		expect(tool).toMatchObject({ incompleteArguments: true, incompleteArgumentsReason: "truncated" });
+	});
+
+	it("fails closed on non-object completed tool arguments", async () => {
+		vi.spyOn(Messages.prototype, "create").mockImplementation(
+			() => mockRequest(toolUseStreamEvents(["[]"])) as never,
+		);
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		await drain(stream);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage ?? "").toMatch(/non-object arguments/i);
 	});
 
 	it("keeps primitive thinking-delta degradation and emits one bounded warning for it", async () => {
@@ -188,5 +229,33 @@ describe("anthropic tool-argument increment guard", () => {
 		);
 		expect(degradeWarns).toHaveLength(1);
 		expect(degradeWarns[0]?.[1]).toHaveProperty("deltaType", "thinking_delta");
+	});
+
+	it("uses one captured text_delta value", async () => {
+		let reads = 0;
+		const delta = { type: "text_delta" } as Record<string, unknown>;
+		Object.defineProperty(delta, "text", {
+			enumerable: true,
+			get() {
+				reads += 1;
+				return reads <= 3 ? "captured" : { injected: true };
+			},
+		});
+		vi.spyOn(Messages.prototype, "create").mockImplementation(
+			() =>
+				mockRequest([
+					{ type: "message_start", message: { id: "msg_text", usage: { input_tokens: 1, output_tokens: 0 } } },
+					{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+					{ type: "content_block_delta", index: 0, delta },
+					{ type: "content_block_stop", index: 0 },
+					{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+					{ type: "message_stop" },
+				]) as never,
+		);
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		await drain(stream);
+		const result = await stream.result();
+		expect(reads).toBe(3);
+		expect(result.content).toEqual([{ type: "text", text: "captured" }]);
 	});
 });

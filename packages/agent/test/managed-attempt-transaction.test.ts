@@ -1677,7 +1677,147 @@ describe("managed attempt transaction", () => {
 			vi.restoreAllMocks();
 		}
 	});
-	it("keeps sanitizer-sentinel deltas fail-closed instead of treating them as empty increments", async () => {
+	it("warns once per run when repeated partial shells degrade primitive content", async () => {
+		const mock = createMockModel();
+		const warnings: unknown[] = [];
+		vi.spyOn(logger, "warn").mockImplementation((message, payload) => {
+			if (message === "agent: managed snapshot degraded a non-string primitive to an empty value") {
+				warnings.push(payload);
+			}
+		});
+		const malformed = assistantMessage(mock.model) as unknown as { content: number };
+		malformed.content = 42;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: malformed as unknown as AssistantMessage });
+					for (let index = 0; index < 3; index++) {
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: 0,
+							delta: undefined as unknown as string,
+							partial: malformed as unknown as AssistantMessage,
+						});
+					}
+					stream.push({ type: "done", reason: "stop", message: malformed as unknown as AssistantMessage });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+		expect(warnings.filter(payload => (payload as { field?: string }).field === "shell.content")).toHaveLength(1);
+	});
+	it("warns once per run for degraded prose and fails closed on primitive executable deltas", () => {
+		const mock = createMockModel();
+		const message = assistantMessage(mock.model);
+		const warnings: Array<{ message: string; payload: unknown }> = [];
+		vi.spyOn(logger, "warn").mockImplementation((warning, payload) => {
+			warnings.push({ message: warning, payload });
+		});
+		const diagnostics = new Set<string>();
+
+		for (const delta of [undefined, 42, true]) {
+			const snapshot = managedAssistantEventSnapshot(
+				{ type: "thinking_delta", contentIndex: 0, delta: delta as unknown as string, partial: message },
+				message,
+				diagnostics,
+			);
+			expect(snapshot).toMatchObject({ type: "thinking_delta", delta: "" });
+		}
+		expect(warnings).toEqual([
+			{
+				message: "agent: managed snapshot degraded a non-string primitive to an empty value",
+				payload: { field: "event.delta", receivedType: "undefined" },
+			},
+		]);
+
+		for (const delta of [undefined, null, 42, true, 1n]) {
+			expect(() =>
+				managedAssistantEventSnapshot(
+					{ type: "toolcall_delta", contentIndex: 0, delta: delta as unknown as string, partial: message },
+					message,
+					diagnostics,
+				),
+			).toThrow(/snapshot/i);
+		}
+	});
+	it("uses one captured tool delta value when an accessor changes between reads", () => {
+		const mock = createMockModel();
+		const message = assistantMessage(mock.model);
+		let reads = 0;
+		const event = {
+			type: "toolcall_delta",
+			contentIndex: 0,
+			partial: message,
+			get delta(): unknown {
+				reads += 1;
+				return reads === 1 ? 42 : '{"laundered":true}';
+			},
+		} as unknown as AssistantMessageEvent;
+
+		expect(() => managedAssistantEventSnapshot(event, message)).toThrow(/snapshot/i);
+		expect(reads).toBe(1);
+	});
+	it("preserves a prototype delta when the event type is an own property", () => {
+		const mock = createMockModel();
+		const message = assistantMessage(mock.model);
+		let reads = 0;
+		const prototype = {
+			get delta(): string {
+				reads += 1;
+				return '{"path":"prototype.ts"}';
+			},
+		};
+		const event = Object.assign(Object.create(prototype) as Record<string, unknown>, {
+			type: "toolcall_delta",
+			contentIndex: 0,
+			partial: message,
+		}) as unknown as AssistantMessageEvent;
+
+		expect(managedAssistantEventSnapshot(event, message)).toMatchObject({
+			type: "toolcall_delta",
+			delta: '{"path":"prototype.ts"}',
+		});
+		expect(reads).toBe(1);
+	});
+	it("preserves a valid tool delta from a readable proxy event", () => {
+		const mock = createMockModel();
+		const message = assistantMessage(mock.model);
+		const event = new Proxy(
+			{
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: '{"path":"proxy.ts"}',
+				partial: message,
+			} as AssistantMessageEvent,
+			{},
+		);
+
+		expect(managedAssistantEventSnapshot(event, message)).toMatchObject({
+			type: "toolcall_delta",
+			delta: '{"path":"proxy.ts"}',
+		});
+	});
+	it("preserves a valid tool delta when unrelated metadata requires sanitization", () => {
+		const mock = createMockModel();
+		const message = assistantMessage(mock.model);
+		const event = {
+			type: "toolcall_delta",
+			contentIndex: 0,
+			delta: '{"path":"metadata.ts"}',
+			partial: message,
+			providerMetadata: { sequence: 1n },
+		} as unknown as AssistantMessageEvent;
+
+		expect(managedAssistantEventSnapshot(event, message)).toMatchObject({
+			type: "toolcall_delta",
+			delta: '{"path":"metadata.ts"}',
+		});
+	});
+	it("preserves a literal sentinel-looking delta when no sanitizer produced it", async () => {
 		const diagnostics = captureSnapshotDiagnostics();
 		const mock = createMockModel();
 		const agent = new Agent({
@@ -1699,9 +1839,8 @@ describe("managed attempt transaction", () => {
 			},
 		});
 		await agent.prompt("run", { fallbackManaged: true });
-		expect(agent.state.error).toContain("local snapshot");
-		expect(diagnostics).toHaveLength(1);
-		expect(diagnostics[0]).toMatchObject({ stage: "event.delta", errorKind: "local_snapshot_failure" });
+		expect(agent.state.error).toBeUndefined();
+		expect(diagnostics).toHaveLength(0);
 	});
 	it("normalizes invalid stop reasons and rejects invalid event indices", async () => {
 		const mock = createMockModel();

@@ -735,6 +735,26 @@ const SANITIZER_SENTINELS: ReadonlySet<string> = new Set([
 	"[truncated]",
 	"[Circular]",
 ]);
+/**
+ * Bounded diagnostic for a degraded primitive at the shared managed-snapshot
+ * boundary. Every provider/custom stream that still forwards a malformed
+ * primitive increment degrades here (to "" / []), so the degradation stays
+ * observable. The caller supplies a run-scoped set so repeated malformed
+ * increments emit at most one payload-free warning per field name, naming
+ * only the field and the received typeof — never the payload.
+ */
+function warnManagedDegradedPrimitive(
+	field: string,
+	received: unknown,
+	diagnostics: Set<string> = new Set<string>(),
+): void {
+	if (diagnostics.has(field)) return;
+	diagnostics.add(field);
+	logger.warn("agent: managed snapshot degraded a non-string primitive to an empty value", {
+		field,
+		receivedType: received === null ? "null" : typeof received,
+	});
+}
 
 /**
  * Cycle-aware deep clone that always returns a detached, JSON-serializable
@@ -887,16 +907,16 @@ function managedSnapshotJsonBytes(value: unknown): number | undefined {
 	}
 }
 
-function managedAttemptSnapshotDetailed<T>(value: T): { snapshot: T; jsonBytes?: number } {
+function managedAttemptSnapshotDetailed<T>(value: T): { snapshot: T; jsonBytes?: number; sanitized: boolean } {
 	try {
 		const snapshot = structuredClone(value);
 		const jsonBytes = managedSnapshotJsonBytes(snapshot);
-		if (jsonBytes !== undefined) return { snapshot, jsonBytes };
+		if (jsonBytes !== undefined) return { snapshot, jsonBytes, sanitized: false };
 		const sanitized = sanitizedDetachedClone(snapshot);
-		return { snapshot: sanitized, jsonBytes: managedSnapshotJsonBytes(sanitized) };
+		return { snapshot: sanitized, jsonBytes: managedSnapshotJsonBytes(sanitized), sanitized: true };
 	} catch {
 		const snapshot = sanitizedDetachedClone(value);
-		return { snapshot, jsonBytes: managedSnapshotJsonBytes(snapshot) };
+		return { snapshot, jsonBytes: managedSnapshotJsonBytes(snapshot), sanitized: true };
 	}
 }
 
@@ -997,7 +1017,11 @@ function losslessDetachedClone<T>(value: T): T {
  * are read, and executable content is retained only when it has its complete
  * discriminant shape.
  */
-function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]): AssistantMessage {
+function managedAssistantShell(
+	value: unknown,
+	model: AgentLoopConfig["model"],
+	degradedFieldDiagnostics: Set<string> = new Set<string>(),
+): AssistantMessage {
 	const detailed = managedAttemptSnapshotDetailed(value);
 	const snapshotRecord = isManagedPlainRecord(detailed.snapshot) ? detailed.snapshot : undefined;
 	// Two benign root degradations are repaired by reading through the
@@ -1030,6 +1054,9 @@ function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]):
 		}
 		if (rawContent !== null && typeof rawContent === "object") {
 			throw new ManagedAttemptSnapshotError("shell.content");
+		}
+		if (rawArray === undefined && rawContent !== undefined && !SANITIZER_SENTINELS.has(rawContent as string)) {
+			warnManagedDegradedPrimitive("shell.content", rawContent, degradedFieldDiagnostics);
 		}
 	}
 	const content = rawArray === undefined ? [] : rawArray.flatMap(managedContentBlock);
@@ -1154,8 +1181,45 @@ function managedAssistantUsage(value: unknown): AssistantMessage["usage"] {
 export function managedAssistantEventSnapshot(
 	event: AssistantMessageEvent,
 	message: AssistantMessage,
+	degradedFieldDiagnostics: Set<string> = new Set<string>(),
 ): AssistantMessageEvent {
-	const detached = managedAttemptSnapshot(event);
+	const directType = managedProperty(event, "type");
+	if (
+		directType === "text_delta" ||
+		directType === "thinking_delta" ||
+		directType === "reasoning_summary_delta" ||
+		directType === "toolcall_delta"
+	) {
+		// Delta events are snapshotted field-by-field so unrelated event metadata
+		// cannot erase provenance. The delta is read once, detached once, then the
+		// same captured value is both validated and emitted.
+		const contentIndex = managedAttemptSnapshot(managedProperty(event, "contentIndex"));
+		if (!Number.isInteger(contentIndex) || (contentIndex as number) < 0) {
+			throw new ManagedAttemptSnapshotError("event.contentIndex");
+		}
+		const deltaSnapshot = managedAttemptSnapshotDetailed(managedProperty(event, "delta"));
+		const delta = deltaSnapshot.snapshot;
+		if (directType === "toolcall_delta" && (deltaSnapshot.sanitized || typeof delta !== "string")) {
+			throw new ManagedAttemptSnapshotError("event.delta");
+		}
+		if (deltaSnapshot.sanitized && typeof delta === "string" && SANITIZER_SENTINELS.has(delta)) {
+			throw new ManagedAttemptSnapshotError("event.delta");
+		}
+		if (delta !== undefined && delta !== null && typeof delta === "object") {
+			throw new ManagedAttemptSnapshotError("event.delta");
+		}
+		if (typeof delta !== "string") {
+			warnManagedDegradedPrimitive("event.delta", delta, degradedFieldDiagnostics);
+		}
+		return {
+			type: directType,
+			contentIndex: contentIndex as number,
+			delta: typeof delta === "string" ? delta : "",
+			partial: message,
+		};
+	}
+	const eventSnapshot = managedAttemptSnapshotDetailed(event);
+	const detached = eventSnapshot.snapshot;
 	const record = isManagedPlainRecord(detached) ? detached : undefined;
 	// Root repair, mirroring the shell: two benign degradations are re-read
 	// through the original event with guarded reads (`managedProperty`) —
@@ -1185,34 +1249,17 @@ export function managedAssistantEventSnapshot(
 		type === "toolcall_start"
 	)
 		return { type, contentIndex: indexed(), partial: message };
-	if (
-		type === "text_delta" ||
-		type === "thinking_delta" ||
-		type === "reasoning_summary_delta" ||
-		type === "toolcall_delta"
-	) {
-		const delta = managedProperty(source, "delta");
-		// Empty/missing deltas are ordinary provider variance (Z.AI/Codex
-		// thinking_delta with undefined, or a numeric token count). A
-		// sentinel-marked delta is a sanitizer collapse of a non-cloneable
-		// original and stays fail-closed. Object-shaped deltas stay
-		// fail-closed for the same reason as object-shaped content.
-		if (typeof delta === "string" && SANITIZER_SENTINELS.has(delta)) {
-			throw new ManagedAttemptSnapshotError("event.delta");
-		}
-		if (delta !== undefined && delta !== null && typeof delta === "object") {
-			throw new ManagedAttemptSnapshotError("event.delta");
-		}
-		const safeDelta = typeof delta === "string" ? delta : "";
-		return { type, contentIndex: indexed(), delta: safeDelta, partial: message };
-	}
 	if (type === "text_end" || type === "thinking_end" || type === "reasoning_summary_end") {
-		const content = managedProperty(source, "content");
-		if (typeof content === "string" && SANITIZER_SENTINELS.has(content)) {
+		const contentSnapshot = managedAttemptSnapshotDetailed(managedProperty(source, "content"));
+		const content = contentSnapshot.snapshot;
+		if (contentSnapshot.sanitized && typeof content === "string" && SANITIZER_SENTINELS.has(content)) {
 			throw new ManagedAttemptSnapshotError("event.content");
 		}
 		if (content !== undefined && content !== null && typeof content === "object") {
 			throw new ManagedAttemptSnapshotError("event.content");
+		}
+		if (typeof content !== "string") {
+			warnManagedDegradedPrimitive("event.content", content, degradedFieldDiagnostics);
 		}
 		const safeContent = typeof content === "string" ? content : "";
 		return { type, contentIndex: indexed(), content: safeContent, partial: message };
@@ -1322,6 +1369,7 @@ class ManagedAttemptTransaction {
 	#lastStagedShape: { stagedEventCount: number; stagedBytes: number; contentBlockCount: number } | undefined;
 	#discarded = false;
 	#committed = false;
+	#degradedFieldDiagnostics = new Set<string>();
 
 	constructor(
 		private readonly stream: EventStream<AgentEvent, AgentMessage[]>,
@@ -1614,22 +1662,28 @@ class ManagedAttemptTransaction {
 		if (this.snapshotMode === "lossless") return event;
 		if (event.type === "message_start" || event.type === "message_end" || event.type === "turn_end") {
 			return event.message.role === "assistant"
-				? { ...event, message: managedAssistantShell(event.message, this.model) }
+				? { ...event, message: managedAssistantShell(event.message, this.model, this.#degradedFieldDiagnostics) }
 				: event;
 		}
 		if (event.type === "message_update") {
-			const message = managedAssistantShell(event.message, this.model);
+			const message = managedAssistantShell(event.message, this.model, this.#degradedFieldDiagnostics);
 			return {
 				...event,
 				message,
-				assistantMessageEvent: managedAssistantEventSnapshot(event.assistantMessageEvent, message),
+				assistantMessageEvent: managedAssistantEventSnapshot(
+					event.assistantMessageEvent,
+					message,
+					this.#degradedFieldDiagnostics,
+				),
 			};
 		}
 		if (event.type === "agent_end") {
 			return {
 				...event,
 				messages: event.messages.map(message =>
-					message.role === "assistant" ? managedAssistantShell(message, this.model) : message,
+					message.role === "assistant"
+						? managedAssistantShell(message, this.model, this.#degradedFieldDiagnostics)
+						: message,
 				),
 			};
 		}
@@ -1665,11 +1719,13 @@ class ManagedAttemptTransaction {
 	#assistantSnapshot(message: AssistantMessage): AssistantMessage {
 		return this.snapshotMode === "lossless"
 			? this.#losslessSnapshot(message)
-			: managedAssistantShell(message, this.model);
+			: managedAssistantShell(message, this.model, this.#degradedFieldDiagnostics);
 	}
 
 	#assistantEventSnapshot(event: AssistantMessageEvent, message: AssistantMessage): AssistantMessageEvent {
-		if (this.snapshotMode === "managed") return managedAssistantEventSnapshot(event, message);
+		if (this.snapshotMode === "managed") {
+			return managedAssistantEventSnapshot(event, message, this.#degradedFieldDiagnostics);
+		}
 		const snapshot = this.#losslessSnapshot(event);
 		if (snapshot.type === "done") return { ...snapshot, message };
 		if (snapshot.type === "error") return { ...snapshot, error: message };
@@ -2837,6 +2893,7 @@ async function streamAssistantResponse(
 	provisionalToolTransaction?: ManagedAttemptTransaction,
 	toolChoiceOverride?: { value: ToolChoice | undefined },
 ): Promise<AssistantMessage> {
+	const managedDegradedFieldDiagnostics = new Set<string>();
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
@@ -3161,7 +3218,7 @@ async function streamAssistantResponse(
 					switch (event.type) {
 						case "start":
 							partialMessage = config.fallbackManaged
-								? managedAssistantShell(event.partial, config.model)
+								? managedAssistantShell(event.partial, config.model, managedDegradedFieldDiagnostics)
 								: event.partial;
 							context.messages.push(partialMessage);
 							addedPartial = true;
@@ -3189,7 +3246,7 @@ async function streamAssistantResponse(
 						case "toolcall_end":
 							if (partialMessage) {
 								partialMessage = config.fallbackManaged
-									? managedAssistantShell(event.partial, config.model)
+									? managedAssistantShell(event.partial, config.model, managedDegradedFieldDiagnostics)
 									: event.partial;
 								// Normalize through the managed event snapshot instead of a
 								// naive `{ ...event }` spread: spreading copies only own
@@ -3199,7 +3256,7 @@ async function streamAssistantResponse(
 								// downstream. The snapshot repairs benign class/prototype shapes
 								// and keeps the named fail-fast diagnostics for hostile ones.
 								const partialEvent = config.fallbackManaged
-									? managedAssistantEventSnapshot(event, partialMessage)
+									? managedAssistantEventSnapshot(event, partialMessage, managedDegradedFieldDiagnostics)
 									: event;
 								context.messages[context.messages.length - 1] = partialMessage;
 								if (provisionalToolTransaction) {
@@ -3228,7 +3285,7 @@ async function streamAssistantResponse(
 						case "done":
 						case "error": {
 							const finalMessage = config.fallbackManaged
-								? managedAssistantShell(await finishResponse(), config.model)
+								? managedAssistantShell(await finishResponse(), config.model, managedDegradedFieldDiagnostics)
 								: await finishResponse();
 							promoteTypedEmptyResponseStop(finalMessage);
 							if (addedPartial) {
@@ -3251,7 +3308,7 @@ async function streamAssistantResponse(
 			}
 
 			const trailing = config.fallbackManaged
-				? managedAssistantShell(await finishResponse(), config.model)
+				? managedAssistantShell(await finishResponse(), config.model, managedDegradedFieldDiagnostics)
 				: await finishResponse();
 			await finishChat(trailing);
 			return trailing;

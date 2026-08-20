@@ -182,7 +182,7 @@ describe("agentLoop with Anthropic truncated tool calls", () => {
 		expect(toolResults[1]).toEqual({ isError: false, text: "wrote" });
 	});
 
-	it("executes only the complete same-ID replacement after a malformed duplicate index", async () => {
+	it("fails closed before executing a malformed duplicate index", async () => {
 		const responses = [duplicateToolResponse("tool_shared"), textResponse("done")];
 		let responseIndex = 0;
 		vi.spyOn(Messages.prototype, "create").mockImplementation(() => {
@@ -223,11 +223,9 @@ describe("agentLoop with Anthropic truncated tool calls", () => {
 			}
 		}
 
-		expect(responseIndex).toBe(2);
-		expect(executed).toEqual([{ path: "b.ts", content: "ok" }]);
+		expect(responseIndex).toBe(1);
+		expect(executed).toHaveLength(0);
 		expect(toolResults).toHaveLength(2);
-		expect(toolResults[0].isError).toBe(true);
-		expect(toolResults[0].text).toContain("cut off");
-		expect(toolResults[1]).toEqual({ isError: false, text: "wrote" });
+		expect(toolResults.every(result => result.isError)).toBe(true);
 	});
 });

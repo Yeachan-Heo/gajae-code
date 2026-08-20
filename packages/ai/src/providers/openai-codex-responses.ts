@@ -163,10 +163,21 @@ const CODEX_PROGRESS_EVENT_TYPES = new Set([
 	"error",
 ]);
 
+/**
+ * A progress event must carry real semantic payload, matching the Anthropic
+ * predicate: a recognized envelope whose `delta` is absent or not a non-empty
+ * string is NOT progress — otherwise repeated malformed/no-op deltas reset the
+ * idle watchdog indefinitely and a managed attempt need never terminate.
+ * Non-delta envelope types (lifecycle, item boundaries, terminal events) count
+ * as progress by type alone, as before.
+ */
 function isCodexStreamProgressEvent(event: unknown): boolean {
 	if (!event || typeof event !== "object") return false;
 	const type = (event as { type?: unknown }).type;
-	return typeof type === "string" && CODEX_PROGRESS_EVENT_TYPES.has(type);
+	if (typeof type !== "string" || !CODEX_PROGRESS_EVENT_TYPES.has(type)) return false;
+	if (!type.endsWith(".delta")) return true;
+	const delta = (event as { delta?: unknown }).delta;
+	return typeof delta === "string" && delta.length > 0;
 }
 type CodexTransport = "sse" | "websocket";
 interface CodexInitialTransport {
@@ -177,7 +188,7 @@ interface CodexInitialTransport {
 }
 type CodexEventItem = ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | ResponseCustomToolCall;
 type CodexThinkingBlock = ThinkingContent & { summaryBuffer: string; rawBuffer: string; summaryStarted: boolean };
-type CodexOutputBlock = CodexThinkingBlock | TextContent | (ToolCall & { partialJson: string });
+type CodexOutputBlock = CodexThinkingBlock | TextContent | (ToolCall & { partialJson: string; doneInput?: string });
 export interface OpenAICodexWebSocketDebugStats {
 	fullContextRequests: number;
 	deltaRequests: number;
@@ -594,6 +605,10 @@ function resetOutputState(output: AssistantMessage): void {
 function removeTransientBlockIndices(output: AssistantMessage): void {
 	for (const block of output.content) {
 		delete (block as { index?: number }).index;
+		if (block.type === "toolCall") {
+			delete (block as { partialJson?: string }).partialJson;
+			delete (block as { doneInput?: string }).doneInput;
+		}
 	}
 }
 
@@ -1022,6 +1037,13 @@ function handleCodexStreamEvent(args: {
 		runtime.currentItem = item;
 		runtime.currentBlock = createOutputBlockForItem(item);
 		if (!runtime.currentBlock) return firstTokenTime;
+		const currentBlock = runtime.currentBlock;
+		if (
+			currentBlock.type === "toolCall" &&
+			output.content.some(block => block.type === "toolCall" && block.id === currentBlock.id)
+		) {
+			throw new Error("Codex stream reused an active tool-call identifier");
+		}
 		output.content.push(runtime.currentBlock);
 		stream.push({
 			type: getOutputBlockStartEventType(runtime.currentBlock),
@@ -1037,13 +1059,13 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.reasoning_summary_text.delta") {
-		noteCodexDegradedIncrement(
+		const delta = normalizeCodexIncrement(
 			rawEvent,
 			"response.reasoning_summary_text.delta",
 			model,
 			runtime.degradedIncrementDiagnostics,
 		);
-		handleReasoningSummaryTextDelta(runtime.currentItem, runtime.currentBlock, rawEvent, stream, output, blockIndex);
+		handleReasoningSummaryTextDelta(runtime.currentItem, runtime.currentBlock, delta, stream, output, blockIndex);
 		return firstTokenTime;
 	}
 
@@ -1053,13 +1075,13 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.reasoning_text.delta") {
-		noteCodexDegradedIncrement(
+		const delta = normalizeCodexIncrement(
 			rawEvent,
 			"response.reasoning_text.delta",
 			model,
 			runtime.degradedIncrementDiagnostics,
 		);
-		handleReasoningTextDelta(runtime.currentItem, runtime.currentBlock, rawEvent, stream, output, blockIndex);
+		handleReasoningTextDelta(runtime.currentItem, runtime.currentBlock, delta, stream, output, blockIndex);
 		return firstTokenTime;
 	}
 
@@ -1069,11 +1091,16 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.output_text.delta") {
-		noteCodexDegradedIncrement(rawEvent, "response.output_text.delta", model, runtime.degradedIncrementDiagnostics);
+		const delta = normalizeCodexIncrement(
+			rawEvent,
+			"response.output_text.delta",
+			model,
+			runtime.degradedIncrementDiagnostics,
+		);
 		handleMessageTextDelta(
 			runtime.currentItem,
 			runtime.currentBlock,
-			rawEvent,
+			delta,
 			stream,
 			output,
 			blockIndex,
@@ -1083,28 +1110,19 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.refusal.delta") {
-		noteCodexDegradedIncrement(rawEvent, "response.refusal.delta", model, runtime.degradedIncrementDiagnostics);
-		handleMessageTextDelta(
-			runtime.currentItem,
-			runtime.currentBlock,
+		const delta = normalizeCodexIncrement(
 			rawEvent,
-			stream,
-			output,
-			blockIndex,
-			"refusal",
+			"response.refusal.delta",
+			model,
+			runtime.degradedIncrementDiagnostics,
 		);
+		handleMessageTextDelta(runtime.currentItem, runtime.currentBlock, delta, stream, output, blockIndex, "refusal");
 		return firstTokenTime;
 	}
 
 	if (eventType === "response.function_call_arguments.delta") {
-		assertPrimitiveToolArgumentIncrement(rawEvent, "response.function_call_arguments.delta");
-		noteCodexDegradedIncrement(
-			rawEvent,
-			"response.function_call_arguments.delta",
-			model,
-			runtime.degradedIncrementDiagnostics,
-		);
-		handleToolCallArgumentsDelta(runtime.currentItem, runtime.currentBlock, rawEvent, stream, output, blockIndex);
+		const delta = assertStringToolArgumentIncrement(rawEvent, "response.function_call_arguments.delta");
+		handleToolCallArgumentsDelta(runtime.currentItem, runtime.currentBlock, delta, stream, output, blockIndex);
 		return firstTokenTime;
 	}
 
@@ -1114,14 +1132,8 @@ function handleCodexStreamEvent(args: {
 	}
 
 	if (eventType === "response.custom_tool_call_input.delta") {
-		assertPrimitiveToolArgumentIncrement(rawEvent, "response.custom_tool_call_input.delta");
-		noteCodexDegradedIncrement(
-			rawEvent,
-			"response.custom_tool_call_input.delta",
-			model,
-			runtime.degradedIncrementDiagnostics,
-		);
-		handleCustomToolCallInputDelta(runtime.currentItem, runtime.currentBlock, rawEvent, stream, output, blockIndex);
+		const delta = assertStringToolArgumentIncrement(rawEvent, "response.custom_tool_call_input.delta");
+		handleCustomToolCallInputDelta(runtime.currentItem, runtime.currentBlock, delta, stream, output, blockIndex);
 		return firstTokenTime;
 	}
 
@@ -1168,6 +1180,10 @@ function createOutputBlockForItem(item: CodexEventItem): CodexOutputBlock | null
 		};
 	}
 	if (item.type === "custom_tool_call") {
+		const initialInput: unknown = item.input;
+		if (typeof initialInput !== "string") {
+			throw new Error("Codex custom_tool_call started with non-string input");
+		}
 		// Wire name flows through unchanged; the agent-loop dispatcher also
 		// matches `Tool.customWireName`. Reuse `partialJson` as the
 		// accumulation buffer for the raw input string.
@@ -1175,9 +1191,9 @@ function createOutputBlockForItem(item: CodexEventItem): CodexOutputBlock | null
 			type: "toolCall",
 			id: encodeResponsesToolCallId(item.call_id, item.id),
 			name: item.name,
-			arguments: { input: item.input ?? "" },
+			arguments: { input: initialInput },
 			customWireName: item.name,
-			partialJson: item.input ?? "",
+			partialJson: initialInput,
 		};
 	}
 	return null;
@@ -1200,43 +1216,47 @@ function handleReasoningSummaryPartAdded(currentItem: CodexEventItem | null, raw
  * an empty string by the increment handlers. Diagnose at most once per event
  * type per stream, naming only the envelope shape — never the payload.
  */
-function noteCodexDegradedIncrement(
+function normalizeCodexIncrement(
 	rawEvent: Record<string, unknown>,
 	eventType: string,
 	model: Model<"openai-codex-responses">,
 	degradedIncrementDiagnostics: Set<string>,
-): void {
+): string {
 	const raw = (rawEvent as { delta?: unknown }).delta;
-	if (typeof raw === "string") return;
-	if (degradedIncrementDiagnostics.has(eventType)) return;
-	degradedIncrementDiagnostics.add(eventType);
-	logger.warn("codex: degraded non-string stream increment to empty string", {
-		model: model.id,
-		provider: model.provider,
-		eventType,
-		receivedType: raw === null ? "null" : typeof raw,
-	});
+	if (typeof raw === "string") return raw;
+	if (!degradedIncrementDiagnostics.has(eventType)) {
+		degradedIncrementDiagnostics.add(eventType);
+		logger.warn("codex: degraded non-string stream increment to empty string", {
+			model: model.id,
+			provider: model.provider,
+			eventType,
+			receivedType: raw === null ? "null" : typeof raw,
+		});
+	}
+	return "";
 }
 
 /**
- * A non-primitive tool-argument increment means the upstream producer emitted
- * a live value instead of streamed JSON text. Coercing it to "" would silently
- * corrupt the tool call, so the turn fails closed. The payload never enters
- * the error message.
+ * Tool-argument fragments are positional JSON text. Erasing or coercing ANY
+ * malformed increment — primitive, object, or function — assembles
+ * valid-but-wrong arguments (e.g. `{"n":1` + numeric primitive erased to ""
+ * + `3}` parses as {"n":13} and executes), so the turn fails closed on every
+ * non-string delta. The payload never enters the error message.
  */
-function assertPrimitiveToolArgumentIncrement(rawEvent: Record<string, unknown>, eventType: string): void {
+function assertStringToolArgumentIncrement(rawEvent: Record<string, unknown>, eventType: string): string {
 	const raw = (rawEvent as { delta?: unknown }).delta;
-	if ((typeof raw === "object" && raw !== null) || typeof raw === "function") {
+	if (typeof raw !== "string") {
 		throw new Error(
-			`Codex stream sent a non-primitive ${eventType} tool-argument increment; failing the turn instead of silently dropping tool arguments`,
+			`Codex stream sent a non-string ${eventType} tool-argument increment; failing the turn instead of assembling wrong tool arguments`,
 		);
 	}
+	return raw;
 }
 
 function handleReasoningSummaryTextDelta(
 	currentItem: CodexEventItem | null,
 	currentBlock: CodexOutputBlock | null,
-	rawEvent: Record<string, unknown>,
+	delta: string,
 	stream: AssistantMessageEventStream,
 	output: AssistantMessage,
 	blockIndex: () => number,
@@ -1249,8 +1269,6 @@ function handleReasoningSummaryTextDelta(
 	currentItem.summary = currentItem.summary || [];
 	const lastPart = currentItem.summary[currentItem.summary.length - 1];
 	if (!lastPart) return;
-	const delta =
-		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.thinking += delta;
 	currentBlock.summaryBuffer += delta;
 	lastPart.text += delta;
@@ -1277,14 +1295,12 @@ function handleReasoningSummaryPartDone(
 function handleReasoningTextDelta(
 	currentItem: CodexEventItem | null,
 	currentBlock: CodexOutputBlock | null,
-	rawEvent: Record<string, unknown>,
+	delta: string,
 	stream: AssistantMessageEventStream,
 	output: AssistantMessage,
 	blockIndex: () => number,
 ): void {
 	if (currentItem?.type !== "reasoning" || currentBlock?.type !== "thinking") return;
-	const delta =
-		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.thinking += delta;
 	currentBlock.rawBuffer += delta;
 	stream.push({ type: "thinking_delta", contentIndex: blockIndex(), delta, partial: output });
@@ -1302,7 +1318,7 @@ function handleContentPartAdded(currentItem: CodexEventItem | null, rawEvent: Re
 function handleMessageTextDelta(
 	currentItem: CodexEventItem | null,
 	currentBlock: CodexOutputBlock | null,
-	rawEvent: Record<string, unknown>,
+	delta: string,
 	stream: AssistantMessageEventStream,
 	output: AssistantMessage,
 	blockIndex: () => number,
@@ -1312,8 +1328,6 @@ function handleMessageTextDelta(
 	if (!currentItem.content || currentItem.content.length === 0) return;
 	const lastPart = currentItem.content[currentItem.content.length - 1];
 	if (!lastPart || lastPart.type !== partType) return;
-	const delta =
-		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.text += delta;
 	if (lastPart.type === "output_text") {
 		lastPart.text += delta;
@@ -1326,14 +1340,12 @@ function handleMessageTextDelta(
 function handleToolCallArgumentsDelta(
 	currentItem: CodexEventItem | null,
 	currentBlock: CodexOutputBlock | null,
-	rawEvent: Record<string, unknown>,
+	delta: string,
 	stream: AssistantMessageEventStream,
 	output: AssistantMessage,
 	blockIndex: () => number,
 ): void {
 	if (currentItem?.type !== "function_call" || currentBlock?.type !== "toolCall") return;
-	const delta =
-		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.partialJson += delta;
 	currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
 	stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta, partial: output });
@@ -1356,14 +1368,12 @@ function handleToolCallArgumentsDone(
 function handleCustomToolCallInputDelta(
 	currentItem: CodexEventItem | null,
 	currentBlock: CodexOutputBlock | null,
-	rawEvent: Record<string, unknown>,
+	delta: string,
 	stream: AssistantMessageEventStream,
 	output: AssistantMessage,
 	blockIndex: () => number,
 ): void {
 	if (currentItem?.type !== "custom_tool_call" || currentBlock?.type !== "toolCall") return;
-	const delta =
-		typeof (rawEvent as { delta?: unknown }).delta === "string" ? (rawEvent as { delta: string }).delta : "";
 	currentBlock.partialJson += delta;
 	currentBlock.arguments = { input: currentBlock.partialJson };
 	stream.push({ type: "toolcall_delta", contentIndex: blockIndex(), delta, partial: output });
@@ -1375,11 +1385,17 @@ function handleCustomToolCallInputDone(
 	rawEvent: Record<string, unknown>,
 ): void {
 	if (currentItem?.type !== "custom_tool_call" || currentBlock?.type !== "toolCall") return;
-	const input = (rawEvent as { input?: string }).input;
-	if (typeof input === "string") {
-		currentBlock.partialJson = input;
-		currentBlock.arguments = { input };
+	const input = (rawEvent as { input?: unknown }).input;
+	if (typeof input !== "string") {
+		throw new Error("Codex stream sent non-string input in custom_tool_call_input.done");
 	}
+	if (currentBlock.partialJson && currentBlock.partialJson !== input) {
+		throw new Error(
+			"Codex custom_tool_call input.done disagrees with the streamed input buffer; failing the turn instead of executing corrupted input",
+		);
+	}
+	currentBlock.doneInput = input;
+	currentBlock.arguments = { input };
 }
 
 function handleOutputItemDone(
@@ -1459,36 +1475,90 @@ function handleOutputItemDone(
 	}
 
 	if (item.type === "function_call") {
+		if (typeof item.arguments !== "string") {
+			throw new Error("Codex function_call completed with non-string terminal arguments");
+		}
+		let terminalArguments: unknown;
+		try {
+			terminalArguments = JSON.parse(item.arguments);
+		} catch {
+			throw new Error("Codex function_call completed with malformed terminal arguments");
+		}
+		if (!terminalArguments || typeof terminalArguments !== "object" || Array.isArray(terminalArguments)) {
+			throw new Error("Codex function_call terminal arguments were not a JSON object");
+		}
 		const id = encodeResponsesToolCallId(item.call_id, item.id);
+		if (runtime.currentBlock?.type !== "toolCall" || runtime.currentBlock.id !== id) {
+			throw new Error("Codex function_call terminal item did not match the active tool call");
+		}
 		runtime.finalizedToolCallIds.add(id);
 		const toolCall: ToolCall = {
 			type: "toolCall",
 			id,
 			name: codexToolCanonicalName(item.name),
-			arguments: parseStreamingJson(item.arguments || "{}"),
+			arguments: terminalArguments as Record<string, unknown>,
 			...(findUnnecessaryUnicodeEscape(item.arguments || "") ? { escapedNonAsciiArguments: true } : {}),
 		};
+		Object.assign(runtime.currentBlock, toolCall);
+		delete (runtime.currentBlock as { partialJson?: string }).partialJson;
+		delete (runtime.currentBlock as { doneInput?: string }).doneInput;
 		runtime.canSafelyReplayWebsocketOverSse = false;
 		stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
+		runtime.currentItem = null;
+		runtime.currentBlock = null;
 		return;
 	}
 
 	if (item.type === "custom_tool_call") {
+		const terminalInput: unknown = item.input;
+		if (typeof terminalInput !== "string") {
+			throw new Error(
+				"Codex custom_tool_call completed with non-string terminal input; failing the turn instead of finalizing from the streamed buffer",
+			);
+		}
 		const id = encodeResponsesToolCallId(item.call_id, item.id);
+		if (runtime.currentBlock?.type !== "toolCall" || runtime.currentBlock.id !== id) {
+			throw new Error("Codex custom_tool_call terminal item did not match the active tool call");
+		}
 		runtime.finalizedToolCallIds.add(id);
-		const rawInput =
+		// The terminal `output_item.done.item.input` is the authoritative
+		// complete input; the streamed `partialJson` buffer is advisory. If both
+		// exist and disagree, the stream was corrupted (dropped/malformed
+		// increments), so fail closed instead of executing either variant —
+		// matching function-call finalization, which always trusts the terminal
+		// `item.arguments`.
+		const streamedInput =
 			runtime.currentBlock?.type === "toolCall" && runtime.currentBlock.partialJson
 				? runtime.currentBlock.partialJson
-				: (item.input ?? "");
+				: undefined;
+		if (streamedInput !== undefined && streamedInput !== terminalInput) {
+			throw new Error(
+				"Codex custom_tool_call terminal input disagrees with the streamed input buffer; failing the turn instead of executing a corrupted tool call",
+			);
+		}
+		if (
+			runtime.currentBlock?.type === "toolCall" &&
+			runtime.currentBlock.doneInput !== undefined &&
+			runtime.currentBlock.doneInput !== terminalInput
+		) {
+			throw new Error(
+				"Codex custom_tool_call terminal input disagrees with input.done; failing the turn instead of executing conflicting input",
+			);
+		}
 		const toolCall: ToolCall = {
 			type: "toolCall",
 			id,
 			name: item.name,
-			arguments: { input: rawInput },
+			arguments: { input: terminalInput },
 			customWireName: item.name,
 		};
+		Object.assign(runtime.currentBlock, toolCall);
+		delete (runtime.currentBlock as { partialJson?: string }).partialJson;
+		delete (runtime.currentBlock as { doneInput?: string }).doneInput;
 		runtime.canSafelyReplayWebsocketOverSse = false;
 		stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
+		runtime.currentItem = null;
+		runtime.currentBlock = null;
 		return;
 	}
 
@@ -1550,6 +1620,12 @@ function handleResponseCompleted(
 	// call that never received its `output_item.done` so the agent loop rejects
 	// the truncated arguments instead of executing a best-effort partial parse.
 	flagTruncatedToolCalls(output, output.stopReason, block => runtime.finalizedToolCallIds.has(block.id));
+	if (
+		output.stopReason === "stop" &&
+		output.content.some(block => block.type === "toolCall" && !runtime.finalizedToolCallIds.has(block.id))
+	) {
+		throw new Error("Codex response completed with an unfinalized tool call");
+	}
 	if (output.content.some(block => block.type === "toolCall") && output.stopReason === "stop") {
 		output.stopReason = "toolUse";
 	}
@@ -1614,6 +1690,7 @@ async function tryRetryWithoutForcedToolChoice(
 	runtime.currentBlock = null;
 	runtime.sawTerminalEvent = false;
 	runtime.nativeOutputItems.length = 0;
+	runtime.finalizedToolCallIds.clear();
 	resetOutputState(context.output);
 	context.firstTokenTime = undefined;
 
@@ -1709,6 +1786,7 @@ async function tryReconnectCodexWebSocketOnConnectionLimit(
 		runtime.currentItem = null;
 		runtime.currentBlock = null;
 		runtime.nativeOutputItems.length = 0;
+		runtime.finalizedToolCallIds.clear();
 		resetOutputState(context.output);
 		context.firstTokenTime = undefined;
 		recordCodexWebSocketFailure(websocketState, true);
@@ -1755,6 +1833,7 @@ async function tryRecoverCodexPreviousResponseNotFound(
 	runtime.currentBlock = null;
 	runtime.sawTerminalEvent = false;
 	runtime.nativeOutputItems.length = 0;
+	runtime.finalizedToolCallIds.clear();
 	resetOutputState(context.output);
 	context.firstTokenTime = undefined;
 
@@ -1813,6 +1892,7 @@ async function tryReplayWebsocketFailureOverSse(
 		runtime.currentItem = null;
 		runtime.currentBlock = null;
 		runtime.nativeOutputItems.length = 0;
+		runtime.finalizedToolCallIds.clear();
 		resetOutputState(context.output);
 		context.firstTokenTime = undefined;
 	}
@@ -1853,6 +1933,8 @@ async function tryRetryCodexProviderError(
 	runtime.currentItem = null;
 	runtime.currentBlock = null;
 	runtime.sawTerminalEvent = false;
+	runtime.nativeOutputItems.length = 0;
+	runtime.finalizedToolCallIds.clear();
 	resetOutputState(context.output);
 	context.firstTokenTime = undefined;
 	await scheduler.wait(CODEX_RETRY_DELAY_MS * runtime.providerRetryAttempt, {
@@ -1895,6 +1977,7 @@ function finalizeCodexResponse(
 		throw new Error("Codex response failed");
 	}
 
+	removeTransientBlockIndices(output);
 	output.providerPayload = createOpenAIResponsesHistoryPayload(context.model.provider, runtime.nativeOutputItems);
 	output.duration = Date.now() - context.startTime;
 	if (completion.firstTokenTime) {
@@ -2364,10 +2447,15 @@ class CodexWebSocketConnection {
 		this.#socket = socket;
 		let settled = false;
 		let timeout: NodeJS.Timeout | undefined;
+		const clearPending = () => {
+			if (timeout) clearTimeout(timeout);
+			if (signal) signal.removeEventListener("abort", onAbort);
+		};
 		const onAbort = () => {
 			socket.close(1000, "aborted");
 			if (!settled) {
 				settled = true;
+				clearPending();
 				reject(createCodexWebSocketTransportError("request was aborted"));
 			}
 		};
@@ -2378,17 +2466,16 @@ class CodexWebSocketConnection {
 				signal.addEventListener("abort", onAbort, { once: true });
 			}
 		}
-		const clearPending = () => {
-			if (timeout) clearTimeout(timeout);
-			if (signal) signal.removeEventListener("abort", onAbort);
-		};
-		timeout = setTimeout(() => {
-			socket.close(1000, "connect-timeout");
-			if (!settled) {
-				settled = true;
-				reject(createCodexWebSocketTransportError("connection timeout"));
-			}
-		}, CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS);
+		if (!settled) {
+			timeout = setTimeout(() => {
+				socket.close(1000, "connect-timeout");
+				if (!settled) {
+					settled = true;
+					clearPending();
+					reject(createCodexWebSocketTransportError("connection timeout"));
+				}
+			}, CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS);
+		}
 
 		socket.onopen = event => {
 			if (!settled) {
@@ -2426,6 +2513,7 @@ class CodexWebSocketConnection {
 		};
 		socket.onmessage = event => {
 			try {
+				if (!this.#activeRequest) return;
 				const text = typeof event.data === "string" ? event.data : Buffer.from(event.data).toString("utf-8");
 				if (!text) return;
 				const parsed = JSON.parse(text) as Record<string, unknown>;
@@ -2456,6 +2544,7 @@ class CodexWebSocketConnection {
 		request: Record<string, unknown>,
 		signal?: AbortSignal,
 		firstEventTimeoutMs?: number,
+		idleTimeoutMs = this.#idleTimeoutMs,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
 			throw createCodexWebSocketTransportError("websocket connection is unavailable");
@@ -2479,14 +2568,23 @@ class CodexWebSocketConnection {
 		try {
 			this.#socket.send(JSON.stringify(request));
 			let sawFirstProgress = false;
-			let lastProgressAt = Date.now();
+			const startedAt = Date.now();
+			let lastProgressAt = startedAt;
 			while (true) {
-				let timeoutMs = firstEventTimeoutMs;
+				let timeoutMs =
+					firstEventTimeoutMs === undefined ? undefined : firstEventTimeoutMs - (Date.now() - startedAt);
 				if (sawFirstProgress) {
-					timeoutMs = this.#idleTimeoutMs - (Date.now() - lastProgressAt);
+					timeoutMs = idleTimeoutMs - (Date.now() - lastProgressAt);
 					if (timeoutMs <= 0) {
+						this.close("idle-timeout");
 						throw createCodexWebSocketTransportError("idle timeout waiting for websocket");
 					}
+				} else if (timeoutMs !== undefined && timeoutMs <= 0) {
+					this.close("first-event-timeout");
+					throw createCodexWebSocketTransportError(
+						"timeout waiting for first websocket event",
+						STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
+					);
 				}
 				const next = await this.#nextMessage(
 					timeoutMs,
@@ -2503,20 +2601,19 @@ class CodexWebSocketConnection {
 					sawFirstProgress = true;
 					lastProgressAt = Date.now();
 				}
-				yield next;
 				const eventType = typeof next.type === "string" ? next.type : "";
-				if (
+				const terminal =
 					eventType === "response.completed" ||
 					eventType === "response.done" ||
 					eventType === "response.incomplete" ||
 					eventType === "response.failed" ||
-					eventType === "error"
-				) {
-					break;
-				}
+					eventType === "error";
+				yield next;
+				if (terminal) break;
 			}
 		} finally {
 			this.#activeRequest = false;
+			this.#queue.length = 0;
 			if (signal) {
 				signal.removeEventListener("abort", onAbort);
 			}
@@ -2559,9 +2656,9 @@ class CodexWebSocketConnection {
 			await promise;
 			if (timeout) clearTimeout(timeout);
 			if (timedOut && this.#queue.length === 0) {
-				if (providerCode === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE) {
-					this.close("first-event-timeout");
-				}
+				this.close(
+					providerCode === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE ? "first-event-timeout" : "idle-timeout",
+				);
 				return createCodexWebSocketTransportError(timeoutReason, providerCode);
 			}
 		}
@@ -2664,7 +2761,12 @@ async function openCodexWebSocketEventStream(
 	firstEventTimeoutMs?: number,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const connection = await getOrCreateCodexWebSocketConnection(state, url, headers, signal, options);
-	return connection.streamRequest(request, signal, firstEventTimeoutMs);
+	return connection.streamRequest(
+		request,
+		signal,
+		firstEventTimeoutMs,
+		getCodexWebSocketIdleTimeoutMs(options?.streamIdleTimeoutMs),
+	);
 }
 
 function createCodexHeaders(

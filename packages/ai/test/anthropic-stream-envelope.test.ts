@@ -607,12 +607,8 @@ describe("anthropic stream envelope handling", () => {
 		}
 		const result = await stream.result();
 
-		// The orphaned block keeps its streamed arguments and sheds internal
-		// stream-only fields; the replacement block owns subsequent deltas.
-		expect(result.content).toEqual([
-			{ type: "toolCall", id: "tool_orphaned", name: "bash", arguments: { command: "pwd" } },
-			{ type: "toolCall", id: "tool_replacement", name: "bash", arguments: { command: "ls" } },
-		]);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage ?? "").toMatch(/reused an active content block index/i);
 	});
 
 	it("round-trips OAuth tool prefixes without stripping original tool names that contain the prefix", () => {
