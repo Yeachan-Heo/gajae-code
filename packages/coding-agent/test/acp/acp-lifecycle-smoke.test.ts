@@ -164,6 +164,10 @@ class AcpStdioClient {
 			stderr: "pipe",
 			detached: true,
 		});
+		// Recorded immediately after spawn so teardown can prove the PID still
+		// belongs to this process before signalling its group. Read once here rather
+		// than at teardown, where the original may already be gone.
+		this.#startedAt = this.#readStartTime(this.#child.pid);
 		this.#scopeCwds.add(cwd);
 		this.#stderrDone = this.#readStderr();
 		this.#framesDone = this.#readFrames();
@@ -231,8 +235,21 @@ class AcpStdioClient {
 					"the ACP lifecycle fixture is POSIX-scoped",
 			);
 		}
+		// The Windows note above applies here too: a numeric PID is not proof of
+		// identity. POSIX recycles PIDs, and a process group id is just the leader's
+		// PID -- so if the fixture already exited, `kill(-pid)` can reach an
+		// unrelated group.
+		//
+		// The authoritative check is the spawn handle: the runtime keeps it bound to
+		// the process it actually created, so it cannot be fooled by PID reuse. BOTH
+		// fields are required -- a signal-killed child reports `exitCode === null`
+		// with the signal in `signalCode`, so testing exitCode alone would treat a
+		// dead process as live. The start-time comparison is defence in depth only:
+		// `ps -o lstart=` has one-second granularity, so it cannot distinguish two
+		// processes started within the same second and must not be relied on alone.
 		const pid = this.#child.pid;
-		if (Number.isInteger(pid) && pid !== undefined && pid > 0) {
+		const live = this.#child.exitCode === null && this.#child.signalCode === null;
+		if (Number.isInteger(pid) && pid !== undefined && pid > 0 && live && this.#groupIdentityIntact(pid)) {
 			try {
 				process.kill(-pid, signal);
 				return;
@@ -241,6 +258,22 @@ class AcpStdioClient {
 			}
 		}
 		this.#child.kill(signal);
+	}
+
+	/**
+	 * True when `pid` is still the process this fixture spawned, proven by an
+	 * unchanged start time rather than by the PID alone. A recycled PID gets a new
+	 * start time, so a mismatch means the original is gone and the group must not
+	 * be signalled. Any failure to read it is treated as NOT intact: refusing to
+	 * signal a group we cannot identify is the safe direction, and the child
+	 * handle still gets its own signal.
+	 */
+	#groupIdentityIntact(pid: number): boolean {
+		if (this.#startedAt === undefined) return false;
+		const probe = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+		if (probe.exitCode !== 0) return false;
+		const current = probe.stdout.toString().trim();
+		return current !== "" && current === this.#startedAt;
 	}
 
 	/** First terminal cause wins; later ones are consequences of it. */
@@ -434,6 +467,16 @@ class AcpStdioClient {
 	 * their original failure first and still report the cleanup failure after it.
 	 */
 	readonly cleanupFailures: string[] = [];
+	/** `ps -o lstart=` for the fixture PID, captured at spawn; undefined if unreadable. */
+	#startedAt: string | undefined;
+
+	#readStartTime(pid: number | undefined): string | undefined {
+		if (!Number.isInteger(pid) || pid === undefined || pid <= 0) return undefined;
+		const probe = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+		if (probe.exitCode !== 0) return undefined;
+		const value = probe.stdout.toString().trim();
+		return value === "" ? undefined : value;
+	}
 
 	async dispose(): Promise<void> {
 		const sessions = new Set(this.#opened);
