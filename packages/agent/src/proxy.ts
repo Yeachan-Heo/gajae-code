@@ -71,7 +71,14 @@ export type ProxyAssistantMessageEvent =
 	| { type: "reasoning_summary_start"; contentIndex: number }
 	| { type: "reasoning_summary_delta"; contentIndex: number; delta: string }
 	| { type: "reasoning_summary_end"; contentIndex: number; content?: string }
-	| { type: "toolcall_start"; contentIndex: number; id: string; toolName: string }
+	| {
+			type: "toolcall_start";
+			contentIndex: number;
+			id: string;
+			toolName: string;
+			/** True when the provider already executed this call itself (Cursor native tools). Relay of `ToolCall.providerExecuted`; dropped markers re-execute provider-side calls locally. */
+			providerExecuted?: boolean;
+	  }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string }
 	| { type: "toolcall_end"; contentIndex: number }
 	| {
@@ -357,6 +364,10 @@ function processProxyEvent(
 				name: proxyEvent.toolName,
 				arguments: {},
 				partialJson: "",
+				// The marker decides whether the agent loop dispatches this call
+				// locally. Reconstructing without it would re-execute provider-side
+				// calls (Cursor native tools) after the wire already ran them.
+				...(proxyEvent.providerExecuted ? { providerExecuted: true } : {}),
 			} satisfies ToolCall & { partialJson: string } as ToolCall;
 			return { type: "toolcall_start", contentIndex: proxyEvent.contentIndex, partial };
 
