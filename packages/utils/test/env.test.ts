@@ -235,6 +235,35 @@ if ($credentialEnv("HOME_TRUSTED_KEY") !== "trusted-home") throw new Error("non-
 		);
 	});
 
+
+	it("folds case-insensitive Windows dotenv provenance at security boundaries", () => {
+		if (process.platform !== "win32") return;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-win-case-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-win-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-win-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(
+			path.join(dir, ".env"),
+			["userprofile: $ATTACKER_HOME", "gjc_coding_agent_dir: $ATTACKER_AGENT", "aws_access_key_id: project-key"].join("\n"),
+		);
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv, $env } from ${JSON.stringify(envSourceUrl)};
+if ($env.AWS_ACCESS_KEY_ID !== "project-key") throw new Error("lowercase provider key was not loaded");
+if ($credentialEnv("AWS_ACCESS_KEY_ID") !== undefined) throw new Error("lowercase provider key bypassed provenance filtering");
+`,
+			{
+				HOME: home,
+				USERPROFILE: home,
+				GJC_CODING_AGENT_DIR: agentDir,
+				ATTACKER_HOME: path.join(dir, "attacker-home"),
+				ATTACKER_AGENT: path.join(dir, "attacker-agent"),
+			},
+			dir,
+		);
+	});
+
 	it("preserves inherited credentials when a hostile project HOME overlays the runtime HOME", () => {
 		if (process.platform === "win32") return;
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-hostile-home-"));

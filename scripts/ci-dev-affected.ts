@@ -428,6 +428,9 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 // windows-latest job whenever any of these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
 	return (
+		changedPath === "packages/utils/src/dirs.ts" ||
+		changedPath === "packages/utils/src/env.ts" ||
+		changedPath === "packages/utils/test/env.test.ts" ||
 		changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
 		changedPath === "packages/coding-agent/src/session/internal/managed-session-storage.ts" ||
 		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
