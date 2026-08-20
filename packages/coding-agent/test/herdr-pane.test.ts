@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -898,34 +899,57 @@ describe("herdr server replacement", () => {
 
 		expect(resolved).toEqual({ paneId: "pane-7", binPath: "/usr/bin/herdr", socketPath: "/tmp/herdr/herdr.sock" });
 	});
-	it("detects a real socket being unlinked and rebound", async () => {
-		// The production watch is the whole point of the feature: a server
-		// replacement is unlink-then-bind on the same path, which arrives as a
-		// single event while the path momentarily has no inode.
+	it("detects a real socket being unlinked and rebound even when Linux reuses its inode", async () => {
 		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-socket-"));
 		const socketPath = path.join(directory, "herdr.sock");
-		fs.writeFileSync(socketPath, "");
 		const { calls, spawn } = recordingSpawn();
+		const reasserted = Promise.withResolvers<void>();
+		const listen = async (): Promise<net.Server> => {
+			const server = net.createServer();
+			const ready = Promise.withResolvers<void>();
+			server.once("error", ready.reject);
+			server.listen(socketPath, ready.resolve);
+			await ready.promise;
+			return server;
+		};
+		const close = async (server: net.Server): Promise<void> => {
+			const closed = Promise.withResolvers<void>();
+			server.close(error => (error ? closed.reject(error) : closed.resolve()));
+			await closed.promise;
+		};
+		let server = await listen();
 		const reporter = createHerdrReporter(
 			{ paneId: "pane-7", binPath: "/usr/bin/herdr", socketPath },
 			eventSource().subscribe,
-			{ env: paneEnv(), spawn },
+			{
+				env: paneEnv(),
+				spawn(command) {
+					const process = spawn(command);
+					if (
+						command.includes("report-agent") &&
+						calls.filter(call => call.command.includes("report-agent")).length === 2
+					)
+						reasserted.resolve();
+					return process;
+				},
+			},
 		);
 		const before = calls.filter(call => call.command.includes("report-agent")).length;
 
 		try {
-			fs.unlinkSync(socketPath);
-			fs.writeFileSync(socketPath, "");
+			await close(server);
+			server = await listen();
 
-			const deadline = Date.now() + 5_000;
-			while (calls.filter(call => call.command.includes("report-agent")).length === before) {
-				if (Date.now() > deadline) break;
-				await Bun.sleep(50);
-			}
-
+			await Promise.race([
+				reasserted.promise,
+				Bun.sleep(2_000).then(() =>
+					Promise.reject(new Error("timed out waiting for socket replacement re-assert")),
+				),
+			]);
 			expect(calls.filter(call => call.command.includes("report-agent")).length).toBe(before + 1);
 		} finally {
 			reporter.release();
+			await close(server);
 			fs.rmSync(directory, { recursive: true, force: true });
 		}
 	});

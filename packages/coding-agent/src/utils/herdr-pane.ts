@@ -393,18 +393,22 @@ function buildOwnerMarker(paneId: string, pid: number, incarnation: string | und
  * recreated, which would drop a watch bound to the old inode.
  */
 function watchSocketReplacement(socketPath: string, onReplaced: () => void): () => void {
-	const inode = (): number | undefined => {
+	const identity = (): string | undefined => {
 		try {
-			return fs.statSync(socketPath).ino;
+			const stat = fs.lstatSync(socketPath);
+			// Herdr publishes a Unix-domain socket directly. Do not follow a
+			// symlink from an inherited environment into an unrelated directory.
+			return stat.isSocket() ? `${stat.dev}:${stat.ino}` : undefined;
 		} catch {
 			return undefined;
 		}
 	};
 
-	let seen = inode();
+	let seen = identity();
 	let settle: ReturnType<typeof setTimeout> | undefined;
 	let attempts = 0;
 	let closed = false;
+	let replacementPending = false;
 
 	/**
 	 * Replacement arrives as unlink-then-bind, and the watch usually only
@@ -415,7 +419,7 @@ function watchSocketReplacement(socketPath: string, onReplaced: () => void): () 
 	const check = (): void => {
 		if (closed) return;
 		settle = undefined;
-		const current = inode();
+		const current = identity();
 		if (current === undefined) {
 			if (attempts >= SOCKET_SETTLE_ATTEMPTS) return;
 			attempts += 1;
@@ -423,8 +427,9 @@ function watchSocketReplacement(socketPath: string, onReplaced: () => void): () 
 			return;
 		}
 		attempts = 0;
-		if (current === seen) return;
+		if (current === seen && !replacementPending) return;
 		seen = current;
+		replacementPending = false;
 		onReplaced();
 	};
 
@@ -436,8 +441,13 @@ function watchSocketReplacement(socketPath: string, onReplaced: () => void): () 
 
 	let watcher: fs.FSWatcher;
 	try {
-		watcher = fs.watch(path.dirname(socketPath), (_event, filename) => {
+		watcher = fs.watch(path.dirname(socketPath), (event, filename) => {
 			if (filename && path.basename(String(filename)) !== path.basename(socketPath)) return;
+			// Linux may recycle the same inode for an unlink-and-bind performed in
+			// one scheduler tick. A matching directory rename is therefore proof of
+			// a replacement even if the settled inode compares equal. A missing
+			// filename cannot safely be attributed, so re-assert conservatively.
+			if (event === "rename" || !filename) replacementPending = true;
 			attempts = 0;
 			schedule();
 		});
