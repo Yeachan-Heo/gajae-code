@@ -2392,6 +2392,59 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
+	it("keeps an anchor-naming rejection fatal when the request sent no anchor", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-no-anchor-sent-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		class RequiresAnchorWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				// The very first turn never carries an anchor. A rejection naming the
+				// field is a real validation fault, not a stale continuation.
+				this.sendJson({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						code: "invalid_request_error",
+						message: "Invalid request: previous_response_id is required",
+					},
+				});
+			}
+		}
+
+		global.WebSocket = RequiresAnchorWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const response = await streamOpenAICodexResponses(
+			model,
+			{
+				systemPrompt: ["You are a helpful assistant."],
+				messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+			},
+			{
+				apiKey: token,
+				sessionId: "ws-no-anchor-sent-session",
+				providerSessionState: new Map<string, ProviderSessionState>(),
+			},
+		).result();
+
+		expect(response.stopReason).toBe("error");
+		// No anchor was sent, so no state-clearing replay may be attempted.
+		expect(sentRequests).toHaveLength(1);
+		expect(sentRequests[0]?.previous_response_id).toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
 	it("bounds Codex anchor recovery to a single full-context replay", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-anchor-oneshot-");
 		setAgentDir(tempDir.path());

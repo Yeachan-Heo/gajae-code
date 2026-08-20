@@ -203,6 +203,8 @@ interface CodexInitialTransport {
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
 	toolChoiceFallbackApplied?: boolean;
+	/** Whether the dispatched request actually carried a `previous_response_id` anchor. */
+	sentPreviousResponseId?: boolean;
 }
 type CodexEventItem = ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | ResponseCustomToolCall;
 type CodexThinkingBlock = ThinkingContent & { summaryBuffer: string; rawBuffer: string; summaryStarted: boolean };
@@ -312,6 +314,14 @@ interface CodexStreamRuntime {
 	 * fault and must surface instead of replaying full context up to five times.
 	 */
 	previousResponseRecoveryAttempted: boolean;
+	/**
+	 * Whether the in-flight request actually carried a `previous_response_id`.
+	 * Anchor recovery is only meaningful when it did: a rejection naming the field
+	 * on an anchor-free request (`previous_response_id is required`) is a real
+	 * validation fault, and clearing session state plus resending the identical
+	 * body would destroy valid metadata to no effect.
+	 */
+	sentPreviousResponseId: boolean;
 	sseRequestBodyOverride?: RequestBody;
 	sawTerminalEvent: boolean;
 	canSafelyReplayWebsocketOverSse: boolean;
@@ -854,8 +864,10 @@ async function openCodexWebSocketTransport(
 	eventStream: AsyncGenerator<Record<string, unknown>>;
 	requestBodyForState: RequestBody;
 	transport: CodexTransport;
+	sentPreviousResponseId: boolean;
 }> {
 	const websocketRequest = buildCodexWebSocketRequest(requestContext.transformedBody, websocketState);
+	const sentPreviousResponseId = typeof websocketRequest.previous_response_id === "string";
 	const websocketHeaders = createCodexHeaders(
 		requestContext.requestHeaders,
 		requestContext.accountId,
@@ -873,6 +885,7 @@ async function openCodexWebSocketTransport(
 		sentTurnStateHeader: websocketHeaders.has(X_CODEX_TURN_STATE_HEADER),
 		sentModelsEtagHeader: websocketHeaders.has(X_MODELS_ETAG_HEADER),
 		requestType: websocketRequest.type,
+		sentPreviousResponseId,
 		retry,
 		retryBudget: getCodexWebSocketRetryBudget(options),
 	});
@@ -885,7 +898,7 @@ async function openCodexWebSocketTransport(
 		options,
 		requestSetup.firstEventTimeoutMs,
 	);
-	return { eventStream, requestBodyForState, transport: "websocket" };
+	return { eventStream, requestBodyForState, transport: "websocket", sentPreviousResponseId };
 }
 
 async function openCodexSseTransport(
@@ -950,6 +963,7 @@ async function reopenCodexWebSocketRuntimeStream(
 		runtime.eventStream = next.eventStream;
 		runtime.requestBodyForState = next.requestBodyForState;
 		runtime.transport = next.transport;
+		runtime.sentPreviousResponseId = next.sentPreviousResponseId === true;
 		state.lastTransport = next.transport;
 	} catch (error) {
 		const wsError = error instanceof Error ? error : new Error(String(error));
@@ -982,6 +996,8 @@ async function reopenCodexSseRuntimeStream(
 	runtime.eventStream = next.eventStream;
 	runtime.requestBodyForState = next.requestBodyForState;
 	runtime.transport = next.transport;
+	// SSE never attaches `previous_response_id`; only buildCodexWebSocketRequest does.
+	runtime.sentPreviousResponseId = false;
 	if (state) {
 		state.lastTransport = next.transport;
 	}
@@ -993,6 +1009,7 @@ function createCodexStreamRuntime(initial: {
 	transport: CodexTransport;
 	websocketState?: CodexWebSocketSessionState;
 	toolChoiceFallbackApplied?: boolean;
+	sentPreviousResponseId?: boolean;
 }): CodexStreamRuntime {
 	return {
 		eventStream: initial.eventStream,
@@ -1006,6 +1023,7 @@ function createCodexStreamRuntime(initial: {
 		providerRetryAttempt: 0,
 		toolChoiceFallbackAttempted: initial.toolChoiceFallbackApplied === true,
 		previousResponseRecoveryAttempted: false,
+		sentPreviousResponseId: initial.sentPreviousResponseId === true,
 		sseRequestBodyOverride: initial.toolChoiceFallbackApplied
 			? structuredCloneJSON(initial.requestBodyForState)
 			: undefined,
@@ -1740,6 +1758,7 @@ async function tryRetryWithoutForcedToolChoice(
 	runtime.requestBodyForState = next.requestBodyForState;
 	runtime.sseRequestBodyOverride = next.requestBodyForState;
 	runtime.transport = next.transport;
+	runtime.sentPreviousResponseId = false;
 	if (websocketState) {
 		websocketState.lastTransport = next.transport;
 	}
@@ -1846,6 +1865,11 @@ async function tryRecoverCodexPreviousResponseNotFound(
 	const websocketState = context.requestContext.websocketState;
 	if (
 		!isCodexPreviousResponseNotFound(error) ||
+		// An anchor rejection is only actionable when this request actually sent one.
+		// `previous_response_id is required` on an anchor-free request is a genuine
+		// validation fault: clearing session metadata and resending the identical
+		// body cannot fix it.
+		!runtime.sentPreviousResponseId ||
 		runtime.previousResponseRecoveryAttempted ||
 		!websocketState ||
 		context.options?.fallbackManaged ||
