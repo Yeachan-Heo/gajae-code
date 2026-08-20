@@ -195,22 +195,45 @@ class AcpStdioClient {
 	}
 
 	/**
-	 * On POSIX, signal the fixture's process group, not just the client. Mirrors
-	 * `signalReplayProcessTree` in `src/gjc-runtime/ultragoal-evidence.ts`: a
-	 * negative pid targets the group, `ESRCH` means it is already gone, and any
-	 * other failure falls back to signalling the direct child. Windows has no
-	 * process-group signal mechanism in this fixture, so it intentionally takes
-	 * that direct-child fallback only.
+	 * Terminate the fixture's whole process tree, not just the client.
+	 *
+	 * On POSIX this mirrors `signalReplayProcessTree` in
+	 * `src/gjc-runtime/ultragoal-evidence.ts`: a negative pid targets the group
+	 * and `ESRCH` means it is already gone.
+	 *
+	 * Windows has no process-group signal, and signalling the direct child alone
+	 * is not subtree cleanup -- the ACP CLI, broker, session host, and any
+	 * grandchild survive while disposal reports success. `taskkill /T` is the
+	 * owned-tree mechanism available without holding a Job Object, so it is used
+	 * there and its outcome is recorded. If the tree cannot be reaped, disposal
+	 * surfaces that instead of presenting a direct-child kill as subtree cleanup.
 	 */
 	#signalTree(signal: NodeJS.Signals): void {
 		const pid = this.#child.pid;
-		if (process.platform !== "win32" && Number.isInteger(pid) && pid > 0) {
-			try {
-				process.kill(-pid, signal);
-				return;
-			} catch (cause) {
-				if ((cause as NodeJS.ErrnoException).code === "ESRCH") return;
-			}
+		if (!Number.isInteger(pid) || pid === undefined || pid <= 0) {
+			this.#child.kill(signal);
+			return;
+		}
+		if (process.platform === "win32") {
+			// `/T` reaps descendants; `/F` is required because the fixture's children
+			// have no window to accept a graceful close.
+			const reaped = Bun.spawnSync(["taskkill", "/pid", String(pid), "/T", "/F"], {
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			// 128 is taskkill's "process not found", i.e. already gone.
+			if (reaped.success || reaped.exitCode === 128) return;
+			this.cleanupFailures.push(
+				`taskkill /T failed for pid ${pid} (exit ${reaped.exitCode}); fixture descendants may have leaked`,
+			);
+			this.#child.kill(signal);
+			return;
+		}
+		try {
+			process.kill(-pid, signal);
+			return;
+		} catch (cause) {
+			if ((cause as NodeJS.ErrnoException).code === "ESRCH") return;
 		}
 		this.#child.kill(signal);
 	}
