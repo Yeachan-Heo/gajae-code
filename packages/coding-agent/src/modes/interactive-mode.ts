@@ -1440,6 +1440,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.ui.requestRender();
 	}
 
+	detachComposer(): void {
+		// Pet-aware: an active pet mounts PetFramedEditor, so detach whatever
+		// composition is actually mounted — a raw-editor-only detach would be a
+		// no-op and let the terminal clear() dispose the framed composer.
+		if (this.petWidget) {
+			this.petWidget.detachComposer();
+		} else {
+			this.editorContainer.detachChild(this.editor);
+		}
+	}
+
 	#createPetWidget(editor: CustomEditor): GajaePetWidget {
 		return new GajaePetWidget({
 			ui: this.ui,

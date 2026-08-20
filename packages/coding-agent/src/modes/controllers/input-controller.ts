@@ -1320,9 +1320,14 @@ export class InputController {
 			this.ctx.restoreComposer();
 			return;
 		}
-		// The composer is reusable across overlays: detach (never dispose)
-		// before clearing so only the transient overlay is torn down.
-		this.ctx.editorContainer.detachChild(this.ctx.editor);
+		// The composer composition is reusable across overlays: detach
+		// (never dispose) whatever is mounted so only the transient overlay
+		// is torn down.
+		if (typeof this.ctx.detachComposer === "function") {
+			this.ctx.detachComposer();
+		} else {
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
+		}
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.ctx.editor);
 		this.ctx.ui.setFocus(this.ctx.editor);
@@ -1384,9 +1389,14 @@ export class InputController {
 					),
 			},
 		);
-		// Detach the reusable composer before clearing so the terminal clear()
-		// disposes only the selector overlay, not the editor.
-		this.ctx.editorContainer.detachChild(this.ctx.editor);
+		// Detach the mounted composition (pet-aware) before clearing so the
+		// terminal clear() disposes only the selector overlay, never the
+		// composer (disposal is terminal).
+		if (typeof this.ctx.detachComposer === "function") {
+			this.ctx.detachComposer();
+		} else {
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
+		}
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(selector);
 		this.ctx.ui.setFocus(selector);

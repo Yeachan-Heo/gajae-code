@@ -9,6 +9,7 @@ import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { formatKeyHint as formatKeyHintForPlatform } from "../src/config/keybindings";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { CustomEditor, type PasteTextContext } from "../src/modes/components/custom-editor";
+import { GajaePetWidget, PetFramedEditor } from "../src/modes/components/gajae-pet-widget";
 import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
 import { InputController } from "../src/modes/controllers/input-controller";
 import { initTheme } from "../src/modes/theme/theme";
@@ -891,6 +892,128 @@ describe("InputController keybinding setup", () => {
 			expect(editor.getText()).toBe("current draftx");
 		} finally {
 			setDefaultTabWidth(defaultWidth);
+			editor.dispose();
+		}
+	});
+
+	it("preserves the pet-framed composer across queued-message selector transitions in an active pet session", async () => {
+		// Controller-level active-pet regression: the mounted child is
+		// PetFramedEditor, so the queued-selector open must detach the framed
+		// composition (not just the raw editor) and the close must remount it
+		// through the pet-aware restore. Exercises cancel, final-item delete,
+		// and move/refresh, then proves the composer still accepts input and
+		// receives tab-width invalidations.
+		const { InputController, ctx, queues } = await createContext();
+		const editor = new CustomEditor(defaultEditorTheme);
+		const editorContainer = new Container();
+		const floorContainer = new Container();
+		editorContainer.addChild(editor);
+		const petUi = {
+			requestRender: () => {},
+			setPostRenderEmitter: () => {},
+			queueTerminalCleanup: () => {},
+			get terminalAvailable() {
+				return false;
+			},
+			get isRunning() {
+				return true;
+			},
+			terminal: { columns: 80, rows: 30, write: () => {} },
+			acquireRasterLease: async () => ({ status: "denied" as const }),
+			invalidateRasterLease: async () => {},
+			writeRasterOutput: async () => ({ status: "written" as const }),
+		};
+		const widget = new GajaePetWidget({
+			ui: petUi as unknown as never,
+			editor,
+			editorContainer,
+			floorContainer,
+			isWorking: () => false,
+			getComposerBottomOffset: () => floorContainer.render(80).length,
+			syncManagedItermCursor: async () => true,
+			forcePixelProtocol: "sixel",
+			autoFlexGapMs: null,
+		});
+		// Active pet: mounts the framed composition and claims the emitter.
+		widget.setMode("red");
+		const framed = editorContainer.children[0];
+		if (!(framed instanceof PetFramedEditor)) {
+			widget.dispose();
+			editor.dispose();
+			throw new Error("Expected the active pet to mount PetFramedEditor");
+		}
+		ctx.editor = editor;
+		ctx.editorContainer = editorContainer as unknown as InteractiveModeContext["editorContainer"];
+		queues.editorContainerChildren = editorContainer.children as unknown[];
+		// Pet-aware host contract, exactly as InteractiveMode implements it.
+		Object.assign(ctx, {
+			detachComposer: () => widget.detachComposer(),
+			restoreComposer: () => widget.remountComposer(),
+		});
+		const defaultWidth = getDefaultTabWidth();
+		const otherWidth = defaultWidth === 3 ? 4 : 3;
+		const invalidations = { count: 0 };
+		const originalInvalidate = editor.invalidate.bind(editor);
+		editor.invalidate = () => {
+			invalidations.count += 1;
+			originalInvalidate();
+		};
+		try {
+			editor.setText("current draft");
+
+			// Cancel: the framed composition survives the overlay round-trip.
+			queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+			const controller = new InputController(ctx);
+			controller.handleDequeue();
+			let selector = editorContainer.children[0];
+			if (!(selector instanceof QueuedMessageSelectorComponent)) {
+				throw new Error("Expected queued message selector to be shown");
+			}
+			selector.handleInput("\x1b");
+			expect(editorContainer.children[0]).toBe(framed);
+			expect(editorContainer.children).toHaveLength(1);
+
+			// Final-item delete: delete down to empty, still framed.
+			controller.handleDequeue();
+			selector = editorContainer.children[0];
+			if (!(selector instanceof QueuedMessageSelectorComponent)) {
+				throw new Error("Expected queued message selector to re-open");
+			}
+			selector.handleInput("\x1b[3~");
+			let reopened = editorContainer.children[0];
+			if (!(reopened instanceof QueuedMessageSelectorComponent)) {
+				throw new Error("Expected queued message selector to re-open after delete");
+			}
+			reopened.handleInput("\x1b[3~");
+			expect(queues.sessionQueuedMessages).toEqual([]);
+			expect(editorContainer.children[0]).toBe(framed);
+
+			// Move/refresh: requeue, reorder through the selector, then cancel.
+			queues.sessionQueuedMessages.push("first queued message", "second queued message");
+			controller.handleDequeue();
+			selector = editorContainer.children[0];
+			if (!(selector instanceof QueuedMessageSelectorComponent)) {
+				throw new Error("Expected queued message selector to be shown");
+			}
+			selector.handleInput("\x1b[1;5B");
+			reopened = editorContainer.children[0];
+			if (!(reopened instanceof QueuedMessageSelectorComponent)) {
+				throw new Error("Expected queued message selector to re-open after move");
+			}
+			reopened.handleInput("\x1b");
+			expect(editorContainer.children[0]).toBe(framed);
+
+			// The composer still accepts input and its tab-width listener is
+			// live (a disposed editor's listener would stop firing).
+			const before = invalidations.count;
+			setDefaultTabWidth(otherWidth);
+			setDefaultTabWidth(defaultWidth);
+			expect(invalidations.count).toBeGreaterThan(before);
+			editor.handleInput("x");
+			expect(editor.getText()).toBe("current draftx");
+		} finally {
+			setDefaultTabWidth(defaultWidth);
+			widget.dispose();
 			editor.dispose();
 		}
 	});
