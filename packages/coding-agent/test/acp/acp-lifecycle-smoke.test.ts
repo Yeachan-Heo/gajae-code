@@ -47,6 +47,11 @@ const STDERR_TAIL_LIMIT = 4_000;
  * exact thing this client exists to avoid.
  */
 const STDERR_DRAIN_MS = 2_000;
+// The broker unregisters a host and appends to its index asynchronously after
+// `session/close` returns, so the assertion has to be eventual rather than a
+// single read of a file that is still being written.
+const HOST_UNREGISTRATION_TIMEOUT_MS = 10_000;
+const HOST_UNREGISTRATION_POLL_MS = 50;
 
 interface RpcError {
 	code: number;
@@ -531,16 +536,32 @@ function rowsOf(value: unknown): SessionRow[] {
 	return Array.isArray(sessions) ? (sessions as SessionRow[]) : [];
 }
 
-async function brokerRecordedHostUnregistration(agentDir: string, sessionId: string): Promise<boolean> {
-	const index = Bun.file(path.join(agentDir, "sdk", "sessions", "index.jsonl"));
-	if (!(await index.exists())) return false;
-	return (await index.text())
+function indexRecordsUnregistration(text: string, sessionId: string): boolean {
+	return text
 		.split("\n")
 		.filter(Boolean)
 		.some(line => {
 			const event = JSON.parse(line) as BrokerIndexEvent;
 			return event.type === "host_unregistered" && event.sessionId === sessionId;
 		});
+}
+
+/**
+ * Host shutdown and index persistence are asynchronous, so a single read taken
+ * immediately after `session/close` observes a race rather than the contract.
+ * Poll to a bounded deadline: a genuine failure still fails, but a slow runner
+ * does not turn into a false negative on a required gate.
+ */
+async function brokerRecordedHostUnregistration(agentDir: string, sessionId: string): Promise<boolean> {
+	const index = Bun.file(path.join(agentDir, "sdk", "sessions", "index.jsonl"));
+	const deadline = Date.now() + HOST_UNREGISTRATION_TIMEOUT_MS;
+	for (;;) {
+		if (await index.exists()) {
+			if (indexRecordsUnregistration(await index.text(), sessionId)) return true;
+		}
+		if (Date.now() >= deadline) return false;
+		await Bun.sleep(HOST_UNREGISTRATION_POLL_MS);
+	}
 }
 
 /** Everything the lifecycle sequence observed, captured once and asserted per criterion. */
@@ -826,50 +847,53 @@ lifecycleTest("request timeout teardown force-kills a fixture that ignores termi
 	}
 });
 
-lifecycleTest("a failed session close still reaps the fixture, fails the run, and preserves the primary failure", async () => {
-	const cwd = await makeScratch();
-	const fixture = path.join(cwd, "close-failure-acp-fixture.ts");
-	const terminated = path.join(cwd, "terminated");
-	await Bun.write(
-		fixture,
-		[
-			`process.on("SIGTERM", () => { Bun.write(${JSON.stringify(terminated)}, "terminated"); });`,
-			'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "fixture/ready" }) + "\\n");',
-			"for await (const line of process.stdin) {",
-			"  const request = JSON.parse(line);",
-			'  if (request.method === "session/close") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "close failed" } }) + "\\n");',
-			"}",
-		].join("\n"),
-	);
-	const client = new AcpStdioClient(cwd, ["bun", fixture]);
-	let disposed = false;
+lifecycleTest(
+	"a failed session close still reaps the fixture, fails the run, and preserves the primary failure",
+	async () => {
+		const cwd = await makeScratch();
+		const fixture = path.join(cwd, "close-failure-acp-fixture.ts");
+		const terminated = path.join(cwd, "terminated");
+		await Bun.write(
+			fixture,
+			[
+				`process.on("SIGTERM", () => { Bun.write(${JSON.stringify(terminated)}, "terminated"); });`,
+				'process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "fixture/ready" }) + "\\n");',
+				"for await (const line of process.stdin) {",
+				"  const request = JSON.parse(line);",
+				'  if (request.method === "session/close") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "close failed" } }) + "\\n");',
+				"}",
+			].join("\n"),
+		);
+		const client = new AcpStdioClient(cwd, ["bun", fixture]);
+		let disposed = false;
 
-	try {
-		await client.waitForNotification("fixture/ready");
-		client.track("session-that-cannot-close");
-		// The primary failure (request timeout) must lead, with the aggregated
-		// cleanup failure chained as its cause — never silently dropped, and never
-		// replacing the timeout as the top-level error.
-		const primary = (await (async () => {
-			try {
-				return await client.call("initialize", {}, 50);
-			} catch (cause) {
-				return await client.disposePreserving(cause);
-			} finally {
-				disposed = true;
-			}
-		})().catch((cause: unknown) => cause as Error)) as Error;
-		expect(primary).toBeInstanceOf(Error);
-		expect(primary.message).toContain("ACP request timed out after 50ms: initialize");
-		const cleanup = primary.cause;
-		expect(cleanup).toBeInstanceOf(Error);
-		expect((cleanup as Error).message).toContain("session/close session-that-cannot-close failed");
-		// Termination is unconditional: the fixture wrote its SIGTERM marker.
-		expect(await Bun.file(terminated).exists()).toBe(true);
-	} finally {
-		if (!disposed) await client.dispose();
-	}
-});
+		try {
+			await client.waitForNotification("fixture/ready");
+			client.track("session-that-cannot-close");
+			// The primary failure (request timeout) must lead, with the aggregated
+			// cleanup failure chained as its cause — never silently dropped, and never
+			// replacing the timeout as the top-level error.
+			const primary = (await (async () => {
+				try {
+					return await client.call("initialize", {}, 50);
+				} catch (cause) {
+					return await client.disposePreserving(cause);
+				} finally {
+					disposed = true;
+				}
+			})().catch((cause: unknown) => cause as Error)) as Error;
+			expect(primary).toBeInstanceOf(Error);
+			expect(primary.message).toContain("ACP request timed out after 50ms: initialize");
+			const cleanup = primary.cause;
+			expect(cleanup).toBeInstanceOf(Error);
+			expect((cleanup as Error).message).toContain("session/close session-that-cannot-close failed");
+			// Termination is unconditional: the fixture wrote its SIGTERM marker.
+			expect(await Bun.file(terminated).exists()).toBe(true);
+		} finally {
+			if (!disposed) await client.dispose();
+		}
+	},
+);
 
 test.skipIf(process.platform === "win32")(
 	"POSIX disposal reaps a grandchild the fixture spawned, not just the fixture",
