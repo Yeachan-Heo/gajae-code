@@ -393,19 +393,43 @@ function buildOwnerMarker(paneId: string, pid: number, incarnation: string | und
  * recreated, which would drop a watch bound to the old inode.
  */
 function watchSocketReplacement(socketPath: string, onReplaced: () => void): () => void {
-	const identity = (): string | undefined => {
+	type SocketIdentity = { kind: "socket"; value: string } | { kind: "absent" } | { kind: "invalid"; reason: string };
+
+	const identity = (): SocketIdentity => {
 		try {
 			const stat = fs.lstatSync(socketPath);
 			// Herdr publishes a Unix-domain socket directly. Do not follow a
 			// symlink from an inherited environment into an unrelated directory.
-			return stat.isSocket() ? `${stat.dev}:${stat.ino}` : undefined;
-		} catch {
-			return undefined;
+			return stat.isSocket()
+				? { kind: "socket", value: `${stat.dev}:${stat.ino}` }
+				: { kind: "invalid", reason: stat.isSymbolicLink() ? "symlink" : "not-a-socket" };
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			return code === "ENOENT" ? { kind: "absent" } : { kind: "invalid", reason: code ?? String(error) };
 		}
 	};
 
-	let seen = identity();
-	let settle: ReturnType<typeof setTimeout> | undefined;
+	const socketDirectory = path.dirname(socketPath);
+	try {
+		const directory = fs.lstatSync(socketDirectory);
+		const uid = process.getuid?.();
+		if (
+			!directory.isDirectory() ||
+			directory.isSymbolicLink() ||
+			uid === undefined ||
+			directory.uid !== uid ||
+			directory.mode & 0o022
+		) {
+			logger.debug("herdr socket directory is not user-private", { socketDirectory });
+			return () => {};
+		}
+	} catch (error) {
+		logger.debug("herdr socket directory inspection failed", { error: String(error) });
+		return () => {};
+	}
+
+	let seen: string | undefined;
+	let settle: NodeJS.Timeout | undefined;
 	let attempts = 0;
 	let closed = false;
 	let replacementPending = false;
@@ -420,15 +444,19 @@ function watchSocketReplacement(socketPath: string, onReplaced: () => void): () 
 		if (closed) return;
 		settle = undefined;
 		const current = identity();
-		if (current === undefined) {
+		if (current.kind === "absent") {
 			if (attempts >= SOCKET_SETTLE_ATTEMPTS) return;
 			attempts += 1;
 			schedule();
 			return;
 		}
+		if (current.kind === "invalid") {
+			logger.debug("herdr socket identity rejected", { reason: current.reason });
+			return;
+		}
 		attempts = 0;
-		if (current === seen && !replacementPending) return;
-		seen = current;
+		if (current.value === seen && !replacementPending) return;
+		seen = current.value;
 		replacementPending = false;
 		onReplaced();
 	};
@@ -439,9 +467,16 @@ function watchSocketReplacement(socketPath: string, onReplaced: () => void): () 
 		settle.unref?.();
 	};
 
+	const beforeWatch = identity();
+	if (beforeWatch.kind === "invalid") {
+		logger.debug("herdr socket identity rejected", { reason: beforeWatch.reason });
+		return () => {};
+	}
+	seen = beforeWatch.kind === "socket" ? beforeWatch.value : undefined;
+
 	let watcher: fs.FSWatcher;
 	try {
-		watcher = fs.watch(path.dirname(socketPath), (event, filename) => {
+		watcher = fs.watch(socketDirectory, (event, filename) => {
 			if (filename && path.basename(String(filename)) !== path.basename(socketPath)) return;
 			// Linux may recycle the same inode for an unlink-and-bind performed in
 			// one scheduler tick. A matching directory rename is therefore proof of
@@ -458,6 +493,20 @@ function watchSocketReplacement(socketPath: string, onReplaced: () => void): () 
 	}
 	watcher.unref?.();
 	watcher.on("error", error => logger.debug("herdr socket watch error", { error: String(error) }));
+	// fs.watch registration and lstat are not atomic. Compare the identity on
+	// both sides of registration so a handoff in that narrow interval cannot be
+	// adopted as the baseline and silently miss its required re-assertion.
+	const afterWatch = identity();
+	if (afterWatch.kind === "invalid") {
+		logger.debug("herdr socket identity rejected", { reason: afterWatch.reason });
+	} else if (afterWatch.kind === "socket" && afterWatch.value !== seen) {
+		seen = afterWatch.value;
+		replacementPending = true;
+		schedule();
+	} else if (afterWatch.kind === "absent") {
+		replacementPending = true;
+		schedule();
+	}
 	return () => {
 		closed = true;
 		if (settle) clearTimeout(settle);
@@ -647,9 +696,6 @@ function createHerdrReporterWithClaim(
 		}
 	});
 
-	// A freshly started agent is idle at the prompt.
-	report("idle");
-
 	/**
 	 * A replaced server starts with an empty agent registry, and `report` is
 	 * deduplicated against the last state, so a session sitting at its prompt
@@ -668,6 +714,11 @@ function createHerdrReporterWithClaim(
 
 	const watch = options.watchServerReplacement ?? watchSocketReplacement;
 	let unwatch: (() => void) | null = paneEnv.socketPath ? watch(paneEnv.socketPath, reassert) : null;
+
+	// Install the watch before the first report. A server handoff in reporter
+	// setup is then either observed by fs.watch or detected by the identity
+	// comparison around registration, and is never silently adopted as baseline.
+	report("idle");
 
 	return {
 		report,

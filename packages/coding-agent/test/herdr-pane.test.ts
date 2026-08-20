@@ -770,12 +770,13 @@ describe("herdr pane title", () => {
 
 describe("herdr server replacement", () => {
 	/** Stand-in for the socket watch; the test drives replacement directly. */
-	function fakeWatch() {
+	function fakeWatch(replaceDuringInstall = false) {
 		let onReplaced: (() => void) | null = null;
 		let closed = 0;
 		return {
 			watch(_socketPath: string, next: () => void) {
 				onReplaced = next;
+				if (replaceDuringInstall) onReplaced();
 				return () => {
 					closed += 1;
 					onReplaced = null;
@@ -821,6 +822,19 @@ describe("herdr server replacement", () => {
 		// The state memo must survive the re-assert, or the next real transition
 		// would be deduplicated against a cleared value.
 		expect(reporter.state).toBe("working");
+	});
+
+	it("does not miss a replacement while installing the watcher", () => {
+		const { calls, spawn } = recordingSpawn();
+		createHerdrReporter(SOCKET_PANE, eventSource().subscribe, {
+			env: paneEnv(),
+			spawn,
+			watchServerReplacement: fakeWatch(true).watch,
+		});
+
+		const reports = calls.filter(call => call.command.includes("report-agent"));
+		expect(reports).toHaveLength(1);
+		expect(reports[0]?.command).toContain("idle");
 	});
 
 	it("raises the sequence so the replaced server accepts the re-report", () => {
