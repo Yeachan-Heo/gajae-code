@@ -117,11 +117,22 @@ const CODEX_WEBSOCKET_RETRY_BUDGET = CODEX_MAX_RETRIES;
 const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error";
 const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_found", "codex_previous_response_stale"]);
 // Some Codex deployments reject a stale continuation anchor with a generic
-// `invalid_request_error` code and only name the anchor in the message
-// (`Invalid \`previous_response_id\`.`). Classify by message so the anchor is
-// cleared and the turn retried with full context instead of killing the session.
-const CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE =
-	/(?:invalid|expired|unknown|stale|not[ _-]?found|no longer)[^\n]{0,48}previous[ _`-]*response[ _`-]*id|previous[ _`-]*response[ _`-]*id[^\n]{0,48}(?:invalid|expired|unknown|stale|not[ _-]?found|no longer)/i;
+// `invalid_request_error` code and name the anchor only in the message
+// (`Invalid \`previous_response_id\`.`). Match the canonical request-field token
+// with a stale qualifier on either side, so the anchor is cleared and the turn
+// retried with full context instead of killing the session.
+//
+// Deliberately requires the `previous_response_id` field token rather than prose
+// like "previous response ... ID": a deterministic history fault such as
+// `Previous response's tool call ID is malformed.` must stay fatal, since
+// replaying it re-sends the same offending item.
+const CODEX_PREVIOUS_RESPONSE_ID_TOKEN = String.raw`previous[ _-]response[ _-]id`;
+const CODEX_ANCHOR_STALE_QUALIFIER = String.raw`invalid|expired|unknown|stale|not[ _-]?found|no longer`;
+const CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE = new RegExp(
+	`(?:${CODEX_ANCHOR_STALE_QUALIFIER})[^\\n]{0,48}?${CODEX_PREVIOUS_RESPONSE_ID_TOKEN}` +
+		`|${CODEX_PREVIOUS_RESPONSE_ID_TOKEN}[^\\n]{0,48}?(?:${CODEX_ANCHOR_STALE_QUALIFIER})`,
+	"i",
+);
 const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
 const CODEX_NON_RETRYABLE_EVENT_CODES = new Set([
 	"invalid_function_parameters",
@@ -295,6 +306,12 @@ interface CodexStreamRuntime {
 	websocketStreamRetries: number;
 	providerRetryAttempt: number;
 	toolChoiceFallbackAttempted: boolean;
+	/**
+	 * Stale-anchor recovery is one-shot. Once the anchor is cleared the replay no
+	 * longer carries `previous_response_id`, so a repeated rejection is a real
+	 * fault and must surface instead of replaying full context up to five times.
+	 */
+	previousResponseRecoveryAttempted: boolean;
 	sseRequestBodyOverride?: RequestBody;
 	sawTerminalEvent: boolean;
 	canSafelyReplayWebsocketOverSse: boolean;
@@ -988,6 +1005,7 @@ function createCodexStreamRuntime(initial: {
 		websocketStreamRetries: 0,
 		providerRetryAttempt: 0,
 		toolChoiceFallbackAttempted: initial.toolChoiceFallbackApplied === true,
+		previousResponseRecoveryAttempted: false,
 		sseRequestBodyOverride: initial.toolChoiceFallbackApplied
 			? structuredCloneJSON(initial.requestBodyForState)
 			: undefined,
@@ -1815,7 +1833,9 @@ async function tryReconnectCodexWebSocketOnConnectionLimit(
 function isCodexPreviousResponseNotFound(error: unknown): boolean {
 	if (!(error instanceof CodexProviderStreamError)) return false;
 	if (typeof error.code === "string" && CODEX_PREVIOUS_RESPONSE_STALE_CODES.has(error.code)) return true;
-	return CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE.test(error.message);
+	// Raw provider message only — `error.message` carries appended `code=` metadata
+	// that would supply the stale qualifier the provider never sent.
+	return CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE.test(error.providerMessage);
 }
 
 async function tryRecoverCodexPreviousResponseNotFound(
@@ -1826,6 +1846,7 @@ async function tryRecoverCodexPreviousResponseNotFound(
 	const websocketState = context.requestContext.websocketState;
 	if (
 		!isCodexPreviousResponseNotFound(error) ||
+		runtime.previousResponseRecoveryAttempted ||
 		!websocketState ||
 		context.options?.fallbackManaged ||
 		runtime.transport !== "websocket" ||
@@ -1837,6 +1858,7 @@ async function tryRecoverCodexPreviousResponseNotFound(
 	}
 
 	runtime.providerRetryAttempt += 1;
+	runtime.previousResponseRecoveryAttempted = true;
 	resetCodexWebSocketAppendState(websocketState);
 	resetCodexSessionMetadata(websocketState);
 	runtime.currentItem = null;
@@ -3083,12 +3105,20 @@ function getCodexEventErrorMessage(rawEvent: Record<string, unknown>): string {
 class CodexProviderStreamError extends Error {
 	readonly retryable: boolean;
 	readonly code?: string;
+	/**
+	 * Provider-supplied message, before display formatting appends `code=`/`status=`
+	 * metadata. Classification must read this, never `message`: the formatted string
+	 * mixes the code into the prose and would let `code=invalid_request_error`
+	 * satisfy a message pattern the provider never actually sent.
+	 */
+	readonly providerMessage: string;
 
-	constructor(message: string, retryable: boolean, code?: string) {
+	constructor(message: string, retryable: boolean, code: string | undefined, providerMessage: string) {
 		super(message);
 		this.name = "CodexProviderStreamError";
 		this.retryable = retryable;
 		this.code = code;
+		this.providerMessage = providerMessage;
 	}
 }
 
@@ -3114,7 +3144,12 @@ function createCodexProviderStreamError(rawEvent: Record<string, unknown>): Code
 		typeof rawEvent.type === "string" && rawEvent.type === "error"
 			? formatCodexErrorEvent(rawEvent, code, message)
 			: (formatCodexFailure(rawEvent) ?? "Codex response failed");
-	return new CodexProviderStreamError(formattedMessage, isRetryableCodexFailureEvent(rawEvent), code || undefined);
+	return new CodexProviderStreamError(
+		formattedMessage,
+		isRetryableCodexFailureEvent(rawEvent),
+		code || undefined,
+		message,
+	);
 }
 
 function isRetryableCodexProviderError(error: unknown): boolean {
