@@ -203,37 +203,37 @@ class AcpStdioClient {
 	 *
 	 * Windows has no process-group signal, and signalling the direct child alone
 	 * is not subtree cleanup -- the ACP CLI, broker, session host, and any
-	 * grandchild survive while disposal reports success. `taskkill /T` is the
-	 * owned-tree mechanism available without holding a Job Object, so it is used
-	 * there and its outcome is recorded. If the tree cannot be reaped, disposal
-	 * surfaces that instead of presenting a direct-child kill as subtree cleanup.
+	 * grandchild survive while disposal reports success. Rather than present that
+	 * as subtree cleanup, the Windows branch fails loudly and the suite is scoped
+	 * to POSIX; see the branch body for why a PID-targeted kill is not a
+	 * substitute.
 	 */
 	#signalTree(signal: NodeJS.Signals): void {
-		const pid = this.#child.pid;
-		if (!Number.isInteger(pid) || pid === undefined || pid <= 0) {
-			this.#child.kill(signal);
-			return;
-		}
 		if (process.platform === "win32") {
-			// `/T` reaps descendants; `/F` is required because the fixture's children
-			// have no window to accept a graceful close.
-			const reaped = Bun.spawnSync(["taskkill", "/pid", String(pid), "/T", "/F"], {
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			// 128 is taskkill's "process not found", i.e. already gone.
-			if (reaped.success || reaped.exitCode === 128) return;
-			this.cleanupFailures.push(
-				`taskkill /T failed for pid ${pid} (exit ${reaped.exitCode}); fixture descendants may have leaked`,
-			);
+			// This fixture's cleanup contract is subtree reaping, and Windows offers
+			// no way to honor it here. There is no process-group signal, and a bare
+			// `taskkill /pid <pid> /T` is unsafe: the fixture can exit before
+			// teardown and Windows recycles PIDs, so the numeric PID is not proof of
+			// identity and the kill could hit an unrelated tree. Honoring the
+			// contract needs an identity-bound Job Object held for the fixture
+			// lifetime, which this fixture has no binding for.
+			//
+			// Fail loudly rather than terminate the direct child and call that
+			// subtree cleanup. The caller records this in the disposal accumulator.
 			this.#child.kill(signal);
-			return;
+			throw new Error(
+				"subtree reaping is not implemented on Windows (requires an identity-bound Job Object); " +
+					"the ACP lifecycle fixture is POSIX-scoped",
+			);
 		}
-		try {
-			process.kill(-pid, signal);
-			return;
-		} catch (cause) {
-			if ((cause as NodeJS.ErrnoException).code === "ESRCH") return;
+		const pid = this.#child.pid;
+		if (Number.isInteger(pid) && pid !== undefined && pid > 0) {
+			try {
+				process.kill(-pid, signal);
+				return;
+			} catch (cause) {
+				if ((cause as NodeJS.ErrnoException).code === "ESRCH") return;
+			}
 		}
 		this.#child.kill(signal);
 	}
@@ -709,7 +709,14 @@ beforeAll(async () => {
 	await client.dispose();
 });
 
-test("initialize advertises every session lifecycle capability", () => {
+// The fixture's teardown contract is subtree reaping, which cannot be honored
+// on Windows without an identity-bound Job Object (see `#signalTree`). Scope the
+// suite to POSIX explicitly rather than run it with a cleanup step that would
+// terminate only the direct child and leave the ACP CLI, broker, session host
+// and this suite's grandchild behind.
+const lifecycleTest = test.skipIf(process.platform === "win32");
+
+lifecycleTest("initialize advertises every session lifecycle capability", () => {
 	expect(observed.sessionCapabilities).toEqual(
 		expect.objectContaining({
 			list: expect.any(Object),
@@ -721,19 +728,19 @@ test("initialize advertises every session lifecycle capability", () => {
 	);
 });
 
-test("session/new returns a distinct session id per workspace", () => {
+lifecycleTest("session/new returns a distinct session id per workspace", () => {
 	expect(observed.createdSessionId).toMatch(/\S/);
 	expect(observed.otherSessionId).toMatch(/\S/);
 	expect(observed.otherSessionId).not.toBe(observed.createdSessionId);
 });
 
-test("session/list filtered by cwd returns the created session with its required identifying fields", () => {
+lifecycleTest("session/list filtered by cwd returns the created session with its required identifying fields", () => {
 	const row = observed.listedRows.find(candidate => candidate.sessionId === observed.createdSessionId);
 	expect(row).toBeDefined();
 	expect(row?.cwd).toBe(observed.scratchCwd);
 });
 
-test("session/list discriminates on cwd instead of returning every session", () => {
+lifecycleTest("session/list discriminates on cwd instead of returning every session", () => {
 	// Each listing must exclude the other workspace's session; a `cwd` parameter that
 	// is accepted and then ignored fails here but would pass a contains-only check.
 	expect(observed.listedRows.map(row => row.sessionId)).not.toContain(observed.otherSessionId);
@@ -741,47 +748,47 @@ test("session/list discriminates on cwd instead of returning every session", () 
 	expect(observed.otherCwdRows.map(row => row.sessionId)).not.toContain(observed.createdSessionId);
 });
 
-test("session/close costs the session its prompt eligibility", () => {
+lifecycleTest("session/close costs the session its prompt eligibility", () => {
 	expect(observed.promptAfterCloseRejected).toBe(true);
 });
 
-test("the first session/close reaches the broker and shuts down its host before resume", () => {
+lifecycleTest("the first session/close reaches the broker and shuts down its host before resume", () => {
 	expect(observed.brokerRecordedHostUnregistrationAfterClose).toBe(true);
 });
 
-test("session/resume reattaches a session that was closed", () => {
+lifecycleTest("session/resume reattaches a session that was closed", () => {
 	expect(observed.promptAfterResume.stopReason).toBe("end_turn");
 	expect(observed.closeAfterResume).toEqual({});
 });
 
-test("session/fork mints a session id distinct from its source", () => {
+lifecycleTest("session/fork mints a session id distinct from its source", () => {
 	expect(observed.forkedSessionId).toMatch(/\S/);
 	expect(observed.forkedSessionId).not.toBe(observed.createdSessionId);
 	expect(sessionIdOf(observed.forkResult)).toBe(observed.forkedSessionId);
 	expect(observed.forkPreservedSourceState).toBe(true);
 });
 
-test("session/delete removes the forked session from the listing", () => {
+lifecycleTest("session/delete removes the forked session from the listing", () => {
 	expect(observed.deleteForked).toEqual({});
 	const remaining = observed.rowsAfterDelete.map(row => row.sessionId);
 	expect(remaining).not.toContain(observed.forkedSessionId);
 	expect(remaining).toContain(observed.createdSessionId);
 });
 
-test("session/close closes the created session", () => {
+lifecycleTest("session/close closes the created session", () => {
 	expect(observed.closeCreated).toEqual({});
 });
 
-test("session/close is idempotent when repeated on the same session", () => {
+lifecycleTest("session/close is idempotent when repeated on the same session", () => {
 	expect(observed.closeCreatedAgain).toEqual({});
 });
 
-test("the fork operation streams a session update for the forked session", () => {
+lifecycleTest("the fork operation streams a session update for the forked session", () => {
 	expect(observed.notifications).toContain("session/update");
 	expect(observed.forkSessionUpdateObserved).toBe(true);
 });
 
-test("request timeout teardown force-kills a fixture that ignores termination", async () => {
+lifecycleTest("request timeout teardown force-kills a fixture that ignores termination", async () => {
 	const cwd = await makeScratch();
 	const fixture = path.join(cwd, "hung-acp-fixture.ts");
 	await Bun.write(
@@ -811,7 +818,7 @@ test("request timeout teardown force-kills a fixture that ignores termination", 
 	}
 });
 
-test("a failed session close still reaps the fixture, fails the run, and preserves the primary failure", async () => {
+lifecycleTest("a failed session close still reaps the fixture, fails the run, and preserves the primary failure", async () => {
 	const cwd = await makeScratch();
 	const fixture = path.join(cwd, "close-failure-acp-fixture.ts");
 	const terminated = path.join(cwd, "terminated");
@@ -901,7 +908,7 @@ test.skipIf(process.platform === "win32")(
 	},
 );
 
-test("a final stdout response settles before a one-shot fixture exit", async () => {
+lifecycleTest("a final stdout response settles before a one-shot fixture exit", async () => {
 	const cwd = await makeScratch();
 	const fixture = path.join(cwd, "one-shot-acp-fixture.ts");
 	await Bun.write(
@@ -923,7 +930,7 @@ test("a final stdout response settles before a one-shot fixture exit", async () 
 	}
 });
 
-test("a malformed creation response still reaps every session in the test-owned scope", async () => {
+lifecycleTest("a malformed creation response still reaps every session in the test-owned scope", async () => {
 	const cwd = await makeScratch();
 	const fixture = path.join(cwd, "lost-creation-acp-fixture.ts");
 	const reaped = path.join(cwd, "reaped");
@@ -950,7 +957,7 @@ test("a malformed creation response still reaps every session in the test-owned 
 	expect(await Bun.file(reaped).text()).toBe("reaped");
 });
 
-test("malformed JSON-RPC responses cannot settle lifecycle requests", async () => {
+lifecycleTest("malformed JSON-RPC responses cannot settle lifecycle requests", async () => {
 	const cwd = await makeScratch();
 	const fixture = path.join(cwd, "malformed-acp-fixture.ts");
 	await Bun.write(
@@ -970,7 +977,7 @@ test("malformed JSON-RPC responses cannot settle lifecycle requests", async () =
 	}
 });
 
-test("fixture child environment excludes ambient credentials", async () => {
+lifecycleTest("fixture child environment excludes ambient credentials", async () => {
 	const cwd = await makeScratch();
 	const child = Bun.spawn(["bun", "-e", "process.stdout.write(JSON.stringify(process.env))"], {
 		cwd: REPO_ROOT,
@@ -993,7 +1000,7 @@ test("fixture child environment excludes ambient credentials", async () => {
 	expect(environment.TMPDIR).toBe(cwd);
 });
 
-test("a fast successful RPC leaves no pending request deadline", async () => {
+lifecycleTest("a fast successful RPC leaves no pending request deadline", async () => {
 	const cwd = await makeScratch();
 	const fixture = path.join(cwd, "fast-acp-fixture.ts");
 	await Bun.write(
