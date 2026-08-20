@@ -1066,3 +1066,59 @@ test("drain surfaces a failed publication in its awaited window instead of repor
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+test("concurrent drains report every publication failure exactly once (#4743)", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-drain-concurrent-"));
+	try {
+		const sessionFile = path.join(root, "session.jsonl");
+		const sessionId = "drain-concurrent";
+		const store = createReconciliationStore({ sessionFile, sessionId });
+		await store.load();
+		const storeDirectory = path.dirname(reconciliationStorePath(sessionFile, sessionId));
+		await fs.writeFile(storeDirectory, "block reconciliation persistence");
+		const record = (suffix: string) => ({
+			kind: "prompt" as const,
+			commandId: `command-${suffix}`,
+			turnId: `turn-${suffix}`,
+			createdAt: 1,
+			acceptedAt: 1,
+			status: "terminal_ok" as const,
+			terminalAt: 2,
+			terminalOutcome: { kind: "success" as const },
+		});
+		const failures = [
+			store.transact(() => [record("concurrent-a")]).catch((error: NodeJS.ErrnoException) => error),
+			store.transact(() => [record("concurrent-b")]).catch((error: NodeJS.ErrnoException) => error),
+		];
+		// Two teardown owners drain the same store at once. Evidence is retained
+		// until claimed, so neither drain can be starved into reporting quiescence
+		// while a failure is still unreported, exactly one of them carries each
+		// failure, and the serialized chain deadlocks neither.
+		const reported = await Promise.all([
+			store.drain?.().then(
+				() => undefined,
+				(error: unknown) => error,
+			),
+			store.drain?.().then(
+				() => undefined,
+				(error: unknown) => error,
+			),
+		]);
+		const reportedCodes = reported.flatMap(error =>
+			error instanceof AggregateError
+				? error.errors.map(member => (member as NodeJS.ErrnoException).code)
+				: error === undefined
+					? []
+					: [(error as NodeJS.ErrnoException).code],
+		);
+		expect(reportedCodes).toEqual(["reconciliation_persist_failed", "reconciliation_persist_failed"]);
+		expect((await Promise.all(failures)).map(error => (error as NodeJS.ErrnoException).code)).toEqual([
+			"reconciliation_persist_failed",
+			"reconciliation_persist_failed",
+		]);
+		// Both failures have been claimed, so a drain opened after them is clean:
+		// reported evidence never permanently poisons the store.
+		await store.drain?.();
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

@@ -625,12 +625,13 @@ export function createReconciliationStore(options: {
 	let terminalMemory: DurableTerminalScopeRecord[] = [];
 	let terminalKeyMemory: EvictedTerminalKeyEntry[] = [];
 	let chain: Promise<void> = Promise.resolve();
-	// #4743: transaction tails neutralize rejection on the serialization chain, so
-	// a failed publication is invisible to a plain tail await. Record the failure
-	// sequence here so drain() can surface evidence for exactly the window it
-	// awaited instead of reporting a failed write as drained.
-	let persistFailureCount = 0;
-	let lastPersistFailure: unknown;
+	// #4743: transaction tails neutralize rejection on the serialization chain and
+	// publications are enqueued fire-and-forget, so a failed write has no observer
+	// at all. Retain every persistence failure until a drain reports it, then clear
+	// it: surface-once means no failure is lost (even one that landed before
+	// teardown began) and no later drain is permanently poisoned by a failure an
+	// owner has already been told about.
+	let unreportedPersistFailures: unknown[] = [];
 
 	const writeAtomic = async (document: ReconciliationStoreDocument): Promise<void> => {
 		if (!filePath) return;
@@ -658,8 +659,7 @@ export function createReconciliationStore(options: {
 			const coded = Object.assign(error instanceof Error ? error : new Error("reconciliation persist failed"), {
 				code: "reconciliation_persist_failed",
 			});
-			persistFailureCount += 1;
-			lastPersistFailure = coded;
+			unreportedPersistFailures.push(coded);
 			throw coded;
 		}
 	};
@@ -839,9 +839,6 @@ export function createReconciliationStore(options: {
 		transactTerminalState,
 		transactTerminalKeys,
 		drain: async () => {
-			// Snapshot the failure sequence first: only failures recorded after this
-			// point belong to the window this drain awaits (#4743).
-			const observedFailures = persistFailureCount;
 			while (true) {
 				const observed = chain;
 				await observed;
@@ -852,10 +849,13 @@ export function createReconciliationStore(options: {
 				if (chain === observed) {
 					// Transaction tails neutralize rejections on `chain`, so a failed
 					// publication would otherwise be indistinguishable from a completed
-					// one: surface the recorded failure instead of claiming quiescence
-					// (#4743).
-					if (persistFailureCount > observedFailures) throw lastPersistFailure;
-					return;
+					// one. Claim the retained evidence (clearing it so exactly one drain
+					// reports each failure) and reject instead of claiming quiescence.
+					if (unreportedPersistFailures.length === 0) return;
+					const claimed = unreportedPersistFailures;
+					unreportedPersistFailures = [];
+					if (claimed.length === 1) throw claimed[0];
+					throw new AggregateError(claimed, "Reconciliation persistence failed during the drained window.");
 				}
 			}
 		},
