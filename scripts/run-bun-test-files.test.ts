@@ -77,7 +77,6 @@ describe("fresh-process test harness contracts", () => {
 			"/repo root",
 			{
 				PATH: "/bin",
-				E2E: "1",
 				ANTHROPIC_API_KEY: "host-secret",
 				ANTHROPIC_BASE_URL: "https://host.invalid",
 				GEMINI_API_KEY: "host-secret",
@@ -110,6 +109,25 @@ describe("fresh-process test harness contracts", () => {
 		expect(spec.env.MISTRAL_API_KEY).toBeUndefined();
 		expect(spec.env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
 		expect(spec.env.OPENAI_API_KEY).toBeUndefined();
+	});
+
+	test("preserves credentials and provider endpoints for explicit E2E children", () => {
+		const spec = buildTestProcessSpec(
+			"packages/ai/test/oauth.test.ts",
+			"/tmp/e2e-sandbox",
+			30_000,
+			"/repo",
+			{
+				E2E: "true",
+				OPENAI_API_KEY: "e2e-key",
+				OPENAI_BASE_URL: "https://e2e-provider.invalid/v1",
+				AWS_SECRET_ACCESS_KEY: "e2e-secret",
+			},
+		);
+		expect(spec.env.E2E).toBe("true");
+		expect(spec.env.OPENAI_API_KEY).toBe("e2e-key");
+		expect(spec.env.OPENAI_BASE_URL).toBe("https://e2e-provider.invalid/v1");
+		expect(spec.env.AWS_SECRET_ACCESS_KEY).toBe("e2e-secret");
 	});
 
 	test("fresh children prevent process environment and global state leaks", async () => {
@@ -188,7 +206,7 @@ describe("fresh-process test harness contracts", () => {
 		let exitCode: number;
 		try {
 			exitCode = await runHarness(
-				{ root: "tests", testTimeoutMs: 60_000, fileTimeoutMs: 100, concurrency: 1 },
+					{ root: "tests", testTimeoutMs: 60_000, fileTimeoutMs: 5_000, concurrency: 1 },
 				undefined,
 				root,
 			);
@@ -202,7 +220,7 @@ describe("fresh-process test harness contracts", () => {
 		expect(descendantPid).toBeInteger();
 		const observed = await probeLinuxProcess(descendantPid);
 		if (observed?.startTime === startTime) expect(await processIdentityIsExecuting(observed)).toBe(false);
-	});
+	}, 20_000);
 
 	test("a normally exited test file cannot leave an active descendant", async () => {
 		if (process.platform !== "linux") return;

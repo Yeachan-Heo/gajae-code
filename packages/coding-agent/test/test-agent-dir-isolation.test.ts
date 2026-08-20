@@ -13,6 +13,7 @@ import {
 	decideAgentDirIsolation,
 	defaultAgentDirFor,
 	readProjectEnvFile,
+	stripAmbientProviderEnvironment,
 } from "../../../scripts/test-agent-dir-isolation";
 
 const HOME = "/home/operator";
@@ -122,7 +123,13 @@ describe("project .env reader", () => {
 		try {
 			await fs.promises.writeFile(
 				path.join(dir, ".env"),
-				["# comment", 'GJC_CODING_AGENT_DIR="/quoted/dir"', "PI_CONFIG_DIR=.plain", "MALFORMED", ""].join("\n"),
+				[
+					"# comment",
+					'export GJC_CODING_AGENT_DIR="/quoted/dir" # inline comment',
+					"PI_CONFIG_DIR = .plain#dotenv comment",
+					"MALFORMED",
+					"",
+				].join("\n"),
 			);
 			expect(readProjectEnvFile(dir)).toEqual({
 				GJC_CODING_AGENT_DIR: "/quoted/dir",
@@ -140,6 +147,48 @@ describe("project .env reader", () => {
 		} finally {
 			await fs.promises.rm(dir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("provider environment isolation", () => {
+	test("removes ambient provider credentials and endpoints without touching unrelated variables", () => {
+		const env: Record<string, string | undefined> = {
+			OPENAI_API_KEY: "ambient-key",
+			OPENAI_BASE_URL: "https://provider.example.test/v1",
+			ANTHROPIC_AUTH_TOKEN: "ambient-token",
+			ANTHROPIC_SEARCH_MODEL: "ambient-search-model",
+			AZURE_OPENAI_API_VERSION: "ambient-api-version",
+			AZURE_OPENAI_DEPLOYMENT_NAME_MAP: "ambient-deployments",
+			AWS_PROFILE: "ambient-profile",
+			AWS_REGION: "us-east-1",
+			AWS_DEFAULT_REGION: "us-west-2",
+			AWS_EC2_METADATA_DISABLED: "false",
+			AWS_BEARER_TOKEN_BEDROCK: "ambient-bedrock-token",
+			AWS_BEDROCK_SKIP_AUTH: "true",
+			GOOGLE_APPLICATION_CREDENTIALS: "/ambient/credentials.json",
+			HUGGINGFACE_HUB_TOKEN: "ambient-huggingface-token",
+			GITHUB_TOKEN: "ambient-github-token",
+			GITLAB_TOKEN: "ambient-gitlab-token",
+			PERPLEXITY_COOKIES: "ambient-cookies",
+			SEARXNG_ENDPOINT: "https://search.example.test",
+			CLAUDE_CODE_CLIENT_KEY: "/ambient/client.key",
+			NODE_EXTRA_CA_CERTS: "/ambient/ca.pem",
+			KIRO_REGION: "ambient-region",
+			OPENCODEX_HOME: "/ambient/opencodex",
+			HTTPS_PROXY: "https://proxy.example.test",
+			HTTP_PROXY: "http://proxy.example.test",
+			ALL_PROXY: "socks5://proxy.example.test",
+			https_proxy: "https://lower-proxy.example.test",
+			http_proxy: "http://lower-proxy.example.test",
+			all_proxy: "socks5://lower-proxy.example.test",
+			ZCODE_APP_VERSION: "ambient-version",
+			ZCODE_RELEASE_CHANNEL: "ambient-channel",
+			PATH: "/usr/bin",
+		};
+
+		stripAmbientProviderEnvironment(env);
+
+		expect(env).toEqual({ PATH: "/usr/bin" });
 	});
 });
 
@@ -205,5 +254,54 @@ describe("preload fail-closed behavior (real preload path)", () => {
 		expect(adopted).not.toBe(defaultAgentDir);
 		expect(path.basename(adopted).startsWith("gjc-test-agent-")).toBe(true);
 		await fs.promises.rm(adopted, { recursive: true, force: true });
+	}, 30_000);
+
+	test("strips ambient provider environment in the real preload", async () => {
+		const probe = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"--preload",
+				preload,
+				"-e",
+				"console.log(JSON.stringify({ openaiKey: process.env.OPENAI_API_KEY, openaiBaseUrl: process.env.OPENAI_BASE_URL, path: process.env.PATH }))",
+			],
+			env: {
+				...process.env,
+				OPENAI_API_KEY: "ambient-key",
+				OPENAI_BASE_URL: "https://provider.example.test/v1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		expect(probe.exitCode).toBe(0);
+		expect(JSON.parse(probe.stdout.toString())).toEqual({ path: process.env.PATH });
+	}, 30_000);
+
+	test("preserves explicit E2E provider credentials in the real preload", async () => {
+		const probe = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"--preload",
+				preload,
+				"-e",
+				"console.log(JSON.stringify({ e2e: process.env.E2E, openaiKey: process.env.OPENAI_API_KEY, openaiBaseUrl: process.env.OPENAI_BASE_URL }))",
+			],
+			env: {
+				...process.env,
+				E2E: "1",
+				OPENAI_API_KEY: "e2e-key",
+				OPENAI_BASE_URL: "https://e2e-provider.example.test/v1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		expect(probe.exitCode).toBe(0);
+		expect(JSON.parse(probe.stdout.toString())).toMatchObject({
+			e2e: "1",
+			openaiKey: "e2e-key",
+			openaiBaseUrl: "https://e2e-provider.example.test/v1",
+		});
 	}, 30_000);
 });

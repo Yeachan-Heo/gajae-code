@@ -153,9 +153,12 @@ export function buildTestProcessSpec(
 ): TestProcessSpec {
 	const home = path.join(sandbox, "home");
 	const env: NodeJS.ProcessEnv = { ...parentEnv };
-	for (const name of PROVIDER_ENDPOINT_ENV) env[name] = undefined;
-	for (const name of Object.keys(env)) {
-		if (isCredentialEnvironmentName(name)) env[name] = undefined;
+	const e2eEnabled = /^(1|true|yes|on)$/iu.test(parentEnv.E2E?.trim() ?? "");
+	if (!e2eEnabled) {
+		for (const name of PROVIDER_ENDPOINT_ENV) env[name] = undefined;
+		for (const name of Object.keys(env)) {
+			if (isCredentialEnvironmentName(name)) env[name] = undefined;
+		}
 	}
 	for (const name of INHERITED_GJC_STATE_ENV) env[name] = undefined;
 	return {

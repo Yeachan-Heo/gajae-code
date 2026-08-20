@@ -21,6 +21,65 @@ export type AgentDirIsolationDecision =
 	/** An explicit, trusted, non-default pin: honor it. */
 	| { action: "honor"; agentDir: string };
 
+const AMBIENT_PROVIDER_ENV_PATTERN = /(?:_API_KEY|_AUTH_TOKEN|_OAUTH_TOKEN|_ACCESS_TOKEN|_BASE_URL)$/;
+const AMBIENT_PROVIDER_ENV_EXACT = new Set([
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"ANTHROPIC_SEARCH_MODEL",
+	"AZURE_OPENAI_API_VERSION",
+	"AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+	"AWS_ACCESS_KEY_ID",
+	"AWS_BEARER_TOKEN_BEDROCK",
+	"AWS_BEDROCK_SKIP_AUTH",
+	"AWS_BEARER_TOKEN_KIRO",
+	"AWS_CONFIG_FILE",
+	"AWS_DEFAULT_REGION",
+	"AWS_EC2_METADATA_DISABLED",
+	"AWS_PROFILE",
+	"AWS_REGION",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_SESSION_TOKEN",
+	"AWS_SHARED_CREDENTIALS_FILE",
+	"ALL_PROXY",
+	"CLAUDE_CODE_CLIENT_CERT",
+	"CLAUDE_CODE_CLIENT_KEY",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"CLAUDE_CONFIG_DIR",
+	"CODEX_HOME",
+	"COPILOT_GITHUB_TOKEN",
+	"GCLOUD_PROJECT",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
+	"GITLAB_TOKEN",
+	"GOOGLE_APPLICATION_CREDENTIALS",
+	"GOOGLE_CLOUD_LOCATION",
+	"GOOGLE_CLOUD_PROJECT",
+	"HF_TOKEN",
+	"HUGGINGFACE_HUB_TOKEN",
+	"KIRO_REGION",
+	"NODE_EXTRA_CA_CERTS",
+	"OPENCODEX_HOME",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"all_proxy",
+	"PERPLEXITY_COOKIES",
+	"QWEN_PORTAL_API_KEY",
+	"SEARXNG_BASIC_PASSWORD",
+	"SEARXNG_BASIC_USERNAME",
+	"SEARXNG_ENDPOINT",
+	"SEARXNG_TOKEN",
+	"ZCODE_APP_VERSION",
+	"ZCODE_RELEASE_CHANNEL",
+]);
+
+/** Remove provider credentials and endpoints inherited from the operator shell. */
+export function stripAmbientProviderEnvironment(env: Record<string, string | undefined>): void {
+	for (const key of Object.keys(env)) {
+		if (AMBIENT_PROVIDER_ENV_PATTERN.test(key) || AMBIENT_PROVIDER_ENV_EXACT.has(key)) delete env[key];
+	}
+}
+
 /**
  * Minimal `KEY=value` reader for the caller's project `.env`.
  *
@@ -42,10 +101,26 @@ export function readProjectEnvFile(cwd: string): Record<string, string> {
 	for (const line of raw.split("\n")) {
 		const trimmed = line.trim();
 		if (!trimmed || trimmed.startsWith("#")) continue;
-		const eq = trimmed.indexOf("=");
-		if (eq <= 0) continue;
-		const key = trimmed.slice(0, eq).trim();
-		let value = trimmed.slice(eq + 1).trim();
+		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(trimmed);
+		if (!match) continue;
+		const key = match[1]!;
+		let value = match[2]!.trim();
+		let quote: '"' | "'" | undefined;
+		for (let index = 0; index < value.length; index++) {
+			const char = value[index];
+			if (char === "\\") {
+				index++;
+				continue;
+			}
+			if ((char === '"' || char === "'") && (!quote || quote === char)) {
+				quote = quote ? undefined : char;
+				continue;
+			}
+			if (char === "#" && !quote) {
+				value = value.slice(0, index).trimEnd();
+				break;
+			}
+		}
 		if (
 			value.length >= 2 &&
 			((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))

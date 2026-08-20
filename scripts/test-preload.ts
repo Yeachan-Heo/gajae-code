@@ -1,4 +1,4 @@
-import { decideAgentDirIsolation, readProjectEnvFile } from "./test-agent-dir-isolation";
+import { decideAgentDirIsolation, readProjectEnvFile, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,6 +23,14 @@ try {
 } catch {
 	// Leave the environment untouched if the temp root cannot be resolved.
 }
+
+// Hermetic unit shards must not discover the operator's provider credentials or
+// proxy endpoints. Explicitly opted-in E2E runs are different: their tests use
+// E2E=1 as the credential gate, so scrubbing the same variables here would make
+// them silently skip instead of exercising the live provider path. E2E callers
+// own that opt-in and must provide their credentials explicitly.
+const e2eEnabled = /^(1|true|yes|on)$/i.test(process.env.E2E?.trim() ?? "");
+if (!e2eEnabled) stripAmbientProviderEnvironment(process.env);
 
 // Isolate the agent directory for every test process. `getAgentDir()` (and
 // therefore `Settings.isolated()` and every daemon-path helper) resolves the

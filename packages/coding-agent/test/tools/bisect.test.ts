@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,8 +20,6 @@ function session(cwd: string): ToolSession {
 
 // ── temp-repo helpers ────────────────────────────────────────────────────────
 
-const tempRoots: string[] = [];
-
 async function gitRun(cwd: string, args: string[]): Promise<string> {
 	const child = Bun.spawn(["git", ...args], {
 		cwd,
@@ -40,7 +38,6 @@ async function gitRun(cwd: string, args: string[]): Promise<string> {
 
 async function makeRepo(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bisect-"));
-	tempRoots.push(dir);
 	await gitRun(dir, ["init", "-q"]);
 	await gitRun(dir, ["config", "user.email", "test@example.com"]);
 	await gitRun(dir, ["config", "user.name", "Bisect Test"]);
@@ -58,12 +55,16 @@ async function commitFlag(cwd: string, content: string, message: string): Promis
 	return gitRun(cwd, ["rev-parse", "HEAD"]);
 }
 
-afterEach(async () => {
-	while (tempRoots.length > 0) {
-		const dir = tempRoots.pop()!;
-		await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
-	}
-});
+function itWithRepo(name: string, run: (repo: string) => Promise<void>): void {
+	it(name, async () => {
+		const repo = await makeRepo();
+		try {
+			await run(repo);
+		} finally {
+			await fs.rm(repo, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+}
 
 // ── pure helpers ─────────────────────────────────────────────────────────────
 
@@ -165,8 +166,7 @@ describe("runBisectController", () => {
 // ── integration against a real repository ────────────────────────────────────
 
 describe("BisectTool.execute", () => {
-	it("finds the first bad commit and restores the worktree", async () => {
-		const repo = await makeRepo();
+	itWithRepo("finds the first bad commit and restores the worktree", async repo => {
 		const good = await commitFlag(repo, "PASS\n", "c0 baseline");
 		await commitFlag(repo, "PASS\n", "c1 still ok");
 		const bug = await commitFlag(repo, "FAIL\n", "c2 introduce bug");
@@ -192,8 +192,7 @@ describe("BisectTool.execute", () => {
 		expect(await Bun.file(path.join(repo, ".git", "BISECT_LOG")).exists()).toBe(false);
 	});
 
-	it("finds the fixing commit in invert mode", async () => {
-		const repo = await makeRepo();
+	itWithRepo("finds the fixing commit in invert mode", async repo => {
 		const broken = await commitFlag(repo, "FAIL\n", "c0 broken");
 		await commitFlag(repo, "FAIL\n", "c1 broken");
 		const fix = await commitFlag(repo, "PASS\n", "c2 fix");
@@ -212,8 +211,7 @@ describe("BisectTool.execute", () => {
 		expect(result.details?.culprit).toBe(fix);
 	});
 
-	it("restores tracked files that the predicate modified", async () => {
-		const repo = await makeRepo();
+	itWithRepo("restores tracked files that the predicate modified", async repo => {
 		// sentinel.txt is committed once and never changes across commits, so a
 		// local edit to it is carried across every candidate checkout instead of
 		// blocking bisect — leaving it dirty at teardown unless the tool cleans up.
@@ -242,8 +240,7 @@ describe("BisectTool.execute", () => {
 		expect(await Bun.file(path.join(repo, "sentinel.txt")).text()).toBe("base\n");
 	});
 
-	it("restores the repo when invoked from a subdirectory a candidate deletes", async () => {
-		const repo = await makeRepo();
+	itWithRepo("restores the repo when invoked from a subdirectory a candidate deletes", async repo => {
 		// good + HEAD contain sub/, but the intermediate first-bad commit deletes
 		// it — so a naive tool running from repo/sub would lose its cwd mid-bisect.
 		await fs.mkdir(path.join(repo, "sub"), { recursive: true });
@@ -278,8 +275,7 @@ describe("BisectTool.execute", () => {
 		expect(await Bun.file(path.join(repo, "sub", "keep.txt")).exists()).toBe(true);
 	});
 
-	it("restores from a subdirectory even when the run does not converge (failure path)", async () => {
-		const repo = await makeRepo();
+	itWithRepo("restores from a subdirectory even when the run does not converge (failure path)", async repo => {
 		await fs.mkdir(path.join(repo, "sub"), { recursive: true });
 		await fs.writeFile(path.join(repo, "sub", "keep.txt"), "keep\n");
 		const good = await commitFlag(repo, "PASS\n", "c0 baseline (sub present)");
@@ -312,8 +308,7 @@ describe("BisectTool.execute", () => {
 		expect(await Bun.file(path.join(repo, "sub", "keep.txt")).exists()).toBe(true);
 	});
 
-	it("rejects a dirty working tree", async () => {
-		const repo = await makeRepo();
+	itWithRepo("rejects a dirty working tree", async repo => {
 		const good = await commitFlag(repo, "ok\n", "c0");
 		await commitFlag(repo, "broken\n", "c1");
 		await fs.writeFile(path.join(repo, "flag.txt"), "uncommitted\n");
@@ -330,8 +325,7 @@ describe("BisectTool.execute", () => {
 		).rejects.toThrow(/uncommitted/i);
 	});
 
-	it("rejects when good is not an ancestor of bad", async () => {
-		const repo = await makeRepo();
+	itWithRepo("rejects when good is not an ancestor of bad", async repo => {
 		const older = await commitFlag(repo, "ok\n", "c0");
 		const newer = await commitFlag(repo, "ok\n", "c1");
 
@@ -349,18 +343,20 @@ describe("BisectTool.execute", () => {
 
 	it("rejects outside a git repository", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-bisect-nogit-"));
-		tempRoots.push(dir);
-
-		await expect(
-			new BisectTool(session(dir)).execute("call", {
-				good: "HEAD",
-				bad: "HEAD",
-				run: "true",
-				invert: false,
-				maxSteps: 40,
-				stepTimeoutMs: 60_000,
-			}),
-		).rejects.toThrow(/git repository/i);
+		try {
+			await expect(
+				new BisectTool(session(dir)).execute("call", {
+					good: "HEAD",
+					bad: "HEAD",
+					run: "true",
+					invert: false,
+					maxSteps: 40,
+					stepTimeoutMs: 60_000,
+				}),
+			).rejects.toThrow(/git repository/i);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 
