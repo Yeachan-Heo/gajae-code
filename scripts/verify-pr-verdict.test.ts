@@ -297,6 +297,40 @@ describe("maintainer self-review comment gate (issue #4703)", () => {
 		expect(result.diagnostics.join("\n")).toContain("not backed by an authenticated");
 	});
 
+	test("external contributor: a distinct external author cannot use the self-review path", () => {
+		// Distinct external author (not the repo owner), body names that external
+		// author as reviewer-id, and the author posts their own signed comment.
+		const externalAuthor = "external-contrib";
+		const record = `gajae.pr-self-review.v1 verdict:merge-approved base:${base} head:${head} sha256:${digest} reviewer-id:${externalAuthor} risk:low-risk extra:none evidence:external contributor attempt`;
+		const payload = selfReviewSignedPayload({ verdict: "merge-approved", baseSha: base, headSha: head, diffSha256: digest, reviewerId: externalAuthor, risk: "low-risk", extra: { kind: "none" }, evidence: "external contributor attempt" });
+		const body = `${record}\nself-review-signature: sha256:${selfReviewSignature(payload)}\nSigned-off-by: gaebal-gajae (clawdbot) 🦞`;
+		const externalSelfApproved = approved.replace("reviewer-id:review-agent", `reviewer-id:${externalAuthor}`);
+		const externalBody = `## GJC verdict\n\n${externalSelfApproved}\n`;
+		// Non-owner association (NONE / CONTRIBUTOR) fails closed.
+		for (const association of ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"]) {
+			const result = validatePrContract(validInput({
+				body: externalBody,
+				authorLogin: externalAuthor,
+				selfReviewComment: { login: externalAuthor, authorAssociation: association, body },
+			}));
+			expect(result.ok).toBe(false);
+			expect(result.diagnostics.join("\n")).toContain("not the repository owner");
+		}
+		// Even a MEMBER/COLLABORATOR cannot self-review; only the owner account may.
+		const member = validatePrContract(validInput({
+			body: externalBody,
+			authorLogin: externalAuthor,
+			selfReviewComment: { login: externalAuthor, authorAssociation: "MEMBER", body },
+		}));
+		expect(member.ok).toBe(false);
+		expect(member.diagnostics.join("\n")).toContain("not the repository owner");
+		// Without any comment, the external author still needs an authenticated
+		// approving GitHub review from a repository maintainer.
+		const noComment = validatePrContract(validInput({ body: externalBody, authorLogin: externalAuthor, selfReviewComment: null }));
+		expect(noComment.ok).toBe(false);
+		expect(noComment.diagnostics.join("\n")).toContain("not backed by an authenticated");
+	});
+
 	test("parseSelfReview rejects duplicate records and missing footer", () => {
 		const comment = selfReviewComment().body;
 		expect(parseSelfReview(`${comment}\n${comment}`).diagnostics.join("\n")).toContain("keep exactly one");
@@ -428,7 +462,7 @@ test("workflow is trusted-default-branch-controlled, read-only, exact-head, and 
 test("workflow re-runs the trusted validator on maintainer self-review comment events", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(workflow).toContain("issue_comment:");
-	expect(workflow).toContain("types: [created, edited]");
+	expect(workflow).toContain("types: [created, edited, deleted]");
 	// Comment bytes are workflow input only; the validator still runs from the immutable
 	// base checkout and never executes head-controlled code.
 	expect(workflow).toContain('bun --no-env-file --config="$empty_bunfig" "$trusted_root/scripts/verify-pr-verdict.ts"');
@@ -437,6 +471,23 @@ test("workflow re-runs the trusted validator on maintainer self-review comment e
 	const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
 	expect(source).toContain("/issues/${number}/comments");
 	expect(source).toContain("author_association");
+});
+
+test("comment-triggered validation publishes a head-bound status and skips non-PR comments", async () => {
+	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
+	// issue_comment runs associate with the default-branch SHA; the resolved exact
+	// PR head must carry the durable authorization/revocation record instead.
+	expect(workflow).toContain("/statuses/${head_sha}");
+	expect(workflow).toContain("PR contract (self-review)");
+	expect(workflow).toContain("statuses: write");
+	// Revocation: deleting the sole authorizing comment must re-evaluate and the
+	// head-bound status flips to failure when no valid record remains.
+	expect(workflow).toContain("types: [created, edited, deleted]");
+	// Ordinary issues are not pull requests: the resolve step must skip cleanly
+	// instead of failing the job on the 404.
+	expect(workflow).toContain('if ! pr_json="$(gh api "repos/${{ github.repository }}/pulls/${number}" 2>/dev/null)"; then');
+	// A trusted base that predates self-review validation can never authorize.
+	expect(workflow).toContain("predates self-review validation");
 });
 
 test("issue_comment events cannot launch or cancel the affected Dev CI pipeline", async () => {
@@ -520,6 +571,10 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("not the repository owner");
 	expect(workflow).toContain("does not match the PR body risk classification");
 	expect(workflow).toContain("names the PR author; the independent reviewer must be a distinct maintainer");
+	// Bootstrap/canonical parity (review P1): the mirror rejects duplicate-record,
+	// multi-signature, and missing-footer comments exactly like the canonical parser.
+	expect(workflow).toContain("exactly one record, signature, and footer line");
+	expect(workflow).toContain('footerLines = lines.filter(line => line === "Signed-off-by: gaebal-gajae (clawdbot) 🦞")');
 });
 
 test("review events cannot launch or cancel the affected Dev CI pipeline", async () => {

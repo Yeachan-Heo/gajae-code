@@ -26,6 +26,11 @@ export const JOB_WRITE_ALLOWLIST: readonly { workflow: string; job: string; scop
 	// short-lived registry credential. It grants nothing in this repository, and
 	// it is what removes the long-lived NPM_TOKEN from the release path.
 	{ workflow: ".github/workflows/ci.yml", job: "publish", scope: "id-token" },
+	// PR contract validation publishes a head-bound commit status for
+	// issue_comment-triggered runs (issue #4703): the comment event's own check
+	// associates with the default-branch SHA, so the durable authorization and its
+	// revocation must be recorded on the resolved exact PR head.
+	{ workflow: ".github/workflows/pr-validation.yml", job: "validate", scope: "statuses" },
 ];
 
 export const REQUIRED_READ_DEFAULT: readonly string[] = [

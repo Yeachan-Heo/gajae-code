@@ -351,16 +351,19 @@ interface IssueComment {
 
 /**
  * Fetch every issue comment on the PR through the trusted workflow token and return the
- * newest comment that carries a self-review record. Only GitHub API data is trusted:
- * the PR body and head-controlled code are never parsed as a self-review source.
+ * newest comment that carries a self-review record from the eligible identity (the PR
+ * author — the only login the self-review path can authorize). Only GitHub API data is
+ * trusted: the PR body and head-controlled code are never parsed as a self-review source.
  * All pages are scanned before selecting the newest candidate so an old stale record
- * can never shadow a newer one, and any API failure fails closed (issue #4703).
+ * can never shadow a newer one; comments from other identities are ignored entirely so
+ * an outsider's malformed or stale record cannot poison an independently reviewed PR.
+ * Any API failure fails closed (issue #4703).
  */
-async function fetchSelfReviewComment(event: PullRequestEvent): Promise<AuthenticatedSelfReviewComment | null> {
+async function fetchSelfReviewComment(event: PullRequestEvent, authorLogin: string): Promise<AuthenticatedSelfReviewComment | null> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
 	const token = Bun.env.GITHUB_TOKEN;
-	if (!repository || !number || !token) return null;
+	if (!repository || !number || !token || !authorLogin) return null;
 	let newest: IssueComment | null = null;
 	for (let page = 1; ; page++) {
 		const response = await fetch(`https://api.github.com/repos/${repository}/issues/${number}/comments?per_page=100&page=${page}`, {
@@ -373,6 +376,7 @@ async function fetchSelfReviewComment(event: PullRequestEvent): Promise<Authenti
 		if (!response.ok) throw new Error(`Issue comments API failed: ${response.status}; failing closed instead of skipping the self-review gate.`);
 		const comments = await response.json() as IssueComment[];
 		for (const comment of comments) {
+			if (comment.user?.login?.toLowerCase() !== authorLogin.toLowerCase()) continue;
 			if ((comment.body ?? "").split(/\r?\n/u).some(line => line.trim().startsWith(SELF_REVIEW_PREFIX))) newest = comment;
 		}
 		if (comments.length < 100) break;
@@ -552,7 +556,10 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 	const approval = parsed.verdict?.verdict === "merge-approved"
 		? await authenticatedApproval(event, parsed.verdict.reviewerId, headSha)
 		: {};
-	const selfReviewComment = await fetchSelfReviewComment(event);
+	const selfReviewComment = parsed.verdict?.verdict === "merge-approved"
+		&& parsed.verdict.reviewerId.toLowerCase() === authorLogin.toLowerCase()
+		? await fetchSelfReviewComment(event, authorLogin)
+		: null;
 	const bodyRisk = parseBodyRisk(body);
 	const independentLogin = selfReviewComment ? independentReviewerLogin(selfReviewComment.body) : null;
 	const independentReviewer = independentLogin && selfReviewComment?.login.toLowerCase() === authorLogin.toLowerCase()

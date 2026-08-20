@@ -122,8 +122,14 @@ jobs:
               // Newest record wins: iterate newest-first and stop at the first valid one.
               for (const comment of candidates.reverse()) {
                 const lines = (comment.body ?? "").split(/\r?\n/).map(line => line.trim());
-                const recordMatch = recordPattern.exec(lines.find(line => line.startsWith("gajae.pr-self-review.v1")) ?? "");
-                const signatureMatch = signaturePattern.exec(lines.find(line => signaturePattern.test(line)) ?? "");
+                // Parity with the canonical parser: exactly one record, one signature,
+                // and one signed-off-by footer line per comment (issue #4703 review P1).
+                const recordLines = lines.filter(line => line.startsWith("gajae.pr-self-review.v1"));
+                const signatureLines = lines.filter(line => signaturePattern.test(line));
+                const footerLines = lines.filter(line => line === "Signed-off-by: gaebal-gajae (clawdbot) 🦞");
+                if (recordLines.length !== 1 || signatureLines.length !== 1 || footerLines.length !== 1) throw new Error(`Self-review comment must contain exactly one record, signature, and footer line; found ${recordLines.length}/${signatureLines.length}/${footerLines.length}.`);
+                const recordMatch = recordPattern.exec(recordLines[0]);
+                const signatureMatch = signaturePattern.exec(signatureLines[0]);
                 if (!recordMatch || !signatureMatch) throw new Error("Self-review comment present but malformed or unsigned; refusing self-approval.");
                 const [, sVerdict, sBase, sHead, sDigest, sReviewer, sRisk, sExtra, sEvidence] = recordMatch;
                 const payload = [`gajae.pr-self-review.v1 verdict:${sVerdict}`, `base:${sBase}`, `head:${sHead}`, `sha256:${sDigest}`, `reviewer-id:${sReviewer}`, `risk:${sRisk}`, `extra:${sExtra}`, `evidence:${sEvidence}`].join("\n");
