@@ -435,6 +435,8 @@ export function needsDarwinArm64TabWorkerSmoke(paths: readonly string[]): boolea
 // windows-latest job whenever any of these change.
 export function isWindowsSessionPathRegressionPath(changedPath: string): boolean {
 	return (
+		changedPath === "packages/coding-agent/src/sdk/broker/lifecycle.ts" ||
+		changedPath === "packages/coding-agent/src/commands/sdk.ts" ||
 		changedPath === "packages/coding-agent/src/session/internal/managed-session-scope.ts" ||
 		changedPath === "packages/coding-agent/src/session/internal/managed-session-storage.ts" ||
 		changedPath === "packages/coding-agent/src/session/blob-store.ts" ||
@@ -445,6 +447,7 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/test/session/managed-lock-lease.windows.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-session-directory.windows.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts" ||
+		changedPath === "packages/coding-agent/test/sdk-lifecycle-ready-then-exit.test.ts" ||
 		changedPath === "packages/coding-agent/test/sdk-session-index-lock-contention.test.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/broker/process-incarnation.ts" ||
 		changedPath === "packages/coding-agent/src/config/file-lock.ts" ||

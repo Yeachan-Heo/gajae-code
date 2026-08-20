@@ -2143,14 +2143,17 @@ async function hasPublishedReadyAuthority(
 		readEffectMarker(lifecycleReadyPath(root, id)),
 	]);
 	if (!effect || !ready || !sameEffectMarker(effect, expected) || !sameEffectMarker(ready, expected)) return false;
+	let endpoint: { sessionId?: unknown; pid?: unknown };
 	try {
-		const endpoint = JSON.parse(await fs.readFile(path.join(root, "sdk", `${id}.json`), "utf8")) as {
+		endpoint = JSON.parse(await fs.readFile(path.join(root, "sdk", `${id}.json`), "utf8")) as {
 			sessionId?: unknown;
 			pid?: unknown;
 		};
-		return endpoint.pid === expected.pid && endpoint.sessionId === id;
-	} catch {
-		if (!index) return false;
+	} catch (error) {
+		// Only a missing endpoint means "gracefully removed"; anything else (EACCES,
+		// EIO, malformed JSON) is its own condition and must not silently route the
+		// teardown decision to the secondary authority.
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !index) return false;
 		const sessionIndex = index.index;
 		await sessionIndex.refresh();
 		return sessionIndex
@@ -2162,6 +2165,7 @@ async function hasPublishedReadyAuthority(
 					(session.hostIncarnation ?? session.processIncarnation) === expected.incarnation,
 			);
 	}
+	return endpoint.pid === expected.pid && endpoint.sessionId === id;
 }
 
 export function sanitizeSessionHostSpawnLogForTest(value: string): string {

@@ -238,7 +238,7 @@ test("lifecycle service certainty for ready_then_exited is terminal, not retryab
 		actor: { id: "tester", namespace: "local" },
 		capability: "session.create",
 		requestKey: "certainty-rte",
-		target: { cwd: "/tmp" },
+		target: { cwd: process.env.TMPDIR ?? "/tmp" },
 	});
 	expect(outcome.ok).toBe(false);
 	if (outcome.ok) throw new Error("expected failure");

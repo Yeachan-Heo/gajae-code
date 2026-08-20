@@ -415,6 +415,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/coding-agent/test/sdk-lifecycle-ready-then-exit.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/natives/test/windows-avx2-probe.windows.test.ts --timeout 10000
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/utils/test/env-provenance.windows.test.ts
