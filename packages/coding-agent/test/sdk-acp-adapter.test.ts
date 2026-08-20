@@ -689,7 +689,7 @@ test("the production ACP MCP launch path preserves broker admission timeout fail
 				signal: controller.signal,
 				closed: Promise.withResolvers<void>().promise,
 			} as unknown as AgentSideConnection,
-			{ agentDir },
+			{ agentDir, expectedPackageGeneration: "test" },
 		);
 		await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
 		await expect(

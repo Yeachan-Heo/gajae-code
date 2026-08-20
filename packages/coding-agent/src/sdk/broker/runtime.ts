@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import internalSourceMarker from "./internal-source-marker-2178.txt" with { type: "file" };
@@ -11,6 +12,12 @@ export type SdkInternalSpawnCommand =
 			args: string[];
 			env: NodeJS.ProcessEnv;
 			cwd: string;
+			/**
+			 * Stable digest of the package tree this descriptor would spawn. A live
+			 * broker publishing a different generation predates the current install
+			 * and must not be reused (see ensure.ts).
+			 */
+			generation: string;
 	  }
 	| {
 			kind: "compiled";
@@ -18,6 +25,7 @@ export type SdkInternalSpawnCommand =
 			args: string[];
 			env: NodeJS.ProcessEnv;
 			cwd?: undefined;
+			generation: string;
 	  };
 
 type EmbeddedFile = Blob | { name: string };
@@ -73,15 +81,41 @@ function internalEnvironment(environment: NodeJS.ProcessEnv, source: boolean): N
 	}
 	return isolated;
 }
-function expectedPackageName(packageDirectory: string): void {
+function expectedPackageIdentity(packageDirectory: string): string {
 	try {
 		const manifest = JSON.parse(fs.readFileSync(path.join(packageDirectory, "package.json"), "utf8")) as {
 			name?: unknown;
+			version?: unknown;
 		};
 		if (manifest.name !== "@gajae-code/coding-agent") throw new Error("unexpected package name");
+		if (typeof manifest.version !== "string" || manifest.version.length === 0)
+			throw new Error("unexpected package version");
+		return manifest.version;
 	} catch {
 		throw new Error("SDK internal launch refused: product package identity is invalid.");
 	}
+}
+
+/**
+ * Digest of the exact on-disk package a descriptor would spawn. File mtimes cover
+ * same-version replacement (binary rebuild, in-place reinstall); the manifest
+ * version covers package managers that preserve tarball mtimes. In-memory code
+ * vintage is deliberately not an input: a process that outlived an upgrade must
+ * still compute the SAME value a freshly spawned broker publishes, or every
+ * ensure would retire a current broker.
+ */
+function sdkPackageGeneration(kind: SdkInternalSpawnCommand["kind"], version: string, files: string[]): string {
+	const hash = createHash("sha256");
+	hash.update(kind);
+	hash.update("\0");
+	hash.update(version);
+	for (const file of files) {
+		const stat = fs.statSync(file, { bigint: true });
+		hash.update("\0");
+		hash.update(file);
+		hash.update(`:${stat.size}:${stat.mtimeNs}`);
+	}
+	return hash.digest("hex");
 }
 
 function sourceDescriptor(
@@ -107,7 +141,7 @@ function sourceDescriptor(
 	const canonicalBrokerDirectory = fs.realpathSync(brokerDirectory);
 	const canonicalPackageDirectory = fs.realpathSync(packageDirectory);
 	const canonicalSourceDirectory = fs.realpathSync(sourceDirectory);
-	expectedPackageName(canonicalPackageDirectory);
+	const packageVersion = expectedPackageIdentity(canonicalPackageDirectory);
 	if (
 		!containedPath(canonicalPackageDirectory, canonicalBrokerDirectory) ||
 		!containedPath(canonicalPackageDirectory, canonicalSourceDirectory) ||
@@ -122,6 +156,7 @@ function sourceDescriptor(
 		args: ["--no-env-file", `--config=${config}`, cli, "sdk", action],
 		env: internalEnvironment(options.environment ?? process.env, true),
 		cwd: canonicalBrokerDirectory,
+		generation: sdkPackageGeneration("bun-source", packageVersion, [cli, config]),
 	};
 }
 
@@ -145,6 +180,7 @@ function resolveSdkInternalSpawnCommandWithEvidence(
 			file: executable,
 			args: ["sdk", action],
 			env: internalEnvironment(options.environment ?? process.env, false),
+			generation: sdkPackageGeneration("compiled", "binary", [executable]),
 		};
 	}
 	throw new Error("SDK internal launch refused: compiled-runtime marker evidence is inconsistent.");
@@ -153,6 +189,11 @@ function resolveSdkInternalSpawnCommandWithEvidence(
 /** Resolve the production descriptor from the statically imported marker and current Bun runtime evidence. */
 export function resolveSdkInternalSpawnCommand(action: SdkInternalAction): SdkInternalSpawnCommand {
 	return resolveSdkInternalSpawnCommandWithEvidence(action, {});
+}
+
+/** Resolve the generation the production descriptor would publish, without spawning. */
+export function resolveSdkPackageGeneration(): string {
+	return resolveSdkInternalSpawnCommand("broker-internal").generation;
 }
 
 /** Test hook: injects runtime evidence without weakening the production marker authority. */

@@ -53,7 +53,7 @@ async function createAgent(): Promise<AcpAgent> {
 		closed: Promise.withResolvers<void>().promise,
 	} as unknown as AgentSideConnection;
 
-	return new AcpAgent(connection, { agentDir });
+	return new AcpAgent(connection, { agentDir, expectedPackageGeneration: "test" });
 }
 
 function buildInitializeRequest(overrides: Partial<InitializeRequest> = {}): InitializeRequest {

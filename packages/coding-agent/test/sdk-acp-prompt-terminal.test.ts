@@ -247,6 +247,7 @@ async function createFixture(
 			...(options.cancelSettlementGraceMs === undefined
 				? {}
 				: { cancelSettlementGraceMs: options.cancelSettlementGraceMs }),
+			expectedPackageGeneration: "test",
 		},
 	);
 	const created = await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session");

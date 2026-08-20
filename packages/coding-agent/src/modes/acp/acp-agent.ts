@@ -49,6 +49,7 @@ import {
 import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
+import { resolveSdkPackageGeneration } from "../../sdk/broker/runtime";
 import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
@@ -1171,6 +1172,7 @@ export async function applyAcpStartupOptions(
 export class AcpAgent implements Agent {
 	readonly #connection: AgentSideConnection;
 	readonly #agentDir: string;
+	readonly #expectedPackageGeneration: string;
 	readonly #router: SessionRouter;
 	readonly #pendingRouterAdapters = new Map<string, AcpSdkAdapter>();
 	readonly #pendingRouterFrames = new Map<string, Record<string, unknown>[]>();
@@ -1202,12 +1204,22 @@ export class AcpAgent implements Agent {
 					startupOptions?: AcpStartupOptions;
 					cancelSettlementGraceMs?: number;
 					promptWatchdogClock?: PromptWatchdogClock;
+					/**
+					 * Broker generation this agent retires on sight (see ensure.ts). Tests
+					 * pin the fixture broker's generation so their in-process broker is
+					 * never recycled; production resolves the live package generation.
+					 */
+					expectedPackageGeneration?: string;
 			  }
 			| unknown,
 	) {
 		this.#connection = connection;
 		const candidate = object(options);
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
+		this.#expectedPackageGeneration =
+			typeof candidate?.expectedPackageGeneration === "string"
+				? candidate.expectedPackageGeneration
+				: resolveSdkPackageGeneration();
 		this.#router = new SessionRouter({
 			agentDir: this.#agentDir,
 			deps: {
@@ -2376,7 +2388,10 @@ export class AcpAgent implements Agent {
 		if (!this.#broker) {
 			let pending!: Promise<BrokerConnection>;
 			pending = (async () => {
-				await ensureBroker({ agentDir: this.#agentDir });
+				await ensureBroker({
+					agentDir: this.#agentDir,
+					expectedPackageGeneration: this.#expectedPackageGeneration,
+				});
 				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
 				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });

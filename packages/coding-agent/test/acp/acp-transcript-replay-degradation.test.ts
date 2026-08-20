@@ -276,7 +276,7 @@ describe("ACP transcript replay degradation", () => {
 			signal: connectionAbort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection;
-		const acp = new AcpAgent(connection, { agentDir });
+		const acp = new AcpAgent(connection, { agentDir, expectedPackageGeneration: "test" });
 		agent = acp;
 		const created = await bounded(acp.newSession({ cwd, mcpServers: [] }), "new session");
 		await waitFor(

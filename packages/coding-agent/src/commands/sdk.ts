@@ -25,6 +25,7 @@ import {
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
+import { resolveSdkPackageGeneration } from "../sdk/broker/runtime";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkSessionCli } from "../sdk/cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
@@ -938,6 +939,9 @@ export default class Sdk extends Command {
 		const agentDir = internal.agentDir;
 		const broker = new Broker({
 			agentDir,
+			// Published in broker discovery so ensurers can retire a broker that
+			// predates the current package install instead of reusing stale code.
+			packageGeneration: resolveSdkPackageGeneration(),
 			resolveDirectoryMigration: async cwd => {
 				const policy = (await Settings.loadForScope({ cwd, agentDir })).get("session.directoryMigration");
 				return policy === "disabled" ? "disabled" : "copy-retain";

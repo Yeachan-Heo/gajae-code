@@ -145,7 +145,10 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 	});
 
 	const abort = new AbortController();
-	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, { agentDir });
+	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
+		agentDir,
+		expectedPackageGeneration: "test",
+	});
 	const result = await agent.extMethod("_gjc/sdk/global", { operation: "session.list" });
 
 	expect(result).toMatchObject({ ok: true, result: { sessions: [] } });
@@ -175,6 +178,7 @@ test("production ACP drains session.list continuation pages before returning ses
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
 		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
 	});
 	try {
 		const listed = await agent.listSessions({});
@@ -195,6 +199,7 @@ test("production ACP rejects an ok:false session.list continuation instead of re
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
 		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
 	});
 	try {
 		await expect(agent.listSessions({})).rejects.toMatchObject({
@@ -215,6 +220,7 @@ test("production ACP rejects repeated session.list cursors without returning par
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
 		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
 	});
 	try {
 		await expect(agent.listSessions({})).rejects.toMatchObject({
@@ -236,6 +242,7 @@ test("production ACP rejects malformed session.list continuation pages without p
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
 		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
 	});
 	try {
 		await expect(agent.listSessions({})).rejects.toMatchObject({
@@ -663,7 +670,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			signal: controller.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
-		{ agentDir, startupOptions: { modelPreset: "codex-medium" } },
+		{ agentDir, startupOptions: { modelPreset: "codex-medium" }, expectedPackageGeneration: "test" },
 	);
 	const initialized = await bounded(agent.initialize({ protocolVersion: 1, clientCapabilities: {} }), "initialize");
 	// Legacy MCP HTTP+SSE is deprecated and unimplemented, so it must not be advertised.
@@ -1220,7 +1227,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	).rejects.toMatchObject({ code: "unsupported" });
 
 	const observerAbort = new AbortController();
-	const observer = new AcpAgent({ signal: observerAbort.signal } as unknown as AgentSideConnection, { agentDir });
+	const observer = new AcpAgent({ signal: observerAbort.signal } as unknown as AgentSideConnection, {
+		agentDir,
+		expectedPackageGeneration: "test",
+	});
 	await bounded(observer.listSessions({}), "observer list");
 	const brokerRequestCount = brokerRequests.length;
 	expect(await bounded(observer.closeSession({ sessionId: created.sessionId }), "observer close")).toEqual({});

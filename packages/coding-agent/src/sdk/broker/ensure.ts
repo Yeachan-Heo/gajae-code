@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { SdkClient } from "../client/client";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
@@ -15,6 +16,13 @@ export interface EnsureBrokerSettings {
 	 * broker and the child that attaches to it share one owned root.
 	 */
 	env?: NodeJS.ProcessEnv;
+	/**
+	 * Generation of the package this process would spawn (see runtime.ts). A live
+	 * broker publishing a different generation predates the current install — it
+	 * loaded its code before the package was replaced — and is retired before a
+	 * fresh broker is spawned. Omitted: any live broker is reused unchanged.
+	 */
+	expectedPackageGeneration?: string;
 }
 
 const DISCOVERY_TIMEOUT_MS = 10_000;
@@ -285,6 +293,51 @@ function createFixtureLease(owner: BrokerOwner, child: ChildProcess): ExactFixtu
 	return createFixtureLeaseFromChild(child, () => owner.stop());
 }
 
+/**
+ * Grace window for a stale-generation broker to exit after its shutdown request.
+ * Kept short: the caller is mid-launch and a wedged broker must degrade to reuse,
+ * not block the spawn path.
+ */
+const STALE_BROKER_SHUTDOWN_TIMEOUT_MS = 2_000;
+
+/**
+ * Stop a live broker whose published generation differs from the package this
+ * process would spawn. The authenticated `broker.shutdown` op is tried first;
+ * brokers that predate the op (or fail transport) take an identity-fenced
+ * SIGTERM instead. Best-effort: on any failure the caller falls back to reusing
+ * whatever discovery still advertises, which is exactly the pre-recycle
+ * behavior, so availability never regresses.
+ */
+async function retireStaleBroker(agentDir: string, stale: BrokerDiscovery, heartbeatTtlMs?: number): Promise<void> {
+	try {
+		const client = await SdkClient.connect(stale.url, stale.token, {
+			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
+			reconnectAttempts: 0,
+		});
+		try {
+			await client.global("broker.shutdown", {});
+		} finally {
+			await client.close().catch(() => {});
+		}
+	} catch {
+		// RPC unreachable or unknown_operation (broker predates the shutdown op):
+		// signal the published identity only when the pid still proves it.
+		if (brokerProcessIncarnation(stale.pid) === stale.incarnation) {
+			try {
+				process.kill(stale.pid, "SIGTERM");
+			} catch {
+				// raced the broker's own exit
+			}
+		}
+	}
+	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+		if (!current || current.pid !== stale.pid || current.incarnation !== stale.incarnation) return;
+		await sleep(50);
+	}
+}
+
 async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: EnsureInitiator): Promise<EnsureOutcome> {
 	const priorOwner = owners.get(settings.agentDir);
 	const existing = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
@@ -297,7 +350,15 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 		if (discoveredAfterCleanup) return { kind: "external-discovery", discovery: discoveredAfterCleanup };
 	} else if (existing) {
-		return { kind: "external-discovery", discovery: existing };
+		const stale =
+			settings.expectedPackageGeneration !== undefined &&
+			existing.packageGeneration !== settings.expectedPackageGeneration;
+		if (!stale) return { kind: "external-discovery", discovery: existing };
+		await retireStaleBroker(settings.agentDir, existing, settings.heartbeatTtlMs);
+		// Reuse whatever now owns discovery: a concurrent ensurer's fresh broker,
+		// or the stale one itself when retirement did not complete.
+		const afterRetire = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		if (afterRetire) return { kind: "external-discovery", discovery: afterRetire };
 	}
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");

@@ -155,6 +155,7 @@ it("isolates source SDK children and preserves compiled self-spawn", () => {
 		file: process.execPath,
 		args: ["sdk", "session-host-internal"],
 		env: { PATH: process.env.PATH, PI_COMPILED: "spoofed" },
+		generation: expect.any(String),
 	});
 	expect(compiled.env.BUN_OPTIONS).toBeUndefined();
 	const windowsMarkerPath = "C:/~BUN/root/internal-source-marker-2178-abcd.txt";
@@ -170,6 +171,7 @@ it("isolates source SDK children and preserves compiled self-spawn", () => {
 		file: process.execPath,
 		args: ["sdk", "broker-internal"],
 		env: { PATH: process.env.PATH, PI_COMPILED: "spoofed" },
+		generation: expect.any(String),
 	});
 });
 

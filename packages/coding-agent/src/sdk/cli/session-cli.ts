@@ -3,6 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
+import { resolveSdkPackageGeneration } from "../broker/runtime";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
@@ -336,7 +337,7 @@ type SessionRows = {
 };
 
 async function sessionRows(agentDir: string): Promise<SessionRows> {
-	await ensureBroker({ agentDir });
+	await ensureBroker({ agentDir, expectedPackageGeneration: resolveSdkPackageGeneration() });
 	return await withRouter(agentDir, async router => {
 		const response = await paginatedSessionList(router);
 		const result = resultObject(response) ?? {};
@@ -513,7 +514,7 @@ async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliA
 	if (inputRef === undefined) promptInput.clientRef = clientRef;
 	const invalid = validateAdapterControl("turn.prompt", promptInput);
 	if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
-	await ensureBroker({ agentDir });
+	await ensureBroker({ agentDir, expectedPackageGeneration: resolveSdkPackageGeneration() });
 
 	return await withRouter(agentDir, async router => {
 		const response = await requestControl(router, sessionId, "turn.prompt", promptInput, args);
@@ -546,7 +547,7 @@ async function runStatus(
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
 	assertClientRef(opRef);
-	await ensureBroker({ agentDir });
+	await ensureBroker({ agentDir, expectedPackageGeneration: resolveSdkPackageGeneration() });
 	return await withRouter(agentDir, async router => {
 		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef: opRef }, args);
 		const status = resultObject(response) ?? {};
@@ -1045,7 +1046,7 @@ async function runRawControl(
 ): Promise<unknown> {
 	const invalid = validateAdapterControl(operation, input);
 	if (invalid) throw new SdkSessionCliError(invalid.code, invalid.message, 2);
-	await ensureBroker({ agentDir });
+	await ensureBroker({ agentDir, expectedPackageGeneration: resolveSdkPackageGeneration() });
 	return await withRouter(agentDir, async router => await requestControl(router, sessionId, operation, input, args));
 }
 
@@ -1056,7 +1057,7 @@ async function runRawQuery(
 	input: JsonRecord,
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
-	await ensureBroker({ agentDir });
+	await ensureBroker({ agentDir, expectedPackageGeneration: resolveSdkPackageGeneration() });
 	return await withRouter(agentDir, async router => await requestQuery(router, sessionId, operation, input, args));
 }
 
@@ -1100,7 +1101,7 @@ async function runRawGlobal(
 	args: SdkSessionCliArgs,
 ): Promise<unknown> {
 	if (operation === "session.list") {
-		await ensureBroker({ agentDir });
+		await ensureBroker({ agentDir, expectedPackageGeneration: resolveSdkPackageGeneration() });
 		return await withRouter(agentDir, async router => await paginatedSessionList(router, input));
 	}
 	if (!isLifecycleOperation(operation))

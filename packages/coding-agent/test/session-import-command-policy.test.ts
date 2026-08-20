@@ -212,7 +212,7 @@ async function createAcpPromptFixture(): Promise<AcpPromptFixture> {
 			signal: abort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
-		{ agentDir },
+		{ agentDir, expectedPackageGeneration: "test" },
 	);
 	const created = await agent.newSession({ cwd, mcpServers: [] });
 	return {

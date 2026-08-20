@@ -201,7 +201,7 @@ describe("ACP production cancellation completion", () => {
 			signal: connectionAbort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection;
-		const acp = new AcpAgent(connection, { agentDir });
+		const acp = new AcpAgent(connection, { agentDir, expectedPackageGeneration: "test" });
 		const created = await bounded(acp.newSession({ cwd, mcpServers: [] }), "new session");
 		expect(created.configOptions).toEqual(
 			expect.arrayContaining([
@@ -315,6 +315,7 @@ describe("ACP request failure codes", () => {
 	function agent(): AcpAgent {
 		return new AcpAgent({ signal: connectionAbort.signal } as unknown as AgentSideConnection, {
 			agentDir: "/tmp",
+			expectedPackageGeneration: "test",
 		});
 	}
 

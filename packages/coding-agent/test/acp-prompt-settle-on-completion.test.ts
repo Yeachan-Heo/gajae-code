@@ -304,6 +304,7 @@ async function createFixture(
 			agentDir,
 			promptWatchdogClock: clock,
 			cancelSettlementGraceMs: options.cancelSettlementGraceMs ?? 5_000,
+			expectedPackageGeneration: "test",
 		},
 	);
 	const created = await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session");

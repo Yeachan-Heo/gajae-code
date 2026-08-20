@@ -1,5 +1,6 @@
 import { logger } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
+import { resolveSdkPackageGeneration } from "../broker/runtime";
 import { SdkClient } from "../client/client";
 import { readSdkBrokerDiscovery } from "../client/discovery";
 import {
@@ -22,7 +23,7 @@ export class AgentDirSessionLifecycleClient implements SessionLifecycleClient {
 		input: Record<string, unknown>,
 		options: SessionLifecycleClientRequestOptions,
 	): Promise<unknown> {
-		await ensureBroker({ agentDir: this.#agentDir });
+		await ensureBroker({ agentDir: this.#agentDir, expectedPackageGeneration: resolveSdkPackageGeneration() });
 		const discovery = await readSdkBrokerDiscovery(this.#agentDir);
 		if (!discovery) throw new Error("SDK broker discovery is unavailable.");
 		const client = await SdkClient.connect(discovery.url, discovery.token, {
