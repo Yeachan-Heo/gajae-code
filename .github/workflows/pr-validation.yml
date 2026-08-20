@@ -34,13 +34,14 @@ jobs:
     name: Validate exact-head PR contract
     runs-on: ubuntu-22.04
     timeout-minutes: 10
-    # Job-level least privilege: comment-triggered runs publish a head-bound commit
-    # status (statuses: write) so authorization/revocation is durable on the exact PR
-    # head; everything else stays read-only.
+    # Job-level least privilege: comment-triggered runs publish a head-bound check
+    # run under the required context name (checks: write) so authorization and
+    # revocation update the SAME required authority as pull_request_target runs;
+    # everything else stays read-only.
     permissions:
       contents: read
       pull-requests: read
-      statuses: write
+      checks: write
     steps:
       - name: Resolve PR head/base from the event or the comment's PR
         id: pr
@@ -119,12 +120,18 @@ jobs:
           cd "$trusted_root"
           bun --no-env-file --config="$empty_bunfig" "$trusted_root/scripts/verify-pr-verdict.ts" \
             --event "$GITHUB_EVENT_PATH" --repo "$repo_root" --trusted-root "$trusted_root"
-      - name: Publish head-bound contract status for comment-triggered validation
+      - name: Publish head-bound check result for comment-triggered validation
         # issue_comment runs are associated with the default-branch SHA, not the PR
-        # head. Publish an explicit commit status on the resolved exact head so the
-        # comment-triggered authorization (and its revocation, via the deleted event)
-        # is durably visible on the PR head itself. pull_request/pull_request_review
-        # runs already report head-bound job checks and do not need this.
+        # head. Create/update a CHECK RUN on the resolved exact head with the exact
+        # name of the required context ("Validate exact-head PR contract" in this
+        # "PR contract" workflow), so comment events — including deletion of the
+        # backing self-review record — publish to the SAME required authority the
+        # pull_request_target runs report. A parallel status context could never
+        # revoke a green required check; this can.
+        # Branch-protection rollout contract: once this lands, dev branch
+        # protection should require "PR contract / Validate exact-head PR contract"
+        # (strict); until protection is enabled, the Dev CI PR contract bootstrap
+        # job plus the verdict discipline remain the enforced path.
         if: ${{ always() && github.event_name == 'issue_comment' && steps.pr.outputs.skip != 'true' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -134,21 +141,26 @@ jobs:
           head_sha="${{ steps.pr.outputs.head_sha }}"
           base_sha="${{ steps.pr.outputs.base_sha }}"
           trusted_root="$PWD/trusted-base"
-          state="failure"
-          description="PR contract re-evaluated from comment event"
+          conclusion="failure"
+          summary="PR contract re-evaluated from a comment event"
           if [[ "${{ steps.validate.outcome }}" == "success" ]]; then
-            state="success"
-            description="PR contract valid at exact head (comment-triggered re-validation)"
+            conclusion="success"
+            summary="PR contract valid at exact head (comment-triggered re-validation)"
             # A trusted base that predates the self-review-aware validator cannot
             # authorize anything; never publish success for that case.
             if [[ -f "$trusted_root/scripts/verify-pr-verdict.ts" ]] \
               && ! grep -q "gajae.pr-self-review.v1" "$trusted_root/scripts/verify-pr-verdict.ts"; then
-              state="failure"
-              description="trusted base ${base_sha:0:10} predates self-review validation; bootstrap remains authoritative"
+              conclusion="failure"
+              summary="trusted base ${base_sha:0:10} predates self-review validation; bootstrap remains authoritative"
             fi
           fi
-          gh api --method POST "repos/${{ github.repository }}/statuses/${head_sha}" \
-            -f state="$state" \
-            -f context="PR contract (self-review)" \
-            -f description="$description" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          details_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh api --method POST "repos/${{ github.repository }}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -f name="Validate exact-head PR contract" \
+            -f head_sha="$head_sha" \
+            -f status="completed" \
+            -f conclusion="$conclusion" \
+            -f 'output[title]="PR contract (comment-triggered exact-head re-validation)"' \
+            -f "output[summary]=$summary" \
+            -f "details_url=$details_url"

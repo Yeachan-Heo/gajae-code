@@ -5,16 +5,16 @@ import * as path from "node:path";
 const SHA40 = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const VERDICT_PREFIX = "gajae.pr-review-verdict.v1";
-const VERDICT_PATTERN = /^gajae\.pr-review-verdict\.v1 (merge-approved|merge-blocked|needs-human) sha256:([0-9a-f]{64}) reviewer:(architect|critic|human) reviewer-id:([^\s]+) evidence:(.+)$/u;
+const VERDICT_PATTERN = /^gajae\.pr-review-verdict\.v1 (merge-approved|merge-self-approved|merge-blocked|needs-human) sha256:([0-9a-f]{64}) reviewer:(architect|critic|human) reviewer-id:([^\s]+) evidence:(.+)$/u;
 const SELF_REVIEW_PREFIX = "gajae.pr-self-review.v1";
-const SELF_REVIEW_PATTERN = /^gajae\.pr-self-review\.v1 verdict:(merge-approved|merge-blocked) base:([0-9a-f]{40}) head:([0-9a-f]{40}) sha256:([0-9a-f]{64}) reviewer-id:([^\s]+) risk:(low-risk|regression-risk|high-risk) extra:(none|gpt-heavy|independent:[^\s]+) evidence:(.+)$/u;
+const SELF_REVIEW_PATTERN = /^gajae\.pr-self-review\.v1 verdict:(merge-approved|merge-self-approved|merge-blocked) base:([0-9a-f]{40}) head:([0-9a-f]{40}) sha256:([0-9a-f]{64}) reviewer-id:([^\s]+) risk:(low-risk|regression-risk|high-risk) extra:(none|independent:[^\s]+) evidence:(.+)$/u;
 const SELF_REVIEW_SIGNATURE_PATTERN = /^self-review-signature: sha256:([0-9a-f]{64})$/u;
 const SELF_REVIEW_FOOTER = "Signed-off-by: gaebal-gajae (clawdbot) 🦞";
 
-export type PrVerdict = "merge-approved" | "merge-blocked" | "needs-human";
+export type PrVerdict = "merge-approved" | "merge-self-approved" | "merge-blocked" | "needs-human";
 export type ReviewerRole = "architect" | "critic" | "human";
 export type SelfReviewRisk = "low-risk" | "regression-risk" | "high-risk";
-export type SelfReviewExtra = { kind: "none" } | { kind: "gpt-heavy" } | { kind: "independent"; login: string };
+export type SelfReviewExtra = { kind: "none" } | { kind: "independent"; login: string };
 
 export interface ParsedPrVerdict {
 	verdict: PrVerdict;
@@ -25,7 +25,7 @@ export interface ParsedPrVerdict {
 }
 
 export interface ParsedSelfReview {
-	verdict: "merge-approved" | "merge-blocked";
+	verdict: "merge-approved" | "merge-self-approved" | "merge-blocked";
 	baseSha: string;
 	headSha: string;
 	diffSha256: string;
@@ -146,12 +146,10 @@ export function parseSelfReview(body: string): { selfReview?: ParsedSelfReview; 
 	const extraToken = match[7]!;
 	const extra: SelfReviewExtra = extraToken === "none"
 		? { kind: "none" }
-		: extraToken === "gpt-heavy"
-			? { kind: "gpt-heavy" }
-			: { kind: "independent", login: extraToken.slice("independent:".length) };
+		: { kind: "independent", login: extraToken.slice("independent:".length) };
 	return {
 		selfReview: {
-			verdict: match[1] as "merge-approved" | "merge-blocked",
+			verdict: match[1] as "merge-approved" | "merge-self-approved" | "merge-blocked",
 			baseSha: match[2]!,
 			headSha: match[3]!,
 			diffSha256: match[4]!,
@@ -166,16 +164,14 @@ export function parseSelfReview(body: string): { selfReview?: ParsedSelfReview; 
 }
 
 /**
- * Canonicalize a parsed self-review record into the exact signed payload: every bound
- * field in fixed order, then the evidence. The signature covers exactly these bytes,
- * so any field drift (stale head, forged verdict, edited evidence) breaks the signature.
+ * Canonicalize a parsed self-review record into the exact checksum payload: every bound
+ * field in fixed order, then the evidence. This is an INTEGRITY digest, not
+ * authentication: it proves the comment text matches what was posted for the bound
+ * head, exactly like the diff digest. Authorization never rests on it (issue #4703
+ * review: a self-issued hash cannot be an authorization control).
  */
 export function selfReviewSignedPayload(review: Omit<ParsedSelfReview, "signature">): string {
-	const extraToken = review.extra.kind === "none"
-		? "none"
-		: review.extra.kind === "gpt-heavy"
-			? "gpt-heavy"
-			: `independent:${review.extra.login}`;
+	const extraToken = review.extra.kind === "none" ? "none" : `independent:${review.extra.login}`;
 	return [
 		`${SELF_REVIEW_PREFIX} verdict:${review.verdict}`,
 		`base:${review.baseSha}`,
@@ -195,10 +191,12 @@ export function selfReviewSignature(payload: string): string {
 }
 
 /**
- * Risk-classified review policy (issue #4703 final owner decision).
- * An extra:independent:<login> token only satisfies the gate when the named reviewer is a
+ * Risk-classified review policy (issue #4703, post-review semantics).
+ * `extra:independent:<login>` only satisfies the gate when the named reviewer is a
  * distinct maintainer with admin/maintain/write permission and an authenticated APPROVED
  * review on the exact head; the token shape alone never satisfies the policy.
+ * `extra:gpt-heavy` was removed: an author-supplied token with no authenticated
+ * run artifact behind it cannot substitute for review evidence (review finding 3).
  */
 export function selfReviewSatisfiesPolicy(review: ParsedSelfReview, independentReviewer: IndependentReviewerEvidence | null = null): boolean {
 	const independentApproved = (extra: { login: string }): boolean => {
@@ -211,7 +209,7 @@ export function selfReviewSatisfiesPolicy(review: ParsedSelfReview, independentR
 		case "low-risk":
 			return review.extra.kind === "none";
 		case "regression-risk":
-			return review.extra.kind === "gpt-heavy" || (review.extra.kind === "independent" && independentApproved(review.extra));
+			return review.extra.kind === "independent" && independentApproved(review.extra);
 		case "high-risk":
 			return review.extra.kind === "independent" && independentApproved(review.extra);
 	}
@@ -236,19 +234,13 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 				`Verdict digest ${parsed.verdict.diffSha256} is stale; exact ${input.baseSha}...${input.headSha} diff digest is ${input.computedDiffSha256}. Regenerate the verdict after the final commit.`,
 			);
 		}
-		if (parsed.verdict.verdict === "merge-approved" && parsed.verdict.reviewerId.toLowerCase() === input.authorLogin.toLowerCase() && !selfReview.ok) {
-			diagnostics.push(`merge-approved cannot be self-approved: reviewer-id ${parsed.verdict.reviewerId} matches PR author ${input.authorLogin}. Record a signed gajae.pr-self-review.v1 maintainer comment for the exact head, or obtain independent review.`);
+		// merge-approved is the reviewed path: it ALWAYS requires an authenticated
+		// exact-head APPROVED review from a distinct identity. The author cannot
+		// reach it through any comment of their own (universal invariant).
+		if (parsed.verdict.verdict === "merge-approved" && parsed.verdict.reviewerId.toLowerCase() === input.authorLogin.toLowerCase()) {
+			diagnostics.push(`merge-approved cannot be self-approved: reviewer-id ${parsed.verdict.reviewerId} matches PR author ${input.authorLogin}. A solo merge is only available as the explicitly named merge-self-approved verdict for a low-risk owner change.`);
 		}
-		// The self-review comment can only authorize the identity it validated: the PR-body
-		// verdict must name exactly that reviewer (issue #4703 hardening).
-		if (parsed.verdict.verdict === "merge-approved" && selfReview.ok && selfReview.reviewerId
-			&& parsed.verdict.reviewerId.toLowerCase() !== selfReview.reviewerId.toLowerCase()) {
-			diagnostics.push(`merge-approved reviewer-id ${parsed.verdict.reviewerId} does not match the validated self-review identity ${selfReview.reviewerId}; the self-review comment cannot authorize a different reviewer.`);
-		}
-		if (input.requireMergeApproved && parsed.verdict.verdict !== "merge-approved") {
-			diagnostics.push(`Verdict ${parsed.verdict.verdict} intentionally blocks merge. Obtain independent review, update the exact-head verdict to merge-approved, and rerun this check.`);
-		}
-		if (input.requireMergeApproved && parsed.verdict.verdict === "merge-approved" && !selfReview.ok) {
+		if (input.requireMergeApproved && parsed.verdict.verdict === "merge-approved") {
 			if (!input.authenticatedReviewerLogin || input.authenticatedReviewerLogin.toLowerCase() !== parsed.verdict.reviewerId.toLowerCase()) {
 				diagnostics.push(`merge-approved reviewer-id ${parsed.verdict.reviewerId} is not backed by an authenticated approving GitHub review.`);
 			}
@@ -256,23 +248,42 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 				diagnostics.push(`Authenticated approval must target exact PR head ${input.headSha}, not ${input.authenticatedReviewHeadSha ?? "a missing commit"}.`);
 			}
 		}
+		// merge-self-approved is the honest solo path: it exists only for the repository
+		// owner, only for low-risk, and only backed by the risk record comment bound to
+		// this exact head. The name itself records that no independent human reviewed.
+		if (parsed.verdict.verdict === "merge-self-approved") {
+			if (parsed.verdict.reviewerId.toLowerCase() !== input.authorLogin.toLowerCase()) {
+				diagnostics.push(`merge-self-approved reviewer-id ${parsed.verdict.reviewerId} must name the PR author ${input.authorLogin}; this verdict is exclusively the owner's self-authorization.`);
+			}
+			if (!selfReview.ok) {
+				diagnostics.push("merge-self-approved requires a valid gajae.pr-self-review.v1 risk record for the exact head (owner identity, low-risk classification, fresh base/head/digest).");
+			} else if (selfReview.risk !== "low-risk" || selfReview.verdict !== "merge-self-approved") {
+				diagnostics.push(`merge-self-approved requires the risk record to classify this change low-risk with verdict:merge-self-approved; record says risk:${selfReview.risk} verdict:${selfReview.verdict}. Higher risk classes must use independent review (merge-approved).`);
+			}
+		}
+		if (input.requireMergeApproved && parsed.verdict.verdict !== "merge-approved" && parsed.verdict.verdict !== "merge-self-approved") {
+			diagnostics.push(`Verdict ${parsed.verdict.verdict} intentionally blocks merge. Obtain independent review (merge-approved) or, for a low-risk owner change, the explicit merge-self-approved path.`);
+		}
 	}
 	diagnostics.push(...selfReview.diagnostics);
 	return { ok: diagnostics.length === 0, verdict: parsed.verdict, diagnostics };
 }
 
 /**
- * Evaluate the trusted maintainer self-review comment (issue #4703).
+ * Evaluate the trusted maintainer self-review record (issue #4703, post-review
+ * semantics). The record is the RISK CLASSIFICATION for an owner-authored PR: it
+ * binds the author's own classification of the change to the exact base/head/digest.
+ * Its hash is integrity-only (tamper evidence), never authorization.
  *
- * Returns ok=true only when a comment exists, is well-formed, carries a valid signature
- * over the exact bound fields, comes from an authorized maintainer identity, targets the
- * exact event base/head/digest, approves, and satisfies the risk-classified policy
- * (low-risk: signed self-review alone; regression-risk: additionally gpt-heavy validation
- * OR an assigned independent domain reviewer; high-risk: one assigned independent reviewer).
+ * Returns ok=true only when a comment exists, is well-formed, carries a matching
+ * integrity digest, comes from the owner identity, targets the exact event
+ * base/head/digest, and satisfies the risk-classified policy (low-risk: extra:none;
+ * regression-risk and high-risk: an authenticated exact-head APPROVED review from a
+ * distinct maintainer named by extra:independent:<login>).
  * The PR body can never supply this record: evaluateSelfReviewComment reads only the
  * trusted comment data fetched from the GitHub API under workflow permissions.
  */
-function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; reviewerId?: string; diagnostics: string[] } {
+function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; reviewerId?: string; risk?: SelfReviewRisk; verdict?: "merge-approved" | "merge-self-approved" | "merge-blocked"; diagnostics: string[] } {
 	const comment = input.selfReviewComment;
 	if (!comment) return { ok: false, diagnostics: [] };
 	const diagnostics: string[] = [];
@@ -280,12 +291,12 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 	if (!parsedComment.selfReview) return { ok: false, diagnostics: parsedComment.diagnostics };
 	const review = parsedComment.selfReview;
 	// Delegated maintainer identity (issue #4703): only the repository owner account may
-	// use the self-review path; ordinary collaborators cannot self-approve.
+	// post the risk record; ordinary collaborators cannot.
 	if (comment.authorAssociation !== "OWNER" || comment.login.toLowerCase() !== review.reviewerId.toLowerCase()) {
 		diagnostics.push(`Self-review comment identity ${comment.login} (${comment.authorAssociation}) is not the repository owner matching reviewer-id ${review.reviewerId}.`);
 	}
-	if (review.verdict !== "merge-approved") {
-		diagnostics.push(`Self-review verdict ${review.verdict} does not authorize merge.`);
+	if (review.verdict === "merge-blocked") {
+		diagnostics.push("Self-review verdict merge-blocked does not authorize any merge.");
 	}
 	if (review.baseSha !== input.baseSha) {
 		diagnostics.push(`Self-review base ${review.baseSha} is stale; immutable event base is ${input.baseSha}.`);
@@ -296,9 +307,9 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 	if (review.diffSha256 !== input.computedDiffSha256) {
 		diagnostics.push(`Self-review digest ${review.diffSha256} is stale; exact ${input.baseSha}...${input.headSha} diff digest is ${input.computedDiffSha256}.`);
 	}
-	const expectedSignature = selfReviewSignature(selfReviewSignedPayload(review));
-	if (review.signature !== expectedSignature) {
-		diagnostics.push("Self-review signature does not match the signed payload; the record or evidence was altered.");
+	const expectedDigest = selfReviewSignature(selfReviewSignedPayload(review));
+	if (review.signature !== expectedDigest) {
+		diagnostics.push("Self-review integrity digest does not match the record; the record or evidence was altered.");
 	}
 	if (review.reviewerId.toLowerCase() !== input.authorLogin.toLowerCase()) {
 		diagnostics.push(`Self-review reviewer-id ${review.reviewerId} must match the PR author ${input.authorLogin} for a maintainer self-review.`);
@@ -307,13 +318,13 @@ function evaluateSelfReviewComment(input: PrValidationInput): { ok: boolean; rev
 		diagnostics.push(`Self-review risk ${review.risk} does not match the PR body risk classification ${input.bodyRisk}; the classifications must agree.`);
 	}
 	if (!selfReviewSatisfiesPolicy(review, input.independentReviewer ?? null)) {
-		const required = review.risk === "regression-risk" ? "gpt-heavy validation or an authenticated exact-head approval from an assigned independent reviewer" : "an authenticated exact-head approval from an assigned independent reviewer";
-		diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${review.extra.kind}); the risk-fix OR gate is not satisfied.`);
+		const required = "an authenticated exact-head approval from a distinct independent reviewer (extra:independent:<login>)";
+		diagnostics.push(`Self-review risk ${review.risk} requires ${required} (extra:${review.extra.kind === "independent" ? `independent:${review.extra.login}` : review.extra.kind}); the risk-classified gate is not satisfied.`);
 	}
 	if (review.extra.kind === "independent" && review.extra.login.toLowerCase() === input.authorLogin.toLowerCase()) {
 		diagnostics.push(`Self-review extra:independent:${review.extra.login} names the PR author; the independent reviewer must be a distinct maintainer.`);
 	}
-	return { ok: diagnostics.length === 0, reviewerId: review.reviewerId, diagnostics };
+	return { ok: diagnostics.length === 0, reviewerId: review.reviewerId, risk: review.risk, verdict: review.verdict, diagnostics };
 }
 
 export function canonicalDiffSha256(diff: Uint8Array | string): string {
@@ -556,16 +567,19 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 	const approval = parsed.verdict?.verdict === "merge-approved"
 		? await authenticatedApproval(event, parsed.verdict.reviewerId, headSha)
 		: {};
-	const selfReviewComment = parsed.verdict?.verdict === "merge-approved"
-		&& parsed.verdict.reviewerId.toLowerCase() === authorLogin.toLowerCase()
+	// The self-review record is fetched whenever the verdict names the author (the
+	// merge-self-approved solo path) or the body verdict is merge-approved with a
+	// self-review record expected to carry the risk classification.
+	const selfReviewComment = parsed.verdict && parsed.verdict.reviewerId.toLowerCase() === authorLogin.toLowerCase()
 		? await fetchSelfReviewComment(event, authorLogin)
 		: null;
-	const bodyRisk = parseBodyRisk(body);
+	const bodyRiskParsed = parseBodyRisk(body);
+	const bodyRisk = bodyRiskParsed.risk;
 	const independentLogin = selfReviewComment ? independentReviewerLogin(selfReviewComment.body) : null;
 	const independentReviewer = independentLogin && selfReviewComment?.login.toLowerCase() === authorLogin.toLowerCase()
 		? await fetchIndependentReviewerEvidence(event, independentLogin, headSha)
 		: null;
-	return validatePrContract({
+	const result = validatePrContract({
 		body,
 		baseRef,
 		baseSha,
@@ -581,20 +595,28 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 		bodyRisk,
 		independentReviewer,
 	});
+	return { ...result, diagnostics: [...bodyRiskParsed.diagnostics, ...result.diagnostics] };
 }
 
 /**
  * Parse the risk classification declared in the PR body's Risk classification section.
- * The self-review comment must declare the same risk (issue #4703 hardening).
+ * Exactly one class must be checked: zero or multiple checked boxes fail closed
+ * (review finding 3 — a missing classification must not waive the stricter tiers),
+ * and the self-review record must declare the same risk.
  */
-export function parseBodyRisk(body: string): string | null {
-	const selected = body
+export function parseBodyRisk(body: string): { risk: string | null; diagnostics: string[] } {
+	const checked = body
 		.split(/\r?\n/u)
 		.map(line => line.trim())
-		.find(line => /^-\s*\[(x|X)\]\s*`(low-risk|regression-risk|high-risk)`/u.test(line));
-	if (!selected) return null;
-	const match = /`(low-risk|regression-risk|high-risk)`/u.exec(selected);
-	return match?.[1] ?? null;
+		.filter(line => /^-\s*\[(x|X)\]\s*`(low-risk|regression-risk|high-risk)`/u.test(line));
+	if (checked.length === 0) {
+		return { risk: null, diagnostics: ["PR body must check exactly one risk classification (low-risk, regression-risk, or high-risk); found none."] };
+	}
+	if (checked.length > 1) {
+		return { risk: null, diagnostics: [`PR body must check exactly one risk classification; found ${checked.length}.`] };
+	}
+	const match = /`(low-risk|regression-risk|high-risk)`/u.exec(checked[0]!);
+	return { risk: match?.[1] ?? null, diagnostics: match ? [] : ["PR body risk classification line is malformed."] };
 }
 
 /** Extract the independent reviewer login from a self-review comment, if any. */
@@ -681,13 +703,21 @@ export async function main(argv: string[]): Promise<number> {
 	const signIndex = argv.indexOf("--self-review-sign");
 	if (signIndex >= 0) {
 		const args = argv.slice(signIndex + 1);
-		if (args.length !== 7) {
-			console.error("::error::--self-review-sign requires exactly 7 args: <base-sha> <head-sha> <diff-sha256> <reviewer-id> <risk> <extra> <evidence>");
+		if (args.length !== 8) {
+			console.error("::error::--self-review-sign requires exactly 8 args: <verdict> <base-sha> <head-sha> <diff-sha256> <reviewer-id> <risk> <extra> <evidence>");
 			return 1;
 		}
-		const [baseSha, headSha, diffSha256, reviewerId, risk, extra, evidence] = args as [string, string, string, string, string, string, string];
-		const parsedExtra: SelfReviewExtra = extra === "none" ? { kind: "none" } : extra === "gpt-heavy" ? { kind: "gpt-heavy" } : { kind: "independent", login: extra.slice("independent:".length) };
-		const payload = selfReviewSignedPayload({ verdict: "merge-approved", baseSha, headSha, diffSha256, reviewerId, risk: risk as SelfReviewRisk, extra: parsedExtra, evidence });
+		const [verdict, baseSha, headSha, diffSha256, reviewerId, risk, extra, evidence] = args as [string, string, string, string, string, string, string, string];
+		if (verdict !== "merge-approved" && verdict !== "merge-self-approved" && verdict !== "merge-blocked") {
+			console.error("::error::verdict must be merge-approved, merge-self-approved, or merge-blocked");
+			return 1;
+		}
+		if (extra !== "none" && !extra.startsWith("independent:")) {
+			console.error("::error::extra must be none or independent:<login>; gpt-heavy is no longer a policy-satisfying token");
+			return 1;
+		}
+		const parsedExtra: SelfReviewExtra = extra === "none" ? { kind: "none" } : { kind: "independent", login: extra.slice("independent:".length) };
+		const payload = selfReviewSignedPayload({ verdict, baseSha, headSha, diffSha256, reviewerId, risk: risk as SelfReviewRisk, extra: parsedExtra, evidence });
 		console.log(selfReviewSignature(payload));
 		return 0;
 	}
@@ -695,7 +725,7 @@ export async function main(argv: string[]): Promise<number> {
 		? await validateEvent(path.resolve(process.cwd(), argv[eventIndex + 1]!), cwd, trustedRoot)
 		: preflightIndex >= 0 && argv[preflightIndex + 1]
 			? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot, invocationCwd)
-			: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --self-review-sign <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>"] };
+			: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command> | --self-review-sign <verdict> <base> <head> <digest> <reviewer-id> <risk> <extra> <evidence>"] };
 	for (const diagnostic of result.diagnostics) console.error(`::error::${diagnostic}`);
 	if (result.ok && result.verdict) console.log(`PR contract valid: ${result.verdict.verdict} ${result.verdict.diffSha256}`);
 	return result.ok ? 0 : 1;

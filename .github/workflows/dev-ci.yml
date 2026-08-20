@@ -86,14 +86,13 @@ jobs:
           empty_bunfig="$RUNNER_TEMP/gjc-pr-contract-empty-bunfig.toml"
           printf '# trusted empty Bun configuration\n' > "$empty_bunfig"
           bun --no-env-file --config="$empty_bunfig" -e '
-            const pattern = /^gajae\.pr-review-verdict\.v1 (merge-approved|merge-blocked|needs-human) sha256:([0-9a-f]{64}) reviewer:(architect|critic|human) reviewer-id:([^\s]+) evidence:(.+)$/;
+            const pattern = /^gajae\.pr-review-verdict\.v1 (merge-approved|merge-self-approved|merge-blocked|needs-human) sha256:([0-9a-f]{64}) reviewer:(architect|critic|human) reviewer-id:([^\s]+) evidence:(.+)$/;
             const lines = (Bun.env.PR_BODY ?? "").split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith("gajae.pr-review-verdict.v1"));
             if (lines.length !== 1) throw new Error(`Expected exactly one verdict line; found ${lines.length}.`);
             const match = pattern.exec(lines[0]);
             if (!match) throw new Error("Malformed gajae.pr-review-verdict.v1 line.");
             if (Bun.env.PR_BASE_REF !== "dev") throw new Error(`PR base must be dev, not ${Bun.env.PR_BASE_REF}.`);
             const [verdict, declaredDigest, , reviewerId] = match.slice(1);
-            if (verdict !== "merge-approved") throw new Error(`Verdict ${verdict} intentionally blocks merge.`);
             const run = async argv => { const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" }); const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).bytes(), new Response(child.stderr).text(), child.exited]); if (exitCode !== 0) throw new Error(`${argv.join(" ")} failed: ${stderr}`); return stdout; };
             const head = new TextDecoder().decode(await run(["git", "rev-parse", "HEAD"])).trim();
             if (head !== Bun.env.PR_HEAD_SHA) throw new Error(`Checked-out head ${head} != event head ${Bun.env.PR_HEAD_SHA}.`);
@@ -102,66 +101,65 @@ jobs:
             const diff = await run(["git", "diff", "--binary", "--full-index", "--no-ext-diff", `${Bun.env.PR_BASE_SHA}...${head}`]);
             const digest = new Bun.CryptoHasher("sha256").update(diff).digest("hex");
             if (digest !== declaredDigest) throw new Error(`Stale verdict digest ${declaredDigest}; exact digest is ${digest}.`);
-            // Maintainer self-review (issue #4703): a signed gajae.pr-self-review.v1 PR comment
-            // from the repository owner account, bound to the exact base/head/digest and to the
-            // PR body verdict identity and risk classification, authorizes merge under the
-            // risk-classified policy; otherwise the author cannot self-approve.
-            let selfReviewOk = false;
+            // Exactly one risk classification is mandatory (review finding 3): a missing
+            // classification must never waive the stricter review tiers.
             const bodyRiskLines = (Bun.env.PR_BODY ?? "").split(/\r?\n/).map(line => line.trim()).filter(line => /^-\s*\[(x|X)\]\s*`(low-risk|regression-risk|high-risk)`/.test(line));
-            if (bodyRiskLines.length > 1) throw new Error(`PR body must check exactly one risk classification; found ${bodyRiskLines.length}.`);
-            const bodyRiskMatch = bodyRiskLines.length === 1 ? /`(low-risk|regression-risk|high-risk)`/.exec(bodyRiskLines[0]) : null;
-            const bodyRisk = bodyRiskMatch ? bodyRiskMatch[1] : null;
+            if (bodyRiskLines.length !== 1) throw new Error(`PR body must check exactly one risk classification; found ${bodyRiskLines.length}.`);
+            const bodyRiskMatch = /`(low-risk|regression-risk|high-risk)`/.exec(bodyRiskLines[0]);
+            if (!bodyRiskMatch) throw new Error("PR body risk classification line is malformed.");
+            const bodyRisk = bodyRiskMatch[1];
             const reviewPermission = async login => { const response = await fetch(`https://api.github.com/repos/${Bun.env.GITHUB_REPOSITORY}/collaborators/${encodeURIComponent(login)}/permission`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${Bun.env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }); if (!response.ok) throw new Error(`Reviewer permission lookup failed: ${response.status}`); return (await response.json()).permission; };
             const fetchReviews = async () => { const reviews = []; for (let page = 1; ; page++) { const response = await fetch(`https://api.github.com/repos/${Bun.env.GITHUB_REPOSITORY}/pulls/${Bun.env.PR_NUMBER}/reviews?per_page=100&page=${page}`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${Bun.env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }); if (!response.ok) throw new Error(`Reviews API failed: ${response.status}`); const batch = await response.json(); reviews.push(...batch); if (batch.length < 100) break; } return reviews; };
-            if (reviewerId.toLowerCase() === (Bun.env.PR_AUTHOR ?? "").toLowerCase()) {
+            let selfAuthorized = false;
+            if (verdict === "merge-self-approved") {
+              // Honest solo path (issue #4703): owner-only, low-risk-only, backed by the
+              // risk-record comment bound to this exact head. merge-approved NEVER accepts
+              // the author as reviewer; higher risk classes need independent review.
+              if (reviewerId.toLowerCase() !== (Bun.env.PR_AUTHOR ?? "").toLowerCase()) throw new Error("merge-self-approved reviewer-id must name the PR author; this verdict is exclusively the owner self-authorization.");
               const comments = [];
               for (let page = 1; ; page++) { const response = await fetch(`https://api.github.com/repos/${Bun.env.GITHUB_REPOSITORY}/issues/${Bun.env.PR_NUMBER}/comments?per_page=100&page=${page}`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${Bun.env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }); if (!response.ok) throw new Error(`Comments API failed: ${response.status}`); const batch = await response.json(); comments.push(...batch); if (batch.length < 100) break; }
-              const recordPattern = /^gajae\.pr-self-review\.v1 verdict:(merge-approved|merge-blocked) base:([0-9a-f]{40}) head:([0-9a-f]{40}) sha256:([0-9a-f]{64}) reviewer-id:([^\s]+) risk:(low-risk|regression-risk|high-risk) extra:(none|gpt-heavy|independent:[^\s]+) evidence:(.+)$/;
+              const recordPattern = /^gajae\.pr-self-review\.v1 verdict:(merge-approved|merge-self-approved|merge-blocked) base:([0-9a-f]{40}) head:([0-9a-f]{40}) sha256:([0-9a-f]{64}) reviewer-id:([^\s]+) risk:(low-risk|regression-risk|high-risk) extra:(none|independent:[^\s]+) evidence:(.+)$/;
               const signaturePattern = /^self-review-signature: sha256:([0-9a-f]{64})$/;
-              const candidates = comments.filter(comment => (comment.body ?? "").split(/\r?\n/).some(line => line.trim().startsWith("gajae.pr-self-review.v1")));
+              const eligible = comments.filter(comment => comment.user?.login?.toLowerCase() === reviewerId.toLowerCase() && (comment.body ?? "").split(/\r?\n/).some(line => line.trim().startsWith("gajae.pr-self-review.v1")));
               // Newest record wins: iterate newest-first and stop at the first valid one.
-              for (const comment of candidates.reverse()) {
+              for (const comment of eligible.reverse()) {
                 const lines = (comment.body ?? "").split(/\r?\n/).map(line => line.trim());
                 // Parity with the canonical parser: exactly one record, one signature,
-                // and one signed-off-by footer line per comment (issue #4703 review P1).
+                // and one signed-off-by footer line per comment.
                 const recordLines = lines.filter(line => line.startsWith("gajae.pr-self-review.v1"));
                 const signatureLines = lines.filter(line => signaturePattern.test(line));
                 const footerLines = lines.filter(line => line === "Signed-off-by: gaebal-gajae (clawdbot) 🦞");
                 if (recordLines.length !== 1 || signatureLines.length !== 1 || footerLines.length !== 1) throw new Error(`Self-review comment must contain exactly one record, signature, and footer line; found ${recordLines.length}/${signatureLines.length}/${footerLines.length}.`);
                 const recordMatch = recordPattern.exec(recordLines[0]);
                 const signatureMatch = signaturePattern.exec(signatureLines[0]);
-                if (!recordMatch || !signatureMatch) throw new Error("Self-review comment present but malformed or unsigned; refusing self-approval.");
+                if (!recordMatch || !signatureMatch) throw new Error("Self-review comment present but malformed or unsigned; refusing self-authorization.");
                 const [, sVerdict, sBase, sHead, sDigest, sReviewer, sRisk, sExtra, sEvidence] = recordMatch;
                 const payload = [`gajae.pr-self-review.v1 verdict:${sVerdict}`, `base:${sBase}`, `head:${sHead}`, `sha256:${sDigest}`, `reviewer-id:${sReviewer}`, `risk:${sRisk}`, `extra:${sExtra}`, `evidence:${sEvidence}`].join("\n");
                 const expected = new Bun.CryptoHasher("sha256").update("gajae.pr-self-review.v1.signature-domain").update(payload).digest("hex");
-                if (signatureMatch[1] !== expected) throw new Error("Self-review signature does not match the signed payload.");
-                // Only the repository owner account (delegated maintainer identity) may self-review.
+                if (signatureMatch[1] !== expected) throw new Error("Self-review integrity digest does not match the record.");
+                // Only the repository owner account (delegated maintainer identity) may self-authorize.
                 if (comment.author_association !== "OWNER" || comment.user?.login?.toLowerCase() !== reviewerId.toLowerCase()) throw new Error(`Self-review comment identity ${comment.user?.login} (${comment.author_association}) is not the repository owner matching reviewer-id ${reviewerId}.`);
-                if (sVerdict !== "merge-approved") throw new Error(`Self-review verdict ${sVerdict} does not authorize merge.`);
+                if (sVerdict !== "merge-self-approved") throw new Error(`Self-review verdict ${sVerdict} does not authorize the merge-self-approved path.`);
                 if (sBase !== Bun.env.PR_BASE_SHA || sHead !== head || sDigest !== digest) throw new Error("Self-review is stale: base/head/digest do not match this exact PR.");
-                if (bodyRisk && sRisk !== bodyRisk) throw new Error(`Self-review risk ${sRisk} does not match the PR body risk classification ${bodyRisk}; the classifications must agree.`);
-                let extraSatisfies = sRisk === "low-risk" ? sExtra === "none" : sRisk === "regression-risk" ? sExtra === "gpt-heavy" : false;
-                if (!extraSatisfies && sExtra.startsWith("independent:")) {
-                  const independent = sExtra.slice("independent:".length);
-                  if (independent.toLowerCase() === (Bun.env.PR_AUTHOR ?? "").toLowerCase()) throw new Error("Self-review extra:independent names the PR author; the independent reviewer must be a distinct maintainer.");
-                  const reviews = await fetchReviews();
-                  const approved = reviews.some(review => review.user?.login?.toLowerCase() === independent.toLowerCase() && review.state === "APPROVED" && review.commit_id === head);
-                  const permission = await reviewPermission(independent);
-                  extraSatisfies = approved && ["admin", "maintain", "write"].includes(permission);
-                }
-                if (!extraSatisfies) throw new Error(`Self-review risk ${sRisk} requires supplementary review evidence (extra:${sExtra}); the risk-fix OR gate is not satisfied.`);
-                selfReviewOk = true;
+                if (sRisk !== bodyRisk) throw new Error(`Self-review risk ${sRisk} does not match the PR body risk classification ${bodyRisk}; the classifications must agree.`);
+                if (sRisk !== "low-risk") throw new Error(`merge-self-approved is only available for low-risk changes; this record classifies ${sRisk} and requires independent review (merge-approved).`);
+                if (sExtra !== "none") throw new Error(`merge-self-approved requires extra:none; got ${sExtra}.`);
+                selfAuthorized = true;
                 break;
               }
-              if (!selfReviewOk) throw new Error("merge-approved cannot be self-approved without a valid signed gajae.pr-self-review.v1 comment for this exact head.");
-            }
-            if (!selfReviewOk) {
+              if (!selfAuthorized) throw new Error("merge-self-approved requires a valid gajae.pr-self-review.v1 risk record (owner, low-risk, extra:none) bound to this exact head.");
+            } else if (verdict === "merge-approved") {
+              // The reviewed path: ALWAYS an authenticated exact-head APPROVED review
+              // from a distinct identity with repository review authority.
+              if (reviewerId.toLowerCase() === (Bun.env.PR_AUTHOR ?? "").toLowerCase()) throw new Error("merge-approved cannot be self-approved: the reviewer must be distinct from the PR author. A solo merge is only the explicitly named merge-self-approved verdict.");
               const latest = (await fetchReviews()).filter(review => review.user?.login?.toLowerCase() === reviewerId.toLowerCase() && review.state !== "COMMENTED" && review.commit_id === head).at(-1);
               if (latest?.state !== "APPROVED" || latest.commit_id !== head) throw new Error(`Reviewer ${reviewerId} lacks an effective exact-head approval.`);
               const permission = await reviewPermission(reviewerId);
               if (!["admin", "maintain", "write"].includes(permission)) throw new Error(`Reviewer ${reviewerId} lacks repository review authority.`);
+            } else {
+              throw new Error(`Verdict ${verdict} intentionally blocks merge.`);
             }
-            console.log(`Bootstrap PR contract valid: ${digest}${selfReviewOk ? " (maintainer self-review)" : ""}`);
+            console.log(`Bootstrap PR contract valid: ${digest}${selfAuthorized ? " (SELF-AUTHORIZED: merge-self-approved, no independent human review)" : ""}`);
           '
       - name: Run bootstrap G1 writer gate
         run: bun scripts/verify-gjc-state-writers.ts --fail --root .

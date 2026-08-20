@@ -12,18 +12,18 @@
 
 ## Risk classification
 
-<!-- Classify honestly; the exact-head gate enforces the matching review path (issue #4703). -->
+<!-- Classify honestly; exactly one box must be checked — the exact-head gate fails closed on zero or multiple. The checked class selects the merge path (issue #4703). -->
 
-- [ ] `low-risk` — ordinary fix/maintenance; signed maintainer self-review comment + CI suffices.
-- [ ] `regression-risk` — fix with material regression risk; additionally requires an exact-head `gpt-heavy` profile validation/review with recorded evidence **or** one assigned independent domain reviewer whose authenticated exact-head `APPROVED` review the gate verifies (`extra:gpt-heavy` / `extra:independent:<login>`; the token alone never suffices).
+- [ ] `low-risk` — ordinary fix/maintenance; the repository owner may use the explicit `merge-self-approved` solo verdict (no independent human review; the verdict name itself records this) with a risk-record comment bound to the exact head.
+- [ ] `regression-risk` — fix with material regression risk; requires one assigned independent domain reviewer whose authenticated exact-head `APPROVED` review the gate verifies (`extra:independent:<login>`; the token alone never suffices).
 - [ ] `high-risk` — large refactor, feature, or materially high-risk change (security/auth/install/remove/public API/destructive lifecycle/architecture); requires one assigned independent domain reviewer with an authenticated exact-head `APPROVED` review (`extra:independent:<login>`).
 
 ## GJC verdict
 
-<!-- Paste one exact-head verdict. reviewer-id is the reviewer's GitHub login. For owner-authored maintainer PRs (repository owner account only) the reviewer-id may equal the PR author when a signed gajae.pr-self-review.v1 comment for the exact head exists and the risk classification agrees; otherwise self-approval is BLOCK. If neither an authenticated approving GitHub review for this exact head nor a valid self-review comment exists, write needs-human and stop. -->
+<!-- Paste one exact-head verdict. reviewer-id is the reviewer's GitHub login. merge-approved requires an authenticated exact-head APPROVED review from an identity distinct from the PR author — the author can never reach it. The repository owner may instead use merge-self-approved, the explicitly named solo force path for a low-risk change with a valid risk-record comment; its name records that no independent human reviewed. Otherwise write needs-human and stop. -->
 
 ```text
-gajae.pr-review-verdict.v1 <merge-approved|merge-blocked|needs-human> sha256:<exact-base...head-diff-hash> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<ci-run-url-or-local-command>
+gajae.pr-review-verdict.v1 <merge-approved|merge-self-approved|merge-blocked|needs-human> sha256:<exact-base...head-diff-hash> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<ci-run-url-or-local-command>
 ```
 
 ---

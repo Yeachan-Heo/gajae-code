@@ -57,7 +57,7 @@ describe("workflow permission policy", () => {
 		expect(JOB_WRITE_ALLOWLIST).toEqual([
 			{ workflow: CI_WORKFLOW, job: "publish", scope: "contents" },
 			{ workflow: CI_WORKFLOW, job: "publish", scope: "id-token" },
-			{ workflow: PR_VALIDATION_WORKFLOW, job: "validate", scope: "statuses" },
+			{ workflow: PR_VALIDATION_WORKFLOW, job: "validate", scope: "checks" },
 		]);
 		expect(jobWriteScopes(document)).toEqual(["publish.contents", "publish.id-token"]);
 	});
@@ -73,7 +73,7 @@ describe("workflow permission policy", () => {
 		expect(jobWriteScopes(document)).toEqual([]);
 	});
 
-	test("pr-validation.yml has an exact read-scoped workflow default and only the allowlisted statuses write job", async () => {
+	test("pr-validation.yml has an exact read-scoped workflow default and only the allowlisted checks write job", async () => {
 		const workflows = await readWorkflowDocuments();
 		const prValidation = workflows.find(workflow => workflow.file === PR_VALIDATION_WORKFLOW);
 		expect(prValidation).toBeDefined();
@@ -81,10 +81,11 @@ describe("workflow permission policy", () => {
 
 		expect(REQUIRED_READ_DEFAULT).toContain(PR_VALIDATION_WORKFLOW);
 		expect(document.permissions).toEqual({ contents: "read", "pull-requests": "read" });
-		// The validate job publishes a head-bound commit status for issue_comment runs
-		// (issue #4703); it is the only allowlisted write scope in this workflow.
-		expect(jobWriteScopes(document)).toEqual(["validate.statuses"]);
-		expect(JOB_WRITE_ALLOWLIST).toContainEqual({ workflow: PR_VALIDATION_WORKFLOW, job: "validate", scope: "statuses" });
+		// The validate job publishes a head-bound check run under the required
+		// context name for issue_comment runs (issue #4703); it is the only
+		// allowlisted write scope in this workflow.
+		expect(jobWriteScopes(document)).toEqual(["validate.checks"]);
+		expect(JOB_WRITE_ALLOWLIST).toContainEqual({ workflow: PR_VALIDATION_WORKFLOW, job: "validate", scope: "checks" });
 	});
 
 	test("detects a ci.yml workflow contents write mutation", async () => {

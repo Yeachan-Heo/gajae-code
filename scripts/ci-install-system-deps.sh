@@ -11,24 +11,6 @@
 # `-eo pipefail` mirrors the default shell GitHub Actions uses for `run:`
 # steps, so the extracted script keeps the inline blocks' failure semantics.
 set -eo pipefail
-# Guard against stalled apt mirrors (observed: azure.archive.ubuntu.com stopped
-# responding mid-fetch and apt blocked until the job's hard timeout). apt has no
-# default per-request deadline, so bound each update/install pass and retry with
-# the fallback mirror before giving up.
-apt_with_timeout() {
-   local attempt rc
-   for attempt in 1 2 3; do
-      timeout --foreground 8m "$@" && return 0
-      rc=$?
-      echo "system-deps: apt attempt ${attempt} failed or stalled (exit ${rc}); retrying with a fallback mirror." >&2
-      # Force the canonical archive.ubuntu.com mirror: azure.archive.ubuntu.com is
-      # the runner default and is what stalls on cold runners.
-      printf 'deb https://archive.ubuntu.com/ubuntu jammy main universe\ndeb https://archive.ubuntu.com/ubuntu jammy-updates main universe\ndeb https://archive.ubuntu.com/ubuntu jammy-security main universe\n' \
-         | sudo tee /etc/apt/sources.list.d/gjc-fallback.list >/dev/null
-   done
-   echo "system-deps: apt remained stalled after retries; failing closed." >&2
-   return 1
-}
 
 # Tools expected on PATH (imagemagick is satisfied by `convert` or `magick`).
 required_path_tools=(fd rg tmux gh)
@@ -63,8 +45,8 @@ fi
 
 echo "system-deps: missing dependencies detected; installing."
 if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-   apt_with_timeout sudo apt-get update
-   apt_with_timeout sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
+   sudo apt-get update
+   sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep imagemagick tmux gh
    sudo ln -sf $(which fdfind) /usr/local/bin/fd
    sudo ln -sf /usr/bin/convert /usr/local/bin/magick
 else
