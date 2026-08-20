@@ -1670,7 +1670,7 @@ mod publication {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 	use super::publication::errno_name;
 
