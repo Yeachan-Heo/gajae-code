@@ -80,17 +80,50 @@ describe("issue #4718: loader activation transaction", () => {
 		expect(result.runtime.pendingProviderRegistrations.map(r => r.name)).toEqual(["good-provider"]);
 	});
 
-	test("staged writes are invisible to the shared runtime until commit", async () => {
-		await fs.writeFile(path.join(tmp, "bad.ts"), failingFactorySource);
+	test("staged writes are invisible to the shared runtime while the factory is suspended", async () => {
+		const runtime = {
+			flagValues: new Map<string, boolean | string>(),
+			pendingProviderRegistrations: [] as { name: string; config: unknown; sourceId: string }[],
+		} as never;
 
-		const eventBus = new EventBus();
-		const runtimePromise = loadExtensions([path.join(tmp, "bad.ts")], tmp, eventBus);
+		const gate = Promise.withResolvers<void>();
+		const reachedGate = Promise.withResolvers<void>();
 
-		// While (and after) the failed factory ran, nothing was committed.
-		const result = await runtimePromise;
-		expect(result.errors).toHaveLength(1);
-		expect(result.runtime.flagValues.size).toBe(0);
-		expect(result.runtime.pendingProviderRegistrations).toHaveLength(0);
+		const loading = loadExtensionFromFactory(
+			async pi => {
+				pi.registerFlag("--inflight", { type: "boolean", default: true });
+				pi.registerProvider("inflight-provider", {
+					baseUrl: "https://example.com/v1",
+					api: "openai-completions",
+					apiKey: "literal-key",
+				});
+				reachedGate.resolve();
+				await gate.promise;
+			},
+			tmp,
+			new EventBus(),
+			runtime,
+			"<inflight>",
+		);
+
+		// The factory has registered but is suspended before commit: the
+		// shared runtime must not yet observe either staged write. (Direct
+		// mutation would fail this — the value would already be live here.)
+		await reachedGate.promise;
+		expect((runtime as { flagValues: Map<string, unknown> }).flagValues.get("--inflight")).toBeUndefined();
+		expect((runtime as { flagValues: Map<string, unknown> }).flagValues.size).toBe(0);
+		expect((runtime as { pendingProviderRegistrations: unknown[] }).pendingProviderRegistrations.length).toBe(0);
+
+		gate.resolve();
+		await loading;
+
+		// After commit, both writes are published.
+		expect((runtime as { flagValues: Map<string, unknown> }).flagValues.get("--inflight")).toBe(true);
+		expect(
+			(runtime as { pendingProviderRegistrations: Array<{ name: string }> }).pendingProviderRegistrations.map(
+				r => r.name,
+			),
+		).toEqual(["inflight-provider"]);
 	});
 
 	test("inline factory failure rolls back staged writes", async () => {
@@ -325,5 +358,123 @@ describe("issue #4718: loader activation transaction", () => {
 		// the closed scope's staged default is not resurrected.
 		(runtime as { flagValues: Map<string, string> }).flagValues.delete("--post-commit");
 		expect(retainedGetFlag?.("--post-commit")).toBeUndefined();
+	});
+
+	test("a fault inside commit leaves no partially published state behind", async () => {
+		class FaultingFlagMap extends Map<string, boolean | string> {
+			readonly faultKey: string;
+
+			constructor(faultKey: string, entries?: [string, boolean | string][]) {
+				super(entries);
+				this.faultKey = faultKey;
+			}
+
+			override set(key: string, value: boolean | string): this {
+				if (key === this.faultKey) throw new Error("injected commit fault");
+				return super.set(key, value);
+			}
+		}
+
+		// A pre-existing committed flag proves overwrite-restore, and the two
+		// staged flags prove absent-entry removal (--first publishes, then
+		// --second faults: both must end absent).
+		const flagValues = new FaultingFlagMap("--second", [["--preexisting", "kept"]]);
+		const runtime = {
+			flagValues,
+			pendingProviderRegistrations: [] as { name: string; config: unknown; sourceId: string }[],
+		} as never;
+
+		await expect(
+			loadExtensionFromFactory(
+				pi => {
+					pi.registerFlag("--first", { type: "boolean", default: true });
+					pi.registerFlag("--second", { type: "boolean", default: true });
+					pi.registerProvider("commit-provider", {
+						baseUrl: "https://example.com/v1",
+						api: "openai-completions",
+						apiKey: "literal-key",
+					});
+				},
+				tmp,
+				new EventBus(),
+				runtime,
+				"<fault>",
+			),
+		).rejects.toThrow("injected commit fault");
+
+		expect(flagValues.get("--first")).toBeUndefined();
+		expect(flagValues.get("--second")).toBeUndefined();
+		expect(flagValues.get("--preexisting")).toBe("kept");
+		expect((runtime as { pendingProviderRegistrations: unknown[] }).pendingProviderRegistrations).toHaveLength(0);
+	});
+
+	test("a fault during provider publication truncates the queue to its prior state", async () => {
+		type Registration = { name: string; config: unknown; sourceId: string };
+		class FaultingQueue extends Array<Registration> {
+			fault = false;
+
+			override push(...items: Registration[]): number {
+				if (this.fault) throw new Error("injected queue fault");
+				return super.push(...items);
+			}
+		}
+
+		const queue = new FaultingQueue();
+		const runtime = {
+			flagValues: new Map<string, boolean | string>(),
+			pendingProviderRegistrations: queue,
+		} as never;
+
+		// Seed one legitimately committed registration from an earlier factory.
+		await loadExtensionFromFactory(
+			pi => {
+				pi.registerProvider("earlier-provider", {
+					baseUrl: "https://example.com/v1",
+					api: "openai-completions",
+					apiKey: "literal-key",
+				});
+			},
+			tmp,
+			new EventBus(),
+			runtime,
+			"<earlier>",
+		);
+		expect(queue).toHaveLength(1);
+
+		queue.fault = true;
+		await expect(
+			loadExtensionFromFactory(
+				pi => {
+					pi.registerFlag("--queued", { type: "boolean", default: true });
+					pi.registerProvider("faulted-provider", {
+						baseUrl: "https://example.com/v1",
+						api: "openai-completions",
+						apiKey: "literal-key",
+					});
+				},
+				tmp,
+				new EventBus(),
+				runtime,
+				"<faulted>",
+			),
+		).rejects.toThrow("injected queue fault");
+
+		// The flag published before the queue fault must be rolled back, and
+		// the queue must hold only the earlier committed registration.
+		expect((runtime as { flagValues: Map<string, unknown> }).flagValues.get("--queued")).toBeUndefined();
+		expect(queue.map(r => r.name)).toEqual(["earlier-provider"]);
+
+		// The runtime stays usable: a later normal factory commits cleanly.
+		queue.fault = false;
+		await loadExtensionFromFactory(
+			pi => {
+				pi.registerFlag("--recovered", { type: "boolean", default: true });
+			},
+			tmp,
+			new EventBus(),
+			runtime,
+			"<recovered>",
+		);
+		expect((runtime as { flagValues: Map<string, unknown> }).flagValues.get("--recovered")).toBe(true);
 	});
 });

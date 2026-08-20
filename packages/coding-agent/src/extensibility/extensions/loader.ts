@@ -186,17 +186,56 @@ export class ExtensionActivationScope {
 		return this.#stagedProviderRegistrations;
 	}
 
+	/**
+	 * Publish the staged mutations into the shared runtime as one transaction.
+	 *
+	 * Prior state is journaled before any live mutation so a throw partway
+	 * through publication is undone before it escapes: flag entries that did
+	 * not exist are removed, overwritten entries are restored, and the
+	 * provider queue is truncated to its prior length. The scope only becomes
+	 * terminal once publication has fully succeeded, so a failed commit
+	 * leaves the shared runtime exactly as it was (issue #4718).
+	 */
 	commit(): void {
 		if (this.#closed) return;
-		this.#closed = true;
-		for (const [name, value] of this.#stagedFlagDefaults) {
-			this.#runtime.flagValues.set(name, value);
+		const priorFlagEntries = new Map<string, { existed: true; value: boolean | string } | { existed: false }>();
+		for (const name of this.#stagedFlagDefaults.keys()) {
+			// Flag values are `boolean | string`, so `undefined` means absent.
+			const current = this.#runtime.flagValues.get(name);
+			priorFlagEntries.set(name, current === undefined ? { existed: false } : { existed: true, value: current });
 		}
-		this.#runtime.pendingProviderRegistrations.push(...this.#stagedProviderRegistrations);
+		const priorProviderCount = this.#runtime.pendingProviderRegistrations.length;
+
+		try {
+			for (const [name, value] of this.#stagedFlagDefaults) {
+				this.#runtime.flagValues.set(name, value);
+			}
+			for (const registration of this.#stagedProviderRegistrations) {
+				this.#runtime.pendingProviderRegistrations.push(registration);
+			}
+		} catch (err) {
+			for (const [name, prior] of priorFlagEntries) {
+				if (prior.existed) {
+					this.#runtime.flagValues.set(name, prior.value);
+				} else {
+					this.#runtime.flagValues.delete(name);
+				}
+			}
+			this.#runtime.pendingProviderRegistrations.length = priorProviderCount;
+			this.#close();
+			throw err;
+		}
+
+		this.#closed = true;
 	}
 
 	rollback(): void {
 		if (this.#closed) return;
+		this.#close();
+	}
+
+	/** Mark the scope terminal and drop the staged copies. */
+	#close(): void {
 		this.#closed = true;
 		this.#stagedFlagDefaults.clear();
 		this.#stagedProviderRegistrations.length = 0;
