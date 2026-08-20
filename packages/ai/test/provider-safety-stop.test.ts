@@ -33,7 +33,7 @@ describe("provider safety-stop provenance authority", () => {
 		const publicSurface = publicAi as unknown as Record<string, unknown>;
 		expect(publicSurface.applyProviderSafetyStop).toBeUndefined();
 		expect(typeof publicSurface.isProviderSafetyStopAuthenticated).toBe("function");
-		expect(typeof publicSurface.transferProviderSafetyStop).toBe("function");
+		expect(publicSurface.transferProviderSafetyStop).toBeUndefined();
 	});
 
 	test("mints the typed kind only for structured first-party refusal signals", () => {
@@ -62,6 +62,16 @@ describe("provider safety-stop provenance authority", () => {
 		expect(mintProviderSafetyStop(forged, "refusal", forgedCapability)).toBe(false);
 		expect(isProviderSafetyStopAuthenticated(forged)).toBe(false);
 		expect(forged.errorKind).toBeUndefined();
+	});
+
+	test("a public consumer cannot clone authority from a genuine marked source", () => {
+		const marked = message();
+		expect(mintProviderSafetyStop(marked, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY)).toBe(true);
+
+		const forgedDestination = { ...marked };
+		expect(isProviderSafetyStopAuthenticated(marked)).toBe(true);
+		expect(isProviderSafetyStopAuthenticated(forgedDestination)).toBe(false);
+		expect((publicAi as unknown as Record<string, unknown>).transferProviderSafetyStop).toBeUndefined();
 	});
 
 	test("data alone is never authenticated: clones, JSON round-trips, and fresh copies lose authority", () => {

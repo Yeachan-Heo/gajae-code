@@ -1,10 +1,6 @@
 import type { AssistantMessage } from "../types";
 
-/**
- * This module is intentionally outside the package export map. Only the
- * first-party provider adapters import its minting capability. The public
- * provider-safety-stop utility exposes verification and transfer only.
- */
+/** This module is intentionally outside the package export map. */
 const PROVIDER_SAFETY_STOP_ADAPTER_BRAND = Symbol("provider-safety-stop-adapter-brand");
 
 export type ProviderSafetyStopAdapterCapability = {
@@ -62,14 +58,4 @@ export function mintProviderSafetyStop(
 /** Identity check for terminal provider safety-stop authority. */
 export function isProviderSafetyStopAuthenticated(message: unknown): boolean {
 	return typeof message === "object" && message !== null && authenticatedProviderSafetyStops.has(message);
-}
-
-/**
- * Carry existing authority across a runtime-owned message rebuild. This does
- * not mint authority from message data and is safe to expose publicly.
- */
-export function transferProviderSafetyStop(from: unknown, to: AssistantMessage): void {
-	if (typeof from === "object" && from !== null && authenticatedProviderSafetyStops.has(from)) {
-		authenticatedProviderSafetyStops.add(to);
-	}
 }

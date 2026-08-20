@@ -3,10 +3,6 @@
  *
  * First-party adapters mint terminal authority through the package-private
  * adapter-internals module. Public consumers may only verify existing
- * authority or transfer it across a runtime-owned rebuild; message fields and
- * structured refusal text never mint authority.
+ * authority; message fields and structured refusal text never mint authority.
  */
-export {
-	isProviderSafetyStopAuthenticated,
-	transferProviderSafetyStop,
-} from "../adapter-internals/provider-safety-stop";
+export { isProviderSafetyStopAuthenticated } from "../adapter-internals/provider-safety-stop";
