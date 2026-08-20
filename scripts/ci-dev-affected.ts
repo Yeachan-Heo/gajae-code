@@ -892,12 +892,17 @@ export function planTasks(
 	for (const canary of selectCanaryTests(paths.filter(changedPath => !isDocOrChangelogPath(changedPath)))) {
 		addTestFileTask(tasks, canary);
 	}
-	// Push-mode uses this broad planner rather than planTargetedTasks(). The
-	// lifecycle smoke is pruned from ordinary coding-agent shards, so its
-	// behavioral owners must be escalated here as well or post-merge Dev CI
-	// never runs the advertised lifecycle gate.
+	// Push-mode uses this broad planner rather than planTargetedTasks(). Tests
+	// pruned from the ordinary coding-agent shards must be escalated here or
+	// post-merge Dev CI never runs them at all.
+	//
+	// Only DEDICATED-ONLY owners qualify. A behavioral test that still lives in
+	// the shards is already covered, and emitting a second task for it pulls it
+	// out of the suite it is meant to run inside -- which is what the
+	// eight-shard push-routing regression pins.
 	for (const changedPath of paths) {
 		for (const testFile of behavioralTestsFor(changedPath)) {
+			if (!isDedicatedOnlyTest(testFile)) continue;
 			addTestFileTask(tasks, testFile);
 		}
 	}
