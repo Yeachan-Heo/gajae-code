@@ -579,11 +579,19 @@ async function makeScratch(): Promise<string> {
 	return dir;
 }
 
+// Bun runs suite hooks even when every individual test is skipped, so the
+// per-test `skipIf` alone would still create and dispose the fixture on
+// Windows — reaching the POSIX-only teardown that deliberately throws there.
+// The platform guard has to cover the hooks, not just the cases.
+const skipLifecycleSuite = process.platform === "win32";
+
 afterAll(async () => {
+	if (skipLifecycleSuite) return;
 	await Promise.all(scratchDirs.map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
 beforeAll(async () => {
+	if (skipLifecycleSuite) return;
 	const scratchCwd = await makeScratch();
 	// A second workspace exists solely so the cwd filter has something to exclude:
 	// with one session in the index, an implementation ignoring `cwd` entirely would
@@ -714,7 +722,7 @@ beforeAll(async () => {
 // suite to POSIX explicitly rather than run it with a cleanup step that would
 // terminate only the direct child and leave the ACP CLI, broker, session host
 // and this suite's grandchild behind.
-const lifecycleTest = test.skipIf(process.platform === "win32");
+const lifecycleTest = test.skipIf(skipLifecycleSuite);
 
 lifecycleTest("initialize advertises every session lifecycle capability", () => {
 	expect(observed.sessionCapabilities).toEqual(

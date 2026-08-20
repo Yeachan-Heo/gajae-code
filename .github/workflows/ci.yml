@@ -291,7 +291,7 @@ jobs:
               overwrite: true
 
    acp_lifecycle_smoke:
-      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag' || inputs.rehearsal == 'nightly-release') && needs.main_plan.outputs.has_tasks == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag' || inputs.rehearsal == 'nightly-release') && needs.main_plan.outputs.has_tasks == 'true' && needs.main_native.result == 'success' }}
       needs: [main_plan, main_native]
       runs-on: ubuntu-22.04
       timeout-minutes: 15
@@ -347,7 +347,10 @@ jobs:
               case "$native" in success|skipped) ;; *) echo "native gate failed"; exit 1;; esac
               test "$shards" = success
               test "$conformance" = success
-              test "$lifecycle" = success
+              # The lifecycle job is gated on main_native actually producing its
+              # artifact, so a targeted or no-native plan skips it by design.
+              # An intentional skip is not a failure; only a real non-success is.
+              case "$lifecycle" in success|skipped) ;; *) echo "lifecycle gate failed"; exit 1;; esac
 
    nightly_gate:
       if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
