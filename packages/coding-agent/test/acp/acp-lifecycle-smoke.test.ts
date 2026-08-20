@@ -579,14 +579,25 @@ function rowsOf(value: unknown): SessionRow[] {
 	return Array.isArray(sessions) ? (sessions as SessionRow[]) : [];
 }
 
+/**
+ * The broker appends to this index while we poll it, so the final line can be a
+ * partial write. Skip lines that do not parse instead of throwing: an exception
+ * here aborts the whole polling loop, turning "the record has not landed yet"
+ * into a hard failure. A genuinely absent unregistration still fails, because
+ * the deadline expires with nothing matched.
+ */
 function indexRecordsUnregistration(text: string, sessionId: string): boolean {
-	return text
-		.split("\n")
-		.filter(Boolean)
-		.some(line => {
-			const event = JSON.parse(line) as BrokerIndexEvent;
-			return event.type === "host_unregistered" && event.sessionId === sessionId;
-		});
+	for (const line of text.split("\n")) {
+		if (line === "") continue;
+		let event: BrokerIndexEvent;
+		try {
+			event = JSON.parse(line) as BrokerIndexEvent;
+		} catch {
+			continue;
+		}
+		if (event.type === "host_unregistered" && event.sessionId === sessionId) return true;
+	}
+	return false;
 }
 
 /**
