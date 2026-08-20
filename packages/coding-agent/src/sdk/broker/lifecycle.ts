@@ -13,7 +13,6 @@ function nativeLifecycle(): typeof import("@gajae-code/natives") {
 	return nativeLifecycleBindings;
 }
 
-import type { FileHandle } from "node:fs/promises";
 import { $credentialEnv, logger, resolveEquivalentPath } from "@gajae-code/utils";
 
 import {
@@ -101,11 +100,14 @@ const MAX_PROCESS_INCARNATION_LENGTH = 256;
 const SESSION_HOST_SPAWN_LOG_TAIL_BYTES = 1_024;
 const READY_THEN_EXIT_MESSAGE = "became ready then exited before live admission";
 
-function readyThenExitedResponse(id: string, child?: ChildProcess, excerpt = ""): BrokerResponse {
+function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerResponse {
 	const parts = [`Session ${id} ${READY_THEN_EXIT_MESSAGE}.`];
 	if (child && child.exitCode !== null) parts.push(`exit=${child.exitCode}`);
 	if (child?.signalCode) parts.push(`signal=${child.signalCode}`);
-	if (excerpt) parts.push(`Host stderr: ${excerpt}`);
+	// Host stderr is deliberately excluded: the detached host receives launch
+	// configuration and inherited credentials, and no pattern-based redaction can
+	// prove arbitrary child output free of that material (#4712 review). The
+	// sanitized excerpt stays in the access-restricted broker-local spawn log.
 	return fail("ready_then_exited", parts.join(" "));
 }
 
@@ -2166,48 +2168,84 @@ export function sanitizeSessionHostSpawnLogForTest(value: string): string {
 	return sanitizeSdkStartupMessage(value);
 }
 
-async function openSessionHostSpawnLog(
-	agentDir: string,
-	sessionId: string,
-): Promise<{ path: string; handle: FileHandle } | undefined> {
-	try {
-		await fs.mkdir(path.join(agentDir, "sdk"), { recursive: true, mode: 0o700 });
-		const spawnLogPath = path.join(agentDir, "sdk", `session-host-spawn.${sessionId}.${randomUUID()}.log`);
-		return { path: spawnLogPath, handle: await fs.open(spawnLogPath, "w", 0o600) };
-	} catch {
-		return undefined;
-	}
+/**
+ * Bounded in-memory collector for detached-host stderr (#4712 review).
+ *
+ * A spawned host inherits launch configuration and credential-bearing
+ * environment material, so its output is never trusted into caller-visible
+ * strings, and a regular-file descriptor would let a noisy child consume
+ * unbounded disk for its whole lifetime. The child instead gets a pipe that
+ * the broker drains into this fixed-size ring: oldest bytes are dropped as
+ * new ones arrive, nothing is written to disk, and the retained window is
+ * sanitized only for broker-local diagnostics.
+ */
+type SessionHostStderrRing = { bytes: Uint8Array; write: number; dropped: boolean };
+
+function sessionHostStderrRing(): SessionHostStderrRing {
+	return { bytes: new Uint8Array(SESSION_HOST_SPAWN_LOG_TAIL_BYTES), write: 0, dropped: false };
 }
 
-async function readSessionHostSpawnLogTail(spawnLogPath: string): Promise<string> {
-	try {
-		const file = Bun.file(spawnLogPath);
-		const size = file.size;
-		if (!Number.isFinite(size) || size <= 0) return "";
-		// Sanitize the whole log before any byte-window selection: slicing first
-		// could cut into the middle of a credential, destroying the recognizable
-		// prefix the sanitizer needs and leaking the surviving suffix.
-		const sanitized = sanitizeSdkStartupMessage(await file.text());
-		if (Buffer.byteLength(sanitized) <= SESSION_HOST_SPAWN_LOG_TAIL_BYTES) return sanitized;
-		let start = 0;
-		while (start < sanitized.length && Buffer.byteLength(sanitized.slice(start)) > SESSION_HOST_SPAWN_LOG_TAIL_BYTES)
-			start += 1;
-		return sanitized.slice(start);
-	} catch {
-		return "";
-	}
+export function sessionHostStderrRingForTest(): SessionHostStderrRing {
+	return sessionHostStderrRing();
 }
 
-export async function readSessionHostSpawnLogTailForTest(spawnLogPath: string): Promise<string> {
-	return await readSessionHostSpawnLogTail(spawnLogPath);
+function drainSessionHostStderr(
+	stderr: ReadableStream<Uint8Array> | NodeJS.ReadableStream | undefined,
+	ring: SessionHostStderrRing,
+): void {
+	if (!stderr) return;
+	(async () => {
+		try {
+			const reader =
+				"getReader" in stderr
+					? { read: () => stderr.getReader().read(), close: () => stderr.getReader().releaseLock() }
+					: null;
+			if (reader) {
+				for (;;) {
+					const { done, value } = await reader.read();
+					if (done || !value) break;
+					appendRingChunk(ring, value);
+				}
+				return;
+			}
+			for await (const chunk of stderr as AsyncIterable<Uint8Array | string>) {
+				if (typeof chunk === "string") appendRingChunk(ring, new TextEncoder().encode(chunk));
+				else if (chunk.length > 0) appendRingChunk(ring, chunk);
+			}
+		} catch {
+			// The child exiting closes the pipe; a failed drain drops diagnostics only.
+		}
+	})();
 }
 
-async function removeSessionHostSpawnLog(spawnLogPath: string): Promise<void> {
-	try {
-		await fs.unlink(spawnLogPath);
-	} catch {
-		// Diagnostics must not affect lifecycle ownership.
+function appendRingChunk(ring: SessionHostStderrRing, chunk: Uint8Array): void {
+	if (chunk.length >= ring.bytes.length) {
+		ring.bytes.set(chunk.subarray(chunk.length - ring.bytes.length));
+		ring.write = ring.bytes.length;
+		ring.dropped = true;
+		return;
 	}
+	const overflow = ring.write + chunk.length - ring.bytes.length;
+	if (overflow > 0) {
+		ring.bytes.copyWithin(0, overflow);
+		ring.write -= overflow;
+		ring.dropped = true;
+	}
+	ring.bytes.set(chunk, ring.write);
+	ring.write += chunk.length;
+}
+
+export function drainSessionHostStderrForTest(stderr: ReadableStream<Uint8Array>, ring: SessionHostStderrRing): void {
+	drainSessionHostStderr(stderr, ring);
+}
+
+/** Sanitized broker-local tail of what the host wrote to stderr; never returned to callers. */
+function sessionHostStderrExcerpt(ring: SessionHostStderrRing): string {
+	return sanitizeSdkStartupMessage(new TextDecoder().decode(ring.bytes.subarray(0, ring.write)));
+}
+
+export function sessionHostStderrExcerptForTest(ring: SessionHostStderrRing): string {
+	return sessionHostStderrExcerpt(ring);
 }
 
 type LifecycleFileCapture = {
@@ -3860,15 +3898,14 @@ async function executeLifecycleResponse(
 		};
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
-		const spawnLog = await openSessionHostSpawnLog(broker.settings.agentDir, launch.id);
-		let spawnLogExcerpt = "";
+		const stderrRing = sessionHostStderrRing();
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
-					stdio: ["ignore", "ignore", spawnLog ? spawnLog.handle.fd : "ignore"],
+					stdio: ["ignore", "ignore", "pipe"],
 					env: {
 						...("kind" in cmd ? cmd.env : process.env),
 						GJC_AGENT_DIR: broker.settings.agentDir,
@@ -3901,8 +3938,6 @@ async function executeLifecycleResponse(
 				});
 			});
 			if (!authorizedSpawn.authorized) {
-				await spawnLog?.handle.close().catch(() => {});
-				if (spawnLog) await removeSessionHostSpawnLog(spawnLog.path);
 				return fail(
 					"startup_admission_refused",
 					"SDK host startup was refused because the broker no longer owns the session root.",
@@ -3910,6 +3945,7 @@ async function executeLifecycleResponse(
 			}
 			const spawned = authorizedSpawn.value;
 			child = spawned;
+			drainSessionHostStderr(spawned.stderr, stderrRing);
 			const pid = spawned.pid;
 			if (!pid) throw new Error("spawned session has no pid");
 			const incarnation = processIncarnationForBroker(broker, pid);
@@ -3920,11 +3956,7 @@ async function executeLifecycleResponse(
 			});
 			await writeEffectMarker(launch.root, launch.id, spawnedAuthority);
 			spawned.unref();
-			await spawnLog?.handle.close();
 		} catch (error) {
-			await spawnLog?.handle.close().catch(() => {});
-			spawnLogExcerpt = spawnLog ? await readSessionHostSpawnLogTail(spawnLog.path) : "";
-			if (spawnLog) await removeSessionHostSpawnLog(spawnLog.path);
 			const terminated = child
 				? await terminateSpawnedChild(
 						child,
@@ -3946,7 +3978,6 @@ async function executeLifecycleResponse(
 					);
 		}
 		if (!child || !spawnedAuthority) {
-			if (spawnLog) await removeSessionHostSpawnLog(spawnLog.path);
 			return fail("spawn_failed", "Unable to retain the spawned session process identity.");
 		}
 		await broker.ledger.transition(identity, "awaiting_ready", { intendedSessionId: launch.id, effectMarker });
@@ -3961,8 +3992,6 @@ async function executeLifecycleResponse(
 		);
 
 		if (readiness.kind !== "ready") {
-			spawnLogExcerpt = spawnLog ? await readSessionHostSpawnLogTail(spawnLog.path) : "";
-			if (spawnLog) await removeSessionHostSpawnLog(spawnLog.path);
 			const terminated = await terminateSpawnedChild(
 				child,
 				broker,
@@ -3973,13 +4002,16 @@ async function executeLifecycleResponse(
 				spawnedAuthority,
 				timing,
 			);
-			const excerpt = spawnLogExcerpt ? ` Host stderr: ${spawnLogExcerpt}` : "";
 
 			if (!terminated)
 				return fail(
 					"terminal_uncertain",
 					`Session ${launch.id} did not become ready and its spawned process could not be verified dead.`,
 				);
+			// Host stderr never reaches caller-visible error strings: the detached
+			// host handles launch configuration and inherited credentials, so its
+			// output cannot be proven free of secret material. The sanitized tail
+			// stays in the broker-local bounded ring only.
 			return readiness.kind === "startup_failed"
 				? fail(
 						readiness.failure.code ?? "spawn_failed",
@@ -3988,15 +4020,14 @@ async function executeLifecycleResponse(
 						readiness.failure.details,
 					)
 				: readiness.kind === "ready_then_exited"
-					? readyThenExitedResponse(launch.id, child, spawnLogExcerpt)
+					? readyThenExitedResponse(launch.id, child)
 					: readiness.kind === "child_exited"
-						? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.${excerpt}`)
+						? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
 						: fail(
 								"readiness_timeout",
-								`Session ${launch.id} did not register an endpoint before the readiness timeout.${excerpt}`,
+								`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
 							);
 		}
-		if (spawnLog) await removeSessionHostSpawnLog(spawnLog.path);
 		await reconcileReadyScope(broker, launch.id, launch.cwd);
 		const verified = await currentReadyAuthority(broker, launch.id, launch.root, spawnedAuthority);
 		if (!verified || !sameReadyAuthority(readiness.authority, verified)) {

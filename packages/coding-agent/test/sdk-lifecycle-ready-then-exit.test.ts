@@ -4,9 +4,11 @@ import * as path from "node:path";
 import { acpMcpLaunchFailure } from "../src/sdk/acp";
 import { Broker } from "../src/sdk/broker/broker";
 import {
-	readSessionHostSpawnLogTailForTest,
+	drainSessionHostStderrForTest,
 	readyThenExitToleranceEnabledForTest,
 	sanitizeSessionHostSpawnLogForTest,
+	sessionHostStderrExcerptForTest,
+	sessionHostStderrRingForTest,
 	setLifecycleCommandResolverForTest,
 	setLifecycleHostPlatformForTest,
 } from "../src/sdk/broker/lifecycle";
@@ -68,22 +70,28 @@ test("session-host spawn-log sanitation redacts secrets and URLs", () => {
 	expect(clean).toMatch(/redacted/i);
 });
 
-test("spawn-log tail sanitizes the whole log before cutting, even when the cut lands inside a secret", async () => {
-	const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-spawn-log-"));
-	const logPath = path.join(dir, "spawn.log");
-	// Padding longer than the 1024-byte tail bound plus the prior 512 overlap, so
-	// the retained window provably starts *inside* the secret's value and any
-	// slice-before-sanitize implementation leaks its surviving suffix.
+test("session-host stderr ring keeps only the newest window and sanitizes it whole", async () => {
+	const ring = sessionHostStderrRingForTest();
+	// Fill far past the ring capacity so the retained window provably starts
+	// *inside* the secret's value and a sanitize-after-cut design would leak
+	// the surviving suffix; the ring is sanitized whole instead.
 	const secret = "token=supersecret-boundary-value-with-a-long-suffix";
-	await Bun.write(logPath, `${"x".repeat(2200)}${secret}`);
-	try {
-		const tail = await readSessionHostSpawnLogTailForTest(logPath);
-		expect(tail).not.toContain("supersecret-boundary-value-with-a-long-suffix");
-		expect(tail).not.toContain("boundary-value");
-		expect(tail).toMatch(/redacted/i);
-	} finally {
-		await fs.rm(dir, { recursive: true, force: true });
-	}
+	const noise = "x".repeat(ring.bytes.length + 1024);
+	const encoder = new TextEncoder();
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(encoder.encode(noise));
+			controller.enqueue(encoder.encode(secret));
+			controller.close();
+		},
+	});
+	drainSessionHostStderrForTest(stream, ring);
+	await Bun.sleep(50);
+	const excerpt = sessionHostStderrExcerptForTest(ring);
+	expect(ring.dropped).toBe(true);
+	expect(excerpt).not.toContain("supersecret-boundary-value-with-a-long-suffix");
+	expect(excerpt).not.toContain("boundary-value");
+	expect(excerpt).not.toContain("token=");
 });
 
 test("ready-then-exit tolerance is win32-only through the host-platform seam", () => {
@@ -190,8 +198,8 @@ test("win32 host that rejects after ready is ready_then_exited, never spawn_fail
 		expect(response.error.code).toBe("ready_then_exited");
 		expect(response.error.code).not.toBe("spawn_failed");
 		expect(response.error.message).toMatch(/became ready then exited before live admission/i);
-		// The user-visible message must carry the stderr excerpt exactly once.
-		expect(response.error.message.match(/Host stderr:/g)?.length ?? 0).toBeLessThanOrEqual(1);
+		// The user-visible message must never carry host stderr (#4712 review).
+		expect(response.error.message).not.toContain("Host stderr");
 		expect(await broker.handleRequest("session.create", input, "host-reject-after-ready")).toEqual(response);
 	} finally {
 		if (previous === undefined) delete process.env.GJC_SDK_TEST_REJECT_AFTER_READY;
