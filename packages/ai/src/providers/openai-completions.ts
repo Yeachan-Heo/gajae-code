@@ -10,6 +10,10 @@ import type {
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions";
 import packageJson from "../../package.json" with { type: "json" };
+import {
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { type Effort, getSupportedEfforts } from "../model-thinking";
 import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
@@ -58,7 +62,6 @@ import { findUnnecessaryUnicodeEscape, isCompleteJson, parseStreamingJson } from
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
-import { applyProviderSafetyStop } from "../utils/provider-safety-stop";
 import { callWithCopilotModelRetry } from "../utils/retry";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { adaptSchemaForStrict, flattenToolRootCombinators, NO_STRICT, toolWireSchema } from "../utils/schema";
@@ -834,7 +837,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				// Terminal authority comes from the adapter mark, not the wire
 				// field: this call site parsed the structured content_filter
 				// finish reason from the provider's own response (#4777).
-				applyProviderSafetyStop(output, "content_filter");
+				mintProviderSafetyStop(output, "content_filter", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
 				if (errorMessage) output.errorMessage = errorMessage;
 			};
 
@@ -1080,7 +1083,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				// The structured content_filter code was parsed from the captured
 				// HTTP response body; mint adapter provenance for the terminal
 				// kind instead of trusting a wire-assignable field (#4777).
-				applyProviderSafetyStop(output, "content_filter");
+				mintProviderSafetyStop(output, "content_filter", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
 			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;

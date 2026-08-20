@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentOptions } from "@gajae-code/agent-core";
-import { type AssistantMessage, applyProviderSafetyStop, getBundledModel, type Model } from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, type Model } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -22,6 +22,10 @@ import {
 	resolveProviderSafetyStopHint,
 } from "@gajae-code/coding-agent/session/provider-safety-stop-hint";
 import { TempDir } from "@gajae-code/utils";
+import {
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../../ai/src/adapter-internals/provider-safety-stop";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -66,8 +70,9 @@ function safetyStopStream(
 		// parsed from the provider's own response mints the terminal authority.
 		// Omitting the mark simulates a wire/custom-stream payload that only
 		// carries the forged field.
-		if (options?.authenticated !== false) applyProviderSafetyStop(message, "refusal");
-		else message.errorKind = "provider_safety_stop";
+		if (options?.authenticated !== false) {
+			mintProviderSafetyStop(message, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+		} else message.errorKind = "provider_safety_stop";
 		stream.push({ type: "start", partial: message });
 		stream.push({ type: "error", reason: "error", error: message });
 	});

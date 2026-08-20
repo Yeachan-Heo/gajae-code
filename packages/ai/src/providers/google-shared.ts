@@ -3,6 +3,10 @@
  */
 
 import { extractHttpStatusFromError, readJsonl, readSseJson } from "@gajae-code/utils";
+import {
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -22,7 +26,6 @@ import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
-import { applyProviderSafetyStop } from "../utils/provider-safety-stop";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
 import {
 	isForcedToolChoiceUnsupportedError,
@@ -662,7 +665,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 				// Terminal authority is minted by the adapter after parsing the
 				// structured candidate finish reason; a wire-assignable field
 				// alone never carries it (#4777).
-				applyProviderSafetyStop(output, candidate.finishReason);
+				mintProviderSafetyStop(output, candidate.finishReason, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
 				output.stopReason = "error";
 			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 				output.stopReason = mapStopReason(candidate.finishReason);
@@ -677,7 +680,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 			if (isGooglePromptSafetyStopReason(blockReason)) {
 				// Prompt-level block reasons carry the same adapter-minted
 				// authority as candidate finish reasons (#4777).
-				applyProviderSafetyStop(output, blockReason);
+				mintProviderSafetyStop(output, blockReason, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
 				output.stopReason = "error";
 			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 				output.stopReason = "error";

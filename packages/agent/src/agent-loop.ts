@@ -3559,9 +3559,11 @@ async function streamAssistantResponse(
 				closeIterator();
 			}
 
+			const finished = await finishResponse();
+			sanitizeProviderSafetyStopProvenance(finished);
 			const trailing = config.fallbackManaged
-				? managedAssistantShell(await finishResponse(), config.model, managedDegradedFieldDiagnostics)
-				: await finishResponse();
+				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics)
+				: finished;
 			await finishChat(trailing);
 			return trailing;
 		});

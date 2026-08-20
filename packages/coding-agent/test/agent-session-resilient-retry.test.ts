@@ -2,13 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentTool, type StreamFn } from "@gajae-code/agent-core";
-import {
-	type AssistantMessage,
-	applyProviderSafetyStop,
-	getBundledModel,
-	type Model,
-	type ToolCall,
-} from "@gajae-code/ai";
+import { type AssistantMessage, getBundledModel, type Model, type ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -21,6 +15,10 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import {
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../../ai/src/adapter-internals/provider-safety-stop";
 
 /**
  * Anthropic's statusless capacity-overload envelope exactly as observed in a
@@ -199,7 +197,9 @@ describe("AgentSession resilient retry", () => {
 					// first-party provider envelope, so the structured refusal signal
 					// carries the terminal authority rather than the wire field
 					// alone (#4777).
-					if (options.errorKind === "provider_safety_stop") applyProviderSafetyStop(message, "refusal");
+					if (options.errorKind === "provider_safety_stop") {
+						mintProviderSafetyStop(message, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+					}
 					stream.push({ type: "start", partial: message });
 					stream.push({ type: "error", reason: "error", error: message });
 				});

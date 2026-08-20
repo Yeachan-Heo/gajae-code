@@ -21,6 +21,10 @@ import {
 	readSseEvents,
 } from "@gajae-code/utils";
 import {
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
+import {
 	hasOpus47ApiRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
@@ -82,7 +86,6 @@ import {
 } from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { notifyProviderResponse } from "../utils/provider-response";
-import { applyProviderSafetyStop } from "../utils/provider-safety-stop";
 import { isCopilotTransientModelError } from "../utils/retry";
 import { getRetryAfterMsFromHeaders } from "../utils/retry-after";
 import { resolveRetryBudget } from "../utils/retry-budget";
@@ -2447,9 +2450,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								// structured refusal signal was parsed from the stream
 								// delta, so the mark (not the wire field) carries the
 								// authority (#4777).
-								applyProviderSafetyStop(
+								mintProviderSafetyStop(
 									output,
 									stopDetails?.type === "refusal" ? "refusal" : (rawStopReason ?? "refusal"),
+									PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 								);
 								if (stopDetails?.type === "refusal") {
 									const explanation = stopDetails.explanation?.trim();

@@ -6,6 +6,10 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@gajae-code/utils";
+import {
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -22,7 +26,6 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
-import { applyProviderSafetyStop } from "../utils/provider-safety-stop";
 import { resolveRetryBudget } from "../utils/retry-budget";
 // Refresh is the sole responsibility of AuthStorage (broker-aware, single-flighted);
 // the stream provider trusts the access token threaded through `options.apiKey`.
@@ -569,7 +572,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							hasContent = true;
 							// Adapter-minted terminal authority from the parsed
 							// structured finish reason (#4777).
-							applyProviderSafetyStop(output, candidate.finishReason);
+							mintProviderSafetyStop(output, candidate.finishReason, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
 							output.stopReason = "error";
 						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 							output.stopReason = mapStopReasonString(candidate.finishReason);
@@ -584,7 +587,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						hasContent = true;
 						if (isGooglePromptSafetyStopReason(blockReason)) {
 							// Prompt-level block reason: adapter-minted authority (#4777).
-							applyProviderSafetyStop(output, blockReason);
+							mintProviderSafetyStop(output, blockReason, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
 							output.stopReason = "error";
 						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 							output.stopReason = "error";
