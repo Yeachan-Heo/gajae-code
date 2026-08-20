@@ -58,6 +58,7 @@ import { findUnnecessaryUnicodeEscape, isCompleteJson, parseStreamingJson } from
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
+import { applyProviderSafetyStop } from "../utils/provider-safety-stop";
 import { callWithCopilotModelRetry } from "../utils/retry";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { adaptSchemaForStrict, flattenToolRootCombinators, NO_STRICT, toolWireSchema } from "../utils/schema";
@@ -829,8 +830,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			let providerSafetyStop = false;
 			const markProviderSafetyStop = (errorMessage?: string): void => {
 				providerSafetyStop = true;
-				output.errorKind = "provider_safety_stop";
 				output.stopReason = "error";
+				// Terminal authority comes from the adapter mark, not the wire
+				// field: this call site parsed the structured content_filter
+				// finish reason from the provider's own response (#4777).
+				applyProviderSafetyStop(output, "content_filter");
 				if (errorMessage) output.errorMessage = errorMessage;
 			};
 
@@ -1073,7 +1077,10 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
 			output.errorMessage = rewriteCopilotError(output.errorMessage, normalizedError, model.provider);
 			if (hasContentFilterSafetyCode(capturedErrorResponse)) {
-				output.errorKind = "provider_safety_stop";
+				// The structured content_filter code was parsed from the captured
+				// HTTP response body; mint adapter provenance for the terminal
+				// kind instead of trusting a wire-assignable field (#4777).
+				applyProviderSafetyStop(output, "content_filter");
 			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;

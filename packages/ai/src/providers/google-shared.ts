@@ -22,6 +22,7 @@ import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
+import { applyProviderSafetyStop } from "../utils/provider-safety-stop";
 import { normalizeSchemaForCCA, normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
 import {
 	isForcedToolChoiceUnsupportedError,
@@ -658,7 +659,10 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 
 		if (candidate?.finishReason) {
 			if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
-				output.errorKind = PROVIDER_SAFETY_STOP;
+				// Terminal authority is minted by the adapter after parsing the
+				// structured candidate finish reason; a wire-assignable field
+				// alone never carries it (#4777).
+				applyProviderSafetyStop(output, candidate.finishReason);
 				output.stopReason = "error";
 			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 				output.stopReason = mapStopReason(candidate.finishReason);
@@ -671,7 +675,9 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 		const blockReason = getGooglePromptBlockReason(chunk.promptFeedback);
 		if (blockReason) {
 			if (isGooglePromptSafetyStopReason(blockReason)) {
-				output.errorKind = PROVIDER_SAFETY_STOP;
+				// Prompt-level block reasons carry the same adapter-minted
+				// authority as candidate finish reasons (#4777).
+				applyProviderSafetyStop(output, blockReason);
 				output.stopReason = "error";
 			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 				output.stopReason = "error";

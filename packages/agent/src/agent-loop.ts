@@ -12,11 +12,13 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	EventStream,
+	isProviderSafetyStopAuthenticated,
 	isZodSchema,
 	streamSimple,
 	type ToolChoice,
 	type ToolResultMessage,
 	type TSchema,
+	transferProviderSafetyStop,
 	transportFailureFacts,
 	type UserMessage,
 	validateToolArguments,
@@ -360,6 +362,18 @@ function managedTransportFailure(failure: unknown) {
 function managedRetryableFailure(failure: unknown): boolean {
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
+	// A typed provider safety stop is terminal evidence ahead of any transport
+	// class, but only with adapter-minted provenance: unauthenticated labels
+	// are stripped at the stream exit (`sanitizeProviderSafetyStopProvenance`)
+	// and must fall through to ordinary transport classification so the chain
+	// can still advance (#4777).
+	if (
+		managedProperty(failure, "stopReason") === "error" &&
+		managedProperty(failure, "errorKind") === "provider_safety_stop" &&
+		isProviderSafetyStopAuthenticated(failure)
+	) {
+		return false;
+	}
 	const trigger = classifyFallbackTrigger(facts);
 	// A plain `forbidden` is terminal: retrying it just re-sends a request the
 	// caller is not authorized to make, and the credential-mutating consumers
@@ -383,6 +397,26 @@ function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
 	}
 	message.stopReason = "error";
 	message.errorMessage = "Provider returned an empty response with zero token usage";
+}
+/**
+ * Terminal safety-stop authority is provenance-bound, not data-bound: a
+ * provider or custom stream payload that self-labels
+ * `errorKind: "provider_safety_stop"` without the adapter-minted mark must not
+ * terminalize the failure, because terminal treatment suppresses the user's
+ * configured fallback chain (#4777 review follow-up). Strip the unauthenticated
+ * field from the live final message at the single stream-exit point, before
+ * the managed snapshot shell clones it and before any retry/discard policy
+ * reads it, so a forged label degrades to an ordinary (fallback-eligible)
+ * error everywhere downstream — loop gates, session policy, and persistence.
+ */
+function sanitizeProviderSafetyStopProvenance(message: AssistantMessage): void {
+	if (
+		message.stopReason === "error" &&
+		message.errorKind === "provider_safety_stop" &&
+		!isProviderSafetyStopAuthenticated(message)
+	) {
+		delete message.errorKind;
+	}
 }
 
 /**
@@ -1218,7 +1252,7 @@ function managedAssistantShell(
 	// runtime failure in the executor's parent-facing summary (#4618).
 	delete safeMetadata.errorKind;
 	delete safeMetadata.bufferOverflow;
-	return {
+	const rebuilt: AssistantMessage = {
 		...safeMetadata,
 		role: "assistant",
 		content,
@@ -1233,6 +1267,12 @@ function managedAssistantShell(
 		...(errorKind ? { errorKind } : {}),
 		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
 	};
+	// The closed-literal copy above is fed by the stream-exit provenance
+	// sanitize, so an unauthenticated label never reaches here; carry the
+	// adapter-minted authority across the rebuild so downstream gates (the
+	// discard decision and session policy) can re-verify identity (#4777).
+	if (errorKind) transferProviderSafetyStop(value, rebuilt);
+	return rebuilt;
 }
 
 function managedContentBlock(block: unknown): AssistantMessage["content"] {
@@ -3494,9 +3534,11 @@ async function streamAssistantResponse(
 
 						case "done":
 						case "error": {
+							const finished = await finishResponse();
+							sanitizeProviderSafetyStopProvenance(finished);
 							const finalMessage = config.fallbackManaged
-								? managedAssistantShell(await finishResponse(), config.model, managedDegradedFieldDiagnostics)
-								: await finishResponse();
+								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics)
+								: finished;
 							promoteTypedEmptyResponseStop(finalMessage);
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
