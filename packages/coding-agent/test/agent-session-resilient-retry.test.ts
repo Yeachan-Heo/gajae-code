@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentTool, type StreamFn } from "@gajae-code/agent-core";
-import { type AssistantMessage, getBundledModel, type Model, type ToolCall } from "@gajae-code/ai";
+import {
+	type AssistantMessage,
+	applyProviderSafetyStop,
+	getBundledModel,
+	type Model,
+	type ToolCall,
+} from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -189,6 +195,11 @@ describe("AgentSession resilient retry", () => {
 							: { transportFailure: callFailure?.transportFailure ?? options.transportFailure }),
 						timestamp: Date.now(),
 					};
+					// The typed safety stop is adapter-minted: this helper simulates a
+					// first-party provider envelope, so the structured refusal signal
+					// carries the terminal authority rather than the wire field
+					// alone (#4777).
+					if (options.errorKind === "provider_safety_stop") applyProviderSafetyStop(message, "refusal");
 					stream.push({ type: "start", partial: message });
 					stream.push({ type: "error", reason: "error", error: message });
 				});
