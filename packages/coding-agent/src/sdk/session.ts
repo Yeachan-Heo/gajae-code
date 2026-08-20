@@ -2314,6 +2314,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (options.enableMcpAutoload !== false) {
 				try {
 					const loaded = await loadAllMCPConfigs(cwd, {
+						// User scope is this session's agent directory, the same file
+						// `gjc mcp add` (user scope) writes; an SDK embedder that runs on
+						// its own agent directory autoloads its own registrations.
+						agentDir,
 						// Project-scope native config loads by default; only an
 						// explicitly configured `mcp.enableProjectConfig: false`
 						// disables it (the legacy schema default stays false for

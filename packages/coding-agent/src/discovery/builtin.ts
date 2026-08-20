@@ -4,7 +4,7 @@
  * Primary provider for GJC native configs. Supports all capabilities.
  */
 import * as path from "node:path";
-import { logger, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
+import { getAgentDir, logger, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
@@ -43,6 +43,20 @@ const PATHS = SOURCE_PATHS.native;
 
 function getUserAgentDirs(): string[] {
 	return [PATHS.userAgent];
+}
+
+/**
+ * GJC's user-scope config directory.
+ *
+ * Home-relative `<home>/.gjc/agent` is only its default location: an agent
+ * directory profile (`--agent-dir`, `GJC_CODING_AGENT_DIR`, `setAgentDir()`)
+ * moves the whole user scope, and the writers (`getMCPConfigPath("user")` and
+ * everything `gjc mcp add` reaches) already follow it. Resolving from the home
+ * default instead would hide a profile's own registrations and load the default
+ * profile's servers into it.
+ */
+function resolveUserAgentDir(ctx: LoadContext): string {
+	return ctx.userAgentDir ?? getAgentDir();
 }
 
 function getProjectConfigDirs(): string[] {
@@ -226,15 +240,14 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		return result;
 	};
 
+	const userAgentDir = resolveUserAgentDir(ctx);
 	const paths = [
 		...getProjectConfigDirs().flatMap(projectConfigDir => [
 			{ path: path.join(ctx.cwd, projectConfigDir, "mcp.json"), level: "project" as const },
 			{ path: path.join(ctx.cwd, projectConfigDir, ".mcp.json"), level: "project" as const },
 		]),
-		...getUserAgentDirs().flatMap(userAgentDir => [
-			{ path: path.join(ctx.home, userAgentDir, "mcp.json"), level: "user" as const },
-			{ path: path.join(ctx.home, userAgentDir, ".mcp.json"), level: "user" as const },
-		]),
+		{ path: path.join(userAgentDir, "mcp.json"), level: "user" as const },
+		{ path: path.join(userAgentDir, ".mcp.json"), level: "user" as const },
 	];
 
 	const contents = await Promise.allSettled(

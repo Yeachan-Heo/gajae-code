@@ -60,8 +60,13 @@ describe("red-team: conventional MCP autoload", () => {
 	beforeEach(async () => {
 		MCPManager.resetForTests();
 		projectDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-redteam-project-"));
-		agentDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-redteam-agent-"));
 		tempHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-redteam-home-"));
+		// The MCP user scope is the agent directory (that is where `gjc mcp add`
+		// writes), so isolating it is exactly `setAgentDir`. Anchor it inside the
+		// temp home so the layout matches a real profile and nothing here can reach
+		// the developer's real `~/.gjc/agent/mcp.json`.
+		agentDir = path.join(tempHome, ".gjc", "agent");
+		await fs.promises.mkdir(agentDir, { recursive: true });
 		setAgentDir(agentDir);
 		vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 		authStorage = await AuthStorage.create(":memory:");
@@ -82,8 +87,8 @@ describe("red-team: conventional MCP autoload", () => {
 		await fs.promises.writeFile(filePath, typeof content === "string" ? content : JSON.stringify(content));
 	}
 
-	async function writeUserNativeConfig(content: unknown): Promise<string> {
-		const filePath = path.join(tempHome, ".gjc", "agent", "mcp.json");
+	async function writeUserNativeConfig(content: unknown, filename = "mcp.json"): Promise<string> {
+		const filePath = path.join(agentDir, filename);
 		await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
 		await fs.promises.writeFile(filePath, JSON.stringify(content));
 		return filePath;
@@ -430,9 +435,7 @@ describe("red-team: conventional MCP autoload", () => {
 		});
 
 		it("user .gjc/agent/.mcp.json is read alongside user .gjc/agent/mcp.json", async () => {
-			const userDotPath = path.join(tempHome, ".gjc", "agent", ".mcp.json");
-			await fs.promises.mkdir(path.dirname(userDotPath), { recursive: true });
-			await fs.promises.writeFile(userDotPath, JSON.stringify({ mcpServers: { dotUser: demoConfig() } }));
+			await writeUserNativeConfig({ mcpServers: { dotUser: demoConfig() } }, ".mcp.json");
 			const loaded = await loadAllMCPConfigs(projectDir, {
 				filterExa: false,
 				nativeOnly: true,

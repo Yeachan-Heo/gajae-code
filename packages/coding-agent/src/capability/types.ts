@@ -15,6 +15,20 @@ export interface LoadContext {
 	cwd: string;
 	/** User home directory */
 	home: string;
+	/**
+	 * GJC's user-scope config directory: the resolved agent directory
+	 * (`getAgentDir()`), which `--agent-dir`, `GJC_CODING_AGENT_DIR` and
+	 * `setAgentDir()` redirect away from `<home>/.gjc/agent`. `loadCapability`
+	 * always sets it; ad-hoc contexts built for path scanning may omit it, and
+	 * consumers then fall back to the same process-wide `getAgentDir()`.
+	 *
+	 * A native surface whose write path targets the agent directory resolves its
+	 * user scope from here, or discovery reads a different file than the one the
+	 * writer produced: `gjc mcp add` (user scope) writes `getMCPConfigPath("user")`
+	 * under this directory. Surfaces whose writers are home-relative (skills) keep
+	 * resolving from `home`.
+	 */
+	userAgentDir?: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
 }
@@ -67,6 +81,12 @@ export interface LoadOptions {
 	excludeProviders?: string[];
 	/** Custom cwd. Default: getProjectDir() */
 	cwd?: string;
+	/**
+	 * Agent directory backing `LoadContext.userAgentDir`. Default: getAgentDir().
+	 * Set it when loading for a session whose agent directory differs from the
+	 * process-wide one (`createAgentSession({ agentDir })`).
+	 */
+	agentDir?: string;
 	/** Include items even if they fail validation. Default: false */
 	includeInvalid?: boolean;
 	/** Include items disabled via settings. Default: false */

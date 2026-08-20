@@ -43,11 +43,14 @@ describe("conventional MCP autoload in standalone sessions", () => {
 	beforeEach(async () => {
 		MCPManager.resetForTests();
 		projectDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-autoload-project-"));
-		agentDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-autoload-agent-"));
 		tempHome = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-mcp-autoload-home-"));
+		// The MCP user scope is the agent directory, so `setAgentDir` is what keeps
+		// this test off the developer's real ~/.gjc MCP configuration.
+		agentDir = path.join(tempHome, ".gjc", "agent");
+		await fs.promises.mkdir(agentDir, { recursive: true });
 		setAgentDir(agentDir);
-		// Point the capability loader at a temp home so the test never reads or
-		// writes the developer's real ~/.gjc MCP configuration.
+		// Home-relative surfaces (skills and other convention scans) resolve from
+		// the mocked home.
 		vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 		authStorage = await AuthStorage.create(":memory:");
 		modelRegistry = new ModelRegistry(authStorage);

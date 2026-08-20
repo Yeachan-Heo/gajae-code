@@ -745,10 +745,17 @@ export function getProjectPluginOverridesPath(cwd: string = getProjectDir()): st
 // MCP config paths
 // =============================================================================
 
-/** Get the primary MCP config file path (first candidate). */
-export function getMCPConfigPath(scope: "user" | "project", cwd: string = getProjectDir()): string {
+/**
+ * Get the primary MCP config file path (first candidate).
+ *
+ * User scope lives in the agent directory, so a profile override
+ * (`--agent-dir`, `GJC_CODING_AGENT_DIR`, `setAgentDir()`) moves it. Pass
+ * `agentDir` to resolve the scope of a session whose agent directory differs
+ * from the process-wide one.
+ */
+export function getMCPConfigPath(scope: "user" | "project", cwd: string = getProjectDir(), agentDir?: string): string {
 	if (scope === "user") {
-		return path.join(getAgentDir(), "mcp.json");
+		return path.join(agentDir ?? getAgentDir(), "mcp.json");
 	}
 	return path.join(getProjectAgentDir(cwd), "mcp.json");
 }

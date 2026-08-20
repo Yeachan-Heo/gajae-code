@@ -11,6 +11,8 @@ Ordinary top-level standalone sessions (`gjc`, `gjc --tmux`, print/text/json mod
 | `.gjc/mcp.json`, `.gjc/.mcp.json` | project | Native GJC config; written by `gjc mcp add --project`. |
 | `~/.gjc/agent/mcp.json`, `~/.gjc/agent/.mcp.json` | user | Native GJC config; written by `gjc mcp add`. |
 
+User scope is the agent directory, not a fixed home path: an agent-directory profile (`GJC_CODING_AGENT_DIR`, an SDK session's `agentDir`) moves discovery, `gjc mcp add`, and the `disabledServers` denylist together, so a profile always autoloads its own registrations and never the default profile's.
+
 Precedence per server name is deterministic: the native project scope wins over the native user scope on a name collision. Plugin-bundle MCP servers (from installed GJC plugins) override conventional servers with the same name; they are a validated, always-on product surface.
 
 Claude Code and Codex MCP files (project `.claude/mcp.json` / `.claude/.mcp.json`, `.codex/config.toml` `[mcp_servers.*]`, and their user-global counterparts) are **import sources, not runtime authorities**: sessions never load them at startup. A bounded compatibility layer normalizes them into the same internal MCP contract, and an explicit import transaction writes the normalized definitions into the chosen `.gjc` scope (the `/extensions` import surface). `~/.claude`, `~/.codex`, and other foreign user-home configs are never read.
@@ -20,7 +22,7 @@ Claude Code and Codex MCP files (project `.claude/mcp.json` / `.claude/.mcp.json
 A server is loaded at startup when all of the following hold:
 
 - the server is not marked `enabled: false`;
-- the server name is not in the `disabledServers` list of either native config scope (`~/.gjc/agent/mcp.json` or `./.gjc/mcp.json`);
+- the server name is not in the `disabledServers` list of either native config scope (`<agent dir>/mcp.json` or `./.gjc/mcp.json`);
 - the server is not marked `autoload: false` (autoload defaults to true; `autoload: false` keeps a server configured for on-demand `/mcp` connection);
 - project-scope servers load by default; setting `mcp.enableProjectConfig` explicitly to `false` in settings disables every project-scope source for that environment.
 
@@ -60,7 +62,7 @@ There is no MCP config reload while the session runs except `/mcp reload` in ses
 
 ## Boundary
 
-Standalone GJC does not inherit user-home MCP configurations from Claude Code, Codex, OpenCode, or other tools (`~/.claude`, `~/.codex`, and similar user-global configs are never read). MCP servers often carry credentials, filesystem reach, browser state, approval semantics, and lifecycle that belong to the configuring host. Claude/Codex MCP files are normalized only through the bounded compatibility layer on explicit import, and the only MCP config read from the user's home directory at session startup is GJC's own `~/.gjc/agent/mcp.json`.
+Standalone GJC does not inherit user-home MCP configurations from Claude Code, Codex, OpenCode, or other tools (`~/.claude`, `~/.codex`, and similar user-global configs are never read). MCP servers often carry credentials, filesystem reach, browser state, approval semantics, and lifecycle that belong to the configuring host. Claude/Codex MCP files are normalized only through the bounded compatibility layer on explicit import, and the only MCP config read from the user's home directory at session startup is GJC's own `~/.gjc/agent/mcp.json` (or the active agent directory when a profile overrides it).
 
 `--mode rpc`, `--mode rpc-ui`, `--mode bridge`, and `gjc sdk serve` have been removed. Do not use the former RPC host-tool protocol to connect an MCP server; use Coordinator MCP, the [SDK session CLI](./sdk-session-cli.md), or a managed adapter for supported external control.
 

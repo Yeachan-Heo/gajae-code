@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { setAgentDir } from "@gajae-code/utils";
+import { getMCPConfigPath, setAgentDir } from "@gajae-code/utils";
 import type { MCPServer } from "../../src/capability/mcp";
 import { normalizeClaudeMcpJson, normalizeCodexMcpToml, validateMCPCompatServer } from "../../src/discovery/mcp-compat";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
@@ -111,6 +111,60 @@ describe("conventional MCP precedence", () => {
 
 		const loaded = await loadAllMCPConfigs(projectDir, { filterExa: false });
 		expect(Object.keys(loaded.configs)).toEqual([]);
+	});
+});
+
+describe("native user scope resolution", () => {
+	// Regression: discovery used to derive the user scope from `<home>/.gjc/agent`
+	// while every writer (`gjc mcp add` user scope, the `/mcp` wizard, the
+	// disabledServers denylist) writes `getMCPConfigPath("user")` under the agent
+	// directory. Under an agent-directory profile the two disagreed: the profile's
+	// own registrations never loaded and the default profile's servers loaded in
+	// their place (#4767).
+	it("reads the same user file `gjc mcp add --scope user` writes when the agent directory is a profile", async () => {
+		const profileAgentDir = path.join(tempHome, "profile-a");
+		await fs.mkdir(profileAgentDir, { recursive: true });
+		setAgentDir(profileAgentDir);
+
+		const userConfigPath = getMCPConfigPath("user", projectDir);
+		expect(userConfigPath).toBe(path.join(profileAgentDir, "mcp.json"));
+		await fs.writeFile(
+			userConfigPath,
+			JSON.stringify({ mcpServers: { profileSrv: { type: "stdio", command: "profile-bin" } } }),
+		);
+
+		const loaded = await loadAllMCPConfigs(projectDir, { filterExa: false, nativeOnly: true, autoloadOnly: true });
+		expect(Object.keys(loaded.configs)).toEqual(["profileSrv"]);
+		expect(loaded.sources.profileSrv.level).toBe("user");
+		expect(loaded.sources.profileSrv.path).toBe(userConfigPath);
+	});
+
+	it("honors an explicit agentDir over the process-wide one for both servers and the denylist", async () => {
+		const sessionAgentDir = path.join(tempHome, "profile-session");
+		await fs.mkdir(sessionAgentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(sessionAgentDir, "mcp.json"),
+			JSON.stringify({
+				mcpServers: { sessionSrv: { type: "stdio", command: "session-bin" } },
+				disabledServers: ["deniedProject"],
+			}),
+		);
+		// The process-wide scope holds a different server that must not leak in.
+		await writeUserNativeConfig({ mcpServers: { globalSrv: { type: "stdio", command: "global-bin" } } });
+		await writeProjectConfig(".gjc/mcp.json", {
+			mcpServers: { deniedProject: { type: "stdio", command: "denied-bin" } },
+		});
+
+		const loaded = await loadAllMCPConfigs(projectDir, {
+			filterExa: false,
+			nativeOnly: true,
+			autoloadOnly: true,
+			agentDir: sessionAgentDir,
+		});
+		// `globalSrv` (process-wide scope) stays out, and `deniedProject` is dropped
+		// by the denylist in the session scope's own config file.
+		expect(Object.keys(loaded.configs)).toEqual(["sessionSrv"]);
+		expect(loaded.sources.sessionSrv.path).toBe(path.join(sessionAgentDir, "mcp.json"));
 	});
 });
 

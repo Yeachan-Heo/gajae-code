@@ -34,6 +34,12 @@ export interface LoadMCPConfigsOptions {
 	nativeOnly?: boolean;
 	/** Load only this explicit MCP config file. */
 	configPath?: string;
+	/**
+	 * Agent directory that holds the user scope (`<agentDir>/mcp.json`).
+	 * Default: `getAgentDir()`. Sessions created with their own `agentDir` pass it
+	 * so discovery and `gjc mcp add --scope user` read and write the same file.
+	 */
+	agentDir?: string;
 }
 
 /** Result of loading MCP configs */
@@ -140,6 +146,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		// implicit runtime authorities.
 		const result = await loadCapability<MCPServer>(mcpCapability.id, {
 			cwd,
+			agentDir: options?.agentDir,
 			providers: options?.nativeOnly === true ? ["native"] : undefined,
 		});
 		// Filter out project-level configs if disabled
@@ -150,7 +157,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		// must not abort discovery of valid servers in the other scope (the
 		// capability loader itself is already per-file tolerant).
 		const [userDisabled, projectDisabled] = await Promise.all([
-			readDisabledServers(getMCPConfigPath("user", cwd)).catch(() => []),
+			readDisabledServers(getMCPConfigPath("user", cwd, options?.agentDir)).catch(() => []),
 			readDisabledServers(getMCPConfigPath("project", cwd)).catch(() => []),
 		]);
 		disabledServers = new Set([...userDisabled, ...projectDisabled]);
