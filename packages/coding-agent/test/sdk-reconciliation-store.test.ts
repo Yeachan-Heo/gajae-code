@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -974,4 +975,49 @@ test("empty-store reload clears retained evicted-terminal keys on every empty-lo
 	await pathless.load();
 	expect(pathless.snapshotTerminalKeys()).toEqual([]);
 	await fs.rm(root, { recursive: true, force: true });
+});
+
+test("drain resolves only after an in-flight publication's atomic rename settles (#4743)", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-drain-"));
+	const sessionFile = path.join(root, "session.jsonl");
+	const sessionId = "drain-race";
+	const store = createReconciliationStore({ sessionFile, sessionId });
+	await store.load();
+	const target = reconciliationStorePath(sessionFile, sessionId);
+	const gate = Promise.withResolvers<void>();
+	const realRename = fsPromises.rename.bind(fsPromises);
+	const rename = spyOn(fsPromises, "rename").mockImplementation(async (from: unknown, to: unknown) => {
+		if (String(to) === target) await gate.promise;
+		return await realRename(from as string, to as string);
+	});
+	try {
+		const publication = store.transact(() => [
+			{
+				kind: "prompt",
+				commandId: "command-drain",
+				turnId: "turn-drain",
+				createdAt: 1,
+				acceptedAt: 1,
+				status: "terminal_ok",
+				terminalAt: 2,
+				terminalOutcome: { kind: "success" },
+			},
+		]);
+		// The publication's rename is held by the gate; drain must observe it.
+		await Bun.sleep(50);
+		let drained = false;
+		const drain = (store.drain?.() ?? Promise.resolve()).then(() => {
+			drained = true;
+		});
+		await Bun.sleep(100);
+		expect(drained).toBe(false);
+		gate.resolve();
+		await publication;
+		await drain;
+		expect(drained).toBe(true);
+		expect(await fs.readFile(target, "utf8")).toContain("command-drain");
+	} finally {
+		rename.mockRestore();
+		await fs.rm(root, { recursive: true, force: true });
+	}
 });

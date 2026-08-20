@@ -1186,6 +1186,9 @@ interface SessionRuntime {
 	/** Aborts and fences side turns while notification delivery is disabled. */
 	disableEphemeralTurns: () => void;
 	waitForGateResolutionQuiescence: () => Promise<void>;
+	/** Awaits durable quiescence of every reconciliation transaction this runtime
+	 *  admitted, so teardown owners observe a settled store (#4743). */
+	drainDurableReconciliation: () => Promise<void>;
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T>;
 	workflowGate?: WorkflowGateEmitter;
 	gatePresentations?: PresentationArbiter;
@@ -4343,6 +4346,18 @@ export function createNotificationsExtension(
 				logger.warn(`notifications: stop failed: ${String(e)}`);
 			}
 		}
+		// #4743: terminal release must not be reported while a fire-and-forget
+		// reconciliation publication this runtime admitted is still between its temp
+		// write and atomic rename — an owner removing the state tree at that instant
+		// fails the rename with ENOENT/reconciliation_persist_failed. Observe durable
+		// quiescence AFTER the endpoint stopped serving (no new admissions) and
+		// BEFORE the terminal release is recorded.
+		try {
+			await rt.drainDurableReconciliation();
+		} catch (e) {
+			ownerReleaseFailures.push(e);
+			logger.warn(`sdk reconciliation drain failed: ${String(e)}`);
+		}
 		lifecycleStartupCapability?.rollback?.recordStop(rt.host.generation, {
 			runtimeRemoved: true,
 			hostStopped: rt.hostStopped && rt.serverStopped,
@@ -6742,6 +6757,17 @@ export function createNotificationsExtension(
 			enableNotifications: () => {},
 			disposeGateTerminalController: () => {},
 			disposeAckRecoveryParticipant: () => {},
+			// #4743: session teardown must observe durable quiescence of every
+			// reconciliation transaction this runtime admitted. Fire-and-forget
+			// post-response publications (agent_end/agent_failed transitions) are
+			// enqueued on the store chain, not awaited by their callers; without this
+			// drain an external teardown owner removing the state tree the moment
+			// session_shutdown resolves can delete the .sdk-reconciliation directory
+			// between a publication's temp write and its atomic rename (ENOENT,
+			// reconciliation_persist_failed).
+			drainDurableReconciliation: async () => {
+				await durableStore?.drain?.();
+			},
 			disposeGateEmitterListener: () => {},
 			trackGateResolution,
 			waitForGateResolutionQuiescence: async () => {
