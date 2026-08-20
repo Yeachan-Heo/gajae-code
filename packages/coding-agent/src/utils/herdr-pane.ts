@@ -41,6 +41,11 @@ const HERDR_BIN_PATH_ENV = "HERDR_BIN_PATH";
  */
 const HERDR_PANE_OWNER_ENV = "GJC_HERDR_PANE_OWNER";
 const HERDR_PANE_OWNER_VERSION = 1;
+const HERDR_SOCKET_PATH_ENV = "HERDR_SOCKET_PATH";
+/** Debounce between a socket directory event and reading the socket's identity. */
+const SOCKET_SETTLE_MS = 150;
+/** ~3s of re-checks while the path is empty between unlink and bind. */
+const SOCKET_SETTLE_ATTEMPTS = 20;
 const HERDR_COMMAND = "herdr";
 const AGENT_LABEL = "gjc";
 const SOURCE = "custom:gjc";
@@ -130,11 +135,22 @@ function nextMetadataSeq(): number {
 	return metadataSeq;
 }
 
+/**
+ * Last title this process reported. A replaced Herdr server starts with an empty
+ * metadata store, so the title has to be re-sent from here: the session name
+ * lives in the session, not in Herdr, and nothing else would ever resend it.
+ */
+let lastReportedTitle: string | undefined;
+
 export type HerdrAgentState = "idle" | "working" | "blocked";
 
 export interface HerdrPaneEnvironment {
 	paneId: string;
 	binPath: string;
+	/** Herdr's API socket, when the pane environment names one. Its identity is
+	 * how a replaced server is detected; absent means replacement is undetectable
+	 * and the reporter simply keeps its normal transition-driven behavior. */
+	socketPath?: string;
 }
 
 export interface HerdrReportProcess {
@@ -157,6 +173,9 @@ export interface HerdrReporterOptions {
 		command: string[],
 		options: { env: NodeJS.ProcessEnv; stdin: "ignore"; stdout: "ignore"; stderr: "ignore" },
 	) => HerdrReportProcess;
+	/** Watch for Herdr server replacement. Parameterized so the re-assert path is
+	 * testable without a live server; returns a disposer. */
+	watchServerReplacement?: (socketPath: string, onReplaced: () => void) => () => void;
 }
 
 export type HerdrProcessProbe =
@@ -219,13 +238,15 @@ export function resolveHerdrPaneEnvironment(options: HerdrReporterOptions = {}):
 	// then vanishes from the agent list until the session is restarted.
 	if (!mayClaimPane(env, paneId, options)) return null;
 
+	const socketPath = env[HERDR_SOCKET_PATH_ENV]?.trim() || undefined;
+
 	const configured = env[HERDR_BIN_PATH_ENV]?.trim();
-	if (configured) return { paneId, binPath: configured };
+	if (configured) return { paneId, binPath: configured, socketPath };
 
 	const which = options.which ?? Bun.which;
 	try {
 		const resolved = which(HERDR_COMMAND);
-		return resolved ? { paneId, binPath: resolved } : null;
+		return resolved ? { paneId, binPath: resolved, socketPath } : null;
 	} catch (error) {
 		logger.debug("herdr binary lookup failed", { error: String(error) });
 		return null;
@@ -363,6 +384,80 @@ function buildOwnerMarker(paneId: string, pid: number, incarnation: string | und
 	return JSON.stringify(marker);
 }
 
+/**
+ * Watch for the Herdr server being replaced under a live pane.
+ *
+ * A server restart or `herdr update --handoff` rebinds the same socket path to a
+ * new inode, so the file identity — not its mere existence — is the signal. The
+ * watch is on the containing directory because the socket itself is unlinked and
+ * recreated, which would drop a watch bound to the old inode.
+ */
+function watchSocketReplacement(socketPath: string, onReplaced: () => void): () => void {
+	const inode = (): number | undefined => {
+		try {
+			return fs.statSync(socketPath).ino;
+		} catch {
+			return undefined;
+		}
+	};
+
+	let seen = inode();
+	let settle: ReturnType<typeof setTimeout> | undefined;
+	let attempts = 0;
+	let closed = false;
+
+	/**
+	 * Replacement arrives as unlink-then-bind, and the watch usually only
+	 * delivers the unlink: at that instant the path has no inode to compare. So
+	 * an event schedules a bounded re-check instead of deciding immediately, and
+	 * the window closes once the new socket appears or the retries run out.
+	 */
+	const check = (): void => {
+		if (closed) return;
+		settle = undefined;
+		const current = inode();
+		if (current === undefined) {
+			if (attempts >= SOCKET_SETTLE_ATTEMPTS) return;
+			attempts += 1;
+			schedule();
+			return;
+		}
+		attempts = 0;
+		if (current === seen) return;
+		seen = current;
+		onReplaced();
+	};
+
+	const schedule = (): void => {
+		if (closed || settle) return;
+		settle = setTimeout(check, SOCKET_SETTLE_MS);
+		settle.unref?.();
+	};
+
+	let watcher: fs.FSWatcher;
+	try {
+		watcher = fs.watch(path.dirname(socketPath), (_event, filename) => {
+			if (filename && path.basename(String(filename)) !== path.basename(socketPath)) return;
+			attempts = 0;
+			schedule();
+		});
+	} catch (error) {
+		// An unwatchable directory only costs the re-assert; never a session.
+		logger.debug("herdr socket watch failed", { error: String(error) });
+		return () => {};
+	}
+	watcher.unref?.();
+	watcher.on("error", error => logger.debug("herdr socket watch error", { error: String(error) }));
+	return () => {
+		closed = true;
+		if (settle) clearTimeout(settle);
+		settle = undefined;
+		try {
+			watcher.close();
+		} catch {}
+	};
+}
+
 /** Build the argv for a state report. Exported for tests. */
 export function buildHerdrReportArgs(paneId: string, state: HerdrAgentState, seq: number): string[] {
 	return [
@@ -479,6 +574,7 @@ export function syncHerdrPaneTitle(sessionName: string | undefined, options: Her
 	const paneEnv = resolveHerdrPaneEnvironment(options);
 	if (!paneEnv) return;
 
+	lastReportedTitle = title;
 	runHerdrCommand(
 		paneEnv.binPath,
 		buildHerdrTitleArgs(paneEnv.paneId, title, nextMetadataSeq()),
@@ -544,6 +640,25 @@ function createHerdrReporterWithClaim(
 	// A freshly started agent is idle at the prompt.
 	report("idle");
 
+	/**
+	 * A replaced server starts with an empty agent registry, and `report` is
+	 * deduplicated against the last state, so a session sitting at its prompt
+	 * would stay invisible in the sidebar until it happened to change state.
+	 * Clearing the memo forces the next report through.
+	 */
+	const reassert = (): void => {
+		if (released) return;
+		const state = currentState ?? "idle";
+		currentState = null;
+		report(state);
+		if (lastReportedTitle) {
+			run(buildHerdrTitleArgs(paneEnv.paneId, lastReportedTitle, nextMetadataSeq()), HERDR_REPORT_TIMEOUT_MS);
+		}
+	};
+
+	const watch = options.watchServerReplacement ?? watchSocketReplacement;
+	let unwatch: (() => void) | null = paneEnv.socketPath ? watch(paneEnv.socketPath, reassert) : null;
+
 	return {
 		report,
 		release() {
@@ -551,6 +666,8 @@ function createHerdrReporterWithClaim(
 			released = true;
 			unsubscribe?.();
 			unsubscribe = null;
+			unwatch?.();
+			unwatch = null;
 			if (!releaseAuthority) return;
 			const env = options.env ?? process.env;
 			if (claimMarker !== undefined && env[HERDR_PANE_OWNER_ENV] === claimMarker) delete env[HERDR_PANE_OWNER_ENV];
