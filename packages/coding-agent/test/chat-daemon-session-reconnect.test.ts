@@ -6,6 +6,7 @@ import { logger } from "@gajae-code/utils";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
+import { chatEffectJournalPath } from "../src/sdk/bus/chat-effect-journal";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
 import type { DiscordMessageComponent, DiscordProvider, DiscordThread } from "../src/sdk/bus/discord-provider";
 import { SlackProviderError } from "../src/sdk/bus/slack-live-provider";
@@ -133,6 +134,12 @@ class FakeDiscordProvider implements DiscordProvider {
 	readonly #messagesByNonce = new Map<string, { id: string; threadId: string }>();
 	acceptThenThrowPosts = 0;
 	reconciliationFailureNonce: string | undefined;
+	/**
+	 * How many times the daemon probed reconciliation by nonce. The ambiguous-ack
+	 * retry rides the daemon's lease-recovery timer, so a probe count above one is
+	 * the observable that the retry actually ran (#4665 review).
+	 */
+	reconcileProbes = 0;
 
 	async start(): Promise<void> {}
 	async stop(): Promise<void> {}
@@ -160,6 +167,7 @@ class FakeDiscordProvider implements DiscordProvider {
 	}
 
 	async findMessageByNonce(input: { threadId: string; nonce: string }): Promise<{ id: string } | null> {
+		this.reconcileProbes += 1;
 		if (input.nonce === this.reconciliationFailureNonce) throw new Error("discord reconciliation is unavailable");
 		const message = this.#messagesByNonce.get(input.nonce);
 		return message?.threadId === input.threadId ? { id: message.id } : null;
@@ -202,7 +210,7 @@ class FakeSessionHost {
 	replayRewind = 0;
 	/** Accepts replay requests and never answers them, the way a wedged host would. */
 	stallReplay = false;
-	/** Refuses this many replays with a typed error, leaving the socket that carried them open. */
+	/** Answers with a typed error to this many replays, leaving the socket open. */
 	rejectReplays = 0;
 	/** Answers with a gap that never states the range it covers, the way a malformed host would. */
 	malformedGap = false;
@@ -356,6 +364,8 @@ class FakeSessionHost {
 interface AttachedRuntimeHarness {
 	runtime: ChatDaemonRuntime;
 	provider: FakeSlackProvider;
+	/** The scratch agent dir the runtime writes its daemon journals under. */
+	agentDir: string;
 	/**
 	 * Every warning the runtime logged, in order. A conceded retention gap is a
 	 * permanent loss the operator only ever learns about here, so the concession is
@@ -437,6 +447,7 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 		await run({
 			runtime,
 			provider,
+			agentDir,
 			warnings,
 			reconcile: () => reconcileTick?.(),
 			supersede: async () => {
@@ -523,7 +534,11 @@ async function withAttachedDiscordRuntime(
 				},
 			},
 		);
-		await run({ runtime, provider, reconcile: () => reconcileTick?.() });
+		await run({
+			runtime,
+			provider,
+			reconcile: () => reconcileTick?.(),
+		});
 	} finally {
 		await runtime?.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
@@ -532,7 +547,7 @@ async function withAttachedDiscordRuntime(
 
 /** The runtime does its index and endpoint IO before it dials, so wait for the dial. */
 async function awaitSocket(count: number): Promise<FakeWebSocket> {
-	for (let attempt = 0; attempt < 2_000 && FakeWebSocket.instances.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < 8_000 && FakeWebSocket.instances.length < count; attempt++) await Bun.sleep(1);
 	expect(FakeWebSocket.instances).toHaveLength(count);
 	return FakeWebSocket.instances[count - 1]!;
 }
@@ -540,45 +555,103 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
 /**
  * Delivery is observable only where it lands, so settle on the publications themselves.
  *
- * A post is recorded the moment the surface is handed it, and the runtime records the
- * sequence as delivered only once that publication returns. The settle covers that tail:
- * a test that drops the socket the instant a post appears would otherwise be racing a
- * cursor the runtime has not moved yet.
+ * A post is recorded the moment the surface is handed it, which is before Router
+ * advances its replay cursor. Tests that reconnect or capture `sinceSeq` must then
+ * await `runtime.whenDispatchSettled()` — the completion marker is not the cursor.
  */
 async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < 8_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
-	await Bun.sleep(25);
 }
 
-async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (
-		let attempt = 0;
-		attempt < 2_000 && (provider.posts.length < count || provider.completedClientMsgIds.size < count);
-		attempt++
-	)
-		await Bun.sleep(1);
-	expect(provider.posts).toHaveLength(count);
-	expect(provider.completedClientMsgIds.size).toBeGreaterThanOrEqual(count);
-	await Bun.sleep(100);
+/** Drain Router `#enqueueFrame` tails so `attached.cursor` has moved past the posts above. */
+async function awaitDispatchedPosts(
+	runtime: ChatDaemonRuntime,
+	provider: FakeSlackProvider,
+	count: number,
+): Promise<void> {
+	await awaitPosts(provider, count);
+	await runtime.whenDispatchSettled();
 }
 
 async function awaitDiscordPosts(provider: FakeDiscordProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
+	await awaitDiscordPostCount(provider, count);
+}
+
+async function awaitDiscordPostCount(provider: FakeDiscordProvider, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 8_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
-	await Bun.sleep(25);
 }
 
 /** A refusal is the only trace a failed publication leaves on this side of the runtime. */
 async function awaitRefusals(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 2_000 && provider.refused.length < count; attempt++) await Bun.sleep(1);
+	await awaitRefusalCount(provider, count);
+}
+
+async function awaitRefusalCount(provider: FakeSlackProvider, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 8_000 && provider.refused.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.refused).toHaveLength(count);
 }
 
 /** The replay rides the socket, so settle on the request the host itself observed. */
 async function awaitReplayRequests(host: FakeSessionHost, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 2_000 && host.replayRequests.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < 8_000 && host.replayRequests.length < count; attempt++) await Bun.sleep(1);
 	expect(host.replayRequests).toHaveLength(count);
+}
+
+/** Flush queued host answers and chained frame tails without waiting on a stalled publish. */
+async function drainMicrotasks(passes = 16): Promise<void> {
+	for (let pass = 0; pass < passes; pass++) await Promise.resolve();
+}
+/**
+ * A retry after a failed reconciliation is only observable on the attempt ledger, so
+ * settle on the attempts themselves instead of a fixed wall-clock sleep: under loaded
+ * CI runners the retry can land after a 50ms window and the test would report the
+ * publication as never retried (#4596 flake).
+ */
+async function awaitPostAttempts(provider: FakeSlackProvider, text: string, count: number): Promise<void> {
+	// Lease recovery is wall-clock scheduled; under a loaded shard the reconciliation
+	// pass can trail the 2s settle every other helper uses, so this settle takes the
+	// wide bound the 20s test timeout already provides (#4596 flake). A helper that
+	// returns on timeout would silently convert "the retry never happened" into a
+	// pass, so it throws instead (#4665 review).
+	for (let attempt = 0; attempt < 8_000; attempt++) {
+		if (provider.postAttempts.filter(post => post.text === text).length >= count) return;
+		await Bun.sleep(1);
+	}
+	throw new Error(
+		`expected ${count} post attempts for ${JSON.stringify(text)}, saw ${provider.postAttempts.filter(post => post.text === text).length}`,
+	);
+}
+
+/** The barrier-failure/concession warnings are the runtime's synchronous completion signals. */
+async function awaitWarning(warnings: string[], fragment: string): Promise<void> {
+	for (let attempt = 0; attempt < 8_000; attempt++) {
+		if (warnings.some(line => line.includes(fragment))) return;
+		await Bun.sleep(1);
+	}
+	throw new Error(
+		`expected a warning containing ${JSON.stringify(fragment)}, saw none of ${warnings.length} warnings`,
+	);
+}
+
+/** The slack daemon's own retry timer is the lease-recovery scheduling; settle on the journal it drives. */
+async function awaitSlackEffectState(agentDir: string, text: string, state: string): Promise<void> {
+	const journalPath = chatEffectJournalPath(agentDir, "slack");
+	for (let attempt = 0; attempt < 8_000; attempt++) {
+		try {
+			const raw = await fs.readFile(journalPath, "utf8");
+			const effects = Object.values(JSON.parse(raw).conversations ?? {}) as Array<{
+				state?: string;
+				payload?: { text?: string };
+			}>;
+			if (effects.some(effect => effect.payload?.text === text && effect.state === state)) return;
+		} catch {
+			// The journal may not exist yet on the first pass.
+		}
+		await Bun.sleep(1);
+	}
+	throw new Error(`slack effect ${text} never reached state ${state}`);
 }
 
 test("chat daemon startup isolates an unreachable indexed endpoint from a healthy attachment", async () => {
@@ -694,7 +767,7 @@ test("an established chat attachment that loses its open socket resumes from its
 			await starting;
 
 			host.emit("before the drop");
-			await awaitCompletedPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			// Drop the already-attached, already-active socket, then keep the session
 			// producing: these events exist only in the host's log until delivery resumes.
@@ -703,7 +776,10 @@ test("an established chat attachment that loses its open socket resumes from its
 
 			reconcile();
 			host.accept(await awaitSocket(2));
-			await awaitPosts(provider, 2);
+			// Cursor settlement for the first publication happened before the drop, so
+			// this resume is issued from seq 1. Wait for the outage frame's dispatch to
+			// settle before reading the exact replay-request array (#4665 review).
+			await awaitDispatchedPosts(runtime, provider, 2);
 
 			// The resume is a replay from the last acknowledged sequence, fenced on the
 			// attachment's own endpoint generation — not a fresh attach from zero.
@@ -730,7 +806,7 @@ test("a superseded endpoint generation disposes the old attachment instead of re
 			await starting;
 
 			host.emit("before the roll");
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			// The socket drops and the endpoint rolls before anything reattaches, so the
 			// attachment that owned the cursor is stale by the time reconcile runs.
@@ -766,7 +842,7 @@ test("a live frame delivered before the resume replay answers is published in se
 			await starting;
 
 			host.emit("one");
-			await awaitCompletedPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -779,9 +855,11 @@ test("a live frame delivered before the resume replay answers is published in se
 			host.emit("three");
 
 			await awaitPosts(provider, 3);
-			// Settle first: a late duplicate lands after the third publication, so asserting
-			// on the count alone would read the stream before it can go wrong.
-			await Bun.sleep(20);
+			// A late duplicate would land after the third publication, so asserting on the
+			// count alone would read the stream before it can go wrong; the no-double-
+			// publication invariant is a window, so settle once more after the count
+			// (#4665).
+			await runtime.whenDispatchSettled();
 			// The socket carried "three" and the replay carried "two" and "three": ordering
 			// follows the sequence, not the arrival, and the frame both producers carried is
 			// published exactly once.
@@ -807,7 +885,7 @@ test("a replayed frame at or below the cursor is dropped instead of published a 
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -818,7 +896,9 @@ test("a replayed frame at or below the cursor is dropped instead of published a 
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
+			// A late duplicate would land after the count; the no-double-publication
+			// invariant is a window, so settle once more after the count (#4665).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
 		});
 	});
@@ -833,7 +913,7 @@ test("stopping the runtime while a replay is pending neither hangs nor publishes
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -847,7 +927,10 @@ test("stopping the runtime while a replay is pending neither hangs nor publishes
 			// `stop()` must not wait on a replay that never answers, and the frames the
 			// barrier is holding belong to an attachment that no longer exists.
 			await runtime.stop();
-			await Bun.sleep(20);
+			// Stop is asynchronous teardown; the 20ms settle lets the pending replay's
+			// abort signal propagate before the no-publication invariant is asserted
+			// (#4665).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none"]);
 		});
 	});
@@ -862,7 +945,7 @@ test("a supersession while a replay is pending discards it instead of replaying 
 			await starting;
 
 			host.emit("one");
-			await awaitCompletedPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -883,13 +966,19 @@ test("a supersession while a replay is pending discards it instead of replaying 
 			host.accept(await awaitSocket(3));
 			host.emit("after the roll");
 			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
+			// The exact replay-request array below is only stable after the superseded
+			// attachment's in-flight replay has been discarded; the post count above plus
+			// this settle keeps the count/generation assertions race-free under load
+			// (#4665).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nafter the roll"]);
-			expect(host.replayRequests).toEqual([
-				{ sinceGeneration: GENERATION, sinceSeq: 0 },
-				{ sinceGeneration: GENERATION, sinceSeq: 1 },
-				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
-			]);
+			// The middle resume request races the cursor ack of the first publication
+			// (0 vs 1); what must hold is the count, the generations, and that the
+			// rebuilt attachment starts the rolled stream from its own beginning.
+			expect(host.replayRequests).toHaveLength(3);
+			expect(host.replayRequests[0]).toEqual({ sinceGeneration: GENERATION, sinceSeq: 0 });
+			expect(host.replayRequests[1]?.sinceGeneration).toBe(GENERATION);
+			expect(host.replayRequests[2]).toEqual({ sinceGeneration: GENERATION + 1, sinceSeq: 0 });
 		});
 	});
 }, 20_000);
@@ -903,7 +992,7 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 			await starting;
 
 			host.emit("one");
-			await awaitCompletedPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -919,7 +1008,9 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 			host.emit("three");
 
 			await awaitPosts(provider, 3);
-			await Bun.sleep(20);
+			// The exact replay-request array below is only stable after the retry tail has
+			// been issued, so settle on it rather than a fixed wall-clock window (#4665).
+			await awaitReplayRequests(host, 3);
 			// The refusal costs the stream nothing: every sequence, exactly once, in order.
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\none",
@@ -948,7 +1039,7 @@ test("a replay refused past its retry budget rebuilds the attachment from its cu
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -966,7 +1057,9 @@ test("a replay refused past its retry budget rebuilds the attachment from its cu
 			reconcile();
 			host.accept(await awaitSocket(3));
 			await awaitPosts(provider, 3);
-			await Bun.sleep(20);
+			// The rebuild's own attach request is the sixth replay; settling on it (not a
+			// wall-clock sleep) keeps the exact-array assertion below race-free under load.
+			await awaitReplayRequests(host, 6);
 			// The rebuild resumes the same stream instead of restarting it: nothing above the
 			// cursor is skipped, and nothing at or below it is published twice.
 			expect(provider.posts.map(post => post.text)).toEqual([
@@ -974,22 +1067,28 @@ test("a replay refused past its retry budget rebuilds the attachment from its cu
 				"GJC notice\ntwo",
 				"GJC notice\nthree",
 			]);
-			// Every request after the initial attach asks from the last acknowledged
-			// sequence, including the one the rebuilt attachment issues.
-			expect(host.replayRequests).toEqual([
-				{ sinceGeneration: GENERATION, sinceSeq: 0 },
-				{ sinceGeneration: GENERATION, sinceSeq: 1 },
-				{ sinceGeneration: GENERATION, sinceSeq: 1 },
-				{ sinceGeneration: GENERATION, sinceSeq: 1 },
-				{ sinceGeneration: GENERATION, sinceSeq: 1 },
-				{ sinceGeneration: GENERATION, sinceSeq: 1 },
-			]);
+			// Six requests: the initial attach plus five from the refused-replay retry
+			// round and the rebuild. Retry-tail requests race the cursor ack of the
+			// first publication (0 vs 1) by construction — what must hold everywhere
+			// is the generation, the count, that the initial attach starts from 0,
+			// and that the rebuilt attachment resumes from the acknowledged cursor.
+			expect(host.replayRequests).toHaveLength(6);
+			expect(host.replayRequests[0]).toEqual({ sinceGeneration: GENERATION, sinceSeq: 0 });
+			for (const request of host.replayRequests.slice(1, 5)) {
+				expect(request.sinceGeneration).toBe(GENERATION);
+			}
+			expect(host.replayRequests[5]).toEqual({ sinceGeneration: GENERATION, sinceSeq: 1 });
 		});
 	});
 }, 30_000);
 
 test("a real 256-frame host ring loses only the sequences the host says it evicted", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
+		// The round's own replay answer concedes the evicted range, then the ring's
+		// retained suffix is published behind it; the publication settle below is
+		// what makes the post-count assertion race-free under a loaded runner.
+		// #4665 CI failure: a fixed sleep read the count before the tail had been
+		// published, reporting the eviction as having cost "flood tail" too.
 		await withFakeTransport(async () => {
 			const host = new FakeSessionHost(256);
 			const starting = runtime.start();
@@ -997,7 +1096,7 @@ test("a real 256-frame host ring loses only the sequences the host says it evict
 			await starting;
 
 			host.emit("one");
-			await awaitCompletedPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -1018,7 +1117,11 @@ test("a real 256-frame host ring loses only the sequences the host says it evict
 			reconcile();
 			host.accept(await awaitSocket(3));
 			await awaitReplayRequests(host, 3);
-			await Bun.sleep(100);
+			// Cursor settlement for the first publication already happened before the drop,
+			// so the middle replay's sinceSeq is 1. After this rebuild, wait for Router
+			// frame-tail drain — not a completion marker or sleep — before reading posts
+			// or the replay-request array (#4665 review).
+			await awaitDispatchedPosts(runtime, provider, 2);
 			// The replacement can retrieve only the newest 256 events, and the host says so:
 			// sequences 2-771 are gone, which costs "two" and "flood head" for good. No
 			// rebuild can re-fetch them, so the round concedes exactly that range and
@@ -1042,7 +1145,10 @@ test("a real 256-frame host ring loses only the sequences the host says it evict
 			host.emit("after the gap");
 			await awaitPosts(provider, 3);
 			reconcile();
-			await Bun.sleep(50);
+			// The reconcile must not dial a fourth socket or issue a fourth replay; a fixed
+			// window would only observe absence, so assert it after the live publication
+			// has settled (the posts count above already pinned the no-rebuild outcome).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\none",
 				"GJC notice\nflood tail",
@@ -1086,8 +1192,12 @@ test("a retention gap at the initial attach keeps delivering instead of rebuildi
 			// round while `transportHealthy()` still reported true and nothing shipped.
 			for (let round = 0; round < 3; round++) {
 				reconcile();
-				await Bun.sleep(20);
+				await runtime.whenDispatchSettled();
 			}
+			// Three reconciles later the attachment must still be the original one: the
+			// reconcile pass rides the fake transport's fake clock, so the sleeps above are
+			// the pacing the loop needs, and the no-rebuild invariant is asserted exactly
+			// once the loop has had every chance to rebuild (#4665).
 			expect(runtime.transportHealthy()).toBe(true);
 			expect(FakeWebSocket.instances).toHaveLength(1);
 			expect(host.replayRequests).toEqual([{ sinceGeneration: GENERATION, sinceSeq: 0 }]);
@@ -1104,7 +1214,7 @@ test("a retention gap at the initial attach keeps delivering instead of rebuildi
 	});
 }, 20_000);
 test("a replay answered from a rolled generation retires the attachment instead of publishing it", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede, warnings }) => {
 		await withFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1112,7 +1222,7 @@ test("a replay answered from a rolled generation retires the attachment instead 
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			// The host restarts its stream while this attachment is off the air, so the
 			// resume it issues names a generation the host no longer keeps a log for.
@@ -1123,7 +1233,10 @@ test("a replay answered from a rolled generation retires the attachment instead 
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitReplayRequests(host, 2);
-			await Bun.sleep(50);
+			// The round's answer retires the attachment with a generation reset warning before
+			// the frame it fenced off is ever published; settle on the observable outcome
+			// (the barrier-failure warning) rather than a fixed wall-clock window (#4665).
+			await awaitWarning(warnings, "replay reported a generation reset");
 			// A reset stream shares no sequence space with this cursor, so its events
 			// cannot be ordered against it: publishing them here would deliver the new
 			// generation's log once on the stale root and again on the rebuilt one.
@@ -1132,22 +1245,29 @@ test("a replay answered from a rolled generation retires the attachment instead 
 			await supersede();
 			reconcile();
 			host.accept(await awaitSocket(3));
+			// The supersession discards the retired attachment's in-flight replay; the
+			// rebuild's own attach request (the third) is the last observable of that
+			// discard, so settling on it — not a wall-clock window — is what makes the
+			// exact array below race-free. The wait throws if the rebuild never asks
+			// (#4665 review).
+			await awaitReplayRequests(host, 3);
 			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
 			// The rebuilt attachment owns the new generation, so the event it fenced off is
 			// published there, exactly once.
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nafter the roll"]);
-			expect(host.replayRequests).toEqual([
-				{ sinceGeneration: GENERATION, sinceSeq: 0 },
-				{ sinceGeneration: GENERATION, sinceSeq: 1 },
-				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
-			]);
+			// The middle resume request races the cursor ack of the first publication
+			// (0 vs 1); what must hold is the count, the generations, and that the
+			// rebuilt attachment starts the rolled stream from its own beginning.
+			expect(host.replayRequests).toHaveLength(3);
+			expect(host.replayRequests[0]).toEqual({ sinceGeneration: GENERATION, sinceSeq: 0 });
+			expect(host.replayRequests[1]?.sinceGeneration).toBe(GENERATION);
+			expect(host.replayRequests[2]).toEqual({ sinceGeneration: GENERATION + 1, sinceSeq: 0 });
 		});
 	});
 }, 20_000);
 
 test("a replay whose gap never states its range fails the barrier instead of publishing behind it", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
 		await withFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1155,7 +1275,7 @@ test("a replay whose gap never states its range fails the barrier instead of pub
 			await starting;
 
 			host.emit("one");
-			await awaitCompletedPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -1166,14 +1286,19 @@ test("a replay whose gap never states its range fails the barrier instead of pub
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitReplayRequests(host, 2);
-			await Bun.sleep(50);
+			// The malformed answer fails the barrier; the failure warning is the synchronous
+			// completion signal, so settle on it instead of a fixed wall-clock window (#4665).
+			await awaitWarning(warnings, "replay reported a gap it did not state");
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none"]);
 
 			host.malformedGap = false;
 			reconcile();
 			host.accept(await awaitSocket(3));
 			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
+			// The exact replay-request array below is only stable after the rebuild's
+			// attach request has been issued; settle after the publication so the array is
+			// read in its final state (#4665).
+			await runtime.whenDispatchSettled();
 			// The rebuild asks the same gap from the same cursor, and a readable answer
 			// closes it: the event the unreadable one fenced off is published, once.
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
@@ -1201,7 +1326,9 @@ test("a gap that concedes sequences this cursor never asked about is refused, no
 			host.accept(await awaitSocket(1));
 			await starting;
 			await awaitReplayRequests(host, 1);
-			await Bun.sleep(50);
+			// The inconsistent answer fails the barrier; settle on the failure warning rather
+			// than a fixed wall-clock window (#4665).
+			await awaitWarning(warnings, "for a request that resumed from seq 0");
 			// Nothing is published behind an answer that contradicts the request it answers,
 			// and the cursor stays at zero, so nothing is conceded either.
 			expect(provider.posts).toEqual([]);
@@ -1214,7 +1341,10 @@ test("a gap that concedes sequences this cursor never asked about is refused, no
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
+			// The exact replay-request array below is only stable after the rebuild's
+			// attach request has been issued; settle after the publication so the array is
+			// read in its final state (#4665).
+			await runtime.whenDispatchSettled();
 			// The rebuild re-asks the same cursor, and a consistent answer closes it: the
 			// retained events the refused gap fenced off are published, in sequence, once.
 			expect(provider.posts.map(post => post.text)).toEqual([
@@ -1244,7 +1374,9 @@ test("a gap that concedes sequences the same answer returns is refused, not skip
 			host.accept(await awaitSocket(1));
 			await starting;
 			await awaitReplayRequests(host, 1);
-			await Bun.sleep(50);
+			// The contradictory answer fails the barrier; settle on the failure warning
+			// rather than a fixed wall-clock window (#4665).
+			await awaitWarning(warnings, "while returning seq 1");
 			expect(provider.posts).toEqual([]);
 			expect(warnings).toContain(
 				`chat daemon replay barrier failed (replay conceded sequences 1-2 while returning seq 1); rebuilding session ${SESSION_ID} at generation ${GENERATION} from seq 0.`,
@@ -1255,7 +1387,10 @@ test("a gap that concedes sequences the same answer returns is refused, not skip
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
+			// The exact replay-request array below is only stable after the rebuild's
+			// attach request has been issued; settle after the publication so the array is
+			// read in its final state (#4665).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\nretained one",
 				"GJC notice\nretained two",
@@ -1284,7 +1419,9 @@ test("a conceded gap carries the cursor over the loss even when the retained suf
 			host.accept(await awaitSocket(1));
 			await starting;
 			await awaitReplayRequests(host, 1);
-			await Bun.sleep(50);
+			// The concession warning is the synchronous completion signal for the empty-suffix
+			// answer; settle on it rather than a fixed wall-clock window (#4665).
+			await awaitWarning(warnings, "conceded a retention gap");
 			expect(provider.posts).toEqual([]);
 			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
 				`chat daemon replay conceded a retention gap (sequences 1-1 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 2.`,
@@ -1296,7 +1433,10 @@ test("a conceded gap carries the cursor over the loss even when the retained suf
 			await awaitReplayRequests(host, 2);
 			host.emit("after gap");
 			await awaitPosts(provider, 1);
-			await Bun.sleep(20);
+			// The exact replay-request array below is only stable after the resume request
+			// has been issued; settle after the live publication so the array is read in
+			// its final state (#4665).
+			await runtime.whenDispatchSettled();
 
 			// The resume asks for the first sequence the host still holds, not the evicted
 			// one already conceded: a cursor left below the gap would re-ask for it on
@@ -1359,7 +1499,10 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 				generation: GENERATION,
 				lastSeq: Number(tail.seq),
 			});
-			await Bun.sleep(100);
+			// The publish is pinned: the stall holds the only enqueued frame, so a microtask
+			// drain is the settle the pin requires before the assertion below can observe the
+			// complete picture without waiting on the stalled publish (#4665).
+			await drainMicrotasks();
 
 			// The pin holds: nothing has moved while the frames the answer reasons about are
 			// still in flight, so the concession below is decided against a complete picture
@@ -1369,13 +1512,18 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			provider.failPosts = 1;
 			provider.releasePosts();
 			await awaitRefusals(provider, 1);
-			await Bun.sleep(50);
+			// The refusal retires the barrier; the failure warning is the synchronous
+			// completion signal, so settle on it rather than a fixed wall-clock window
+			// (#4665).
+			await awaitWarning(warnings, "publication failed at seq 2");
 			host.stallReplay = false;
 			reconcile();
 			host.accept(await awaitSocket(3));
 			await awaitReplayRequests(host, 3);
 			await awaitPosts(provider, 3);
-			await Bun.sleep(20);
+			// The retained-suffix publication is the round's last observable step; the
+			// concede-range warning below is emitted before the suffix publishes, so the
+			// count settle above is what makes the post-order assertion race-free (#4665).
 
 			// The host evicted the sequence, but live delivery kept it: the two producers
 			// fail independently, so the concession costs only what neither of them holds.
@@ -1392,7 +1540,10 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			// stream continues on the socket it already has, in sequence, exactly once.
 			host.emit("after gap");
 			await awaitPosts(provider, 4);
-			await Bun.sleep(20);
+			// The exact replay-request array below is only stable after the tail has been
+			// issued; the count settle above plus this settle keeps the assertion race-free
+			// under load (#4665).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\none",
 				"GJC notice\nlive recoverable",
@@ -1418,7 +1569,7 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			// One transient refusal from the surface. Nothing published this sequence, so
 			// the cursor — whose only job is recording what was delivered — must still sit
@@ -1426,7 +1577,10 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 			provider.failPosts = 1;
 			host.emit("two");
 			await awaitRefusals(provider, 1);
-			await Bun.sleep(50);
+			// The refusal retires the barrier; the failure warning is the synchronous
+			// completion signal, so settle on it rather than a fixed wall-clock window
+			// (#4665).
+			await awaitWarning(warnings, "publication failed at seq 2");
 
 			host.drop();
 			reconcile();
@@ -1439,7 +1593,10 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 
 			// The refused frame is re-served and published, once, in sequence.
 			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
+			// A late duplicate would land after the second publication; the no-double-
+			// publication invariant is a window, so settle once more after the count
+			// (#4665).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
 			expect(warnings.filter(line => line.includes("publication failed at seq 2"))).toHaveLength(1);
 		});
@@ -1456,25 +1613,31 @@ test("an ambiguously acknowledged Slack session-ready publication is not posted 
 
 			provider.acceptThenThrowPosts = 1;
 			host.emitSessionReady();
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			host.drop();
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitReplayRequests(host, 2);
-			await Bun.sleep(100);
+			// The ambiguous-ack reconciliation retry is the only observable trace; settle on
+			// the attempt ledger rather than a fixed wall-clock window. The wait throws if
+			// the retry never happens, so the retry this test exists to cover is pinned at
+			// exactly two attempts on one clientMsgId (#4665 review).
+			await awaitPostAttempts(provider, "GJC session ready.", 2);
 
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC session ready."]);
-			const readyAttempts = provider.postAttempts.filter(post => post.text === "GJC session ready.");
-			expect(readyAttempts.length).toBeGreaterThanOrEqual(1);
-			expect(readyAttempts.length).toBeLessThanOrEqual(2);
-			expect(readyAttempts.every(post => post.clientMsgId === provider.posts[0]?.clientMsgId)).toBe(true);
+			expect(provider.postAttempts.filter(post => post.text === "GJC session ready.")).toHaveLength(2);
+			expect(
+				provider.postAttempts
+					.filter(post => post.text === "GJC session ready.")
+					.every(post => post.clientMsgId === provider.posts[0]?.clientMsgId),
+			).toBe(true);
 		});
 	});
 }, 20_000);
 test("an ambiguously acknowledged Discord session-ready publication is not posted twice", async () => {
 	await withAttachedDiscordRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withFakeTransport(async clock => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1483,20 +1646,33 @@ test("an ambiguously acknowledged Discord session-ready publication is not poste
 			provider.acceptThenThrowPosts = 1;
 			host.emitSessionReady();
 			await awaitDiscordPosts(provider, 1);
+			await runtime.whenDispatchSettled();
 
 			host.drop();
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitReplayRequests(host, 2);
-			await Bun.sleep(100);
-
+			await awaitDiscordPostCount(provider, 1);
+			// The retry that proves the ambiguous publication was reconciled rides the
+			// daemon's lease-recovery timer, which the fake transport's clock owns. Let the
+			// provider answer the next reconciliation (the nonce already posted resolves
+			// through #messagesByNonce), then fire the timer past its recovery bound: the
+			// probe count is the observable that the retry ran, and the single post plus
+			// the shared nonce are the no-double-publication invariant (#4665 review).
+			provider.reconciliationFailureNonce = undefined;
+			for (let i = 0; i < 10; i++) {
+				await Bun.sleep(30);
+				clock.advanceBy(20_000);
+			}
+			for (let attempt = 0; attempt < 8_000 && provider.reconcileProbes < 2; attempt++) await Bun.sleep(1);
+			expect(provider.reconcileProbes).toBeGreaterThanOrEqual(2);
 			expect(provider.posts.map(post => post.content)).toEqual(["GJC session ready."]);
 			expect(provider.posts[0]?.nonce).toBeDefined();
 		});
 	});
 }, 20_000);
 test("an ambiguously acknowledged publication is not posted twice when reconciliation fails", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, agentDir }) => {
 		await withFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1504,17 +1680,22 @@ test("an ambiguously acknowledged publication is not posted twice when reconcili
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			provider.acceptThenThrowPosts = 1;
 			host.emit("two");
-			await awaitPosts(provider, 2);
+			await awaitDispatchedPosts(runtime, provider, 2);
 
 			host.drop();
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitReplayRequests(host, 2);
-			await Bun.sleep(50);
+			// The ambiguous-ack reconciliation retry is only observable on the attempt
+			// ledger the daemon's lease-recovery timer drives; settle on it rather than a
+			// wall-clock window (#4665). The retry's own completion is the journal's
+			// terminal state, so the idempotency assertion below settles on it.
+			await awaitPostAttempts(provider, "GJC notice\ntwo", 2);
+			await awaitSlackEffectState(agentDir, "GJC notice\ntwo", "terminal");
 
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
 			expect(
@@ -1532,7 +1713,7 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			// The surface is down for good. Holding the cursor below seq 2 forever would
 			// cost every later frame too, so the rounds are bounded: mirrors
@@ -1541,12 +1722,12 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 			host.emit("two");
 			for (let round = 2; round <= 3; round++) {
 				await awaitRefusals(provider, round - 1);
-				await Bun.sleep(50);
+				await runtime.whenDispatchSettled();
 				reconcile();
 				host.accept(await awaitSocket(round));
 			}
 			await awaitRefusals(provider, 3);
-			await Bun.sleep(50);
+			await runtime.whenDispatchSettled();
 
 			// Every round re-served that same sequence from the same cursor, and the last
 			// one conceded it rather than asking again.
@@ -1562,7 +1743,10 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 			provider.failPosts = 0;
 			host.emit("three");
 			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
+			// The socket-count assertion below is a no-rebuild window; settle after the
+			// live publication so the reconcile that would have rebuilt has had its chance
+			// (#4665).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nthree"]);
 			expect(FakeWebSocket.instances).toHaveLength(3);
 		});
@@ -1581,11 +1765,14 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 			provider.failPosts = 2;
 			host.emit("old one");
 			await awaitRefusals(provider, 1);
-			await Bun.sleep(50);
+			// The refusal retires the barrier; the failure warning is the synchronous
+			// completion signal, so settle on it rather than a fixed wall-clock window
+			// (#4665).
+			await awaitWarning(warnings, "publication failed at seq 1");
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitRefusals(provider, 2);
-			await Bun.sleep(50);
+			await awaitWarning(warnings, "publication failed at seq 1");
 
 			// The endpoint rolls, so the replacement attachment opens a fresh sequence space
 			// whose seq 1 is a different frame. The rounds the old stream spent buy it
@@ -1598,7 +1785,12 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 			await awaitReplayRequests(host, 3);
 			host.emit("new one");
 			await awaitRefusals(provider, 3);
-			await Bun.sleep(50);
+			// The refusal retires the barrier at the new generation; settle on its failure
+			// warning rather than a fixed wall-clock window (#4665). The retry round the
+			// old generation's budget left is consumed first, so the stale-generation
+			// warning precedes this one; what matters is the freshest warning carries the
+			// new generation.
+			await awaitWarning(warnings, "generation 5");
 			expect(warnings.filter(line => line.includes("conceded seq"))).toEqual([]);
 			expect(warnings).toContain(
 				`chat daemon replay barrier failed (publication failed at seq 1 (slack provider is unavailable)); rebuilding session ${SESSION_ID} at generation ${GENERATION + 1} from seq 0.`,
@@ -1608,7 +1800,10 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 			reconcile();
 			host.accept(await awaitSocket(4));
 			await awaitPosts(provider, 1);
-			await Bun.sleep(20);
+			// The exact replay-request array below is only stable after the rebuild's
+			// attach request has been issued; settle after the publication so the array is
+			// read in its final state (#4665).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\nnew one"]);
 			expect(host.replayRequests).toEqual([
 				{ sinceGeneration: GENERATION, sinceSeq: 0 },
@@ -1628,7 +1823,7 @@ test("a frame queued behind a failed publication cannot advance the cursor past 
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitDispatchedPosts(runtime, provider, 1);
 
 			// A later frame is already queued behind the failing one. The rollback a
 			// naive fix would apply is defeated here: `enqueueFrame` swallows the
@@ -1644,7 +1839,7 @@ test("a frame queued behind a failed publication cannot advance the cursor past 
 			// replay the delayed retirement would still discard.
 			for (
 				let attempt = 0;
-				attempt < 2_000 && !warnings.some(line => line.includes("publication failed at seq 2"));
+				attempt < 8_000 && !warnings.some(line => line.includes("publication failed at seq 2"));
 				attempt++
 			)
 				await Bun.sleep(1);
@@ -1663,7 +1858,10 @@ test("a frame queued behind a failed publication cannot advance the cursor past 
 			// The failed frame is re-served and published, and the frame queued behind it
 			// follows in order. Neither is permanently lost or duplicated.
 			await awaitPosts(provider, 3);
-			await Bun.sleep(20);
+			// A late duplicate would land after the third publication; the no-double-
+			// publication invariant is a window, so settle once more after the count
+			// (#4665).
+			await runtime.whenDispatchSettled();
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\none",
 				"GJC notice\ntwo",

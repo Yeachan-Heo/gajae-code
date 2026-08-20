@@ -364,6 +364,10 @@ export class ChatDaemonRuntime {
 	transportHealthy(): boolean {
 		return this.#transportHealthy?.() ?? false;
 	}
+	/** Await Router sequenced-frame dispatch so tests can observe cursor settlement. */
+	async whenDispatchSettled(): Promise<void> {
+		await this.#router.whenDispatchSettled();
+	}
 
 	async stop(): Promise<void> {
 		const providerResults = await Promise.allSettled([this.#discord?.stop(), this.#slack?.stop()]);

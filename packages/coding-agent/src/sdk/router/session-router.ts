@@ -413,6 +413,22 @@ export class SessionRouter {
 		// putting any ready tail back onto the fleet-wide reconcile tail.
 		await Promise.all([...this.#sessions.values()].map(attached => attached.readyTail));
 	}
+	/**
+	 * Await every in-flight sequenced frame tail. Cursor advancement happens in
+	 * `#enqueueFrame` after `onFrame` returns, so this is the observable that the
+	 * replay cursor has moved for work already queued. It does not wait for a
+	 * stalled replay request or a pinned provider publish — those are caller-owned
+	 * and would hang a test that still needs to drive them.
+	 */
+	async whenDispatchSettled(): Promise<void> {
+		for (let pass = 0; pass < 8_000; pass++) {
+			await Promise.resolve();
+			const tails = [...this.#frameTails.values()];
+			if (tails.length === 0) return;
+			await Promise.all(tails.map(task => task.catch(() => undefined)));
+		}
+		throw new Error("SessionRouter frame dispatch did not settle");
+	}
 	/** Ingests a credential-bearing Broker lifecycle result directly into Router custody. */
 	async adoptLifecycleResult(
 		value: unknown,
