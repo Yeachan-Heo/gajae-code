@@ -188,17 +188,24 @@ export class CommandController {
 			const customShare = await loadCustomShare();
 			if (customShare) {
 				const loader = new BorderedLoader(this.ctx.ui, theme, "Sharing...");
-				// Detach the reusable composer before clearing so the terminal
-				// clear() disposes nothing the session still owns.
-				this.ctx.editorContainer.detachChild(this.ctx.editor);
+				// Detach the mounted composition (pet-aware) before clearing so
+				// the terminal clear() disposes nothing the session still owns.
+				if (typeof this.ctx.detachComposer === "function") {
+					this.ctx.detachComposer();
+				} else {
+					this.ctx.editorContainer.detachChild(this.ctx.editor);
+				}
 				this.ctx.editorContainer.clear();
 				this.ctx.editorContainer.addChild(loader);
+				this.ctx.ui.setFocus(loader);
+				this.ctx.ui.requestRender();
 
 				const restoreEditor = async () => {
 					loader.dispose();
 					this.ctx.editorContainer.clear();
 					this.ctx.editorContainer.addChild(this.ctx.editor);
 					this.ctx.ui.setFocus(this.ctx.editor);
+					this.ctx.ui.requestRender();
 				};
 
 				try {
@@ -246,9 +253,13 @@ export class CommandController {
 		}
 
 		const loader = new BorderedLoader(this.ctx.ui, theme, "Creating gist...");
-		// Detach the reusable composer before clearing so the terminal clear()
-		// disposes nothing the session still owns.
-		this.ctx.editorContainer.detachChild(this.ctx.editor);
+		// Detach the mounted composition (pet-aware) before clearing so the
+		// terminal clear() disposes nothing the session still owns.
+		if (typeof this.ctx.detachComposer === "function") {
+			this.ctx.detachComposer();
+		} else {
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
+		}
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(loader);
 		this.ctx.ui.setFocus(loader);

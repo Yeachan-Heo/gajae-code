@@ -292,6 +292,8 @@ export interface InteractiveModeContext {
 	commitPetPreviewMode(mode: PetMode): boolean;
 	/** Re-mount the composer (pet-aware) after an overlay/selector closes. */
 	restoreComposer(): void;
+	/** Detach the mounted composer composition (pet-aware) before a terminal overlay clear(). */
+	detachComposer(): void;
 	startPendingSubmission(
 		input: {
 			text: string;

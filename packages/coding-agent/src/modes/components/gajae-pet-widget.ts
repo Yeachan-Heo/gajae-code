@@ -462,6 +462,12 @@ export class GajaePetWidget {
 		if (owner === undefined || owner === this) this.#mountEditor(this.#mode !== "off");
 	}
 
+	/** Detach the mounted composition (plain or framed) so a terminal clear() cannot dispose it. */
+	detachComposer(): void {
+		this.#editorContainer.detachChild(this.#editor);
+		this.#editorContainer.detachChild(this.#framedEditor);
+	}
+
 	#syncWorkingState(now: number): PetSkinId | undefined {
 		if (this.#mode === "off") return undefined;
 		const skin = PET_SKINS[this.#mode];

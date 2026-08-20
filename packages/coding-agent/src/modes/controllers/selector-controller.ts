@@ -1338,10 +1338,14 @@ export class SelectorController {
 			}
 		};
 		const { component, focus } = create(done);
-		// The composer is reusable across overlays; detach it before clearing so
-		// clear() disposes only the transient overlay, not the editor's
-		// tab-width listener / paste state (disposal is terminal).
-		this.ctx.editorContainer.detachChild(this.ctx.editor);
+		// The composer composition is reusable across overlays; detach whatever
+		// is actually mounted (pet-aware) before clearing so clear() disposes
+		// only the transient overlay, not the composer (disposal is terminal).
+		if (typeof this.ctx.detachComposer === "function") {
+			this.ctx.detachComposer();
+		} else {
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
+		}
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(component);
 		this.ctx.ui.setFocus(focus);
@@ -3165,10 +3169,14 @@ export class SelectorController {
 							this.ctx.ui.setFocus(this.ctx.editor);
 							resolve(code);
 						};
-						// Detach the reusable composer before clearing so the
-						// clear() disposes only the prior transient, never the
-						// editor (disposal is terminal).
-						this.ctx.editorContainer.detachChild(this.ctx.editor);
+						// Detach the mounted composition (pet-aware) before
+						// clearing so the clear() disposes only the prior
+						// transient, never the composer (disposal is terminal).
+						if (typeof this.ctx.detachComposer === "function") {
+							this.ctx.detachComposer();
+						} else {
+							this.ctx.editorContainer.detachChild(this.ctx.editor);
+						}
 						this.ctx.editorContainer.clear();
 						this.ctx.editorContainer.addChild(codeInput);
 						this.ctx.ui.setFocus(codeInput);
@@ -3624,9 +3632,14 @@ export class SelectorController {
 				this.ctx.ui.requestRender();
 			},
 		});
-		// Detach the reusable composer before clearing so the clear() disposes
-		// only a prior transient, never the editor (disposal is terminal).
-		this.ctx.editorContainer.detachChild(this.ctx.editor);
+		// Detach the mounted composition (pet-aware) before clearing so the
+		// clear() disposes only a prior transient, never the composer
+		// (disposal is terminal).
+		if (typeof this.ctx.detachComposer === "function") {
+			this.ctx.detachComposer();
+		} else {
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
+		}
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(overlay);
 		this.ctx.ui.setFocus(overlay.getFocus());
@@ -3657,9 +3670,14 @@ export class SelectorController {
 			},
 		});
 		unsubscribe = aggregator.onChange(() => this.#tasksPane?.refresh());
-		// Detach the reusable composer before clearing so the clear() disposes
-		// only a prior transient, never the editor (disposal is terminal).
-		this.ctx.editorContainer.detachChild(this.ctx.editor);
+		// Detach the mounted composition (pet-aware) before clearing so the
+		// clear() disposes only a prior transient, never the composer
+		// (disposal is terminal).
+		if (typeof this.ctx.detachComposer === "function") {
+			this.ctx.detachComposer();
+		} else {
+			this.ctx.editorContainer.detachChild(this.ctx.editor);
+		}
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(this.#tasksPane);
 		this.ctx.ui.setFocus(this.#tasksPane.getFocus());
