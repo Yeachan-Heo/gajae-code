@@ -111,7 +111,6 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"queue.message.move": "invalid_position",
 	"queue.message.update": "invalid_message",
 	"transcript.body": "resource_gone",
-	"goal.list/get": "resource_gone",
 	"session.last_assistant": "resource_gone",
 	"resource.body": "resource_gone",
 	"artifact.read": "resource_gone",

@@ -14,6 +14,7 @@ import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../co
 import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../config/model-selector-value";
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
+import { normalizeGoal } from "../../goals/state";
 import {
 	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
@@ -869,6 +870,48 @@ function createQuerySurface(
 			throw error;
 		}
 	};
+	const getDurableGoalState = (): { kind: "state"; state: unknown } | { kind: "empty" } | { kind: "unavailable" } => {
+		// A recreated SDK host can observe the session before its in-memory goal
+		// projection is hydrated. The latest mode_change is the durable authority;
+		// never borrow a goal from another session or an older branch.
+		let branch: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>;
+		try {
+			branch = ctx.sessionManager.getBranch();
+		} catch {
+			return { kind: "unavailable" };
+		}
+		for (const entry of branch.toReversed()) {
+			if (entry.type !== "mode_change") continue;
+			if (entry.mode !== "goal" && entry.mode !== "goal_paused") return { kind: "empty" };
+			const goal = normalizeGoal(entry.data?.goal);
+			if (!goal) return { kind: "unavailable" };
+			return { kind: "state", state: { enabled: entry.mode === "goal", mode: "active", goal } };
+		}
+		return { kind: "empty" };
+	};
+	const getGoalState = (): unknown => {
+		const liveState =
+			typeof (ctx as Partial<ExtensionContext>).getGoalState === "function" ? ctx.getGoalState() : undefined;
+		if (liveState !== undefined) return liveState;
+		const durableState = getDurableGoalState();
+		if (durableState.kind === "state") return durableState.state;
+		if (durableState.kind === "unavailable")
+			return {
+				enabled: false,
+				goal: null,
+				reason: "goal_state_unavailable",
+				recoverable: true,
+				message:
+					"The authoritative goal state could not be recovered from this session. Reconnect or resume the session before retrying.",
+			};
+		return {
+			enabled: false,
+			goal: null,
+			reason: "no_active_goal",
+			message:
+				"No goal is active in this session: goal mode has not created or resumed a goal, so no goal snapshot exists yet.",
+		};
+	};
 	return {
 		getTranscriptEntries: () =>
 			typeof (ctx as Partial<ExtensionContext>).getTranscript === "function" ? ctx.getTranscript() : [],
@@ -877,8 +920,7 @@ function createQuerySurface(
 			systemPrompt: ctx.getSystemPrompt(),
 			...getLiveState(),
 		}),
-		getGoalState: () =>
-			typeof (ctx as Partial<ExtensionContext>).getGoalState === "function" ? ctx.getGoalState() : undefined,
+		getGoalState,
 		getTodoState: () =>
 			typeof (ctx as Partial<ExtensionContext>).getTodoState === "function" ? ctx.getTodoState() : [],
 		getDiff,

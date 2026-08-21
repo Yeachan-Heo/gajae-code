@@ -13,9 +13,11 @@ import {
 } from "../../session/terminal-abort";
 import { Broker } from "../broker/broker";
 import { createReconciliationStore } from "../bus/reconciliation-store";
+import { CursorRegistry, QueryHandlers, RevisionStore } from "./query";
 import {
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
+	createSdkSurfaceFactory,
 	SessionSdkSessionRuntime,
 	type SessionSdkTransport,
 } from "./session-runtime";
@@ -76,7 +78,11 @@ function admissionBarrier(target: number) {
 	};
 }
 
-function extensionContext(sessionId: string, cwd: string): ExtensionContext {
+function extensionContext(
+	sessionId: string,
+	cwd: string,
+	options: { goalState?: unknown; branch?: unknown[] } = {},
+): ExtensionContext {
 	return {
 		cwd,
 		workflowGate: undefined,
@@ -85,9 +91,122 @@ function extensionContext(sessionId: string, cwd: string): ExtensionContext {
 			getSessionId: () => sessionId,
 			getSessionFile: () => path.join(cwd, `${sessionId}.json`),
 			getSessionName: () => undefined,
+			getBranch: () => options.branch ?? [],
 		},
+		getGoalState: () => options.goalState,
 	} as unknown as ExtensionContext;
 }
+
+function goalModeEntry(sessionId: string, tokensUsed: number): Record<string, unknown> {
+	return {
+		type: "mode_change",
+		id: `goal-${sessionId}`,
+		parentId: null,
+		timestamp: new Date(1_000).toISOString(),
+		mode: "goal",
+		data: {
+			goal: {
+				id: `goal-${sessionId}`,
+				objective: "Preserve the active SDK goal",
+				status: "active",
+				tokensUsed,
+				timeUsedSeconds: 2,
+				createdAt: 1_000,
+				updatedAt: 2_000,
+			},
+		},
+	};
+}
+
+async function queryGoalState(ctx: ExtensionContext, sessionId: string): Promise<unknown> {
+	const surface = createSdkSurfaceFactory({ ctx, id: sessionId, api: {} as ExtensionAPI }).query;
+	const store = new RevisionStore(sessionId);
+	const cursors = new CursorRegistry("goal-test-token", store);
+	const response = await new QueryHandlers(surface, sessionId, store, cursors).dispatch({
+		query: "goal.list/get",
+		connectionId: "goal-test-connection",
+	});
+	if (!response.ok) throw new Error(`goal query failed: ${JSON.stringify(response)}`);
+	return response.page?.items[0];
+}
+
+describe("SDK goal snapshot lifecycle", () => {
+	test("recovers an active nonzero-activity goal from the durable session projection", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-goal-recovery-"));
+		try {
+			const sessionId = "runtime-recreated";
+			const branch = [goalModeEntry(sessionId, 17)];
+			const liveGoal = {
+				enabled: true,
+				mode: "active",
+				goal: { ...(branch[0] as { data: { goal: Record<string, unknown> } }).data.goal },
+			};
+			const live = await queryGoalState(
+				extensionContext(sessionId, cwd, { goalState: liveGoal, branch }),
+				sessionId,
+			);
+			const recreated = await queryGoalState(extensionContext(sessionId, cwd, { branch }), sessionId);
+
+			expect(live).toMatchObject({ enabled: true, goal: { status: "active", tokensUsed: 17 } });
+			expect(recreated).toEqual(live);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps fresh session/worktree projections isolated while an active turn has activity", async () => {
+		const root = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-goal-isolation-"));
+		try {
+			const first = await queryGoalState(
+				extensionContext("fresh-session-a", path.join(root, "a"), {
+					branch: [goalModeEntry("fresh-session-a", 11)],
+				}),
+				"fresh-session-a",
+			);
+			const second = await queryGoalState(
+				extensionContext("fresh-session-b", path.join(root, "b"), {
+					branch: [goalModeEntry("fresh-session-b", 23)],
+				}),
+				"fresh-session-b",
+			);
+
+			expect(first).toMatchObject({ goal: { id: "goal-fresh-session-a", tokensUsed: 11 } });
+			expect(second).toMatchObject({ goal: { id: "goal-fresh-session-b", tokensUsed: 23 } });
+			expect(first).not.toEqual(second);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("returns an explicit no-active-goal diagnostic for the zero-activity control", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-goal-empty-"));
+		try {
+			const result = await queryGoalState(extensionContext("zero-activity", cwd), "zero-activity");
+			expect(result).toMatchObject({ enabled: false, goal: null, reason: "no_active_goal" });
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("returns a recoverable diagnostic when durable active-goal state is malformed", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-goal-corrupt-"));
+		try {
+			const result = await queryGoalState(
+				extensionContext("corrupt-goal", cwd, {
+					branch: [{ ...goalModeEntry("corrupt-goal", 19), data: { goal: { status: "active" } } }],
+				}),
+				"corrupt-goal",
+			);
+			expect(result).toMatchObject({
+				reason: "goal_state_unavailable",
+				recoverable: true,
+				goal: null,
+			});
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+});
 
 test("preserves an agent failure code in host prompt reconciliation", async () => {
 	const reconciliation = createInvocationReconciliation();

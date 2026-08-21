@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- SDK `goal.list/get` no longer reports `resource_gone` when an in-flight session's live goal projection is temporarily unavailable. It recovers the latest authoritative goal mode state from the current session branch after runtime recreation or session replacement, while goal-less sessions return an explicit `no_active_goal` diagnostic instead of being confused with snapshot-store loss (#4824).
+
 - `/logout` (and `gjc accounts logout`) now remove stored API-key credentials, not just OAuth rows. The interactive logout and the CLI only enumerated `oauth` inventory, so API-key logins (OpenCode Go/Zen, Cursor, Venice, DeepSeek, …) were rejected with `API-key credentials are not managed here`; both paths now remove stored credentials of either kind.
 - Queued SDK prompts now retain their dispatch-time ownership across selection fences instead of reclassifying from a contradictory later streaming snapshot. Fresh promotion, earlier follow-up ordering, and terminal-abort cancellation are reachable again, while `/btw` test fixtures now model the user-drainable queue count required by the current empty-submit contract.
 - Coordinator stop and idle-reap now initialize canonical namespace state before reading durable deletion recovery. Fresh or upgraded projection-only sessions were misreported as `state_corrupt` before the broker close was attempted, and completed deletion receipts were excluded from the idempotent missing-session lookup; both paths now preserve strict malformed-state rejection while allowing safe cleanup and replay.
