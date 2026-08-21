@@ -14,11 +14,12 @@
  * containerized GJC deployments that route every LLM call through a
  * credential-holding sidecar so the container stays credential-free.
  */
+
+import { readSseJson } from "@gajae-code/utils";
 import {
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 	restoreProviderSafetyStopFromTrustedTransport,
 } from "../adapter-internals/provider-safety-stop";
-import { readSseJson } from "@gajae-code/utils";
 import type {
 	Api,
 	AssistantMessage,
@@ -222,9 +223,15 @@ export function streamPiNative<TApi extends Api>(
 					// re-establish it there. Remote endpoints stay unauthenticated.
 					if (trustedTransport) {
 						if (event.type === "done") {
-							restoreProviderSafetyStopFromTrustedTransport(event.message, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+							restoreProviderSafetyStopFromTrustedTransport(
+								event.message,
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+							);
 						} else {
-							restoreProviderSafetyStopFromTrustedTransport(event.error, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+							restoreProviderSafetyStopFromTrustedTransport(
+								event.error,
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+							);
 						}
 					}
 				}

@@ -98,7 +98,10 @@ describe("provider safety-stop provenance authority", () => {
 		// exports map; `./adapter-internals/*` is null there, so neither the
 		// mint nor the capability is importable outside first-party relative
 		// imports (#4777 review follow-up).
-		await expect(import("@gajae-code/ai/adapter-internals/provider-safety-stop")).rejects.toThrow();
+		// Non-literal specifier so typecheck cannot resolve the blocked subpath;
+		// the point is runtime resolution failing closed.
+		const deepImport = "@gajae-code/ai/adapter-internals/provider-safety-stop";
+		await expect(import(deepImport)).rejects.toThrow();
 		const manifest = (await import("../package.json", { with: { type: "json" } })).default;
 		expect(manifest.exports["./adapter-internals/*"]).toBeNull();
 	});

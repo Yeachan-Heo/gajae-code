@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 import { streamPiNative } from "../src/providers/pi-native-client";
 import type { AssistantMessage, AssistantMessageEvent, Context, FetchImpl, Model } from "../src/types";
+import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 
 function sseBytes(events: AssistantMessageEvent[]): Uint8Array {
 	const encoder = new TextEncoder();
@@ -329,7 +329,7 @@ describe("streamPiNative provider safety-stop provenance", () => {
 
 	it("restores authority on a done-carried typed stop and never mints it for other messages", async () => {
 		const fetchImpl: FetchImpl = (async () =>
-			fakeResponse([{ type: "done", reason: "error", message: typedStop() }])) as FetchImpl;
+			fakeResponse([{ type: "done", reason: "stop", message: typedStop() }])) as FetchImpl;
 		const model = fakeModel({ baseUrl: "http://localhost:4000" });
 
 		const result = await streamPiNative(model, baseContext, { apiKey: "k", fetch: fetchImpl }).result();
