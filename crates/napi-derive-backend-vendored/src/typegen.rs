@@ -123,13 +123,45 @@ pub fn format_js_property_name(js_name: &str) -> String {
 		)
 	});
 
-	let needs_quotes = starts_with_digit || has_invalid_chars;
+	// Control characters and Unicode line separators are never valid in bare
+	// identifiers; quoting alone is not enough because they would break the
+	// string literal itself, so they must be quoted AND escaped.
+	let has_control_chars = js_name
+		.chars()
+		.any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}');
+
+	let needs_quotes = starts_with_digit || has_invalid_chars || has_control_chars;
 
 	if needs_quotes {
-		format!("'{js_name}'")
+		format!("'{}'", escape_js_string_literal(js_name))
 	} else {
 		js_name.to_string()
 	}
+}
+
+/// Escapes a property name for embedding inside a single-quoted JavaScript
+/// string literal. Attribute-controlled names may contain any character, so
+/// quotes, backslashes, and line breaks must not corrupt the declaration.
+fn escape_js_string_literal(js_name: &str) -> String {
+	use std::fmt::Write;
+
+	let mut escaped = String::with_capacity(js_name.len());
+	for c in js_name.chars() {
+		match c {
+			'\'' => escaped += "\\'",
+			'\\' => escaped += "\\\\",
+			'\n' => escaped += "\\n",
+			'\r' => escaped += "\\r",
+			'\t' => escaped += "\\t",
+			'\u{2028}' => escaped += "\\u2028",
+			'\u{2029}' => escaped += "\\u2029",
+			c if (c as u32) < 0x20 => {
+				write!(escaped, "\\u{:04X}", c as u32).unwrap();
+			},
+			c => escaped.push(c),
+		}
+	}
+	escaped
 }
 
 impl JSDoc {
@@ -1065,9 +1097,9 @@ mod tests {
 		assert_eq!(format_js_property_name("brace{"), "'brace{'");
 		assert_eq!(format_js_property_name("brace}"), "'brace}'");
 		assert_eq!(format_js_property_name("pipe|"), "'pipe|'");
-		assert_eq!(format_js_property_name("backslash\\"), "'backslash\\'");
+		assert_eq!(format_js_property_name("backslash\\"), "'backslash\\\\'");
 		assert_eq!(format_js_property_name("semicolon;"), "'semicolon;'");
-		assert_eq!(format_js_property_name("quote'"), "'quote''");
+		assert_eq!(format_js_property_name("quote'"), "'quote\\''");
 		assert_eq!(format_js_property_name("doublequote\""), "'doublequote\"'");
 		assert_eq!(format_js_property_name("less<"), "'less<'");
 		assert_eq!(format_js_property_name("greater>"), "'greater>'");
@@ -1101,5 +1133,64 @@ mod tests {
 		assert_eq!(format_js_property_name("invalid-name-123"), "'invalid-name-123'");
 		assert_eq!(format_js_property_name("café_bar"), "café_bar");
 		assert_eq!(format_js_property_name("café-bar"), "'café-bar'");
+	}
+
+	#[test]
+	fn test_format_js_property_name_escapes_embedded_quotes_and_backslashes() {
+		// Embedded quotes and backslashes must be escaped inside the quoted literal,
+		// otherwise the emitted declaration is malformed or injectable.
+		assert_eq!(format_js_property_name("it's"), "'it\\'s'");
+		assert_eq!(format_js_property_name("a\\b"), "'a\\\\b'");
+		assert_eq!(format_js_property_name("'"), "'\\''");
+		assert_eq!(format_js_property_name("\\"), "'\\\\'");
+		assert_eq!(format_js_property_name("q'\\b"), "'q\\'\\\\b'");
+	}
+
+	#[test]
+	fn test_format_js_property_name_quotes_and_escapes_line_breaks() {
+		// Newlines and carriage returns are control characters: they must be both
+		// quoted and escaped so the declaration stays on one well-formed line.
+		assert_eq!(format_js_property_name("a\nb"), "'a\\nb'");
+		assert_eq!(format_js_property_name("a\rb"), "'a\\rb'");
+		assert_eq!(format_js_property_name("a\tb"), "'a\\tb'");
+		assert_eq!(format_js_property_name("\n"), "'\\n'");
+	}
+
+	#[test]
+	fn test_format_js_property_name_quotes_and_escapes_control_characters() {
+		// Other C0 control characters have no literal form and must use \\u escapes.
+		assert_eq!(format_js_property_name("a\u{0001}b"), "'a\\u0001b'");
+		assert_eq!(format_js_property_name("a\u{0000}b"), "'a\\u0000b'");
+		assert_eq!(format_js_property_name("a\u{001F}b"), "'a\\u001Fb'");
+	}
+
+	#[test]
+	fn test_format_js_property_name_escapes_unicode_line_separators() {
+		// U+2028/U+2029 are valid JSON but terminate JS source lines: quote and escape.
+		assert_eq!(format_js_property_name("a\u{2028}b"), "'a\\u2028b'");
+		assert_eq!(format_js_property_name("a\u{2029}b"), "'a\\u2029b'");
+	}
+
+	#[test]
+	fn test_format_js_property_name_quoted_output_is_always_well_formed() {
+		// Adversarial round-trip invariant: for any input needing quotes, the output
+		// is a single-line literal that starts and ends with a quote, never ends in
+		// a bare backslash, and embeds no raw line break.
+		for name in
+			["a'b", "a\\b", "a\nb", "a\rb", "a\u{0007}b", "a\u{2028}b", "'\\'\n", "0'", "-\\-"]
+		{
+			let formatted = format_js_property_name(name);
+			assert!(formatted.starts_with('\''), "must be quoted: {name:?} -> {formatted:?}");
+			assert!(formatted.ends_with('\''), "must end with quote: {name:?} -> {formatted:?}");
+			assert!(!formatted.ends_with("\\'") || formatted.len() > 2, "trivial: {formatted:?}");
+			assert!(
+				!formatted.contains('\n') && !formatted.contains('\r'),
+				"no raw line breaks: {formatted:?}"
+			);
+			assert!(
+				!formatted[..formatted.len() - 1].ends_with('\\'),
+				"no bare trailing backslash escaping the closing quote: {name:?} -> {formatted:?}"
+			);
+		}
 	}
 }

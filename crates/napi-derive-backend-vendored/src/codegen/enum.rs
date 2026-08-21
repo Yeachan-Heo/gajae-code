@@ -48,7 +48,7 @@ impl NapiEnum {
 			 }
 
 			 fn value_type() -> napi::ValueType {
-				napi::ValueType::Object
+				#validate_type
 			 }
 		  }
 
@@ -301,6 +301,95 @@ impl NapiEnum {
 		  extern "C" fn #register_name() {
 			 napi::bindgen_prelude::register_module_export(#js_mod_ident, #js_name_lit, #callback_name);
 		  }
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use proc_macro2::Span;
+	use syn::Ident;
+
+	use crate::{NapiEnum, NapiEnumValue, NapiEnumVariant};
+
+	fn enum_for(is_string_enum: bool) -> NapiEnum {
+		let (a, b) = if is_string_enum {
+			(NapiEnumValue::String("a".to_string()), NapiEnumValue::String("b".to_string()))
+		} else {
+			(NapiEnumValue::Number(1), NapiEnumValue::Number(2))
+		};
+		NapiEnum {
+			name: Ident::new("TestEnum", Span::call_site()),
+			js_name: "TestEnum".to_string(),
+			variants: vec![
+				NapiEnumVariant {
+					name:     Ident::new("A", Span::call_site()),
+					val:      a,
+					comments: vec![],
+				},
+				NapiEnumVariant {
+					name:     Ident::new("B", Span::call_site()),
+					val:      b,
+					comments: vec![],
+				},
+			],
+			js_mod: None,
+			comments: vec![],
+			skip_typescript: false,
+			register_name: Ident::new("TestEnum", Span::call_site()),
+			is_string_enum,
+			object_from_js: true,
+			object_to_js: true,
+		}
+	}
+
+	fn rendered(is_string_enum: bool) -> String {
+		enum_for(is_string_enum)
+			.gen_napi_value_map_impl()
+			.to_string()
+	}
+
+	#[test]
+	fn string_enum_value_type_reports_string() {
+		let tokens = rendered(true);
+		assert!(tokens.contains("value_type"), "TypeName impl must define value_type: {tokens}");
+		assert!(
+			tokens.contains("bindgen_prelude :: ValueType :: String"),
+			"string enum value_type must report String, got: {tokens}"
+		);
+	}
+
+	#[test]
+	fn numeric_enum_value_type_reports_number() {
+		let tokens = rendered(false);
+		assert!(tokens.contains("value_type"), "TypeName impl must define value_type: {tokens}");
+		assert!(
+			tokens.contains("bindgen_prelude :: ValueType :: Number"),
+			"numeric enum value_type must report Number, got: {tokens}"
+		);
+	}
+
+	#[test]
+	fn enum_metadata_never_contradicts_validation() {
+		for is_string_enum in [true, false] {
+			let tokens = rendered(is_string_enum);
+			let primitive = if is_string_enum { "String" } else { "Number" };
+			assert!(
+				!tokens.contains("ValueType :: Object"),
+				"enum type metadata must never claim Object while values are primitives: {tokens}"
+			);
+			let value_type_at = tokens.find("value_type").expect("value_type present");
+			let assert_at = tokens
+				.find("assert_type_of")
+				.expect("assert_type_of present");
+			assert!(
+				tokens[value_type_at..].contains(primitive),
+				"value_type must report {primitive}: {tokens}"
+			);
+			assert!(
+				tokens[assert_at..].contains(primitive),
+				"validate must assert {primitive}: {tokens}"
+			);
 		}
 	}
 }

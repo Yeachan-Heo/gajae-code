@@ -29,12 +29,37 @@ function frame(value: unknown): string {
 export class ControlServer {
 	#server: net.Server | null = null;
 	#sockets = new Set<net.Socket>();
+	/** Serializes listen/close so lifecycle operations cannot unlink or replace each other's socket. */
+	#lifecycle: Promise<void> = Promise.resolve();
 	constructor(
 		readonly socketPath: string,
 		private readonly handler: EndpointHandler,
 	) {}
 
 	async listen(): Promise<void> {
+		return this.#serialized(() => this.#listen());
+	}
+
+	/**
+	 * Runs a lifecycle operation exclusively. Concurrent callers await the in-flight
+	 * operation first, so a second listen can never unlink the bound socket of a live
+	 * server and leave it orphaned, and close can never race a bind into a survivor.
+	 */
+	async #serialized(operation: () => Promise<void>): Promise<void> {
+		const previous = this.#lifecycle;
+		const gate = Promise.withResolvers<void>();
+		this.#lifecycle = gate.promise;
+		await previous;
+		try {
+			await operation();
+		} finally {
+			gate.resolve();
+		}
+	}
+
+	async #listen(): Promise<void> {
+		// A repeated listen awaits the live server instead of rebinding it.
+		if (this.#server) return;
 		await fs.mkdir(path.dirname(this.socketPath), { recursive: true });
 		if (Buffer.byteLength(this.socketPath) > MAX_UNIX_SOCKET_PATH_BYTES) {
 			throw new Error(`socket_path_too_long:${this.socketPath}`);
@@ -42,15 +67,15 @@ export class ControlServer {
 		await fs.rm(this.socketPath, { force: true });
 		const server = net.createServer(socket => this.#onConnection(socket));
 		try {
-			await new Promise<void>((resolve, reject) => {
-				const onError = (error: Error): void => reject(error);
-				server.once("error", onError);
-				server.listen(this.socketPath, () => {
-					server.removeListener("error", onError);
-					this.#server = server;
-					resolve();
-				});
+			const bound = Promise.withResolvers<void>();
+			const onError = (error: Error): void => bound.reject(error);
+			server.once("error", onError);
+			server.listen(this.socketPath, () => {
+				server.removeListener("error", onError);
+				this.#server = server;
+				bound.resolve();
 			});
+			await bound.promise;
 		} catch (error) {
 			server.removeAllListeners("error");
 			server.on("error", () => {});
@@ -100,7 +125,7 @@ export class ControlServer {
 		return this.handler({ verb: req.verb, input: req.input ?? {} });
 	}
 
-	async close(): Promise<void> {
+	async #close(): Promise<void> {
 		const server = this.#server;
 		this.#server = null;
 		let closeError: unknown = null;
@@ -108,14 +133,14 @@ export class ControlServer {
 			// Stop accepting first, then terminate every accepted socket. This makes
 			// close independent of handler completion or a peer that never sends FIN.
 			for (const socket of this.#sockets) socket.destroy();
+			const closed = Promise.withResolvers<void>();
 			try {
-				await new Promise<void>((resolve, reject) => {
-					try {
-						server.close(error => (error ? reject(error) : resolve()));
-					} catch (error) {
-						reject(error);
-					}
-				});
+				server.close(error => (error ? closed.reject(error) : closed.resolve()));
+			} catch (error) {
+				closed.reject(error);
+			}
+			try {
+				await closed.promise;
 			} catch (error) {
 				closeError = error;
 			}
@@ -123,6 +148,10 @@ export class ControlServer {
 		for (const socket of this.#sockets) socket.destroy();
 		await fs.rm(this.socketPath, { force: true });
 		if (closeError) throw closeError;
+	}
+
+	async close(): Promise<void> {
+		return this.#serialized(() => this.#close());
 	}
 }
 

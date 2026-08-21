@@ -146,6 +146,36 @@ describe("control endpoint", () => {
 		expect(b.count).toBe(2);
 	});
 
+	it("awaits concurrent listen calls on one live server instead of rebinding", async () => {
+		let count = 0;
+		server = new ControlServer(sock, async () => ({ ok: true, count: ++count }));
+		await Promise.all([server.listen(), server.listen(), server.listen()]);
+		const res = (await callEndpoint(sock, { verb: "observe", input: {} })) as Record<string, unknown>;
+		expect(res.ok).toBe(true);
+		expect(res.count).toBe(1);
+		await server.close();
+		server = null;
+	});
+
+	it("leaves no listener behind when close races listen calls", async () => {
+		server = new ControlServer(sock, async () => ({ ok: true }));
+		await Promise.all([server.listen(), server.listen(), server.close()]);
+		server = null;
+		await expect(callEndpoint(sock, { verb: "observe", input: {} }, 50)).rejects.toBeInstanceOf(
+			EndpointUnreachableError,
+		);
+	});
+
+	it("rebinds after close without a stale socket path", async () => {
+		server = new ControlServer(sock, async () => ({ ok: true, round: 1 }));
+		await server.listen();
+		await server.close();
+		server = new ControlServer(sock, async () => ({ ok: true, round: 2 }));
+		await server.listen();
+		const res = (await callEndpoint(sock, { verb: "observe", input: {} })) as Record<string, unknown>;
+		expect(res.round).toBe(2);
+	});
+
 	it("closes accepted peers that have not completed a frame", async () => {
 		server = new ControlServer(sock, async () => ({ ok: true }));
 		await server.listen();
