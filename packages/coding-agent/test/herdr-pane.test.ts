@@ -785,6 +785,14 @@ describe("herdr server replacement", () => {
 			replace() {
 				onReplaced?.();
 			},
+			replaceWithSameIdentityRename() {
+				// Model unlink-and-bind when Linux reuses the socket inode. The
+				// rename event is the replacement evidence, not a changed lstat.
+				const beforeIdentity = "dev:ino";
+				const afterIdentity = "dev:ino";
+				expect(afterIdentity).toBe(beforeIdentity);
+				onReplaced?.();
+			},
 			get watching() {
 				return onReplaced !== null;
 			},
@@ -966,5 +974,22 @@ describe("herdr server replacement", () => {
 			await close(server);
 			fs.rmSync(directory, { recursive: true, force: true });
 		}
+	});
+
+	it("reasserts after an injected same-identity socket rename", () => {
+		const { calls, spawn } = recordingSpawn();
+		const events = eventSource();
+		const watcher = fakeWatch();
+		createHerdrReporter(SOCKET_PANE, events.subscribe, {
+			env: paneEnv(),
+			spawn,
+			watchServerReplacement: watcher.watch,
+		});
+		events.emit({ type: "agent_start" });
+		const beforeReplacement = calls.filter(call => call.command.includes("report-agent")).length;
+
+		watcher.replaceWithSameIdentityRename();
+
+		expect(calls.filter(call => call.command.includes("report-agent"))).toHaveLength(beforeReplacement + 1);
 	});
 });
