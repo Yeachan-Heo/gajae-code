@@ -2030,6 +2030,8 @@ describe("dedicated-only tests — routing contract", () => {
 		// the planner-contract suite (this file) is what fails when they drift.
 		const pushTasks = planTasks(["bunfig.toml"], packages);
 		expect(pushTasks.find(task => task.key === "test:scripts/ci-dev-affected.test.ts")).toBeDefined();
+		const packagePushTasks = planTasks(["packages/coding-agent/bunfig.toml"], packages);
+		expect(packagePushTasks.find(task => task.key === "test:scripts/ci-dev-affected.test.ts")).toBeDefined();
 		for (const changedPath of ["bunfig.toml", "packages/coding-agent/bunfig.toml"]) {
 			const tasks = planTargetedTasks([changedPath], packages, [ACP_LIFECYCLE]);
 			expect(tasks.find(task => task.key === "test:scripts/ci-dev-affected.test.ts")).toBeDefined();
