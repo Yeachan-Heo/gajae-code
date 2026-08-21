@@ -611,10 +611,19 @@ export interface ToolCall {
 	 * kinds whose display label is not a registered tool (`glob`, `grep`, `ls`,
 	 * `read_lints`, ...) instead abort the turn with `Tool <name> not found`.
 	 *
-	 * Flagged calls are recorded in history with a synthetic success result so
-	 * call/result pairing stays intact, without executing anything locally.
+	 * The marker is accepted only for a Cursor model and its matching transport.
+	 * Calls from other providers are dispatched normally even when a foreign
+	 * payload includes a lookalike field.
 	 */
-	providerExecuted?: boolean;
+	providerExecuted?: "cursor-exec";
+	/**
+	 * Provider-side outcome for a provider-executed call. Trusted calls must carry
+	 * this result so the agent loop never fabricates success from ownership alone.
+	 */
+	providerExecutionResult?: {
+		status: "success" | "error";
+		output: string;
+	};
 	/**
 	 * Set when the provider detected the argument JSON was not safely executable —
 	 * the model hit its output-token limit (or the response was otherwise cut short)

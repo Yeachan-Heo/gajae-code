@@ -29,10 +29,17 @@ function countingTool(name: string, counter: { n: number }): TestTool {
 
 async function runOnce(
 	tools: TestTool[],
-	call: { name: string; arguments: Record<string, unknown>; providerExecuted?: boolean },
+	call: {
+		name: string;
+		arguments: Record<string, unknown>;
+		providerExecuted?: "cursor-exec";
+		trustedProvider?: boolean;
+		providerExecutionResult?: { status: "success" | "error"; output: string };
+	},
 ): Promise<Array<{ isError?: boolean; text: string }>> {
 	const context: AgentContext = { systemPrompt: [""], messages: [], tools };
 	const mock = createMockModel({
+		provider: call.providerExecuted && call.trustedProvider !== false ? "cursor" : undefined,
 		responses: [
 			{
 				content: [
@@ -41,7 +48,17 @@ async function runOnce(
 						id: "tc-1",
 						name: call.name,
 						arguments: call.arguments,
-						...(call.providerExecuted ? { providerExecuted: true } : {}),
+						...(call.providerExecuted ? { providerExecuted: call.providerExecuted } : {}),
+						...(call.providerExecutionResult
+							? { providerExecutionResult: call.providerExecutionResult }
+							: call.providerExecuted
+								? {
+										providerExecutionResult: {
+											status: "success" as const,
+											output: "executed by the provider during streaming",
+										},
+									}
+								: {}),
 					},
 				],
 			},
@@ -72,7 +89,7 @@ describe("agentLoop: provider-executed tool calls are not dispatched locally", (
 		const results = await runOnce([countingTool("bash", counter)], {
 			name: "bash",
 			arguments: { command: "rm -rf build" },
-			providerExecuted: true,
+			providerExecuted: "cursor-exec",
 		});
 
 		// The whole point: the side effect must not happen twice.
@@ -88,13 +105,13 @@ describe("agentLoop: provider-executed tool calls are not dispatched locally", (
 		const results = await runOnce([countingTool("bash", counter)], {
 			name: "bash",
 			arguments: { command: "echo hi" },
-			providerExecuted: true,
+			providerExecuted: "cursor-exec",
 		});
 
 		// One call in, exactly one result out - an unpaired tool call would
 		// corrupt the next request's message sequence.
 		expect(results).toHaveLength(1);
-		expect(results[0].text).toContain("bash");
+		expect(results[0].text).toContain("provider");
 	});
 
 	it("does not fail with tool-not-found when the display label is not a registered tool", async () => {
@@ -105,7 +122,7 @@ describe("agentLoop: provider-executed tool calls are not dispatched locally", (
 		const results = await runOnce([countingTool("bash", counter)], {
 			name: "glob",
 			arguments: { globPattern: "**/*.ts" },
-			providerExecuted: true,
+			providerExecuted: "cursor-exec",
 		});
 
 		expect(counter.n).toBe(0);
@@ -139,5 +156,155 @@ describe("agentLoop: provider-executed tool calls are not dispatched locally", (
 		expect(results).toHaveLength(1);
 		expect(results[0].isError).toBe(true);
 		expect(results[0].text).toContain("Tool glob not found");
+	});
+
+	it("does not trust a marker from a non-Cursor provider", async () => {
+		const counter = { n: 0 };
+		const results = await runOnce([countingTool("bash", counter)], {
+			name: "bash",
+			arguments: {},
+			providerExecuted: "cursor-exec",
+			trustedProvider: false,
+		});
+
+		expect(counter.n).toBe(1);
+		expect(results[0]?.isError).toBeFalsy();
+		expect(results[0]?.text).toContain("executed locally");
+	});
+
+	it("refuses local execution and reports an error without provider outcome", async () => {
+		const counter = { n: 0 };
+		const mock = createMockModel({
+			provider: "cursor",
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tc-1",
+							name: "bash",
+							arguments: {},
+							providerExecuted: "cursor-exec",
+						},
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			{ systemPrompt: [""], messages: [], tools: [countingTool("bash", counter)] },
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			mock.stream,
+		);
+		const results: Array<{ isError?: boolean; text: string }> = [];
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				results.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+
+		expect(counter.n).toBe(0);
+		expect(results).toEqual([
+			{
+				isError: true,
+				text: 'Tool call "bash" was marked as provider-executed without an execution result; local execution was refused.',
+			},
+		]);
+	});
+
+	it("preserves provider provenance through managed attempt sanitization", async () => {
+		const counter = { n: 0 };
+		const mock = createMockModel({
+			provider: "cursor",
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tc-1",
+							name: "bash",
+							arguments: { command: "echo provider" },
+							providerExecuted: "cursor-exec",
+							providerExecutionResult: { status: "success", output: "provider output" },
+						},
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			{ systemPrompt: [""], messages: [], tools: [countingTool("bash", counter)] },
+			{ model: mock.model, convertToLlm: identityConverter, fallbackManaged: true },
+			undefined,
+			mock.stream,
+		);
+		const results: Array<{ isError?: boolean; text: string }> = [];
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				results.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+
+		expect(counter.n).toBe(0);
+		expect(results).toEqual([{ isError: false, text: "provider output" }]);
+	});
+
+	it("uses the provider outcome without running local hooks", async () => {
+		const counter = { n: 0 };
+		let beforeCalls = 0;
+		let afterCalls = 0;
+		const mock = createMockModel({
+			provider: "cursor",
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tc-1",
+							name: "bash",
+							arguments: {},
+							providerExecuted: "cursor-exec",
+							providerExecutionResult: { status: "error", output: "provider rejected" },
+						},
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const model = mock.model;
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [countingTool("bash", counter)] };
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			{
+				model,
+				convertToLlm: identityConverter,
+				beforeToolCall: async () => {
+					beforeCalls += 1;
+				},
+				afterToolCall: async () => {
+					afterCalls += 1;
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		const results: Array<{ isError?: boolean; text: string }> = [];
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				results.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+
+		expect(counter.n).toBe(0);
+		expect(beforeCalls).toBe(0);
+		expect(afterCalls).toBe(0);
+		expect(results).toEqual([{ isError: true, text: "provider rejected" }]);
 	});
 });

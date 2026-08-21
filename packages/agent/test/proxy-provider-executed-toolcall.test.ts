@@ -12,8 +12,8 @@ type TestTool = AgentTool<EmptySchema, Record<string, never>>;
 const model: Model = {
 	id: "test",
 	name: "test",
-	api: "openai-responses",
-	provider: "test",
+	api: "cursor-agent",
+	provider: "cursor",
 	baseUrl: "https://example.test",
 	reasoning: false,
 	input: ["text"],
@@ -103,10 +103,14 @@ describe("streamProxy provider-executed tool calls cross the wire", () => {
 				contentIndex: 0,
 				id: "call-1",
 				toolName: "bash",
-				providerExecuted: true,
+				providerExecuted: "cursor-exec",
 			},
-			{ type: "toolcall_delta", contentIndex: 0, delta: '{"command":"rm -rf build"}' },
-			{ type: "toolcall_end", contentIndex: 0 },
+			{
+				type: "toolcall_end",
+				contentIndex: 0,
+				arguments: { command: "rm -rf build" },
+				providerExecutionResult: { status: "success", output: "provider output" },
+			},
 			{ type: "done", reason: "stop", usage },
 		]);
 
@@ -114,8 +118,24 @@ describe("streamProxy provider-executed tool calls cross the wire", () => {
 		const ended = events.find(event => event.type === "toolcall_end");
 		expect(ended?.type).toBe("toolcall_end");
 		if (ended?.type !== "toolcall_end") throw new Error("expected a toolcall_end event");
-		expect(ended.toolCall.providerExecuted).toBe(true);
+		expect(ended.toolCall.providerExecuted).toBe("cursor-exec");
+		expect(ended.toolCall.providerExecutionResult).toEqual({ status: "success", output: "provider output" });
 		expect(ended.toolCall.arguments).toMatchObject({ command: "rm -rf build" });
+	});
+
+	test("ignores malformed provider markers and keeps final ordinary arguments", async () => {
+		installProxyEvents([
+			{ type: "start" },
+			{ type: "toolcall_start", contentIndex: 0, id: "call-malformed", toolName: "lookup", providerExecuted: true },
+			{ type: "toolcall_end", contentIndex: 0, arguments: { query: "status" } },
+			{ type: "done", reason: "stop", usage },
+		]);
+
+		const events = await collectEvents();
+		const ended = events.find(event => event.type === "toolcall_end");
+		if (ended?.type !== "toolcall_end") throw new Error("expected a toolcall_end event");
+		expect(ended.toolCall.providerExecuted).toBeUndefined();
+		expect(ended.toolCall.arguments).toEqual({ query: "status" });
 	});
 
 	test("leaves ordinary wire calls unflagged", async () => {
@@ -145,10 +165,14 @@ describe("streamProxy provider-executed tool calls cross the wire", () => {
 					contentIndex: 0,
 					id: "call-3",
 					toolName: "bash",
-					providerExecuted: true,
+					providerExecuted: "cursor-exec",
 				},
 				{ type: "toolcall_delta", contentIndex: 0, delta: '{"command":"echo ran-on-the-provider"}' },
-				{ type: "toolcall_end", contentIndex: 0 },
+				{
+					type: "toolcall_end",
+					contentIndex: 0,
+					providerExecutionResult: { status: "success", output: "provider output" },
+				},
 				{ type: "done", reason: "toolUse", usage },
 			],
 			[
@@ -192,7 +216,7 @@ describe("streamProxy provider-executed tool calls cross the wire", () => {
 		expect(counter.n).toBe(0);
 		expect(results).toHaveLength(1);
 		expect(results[0]?.isError).toBeFalsy();
-		expect(results[0]?.text).toContain("executed by the provider during streaming");
+		expect(results[0]?.text).toContain("provider output");
 		expect(results[0]?.text).not.toContain("executed locally");
 	});
 });

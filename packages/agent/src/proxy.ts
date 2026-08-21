@@ -76,11 +76,17 @@ export type ProxyAssistantMessageEvent =
 			contentIndex: number;
 			id: string;
 			toolName: string;
-			/** True when the provider already executed this call itself (Cursor native tools). Relay of `ToolCall.providerExecuted`; dropped markers re-execute provider-side calls locally. */
-			providerExecuted?: boolean;
+			/** Cursor exec attestation; accepted only for a Cursor model. */
+			providerExecuted?: "cursor-exec";
 	  }
 	| { type: "toolcall_delta"; contentIndex: number; delta: string }
-	| { type: "toolcall_end"; contentIndex: number }
+	| {
+			type: "toolcall_end";
+			contentIndex: number;
+			/** Final arguments for providers that do not emit argument deltas. */
+			arguments?: Record<string, unknown>;
+			providerExecutionResult?: { status: "success" | "error"; output: string };
+	  }
 	| {
 			type: "done";
 			reason: Extract<StopReason, "stop" | "length" | "toolUse">;
@@ -357,7 +363,8 @@ function processProxyEvent(
 			throw new Error("Received thinking_end for non-thinking content");
 		}
 
-		case "toolcall_start":
+		case "toolcall_start": {
+			const trustedProviderMarker = model.provider === "cursor" && proxyEvent.providerExecuted === "cursor-exec";
 			partial.content[proxyEvent.contentIndex] = {
 				type: "toolCall",
 				id: proxyEvent.id,
@@ -367,9 +374,10 @@ function processProxyEvent(
 				// The marker decides whether the agent loop dispatches this call
 				// locally. Reconstructing without it would re-execute provider-side
 				// calls (Cursor native tools) after the wire already ran them.
-				...(proxyEvent.providerExecuted ? { providerExecuted: true } : {}),
+				...(trustedProviderMarker ? { providerExecuted: "cursor-exec" as const } : {}),
 			} satisfies ToolCall & { partialJson: string } as ToolCall;
 			return { type: "toolcall_start", contentIndex: proxyEvent.contentIndex, partial };
+		}
 
 		case "toolcall_delta": {
 			const content = partial.content[proxyEvent.contentIndex];
@@ -390,6 +398,20 @@ function processProxyEvent(
 		case "toolcall_end": {
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "toolCall") {
+				if (proxyEvent.arguments !== undefined) {
+					if (!isProxyRecord(proxyEvent.arguments)) {
+						throw new Error("Received invalid toolcall_end arguments");
+					}
+					content.arguments = { ...proxyEvent.arguments };
+				}
+				if (proxyEvent.providerExecutionResult !== undefined) {
+					if (!isProviderExecutionResult(proxyEvent.providerExecutionResult)) {
+						throw new Error("Received invalid provider execution result");
+					}
+					if (content.providerExecuted === "cursor-exec") {
+						content.providerExecutionResult = { ...proxyEvent.providerExecutionResult };
+					}
+				}
 				const raw = (content as { partialJson?: string }).partialJson;
 				if (raw && findUnnecessaryUnicodeEscape(raw)) content.escapedNonAsciiArguments = true;
 				delete (content as any).partialJson;
@@ -416,4 +438,13 @@ function processProxyEvent(
 			calculateCost(model, partial.usage);
 			return { type: "error", reason: proxyEvent.reason, error: partial };
 	}
+}
+
+function isProxyRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isProviderExecutionResult(value: unknown): value is { status: "success" | "error"; output: string } {
+	if (!isProxyRecord(value) || typeof value.output !== "string") return false;
+	return value.status === "success" || value.status === "error";
 }

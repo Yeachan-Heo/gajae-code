@@ -79,8 +79,12 @@ export type MockContent =
 			incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
 			/** Simulate a provider-flagged `\uXXXX`-escaped non-ASCII argument payload. */
 			escapedNonAsciiArguments?: boolean;
-			/** Simulate a provider that already executed the call itself (Cursor native tools). */
-			providerExecuted?: boolean;
+			/** Simulate a Cursor provider-executed call. */
+			providerExecuted?: "cursor-exec";
+			providerExecutionResult?: {
+				status: "success" | "error";
+				output: string;
+			};
 			thoughtSignature?: string;
 	  };
 /** One scripted response. */
@@ -437,7 +441,8 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 				? { incompleteArguments: true, incompleteArgumentsReason: input.incompleteArgumentsReason ?? "truncated" }
 				: {}),
 			...(input.escapedNonAsciiArguments ? { escapedNonAsciiArguments: true } : {}),
-			...(input.providerExecuted ? { providerExecuted: true } : {}),
+			...(input.providerExecuted ? { providerExecuted: input.providerExecuted } : {}),
+			...(input.providerExecutionResult ? { providerExecutionResult: input.providerExecutionResult } : {}),
 			...(input.thoughtSignature ? { thoughtSignature: input.thoughtSignature } : {}),
 		} as ToolCall;
 	}

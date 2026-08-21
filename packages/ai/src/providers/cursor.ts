@@ -660,6 +660,23 @@ type ToolCallState = ToolCall & {
 	[kCursorExecResolved]?: true;
 };
 
+const CURSOR_NATIVE_EXEC_CASES = new Set([
+	"shellToolCall",
+	"deleteToolCall",
+	"globToolCall",
+	"grepToolCall",
+	"readToolCall",
+	"editToolCall",
+	"lsToolCall",
+	"readLintsToolCall",
+	"fetchToolCall",
+]);
+
+function cursorExecOwnedToolCase(toolCall: Record<string, unknown>): string | undefined {
+	const oneof = toolCall.tool as { case?: string } | undefined;
+	return oneof?.case && CURSOR_NATIVE_EXEC_CASES.has(oneof.case) ? oneof.case : undefined;
+}
+
 interface BlockState {
 	currentTextBlock: (TextContent & { index: number }) | null;
 	currentThinkingBlock: (ThinkingContent & { index: number }) | null;
@@ -2323,7 +2340,7 @@ export function buildNativeToolCallBlock(
 			// apart from a model-issued call and dispatches it again, re-running the
 			// command; kinds whose display label is not a registered tool (glob,
 			// grep, ls, read_lints, ...) abort the turn with "Tool <name> not found".
-			providerExecuted: true,
+			...(CURSOR_NATIVE_EXEC_CASES.has(key) ? { providerExecuted: "cursor-exec" as const } : {}),
 		};
 	}
 	return null;
@@ -2537,6 +2554,21 @@ function processInteractionUpdate(
 				const todoArgs = buildTodoWriteArgs(toolCall);
 				if (todoArgs) {
 					state.currentToolCall.arguments = todoArgs;
+				}
+			} else if (state.currentToolCall.kind === "native" && toolCall) {
+				const providerCase = cursorExecOwnedToolCase(toolCall as unknown as Record<string, unknown>);
+				if (providerCase) {
+					const oneof = (toolCall as unknown as { tool?: { value?: { result?: unknown } } }).tool;
+					const rawResult = oneof?.value?.result;
+					const safeResult = cursorJsonSafeValue(rawResult);
+					const resultCase =
+						rawResult && typeof rawResult === "object"
+							? ((rawResult as { result?: { case?: unknown } }).result?.case ?? undefined)
+							: undefined;
+					state.currentToolCall.providerExecutionResult = {
+						status: resultCase === "success" ? "success" : "error",
+						output: JSON.stringify(safeResult) ?? "null",
+					};
 				}
 			}
 			const idx = output.content.indexOf(state.currentToolCall);

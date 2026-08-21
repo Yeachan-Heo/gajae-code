@@ -21,7 +21,7 @@ describe("cursor native tool calls are flagged as provider-executed", () => {
 		expect(block).toMatchObject({
 			type: "toolCall",
 			name: "bash",
-			providerExecuted: true,
+			providerExecuted: "cursor-exec",
 		});
 		// The command must still be visible to the user.
 		expect(block?.arguments).toMatchObject({ command: "rm -rf build" });
@@ -36,8 +36,22 @@ describe("cursor native tool calls are flagged as provider-executed", () => {
 		] as const) {
 			const block = buildNativeToolCallBlock(payload as Record<string, unknown>, "call-x", 0);
 			expect(block?.name).toBe(expectedName);
-			// Without the flag these abort the turn with `Tool <name> not found`.
-			expect(block?.providerExecuted).toBe(true);
+			// These are handled by Cursor's exec transport even when no local tool
+			// with the display label is registered.
+			expect(block?.providerExecuted).toBe("cursor-exec");
+		}
+	});
+
+	it("does not attest unsupported native variants", () => {
+		for (const payload of [
+			{ taskToolCall: { args: { description: "delegate" } } },
+			{ webSearchToolCall: { args: { searchTerm: "status" } } },
+			{ createPlanToolCall: { args: { plan: "plan" } } },
+			{ askQuestionToolCall: { args: { title: "question" } } },
+			{ applyAgentDiffToolCall: { args: { agentId: "agent" } } },
+		]) {
+			const block = buildNativeToolCallBlock(payload, "call-unsupported", 0);
+			expect(block?.providerExecuted).toBeUndefined();
 		}
 	});
 
