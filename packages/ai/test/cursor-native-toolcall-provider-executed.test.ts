@@ -27,6 +27,22 @@ describe("cursor native tool calls are flagged as provider-executed", () => {
 		expect(block?.arguments).toMatchObject({ command: "rm -rf build" });
 	});
 
+	it("flags the protobuf oneof shape emitted by Cursor", () => {
+		const block = buildNativeToolCallBlock(
+			{
+				tool: {
+					case: "shellToolCall",
+					value: { args: { command: "echo provider" } },
+				},
+			},
+			"call-oneof",
+			0,
+		);
+
+		expect(block).toMatchObject({ name: "bash", providerExecuted: "cursor-exec" });
+		expect(block?.arguments).toEqual({ command: "echo provider" });
+	});
+
 	it("flags native kinds whose display label is not a registered tool", () => {
 		for (const [payload, expectedName] of [
 			[{ globToolCall: { $typeName: "agent.v1.GlobToolCall", args: { globPattern: "**/*.ts" } } }, "glob"],

@@ -674,7 +674,11 @@ const CURSOR_NATIVE_EXEC_CASES = new Set([
 
 function cursorExecOwnedToolCase(toolCall: Record<string, unknown>): string | undefined {
 	const oneof = toolCall.tool as { case?: string } | undefined;
-	return oneof?.case && CURSOR_NATIVE_EXEC_CASES.has(oneof.case) ? oneof.case : undefined;
+	if (oneof?.case && CURSOR_NATIVE_EXEC_CASES.has(oneof.case)) return oneof.case;
+	for (const key of Object.keys(toolCall)) {
+		if (CURSOR_NATIVE_EXEC_CASES.has(key)) return key;
+	}
+	return undefined;
 }
 
 interface BlockState {
@@ -2311,6 +2315,7 @@ export function buildNativeToolCallBlock(
 					: { raw: convertedArgs },
 			index,
 			kind: "native",
+			...(CURSOR_NATIVE_EXEC_CASES.has(oneof.case) ? { providerExecuted: "cursor-exec" as const } : {}),
 		};
 	}
 	for (const [key, payload] of Object.entries(toolCall)) {
