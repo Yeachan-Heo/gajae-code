@@ -304,11 +304,12 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	logger.setTransports({ file: true });
 	vi.restoreAllMocks();
 	resetActiveSkillsForTests();
 	setAgentDir(originalAgentDir);
+	logger.setTransports({ file: true });
 	await expect(fs.readdir(homeDir)).resolves.toEqual(homeBefore);
+	await expect(fs.readdir(loggerHomeDir)).resolves.toEqual([]);
 	await fs.rm(root, { recursive: true, force: true });
 });
 
