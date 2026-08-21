@@ -114,10 +114,11 @@ export function getStreamFirstEventTimeoutMs(
 export function resolveOpenAISdkRequestTimeoutMs(
 	provider: string,
 	streamFirstEventTimeoutOverride?: number,
+	modelId?: string,
 ): number | undefined {
 	const providerFirstEventFallbackMs = getProviderFirstEventTimeoutFallbackMs(provider);
 	const envSdkTimeoutMs = getStreamFirstEventTimeoutMs(
-		getOpenAIStreamIdleTimeoutMs(provider),
+		getOpenAIStreamIdleTimeoutMs(provider, modelId),
 		providerFirstEventFallbackMs,
 	);
 	if (streamFirstEventTimeoutOverride === 0) return undefined;

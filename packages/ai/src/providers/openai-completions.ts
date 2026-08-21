@@ -1239,7 +1239,7 @@ async function createClient(
 	// The OpenAI SDK's default is 10 minutes per attempt × `maxRetries`, which
 	// turns a stalled-before-headers fetch into a multi-minute hang invisible
 	// to the agent loop (the iterator watchdog only arms AFTER `create()` returns).
-	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(model.provider, streamFirstEventTimeoutOverride);
+	const sdkTimeoutMs = resolveOpenAISdkRequestTimeoutMs(model.provider, streamFirstEventTimeoutOverride, model.id);
 	return {
 		client: new OpenAI({
 			apiKey,
