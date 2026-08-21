@@ -372,6 +372,18 @@ export class TtsrManager {
 	}
 
 	/**
+	 * Atomically replace the monitored TTSR rule set, e.g. after the session
+	 * moved to a new project root. Returns each rule's claim result in input
+	 * order (same contract as `addRule`). Injection records and the message
+	 * counter are preserved, so `repeat: "once"` semantics survive the
+	 * replacement and records for names absent from the new set stay inert.
+	 */
+	replaceRules(rules: Rule[]): boolean[] {
+		this.#rules.clear();
+		return rules.map(rule => this.addRule(rule));
+	}
+
+	/**
 	 * Add a stream chunk to its scoped buffer and return matching rules.
 	 *
 	 * Buffers are isolated by source/tool key so matches don't bleed across

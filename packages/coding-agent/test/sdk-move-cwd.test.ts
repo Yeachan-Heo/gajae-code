@@ -38,6 +38,13 @@ describe("createAgentSession cwd after /move", () => {
 		// Distinct context-file trees so the stable-prompt re-root is observable.
 		fs.writeFileSync(path.join(cwdA, "AGENTS.md"), "# Project A\nRun commands from project A.\n");
 		fs.writeFileSync(path.join(cwdB, "AGENTS.md"), "# Project B\nRun commands from project B.\n");
+		// SYSTEM.md is the cwd-scoped prompt-customization file (inside the
+		// project config dir); it must follow the move too (stable prompt
+		// rebuild reads the live cwd).
+		fs.mkdirSync(path.join(cwdA, ".gjc"), { recursive: true });
+		fs.mkdirSync(path.join(cwdB, ".gjc"), { recursive: true });
+		fs.writeFileSync(path.join(cwdA, ".gjc", "SYSTEM.md"), "You are working in PROJECT-ALPHA.\n");
+		fs.writeFileSync(path.join(cwdB, ".gjc", "SYSTEM.md"), "You are working in PROJECT-BETA.\n");
 
 		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
 		const { session } = await createAgentSession({
@@ -70,6 +77,13 @@ describe("createAgentSession cwd after /move", () => {
 			const promptAfter = session.systemPrompt.join("\n");
 			expect(promptAfter).toContain("Project B");
 			expect(promptAfter).not.toContain("Project A");
+
+			// The cwd-scoped SYSTEM.md customization and the tree-derived AGENTS.md
+			// directory list follow the move as well (live-cwd rebuild).
+			expect(promptAfter).toContain("PROJECT-BETA");
+			expect(promptAfter).not.toContain("PROJECT-ALPHA");
+			expect(promptAfter).toContain("cwd-b");
+			expect(promptAfter).not.toContain("cwd-a");
 
 			const bashTool = session.getToolByName("bash");
 			if (!bashTool) throw new Error("Expected bash tool");

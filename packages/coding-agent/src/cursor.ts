@@ -38,7 +38,9 @@ import { resolveToCwd } from "./tools/path-utils";
 type CursorExecEventEmitter = (event: AgentEvent, dispatchedTool?: AgentTool) => void;
 
 interface CursorExecBridgeOptions {
-	cwd: string;
+	cwd?: string;
+	/** Live cwd accessor; when present it wins over the static `cwd` snapshot so native operations follow `AgentSession.moveCwd()`. */
+	getCwd?: () => string;
 	tools: Map<string, AgentTool>;
 	getEditReplaceTool?: () => AgentTool | undefined;
 	createSearchTool?: (options: { context?: number; totalMatchLimit?: number }) => AgentTool | undefined;
@@ -135,7 +137,7 @@ async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, 
 	const toolName = "delete";
 	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: { path: pathArg } });
 
-	const absolutePath = resolveToCwd(pathArg, options.cwd);
+	const absolutePath = resolveToCwd(pathArg, options.getCwd?.() ?? options.cwd ?? process.cwd());
 	let isError = false;
 	let result: AgentToolResult<unknown>;
 

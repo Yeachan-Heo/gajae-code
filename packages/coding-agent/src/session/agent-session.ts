@@ -15,6 +15,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as crypto from "node:crypto";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
@@ -189,6 +190,7 @@ import {
 	logger,
 	prompt,
 	Snowflake,
+	setProjectDir,
 } from "@gajae-code/utils";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
@@ -236,6 +238,7 @@ import { getDefault } from "../config/settings-schema";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
+import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
 import { MAX_EDIT_FILE_BYTES } from "../edit/read-file";
 import { disposeVmContextsByOwner } from "../eval/js/context-manager";
@@ -9918,10 +9921,23 @@ export class AgentSession {
 	 *   to pass caller input through unchecked.
 	 * - Moving to the current cwd is a no-op (nothing disposed, nothing
 	 *   cleared), so a redundant move cannot degrade startup context.
-	 * - Every fallible re-rooting step runs *before* `sessionManager.moveTo()`
-	 *   commits the new cwd: the lazy service is disposed first (its abort can
-	 *   reject), and only then is cwd published and the caches cleared. A
-	 *   failure therefore leaves the session exactly where it was.
+	 * - The launch-cwd workspace-tree service is dropped (and disposed)
+	 *   before the move commits. Once `dispose()` starts, a lazy service can
+	 *   never serve another scan, so a disposal failure is logged and the move
+	 *   proceeds: `#buildVolatileProjectContextMessageLocked` falls back to a
+	 *   direct scan of the live cwd, which is always the correct root. A
+	 *   disposal failure must not strand the session in the old directory.
+	 * - If `sessionManager.moveTo()` rejects without committing, the session
+	 *   stays exactly where it was and the error propagates. If it rejects
+	 *   after publishing the destination (non-managed destinations retain the
+	 *   move when post-publication header persistence fails), the tree caches
+	 *   are cleared and the post-commit re-root still runs before the original
+	 *   error propagates, so the session's tree state always matches the
+	 *   committed cwd.
+	 * - Post-commit re-rooting (project-dir/plugin/capability refresh and the
+	 *   `onCwdMoved` hook) never rejects: the cwd is already committed, so a
+	 *   refresh failure degrades visibly via the logger instead of reporting
+	 *   an unsuccessful move over committed state.
 	 * - The whole operation is serialized against the volatile-tree
 	 *   scan/refresh (`#buildVolatileProjectContextMessage`), so an in-flight
 	 *   old-root refresh can never repopulate the cache after the move clears
@@ -9930,7 +9946,7 @@ export class AgentSession {
 	async moveCwd(newCwd: string): Promise<void> {
 		const resolvedPath = resolveToCwd(newCwd, this.sessionManager.getCwd());
 		if (resolvedPath === this.sessionManager.getCwd()) return;
-		let stat: Awaited<ReturnType<typeof fs.promises.stat>>;
+		let stat: Stats;
 		try {
 			stat = await fs.promises.stat(resolvedPath);
 		} catch {
@@ -9940,28 +9956,68 @@ export class AgentSession {
 		await this.#runExclusiveWorkspaceTreeOperation(() => this.#moveCwdLocked(resolvedPath));
 	}
 
-	/** Caller has already validated; serialize, dispose, commit, clear. */
+	/** Caller has already validated; serialize, dispose, commit, clear, re-root. */
 	async #moveCwdLocked(resolvedPath: string): Promise<void> {
-		// Fallible work first: disposing an initializing lazy service aborts its
-		// scan and can reject. Do it before the cwd is published so a failure
-		// leaves the session fully unmoved.
 		const service = this.#workspaceTreeService;
 		if (service) {
-			// The service captured the launch cwd at construction; the direct-scan
-			// fallback in #buildVolatileProjectContextMessage reads the live cwd.
+			// Drop the field first: once dispose() starts the service can never
+			// serve another get(), so the reference is dead in every outcome and
+			// the volatile builder's direct-scan fallback (live cwd) takes over.
+			// A disposal failure is a degraded teardown of an already-abandoned
+			// service — log it, never block the directory move on it.
 			this.#workspaceTreeService = undefined;
-			await service.dispose();
+			await service.dispose().catch(error => {
+				logger.warn("Workspace-tree service disposal failed during cwd move", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 		}
-		await this.sessionManager.moveTo(resolvedPath);
-		// Only cache/state clears remain — none of these can throw.
+		try {
+			await this.sessionManager.moveTo(resolvedPath);
+		} catch (error) {
+			if (this.sessionManager.getCwd() === resolvedPath) {
+				// moveTo published the destination and then failed (non-managed
+				// destinations deliberately retain the move). Keep tree state
+				// consistent with the committed cwd before surfacing the error.
+				this.#clearWorkspaceTreeCaches();
+				await this.#refreshProjectScopeAfterCwdMove();
+			}
+			throw error;
+		}
+		this.#clearWorkspaceTreeCaches();
+		await this.#refreshProjectScopeAfterCwdMove();
+	}
+
+	#clearWorkspaceTreeCaches(): void {
 		this.#initialWorkspaceTree = undefined;
 		this.#cachedWorkspaceTree = undefined;
 		this.#cachedWorkspaceTreeAt = 0;
-		// Re-root every project-scoped consumer (stable prompt inputs, subagent
-		// tree forwarding). Runs last: the cwd is already committed, so a
-		// discovery failure must degrade, not reject the move — the SDK hook
-		// handles that internally.
-		await this.#onCwdMoved?.();
+	}
+
+	/**
+	 * Re-root process-global project state after the cwd has committed. Every
+	 * step is best-effort by design: the directory is already moved, so a
+	 * refresh failure must degrade visibly (logger) rather than reject an
+	 * already-committed move.
+	 */
+	async #refreshProjectScopeAfterCwdMove(): Promise<void> {
+		setProjectDir(this.sessionManager.getCwd());
+		clearClaudePluginRootsCache(); // re-warms preloadedPluginRoots with the new project dir (async)
+		try {
+			await this.#onCwdMoved?.();
+		} catch (error) {
+			logger.warn("onCwdMoved re-rooting failed after cwd move", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		try {
+			// resetCapabilities() + SSH re-discovery scoped to the new root.
+			await this.refreshSshTool({ activateIfAvailable: true });
+		} catch (error) {
+			logger.warn("SSH tool refresh failed after cwd move", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	/**

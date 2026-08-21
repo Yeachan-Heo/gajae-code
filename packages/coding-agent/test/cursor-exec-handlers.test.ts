@@ -6,7 +6,11 @@
  * and call them without the class instance. Before the constructor binding fix this threw:
  *   "undefined is not an object (evaluating 'this.#optionsForCall')"
  */
+
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { create } from "@bufbuild/protobuf";
 import type { AgentEvent, AgentTool } from "@gajae-code/agent-core";
 import { dispatchedToolIdentity } from "@gajae-code/agent-core";
@@ -372,5 +376,44 @@ describe("CursorExecHandlers dispatched tool identity", () => {
 		const start = events.find(event => event.type === "tool_execution_start");
 		expect(start).toBeDefined();
 		expect(dispatchedToolIdentity(start as object)).toBeUndefined();
+	});
+});
+
+describe("CursorExecHandlers cwd resolution", () => {
+	it("resolves native delete paths against the live cwd accessor, not the launch snapshot", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-cursor-livecwd-"));
+		const projectA = path.join(tempDir, "project-a");
+		const projectB = path.join(tempDir, "project-b");
+		fs.mkdirSync(projectA, { recursive: true });
+		fs.mkdirSync(projectB, { recursive: true });
+		const fileInA = path.join(projectA, "target.txt");
+		fs.writeFileSync(fileInA, "stale project file");
+		const fileInB = path.join(projectB, "target.txt");
+		fs.writeFileSync(fileInB, "current project file");
+		try {
+			// Simulates the session moving: static snapshot stays at launch root
+			// A while the live accessor reports B. A delete must resolve into
+			// the current project, and B's file must be the one deleted.
+			const handlers = new CursorExecHandlers({
+				cwd: projectA,
+				getCwd: () => projectB,
+				tools: new Map(),
+			} as never);
+
+			const result = await handlers.delete(create(DeleteArgsSchema, { path: "target.txt", toolCallId: "d-live" }));
+			expect(result.isError).toBe(false);
+			expect(fs.existsSync(fileInB)).toBe(false);
+			expect(fs.existsSync(fileInA)).toBe(true);
+
+			// Static-snapshot bridge without getCwd keeps the old resolution.
+			const staticHandlers = new CursorExecHandlers({ cwd: projectA, tools: new Map() } as never);
+			const staticResult = await staticHandlers.delete(
+				create(DeleteArgsSchema, { path: "target.txt", toolCallId: "d-static" }),
+			);
+			expect(staticResult.isError).toBe(false);
+			expect(fs.existsSync(fileInA)).toBe(false);
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 });

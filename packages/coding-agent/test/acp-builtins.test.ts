@@ -1,4 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
 import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
 import { Settings } from "../src/config/settings";
@@ -79,6 +81,7 @@ interface FakeAcpBuiltinSession {
 	setTodoPhases(phases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>): void;
 	refreshBaseSystemPrompt(): Promise<void>;
 	refreshSshTool(options?: { activateIfAvailable?: boolean }): Promise<void>;
+	moveCwd(newCwd: string): Promise<void>;
 	getToolByName(name: string): unknown;
 	compact(args?: string): Promise<void>;
 	getContextUsage(): { tokens?: number; contextWindow: number } | undefined;
@@ -199,6 +202,21 @@ function createRuntime() {
 			this.thinkingLevelCalls.push({ thinkingLevel, persist });
 		},
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
+		async moveCwd(newCwd: string) {
+			// Mirrors AgentSession.moveCwd()'s target validation so `/move`
+			// usage errors stay observable without constructing a real session.
+			// `sessionManager` is attached by the caller via Object.assign.
+			const manager = (this as unknown as { sessionManager: SessionManager }).sessionManager;
+			const resolved = path.resolve(manager.getCwd(), newCwd);
+			let stat: fs.Stats | undefined;
+			try {
+				stat = await fs.promises.stat(resolved);
+			} catch {
+				throw new Error(`Directory does not exist: ${resolved}`);
+			}
+			if (!stat.isDirectory()) throw new Error(`Not a directory: ${resolved}`);
+			await manager.moveTo(resolved);
+		},
 	};
 	const fakeSessionManager = {
 		_sessionFile: undefined as string | undefined,

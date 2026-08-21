@@ -1913,11 +1913,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		]);
 		// Mutable re-root holders: `AgentSession.moveCwd()` publishes a fresh
 		// post-move snapshot here so later `rebuildSystemPrompt` passes and every
-		// `ToolSession.workspaceTree` consumer (including task subagents) read the
-		// live project root instead of the launch-time one. `undefined` means "no
-		// post-move snapshot yet"; consumers fall back to the startup values.
+		// `ToolSession` consumer (including task subagents spawned after the
+		// move) read the live project root instead of the launch-time one.
+		// `undefined` means "no post-move snapshot yet"; consumers fall back to
+		// the startup values.
 		let rerootedContextFiles = contextFilesResult.contextFiles;
 		let rerootedWorkspaceTree = resolvedWorkspaceTree;
+		// Skills/rules holders: the cwd-move hook republishes new-root discovery
+		// here unless the caller explicitly owns those inputs (options.skills /
+		// options.rules), mirroring the startup discovery paths.
+		let rerootedSkills = skills;
+		let rerootedRulebookRules = rulebookRules;
+		let rerootedAlwaysApplyRules = alwaysApplyRules;
 		const contextFiles = () => rerootedContextFiles;
 		const discoveredContextFileWarnings = contextFilesResult.warnings;
 
@@ -2040,9 +2047,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return !requestedToolNames || requestedToolNames.includes("edit");
 			},
 			skipPythonPreflight: options.skipPythonPreflight,
-			contextFiles: contextFiles(),
-			workspaceTree: rerootedWorkspaceTree,
-			skills,
+			get contextFiles() {
+				return rerootedContextFiles;
+			},
+			get workspaceTree() {
+				return rerootedWorkspaceTree;
+			},
+			get skills() {
+				return rerootedSkills;
+			},
 			eventBus,
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,
@@ -3052,6 +3065,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let cursorEventEmitter: ((event: AgentEvent) => void) | undefined;
 		const cursorExecHandlers = new CursorExecHandlers({
 			cwd,
+			getCwd: () => sessionManager.getCwd(),
 			tools: toolRegistry,
 			getEditReplaceTool: () => cursorReplaceEditTool,
 			createSearchTool: options => {
@@ -3136,7 +3150,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const appendPrompt: string | undefined = memoryInstructions ?? undefined;
 			let pluginSystemAppendices = "";
 			try {
-				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd });
+				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd: sessionManager.getCwd() });
 			} catch (error) {
 				gjcProducersComplete = false;
 				logger.warn("Failed to render GJC plugin system appendices", { error: safeErrorForLog(error) });
@@ -3150,13 +3164,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// `unavailable` rather than a stale generation.
 			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot(), gjcPassEpoch);
 			const defaultPrompt = await buildSystemPromptInternal({
-				cwd,
-				skills,
+				cwd: sessionManager.getCwd(),
+				skills: rerootedSkills,
 				contextFiles: contextFiles(),
 				tools: promptTools,
 				toolNames,
-				rules: rulebookRules,
-				alwaysApplyRules,
+				rules: rerootedRulebookRules,
+				alwaysApplyRules: rerootedAlwaysApplyRules,
 				skillsSettings: settings.getGroup("skills"),
 				appendSystemPrompt: appendPrompt,
 				pluginAppendices: pluginSystemAppendices,
@@ -3693,11 +3707,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await session?.refreshBaseSystemPrompt();
 			},
 			onCwdMoved: async () => {
-				// AgentSession.moveCwd() committed a new cwd: re-discover every
-				// project-scoped input that the launch-time closures captured, then
-				// rebuild the stable prompt prefix from the new root. Discovery
-				// failures degrade to the previous snapshot (mirroring startup's
-				// deadline fallback) instead of failing the already-committed move.
+				// AgentSession.moveCwd() committed a new cwd: re-establish the
+				// complete project scope from the new root, then rebuild the stable
+				// prompt prefix. Explicit caller-supplied skills/rules stay
+				// caller-owned; each discovery failure degrades to the previous
+				// snapshot (mirroring startup's deadline fallback) instead of
+				// failing the already-committed move.
 				const nextCwd = sessionManager.getCwd();
 				try {
 					const [files, tree] = await Promise.all([
@@ -3709,6 +3724,44 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					workspaceTreePromise = Promise.resolve(tree);
 				} catch {
 					// keep previous snapshots; the volatile context still follows cwd
+				}
+				if (options.skills === undefined && settings.get("skills.enabled")) {
+					try {
+						const skillsResult = await loadSkills({
+							...settings.getGroup("skills"),
+							cwd: nextCwd,
+							disabledExtensions: settings.get("disabledExtensions"),
+						});
+						rerootedSkills = withEmbeddedDefaultGjcSkills(skillsResult.skills);
+					} catch {
+						// keep previous skills snapshot
+					}
+				}
+				if (options.rules === undefined) {
+					try {
+						const rulesResult = await loadCapability<Rule>(ruleCapability.id, { cwd: nextCwd });
+						// Same bucketing as startup: TTSR-claimed rules stay with the
+						// manager, the rest split into prompt rules / always-apply.
+						const claims = ttsrManager.replaceRules(rulesResult.items);
+						const nextRulebookRules: Rule[] = [];
+						const nextAlwaysApplyRules: Rule[] = [];
+						rulesResult.items.forEach((rule, index) => {
+							if (claims[index]) return;
+							if (rule.alwaysApply === true) {
+								nextAlwaysApplyRules.push(rule);
+								return;
+							}
+							if (rule.description) nextRulebookRules.push(rule);
+						});
+						rerootedRulebookRules = nextRulebookRules;
+						rerootedAlwaysApplyRules = nextAlwaysApplyRules;
+					} catch {
+						// keep previous rules snapshot
+					}
+				}
+				if (!options.parentTaskPrefix) {
+					setActiveSkills(rerootedSkills);
+					setActiveRules([...rerootedRulebookRules, ...rerootedAlwaysApplyRules]);
 				}
 				await session?.refreshBaseSystemPrompt();
 			},

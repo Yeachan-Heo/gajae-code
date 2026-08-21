@@ -5,12 +5,10 @@ import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/ag
 import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
-import { formatBytes, formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
+import { formatBytes, formatDuration, Snowflake } from "@gajae-code/utils";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
-import { reset as resetCapabilities } from "../../capability";
 import type { KeybindingsManager } from "../../config/keybindings";
-import { clearClaudePluginRootsCache } from "../../discovery/helpers";
 import { loadCustomShare } from "../../export/custom-share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import type { HindsightApi, HindsightSessionState } from "../../hindsight";
@@ -1147,11 +1145,9 @@ export class CommandController {
 		try {
 			await this.ctx.sessionManager.flush();
 			await this.ctx.session.moveCwd(resolvedPath);
-			setProjectDir(resolvedPath);
-			clearClaudePluginRootsCache(); // re-warms preloadedPluginRoots with new project dir (async)
-			resetCapabilities();
+			// setProjectDir / plugin roots / capabilities / SSH refresh are owned
+			// by session.moveCwd(), shared with every other cwd-mutation surface.
 			await this.ctx.refreshSlashCommandState(resolvedPath);
-			await this.ctx.session.refreshSshTool({ activateIfAvailable: true });
 
 			this.ctx.statusLine.rewatchBranch();
 			this.ctx.statusLine.invalidate();

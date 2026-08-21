@@ -6,7 +6,11 @@ import { getBundledModel } from "@gajae-code/ai";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { createWorkspaceTreeService } from "@gajae-code/coding-agent/runtime/workspace-tree-service";
+import { createLazyService, type LazyService } from "@gajae-code/coding-agent/runtime/lazy-service";
+import {
+	createWorkspaceTreeService,
+	type WorkspaceTreeRuntime,
+} from "@gajae-code/coding-agent/runtime/workspace-tree-service";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
@@ -43,6 +47,30 @@ describe("AgentSession workspace tree after /move", () => {
 	let authStorage: AuthStorage | undefined;
 	let settings: Settings;
 	const volatilePromptContexts: string[][] = [];
+
+	/** Bare agent used by hook/failure-path sessions that never prompt the model. */
+	function newAgent(): Agent {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+		return new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			convertToLlm,
+			streamFn: () => {
+				throw new Error("not expected to stream");
+			},
+		});
+	}
+
+	function testModelRegistry(): ModelRegistry {
+		return new ModelRegistry(
+			authStorage ??
+				(() => {
+					throw new Error("auth storage missing");
+				})(),
+			path.join(tempDir.path(), "models.yml"),
+		);
+	}
 
 	function createSession(options?: { useWorkspaceTreeService?: boolean }): void {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -136,8 +164,8 @@ describe("AgentSession workspace tree after /move", () => {
 		cwdB = path.join(tempDir.path(), "cwd-b");
 		fs.mkdirSync(cwdA, { recursive: true });
 		fs.mkdirSync(cwdB, { recursive: true });
-		fs.writeFileSync(path.join(cwdA, "marker-a.txt"), "a");
-		fs.writeFileSync(path.join(cwdB, "marker-b.txt"), "b");
+		await Bun.write(path.join(cwdA, "marker-a.txt"), "a");
+		await Bun.write(path.join(cwdB, "marker-b.txt"), "b");
 		volatilePromptContexts.length = 0;
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
@@ -235,6 +263,61 @@ describe("AgentSession workspace tree after /move", () => {
 		});
 		await session.moveCwd(cwdB);
 		expect(movedTo).toBe(cwdB);
+		expect(sessionManager.getCwd()).toBe(cwdB);
+	});
+
+	it("completes the move when the workspace-tree service disposal rejects", async () => {
+		createSession();
+		await session.dispose();
+		const failingDisposeService = createLazyService<never>({
+			id: "workspace-tree-test-failing-dispose",
+			enabled: () => true,
+			initialize: async () => ({
+				value: undefined as never,
+				dispose: () => {
+					throw new Error("dispose boom");
+				},
+			}),
+		});
+		await failingDisposeService.prewarm("test");
+		session = new AgentSession({
+			agent: newAgent(),
+			sessionManager,
+			settings,
+			modelRegistry: testModelRegistry(),
+			toolRegistry: new Map<string, AgentTool>(),
+			workspaceTreeService: failingDisposeService as unknown as LazyService<WorkspaceTreeRuntime>,
+		});
+		await expect(session.moveCwd(cwdB)).resolves.toBeUndefined();
+		expect(sessionManager.getCwd()).toBe(cwdB);
+	});
+
+	it("propagates moveTo failure while the cwd stays unchanged", async () => {
+		createSession();
+		await session.dispose();
+		const failingMoveTo = sessionManager.moveTo.bind(sessionManager);
+		sessionManager.moveTo = async () => {
+			throw new Error("moveTo boom");
+		};
+		session = createHookedSession({
+			onCwdMoved: () => {
+				throw new Error("hook must not run when the move never committed");
+			},
+		});
+		await expect(session.moveCwd(cwdB)).rejects.toThrow("moveTo boom");
+		expect(sessionManager.getCwd()).toBe(cwdA);
+		sessionManager.moveTo = failingMoveTo;
+	});
+
+	it("never rejects from a failing post-commit onCwdMoved hook", async () => {
+		createSession();
+		await session.dispose();
+		session = createHookedSession({
+			onCwdMoved: () => {
+				throw new Error("hook boom");
+			},
+		});
+		await expect(session.moveCwd(cwdB)).resolves.toBeUndefined();
 		expect(sessionManager.getCwd()).toBe(cwdB);
 	});
 });
