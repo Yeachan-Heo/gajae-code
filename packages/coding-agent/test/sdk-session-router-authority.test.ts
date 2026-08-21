@@ -55,6 +55,7 @@ interface RouterFixture {
 
 async function routerFixture(
 	options: {
+		invokeDispatchObservers?: boolean;
 		onAttachment?: (attachment: SessionAttachment) => void | Promise<void>;
 		onAttachmentReady?: (attachment: SessionAttachment) => void | Promise<void>;
 		onSessionRemoved?: (
@@ -145,6 +146,15 @@ async function routerFixture(
 					request: async (operation, requestOption) => {
 						requests.push(operation);
 						requestOptions.push(requestOption);
+						if (options.invokeDispatchObservers !== false) {
+							const context = {
+								frame: operation,
+								connectionId: "fixture-connection",
+								generation: 1,
+							};
+							requestOption?.beforeDispatch?.(context);
+							requestOption?.onDispatch?.(context);
+						}
 						return { events: [] };
 					},
 					close: async () => {},
@@ -834,12 +844,6 @@ describe("SessionRouter dispatch authority", () => {
 			// The wire frame the private client received still carries the stamped
 			// endpoint token (the transport needs it); only the observer copy is redacted.
 			expect(dispatched.requests[index]?.token).toBe("secret");
-			// Invoke the recorded observers exactly as a real transport would.
-			const recorded = dispatched.requestOptions.at(-1);
-			const recordedFrame = dispatched.requests[index] as Record<string, unknown>;
-			if (recorded?.beforeDispatch)
-				recorded.beforeDispatch({ frame: recordedFrame, connectionId: "c", generation: 1 });
-			if (recorded?.onDispatch) recorded.onDispatch({ frame: recordedFrame, connectionId: "c", generation: 1 });
 			// Neither callback phase observed the token.
 			expect(seen).toHaveLength(2);
 			for (const entry of seen) {
@@ -861,6 +865,7 @@ describe("SessionRouter dispatch authority", () => {
 		const fixture = await routerFixture();
 		try {
 			const boundaries: string[] = [];
+			const observedIds: string[] = [];
 			await fixture.router.request(
 				fixture.sessionId,
 				{ type: "control_request", id: "boundary", operation: "turn.prompt", input: {} },
@@ -870,9 +875,11 @@ describe("SessionRouter dispatch authority", () => {
 					timeoutMs: 1_500,
 					beforeDispatch: context => {
 						boundaries.push(`before:${String(context.frame.operation)}`);
+						observedIds.push(String(context.frame.id));
 					},
 					onDispatch: context => {
 						boundaries.push(`after:${String(context.frame.operation)}:${context.generation > 0}`);
+						observedIds.push(String(context.frame.id));
 					},
 				},
 			);
@@ -885,10 +892,44 @@ describe("SessionRouter dispatch authority", () => {
 			expect(options?.timeoutMs).toBe(1_500);
 			expect(typeof options?.beforeDispatch).toBe("function");
 			expect(typeof options?.onDispatch).toBe("function");
-			const context = { frame: { operation: "turn.prompt" }, connectionId: "c", generation: 1 };
-			options?.beforeDispatch?.(context);
-			options?.onDispatch?.(context);
 			expect(boundaries).toEqual(["before:turn.prompt", "after:turn.prompt:true"]);
+			expect(observedIds).toEqual(["boundary", "boundary"]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("preserves managed-router observer thenables for the client boundary", async () => {
+		const fixture = await routerFixture({ invokeDispatchObservers: false });
+		try {
+			const beforeFailure = new Error("managed before failure");
+			const afterFailure = new Error("managed after failure");
+			await fixture.router.request(
+				fixture.sessionId,
+				{ type: "control_request", id: "thenable", operation: "turn.prompt", input: {} },
+				1,
+				undefined,
+				{
+					beforeDispatch: async () => {
+						throw beforeFailure;
+					},
+					onDispatch: async () => {
+						throw afterFailure;
+					},
+				},
+			);
+			const options = fixture.clients[0]?.requestOptions.at(-1);
+			expect(options?.beforeDispatch).toBeDefined();
+			expect(options?.onDispatch).toBeDefined();
+			const context = {
+				frame: { id: "client-generated", operation: "turn.prompt" },
+				connectionId: "fixture-connection",
+				generation: 1,
+			};
+			const beforeResult = options!.beforeDispatch!(context) as unknown as Promise<never>;
+			const afterResult = options!.onDispatch!(context) as unknown as Promise<never>;
+			await expect(beforeResult).rejects.toBe(beforeFailure);
+			await expect(afterResult).rejects.toBe(afterFailure);
 		} finally {
 			await fixture.router.stop();
 		}

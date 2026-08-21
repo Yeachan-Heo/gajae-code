@@ -620,7 +620,6 @@ export class SessionRouter {
 		// token: the wire frame alone carries credentials, and the observer
 		// context is a deep-frozen, token-redacted copy (#4640 review).
 		const wireFrame = this.#prepareFrame(attached, frame);
-		const observerFrame = wireFrame.token === undefined ? wireFrame : redactDispatchFrame(wireFrame);
 		const { beforeDispatch, onDispatch, ...requestOptions } = options ?? {};
 		const response = await attached.client.request(wireFrame, {
 			...requestOptions,
@@ -628,14 +627,20 @@ export class SessionRouter {
 			...(beforeDispatch
 				? {
 						beforeDispatch: (context: SdkDispatchContext) => {
-							beforeDispatch({ ...context, frame: observerFrame });
+							return beforeDispatch({
+								...context,
+								frame: redactDispatchFrame(context.frame),
+							});
 						},
 					}
 				: {}),
 			...(onDispatch
 				? {
 						onDispatch: (context: SdkDispatchContext) => {
-							onDispatch({ ...context, frame: observerFrame });
+							return onDispatch({
+								...context,
+								frame: redactDispatchFrame(context.frame),
+							});
 						},
 					}
 				: {}),

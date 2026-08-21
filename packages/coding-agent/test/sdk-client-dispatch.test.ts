@@ -399,7 +399,7 @@ test("beforeDispatch closing the client prevents the send and keeps the boundary
 			probeRequest.catch(() => undefined);
 			await flush();
 			expect(probeSocket.sent).toHaveLength(0);
-			expect(client.getSentRecord(capturedId)).toBeUndefined();
+			expect(probeClient.getSentRecord(capturedId)).toBeUndefined();
 			boundaryFrameIds.push(capturedId);
 			expect(boundaryFrameIds).toHaveLength(1);
 			await probeClient.close().catch(() => undefined);
