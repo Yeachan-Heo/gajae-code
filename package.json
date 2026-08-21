@@ -2,7 +2,7 @@
   "name": "gajae-code",
   "private": true,
   "type": "module",
-  "packageManager": "bun@1.3.14",
+  "packageManager": "bun@1.4.0",
   "workspaces": {
     "packages": [
       "packages/*"

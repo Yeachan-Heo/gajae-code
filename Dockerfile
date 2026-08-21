@@ -18,7 +18,7 @@
 #
 ###############################################################################
 
-ARG BUN_VERSION=1.3.14
+ARG BUN_VERSION=1.4.0
 
 ############################
 # 1) natives-builder — Rust + Bun → pi_natives.linux-<arch>.node

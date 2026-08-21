@@ -71,4 +71,4 @@ bun test packages/agent packages/ai
 bun scripts/verify-g002-gates.ts
 ```
 
-Use `mise x bun@1.3.14 -- <command>` when `bun` is not on `PATH`.
+Use `mise x bun@1.4.0 -- <command>` when `bun` is not on `PATH`.

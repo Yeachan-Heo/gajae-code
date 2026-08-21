@@ -122,7 +122,7 @@ BASELINE_FIELDS = {
     "captureSemanticsId",
 }
 CAPTURE_SEMANTICS_ID = "gjc.memory-baseline.capture/3"
-BUN_VERSION = "1.3.14"
+BUN_VERSION = "1.4.0"
 LOGICAL_BUN_EXECUTABLE = "bun"
 RESULT_JSON = "perf-corpus-rlm-result.json"
 RESULT_MARKDOWN = "perf-corpus-rlm-result.md"

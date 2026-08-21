@@ -83,7 +83,7 @@ describe("composer bash policy", () => {
 		"npm --version",
 		"pnpm --version",
 		"yarn --version",
-		"mise x bun@1.3.14 -- bun test packages/coding-agent/test/tools/composer-bash-policy.test.ts",
+		"mise x bun@1.4.0 -- bun test packages/coding-agent/test/tools/composer-bash-policy.test.ts",
 	])("allows terminal operations for composer model: %s", command => {
 		expect(checkComposerBashPolicy({ modelId: COMPOSER_MODEL, commands: [command] })).toEqual({ allowed: true });
 	});
