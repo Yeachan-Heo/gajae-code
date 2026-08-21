@@ -109,6 +109,24 @@ describe("control endpoint", () => {
 		);
 	});
 
+	it("rejects when the owner resets the peer", async () => {
+		rawServer = net.createServer(socket => {
+			trackRawSocket(socket);
+			socket.destroy();
+		});
+		await new Promise<void>((resolve, reject) => {
+			rawServer?.once("error", reject);
+			rawServer?.listen(sock, () => {
+				rawServer?.removeListener("error", reject);
+				resolve();
+			});
+		});
+
+		await expect(callEndpoint(sock, { verb: "observe", input: {} }, 500)).rejects.toBeInstanceOf(
+			EndpointUnreachableError,
+		);
+	});
+
 	it("rejects overlong socket paths before binding", async () => {
 		const overlong = path.join(dir, "x".repeat(120), "c.sock");
 		server = new ControlServer(overlong, async () => ({ ok: true }));
@@ -126,5 +144,22 @@ describe("control endpoint", () => {
 		const b = (await callEndpoint(sock, { verb: "observe", input: {} })) as Record<string, unknown>;
 		expect(a.count).toBe(1);
 		expect(b.count).toBe(2);
+	});
+
+	it("closes accepted peers that have not completed a frame", async () => {
+		server = new ControlServer(sock, async () => ({ ok: true }));
+		await server.listen();
+		const peer = net.connect(sock);
+		await new Promise<void>((resolve, reject) => {
+			peer.once("connect", resolve);
+			peer.once("error", reject);
+		});
+		const peerClosed = new Promise<void>(resolve => peer.once("close", () => resolve()));
+		peer.write('{"verb":"observe","input":{}');
+
+		await server.close();
+		server = null;
+		await peerClosed;
+		expect(peer.destroyed).toBe(true);
 	});
 });

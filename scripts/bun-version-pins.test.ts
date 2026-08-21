@@ -47,12 +47,10 @@ describe("repository Bun version pins", () => {
 	test("keeps CI, release, installer, documentation, and evidence pins aligned", async () => {
 		const version = pinnedBunVersion(await manifest("package.json"));
 		const exactWorkflowPaths = [
+			".github/actions/build-native/action.yml",
 			".github/workflows/ci.yml",
 			".github/workflows/dev-ci.yml",
 			".github/workflows/pr-validation.yml",
-		];
-		const minorWorkflowPaths = [
-			".github/actions/build-native/action.yml",
 			".github/workflows/public-site-sync.yml",
 		];
 
@@ -61,10 +59,6 @@ describe("repository Bun version pins", () => {
 			expectMatchesToEqual(source, /bun-version:\s*["']?(\d+\.\d+\.\d+)/g, version);
 			const cachePins = [...source.matchAll(/\bbun-(\d+\.\d+\.\d+)-\$\{\{/g)].map(match => match[1]);
 			if (cachePins.length > 0) expect(new Set(cachePins), relativePath).toEqual(new Set([version]));
-		}
-		const minorVersion = version.split(".").slice(0, 2).join(".");
-		for (const relativePath of minorWorkflowPaths) {
-			expectMatchesToEqual(await text(relativePath), /bun-version:\s*["']?(\d+\.\d+)/g, minorVersion);
 		}
 
 		expect(await text("Dockerfile")).toContain(`ARG BUN_VERSION=${version}`);
