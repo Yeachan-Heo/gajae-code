@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { loadCapability } from "@gajae-code/coding-agent/capability";
 import { clearCache as clearFsCache } from "@gajae-code/coding-agent/capability/fs";
 import { clearClaudePluginRootsCache } from "@gajae-code/coding-agent/discovery/helpers";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import "@gajae-code/coding-agent/discovery/claude-plugins";
 import type { MCPServer } from "../src/capability/mcp";
 
@@ -27,7 +28,7 @@ describe("issue-851: marketplace plugins load flat .mcp.json shape", () => {
 		vi.restoreAllMocks();
 		if (originalHome === undefined) delete process.env.HOME;
 		else process.env.HOME = originalHome;
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await safeRm(tempDir, { recursive: true, force: true });
 	});
 
 	async function setupPlugin(pluginId: string, mcpJson: unknown): Promise<void> {

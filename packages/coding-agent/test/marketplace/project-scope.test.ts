@@ -8,6 +8,7 @@
  * This file imports from helpers.ts directly — the native addon IS present in the
  * test environment (verified: `bun run import-helpers.ts` succeeds).
  */
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -19,6 +20,7 @@ import {
 	readInstalledPluginsRegistry,
 	writeInstalledPluginsRegistry,
 } from "@gajae-code/coding-agent/extensibility/plugins/marketplace";
+import { safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
 import {
 	clearClaudePluginRootsCache,
 	listClaudePluginRoots,
@@ -47,7 +49,7 @@ describe("resolveActiveProjectRegistryPath", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
+		safeRmSync(tmpDir, { recursive: true, force: true });
 	});
 
 	it("walk-up finds nearest .gjc/ directory", async () => {
@@ -121,7 +123,7 @@ describe("resolveActiveProjectRegistryPath", () => {
 			const homeGjcPath = path.join(homeDir, ".gjc", "plugins", "installed_plugins.json");
 			expect(result).not.toBe(homeGjcPath);
 		} finally {
-			if (!hadGit) await fs.promises.rm(fakeHomeGit, { recursive: true, force: true });
+			if (!hadGit) await safeRm(fakeHomeGit, { recursive: true, force: true });
 		}
 	});
 
@@ -165,8 +167,8 @@ describe("listClaudePluginRoots — project shadows user", () => {
 	afterEach(() => {
 		// Cache is keyed by home:projectPath — must clear between tests.
 		clearClaudePluginRootsCache();
-		fs.rmSync(tmpHome, { recursive: true, force: true });
-		fs.rmSync(tmpProject, { recursive: true, force: true });
+		safeRmSync(tmpHome, { recursive: true, force: true });
+		safeRmSync(tmpProject, { recursive: true, force: true });
 	});
 
 	it("project entry shadows user entry when plugin IDs match", async () => {

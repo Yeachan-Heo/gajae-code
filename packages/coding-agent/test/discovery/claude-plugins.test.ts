@@ -10,6 +10,7 @@ import {
 	parseClaudePluginsRegistry,
 } from "@gajae-code/coding-agent/discovery/helpers";
 import { discoverAgents } from "@gajae-code/coding-agent/task/discovery";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 import "@gajae-code/coding-agent/discovery/claude-plugins";
 import type { Skill } from "@gajae-code/coding-agent/capability/skill";
 import type { SlashCommand } from "@gajae-code/coding-agent/capability/slash-command";
@@ -79,7 +80,7 @@ describe("listClaudePluginRoots", () => {
 		} else {
 			process.env.HOME = originalHome;
 		}
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await safeRm(tempDir, { recursive: true, force: true });
 	});
 
 	test("returns empty roots when no registry file exists", async () => {
@@ -561,7 +562,7 @@ describe("discoverAgents plugin precedence", () => {
 
 	afterEach(async () => {
 		clearClaudePluginRootsCache();
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await safeRm(tempDir, { recursive: true, force: true });
 	});
 
 	test("prefers project-scoped plugin agent over user-scoped plugin agent", async () => {

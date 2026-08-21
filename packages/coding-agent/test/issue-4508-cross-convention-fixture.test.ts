@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { Settings } from "../src/config/settings";
 import { applyImport, type BuildImportPreviewOptions, buildImportPreview } from "../src/customization/import";
 import { discoverRuntimeSkills } from "../src/extensibility/runtime-skill-discovery";
@@ -297,7 +298,7 @@ afterEach(async () => {
 	resetActiveSkillsForTests();
 	setAgentDir(originalAgentDir);
 	await expect(fs.readdir(homeDir)).resolves.toEqual(homeBefore);
-	await fs.rm(root, { recursive: true, force: true });
+	await safeRm(root, { recursive: true, force: true });
 });
 
 describe("issue #4508 cross-convention canonical fixture", () => {
@@ -322,7 +323,7 @@ describe("issue #4508 cross-convention canonical fixture", () => {
 					"collision-hook-ran",
 				);
 				expect(await fs.readFile(path.join(projectDir, ".gjc", "mcp.json"), "utf8")).toContain("native-collision");
-				await fs.rm(path.join(projectDir, ".gjc"), { recursive: true, force: true });
+				await safeRm(path.join(projectDir, ".gjc"), { recursive: true, force: true });
 				const plan = await buildImportPreview(previewOptions(convention));
 				const previewJson = JSON.stringify(plan.preview);
 				await expect(fs.stat(path.join(projectDir, ".gjc"))).rejects.toMatchObject({ code: "ENOENT" });

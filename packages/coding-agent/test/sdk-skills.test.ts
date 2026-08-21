@@ -7,6 +7,7 @@ import { DEFAULT_GJC_DEFINITION_NAMES } from "@gajae-code/coding-agent/defaults/
 import type { Skill } from "@gajae-code/coding-agent/sdk";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { safeRmSync } from "../../../scripts/safe-cleanup";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 function createIsolatedSkillsSettings(): Settings {
@@ -71,7 +72,7 @@ Loaded via symbolic link.
 	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
 
 	it("loads embedded default GJC workflow skills even when .gjc is absent and arbitrary skill discovery is disabled", async () => {
-		fs.rmSync(path.join(tempDir, ".gjc"), { recursive: true, force: true });
+		safeRmSync(path.join(tempDir, ".gjc"), { recursive: true, force: true });
 		const { session } = await createAgentSession({
 			cwd: tempDir,
 			agentDir: tempDir,
@@ -110,7 +111,7 @@ Loaded via symbolic link.
 
 	it("should still discover project skills when user skills directory is missing", async () => {
 		const userAgentDir = path.join(tempHomeDir, ".gjc", "agent");
-		fs.rmSync(path.join(userAgentDir, "skills"), { recursive: true, force: true });
+		safeRmSync(path.join(userAgentDir, "skills"), { recursive: true, force: true });
 		fs.writeFileSync(path.join(userAgentDir, "placeholder.txt"), "placeholder");
 
 		const { session } = await createAgentSession({

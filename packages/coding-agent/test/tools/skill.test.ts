@@ -10,6 +10,7 @@ import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/mess
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 
 async function makeSkill(name: string, content: string): Promise<Skill> {
 	const dir = await mkdtemp(path.join(os.tmpdir(), `skill-tool-${name}-`));
@@ -253,10 +254,10 @@ describe("SkillTool", () => {
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
 			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
 			else process.env.PI_CONFIG_DIR = originalPiConfigDir;
-			if (unrelated) await fs.rm(unrelated.baseDir, { recursive: true, force: true });
-			if (preloaded) await fs.rm(preloaded.baseDir, { recursive: true, force: true });
-			await fs.rm(cwd, { recursive: true, force: true });
-			await fs.rm(home, { recursive: true, force: true });
+			if (unrelated) await safeRm(unrelated.baseDir, { recursive: true, force: true });
+			if (preloaded) await safeRm(preloaded.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
 		}
 	});
 
@@ -415,9 +416,9 @@ describe("SkillTool", () => {
 			else process.env.PI_CODING_AGENT_DIR = originalPiCodingAgentDir;
 			if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
 			else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
-			if (loaded) await fs.rm(loaded.baseDir, { recursive: true, force: true });
-			await fs.rm(cwd, { recursive: true, force: true });
-			await fs.rm(home, { recursive: true, force: true });
+			if (loaded) await safeRm(loaded.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
 		}
 	});
 

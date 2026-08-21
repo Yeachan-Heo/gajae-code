@@ -7,11 +7,13 @@
  * through the bounded mcp-compat layer; they are never implicit competing
  * runtime authorities, and foreign user-home configuration is never read.
  */
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getMCPConfigPath, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 import type { MCPServer } from "../../src/capability/mcp";
 import { normalizeClaudeMcpJson, normalizeCodexMcpToml, validateMCPCompatServer } from "../../src/discovery/mcp-compat";
 import { loadAllMCPConfigs } from "../../src/runtime-mcp/config";
@@ -45,8 +47,8 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	if (originalAgentDir) setAgentDir(originalAgentDir);
 	else delete process.env.GJC_CODING_AGENT_DIR;
-	await fs.rm(projectDir, { recursive: true, force: true });
-	await fs.rm(tempHome, { recursive: true, force: true });
+	await safeRm(projectDir, { recursive: true, force: true });
+	await safeRm(tempHome, { recursive: true, force: true });
 });
 
 describe("conventional MCP precedence", () => {

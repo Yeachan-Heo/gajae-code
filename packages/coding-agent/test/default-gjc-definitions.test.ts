@@ -25,6 +25,7 @@ import { getBundledAgent } from "@gajae-code/coding-agent/task/agents";
 import { discoverAgents } from "@gajae-code/coding-agent/task/discovery";
 import { checkBashAllowedPrefixes } from "@gajae-code/coding-agent/tools/bash-allowed-prefixes";
 import { prompt } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 
 const tempRoots: string[] = [];
 const roleAgentNames = ["architect", "critic", "executor", "planner"] as const;
@@ -66,7 +67,7 @@ async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
 
 afterEach(async () => {
 	resetActiveSkillsForTests();
-	await Promise.all(tempRoots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
+	await Promise.all(tempRoots.splice(0).map(root => safeRm(root, { recursive: true, force: true })));
 });
 
 describe("default GJC definitions", () => {

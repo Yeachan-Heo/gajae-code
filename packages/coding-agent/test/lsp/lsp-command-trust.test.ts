@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as piUtils from "@gajae-code/utils";
 import { TempDir } from "@gajae-code/utils";
+import { registerOwnedDeletionRoot, safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
 import * as discoveryHelpers from "../../src/discovery/helpers";
 import { createLspWritethrough, LspTool } from "../../src/lsp";
 import { shutdownAll } from "../../src/lsp/client";
@@ -252,7 +253,13 @@ describe("LSP repository command trust", () => {
 	it("wraps supported servers with an external lspmux and honors both disable variables", async () => {
 		using tempDir = TempDir.createSync("@gjc-lspmux-external-");
 		const cwd = path.join(tempDir.path(), "repo");
+		// Issue #4794: trusted user-scope resolution only honors the REAL home
+		// (resolvers capture os.homedir at import time, so a mock cannot
+		// redirect it). This test therefore still creates its fixture under the
+		// real home, but the deletion is explicitly granted for exactly this
+		// process-created directory and still refuses the home itself.
 		const externalBinDir = path.join(os.homedir(), `.gjc-lspmux-external-${process.pid}-${Date.now()}`);
+		const forgetGrant = registerOwnedDeletionRoot(externalBinDir);
 		await fs.promises.mkdir(cwd, { recursive: true });
 		await fs.promises.mkdir(externalBinDir, { recursive: true });
 		try {
@@ -275,7 +282,8 @@ describe("LSP repository command trust", () => {
 			Bun.env.PI_DISABLE_LSPMUX = "1";
 			expect((await detectLspmux(cwd)).available).toBe(false);
 		} finally {
-			await fs.promises.rm(externalBinDir, { recursive: true, force: true });
+			await safeRm(externalBinDir, { recursive: true, force: true });
+			forgetGrant();
 		}
 	});
 
@@ -523,10 +531,15 @@ describe("LSP repository command trust", () => {
 		using tempDir = TempDir.createSync("@gjc-lsp-command-fields-");
 		const cwd = tempDir.path();
 		const configDirName = `.gjc-lsp-command-trust-${process.pid}-${Date.now()}`;
+		// Issue #4794: user-scope config resolution goes through the trusted
+		// home resolver, which only honors the REAL home (the os.homedir
+		// binding is captured at import time and cannot be redirected by a
+		// mock). The fixture stays under the real home, but its recursive
+		// deletion is granted for exactly this process-created directory.
 		const userConfigDir = path.join(os.homedir(), configDirName);
+		const forgetGrant = registerOwnedDeletionRoot(userConfigDir);
 		const userAgentDir = path.join(userConfigDir, "agent");
 		const trustedServer = path.join(userConfigDir, "typescript-language-server");
-
 		fs.mkdirSync(userAgentDir, { recursive: true });
 		fs.writeFileSync(trustedServer, "#!/bin/sh\nexit 0\n");
 		fs.chmodSync(trustedServer, 0o755);
@@ -570,7 +583,8 @@ describe("LSP repository command trust", () => {
 			expect(server?.initOptions).toEqual({ trustedInitialization: true });
 			expect(server?.settings).toEqual({ trustedSettings: true });
 		} finally {
-			fs.rmSync(userConfigDir, { recursive: true, force: true });
+			safeRmSync(userConfigDir, { recursive: true, force: true });
+			forgetGrant();
 		}
 	});
 });
