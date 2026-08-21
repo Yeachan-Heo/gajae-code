@@ -4740,10 +4740,19 @@ export class AgentSession {
 				if (event.type === "agent_end" && !maintenanceCheckpoint) {
 					if (terminalOwner ? !terminalClaim?.ok : this.activePromptHandle !== undefined) return;
 				}
-				// A prompt-owned event with a captured handle must have obtained an exact
-				// producer lease before its handler was created. Failed ownership never
-				// schedules prompt work or falls back to a successor's handle.
-				if (activePromptHandle && !eventLease) return;
+				// Terminal publication is ownership-sensitive and is handled above. A
+				// message/turn lifecycle event is different: its canonical transcript
+				// append is the evidence needed to recover the run. Do not drop that
+				// evidence merely because the best-effort post-prompt lease could not be
+				// acquired. The current-handle check still fences a genuinely late event
+				// from a replaced run without allowing a successor handle to be borrowed.
+				if (
+					activePromptHandle &&
+					!eventLease &&
+					event.type !== "agent_end" &&
+					this.activePromptHandle !== activePromptHandle
+				)
+					return;
 				if (eventLease && event.type === "agent_end")
 					this.#postPromptLeases.set(eventLease.resourceRunId, eventLease);
 				if (eventLease) {
