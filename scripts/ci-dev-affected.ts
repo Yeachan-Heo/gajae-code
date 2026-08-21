@@ -965,7 +965,12 @@ export function planTargetedTasks(
 	}
 
 	for (const changedPath of relevant) {
-		if (isFullWorkspacePath(changedPath)) continue;
+		if (isFullWorkspacePath(changedPath)) {
+			for (const testFile of behavioralTestsFor(changedPath)) {
+				addTestFileTask(tasks, testFile, validateTestPaths);
+			}
+			continue;
+		}
 		if (isWorkflowPath(changedPath)) {
 			needYamlParse = true;
 			needCiSelftest = true;
