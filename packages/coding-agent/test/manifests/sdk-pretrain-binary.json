@@ -22,7 +22,7 @@
   "supportedPlatforms": ["darwin", "linux", "win32"],
   "toolchain": {
     "runtime": "bun",
-    "version": "1.3.14",
+    "version": "1.4.0",
     "dependencyInstall": ["bun", "install", "--offline", "--frozen-lockfile"],
     "nativeBuild": ["bun", "--cwd=packages/natives", "run", "build"],
     "nativeEmbed": ["bun", "--cwd=packages/natives", "run", "embed:native"],
