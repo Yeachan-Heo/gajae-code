@@ -55,6 +55,26 @@ export function mintProviderSafetyStop(
 	return true;
 }
 
+/**
+ * Restore authority for a message that crossed a first-party trusted
+ * transport boundary (the pi-native auth-gateway loopback channel). The
+ * gateway serializes an adapter-minted message to SSE and the client parses
+ * a fresh object, which loses the process-local mark. The typed kind is only
+ * ever written by a first-party mint on the gateway side, so a terminal
+ * error pair arriving over that channel re-establishes exactly the authority
+ * serialization dropped — it never creates authority for a message the
+ * gateway did not already authenticate (#4777 review follow-up).
+ */
+export function restoreProviderSafetyStopFromTrustedTransport(
+	message: AssistantMessage,
+	capability: ProviderSafetyStopAdapterCapability,
+): boolean {
+	if (capability !== PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY) return false;
+	if (message.stopReason !== "error" || message.errorKind !== "provider_safety_stop") return false;
+	authenticatedProviderSafetyStops.add(message);
+	return true;
+}
+
 /** Identity check for terminal provider safety-stop authority. */
 export function isProviderSafetyStopAuthenticated(message: unknown): boolean {
 	return typeof message === "object" && message !== null && authenticatedProviderSafetyStops.has(message);

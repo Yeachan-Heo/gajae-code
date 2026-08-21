@@ -14,6 +14,10 @@
  * containerized GJC deployments that route every LLM call through a
  * credential-holding sidecar so the container stays credential-free.
  */
+import {
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+	restoreProviderSafetyStopFromTrustedTransport,
+} from "../adapter-internals/provider-safety-stop";
 import { readSseJson } from "@gajae-code/utils";
 import type {
 	Api,
@@ -110,6 +114,32 @@ function resolveStreamUrl(model: Model<Api>): string {
 	return `${model.baseUrl.replace(/\/+$/, "")}/v1/pi/stream`;
 }
 
+/**
+ * The trusted-transport boundary for restoring provider safety-stop authority:
+ * the default `gjc auth-gateway` bind is loopback (`127.0.0.1:4000`), so a
+ * terminal typed stop parsed from a loopback gateway response re-establishes
+ * the adapter-minted mark that SSE serialization dropped. A non-loopback
+ * gateway target is an explicitly configured remote endpoint — its payloads
+ * stay unauthenticated and degrade to ordinary fallback-eligible errors
+ * (#4777 review follow-up).
+ */
+function isLoopbackGatewayUrl(url: string): boolean {
+	try {
+		const parsed = new URL(url);
+		if (parsed.protocol !== "http:") return false;
+		const host = parsed.hostname.toLowerCase();
+		return (
+			host === "localhost" ||
+			host === "[::1]" ||
+			host === "::1" ||
+			host === "127.0.0.1" ||
+			/^127\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}$/.test(host)
+		);
+	} catch {
+		return false;
+	}
+}
+
 function buildHeaders(model: Model<Api>, apiKey: string | undefined): Record<string, string> {
 	const headers: Record<string, string> = {
 		"Content-Type": "application/json",
@@ -160,6 +190,7 @@ export function streamPiNative<TApi extends Api>(
 
 		try {
 			const url = resolveStreamUrl(model as Model<Api>);
+			const trustedTransport = isLoopbackGatewayUrl(url);
 			const fetchImpl = options?.fetch ?? globalThis.fetch;
 			const headers = buildHeaders(model as Model<Api>, options?.apiKey);
 			const body = JSON.stringify({
@@ -184,7 +215,19 @@ export function streamPiNative<TApi extends Api>(
 				response.body as ReadableStream<Uint8Array>,
 				signal,
 			)) {
-				if (event.type === "done" || event.type === "error") sawTerminal = true;
+				if (event.type === "done" || event.type === "error") {
+					sawTerminal = true;
+					// SSE serialization drops the adapter-minted authority mark; a
+					// loopback gateway hop is first-party trusted transport, so
+					// re-establish it there. Remote endpoints stay unauthenticated.
+					if (trustedTransport) {
+						if (event.type === "done") {
+							restoreProviderSafetyStopFromTrustedTransport(event.message, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+						} else {
+							restoreProviderSafetyStopFromTrustedTransport(event.error, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+						}
+					}
+				}
 				stream.push(event);
 				// `stream.push` resolves `.result()` on `done`/`error`; subsequent
 				// pushes are silently dropped by the base class. We still iterate

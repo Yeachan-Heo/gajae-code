@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 import { streamPiNative } from "../src/providers/pi-native-client";
 import type { AssistantMessage, AssistantMessageEvent, Context, FetchImpl, Model } from "../src/types";
 
@@ -296,5 +297,48 @@ describe("streamPiNative event flow", () => {
 			signal: controller.signal,
 		}).result();
 		expect(captured.signal).toBe(controller.signal);
+	});
+});
+
+describe("streamPiNative provider safety-stop provenance", () => {
+	const typedStop = (): AssistantMessage =>
+		baseAssistant({
+			stopReason: "error",
+			errorKind: "provider_safety_stop",
+			errorMessage: "Refusal (safety): policy violation",
+		});
+
+	it("restores adapter-minted authority for a typed stop from a loopback gateway", async () => {
+		const fetchImpl: FetchImpl = (async () =>
+			fakeResponse([{ type: "error", reason: "error", error: typedStop() }])) as FetchImpl;
+		const model = fakeModel({ baseUrl: "http://127.0.0.1:4000" });
+
+		const result = await streamPiNative(model, baseContext, { apiKey: "k", fetch: fetchImpl }).result();
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+	});
+
+	it("does not authenticate a typed stop from a non-loopback gateway endpoint", async () => {
+		const fetchImpl: FetchImpl = (async () =>
+			fakeResponse([{ type: "error", reason: "error", error: typedStop() }])) as FetchImpl;
+
+		const result = await streamPiNative(fakeModel(), baseContext, { apiKey: "k", fetch: fetchImpl }).result();
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+	});
+
+	it("restores authority on a done-carried typed stop and never mints it for other messages", async () => {
+		const fetchImpl: FetchImpl = (async () =>
+			fakeResponse([{ type: "done", reason: "error", message: typedStop() }])) as FetchImpl;
+		const model = fakeModel({ baseUrl: "http://localhost:4000" });
+
+		const result = await streamPiNative(model, baseContext, { apiKey: "k", fetch: fetchImpl }).result();
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+
+		const plainFetch: FetchImpl = (async () =>
+			fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }])) as FetchImpl;
+		const plain = await streamPiNative(model, baseContext, { apiKey: "k", fetch: plainFetch }).result();
+		expect(plain.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(plain)).toBe(false);
 	});
 });
