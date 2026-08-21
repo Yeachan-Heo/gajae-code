@@ -202,10 +202,16 @@ export class CommandController {
 
 				const restoreEditor = async () => {
 					loader.dispose();
-					this.ctx.editorContainer.clear();
-					this.ctx.editorContainer.addChild(this.ctx.editor);
-					this.ctx.ui.setFocus(this.ctx.editor);
-					this.ctx.ui.requestRender();
+					// Prefer the pet-aware composer restore (InteractiveMode.restoreComposer); fall back
+					// to a plain editor swap for contexts that predate it (e.g. lightweight test doubles).
+					if (typeof this.ctx.restoreComposer === "function") {
+						this.ctx.restoreComposer();
+					} else {
+						this.ctx.editorContainer.clear();
+						this.ctx.editorContainer.addChild(this.ctx.editor);
+						this.ctx.ui.setFocus(this.ctx.editor);
+						this.ctx.ui.requestRender();
+					}
 				};
 
 				try {
@@ -267,9 +273,16 @@ export class CommandController {
 
 		const restoreEditor = async () => {
 			loader.dispose();
-			this.ctx.editorContainer.clear();
-			this.ctx.editorContainer.addChild(this.ctx.editor);
-			this.ctx.ui.setFocus(this.ctx.editor);
+			// Prefer the pet-aware composer restore (InteractiveMode.restoreComposer); fall back
+			// to a plain editor swap for contexts that predate it (e.g. lightweight test doubles).
+			if (typeof this.ctx.restoreComposer === "function") {
+				this.ctx.restoreComposer();
+			} else {
+				this.ctx.editorContainer.clear();
+				this.ctx.editorContainer.addChild(this.ctx.editor);
+				this.ctx.ui.setFocus(this.ctx.editor);
+				this.ctx.ui.requestRender();
+			}
 		};
 
 		let cancellationRequested = false;
