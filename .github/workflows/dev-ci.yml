@@ -340,7 +340,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       # The guard's AST canonicalization is parser-version sensitive: install the
       # pinned @babel/parser from the lockfile so the current-tree digest check is
       # deterministic and matches the committed attestations (no auto-install drift).
@@ -385,7 +385,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - run: bun install --frozen-lockfile
       - name: Build native addon (win32-x64 baseline)
         env:
@@ -448,7 +448,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - run: bun install --frozen-lockfile
       - name: Run native build toolchain tests
         run: bun test packages/natives/test/build-native-profile.test.ts
@@ -495,7 +495,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - run: bun install --frozen-lockfile
       - name: Build native addon (win32-x64 baseline)
         env:
@@ -568,7 +568,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - name: Install system deps
         run: bash scripts/ci-install-system-deps.sh
       - run: bun install --frozen-lockfile
@@ -629,7 +629,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - run: bun install --frozen-lockfile
       - name: Build native addon (darwin-arm64)
         env:
@@ -733,7 +733,7 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
       - name: Install system deps
         run: bash scripts/ci-install-system-deps.sh
       - run: bun install --frozen-lockfile
@@ -962,9 +962,9 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.bun/install/cache
-          key: bun-1.3.14-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-
+            bun-1.4.0-${{ runner.os }}-
       - run: bun install --frozen-lockfile
       - name: Run GJC state gate shard
         run: bun scripts/ci-gjc-state-gates.ts --group=${{ matrix.group }}

@@ -1897,13 +1897,12 @@ dependencies = [
 [[package]]
 name = "napi-derive-backend"
 version = "5.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd961eb2aa8965e3f29722d754f3a86907eb1984e2fbcbe3fe87b9a02d6bfba"
 dependencies = [
  "convert_case",
  "proc-macro2",
  "quote",
  "semver",
+ "serde_json",
  "syn",
 ]
 

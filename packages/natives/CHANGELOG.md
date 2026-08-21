@@ -3,6 +3,7 @@
 ## [Unreleased]
 ### Fixed
 
+- Vendored the active `napi-derive-backend` with a Bun 1.4 async-reference cleanup correction: references that Bun has already finalized report `napi_invalid_arg` and are treated as complete instead of aborting SDK lifecycle hosts after successful native promises.
 - Windows AVX2 PowerShell fallback probes are now bounded to 4 seconds with a hard kill, hidden-window execution, and capped output; timeout, spawn-error, and non-decisive results fail closed to the baseline variant while emitting only bounded shape diagnostics (#4781).
 - Windows AVX2 detection no longer flashes a console window on GJC process start (#4652). The native loader and the build-time host probe now ask `kernel32.dll!IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)` in-process via `bun:ffi` (no subprocess, no window), fall back to a hidden (`windowsHide`) PowerShell probe using an `Add-Type` P/Invoke that also works on stock Windows PowerShell 5.1, and fail safe to the baseline variant when both are unavailable. Previously the probe ran `[System.Runtime.Intrinsics.X86.Avx2]::IsSupported` — unhedded, so detached console-less parents (SDK broker, session hosts) spawned a visible OpenConsole/WindowsTerminal window per process start, and on PowerShell 5.1 the type does not exist, silently forcing the baseline addon on AVX2-capable machines.
 

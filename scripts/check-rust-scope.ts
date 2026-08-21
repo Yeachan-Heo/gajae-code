@@ -58,6 +58,11 @@ const RUST_SCOPE_ALLOWLIST: readonly RustScopeEntry[] = [
 		packageName: "brush-builtins",
 		rationale: "Vendored Rust shell builtin dependency for the native shell boundary.",
 	},
+	{
+		dir: "crates/napi-derive-backend-vendored",
+		packageName: "napi-derive-backend",
+		rationale: "Vendored N-API proc-macro dependency required for safe Bun 1.4 native async-reference cleanup.",
+	},
 ] as const;
 
 const ALLOWED_NON_CRATE_RUST_FILES = new Set(["packages/coding-agent/test/fixtures/chunk-edit-indent.rs"]);

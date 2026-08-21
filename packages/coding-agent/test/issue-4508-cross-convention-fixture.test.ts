@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { applyImport, type BuildImportPreviewOptions, buildImportPreview } from "../src/customization/import";
 import { discoverRuntimeSkills } from "../src/extensibility/runtime-skill-discovery";
@@ -74,6 +74,8 @@ rl.on("line", line => {
 let root: string;
 let projectDir: string;
 let homeDir: string;
+let loggerHomeDir: string;
+
 let agentDir: string;
 let originalAgentDir: string;
 let homeBefore: string[];
@@ -207,10 +209,12 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 	expect(runtimeSkills.candidates.some(candidate => candidate.name === SKILL_NAME)).toBe(false);
 	const untrustedLoadedSkills = await loadSkills({
 		cwd: projectDir,
+		home: homeDir,
 		enabled: true,
 		trustProjectSkills: false,
 		trustUserSkills: true,
 	});
+
 	expect(untrustedLoadedSkills.skills.some(skill => skill.name === SKILL_NAME)).toBe(false);
 
 	const trustedRuntimeSkills = await discoverRuntimeSkills({
@@ -223,10 +227,12 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 
 	const loadedSkills = await loadSkills({
 		cwd: projectDir,
+		home: homeDir,
 		enabled: true,
 		trustProjectSkills: true,
 		trustUserSkills: true,
 	});
+
 	const loadedSkill = loadedSkills.skills.find(skill => skill.name === SKILL_NAME);
 	expect(loadedSkill).toBeDefined();
 	expect(loadedSkill?.filePath).toBe(path.join(projectDir, ".gjc", "skills", SKILL_NAME, "SKILL.md"));
@@ -280,19 +286,25 @@ beforeEach(async () => {
 	root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-issue-4508-"));
 	projectDir = path.join(root, "project");
 	homeDir = path.join(root, "home");
+	loggerHomeDir = path.join(root, "logger-home");
+
 	agentDir = path.join(root, "agent");
 	await fs.mkdir(projectDir, { recursive: true });
 	await fs.mkdir(homeDir, { recursive: true });
+	await fs.mkdir(loggerHomeDir, { recursive: true });
 	await fs.mkdir(agentDir, { recursive: true });
 	await writeFile(path.join(projectDir, READ_TARGET), "cross-convention read target\n");
 	homeBefore = await fs.readdir(homeDir);
 	originalAgentDir = getAgentDir();
 	setAgentDir(agentDir);
-	vi.spyOn(os, "homedir").mockReturnValue(homeDir);
+	vi.spyOn(os, "homedir").mockReturnValue(loggerHomeDir);
+	logger.setTransports({ file: path.join(root, "logger") });
+
 	MCPManager.resetForTests();
 });
 
 afterEach(async () => {
+	logger.setTransports({ file: true });
 	vi.restoreAllMocks();
 	resetActiveSkillsForTests();
 	setAgentDir(originalAgentDir);

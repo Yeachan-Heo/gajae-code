@@ -546,26 +546,37 @@ describe("SkillDiscoveryTool", () => {
 
 	it("advertises project .claude/skills and .codex/skills as import candidates with zero configuration", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-skills-"));
-		await makeSkill(path.join(cwd, ".claude", "skills"), "claude-helper", "Claude convention helper");
-		await makeSkill(path.join(cwd, ".codex", "skills"), "codex-helper", "Codex convention helper");
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-skills-home-"));
+		try {
+			await makeSkill(path.join(cwd, ".claude", "skills"), "claude-helper", "Claude convention helper");
+			await makeSkill(path.join(cwd, ".codex", "skills"), "codex-helper", "Codex convention helper");
 
-		// No skills.* settings at all: convention skills are discoverable in a
-		// normal session as import candidates — never as invokable candidates —
-		// and each diagnostic names the copy command that enables the skill.
-		const zeroConfig = Settings.isolated({ "skill.enabled": true });
-		const result = await new SkillDiscoveryTool(createSession(cwd, { settings: zeroConfig })).execute("call", {});
-		expect(result.details?.candidates).toEqual([]);
-		const diagnostics = result.details?.diagnostics ?? [];
-		expect(diagnostics.some(message => message.includes('"claude-helper"') && message.includes(".claude"))).toBe(
-			true,
-		);
-		expect(diagnostics.some(message => message.includes('"codex-helper"') && message.includes(".codex"))).toBe(true);
-		const importDiagnostics = diagnostics.filter(message =>
-			message.includes("import sources are not loaded directly"),
-		);
-		expect(importDiagnostics.some(message => message.includes('"claude-helper"'))).toBe(true);
-		expect(importDiagnostics.some(message => message.includes('"codex-helper"'))).toBe(true);
-		expect(importDiagnostics.every(message => message.includes(".gjc/skills/"))).toBe(true);
+			// No skills.* settings at all: convention skills are discoverable in a
+			// normal session as import candidates — never as invokable candidates —
+			// and each diagnostic names the copy command that enables the skill.
+			const zeroConfig = Settings.isolated({ "skill.enabled": true });
+			const result = await new SkillDiscoveryTool(createSession(cwd, { settings: zeroConfig, home })).execute(
+				"call",
+				{},
+			);
+			expect(result.details?.candidates).toEqual([]);
+			const diagnostics = result.details?.diagnostics ?? [];
+			expect(diagnostics.some(message => message.includes('"claude-helper"') && message.includes(".claude"))).toBe(
+				true,
+			);
+			expect(diagnostics.some(message => message.includes('"codex-helper"') && message.includes(".codex"))).toBe(
+				true,
+			);
+			const importDiagnostics = diagnostics.filter(message =>
+				message.includes("import sources are not loaded directly"),
+			);
+			expect(importDiagnostics.some(message => message.includes('"claude-helper"'))).toBe(true);
+			expect(importDiagnostics.some(message => message.includes('"codex-helper"'))).toBe(true);
+			expect(importDiagnostics.every(message => message.includes(".gjc/skills/"))).toBe(true);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+			await fs.rm(home, { recursive: true, force: true });
+		}
 	});
 
 	it("applies runtime precedence: project .gjc beats user, convention copies stay import candidates", async () => {

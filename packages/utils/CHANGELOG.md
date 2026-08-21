@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+
+### Changed
+
+- Raised the minimum supported Bun runtime to 1.4.0 and adapted fatal stdout broken-pipe classification and fetch retry stream-cancellation coverage to Bun 1.4's native stream semantics.
 - Project dotenv declarations are now excluded from credential and agent-directory provenance even when Bun expands their values before startup, preventing repository-controlled redirects of trusted state and egress (#4715).
 - The independent-evidence rule for the trusted account home (#4766) is now pinned by discriminating regression proof for the shape its macOS repro cannot reach: a Linux identity whose uid has no local `/etc/passwd` entry (NSS/LDAP/SSSD-backed accounts, minimal or distroless containers), reported as #4773. New subprocess tests run the resolver under an unprivileged user namespace whose mapped uid is verified absent from the local passwd database (chosen from common subordinate-style candidates or the invoking user's `/etc/subuid` range), so the runtime `userInfo().homedir` echo of a checkout-declared home variable cannot silently regress back into the trusted set; they fail on the pre-rule behavior, hosts without the capability skip with a loud warning naming the lost coverage, and the compat shapes (passwd-backed uid, absent platform home variable, unambiguous operator home, dynamic declaration) are asserted unchanged on every platform, using the platform-authoritative key (`USERPROFILE` on Windows). `agent-dir-trust.test.ts`'s account-home expectation now reads the passwd database directly instead of a parent-side `os.userInfo().homedir`, which follows an isolated `HOME` and made the assertion fail under a pristine `HOME` (#4773).
 

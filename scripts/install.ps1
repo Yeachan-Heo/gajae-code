@@ -26,7 +26,7 @@ $Repo = "Yeachan-Heo/gajae-code"
 $Package = "@gajae-code/coding-agent"
 $InstallDir = if ($env:GJC_INSTALL_DIR) { $env:GJC_INSTALL_DIR } else { "$env:LOCALAPPDATA\gjc" }
 $BinaryName = "gjc-windows-x64.exe"
-$MinimumBunVersion = "1.3.14"
+$MinimumBunVersion = "1.4.0"
 
 function Test-BunInstalled {
     try {

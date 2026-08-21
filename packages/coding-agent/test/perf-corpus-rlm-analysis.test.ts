@@ -504,7 +504,7 @@ function reportFor(
 		environment,
 		platform: "darwin",
 		arch: "arm64",
-		bunVersion: "1.3.14",
+		bunVersion: "1.4.0",
 		bunExecutable: "bun",
 		bunExecutableSha256: "b".repeat(64),
 		worktreeFingerprint: "c".repeat(64),
@@ -1090,7 +1090,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		});
 		expect(result.cohort?.sharedRunnerProvenance).toMatchObject({
 			runtimeCommand: "bun packages/coding-agent/bench/perf-corpus.bench.ts",
-			bunVersion: "1.3.14",
+			bunVersion: "1.4.0",
 			bunExecutable: "bun",
 			bunExecutableSha256: "b".repeat(64),
 			worktreeFingerprint: "c".repeat(64),

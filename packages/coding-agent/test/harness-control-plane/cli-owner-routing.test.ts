@@ -39,7 +39,16 @@ class FakeTransport implements HarnessSessionTransport {
 let root: string;
 let owner: RuntimeOwner | null = null;
 let hungServer: net.Server | null = null;
+let hungSockets = new Set<net.Socket>();
 let cliEnv: HarnessCliEnv;
+
+function trackHungSocket(socket: net.Socket): void {
+	hungSockets.add(socket);
+	socket.once("close", () => hungSockets.delete(socket));
+	socket.on("error", () => {
+		if (!socket.destroyed) socket.destroy();
+	});
+}
 
 function seed(workspace: string): SessionState {
 	const now = new Date().toISOString();
@@ -93,6 +102,7 @@ const passingFinalizeChecks: FinalizeChecks = {
 
 beforeEach(async () => {
 	root = await mkdtemp(path.join(tmpdir(), "h"));
+	hungSockets = new Set();
 	cliEnv = createHarnessCliEnv(repoRoot);
 	await writeSessionState(root, seed(root));
 	owner = new RuntimeOwner({
@@ -109,8 +119,10 @@ beforeEach(async () => {
 afterEach(async () => {
 	cliEnv.cleanup();
 	await owner?.stop();
+	for (const socket of hungSockets) socket.destroy();
 	await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
 	hungServer = null;
+	hungSockets.clear();
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -171,6 +183,7 @@ describe("gjc harness CLI -> live owner routing", () => {
 		owner = null;
 		const socketPath = controlSocketPath(root, SID);
 		hungServer = net.createServer(socket => {
+			trackHungSocket(socket);
 			socket.on("data", () => {});
 		});
 		await new Promise<void>((resolve, reject) => {
@@ -204,6 +217,7 @@ describe("gjc harness CLI -> live owner routing", () => {
 		owner = null;
 		const socketPath = controlSocketPath(root, SID);
 		hungServer = net.createServer(socket => {
+			trackHungSocket(socket);
 			socket.end("not-json\n");
 		});
 		await new Promise<void>((resolve, reject) => {

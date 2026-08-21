@@ -28,6 +28,7 @@ function frame(value: unknown): string {
 
 export class ControlServer {
 	#server: net.Server | null = null;
+	#sockets = new Set<net.Socket>();
 	constructor(
 		readonly socketPath: string,
 		private readonly handler: EndpointHandler,
@@ -39,18 +40,39 @@ export class ControlServer {
 			throw new Error(`socket_path_too_long:${this.socketPath}`);
 		}
 		await fs.rm(this.socketPath, { force: true });
-		await new Promise<void>((resolve, reject) => {
-			const server = net.createServer(socket => this.#onConnection(socket));
-			server.once("error", reject);
-			server.listen(this.socketPath, () => {
-				server.removeListener("error", reject);
-				this.#server = server;
-				resolve();
+		const server = net.createServer(socket => this.#onConnection(socket));
+		try {
+			await new Promise<void>((resolve, reject) => {
+				const onError = (error: Error): void => reject(error);
+				server.once("error", onError);
+				server.listen(this.socketPath, () => {
+					server.removeListener("error", onError);
+					this.#server = server;
+					resolve();
+				});
 			});
-		});
+		} catch (error) {
+			server.removeAllListeners("error");
+			server.on("error", () => {});
+			try {
+				server.close();
+			} catch {
+				// The listener may never have reached the bound state.
+			}
+			await fs.rm(this.socketPath, { force: true });
+			throw error;
+		}
 	}
 
 	#onConnection(socket: net.Socket): void {
+		this.#sockets.add(socket);
+		socket.once("close", () => this.#sockets.delete(socket));
+		// Bun 1.4 can report a peer reset through `close` without destroying an
+		// accepted half-open socket unless an error listener is installed. The
+		// endpoint owns each accepted socket, so force its lifecycle to finish.
+		socket.on("error", () => {
+			if (!socket.destroyed) socket.destroy();
+		});
 		socket.setEncoding("utf8");
 		let buffer = "";
 		let handled = false;
@@ -63,10 +85,11 @@ export class ControlServer {
 			const line = buffer.slice(0, idx).trim();
 			void this.#dispatch(line)
 				.then(response => {
-					socket.end(frame(response));
+					if (!socket.destroyed) socket.end(frame(response));
 				})
 				.catch((error: unknown) => {
-					socket.end(frame({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+					if (!socket.destroyed)
+						socket.end(frame({ ok: false, error: error instanceof Error ? error.message : String(error) }));
 				});
 		});
 	}
@@ -80,10 +103,26 @@ export class ControlServer {
 	async close(): Promise<void> {
 		const server = this.#server;
 		this.#server = null;
+		let closeError: unknown = null;
 		if (server) {
-			await new Promise<void>(resolve => server.close(() => resolve()));
+			// Stop accepting first, then terminate every accepted socket. This makes
+			// close independent of handler completion or a peer that never sends FIN.
+			for (const socket of this.#sockets) socket.destroy();
+			try {
+				await new Promise<void>((resolve, reject) => {
+					try {
+						server.close(error => (error ? reject(error) : resolve()));
+					} catch (error) {
+						reject(error);
+					}
+				});
+			} catch (error) {
+				closeError = error;
+			}
 		}
+		for (const socket of this.#sockets) socket.destroy();
 		await fs.rm(this.socketPath, { force: true });
+		if (closeError) throw closeError;
 	}
 }
 
@@ -100,14 +139,38 @@ export class EndpointUnreachableError extends Error {
 /** Call the owner's control endpoint. Rejects with {@link EndpointUnreachableError} when no owner listens or responds. */
 export function callEndpoint(socketPath: string, req: EndpointRequest, timeoutMs = 5_000): Promise<unknown> {
 	return new Promise((resolve, reject) => {
-		const socket = net.connect(socketPath);
+		let socket: net.Socket;
+		try {
+			socket = net.connect(socketPath);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException | null)?.code;
+			if (
+				code === "ENOENT" ||
+				code === "ECONNREFUSED" ||
+				code === "ECONNRESET" ||
+				code === "EPIPE" ||
+				code === "ENAMETOOLONG" ||
+				code === "EINVAL" ||
+				code === "ENOTSOCK"
+			) {
+				reject(new EndpointUnreachableError(socketPath, code.toLowerCase()));
+			} else {
+				reject(error);
+			}
+			return;
+		}
 		let buffer = "";
 		let settled = false;
-		const done = (fn: () => void): void => {
+		const done = (fn: () => void, graceful = false): void => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			socket.destroy();
+			try {
+				if (graceful) socket.end();
+				else socket.destroy();
+			} catch {
+				if (!socket.destroyed) socket.destroy();
+			}
 			fn();
 		};
 		const timer = setTimeout(
@@ -115,7 +178,13 @@ export function callEndpoint(socketPath: string, req: EndpointRequest, timeoutMs
 			timeoutMs,
 		);
 		socket.setEncoding("utf8");
-		socket.on("connect", () => socket.write(frame(req)));
+		socket.on("connect", () => {
+			try {
+				socket.write(frame(req));
+			} catch (error) {
+				done(() => reject(error));
+			}
+		});
 		socket.on("data", (chunk: string) => {
 			buffer += chunk;
 			const idx = buffer.indexOf("\n");
@@ -127,8 +196,14 @@ export function callEndpoint(socketPath: string, req: EndpointRequest, timeoutMs
 					} catch {
 						reject(new EndpointUnreachableError(socketPath, "bad_frame"));
 					}
-				});
+				}, true);
 			}
+		});
+		socket.on("end", () => {
+			if (!settled) done(() => reject(new EndpointUnreachableError(socketPath, "closed")));
+		});
+		socket.on("close", () => {
+			if (!settled) done(() => reject(new EndpointUnreachableError(socketPath, "closed")));
 		});
 		socket.on("error", (error: NodeJS.ErrnoException) => {
 			done(() => {
@@ -136,7 +211,10 @@ export function callEndpoint(socketPath: string, req: EndpointRequest, timeoutMs
 					error.code === "ENOENT" ||
 					error.code === "ECONNREFUSED" ||
 					error.code === "ECONNRESET" ||
-					error.code === "EPIPE"
+					error.code === "EPIPE" ||
+					error.code === "ENAMETOOLONG" ||
+					error.code === "EINVAL" ||
+					error.code === "ENOTSOCK"
 				) {
 					reject(new EndpointUnreachableError(socketPath, error.code.toLowerCase()));
 				} else {

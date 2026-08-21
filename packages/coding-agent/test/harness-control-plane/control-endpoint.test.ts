@@ -14,18 +14,30 @@ let dir: string;
 let sock: string;
 let server: ControlServer | null = null;
 let rawServer: net.Server | null = null;
+let rawSockets = new Set<net.Socket>();
+
+function trackRawSocket(socket: net.Socket): void {
+	rawSockets.add(socket);
+	socket.once("close", () => rawSockets.delete(socket));
+	socket.on("error", () => {
+		if (!socket.destroyed) socket.destroy();
+	});
+}
 
 beforeEach(async () => {
 	// Keep the socket path short (AF_UNIX sun_path limit) by living directly in a temp dir.
 	dir = await mkdtemp(path.join(tmpdir(), "h-ep-"));
 	sock = path.join(dir, "c.sock");
 	server = null;
+	rawSockets = new Set();
 });
 
 afterEach(async () => {
+	for (const socket of rawSockets) socket.destroy();
 	await server?.close();
 	await new Promise<void>(resolve => rawServer?.close(() => resolve()) ?? resolve());
 	rawServer = null;
+	rawSockets.clear();
 	await rm(dir, { recursive: true, force: true });
 });
 
@@ -63,6 +75,7 @@ describe("control endpoint", () => {
 
 	it("rejects with EndpointUnreachableError when the owner accepts but never responds", async () => {
 		rawServer = net.createServer(socket => {
+			trackRawSocket(socket);
 			socket.on("data", () => {});
 		});
 		await new Promise<void>((resolve, reject) => {
@@ -80,6 +93,7 @@ describe("control endpoint", () => {
 
 	it("rejects malformed owner frames as EndpointUnreachableError", async () => {
 		rawServer = net.createServer(socket => {
+			trackRawSocket(socket);
 			socket.end("not-json\n");
 		});
 		await new Promise<void>((resolve, reject) => {

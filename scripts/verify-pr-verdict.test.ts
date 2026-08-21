@@ -526,7 +526,7 @@ test("issue_comment events cannot launch or cancel the affected Dev CI pipeline"
 
 test("trusted Bun launch cannot load an untrusted repo bunfig preload", async () => {
 	const root = await Bun.file(new URL("../package.json", import.meta.url)).json() as { packageManager: string };
-	expect(root.packageManager).toBe("bun@1.3.14");
+	expect(root.packageManager).toBe("bun@1.4.0");
 	const temp = await fs.mkdtemp("/tmp/gjc-pr-bun-isolation-");
 	try {
 		const trusted = path.join(temp, "trusted");

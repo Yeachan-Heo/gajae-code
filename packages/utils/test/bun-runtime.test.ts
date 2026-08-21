@@ -6,10 +6,10 @@ describe("formatBunRuntimeError", () => {
 	it("reports the required and detected Bun versions", () => {
 		const message = formatBunRuntimeError({
 			currentVersion: "1.3.12",
-			minVersion: "1.3.14",
+			minVersion: "1.4.0",
 			platform: "linux",
 		});
-		expect(message).toContain("requires Bun >= 1.3.14");
+		expect(message).toContain("requires Bun >= 1.4.0");
 		expect(message).toContain("v1.3.12");
 		expect(message.endsWith("\n")).toBe(true);
 	});
@@ -17,7 +17,7 @@ describe("formatBunRuntimeError", () => {
 	it("names the detected runtime path when provided", () => {
 		const message = formatBunRuntimeError({
 			currentVersion: "1.3.12",
-			minVersion: "1.3.14",
+			minVersion: "1.4.0",
 			execPath: "C:\\Users\\dev\\.bun\\bin\\bun.exe",
 			platform: "win32",
 		});
@@ -27,7 +27,7 @@ describe("formatBunRuntimeError", () => {
 	it("gives a Windows-specific upgrade and PATH fix on win32", () => {
 		const message = formatBunRuntimeError({
 			currentVersion: "1.3.12",
-			minVersion: "1.3.14",
+			minVersion: "1.4.0",
 			platform: "win32",
 		});
 		expect(message).toContain('powershell -c "irm bun.sh/install.ps1|iex"');
@@ -38,7 +38,7 @@ describe("formatBunRuntimeError", () => {
 	it("uses bun upgrade on non-Windows platforms", () => {
 		const message = formatBunRuntimeError({
 			currentVersion: "1.3.12",
-			minVersion: "1.3.14",
+			minVersion: "1.4.0",
 			platform: "darwin",
 		});
 		expect(message).toContain("bun upgrade");
