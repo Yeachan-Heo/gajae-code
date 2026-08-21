@@ -3164,9 +3164,16 @@ export class SelectorController {
 						const codeInput = new Input();
 						codeInput.onSubmit = () => {
 							const code = codeInput.getValue();
-							this.ctx.editorContainer.clear();
-							this.ctx.editorContainer.addChild(this.ctx.editor);
-							this.ctx.ui.setFocus(this.ctx.editor);
+							// Prefer the pet-aware composer restore (InteractiveMode.restoreComposer);
+							// fall back to a plain editor swap for contexts that predate it
+							// (e.g. lightweight test doubles).
+							if (typeof this.ctx.restoreComposer === "function") {
+								this.ctx.restoreComposer();
+							} else {
+								this.ctx.editorContainer.clear();
+								this.ctx.editorContainer.addChild(this.ctx.editor);
+								this.ctx.ui.setFocus(this.ctx.editor);
+							}
 							resolve(code);
 						};
 						// Detach the mounted composition (pet-aware) before
@@ -3620,9 +3627,15 @@ export class SelectorController {
 	showJobsOverlay(observer: JobsObserver): void {
 		let overlay: JobsOverlayComponent | undefined;
 		const close = () => {
-			this.ctx.editorContainer.clear();
-			this.ctx.editorContainer.addChild(this.ctx.editor);
-			this.ctx.ui.setFocus(this.ctx.editor);
+			// Prefer the pet-aware composer restore (InteractiveMode.restoreComposer); fall back
+			// to a plain editor swap for contexts that predate it (e.g. lightweight test doubles).
+			if (typeof this.ctx.restoreComposer === "function") {
+				this.ctx.restoreComposer();
+			} else {
+				this.ctx.editorContainer.clear();
+				this.ctx.editorContainer.addChild(this.ctx.editor);
+				this.ctx.ui.setFocus(this.ctx.editor);
+			}
 			this.ctx.ui.requestRender();
 		};
 		overlay = new JobsOverlayComponent(observer, {
@@ -3656,9 +3669,15 @@ export class SelectorController {
 			unsubscribe?.();
 			this.#tasksPane = undefined;
 			this.#closeTasksPane = undefined;
-			this.ctx.editorContainer.clear();
-			this.ctx.editorContainer.addChild(this.ctx.editor);
-			this.ctx.ui.setFocus(this.ctx.editor);
+			// Prefer the pet-aware composer restore (InteractiveMode.restoreComposer); fall back
+			// to a plain editor swap for contexts that predate it (e.g. lightweight test doubles).
+			if (typeof this.ctx.restoreComposer === "function") {
+				this.ctx.restoreComposer();
+			} else {
+				this.ctx.editorContainer.clear();
+				this.ctx.editorContainer.addChild(this.ctx.editor);
+				this.ctx.ui.setFocus(this.ctx.editor);
+			}
 			this.ctx.ui.requestRender();
 		};
 		this.#closeTasksPane = close;

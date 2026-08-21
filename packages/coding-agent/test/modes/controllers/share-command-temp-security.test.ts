@@ -42,6 +42,28 @@ function createContext(exportToHtml: (file: string) => Promise<unknown>) {
 	return { ctx, editor, editorContainer };
 }
 
+/** Pet-aware host: the composer is restored through restoreComposer, never the raw editor. */
+function createPetContext(exportToHtml: (file: string) => Promise<unknown>) {
+	const editor = { id: "core-editor" };
+	const editorContainer = createContainer();
+	editorContainer.addChild(editor);
+	const restoreComposer = vi.fn(() => {
+		editorContainer.clear();
+		editorContainer.addChild({ id: "pet-framed-editor" });
+	});
+	const ctx = {
+		session: { exportToHtml: vi.fn(exportToHtml) },
+		editor,
+		editorContainer,
+		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+		showError: vi.fn(),
+		showStatus: vi.fn(),
+		restoreComposer,
+		detachComposer: vi.fn(),
+	} as unknown as InteractiveModeContext;
+	return { ctx, editor, editorContainer, restoreComposer };
+}
+
 async function waitForFile(file: string): Promise<void> {
 	for (let attempt = 0; attempt < 400; attempt++) {
 		if (await Bun.file(file).exists()) return;
@@ -207,6 +229,66 @@ process.stdout.write("https://gist.github.com/example/deadbeef\\n");
 			expect(await Bun.file(path.dirname(stagedFile)).exists()).toBe(false);
 			expect(ctx.showStatus).toHaveBeenCalledWith("Share cancelled");
 			expect(ctx.showError).not.toHaveBeenCalled();
+			await fs.rm(root, { recursive: true, force: true });
+		},
+	);
+
+	it("restores the composer through the pet-aware authority after a custom share", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-share-pet-test-"));
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(agentDir);
+		setAgentDir(agentDir);
+		await Bun.write(
+			path.join(agentDir, "share.ts"),
+			`export default async () => {
+	await Bun.sleep(1);
+	return "https://example.test/share";
+};
+`,
+		);
+		const { ctx, editor, editorContainer, restoreComposer } = createPetContext(async file => {
+			await Bun.write(file, "session");
+		});
+
+		await new CommandController(ctx).handleShareCommand();
+
+		expect(restoreComposer).toHaveBeenCalledTimes(1);
+		expect(ctx.showStatus).toHaveBeenCalledWith("Share URL: https://example.test/share");
+		// The pet-aware restore remounted the framed composition, never the raw editor.
+		expect(editorContainer.children).not.toContain(editor);
+		expect((editorContainer.children[0] as { id?: string }).id).toBe("pet-framed-editor");
+		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"restores the composer through the pet-aware authority after a gist upload",
+		async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-gist-pet-test-"));
+			const binDir = path.join(root, "bin");
+			const fakeGh = path.join(binDir, "gh");
+			await fs.mkdir(binDir);
+			await Bun.write(
+				fakeGh,
+				`#!/usr/bin/env bun
+if (Bun.argv[2] === "auth") process.exit(0);
+process.stdout.write("https://gist.github.com/example/deadbeef\\n");
+`,
+			);
+			await fs.chmod(fakeGh, 0o755);
+			process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+
+			const { ctx, editor, editorContainer, restoreComposer } = createPetContext(async file => {
+				await Bun.write(file, "session");
+			});
+
+			await new CommandController(ctx).handleShareCommand();
+
+			expect(restoreComposer).toHaveBeenCalledTimes(1);
+			expect(ctx.showStatus).toHaveBeenCalledWith(
+				expect.stringContaining("https://gist.github.com/example/deadbeef"),
+			);
+			expect(editorContainer.children).not.toContain(editor);
+			expect((editorContainer.children[0] as { id?: string }).id).toBe("pet-framed-editor");
 			await fs.rm(root, { recursive: true, force: true });
 		},
 	);
