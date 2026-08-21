@@ -34,6 +34,7 @@ const ORIGINAL_GJC_SESSION_ID = process.env.GJC_SESSION_ID;
 // not falsely triggered by captureIncomplete or git-command timeouts under
 // parallel shard load.
 const ORIGINAL_CI_DEV_CHANGED_PATHS = process.env.CI_DEV_CHANGED_PATHS;
+const ORIGINAL_GITHUB_WORKSPACE = process.env.GITHUB_WORKSPACE;
 const tempRoots: string[] = [];
 
 async function tempDir(): Promise<string> {
@@ -44,6 +45,7 @@ async function tempDir(): Promise<string> {
 
 beforeEach(() => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	delete process.env.GITHUB_WORKSPACE;
 	process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/test/gjc-runtime/ultragoal-critic-gate.test.ts";
 });
 
@@ -56,6 +58,8 @@ afterAll(() => {
 	else process.env.GJC_SESSION_ID = ORIGINAL_GJC_SESSION_ID;
 	if (ORIGINAL_CI_DEV_CHANGED_PATHS === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
 	else process.env.CI_DEV_CHANGED_PATHS = ORIGINAL_CI_DEV_CHANGED_PATHS;
+	if (ORIGINAL_GITHUB_WORKSPACE === undefined) delete process.env.GITHUB_WORKSPACE;
+	else process.env.GITHUB_WORKSPACE = ORIGINAL_GITHUB_WORKSPACE;
 });
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const PNG_CRC_TABLE = new Uint32Array(256).map((_, index) => {

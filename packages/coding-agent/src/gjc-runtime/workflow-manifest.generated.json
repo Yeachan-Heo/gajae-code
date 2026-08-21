@@ -813,6 +813,9 @@
         "initial": true
       },
       {
+        "id": "intent"
+      },
+      {
         "id": "architect"
       },
       {
@@ -854,7 +857,22 @@
     "transitions": [
       {
         "from": "planner",
+        "to": "intent",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "planner",
         "to": "architect",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "intent",
+        "to": "architect",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "intent",
+        "to": "revision",
         "verb": "write-artifact"
       },
       {
@@ -880,6 +898,11 @@
       {
         "from": "critic",
         "to": "revision",
+        "verb": "write-artifact"
+      },
+      {
+        "from": "revision",
+        "to": "intent",
         "verb": "write-artifact"
       },
       {
@@ -919,6 +942,11 @@
       },
       {
         "from": "planner",
+        "to": "handoff",
+        "verb": "handoff"
+      },
+      {
+        "from": "intent",
         "to": "handoff",
         "verb": "handoff"
       },
@@ -1105,6 +1133,7 @@
         ],
         "enumValues": [
           "planner",
+          "intent",
           "architect",
           "critic",
           "disposition",

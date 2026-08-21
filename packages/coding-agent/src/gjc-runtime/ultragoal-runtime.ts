@@ -62,7 +62,50 @@ import {
 	writeArtifact,
 	writeGuardedJsonAtomic,
 } from "./state-writer";
+import {
+	categorizeComputerChangePath,
+	ciDevChangedPathRows,
+	computeCheckpointChangeSet,
+	computeUltragoalReviewSourceHash,
+	mergeChangeSetPaths,
+	normalizeChangeSetPath,
+	parseGitNameStatus,
+	parseGitUntrackedPaths,
+	parseUnifiedDiffPaths,
+	resolveGitBase,
+	spawnText,
+	type UltragoalChangeCategory,
+	type UltragoalChangeSet,
+	type UltragoalChangeSetPath,
+	type UltragoalChangeStatus,
+} from "./ultragoal-change-set";
+import {
+	resolveUltragoalValidationApplicability,
+	type UltragoalValidationApplicability,
+	type UltragoalValidationLane,
+	type UltragoalValidationLaneSelection,
+	validationLaneSelectionFor,
+} from "./ultragoal-validation-policy";
 import { resolveWorkflowSetting } from "./workflow-settings";
+
+export {
+	categorizeComputerChangePath,
+	ciDevChangedPathRows,
+	computeCheckpointChangeSet,
+	computeUltragoalReviewSourceHash,
+	mergeChangeSetPaths,
+	normalizeChangeSetPath,
+	normalizeRepoPath,
+	parseGitNameStatus,
+	parseGitUntrackedPaths,
+	parseUnifiedDiffPaths,
+	resolveGitBase,
+	spawnText,
+	type UltragoalChangeCategory,
+	type UltragoalChangeSet,
+	type UltragoalChangeSetPath,
+	type UltragoalChangeStatus,
+} from "./ultragoal-change-set";
 
 export {
 	captureUltragoalRecoverySnapshot,
@@ -1526,33 +1569,6 @@ function formatExpectedKindWords(words: string[]): string {
 
 export type SurfaceFamily = "web" | "cli" | "native" | "api-package" | "algorithm-math" | "unknown";
 
-export type UltragoalChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "unknown";
-export type UltragoalChangeCategory =
-	| "code"
-	| "generated-binding"
-	| "tool"
-	| "settings-registry"
-	| "prompt-doc-behavior"
-	| "docs-static"
-	| "other";
-export interface UltragoalChangeSetPath extends JsonObject {
-	path: string;
-	status: UltragoalChangeStatus;
-	oldPath?: string;
-	category?: UltragoalChangeCategory;
-}
-export interface UltragoalChangeSet extends JsonObject {
-	source: "checkpoint-git" | "review-pr" | "review-branch" | "review-worktree" | "review-spec";
-	baseRef?: string;
-	headRef?: string;
-	mergeBase?: string;
-	paths: UltragoalChangeSetPath[];
-	rawDiffStat?: string;
-	rawDiff?: string;
-	captureIncomplete?: boolean;
-	trusted: true;
-}
-
 const MANDATORY_COMPUTER_CASE_IDS = [
 	"kill-switch-bypass",
 	"suspended-enforcement",
@@ -1562,40 +1578,6 @@ const MANDATORY_COMPUTER_CASE_IDS = [
 	"runaway-loop-halt",
 	"blast-radius",
 ] as const;
-const TOOLS_INDEX_PATH = "packages/coding-agent/src/tools/index.ts";
-
-export function normalizeRepoPath(value: string): string {
-	return value.replaceAll("\\\\", "/").replace(/^\.\//, "");
-}
-
-export function normalizeChangeSetPath(value: string): string {
-	return value.replace(/^\.\//, "");
-}
-
-export function categorizeComputerChangePath(value: string): UltragoalChangeCategory {
-	const normalized = normalizeRepoPath(value);
-	if (normalized.startsWith("crates/pi-natives/src/computer/")) return "code";
-	if (/^packages\/natives\/native\/index\.(?:d\.ts|js)$/.test(normalized)) return "generated-binding";
-	if (
-		normalized === "packages/coding-agent/src/tools/computer.ts" ||
-		normalized.startsWith("packages/coding-agent/src/tools/computer/")
-	)
-		return "tool";
-	if (
-		normalized === TOOLS_INDEX_PATH ||
-		normalized === "packages/coding-agent/src/tools/renderers.ts" ||
-		normalized === "packages/coding-agent/src/config/settings-schema.ts"
-	)
-		return "settings-registry";
-	if (
-		normalized === "packages/coding-agent/src/prompts/tools/computer.md" ||
-		normalized === "packages/coding-agent/src/defaults/gjc/skills/ultragoal/SKILL.md" ||
-		normalized === "packages/coding-agent/src/prompts/agents/executor.md"
-	)
-		return "prompt-doc-behavior";
-	if (normalized === "docs/tools/computer.md" || normalized === "docs/computer-use/README.md") return "docs-static";
-	return "other";
-}
 
 function isComputerControlSurfaceCategory(category: UltragoalChangeCategory): boolean {
 	// Shared behavior registries are intentionally conservative: a path-only or
@@ -2500,6 +2482,98 @@ function validateDeferredCompletionQualityGate(
 			"deferredToBatch.changeSet.changeSetHash does not match declared paths; omit changeSetHash and the runtime computes it",
 		);
 }
+/** #4560: declared lane-selection proof shape on the quality gate. */
+type DeclaredValidationLaneSelection = UltragoalValidationLaneSelection;
+
+function readDeclaredValidationLaneSelection(gate: JsonObject): DeclaredValidationLaneSelection | undefined {
+	const declared = qualityGateObject(gate.validationLaneSelection);
+	if (!declared) return undefined;
+	const riskClass = nonEmptyString(declared.riskClass);
+	const reasons = stringArray(declared.reasons);
+	const omittedLanes = stringArray(declared.omittedLanes);
+	if (!riskClass || !reasons || !omittedLanes) {
+		throw new Error(
+			"validationLaneSelection must carry riskClass, reasons, and omittedLanes string arrays mirroring the runtime selection",
+		);
+	}
+	if (riskClass !== "low" && riskClass !== "high")
+		throw new Error('validationLaneSelection.riskClass must be "low" or "high"');
+	if (omittedLanes.some(lane => !["cleaner", "architect", "qa", "terminal-critic"].includes(lane)))
+		throw new Error("validationLaneSelection.omittedLanes contains an unsupported lane");
+	return { riskClass, reasons, omittedLanes: omittedLanes as UltragoalValidationLane[] };
+}
+
+/**
+ * #4560: validate a declared low-risk lane reduction against the
+ * runtime-computed applicability. The runtime selection is authoritative: a
+ * declaration that disagrees with the computed risk class, reasons, or
+ * omitted-lane set fails closed and the full cohort stays mandatory.
+ */
+function validateDeclaredValidationLaneSelection(
+	declared: DeclaredValidationLaneSelection,
+	applicability: UltragoalValidationApplicability,
+	found: QualityGateDiagnostics,
+): boolean {
+	if (declared.riskClass !== applicability.riskClass) {
+		found.add(
+			"validationLaneSelection",
+			"selection_mismatch",
+			"declared validationLaneSelection riskClass does not match the runtime-computed risk class",
+		);
+		return false;
+	}
+	const expected = validationLaneSelectionFor(applicability);
+	if (
+		declared.reasons.length !== expected.reasons.length ||
+		declared.reasons.some((reason, index) => reason !== expected.reasons[index])
+	) {
+		found.add(
+			"validationLaneSelection.reasons",
+			"reasons_mismatch",
+			"declared validationLaneSelection reasons must exactly mirror the runtime-computed selection basis",
+		);
+		return false;
+	}
+	const expectedOmitted = expected.omittedLanes;
+	const declaredOmitted = new Set(declared.omittedLanes);
+	if (declaredOmitted.has("qa")) {
+		found.add(
+			"validationLaneSelection",
+			"qa_lane_mandatory",
+			"validationLaneSelection can never omit the qa lane; verification is mandatory at every boundary",
+		);
+		return false;
+	}
+	if (declaredOmitted.size !== expectedOmitted.length || expectedOmitted.some(lane => !declaredOmitted.has(lane))) {
+		found.add(
+			"validationLaneSelection",
+			"omitted_lanes_mismatch",
+			"declared validationLaneSelection omittedLanes must exactly mirror the runtime-computed inapplicable lanes",
+		);
+		return false;
+	}
+	return applicability.riskClass === "low";
+}
+
+/** #4560: newest joined cohort (generation + frozen sourceHash) in the ledger. */
+function latestJoinedCohortSourceHash(
+	ledger: readonly UltragoalLedgerEvent[],
+): { reviewGeneration: number; sourceHash: string } | undefined {
+	let latest: { reviewGeneration: number; sourceHash: string } | undefined;
+	for (const event of ledger) {
+		if (event.event !== "goal_checkpointed" || event.status !== "complete") continue;
+		const cohort = qualityGateObject(
+			qualityGateObject(event.qualityGateJson)?.iteration as JsonObject | undefined,
+		)?.reviewCohort;
+		const record = qualityGateObject(cohort);
+		if (!record) continue;
+		const reviewGeneration = record.reviewGeneration;
+		const sourceHash = nonEmptyString(record.sourceHash);
+		if (typeof reviewGeneration !== "number" || !sourceHash) continue;
+		if (!latest || reviewGeneration >= latest.reviewGeneration) latest = { reviewGeneration, sourceHash };
+	}
+	return latest;
+}
 const COHORT_LANE_KEYS = ["cleaner", "architect", "qa"] as const;
 
 /**
@@ -2509,7 +2583,11 @@ const COHORT_LANE_KEYS = ["cleaner", "architect", "qa"] as const;
  * generations are delta-only. Cohort state rides the existing `iteration` gate key so
  * no new top-level quality-gate key is introduced.
  */
-function validateReviewCohort(gate: JsonObject, iteration: JsonObject): void {
+function validateReviewCohort(
+	gate: JsonObject,
+	iteration: JsonObject,
+	options: { lowRiskReduced?: boolean } = {},
+): void {
 	const cohort = qualityGateObject(iteration.reviewCohort);
 	if (!cohort) throw new Error("qualityGate iteration.reviewCohort is required at the review boundary");
 	const generation = cohort.reviewGeneration;
@@ -2524,7 +2602,15 @@ function validateReviewCohort(gate: JsonObject, iteration: JsonObject): void {
 	const unsupportedLanes = Object.keys(lanes).filter(key => !(COHORT_LANE_KEYS as readonly string[]).includes(key));
 	if (unsupportedLanes.length > 0)
 		throw new Error(`iteration.reviewCohort.lanes contains unsupported lanes: ${unsupportedLanes.join(", ")}`);
-	for (const lane of COHORT_LANE_KEYS) {
+	// #4560: on a runtime-selected low-risk single-goal boundary, cleaner and
+	// architect may be omitted only through the deterministic
+	// validationLaneSelection proof validated by the caller; the QA lane and
+	// the frozen source hash stay mandatory, and cohort parallelism is
+	// untouched whenever lanes do run.
+	const requiredLanes: readonly (typeof COHORT_LANE_KEYS)[number][] = options.lowRiskReduced
+		? COHORT_LANE_KEYS.filter(lane => lane === "qa")
+		: [...COHORT_LANE_KEYS];
+	for (const lane of requiredLanes) {
 		if (Array.isArray(lanes[lane]))
 			throw new Error(`iteration.reviewCohort.lanes.${lane} must be one lane per generation, not a list`);
 		const record = qualityGateObject(lanes[lane]);
@@ -2618,6 +2704,7 @@ async function validateCompletionQualityGate(
 			"executorQa",
 			"iteration",
 			"validationBatchClose",
+			"validationLaneSelection",
 			"criticReview",
 		]);
 		const unsupportedKeys = Object.keys(gate).filter(key => !allowedKeys.has(key));
@@ -2643,8 +2730,15 @@ async function validateCompletionQualityGate(
 	}
 	const allowedKeys = new Set(
 		batchMode
-			? ["architectReview", "executorQa", "iteration", "validationBatchClose", "criticReview"]
-			: ["architectReview", "executorQa", "iteration", "criticReview"],
+			? [
+					"architectReview",
+					"executorQa",
+					"iteration",
+					"validationBatchClose",
+					"criticReview",
+					"validationLaneSelection",
+				]
+			: ["architectReview", "executorQa", "iteration", "criticReview", "validationLaneSelection"],
 	);
 	const unsupportedKeys = Object.keys(gate).filter(key => !allowedKeys.has(key));
 	if (unsupportedKeys.length > 0) {
@@ -2654,14 +2748,52 @@ async function validateCompletionQualityGate(
 			`qualityGate contains unsupported keys: ${unsupportedKeys.join(", ")}`,
 		);
 	}
+	// #4560: deterministic risk/applicability selection for expensive boundary
+	// lanes. The runtime — never free-form model prose — decides whether a
+	// low-risk single-goal boundary may omit redundant review ceremony
+	// (cleaner/architect/terminal-critic). QA/targeted verification and the
+	// hash/receipt/join guarantees always remain mandatory. Anything risky or
+	// unprovable keeps today's full heavyweight cohort unchanged. The current
+	// frozen source under review is the gate's own cohort sourceHash.
+	const gateIteration = qualityGateObject(gate.iteration);
+	const gateCohortSourceHash = nonEmptyString(qualityGateObject(gateIteration?.reviewCohort)?.sourceHash);
+	const authoritativeSourceHash = computeUltragoalReviewSourceHash(options.changeSet);
+	if (gateCohortSourceHash && authoritativeSourceHash && gateCohortSourceHash !== authoritativeSourceHash) {
+		found.add(
+			"iteration.reviewCohort.sourceHash",
+			"source_hash_mismatch",
+			"iteration.reviewCohort.sourceHash must equal the runtime-computed digest of the authoritative current source basis",
+		);
+	}
+	const applicability = resolveUltragoalValidationApplicability({
+		changeSet: options.changeSet,
+		requiredGoals: options.plan?.goals.filter(goal => goal.status !== "superseded").length,
+		hasOpenReviewBlockers: options.plan?.goals.some(goal => goal.status === "review_blocked") ?? false,
+		latestCohortSourceHash: options.ledger ? latestJoinedCohortSourceHash(options.ledger)?.sourceHash : undefined,
+		currentSourceHash: gateCohortSourceHash ?? undefined,
+		authoritativeSourceHash,
+	});
+	let laneSelection: DeclaredValidationLaneSelection | undefined;
+	found.check("validationLaneSelection", "selection_invalid", () => {
+		laneSelection = readDeclaredValidationLaneSelection(gate);
+	});
+	const lowRiskReduced =
+		laneSelection !== undefined && validateDeclaredValidationLaneSelection(laneSelection, applicability, found);
 	const architectReview = qualityGateObject(gate.architectReview);
 	const executorQa = qualityGateObject(gate.executorQa);
 	const iteration = qualityGateObject(gate.iteration);
-	if (!architectReview || !executorQa || !iteration) {
+	// #4560: when the runtime-verified selection omits the architect lane, the
+	// boundary must not still demand architect evidence \u2014 otherwise the advertised
+	// omission is unusable and the caller has to run or fabricate the lane anyway.
+	// QA and iteration evidence stay mandatory in every case.
+	const architectRequired = !lowRiskReduced || applicability.lanes.architect.applicable;
+	if ((architectRequired && !architectReview) || !executorQa || !iteration) {
 		found.add(
 			"qualityGate",
 			"missing_required_sections",
-			"qualityGate requires architectReview, executorQa, and iteration objects",
+			architectRequired
+				? "qualityGate requires architectReview, executorQa, and iteration objects"
+				: "qualityGate requires executorQa and iteration objects",
 		);
 		found.throwIfAny();
 		return;
@@ -2678,8 +2810,16 @@ async function validateCompletionQualityGate(
 				"checkpoint --status complete blocked: terminal-critic ceiling reached; requires human/leader gjc ultragoal record-critic-gate-override before completion",
 			);
 		}
+		// #4560: terminal-critic proportionality. The critic verdict is
+		// mandatory on multi-goal/boundary, high-risk, or evidence-uncertain
+		// runs. A single-goal low-risk run whose joined cohort is clean and
+		// whose immutable source basis is unchanged may satisfy the terminus
+		// through the runtime-verified validationLaneSelection proof instead
+		// of duplicating the already-joined review with another read pass.
 		const criticReview = qualityGateObject(gate.criticReview);
-		if (criticReview?.verdict !== "OKAY") {
+		const criticProportionallySatisfied =
+			lowRiskReduced && applicability.basisUnchanged && !applicability.hasOpenReviewBlockers;
+		if (criticReview?.verdict !== "OKAY" && !criticProportionallySatisfied) {
 			found.add(
 				"criticReview.verdict",
 				"critic_verdict_not_okay",
@@ -2695,31 +2835,33 @@ async function validateCompletionQualityGate(
 			);
 		}
 	}
-	if (
-		architectReview.architectureStatus !== CLEAN_ARCHITECT_STATUS ||
-		architectReview.productStatus !== CLEAN_ARCHITECT_STATUS ||
-		architectReview.codeStatus !== CLEAN_ARCHITECT_STATUS ||
-		architectReview.recommendation !== APPROVE_RECOMMENDATION
-	) {
-		found.add(
-			"architectReview",
-			"architect_not_clear",
-			"checkpoint --status complete requires architect review approval: architectReview architecture/product/code must be CLEAR and recommendation must be APPROVE",
+	if (architectReview) {
+		if (
+			architectReview.architectureStatus !== CLEAN_ARCHITECT_STATUS ||
+			architectReview.productStatus !== CLEAN_ARCHITECT_STATUS ||
+			architectReview.codeStatus !== CLEAN_ARCHITECT_STATUS ||
+			architectReview.recommendation !== APPROVE_RECOMMENDATION
+		) {
+			found.add(
+				"architectReview",
+				"architect_not_clear",
+				"checkpoint --status complete requires architect review approval: architectReview architecture/product/code must be CLEAR and recommendation must be APPROVE",
+			);
+		}
+		if (!nonEmptyStringArray(architectReview.commands)) {
+			found.add(
+				"architectReview.commands",
+				"missing_command_array",
+				"qualityGate architectReview.commands must be a non-empty string array",
+			);
+		}
+		found.check("architectReview.evidence", "missing_evidence", () =>
+			requireNonEmptyString(architectReview.evidence, "architectReview.evidence"),
+		);
+		found.check("architectReview.blockers", "non_empty_blockers", () =>
+			requireEmptyBlockers(architectReview.blockers, "architectReview.blockers"),
 		);
 	}
-	if (!nonEmptyStringArray(architectReview.commands)) {
-		found.add(
-			"architectReview.commands",
-			"missing_command_array",
-			"qualityGate architectReview.commands must be a non-empty string array",
-		);
-	}
-	found.check("architectReview.evidence", "missing_evidence", () =>
-		requireNonEmptyString(architectReview.evidence, "architectReview.evidence"),
-	);
-	found.check("architectReview.blockers", "non_empty_blockers", () =>
-		requireEmptyBlockers(architectReview.blockers, "architectReview.blockers"),
-	);
 	if (
 		executorQa.status !== PASSED_STATUS ||
 		executorQa.e2eStatus !== PASSED_STATUS ||
@@ -2763,7 +2905,9 @@ async function validateCompletionQualityGate(
 	found.check("iteration.blockers", "non_empty_blockers", () =>
 		requireEmptyBlockers(iteration.blockers, "iteration.blockers"),
 	);
-	found.check("iteration.reviewCohort", "review_cohort_invalid", () => validateReviewCohort(gate, iteration));
+	found.check("iteration.reviewCohort", "review_cohort_invalid", () =>
+		validateReviewCohort(gate, iteration, { lowRiskReduced }),
+	);
 	if (batchMode && options.goal && options.plan && options.ledger) {
 		found.check("validationBatchClose", "batch_close_invalid", () =>
 			validateBatchCloseQualityGate(gate, options.plan!, batchMode, options.ledger!, options.changeSet),
@@ -3483,6 +3627,24 @@ export async function checkpointUltragoalGoal(input: {
 			: input.qualityGateJson
 				? await readStructuredValue(input.cwd, input.qualityGateJson)
 				: undefined;
+	if (input.status === "complete" && !staleCompleteReceiptReplay) {
+		// Validation consumes an asynchronous source snapshot. Re-capture directly
+		// after it returns and require the authoritative digest to remain identical;
+		// otherwise a concurrent edit could be committed against bytes that were not
+		// the reviewed basis.
+		const finalChangeSet = await computeCheckpointChangeSet(input.cwd);
+		const initialSourceHash = computeUltragoalReviewSourceHash(changeSet);
+		const finalSourceHash = computeUltragoalReviewSourceHash(finalChangeSet);
+		if (
+			((initialSourceHash || finalSourceHash) && initialSourceHash !== finalSourceHash) ||
+			changeSet?.captureIncomplete ||
+			finalChangeSet?.captureIncomplete
+		) {
+			throw new Error(
+				"completion source changed or could not be captured consistently during validation; retry the checkpoint against a stable repository state",
+			);
+		}
+	}
 	const now = new Date().toISOString();
 	const beforeStatus = goal.status;
 	if (input.status === "complete") {
@@ -4212,28 +4374,6 @@ async function readOptionalExecutorQa(cwd: string, value: string | undefined): P
 	return structured as JsonObject;
 }
 
-import {
-	ciDevChangedPathRows,
-	computeCheckpointChangeSet,
-	mergeChangeSetPaths,
-	parseGitNameStatus,
-	parseGitUntrackedPaths,
-	parseUnifiedDiffPaths,
-	resolveGitBase,
-	spawnText,
-} from "./ultragoal-change-set";
-
-export {
-	ciDevChangedPathRows,
-	computeCheckpointChangeSet,
-	mergeChangeSetPaths,
-	parseGitNameStatus,
-	parseGitUntrackedPaths,
-	parseUnifiedDiffPaths,
-	resolveGitBase,
-	spawnText,
-};
-
 function changeSetFromReviewSource(source: JsonObject): UltragoalChangeSet | undefined {
 	const kind = nonEmptyString(source.kind);
 	if (kind === "spec") {
@@ -4722,6 +4862,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 			"",
 			"USAGE",
 			"  $ gjc ultragoal quality-gate init [--surface <name> ...] --out <path>",
+			"  $ gjc ultragoal quality-gate source-hash [--json]",
 			"  $ gjc ultragoal quality-gate validate --quality-gate-json <json-or-path> [--goal-id <id>] [--json]",
 			"",
 			"FLAGS",
@@ -4733,6 +4874,7 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 			"",
 			"EXAMPLES",
 			"  $ gjc ultragoal quality-gate init --surface web --surface api --out ./quality-gate.json",
+			"  $ gjc ultragoal quality-gate source-hash --json",
 			"  $ gjc ultragoal quality-gate validate --quality-gate-json ./quality-gate.json --json",
 			"",
 		].join("\n");
@@ -4756,6 +4898,8 @@ function renderUltragoalHelp(args: readonly string[]): string | null {
 		"  record-critic-verdict",
 		"  record-critic-gate-override",
 		"  quality-gate init",
+		"  quality-gate source-hash",
+		"  quality-gate lane-selection",
 		"  quality-gate validate",
 
 		"",
@@ -5141,6 +5285,57 @@ async function dispatchUltragoalCommand(
 			case "quality-gate": {
 				const positional = args.filter(arg => !arg.startsWith("-"));
 				const subcommand = positional[1];
+				if (subcommand === "source-hash") {
+					const changeSet = await computeCheckpointChangeSet(cwd);
+					const sourceHash = computeUltragoalReviewSourceHash(changeSet);
+					if (!sourceHash) {
+						return {
+							status: 1,
+							stderr:
+								"Unable to compute an authoritative source hash: change-set capture is incomplete, untrusted, or contains unknown-status paths.\n",
+						};
+					}
+					const payload = {
+						sourceHash,
+						baseRef: changeSet?.baseRef,
+						mergeBase: changeSet?.mergeBase,
+						headRef: changeSet?.headRef,
+						pathCount: changeSet?.paths.length ?? 0,
+					};
+					return json
+						? { status: 0, stdout: `${JSON.stringify(payload, null, 2)}\n` }
+						: { status: 0, stdout: `${sourceHash}\n` };
+				}
+				if (subcommand === "lane-selection") {
+					// #4560: expose the authoritative computed selection so a caller can
+					// declare `validationLaneSelection` without running or fabricating the
+					// very lanes the selection may omit.
+					const sessionId = currentUltragoalSessionId(cwd);
+					const changeSet = await computeCheckpointChangeSet(cwd);
+					const plan = await readUltragoalPlan(cwd, sessionId).catch(() => null);
+					const ledger = await readUltragoalLedger(cwd, sessionId).catch(() => null);
+					const authoritativeSourceHash = computeUltragoalReviewSourceHash(changeSet);
+					const applicability = resolveUltragoalValidationApplicability({
+						changeSet,
+						requiredGoals: plan?.goals.filter(goal => goal.status !== "superseded").length,
+						hasOpenReviewBlockers: plan?.goals.some(goal => goal.status === "review_blocked") ?? false,
+						latestCohortSourceHash: ledger ? latestJoinedCohortSourceHash(ledger)?.sourceHash : undefined,
+						currentSourceHash: authoritativeSourceHash ?? undefined,
+						authoritativeSourceHash,
+					});
+					const laneSelection = validationLaneSelectionFor(applicability);
+					const payload = {
+						validationLaneSelection: laneSelection,
+						basisUnchanged: applicability.basisUnchanged,
+						sourceHash: authoritativeSourceHash,
+					};
+					return json
+						? { status: 0, stdout: `${JSON.stringify(payload, null, 2)}\n` }
+						: {
+								status: 0,
+								stdout: `riskClass=${applicability.riskClass} omittedLanes=${laneSelection.omittedLanes.join(",") || "(none)"}\n`,
+							};
+				}
 				if (subcommand === "init") {
 					const out = flagValue(args, "--out");
 					if (!out?.trim()) {
@@ -5164,7 +5359,7 @@ async function dispatchUltragoalCommand(
 				if (subcommand !== "validate") {
 					return {
 						status: 1,
-						stderr: `Unknown gjc ultragoal quality-gate subcommand: ${subcommand ?? "(missing)"}; supported: init, validate\n`,
+						stderr: `Unknown gjc ultragoal quality-gate subcommand: ${subcommand ?? "(missing)"}; supported: init, source-hash, lane-selection, validate\n`,
 					};
 				}
 				const qualityGateJson = flagValue(args, "--quality-gate-json");

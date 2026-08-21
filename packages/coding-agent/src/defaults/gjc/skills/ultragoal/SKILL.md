@@ -50,6 +50,7 @@ gjc ultragoal create-goals --brief "<brief>"
 gjc ultragoal create-goals --brief-file <path>
 gjc ultragoal complete-goals
 gjc ultragoal complete-goals --retry-failed
+gjc ultragoal quality-gate source-hash --json
 gjc ultragoal quality-gate validate --quality-gate-json <quality-gate-json-or-path> [--goal-id <id>] [--json]
 gjc ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --quality-gate-json <quality-gate-json-or-path>
 gjc ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"
@@ -299,7 +300,7 @@ The heavyweight gate runs **once per boundary generation**, not once per story a
 One generation freezes the change set and reviews it exactly once:
 
 1. Run implementation verification for the boundary's cumulative change set.
-2. **Freeze the change set.** Compute one immutable `sourceHash` over the reviewed source. Every lane in this generation inspects that same frozen snapshot; a lane verdict carrying a different `sourceHash` is rejected.
+2. **Freeze the change set.** Run `gjc ultragoal quality-gate source-hash --json` on the clean reviewed snapshot and use its `sourceHash` exactly. The runtime binds this digest to the integration base, merge base, normalized changed paths, captured diff, and untracked-content digest. Every lane in this generation inspects that same frozen snapshot; a lane verdict carrying a different `sourceHash` is rejected. Any later source or base change requires rerunning this command and starting a new generation.
 3. **Run the cohort lanes on the frozen snapshot** — at most one `cleaner`, one `architect`, and one `qa` lane per generation. They may run in parallel because they share the frozen source; a second architect or QA lane in the same generation is rejected. The `cleaner` lane is the internal ai-slop-cleaner skill fragment run over the frozen change set: a read-only detector that emits an `AI SLOP CLEANUP REPORT`, and it still runs and records a passed/no-op report when there are no relevant edits. Its BLOCKING findings join the cohort findings rather than starting their own fix loop; advisory findings are included in the gate report only and are not written to the Ultragoal ledger.
 4. Delegate an `architect` review covering all three lanes:
    - architecture-side: system boundaries, layering, data/control flow, operational risks.

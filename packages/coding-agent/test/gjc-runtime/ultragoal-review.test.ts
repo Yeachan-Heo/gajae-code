@@ -16,6 +16,7 @@ const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 let savedSessionId: string | undefined;
 let savedCiDevChangedPaths: string | undefined;
+let savedGithubWorkspace: string | undefined;
 
 async function runGit(cwd: string, args: string[]): Promise<void> {
 	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -30,10 +31,12 @@ async function runGit(cwd: string, args: string[]): Promise<void> {
 beforeAll(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
 	savedCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+	savedGithubWorkspace = process.env.GITHUB_WORKSPACE;
 });
 
 beforeEach(() => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	delete process.env.GITHUB_WORKSPACE;
 	// Temp dirs live outside the enclosing git work tree (os.tmpdir) and each
 	// inits its own standalone git repo. computeCheckpointChangeSet still
 	// merges CI_DEV_CHANGED_PATHS into the computed change set. Pin a
@@ -63,6 +66,8 @@ afterAll(() => {
 	else process.env.GJC_SESSION_ID = savedSessionId;
 	if (savedCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
 	else process.env.CI_DEV_CHANGED_PATHS = savedCiDevChangedPaths;
+	if (savedGithubWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+	else process.env.GITHUB_WORKSPACE = savedGithubWorkspace;
 });
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const PNG_CRC_TABLE = new Uint32Array(256).map((_, index) => {

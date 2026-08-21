@@ -51,6 +51,7 @@ let savedSessionFile: string | undefined;
 // computer surface was touched. batchTempDir overrides this with its own batch
 // paths; the explicit CI-leak tests override within their own scope.
 const ORIGINAL_CI_DEV_CHANGED_PATHS = process.env.CI_DEV_CHANGED_PATHS;
+const ORIGINAL_GITHUB_WORKSPACE = process.env.GITHUB_WORKSPACE;
 const NON_COMPUTER_TEST_PATH = "packages/coding-agent/test/gjc-runtime/ultragoal-runtime.test.ts";
 
 beforeEach(() => {
@@ -58,6 +59,8 @@ beforeEach(() => {
 	savedSessionFile = process.env.GJC_SESSION_FILE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
 	delete process.env.GJC_SESSION_FILE;
+	// These fixtures intentionally simulate CI path evidence for independent temp repos.
+	delete process.env.GITHUB_WORKSPACE;
 	process.env.CI_DEV_CHANGED_PATHS = NON_COMPUTER_TEST_PATH;
 });
 
@@ -92,6 +95,8 @@ afterEach(async () => {
 	else process.env.GJC_SESSION_FILE = savedSessionFile;
 	if (ORIGINAL_CI_DEV_CHANGED_PATHS === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
 	else process.env.CI_DEV_CHANGED_PATHS = ORIGINAL_CI_DEV_CHANGED_PATHS;
+	if (ORIGINAL_GITHUB_WORKSPACE === undefined) delete process.env.GITHUB_WORKSPACE;
+	else process.env.GITHUB_WORKSPACE = ORIGINAL_GITHUB_WORKSPACE;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -2289,7 +2294,7 @@ describe("native GJC ultragoal runtime", () => {
 
 		const unknown = await runNativeUltragoalCommand(["quality-gate", "collect"], root);
 		expect(unknown.status).toBe(1);
-		expect(unknown.stderr).toContain("supported: init, validate");
+		expect(unknown.stderr).toContain("supported: init, source-hash, lane-selection, validate");
 
 		const missing = await runNativeUltragoalCommand(["quality-gate", "validate"], root);
 		expect(missing.status).toBe(1);

@@ -14,6 +14,7 @@ const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 let savedSessionId: string | undefined;
 let savedCiDevChangedPaths: string | undefined;
+let savedGithubWorkspace: string | undefined;
 
 afterEach(async () => {
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
@@ -24,15 +25,19 @@ afterAll(() => {
 	else process.env.GJC_SESSION_ID = savedSessionId;
 	if (savedCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
 	else process.env.CI_DEV_CHANGED_PATHS = savedCiDevChangedPaths;
+	if (savedGithubWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+	else process.env.GITHUB_WORKSPACE = savedGithubWorkspace;
 });
 
 beforeAll(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
 	savedCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+	savedGithubWorkspace = process.env.GITHUB_WORKSPACE;
 });
 
 beforeEach(() => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	delete process.env.GITHUB_WORKSPACE;
 	// Temp dirs live outside the enclosing git work tree (os.tmpdir) so
 	// computeCheckpointChangeSet falls through to the CI_DEV_CHANGED_PATHS-only
 	// path. Pin a non-computer path so the mandatory computer red-team suite is

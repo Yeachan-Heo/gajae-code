@@ -33,6 +33,12 @@ const criticApprovalContractPatterns = [
 ] as const;
 
 const ralplanReviewPipelineContractPatterns = [
+	/Pre-consensus material-intent reconciliation/u,
+	/always before Architect\/Critic/u,
+	/--stage intent/u,
+	/When material open items exist, use the `ask` tool one at a time/u,
+	/When none exist, proceed without an empty ceremony or user prompt/u,
+	/they never review the superseded pre-reconciliation draft/u,
 	/Review fan-out after Planner persistence/u,
 	/launch the Architect and Critic ONCE per run as detached, resumable review lanes/u,
 	/Plan-only Critic lane/u,

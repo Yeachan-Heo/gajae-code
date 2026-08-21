@@ -65,7 +65,7 @@ import {
  * 2. **Artifact write**: `gjc ralplan --write --stage <type> --stage_n <N>
  *    (--artifact <path-or-string> | --artifact-env GJC_RALPLAN_ARTIFACT)
  *    [--run-id <id>] [--session-id <id>] [--lane-verdict <token>] [--json]` persists Planner / Architect
- *    / Critic / disposition / revision / post-interview / ADR / final artifacts under
+ *    / Critic / intent / disposition / revision / post-interview / ADR / final artifacts under
  *    `.gjc/plans/ralplan/<run-id>/`, maintains an `index.jsonl` audit log, copies `final`
  *    stages to `pending-approval.md`, and advances the HUD chip to reflect the latest
  *    persisted stage. Disposition stage artifacts are fail-closed JSON documents that
@@ -80,6 +80,7 @@ export interface RalplanCommandResult {
 
 const KNOWN_STAGES = [
 	"planner",
+	"intent",
 	"architect",
 	"critic",
 	"disposition",
