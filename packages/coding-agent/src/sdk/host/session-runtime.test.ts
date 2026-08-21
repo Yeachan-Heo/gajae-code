@@ -81,7 +81,11 @@ function admissionBarrier(target: number) {
 function extensionContext(
 	sessionId: string,
 	cwd: string,
-	options: { goalState?: unknown; branch?: unknown[] } = {},
+	options: {
+		goalState?: unknown;
+		branch?: unknown[];
+		liveState?: { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number };
+	} = {},
 ): ExtensionContext {
 	return {
 		cwd,
@@ -118,8 +122,17 @@ function goalModeEntry(sessionId: string, tokensUsed: number): Record<string, un
 	};
 }
 
-async function queryGoalState(ctx: ExtensionContext, sessionId: string): Promise<unknown> {
-	const surface = createSdkSurfaceFactory({ ctx, id: sessionId, api: {} as ExtensionAPI }).query;
+async function queryGoalState(
+	ctx: ExtensionContext,
+	sessionId: string,
+	liveState?: { isStreaming: boolean; steeringQueueDepth: number; followupQueueDepth: number },
+): Promise<unknown> {
+	const surface = createSdkSurfaceFactory({
+		ctx,
+		id: sessionId,
+		api: {} as ExtensionAPI,
+		getLiveState: () => liveState ?? { isStreaming: false, steeringQueueDepth: 0, followupQueueDepth: 0 },
+	}).query;
 	const store = new RevisionStore(sessionId);
 	const cursors = new CursorRegistry("goal-test-token", store);
 	const response = await new QueryHandlers(surface, sessionId, store, cursors).dispatch({
@@ -144,6 +157,7 @@ describe("SDK goal snapshot lifecycle", () => {
 			const live = await queryGoalState(
 				extensionContext(sessionId, cwd, { goalState: liveGoal, branch }),
 				sessionId,
+				{ isStreaming: true, steeringQueueDepth: 1, followupQueueDepth: 0 },
 			);
 			const recreated = await queryGoalState(extensionContext(sessionId, cwd, { branch }), sessionId);
 
