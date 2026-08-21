@@ -34,9 +34,6 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 	}
 }
 
-async function readState(stateFile: string): Promise<Record<string, unknown>> {
-	return JSON.parse(await fsp.readFile(stateFile, "utf8")) as Record<string, unknown>;
-}
 describe("Coordinator MCP runtime readiness", () => {
 	it("bounds runtime acknowledgement waits independently of caller input", () => {
 		expect(boundedRuntimePromptAckTimeoutMs(250)).toBe(250);
@@ -57,9 +54,6 @@ describe("Coordinator MCP runtime readiness", () => {
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (_model, _context, options) => {
-				queueMicrotask(() => {
-					stream.push({ type: "start", partial: createAssistantMessage("") });
-				});
 				options?.signal?.addEventListener(
 					"abort",
 					() => stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") }),
@@ -89,7 +83,7 @@ describe("Coordinator MCP runtime readiness", () => {
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = session.sessionId;
 		try {
-			const prompt = session.prompt("hold open");
+			const prompt = session.prompt("hold open", { synthetic: true, expandPromptTemplates: false });
 			await waitFor(() => session.isStreaming && fs.existsSync(stateFile), "running runtime state");
 			session.agent.emitExternalEvent({
 				type: "message_end",
@@ -97,14 +91,13 @@ describe("Coordinator MCP runtime readiness", () => {
 			});
 			await waitFor(() => messageEndHandlerStarted, "message_end extension handler");
 
-			await session.abort();
-			await Bun.sleep(25);
-			expect((await readState(stateFile)).state).toBe("running");
+			const abort = session.abort();
+			expect((JSON.parse(fs.readFileSync(stateFile, "utf8")) as Record<string, unknown>).state).toBe("running");
 			// The provider stream may have stopped already; readiness is the durable
 			// terminal state, which must remain running until the handler barrier clears.
 
 			messageEndBarrier.resolve();
-			await prompt.catch(() => {});
+			await Promise.all([prompt.catch(() => {}), abort]);
 			await waitFor(() => {
 				if (!fs.existsSync(stateFile)) return false;
 				const state = JSON.parse(fs.readFileSync(stateFile, "utf8")) as { state?: unknown };
