@@ -14,6 +14,7 @@ import {
 	EventStream,
 	isProviderSafetyStopAuthenticated,
 	isZodSchema,
+	revokeProviderSafetyStop,
 	streamSimple,
 	type ToolChoice,
 	type ToolResultMessage,
@@ -421,14 +422,41 @@ function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
  * the managed snapshot shell clones it and before any retry/discard policy
  * reads it, so a forged label degrades to an ordinary (fallback-eligible)
  * error everywhere downstream — loop gates, session policy, and persistence.
+ *
+ * The label is stripped regardless of stopReason: the field is reserved for
+ * adapter-minted terminal stops, and downstream consumers (session compaction
+ * checks among them) read it without re-checking the error state, so a forged
+ * label on a nominally successful response must not survive either. A frozen
+ * or Proxy-trapped final message is rebuilt as a plain mutable copy instead of
+ * letting the strip abort the run.
  */
-function sanitizeProviderSafetyStopProvenance(message: AssistantMessage): void {
-	if (
-		message.stopReason === "error" &&
-		message.errorKind === "provider_safety_stop" &&
-		!isManagedProviderSafetyStopAuthenticated(message)
-	) {
+function sanitizeProviderSafetyStopProvenance(message: AssistantMessage): AssistantMessage {
+	if (message.errorKind !== "provider_safety_stop" || isManagedProviderSafetyStopAuthenticated(message)) {
+		return message;
+	}
+	try {
 		delete message.errorKind;
+		return message;
+	} catch {
+		const rebuilt: AssistantMessage = { ...message };
+		delete rebuilt.errorKind;
+		return rebuilt;
+	}
+}
+
+/**
+ * Expire residual terminal safety-stop authority before a dispatch exposes
+ * committed history to a stream. Once a stop has been adjudicated, its
+ * committed assistant message may be handed unchanged to a later — possibly
+ * custom — stream through `convertToLlm`; a live mark would let that stream
+ * re-use the authenticated object (or a mutation of it) to forge a terminal
+ * failure and suppress the fallback chain (#4777 review follow-up).
+ */
+function expireProviderSafetyStopAuthority(messages: AgentMessage[]): void {
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		revokeProviderSafetyStop(message);
+		managedProviderSafetyStops.delete(message);
 	}
 }
 
@@ -3160,6 +3188,14 @@ async function streamAssistantResponse(
 		messages = await config.transformContext(messages, signal, scope);
 	}
 
+	// Expire residual terminal safety-stop authority before this dispatch:
+	// committed history (including a previously adjudicated stop) is handed
+	// to the stream through convertToLlm below, and a live mark would let a
+	// custom stream re-use the authenticated object to forge a terminal
+	// failure (#4777 review follow-up).
+	expireProviderSafetyStopAuthority(messages);
+	if (messages !== context.messages) expireProviderSafetyStopAuthority(context.messages);
+
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[]) and normalize at the LLM boundary.
 	// Cache hits are keyed by provider-visible content hashes, never message object identity.
 	const normalizedMessages = await convertAndNormalizeMessages(messages, context, config);
@@ -3547,8 +3583,7 @@ async function streamAssistantResponse(
 
 						case "done":
 						case "error": {
-							const finished = await finishResponse();
-							sanitizeProviderSafetyStopProvenance(finished);
+							const finished = sanitizeProviderSafetyStopProvenance(await finishResponse());
 							const finalMessage = config.fallbackManaged
 								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics)
 								: finished;
@@ -3572,8 +3607,7 @@ async function streamAssistantResponse(
 				closeIterator();
 			}
 
-			const finished = await finishResponse();
-			sanitizeProviderSafetyStopProvenance(finished);
+			const finished = sanitizeProviderSafetyStopProvenance(await finishResponse());
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics)
 				: finished;

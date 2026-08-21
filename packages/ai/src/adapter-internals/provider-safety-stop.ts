@@ -79,3 +79,16 @@ export function restoreProviderSafetyStopFromTrustedTransport(
 export function isProviderSafetyStopAuthenticated(message: unknown): boolean {
 	return typeof message === "object" && message !== null && authenticatedProviderSafetyStops.has(message);
 }
+
+/**
+ * Drop terminal authority for a message. Exposing revocation publicly is
+ * safe by construction: it can only remove authority, never grant it, so a
+ * hostile caller cannot use it to forge a stop — only to degrade a genuine
+ * one to an ordinary fallback-eligible error. The managed runtime uses it to
+ * expire marks once a stop has been adjudicated, before the committed
+ * message is exposed to later stream dispatches (#4777 review follow-up).
+ */
+export function revokeProviderSafetyStop(message: unknown): void {
+	if (typeof message !== "object" || message === null) return;
+	authenticatedProviderSafetyStops.delete(message);
+}

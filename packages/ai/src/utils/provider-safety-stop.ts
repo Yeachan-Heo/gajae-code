@@ -5,4 +5,4 @@
  * adapter-internals module. Public consumers may only verify existing
  * authority; message fields and structured refusal text never mint authority.
  */
-export { isProviderSafetyStopAuthenticated } from "../adapter-internals/provider-safety-stop";
+export { isProviderSafetyStopAuthenticated, revokeProviderSafetyStop } from "../adapter-internals/provider-safety-stop";
