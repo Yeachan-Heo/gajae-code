@@ -177,6 +177,14 @@ function installProcessStdoutWriteClassifier(): void {
 		encoding?: BufferEncoding | StdoutWriteCallback,
 		callback?: StdoutWriteCallback,
 	): boolean => {
+		// Bun 1.4 stopped surfacing a broken stdout pipe as a synchronous throw
+		// from `write()`; it now rejects asynchronously (via the write's own
+		// callback and an `unhandledRejection`) with an error object that lacks
+		// the `fd`/`syscall` fields the fallback attribution path relies on.
+		// Always attach an internal callback — even when the caller passed none —
+		// so `markDirectProcessStdoutWriteError` still runs before that async
+		// rejection reaches `handleFatalError`. The synchronous `try/catch` below
+		// stays as a fallback for Bun/Node versions that still throw synchronously.
 		try {
 			if (typeof encoding === "function") return originalWrite(chunk, markCallback(encoding));
 			if (callback) {
@@ -184,8 +192,16 @@ function installProcessStdoutWriteClassifier(): void {
 					? originalWrite(chunk, encoding, markCallback(callback))
 					: originalWrite(chunk, markCallback(callback));
 			}
-			if (encoding === undefined) return originalWrite(chunk);
-			return typeof chunk === "string" ? originalWrite(chunk, encoding) : originalWrite(chunk);
+			return typeof chunk === "string"
+				? originalWrite(
+						chunk,
+						encoding,
+						markCallback(() => {}),
+					)
+				: originalWrite(
+						chunk,
+						markCallback(() => {}),
+					);
 		} catch (error) {
 			stdoutEpipeClassifier.markDirectProcessStdoutWriteError(error);
 			throw error;

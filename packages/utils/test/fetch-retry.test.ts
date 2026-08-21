@@ -78,7 +78,13 @@ describe("fetchWithRetry", () => {
 	it("continues retrying when discarded-body cancellation never settles", async () => {
 		const discardedResponse = new Response("retry", { status: 503 });
 		const cancellation = Promise.withResolvers<void>();
-		const cancelSpy = vi.spyOn(discardedResponse.body!, "cancel").mockImplementation(() => cancellation.promise);
+		// Bun 1.4 stopped keeping `response.body` referentially stable across
+		// `response.clone()`; the retry loop re-reads `response.body` after
+		// cloning, so cancellation lands on a different `ReadableStream`
+		// instance than one snapshotted before the clone. Spy on the shared
+		// prototype method instead, so the assertion observes the cancel
+		// regardless of which instance receives it.
+		const cancelSpy = vi.spyOn(ReadableStream.prototype, "cancel").mockImplementation(() => cancellation.promise);
 		let attempt = 0;
 
 		const request = fetchWithRetry("https://example.invalid/pending-cancel", {
@@ -104,7 +110,7 @@ describe("fetchWithRetry", () => {
 	it("continues retrying when discarded-body cancellation rejects", async () => {
 		const discardedResponse = new Response("retry", { status: 503 });
 		const cancelSpy = vi
-			.spyOn(discardedResponse.body!, "cancel")
+			.spyOn(ReadableStream.prototype, "cancel")
 			.mockRejectedValue(new Error("transport refused cancellation"));
 		let attempt = 0;
 
@@ -127,7 +133,9 @@ describe("fetchWithRetry", () => {
 		const discardedResponse = new Response("retry", { status: 503 });
 		const cancellation = Promise.withResolvers<void>();
 		const cleanupStarted = Promise.withResolvers<void>();
-		const cancelSpy = vi.spyOn(discardedResponse.body!, "cancel").mockImplementation(() => {
+		const cancelSpy = vi.spyOn(ReadableStream.prototype, "cancel").mockImplementation(function (
+			this: ReadableStream,
+		) {
 			cleanupStarted.resolve();
 			return cancellation.promise;
 		});
