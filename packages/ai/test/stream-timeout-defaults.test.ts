@@ -99,6 +99,12 @@ describe("getStreamIdleTimeoutMs(fallbackMs)", () => {
 		expect(getStreamIdleTimeoutMs(300_000)).toBe(77);
 	});
 
+	it("prefers the generic stream alias over the OpenAI-specific alias", () => {
+		Bun.env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS = "42";
+		Bun.env.PI_STREAM_IDLE_TIMEOUT_MS = "99";
+		expect(getStreamIdleTimeoutMs()).toBe(99);
+	});
+
 	it("treats GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS=0 as a watchdog disable", () => {
 		Bun.env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS = "0";
 		expect(getStreamIdleTimeoutMs(300_000)).toBeUndefined();
