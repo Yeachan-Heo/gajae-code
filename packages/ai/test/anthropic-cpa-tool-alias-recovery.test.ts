@@ -182,7 +182,44 @@ function createPartialToolUseThenCpaAliasError(alias: string): MockAnthropicRequ
 							index: 0,
 							content_block: { type: "tool_use", id: "toolu_cpa_partial", name: alias, input: {} },
 						};
-						throw new Error(cpaAliasErrorMessage(alias));
+						const error = Object.assign(new Error(`500 ${cpaAliasErrorMessage(alias)}`), { status: 500 });
+						throw error;
+					},
+				},
+				response,
+				request_id: response.headers.get("request-id"),
+			};
+		},
+	};
+}
+
+// A stream that yields one `thinking` content block (firstTokenTime is set by
+// any content_block_start, not only tool_use) and then dies with the CPA
+// signature: the managed ineligible path must treat this exactly like a
+// mid-stream tool_use failure.
+function createPartialThinkingThenCpaAliasError(alias: string): MockAnthropicRequest {
+	const response = new Response(null, { status: 200, headers: { "request-id": "req_cpa_thinking_partial" } });
+	return {
+		async withResponse() {
+			return {
+				data: {
+					async *[Symbol.asyncIterator]() {
+						yield {
+							type: "message_start",
+							message: {
+								id: "msg_cpa_thinking_partial",
+								usage: {
+									input_tokens: 1,
+									output_tokens: 0,
+									cache_read_input_tokens: 0,
+									cache_creation_input_tokens: 0,
+								},
+							},
+						};
+						yield { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } };
+						yield { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hm" } };
+						const error = Object.assign(new Error(`500 ${cpaAliasErrorMessage(alias)}`), { status: 500 });
+						throw error;
 					},
 				},
 				response,
@@ -542,5 +579,125 @@ describe("CPA tool alias restore failure under managed fallback (issue #4338)", 
 		expect(bodies).toHaveLength(1);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("cannot restore Claude OAuth MCP tool alias");
+	});
+});
+
+describe("CPA ineligible repair after streamed content (PR #4790 fix-forward)", () => {
+	it("records steering and rethrows raw with transport facts when a managed attempt fails mid-stream", async () => {
+		const bodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			bodies.push(JSON.parse(JSON.stringify(body)));
+			return createPartialToolUseThenCpaAliasError(CPA_ALIAS_FIND) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		const context = makeContext([userMessage("find me the config")], [findTool, searchTool, bashTool]);
+		const options = { client, fallbackManaged: true, providerSessionState };
+
+		const first = await streamAnthropic(model, context, options).result();
+		// The staged ManagedAttemptTransaction never published the streamed
+		// events, so the controller's rebuild is replay-safe: the provider
+		// records the steering for this exact turn and surfaces the RAW failure
+		// with its 500 transport facts intact so the fallback controller can
+		// discard the attempt and rebuild the turn with the steering.
+		expect(bodies).toHaveLength(1);
+		expect(first.stopReason).toBe("error");
+		expect(first.errorStatus).toBe(500);
+		expect(first.transportFailure?.status).toBe(500);
+		// The staged toolcall_start never reached a live consumer, so the
+		// surfaced message stays the raw proxy error, not the ineligible error.
+		expect(first.errorMessage).toContain("cannot restore Claude OAuth MCP tool alias");
+		expect(first.errorMessage).not.toContain("Repair could not be safely attempted");
+
+		const second = await streamAnthropic(model, context, options).result();
+		// The steered rebuild streamed content again and failed mid-stream once
+		// more: the fingerprint is already recorded, so the attempt terminalizes
+		// with the actionable ineligible error and no transport facts.
+		expect(bodies).toHaveLength(2);
+		expect(lastUserContent(bodies[1])).toContain('The callable tool is "find"');
+		expect(second.stopReason).toBe("error");
+		expect(second.errorMessage).toContain("Repair could not be safely attempted");
+		expect(second.errorMessage).toContain("The turn was not re-sent");
+		expect(second.errorStatus).toBeUndefined();
+		expect(second.transportFailure).toBeUndefined();
+	});
+
+	it("records steering and rethrows raw when a managed attempt fails after streamed thinking", async () => {
+		const bodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			bodies.push(JSON.parse(JSON.stringify(body)));
+			return createPartialThinkingThenCpaAliasError(CPA_ALIAS_FIND) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		const context = makeContext([userMessage("find me the config")], [findTool, searchTool, bashTool]);
+		const first = await streamAnthropic(model, context, {
+			client,
+			fallbackManaged: true,
+			providerSessionState,
+		}).result();
+
+		// firstTokenTime is stamped by any content_block_start — including
+		// thinking — so this is the same managed ineligible path: raw failure
+		// with transport facts so the controller owns the retry.
+		expect(bodies).toHaveLength(1);
+		expect(first.stopReason).toBe("error");
+		expect(first.transportFailure?.status).toBe(500);
+		expect(first.errorMessage).toContain("cannot restore Claude OAuth MCP tool alias");
+	});
+
+	it("terminalizes with the actionable ineligible error in a managed attempt without session state", async () => {
+		const bodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			bodies.push(JSON.parse(JSON.stringify(body)));
+			return createPartialToolUseThenCpaAliasError(CPA_ALIAS_FIND) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const context = makeContext([userMessage("find me the config")], [findTool, searchTool, bashTool]);
+		const result = await streamAnthropic(model, context, { client, fallbackManaged: true }).result();
+
+		// Nowhere to record steering: keep the actionable terminal error path.
+		expect(bodies).toHaveLength(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Repair could not be safely attempted");
+		expect(result.errorMessage).toContain("The turn was not re-sent");
+		expect(result.errorStatus).toBeUndefined();
+		expect(result.transportFailure).toBeUndefined();
+	});
+
+	it("names the unique callable tool when OAuth wire names are proxy_-prefixed", async () => {
+		const bodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			// Production Claude-OAuth shape: convertTools() prefixes every wire
+			// tool name with proxy_ (isOAuthToken=true), while the parsed alias
+			// base stays the bare name. options.client forces isOAuthToken=false
+			// in these fixtures, so emulate the wire shape directly.
+			const cloaked = JSON.parse(JSON.stringify(body)) as { tools?: Array<{ name: string }> };
+			if (Array.isArray(cloaked.tools)) {
+				cloaked.tools = cloaked.tools.map(tool => ({ ...tool, name: `proxy_${tool.name}` }));
+			}
+			bodies.push(cloaked);
+			return createPartialToolUseThenCpaAliasError(CPA_ALIAS_FIND) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const context = makeContext([userMessage("find me the config")], [findTool, searchTool, bashTool]);
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		// stripClaudeToolPrefix normalization resolves proxy_find -> "find":
+		// the terminal error names the callable tool instead of falling back
+		// to discovery guidance.
+		expect(bodies).toHaveLength(1);
+		expect(bodies[0]?.tools).toEqual(
+			[{ name: "proxy_find" }, { name: "proxy_search" }, { name: "proxy_bash" }].map(t =>
+				expect.objectContaining(t),
+			) as never,
+		);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain('The callable tool name is "find"');
+		expect(result.errorMessage).not.toContain("No unique callable tool name could be determined");
 	});
 });

@@ -1760,8 +1760,13 @@ export function applyAnthropicUsageExtras(usage: Usage, source: AnthropicUsageLi
 
 /**
  * Unique request-local tool whose wire name equals the parsed base, if any.
- * Only an exact, singular match is trusted; zero or multiple matches yield
- * `undefined` so the repair never guesses among ambiguous aliases.
+ * OAuth requests cloak every wire tool name with the `proxy_` prefix
+ * (`convertTools` → `applyClaudeToolPrefix`), while the parsed alias base is
+ * the uncloaked name, so candidates are compared after stripping the prefix —
+ * the same normalization inbound `tool_use` names already get. Only an exact,
+ * singular match is trusted; zero or multiple matches yield `undefined` so the
+ * repair never guesses among ambiguous aliases. The returned name is the
+ * callable base (unprefixed), matching what the model must emit.
  */
 function resolveCpaCallableToolName(
 	params: MessageCreateParamsStreaming,
@@ -1772,9 +1777,10 @@ function resolveCpaCallableToolName(
 	if (!tools) return undefined;
 	let match: string | undefined;
 	for (const tool of tools) {
-		if (tool.name !== failure.baseName) continue;
+		if (tool.name === undefined) continue;
+		if (stripClaudeToolPrefix(tool.name) !== failure.baseName) continue;
 		if (match !== undefined) return undefined;
-		match = tool.name;
+		match = failure.baseName;
 	}
 	return match;
 }
@@ -2898,11 +2904,59 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						}
 						// Repair is not safely eligible: response content (text, thinking,
 						// redacted-thinking, or tool_use — not only tool_use) has already
-						// started streaming to a live consumer this attempt. `resetOutputForRetry`
-						// clears the mutable output accumulator but cannot retract an event
-						// already delivered downstream, so resending here could leak a
-						// duplicate/orphaned block lifecycle. Never retry; surface GJC's own
-						// actionable terminal error instead of the raw proxy JSON.
+						// streamed this attempt. Whether a resend is safe depends on who
+						// owns the attempt's events:
+						// - Unmanaged: events were published live to stream consumers the
+						//   instant each block started. `resetOutputForRetry` clears the
+						//   mutable output accumulator but cannot retract an already-delivered
+						//   event, so resending here could leak a duplicate/orphaned block
+						//   lifecycle. Never retry; surface GJC's own actionable terminal
+						//   error instead of the raw proxy JSON.
+						// - fallbackManaged: the agent loop stages this attempt's events in a
+						//   ManagedAttemptTransaction that has NOT published them, so the
+						//   fallback controller's rebuild-and-resend is replay-safe. Mirror
+						//   the zero-content managed path: record the corrective steering
+						//   against this exact turn and rethrow the RAW failure so its HTTP
+						//   500 transport facts reach the controller, which discards the
+						//   staged attempt and rebuilds the turn with the steering. A steered
+						//   managed attempt that fails again mid-stream lands back here with
+						//   the fingerprint already recorded (recurrence is zero-content-only)
+						//   and terminalizes with the actionable ineligible error.
+						if (options?.fallbackManaged && providerSessionState) {
+							const turnFingerprint = cpaTurnFingerprint(context.messages);
+							if (providerSessionState.cpaToolAliasSteering?.turnFingerprint !== turnFingerprint) {
+								providerSessionState.cpaToolAliasSteering = {
+									message: buildCpaToolAliasSteering(
+										cpaAliasFailure,
+										resolveCpaCallableToolName(params, cpaAliasFailure),
+									),
+									turnFingerprint,
+								};
+								logger.debug(
+									"anthropic: recording CPA tool alias steering for the next managed attempt after streamed content",
+									{
+										model: model.id,
+										alias: cpaAliasFailure.alias,
+										baseName: cpaAliasFailure.baseName,
+									},
+								);
+							} else {
+								logger.debug(
+									"anthropic: CPA steering already recorded for this managed turn; surfacing terminal error after streamed content",
+									{
+										model: model.id,
+										alias: cpaAliasFailure.alias,
+										baseName: cpaAliasFailure.baseName,
+									},
+								);
+								throw createCpaToolAliasTerminalError(
+									cpaAliasFailure,
+									resolveCpaCallableToolName(params, cpaAliasFailure),
+									"ineligible",
+								);
+							}
+							throw streamFailure;
+						}
 						logger.debug(
 							"anthropic: CPA tool alias restore failure ineligible for repair, surfacing actionable terminal error",
 							{
