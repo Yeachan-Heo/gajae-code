@@ -92,4 +92,14 @@ describe("provider safety-stop provenance authority", () => {
 		expect(isProviderSafetyStopAuthenticated(undefined)).toBe(false);
 		expect(isProviderSafetyStopAuthenticated("provider_safety_stop")).toBe(false);
 	});
+
+	test("the mint module is unreachable through the package export map", async () => {
+		// Deep imports through the public package name resolve through the
+		// exports map; `./adapter-internals/*` is null there, so neither the
+		// mint nor the capability is importable outside first-party relative
+		// imports (#4777 review follow-up).
+		await expect(import("@gajae-code/ai/adapter-internals/provider-safety-stop")).rejects.toThrow();
+		const manifest = (await import("../package.json", { with: { type: "json" } })).default;
+		expect(manifest.exports["./adapter-internals/*"]).toBeNull();
+	});
 });

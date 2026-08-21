@@ -67,6 +67,7 @@
 			"types": "./src/index.ts",
 			"import": "./src/index.ts"
 		},
+		"./adapter-internals/*": null,
 		"./*": {
 			"types": "./src/*.ts",
 			"import": "./src/*.ts",
