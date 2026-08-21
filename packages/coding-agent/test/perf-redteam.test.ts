@@ -38,7 +38,7 @@ describe("perf change-set adversarial probes", () => {
 		}
 	});
 
-	it("rejects an append after a corrupt suffix so durable events remain replayable", async () => {
+	it("self-repairs an append after a corrupt suffix so durable events remain replayable", async () => {
 		const dir = await tempDir("gjc-perf-corrupt-");
 		try {
 			const index = await new SessionIndex(dir).open();
@@ -46,14 +46,14 @@ describe("perf change-set adversarial probes", () => {
 			const log = path.join(dir, "sdk", "sessions", "index.jsonl");
 			await fs.appendFile(log, "{broken}");
 			const suffix = await new SessionIndex(dir).open();
-			const beforeAppend = await fs.readFile(log, "utf8");
-			await expect(suffix.append(event("would-be-hidden"))).rejects.toThrow(
-				"Cannot append to corrupt session index log",
-			);
-			expect(await fs.readFile(log, "utf8")).toBe(beforeAppend);
+			// The poisoned bytes are quarantined by the inline repair, the valid
+			// prefix survives, and the append lands durably instead of leaving the
+			// index wedged until an operator intervenes.
+			expect((await suffix.append(event("lands-after-repair"))).indexSeq).toBe(2);
+			expect(await fs.readFile(log, "utf8")).not.toContain("{broken}");
 			const replay = await new SessionIndex(dir).open();
-			expect(replay.listSessions().sessions.map(item => item.sessionId)).toEqual(["prefix"]);
-			expect(replay.listSessions().warnings).toContain("Corrupt session index entry; replay truncated");
+			expect(replay.listSessions().sessions.map(item => item.sessionId)).toEqual(["prefix", "lands-after-repair"]);
+			expect(replay.listSessions().warnings).toEqual([]);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}

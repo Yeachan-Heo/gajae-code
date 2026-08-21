@@ -1057,43 +1057,44 @@ export class SessionIndex {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-			return await withSessionIndexLock("repair", this.#agentDir, async () => {
-				const scan = await this.#scan();
-				if (scan.diagnosis.status === "unsupported") return { ...scan.diagnosis, repaired: false };
-				if (scan.diagnosis.status === "healthy") return { ...scan.diagnosis, repaired: false };
-				const quarantineBase = path.join(dirFor(this.#agentDir), "quarantine");
-				await fs.mkdir(quarantineBase, { recursive: true, mode: 0o700 });
-				await syncDirectory(quarantineBase);
-				const quarantinePath = path.join(quarantineBase, `repair-${Date.now()}-${process.pid}-${randomUUID()}`);
-				await fs.mkdir(quarantinePath, { mode: 0o700 });
-				await syncDirectory(quarantinePath);
-				if (scan.snapshotContents)
-					await writeAndSync(path.join(quarantinePath, "index.snapshot.json"), scan.snapshotContents);
-				if (scan.logContents) await writeAndSync(path.join(quarantinePath, "index.jsonl"), scan.logContents);
-				await syncDirectory(path.join(quarantinePath, "index.jsonl"));
-				// Repair republishes the surviving history as the new snapshot, so it must
-				// apply the same retention the ordinary snapshot path applies. Writing the
-				// raw survivor set instead let one repair of a long-lived index restore an
-				// unbounded snapshot, and every later locked transaction then re-parsed that
-				// whole history while holding the index lock — the broker burns CPU and
-				// unrelated launches time out waiting for the lock.
-				const events = compactEvents([...scan.snapshotEvents, ...scan.validLogEvents], this.#policy);
-				const snapshot = JSON.stringify({
-					version: SESSION_INDEX_SNAPSHOT_VERSION,
-					indexSeq: scan.diagnosis.validPrefixSeq,
-					events,
-				});
-				await replaceAtomically(snapshotFor(this.#agentDir), snapshot);
-				// The republished snapshot already carries the full surviving history (after
-				// compaction), so the log must be truncated to match: leaving the original
-				// events in place keeps every subsequent #scan() parsing them under the lock
-				// — the same starvation the compaction above is meant to end. This mirrors
-				// #rotate(), which writes an empty log after snapshotting.
-				await replaceAtomically(logFor(this.#agentDir), "");
-				await this.#replayUnderLock();
-				return { ...scan.diagnosis, repaired: true, quarantinePath };
-			});
+			return await withSessionIndexLock("repair", this.#agentDir, async () => await this.#repairUnderLock());
 		});
+	}
+	async #repairUnderLock(): Promise<SessionIndexRepairResult> {
+		const scan = await this.#scan();
+		if (scan.diagnosis.status === "unsupported") return { ...scan.diagnosis, repaired: false };
+		if (scan.diagnosis.status === "healthy") return { ...scan.diagnosis, repaired: false };
+		const quarantineBase = path.join(dirFor(this.#agentDir), "quarantine");
+		await fs.mkdir(quarantineBase, { recursive: true, mode: 0o700 });
+		await syncDirectory(quarantineBase);
+		const quarantinePath = path.join(quarantineBase, `repair-${Date.now()}-${process.pid}-${randomUUID()}`);
+		await fs.mkdir(quarantinePath, { mode: 0o700 });
+		await syncDirectory(quarantinePath);
+		if (scan.snapshotContents)
+			await writeAndSync(path.join(quarantinePath, "index.snapshot.json"), scan.snapshotContents);
+		if (scan.logContents) await writeAndSync(path.join(quarantinePath, "index.jsonl"), scan.logContents);
+		await syncDirectory(path.join(quarantinePath, "index.jsonl"));
+		// Repair republishes the surviving history as the new snapshot, so it must
+		// apply the same retention the ordinary snapshot path applies. Writing the
+		// raw survivor set instead let one repair of a long-lived index restore an
+		// unbounded snapshot, and every later locked transaction then re-parsed that
+		// whole history while holding the index lock — the broker burns CPU and
+		// unrelated launches time out waiting for the lock.
+		const events = compactEvents([...scan.snapshotEvents, ...scan.validLogEvents], this.#policy);
+		const snapshot = JSON.stringify({
+			version: SESSION_INDEX_SNAPSHOT_VERSION,
+			indexSeq: scan.diagnosis.validPrefixSeq,
+			events,
+		});
+		await replaceAtomically(snapshotFor(this.#agentDir), snapshot);
+		// The republished snapshot already carries the full surviving history (after
+		// compaction), so the log must be truncated to match: leaving the original
+		// events in place keeps every subsequent #scan() parsing them under the lock
+		// — the same starvation the compaction above is meant to end. This mirrors
+		// #rotate(), which writes an empty log after snapshotting.
+		await replaceAtomically(logFor(this.#agentDir), "");
+		await this.#replayUnderLock();
+		return { ...scan.diagnosis, repaired: true, quarantinePath };
 	}
 	async #tailUnderLock(snapshotSeq = this.indexSeq, allowResync = true): Promise<void> {
 		let data: Buffer;
@@ -1181,10 +1182,25 @@ export class SessionIndex {
 				ownIncarnation = input.processIncarnation ?? processIncarnation(input.pid);
 			return await withSessionIndexLock("append", this.#agentDir, async () => {
 				await this.#replayUnderLock();
-				if (this.#corruptSuffix)
-					throw new Error(
-						"Cannot append to corrupt session index log; run `gjc gc --repair-session-index` to quarantine evidence and retain the valid prefix",
+				if (this.#corruptSuffix) {
+					// A corrupt suffix used to hard-fail every append until a human ran
+					// `gjc gc --repair-session-index` — but the writers that corrupt the
+					// log (typically a stale long-lived broker signing events against an
+					// outdated in-memory indexSeq) keep appending, so the operator-run
+					// repair was re-corrupted within minutes and delegated session
+					// launches stayed dead indefinitely. Run the same quarantine-backed
+					// repair inline instead: evidence is preserved under
+					// sessions/quarantine, the valid prefix is republished, and this
+					// append proceeds against the repaired index.
+					const repair = await this.#repairUnderLock();
+					if (this.#corruptSuffix)
+						throw new Error(
+							"Cannot append to corrupt session index log; automatic repair did not converge — run `gjc gc --repair-session-index` to quarantine evidence and retain the valid prefix",
+						);
+					logger.warn(
+						`sdk broker: session index self-repaired before append (${repair.reason ?? "corrupt suffix"}); evidence quarantined at ${repair.quarantinePath ?? "unknown"}`,
 					);
+				}
 				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 					...input,
 					version: SDK_STATE_VERSION,

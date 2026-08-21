@@ -169,7 +169,12 @@ describe("SDK session index", () => {
 		);
 		const diagnosis = await index.diagnose();
 		expect(diagnosis).toMatchObject({ status: "corrupt", snapshotSeq: 3, validPrefixSeq: 3 });
-		await expect(index.append(event("not-accepted"))).rejects.toThrow("--repair-session-index");
+		// Append self-repairs from the diagnosed watermark instead of resynchronizing
+		// with the incomplete overlap: the accepted event chains from seq 3, not 4.
+		expect((await index.append(event("accepted-after-repair"))).indexSeq).toBe(4);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().warnings).toEqual([]);
+		expect(replay.indexSeq).toBe(4);
 	});
 	it("retains the valid prefix and warns on corrupt post-snapshot data", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
@@ -213,16 +218,19 @@ describe("SDK session index", () => {
 		await index.append(event("before"));
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		await fs.writeFile(path.join(sessionsDir, "index.snapshot.json"), "{");
-		await expect(index.append(event("blocked-before-repair"))).rejects.toThrow("--repair-session-index");
-		expect(await index.repair()).toMatchObject({ status: "corrupt", repaired: true, validPrefixSeq: 1 });
+		// The first append against the corrupt snapshot self-repairs (quarantining
+		// the poisoned snapshot) and then lands; a manual repair afterwards reports
+		// the already-healthy index untouched.
+		expect((await index.append(event("lands-after-self-repair"))).indexSeq).toBe(2);
+		expect(await index.repair()).toMatchObject({ status: "healthy", repaired: false });
 		await index.append({
 			...event("after"),
 			locator: { repo: "r".repeat(4 * 1024 * 1024), stateRoot: "q" },
 		});
 		const snapshot = JSON.parse(await fs.readFile(path.join(sessionsDir, "index.snapshot.json"), "utf8"));
-		expect(snapshot.indexSeq).toBe(2);
+		expect(snapshot.indexSeq).toBe(3);
 		const replay = await new SessionIndex(dir).open();
-		expect(replay.indexSeq).toBe(2);
+		expect(replay.indexSeq).toBe(3);
 		expect(replay.listSessions().warnings).toEqual([]);
 	});
 	it("repairs a structurally invalid high-sequence snapshot before rotating an oversized log", async () => {
@@ -246,22 +254,25 @@ describe("SDK session index", () => {
 			path.join(sessionsDir, "index.jsonl"),
 			`${JSON.stringify({ ...oversized, checksum: sessionIndexChecksum(oversized as Parameters<typeof sessionIndexChecksum>[0]) })}\n`,
 		);
-		await expect(index.append(event("blocked-before-repair"))).rejects.toThrow("--repair-session-index");
-		expect(await index.repair()).toMatchObject({ status: "corrupt", repaired: true, validPrefixSeq: 2 });
+		// The first append self-repairs against the invalid high-sequence snapshot
+		// (quarantining it, republishing the surviving prefix) and then lands.
+		expect((await index.append(event("lands-after-self-repair"))).indexSeq).toBe(3);
+		expect(await index.repair()).toMatchObject({ status: "healthy", repaired: false });
 
 		await index.append(event("after"));
 		await index.compact();
 
-		expect(JSON.parse(await fs.readFile(snapshotFile, "utf8")).indexSeq).toBe(3);
+		expect(JSON.parse(await fs.readFile(snapshotFile, "utf8")).indexSeq).toBe(4);
 
 		expect((await fs.stat(path.join(sessionsDir, "index.jsonl"))).size).toBe(0);
 		const replay = await new SessionIndex(dir).open();
 		expect(replay.listSessions().sessions.map(session => session.sessionId)).toEqual([
 			"before",
 			"oversized",
+			"lands-after-self-repair",
 			"after",
 		]);
-		expect(replay.indexSeq).toBe(3);
+		expect(replay.indexSeq).toBe(4);
 	});
 	it("preserves the repaired valid-prefix watermark after a historical overlap", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-repair-watermark-"));
@@ -511,7 +522,7 @@ describe("SDK session index", () => {
 			.map(line => (JSON.parse(line) as { indexSeq: number }).indexSeq);
 		expect(sequences).toEqual(Array.from({ length: 15 }, (_, index) => index + 1));
 	}, 30_000);
-	it("refuses to append after an unterminated suffix while retaining the valid prefix", async () => {
+	it("self-repairs an unterminated suffix on append while quarantining evidence", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const index = await new SessionIndex(dir).open();
 		await index.append(event("prefix"));
@@ -520,9 +531,54 @@ describe("SDK session index", () => {
 		const corrupt = await new SessionIndex(dir).open();
 		expect(corrupt.listSessions().sessions.map(session => session.sessionId)).toEqual(["prefix"]);
 		expect(corrupt.listSessions().warnings).toContain("Corrupt session index entry; replay truncated");
-		await expect(corrupt.append(event("not-durable"))).rejects.toThrow("Cannot append to corrupt session index log");
+		// Appending against the corrupt suffix repairs in place instead of failing:
+		// the valid prefix survives, the new event lands, and the poisoned bytes are
+		// quarantined for inspection rather than blocking every later launch.
+		const appended = await corrupt.append(event("durable-after-repair"));
+		expect(appended.indexSeq).toBe(2);
 		const replay = await new SessionIndex(dir).open();
-		expect(replay.listSessions().sessions.map(session => session.sessionId)).toEqual(["prefix"]);
+		expect(replay.listSessions().warnings).toEqual([]);
+		expect(replay.listSessions().sessions.map(session => session.sessionId)).toEqual([
+			"prefix",
+			"durable-after-repair",
+		]);
+		const quarantine = await fs.readdir(path.join(dir, "sdk", "sessions", "quarantine"));
+		expect(quarantine.length).toBe(1);
+		const evidence = await fs.readFile(
+			path.join(dir, "sdk", "sessions", "quarantine", quarantine[0]!, "index.jsonl"),
+			"utf8",
+		);
+		expect(evidence).toContain('{"partial":');
+	});
+	it("self-repairs a validly-signed stale-sequence append from another writer", async () => {
+		// Field failure mode: a long-lived broker holding stale in-memory state signs
+		// events with a years-old indexSeq (checksum valid, sequence wrong). One such
+		// row used to poison the log permanently — every later append threw, and an
+		// operator-run repair was re-poisoned by the next stale write, leaving
+		// delegated session launches dead until someone deleted the index by hand.
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
+		const index = await new SessionIndex(dir).open();
+		for (const name of ["one", "two", "three"]) await index.append(event(name));
+		const log = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const stale: Omit<SessionIndexEvent, "checksum"> = {
+			version: SDK_STATE_VERSION,
+			indexSeq: 1,
+			ts: Date.now(),
+			type: "lifecycle_terminal",
+			sessionId: "stale-writer",
+			locator: { repo: "unknown", stateRoot: "q" },
+			endpointGeneration: 0,
+			pid: process.pid,
+			terminalUncertain: true,
+		};
+		await fs.appendFile(log, `${JSON.stringify({ ...stale, checksum: sessionIndexChecksum(stale) })}\n`);
+		const poisoned = await new SessionIndex(dir).open();
+		expect(poisoned.listSessions().warnings).toContain("Corrupt session index entry; replay truncated");
+		const appended = await poisoned.append(event("four"));
+		expect(appended.indexSeq).toBe(4);
+		const replay = await new SessionIndex(dir).open();
+		expect(replay.listSessions().warnings).toEqual([]);
+		expect(replay.listSessions().sessions.map(session => session.sessionId)).toEqual(["one", "two", "three", "four"]);
 	});
 	it("rotates repeatedly while concurrent writers and readers preserve every event", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
