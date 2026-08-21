@@ -83,6 +83,11 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
+	// Both bunfig files restate the ignore list that keeps dedicated-only tests
+	// out of default discovery; the planner-contract suite pins that lockstep,
+	// so an edit to either file runs it.
+	"bunfig.toml": ["scripts/ci-dev-affected.test.ts"],
+	"packages/coding-agent/bunfig.toml": ["scripts/ci-dev-affected.test.ts"],
 };
 const ACP_LIFECYCLE_SMOKE_TEST = "packages/coding-agent/test/acp/acp-lifecycle-smoke.test.ts";
 const ACP_LIFECYCLE_OWNER_PATHS = [
@@ -315,10 +320,6 @@ async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 	return appendBuildTasks(legacy, normalizedPaths, packages, await loadBuildInventory());
 }
 
-// Repo-relative list of TypeScript test files, used by PR-mode targeting to map
-// a changed source file to its directly-named test. node_modules is excluded so
-// the index is identical whether or not dependencies are installed (the planner
-// job skips install; shards install before running) — keeping plans stable.
 // Tests that `bunfig.toml` prunes from default Bun discovery because they are too
 // expensive or environment-heavy to run per ordinary suite, and that must therefore
 // run only through an explicit dedicated task. The bunfig prune removes the file
@@ -355,7 +356,10 @@ export function dedicatedTestCommand(testFile: string): readonly string[] {
 		testFile,
 	];
 }
-
+// Repo-relative list of TypeScript test files, used by PR-mode targeting to map
+// a changed source file to its directly-named test. node_modules is excluded so
+// the index is identical whether or not dependencies are installed (the planner
+// job skips install; shards install before running) — keeping plans stable.
 async function gatherTestFiles(): Promise<string[]> {
 	const patterns = ["packages/**/*.test.ts", "packages/**/*.test.tsx", "scripts/**/*.test.ts"];
 	const found = new Set<string>();
@@ -901,6 +905,12 @@ export function planTasks(
 	// out of the suite it is meant to run inside -- which is what the
 	// eight-shard push-routing regression pins.
 	for (const changedPath of paths) {
+		// A dedicated-only test file is its own owner: it is pruned from every
+		// shard, so a change to the file itself must schedule its dedicated task
+		// here too, or editing the suite post-merge would never run it.
+		if (isDedicatedOnlyTest(changedPath)) {
+			addTestFileTask(tasks, changedPath);
+		}
 		for (const testFile of behavioralTestsFor(changedPath)) {
 			if (!isDedicatedOnlyTest(testFile)) continue;
 			addTestFileTask(tasks, testFile);

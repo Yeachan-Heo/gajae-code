@@ -257,6 +257,16 @@ class AcpStdioClient {
 				if ((cause as NodeJS.ErrnoException).code === "ESRCH") return;
 			}
 		}
+		// Degrading to child-only termination while the fixture is still live is NOT
+		// the same as the already-exited case: a live fixture may still own a broker
+		// and session hosts that only a group signal can reach, so the downgrade is
+		// recorded and dispose() fails the run instead of silently under-cleaning.
+		// An already-exited fixture has nothing left to signal, so it stays silent.
+		if (live) {
+			this.cleanupFailures.push(
+				`subtree signal degraded to child-only at ${signal}: group identity of pid ${pid} could not be proven`,
+			);
+		}
 		this.#child.kill(signal);
 	}
 
@@ -531,8 +541,13 @@ class AcpStdioClient {
 			}
 		}
 		this.cleanupFailures.push(...failures);
-		if (failures.length > 0) {
-			throw new Error(`ACP lifecycle cleanup failed (broker-owned hosts may have leaked):\n${failures.join("\n")}`);
+		// cleanupFailures, not the local list, is authoritative: #signalTree can
+		// append a live-teardown degrade note during the finally block above, and
+		// that downgrade must fail the run exactly like a failed session close.
+		if (this.cleanupFailures.length > 0) {
+			throw new Error(
+				`ACP lifecycle cleanup failed (broker-owned hosts may have leaked):\n${this.cleanupFailures.join("\n")}`,
+			);
 		}
 	}
 

@@ -2010,4 +2010,27 @@ describe("dedicated-only tests — routing contract", () => {
 			expect(isDedicatedOnlyTest(dedicated)).toBe(true);
 		}
 	});
+	test("editing a dedicated-only test file itself schedules its dedicated task in push mode", () => {
+		// The file is pruned from every shard (the inventory test below proves
+		// that), so push-mode coverage can only come from the dedicated task.
+		// Without this route, a post-merge edit to the smoke suite itself would
+		// never run it in Dev CI.
+		const pushTasks = planTasks([ACP_LIFECYCLE], packages);
+		const pushDedicated = pushTasks.find(task => task.key === DEDICATED_TASK_KEY);
+		expect(pushDedicated).toBeDefined();
+		expect(pushDedicated?.command).toEqual(dedicatedTestCommand(ACP_LIFECYCLE));
+		const prTasks = planTargetedTasks([ACP_LIFECYCLE], packages, [ACP_LIFECYCLE]);
+		expect(prTasks.find(task => task.key === DEDICATED_TASK_KEY)?.command).toEqual(
+			dedicatedTestCommand(ACP_LIFECYCLE),
+		);
+	});
+
+	test("bunfig ignore-list edits schedule the planner contract suite that pins the lockstep", () => {
+		// Both bunfig files restate the ignore list that implements the prune;
+		// the planner-contract suite (this file) is what fails when they drift.
+		for (const changedPath of ["bunfig.toml", "packages/coding-agent/bunfig.toml"]) {
+			const tasks = planTargetedTasks([changedPath], packages, [ACP_LIFECYCLE]);
+			expect(tasks.find(task => task.key === "test:scripts/ci-dev-affected.test.ts")).toBeDefined();
+		}
+	});
 });
