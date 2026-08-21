@@ -1420,13 +1420,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// returns both rendered-tree input and the AGENTS.md directory-context index.
 		const STARTUP_SCAN_DEADLINE_MS = 5000;
 		const workspaceTreeMode = settings.get("workspaceTree.mode");
-		const emptyWorkspaceTree: WorkspaceTree = {
-			rootPath: path.resolve(cwd),
+		const emptyWorkspaceTreeForCwd = (rootCwd: string): WorkspaceTree => ({
+			rootPath: path.resolve(rootCwd),
 			rendered: "",
 			truncated: false,
 			totalLines: 0,
 			agentsMdFiles: [],
-		};
+		});
+		const emptyWorkspaceTree = emptyWorkspaceTreeForCwd(cwd);
 		let workspaceTreePromise: Promise<WorkspaceTree> = options.workspaceTree
 			? Promise.resolve(options.workspaceTree)
 			: workspaceTreeMode === "lazy"
@@ -3712,18 +3713,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// prompt prefix. Explicit caller-supplied skills/rules stay
 				// caller-owned; each discovery failure degrades to the previous
 				// snapshot (mirroring startup's deadline fallback) instead of
-				// failing the already-committed move.
+				// failing move.
 				const nextCwd = sessionManager.getCwd();
-				try {
-					const [files, tree] = await Promise.all([
-						loadContextFilesResultInternal({ cwd: nextCwd }),
-						buildWorkspaceTree(nextCwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }),
-					]);
-					rerootedContextFiles = files.contextFiles;
-					rerootedWorkspaceTree = tree;
-					workspaceTreePromise = Promise.resolve(tree);
-				} catch {
-					// keep previous snapshots; the volatile context still follows cwd
+				if (options.contextFiles === undefined) {
+					try {
+						const files = await loadContextFilesResultInternal({ cwd: nextCwd });
+						rerootedContextFiles = files.contextFiles;
+					} catch (error) {
+						// Never retain the old project's authority after a failed discovery.
+						rerootedContextFiles = [];
+						logger.warn("Context file discovery failed after cwd move", { error: safeErrorForLog(error) });
+					}
+				}
+				if (options.workspaceTree === undefined) {
+					try {
+						const tree = await buildWorkspaceTree(nextCwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS });
+						rerootedWorkspaceTree = tree;
+						workspaceTreePromise = Promise.resolve(tree);
+					} catch (error) {
+						// An old tree would mix the previous project's instructions into the
+						// new cwd, so fail closed to an empty tree rooted at the destination.
+						const emptyTree = emptyWorkspaceTreeForCwd(nextCwd);
+						rerootedWorkspaceTree = emptyTree;
+						workspaceTreePromise = Promise.resolve(emptyTree);
+						logger.warn("Workspace tree discovery failed after cwd move", { error: safeErrorForLog(error) });
+					}
 				}
 				if (options.skills === undefined && settings.get("skills.enabled")) {
 					try {
@@ -3733,8 +3747,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							disabledExtensions: settings.get("disabledExtensions"),
 						});
 						rerootedSkills = withEmbeddedDefaultGjcSkills(skillsResult.skills);
-					} catch {
-						// keep previous skills snapshot
+					} catch (error) {
+						// Keep bundled defaults but never retain project-local skills.
+						rerootedSkills = withEmbeddedDefaultGjcSkills([]);
+						logger.warn("Skill discovery failed after cwd move", { error: safeErrorForLog(error) });
 					}
 				}
 				if (options.rules === undefined) {
@@ -3755,8 +3771,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						});
 						rerootedRulebookRules = nextRulebookRules;
 						rerootedAlwaysApplyRules = nextAlwaysApplyRules;
-					} catch {
-						// keep previous rules snapshot
+					} catch (error) {
+						rerootedRulebookRules = [];
+						rerootedAlwaysApplyRules = [];
+						logger.warn("Rule discovery failed after cwd move", { error: safeErrorForLog(error) });
 					}
 				}
 				if (!options.parentTaskPrefix) {

@@ -230,7 +230,7 @@ describe("AgentSession workspace tree after /move", () => {
 		createSession();
 		const missing = path.join(tempDir.path(), "does-not-exist");
 		const file = path.join(tempDir.path(), "plain-file.txt");
-		fs.writeFileSync(file, "x");
+		await Bun.write(file, "x");
 		await expect(session.moveCwd(missing)).rejects.toThrow("Directory does not exist");
 		await expect(session.moveCwd(file)).rejects.toThrow("Not a directory");
 		expect(sessionManager.getCwd()).toBe(cwdA);

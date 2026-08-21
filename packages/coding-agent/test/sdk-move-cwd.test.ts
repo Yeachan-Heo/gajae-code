@@ -36,15 +36,15 @@ describe("createAgentSession cwd after /move", () => {
 		fs.mkdirSync(cwdA, { recursive: true });
 		fs.mkdirSync(cwdB, { recursive: true });
 		// Distinct context-file trees so the stable-prompt re-root is observable.
-		fs.writeFileSync(path.join(cwdA, "AGENTS.md"), "# Project A\nRun commands from project A.\n");
-		fs.writeFileSync(path.join(cwdB, "AGENTS.md"), "# Project B\nRun commands from project B.\n");
+		await Bun.write(path.join(cwdA, "AGENTS.md"), "# Project A\nRun commands from project A.\n");
+		await Bun.write(path.join(cwdB, "AGENTS.md"), "# Project B\nRun commands from project B.\n");
 		// SYSTEM.md is the cwd-scoped prompt-customization file (inside the
 		// project config dir); it must follow the move too (stable prompt
 		// rebuild reads the live cwd).
 		fs.mkdirSync(path.join(cwdA, ".gjc"), { recursive: true });
 		fs.mkdirSync(path.join(cwdB, ".gjc"), { recursive: true });
-		fs.writeFileSync(path.join(cwdA, ".gjc", "SYSTEM.md"), "You are working in PROJECT-ALPHA.\n");
-		fs.writeFileSync(path.join(cwdB, ".gjc", "SYSTEM.md"), "You are working in PROJECT-BETA.\n");
+		await Bun.write(path.join(cwdA, ".gjc", "SYSTEM.md"), "You are working in PROJECT-ALPHA.\n");
+		await Bun.write(path.join(cwdB, ".gjc", "SYSTEM.md"), "You are working in PROJECT-BETA.\n");
 
 		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
 		const { session } = await createAgentSession({
@@ -90,6 +90,43 @@ describe("createAgentSession cwd after /move", () => {
 			const result = await bashTool.execute("pwd-after-move", { command: "pwd" });
 
 			expect(textContent(result)).toContain(cwdB);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("preserves caller-owned context files and workspace trees after move", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-move-explicit-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "cwd-a");
+		const cwdB = path.join(tempDir, "cwd-b");
+		fs.mkdirSync(cwdA, { recursive: true });
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await createAgentSession({
+			cwd: cwdA,
+			agentDir: tempDir,
+			sessionManager,
+			settings: Settings.isolated({
+				"async.enabled": false,
+				"bash.autoBackground.enabled": false,
+				"bashInterceptor.enabled": false,
+			}),
+			model: getBundledModel("openai", "gpt-4o-mini"),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [{ path: path.join(cwdA, "explicit.md"), content: "CALLER-OWNED-CONTEXT" }],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["bash"],
+		});
+
+		try {
+			await session.moveCwd(cwdB);
+			const promptAfter = session.systemPrompt.join("\n");
+			expect(promptAfter).toContain("CALLER-OWNED-CONTEXT");
 		} finally {
 			await session.dispose();
 		}
