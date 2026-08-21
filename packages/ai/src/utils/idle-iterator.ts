@@ -15,6 +15,19 @@ export function getProviderStreamIdleTimeoutFallbackMs(provider: string): number
 	return undefined;
 }
 
+// Grok models behind OpenAI-compatible hosts keep the model id (or an
+// `x-ai/`-prefixed OpenRouter id) even when `provider` is openrouter, kilo,
+// litellm, zenmux, venice, and similar. The long-reasoning silence that
+// motivates the 300s floor is a property of the model, not the account
+// used to reach it, so the floor keys on the model when the provider alone
+// does not already grant it (#4797).
+const GROK_MODEL_ID_PATTERN = /(?:^|[/._-])grok(?:[/._-]|$)/i;
+
+export function isGrokModelId(modelId: string | undefined): boolean {
+	if (!modelId) return false;
+	return GROK_MODEL_ID_PATTERN.test(modelId);
+}
+
 export function getProviderFirstEventTimeoutFallbackMs(provider: string): number | undefined {
 	if (provider === "alibaba-token-plan") return ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS;
 	return provider === "kimi-code" ? KIMI_CODE_FIRST_EVENT_TIMEOUT_MS : undefined;
@@ -50,11 +63,15 @@ export function getStreamIdleTimeoutMs(fallbackMs: number = DEFAULT_STREAM_IDLE_
  *
  * Honors `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS` first (`PI_OPENAI_STREAM_IDLE_TIMEOUT_MS` is the legacy alias). Set `=0` to disable.
  * When `provider` is given, long-reasoning hosts (xAI Grok and Grok Build) use that floor instead of the 120s default.
+ * Grok models reached through other OpenAI-compatible hosts (`openrouter/x-ai/grok-*`, kilo, litellm, …) get the
+ * same floor keyed on the model id, because long-reasoning silence is a property of the model (#4797).
  */
-export function getOpenAIStreamIdleTimeoutMs(provider?: string): number | undefined {
+export function getOpenAIStreamIdleTimeoutMs(provider?: string, modelId?: string): number | undefined {
 	return normalizeIdleTimeoutMs(
-		$env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_STREAM_IDLE_TIMEOUT_MS,
-		getProviderStreamIdleTimeoutFallbackMs(provider ?? "") ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+		$env.GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_STREAM_IDLE_TIMEOUT_MS ?? $env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS,
+		getProviderStreamIdleTimeoutFallbackMs(provider ?? "") ??
+			(isGrokModelId(modelId) ? ANTHROPIC_STREAM_IDLE_TIMEOUT_MS : undefined) ??
+			DEFAULT_STREAM_IDLE_TIMEOUT_MS,
 	);
 }
 
