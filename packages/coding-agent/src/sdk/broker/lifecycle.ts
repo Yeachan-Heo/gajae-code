@@ -57,7 +57,6 @@ import {
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 	type SdkStartupRollbackResult,
-	sanitizeSdkStartupMessage,
 } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
@@ -97,7 +96,6 @@ const MAX_RECEIVED_AT_SKEW_MS = 5_000;
 const MAX_LIFECYCLE_METADATA_BYTES = 4096;
 const MAX_EFFECT_MARKER_LENGTH = 128;
 const MAX_PROCESS_INCARNATION_LENGTH = 256;
-const SESSION_HOST_SPAWN_LOG_TAIL_BYTES = 1_024;
 const READY_THEN_EXIT_MESSAGE = "became ready then exited before live admission";
 
 function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerResponse {
@@ -106,8 +104,8 @@ function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerRespon
 	if (child?.signalCode) parts.push(`signal=${child.signalCode}`);
 	// Host stderr is deliberately excluded: the detached host receives launch
 	// configuration and inherited credentials, and no pattern-based redaction can
-	// prove arbitrary child output free of that material (#4712 review). The
-	// sanitized excerpt stays in the access-restricted broker-local spawn log.
+	// prove arbitrary child output free of that material; its stderr is discarded
+	// by the OS and never captured (#4712 review).
 	return fail("ready_then_exited", parts.join(" "));
 }
 
@@ -848,6 +846,7 @@ type ReadinessResult =
 	| { kind: "ready"; authority: ReadyAuthority }
 	| { kind: "startup_failed"; failure: SdkStartupFailure }
 	| { kind: "ready_then_exited" }
+	| { kind: "ready_probe_failed"; probe: ReadyAuthorityProbe }
 	| { kind: "child_exited" }
 	| { kind: "timeout" };
 type BrokerIndex = Pick<Broker, "index">;
@@ -2126,34 +2125,52 @@ async function hasOwnedReadinessEvidence(
 }
 
 /**
- * Ready-then-exit probe for a dead child. A host that died hard leaves its
- * endpoint file on disk; a host that tore down gracefully removed it first.
- * Both are provably ready when the owned marker + ready marker match and
- * either the endpoint file still names the dead child or the broker's own
- * session index recorded a host registration for exactly this incarnation.
+ * Typed ready-then-exit probe for a dead child (#4712 review: the earlier
+ * boolean collapsed EACCES/EIO/malformed JSON into "absent", routing the
+ * teardown decision through the secondary authority and finally surfacing as
+ * a false `spawn_failed` claim that the child "exited before registering
+ * readiness" when the real failure was reading the endpoint).
+ *
+ * A host that died hard leaves its endpoint file on disk; a host that tore
+ * down gracefully removed it first. `matched` requires the owned marker +
+ * ready marker chain to still name exactly this child and the endpoint file
+ * to still name the same pid and session. `absent_indexed` means the endpoint
+ * file is gone (ENOENT only) and the broker's own session index recorded a
+ * host registration for exactly this incarnation — the sole permitted
+ * fallback authority. `malformed` and `io_error` are their own fail-closed
+ * outcomes: they feed no teardown decision and assert nothing about the
+ * child process.
  */
-async function hasPublishedReadyAuthority(
+type ReadyAuthorityProbe =
+	| { kind: "matched" }
+	| { kind: "absent_indexed" }
+	| { kind: "absent_unindexed" }
+	| { kind: "not_published" }
+	| { kind: "malformed" }
+	| { kind: "io_error"; code: string };
+
+async function probePublishedReadyAuthority(
 	root: string,
 	id: string,
 	expected: EffectMarker,
 	index?: BrokerIndex,
-): Promise<boolean> {
+): Promise<ReadyAuthorityProbe> {
 	const [effect, ready] = await Promise.all([
 		readEffectMarker(lifecycleMarkerPath(root, id)),
 		readEffectMarker(lifecycleReadyPath(root, id)),
 	]);
-	if (!effect || !ready || !sameEffectMarker(effect, expected) || !sameEffectMarker(ready, expected)) return false;
-	let endpoint: { sessionId?: unknown; pid?: unknown };
+	if (!effect || !ready || !sameEffectMarker(effect, expected) || !sameEffectMarker(ready, expected))
+		return { kind: "not_published" };
+	let endpointText: string;
 	try {
-		endpoint = JSON.parse(await fs.readFile(path.join(root, "sdk", `${id}.json`), "utf8")) as {
-			sessionId?: unknown;
-			pid?: unknown;
-		};
+		endpointText = await fs.readFile(path.join(root, "sdk", `${id}.json`), "utf8");
 	} catch (error) {
-		// Only a missing endpoint means "gracefully removed"; anything else (EACCES,
-		// EIO, malformed JSON) is its own condition and must not silently route the
+		const code = (error as NodeJS.ErrnoException).code;
+		// Only a missing endpoint means "gracefully removed"; anything else
+		// (EACCES, EIO, ...) is its own condition and must not silently route the
 		// teardown decision to the secondary authority.
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !index) return false;
+		if (code !== "ENOENT") return { kind: "io_error", code: code ?? "unknown" };
+		if (!index) return { kind: "absent_unindexed" };
 		const sessionIndex = index.index;
 		await sessionIndex.refresh();
 		return sessionIndex
@@ -2163,93 +2180,31 @@ async function hasPublishedReadyAuthority(
 					session.sessionId === id &&
 					session.pid === expected.pid &&
 					(session.hostIncarnation ?? session.processIncarnation) === expected.incarnation,
-			);
+			)
+			? { kind: "absent_indexed" }
+			: { kind: "absent_unindexed" };
 	}
-	return endpoint.pid === expected.pid && endpoint.sessionId === id;
-}
-
-export function sanitizeSessionHostSpawnLogForTest(value: string): string {
-	return sanitizeSdkStartupMessage(value);
-}
-
-/**
- * Bounded in-memory collector for detached-host stderr (#4712 review).
- *
- * A spawned host inherits launch configuration and credential-bearing
- * environment material, so its output is never trusted into caller-visible
- * strings, and a regular-file descriptor would let a noisy child consume
- * unbounded disk for its whole lifetime. The child instead gets a pipe that
- * the broker drains into this fixed-size ring: oldest bytes are dropped as
- * new ones arrive, nothing is written to disk, and the retained window is
- * sanitized only for broker-local diagnostics.
- */
-type SessionHostStderrRing = { bytes: Uint8Array; write: number; dropped: boolean };
-
-function sessionHostStderrRing(): SessionHostStderrRing {
-	return { bytes: new Uint8Array(SESSION_HOST_SPAWN_LOG_TAIL_BYTES), write: 0, dropped: false };
-}
-
-export function sessionHostStderrRingForTest(): SessionHostStderrRing {
-	return sessionHostStderrRing();
-}
-
-function drainSessionHostStderr(
-	stderr: ReadableStream<Uint8Array> | NodeJS.ReadableStream | undefined,
-	ring: SessionHostStderrRing,
-): void {
-	if (!stderr) return;
-	(async () => {
-		try {
-			const reader =
-				"getReader" in stderr
-					? { read: () => stderr.getReader().read(), close: () => stderr.getReader().releaseLock() }
-					: null;
-			if (reader) {
-				for (;;) {
-					const { done, value } = await reader.read();
-					if (done || !value) break;
-					appendRingChunk(ring, value);
-				}
-				return;
-			}
-			for await (const chunk of stderr as AsyncIterable<Uint8Array | string>) {
-				if (typeof chunk === "string") appendRingChunk(ring, new TextEncoder().encode(chunk));
-				else if (chunk.length > 0) appendRingChunk(ring, chunk);
-			}
-		} catch {
-			// The child exiting closes the pipe; a failed drain drops diagnostics only.
-		}
-	})();
-}
-
-function appendRingChunk(ring: SessionHostStderrRing, chunk: Uint8Array): void {
-	if (chunk.length >= ring.bytes.length) {
-		ring.bytes.set(chunk.subarray(chunk.length - ring.bytes.length));
-		ring.write = ring.bytes.length;
-		ring.dropped = true;
-		return;
+	let endpoint: { sessionId?: unknown; pid?: unknown };
+	try {
+		endpoint = JSON.parse(endpointText) as { sessionId?: unknown; pid?: unknown };
+	} catch {
+		return { kind: "malformed" };
 	}
-	const overflow = ring.write + chunk.length - ring.bytes.length;
-	if (overflow > 0) {
-		ring.bytes.copyWithin(0, overflow);
-		ring.write -= overflow;
-		ring.dropped = true;
-	}
-	ring.bytes.set(chunk, ring.write);
-	ring.write += chunk.length;
+	return endpoint.pid === expected.pid && endpoint.sessionId === id ? { kind: "matched" } : { kind: "not_published" };
 }
 
-export function drainSessionHostStderrForTest(stderr: ReadableStream<Uint8Array>, ring: SessionHostStderrRing): void {
-	drainSessionHostStderr(stderr, ring);
+/** Test seam for the typed ready-authority probe boundary (#4712 review). */
+export async function probePublishedReadyAuthorityForTest(
+	root: string,
+	id: string,
+	expected: EffectMarker,
+): Promise<ReadyAuthorityProbe> {
+	return probePublishedReadyAuthority(root, id, expected);
 }
 
-/** Sanitized broker-local tail of what the host wrote to stderr; never returned to callers. */
-function sessionHostStderrExcerpt(ring: SessionHostStderrRing): string {
-	return sanitizeSdkStartupMessage(new TextDecoder().decode(ring.bytes.subarray(0, ring.write)));
-}
-
-export function sessionHostStderrExcerptForTest(ring: SessionHostStderrRing): string {
-	return sessionHostStderrExcerpt(ring);
+/** Human-readable, honest description of a fail-closed probe outcome. */
+function describeReadyProbeFailure(probe: ReadyAuthorityProbe): string {
+	return probe.kind === "io_error" ? `endpoint read failed (${probe.code})` : "endpoint file is malformed";
 }
 
 type LifecycleFileCapture = {
@@ -2354,6 +2309,15 @@ async function removeOwnedLifecycleArtifacts(
 		}
 		if (parsed.pid !== expected.pid || observeProcess(expected.pid, expected.incarnation) !== "exited") return false;
 		if (createHash("sha256").update(endpoint.bytes).digest("hex") !== endpoint.digest) return false;
+		// Bind the deletion to the expected process incarnation and endpoint
+		// identity, rechecking immediately before unlink: a successor launch for
+		// this session rewrites the lifecycle marker through the broker before its
+		// child can publish anything, so a marker that no longer matches `expected`
+		// means this endpoint file is no longer provably the dead child's — it may
+		// belong to a PID-reusing successor and must not be unlinked (#4712
+		// review: PID-reuse race must not delete a successor endpoint).
+		const preUnlinkMarker = await readEffectMarker(lifecycleMarkerPath(root, id));
+		if (!preUnlinkMarker || !sameEffectMarker(preUnlinkMarker, expected)) return false;
 		const endpointRemoval = exactUnlinkLifecycleFile(
 			endpointSource,
 			endpoint.identity,
@@ -2415,6 +2379,19 @@ async function removeOwnedLifecycleArtifacts(
 	if (ready && createHash("sha256").update(ready.bytes).digest("hex") !== ready.digest) return false;
 	// Readiness mutation is deferred to the same ledger-backed cleanup transaction.
 	return true;
+}
+
+/**
+ * Test seam for the PID-reuse deletion boundary: a successor launch rewriting
+ * the lifecycle marker must stop the unlink of an endpoint that only matches
+ * by a reused pid (#4712 review).
+ */
+export async function removeOwnedLifecycleArtifactsForTest(
+	root: string,
+	id: string,
+	expected: EffectMarker,
+): Promise<boolean> {
+	return removeOwnedLifecycleArtifacts(root, id, expected);
 }
 
 async function recordTerminalUncertain(broker: Broker, id: string, root: string, pid: number): Promise<void> {
@@ -2532,7 +2509,7 @@ async function terminateSpawnedChild(
 				await recordTerminalUncertain(broker, id, root, pid);
 				return false;
 			}
-			const publishedReady = await hasPublishedReadyAuthority(root, id, expected);
+			const publishedReady = (await probePublishedReadyAuthority(root, id, expected)).kind === "matched";
 			const artifactsRemoved = await removeOwnedLifecycleArtifacts(root, id, expected);
 			await broker.index.refresh();
 			const registered = broker.index
@@ -2967,7 +2944,13 @@ async function waitForReady(
 		) {
 			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
 			if (finalStartupFailure) return { kind: "startup_failed", failure: finalStartupFailure };
-			return (await hasPublishedReadyAuthority(root, id, expected, broker)) && readyThenExitToleranceEnabled()
+			// A malformed or unreadable endpoint is its own fail-closed outcome: it
+			// never feeds the teardown decision and never claims the child "exited
+			// before registering readiness" (#4712 review).
+			const probe = await probePublishedReadyAuthority(root, id, expected, broker);
+			if (probe.kind === "malformed" || probe.kind === "io_error") return { kind: "ready_probe_failed", probe };
+			const publishedReady = probe.kind === "matched" || probe.kind === "absent_indexed";
+			return publishedReady && readyThenExitToleranceEnabled()
 				? { kind: "ready_then_exited" }
 				: { kind: "child_exited" };
 		}
@@ -3902,14 +3885,18 @@ async function executeLifecycleResponse(
 		};
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
-		const stderrRing = sessionHostStderrRing();
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
-					stdio: ["ignore", "ignore", "pipe"],
+					// stdio stays "ignore": `unref()` does not detach an active
+					// stdio handle, so a parent-owned stderr pipe would keep the
+					// broker process alive for the host's whole lifetime (retention
+					// through restart/shutdown). Host stderr is therefore discarded
+					// by the OS rather than captured (#4712 review).
+					stdio: "ignore",
 					env: {
 						...("kind" in cmd ? cmd.env : process.env),
 						GJC_AGENT_DIR: broker.settings.agentDir,
@@ -3949,7 +3936,6 @@ async function executeLifecycleResponse(
 			}
 			const spawned = authorizedSpawn.value;
 			child = spawned;
-			drainSessionHostStderr(spawned.stderr, stderrRing);
 			const pid = spawned.pid;
 			if (!pid) throw new Error("spawned session has no pid");
 			const incarnation = processIncarnationForBroker(broker, pid);
@@ -4008,14 +3994,19 @@ async function executeLifecycleResponse(
 			);
 
 			if (!terminated)
-				return fail(
-					"terminal_uncertain",
-					`Session ${launch.id} did not become ready and its spawned process could not be verified dead.`,
-				);
+				return readiness.kind === "ready_probe_failed"
+					? fail(
+							"endpoint_unreadable",
+							`Session ${launch.id} exited, and its readiness could not be determined: ${describeReadyProbeFailure(readiness.probe)}; cleanup could not be proven.`,
+						)
+					: fail(
+							"terminal_uncertain",
+							`Session ${launch.id} did not become ready and its spawned process could not be verified dead.`,
+						);
 			// Host stderr never reaches caller-visible error strings: the detached
 			// host handles launch configuration and inherited credentials, so its
-			// output cannot be proven free of secret material. The sanitized tail
-			// stays in the broker-local bounded ring only.
+			// output cannot be proven free of secret material — it is discarded at
+			// the OS level (stdio "ignore"), never captured (#4712 review).
 			return readiness.kind === "startup_failed"
 				? fail(
 						readiness.failure.code ?? "spawn_failed",
@@ -4025,12 +4016,17 @@ async function executeLifecycleResponse(
 					)
 				: readiness.kind === "ready_then_exited"
 					? readyThenExitedResponse(launch.id, child)
-					: readiness.kind === "child_exited"
-						? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
-						: fail(
-								"readiness_timeout",
-								`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
-							);
+					: readiness.kind === "ready_probe_failed"
+						? fail(
+								"endpoint_unreadable",
+								`Session ${launch.id} exited, and its readiness could not be determined: ${describeReadyProbeFailure(readiness.probe)}.`,
+							)
+						: readiness.kind === "child_exited"
+							? fail("spawn_failed", `Session ${launch.id} exited before registering readiness.`)
+							: fail(
+									"readiness_timeout",
+									`Session ${launch.id} did not register an endpoint before the readiness timeout.`,
+								);
 		}
 		await reconcileReadyScope(broker, launch.id, launch.cwd);
 		const verified = await currentReadyAuthority(broker, launch.id, launch.root, spawnedAuthority);
@@ -5157,42 +5153,47 @@ export async function executeLifecycle(
 		(operation === "session.create" || operation === "session.fork" || operation === "session.resume")
 			? entry.effectIntent?.childOwnershipEstablished === false
 				? response
-				: response.error.code === "ready_then_exited" && (cleanupProof || provenDeadCleanup)
-					? {
-							...response,
-							...(durableEffects ? { durableEffects } : {}),
-							...(startupFailure ? { startupFailure } : {}),
-						}
-					: startupFailure && cleanupProof
+				: response.error.code === "endpoint_unreadable"
+					? response
+					: // An unreadable/corrupt endpoint is already the fail-closed honest
+						// terminal classification (it names the artifact, not the
+						// child); the reconciliation wrapper must not erase it.
+						response.error.code === "ready_then_exited" && (cleanupProof || provenDeadCleanup)
 						? {
-								ok: false,
-								error: startupFailure.code
-									? {
-											code: startupFailure.code,
-											message: startupFailure.message,
-											details: startupFailure.details!,
-											endpoint: "unavailable" as const,
-										}
-									: {
-											code: "spawn_failed",
-											message: startupFailure.message,
-											endpoint: "unavailable" as const,
-										},
+								...response,
 								...(durableEffects ? { durableEffects } : {}),
-								startupFailure,
+								...(startupFailure ? { startupFailure } : {}),
 							}
-						: provenDeadCleanup && response.error.code !== "terminal_uncertain"
-							? response
-							: {
+						: startupFailure && cleanupProof
+							? {
 									ok: false,
-									error: {
-										code: "terminal_uncertain",
-										message:
-											"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
-									},
+									error: startupFailure.code
+										? {
+												code: startupFailure.code,
+												message: startupFailure.message,
+												details: startupFailure.details!,
+												endpoint: "unavailable" as const,
+											}
+										: {
+												code: "spawn_failed",
+												message: startupFailure.message,
+												endpoint: "unavailable" as const,
+											},
 									...(durableEffects ? { durableEffects } : {}),
-									...(startupFailure ? { startupFailure } : {}),
+									startupFailure,
 								}
+							: provenDeadCleanup && response.error.code !== "terminal_uncertain"
+								? response
+								: {
+										ok: false,
+										error: {
+											code: "terminal_uncertain",
+											message:
+												"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+										},
+										...(durableEffects ? { durableEffects } : {}),
+										...(startupFailure ? { startupFailure } : {}),
+									}
 			: response;
 	return {
 		response: terminalResponse,

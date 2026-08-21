@@ -1275,6 +1275,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/utils/src/dirs.ts",
 			"packages/utils/src/env.ts",
 			"packages/utils/test/env-provenance.windows.test.ts",
+			// #4712: the ready-then-exit tolerance is win32-only, so the lifecycle
+			// classification and its regression test must execute on Windows.
+			"packages/coding-agent/src/sdk/broker/lifecycle.ts",
+			"packages/coding-agent/src/commands/sdk.ts",
+			"packages/coding-agent/test/sdk-lifecycle-ready-then-exit.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);

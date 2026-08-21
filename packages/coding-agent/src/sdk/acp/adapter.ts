@@ -74,6 +74,7 @@ const ACP_MCP_PRESERVED_LAUNCH_CODES = new Set([
 	"startup_admission_refused",
 	"startup_admission_timeout",
 	"ready_then_exited",
+	"endpoint_unreadable",
 ]);
 
 /**
