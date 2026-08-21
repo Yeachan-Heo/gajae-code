@@ -781,7 +781,7 @@ export class RuntimeOwner {
 		state.updatedAt = new Date(this.#opts.clock ? this.#opts.clock() : Date.now()).toISOString();
 		await writeSessionState(this.#opts.root, state);
 		await this.#emit("info", "owner_retired", {});
-		queueMicrotask(() => void this.stop().catch(() => {}));
+		setTimeout(() => void this.stop().catch(() => {}), 0);
 		return this.#response(state, { retired: true });
 	}
 

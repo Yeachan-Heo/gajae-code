@@ -556,7 +556,11 @@ describe("Codex wake publisher", () => {
 	it("bounds a stalled upgrade with the establishment deadline", async () => {
 		const root = await tempRoot();
 		const socketPath = path.join(root, "codex-stall.sock");
-		const server = net.createServer(() => {});
+		let acceptedSocket: net.Socket | undefined;
+		const server = net.createServer(socket => {
+			acceptedSocket = socket;
+			socket.on("error", () => {});
+		});
 		const listening = Promise.withResolvers<void>();
 		server.once("error", listening.reject);
 		server.listen(socketPath, () => listening.resolve());
@@ -572,6 +576,7 @@ describe("Codex wake publisher", () => {
 			).rejects.toThrow("codex_app_server_unavailable");
 			expect(Date.now() - started).toBeLessThan(5_000);
 		} finally {
+			acceptedSocket?.destroy();
 			await closeServer(server);
 		}
 	});
