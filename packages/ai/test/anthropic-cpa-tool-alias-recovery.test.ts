@@ -153,6 +153,45 @@ function createPartialThenCpaAliasError(alias: string): MockAnthropicRequest {
 	};
 }
 
+// A stream that yields one `tool_use` content block (the rejected cloaked
+// alias itself, so `firstTokenTime` is set by the very block CPA rejects)
+// and then dies with the CPA signature: the repair must NOT fire, since the
+// `toolcall_start` event has already been published live before the failure
+// can be classified.
+function createPartialToolUseThenCpaAliasError(alias: string): MockAnthropicRequest {
+	const response = new Response(null, { status: 200, headers: { "request-id": "req_cpa_tool_use_partial" } });
+	return {
+		async withResponse() {
+			return {
+				data: {
+					async *[Symbol.asyncIterator]() {
+						yield {
+							type: "message_start",
+							message: {
+								id: "msg_cpa_tool_use_partial",
+								usage: {
+									input_tokens: 1,
+									output_tokens: 0,
+									cache_read_input_tokens: 0,
+									cache_creation_input_tokens: 0,
+								},
+							},
+						};
+						yield {
+							type: "content_block_start",
+							index: 0,
+							content_block: { type: "tool_use", id: "toolu_cpa_partial", name: alias, input: {} },
+						};
+						throw new Error(cpaAliasErrorMessage(alias));
+					},
+				},
+				response,
+				request_id: response.headers.get("request-id"),
+			};
+		},
+	};
+}
+
 const findTool: Tool = {
 	name: "find",
 	description: "Find files",
@@ -338,7 +377,7 @@ describe("CPA tool alias restore failure recovery (issue #4338)", () => {
 		expect(repaired).not.toContain('The callable tool is "');
 	});
 
-	it("does not repair after partial content has streamed", async () => {
+	it("surfaces an actionable terminal error instead of repairing after partial content has streamed", async () => {
 		const bodies: unknown[] = [];
 		const create = ((body: unknown) => {
 			bodies.push(JSON.parse(JSON.stringify(body)));
@@ -349,10 +388,48 @@ describe("CPA tool alias restore failure recovery (issue #4338)", () => {
 		const context = makeContext([userMessage("find me the config")], [findTool, searchTool, bashTool]);
 		const result = await streamAnthropic(model, context, { client }).result();
 
-		// A token was already emitted: no corrective retry, no blind resend.
+		// A token was already emitted (a `text` block, not `tool_use`): no
+		// corrective retry, no blind resend. GJC's own actionable message
+		// surfaces instead of the raw proxy JSON, and the wording is
+		// content-type-agnostic ("response content", not "tool call") since
+		// this fixture never streams a tool_use block at all.
 		expect(bodies).toHaveLength(1);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("cannot restore Claude OAuth MCP tool alias");
+		expect(result.errorMessage).toContain(CPA_ALIAS_FIND);
+		expect(result.errorMessage).toContain(
+			"Repair could not be safely attempted because response content had already begun streaming to the client",
+		);
+		expect(result.errorMessage).toContain("The turn was not re-sent");
+		expect(result.errorMessage).not.toContain("cannot restore Claude OAuth MCP tool alias");
+		expect(result.errorStatus).toBeUndefined();
+		expect(result.transportFailure).toBeUndefined();
+	});
+
+	it("surfaces an actionable terminal error when a tool_use block has already streamed", async () => {
+		const bodies: unknown[] = [];
+		const create = ((body: unknown) => {
+			bodies.push(JSON.parse(JSON.stringify(body)));
+			return createPartialToolUseThenCpaAliasError(CPA_ALIAS_FIND) as never;
+		}) as unknown as Anthropic["messages"]["create"];
+		const client = { messages: { create } } as Anthropic;
+
+		const context = makeContext([userMessage("find me the config")], [findTool, searchTool, bashTool]);
+		const result = await streamAnthropic(model, context, { client }).result();
+
+		// The rejected tool_use block itself already published a live
+		// `toolcall_start` event before the CPA failure could be classified:
+		// no corrective retry, no blind resend. GJC's own actionable message
+		// surfaces instead of the raw proxy JSON.
+		expect(bodies).toHaveLength(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(CPA_ALIAS_FIND);
+		expect(result.errorMessage).toContain(
+			"Repair could not be safely attempted because response content had already begun streaming to the client",
+		);
+		expect(result.errorMessage).toContain("The turn was not re-sent");
+		expect(result.errorMessage).not.toContain("cannot restore Claude OAuth MCP tool alias");
+		expect(result.errorStatus).toBeUndefined();
+		expect(result.transportFailure).toBeUndefined();
 	});
 
 	it("leaves unrelated 500s on the generic retry path untouched", async () => {

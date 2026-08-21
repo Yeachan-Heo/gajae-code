@@ -1796,15 +1796,30 @@ function buildCpaToolAliasSteering(failure: CpaToolAliasRestoreFailure, callable
 }
 
 /**
- * Actionable terminal error for a CPA alias-restore failure that survived the
- * single corrective attempt. Deliberately statusless: no HTTP status, no
- * transport facts, and no recognizable status phrase, so neither the provider
- * generic 5xx retry nor the managed fallback controller re-sends the unchanged
- * request. Only the rejected alias and the deterministic callable name (when
- * provable) are quoted — never the request body or headers.
+ * Actionable terminal error for a CPA alias-restore failure. Deliberately
+ * statusless: no HTTP status, no transport facts, and no recognizable status
+ * phrase, so neither the provider generic 5xx retry nor the managed fallback
+ * controller re-sends the unchanged request. Only the rejected alias and the
+ * deterministic callable name (when provable) are quoted — never the request
+ * body or headers.
+ *
+ * `reason` distinguishes the two ways a CPA failure ends up here:
+ * - `"recurrence"`: the single corrective attempt was already applied to this
+ *   turn and the proxy rejected it again.
+ * - `"ineligible"`: no corrective attempt was made at all, because response
+ *   content (text, thinking, redacted-thinking, or tool_use — not only
+ *   tool_use) had already started streaming to the client this attempt, so a
+ *   resend could duplicate or corrupt content the client already observed.
  */
-function createCpaToolAliasTerminalError(failure: CpaToolAliasRestoreFailure, callableToolName?: string): Error {
-	const base = `Claude OAuth proxy rejected tool call "${failure.alias}": the proxy cannot restore the Claude OAuth MCP tool alias (no unique request-local match), and the corrective retry was rejected again.`;
+function createCpaToolAliasTerminalError(
+	failure: CpaToolAliasRestoreFailure,
+	callableToolName: string | undefined,
+	reason: "recurrence" | "ineligible",
+): Error {
+	const base =
+		reason === "recurrence"
+			? `Claude OAuth proxy rejected tool call "${failure.alias}": the proxy cannot restore the Claude OAuth MCP tool alias (no unique request-local match), and the corrective retry was rejected again.`
+			: `Claude OAuth proxy rejected tool call "${failure.alias}": the proxy cannot restore the Claude OAuth MCP tool alias (no unique request-local match). Repair could not be safely attempted because response content had already begun streaming to the client.`;
 	const guidance =
 		callableToolName !== undefined
 			? ` The callable tool name is "${callableToolName}"; call it by exactly that name.`
@@ -2812,67 +2827,94 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					// recurrence. The narrow CPA phrase is the route gate, so native
 					// Anthropic and non-CPA proxies are untouched.
 					const cpaAliasFailure = parseCpaToolAliasRestoreFailure(streamFailure);
-					if (cpaAliasFailure && firstTokenTime === undefined) {
-						if (options?.fallbackManaged) {
-							// The managed fallback controller owns retries: never retry
-							// inside the attempt it handed us. Record the corrective
-							// steering against this exact turn and surface the raw error;
-							// the controller's next attempt rebuilds the request with the
-							// steering. Without shared session state there is nowhere to
-							// record, so fall through to the controller unchanged.
-							if (!providerSessionState) throw streamFailure;
-							const turnFingerprint = cpaTurnFingerprint(context.messages);
-							if (providerSessionState.cpaToolAliasSteering?.turnFingerprint === turnFingerprint) {
-								// The steering was already applied to this attempt and the proxy
-								// rejected again: the single corrective attempt is spent. Surface
-								// an actionable terminal error instead of another unchanged
-								// resend.
-								throw createCpaToolAliasTerminalError(
-									cpaAliasFailure,
-									resolveCpaCallableToolName(params, cpaAliasFailure),
-								);
+					if (cpaAliasFailure) {
+						if (firstTokenTime === undefined) {
+							if (options?.fallbackManaged) {
+								// The managed fallback controller owns retries: never retry
+								// inside the attempt it handed us. Record the corrective
+								// steering against this exact turn and surface the raw error;
+								// the controller's next attempt rebuilds the request with the
+								// steering. Without shared session state there is nowhere to
+								// record, so fall through to the controller unchanged.
+								if (!providerSessionState) throw streamFailure;
+								const turnFingerprint = cpaTurnFingerprint(context.messages);
+								if (providerSessionState.cpaToolAliasSteering?.turnFingerprint === turnFingerprint) {
+									// The steering was already applied to this attempt and the proxy
+									// rejected again: the single corrective attempt is spent. Surface
+									// an actionable terminal error instead of another unchanged
+									// resend.
+									throw createCpaToolAliasTerminalError(
+										cpaAliasFailure,
+										resolveCpaCallableToolName(params, cpaAliasFailure),
+										"recurrence",
+									);
+								}
+								providerSessionState.cpaToolAliasSteering = {
+									message: buildCpaToolAliasSteering(
+										cpaAliasFailure,
+										resolveCpaCallableToolName(params, cpaAliasFailure),
+									),
+									turnFingerprint,
+								};
+								logger.debug("anthropic: recording CPA tool alias steering for the next managed attempt", {
+									model: model.id,
+									alias: cpaAliasFailure.alias,
+									baseName: cpaAliasFailure.baseName,
+									error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+								});
+								throw streamFailure;
 							}
-							providerSessionState.cpaToolAliasSteering = {
-								message: buildCpaToolAliasSteering(
-									cpaAliasFailure,
-									resolveCpaCallableToolName(params, cpaAliasFailure),
-								),
-								turnFingerprint,
-							};
-							logger.debug("anthropic: recording CPA tool alias steering for the next managed attempt", {
-								model: model.id,
-								alias: cpaAliasFailure.alias,
-								baseName: cpaAliasFailure.baseName,
-								error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
-							});
-							throw streamFailure;
-						}
-						if (!cpaAliasRepairApplied) {
-							cpaAliasRepairApplied = true;
-							logger.debug("anthropic: repairing CPA tool alias restore failure with corrective steering", {
-								model: model.id,
-								alias: cpaAliasFailure.alias,
-								baseName: cpaAliasFailure.baseName,
-								error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
-							});
-							appendCpaSteeringToMessages(
-								params,
-								buildCpaToolAliasSteering(cpaAliasFailure, resolveCpaCallableToolName(params, cpaAliasFailure)),
+							if (!cpaAliasRepairApplied) {
+								cpaAliasRepairApplied = true;
+								logger.debug("anthropic: repairing CPA tool alias restore failure with corrective steering", {
+									model: model.id,
+									alias: cpaAliasFailure.alias,
+									baseName: cpaAliasFailure.baseName,
+									error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+								});
+								appendCpaSteeringToMessages(
+									params,
+									buildCpaToolAliasSteering(
+										cpaAliasFailure,
+										resolveCpaCallableToolName(params, cpaAliasFailure),
+									),
+								);
+								// Exactly one corrective attempt per request: the provider retry
+								// budget is deliberately NOT reset, so a persistent failure runs
+								// out instead of renewing the budget it is supposed to consume
+								// (issue #4011), and the recurrence branch below terminalizes
+								// before the generic 5xx retry can re-send the unchanged request.
+								// This corrective replay uploads the steered body: count it so the
+								// first-event timeout ceiling bounds TOTAL uploads (issue #4464).
+								providerUploadCount++;
+								resetOutputForRetry();
+								continue;
+							}
+							throw createCpaToolAliasTerminalError(
+								cpaAliasFailure,
+								resolveCpaCallableToolName(params, cpaAliasFailure),
+								"recurrence",
 							);
-							// Exactly one corrective attempt per request: the provider retry
-							// budget is deliberately NOT reset, so a persistent failure runs
-							// out instead of renewing the budget it is supposed to consume
-							// (issue #4011), and the recurrence branch below terminalizes
-							// before the generic 5xx retry can re-send the unchanged request.
-							// This corrective replay uploads the steered body: count it so the
-							// first-event timeout ceiling bounds TOTAL uploads (issue #4464).
-							providerUploadCount++;
-							resetOutputForRetry();
-							continue;
 						}
+						// Repair is not safely eligible: response content (text, thinking,
+						// redacted-thinking, or tool_use — not only tool_use) has already
+						// started streaming to a live consumer this attempt. `resetOutputForRetry`
+						// clears the mutable output accumulator but cannot retract an event
+						// already delivered downstream, so resending here could leak a
+						// duplicate/orphaned block lifecycle. Never retry; surface GJC's own
+						// actionable terminal error instead of the raw proxy JSON.
+						logger.debug(
+							"anthropic: CPA tool alias restore failure ineligible for repair, surfacing actionable terminal error",
+							{
+								model: model.id,
+								alias: cpaAliasFailure.alias,
+								baseName: cpaAliasFailure.baseName,
+							},
+						);
 						throw createCpaToolAliasTerminalError(
 							cpaAliasFailure,
 							resolveCpaCallableToolName(params, cpaAliasFailure),
+							"ineligible",
 						);
 					}
 					const isTransientEnvelopeFailure =
