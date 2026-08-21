@@ -691,7 +691,8 @@ describe("CPA ineligible repair after streamed content (PR #4790 fix-forward)", 
 		// the terminal error names the callable tool instead of falling back
 		// to discovery guidance.
 		expect(bodies).toHaveLength(1);
-		expect(bodies[0]?.tools).toEqual(
+		const firstBody = bodies[0] as { tools?: Array<{ name: string }> } | undefined;
+		expect(firstBody?.tools).toEqual(
 			[{ name: "proxy_find" }, { name: "proxy_search" }, { name: "proxy_bash" }].map(t =>
 				expect.objectContaining(t),
 			) as never,
