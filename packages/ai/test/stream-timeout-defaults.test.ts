@@ -122,6 +122,12 @@ describe("getOpenAIStreamIdleTimeoutMs()", () => {
 		Bun.env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS = "42";
 		expect(getOpenAIStreamIdleTimeoutMs()).toBe(42);
 	});
+
+	it("prefers the OpenAI-specific alias over the generic stream alias", () => {
+		Bun.env.PI_OPENAI_STREAM_IDLE_TIMEOUT_MS = "42";
+		Bun.env.PI_STREAM_IDLE_TIMEOUT_MS = "99";
+		expect(getOpenAIStreamIdleTimeoutMs()).toBe(42);
+	});
 });
 
 describe("getStreamFirstEventTimeoutMs(idleTimeoutMs, fallbackMs)", () => {
