@@ -912,8 +912,9 @@ export function planTasks(
 			addTestFileTask(tasks, changedPath);
 		}
 		for (const testFile of behavioralTestsFor(changedPath)) {
-			if (!isDedicatedOnlyTest(testFile)) continue;
-			addTestFileTask(tasks, testFile);
+			if (isDedicatedOnlyTest(testFile) || changedPath === "bunfig.toml" || changedPath === "packages/coding-agent/bunfig.toml") {
+				addTestFileTask(tasks, testFile);
+			}
 		}
 	}
 

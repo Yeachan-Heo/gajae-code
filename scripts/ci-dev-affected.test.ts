@@ -2028,6 +2028,8 @@ describe("dedicated-only tests — routing contract", () => {
 	test("bunfig ignore-list edits schedule the planner contract suite that pins the lockstep", () => {
 		// Both bunfig files restate the ignore list that implements the prune;
 		// the planner-contract suite (this file) is what fails when they drift.
+		const pushTasks = planTasks(["bunfig.toml"], packages);
+		expect(pushTasks.find(task => task.key === "test:scripts/ci-dev-affected.test.ts")).toBeDefined();
 		for (const changedPath of ["bunfig.toml", "packages/coding-agent/bunfig.toml"]) {
 			const tasks = planTargetedTasks([changedPath], packages, [ACP_LIFECYCLE]);
 			expect(tasks.find(task => task.key === "test:scripts/ci-dev-affected.test.ts")).toBeDefined();
