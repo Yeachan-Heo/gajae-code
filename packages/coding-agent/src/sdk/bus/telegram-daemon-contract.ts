@@ -274,7 +274,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 169 delivers every ring-positioned session event live through the
  * bounded, capability-gated directed subscriber leg used by replay.
  */
-export const DAEMON_GENERATION = 171;
+export const DAEMON_GENERATION = 172;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
