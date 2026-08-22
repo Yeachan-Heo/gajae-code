@@ -277,6 +277,54 @@ describe("plugin uninstall --dry-run", () => {
 		CLI_TEST_TIMEOUT_MS,
 	);
 
+	// A corrupt user-scope registry must not change which uninstall path a target
+	// takes. The real path's classification read throws a load error for a
+	// corrupt scope and skips it, so the preview classifies the same way instead
+	// of refusing the marketplace/npm target the real uninstall removes.
+	it(
+		"keeps a corrupt user registry from rerouting a marketplace dry run",
+		async () => {
+			const sandbox = await makeSandbox();
+			expect((await sandbox.run(["marketplace", "add", marketplaceFixture])).exitCode).toBe(0);
+			expect((await sandbox.run(["install", "hello-plugin@test-marketplace", "--scope", "user"])).exitCode).toBe(0);
+			const registryPath = path.join(sandbox.home, ".gjc", "agent", "gjc-plugins", "registry.json");
+			await fs.mkdir(path.dirname(registryPath), { recursive: true });
+			await fs.writeFile(registryPath, "{ corrupt");
+			const before = await sandbox.snapshot();
+
+			const dryRun = await sandbox.run([
+				"uninstall",
+				"hello-plugin@test-marketplace",
+				"--scope",
+				"user",
+				"--dry-run",
+			]);
+
+			expect(dryRun.exitCode).toBe(0);
+			expect(dryRun.stdout).toContain("[dry-run] Would uninstall hello-plugin@test-marketplace (user)");
+			expectUnchanged(before, await sandbox.snapshot());
+		},
+		CLI_TEST_TIMEOUT_MS,
+	);
+
+	it(
+		"keeps a corrupt user registry from rerouting an npm dry run",
+		async () => {
+			const sandbox = await makeSandbox();
+			const registryPath = path.join(sandbox.home, ".gjc", "agent", "gjc-plugins", "registry.json");
+			await fs.mkdir(path.dirname(registryPath), { recursive: true });
+			await fs.writeFile(registryPath, "{ corrupt");
+			const before = await sandbox.snapshot();
+
+			const dryRun = await sandbox.run(["uninstall", "some-npm-name", "--dry-run", "--json"]);
+
+			expect(dryRun.exitCode).toBe(0);
+			expect(JSON.parse(dryRun.stdout)).toEqual({ dryRun: true, wouldUninstall: "some-npm-name" });
+			expectUnchanged(before, await sandbox.snapshot());
+		},
+		CLI_TEST_TIMEOUT_MS,
+	);
+
 	it(
 		"previews a legacy project bundle by name without migrating or locking the registry",
 		async () => {
