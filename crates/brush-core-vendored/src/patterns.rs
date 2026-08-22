@@ -246,6 +246,26 @@ impl Pattern {
 			vec![working_dir.to_path_buf()]
 		};
 
+		// bash semantics for components after the last glob component: they are
+		// appended literally below (no directory read), so the resulting paths are
+		// not guaranteed to exist. bash only returns matches whose full path
+		// exists (lstat), and a pattern with a trailing separator (e.g. `*/`,
+		// which splits into a final all-empty component) additionally requires
+		// the match to be a directory. Detect both cases up front so the final
+		// filter below can enforce them; patterns whose last component is itself
+		// a glob need no extra check because their paths come from `read_dir`.
+		let last_glob_component = components.iter().rposition(|component| {
+			component.iter().any(|piece| {
+				matches!(piece, PatternPiece::Pattern(_))
+					&& requires_expansion(piece.as_str(), self.enable_extended_globbing)
+			})
+		});
+		let has_literal_suffix = last_glob_component.is_some_and(|idx| idx + 1 < components.len());
+		let requires_directory = has_literal_suffix
+			&& components
+				.last()
+				.is_some_and(|component| component.iter().all(|piece| piece.as_str().is_empty()));
+
 		for component in components {
 			if !component.iter().any(|piece| {
 				matches!(piece, PatternPiece::Pattern(_))
@@ -305,6 +325,19 @@ impl Pattern {
 		let results: Vec<_> = paths_so_far
 			.into_iter()
 			.filter_map(|path| {
+				// Enforce trailing-separator directory semantics and literal-suffix
+				// existence (see the component-scan above). `is_dir` follows
+				// symlinks, matching bash (`*/` matches symlinks to directories);
+				// `symlink_metadata` does not, matching bash's lstat-based
+				// existence check for literal suffixes.
+				if requires_directory {
+					if !path.is_dir() {
+						return None;
+					}
+				} else if has_literal_suffix && path.symlink_metadata().is_err() {
+					return None;
+				}
+
 				if let Some(filter) = path_filter
 					&& !filter(path.as_path())
 				{
@@ -888,6 +921,79 @@ mod tests {
 				"result {p:?} still contains absolute working-dir prefix {scratch_str:?}"
 			);
 		}
+
+		Ok(())
+	}
+
+	/// Regression test for trailing-slash glob semantics: `pattern*/` must
+	/// match directories only (bash/POSIX), never plain files. Pre-fix, the
+	/// trailing separator produced a final empty component that was appended
+	/// literally without a directory check, so `LICENSE*/` matched the plain
+	/// file `LICENSE` and idioms like `ls -d */` received file arguments.
+	#[test]
+	fn test_trailing_slash_glob_matches_directories_only() -> Result<()> {
+		let scratch = tempfile::tempdir()?;
+		std::fs::create_dir(scratch.path().join("dir1"))?;
+		std::fs::create_dir(scratch.path().join("dir2"))?;
+		std::fs::write(scratch.path().join("file1"), "")?;
+		std::fs::write(scratch.path().join("file2"), "")?;
+
+		let pattern = Pattern::from("*/").set_extended_globbing(false);
+		let result = pattern.expand::<fn(&Path) -> bool>(
+			scratch.path(),
+			None,
+			&FilenameExpansionOptions::default(),
+		)?;
+
+		let mut paths = expect_expanded(result)?;
+		paths.sort();
+		assert_eq!(paths, vec!["dir1/".to_string(), "dir2/".to_string()]);
+
+		// A glob prefix with a trailing separator behaves the same way.
+		let pattern = Pattern::from("file*/").set_extended_globbing(false);
+		let result = pattern.expand::<fn(&Path) -> bool>(
+			scratch.path(),
+			None,
+			&FilenameExpansionOptions::default(),
+		)?;
+
+		let paths = expect_expanded(result)?;
+		assert!(paths.is_empty(), "files must not match a trailing-slash glob: {paths:?}");
+
+		Ok(())
+	}
+
+	/// Regression test for literal suffix components after a glob: bash only
+	/// returns matches whose full path exists. Pre-fix, `*/name` appended
+	/// `name` to every match of `*` without an existence check, fabricating
+	/// paths like `plainfile/name`.
+	#[test]
+	fn test_literal_suffix_after_glob_requires_existing_path() -> Result<()> {
+		let scratch = tempfile::tempdir()?;
+		let sub = scratch.path().join("sub");
+		std::fs::create_dir(&sub)?;
+		std::fs::write(sub.join("present"), "")?;
+		std::fs::write(scratch.path().join("plain"), "")?;
+
+		let pattern = Pattern::from("*/present").set_extended_globbing(false);
+		let result = pattern.expand::<fn(&Path) -> bool>(
+			scratch.path(),
+			None,
+			&FilenameExpansionOptions::default(),
+		)?;
+
+		let paths = expect_expanded(result)?;
+		assert_eq!(paths, vec!["sub/present".to_string()]);
+
+		let pattern = Pattern::from("*/absent").set_extended_globbing(false);
+		let result = pattern.expand::<fn(&Path) -> bool>(
+			scratch.path(),
+			None,
+			&FilenameExpansionOptions::default(),
+		)?;
+
+		let paths = expect_expanded(result)?;
+		assert!(paths.is_empty(), "nonexistent literal suffix must not match: {paths:?}");
 
 		Ok(())
 	}
