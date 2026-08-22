@@ -524,15 +524,17 @@ async function findGjcBundlesForUninstall(
 		try {
 			if (mode.preview) {
 				const result = await previewGjcBundleUninstall({ cwd }, identity);
-				if (result.ok) {
-					matches.push(identity);
-				} else if (result.error.code === "registry_unreadable") {
+				if (!result.ok && result.error.code === "registry_unreadable") {
 					// Ownership of this scope is unknown; guessing another owner (or
 					// reporting a false both-scopes ambiguity against the other scope's
 					// real match) could preview the wrong target. Fail closed on the
 					// typed refusal, surfaced with its own repair hint.
 					throw new GjcPluginLoadError("invalid_manifest", result.error.message);
 				}
+				// Any other refusal still identifies a GJC bundle this scope owns
+				// (e.g. invalid_target for non-uninstallable metadata); surface it so
+				// the preview refuses exactly what the real uninstall refuses.
+				if (result.ok || result.error.code !== "not_installed") matches.push(identity);
 			} else {
 				const result = await getGjcBundle({ cwd }, identity);
 				if (result.ok) matches.push(result.value.identity);

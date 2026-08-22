@@ -369,6 +369,31 @@ describe("plugin uninstall --dry-run", () => {
 		CLI_TEST_TIMEOUT_MS,
 	);
 
+	// A registry entry that is present but not uninstallable must surface as the
+	// same refusal in dry-run and real mode; the preview may never report a
+	// would-uninstall the real command would refuse with invalid_target.
+	it(
+		"refuses a non-uninstallable GJC entry identically in dry-run and real mode",
+		async () => {
+			const sandbox = await makeSandbox();
+			expect((await sandbox.run(["install", gjcBundleFixture, "--user"])).exitCode).toBe(0);
+			const registryPath = path.join(sandbox.home, ".gjc", "agent", "gjc-plugins", "registry.json");
+			const raw = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+				plugins: Array<Record<string, unknown>>;
+			};
+			delete raw.plugins[0].version;
+			await fs.writeFile(registryPath, JSON.stringify(raw));
+			const before = await sandbox.snapshot();
+
+			const dryRun = await sandbox.run(["uninstall", "valid-six-surface-bundle", "--user", "--dry-run"]);
+
+			expect(dryRun.exitCode).toBe(3);
+			expect(dryRun.stderr).toContain("its installed metadata is invalid");
+			expectUnchanged(before, await sandbox.snapshot());
+		},
+		CLI_TEST_TIMEOUT_MS,
+	);
+
 	it(
 		"previews a legacy project bundle by name without migrating or locking the registry",
 		async () => {
