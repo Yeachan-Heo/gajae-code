@@ -499,6 +499,13 @@ export interface GjcInstallResult {
 	summary: GjcBundleSummary;
 }
 
+/** A resolved uninstall that was deliberately not performed. */
+export interface GjcUninstallPreview {
+	status: "would-uninstall";
+	identity: GjcBundleIdentity;
+	summary: GjcBundleSummary;
+}
+
 export interface GjcToggleResult {
 	summary: GjcBundleSummary;
 	/** False when the requested state already matched (no persisted mutation). */

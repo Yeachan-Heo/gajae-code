@@ -478,7 +478,22 @@ export class MarketplaceManager {
 		return identities;
 	}
 
-	async uninstallPlugin(pluginId: string, scope?: "user" | "project"): Promise<void> {
+	/**
+	 * Resolve which installed copy an uninstall would remove.
+	 *
+	 * Strictly read-only, and the shared preflight for {@link uninstallPlugin}:
+	 * target lookup, scope disambiguation, and cache-path validation all happen
+	 * here, so a preview refuses exactly what the real uninstall refuses.
+	 */
+	async resolveUninstallTarget(
+		pluginId: string,
+		scope?: "user" | "project",
+	): Promise<{
+		scope: "user" | "project";
+		entries: InstalledPluginEntry[];
+		cachePaths: string[];
+		registry: InstalledPluginsRegistry;
+	}> {
 		const parsed = parsePluginId(pluginId);
 		if (!parsed) {
 			throw new Error(`Invalid plugin ID format: "${pluginId}". Expected "name@marketplace".`);
@@ -514,10 +529,22 @@ export class MarketplaceManager {
 			targetScope = "user";
 		}
 
-		const targetEntries = targetScope === "project" ? projectEntries! : userEntries!;
-		const targetReg = targetScope === "project" ? projectReg : userReg;
+		const entries = targetScope === "project" ? projectEntries! : userEntries!;
+		return {
+			scope: targetScope,
+			entries,
+			cachePaths: await this.#validateCacheDeletionTargets(pluginId, entries),
+			registry: targetScope === "project" ? projectReg : userReg,
+		};
+	}
+
+	async uninstallPlugin(pluginId: string, scope?: "user" | "project"): Promise<void> {
+		const {
+			scope: targetScope,
+			cachePaths: targetCachePaths,
+			registry: targetReg,
+		} = await this.resolveUninstallTarget(pluginId, scope);
 		const registryPath = this.#registryPath(targetScope);
-		const targetCachePaths = await this.#validateCacheDeletionTargets(pluginId, targetEntries);
 
 		const updatedReg = removeInstalledPlugin(targetReg, pluginId);
 		await writeInstalledPluginsRegistry(registryPath, updatedReg);

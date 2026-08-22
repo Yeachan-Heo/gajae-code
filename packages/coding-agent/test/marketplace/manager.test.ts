@@ -301,8 +301,36 @@ describe("MarketplaceManager", () => {
 		expect(installed).toHaveLength(0);
 	});
 
+	it("resolveUninstallTarget keeps the cache and the registry entry", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		const instEntry = await ctx.manager.installPlugin("hello-plugin", "test-marketplace");
+		const registryPath = path.join(ctx.tmpDir, "installed_plugins.json");
+		const registryBefore = await Bun.file(registryPath).text();
+
+		const target = await ctx.manager.resolveUninstallTarget(TEST_PLUGIN_ID);
+
+		expect(target.scope).toBe("user");
+		expect(target.cachePaths).toEqual([instEntry.installPath]);
+		expect(fs.existsSync(instEntry.installPath)).toBe(true);
+		expect(await Bun.file(registryPath).text()).toBe(registryBefore);
+		expect(await ctx.manager.listInstalledPlugins()).toHaveLength(1);
+	});
+
+	// The preview resolves the same target the real uninstall would, so scope
+	// disambiguation cannot be silently skipped.
+	it("resolveUninstallTarget reports the resolved scope and still refuses an ambiguous target", async () => {
+		await ctx.manager.addMarketplace(FIXTURE_DIR);
+		await ctx.manager.installPlugin("hello-plugin", "test-marketplace", { scope: "project" });
+
+		expect((await ctx.manager.resolveUninstallTarget(TEST_PLUGIN_ID)).scope).toBe("project");
+
+		await ctx.manager.installPlugin("hello-plugin", "test-marketplace", { scope: "user" });
+		await expect(ctx.manager.resolveUninstallTarget(TEST_PLUGIN_ID)).rejects.toThrow(/both user and project scope/);
+	});
+
 	it("uninstallPlugin nonexistent → throws", async () => {
 		await expect(ctx.manager.uninstallPlugin("ghost-plugin@nowhere")).rejects.toThrow(/not installed/);
+		await expect(ctx.manager.resolveUninstallTarget("ghost-plugin@nowhere")).rejects.toThrow(/not installed/);
 	});
 
 	it("uninstallPlugin with invalid ID format → throws clear error", async () => {
