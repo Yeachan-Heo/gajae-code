@@ -20,6 +20,7 @@ import {
 	isGjcPluginSourceShape,
 	listGjcBundles,
 	migrationDoctorCheckMessage,
+	previewGjcBundleUninstall,
 	previewGjcBundleUpdate,
 	runGjcPluginMigrationPreflight,
 	uninstallGjcBundle,
@@ -495,17 +496,38 @@ function isGjcRegistryShapeFailure(error: unknown): boolean {
 	);
 }
 
+/**
+ * Which scopes own `name` as a GJC bundle.
+ *
+ * Classification runs for every uninstall target, including npm and marketplace
+ * names that never reach the GJC path, so the preview mode must be read-only:
+ * the migrating read used by the real path persists legacy-root discovery and
+ * takes the scope lock, which would let `--dry-run` write a registry for a
+ * target it does not even own.
+ *
+ * In preview mode a `not_installed` refusal means GJC does not own the name in
+ * that scope and the caller falls through; any other refusal still identifies a
+ * GJC bundle and is surfaced, matching how the real path classifies first and
+ * fails afterwards.
+ */
 async function findGjcBundlesForUninstall(
 	cwd: string,
 	name: string,
 	scope: "user" | "project" | undefined,
-): Promise<GjcBundleSummary[]> {
+	mode: { preview: boolean },
+): Promise<GjcBundleIdentity[]> {
 	const scopes = scope ? [scope] : (["user", "project"] as const);
-	const matches: GjcBundleSummary[] = [];
+	const matches: GjcBundleIdentity[] = [];
 	for (const candidateScope of scopes) {
+		const identity = bundleIdentity(candidateScope, name);
 		try {
-			const result = await getGjcBundle({ cwd }, bundleIdentity(candidateScope, name));
-			if (result.ok) matches.push(result.value);
+			if (mode.preview) {
+				const result = await previewGjcBundleUninstall({ cwd }, identity);
+				if (result.ok || result.error.code !== "not_installed") matches.push(identity);
+			} else {
+				const result = await getGjcBundle({ cwd }, identity);
+				if (result.ok) matches.push(result.value.identity);
+			}
 		} catch (error) {
 			if (!isGjcRegistryShapeFailure(error)) throw error;
 		}
@@ -659,7 +681,7 @@ async function handleInstall(
 async function handleUninstall(
 	manager: PluginManager,
 	packages: string[],
-	flags: { json?: boolean; scope?: "user" | "project"; user?: boolean; project?: boolean },
+	flags: { json?: boolean; dryRun?: boolean; scope?: "user" | "project"; user?: boolean; project?: boolean },
 ): Promise<void> {
 	if (packages.length === 0) {
 		console.error(chalk.red(`Usage: ${APP_NAME} plugin uninstall <package> ...`));
@@ -672,20 +694,28 @@ async function handleUninstall(
 	const installedPlugins = new Set((await mktMgr.listInstalledPlugins()).map(p => p.id));
 
 	for (const name of packages) {
-		const matches = await findGjcBundlesForUninstall(cwd, name, scope);
-		if (matches.length > 0) {
-			if (matches.length > 1) {
+		// Every branch below is split by mode rather than short-circuited inside the
+		// mutating call: under --dry-run this handler only ever reaches read-only
+		// APIs, so no path can write.
+		const gjcMatches = await findGjcBundlesForUninstall(cwd, name, scope, { preview: Boolean(flags.dryRun) });
+		if (gjcMatches.length > 0) {
+			if (gjcMatches.length > 1) {
 				console.error(chalk.red(`GJC bundle "${name}" is installed in both scopes; specify --user or --project.`));
 				process.exit(1);
 			}
-			const identity = matches[0].identity;
-			const result = await uninstallGjcBundle({ cwd }, identity);
+			const identity = gjcMatches[0];
+			const result = flags.dryRun
+				? await previewGjcBundleUninstall({ cwd }, identity)
+				: await uninstallGjcBundle({ cwd }, identity);
 			if (!result.ok) {
 				console.error(chalk.red(`${theme.status.error} ${result.error.message}`));
 				if (result.error.recovery) console.error(chalk.dim(`  Try: ${result.error.recovery}`));
 				process.exit(3);
 			}
-			if (flags.json) {
+			if (flags.dryRun) {
+				if (flags.json) console.log(JSON.stringify({ dryRun: true, wouldUninstall: identity }));
+				else console.log(chalk.dim(`[dry-run] Would uninstall ${identity.name} (${identity.scope})`));
+			} else if (flags.json) {
 				console.log(JSON.stringify({ uninstalled: identity }));
 			} else {
 				console.log(chalk.green(`${theme.status.success} Uninstalled ${identity.name} (${identity.scope})`));
@@ -695,8 +725,15 @@ async function handleUninstall(
 
 		if (installedPlugins.has(name)) {
 			try {
-				await mktMgr.uninstallPlugin(name, flags.scope);
-				console.log(chalk.green(`${theme.status.success} Uninstalled ${name}`));
+				if (flags.dryRun) {
+					const target = await mktMgr.resolveUninstallTarget(name, flags.scope);
+					if (flags.json) console.log(JSON.stringify({ dryRun: true, wouldUninstall: name, scope: target.scope }));
+					else console.log(chalk.dim(`[dry-run] Would uninstall ${name} (${target.scope})`));
+				} else {
+					await mktMgr.uninstallPlugin(name, flags.scope);
+					if (flags.json) console.log(JSON.stringify({ uninstalled: name }));
+					else console.log(chalk.green(`${theme.status.success} Uninstalled ${name}`));
+				}
 			} catch (err) {
 				console.error(chalk.red(`${theme.status.error} Failed to uninstall ${name}: ${err}`));
 				process.exit(1);
@@ -705,11 +742,14 @@ async function handleUninstall(
 		}
 
 		try {
-			await manager.uninstall(name);
-			if (flags.json) {
-				console.log(JSON.stringify({ uninstalled: name }));
+			if (flags.dryRun) {
+				await manager.previewUninstall(name);
+				if (flags.json) console.log(JSON.stringify({ dryRun: true, wouldUninstall: name }));
+				else console.log(chalk.dim(`[dry-run] Would uninstall ${name}`));
 			} else {
-				console.log(chalk.green(`${theme.status.success} Uninstalled ${name}`));
+				await manager.uninstall(name);
+				if (flags.json) console.log(JSON.stringify({ uninstalled: name }));
+				else console.log(chalk.green(`${theme.status.success} Uninstalled ${name}`));
 			}
 		} catch (err) {
 			console.error(chalk.red(`${theme.status.error} Failed to uninstall ${name}: ${err}`));
@@ -1231,7 +1271,7 @@ ${chalk.bold("Options:")}
   --fix            Attempt automatic fixes (doctor)
   --force          Overwrite without prompting (install)
   --scope <scope>  Install scope: user (default) or project (install name@marketplace)
-  --dry-run        Preview changes without applying (install)
+  --dry-run        Preview changes without applying (install, uninstall)
   -l, --local      Use project-local overrides
 
 ${chalk.bold("Examples:")}

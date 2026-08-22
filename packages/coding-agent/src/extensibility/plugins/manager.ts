@@ -231,6 +231,17 @@ export class PluginManager {
 	}
 
 	/**
+	 * Validate what {@link uninstall} would remove, without removing it.
+	 *
+	 * Strictly read-only: it applies the same name validation the real uninstall
+	 * applies and returns before the plugin manifest is materialized, before
+	 * `bun uninstall` runs, and before the runtime config is rewritten.
+	 */
+	async previewUninstall(name: string): Promise<void> {
+		validatePackageName(name);
+	}
+
+	/**
 	 * Uninstall a plugin.
 	 */
 	async uninstall(name: string): Promise<void> {

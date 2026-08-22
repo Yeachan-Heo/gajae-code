@@ -20,6 +20,7 @@ import {
 	targetFingerprint,
 } from "./lifecycle-reconciliation";
 import {
+	readEffectiveRegistryUnpersisted,
 	readRegistry,
 	registryRootForScope,
 	sortRegistryEntries,
@@ -34,11 +35,13 @@ import type {
 	GjcInstallResult,
 	GjcLifecycleError,
 	GjcLifecycleResult,
+	GjcPluginRegistry,
 	GjcPluginRegistryEntry,
 	GjcPluginRegistrySource,
 	GjcPluginScope,
 	GjcReviewedUpdateToken,
 	GjcToggleResult,
+	GjcUninstallPreview,
 	GjcUpdateApplyResult,
 	GjcUpdatePreview,
 } from "./types";
@@ -341,25 +344,72 @@ function uninstallFailure(
 	return fail("invalid_target", `Could not uninstall GJC bundle "${identity.name}" because ${detail}`, recovery);
 }
 
+/**
+ * Resolve and validate the uninstall target. Read-only: it is the shared
+ * preflight for the preview and for the mutating uninstall, so a preview
+ * refuses exactly what the real uninstall would refuse.
+ */
+function resolveUninstallTarget(
+	registry: GjcPluginRegistry,
+	ctx: GjcLifecycleContext,
+	identity: GjcBundleIdentity,
+): GjcLifecycleResult<{ entry: GjcPluginRegistryEntry; root: string }> {
+	const entry = registry.plugins.find(plugin => plugin && plugin.name === identity.name);
+	if (!entry) return { ok: false, error: notInstalled(identity) };
+	if (!isUninstallableEntry(entry, identity)) return { ok: false, error: uninstallFailure(identity, "metadata") };
+
+	const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot);
+	if (!root) return { ok: false, error: uninstallFailure(identity, "metadata") };
+	return { ok: true, value: { entry, root } };
+}
+
+async function readUninstallRegistry(
+	ctx: GjcLifecycleContext,
+	identity: GjcBundleIdentity,
+	read: (scope: GjcPluginScope, cwd: string) => Promise<GjcPluginRegistry>,
+): Promise<GjcLifecycleResult<GjcPluginRegistry>> {
+	try {
+		return { ok: true, value: await read(identity.scope, ctx.cwd) };
+	} catch (error) {
+		if (isMalformedRegistryError(error)) return { ok: false, error: uninstallFailure(identity, "metadata") };
+		throw error;
+	}
+}
+
+/**
+ * What {@link uninstallGjcBundle} would remove, resolved and validated the same
+ * way, without removing it.
+ *
+ * Strictly read-only: no registry lock is taken (acquiring it creates the scope
+ * root and a lockfile) and no migration is persisted, while legacy-root
+ * discovery and entry migration are still applied in memory so the preview sees
+ * exactly the entries the real uninstall would act on.
+ */
+export async function previewGjcBundleUninstall(
+	ctx: GjcLifecycleContext,
+	identity: GjcBundleIdentity,
+): Promise<GjcLifecycleResult<GjcUninstallPreview>> {
+	const registry = await readUninstallRegistry(ctx, identity, readEffectiveRegistryUnpersisted);
+	if (!registry.ok) return registry;
+	const target = resolveUninstallTarget(registry.value, ctx, identity);
+	if (!target.ok) return target;
+	return { ok: true, value: { status: "would-uninstall", identity, summary: toBundleSummary(target.value.entry) } };
+}
+
 export async function uninstallGjcBundle(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
 ): Promise<GjcLifecycleResult<{ identity: GjcBundleIdentity; summary: GjcBundleSummary }>> {
 	return withRegistryLock(identity.scope, ctx.cwd, async () => {
-		let registry: Awaited<ReturnType<typeof readRegistry>>;
-		try {
-			registry = await readRegistry(identity.scope, ctx.cwd, { migrate: false });
-		} catch (error) {
-			if (isMalformedRegistryError(error)) return { ok: false, error: uninstallFailure(identity, "metadata") };
-			throw error;
-		}
+		const read = await readUninstallRegistry(ctx, identity, (scope, cwd) =>
+			readRegistry(scope, cwd, { migrate: false }),
+		);
+		if (!read.ok) return read;
+		const registry = read.value;
 
-		const entry = registry.plugins.find(plugin => plugin && plugin.name === identity.name);
-		if (!entry) return { ok: false, error: notInstalled(identity) };
-		if (!isUninstallableEntry(entry, identity)) return { ok: false, error: uninstallFailure(identity, "metadata") };
-
-		const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot);
-		if (!root) return { ok: false, error: uninstallFailure(identity, "metadata") };
+		const target = resolveUninstallTarget(registry, ctx, identity);
+		if (!target.ok) return target;
+		const { entry, root } = target.value;
 
 		const summary = toBundleSummary(entry);
 		const nextRegistry = { ...registry, plugins: registry.plugins.filter(plugin => plugin !== entry) };

@@ -179,6 +179,26 @@ async function discoverLegacyEntries(
 	return discovered;
 }
 
+/**
+ * The effective registry a migrating read would produce, computed entirely in
+ * memory: raw entries plus legacy-root discovery plus entry migration, with no
+ * lock taken and nothing persisted.
+ *
+ * This is what a preview must read. {@link readRegistry} persists the same
+ * result under the scope lock, and taking that lock creates the scope root and
+ * a lockfile — a filesystem mutation a preview must not make. Reading the raw
+ * registry alone is not equivalent: it cannot see a legacy bundle that exists
+ * on disk without a registry entry, so a preview built on it would disagree
+ * with the uninstall it is previewing.
+ */
+export async function readEffectiveRegistryUnpersisted(scope: GjcPluginScope, cwd: string): Promise<GjcPluginRegistry> {
+	const registry = await readRegistryRaw(scope, cwd);
+	const discovered = await discoverLegacyEntries(scope, cwd, registry.plugins);
+	const migrated = await migrateGjcPluginEntries([...registry.plugins, ...discovered]);
+	if (!migrated.changed && discovered.length === 0) return registry;
+	return { ...registry, plugins: sortRegistryEntries(migrated.entries) };
+}
+
 export async function readRegistry(
 	scope: GjcPluginScope,
 	cwd: string,
