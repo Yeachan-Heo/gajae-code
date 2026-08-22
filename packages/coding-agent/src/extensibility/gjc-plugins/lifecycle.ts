@@ -367,11 +367,12 @@ async function readUninstallRegistry(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
 	read: (scope: GjcPluginScope, cwd: string) => Promise<GjcPluginRegistry>,
+	onMalformed: (identity: GjcBundleIdentity) => GjcLifecycleError,
 ): Promise<GjcLifecycleResult<GjcPluginRegistry>> {
 	try {
 		return { ok: true, value: await read(identity.scope, ctx.cwd) };
 	} catch (error) {
-		if (isMalformedRegistryError(error)) return { ok: false, error: registryUnreadable(identity) };
+		if (isMalformedRegistryError(error)) return { ok: false, error: onMalformed(identity) };
 		throw error;
 	}
 }
@@ -384,12 +385,18 @@ async function readUninstallRegistry(
  * root and a lockfile) and no migration is persisted, while legacy-root
  * discovery and entry migration are still applied in memory so the preview sees
  * exactly the entries the real uninstall would act on.
+ *
+ * A malformed registry reads back as the internal `registry_unreadable` signal:
+ * the CLI's classification uses it to fail closed, because the unreadable scope
+ * may own the requested name and ownership must never be guessed. The exported
+ * mutating {@link uninstallGjcBundle} keeps mapping the same condition to
+ * `invalid_target`, its historical result contract.
  */
 export async function previewGjcBundleUninstall(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
 ): Promise<GjcLifecycleResult<GjcUninstallPreview>> {
-	const registry = await readUninstallRegistry(ctx, identity, readEffectiveRegistryUnpersisted);
+	const registry = await readUninstallRegistry(ctx, identity, readEffectiveRegistryUnpersisted, registryUnreadable);
 	if (!registry.ok) return registry;
 	const target = resolveUninstallTarget(registry.value, ctx, identity);
 	if (!target.ok) return target;
@@ -401,8 +408,14 @@ export async function uninstallGjcBundle(
 	identity: GjcBundleIdentity,
 ): Promise<GjcLifecycleResult<{ identity: GjcBundleIdentity; summary: GjcBundleSummary }>> {
 	return withRegistryLock(identity.scope, ctx.cwd, async () => {
-		const read = await readUninstallRegistry(ctx, identity, (scope, cwd) =>
-			readRegistry(scope, cwd, { migrate: false }),
+		// The mutating API's historical contract maps a malformed registry to the
+		// generic invalid_target metadata failure; only the read-only preview
+		// surfaces the internal registry_unreadable classification signal.
+		const read = await readUninstallRegistry(
+			ctx,
+			identity,
+			(scope, cwd) => readRegistry(scope, cwd, { migrate: false }),
+			failing => uninstallFailure(failing, "metadata"),
 		);
 		if (!read.ok) return read;
 		const registry = read.value;

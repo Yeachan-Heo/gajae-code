@@ -188,7 +188,7 @@ describe("Plugin command scope parsing", () => {
 			],
 		});
 	});
-	it("falls back to non-GJC uninstall when the GJC registry is corrupt", async () => {
+	it("fails closed on uninstall when the GJC registry is corrupt", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
 		agentDirs.push(agentDir);
 		const cwd = await makeTempProject();
@@ -198,8 +198,10 @@ describe("Plugin command scope parsing", () => {
 
 		const result = await runPluginCommand(["uninstall", "not-a-gjc-bundle"], cwd, agentDir);
 
-		expect(`${result.stdout}${result.stderr}`).toMatch(/Uninstalled|Failed to uninstall/);
-		expect(`${result.stdout}${result.stderr}`).not.toContain("Corrupt GJC plugin registry");
+		// Ownership is unknown while the registry is unreadable, so the command
+		// must refuse instead of falling through to a non-GJC uninstall.
+		expect(result.exitCode).toBe(3);
+		expect(`${result.stdout}${result.stderr}`).toContain("Could not read the GJC user plugin registry");
 	});
 
 	it("GJC install and upgrade failures never echo the source or its cause", async () => {

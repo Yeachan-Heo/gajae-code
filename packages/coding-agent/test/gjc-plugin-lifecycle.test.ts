@@ -191,9 +191,54 @@ describe("GJC bundle lifecycle", () => {
 
 		expect(result).toMatchObject({
 			ok: false,
-			error: { code: "registry_unreadable", recovery: expect.stringContaining("retry") },
+			error: { code: "invalid_target", recovery: expect.stringContaining("retry") },
 		});
 		await expect(fs.stat(installedRoot)).resolves.toBeTruthy();
+	});
+	// Exhaustive result contract for the two exported uninstall entry points.
+	// The mutating API must keep its historical `invalid_target` mapping for a
+	// malformed registry; only the read-only preview surfaces the internal
+	// `registry_unreadable` classification signal the CLI fails closed on.
+	test("keeps the mutating and preview uninstall result contracts distinct for a malformed registry", async () => {
+		const cwd = await mkProjectCwd();
+		const identity = await installFixture(cwd, "user");
+		const registryPath = registryPathForScope("user", cwd);
+		const healthy = await fs.readFile(registryPath, "utf8");
+
+		// Healthy: preview resolves the exact target; a repeated real uninstall is not_installed.
+		const previewOk = await previewGjcBundleUninstall({ cwd }, identity);
+		expect(previewOk).toMatchObject({ ok: true, value: { status: "would-uninstall", identity } });
+		await expect(fs.stat(registryPath)).resolves.toBeTruthy();
+
+		// Malformed registry: mutating keeps invalid_target, preview reports registry_unreadable.
+		await fs.writeFile(registryPath, "{ corrupt");
+		const mut = await uninstallGjcBundle({ cwd }, identity);
+		expect(mut).toMatchObject({ ok: false, error: { code: "invalid_target" } });
+		const prev = await previewGjcBundleUninstall({ cwd }, identity);
+		expect(prev).toMatchObject({ ok: false, error: { code: "registry_unreadable" } });
+
+		// Restored registry: the real uninstall still removes the bundle.
+		await fs.writeFile(registryPath, healthy);
+		const removed = await uninstallGjcBundle({ cwd }, identity);
+		expect(removed).toMatchObject({ ok: true, value: { identity } });
+		const gone = await uninstallGjcBundle({ cwd }, identity);
+		expect(gone).toMatchObject({ ok: false, error: { code: "not_installed" } });
+	});
+
+	test("keeps non-uninstallable metadata failures aligned between preview and mutating uninstall", async () => {
+		const cwd = await mkProjectCwd();
+		const identity = await installFixture(cwd, "user");
+		const registryPath = registryPathForScope("user", cwd);
+		const raw = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+			plugins: Array<Record<string, unknown>>;
+		};
+		delete raw.plugins[0].version;
+		await fs.writeFile(registryPath, JSON.stringify(raw));
+
+		const prev = await previewGjcBundleUninstall({ cwd }, identity);
+		expect(prev).toMatchObject({ ok: false, error: { code: "invalid_target" } });
+		const mut = await uninstallGjcBundle({ cwd }, identity);
+		expect(mut).toMatchObject({ ok: false, error: { code: "invalid_target" } });
 	});
 
 	test("restores the root and returns a typed error when registry removal fails", async () => {

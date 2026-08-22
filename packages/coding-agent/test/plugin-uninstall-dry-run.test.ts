@@ -277,12 +277,13 @@ describe("plugin uninstall --dry-run", () => {
 		CLI_TEST_TIMEOUT_MS,
 	);
 
-	// A corrupt user-scope registry must not change which uninstall path a target
-	// takes. The real path's classification read throws a load error for a
-	// corrupt scope and skips it, so the preview classifies the same way instead
-	// of refusing the marketplace/npm target the real uninstall removes.
+	// An unreadable GJC registry means ownership of the target is unknown: the
+	// corrupt scope may be the one that owns the name. Classification fails
+	// closed for both dry-run and real uninstall instead of falling through to
+	// the marketplace or npm branch, which could remove a same-named plugin the
+	// user never targeted.
 	it(
-		"keeps a corrupt user registry from rerouting a marketplace dry run",
+		"fails closed on a corrupt user registry instead of previewing a marketplace dry run",
 		async () => {
 			const sandbox = await makeSandbox();
 			expect((await sandbox.run(["marketplace", "add", marketplaceFixture])).exitCode).toBe(0);
@@ -300,15 +301,16 @@ describe("plugin uninstall --dry-run", () => {
 				"--dry-run",
 			]);
 
-			expect(dryRun.exitCode).toBe(0);
-			expect(dryRun.stdout).toContain("[dry-run] Would uninstall hello-plugin@test-marketplace (user)");
+			expect(dryRun.exitCode).toBe(3);
+			expect(dryRun.stderr).toContain("Could not read the GJC user plugin registry");
+			// The installed marketplace plugin must survive the refusal untouched.
 			expectUnchanged(before, await sandbox.snapshot());
 		},
 		CLI_TEST_TIMEOUT_MS,
 	);
 
 	it(
-		"keeps a corrupt user registry from rerouting an npm dry run",
+		"fails closed on a corrupt user registry for an npm-target dry run",
 		async () => {
 			const sandbox = await makeSandbox();
 			const registryPath = path.join(sandbox.home, ".gjc", "agent", "gjc-plugins", "registry.json");
@@ -318,8 +320,50 @@ describe("plugin uninstall --dry-run", () => {
 
 			const dryRun = await sandbox.run(["uninstall", "some-npm-name", "--dry-run", "--json"]);
 
-			expect(dryRun.exitCode).toBe(0);
-			expect(JSON.parse(dryRun.stdout)).toEqual({ dryRun: true, wouldUninstall: "some-npm-name" });
+			expect(dryRun.exitCode).toBe(3);
+			expect(dryRun.stderr).toContain("Could not read the GJC user plugin registry");
+			expectUnchanged(before, await sandbox.snapshot());
+		},
+		CLI_TEST_TIMEOUT_MS,
+	);
+
+	// The reviewer-reported collision: the corrupt GJC registry may own the name
+	// while npm has a same-named plugin installed. Neither the dry run nor the
+	// real uninstall may touch the npm plugin when GJC ownership is unreadable.
+	it(
+		"never removes a same-named npm plugin when the GJC registry is corrupt",
+		async () => {
+			const sandbox = await makeSandbox();
+			const pluginsDir = path.join(sandbox.home, ".gjc", "plugins");
+			const npmPluginDir = path.join(pluginsDir, "node_modules", "collide-plugin");
+			await fs.mkdir(npmPluginDir, { recursive: true });
+			await fs.writeFile(
+				path.join(pluginsDir, "package.json"),
+				JSON.stringify(
+					{ name: "gjc-plugins", private: true, dependencies: { "collide-plugin": "1.0.0" } },
+					null,
+					"\t",
+				),
+			);
+			await fs.writeFile(
+				path.join(npmPluginDir, "package.json"),
+				JSON.stringify({ name: "collide-plugin", version: "1.0.0", gjc: { version: "1.0.0" } }),
+			);
+			const registryPath = path.join(sandbox.home, ".gjc", "agent", "gjc-plugins", "registry.json");
+			await fs.mkdir(path.dirname(registryPath), { recursive: true });
+			await fs.writeFile(registryPath, "{ corrupt");
+			const before = await sandbox.snapshot();
+
+			const dryRun = await sandbox.run(["uninstall", "collide-plugin", "--dry-run"]);
+
+			expect(dryRun.exitCode).toBe(3);
+			expect(dryRun.stderr).toContain("Could not read the GJC user plugin registry");
+
+			const real = await sandbox.run(["uninstall", "collide-plugin"]);
+
+			expect(real.exitCode).toBe(3);
+			expect(real.stderr).toContain("Could not read the GJC user plugin registry");
+			// The npm plugin must still be on disk after both refusals.
 			expectUnchanged(before, await sandbox.snapshot());
 		},
 		CLI_TEST_TIMEOUT_MS,

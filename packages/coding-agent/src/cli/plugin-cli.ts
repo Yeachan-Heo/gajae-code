@@ -505,14 +505,11 @@ function isGjcRegistryShapeFailure(error: unknown): boolean {
  * takes the scope lock, which would let `--dry-run` write a registry for a
  * target it does not even own.
  *
- * In preview mode a `not_installed` refusal means GJC does not own the name in
- * that scope and the caller falls through; any other refusal still identifies a
- * GJC bundle and is surfaced, matching how the real path classifies first and
- * fails afterwards. A `registry_unreadable` refusal is the one exception: the
- * real path's classification read throws a load error for a corrupt scope
- * registry and `isGjcRegistryShapeFailure` skips that scope entirely, so the
- * preview skips it too — otherwise a corrupt registry would make a dry run
- * refuse a marketplace or npm target the real uninstall removes.
+ * Both modes treat an unreadable scope registry as fatal rather than skipping
+ * the scope: the corrupt registry may be the one that owns the name, so
+ * ownership must never be guessed. Falling through to the marketplace or npm
+ * branch on an unreadable registry could preview — and the real command could
+ * then remove — a same-named plugin the user did not target.
  */
 async function findGjcBundlesForUninstall(
 	cwd: string,
@@ -527,8 +524,14 @@ async function findGjcBundlesForUninstall(
 		try {
 			if (mode.preview) {
 				const result = await previewGjcBundleUninstall({ cwd }, identity);
-				if (result.ok || (result.error.code !== "not_installed" && result.error.code !== "registry_unreadable")) {
+				if (result.ok) {
 					matches.push(identity);
+				} else if (result.error.code === "registry_unreadable") {
+					// Ownership of this scope is unknown; guessing another owner (or
+					// reporting a false both-scopes ambiguity against the other scope's
+					// real match) could preview the wrong target. Fail closed on the
+					// typed refusal, surfaced with its own repair hint.
+					throw new GjcPluginLoadError("invalid_manifest", result.error.message);
 				}
 			} else {
 				const result = await getGjcBundle({ cwd }, identity);
@@ -536,6 +539,13 @@ async function findGjcBundlesForUninstall(
 			}
 		} catch (error) {
 			if (!isGjcRegistryShapeFailure(error)) throw error;
+			// Unreadable scope registry: ownership is unknown, so resolve nothing
+			// and let the caller fail closed instead of guessing another owner.
+			throw new GjcPluginLoadError(
+				"invalid_manifest",
+				`Could not read the GJC ${candidateScope} plugin registry while resolving "${name}"`,
+				{ cause: error },
+			);
 		}
 	}
 	return matches;
@@ -703,7 +713,21 @@ async function handleUninstall(
 		// Every branch below is split by mode rather than short-circuited inside the
 		// mutating call: under --dry-run this handler only ever reaches read-only
 		// APIs, so no path can write.
-		const gjcMatches = await findGjcBundlesForUninstall(cwd, name, scope, { preview: Boolean(flags.dryRun) });
+		let gjcMatches: GjcBundleIdentity[];
+		try {
+			gjcMatches = await findGjcBundlesForUninstall(cwd, name, scope, { preview: Boolean(flags.dryRun) });
+		} catch (error) {
+			// An unreadable scope registry means ownership of `name` is unknown; the
+			// classification above fails closed and this handler must too, rather than
+			// guessing a marketplace or npm owner for a destructive operation.
+			const refusal =
+				error instanceof Error && ("code" in error || error instanceof GjcPluginLoadError)
+					? error.message
+					: `Could not classify "${name}" for uninstall`;
+			console.error(chalk.red(`${theme.status.error} ${refusal}`));
+			console.error(chalk.dim("  Repair the GJC plugin registry (gjc plugin doctor --fix), then retry"));
+			process.exit(3);
+		}
 		if (gjcMatches.length > 0) {
 			if (gjcMatches.length > 1) {
 				console.error(chalk.red(`GJC bundle "${name}" is installed in both scopes; specify --user or --project.`));
