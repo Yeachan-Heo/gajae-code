@@ -508,7 +508,11 @@ function isGjcRegistryShapeFailure(error: unknown): boolean {
  * In preview mode a `not_installed` refusal means GJC does not own the name in
  * that scope and the caller falls through; any other refusal still identifies a
  * GJC bundle and is surfaced, matching how the real path classifies first and
- * fails afterwards.
+ * fails afterwards. A `registry_unreadable` refusal is the one exception: the
+ * real path's classification read throws a load error for a corrupt scope
+ * registry and `isGjcRegistryShapeFailure` skips that scope entirely, so the
+ * preview skips it too — otherwise a corrupt registry would make a dry run
+ * refuse a marketplace or npm target the real uninstall removes.
  */
 async function findGjcBundlesForUninstall(
 	cwd: string,
@@ -523,7 +527,9 @@ async function findGjcBundlesForUninstall(
 		try {
 			if (mode.preview) {
 				const result = await previewGjcBundleUninstall({ cwd }, identity);
-				if (result.ok || result.error.code !== "not_installed") matches.push(identity);
+				if (result.ok || (result.error.code !== "not_installed" && result.error.code !== "registry_unreadable")) {
+					matches.push(identity);
+				}
 			} else {
 				const result = await getGjcBundle({ cwd }, identity);
 				if (result.ok) matches.push(result.value.identity);

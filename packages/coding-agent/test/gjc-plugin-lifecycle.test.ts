@@ -191,7 +191,7 @@ describe("GJC bundle lifecycle", () => {
 
 		expect(result).toMatchObject({
 			ok: false,
-			error: { code: "invalid_target", recovery: expect.stringContaining("retry") },
+			error: { code: "registry_unreadable", recovery: expect.stringContaining("retry") },
 		});
 		await expect(fs.stat(installedRoot)).resolves.toBeTruthy();
 	});

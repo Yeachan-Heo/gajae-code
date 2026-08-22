@@ -371,7 +371,7 @@ async function readUninstallRegistry(
 	try {
 		return { ok: true, value: await read(identity.scope, ctx.cwd) };
 	} catch (error) {
-		if (isMalformedRegistryError(error)) return { ok: false, error: uninstallFailure(identity, "metadata") };
+		if (isMalformedRegistryError(error)) return { ok: false, error: registryUnreadable(identity) };
 		throw error;
 	}
 }
@@ -458,6 +458,19 @@ function notInstalled(identity: GjcBundleIdentity): GjcLifecycleError {
 		"not_installed",
 		`GJC bundle "${identity.name}" is not installed in the ${identity.scope} scope`,
 		`gjc plugin install <source> --${identity.scope}`,
+	);
+}
+/**
+ * The scope registry itself could not be read (corrupt JSON, wrong shape). The
+ * real uninstall path surfaces this from the classification read as a thrown
+ * load error that callers treat as "GJC does not own this scope right now"; the
+ * preview must classify the same way instead of claiming the target.
+ */
+function registryUnreadable(identity: GjcBundleIdentity): GjcLifecycleError {
+	return fail(
+		"registry_unreadable",
+		`Could not read the GJC ${identity.scope} plugin registry while resolving "${identity.name}"`,
+		`Repair the GJC ${identity.scope} registry (gjc plugin doctor --fix), then retry`,
 	);
 }
 

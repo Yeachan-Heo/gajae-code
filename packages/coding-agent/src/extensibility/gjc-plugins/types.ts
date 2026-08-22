@@ -452,6 +452,7 @@ export interface GjcReviewedUpdateToken {
 export type GjcLifecycleErrorCode =
 	| "already_installed_use_upgrade"
 	| "not_installed"
+	| "registry_unreadable"
 	| "identity_mismatch"
 	| "stale_candidate"
 	| "stale_baseline"
