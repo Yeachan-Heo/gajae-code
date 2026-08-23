@@ -862,6 +862,11 @@ export function createInvocationReconciliation(
 			(finalizedRecord as unknown as Record<string, unknown>).pendingOutcome = undefined;
 			if (isCurrent !== undefined && !isCurrent()) return;
 			const commit = Promise.withResolvers<void>();
+			// This promise is an internal coordination signal for lifecycle transitions
+			// that race finalization. A failed durable commit must still reject racing
+			// waiters, but a finalization with no waiter must not create an unhandled
+			// rejection in the host process.
+			void commit.promise.catch(() => undefined);
 			const pending = {
 				finalizedRecord,
 				commit,
@@ -3173,10 +3178,32 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					}
 				}
 			}
-			try {
-				current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
-			} catch {
-				observed = false;
+			const sessionId = ctx.sessionManager.getSessionId();
+			if (type === "agent_failed") {
+				// Failure is a correlated diagnostic, not the terminal lifecycle boundary.
+				// Publish one safe frame per invocation so clients can attribute a shared
+				// run's failure without receiving provider text or an uncorrelated signal.
+				const error = sanitizePromptFailure(
+					failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
+				);
+				for (const invocation of transitions) {
+					try {
+						current.runtime.emitEvent({
+							type,
+							sessionId,
+							...invocation.correlation,
+							error,
+						});
+					} catch {
+						observed = false;
+					}
+				}
+			} else {
+				try {
+					current.runtime.emitEvent({ type, sessionId });
+				} catch {
+					observed = false;
+				}
 			}
 		} catch {
 			observed = false;

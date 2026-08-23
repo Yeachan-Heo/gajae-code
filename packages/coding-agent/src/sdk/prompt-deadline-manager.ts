@@ -320,12 +320,12 @@ export class PromptDeadlineManager {
 		const key = leaseKey(correlation);
 		const lease = this.#leases.get(key);
 		if (!lease) return;
-		this.#uncertaintyRetries.delete(key);
-		const beforeDeadline = promptDeadlineAt(lease);
+		const beforeGeneration = lease.generation;
 		recordAttributableProgress(lease, now);
-		const afterDeadline = promptDeadlineAt(lease);
+		if (lease.generation === beforeGeneration) return;
+		this.#uncertaintyRetries.delete(key);
 		if (this.#expiring.delete(key)) this.#expiryRetries.delete(key);
-		if (afterDeadline !== beforeDeadline || !this.#expiring.has(key)) this.#schedule(key);
+		this.#schedule(key);
 	}
 
 	onAttributableEvent(correlation: InvocationCorrelation, eventType: string, now = this.#now()): void {

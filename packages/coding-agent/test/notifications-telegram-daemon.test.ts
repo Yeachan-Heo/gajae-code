@@ -875,7 +875,10 @@ describe("Telegram daemon retained owner lifecycle", () => {
 		}
 	});
 
-	test("reload handoff signals an incompatible live owner before spawning its replacement", async () => {
+	test.each([
+		["an older serving epoch", 1],
+		["the same serving epoch", SERVING_EPOCH],
+	] as const)("reload handoff replaces a fresh stale-generation owner with %s", async (_description, servingEpoch) => {
 		const agentDir = tempAgentDir();
 		try {
 			const daemonSettings = settings(agentDir);
@@ -897,7 +900,7 @@ describe("Telegram daemon retained owner lifecycle", () => {
 				heartbeatAt: 5_000,
 				version: DAEMON_VERSION,
 				generation: DAEMON_GENERATION - 1,
-				servingEpoch: 1,
+				servingEpoch,
 			});
 
 			expect(

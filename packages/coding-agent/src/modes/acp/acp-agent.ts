@@ -2785,7 +2785,8 @@ export class AcpAgent implements Agent {
 		// queries is what left a finished turn reported as running until the inactivity
 		// watchdog rescued it.
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
-		if (event.type === "agent_end" || event.type === "agent_failed") await this.#emitEndOfTurnUpdates(id, adapter);
+		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter);
+		else if (event.type === "agent_failed") void this.#emitEndOfTurnUpdates(id, adapter).catch(() => undefined);
 	}
 
 	async #rejectPrompt(

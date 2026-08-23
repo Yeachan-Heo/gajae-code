@@ -2138,8 +2138,8 @@ export async function acquireDaemonOwnership(input: {
 	const ownerId =
 		input.ownerId ?? input.randomId?.() ?? `${pid}-${now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
-	// Generation is inventory-only: a lower servingEpoch triggers convergence,
-	// while exact current-generation owners attach (isCurrentCompatibleOwner).
+	// Exact current-generation owners attach (isCurrentCompatibleOwner); lower
+	// serving epochs and older operational generations converge through reload.
 	const attachDecision = (
 		snapshot: OwnerFreshnessSnapshot,
 	):
@@ -2185,6 +2185,9 @@ export async function acquireDaemonOwnership(input: {
 		// A physical owner that cannot prove current compatibility is never safe to
 		// attach. A reload handoff additionally requires a fresh heartbeat: a stale
 		// record must remain blocked rather than authorizing a signal to its PID.
+		// Older operational generations are not attach-compatible even when their
+		// serving epoch is unchanged, but a fully-provenanced owner may still be
+		// replaced through the controlled reload path.
 		if (
 			isFreshLiveOwner({
 				state,
@@ -2196,7 +2199,8 @@ export async function acquireDaemonOwnership(input: {
 				effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 			}) &&
 			(state.version !== DAEMON_VERSION ||
-				((state.servingEpoch === undefined ? 1 : state.servingEpoch) < SERVING_EPOCH &&
+				(((state.servingEpoch === undefined ? 1 : state.servingEpoch) < SERVING_EPOCH ||
+					(state.generation !== undefined && state.generation < DAEMON_GENERATION)) &&
 					isSignalableMatchingOwner({
 						state,
 						tokenFingerprint: input.tokenFingerprint,
@@ -2737,7 +2741,7 @@ async function bindProvisionalDaemonPid(input: {
 	}
 }
 
-/** Wait for a matching compatible owner to publish a ready state. Attach requires exact current-generation and serving-epoch equality (per isCurrentCompatibleOwner); a stale-generation owner is refused with a surfaced diagnostic and is never reloaded (reload is epoch/version-driven). Mutation paths require the same exact-generation equality. */
+/** Wait for a matching compatible owner to publish a ready state. Attach requires exact current-generation and serving-epoch equality (per isCurrentCompatibleOwner); a stale-generation owner is refused for attachment but may be replaced through the controlled reload path when it is fresh and signalable. Mutation paths require the same exact-generation equality. */
 export async function waitForTelegramDaemonReady(input: {
 	settings: Settings;
 	ownerId?: string;

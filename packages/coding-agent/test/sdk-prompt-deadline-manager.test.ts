@@ -393,6 +393,41 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		manager.clearAll();
 	});
 
+	test("stale progress during a suspended claim preserves the expiry fence and timer", async () => {
+		let now = 0;
+		let claimCalls = 0;
+		const claimStarted = Promise.withResolvers<void>();
+		const claimGate = Promise.withResolvers<void>();
+		const { reconciliation, state } = fakeReconciliation();
+		state.claimStarted = () => {
+			claimCalls += 1;
+			claimStarted.resolve();
+		};
+		state.claimRelease = claimGate.promise;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			now: () => now,
+		});
+		const correlation = { commandId: "cmd-stale-progress", turnId: "turn-stale-progress" };
+		manager.onAccepted(correlation);
+		now = 1_000;
+		await claimStarted.promise;
+		expect(manager.isExpiring(correlation)).toBe(true);
+
+		// Equal progress is not a new lease generation. It must not release the
+		// expiry fence or schedule a second expiry while the first one is pending.
+		manager.onProgress(correlation, 0);
+		await Bun.sleep(30);
+		expect(manager.isExpiring(correlation)).toBe(true);
+		expect(claimCalls).toBe(1);
+
+		claimGate.resolve();
+		await Bun.sleep(30);
+		manager.clearAll();
+	});
+
 	test("fresh progress during a suspended finalize cancels this expiry instead of firing exceeded", async () => {
 		// Same generation-aware guarantee but on the finalize await, which previously
 		// retired ownership and cleared the lease unconditionally after a durable

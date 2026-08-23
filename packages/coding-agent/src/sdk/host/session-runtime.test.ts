@@ -390,6 +390,45 @@ test("agent_end is not swallowed when deadline persistence fails", async () => {
 	});
 });
 
+test("a rejected internal finalization commit is sunk without an unhandled rejection", async () => {
+	let records: unknown[] = [];
+	let failNext = false;
+	const store = {
+		path: null,
+		load: async () => records,
+		transact: async (mutator: (current: never[]) => never[]) => {
+			const candidate = mutator(records as never);
+			if (failNext) {
+				failNext = false;
+				throw new Error("internal finalization failed");
+			}
+			records = candidate;
+		},
+	} as never;
+	const reconciliation = createInvocationReconciliation({ store });
+	const correlation = { commandId: "finalize-unhandled-command", turnId: "finalize-unhandled-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "finalize-unhandled-ref");
+	failNext = true;
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown): void => {
+		unhandled.push(reason);
+	};
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		await expect(
+			reconciliation.finalizeOutcome("prompt", correlation, {
+				kind: "failed",
+				code: "prompt_deadline_exceeded",
+				message: "deadline",
+			}),
+		).rejects.toThrow("internal finalization failed");
+		await Bun.sleep(25);
+		expect(unhandled).toEqual([]);
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+	}
+});
+
 test("agent_end upgrades a durable deadline terminal when it races a successful finalize", async () => {
 	let records: unknown[] = [];
 	const store = {
@@ -2746,6 +2785,7 @@ interface InvocationHarness {
 	control(operation: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	query(name: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	emit(event: string, payload?: unknown): Promise<void>;
+	readonly broadcasts: SdkFrame[];
 	stop(): Promise<void>;
 }
 
@@ -2768,6 +2808,7 @@ async function invocationHarness(
 ): Promise<InvocationHarness> {
 	const waiters = new Map<string, (frame: ResponseFrame) => void>();
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void> | void>();
+	const broadcasts: SdkFrame[] = [];
 	let deliver: ((connectionId: string, frame: SdkFrame) => void) | undefined;
 	let nextId = 0;
 	const api = {
@@ -2807,7 +2848,9 @@ async function invocationHarness(
 				const response = frame as ResponseFrame;
 				if (typeof response.id === "string") waiters.get(response.id)?.(response);
 			},
-			broadcastFrame: () => {},
+			broadcastFrame(frame) {
+				broadcasts.push(frame);
+			},
 			start: async () => ({ url: "ws://127.0.0.1:1" }),
 			stop: async () => {},
 		}),
@@ -2837,6 +2880,7 @@ async function invocationHarness(
 	return {
 		control: (operation, input) => request({ type: "control_request", operation, input }),
 		query: (name, input) => request({ type: "query_request", query: name, input }),
+		broadcasts,
 		emit: async (event, payload) => {
 			await handlers.get(event)?.(payload ?? {}, ctx);
 		},
@@ -4007,11 +4051,23 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			});
 			const failing = await harness.control("turn.prompt", { text: "failing" });
 			expect(failing.ok).toBe(true);
+			const idsFailing = { commandId: failing.result?.commandId, turnId: failing.result?.turnId };
 			await harness.emit("agent_start");
 			await harness.emit("agent_failed", {
 				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
 			});
-			const idsFailing = { commandId: failing.result?.commandId, turnId: failing.result?.turnId };
+			const diagnosticFrames = harness.broadcasts.filter(frame => frame.kind === "agent_failed");
+			expect(diagnosticFrames).toHaveLength(1);
+			expect(diagnosticFrames[0]).toMatchObject({
+				kind: "agent_failed",
+				payload: {
+					type: "agent_failed",
+					sessionId: "agent-failed",
+					...idsFailing,
+					error: { code: "provider_unavailable", message: "Prompt submission failed." },
+				},
+			});
+			expect(JSON.stringify(diagnosticFrames[0])).not.toContain("provider unavailable");
 			expect((await harness.query("turn.prompt_status", idsFailing)).result?.status).toBe("in_flight");
 			await harness.emit("agent_end");
 			expect(await settledStatus(harness, "turn.prompt_status", idsFailing)).toMatchObject({
