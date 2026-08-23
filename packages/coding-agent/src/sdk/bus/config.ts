@@ -833,10 +833,7 @@ export interface RedactableAction {
  * image_attachment) which are suppressed at their emit sites, not here. Explicit
  * `telegram_send` file attachments are rejected before the file is read or forwarded.
  */
-export function buildRedactedAction(
-	action: RedactableAction,
-	opts: { redact: boolean; sessionTag: string },
-): RedactableAction {
+export function buildRedactedAction(action: RedactableAction, opts: { redact: boolean }): RedactableAction {
 	if (!opts.redact) return action;
 
 	// Asks stay fully readable/answerable even under redaction.

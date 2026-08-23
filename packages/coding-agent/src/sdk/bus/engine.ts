@@ -30,7 +30,6 @@ export interface EngineSessionSink {
 
 export interface NotificationEngineOptions {
 	redact: boolean;
-	sessionTag: (sessionId: string) => string;
 }
 
 /**
@@ -90,10 +89,7 @@ export class NotificationPresentationEngine {
 	private redactEvent(event: NotificationEvent): NotificationEvent {
 		if (event.type !== "action_needed") return event;
 		return {
-			...buildRedactedAction(event, {
-				redact: this.opts.redact,
-				sessionTag: this.opts.sessionTag(event.sessionId),
-			}),
+			...buildRedactedAction(event, { redact: this.opts.redact }),
 			type: "action_needed",
 		};
 	}

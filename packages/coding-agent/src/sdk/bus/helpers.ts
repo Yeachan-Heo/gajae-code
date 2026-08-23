@@ -58,7 +58,7 @@ export function asksFromAskInput(toolCallId: string, input: unknown): PendingAsk
 /** Prepare an action JSON payload for remote notification delivery. */
 export function notificationActionPayload<T extends RedactableAction>(
 	action: T,
-	opts: { redact: boolean; sessionTag: string },
+	opts: { redact: boolean },
 ): RedactableAction {
 	return buildRedactedAction(action, opts);
 }

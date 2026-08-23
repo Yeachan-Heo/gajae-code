@@ -131,7 +131,6 @@ import {
 	type NotificationConfig,
 	type NotificationSettingsReader,
 	resolveGenericNotificationSessionEligibility,
-	sessionTag,
 	tokenFingerprint,
 } from "./config";
 import { telegramControlCommandUsage } from "./config-commands";
@@ -833,7 +832,6 @@ export class PresentationArbiter {
 	constructor(
 		private readonly server: NotificationServer,
 		private readonly redact: () => boolean,
-		private readonly tag: string,
 	) {}
 
 	/** Gate retention remains available while notification publication is suspended. */
@@ -1058,7 +1056,7 @@ export class PresentationArbiter {
 											]
 										: [],
 						},
-						{ redact: this.redact(), sessionTag: this.tag },
+						{ redact: this.redact() },
 					),
 				),
 				true,
@@ -1247,7 +1245,6 @@ interface SessionRuntime {
 	evidencePublication?: SessionHostRuntimePublication;
 	brokerRegistrationReleased: boolean;
 	verbosity: "lean" | "verbose";
-	sessionTag: string;
 	/** Whether the agent loop is currently running (drives the typing indicator). */
 	busy: boolean;
 	/** Prompt command/turn identities awaiting their corresponding agent_start. */
@@ -4536,7 +4533,6 @@ export function createNotificationsExtension(
 		const pendingInteractive = new Map<string, PendingInteractiveAsk>();
 		const pendingPromptCorrelations: Array<{ commandId: string; turnId: string }> = [];
 		const pendingPromptCorrelationsBySdkRunToken = new Map<string, { commandId: string; turnId: string }>();
-		const tag = sessionTag(id);
 		let runtime: SessionRuntime | undefined;
 
 		// The SDK can always answer now (interactive via the answer source, or the
@@ -4557,7 +4553,7 @@ export function createNotificationsExtension(
 			if (lifecycleRequired) return failLifecycleStartup("failed", error);
 			throw error;
 		}
-		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? true, tag);
+		const gatePresentations = new PresentationArbiter(server, () => runtime?.redact ?? true);
 		gatePresentations.setPublicationSuspended(true);
 		let inboundSdkFrame: ((connectionId: string, frame: Record<string, unknown>) => void) | undefined;
 		const inFlightGateResolutions = new Set<Promise<void>>();
@@ -6942,7 +6938,6 @@ export function createNotificationsExtension(
 			settlementWindow: 0,
 			policyGeneration: 0,
 			workflowGatePublicationEpoch: 0,
-			sessionTag: tag,
 			busy: false,
 			pendingPromptCorrelations,
 			pendingPromptCorrelationsBySdkRunToken,
@@ -8707,7 +8702,7 @@ export function createNotificationsExtension(
 							sessionId: id,
 							summary: undefined,
 						},
-						{ redact: rt.redact, sessionTag: rt.sessionTag },
+						{ redact: rt.redact },
 					),
 				),
 			);

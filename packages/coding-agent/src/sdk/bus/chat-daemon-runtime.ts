@@ -310,7 +310,6 @@ export class ChatDaemonRuntime {
 				[createDiscordAdapter({ channelId: config.parentChannelId })],
 				{
 					redact: this.input.config.presentation?.redact ?? true,
-					sessionTag: sessionId => sessionId.slice(-6),
 				},
 			);
 			this.#discord = new DiscordNotificationDaemon({
@@ -335,7 +334,6 @@ export class ChatDaemonRuntime {
 				[createSlackAdapter({ channelId: config.channelId })],
 				{
 					redact: this.input.config.presentation?.redact ?? true,
-					sessionTag: sessionId => sessionId.slice(-6),
 				},
 			);
 			this.#slack = new SlackNotificationDaemon({
