@@ -593,22 +593,22 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	"opus-codex": { displayName: "Opus + Codex", providerGroup: "COMBOS" },
 	"codex-opencodego": { displayName: "Codex + OpenCodeGo", providerGroup: "COMBOS" },
 	"fable-opus-codex": { displayName: "Fable + Opus + Codex", providerGroup: "COMBOS" },
-	"macos-omlx-fast": { displayName: "4-bit Fast (24GB~36GB+ / Default Ctx)", providerGroup: "MACOS LOCAL (OMLX)" },
+	"macos-omlx-fast": { displayName: "4-bit Fast (24GB~36GB+ / Default Ctx)", providerGroup: "macOS Local (oMLX)" },
 	"macos-omlx-balanced": {
 		displayName: "8-bit Balanced (64GB~128GB / Default Ctx)",
-		providerGroup: "MACOS LOCAL (OMLX)",
+		providerGroup: "macOS Local (oMLX)",
 	},
 	"macos-omlx-quality": {
 		displayName: "8-bit Max Quality (M5 Max 128GB / Default Ctx)",
-		providerGroup: "MACOS LOCAL (OMLX)",
+		providerGroup: "macOS Local (oMLX)",
 	},
 	"macos-omlx-abliterated-fast": {
 		displayName: "4-bit Abliterated Fast (Qwen3.8 27B / Default Ctx)",
-		providerGroup: "MACOS LOCAL (OMLX)",
+		providerGroup: "macOS Local (oMLX)",
 	},
 	"macos-omlx-abliterated-balanced": {
 		displayName: "6-bit Abliterated Balanced (Qwen3.8 27B / Default Ctx)",
-		providerGroup: "MACOS LOCAL (OMLX)",
+		providerGroup: "macOS Local (oMLX)",
 	},
 };
 
@@ -616,7 +616,7 @@ const PROFILE_GROUP_ORDER = [
 	"CODEX",
 	"OPENCODEGO",
 	"COMMAND CODE GOAT",
-	"MACOS LOCAL (OMLX)",
+	"macOS Local (oMLX)",
 	"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 	"CLAUDE",
 	"GLM",
@@ -711,7 +711,7 @@ export function groupModelProfilesForPresetLanding(
 					(OPEN_WEIGHT_PROFILE_RANK.get(a.name) ?? Number.MAX_SAFE_INTEGER) -
 					(OPEN_WEIGHT_PROFILE_RANK.get(b.name) ?? Number.MAX_SAFE_INTEGER),
 			);
-		} else if (group === "MACOS LOCAL (OMLX)") {
+		} else if (group === "macOS Local (oMLX)") {
 			entries.sort(
 				(a, b) =>
 					(MACOS_OMLX_PROFILE_RANK.get(a.name) ?? Number.MAX_SAFE_INTEGER) -

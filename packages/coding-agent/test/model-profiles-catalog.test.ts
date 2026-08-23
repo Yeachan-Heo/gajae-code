@@ -93,11 +93,11 @@ const expectedProfiles: Array<{
 		name: "macos-omlx-quality",
 		requiredProviders: ["omlx"],
 		mapping: {
-			default: "omlx/Qwen3.6-35B-A3B-bf16:high",
-			executor: "omlx/Qwen3.6-35B-A3B-bf16:medium",
-			architect: "omlx/Qwen3.6-35B-A3B-bf16:high",
-			planner: "omlx/Qwen3.6-35B-A3B-bf16:high",
-			critic: "omlx/Qwen3.6-35B-A3B-bf16:high",
+			default: "omlx/Qwen3.6-35B-A3B-8bit:high",
+			executor: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+			architect: "omlx/Qwen3.6-35B-A3B-8bit:high",
+			planner: "omlx/Qwen3.6-35B-A3B-8bit:high",
+			critic: "omlx/Qwen3.6-35B-A3B-8bit:high",
 		},
 	},
 	{
@@ -688,7 +688,6 @@ const commandCodeGoatModels = new Set([
 const macosOmlxModels = new Set([
 	"Qwen3.6-35B-A3B-4bit",
 	"Qwen3.6-35B-A3B-8bit",
-	"Qwen3.6-35B-A3B-bf16",
 	"Qwen3.8-27B-Abliterated-MLX-4bit",
 	"Qwen3.8-27B-Abliterated-MLX-6bit",
 ]);
@@ -921,11 +920,11 @@ describe("built-in model profile catalog", () => {
 		for (const [name, displayName] of Object.entries({
 			"macos-omlx-fast": "4-bit Fast (24GB~36GB+ / Default Ctx)",
 			"macos-omlx-balanced": "8-bit Balanced (64GB~128GB / Default Ctx)",
-			"macos-omlx-quality": "BF16 Max Quality (M5 Max 128GB / Default Ctx)",
+			"macos-omlx-quality": "8-bit Max Quality (M5 Max 128GB / Default Ctx)",
 			"macos-omlx-abliterated-fast": "4-bit Abliterated Fast (Qwen3.8 27B / Default Ctx)",
 			"macos-omlx-abliterated-balanced": "6-bit Abliterated Balanced (Qwen3.8 27B / Default Ctx)",
 		})) {
-			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "MACOS LOCAL (OMLX)" });
+			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "macOS Local (oMLX)" });
 		}
 		for (const [name, displayName] of Object.entries({
 			"grok-45-eco": "Grok 4.5 Eco",
@@ -941,7 +940,7 @@ describe("built-in model profile catalog", () => {
 			"CODEX",
 			"OPENCODEGO",
 			"COMMAND CODE GOAT",
-			"MACOS LOCAL (OMLX)",
+			"macOS Local (oMLX)",
 			"OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
 			"CLAUDE",
 			"GLM",
@@ -955,7 +954,7 @@ describe("built-in model profile catalog", () => {
 		]);
 		expect(
 			groupModelProfilesForPresetLanding(profiles)
-				.get("MACOS LOCAL (OMLX)")
+				.get("macOS Local (oMLX)")
 				?.map(profile => profile.name),
 		).toEqual([
 			"macos-omlx-fast",
