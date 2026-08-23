@@ -103,6 +103,24 @@ async function accepted(store = new MemoryStore()) {
 }
 
 describe("SDK prompt terminal arbiter", () => {
+	test("exhausted deadline repair persists non-definite ownership across hydrate", async () => {
+		const store = new MemoryStore();
+		const first = await accepted(store);
+		await first.reconciliation.claimPendingOutcome("prompt", correlation, failed("prompt_deadline_exceeded"));
+		await first.reconciliation.finalizeOutcome("prompt", correlation, failed("prompt_deadline_exceeded"));
+		await first.reconciliation.markUncertain("prompt", correlation);
+		const reloaded = createKindAwareReconciliation({ store, now: () => 200 });
+		await reloaded.hydrateFromStore();
+		expect(reloaded.lookup("prompt", correlation)).toMatchObject({ status: "accepted" });
+		expect(store.snapshot()).toMatchObject([{ deadlineRecoveryPending: true }]);
+		// No synthetic deadline failure survives restart; a later real agent_end may
+		// converge this explicitly non-definite row without a manual repair step.
+		expect(reloaded.lookup("prompt", correlation)).not.toMatchObject({
+			status: "failed",
+			error: { code: "prompt_deadline_exceeded" },
+		});
+	});
+
 	test("claims the first pending outcome without exposing it as terminal", async () => {
 		const { reconciliation, store } = await accepted();
 		const first = stopped("end_turn");
@@ -132,6 +150,22 @@ describe("SDK prompt terminal arbiter", () => {
 		}
 	});
 
+	test("recordError and content positional arguments remain compatible", async () => {
+		const { reconciliation } = await accepted();
+		await reconciliation.claimPendingOutcome("prompt", correlation, failed("prompt_failed"));
+		await reconciliation.finalizeOutcome(
+			"prompt",
+			correlation,
+			undefined,
+			{ code: "legacy_error", message: "legacy message" },
+			{ text: "legacy content" },
+		);
+		expect(reconciliation.lookup("prompt", correlation)).toMatchObject({
+			status: "failed",
+			error: { code: "legacy_error", message: "legacy message" },
+		});
+	});
+
 	test("maps failure claims to their code unless an error override is supplied", async () => {
 		for (const code of ["prompt_failed", "prompt_deadline_exceeded"] as const) {
 			const { reconciliation } = await accepted();
@@ -147,7 +181,7 @@ describe("SDK prompt terminal arbiter", () => {
 
 		const { reconciliation } = await accepted();
 		await reconciliation.claimPendingOutcome("prompt", correlation, failed("prompt_failed"));
-		await reconciliation.finalizeOutcome("prompt", correlation, undefined, {
+		await reconciliation.finalizeOutcome("prompt", correlation, undefined, undefined, {
 			code: "overridden",
 			message: "override",
 		});

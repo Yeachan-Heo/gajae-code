@@ -54,6 +54,7 @@ function assertNever(value: never): never {
 export function agentSessionEventType(event: AgentSessionEvent): AgentWireEventType {
 	switch (event.type) {
 		case "agent_start":
+		case "agent_failed":
 		case "agent_end":
 		case "turn_start":
 		case "turn_end":

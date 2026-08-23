@@ -139,6 +139,7 @@ export class EventController {
 	constructor(private ctx: InteractiveModeContext) {
 		this.#handlers = {
 			agent_start: e => this.#handleAgentStart(e),
+			agent_failed: async () => {},
 			agent_end: e => this.#handleAgentEnd(e),
 			turn_start: async () => {},
 			turn_end: async () => {},

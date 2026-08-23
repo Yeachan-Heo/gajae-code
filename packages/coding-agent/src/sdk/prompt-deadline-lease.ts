@@ -22,10 +22,18 @@ export interface PromptDeadlineLease {
 	readonly leaseMs: number;
 	/** Deterministic hard maximum runtime from acceptance; never unbounded. */
 	readonly maxMs: number;
+	/** Monotonic revision used to reject stale expiry work after progress. */
+	generation: number;
 }
 
 export function createPromptDeadlineLease(input: { now: number; leaseMs: number; maxMs: number }): PromptDeadlineLease {
-	return { acceptedAt: input.now, lastProgressAt: input.now, leaseMs: input.leaseMs, maxMs: input.maxMs };
+	return {
+		acceptedAt: input.now,
+		lastProgressAt: input.now,
+		leaseMs: input.leaseMs,
+		maxMs: input.maxMs,
+		generation: 0,
+	};
 }
 
 /**
@@ -41,7 +49,10 @@ export function promptDeadlineAt(lease: PromptDeadlineLease): number {
  * never moves the lease backwards, so out-of-order delivery cannot shorten it.
  */
 export function recordAttributableProgress(lease: PromptDeadlineLease, now: number): void {
-	if (now > lease.lastProgressAt) lease.lastProgressAt = now;
+	if (now > lease.lastProgressAt) {
+		lease.lastProgressAt = now;
+		lease.generation += 1;
+	}
 }
 
 /**

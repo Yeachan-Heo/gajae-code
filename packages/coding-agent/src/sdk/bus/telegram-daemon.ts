@@ -2139,7 +2139,7 @@ export async function acquireDaemonOwnership(input: {
 		input.ownerId ?? input.randomId?.() ?? `${pid}-${now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
 	// Generation is inventory-only: a lower servingEpoch triggers convergence,
-	// while same-epoch cross-generation owners attach.
+	// while exact current-generation owners attach (isCurrentCompatibleOwner).
 	const attachDecision = (
 		snapshot: OwnerFreshnessSnapshot,
 	):
@@ -2737,7 +2737,7 @@ async function bindProvisionalDaemonPid(input: {
 	}
 }
 
-/** Wait for a matching compatible owner to publish a ready state. Readiness is serving-epoch gated (same-epoch cross-generation owners attach, per isCurrentCompatibleOwner); generation is inventory-only here. Mutation paths still require exact current-generation equality. */
+/** Wait for a matching compatible owner to publish a ready state. Attach requires exact current-generation and serving-epoch equality (per isCurrentCompatibleOwner); a stale-generation owner is refused with a surfaced diagnostic and is never reloaded (reload is epoch/version-driven). Mutation paths require the same exact-generation equality. */
 export async function waitForTelegramDaemonReady(input: {
 	settings: Settings;
 	ownerId?: string;

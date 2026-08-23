@@ -78,6 +78,23 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
+	"packages/coding-agent/src/session/agent-session.ts": [
+		"packages/coding-agent/test/agent-session-concurrent.test.ts",
+		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
+	],
+	"packages/coding-agent/src/sdk/bus/reconciliation-store.ts": [
+		"packages/coding-agent/test/sdk-reconciliation-store.test.ts",
+	],
+	"packages/coding-agent/src/sdk/bus/kind-aware-reconciliation.ts": [
+		"packages/coding-agent/test/sdk-kind-aware-reconciliation.test.ts",
+	],
+	"packages/coding-agent/test/helpers/sdk-adapter-dispositions-shared.ts": [
+		"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+	],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
 	"packages/coding-agent/src/tools/tool-catalog.generated.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
 	"packages/coding-agent/scripts/generate-tool-catalog.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],

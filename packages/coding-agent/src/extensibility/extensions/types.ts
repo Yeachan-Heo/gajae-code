@@ -9,12 +9,14 @@
  */
 
 import type {
+	AgentFailureDiagnostic,
 	AgentMessage,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	RunSettlementProof,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
+import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { CompactionResult } from "@gajae-code/agent-core/compaction";
 import type {
 	Api,
@@ -744,6 +746,17 @@ export interface AgentStartEvent extends SharedAgentStartEvent {
 	sdkRunToken?: string;
 }
 
+/** Fired when an agent run fails before emitting agent_end. The error is the
+ * sanitized `{ code, message }` diagnostic from the agent runtime — never the raw
+ * provider error. */
+export interface AgentFailedEvent {
+	type: "agent_failed";
+	error: AgentFailureDiagnostic;
+	/** Attempt correlation for the failing run, when scoped (matches the
+	 * agent_start/agent_end scope contract). */
+	scope?: AttemptScope;
+}
+
 /** Fired when a message starts (user, assistant, or toolResult) */
 export interface MessageStartEvent {
 	type: "message_start";
@@ -1020,6 +1033,7 @@ export type ExtensionEvent =
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
 	| AgentStartEvent
+	| AgentFailedEvent
 	| AgentEndEvent
 	| TurnStartEvent
 	| TurnEndEvent
@@ -1185,6 +1199,7 @@ export interface ExtensionAPI {
 	on(event: "after_provider_response", handler: ExtensionHandler<AfterProviderResponseEvent>): void;
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
+	on(event: "agent_failed", handler: ExtensionHandler<AgentFailedEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
@@ -1292,7 +1307,8 @@ export interface ExtensionAPI {
 			queuedAtDispatch?: boolean;
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
-			onQueuedPromoted?: () => void;
+			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			/** Internal SDK correlation owner for an exact queued follow-up. */
 			sdkRunToken?: string;
@@ -1516,8 +1532,13 @@ export type SendUserMessageHandler = (
 		deliverAs?: "steer" | "followUp";
 		onPreflightAccepted?: () => void;
 		onPreflightAcceptCommit?: () => void | Promise<void>;
-		/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
-		onQueuedPromoted?: () => void;
+		/**
+		 * Fired when a queued submission is consumed. `startsOwnRun: true` means
+		 * the batch starts a new run; false means it joins an active run or
+		 * maintenance continuation. Consumers must not assume every promotion
+		 * grants root abort ownership.
+		 */
+		onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 		preflightSignal?: AbortSignal;
 		/** Internal SDK correlation owner for an exact queued follow-up. */
 		sdkRunToken?: string;

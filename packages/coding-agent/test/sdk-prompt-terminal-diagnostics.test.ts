@@ -104,7 +104,7 @@ isolatedSdkHostTest(
 		dirs.push(cwd);
 		const sessionId = `sdk-prompt-terminal-diagnostics-${Date.now()}`;
 		const sessionContext = context(cwd, sessionId);
-		const reason = `Session context exceeds materialization budget (99 > 64 bytes): ${"x".repeat(600)}`;
+		const reason = `Session context exceeds materialization budget (99 > 64 bytes): secret-provider-token=${"x".repeat(600)}`;
 		const model = createMockModel({ handler: { throw: new Error(reason) } });
 		const agent = new Agent({
 			initialState: { model, systemPrompt: ["test"], messages: [], tools: [] },
@@ -171,6 +171,7 @@ isolatedSdkHostTest(
 				outcome: { kind: "failed", code: "prompt_failed", message: "Prompt submission failed." },
 			});
 			expect(JSON.stringify(failure)).not.toContain("materialization budget");
+			expect(JSON.stringify(failure)).not.toContain("secret-provider-token");
 
 			expect(diagnostics).toHaveLength(1);
 			expect(diagnostics[0]).toMatchObject({
@@ -307,8 +308,15 @@ isolatedSdkHostTest(
 			);
 			const cancelled: AgentEndEvent = { type: "agent_end", stopReason: "cancelled", messages: [] };
 			await handlers.get("agent_start")?.({ type: "agent_start" }, sessionContext);
+			await handlers.get("agent_failed")?.(
+				{ type: "agent_failed", error: Object.assign(new Error("cancel secret"), { code: "aborted" }) },
+				sessionContext,
+			);
 			await handlers.get("agent_end")?.(cancelled, sessionContext);
 			await waitFor(() => frames.some(frame => frame.type === "agent_failed"), "cancelled prompt terminal");
+			expect(frames.find(frame => frame.type === "agent_failed")).toMatchObject({
+				error: { code: "aborted", message: "Prompt submission failed." },
+			});
 
 			// A user interrupt is intent, not an undiagnosable defect, so it must not
 			// pollute the operator log with an error for every cancel.

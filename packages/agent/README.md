@@ -70,9 +70,28 @@ prompt("Hello")
 ├─ message_update  { message: partial... }       // Streaming chunks
 ├─ message_update  { message: partial... }
 ├─ message_end     { message: assistantMessage } // Complete response
-├─ turn_end        { message, toolResults: [] }
+├─ turn_end           { message, toolResults: [] }
 └─ agent_end       { messages: [...] }
 ```
+
+When a provider or local run failure occurs, the agent emits `agent_failed`
+before the terminal `agent_end`:
+
+```ts
+{ type: "agent_failed", error, scope? }
+// ...then
+{ type: "agent_end", messages, stopReason: "error" }
+```
+
+`agent_failed` is diagnostic and correlated to the same attempt; consumers must
+not treat it as the terminal boundary or stop waiting for `agent_end`. The
+failure event is additive, so existing `agent_end` handling remains required.
+
+`agent_failed.error` is always a sanitized `{ code, message }` pair produced by
+the runtime's failure sanitizer before emission — never the raw provider error.
+Consumers must not depend on provider-specific detail, request bodies, or raw
+error objects in this payload; the code is a stable classifier and the message
+is a fixed human-readable description.
 
 ### With Tool Calls
 
@@ -116,6 +135,7 @@ The last message in context must be `user` or `toolResult` (not `assistant`).
 | Event                   | Description                                                     |
 | ----------------------- | --------------------------------------------------------------- |
 | `agent_start`           | Agent begins processing                                         |
+| `agent_failed`          | Provider/local failure diagnostic; emitted before terminal `agent_end` |
 | `agent_end`             | Agent completes with all new messages                           |
 | `turn_start`            | New turn begins (one LLM call + tool executions)                |
 | `turn_end`              | Turn completes with assistant message and tool results          |

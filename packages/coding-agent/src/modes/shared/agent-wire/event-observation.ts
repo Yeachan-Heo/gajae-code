@@ -100,6 +100,15 @@ export function observeAgentSessionEvent(event: AgentSessionEvent): AgentWireOwn
 				semantic: true,
 				coalesceKey: null,
 			});
+		case "agent_failed":
+			return obs(event, {
+				kind: "rpc_agent_failed",
+				signal: "error",
+				evidence: {},
+				severity: "critical",
+				semantic: true,
+				coalesceKey: null,
+			});
 		case "turn_start":
 			return obs(event, {
 				kind: "rpc_turn_started",

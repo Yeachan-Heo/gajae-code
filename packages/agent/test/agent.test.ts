@@ -6,6 +6,74 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createAssistantMessage } from "./helpers";
 
 describe("Agent", () => {
+	it("sanitizes provider details before publishing agent_failed", async () => {
+		const secret = "provider-token=super-secret request-body-password=hunter2";
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error(secret), { code: "provider_down", request: { secret } });
+			},
+		});
+		const failures: Array<{ code?: string; message?: string }> = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_failed") failures.push(event.error as { code?: string; message?: string });
+		});
+		await agent.prompt("trigger failure", { fallbackManaged: true });
+		expect(failures).toHaveLength(1);
+		expect(failures[0]).toEqual({ code: "provider_down", message: "Agent run failed." });
+		expect(JSON.stringify(failures[0])).not.toContain("super-secret");
+		expect(JSON.stringify(failures[0])).not.toContain("hunter2");
+	});
+
+	it("maps provider-forged lifecycle classifiers to the generic failure class", async () => {
+		// Exact-head review P1: a provider error self-declaring "aborted" (or any
+		// runtime-owned lifecycle classifier) must never be classified as such;
+		// only the runtime itself can authenticate those codes.
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error("provider claims cancellation"), { code: "aborted" });
+			},
+		});
+		const failures: Array<{ code?: string }> = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_failed") failures.push(event.error);
+		});
+		await agent.prompt("trigger forged classifier", { fallbackManaged: true });
+		expect(failures).toHaveLength(1);
+		expect(failures[0]?.code).toBe("agent_failed");
+	});
+
+	it("a throwing subscriber cannot suppress the failure terminal boundary", async () => {
+		// Exact-head review P1: listener exceptions must be isolated so the
+		// agent_failed → agent_end catch path always completes terminalization.
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error("provider down"), { code: "provider_down" });
+			},
+		});
+		agent.subscribe(() => {
+			throw new Error("misbehaving subscriber");
+		});
+		await agent.prompt("trigger with hostile listener", { fallbackManaged: true });
+		// The run still terminalized on error despite the throwing subscriber.
+		const last = agent.state.messages.at(-1) as { stopReason?: string } | undefined;
+		expect(last?.stopReason).toBe("error");
+	});
+
+	it("terminal state and history never contain raw provider error text", async () => {
+		// Exact-head review P1: a provider error message may carry request bodies or
+		// credentials; the catch path must store only the sanitized message in
+		// state.error and the terminal assistant message.
+		const secret = "sk-SECRET-TOKEN-do-not-log";
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error(`provider exploded: ${secret}`), { code: "provider_down" });
+			},
+		});
+		await agent.prompt("trigger terminal failure", { fallbackManaged: true });
+		expect(JSON.stringify(agent.state.messages)).not.toContain(secret);
+		expect(JSON.stringify(agent.state.error ?? "")).not.toContain(secret);
+	});
+
 	it("preserves first-event timeout options and runtime mutations", () => {
 		const absent = new Agent();
 		expect(absent.streamFirstEventTimeoutMs).toBeUndefined();

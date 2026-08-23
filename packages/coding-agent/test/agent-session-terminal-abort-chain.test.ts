@@ -828,12 +828,16 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// (or during the rearm delay) must never fire its requester-ownership
 		// callback for a run that did not consume it.
 		const promoted: string[] = [];
+		const removalDispositions: boolean[] = [];
 		scriptedResponses = [bashCall("sleep 2", "hold-removal"), stopReply("accepted")];
 		const promptPromise = session.prompt("hold removal window").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active removal window");
 		await session.sendUserMessage("removed steer", {
 			deliverAs: "steer",
-			onQueuedPromoted: () => promoted.push("removed"),
+			onQueuedPromoted: promotion => {
+				if (promotion?.removed) removalDispositions.push(promotion.removed);
+				else promoted.push("removed");
+			},
 		});
 		await session.sendUserMessage("accepted steer", {
 			deliverAs: "steer",
@@ -843,6 +847,9 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		if (!removedEntry) throw new Error("Expected removable steer entry");
 		const removed = session.removeQueuedMessageForEditing(removedEntry.id);
 		expect(removed).toBe("removed steer");
+		// Removal fires exactly one REMOVAL disposition (bounded terminalization);
+		// it must never register as a consumption promotion.
+		expect(removalDispositions).toEqual([true]);
 		expect(promoted).toEqual([]);
 		// The abort's rearm consumes the remaining steer; the removed steer's
 		// hook must never fire (the run-acceptance path only fires hooks for

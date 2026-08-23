@@ -202,6 +202,8 @@ const unsubscribe = session.subscribe((event) => {
 
 - `auto_compaction_start` / `auto_compaction_end`
 - `auto_retry_start` / `auto_retry_end`
+- `agent_failed` (diagnostic failure for the current attempt; the correlated
+  terminal `agent_end` still follows and remains the lifecycle boundary)
 - `retry_fallback_applied` / `retry_fallback_succeeded`
 - `ttsr_triggered`
 - `todo_reminder` / `todo_auto_clear`
@@ -210,6 +212,14 @@ const unsubscribe = session.subscribe((event) => {
 ## Prompt lifecycle
 
 `session.prompt(text, options?)` is the primary entry point.
+
+Failure consumers should handle `agent_failed` as an additive diagnostic event,
+not as terminal completion. It carries only the sanitized `{ code, message }`
+diagnostic for the correlated attempt — never the raw provider/local error —
+so consumers must not depend on provider-specific detail or raw error objects;
+continue waiting for `agent_end` before releasing prompt ownership, deadlines,
+or transport resources. This ordering also applies when the run is canceled or
+enters a maintenance continuation.
 
 Behavior:
 

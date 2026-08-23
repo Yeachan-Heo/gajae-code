@@ -22,6 +22,12 @@ const message = (id: string) => ({
 
 export const EVENT_FIXTURES: Record<AgentWireEventType, AgentSessionEvent> = {
 	agent_start: ev({ type: "agent_start" }),
+	agent_failed: ev({
+		type: "agent_failed",
+		// Sanitized public wire shape: a stable classifier pair, never a raw Error
+		// (exact-head review P2).
+		error: { code: "provider_unavailable", message: "Agent run failed." },
+	}),
 	agent_end: ev({ type: "agent_end", messages: [], stopReason: "completed" }),
 	turn_start: ev({ type: "turn_start" }),
 	turn_end: ev({ type: "turn_end", message: message("m-turn"), toolResults: [] }),

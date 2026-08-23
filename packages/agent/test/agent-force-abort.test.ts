@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	Agent,
 	type AgentEvent,
+	type AgentMessage,
 	type AgentTool,
 	getAgentTerminalOwnerContext,
 	type StreamFn,
@@ -135,6 +136,60 @@ describe("Agent.forceAbort", () => {
 		expect(owner?.domain).toBe(logicalDomain);
 		expect(forcedClaimOk).toBe(true);
 		expect(forcedClaimReason).toBeUndefined();
+	});
+
+	it("reports in-run consumption when a queued follow-up continues as a maintenance continuation (#4668)", async () => {
+		// A maintenance continuation resumes the EXISTING logical run and emits
+		// no new agent_start. A follow-up batch consumed by that continuation is
+		// in-run consumption, not an own-run promotion: reporting startsOwnRun
+		// true makes the SDK wait for an agent_start that never arrives.
+		const model = createMockModel({ responses: [{ content: ["continuation done"] }] });
+		let streamCalls = 0;
+		const streamFn: StreamFn = (selectedModel, context, options) => {
+			streamCalls += 1;
+			if (streamCalls === 1) {
+				const response = createAssistantMessage(
+					[{ type: "toolCall", id: "call-1", name: "echo", arguments: {} }],
+					"toolUse",
+				);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "toolUse", message: response });
+					stream.end(response);
+				});
+				return stream;
+			}
+			return model.stream(selectedModel, context, options);
+		};
+		const tool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Returns a deterministic result.",
+			parameters: { type: "object", properties: {} },
+			execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+		};
+		const agent = new Agent({
+			initialState: { model: model.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn,
+		});
+		agent.setMaintainContext(async () => "pruned" as const);
+		let maintenanceEnded = false;
+		agent.subscribe(event => {
+			if (event.type === "agent_end" && event.stopReason === "maintenance") maintenanceEnded = true;
+		});
+		await agent.prompt("run tool");
+		expect(maintenanceEnded).toBe(true);
+
+		const promotions: boolean[] = [];
+		agent.onFollowUpConsumed = (_messages, promotion = { startsOwnRun: false }) =>
+			promotions.push(promotion.startsOwnRun);
+		agent.followUp({
+			role: "user",
+			content: "queued follow-up",
+			timestamp: Date.now(),
+		} as unknown as AgentMessage);
+		await agent.continueQueuedMessages({ maintenanceContinuation: true });
+		expect(promotions).toEqual([false]);
 	});
 
 	it("forces an ignored abort back to idle and accepts a following prompt", async () => {

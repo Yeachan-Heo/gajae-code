@@ -416,6 +416,7 @@ export type InvocationKind = "prompt" | "skill" | "steer";
 type InvocationStatus = "accepted" | "in_flight" | "terminal_ok" | "failed" | "uncertain";
 interface InvocationRecord extends InvocationCorrelation {
 	kind: InvocationKind;
+	revision: number;
 	clientRef?: string;
 	status: InvocationStatus;
 	acceptedAt: number;
@@ -442,11 +443,18 @@ export interface InvocationReconciliation {
 		correlation: InvocationCorrelation,
 		outcome: { kind: string; code: string; message: string; provenance?: string },
 	): Promise<unknown>;
+	// Positional compatibility (exact-head review P1): the 4th argument is either
+	// the generation-fence isCurrent callback or the legacy recordError object;
+	// both shapes are normalized in the implementation so a legacy object can
+	// never be invoked as a function.
 	finalizeOutcome(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
 		outcome?: { kind: string; code: string; message: string; provenance?: string },
+		arg4?: (() => boolean) | { code: string; message: string },
+		arg5?: unknown,
 	): Promise<void>;
+	markUncertain(kind: InvocationKind, correlation: InvocationCorrelation, isCurrent?: () => boolean): Promise<void>;
 }
 
 export function createInvocationReconciliation(
@@ -475,19 +483,34 @@ export function createInvocationReconciliation(
 			? path.join(options.stateRoot, ".sdk-reconciliation", `${options.sessionId}.json`)
 			: undefined;
 	let persistenceChain: Promise<void> = Promise.resolve();
-	const persist = async (): Promise<void> => {
-		if (store) {
-			await store.transact(() => [...records.values()]);
-			return;
+	let mutationRevision = 0;
+	const pendingFinalizations = new Map<
+		string,
+		{
+			finalizedRecord: InvocationRecord;
+			commit: PromiseWithResolvers<void>;
+			upgrades: Set<PromiseWithResolvers<void>>;
+			errors: unknown[];
 		}
-		if (!reconciliationFile) return;
+	>();
+	const persist = async (): Promise<void> => {
 		const run = async (): Promise<void> => {
+			// Construct the candidate only when this serialized write starts. A
+			// pre-await full snapshot lets a later agent_start/agent_end transition
+			// be overwritten on disk by an older queued write even though the live
+			// map has already converged.
+			const snapshot = [...records.values()].map(record => ({ ...record }));
+			if (store) {
+				await store.transact(() => snapshot.map(record => ({ ...record })));
+				return;
+			}
+			if (!reconciliationFile) return;
 			const directory = path.dirname(reconciliationFile);
 			const temporary = `${reconciliationFile}.${process.pid}.${crypto.randomUUID()}.tmp`;
 			await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 			await fs.writeFile(
 				temporary,
-				JSON.stringify({ version: 1, sessionId: options.sessionId, records: [...records.values()] }),
+				JSON.stringify({ version: 1, sessionId: options.sessionId, records: [...snapshot] }),
 				{ encoding: "utf8", mode: 0o600 },
 			);
 			await fs.chmod(temporary, 0o600);
@@ -530,7 +553,13 @@ export function createInvocationReconciliation(
 				if (candidate.kind !== "prompt" && candidate.kind !== "skill") continue;
 				if (!candidate.commandId || !candidate.turnId || typeof candidate.acceptedAt !== "number") continue;
 				const kind = candidate.kind as InvocationKind;
-				const record: InvocationRecord = { ...candidate, kind } as InvocationRecord;
+				const persistedRevision = (candidate as SdkOnlyInvocationRecord & { revision?: unknown }).revision;
+				const record: InvocationRecord = {
+					...candidate,
+					kind,
+					revision: typeof persistedRevision === "number" ? persistedRevision : ++mutationRevision,
+				} as InvocationRecord;
+				mutationRevision = Math.max(mutationRevision, record.revision);
 				// Never re-hydrate a failure reason that could contain provider secrets
 				// into a fresh process (origin/dev sanitization preserved).
 				if (record.status === "failed") record.error = sanitizePromptFailure(record.error);
@@ -563,12 +592,18 @@ export function createInvocationReconciliation(
 					record.status === "terminal_ok" ||
 					record.status === "failed")
 			) {
-				if (record.terminalAt === undefined && (record.status === "accepted" || record.status === "in_flight")) {
+				if (
+					record.terminalAt === undefined &&
+					(record.status === "accepted" || record.status === "in_flight") &&
+					!(record as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending
+				) {
 					record.status = "failed";
 					record.terminalAt = Date.now();
 					record.error = { code: "process_restart", message: "Reconciliation incomplete after process restart." };
 				}
 				if (record.status === "failed") record.error = sanitizePromptFailure(record.error);
+				record.revision = typeof record.revision === "number" ? record.revision : ++mutationRevision;
+				mutationRevision = Math.max(mutationRevision, record.revision);
 				records.set(key(record.kind, record), { ...record });
 			}
 		}
@@ -607,6 +642,7 @@ export function createInvocationReconciliation(
 			records.set(key(kind, correlation), {
 				...correlation,
 				kind,
+				revision: ++mutationRevision,
 				...(clientRef === undefined ? {} : { clientRef }),
 				status: "accepted",
 				acceptedAt: Date.now(),
@@ -617,42 +653,119 @@ export function createInvocationReconciliation(
 		},
 		async noteTransition(kind, correlation, frame) {
 			if (!correlation) return;
-			const record = records.get(key(kind, correlation));
+			const recordKey = key(kind, correlation);
+			let record = records.get(recordKey);
 			if (!record) return;
+			const pending = pendingFinalizations.get(recordKey);
+			if (pending?.finalizedRecord === record) {
+				const upgrade = Promise.withResolvers<void>();
+				pending.upgrades.add(upgrade);
+				let upgradeError: unknown;
+				try {
+					try {
+						await pending.commit.promise;
+					} catch {
+						// The deadline write failed; continue against the restored record
+						// so a real lifecycle event is never swallowed.
+					}
+					const current = records.get(recordKey);
+					if (frame.type === "agent_end" && current === pending.finalizedRecord) {
+						// A real lifecycle end that arrived during deadline finalization is
+						// stronger evidence than the synthetic deadline outcome. Upgrade the
+						// durable terminal instead of treating the event as a duplicate.
+						const upgraded = {
+							...current,
+							revision: ++mutationRevision,
+							status: "terminal_ok" as const,
+						};
+						// Drop the superseded synthetic deadline error so the surfaced payload is
+						// not the contradictory {status: terminal_ok, error: prompt_deadline_exceeded}.
+						delete (upgraded as Partial<InvocationRecord>).error;
+						records.set(recordKey, upgraded);
+						try {
+							await persist();
+						} catch (error) {
+							// Restore the durable deadline record identity so the lifecycle
+							// caller retains ownership and retries instead of clearing the
+							// lease after a contradictory in-memory success.
+							if (records.get(recordKey) === upgraded) records.set(recordKey, current);
+							upgradeError = error;
+							pending.errors.push(error);
+							throw error;
+						}
+						return;
+					}
+					record = current;
+					if (!record) return;
+				} finally {
+					pending.upgrades.delete(upgrade);
+					if (upgradeError === undefined) upgrade.resolve();
+					else upgrade.reject(upgradeError);
+				}
+			}
 			if (record.terminalAt !== undefined) {
+				if (frame.type === "agent_end" && record.error?.code === "prompt_deadline_exceeded") {
+					const upgraded = { ...record, revision: ++mutationRevision, status: "terminal_ok" as const };
+					// The synthetic deadline error is superseded evidence; terminal_ok must not
+					// surface a deadline failure for a prompt that actually completed.
+					delete (upgraded as Partial<InvocationRecord>).error;
+					records.set(recordKey, upgraded);
+					try {
+						await persist();
+					} catch (error) {
+						if (records.get(recordKey) === upgraded) records.set(recordKey, record);
+						throw error;
+					}
+					return;
+				}
 				// Same late agent_failed enrichment as the kind-aware bus reconciler: a
 				// failure reason may arrive on a different delivery path than the one that
 				// claimed the terminal. Enrich the settled record instead of dropping it;
 				// never resurrect (status/terminalAt untouched), and first reason wins.
 				if (frame.type === "agent_failed" && record.error === undefined) {
+					const next = { ...record, revision: ++mutationRevision };
 					logger.error("SDK invocation failed (late)", {
 						kind,
 						commandId: correlation.commandId,
 						turnId: correlation.turnId,
 						error: formatPromptFailureForLocalLog(frame.error),
 					});
-					record.error = sanitizePromptFailure(frame.error);
-					await persist();
+					next.error = sanitizePromptFailure(frame.error);
+					records.set(recordKey, next);
+					try {
+						await persist();
+					} catch (error) {
+						if (records.get(recordKey) === next) records.set(recordKey, record);
+						throw error;
+					}
 				}
 				return;
 			}
+			const next = { ...record, revision: ++mutationRevision };
+			delete (next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending;
 			if (frame.type === "agent_start") {
-				record.status = "in_flight";
-				record.startedAt = Date.now();
+				next.status = "in_flight";
+				next.startedAt = Date.now();
+			} else if (frame.type === "agent_failed") {
+				// Failure is diagnostic only; agent_end remains the terminal boundary.
+				logger.error("SDK invocation failed", {
+					kind,
+					commandId: correlation.commandId,
+					turnId: correlation.turnId,
+					error: formatPromptFailureForLocalLog(frame.error),
+				});
+				next.error ??= sanitizePromptFailure(frame.error);
 			} else {
-				record.status = frame.type === "agent_failed" ? "failed" : "terminal_ok";
-				record.terminalAt = Date.now();
-				if (frame.type === "agent_failed") {
-					logger.error("SDK invocation failed", {
-						kind,
-						commandId: correlation.commandId,
-						turnId: correlation.turnId,
-						error: formatPromptFailureForLocalLog(frame.error),
-					});
-					record.error = sanitizePromptFailure(frame.error);
-				}
+				next.status = next.error === undefined ? "terminal_ok" : "failed";
+				next.terminalAt = Date.now();
 			}
-			await persist();
+			records.set(recordKey, next);
+			try {
+				await persist();
+			} catch (error) {
+				if (records.get(recordKey) === next) records.set(recordKey, record);
+				throw error;
+			}
 		},
 		lookup(kind, selector) {
 			const record = find(kind, selector);
@@ -683,24 +796,103 @@ export function createInvocationReconciliation(
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return outcome;
 			const pending = (record as unknown as { pendingOutcome?: unknown }).pendingOutcome;
 			if (pending !== undefined) return pending;
-			(record as unknown as Record<string, unknown>).pendingOutcome = outcome;
-			await persist();
+			const next = { ...record, revision: ++mutationRevision } as InvocationRecord & { pendingOutcome?: unknown };
+			next.pendingOutcome = outcome;
+			records.set(key(kind, correlation), next);
+			try {
+				await persist();
+			} catch (error) {
+				if (records.get(key(kind, correlation)) === next) records.set(key(kind, correlation), record);
+				throw error;
+			}
 			return outcome;
 		},
-		async finalizeOutcome(kind, correlation, outcome) {
-			const record = records.get(key(kind, correlation));
+		async finalizeOutcome(
+			kind,
+			correlation,
+			outcome,
+			arg4?: (() => boolean) | { code: string; message: string },
+			arg5?: unknown,
+		) {
+			// Normalize every supported positional form (exact-head review P1):
+			//   (…, isCurrent) | (…, recordError) | (…, undefined, recordError) |
+			//   (…, isCurrent, recordError)
+			const isCurrent = typeof arg4 === "function" ? arg4 : undefined;
+			const recordErrorCandidate =
+				typeof arg4 === "object" && arg4 !== null && "code" in arg4
+					? arg4
+					: typeof arg5 === "object" && arg5 !== null && "code" in arg5
+						? (arg5 as { code: string; message: string })
+						: undefined;
+			const recordError = recordErrorCandidate;
+			const recordKey = key(kind, correlation);
+			const record = records.get(recordKey);
 			if (!record || record.terminalAt !== undefined || record.kind !== kind) return;
 			const finalOutcome = (outcome ??
 				(record as unknown as { pendingOutcome?: { kind: string; code: string; message: string } })
 					.pendingOutcome) as { kind: string; code: string; message: string } | undefined;
-			record.terminalAt = Date.now();
+			const previousRecord = { ...record };
+			const finalizedRecord: InvocationRecord = { ...record, revision: ++mutationRevision, terminalAt: Date.now() };
 			if (finalOutcome?.kind === "failed") {
-				record.status = "failed";
-				record.error = { code: finalOutcome.code, message: finalOutcome.message };
+				finalizedRecord.status = "failed";
+				// Legacy positional recordError overrides the recorded cause; the
+				// outcome's own code/message is the default (exact-head review P1).
+				finalizedRecord.error =
+					recordError !== undefined
+						? { code: recordError.code, message: recordError.message }
+						: { code: finalOutcome.code, message: finalOutcome.message };
 			} else {
-				record.status = "terminal_ok";
+				finalizedRecord.status = "terminal_ok";
 			}
-			(record as unknown as Record<string, unknown>).pendingOutcome = undefined;
+			(finalizedRecord as unknown as Record<string, unknown>).pendingOutcome = undefined;
+			if (isCurrent !== undefined && !isCurrent()) return;
+			const commit = Promise.withResolvers<void>();
+			const pending = {
+				finalizedRecord,
+				commit,
+				upgrades: new Set<PromiseWithResolvers<void>>(),
+				errors: [] as unknown[],
+			};
+			pendingFinalizations.set(recordKey, pending);
+			records.set(recordKey, finalizedRecord);
+			try {
+				await persist();
+				commit.resolve();
+				await Promise.allSettled([...pending.upgrades].map(upgrade => upgrade.promise));
+				if (pending.errors.length > 0) throw pending.errors[0];
+				if (isCurrent !== undefined && !isCurrent()) {
+					const current = records.get(recordKey);
+					if (current === finalizedRecord) {
+						records.set(recordKey, previousRecord);
+						await persist();
+					}
+				}
+			} catch (error) {
+				const current = records.get(recordKey);
+				if (current === finalizedRecord) records.set(recordKey, previousRecord);
+				commit.reject(error);
+				throw error;
+			} finally {
+				if (pendingFinalizations.get(recordKey) === pending) pendingFinalizations.delete(recordKey);
+			}
+		},
+		async markUncertain(kind, correlation, isCurrent) {
+			if (isCurrent !== undefined && !isCurrent()) return;
+			const recordKey = key(kind, correlation);
+			const record = records.get(recordKey);
+			if (!record || record.kind !== kind) return;
+			if (record.terminalAt !== undefined && record.error?.code !== "prompt_deadline_exceeded") return;
+			const next: InvocationRecord = {
+				...record,
+				status: record.startedAt === undefined ? "accepted" : "in_flight",
+				revision: ++mutationRevision,
+			};
+			if (isCurrent !== undefined && !isCurrent()) return;
+			delete next.terminalAt;
+			delete next.error;
+			delete (next as unknown as { outcome?: unknown }).outcome;
+			(next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending = true;
+			records.set(recordKey, next);
 			await persist();
 		},
 	};
@@ -1246,6 +1438,16 @@ async function resolveSdkWorkflowGate(
 	}
 }
 
+/** Compound failure-plus-terminal recovery intent for a rejected submission:
+ * the deadline manager's replay re-records this cause before agent_end so the
+ * abandoned prompt terminalizes failed, never terminal_ok (exact-head review). */
+function rejectionRecoveryIntent(error: unknown): { code: string; message: string } {
+	// The recovery intent is persisted and surfaced through prompt status, so it
+	// carries the sanitized classifier only — never a raw provider message
+	// (exact-head review P1).
+	return sanitizePromptFailure(error);
+}
+
 function createControlSurface(
 	ctx: ExtensionContext,
 	api: ExtensionAPI,
@@ -1261,6 +1463,7 @@ function createControlSurface(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
 		connectionId: string | undefined,
+		promotion?: { startsOwnRun?: boolean; removed?: boolean },
 	) => void,
 	policy?: SdkSurfacePolicy,
 	settings?: Settings,
@@ -1270,7 +1473,12 @@ function createControlSurface(
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams,
 	terminalPublicationCapture?: { resolvers?: Array<(observed: boolean) => void> },
 	activePromptOwnerHolder?: { connectionIds?: ReadonlySet<string> },
-	retirePendingOwner?: (correlation: InvocationCorrelation) => void,
+	retirePendingOwner?: (
+		kind: InvocationKind,
+		correlation: InvocationCorrelation,
+		leaseRelease?: "always" | "recover-failure",
+		failureIntent?: { code: string; message: string },
+	) => void,
 	canResolveGate: () => boolean = () => true,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 ): ControlSurface {
@@ -1360,8 +1568,10 @@ function createControlSurface(
 		run: (options: {
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
+			/** Internal disposition before a queued submission is actually consumed. */
+			onDispatchDisposition: (promotion: { startsOwnRun: boolean }) => void;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
-			onQueuedPromoted: () => void;
+			onQueuedPromoted: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			queuedAtDispatch: boolean;
 		}) => Promise<unknown>,
 		acceptedFields?: () => Record<string, unknown>,
@@ -1428,16 +1638,33 @@ function createControlSurface(
 		// Skills always start their own invocation; a plain prompt starts one
 		// only when idle at dispatch time.
 		const startsOwnTurn = kind === "skill" || (kind === "prompt" && !alwaysQueued && !queuedAtDispatch);
+		let promotionStartsOwnRun: boolean | undefined;
 		try {
 			const submission = Promise.resolve(
 				run({
 					onPreflightAccepted: () => void accept().catch(() => undefined),
 					onPreflightAcceptCommit: accept,
+					onDispatchDisposition: promotion => {
+						promotionStartsOwnRun = promotion.startsOwnRun;
+						if (promotion.startsOwnRun === false) {
+							// Dispatch-race diversion (#4668 review P1): the idle snapshot leased
+							// this prompt at acceptance, but it was actually diverted into the
+							// in-flight run's steering queue. While it sits queued — legitimately
+							// waiting behind a long turn — nothing renews that lease, so it would
+							// false-fire prompt_deadline_exceeded before consumption. Drop the
+							// acceptance-anchored lease and pending entry now; the real
+							// consumption boundary (onQueuedPromoted) re-leases and re-owns it.
+							retirePendingOwner?.(kind, correlation, "always");
+						}
+					},
 					// A queued submission (busy-accepted steering, or a follow-up) that
 					// is later PROMOTED to its own run needs its pending ownership entry
 					// created at promotion so the submitting connection can
 					// terminal-abort that turn (review threads P1/P2).
-					onQueuedPromoted: () => onPromotedTurn?.(kind, correlation, requesterConnectionId),
+					onQueuedPromoted: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => {
+						promotionStartsOwnRun = promotion?.startsOwnRun;
+						onPromotedTurn?.(kind, correlation, requesterConnectionId, promotion);
+					},
 					queuedAtDispatch,
 				}),
 			);
@@ -1449,13 +1676,26 @@ function createControlSurface(
 						// terminalizing here is safe — unless the submission resolved at queue time
 						// (followUp, or a prompt diverted to steer while streaming), in which case
 						// the turn's own lifecycle events drive terminalization.
-						if (!queuedAtDispatch)
+						// Dispatch-race P1: queuedAtDispatch is the pre-dispatch snapshot;
+						// a delayed preflight diverted to steering fires onQueuedPromoted
+						// with startsOwnRun:false and is now attached to the in-flight run.
+						// Do not terminalize from the stale snapshot — the run will.
+						if (!queuedAtDispatch && promotionStartsOwnRun !== false) {
+							// The accepted work settled without its own run still pending:
+							// retire the pending ownership entry (and with it the
+							// acceptance-anchored deadline lease, #4668 review) BEFORE
+							// terminalizing. A stale entry would otherwise be drained by
+							// a later agent_start and hand this connection ownership of
+							// a turn it did not start. No-op when agent_start already
+							// drained the entry.
+							retirePendingOwner?.(kind, correlation);
 							void reconciliation.noteTransition(kind, correlation, {
 								type: "agent_end",
 								...(typeof result === "string"
 									? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
 									: {}),
 							});
+						}
 						return;
 					}
 					if (allowCompletionFallback) {
@@ -1478,8 +1718,79 @@ function createControlSurface(
 						// monitor/cron turn's agent_start would shift the stale entry and
 						// associate the failed submission's connection as owner (review
 						// thread P1).
-						retirePendingOwner?.(correlation);
-						void reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
+						retirePendingOwner?.(kind, correlation);
+						// agent_failed alone is diagnostic-only (agent_end is the
+						// terminal boundary), so the failure reason is recorded first
+						// and the same submission is then terminalized as failed.
+						// Terminalizing only with agent_failed would leave the record
+						// accepted forever — exactly the #4668 zero-activity strand.
+						void (async () => {
+							// Compound failure+terminal recovery, kind-aware (exact-head review P1):
+							// the reason must be durable BEFORE the boundary or the rejection reads
+							// terminal_ok. Prompts hand the compound intent to the deadline manager
+							// (which also retires pending ownership at expiry). Skills have NO lease,
+							// so their recovery owner is this bounded in-place retry loop: the same
+							// order, retried, until both writes land or the budget is spent.
+							const attemptRejectionTerminalization = async (remaining: number): Promise<void> => {
+								try {
+									await reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
+								} catch {
+									if (kind === "prompt") {
+										retirePendingOwner?.(
+											kind,
+											correlation,
+											"recover-failure",
+											rejectionRecoveryIntent(error),
+										);
+										return;
+									}
+									if (remaining <= 1) {
+										// Budget exhausted but NEVER park inert (exact-head review P1): a
+										// skill has no deadline lease, so this loop is its only recovery
+										// owner. Log the sanitized classifier and keep a live scheduled retry
+										// so the accepted record terminalizes eventually instead of stranding
+										// accepted forever.
+										logger.error(
+											"SDK skill rejection exhausted its failure-reason retries; continuing scheduled recovery",
+											{
+												kind,
+												commandId: correlation.commandId,
+												turnId: correlation.turnId,
+												error: sanitizePromptFailure(error),
+											},
+										);
+										await Bun.sleep(1_000);
+										return attemptRejectionTerminalization(remaining);
+									}
+									await Bun.sleep(1_000);
+									return attemptRejectionTerminalization(remaining - 1);
+								}
+								try {
+									await reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
+								} catch (transitionError) {
+									if (kind === "prompt") {
+										retirePendingOwner?.(
+											kind,
+											correlation,
+											"recover-failure",
+											rejectionRecoveryIntent(error),
+										);
+									} else if (remaining > 1) {
+										await Bun.sleep(1_000);
+										return attemptRejectionTerminalization(remaining - 1);
+									}
+									logger.error("SDK accepted submission failed to terminalize after rejection", {
+										kind,
+										commandId: correlation.commandId,
+										turnId: correlation.turnId,
+										// Sanitized representation only: the raw transition error may
+										// carry transport or filesystem detail (exact-head review P2).
+										error: sanitizePromptFailure(transitionError),
+									});
+								}
+							};
+							void attemptRejectionTerminalization(3);
+						})();
 						return;
 					}
 					settled = true;
@@ -2632,6 +2943,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				waitForGateResolutionQuiescence: () => Promise<void>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
 				drainedInvocations?: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
+				attachedInvocations?: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 				openLifecycleBatches: Array<{
 					invocations: Array<{
 						kind: InvocationKind;
@@ -2640,6 +2952,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					}>;
 				}>;
 				disposeGate?: () => void;
+				lifecycleActive: boolean;
+				lifecycleEpoch: number;
+				/** Failure reasons whose durable agent_failed write failed; the
+				 * subsequent agent_end must re-record them before terminalizing or
+				 * the record classifies terminal_ok (exact-head review P1). */
+				unrecordedFailureReasons?: Map<string, { code: string; message: string }>;
 		  }
 		| undefined;
 	// Shared with the control surface's terminal abort: the correlated
@@ -2657,7 +2975,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// turn it did not submit, and never set for agent-initiated turns (review
 	// thread P1).
 	const activePromptOwnerHolder: { connectionIds?: Set<string> } = {};
-	const emitLifecycle = async (type: "agent_start" | "agent_end", ctx: ExtensionContext): Promise<void> => {
+	const emitLifecycle = async (
+		type: "agent_start" | "agent_end" | "agent_failed",
+		ctx: ExtensionContext,
+		failureCause?: unknown,
+		maintenanceOutcome?: string,
+	): Promise<void> => {
 		const current = active;
 		if (!current) return;
 		const adoptLifecycleBatch = (
@@ -2672,17 +2995,42 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (!batch || batch.length === 0) {
 				current.activeInvocation = undefined;
 				current.drainedInvocations = undefined;
+				current.attachedInvocations = undefined;
 				activePromptOwnerHolder.connectionIds = undefined;
 				return;
 			}
 			current.activeInvocation = batch[0];
 			current.drainedInvocations = batch.map(({ kind, correlation }) => ({ kind, correlation }));
+			current.attachedInvocations = undefined;
 			const owners = new Set<string>();
 			for (const entry of batch) if (entry.connectionId !== undefined) owners.add(entry.connectionId);
 			activePromptOwnerHolder.connectionIds = owners;
 		};
 		let transitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
-		if (type === "agent_start") {
+		if (type === "agent_failed") {
+			const active = current.activeInvocation;
+			const candidates = current.openLifecycleBatches[0]?.invocations ?? current.pending;
+			const fallback = active ? [active] : candidates;
+			// In-run ATTACHED correlations share the failing run: without their
+			// agent_failed diagnostic the later agent_end marks them terminal_ok
+			// after a failed shared run (exact-head review P1). Deduplicate by
+			// correlation against the fallback set.
+			const seen = new Set(fallback.map(({ correlation }) => `${correlation.commandId}:${correlation.turnId}`));
+			const attached = (current.attachedInvocations ?? []).filter(({ correlation }) => {
+				const id = `${correlation.commandId}:${correlation.turnId}`;
+				if (seen.has(id)) return false;
+				seen.add(id);
+				return true;
+			});
+			transitions = [...fallback, ...attached].map(({ kind, correlation }) => ({ kind, correlation }));
+		} else if (type === "agent_start") {
+			current.lifecycleEpoch += 1;
+			// Mark lifecycle active even when the drain is empty: a monitor/cron
+			// run started by the session has no SDK pending entry but is still a
+			// real active run that later in-run promotions must attach to instead
+			// of falling back to pending (review P1). Empty drains leave the
+			// previous SDK owner untouched.
+			current.lifecycleActive = true;
 			// Drain EVERY entry admitted for this run: a continuation may promote
 			// several follow-ups (each with its own requester correlation) into one
 			// run, and each submitting connection must be able to terminal-abort it.
@@ -2690,7 +3038,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// turn (queued-while-streaming submissions never push), so a mid-prompt
 			// continuation agent_start with an empty queue leaves the current owner
 			// untouched (review thread P1).
-			const drained = current.pending.splice(0);
+			const drained = current.pending
+				.splice(0)
+				.filter(entry => entry.kind !== "prompt" || !current.deadlineManager.isExpiring(entry.correlation));
 			if (drained.length > 0) {
 				current.openLifecycleBatches.push({ invocations: drained });
 				adoptLifecycleBatch(drained);
@@ -2704,11 +3054,49 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// aborted-turn end that lands after a successor agent_start must
 			// terminalize the aborted invocation, never the successor.
 			const ended = current.openLifecycleBatches[0];
-			transitions = ended
+			const baseTransitions = ended
 				? ended.invocations.map(({ kind, correlation }) => ({ kind, correlation }))
 				: current.activeInvocation
 					? [current.activeInvocation]
 					: [];
+			const attached = current.attachedInvocations ?? [];
+			const seen = new Set(
+				baseTransitions.map(({ correlation }) => `${correlation.commandId}:${correlation.turnId}`),
+			);
+			transitions = [
+				...baseTransitions,
+				...attached.filter(({ correlation }) => {
+					const id = `${correlation.commandId}:${correlation.turnId}`;
+					if (seen.has(id)) return false;
+					seen.add(id);
+					return true;
+				}),
+			];
+		}
+		const eventLifecycleEpoch = current.lifecycleEpoch;
+		const retireEndedLifecycleBatch = (): void => {
+			const ended = current.openLifecycleBatches[0];
+			if (!ended) return;
+			const transitionKeys = new Set(
+				transitions.map(({ correlation }) => `${correlation.commandId}:${correlation.turnId}`),
+			);
+			if (
+				ended.invocations.some(({ correlation }) =>
+					transitionKeys.has(`${correlation.commandId}:${correlation.turnId}`),
+				)
+			)
+				current.openLifecycleBatches.shift();
+		};
+		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") {
+			try {
+				current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
+			} catch {
+				// Maintenance checkpoints are non-terminal lifecycle observations.
+			}
+			const resolvers = terminalPublicationCapture.resolvers;
+			terminalPublicationCapture.resolvers = undefined;
+			for (const resolve of resolvers ?? []) resolve(true);
+			return;
 		}
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
@@ -2716,18 +3104,94 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// ring/broadcast (review thread P2). Reconciliation or event failure is
 		// recorded as observed=false, never rethrown into the api handler.
 		let observed = true;
+		const failedTransitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		try {
 			for (const invocation of transitions) {
-				await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, { type } as never);
-				if ((type as string) === "agent_end" || (type as string) === "agent_failed") {
-					if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+				try {
+					if (type === "agent_end" && invocation.kind === "prompt")
+						current.deadlineManager.noteTerminalTransition(invocation.correlation);
+					if (type === "agent_end") {
+						// Compound recovery (exact-head review P1): if this run's
+						// agent_failed write failed, re-record the sanitized reason
+						// durably BEFORE the boundary so the terminal classification is
+						// failed, never terminal_ok. A failed re-record throws into the
+						// catch below and retains recovery ownership.
+						const reasonKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
+						const unrecorded = current.unrecordedFailureReasons?.get(reasonKey);
+						if (unrecorded !== undefined) {
+							await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, {
+								type: "agent_failed",
+								error: Object.assign(new Error(unrecorded.message), { code: unrecorded.code }),
+							} as never);
+							current.unrecordedFailureReasons?.delete(reasonKey);
+						}
+					}
+					// agent_failed is additive diagnostic state; agent_end remains the
+					// lifecycle boundary that terminalizes ownership and deadlines.
+					const frame =
+						type === "agent_failed"
+							? {
+									type,
+									error:
+										failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
+								}
+							: { type };
+					await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, frame as never);
+					if ((type as string) === "agent_end") {
+						if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+					}
+				} catch {
+					// One broken durable transition must not strand the rest of a
+					// shared-run batch. The failed record remains leased/repairable
+					// and the publication is marked unobserved for terminal callers.
+					observed = false;
+					failedTransitions.push(invocation);
+					if (type === "agent_failed") {
+						// Keep the sanitized reason: the later agent_end must re-record
+						// it before terminalizing, or a successful boundary write
+						// classifies the failed run terminal_ok (exact-head review P1).
+						if (current.unrecordedFailureReasons === undefined) current.unrecordedFailureReasons = new Map();
+						current.unrecordedFailureReasons.set(
+							`${invocation.correlation.commandId}:${invocation.correlation.turnId}`,
+							sanitizePromptFailure(failureCause),
+						);
+					}
 				}
 			}
-			current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
+			try {
+				current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
+			} catch {
+				observed = false;
+			}
 		} catch {
 			observed = false;
 		}
+		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") return;
 		if (type === "agent_end") {
+			if (current.lifecycleEpoch !== eventLifecycleEpoch) {
+				// A successor agent_start won the lifecycle race while this event's
+				// durable transitions were awaiting persistence. Retire the ended
+				// batch before returning; otherwise it remains ahead of the successor
+				// and the next agent_end is paired with stale ownership.
+				retireEndedLifecycleBatch();
+				const resolvers = terminalPublicationCapture.resolvers;
+				terminalPublicationCapture.resolvers = undefined;
+				for (const resolve of resolvers ?? []) resolve(observed);
+				return;
+			}
+			if (failedTransitions.length > 0) {
+				// Durable terminalization failed. Keep the recovery-owned batch and
+				// its deadline leases alive so the deadline manager can replay a real
+				// agent_end instead of clearing into a stale synthetic failure.
+				retireEndedLifecycleBatch();
+				current.lifecycleActive = false;
+				current.activeInvocation = failedTransitions[0];
+				current.drainedInvocations = failedTransitions;
+				const resolvers = terminalPublicationCapture.resolvers;
+				terminalPublicationCapture.resolvers = undefined;
+				for (const resolve of resolvers ?? []) resolve(observed);
+				return;
+			}
 			if (current.openLifecycleBatches.length > 0) current.openLifecycleBatches.shift();
 			for (const invocation of transitions)
 				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
@@ -2742,7 +3206,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 	};
 	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
-	api.on("agent_end", async (_event, ctx) => await emitLifecycle("agent_end", ctx));
+	api.on(
+		"agent_end",
+		async (event, ctx) =>
+			await emitLifecycle(
+				"agent_end",
+				ctx,
+				undefined,
+				event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+			),
+	);
+	api.on("agent_failed", async (event, ctx) => emitLifecycle("agent_failed", ctx, event.error));
 	api.on("turn_start", async (_event, ctx) => {
 		const current = active;
 		if (!current) return;
@@ -2752,16 +3226,59 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	api.on("turn_end", (_event, ctx) =>
 		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
 	);
-	api.on("tool_execution_start", async (_event, ctx) => {
+	// Tool activity renews the deadline of EVERY prompt correlation attached to
+	// the active run — the root invocation plus any in-run consumed follow-ups
+	// sharing it — not only the head, or an attached correlation would
+	// false-fire prompt_deadline_exceeded during a long shared run (#4668).
+	const renewAttributableProgress = (eventType: string): void => {
 		const current = active;
-		if (current?.activeInvocation?.kind !== "prompt") return;
-		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_start");
+		if (!current) return;
+		// Renew only invocations adopted by the CURRENT run: the live lifecycle
+		// batch plus in-run attachments. drainedInvocations may still hold
+		// invocations retained only by the failedTransitions recovery path (their
+		// run already ended), whose leases must NOT be renewed by an unrelated
+		// successor run's tool activity (#4668 review P3) — renewal there
+		// postpones the bounded terminal replay up to maxMs while durable writes
+		// keep failing. In-run attachments are not in any batch yet (no
+		// agent_start follows for them), so they renew through
+		// attachedInvocations instead.
+		const liveRenewalSet = [
+			...(current.openLifecycleBatches[0]?.invocations ?? []),
+			...(current.attachedInvocations ?? []),
+		];
+		const inLiveRun = (entry: { kind: InvocationKind; correlation: InvocationCorrelation }): boolean =>
+			liveRenewalSet.some(
+				v =>
+					v.correlation.commandId === entry.correlation.commandId &&
+					v.correlation.turnId === entry.correlation.turnId,
+			);
+		// Derive EVERY renewal candidate from the live set only (exact-head review):
+		// activeInvocation may be a stale failedTransitions retention whose run
+		// already ended, so it must pass the same live filter — never renew from it
+		// alone.
+		const head = (current.activeInvocation ? [current.activeInvocation] : []).filter(inLiveRun);
+		const drained = (current.drainedInvocations ?? []).filter(inLiveRun);
+		const batch =
+			drained.length > 0
+				? head.length > 0 &&
+					!drained.some(
+						v =>
+							v.correlation.commandId === head[0]!.correlation.commandId &&
+							v.correlation.turnId === head[0]!.correlation.turnId,
+					)
+					? [...drained, ...head]
+					: drained
+				: head;
+		for (const invocation of batch)
+			if (invocation.kind === "prompt")
+				current.deadlineManager.onAttributableEvent(invocation.correlation, eventType);
+	};
+	api.on("tool_execution_start", async (_event, ctx) => {
+		renewAttributableProgress("tool_execution_start");
 		void ctx;
 	});
 	api.on("tool_execution_end", async (_event, ctx) => {
-		const current = active;
-		if (current?.activeInvocation?.kind !== "prompt") return;
-		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_end");
+		renewAttributableProgress("tool_execution_end");
 		void ctx;
 	});
 	const errorCode = (error: unknown): string | undefined =>
@@ -2798,6 +3315,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			getMaxMs: () => {
 				const v = options.settings?.get("sdk.promptMaxRuntimeMs" as never) as number | undefined;
 				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
+			},
+			onExpired: correlation => {
+				const idx = pending.findIndex(
+					entry =>
+						entry.correlation.commandId === correlation.commandId &&
+						entry.correlation.turnId === correlation.turnId,
+				);
+				if (idx >= 0) pending.splice(idx, 1);
 			},
 		});
 		const pending: Array<{
@@ -2839,6 +3364,64 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
 		let runtime: SessionSdkSessionRuntime;
+		// Durable-first bounded terminalization for accepted submissions that leave
+		// their queue or race a run WITHOUT consumption (exact-head review: clearing
+		// the lease before the durable writes strands the row accepted with no
+		// recovery owner when persistence fails, and an agent_failed write that
+		// silently fails lets the following agent_end terminalize the cancellation
+		// as terminal_ok). The reason MUST be durable before the terminal boundary
+		// lands, and the lease is only released after durable terminalization.
+		const terminalizeAbandonedSubmission = (
+			kind: InvocationKind,
+			correlation: InvocationCorrelation,
+			error: { code: string; message: string },
+		): void => {
+			const attempt = async (remaining: number): Promise<void> => {
+				try {
+					// 1. Record the failure reason durably FIRST. If this write fails,
+					// never fall through to agent_end: the record still has no error,
+					// so the terminal boundary would classify it terminal_ok.
+					await reconciliation.noteTransition(kind, correlation, {
+						type: "agent_failed",
+						error: Object.assign(new Error(error.message), { code: error.code }),
+					} as never);
+				} catch (reasonError) {
+					if (remaining <= 1) {
+						// Hand replay to the deadline manager: the lease stays armed and
+						// its bounded expiry retries the durable terminal transition
+						// instead of leaving an accepted row with no recovery owner.
+						deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
+						logger.error("SDK abandoned submission failed to record its failure reason", {
+							kind,
+							commandId: correlation.commandId,
+							turnId: correlation.turnId,
+							error: sanitizePromptFailure(reasonError),
+						});
+						return;
+					}
+					await Bun.sleep(1_000);
+					return attempt(remaining - 1);
+				}
+				try {
+					// 2. Terminal boundary. The durable error from step 1 makes this
+					// classify as failed, never terminal_ok.
+					await reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
+					// 3. Release recovery ownership ONLY after durable terminalization.
+					deadlineManager.clear(correlation);
+				} catch (transitionError) {
+					// Keep the lease armed; the manager replays the real agent_end.
+					deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
+					logger.error("SDK abandoned submission failed to terminalize", {
+						kind,
+						commandId: correlation.commandId,
+						turnId: correlation.turnId,
+						error: sanitizePromptFailure(transitionError),
+					});
+				}
+			};
+			void attempt(3);
+		};
+
 		const controlSurface = createControlSurface(
 			ctx,
 			api,
@@ -2850,14 +3433,108 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// queued would assign its stale connection as owner of a later
 				// agent-initiated turn (review thread P1).
 				if (startsOwnTurn) pending.push({ kind, correlation, connectionId });
+				// Anchor the zero-progress deadline at durable acceptance, not at
+				// agent_start (#4668): an accepted own-turn prompt that wedges
+				// between acceptance and run start (provider/credential/compaction
+				// preflight) never emits agent_start, so a lease created only at
+				// agent_start would leave it accepted with zero activity forever.
+				// Queued submissions (startsOwnTurn === false) are leased at
+				// promotion/agent_start instead, so a prompt waiting behind a
+				// legitimately long turn never false-fires. The agent_start
+				// re-entry in emitLifecycle is a no-op for an existing lease.
+				if (startsOwnTurn && kind === "prompt") deadlineManager.onAccepted(correlation);
 			},
 			steerReconciliation,
-			(kind, correlation, connectionId) => {
-				// A steering-queued submission PROMOTED to its own run (finished
-				// prompt unwinding) starts with an empty pending queue at its
-				// agent_start; create the entry at promotion so the submitting
-				// connection owns that turn (review thread P2).
-				pending.push({ kind, correlation, connectionId });
+			(kind, correlation, connectionId, promotion) => {
+				// Lease at the ACTUAL promotion boundary (#4668 review): a promoted
+				// submission that wedges before its run's agent_start must still
+				// terminalize boundedly instead of remaining accepted forever.
+				if (kind === "prompt") deadlineManager.onAccepted(correlation);
+				if (promotion?.removed) {
+					// The queued submission was REMOVED from its queue before
+					// consumption (queue.message.remove, queue editing, clearQueue, or
+					// the terminal-abort purge). No run will ever adopt it, so retire
+					// any pending ownership entry, drop the lease, and terminalize as a
+					// bounded client-visible failure — never accepted forever (#4668
+					// review P1). agent_failed records the reason; agent_end is the
+					// terminal boundary.
+					const pendingIdx = pending.findIndex(
+						entry =>
+							entry.correlation.commandId === correlation.commandId &&
+							entry.correlation.turnId === correlation.turnId,
+					);
+					if (pendingIdx >= 0) pending.splice(pendingIdx, 1);
+					terminalizeAbandonedSubmission(kind, correlation, {
+						code: "cancelled",
+						message: "Queued prompt was removed before consumption.",
+					});
+					return;
+				}
+				if (promotion?.startsOwnRun !== false) {
+					// A submission PROMOTED to its own run (finished prompt unwinding)
+					// starts with an empty pending queue at its agent_start; create the
+					// entry at promotion so the submitting connection owns that turn
+					// (review thread P2).
+					pending.push({ kind, correlation, connectionId });
+					return;
+				}
+				// Consumed INSIDE the currently running turn: no new agent_start
+				// follows for it, so a pending entry would be drained by an
+				// UNRELATED later agent_start and hand the connection ownership of
+				// a turn it did not start, plus a false prompt_deadline_exceeded
+				// (#4668 review). Attach the submitter to the in-flight run
+				// immediately: it shares that run's ownership and terminalizes
+				// with it.
+				const current = active;
+				if (current?.lifecycleActive) {
+					// If this correlation was already admitted as own-run via the
+					// idle snapshot (onAccepted -> pending) but later diverted to
+					// steering and consumed in-run, move it from pending to the
+					// active run so a later unrelated agent_start cannot re-drain it
+					// (dispatch-race P1).
+					const pendingIdx = pending.findIndex(
+						entry =>
+							entry.correlation.commandId === correlation.commandId &&
+							entry.correlation.turnId === correlation.turnId,
+					);
+					if (pendingIdx >= 0) pending.splice(pendingIdx, 1);
+					// In-run consumed steering tracks deadline but must NOT gain
+					// root turn.abort authority (review P1). The same correlation can
+					// be reported twice — once by the synchronous dispatch-race
+					// disposition at queue time and again when the steering batch is
+					// actually consumed — so attach idempotently (#4668 review P1).
+					if (current.drainedInvocations === undefined)
+						current.drainedInvocations = current.activeInvocation ? [current.activeInvocation] : [];
+					if (current.attachedInvocations === undefined) current.attachedInvocations = [];
+					const alreadyAttached = current.drainedInvocations.some(
+						entry =>
+							entry.correlation.commandId === correlation.commandId &&
+							entry.correlation.turnId === correlation.turnId,
+					);
+					if (!alreadyAttached) current.drainedInvocations.push({ kind, correlation });
+					if (
+						!current.attachedInvocations.some(
+							entry =>
+								entry.correlation.commandId === correlation.commandId &&
+								entry.correlation.turnId === correlation.turnId,
+						)
+					)
+						current.attachedInvocations.push({ kind, correlation });
+					return;
+				}
+				// No in-flight run visible and this is an in-run consumption
+				// racing agent_end (review P1): do not park in pending for the
+				// next unrelated run. Drop and terminalize boundedly.
+				const pendingIdx = pending.findIndex(
+					entry =>
+						entry.correlation.commandId === correlation.commandId &&
+						entry.correlation.turnId === correlation.turnId,
+				);
+				if (pendingIdx >= 0) pending.splice(pendingIdx, 1);
+				terminalizeAbandonedSubmission(kind, correlation, {
+					code: "busy",
+					message: "in-run promotion raced turn end",
+				});
 			},
 			surfaceFactory.policy,
 			options.settings,
@@ -2867,7 +3544,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			options.terminalAbortSeams,
 			terminalPublicationCapture,
 			activePromptOwnerHolder,
-			correlation => {
+			(
+				kind: InvocationKind,
+				correlation: InvocationCorrelation,
+				leaseRelease?: "always" | "recover-failure",
+				failureIntent?: { code: string; message: string },
+			) => {
 				// An accepted submission that settles WITHOUT starting (a rejection
 				// after acceptance) must not leave its pending entry behind: remove
 				// the matching correlation so a later agent-initiated turn never
@@ -2875,6 +3557,28 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// thread P1).
 				const index = pending.findIndex(entry => entry.correlation === correlation);
 				if (index >= 0) pending.splice(index, 1);
+				// Release the acceptance-anchored lease ONLY when the durable row is
+				// already terminal (exact-head review #4): clearing it before the
+				// settlement writes land strands the row accepted with no recovery
+				// owner if persistence fails. When the row is not terminal yet, the
+				// lease stays armed as the bounded recovery owner, and the deadline
+				// manager self-clears it at expiry once the durable row IS terminal —
+				// no phantom prompt_deadline_exceeded over the real outcome.
+				if (leaseRelease === "always") {
+					deadlineManager.clear(correlation);
+					return;
+				}
+				if (leaseRelease === "recover-failure" && failureIntent !== undefined) {
+					// Compound failure-plus-terminal recovery: the settlement's durable
+					// writes failed, so the lease stays armed as the recovery owner and its
+					// replay re-records the failure reason before agent_end (exact-head
+					// review HIGH: a bare terminal replay made rejections terminal_ok).
+					deadlineManager.noteTerminalTransition(correlation, failureIntent);
+					return;
+				}
+				const settledRow = reconciliation.lookup(kind, correlation) as { status?: string };
+				if (settledRow.status === "terminal_ok" || settledRow.status === "failed")
+					deadlineManager.clear(correlation);
 			},
 			() => acceptingGateResolutions,
 			trackGateResolution,
@@ -3096,6 +3800,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 			waitForGateResolutionQuiescence,
 			disposeGate,
+			lifecycleActive: false,
+			lifecycleEpoch: 0,
 		};
 		try {
 			await runtime.start();
@@ -3125,6 +3831,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					},
 					waitForGateResolutionQuiescence,
 					disposeGate,
+					lifecycleActive: false,
+					lifecycleEpoch: 0,
 				};
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}

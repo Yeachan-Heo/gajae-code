@@ -99,6 +99,8 @@ describe("kind-aware reconciliation", () => {
 				await rec.noteAccepted("skill", correlation, clientRef, { skillName: "deep-interview" });
 				await rec.claimPendingOutcome("skill", correlation, testCase.outcome);
 				await rec.noteTransition("skill", correlation, testCase.frame);
+				if (testCase.frame.type === "agent_failed")
+					await rec.noteTransition("skill", correlation, { type: "agent_end" });
 
 				expect(rec.lookup("skill", { clientRef }), testCase.name).toMatchObject({
 					status: testCase.expectedStatus,

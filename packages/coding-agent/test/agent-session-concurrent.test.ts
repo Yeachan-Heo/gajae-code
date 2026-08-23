@@ -477,6 +477,121 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {});
 	}, 20_000);
 
+	it("a queued SDK prompt after an aborted toolResult tail starts a fresh run", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const toolStarted = Promise.withResolvers<void>();
+		const secondProviderStarted = Promise.withResolvers<void>();
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call_abort_tail",
+			name: "abort_tail_tool",
+			arguments: {},
+		};
+		const tool: AgentTool = {
+			name: "abort_tail_tool",
+			label: "Abort tail tool",
+			description: "Creates a toolResult tail before the turn is aborted.",
+			parameters: z.object({}),
+			execute: async () => {
+				toolStarted.resolve();
+				return { content: [{ type: "text" as const, text: "tool result" }] };
+			},
+		};
+		let streamCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [tool] },
+			streamFn: (_model, _context, options) => {
+				streamCalls += 1;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (streamCalls === 1) {
+						const partial: AssistantMessage = {
+							role: "assistant",
+							content: [toolCall],
+							api: "anthropic-messages",
+							provider: "anthropic",
+							model: "mock",
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "toolUse",
+							timestamp: Date.now(),
+						};
+						stream.push({ type: "start", partial });
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+						stream.push({ type: "done", reason: "toolUse", message: partial });
+						return;
+					}
+					if (streamCalls === 2) {
+						secondProviderStarted.resolve();
+						options?.signal?.addEventListener(
+							"abort",
+							() => stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") }),
+							{ once: true },
+						);
+						return;
+					}
+					const successor = createAssistantMessage("successor complete");
+					stream.push({ type: "start", partial: successor });
+					stream.push({ type: "done", reason: "stop", message: successor });
+				});
+				return stream;
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-abort-tool-tail.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+
+		const firstPrompt = session.prompt("First message");
+		await toolStarted.promise;
+		await secondProviderStarted.promise;
+		expect(agent.state.messages.at(-1)?.role).toBe("toolResult");
+
+		const aborting = session.abort({ cause: "user_interrupt" });
+		let promoted = 0;
+		const successor = session.sendUserMessage("queued after tool abort", {
+			queuedAtDispatch: true,
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+		await aborting;
+		await successor;
+		await session.waitForIdle();
+		await firstPrompt.catch(() => {});
+
+		expect(streamCalls).toBe(3);
+		expect(
+			agent.state.messages.filter(
+				message =>
+					message.role === "user" &&
+					Array.isArray(message.content) &&
+					message.content.some(
+						content =>
+							typeof content === "object" &&
+							content.type === "text" &&
+							content.text === "queued after tool abort",
+					),
+			),
+		).toHaveLength(1);
+		expect(promoted).toBe(1);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+	}, 20_000);
+
 	it("queued steering is still resumed after an abort unwind (#4753)", async () => {
 		const { userTexts } = await createAbortLifecycleSession("testauth-abort-steering.db");
 

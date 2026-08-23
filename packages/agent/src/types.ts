@@ -357,7 +357,19 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * attach per-turn state (e.g., a fresh owned-completion lineage) at actual
 	 * resume admission rather than when the message was merely queued.
 	 */
-	onFollowUpConsumed?: (messages: AgentMessage[]) => void;
+	/**
+	 * Invoked when follow-up messages are consumed. `startsOwnRun` is true only
+	 * when the batch owns a new agent run; maintenance and in-run consumption
+	 * report false so callers attach to the existing lifecycle.
+	 */
+	onFollowUpConsumed?: (messages: AgentMessage[], promotion?: { startsOwnRun: boolean }) => void;
+	/**
+	 * Invoked with the steering messages the loop dequeues mid-run for the
+	 * CURRENT turn (right after getSteeringMessages). `promotion.startsOwnRun`
+	 * is false for in-run consumption and true when the batch starts a new run.
+	 */
+	/** Invoked when steering is consumed; see `startsOwnRun` on the promotion disposition. */
+	onSteeringConsumed?: (messages: AgentMessage[], promotion?: { startsOwnRun: boolean }) => void;
 	/**
 	 * One-shot transient recovery instruction attached to the first assistant
 	 * request of this loop invocation. Sent only to the provider (never committed
@@ -760,12 +772,23 @@ export interface AgentContext {
 }
 
 /**
+ * Sanitized failure diagnostic carried by `agent_failed`: a stable classifier code
+ * plus a fixed human-readable message. Never the raw provider error — consumers may
+ * not depend on provider-specific detail, request bodies, or raw error objects.
+ */
+export interface AgentFailureDiagnostic {
+	code: string;
+	message: string;
+}
+
+/**
  * Events emitted by the Agent for UI updates.
  * These events provide fine-grained lifecycle information for messages, turns, and tool executions.
  */
 export type AgentEvent =
 	// Agent lifecycle
 	| { type: "agent_start"; scope?: AttemptScope }
+	| { type: "agent_failed"; error: AgentFailureDiagnostic; scope?: AttemptScope }
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];

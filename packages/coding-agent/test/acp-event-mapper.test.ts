@@ -52,6 +52,27 @@ function expectAcpNotifications(updates: SessionNotification[]): void {
 }
 
 describe("ACP event mapper", () => {
+	it("keeps ownership running for diagnostic agent_failed until agent_end", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{ type: "agent_failed", error: { code: "agent_failed", message: "Agent run failed." } } as AgentSessionEvent,
+			"session-1",
+		);
+		expect(updates).toHaveLength(1);
+		expect(updates[0]?.update).toMatchObject({
+			sessionUpdate: "session_info_update",
+			_meta: {
+				gjcPhase: "error",
+				gjcAgentFailed: true,
+				running: true,
+				gjcRunning: true,
+				// Bounded sanitized diagnostic fields are carried through so ACP
+				// consumers can identify the documented failure cause.
+				gjcAgentFailedCode: "agent_failed",
+				gjcAgentFailedMessage: "Agent run failed.",
+			},
+		});
+	});
+
 	it("attaches a stable messageId to live assistant chunks", () => {
 		const assistantMessage = makeAssistantMessage("chunk");
 		const getMessageId = (message: unknown): string | undefined =>

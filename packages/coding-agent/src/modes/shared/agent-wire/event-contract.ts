@@ -32,6 +32,7 @@ export type AgentWireEventType = AgentSessionEvent["type"];
  */
 const AGENT_SESSION_EVENT_TYPE_REGISTRY: Record<AgentWireEventType, true> = {
 	agent_start: true,
+	agent_failed: true,
 	agent_end: true,
 	turn_start: true,
 	turn_end: true,

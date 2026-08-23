@@ -111,6 +111,9 @@ export const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"queue.message.move": "invalid_position",
 	"queue.message.update": "invalid_message",
 	"transcript.body": "resource_gone",
+	// goal.list/get is intentionally absent: on a goal-less session it now
+	// succeeds with an explicit no_active_goal diagnostic payload instead of
+	// resource_gone (#4668), so adapters must observe ok: true.
 	"session.last_assistant": "resource_gone",
 	"resource.body": "resource_gone",
 	"artifact.read": "resource_gone",
@@ -135,7 +138,32 @@ export const expectedGlobalErrors: Readonly<Record<string, string>> = {
 export function expectSemanticResult(operation: Operation, result: unknown): void {
 	const code = expectedDomainErrors[operation.sdkId];
 	if (code) expect(result).toMatchObject({ ok: false, error: { code } });
-	else expect(result).toMatchObject({ ok: true });
+	else if (operation.sdkId === "goal.list/get") {
+		// Envelope shapes differ per adapter: daemon/MCP return { ok, result|data },
+		// ACP unwraps to the bare payload. When an ok flag is present it must be true.
+		const envelope = result as { ok?: unknown } | null;
+		if (envelope !== null && typeof envelope === "object" && "ok" in envelope)
+			expect(result).toMatchObject({ ok: true });
+		const page =
+			(result as { page?: { items?: unknown[] } } | null)?.page ??
+			(result as { result?: { page?: { items?: unknown[] } } } | null)?.result?.page ??
+			(result as { data?: { page?: { items?: unknown[] } } } | null)?.data?.page;
+		// ACP's translated contract for goal.list/get is the same no_active_goal
+		// diagnostic page the daemon/MCP surfaces return (#4668 review P2): a
+		// missing page is a contract violation, not a pass.
+		if (page == null) throw new Error("goal.list/get diagnostic page must be present");
+		expect(
+			Array.isArray(page.items) && page.items.length > 0,
+			"goal.list/get diagnostic must contain at least one item",
+		).toBe(true);
+		const first = (page as { items: unknown[] }).items[0] as Record<string, unknown> & { message?: unknown };
+		expect(first).toMatchObject({ enabled: false, goal: null, reason: "no_active_goal" });
+		const msg = first.message;
+		expect(
+			typeof msg === "string" && (msg as string).length > 0,
+			"goal.list/get diagnostic message must be non-empty",
+		).toBe(true);
+	} else expect(result).toMatchObject({ ok: true });
 }
 
 export function expectGlobalSemanticResult(operation: Operation, result: unknown): void {
@@ -324,7 +352,29 @@ export async function fixture(): Promise<AdapterFixture> {
 			if (typeof operation !== "string")
 				return { ok: false, error: { code: "invalid_input", message: "invalid frame" } };
 			const code = expectedDomainErrors[operation];
-			return code ? { ok: false, error: { code, message: code } } : { ok: true, result: { ok: true } };
+			if (code) return { ok: false, error: { code, message: code } };
+			// ACP translated contract for goal.list/get (#4668 review P2): a
+			// goal-less session succeeds with the explicit no_active_goal
+			// diagnostic page, never a bare {ok:true} with no payload.
+			if (operation === "goal.list/get")
+				return {
+					ok: true,
+					result: {
+						page: {
+							items: [
+								{
+									enabled: false,
+									goal: null,
+									reason: "no_active_goal",
+									message:
+										"No goal is active in this session: goal mode has not created or resumed a goal, so no goal snapshot exists yet.",
+								},
+							],
+							complete: true,
+						},
+					},
+				};
+			return { ok: true, result: { ok: true } };
 		},
 	};
 	return {

@@ -55,6 +55,78 @@ import type {
 } from "./types";
 import { setAgentTerminalOwnerContext } from "./types";
 
+/**
+ * Closed runtime allowlist of failure-classifier codes. The public diagnostic
+ * contract promises a STABLE runtime classifier independent of provider-specific
+ * detail, so an unknown or provider-supplied code maps to the nearest runtime
+ * class instead of being forwarded verbatim (exact-head review P1/P2).
+ */
+const RUNTIME_FAILURE_CODES = new Set([
+	"agent_failed",
+	"aborted",
+	"local_snapshot_failure",
+	"provider_down",
+	"provider_unavailable",
+	"upstream_stream_interrupted",
+	"argument_validation",
+	"execution",
+	"local_buffer_overflow",
+	"escaped_arguments_discarded",
+	"prompt_failed",
+	"prompt_deadline_exceeded",
+	"skill_runtime",
+	"io_error",
+]);
+
+/** Provider-safe classifier subset: generic transport/validation classes a
+ * provider error may legitimately carry. Lifecycle classifiers ("aborted",
+ * "prompt_deadline_exceeded", local staging kinds) are runtime-owned and can
+ * never be asserted by a provider-supplied string (exact-head review P1). */
+const PROVIDER_ACCEPTABLE_FAILURE_CODES = new Set([
+	"provider_down",
+	"provider_unavailable",
+	"upstream_stream_interrupted",
+	"argument_validation",
+	"execution",
+]);
+
+function sanitizeAgentFailure(error: unknown, runtimeClassifiedCode?: string): { code: string; message: string } {
+	let code = "agent_failed";
+	try {
+		if (runtimeClassifiedCode !== undefined) {
+			// Runtime-authenticated classification: only the runtime itself may
+			// assert lifecycle classifiers; untrusted provider strings map to the
+			// generic failure class below.
+			if (RUNTIME_FAILURE_CODES.has(runtimeClassifiedCode)) code = runtimeClassifiedCode;
+		} else {
+			const candidate = error as { code?: unknown } | undefined;
+			if (
+				typeof candidate?.code === "string" &&
+				candidate.code.length <= 64 &&
+				PROVIDER_ACCEPTABLE_FAILURE_CODES.has(candidate.code)
+			)
+				code = candidate.code;
+		}
+	} catch {
+		// Untrusted provider errors may expose throwing accessors.
+	}
+	return { code, message: "Agent run failed." };
+}
+
+/** Guarded HTTP-status extraction for untrusted provider errors: a throwing
+ * getter must never escape the failure handler and suppress terminalization
+ * (exact-head review P1). */
+function safeErrorStatus(error: unknown): number | undefined {
+	try {
+		return (
+			extractHttpStatusFromError({ status: (error as { errorStatus?: unknown } | undefined)?.errorStatus }) ??
+			extractHttpStatusFromError(error)
+		);
+	} catch {
+		return undefined;
+	}
+}
+
 function assertUserImagePlaceholdersHavePayload(messages: readonly AgentMessage[]): void {
 	for (const message of messages) {
 		if (!("role" in message) || message.role !== "user") continue;
@@ -304,6 +376,8 @@ export interface AgentOptions {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn (reassignable). */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	/** Invoked with the steering messages dequeued mid-run for the current turn (reassignable). */
+	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
 	/**
 	 * Opt-in OpenTelemetry instrumentation. Passing `{}` enables the loop's
@@ -475,6 +549,8 @@ export class Agent {
 	afterToolCall?: AgentLoopConfig["afterToolCall"];
 	/** Invoked with the follow-up messages dequeued for the next turn. Reassign at any time. */
 	onFollowUpConsumed?: AgentLoopConfig["onFollowUpConsumed"];
+	/** Invoked with the steering messages dequeued mid-run for the current turn. Reassign at any time. */
+	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
 
 	constructor(opts: AgentOptions = {}) {
 		this.#state = { ...this.#state, ...opts.initialState };
@@ -519,6 +595,7 @@ export class Agent {
 		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
 		this.onFollowUpConsumed = opts.onFollowUpConsumed;
+		this.onSteeringConsumed = opts.onSteeringConsumed;
 		this.afterToolCall = opts.afterToolCall;
 		this.#telemetry = opts.telemetry;
 		this.#appendOnlyContext = opts.appendOnlyContext;
@@ -1497,8 +1574,13 @@ export class Agent {
 				// the in-loop getFollowUpMessages path uses: denied owned-completion
 				// envelopes are filtered before they reach the loop, and delivered
 				// envelopes settle their registrations — the direct path otherwise
-				// bypasses onFollowUpConsumed entirely (review threads P1/P2).
-				await this.onFollowUpConsumed?.(queuedFollowUp);
+				// bypasses onFollowUpConsumed entirely (review threads P1/P2). A
+				// maintenanceContinuation resumes the existing logical run (no new
+				// agent_start), so its batch is in-run consumption, not an own-run
+				// promotion (#4668 review P1).
+				await this.onFollowUpConsumed?.(queuedFollowUp, {
+					startsOwnRun: options?.maintenanceContinuation !== true,
+				});
 				// The hook can filter the WHOLE batch (every entry denied by a
 				// scope:"owned" abort): starting an empty provider run would
 				// violate the zero-final-call guarantee, so return without
@@ -1544,8 +1626,12 @@ export class Agent {
 			// authorized owned-completion follow-up reaches this branch, so
 			// bypassing the hook would leak every such job's ownership tuple and
 			// eventually exhaust the bounded ownership registries (review thread
-			// P2).
-			await this.onFollowUpConsumed?.(queuedFollowUp);
+			// P2). A maintenanceContinuation resumes the existing logical run (no
+			// new agent_start), so its batch is in-run consumption, not an own-run
+			// promotion (#4668 review P1).
+			await this.onFollowUpConsumed?.(queuedFollowUp, {
+				startsOwnRun: options?.maintenanceContinuation !== true,
+			});
 			// The hook can filter the WHOLE batch (every entry denied by a
 			// scope:"owned" abort): starting an empty provider run would violate
 			// the zero-final-call guarantee, so return without running the loop
@@ -1819,6 +1905,9 @@ export class Agent {
 					this.#steeringQueue = [...queued, ...this.#steeringQueue];
 					return [];
 				}
+				// Mid-run consumption into the CURRENT turn: the batch never starts
+				// its own run (#4668).
+				if (queued.length > 0) await this.onSteeringConsumed?.(queued, { startsOwnRun: false });
 				return queued;
 			},
 			requeueSteeringMessages: (messages: AgentMessage[]) => {
@@ -1835,7 +1924,7 @@ export class Agent {
 					return [];
 				}
 				if (queued.length > 0) {
-					await this.onFollowUpConsumed?.(queued);
+					await this.onFollowUpConsumed?.(queued, { startsOwnRun: false });
 				}
 				return queued;
 			},
@@ -2007,8 +2096,8 @@ export class Agent {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 				stopReason: abortController.signal.aborted ? "aborted" : "error",
-				errorMessage: err?.message || String(err),
-				errorStatus: extractHttpStatusFromError({ status: err?.errorStatus }) ?? extractHttpStatusFromError(err),
+				errorMessage: sanitizeAgentFailure(err).message,
+				errorStatus: safeErrorStatus(err),
 				// Local-diagnostic authority (`errorKind` + structured
 				// `bufferOverflow`) comes from ONE identity check: a foreign error
 				// that self-declares a local kind gets neither field, so the parent
@@ -2018,7 +2107,21 @@ export class Agent {
 				timestamp: Date.now(),
 			} as AgentMessage;
 
-			this.#state.error = err?.message || String(err);
+			// Store the sanitized message only: the raw provider error may carry request
+			// bodies, credentials, or tokens (exact-head review P1).
+			this.#state.error = sanitizeAgentFailure(err).message;
+			this.#emit({
+				type: "agent_failed",
+				// Runtime-authenticated classifiers only: abort comes from the
+				// signal, and a local staging failure comes from the identity-
+				// checked managedLocalErrorDiagnostic — a foreign error that
+				// self-declares a local kind still maps to agent_failed.
+				error: sanitizeAgentFailure(
+					err,
+					abortController.signal.aborted ? "aborted" : managedLocalErrorDiagnostic(err)?.errorKind,
+				),
+				scope: handle.scope,
+			});
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {
 				stopReason: abortController.signal.aborted ? "cancelled" : "error",
 				messages: [errorMsg],
@@ -2096,7 +2199,11 @@ export class Agent {
 					}
 				} catch (err) {
 					if (ownership.isCurrent()) {
-						this.#state.error = err instanceof Error ? err.message : String(err);
+						this.#state.error = sanitizeAgentFailure(err).message;
+						// The documented contract emits the sanitized diagnostic
+						// before the error terminal on this path too (exact-head
+						// review P2).
+						this.#emit({ type: "agent_failed", error: sanitizeAgentFailure(err) });
 						this.requestRunTerminal(managedLogicalRunOwner ?? runId, { stopReason: "error" });
 						if (this.#managedLogicalRunOwner === managedLogicalRunOwner) this.#managedLogicalRunOwner = undefined;
 					}
@@ -2109,7 +2216,16 @@ export class Agent {
 
 	#emit(e: AgentEvent) {
 		for (const listener of this.#listeners) {
-			listener(e);
+			try {
+				listener(e);
+			} catch (error) {
+				// Listener isolation (exact-head review P1): a throwing subscriber
+				// must never abort the emitting control path — in particular the
+				// failure catch that publishes agent_failed and then MUST reach its
+				// agent_end terminal boundary. An observer failure is logged as
+				// diagnostic data and never rethrown into the run loop.
+				console.warn("[pi-agent] event listener threw; swallowing:", sanitizeAgentFailure(error));
+			}
 		}
 	}
 

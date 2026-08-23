@@ -12,7 +12,7 @@
  * carry subsystem-specific message types — lives in the per-subsystem
  * `types.ts` files and is documented there.
  */
-import type { AgentMessage } from "@gajae-code/agent-core";
+import type { AgentMessage, MidRunMaintenanceOutcome } from "@gajae-code/agent-core";
 import type { CompactionPreparation, CompactionResult } from "@gajae-code/agent-core/compaction";
 import type { ImageContent, TextContent, ToolResultMessage } from "@gajae-code/ai/core";
 import type { Rule } from "../capability/rule";
@@ -186,6 +186,8 @@ export interface AgentEndEvent {
 	messages: AgentMessage[];
 	/** Indicates whether the loop ended normally, suspended, cancelled, or entered maintenance. */
 	stopReason?: "completed" | "paused" | "cancelled" | "maintenance";
+	/** Present for maintenance checkpoints; non-aborted checkpoints are not terminal. */
+	maintenanceOutcome?: MidRunMaintenanceOutcome;
 }
 
 /** Fired at the start of each turn */
