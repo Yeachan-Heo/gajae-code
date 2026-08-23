@@ -21,6 +21,7 @@ import {
 	observeProcessForTest,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
+	reapDeadLifecycleMarkers,
 	reapDeadSessionRegistrations,
 	setLifecycleCleanupHookForTest,
 	setLifecycleCommandResolverForTest,
@@ -2436,6 +2437,57 @@ test("broker terminalizes default command resolver failures", async () => {
 		setLifecycleCommandResolverForTest(broker, undefined);
 		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
 		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("reaps only lifecycle markers whose exact owner is proven dead", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-marker-reap-"));
+	const sdk = path.join(root, ".gjc", "state", "sdk");
+	const deadId = "dead-session";
+	const liveId = "live-session";
+	const unreadableId = "unreadable-session";
+	try {
+		await fs.mkdir(sdk, { recursive: true });
+		const dead = { pid: 999_999_999, effectMarker: "dead", incarnation: "linux:1" };
+		const live = { pid: process.pid, effectMarker: "live", incarnation: await incarnation(process.pid) };
+		await Bun.write(path.join(sdk, `${deadId}.lifecycle.json`), JSON.stringify(dead));
+		await Bun.write(path.join(sdk, `${deadId}.lifecycle.ready.json`), JSON.stringify(dead));
+		await Bun.write(path.join(sdk, `${liveId}.lifecycle.json`), JSON.stringify(live));
+		await Bun.write(path.join(sdk, `${unreadableId}.lifecycle.json`), "not lifecycle JSON");
+		const expiredAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		await fs.utimes(path.join(sdk, `${deadId}.lifecycle.json`), expiredAt, expiredAt);
+
+		expect(await reapDeadLifecycleMarkers(path.dirname(sdk))).toBe(1);
+		await expect(Bun.file(path.join(sdk, `${deadId}.lifecycle.json`)).exists()).resolves.toBe(false);
+		await expect(Bun.file(path.join(sdk, `${deadId}.lifecycle.ready.json`)).exists()).resolves.toBe(false);
+		await expect(Bun.file(path.join(sdk, `${liveId}.lifecycle.json`)).exists()).resolves.toBe(true);
+		await expect(Bun.file(path.join(sdk, `${unreadableId}.lifecycle.json`)).exists()).resolves.toBe(true);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("retains the concrete spawn failure when cleanup proof is unavailable", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-spawn-failure-cause-"));
+	const agentDir = path.join(root, "agent");
+	const broker = new Broker({ agentDir });
+	try {
+		setLifecycleCommandResolverForTest(broker, () => {
+			throw new Error("runtime executable is not a readable regular file.");
+		});
+		await broker.start();
+		const response = await broker.handleRequest("session.create", { cwd: root }, "concrete-spawn-failure");
+		expect(response).toEqual({
+			ok: false,
+			error: {
+				code: "spawn_failed",
+				message: "Unable to spawn session: runtime executable is not a readable regular file.",
+			},
+		});
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}

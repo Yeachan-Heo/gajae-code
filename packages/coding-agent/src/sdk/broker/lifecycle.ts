@@ -100,6 +100,7 @@ const MAX_RECEIVED_AT_SKEW_MS = 5_000;
 const MAX_LIFECYCLE_METADATA_BYTES = 4096;
 const MAX_EFFECT_MARKER_LENGTH = 128;
 const MAX_PROCESS_INCARNATION_LENGTH = 256;
+const DEAD_LIFECYCLE_MARKER_EXPIRY_MS = 60 * 60 * 1000;
 const READY_THEN_EXIT_MESSAGE = "became ready then exited before live admission";
 
 function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerResponse {
@@ -1002,6 +1003,100 @@ async function readEffectMarker(file: string): Promise<EffectMarker | undefined>
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Retires stale lifecycle markers only when their exact owner is proven gone. These
+ * files are launch bookkeeping, not authority for a future process: retaining
+ * an abandoned marker indefinitely turns unrelated launch failures into
+ * cleanup uncertainty. Unreadable, malformed, linked, and live markers are
+ * deliberately left untouched.
+ */
+export async function reapDeadLifecycleMarkers(
+	root: string,
+	limit = BROKER_DEAD_REGISTRATION_SWEEP_LIMIT,
+): Promise<number> {
+	let directory: string;
+	try {
+		const canonicalRoot = fsSync.realpathSync(root);
+		directory = path.join(canonicalRoot, "sdk");
+		const directoryStat = fsSync.lstatSync(directory, { bigint: true });
+		if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return 0;
+	} catch {
+		return 0;
+	}
+	let names: string[];
+	try {
+		names = await fs.readdir(directory);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+		return 0;
+	}
+	let reaped = 0;
+	for (const name of names) {
+		if (reaped >= Math.max(0, limit) || !name.endsWith(".lifecycle.json")) continue;
+		const id = name.slice(0, -".lifecycle.json".length);
+		if (!isCanonicalSessionId(id)) continue;
+		const markerPath = path.join(directory, name);
+		const marker = await readEffectMarker(markerPath);
+		if (!marker || observeProcess(marker.pid, marker.incarnation) !== "exited") continue;
+		const primary = captureLifecycleFile(markerPath, true, true);
+		if (!primary || Date.now() - Number(primary.identity.mtimeNs / 1_000_000n) < DEAD_LIFECYCLE_MARKER_EXPIRY_MS)
+			continue;
+		const readyPath = lifecycleReadyPath(path.dirname(directory), id);
+		const ready = captureLifecycleFile(readyPath, true, true);
+		if (ready) {
+			try {
+				const readyMarker = parseLifecycleJson(ready.bytes);
+				if (!isExactEffectMarker(readyMarker) || !sameEffectMarker(readyMarker, marker)) continue;
+			} catch {
+				continue;
+			}
+		}
+		const parent = lifecycleParentIdentity(directory);
+		if (!parent) continue;
+		try {
+			const currentPrimary = captureLifecycleFile(markerPath, true, true)?.identity;
+			const currentReady = ready ? captureLifecycleFile(readyPath, true, true)?.identity : undefined;
+			if (
+				!currentPrimary ||
+				!sameLifecycleCleanupIdentity(
+					currentPrimary,
+					serializeCleanupIdentity({ ...primary.identity, size: Number(primary.identity.size) }),
+				) ||
+				(ready &&
+					(!currentReady ||
+						!sameLifecycleCleanupIdentity(
+							currentReady,
+							serializeCleanupIdentity({ ...ready.identity, size: Number(ready.identity.size) }),
+						)))
+			)
+				continue;
+			if (
+				ready &&
+				!exactUnlinkLifecycleFile(
+					readyPath,
+					ready.identity,
+					path.join(directory, `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`),
+					{ dev: BigInt(parent.dev), ino: BigInt(parent.ino) },
+				).ok
+			)
+				continue;
+			if (
+				!exactUnlinkLifecycleFile(
+					markerPath,
+					primary.identity,
+					path.join(directory, `.gjc-reap-${randomUUID()}-${name}`),
+					{ dev: BigInt(parent.dev), ino: BigInt(parent.ino) },
+				).ok
+			)
+				continue;
+		} catch {
+			continue;
+		}
+		reaped += 1;
+	}
+	return reaped;
 }
 
 async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
@@ -3927,6 +4022,7 @@ async function executeLifecycleResponse(
 				await broker.ledger.transition(identity, "effect_started", { durableEffects });
 				ensureReusableNodeModules(launch.worktreePlan.repoRoot, launch.worktreePlan.worktreePath);
 			}
+			await reapDeadLifecycleMarkers(launch.root);
 		} catch (error) {
 			return fail(
 				"spawn_failed",
@@ -4038,6 +4134,10 @@ async function executeLifecycleResponse(
 			}
 			const spawned = authorizedSpawn.value;
 			child = spawned;
+			const spawnOutcome = Promise.withResolvers<void>();
+			spawned.once("error", error => spawnOutcome.reject(error));
+			spawned.once("spawn", () => spawnOutcome.resolve());
+			await spawnOutcome.promise;
 			const pid = spawned.pid;
 			if (!pid) throw new Error("spawned session has no pid");
 			const incarnation = processIncarnationForBroker(broker, pid);
@@ -5304,7 +5404,10 @@ export async function executeLifecycle(
 										error: {
 											code: "terminal_uncertain",
 											message:
-												"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+												"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation." +
+												(response.error.code === "spawn_failed"
+													? ` Original launch failure: ${response.error.message}`
+													: ""),
 										},
 										...(durableEffects ? { durableEffects } : {}),
 										...(startupFailure ? { startupFailure } : {}),
