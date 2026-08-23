@@ -458,10 +458,11 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 	const id = string(input.sessionId, input.id);
 	switch (operation) {
 		case "session.create":
-			return { root };
+			return { root, worktree: lifecycleWorktreeTarget(input) };
 		case "session.fork":
 			return {
 				root,
+				worktree: lifecycleWorktreeTarget(input),
 				sourceSessionId: string(input.sourceSessionId, input.sourceId),
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
 			};
@@ -472,6 +473,26 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 		default:
 			return { operation, root, sessionId: id };
 	}
+}
+
+/**
+ * A lifecycle request without a worktree remains serialized by its state root.
+ * Worktree launches instead serialize on the source repository plus the
+ * deterministic worktree selector, so concurrent requests cannot both observe
+ * an empty session index and then prepare the same checkout.
+ */
+function lifecycleWorktreeTarget(input: Record<string, unknown>): { name: string | null } | undefined {
+	const worktree = input.worktree;
+	if (worktree === undefined || worktree === false) return undefined;
+	if (worktree === true) return { name: null };
+	if (typeof worktree !== "object" || worktree === null || Array.isArray(worktree)) return undefined;
+	const name = (worktree as Record<string, unknown>).name;
+	return typeof name === "string" && name.length > 0 ? { name } : { name: null };
+}
+
+/** Test seam for lifecycle serialization identity. */
+export function lifecycleTargetForTest(operation: string, input: Record<string, unknown>): unknown {
+	return lifecycleTarget(operation, input);
 }
 
 const BROKER_LOCK_RECORD = "owner.json";

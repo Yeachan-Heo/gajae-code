@@ -77,7 +77,7 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
-import { isSessionAuthorityEligible } from "./session-index";
+import { type IndexedSession, isSessionAuthorityEligible } from "./session-index";
 import {
 	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
@@ -3100,6 +3100,46 @@ function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorkt
 	};
 }
 
+/**
+ * The id of a session still occupying `worktreePath`, or null when it is free.
+ *
+ * `ensureLaunchWorktree` reuses an existing worktree without asking whether anyone
+ * is in it, and an unnamed launch derives its directory deterministically from the
+ * repository's current branch. Two concurrent sessions in one repository therefore
+ * land in the same checkout and overwrite each other's files with no error.
+ *
+ * Only a process observed as definitively exited releases the worktree. `uncertain`
+ * counts as occupied: refusing a launch is recoverable by picking another worktree
+ * name, whereas two live sessions sharing a checkout corrupts work already done.
+ */
+function worktreeOccupant(
+	broker: { index: { listSessions(): { sessions: IndexedSession[] } } },
+	worktreePath: string,
+	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
+): string | null {
+	// Session locators retain the lexical cwd supplied to the host, while a
+	// lifecycle worktree plan may arrive through a symlink. Compare physical
+	// identity where it exists, with resolveEquivalentPath's lexical fallback
+	// for paths that have not been created yet.
+	const target = resolveEquivalentPath(worktreePath);
+	for (const session of broker.index.listSessions().sessions) {
+		if (session.terminal || !session.live) continue;
+		if (resolveEquivalentPath(session.locator.repo) !== target) continue;
+		if (observe(session.pid, session.hostIncarnation ?? session.processIncarnation) === "exited") continue;
+		return session.sessionId;
+	}
+	return null;
+}
+
+/** Test seam for the worktree occupancy boundary. */
+export function worktreeOccupantForTest(
+	sessions: IndexedSession[],
+	worktreePath: string,
+	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
+): string | null {
+	return worktreeOccupant({ index: { listSessions: () => ({ sessions }) } }, worktreePath, observe);
+}
+
 function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
 	const prepared = ensureLaunchWorktree(plan);
 	if (!prepared.enabled || path.resolve(prepared.worktreePath) !== path.resolve(plan.worktreePath))
@@ -3905,6 +3945,16 @@ async function executeLifecycleResponse(
 				"incarnation_unavailable",
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
+		// Refuse before any durable effect is recorded: a launch that cannot own its
+		// worktree should leave no ledger transition or child process behind.
+		if (launch.worktreePlan) {
+			const occupant = worktreeOccupant(broker, launch.worktreePlan.worktreePath);
+			if (occupant && occupant !== launch.id)
+				return fail(
+					"worktree_in_use",
+					`The requested worktree is already held by session ${occupant}. Choose another worktree name or stop that session.`,
+				);
+		}
 		const effectMarker = randomUUID();
 		const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
 		const effectIntent: LifecycleEffectIntent = {
