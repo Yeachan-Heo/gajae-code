@@ -121,6 +121,31 @@ describe("customization inventory", () => {
 		expect(row?.scope).toBe("global");
 	});
 
+	test("selected agent directory owns every global inventory surface", async () => {
+		const profile = path.join(tmpRoot, "selected-agent");
+		const decoy = getAgentDir();
+		await writeFile(path.join(profile, "skills", "profile-skill", "SKILL.md"), SKILL_MD);
+		await writeFile(path.join(profile, "hooks", "pre", "profile.ts"), "export {}\n");
+		await writeFile(
+			path.join(profile, "mcp.json"),
+			JSON.stringify({ mcpServers: { profile: { type: "stdio", command: "profile-command" } } }),
+		);
+		await writeFile(path.join(decoy, "skills", "decoy-skill", "SKILL.md"), SKILL_MD);
+		await writeFile(path.join(decoy, "hooks", "pre", "decoy.ts"), "export {}\n");
+		await writeFile(
+			path.join(decoy, "mcp.json"),
+			JSON.stringify({ mcpServers: { decoy: { type: "stdio", command: "decoy-command" } } }),
+		);
+
+		const inventory = await loadCustomizationInventory({ cwd: projectDir, home: homeDir, agentDir: profile });
+		const globalRows = inventory.rows.filter(row => row.scope === "global");
+		expect(globalRows.map(row => row.name)).toEqual(
+			expect.arrayContaining(["profile-skill", "profile.ts", "profile"]),
+		);
+		expect(globalRows.map(row => row.name)).not.toEqual(expect.arrayContaining(["decoy-skill", "decoy.ts", "decoy"]));
+		expect(globalRows.every(row => row.path.startsWith(profile))).toBe(true);
+	});
+
 	test("invalid frontmatter is flagged with remediation diagnostics", async () => {
 		await writeFile(path.join(projectDir, ".gjc", "skills", "broken", "SKILL.md"), "no frontmatter here\n");
 		const inventory = await loadCustomizationInventory({ cwd: projectDir, home: homeDir });

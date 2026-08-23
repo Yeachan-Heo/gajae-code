@@ -34,7 +34,7 @@ export interface GjcScopePaths {
 	hooksDir: string;
 }
 
-export function resolveScopePaths(scope: GjcScope, projectCwd: string): GjcScopePaths {
+export function resolveScopePaths(scope: GjcScope, projectCwd: string, agentDir?: string): GjcScopePaths {
 	if (scope === "project") {
 		const root = getProjectAgentDir(projectCwd);
 		return {
@@ -45,11 +45,11 @@ export function resolveScopePaths(scope: GjcScope, projectCwd: string): GjcScope
 			hooksDir: path.join(root, "hooks"),
 		};
 	}
-	const root = getAgentDir();
+	const root = path.resolve(agentDir ?? getAgentDir());
 	return {
 		scope,
 		root,
-		mcpConfigPath: getMCPConfigPath("user", projectCwd),
+		mcpConfigPath: path.join(root, "mcp.json"),
 		skillsDir: path.join(root, "skills"),
 		hooksDir: path.join(root, "hooks"),
 	};

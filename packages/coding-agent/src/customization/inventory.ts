@@ -33,6 +33,8 @@ export interface LoadCustomizationInventoryOptions {
 	cwd: string;
 	/** Runtime home override (tests); defaults to the process home. */
 	home?: string;
+	/** Owning session agent directory for global customization surfaces. */
+	agentDir?: string;
 	/** Skill management policy snapshot (trust, include/ignore, disabledExtensions). */
 	policy?: SkillManagementPolicy;
 	/** Disabled extension ids (`skill:<name>` / `mcp:<name>`) from settings. */
@@ -93,6 +95,7 @@ async function loadSkillRows(options: LoadCustomizationInventoryOptions, _warnin
 	const records = await listNativeSkillsForManagement({
 		cwd: options.cwd,
 		home: options.home,
+		agentDir: options.agentDir,
 		policy: options.policy,
 	});
 	const managedPaths = new Set<string>();
@@ -134,7 +137,7 @@ async function loadSkillRows(options: LoadCustomizationInventoryOptions, _warnin
 	// Narrow supplemental pass: flag SKILL.md files the management loader
 	// rejected (missing/invalid frontmatter) as invalid rows with remediation.
 	for (const scope of ["project", "global"] as const) {
-		const skillsDir = resolveScopePaths(scope, options.cwd).skillsDir;
+		const skillsDir = resolveScopePaths(scope, options.cwd, options.agentDir).skillsDir;
 		let dirNames: string[];
 		try {
 			dirNames = (await fs.readdir(skillsDir, { withFileTypes: true }))
@@ -185,7 +188,7 @@ async function loadHookRows(options: LoadCustomizationInventoryOptions, _warning
 	// Runtime semantics: project-first, first-wins on `<type>:<tool>:<name>`.
 	const seen = new Set<string>();
 	for (const scope of ["project", "global"] as const) {
-		const hooksDir = resolveScopePaths(scope, options.cwd).hooksDir;
+		const hooksDir = resolveScopePaths(scope, options.cwd, options.agentDir).hooksDir;
 		for (const phase of HOOK_PHASES) {
 			const phaseDir = path.join(hooksDir, phase);
 			let entries: Dirent[];
@@ -239,7 +242,7 @@ async function loadMcpRows(options: LoadCustomizationInventoryOptions, warnings:
 	);
 	const scopeConfigs = await Promise.all(
 		(["project", "global"] as const).map(async scope => {
-			const configPath = resolveScopePaths(scope, options.cwd).mcpConfigPath;
+			const configPath = resolveScopePaths(scope, options.cwd, options.agentDir).mcpConfigPath;
 			const config = await readMCPConfigFile(configPath).catch(() => null);
 			return { scope, configPath, config };
 		}),

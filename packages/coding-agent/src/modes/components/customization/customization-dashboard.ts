@@ -47,6 +47,7 @@ import { ImportWizard } from "./import-wizard";
 /** Minimal settings slice the dashboard reads and writes. */
 export interface CustomizationSettingsSlice {
 	get(key: string): unknown;
+	getAgentDir?(): string;
 	set?(key: string, value: unknown): void;
 }
 
@@ -149,6 +150,7 @@ export class CustomizationDashboard extends Container {
 		this.#inventory = await loadCustomizationInventory({
 			cwd: this.#cwd,
 			home: this.#homeDir,
+			agentDir: this.#settings?.getAgentDir?.(),
 			policy: this.#skillPolicy(),
 			disabledExtensions: this.#getStringArray("disabledExtensions"),
 		});
@@ -291,7 +293,7 @@ export class CustomizationDashboard extends Container {
 			this.#settings.set("disabledExtensions", result.disabledExtensions);
 			await this.#applyMutation(async () => ({ ok: true }) as { ok: true });
 		} else if (row.surface === "mcps") {
-			const paths = resolveScopePaths(row.scope, this.#cwd);
+			const paths = resolveScopePaths(row.scope, this.#cwd, this.#settings?.getAgentDir?.());
 			const result = await setMcpServerEnabled(
 				paths.mcpConfigPath,
 				row.name,
