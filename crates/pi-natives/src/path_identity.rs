@@ -453,7 +453,7 @@ pub struct NativeSecureSkillWriteResult {
 }
 
 impl NativeSecureSkillWriteResult {
-	fn success(path: String) -> Self {
+	const fn success(path: String) -> Self {
 		Self { ok: true, path: Some(path), code: None }
 	}
 
@@ -748,7 +748,7 @@ const fn is_retryable_exact_replace_status(status: i32) -> bool {
 	status == STATUS_SHARING_VIOLATION
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 /// STATUS_INVALID_PARAMETER: the synthetic NTSTATUS used for early,
 /// pre-syscall name validation rejections in the status-returning open path
 /// (e.g. an embedded NUL or an oversized name), which never reach
@@ -1445,14 +1445,16 @@ pub fn link_no_replace_path(
 }
 
 /// Create or overwrite one native skill's `SKILL.md` without following any
-/// path component. Every ancestor is opened descriptor-relatively with
-/// `O_DIRECTORY|O_NOFOLLOW`; the skill directory is created through the
-/// retained skills-root descriptor, and the final regular file is opened with
-/// `O_NOFOLLOW` before its descriptor is truncated and written.
+/// path component.
 ///
-/// Only Unix targets implement the descriptor-relative primitive. Other
-/// platforms return `unsupported_platform` so callers cannot silently fall
-/// back to a path-based write.
+/// Every ancestor is opened descriptor/handle-relatively with
+/// no-follow authority; the skill directory is created through the retained
+/// skills-root authority, and the final regular file is opened without
+/// following reparses before its retained handle is truncated and written.
+///
+/// Unix and Windows targets implement the descriptor/handle-relative primitive.
+/// Other platforms return `unsupported_platform` so callers cannot silently
+/// fall back to a path-based write.
 #[napi]
 pub fn secure_write_skill_file(
 	root_path: String,
@@ -1475,7 +1477,14 @@ pub fn secure_write_skill_file(
 	}
 	if Path::new(&root_path)
 		.components()
-		.any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+		.any(|component| matches!(component, Component::ParentDir))
+	{
+		return NativeSecureSkillWriteResult::failure("invalid_request");
+	}
+	#[cfg(not(windows))]
+	if Path::new(&root_path)
+		.components()
+		.any(|component| matches!(component, Component::Prefix(_)))
 	{
 		return NativeSecureSkillWriteResult::failure("invalid_request");
 	}
@@ -4523,7 +4532,7 @@ pub(crate) mod platform {
 		}
 		let mut current = unsafe {
 			libc::open(
-				b"/\0".as_ptr().cast(),
+				c"/".as_ptr(),
 				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
 			)
 		};
@@ -6497,10 +6506,10 @@ mod platform {
 			FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
 			FILE_BASIC_INFO, FILE_BEGIN, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
 			FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
-			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileBasicInfo,
-			FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
-			READ_CONTROL, ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID,
-			WRITE_DAC, WRITE_OWNER,
+			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+			FileBasicInfo, FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+			OPEN_EXISTING, READ_CONTROL, ReadFile, SetEndOfFile, SetFileInformationByHandle,
+			SetFilePointerEx, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER, WriteFile,
 		},
 		System::Threading::{GetCurrentProcess, OpenProcessToken},
 	};
@@ -6797,6 +6806,11 @@ mod platform {
 		fn parent(&self) -> Option<HANDLE> {
 			self.ancestors.last().copied()
 		}
+
+		fn retain_child(&mut self, child: HANDLE) {
+			let parent = std::mem::replace(&mut self.target, child);
+			self.ancestors.push(parent);
+		}
 	}
 
 	impl Drop for HeldExact {
@@ -6852,6 +6866,8 @@ mod platform {
 			0xc000_0035 => "quarantine_collision",
 			0xc000_0043 => "sharing_violation",
 			0xc000_0022 => "owner_mismatch",
+			0xc000_00ba => "not_regular_file",
+			0xc000_0103 => "not_directory",
 			0xc000_050b => "reparse_point",
 			0xc000_00d4 => "atomic_unavailable",
 			_ => "io_error",
@@ -6878,6 +6894,24 @@ mod platform {
 		desired_access: u32,
 		directory: bool,
 		share_access: u32,
+	) -> Result<HANDLE, i32> {
+		open_relative_with_disposition_status(
+			parent,
+			name,
+			desired_access,
+			directory,
+			share_access,
+			FILE_OPEN,
+		)
+	}
+
+	fn open_relative_with_disposition_status(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+		desired_access: u32,
+		directory: bool,
+		share_access: u32,
+		create_disposition: u32,
 	) -> Result<HANDLE, i32> {
 		let mut name: Vec<u16> = name.encode_wide().collect();
 		if name.is_empty()
@@ -6923,7 +6957,7 @@ mod platform {
 				null_mut(),
 				FILE_ATTRIBUTE_NORMAL,
 				share_access,
-				FILE_OPEN,
+				create_disposition,
 				options,
 				null_mut(),
 				0,
@@ -9038,12 +9072,280 @@ mod platform {
 		}
 	}
 
+	const FILE_OPEN_IF: u32 = 3;
+
+	fn skill_write_error() -> &'static str {
+		match unsafe { GetLastError() } {
+			2 | 3 => "not_found",
+			5 | 32 => "permission_denied",
+			112 => "no_space",
+			206 => "name_too_long",
+			223 => "content_too_large",
+			_ => "io_error",
+		}
+	}
+
+	fn skill_directory_matches_volume(
+		handle: HANDLE,
+		canonical_volume: &str,
+	) -> Result<(), &'static str> {
+		let canonical = final_path(handle)?;
+		if canonical.starts_with(canonical_volume) {
+			Ok(())
+		} else {
+			Err("identity_unavailable")
+		}
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent handle remains live across the no-follow child open and \
+		          identity check"
+	)]
+	fn open_or_create_skill_directory(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+	) -> Result<HANDLE, &'static str> {
+		let handle = open_relative_with_disposition_status(
+			parent,
+			name,
+			FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+			true,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			FILE_OPEN_IF,
+		)
+		.map_err(ntstatus_code)?;
+		let attributes = match handle_attributes(handle) {
+			Ok(attributes) => attributes,
+			Err(code) => {
+				unsafe { CloseHandle(handle) };
+				return Err(code);
+			},
+		};
+		if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			unsafe { CloseHandle(handle) };
+			return Err("reparse_point");
+		}
+		if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+			unsafe { CloseHandle(handle) };
+			return Err("not_directory");
+		}
+		let rebound = match open_relative(parent, name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true) {
+			Ok(rebound) => rebound,
+			Err(_) => {
+				unsafe { CloseHandle(handle) };
+				return Err("identity_mismatch");
+			},
+		};
+		let same = handles_same_object_checked(handle, rebound).unwrap_or(false);
+		unsafe { CloseHandle(rebound) };
+		if !same {
+			unsafe { CloseHandle(handle) };
+			return Err("identity_mismatch");
+		}
+		Ok(handle)
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained volume and directory handles own every component of the walk"
+	)]
+	fn open_or_create_skill_root(path: &Path) -> Result<(HeldExact, String), &'static str> {
+		let (root, names) = absolute_components(path)?;
+		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)?;
+		let root_attributes = match handle_attributes(root_handle) {
+			Ok(attributes) => attributes,
+			Err(code) => {
+				unsafe { CloseHandle(root_handle) };
+				return Err(code);
+			},
+		};
+		if root_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			unsafe { CloseHandle(root_handle) };
+			return Err("reparse_point");
+		}
+		let canonical_volume = match final_path(root_handle) {
+			Ok(path) => path,
+			Err(code) => {
+				unsafe { CloseHandle(root_handle) };
+				return Err(code);
+			},
+		};
+		let mut authority = HeldExact { target: root_handle, ancestors: Vec::new() };
+		for name in names {
+			let child = match open_or_create_skill_directory(authority.target, &name) {
+				Ok(child) => child,
+				Err(code) => return Err(code),
+			};
+			if let Err(code) = skill_directory_matches_volume(child, &canonical_volume) {
+				unsafe { CloseHandle(child) };
+				return Err(code);
+			}
+			authority.retain_child(child);
+		}
+		Ok((authority, canonical_volume))
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained skill-directory handle remains live through final identity validation"
+	)]
+	fn validate_skill_file_handle(handle: HANDLE) -> Result<(), &'static str> {
+		let attributes = handle_attributes(handle)?;
+		if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return Err("reparse_point");
+		}
+		if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+			return Err("not_regular_file");
+		}
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+			return Err(last_error_code());
+		}
+		if information.nNumberOfLinks != 1 {
+			return Err("hard_link");
+		}
+		Ok(())
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained skill-directory handle and final file handle remain live through \
+		          validation"
+	)]
+	fn revalidate_skill_file_name(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+		file: HANDLE,
+	) -> Result<(), &'static str> {
+		validate_skill_file_handle(file)?;
+		let rebound = match open_relative(parent, name, FILE_READ_ATTRIBUTES | FILE_READ_DATA, false)
+		{
+			Ok(rebound) => rebound,
+			Err(_) => return Err("identity_mismatch"),
+		};
+		let result = validate_skill_file_handle(rebound)
+			.and_then(|()| handles_same_object_checked(file, rebound).map_err(|_| "identity_mismatch"))
+			.and_then(|same| {
+				if same {
+					Ok(())
+				} else {
+					Err("identity_mismatch")
+				}
+			});
+		unsafe { CloseHandle(rebound) };
+		result
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained skill-directory handle and returned file handle remain live through \
+		          creation races"
+	)]
+	fn open_skill_file(parent: HANDLE, name: &std::ffi::OsStr) -> Result<HANDLE, &'static str> {
+		let file = open_relative_with_disposition_status(
+			parent,
+			name,
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA,
+			false,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			FILE_OPEN_IF,
+		)
+		.map_err(ntstatus_code)?;
+		if let Err(code) = revalidate_skill_file_name(parent, name, file) {
+			unsafe { CloseHandle(file) };
+			return Err(code);
+		}
+		Ok(file)
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained writable file handle is the only mutation authority"
+	)]
+	fn truncate_and_write_skill_file(handle: HANDLE, content: &[u8]) -> Result<(), &'static str> {
+		if unsafe { SetFilePointerEx(handle, 0, null_mut(), FILE_BEGIN) } == 0 {
+			return Err(skill_write_error());
+		}
+		if unsafe { SetEndOfFile(handle) } == 0 {
+			return Err(skill_write_error());
+		}
+		let mut offset = 0usize;
+		while offset < content.len() {
+			let chunk = (content.len() - offset).min(u32::MAX as usize);
+			let mut written = 0u32;
+			if unsafe {
+				WriteFile(
+					handle,
+					content[offset..offset + chunk].as_ptr().cast(),
+					chunk as u32,
+					&mut written,
+					null_mut(),
+				)
+			} == 0
+			{
+				return Err(skill_write_error());
+			}
+			if written == 0 {
+				return Err("write_failed");
+			}
+			offset += written as usize;
+		}
+		Ok(())
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "all writes use the retained no-follow authority and are preceded by identity \
+		          checks"
+	)]
 	pub(super) fn secure_write_skill_file(
-		_: &Path,
-		_: &str,
-		_: &str,
+		root_path: &Path,
+		skill_name: &str,
+		content: &str,
 	) -> NativeSecureSkillWriteResult {
-		NativeSecureSkillWriteResult::failure("unsupported_platform")
+		let (mut skills, canonical_volume) = match open_or_create_skill_root(root_path) {
+			Ok(value) => value,
+			Err(code) => return NativeSecureSkillWriteResult::failure(code),
+		};
+		let skill_name = std::ffi::OsString::from(skill_name);
+		let skill_handle = match open_or_create_skill_directory(skills.target, &skill_name) {
+			Ok(handle) => handle,
+			Err(code) => return NativeSecureSkillWriteResult::failure(code),
+		};
+		if let Err(code) = skill_directory_matches_volume(skill_handle, &canonical_volume) {
+			unsafe { CloseHandle(skill_handle) };
+			return NativeSecureSkillWriteResult::failure(code);
+		}
+		skills.retain_child(skill_handle);
+		let file_name = std::ffi::OsStr::new("SKILL.md");
+		let file = match open_skill_file(skills.target, file_name) {
+			Ok(file) => file,
+			Err(code) => return NativeSecureSkillWriteResult::failure(code),
+		};
+		if let Err(code) = revalidate_skill_file_name(skills.target, file_name, file) {
+			unsafe { CloseHandle(file) };
+			return NativeSecureSkillWriteResult::failure(code);
+		}
+		let canonical_path = match final_path(file) {
+			Ok(path) if path.starts_with(&canonical_volume) => path,
+			Ok(_) => {
+				unsafe { CloseHandle(file) };
+				return NativeSecureSkillWriteResult::failure("identity_unavailable");
+			},
+			Err(code) => {
+				unsafe { CloseHandle(file) };
+				return NativeSecureSkillWriteResult::failure(code);
+			},
+		};
+		let result = match truncate_and_write_skill_file(file, content.as_bytes()) {
+			Ok(()) => NativeSecureSkillWriteResult::success(canonical_path),
+			Err(code) => NativeSecureSkillWriteResult::failure(code),
+		};
+		unsafe {
+			CloseHandle(file);
+		}
+		result
 	}
 }
 

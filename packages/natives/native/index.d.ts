@@ -2286,14 +2286,16 @@ export interface SearchResult {
 
 /**
  * Create or overwrite one native skill's `SKILL.md` without following any
- * path component. Every ancestor is opened descriptor-relatively with
- * `O_DIRECTORY|O_NOFOLLOW`; the skill directory is created through the
- * retained skills-root descriptor, and the final regular file is opened with
- * `O_NOFOLLOW` before its descriptor is truncated and written.
+ * path component.
  *
- * Only Unix targets implement the descriptor-relative primitive. Other
- * platforms return `unsupported_platform` so callers cannot silently fall
- * back to a path-based write.
+ * Every ancestor is opened descriptor/handle-relatively with
+ * no-follow authority; the skill directory is created through the retained
+ * skills-root authority, and the final regular file is opened without
+ * following reparses before its retained handle is truncated and written.
+ *
+ * Unix and Windows targets implement the descriptor/handle-relative primitive.
+ * Other platforms return `unsupported_platform` so callers cannot silently
+ * fall back to a path-based write.
  */
 export declare function secureWriteSkillFile(rootPath: string, skillName: string, content: string): NativeSecureSkillWriteResult
 
@@ -2496,7 +2498,6 @@ export interface WorkProfile {
  * Returns UTF-16 lines with active SGR codes carried across line boundaries.
  */
 export declare function wrapTextWithAnsi(text: string, width: number, tabWidth: number): Array<string>
-
 /** Bounded, path-free evidence for a parent-directory durability failure. */
 export interface NativePublishSyncFailure {
   phase: string
@@ -2511,4 +2512,11 @@ export interface NativePublishDiagnostic {
   collectionState: string
   osCode?: number
   syncFailures?: Array<NativePublishSyncFailure>
+}
+
+/** Result of an identity-bound native skill file write. */
+export interface NativeSecureSkillWriteResult {
+  ok: boolean
+  path?: string
+  code?: string
 }

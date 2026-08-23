@@ -15,6 +15,7 @@ import {
 	renameNoReplacePath,
 	repairOwnerOnlyPathSecurityExpected,
 	retainBrokerPublication,
+	secureWriteSkillFile,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
@@ -82,6 +83,91 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect((refusal as Error).message).toContain(
 			"Retained broker publication authority is unavailable. [retained-publication object=sdk; reason=unsupported-platform]",
 		);
+	});
+
+	it("creates missing skill components and overwrites only the retained regular file", async () => {
+		const root = await temporaryDirectory();
+		const skillsRoot = path.join(root, ".gjc", "skills");
+		const first = secureWriteSkillFile(skillsRoot, "managed", "first");
+		expect(first).toMatchObject({ ok: true });
+		if (!first.ok || !first.path) throw new Error(`secure skill create failed: ${first.code}`);
+		expect(first.path).toStartWith("\\\\?\\Volume{");
+		expect(await fs.readFile(path.join(skillsRoot, "managed", "SKILL.md"), "utf8")).toBe("first");
+
+		const second = secureWriteSkillFile(skillsRoot, "managed", "second");
+		expect(second).toMatchObject({ ok: true });
+		if (!second.ok || !second.path) throw new Error(`secure skill overwrite failed: ${second.code}`);
+		expect(second.path).toBe(first.path);
+		expect(await fs.readFile(path.join(skillsRoot, "managed", "SKILL.md"), "utf8")).toBe("second");
+	});
+
+	it("rejects root, ancestor, skill, and final-file reparses without touching junction targets", async () => {
+		const root = await temporaryDirectory();
+		const outside = path.join(root, "outside");
+		const outsideFile = path.join(root, "outside-file.md");
+		await fs.mkdir(outside);
+		await fs.writeFile(path.join(outside, "SKILL.md"), "outside");
+		await fs.writeFile(outsideFile, "outside-file");
+
+		const rootJunction = path.join(root, "root-junction");
+		await fs.symlink(outside, rootJunction, "junction");
+		expect(secureWriteSkillFile(rootJunction, "managed", "blocked")).toEqual({
+			ok: false,
+			code: "reparse_point",
+		});
+		expect(secureWriteSkillFile(String.raw`\\server\share\skills`, "managed", "blocked")).toEqual({
+			ok: false,
+			code: "network_unsupported",
+		});
+
+		const skillsRoot = path.join(root, "skills");
+		await fs.mkdir(skillsRoot);
+		const skillJunction = path.join(skillsRoot, "managed");
+		await fs.symlink(outside, skillJunction, "junction");
+		expect(secureWriteSkillFile(skillsRoot, "managed", "blocked")).toEqual({
+			ok: false,
+			code: "reparse_point",
+		});
+
+		await fs.rm(skillJunction, { recursive: true, force: true });
+		await fs.mkdir(skillJunction);
+		const fileJunction = path.join(skillJunction, "SKILL.md");
+		await fs.symlink(outsideFile, fileJunction, "file");
+		expect(secureWriteSkillFile(skillsRoot, "managed", "blocked")).toEqual({
+			ok: false,
+			code: "reparse_point",
+		});
+		expect(await fs.readFile(outsideFile, "utf8")).toBe("outside-file");
+
+		await fs.rm(fileJunction, { force: true });
+		await fs.mkdir(fileJunction);
+		expect(secureWriteSkillFile(skillsRoot, "managed", "blocked")).toEqual({
+			ok: false,
+			code: "not_regular_file",
+		});
+
+		const nonDirectory = path.join(root, "not-a-directory");
+		await fs.writeFile(nonDirectory, "file");
+		expect(secureWriteSkillFile(path.join(nonDirectory, "skills"), "managed", "blocked")).toEqual({
+			ok: false,
+			code: "not_directory",
+		});
+	});
+
+	it("rejects hard-linked final aliases before truncation", async () => {
+		const root = await temporaryDirectory();
+		const skillsRoot = path.join(root, "skills");
+		const skillDirectory = path.join(skillsRoot, "managed");
+		const outside = path.join(root, "outside.md");
+		await fs.mkdir(skillDirectory, { recursive: true });
+		await fs.writeFile(outside, "outside");
+		await fs.link(outside, path.join(skillDirectory, "SKILL.md"));
+
+		expect(secureWriteSkillFile(skillsRoot, "managed", "blocked")).toEqual({
+			ok: false,
+			code: "hard_link",
+		});
+		expect(await fs.readFile(outside, "utf8")).toBe("outside");
 	});
 
 	it("rejects final and ancestor reparse points for every owner-only ACL operation", async () => {

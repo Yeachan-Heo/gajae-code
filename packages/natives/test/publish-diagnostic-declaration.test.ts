@@ -13,7 +13,7 @@ afterEach(async () => {
 	);
 });
 
-it("typechecks the generated retained-publish diagnostics as a strict declaration consumer", async () => {
+it("typechecks generated native declarations as a strict consumer", async () => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-native-diagnostic-types-"));
 	temporaryDirectories.push(directory);
 	const config = path.join(directory, "tsconfig.json");
@@ -24,6 +24,7 @@ it("typechecks the generated retained-publish diagnostics as a strict declaratio
 	RecoveryFsPublishDiagnostic,
 	RecoveryFsPublishResult,
 	RecoveryFsPublishSyncFailure,
+	NativeSecureSkillWriteResult,
 } from ${JSON.stringify(nativeDeclaration)};
 
 const failure: RecoveryFsPublishSyncFailure = {
@@ -46,7 +47,17 @@ const result: RecoveryFsPublishResult = {
 	phase: "source_parent_sync",
 	diagnostic,
 };
+const createdSkill: NativeSecureSkillWriteResult = {
+	ok: true,
+	path: "C:/skills/managed/SKILL.md",
+};
+const rejectedSkill: NativeSecureSkillWriteResult = {
+	ok: false,
+	code: "reparse_point",
+};
 void result;
+void createdSkill;
+void rejectedSkill;
 `,
 	);
 	await fs.writeFile(

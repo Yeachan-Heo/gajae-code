@@ -158,13 +158,14 @@ async function normalizeGeneratedDeclarationSpacing(): Promise<void> {
 	if (normalized !== bindings) await Bun.write(declarationPath, normalized);
 }
 
-async function ensurePublishDiagnosticDeclaration(): Promise<void> {
+async function ensureGeneratedDeclarationCompleteness(): Promise<void> {
 	const declarationPath = path.join(nativeDir, "index.d.ts");
 	const bindings = await Bun.file(declarationPath).text();
-	if (bindings.includes("export interface NativePublishDiagnostic")) return;
-	if (!bindings.includes("diagnostic: NativePublishDiagnostic"))
-		throw new Error("napi build did not generate the native publish diagnostic reference");
-	const declaration = `\n/** Bounded, path-free evidence for a parent-directory durability failure. */
+	const declarations: string[] = [];
+	if (!bindings.includes("export interface NativePublishDiagnostic")) {
+		if (!bindings.includes("diagnostic: NativePublishDiagnostic"))
+			throw new Error("napi build did not generate the native publish diagnostic reference");
+		declarations.push(`/** Bounded, path-free evidence for a parent-directory durability failure. */
 export interface NativePublishSyncFailure {
   phase: string
   parentRole: string
@@ -178,9 +179,24 @@ export interface NativePublishDiagnostic {
   collectionState: string
   osCode?: number
   syncFailures?: Array<NativePublishSyncFailure>
+}`);
+	}
+	if (!bindings.includes("export interface NativeSecureSkillWriteResult")) {
+		if (!bindings.includes("NativeSecureSkillWriteResult"))
+			throw new Error("napi build did not generate the native secure skill write reference");
+		declarations.push(`/** Result of an identity-bound native skill file write. */
+export interface NativeSecureSkillWriteResult {
+  ok: boolean
+  path?: string
+  code?: string
+}`);
+	}
+	if (declarations.length === 0) return;
+	await Bun.write(declarationPath, `${bindings.trimEnd()}\n${declarations.join("\n\n")}\n`);
 }
-`;
-	await Bun.write(declarationPath, `${bindings.trimEnd()}\n${declaration}`);
+
+async function ensurePublishDiagnosticDeclaration(): Promise<void> {
+	await ensureGeneratedDeclarationCompleteness();
 }
 
 const requiredGeneratedBindingSymbols = [
@@ -189,6 +205,7 @@ const requiredGeneratedBindingSymbols = [
 	"RecoveryFsResult",
 	"NativePublishDiagnostic",
 	"NativePublishSyncFailure",
+	"NativeSecureSkillWriteResult",
 	"openRecoveryFsRoot",
 	"repairOwnerOnlyPathSecurityExpected",
 	"verifyOwnerOnlyPathSecurityExpected",
