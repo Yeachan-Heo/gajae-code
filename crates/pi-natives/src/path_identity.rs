@@ -4657,7 +4657,7 @@ pub(crate) mod platform {
 						| libc::O_CLOEXEC
 						| libc::O_NOFOLLOW
 						| libc::O_NONBLOCK,
-					0o666,
+					0o600,
 				)
 			};
 			if fd < 0 {
@@ -4784,6 +4784,7 @@ pub(crate) mod platform {
 			},
 		};
 		if file.write_all(content.as_bytes()).is_err() {
+			let _ = file.set_len(0);
 			let private_fd = file.as_raw_fd();
 			unlink_private_skill_file(skill_fd, &private_name, private_fd);
 			drop(file);
@@ -4795,6 +4796,7 @@ pub(crate) mod platform {
 		}
 		let private_fd = file.as_raw_fd();
 		if let Err(code) = replace_skill_file_name(skill_fd, &private_name, &final_name, private_fd) {
+			let _ = file.set_len(0);
 			unlink_private_skill_file(skill_fd, &private_name, private_fd);
 			drop(file);
 			unsafe {
@@ -9383,7 +9385,7 @@ mod platform {
 				&name,
 				FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | 0x0001_0000,
 				false,
-				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				0,
 				FILE_CREATE,
 			) {
 				Ok(file) => file,
@@ -9441,6 +9443,7 @@ mod platform {
 	) -> Result<(), &'static str> {
 		#[cfg(test)]
 		pause_secure_skill_write_before_rename_for_test();
+		validate_skill_file_handle(handle)?;
 		rename_handle(handle, parent, final_name, true)
 	}
 
@@ -9483,6 +9486,7 @@ mod platform {
 		}
 		let final_name: Vec<u16> = file_name.encode_wide().collect();
 		if let Err(code) = replace_skill_file_name(file, skills.target, &final_name) {
+			let _ = truncate_and_write_skill_file(file, &[]);
 			let _ = delete_handle(file);
 			unsafe { CloseHandle(file) };
 			return NativeSecureSkillWriteResult::failure(code);
@@ -9818,6 +9822,49 @@ mod secure_skill_write_windows_tests {
 		assert!(result.ok, "{:?}", result.code);
 		assert_eq!(fs::read_to_string(&outside).expect("read external file"), "outside");
 		assert_eq!(fs::read_to_string(&final_path).expect("read published file"), "after");
+	}
+
+	#[test]
+	fn private_file_denies_hard_link_creation_while_writable() {
+		let _guard = HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.0.join(".gjc").join("skills");
+		let skill = root.join("managed");
+		let outside = temporary.0.join("private-alias.md");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_secure_skill_write_before_rename_hook(Some((entered_tx, resume_rx)));
+		let root_for_write = root.clone();
+		let writer = thread::spawn(move || {
+			secure_write_skill_file(
+				root_for_write.to_string_lossy().into_owned(),
+				"managed".to_owned(),
+				"private-stage".to_owned(),
+			)
+		});
+		entered_rx.recv().expect("wait for private-file write");
+		let private = fs::read_dir(&skill)
+			.expect("read skill directory")
+			.map(|entry| entry.expect("read private entry").path())
+			.find(|path| {
+				path
+					.file_name()
+					.is_some_and(|name| name.to_string_lossy().starts_with(".gjc-skill-write-"))
+			})
+			.expect("private skill file");
+		assert!(fs::hard_link(&private, &outside).is_err());
+		resume_tx.send(()).expect("release private-file write");
+		let result = writer.join().expect("secure skill writer thread");
+		platform::set_secure_skill_write_before_rename_hook(None);
+
+		assert!(result.ok, "{:?}", result.code);
+		assert!(!outside.exists());
+		assert_eq!(
+			fs::read_to_string(skill.join("SKILL.md")).expect("read published file"),
+			"private-stage"
+		);
 	}
 
 	#[test]
@@ -12052,6 +12099,47 @@ mod secure_skill_write_tests {
 		assert!(result.ok, "{:?}", result.code);
 		assert_eq!(fs::read_to_string(&outside).expect("read external file"), "outside");
 		assert_eq!(fs::read_to_string(&final_path).expect("read published file"), "after");
+	}
+
+	#[test]
+	fn private_file_hard_link_is_rejected_and_scrubbed() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.0.join(".gjc").join("skills");
+		let skill = root.join("managed");
+		let outside = temporary.0.join("private-alias.md");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_secure_skill_write_before_rename_hook(Some((entered_tx, resume_rx)));
+		let root_for_write = root.clone();
+		let writer = thread::spawn(move || {
+			secure_write_skill_file(
+				root_for_write.to_string_lossy().into_owned(),
+				"managed".to_owned(),
+				"secret-stage".to_owned(),
+			)
+		});
+		entered_rx.recv().expect("wait for private-file write");
+		let private = fs::read_dir(&skill)
+			.expect("read skill directory")
+			.map(|entry| entry.expect("read private entry").path())
+			.find(|path| {
+				path
+					.file_name()
+					.is_some_and(|name| name.to_string_lossy().starts_with(".gjc-skill-write-"))
+			})
+			.expect("private skill file");
+		fs::hard_link(&private, &outside).expect("link private staging file");
+		resume_tx.send(()).expect("release private-file write");
+		let result = writer.join().expect("secure skill writer thread");
+		platform::set_secure_skill_write_before_rename_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(fs::read(&outside).expect("read scrubbed private alias"), b"");
+		assert!(!skill.join("SKILL.md").exists());
 	}
 
 	#[test]
