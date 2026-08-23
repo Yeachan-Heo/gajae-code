@@ -1459,7 +1459,8 @@ pub fn secure_write_skill_file(
 	skill_name: String,
 	content: String,
 ) -> NativeSecureSkillWriteResult {
-	if root_path.contains('\0') || skill_name.contains('\0') || !Path::new(&root_path).is_absolute() {
+	if root_path.contains('\0') || skill_name.contains('\0') || !Path::new(&root_path).is_absolute()
+	{
 		return NativeSecureSkillWriteResult::failure("invalid_request");
 	}
 	if skill_name.is_empty()
@@ -4479,7 +4480,8 @@ pub(crate) mod platform {
 	/// concurrent symlink insertion after `mkdirat` fails closed.
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the retained parent descriptor and NUL-terminated component remain live across each syscall"
+		reason = "the retained parent descriptor and NUL-terminated component remain live across \
+		          each syscall"
 	)]
 	fn open_or_create_skill_directory(
 		parent_fd: libc::c_int,
@@ -4558,7 +4560,8 @@ pub(crate) mod platform {
 
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the opened descriptor and retained parent descriptor remain live through identity checks"
+		reason = "the opened descriptor and retained parent descriptor remain live through identity \
+		          checks"
 	)]
 	fn skill_file_matches_name(
 		parent_fd: libc::c_int,
@@ -4573,9 +4576,8 @@ pub(crate) mod platform {
 			return Err("not_regular_file");
 		}
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
-		if unsafe {
-			libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
-		} != 0
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0
 		{
 			return Err(skill_write_error(&std::io::Error::last_os_error()));
 		}
@@ -4600,12 +4602,10 @@ pub(crate) mod platform {
 	/// before any truncation or write occurs.
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the retained parent descriptor and final component remain live through open, validation, and truncation"
+		reason = "the retained parent descriptor and final component remain live through open, \
+		          validation, and truncation"
 	)]
-	fn open_skill_file(
-		parent_fd: libc::c_int,
-		name: &CString,
-	) -> Result<File, &'static str> {
+	fn open_skill_file(parent_fd: libc::c_int, name: &CString) -> Result<File, &'static str> {
 		const OPEN_RETRY_LIMIT: usize = 4;
 		let base_flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
 		for _ in 0..OPEN_RETRY_LIMIT {
@@ -4627,12 +4627,7 @@ pub(crate) mod platform {
 				return Err(skill_write_error(&open_error));
 			}
 			let created = unsafe {
-				libc::openat(
-					parent_fd,
-					name.as_ptr(),
-					base_flags | libc::O_CREAT | libc::O_EXCL,
-					0o666,
-				)
+				libc::openat(parent_fd, name.as_ptr(), base_flags | libc::O_CREAT | libc::O_EXCL, 0o666)
 			};
 			if created >= 0 {
 				if let Err(code) = skill_file_matches_name(parent_fd, name, created) {
@@ -4693,7 +4688,11 @@ pub(crate) mod platform {
 		};
 		let result = if file.write_all(content.as_bytes()).is_ok() {
 			NativeSecureSkillWriteResult::success(
-				canonical_root.join(skill_name).join("SKILL.md").to_string_lossy().into_owned(),
+				canonical_root
+					.join(skill_name)
+					.join("SKILL.md")
+					.to_string_lossy()
+					.into_owned(),
 			)
 		} else {
 			NativeSecureSkillWriteResult::failure("write_failed")
@@ -6511,9 +6510,8 @@ mod platform {
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
 		NativeOwnerOnlySecurityResult, NativeSecureSkillWriteResult, STATUS_INVALID_PARAMETER,
-		STATUS_SHARING_VIOLATION,
-		is_retryable_exact_replace_status, native_windows_error_code, open_with_transient_retry,
-		sha256,
+		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
+		open_with_transient_retry, sha256,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -11359,12 +11357,20 @@ mod secure_skill_write_tests {
 	fn creates_missing_skill_tree_and_overwrites_regular_file() {
 		let temporary = TempDir::new();
 		let root = temporary.0.join(".gjc").join("skills");
-		let first = secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "first".to_owned());
+		let first = secure_write_skill_file(
+			root.to_string_lossy().into_owned(),
+			"managed".to_owned(),
+			"first".to_owned(),
+		);
 		assert!(first.ok, "{:?}", first.code);
 		let path = root.join("managed").join("SKILL.md");
 		assert_eq!(fs::read_to_string(&path).expect("read first write"), "first");
 
-		let second = secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "second".to_owned());
+		let second = secure_write_skill_file(
+			root.to_string_lossy().into_owned(),
+			"managed".to_owned(),
+			"second".to_owned(),
+		);
 		assert!(second.ok, "{:?}", second.code);
 		assert_eq!(fs::read_to_string(&path).expect("read overwrite"), "second");
 		assert_eq!(second.path.as_deref(), Some(path.to_string_lossy().as_ref()));
@@ -11373,7 +11379,10 @@ mod secure_skill_write_tests {
 	#[test]
 	fn rejects_symlinked_skill_root_skill_directory_and_file() {
 		let assert_rejected_link = |code: Option<&str>| {
-			assert!(matches!(code, Some("reparse_point" | "not_directory")), "unexpected code: {code:?}");
+			assert!(
+				matches!(code, Some("reparse_point" | "not_directory")),
+				"unexpected code: {code:?}"
+			);
 		};
 		let temporary = TempDir::new();
 		let outside = temporary.0.join("outside");
@@ -11402,7 +11411,11 @@ mod secure_skill_write_tests {
 		fs::create_dir(&root).expect("create real skills directory");
 		let skill_link = root.join("managed");
 		std::os::unix::fs::symlink(&outside, &skill_link).expect("create skill symlink");
-		let skill_result = secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "blocked".to_owned());
+		let skill_result = secure_write_skill_file(
+			root.to_string_lossy().into_owned(),
+			"managed".to_owned(),
+			"blocked".to_owned(),
+		);
 		assert_rejected_link(skill_result.code.as_deref());
 
 		fs::remove_file(&skill_link).expect("remove skill symlink");
@@ -11411,16 +11424,26 @@ mod secure_skill_write_tests {
 		fs::write(&outside_file, "outside").expect("seed outside file");
 		std::os::unix::fs::symlink(&outside_file, skill_link.join("SKILL.md"))
 			.expect("create file symlink");
-		let file_result = secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "blocked".to_owned());
+		let file_result = secure_write_skill_file(
+			root.to_string_lossy().into_owned(),
+			"managed".to_owned(),
+			"blocked".to_owned(),
+		);
 		assert_rejected_link(file_result.code.as_deref());
 		assert_eq!(fs::read_to_string(&outside_file).expect("read outside file"), "outside");
 
 		fs::remove_file(skill_link.join("SKILL.md")).expect("remove file symlink");
 		fs::hard_link(&outside_file, skill_link.join("SKILL.md")).expect("create hard link");
-		let hard_link_result =
-			secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "blocked".to_owned());
+		let hard_link_result = secure_write_skill_file(
+			root.to_string_lossy().into_owned(),
+			"managed".to_owned(),
+			"blocked".to_owned(),
+		);
 		assert_eq!(hard_link_result.code.as_deref(), Some("hard_link"));
-		assert_eq!(fs::read_to_string(outside_file).expect("read hard-linked outside file"), "outside");
+		assert_eq!(
+			fs::read_to_string(outside_file).expect("read hard-linked outside file"),
+			"outside"
+		);
 	}
 }
 
