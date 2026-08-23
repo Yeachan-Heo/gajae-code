@@ -199,6 +199,9 @@ describe("skill-management", () => {
 
 		it("uses the configured agent directory when user home is omitted", async () => {
 			await withTempDirs(async (cwd, home) => {
+				const configuredContent = ["---", "description: A configured skill", "---", "", "# configured-skill"].join(
+					"\n",
+				);
 				const originalAgentDir = getAgentDir();
 				const configuredAgentDir = path.join(home, "profile-agent");
 				setAgentDir(configuredAgentDir);
@@ -207,9 +210,9 @@ describe("skill-management", () => {
 						cwd,
 						scope: "user",
 						name: "configured-skill",
-						content: validContent,
+						content: configuredContent,
 					});
-					expect(receipt.path).toBe(path.join(configuredAgentDir, "skills", "my-skill", "SKILL.md"));
+					expect(receipt.path).toBe(path.join(configuredAgentDir, "skills", "configured-skill", "SKILL.md"));
 				} finally {
 					setAgentDir(originalAgentDir);
 				}
