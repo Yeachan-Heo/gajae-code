@@ -2,9 +2,9 @@ import { expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { Settings } from "../src/config/settings";
 import type { BotApi } from "../src/sdk/bus/telegram-daemon";
 import { TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
-import { Settings } from "../src/config/settings";
 
 // ---------------------------------------------------------------------------
 // Daemon-level pins for the #4855 session-tag decision: the flat private-chat
