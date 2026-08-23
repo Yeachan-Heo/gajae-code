@@ -60,6 +60,7 @@ export {
 	// Loading API
 	loadCapability,
 	releaseSettingsScope,
+	loadCapabilityForHome,
 	// Cache management
 	reset,
 	setDisabledProviders,

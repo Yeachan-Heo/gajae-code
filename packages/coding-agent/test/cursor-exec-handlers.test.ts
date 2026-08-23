@@ -57,6 +57,28 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		expect(result.toolName).toBe("read");
 	});
 
+	it("passes cancellation to native writes and rejects an already-aborted write", async () => {
+		const signals: AbortSignal[] = [];
+		const writeTool = {
+			name: "write",
+			label: "write",
+			execute: async (_toolCallId: string, _args: Record<string, unknown>, signal?: AbortSignal) => {
+				if (signal) signals.push(signal);
+				return { content: [{ type: "text" as const, text: "written" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		const controller = new AbortController();
+		const args = create(WriteArgsSchema, { path: "state.txt", fileText: "state", toolCallId: "write-1" });
+
+		await handlers.write(args, controller.signal);
+		expect(signals).toEqual([controller.signal]);
+
+		controller.abort(new Error("timed out"));
+		await expect(handlers.write(args, controller.signal)).rejects.toThrow("timed out");
+		expect(signals).toEqual([controller.signal]);
+	});
+
 	it("a representative set of handlers all work detached", async () => {
 		const handlers = makeHandlers();
 		const { read, ls, grep, shell, write, diagnostics } = handlers;

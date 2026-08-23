@@ -1,0 +1,505 @@
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as http2 from "node:http2";
+import { create, toBinary } from "@bufbuild/protobuf";
+import type { AgentServerMessage, InteractionUpdate } from "../src/providers/cursor/gen/agent_pb";
+import {
+	AgentServerMessageSchema,
+	ConversationStateStructureSchema,
+	ExecServerMessageSchema,
+	HeartbeatUpdateSchema,
+	InteractionUpdateSchema,
+	PiReadExecArgsSchema,
+	TextDeltaUpdateSchema,
+	TokenDeltaUpdateSchema,
+	TurnEndedUpdateSchema,
+} from "../src/providers/cursor/gen/agent_pb";
+import { stream as streamModel } from "../src/stream";
+import type { AssistantMessage, Context, CursorExecHandlers, Model } from "../src/types";
+
+const cursorModel: Model<"cursor-agent"> = {
+	id: "cursor-composer-2.5",
+	name: "Cursor Composer 2.5",
+	api: "cursor-agent",
+	provider: "cursor",
+	baseUrl: "",
+	reasoning: false,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 1,
+	maxTokens: 1,
+};
+
+const baseContext: Context = { messages: [] };
+const CONNECT_END_STREAM_FLAG = 0b00000010;
+
+let server: http2.Http2Server | undefined;
+
+afterEach(async () => {
+	vi.restoreAllMocks();
+	if (!server) return;
+	const closing = Promise.withResolvers<void>();
+	server.close(() => closing.resolve());
+	server = undefined;
+	await closing.promise;
+});
+
+function frameConnectMessage(bytes: Uint8Array, flags = 0): Buffer {
+	const frame = Buffer.alloc(5 + bytes.length);
+	frame[0] = flags;
+	frame.writeUInt32BE(bytes.length, 1);
+	frame.set(bytes, 5);
+	return frame;
+}
+
+function sendInteractionUpdate(stream: http2.ServerHttp2Stream, message: InteractionUpdate["message"]): void {
+	const update = create(InteractionUpdateSchema, { message });
+	sendServerMessage(stream, { case: "interactionUpdate", value: update });
+}
+
+function sendServerMessage(stream: http2.ServerHttp2Stream, message: AgentServerMessage["message"]): void {
+	const serverMessage = create(AgentServerMessageSchema, { message });
+	stream.write(frameConnectMessage(toBinary(AgentServerMessageSchema, serverMessage)));
+}
+
+async function createCursorServer(onStream: (stream: http2.ServerHttp2Stream) => void): Promise<string> {
+	server = http2.createServer();
+	server.on("stream", onStream);
+	const listening = Promise.withResolvers<void>();
+	server.listen(0, "127.0.0.1", () => listening.resolve());
+	await listening.promise;
+	const address = server.address();
+	if (!address || typeof address === "string") throw new Error("Cursor test server did not bind a TCP port");
+	return `http://127.0.0.1:${address.port}`;
+}
+
+async function collectTerminal(
+	baseUrl: string,
+	options: {
+		streamFirstEventTimeoutMs?: number;
+		streamIdleTimeoutMs?: number;
+		execHandlers?: CursorExecHandlers;
+		signal?: AbortSignal;
+	},
+): Promise<{ events: unknown[]; result: AssistantMessage }> {
+	const stream = streamModel({ ...cursorModel, baseUrl }, baseContext, { apiKey: "test-token", ...options });
+	const events: unknown[] = [];
+	for await (const event of stream) events.push(event);
+	return { events, result: await stream.result() };
+}
+
+function isTerminalEvent(event: unknown): boolean {
+	if (!event || typeof event !== "object") return false;
+	const type = (event as { type?: unknown }).type;
+	return type === "done" || type === "error";
+}
+
+describe("Cursor raw transport watchdog", () => {
+	it("does not open a credential-bearing request for a pre-aborted signal", async () => {
+		let requestCount = 0;
+		const baseUrl = await createCursorServer(stream => {
+			requestCount += 1;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		});
+		const controller = new AbortController();
+		controller.abort(new Error("pre-aborted"));
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 20,
+		});
+
+		expect(requestCount).toBe(0);
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("pre-aborted");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("closes the request when abort wins during request setup", async () => {
+		const controller = new AbortController();
+		let requestCount = 0;
+		const baseUrl = await createCursorServer(_stream => {
+			requestCount += 1;
+			controller.abort(new Error("setup race abort"));
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 100,
+		});
+
+		expect(requestCount).toBe(1);
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("setup race abort");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("keeps an active Connect stream alive when heartbeat and token frames arrive without normalized output", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendInteractionUpdate(stream, {
+						case: "heartbeat",
+						value: create(HeartbeatUpdateSchema, {}),
+					}),
+				20,
+			);
+			setTimeout(
+				() =>
+					sendInteractionUpdate(stream, {
+						case: "tokenDelta",
+						value: create(TokenDeltaUpdateSchema, { tokens: 7 }),
+					}),
+				50,
+			);
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "conversationCheckpointUpdate",
+						value: create(ConversationStateStructureSchema, {}),
+					}),
+				65,
+			);
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {}),
+					}),
+				75,
+			);
+			setTimeout(
+				() =>
+					sendInteractionUpdate(stream, {
+						case: "heartbeat",
+						value: create(HeartbeatUpdateSchema, {}),
+					}),
+				90,
+			);
+			setTimeout(() => {
+				sendInteractionUpdate(stream, {
+					case: "turnEnded",
+					value: create(TurnEndedUpdateSchema, {}),
+				});
+				stream.end(frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG));
+			}, 120);
+		});
+
+		const { result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 40,
+			streamIdleTimeoutMs: 40,
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage.output).toBe(7);
+		expect(result.errorMessage).toBeUndefined();
+	});
+
+	it("preserves accumulated Cursor content and usage in exactly one terminal on a silent transport timeout", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendInteractionUpdate(stream, {
+						case: "textDelta",
+						value: create(TextDeltaUpdateSchema, { text: "partial" }),
+					}),
+				10,
+			);
+			setTimeout(
+				() =>
+					sendInteractionUpdate(stream, {
+						case: "tokenDelta",
+						value: create(TokenDeltaUpdateSchema, { tokens: 9 }),
+					}),
+				20,
+			);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 50,
+			streamIdleTimeoutMs: 50,
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Cursor stream stalled while waiting for transport progress");
+		expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "partial" }));
+		expect(result.usage.output).toBe(9);
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("does not rearm after caller abort while an exec handler is pending", async () => {
+		const controller = new AbortController();
+		const handlerReleased = Promise.withResolvers<void>();
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/pending" }) },
+						}),
+					}),
+				10,
+			);
+		});
+
+		const pending = collectTerminal(baseUrl, {
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 40,
+			streamIdleTimeoutMs: 40,
+			execHandlers: {
+				piRead: async () => {
+					await handlerReleased.promise;
+					throw new Error("expected delayed handler failure");
+				},
+			},
+		});
+		await Bun.sleep(25);
+		controller.abort();
+		const { events, result } = await pending;
+		const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+		handlerReleased.resolve();
+		for (let tick = 0; tick < 20; tick++) await Promise.resolve();
+
+		expect(result.stopReason).toBe("aborted");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+		expect(timeoutSpy).not.toHaveBeenCalled();
+	});
+
+	it("keeps a stream alive when a checkpoint is the only transport progress", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendInteractionUpdate(stream, {
+						case: "heartbeat",
+						value: create(HeartbeatUpdateSchema, {}),
+					}),
+				10,
+			);
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "conversationCheckpointUpdate",
+						value: create(ConversationStateStructureSchema, {}),
+					}),
+				45,
+			);
+			setTimeout(() => {
+				sendInteractionUpdate(stream, { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) });
+				stream.end(frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG));
+			}, 80);
+		});
+
+		const { result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 55,
+			streamIdleTimeoutMs: 40,
+		});
+
+		expect(result.stopReason).toBe("stop");
+	});
+
+	it("does not time out while a Cursor exec handler is still running", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/slow" }) },
+						}),
+					}),
+				10,
+			);
+			setTimeout(() => {
+				sendInteractionUpdate(stream, { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) });
+				stream.end(frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG));
+			}, 20);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 40,
+			streamIdleTimeoutMs: 40,
+			execHandlers: {
+				piRead: async () => {
+					await Bun.sleep(100);
+					throw new Error("expected test handler failure");
+				},
+			},
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("times out a truly silent Cursor transport", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 40,
+			streamIdleTimeoutMs: 40,
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Cursor stream timed out while waiting for the first transport event");
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			providerCode: "stream_first_event_timeout",
+			requestBytes: expect.any(Number),
+			firstEventElapsedMs: expect.any(Number),
+			firstEventTimeoutMs: 40,
+			endpointClass: "custom",
+		});
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("bounds a never-settling local exec independently from raw transport progress", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/never" }) },
+						}),
+					}),
+				10,
+			);
+		});
+		const neverSettles = Promise.withResolvers<never>();
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 200,
+			execHandlers: { piRead: async () => neverSettles.promise },
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("applies bounded backpressure while a local exec blocks frame handling", async () => {
+		let serverStream: http2.ServerHttp2Stream | undefined;
+		const baseUrl = await createCursorServer(stream => {
+			serverStream = stream;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				sendServerMessage(stream, {
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 1,
+						message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/flood" }) },
+					}),
+				});
+				for (let index = 0; index < 1_000; index += 1) {
+					sendInteractionUpdate(stream, {
+						case: "heartbeat",
+						value: create(HeartbeatUpdateSchema, {}),
+					});
+				}
+			}, 10);
+		});
+		const neverSettles = Promise.withResolvers<never>();
+
+		const { result } = await collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 200,
+			execHandlers: { piRead: async () => neverSettles.promise },
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
+		for (let tick = 0; tick < 20 && !serverStream?.closed; tick += 1) await Bun.sleep(1);
+		expect(serverStream?.closed).toBe(true);
+	});
+	it("aborts the per-exec signal handed to the handler when the deadline fires", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piReadArgs",
+								value: create(PiReadExecArgsSchema, { path: "/tmp/deadline-abort" }),
+							},
+						}),
+					}),
+				10,
+			);
+		});
+		const observed = Promise.withResolvers<AbortSignal | undefined>();
+
+		const { result } = await collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piRead: call => {
+					observed.resolve(call.signal);
+					return new Promise<never>(() => {});
+				},
+			},
+		});
+
+		const signal = await observed.promise;
+		expect(signal).toBeDefined();
+		for (let tick = 0; tick < 40 && !signal?.aborted; tick += 1) await Bun.sleep(5);
+		expect(signal?.aborted).toBe(true);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
+	});
+
+	it("aborts the per-exec signal when the caller aborts mid-exec", async () => {
+		const controller = new AbortController();
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piReadArgs",
+								value: create(PiReadExecArgsSchema, { path: "/tmp/caller-abort" }),
+							},
+						}),
+					}),
+				10,
+			);
+		});
+		const observed = Promise.withResolvers<AbortSignal | undefined>();
+
+		const pending = collectTerminal(baseUrl, {
+			signal: controller.signal,
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piRead: call => {
+					observed.resolve(call.signal);
+					return new Promise<never>(() => {});
+				},
+			},
+		});
+		const signal = await observed.promise;
+		expect(signal).toBeDefined();
+		controller.abort(new Error("caller cancelled exec"));
+		const { result } = await pending;
+
+		expect(signal?.aborted).toBe(true);
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("caller cancelled exec");
+	});
+});

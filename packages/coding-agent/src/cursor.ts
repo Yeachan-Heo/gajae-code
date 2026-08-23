@@ -77,7 +77,9 @@ async function executeTool(
 	toolCallId: string,
 	args: Record<string, unknown>,
 	overrideTool?: AgentTool,
+	execSignal?: AbortSignal,
 ): Promise<ToolResultMessage> {
+	if (execSignal?.aborted) throw cursorAbortError(execSignal);
 	const tool = overrideTool ?? options.tools.get(toolName);
 	if (!tool) {
 		const result = buildToolErrorResult(`Tool "${toolName}" not available`);
@@ -111,7 +113,7 @@ async function executeTool(
 		result = await tool.execute(
 			toolCallId,
 			args as Record<string, unknown>,
-			undefined,
+			execSignal ?? undefined,
 			onUpdate,
 			options.getToolContext?.(),
 		);
@@ -201,6 +203,11 @@ function shellTimeoutSeconds(timeout: number | undefined): number | undefined {
 	return Math.max(1, Math.ceil(timeout / 1000));
 }
 
+function cursorAbortError(signal: AbortSignal): Error {
+	const reason = signal.reason;
+	return reason instanceof Error ? reason : new Error("Request was aborted");
+}
+
 export class CursorExecHandlers implements ICursorExecHandlers {
 	constructor(private options: CursorExecBridgeOptions) {
 		// Bind every native handler so methods stay instance-safe when invoked
@@ -242,20 +249,34 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		};
 	}
 
-	async read(args: Parameters<NonNullable<ICursorExecHandlers["read"]>>[0]) {
+	async read(args: Parameters<NonNullable<ICursorExecHandlers["read"]>>[0], signal?: AbortSignal) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
-		const toolResultMessage = await executeTool(this.#optionsForCall(), "read", toolCallId, { path: args.path });
+		const toolResultMessage = await executeTool(
+			this.#optionsForCall(),
+			"read",
+			toolCallId,
+			{ path: args.path },
+			undefined,
+			signal,
+		);
 		return toolResultMessage;
 	}
 
-	async ls(args: Parameters<NonNullable<ICursorExecHandlers["ls"]>>[0]) {
+	async ls(args: Parameters<NonNullable<ICursorExecHandlers["ls"]>>[0], signal?: AbortSignal) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		// Redirect ls to read tool, which handles directories
-		const toolResultMessage = await executeTool(this.#optionsForCall(), "read", toolCallId, { path: args.path });
+		const toolResultMessage = await executeTool(
+			this.#optionsForCall(),
+			"read",
+			toolCallId,
+			{ path: args.path },
+			undefined,
+			signal,
+		);
 		return toolResultMessage;
 	}
 
-	async grep(args: Parameters<NonNullable<ICursorExecHandlers["grep"]>>[0]) {
+	async grep(args: Parameters<NonNullable<ICursorExecHandlers["grep"]>>[0], signal?: AbortSignal) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		// Cursor's native Glob tool arrives as a grep exec with a glob but no content
 		// pattern. The search tool requires a non-empty pattern, so an empty pattern
@@ -265,7 +286,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		if (pattern.trim().length === 0) {
 			if (args.glob) {
 				const globPath = `${args.path || "."}/${args.glob}`;
-				return executeTool(this.#optionsForCall(), "find", toolCallId, { paths: [globPath] });
+				return executeTool(this.#optionsForCall(), "find", toolCallId, { paths: [globPath] }, undefined, signal);
 			}
 			const result = buildToolErrorResult(
 				"Cursor grep request rejected: pattern must not be empty. Provide a non-empty search pattern.",
@@ -273,45 +294,69 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			return createToolResultMessage(toolCallId, "search", result, true);
 		}
 		const searchPath = args.glob ? `${args.path || "."}/${args.glob}` : args.path || ".";
-		const toolResultMessage = await executeTool(this.#optionsForCall(), "search", toolCallId, {
-			pattern,
-			paths: [searchPath],
-			i: args.caseInsensitive || undefined,
-		});
+		const toolResultMessage = await executeTool(
+			this.#optionsForCall(),
+			"search",
+			toolCallId,
+			{
+				pattern,
+				paths: [searchPath],
+				i: args.caseInsensitive || undefined,
+			},
+			undefined,
+			signal,
+		);
 		return toolResultMessage;
 	}
 
-	async write(args: Parameters<NonNullable<ICursorExecHandlers["write"]>>[0]) {
+	async write(args: Parameters<NonNullable<ICursorExecHandlers["write"]>>[0], signal?: AbortSignal) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		const content = args.fileText ?? new TextDecoder().decode(args.fileBytes ?? new Uint8Array());
-		const toolResultMessage = await executeTool(this.#optionsForCall(), "write", toolCallId, {
-			path: args.path,
-			content,
-		});
+		const toolResultMessage = await executeTool(
+			this.#optionsForCall(),
+			"write",
+			toolCallId,
+			{
+				path: args.path,
+				content,
+			},
+			undefined,
+			signal,
+		);
 		return toolResultMessage;
 	}
 
-	async delete(args: Parameters<NonNullable<ICursorExecHandlers["delete"]>>[0]) {
+	async delete(args: Parameters<NonNullable<ICursorExecHandlers["delete"]>>[0], signal?: AbortSignal) {
+		if (signal?.aborted) throw cursorAbortError(signal);
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		const toolResultMessage = await executeDelete(this.#optionsForCall(), args.path, toolCallId);
 		return toolResultMessage;
 	}
 
-	async shell(args: Parameters<NonNullable<ICursorExecHandlers["shell"]>>[0]) {
+	async shell(args: Parameters<NonNullable<ICursorExecHandlers["shell"]>>[0], signal?: AbortSignal) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		const timeoutSeconds = shellTimeoutSeconds(args.timeout);
-		const toolResultMessage = await executeTool(this.#optionsForCall(), "bash", toolCallId, {
-			command: args.command,
-			cwd: args.workingDirectory || undefined,
-			timeout: timeoutSeconds,
-		});
+		const toolResultMessage = await executeTool(
+			this.#optionsForCall(),
+			"bash",
+			toolCallId,
+			{
+				command: args.command,
+				cwd: args.workingDirectory || undefined,
+				timeout: timeoutSeconds,
+			},
+			undefined,
+			signal,
+		);
 		return toolResultMessage;
 	}
 
 	async shellStream(
 		args: Parameters<NonNullable<ICursorExecHandlers["shellStream"]>>[0],
 		callbacks: CursorShellStreamCallbacks,
+		signal?: AbortSignal,
 	) {
+		if (signal?.aborted) throw cursorAbortError(signal);
 		const options = this.#optionsForCall();
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		const toolName = "bash";
@@ -373,7 +418,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		};
 
 		try {
-			result = await tool.execute(toolCallId, toolArgs, undefined, onUpdate, options.getToolContext?.());
+			result = await tool.execute(toolCallId, toolArgs, signal, onUpdate, options.getToolContext?.());
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			result = buildToolErrorResult(message);
@@ -414,14 +459,21 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		if (composed === null) {
 			return createToolResultMessage(call.toolCallId, "read", { content: [{ type: "text", text: "" }] }, false);
 		}
-		return executeTool(this.#optionsForCall(), "read", call.toolCallId, { path: composed });
+		return executeTool(this.#optionsForCall(), "read", call.toolCallId, { path: composed }, undefined, call.signal);
 	}
 
 	async piBash(call: Parameters<NonNullable<ICursorExecHandlers["piBash"]>>[0]) {
-		return executeTool(this.#optionsForCall(), "bash", call.toolCallId, {
-			command: call.args.command,
-			timeout: piTimeout(call.args.timeout),
-		});
+		return executeTool(
+			this.#optionsForCall(),
+			"bash",
+			call.toolCallId,
+			{
+				command: call.args.command,
+				timeout: piTimeout(call.args.timeout),
+			},
+			undefined,
+			call.signal,
+		);
 	}
 
 	async piEdit(call: Parameters<NonNullable<ICursorExecHandlers["piEdit"]>>[0]) {
@@ -435,14 +487,22 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			call.toolCallId,
 			{ path: call.args.path, edits },
 			this.options.getEditReplaceTool?.(),
+			call.signal,
 		);
 	}
 
 	async piWrite(call: Parameters<NonNullable<ICursorExecHandlers["piWrite"]>>[0]) {
-		return executeTool(this.#optionsForCall(), "write", call.toolCallId, {
-			path: call.args.path,
-			content: call.args.content,
-		});
+		return executeTool(
+			this.#optionsForCall(),
+			"write",
+			call.toolCallId,
+			{
+				path: call.args.path,
+				content: call.args.content,
+			},
+			undefined,
+			call.signal,
+		);
 	}
 
 	async piGrep(call: Parameters<NonNullable<ICursorExecHandlers["piGrep"]>>[0]) {
@@ -456,33 +516,54 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			paths: [glob ? piJoinPath(path, glob) : path || "."],
 		};
 		if (ignoreCase === true) args.i = true;
-		return executeTool(this.#optionsForCall(), "search", call.toolCallId, args, perCallSearch);
+		return executeTool(this.#optionsForCall(), "search", call.toolCallId, args, perCallSearch, call.signal);
 	}
 
 	async piFind(call: Parameters<NonNullable<ICursorExecHandlers["piFind"]>>[0]) {
 		const { pattern, path, limit } = call.args;
-		return executeTool(this.#optionsForCall(), "find", call.toolCallId, {
-			paths: [piJoinPath(path, pattern)],
-			limit: piLimit(limit),
-		});
+		return executeTool(
+			this.#optionsForCall(),
+			"find",
+			call.toolCallId,
+			{
+				paths: [piJoinPath(path, pattern)],
+				limit: piLimit(limit),
+			},
+			undefined,
+			call.signal,
+		);
 	}
 
 	async piLs(call: Parameters<NonNullable<ICursorExecHandlers["piLs"]>>[0]) {
-		return executeTool(this.#optionsForCall(), "read", call.toolCallId, {
-			path: piLsPath(call.args.path),
-		});
+		return executeTool(
+			this.#optionsForCall(),
+			"read",
+			call.toolCallId,
+			{
+				path: piLsPath(call.args.path),
+			},
+			undefined,
+			call.signal,
+		);
 	}
 
-	async diagnostics(args: Parameters<NonNullable<ICursorExecHandlers["diagnostics"]>>[0]) {
+	async diagnostics(args: Parameters<NonNullable<ICursorExecHandlers["diagnostics"]>>[0], signal?: AbortSignal) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
-		const toolResultMessage = await executeTool(this.#optionsForCall(), "lsp", toolCallId, {
-			action: "diagnostics",
-			file: args.path,
-		});
+		const toolResultMessage = await executeTool(
+			this.#optionsForCall(),
+			"lsp",
+			toolCallId,
+			{
+				action: "diagnostics",
+				file: args.path,
+			},
+			undefined,
+			signal,
+		);
 		return toolResultMessage;
 	}
 
-	async mcp(call: CursorMcpCall) {
+	async mcp(call: CursorMcpCall, signal?: AbortSignal) {
 		const options = this.#optionsForCall();
 		const toolName = call.toolName || call.name;
 		const toolCallId = decodeToolCallId(call.toolCallId);
@@ -495,7 +576,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		}
 
 		const args = Object.keys(call.args ?? {}).length > 0 ? call.args : decodeMcpArgs(call.rawArgs ?? {});
-		const toolResultMessage = await executeTool(options, toolName, toolCallId, args);
+		const toolResultMessage = await executeTool(options, toolName, toolCallId, args, undefined, signal);
 		return toolResultMessage;
 	}
 }

@@ -7,7 +7,7 @@
  * - Loading items for a capability across all providers
  */
 import * as path from "node:path";
-import { getAgentDir, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
+import { getAgentDir, getConfigDirName, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
@@ -245,6 +245,49 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
 	const repoRoot = await findRepoRoot(cwd);
 	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, settings: options.settings };
+	const providers = filterProviders(capability, options);
+
+	return await loadImpl(capability, providers, ctx, options);
+}
+
+/**
+ * Load a capability against an explicitly supplied home directory.
+ *
+ * Cross-profile authority contract: when an explicit `home` is supplied, the
+ * load must resolve every user-scope surface from that home and NEVER fall
+ * back to the process-global `getAgentDir()`. The agent directory is derived
+ * from the supplied home (`<home>/<configDir>/agent`) unless the caller
+ * supplies an explicit `agentDir`; there is no implicit process-profile
+ * fallback. Consumers that cannot derive a user scope must fail closed.
+ */
+export async function loadCapabilityForHome<T>(
+	capabilityId: string,
+	home: string,
+	options: LoadOptions = {},
+): Promise<CapabilityResult<T>> {
+	const capability = capabilities.get(capabilityId) as Capability<T> | undefined;
+	if (!capability) {
+		throw new Error(`Unknown capability: "${capabilityId}"`);
+	}
+
+	const resolvedHome = path.resolve(home);
+	if (!path.isAbsolute(home)) {
+		throw new Error(
+			`loadCapabilityForHome requires an absolute home directory; received "${home}". Refusing to fall back to the process profile.`,
+		);
+	}
+	// Derive the user agent directory from the SUPPLIED home. An explicit
+	// options.agentDir is honored; otherwise `<home>/<configDirName>/agent`.
+	// getAgentDir() is deliberately not consulted: an explicit home must never
+	// read another profile's SYSTEM/RULES/AGENTS, skills, commands, hooks,
+	// settings, or executable descriptors.
+	const userAgentDir = options.agentDir
+		? path.resolve(options.agentDir)
+		: path.join(resolvedHome, getConfigDirName(), "agent");
+
+	const cwd = options.cwd ?? getProjectDir();
+	const repoRoot = await findRepoRoot(cwd);
+	const ctx: LoadContext = { cwd, home: resolvedHome, userAgentDir, repoRoot };
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);

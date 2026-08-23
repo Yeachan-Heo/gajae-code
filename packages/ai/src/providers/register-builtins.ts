@@ -537,7 +537,7 @@ export const streamOpenAIResponses = createLazyStream(
 	loadOpenAIResponsesProviderModule,
 	PROVIDER_OWNED_STREAM_WATCHDOG,
 );
-export const streamCursor = createLazyStream(loadCursorProviderModule);
+export const streamCursor = createLazyStream(loadCursorProviderModule, PROVIDER_OWNED_STREAM_WATCHDOG);
 export const streamOllama = createLazyStream(loadOllamaProviderModule);
 
 export const streamBedrock = createLazyStream(loadBedrockProviderModule);
