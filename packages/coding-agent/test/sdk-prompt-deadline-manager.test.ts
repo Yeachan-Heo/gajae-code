@@ -464,4 +464,23 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(manager.has(correlation)).toBe(false);
 		manager.clearAll();
 	}, 5_000);
+
+	test("re-arms a persisted uncertainty recovery without resetting its acceptance cap", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		const correlation = { commandId: "cmd-restart-recovery", turnId: "turn-restart-recovery" };
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 50,
+			now: () => 100,
+		});
+
+		manager.recoverPending(correlation, 0);
+		await Bun.sleep(20);
+
+		expect(state.finalizeCodes).toEqual(["prompt_deadline_exceeded"]);
+		expect(state.status).toBe("failed");
+		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	});
 });

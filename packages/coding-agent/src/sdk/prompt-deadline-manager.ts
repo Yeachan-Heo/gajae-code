@@ -303,6 +303,19 @@ export class PromptDeadlineManager {
 		this.#schedule(key);
 	}
 
+	/** Re-arm a durable uncertainty-recovery record after process startup without
+	 * resetting its acceptance-anchored hard maximum runtime. */
+	recoverPending(correlation: InvocationCorrelation, acceptedAt: number): void {
+		const key = leaseKey(correlation);
+		if (this.#leases.has(key)) return;
+		const now = this.#now();
+		const lease = createPromptDeadlineLease({ now, leaseMs: this.#getLeaseMs(), maxMs: this.#getMaxMs() });
+		this.#leases.set(key, { ...lease, acceptedAt });
+		this.#correlations.set(key, correlation);
+		this.#uncertaintyRecoveryPending.add(key);
+		this.#schedule(key);
+	}
+
 	onProgress(correlation: InvocationCorrelation, now = this.#now()): void {
 		const key = leaseKey(correlation);
 		const lease = this.#leases.get(key);
