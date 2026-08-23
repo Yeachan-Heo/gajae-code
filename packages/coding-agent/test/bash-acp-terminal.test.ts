@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { Settings } from "../src/config/settings";
 import type { ClientBridge, ClientBridgeTerminalHandle } from "../src/session/client-bridge";
 import { truncateHeadBytes, truncateTailBytes } from "../src/session/streaming-output";
 import type { ToolSession } from "../src/tools";
@@ -13,18 +12,6 @@ interface SessionOptions {
 }
 
 function makeSession(bridge: ClientBridge, options: SessionOptions = {}): ToolSession {
-	const settings = Settings.isolated({
-		"async.enabled": false,
-		"bash.autoBackground.enabled": false,
-		"bash.autoBackground.thresholdMs": 60_000,
-		"bashInterceptor.enabled": false,
-		"astGrep.enabled": false,
-		"astEdit.enabled": false,
-		"search.enabled": false,
-		"find.enabled": false,
-		...(options.tailKiB === undefined ? {} : { "tools.artifactTailBytes": options.tailKiB }),
-		...(options.headKiB === undefined ? {} : { "tools.artifactHeadBytes": options.headKiB }),
-	});
 	return {
 		cwd: "/tmp",
 		hasUI: false,
@@ -583,8 +570,6 @@ describe("BashTool ACP terminal routing", () => {
 		// The global Settings singleton belongs to an EARLIER session (default
 		// profile); the session's REQUESTED directory is the tenant profile and
 		// must win in the spawned command environment.
-		const settings = Settings.isolated();
-		spyOn(settings, "getAgentDir").mockReturnValue("default-profile");
 		const session = {
 			cwd: process.cwd(),
 			settings: {
@@ -604,8 +589,6 @@ describe("BashTool ACP terminal routing", () => {
 	});
 
 	it("lets an explicit legacy agent-directory override beat the session injection", async () => {
-		const settings = Settings.isolated();
-		spyOn(settings, "getAgentDir").mockReturnValue("default-profile");
 		const session = {
 			cwd: process.cwd(),
 			settings: {

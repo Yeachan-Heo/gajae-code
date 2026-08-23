@@ -292,11 +292,10 @@ describe("AgentSession python cleanup", () => {
 		expect(unrelatedKernel.execute).toHaveBeenCalledTimes(2);
 	});
 
-	it("waits for active SDK session Python work without releasing another session's kernel", async () => {
+	it("waits for active SDK session Python work before releasing a shared retained kernel", async () => {
 		const { tempDir, cwd } = createTempProject();
 		tempDirs.push(tempDir);
-		const firstKernel = new FakeKernel();
-		const secondKernel = new FakeKernel();
+		const kernel = new FakeKernel();
 		const blockedExecution = Promise.withResolvers<typeof OK_EXECUTION>();
 		const blockedExecutionStarted = Promise.withResolvers<void>();
 		let blockedExecutionSettled = false;
@@ -308,15 +307,14 @@ describe("AgentSession python cleanup", () => {
 				blockedExecutionSettled = true;
 			},
 		);
-		firstKernel.blockedCode = "print('first')";
-		firstKernel.blockedExecution = blockedExecution.promise;
-		firstKernel.blockedExecutionStarted = () => blockedExecutionStarted.resolve();
-		firstKernel.blockedExecutionReject = error => blockedExecution.reject(error);
+		kernel.blockedCode = "print('first')";
+		kernel.blockedExecution = blockedExecution.promise;
+		kernel.blockedExecutionStarted = () => blockedExecutionStarted.resolve();
+		kernel.blockedExecutionReject = error => blockedExecution.reject(error);
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		const startSpy = vi
 			.spyOn(pythonKernel.PythonKernel, "start")
-			.mockResolvedValueOnce(firstKernel as unknown as PythonKernelInstance)
-			.mockResolvedValueOnce(secondKernel as unknown as PythonKernelInstance);
+			.mockResolvedValue(kernel as unknown as PythonKernelInstance);
 		const firstSession = await createSession(tempDir, cwd);
 		const secondSession = await createSession(tempDir, cwd);
 		expect(startSpy).toHaveBeenCalledTimes(0);
@@ -346,22 +344,19 @@ describe("AgentSession python cleanup", () => {
 			expect(firstDisposed).toBe(false);
 			expect(blockedExecutionSettled).toBe(false);
 			expect(firstExecutionSettled).toBe(false);
-			expect(firstKernel.shutdownCalls).toBe(0);
-			expect(secondKernel.shutdownCalls).toBe(0);
+			expect(kernel.shutdownCalls).toBe(0);
 
 			blockedExecution.resolve(OK_EXECUTION);
 			await Promise.all([observedFirstExecution, secondExecution, disposeFirst]);
 
-			expect(startSpy).toHaveBeenCalledTimes(2);
-			expect(firstKernel.shutdownCalls).toBe(1);
-			expect(secondKernel.shutdownCalls).toBe(0);
-			expect(firstKernel.executeCalls).toEqual(["print('first')"]);
-			expect(secondKernel.executeCalls).toEqual(["print('second')"]);
+			expect(startSpy).toHaveBeenCalledTimes(1);
+			expect(kernel.shutdownCalls).toBe(0);
+			expect(kernel.executeCalls).toEqual(["print('first')", "print('second')"]);
 
 			await secondSession.executePython("print('third')");
 
-			expect(startSpy).toHaveBeenCalledTimes(2);
-			expect(secondKernel.executeCalls).toEqual(["print('second')", "print('third')"]);
+			expect(startSpy).toHaveBeenCalledTimes(1);
+			expect(kernel.executeCalls).toEqual(["print('first')", "print('second')", "print('third')"]);
 		} finally {
 			if (!firstDisposed) {
 				await firstSession.dispose();
@@ -369,8 +364,7 @@ describe("AgentSession python cleanup", () => {
 			await secondSession.dispose();
 		}
 
-		expect(firstKernel.shutdownCalls).toBe(1);
-		expect(secondKernel.shutdownCalls).toBe(1);
+		expect(kernel.shutdownCalls).toBe(1);
 	});
 	it("aborts tracked eval execution during session dispose after warmup completes", async () => {
 		const { tempDir, cwd } = createTempProject();
@@ -438,22 +432,20 @@ describe("AgentSession python cleanup", () => {
 	it("detaches retained kernel ownership even when dispose times out waiting for Python work", async () => {
 		const { tempDir, cwd } = createTempProject();
 		tempDirs.push(tempDir);
-		const firstKernel = new FakeKernel();
-		const secondKernel = new FakeKernel();
+		const kernel = new FakeKernel();
 		const blockedExecution = Promise.withResolvers<typeof OK_EXECUTION>();
 		const blockedExecutionStarted = Promise.withResolvers<void>();
-		firstKernel.blockedCode = "print('blocked')";
-		firstKernel.blockedExecution = blockedExecution.promise;
-		firstKernel.blockedExecutionStarted = () => blockedExecutionStarted.resolve();
-		firstKernel.abortBlockedExecution = false;
+		kernel.blockedCode = "print('blocked')";
+		kernel.blockedExecution = blockedExecution.promise;
+		kernel.blockedExecutionStarted = () => blockedExecutionStarted.resolve();
+		kernel.abortBlockedExecution = false;
 
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		const sleepSpy = mockLongPythonDisposeSleepsImmediate();
 
 		const startSpy = vi
 			.spyOn(pythonKernel.PythonKernel, "start")
-			.mockResolvedValueOnce(secondKernel as unknown as PythonKernelInstance)
-			.mockResolvedValueOnce(firstKernel as unknown as PythonKernelInstance);
+			.mockResolvedValue(kernel as unknown as PythonKernelInstance);
 
 		const firstSession = await createSession(tempDir, cwd);
 		const secondSession = await createSession(tempDir, cwd);
@@ -475,9 +467,8 @@ describe("AgentSession python cleanup", () => {
 
 		expect(firstDisposed).toBe(true);
 		expect(firstExecutionSettled).toBe(false);
-		expect(firstKernel.shutdownCalls).toBe(1);
-		expect(secondKernel.shutdownCalls).toBe(0);
-		expect(startSpy).toHaveBeenCalledTimes(2);
+		expect(kernel.shutdownCalls).toBe(0);
+		expect(startSpy).toHaveBeenCalledTimes(1);
 
 		blockedExecution.resolve(OK_EXECUTION);
 		await expect(firstExecution).resolves.toMatchObject({
@@ -486,13 +477,15 @@ describe("AgentSession python cleanup", () => {
 			stdinRequested: false,
 		});
 		await secondSession.executePython("print('owner-b after detach')");
-		expect(startSpy).toHaveBeenCalledTimes(2);
-		expect(firstKernel.executeCalls).toEqual(["print('blocked')"]);
-		expect(secondKernel.executeCalls).toEqual(["print('owner-b warmup')", "print('owner-b after detach')"]);
+		expect(startSpy).toHaveBeenCalledTimes(1);
+		expect(kernel.executeCalls).toEqual([
+			"print('owner-b warmup')",
+			"print('blocked')",
+			"print('owner-b after detach')",
+		]);
 		await secondSession.dispose();
 
-		expect(firstKernel.shutdownCalls).toBe(1);
-		expect(secondKernel.shutdownCalls).toBe(1);
+		expect(kernel.shutdownCalls).toBe(1);
 	}, 10000);
 
 	it("rejects direct session Python starts once dispose begins", async () => {
