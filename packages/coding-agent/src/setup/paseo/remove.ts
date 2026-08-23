@@ -373,6 +373,7 @@ export async function removePaseoSetup(
 					createdEntries: presentEntries,
 					prunedEntries: [],
 					adoptedEntries: [],
+					entryIdentities: ledger.bridgeEntryIdentities ?? {},
 					bridgeDirCreated: ledger.bridgeDirCreated ?? false,
 					sourceDir,
 				},
@@ -381,7 +382,13 @@ export async function removePaseoSetup(
 				{ bridgeDir },
 			);
 			removed.push(bridgeDir);
-			nextLedger = { ...nextLedger, bridgeEntries: [], bridgeDirCreated: false, bridgeSourceDir: undefined };
+			nextLedger = {
+				...nextLedger,
+				bridgeEntries: [],
+				bridgeEntryIdentities: {},
+				bridgeDirCreated: false,
+				bridgeSourceDir: undefined,
+			};
 		} catch (error) {
 			const detail = error instanceof SkillsBridgeError ? error.message : String(error);
 			remaining.push(ledger.bridgePath ?? deps.paths.bridgeDir);

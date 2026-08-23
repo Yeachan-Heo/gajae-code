@@ -16,11 +16,12 @@ import * as nodeCrypto from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { exactUnlinkSymlink } from "@gajae-code/natives";
 import { getTrustedHomeDir } from "@gajae-code/utils";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
 import type { RawSettings, Settings } from "../../config/settings";
 import type { SettingPath } from "../../config/settings-schema";
-import { readProvenance } from "./paseo-ownership";
+import { type BridgeEntryIdentity, readProvenance } from "./paseo-ownership";
 import type { DriftReason } from "./result-types";
 import {
 	PASEO_SKILL_PREFIX,
@@ -69,10 +70,10 @@ type BridgeEntryAction = "create" | "noop" | "prune-and-recreate";
 
 /** Preflight identity for a symlink GJC is authorized to remove. */
 type SymlinkIdentity = {
-	readonly dev: number;
-	readonly ino: number;
-	readonly size: number;
-	readonly mtimeMs: number;
+	readonly dev: bigint;
+	readonly ino: bigint;
+	readonly size: bigint;
+	readonly mtimeNs: bigint;
 };
 
 type BridgeEntryPlan = {
@@ -124,6 +125,8 @@ export interface SkillsBridgeInstallResult {
 	readonly prunedEntries: readonly string[];
 	/** Recorded legacy links this run re-pointed at the discovered source. */
 	readonly adoptedEntries: readonly string[];
+	/** Install-time no-follow identities for entries this run created or adopted. */
+	readonly entryIdentities: Readonly<Record<string, BridgeEntryIdentity>>;
 	readonly bridgeDirCreated: boolean;
 	/** Directory the created links point at; absent when nothing was created. */
 	readonly sourceDir?: string;
@@ -167,122 +170,34 @@ async function quarantineUnlinkVerified(
 	expectedTarget: string,
 	expectedIdentity: SymlinkIdentity,
 ): Promise<void> {
-	const quarantine = path.join(
-		path.dirname(linkPath),
-		`.gjc-paseo-quarantine-${process.pid}-${nodeCrypto.randomUUID()}`,
-	);
-	await fs.rename(linkPath, quarantine);
-	// Identity is bound by INODE, not by name (#4644 reviews r11/r13): the
-	// quarantined object's (dev, ino) is captured once and every later step —
-	// the verification AND the deletion — must still see that exact inode at
-	// the quarantine name. The link text is verified once for content, and
-	// the unlink itself is guarded by an lstat that requires the same inode
-	// immediately before it. A concurrent actor replacing the quarantine
-	// pathname therefore changes the inode and the deletion refuses — the
-	// foreign object is never unlinked. (A rename onto the name in the final
-	// microseconds between the lstat and the unlink remains theoretically
-	// possible without a descriptor-bound unlink primitive, but it requires
-	// winning a race against an unpredictable single-component name inside
-	// GJC's own bridge directory; the residue sweep below detects and
-	// restores any survivor.)
-	// Restoration is NO-CLOBBER (#4644 reviews r15/r16): a concurrent entry
-	// created at the original linkPath after our rename must never be silently
-	// destroyed. The no-replace natives refuse symlink sources
-	// (reparse_point), so this is the narrowest JS shape: rename only when the
-	// destination is observed vacant, then verify the destination carries the
-	// inode that JUST left the quarantine name — a foreign entry that won the
-	// vacancy-to-rename window was displaced by the rename, and is moved aside
-	// to a recoverable name (never deleted) instead of vanishing.
-	const restoreNoClobber = async (): Promise<void> => {
-		const quarantinedNow = await fs.lstat(quarantine).catch(() => undefined);
-		if (quarantinedNow === undefined) return;
-		// ATOMIC no-clobber restore (#4644 reviews r15–r17): the natives'
-		// no-replace primitives refuse symlink sources (reparse_point), but a
-		// symlink can be recreated atomically with fs.symlink, which fails
-		// EEXIST when the destination is occupied — an occupant that wins the
-		// race is never replaced. On success the quarantined original is
-		// removed (its recreation is byte-identical: same text, verified
-		// against `captured`/`text` above).
-		if (quarantinedNow.isSymbolicLink()) {
-			const currentText = await fs.readlink(quarantine).catch(() => undefined);
-			if (currentText !== undefined) {
-				try {
-					await fs.symlink(currentText, linkPath);
-					await fs.rm(quarantine, { force: true }).catch(() => undefined);
-					return;
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
-					// Fall through to the rename path for unsupported cases.
-				}
-			}
-		}
-		// Non-symlink quarantined object (the divergence branches): the plain
-		// rename stays, gated on the observed-vacant destination as before.
-		const occupied = await fs.lstat(linkPath).then(
-			() => true,
-			() => false,
-		);
-		if (occupied) return;
-		await fs.rename(quarantine, linkPath).catch(() => undefined);
-	};
-	const captured = await fs.lstat(quarantine);
-	if (
-		!captured.isSymbolicLink() ||
-		captured.dev !== expectedIdentity.dev ||
-		captured.ino !== expectedIdentity.ino ||
-		captured.size !== expectedIdentity.size ||
-		captured.mtimeMs !== expectedIdentity.mtimeMs
-	) {
-		await restoreNoClobber();
+	await unlinkSymlinkExactly(linkPath, expectedTarget, expectedIdentity);
+}
+
+async function unlinkSymlinkExactly(
+	linkPath: string,
+	expectedTarget: string,
+	expectedIdentity: SymlinkIdentity,
+): Promise<void> {
+	const text = await fs.readlink(linkPath).catch(() => undefined);
+	if (text === undefined || resolvedLinkTarget(text, linkPath) !== expectedTarget) {
 		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before removal: ${linkPath}`);
 	}
-	const text = await fs.readlink(quarantine).catch(() => undefined);
-	if (text === undefined || resolvedLinkTarget(text, quarantine) !== expectedTarget) {
-		await restoreNoClobber();
-		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before removal: ${linkPath}`);
-	}
-	const sameInode = async (): Promise<boolean> => {
-		const stat = await fs.lstat(quarantine).catch(() => undefined);
-		return (
-			stat !== undefined &&
-			stat.ino === captured.ino &&
-			stat.dev === captured.dev &&
-			stat.isSymbolicLink() &&
-			// Size/mtime of a symlink track its text; a replaced link differs.
-			stat.size === captured.size &&
-			stat.mtimeMs === captured.mtimeMs
+	const parent = await fs.stat(path.dirname(linkPath), { bigint: true });
+	if (!parent.isDirectory()) throw new SkillsBridgeError(`Paseo skill bridge parent is not a directory: ${linkPath}`);
+	const result = exactUnlinkSymlink(linkPath, {
+		dev: expectedIdentity.dev,
+		ino: expectedIdentity.ino,
+		nlink: 1n,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: expectedIdentity.size,
+		mtimeNs: expectedIdentity.mtimeNs,
+		quarantineName: `.gjc-paseo-quarantine-${process.pid}-${nodeCrypto.randomUUID()}`,
+	});
+	if (!result.ok) {
+		throw new SkillsBridgeError(
+			`Paseo skill bridge entry diverged before removal: ${linkPath} (${result.code ?? "unknown"})`,
 		);
-	};
-	// Deletion refuses unless the exact captured inode is still at the name.
-	let unlinked = false;
-	for (let attempt = 0; attempt < 3 && !unlinked; attempt++) {
-		if (!(await sameInode())) {
-			// The quarantine name no longer holds our verified object: restore
-			// whatever is there and refuse. A foreign object is never deleted.
-			await restoreNoClobber();
-			throw new SkillsBridgeError(`Paseo skill bridge entry diverged before removal: ${linkPath}`);
-		}
-		try {
-			await fs.unlink(quarantine);
-			unlinked = true;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-				// Something removed it between the check and the unlink. If the
-				// name is gone entirely the object is gone; nothing foreign was
-				// deleted by us. Treat as done.
-				unlinked = true;
-				break;
-			}
-			if (attempt === 2) throw error;
-		}
-	}
-	// Post-unlink sweep: a foreign object swapped onto the quarantine name in
-	// the final window survives at that name (the unlink consumed ours, or the
-	// inode guard refused). It is never deleted — only restored to the bridge
-	// name so nothing foreign is destroyed or stranded.
-	const residue = await fs.lstat(quarantine).catch(() => undefined);
-	if (residue !== undefined && !(await sameInode())) {
-		await restoreNoClobber();
 	}
 }
 
@@ -353,9 +268,9 @@ async function entryState(
 	| { readonly kind: "conflict" }
 > {
 	try {
-		const stat = await fs.lstat(destination);
+		const stat = await fs.lstat(destination, { bigint: true });
 		if (!stat.isSymbolicLink()) return { kind: "conflict" };
-		const identity = { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+		const identity = { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs };
 		const link = await fs.readlink(destination);
 		if (resolvedLinkTarget(link, destination) !== expected) return { kind: "conflict" };
 		try {
@@ -380,12 +295,12 @@ async function foreignSymlinkState(
 	| { readonly kind: "conflict" }
 > {
 	try {
-		const stat = await fs.lstat(destination);
+		const stat = await fs.lstat(destination, { bigint: true });
 		if (!stat.isSymbolicLink()) return { kind: "conflict" };
 		return {
 			kind: "symlink",
 			link: await fs.readlink(destination),
-			identity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs },
+			identity: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs },
 		};
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
@@ -655,6 +570,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 		createdEntries: [...createdEntries],
 		prunedEntries: [...prunedEntries],
 		adoptedEntries: [...adoptedEntries],
+		entryIdentities: {},
 		bridgeDirCreated,
 		...(preflight.sourceDir ? { sourceDir: preflight.sourceDir } : {}),
 	});
@@ -686,15 +602,44 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 	} catch (error) {
 		fail(error);
 	}
+	const entryIdentities = await installedEntryIdentities(
+		preflight.bridgeDir,
+		[...createdEntries, ...adoptedEntries],
+		preflight.sourceDir,
+	);
 	return createdEntries.length > 0 || prunedEntries.length > 0 || adoptedEntries.length > 0
 		? {
 				createdEntries,
 				prunedEntries,
 				adoptedEntries,
+				entryIdentities,
 				bridgeDirCreated,
 				...(preflight.sourceDir ? { sourceDir: preflight.sourceDir } : {}),
 			}
-		: { createdEntries, prunedEntries, adoptedEntries, bridgeDirCreated };
+		: { createdEntries, prunedEntries, adoptedEntries, entryIdentities, bridgeDirCreated };
+}
+
+async function installedEntryIdentities(
+	bridgeDir: string,
+	names: readonly string[],
+	sourceDir: string | undefined,
+): Promise<Record<string, BridgeEntryIdentity>> {
+	const identities: Record<string, BridgeEntryIdentity> = {};
+	if (sourceDir === undefined) return identities;
+	for (const name of names) {
+		const destination = path.join(bridgeDir, name);
+		const stat = await fs.lstat(destination, { bigint: true });
+		if (!stat.isSymbolicLink() || (await fs.readlink(destination)) === undefined) {
+			throw new SkillsBridgeError(`Paseo skill bridge entry diverged before identity capture: ${destination}`);
+		}
+		identities[name] = {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			size: stat.size.toString(),
+			mtimeNs: stat.mtimeNs.toString(),
+		};
+	}
+	return identities;
 }
 
 /**
@@ -725,8 +670,29 @@ export async function inverseSkillsBridge(
 		// `dangling` still carries link text pointing exactly where we wrote it;
 		// the source went away (Paseo uninstalled or updated), and a dead link in
 		// GJC's own bridge directory is safe -- and correct -- to remove.
-		if (state.kind !== "expected" && state.kind !== "dangling") diverged.push(destination);
-		else removals.push({ destination, target, identity: state.identity });
+		const recorded = result.entryIdentities[name];
+		if (state.kind !== "expected" && state.kind !== "dangling") {
+			diverged.push(destination);
+			continue;
+		}
+		if (recorded === undefined) {
+			diverged.push(destination);
+			continue;
+		}
+		try {
+			removals.push({
+				destination,
+				target,
+				identity: {
+					dev: BigInt(recorded.dev),
+					ino: BigInt(recorded.ino),
+					size: BigInt(recorded.size),
+					mtimeNs: BigInt(recorded.mtimeNs),
+				},
+			});
+		} catch {
+			diverged.push(destination);
+		}
 	}
 	if (diverged.length > 0) {
 		throw new SkillsBridgeError(`Refusing to remove diverged Paseo skill bridge entries: ${diverged.join(", ")}`);

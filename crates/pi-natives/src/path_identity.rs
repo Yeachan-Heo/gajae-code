@@ -303,7 +303,8 @@ struct ExactFileIdentity {
 	sha256:          Option<[u8; 32]>,
 	allow_hard_link: bool,
 }
-/// Typed result of an identity-bound regular-file deletion or directory detach.
+/// Typed result of an identity-bound regular-file/symlink deletion or directory
+/// detach.
 #[napi(object)]
 pub struct NativeExactUnlinkResult {
 	pub ok: bool,
@@ -875,6 +876,18 @@ pub(crate) fn digest_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
 }
 
 fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileIdentity> {
+	exact_file_identity_with_digest(identity, true)
+}
+
+fn exact_symlink_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileIdentity> {
+	let identity = exact_file_identity_with_digest(identity, false)?;
+	(!identity.directory && !identity.detach_only).then_some(identity)
+}
+
+fn exact_file_identity_with_digest(
+	identity: &NativeExactFileIdentity,
+	require_digest: bool,
+) -> Option<ExactFileIdentity> {
 	let (dev_negative, dev, dev_lossless) = identity.dev.get_u64();
 	let (ino_negative, ino, ino_lossless) = identity.ino.get_u64();
 	let nlink = match identity.nlink.as_ref() {
@@ -924,8 +937,13 @@ fn exact_file_identity(identity: &NativeExactFileIdentity) -> Option<ExactFileId
 	});
 	let sha256 = if identity.directory.unwrap_or(false) {
 		None
-	} else {
+	} else if require_digest {
 		Some(parse_sha256(identity.sha256.as_ref())?)
+	} else {
+		match identity.sha256.as_ref() {
+			Some(value) => Some(parse_sha256(Some(value))?),
+			None => None,
+		}
 	};
 
 	Some(ExactFileIdentity {
@@ -1220,6 +1238,32 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 		return NativeExactUnlinkResult::failure("identity_mismatch");
 	};
 	platform::exact_unlink(Path::new(&path), &identity)
+}
+
+/// Remove only the captured symbolic link at `path`.
+///
+/// The caller must provide the link's no-follow identity and a private,
+/// single-component `quarantineName` in that identity. The native protocol
+/// first no-replace-renames the exact link into that quarantine name, verifies
+/// the detached entry without following it, and then deletes the same
+/// identity-bound handle/name. A successor published at the original path is
+/// never touched; any post-detach uncertainty is returned as retained
+/// authority instead of being treated as success.
+#[napi]
+pub fn exact_unlink_symlink(
+	path: String,
+	identity: NativeExactFileIdentity,
+) -> NativeExactUnlinkResult {
+	if path.contains('\0') {
+		return NativeExactUnlinkResult::failure("io_error");
+	}
+	if identity.directory.unwrap_or(false) || identity.detach_only.unwrap_or(false) {
+		return NativeExactUnlinkResult::failure("invalid_request");
+	}
+	let Some(identity) = exact_symlink_identity(&identity) else {
+		return NativeExactUnlinkResult::failure("identity_mismatch");
+	};
+	platform::exact_unlink_symlink(Path::new(&path), &identity)
 }
 
 /// Delete only the regular file that still has the supplied platform identity,
@@ -3872,6 +3916,106 @@ pub(crate) mod platform {
 		}
 	}
 
+	/// Remove one captured symlink through a private no-replace quarantine. The
+	/// public pathname is never used after the detach, so a successor published
+	/// there remains untouched. Every private-name mutation is revalidated with
+	/// `AT_SYMLINK_NOFOLLOW`; a failed validation is restored only with another
+	/// no-replace rename, otherwise the detached authority is retained.
+	pub(super) fn exact_unlink_symlink(
+		path: &Path,
+		identity: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		let Some(quarantine_name) = identity.quarantine_name.as_deref() else {
+			return NativeExactUnlinkResult::failure("quarantine_destination_required");
+		};
+		if quarantine_name.is_empty()
+			|| quarantine_name == "."
+			|| quarantine_name == ".."
+			|| quarantine_name.as_bytes().contains(&b'/')
+		{
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		let (parent_fd, name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => return *result,
+		};
+		let close_parent = |result: NativeExactUnlinkResult| {
+			// SAFETY: this operation owns the walked parent descriptor exactly once.
+			unsafe { libc::close(parent_fd) };
+			result
+		};
+		if let Some((expected_dev, expected_ino)) = identity.parent_dev.zip(identity.parent_ino) {
+			// SAFETY: zero is valid initialized storage for fstat output.
+			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent_fd is the retained walked parent descriptor.
+			if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0
+				|| parent_stat.st_dev as u64 != expected_dev
+				|| parent_stat.st_ino as u64 != expected_ino
+			{
+				return close_parent(NativeExactUnlinkResult::failure("parent_mismatch"));
+			}
+		}
+		let Ok(quarantine) = CString::new(quarantine_name) else {
+			return close_parent(NativeExactUnlinkResult::failure("invalid_request"));
+		};
+		match exact_symlink_matches(parent_fd, &name, identity) {
+			Ok(true) => {},
+			Ok(false) => return close_parent(NativeExactUnlinkResult::failure("identity_mismatch")),
+			Err(code) => return close_parent(NativeExactUnlinkResult::failure(code)),
+		}
+		if let Err(code) = rename_no_replace(parent_fd, parent_fd, &name, &quarantine) {
+			return close_parent(NativeExactUnlinkResult::failure(code));
+		}
+		let detached_path = path
+			.parent()
+			.unwrap_or_else(|| Path::new("."))
+			.join(quarantine_name)
+			.to_string_lossy()
+			.into_owned();
+		let restore_or_retain = |code: &'static str| {
+			// Never move an unverified replacement from the quarantine name. Only
+			// the captured symlink may be restored; a foreign occupant stays at its
+			// private name as retained authority.
+			if !matches!(exact_symlink_matches(parent_fd, &quarantine, identity), Ok(true)) {
+				return close_parent(NativeExactUnlinkResult::detached_failure(
+					"identity_mismatch",
+					detached_path.clone(),
+				));
+			}
+			match rename_no_replace(parent_fd, parent_fd, &quarantine, &name) {
+				Ok(()) => close_parent(NativeExactUnlinkResult::failure(code)),
+				Err("quarantine_collision") => {
+					let mut result =
+						NativeExactUnlinkResult::detached_failure(code, detached_path.clone());
+					result.retained_successor_path = Some(path.to_string_lossy().into_owned());
+					close_parent(result)
+				},
+				Err(_) => close_parent(NativeExactUnlinkResult::detached_failure(
+					"cleanup_pending",
+					detached_path.clone(),
+				)),
+			}
+		};
+		match exact_symlink_matches(parent_fd, &quarantine, identity) {
+			Ok(true) => {},
+			Ok(false) | Err(_) => return restore_or_retain("identity_mismatch"),
+		}
+		// Revalidate immediately before unlinking the private name. This is the
+		// POSIX no-follow boundary; any observed replacement is retained rather
+		// than consumed by cleanup.
+		match exact_symlink_matches(parent_fd, &quarantine, identity) {
+			Ok(true) => {},
+			Ok(false) | Err(_) => return restore_or_retain("identity_mismatch"),
+		}
+		// SAFETY: parent_fd and the private quarantine name remain live; the
+		// detached entry was just revalidated as the captured symlink.
+		if unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), 0) } == 0 {
+			close_parent(NativeExactUnlinkResult::success())
+		} else {
+			restore_or_retain(security_code(&std::io::Error::last_os_error()))
+		}
+	}
+
 	fn exact_unlink_at(
 		parent_fd: libc::c_int,
 		name: CString,
@@ -4620,6 +4764,33 @@ pub(crate) mod platform {
 		// SAFETY: this function owns fd exactly once.
 		unsafe { libc::close(fd) };
 		result
+	}
+
+	fn exact_symlink_matches(
+		parent_fd: libc::c_int,
+		name: &CString,
+		identity: &ExactFileIdentity,
+	) -> Result<bool, &'static str> {
+		// SAFETY: parent_fd and name are live; AT_SYMLINK_NOFOLLOW observes the
+		// directory entry itself and never follows its target.
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent_fd is a retained directory descriptor, name is a live
+		// NUL-terminated component, and named is writable initialized storage.
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0
+		{
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		if named.st_mode & libc::S_IFMT != libc::S_IFLNK {
+			return Ok(false);
+		}
+		Ok(named.st_dev as u64 == identity.dev
+			&& named.st_ino as u64 == identity.ino
+			&& named.st_size as u64 == identity.size
+			&& stat_mtime_ns(&named) == i128::from(identity.mtime_ns)
+			&& identity
+				.nlink
+				.is_none_or(|nlink| nlink == named.st_nlink as u64))
 	}
 
 	#[expect(
@@ -6343,6 +6514,58 @@ mod platform {
 		Ok(handle)
 	}
 
+	/// Open a final reparse point itself, without specifying directory or
+	/// non-directory semantics. `FILE_OPEN_REPARSE_POINT` keeps the target
+	/// opaque while allowing both file and directory symlink forms.
+	fn open_relative_reparse_with_share(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+		desired_access: u32,
+		share_access: u32,
+	) -> Result<HANDLE, i32> {
+		let mut name: Vec<u16> = name.encode_wide().collect();
+		if name.is_empty()
+			|| name.iter().any(|unit| *unit == 0)
+			|| name.len() > (u16::MAX as usize / 2)
+		{
+			return Err(STATUS_INVALID_PARAMETER);
+		}
+		let mut object_name = UnicodeString {
+			length:         (name.len() * size_of::<u16>()) as u16,
+			maximum_length: (name.len() * size_of::<u16>()) as u16,
+			buffer:         name.as_mut_ptr(),
+		};
+		let mut attributes = ObjectAttributes {
+			length: size_of::<ObjectAttributes>() as u32,
+			root_directory: parent,
+			object_name: &mut object_name,
+			attributes: 0,
+			security_descriptor: null_mut(),
+			security_quality_of_service: null_mut(),
+		};
+		let mut status: IoStatusBlock = unsafe { std::mem::zeroed() };
+		let mut handle = INVALID_HANDLE_VALUE;
+		let create_status = unsafe {
+			NtCreateFile(
+				&mut handle,
+				desired_access | SYNCHRONIZE,
+				&mut attributes,
+				&mut status,
+				null_mut(),
+				FILE_ATTRIBUTE_NORMAL,
+				share_access,
+				FILE_OPEN,
+				FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+				null_mut(),
+				0,
+			)
+		};
+		if create_status < 0 {
+			return Err(create_status);
+		}
+		Ok(handle)
+	}
+
 	fn open_relative(
 		parent: HANDLE,
 		name: &std::ffi::OsStr,
@@ -6460,6 +6683,84 @@ mod platform {
 			desired_access,
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		)
+	}
+
+	fn open_symlink_exact(
+		path: &Path,
+		desired_access: u32,
+		final_share_access: u32,
+	) -> Result<HeldExact, NativeExactUnlinkResult> {
+		let (root, names) =
+			absolute_components(path).map_err(|code| NativeExactUnlinkResult::failure(code))?;
+		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+			.map_err(|code| NativeExactUnlinkResult::failure(code))?;
+		let root_attributes = match handle_attributes(root_handle) {
+			Ok(attributes) => attributes,
+			Err(code) => {
+				unsafe { CloseHandle(root_handle) };
+				return Err(NativeExactUnlinkResult::failure(code));
+			},
+		};
+		if root_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			unsafe { CloseHandle(root_handle) };
+			return Err(NativeExactUnlinkResult::failure("reparse_point"));
+		}
+		let mut ancestors = vec![root_handle];
+		for (index, name) in names.iter().enumerate() {
+			let final_component = index + 1 == names.len();
+			let parent = *ancestors.last().expect("volume root retained");
+			if final_component {
+				let handle = match open_relative_reparse_with_share(
+					parent,
+					name,
+					desired_access,
+					final_share_access,
+				) {
+					Ok(handle) => handle,
+					Err(status) => {
+						close_retained(&mut ancestors);
+						return Err(NativeExactUnlinkResult::failure(ntstatus_code(status)));
+					},
+				};
+				let attributes = match handle_attributes(handle) {
+					Ok(attributes) => attributes,
+					Err(code) => {
+						unsafe { CloseHandle(handle) };
+						close_retained(&mut ancestors);
+						return Err(NativeExactUnlinkResult::failure(code));
+					},
+				};
+				if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+					unsafe { CloseHandle(handle) };
+					close_retained(&mut ancestors);
+					return Err(NativeExactUnlinkResult::failure("not_symlink"));
+				}
+				return Ok(HeldExact { target: handle, ancestors });
+			}
+			let handle = match open_relative(parent, name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true)
+			{
+				Ok(handle) => handle,
+				Err(code) => {
+					close_retained(&mut ancestors);
+					return Err(NativeExactUnlinkResult::failure(code));
+				},
+			};
+			let attributes = match handle_attributes(handle) {
+				Ok(attributes) => attributes,
+				Err(code) => {
+					unsafe { CloseHandle(handle) };
+					close_retained(&mut ancestors);
+					return Err(NativeExactUnlinkResult::failure(code));
+				},
+			};
+			if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+				unsafe { CloseHandle(handle) };
+				close_retained(&mut ancestors);
+				return Err(NativeExactUnlinkResult::failure("reparse_point"));
+			}
+			ancestors.push(handle);
+		}
+		unreachable!("absolute_components rejects a volume root target")
 	}
 
 	fn open_directory_exact(path: &Path) -> Result<HeldExact, String> {
@@ -7076,6 +7377,105 @@ mod platform {
 			return NativeExactUnlinkResult::failure("invalid_request");
 		}
 		exact_unlink(path, identity)
+	}
+
+	/// Remove a captured Windows reparse-point entry through its retained
+	/// handle. The handle remains bound to the original object across the
+	/// no-replace quarantine rename and final disposition, so a replacement at
+	/// either pathname can never become the deletion target.
+	pub(super) fn exact_unlink_symlink(
+		path: &Path,
+		identity: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		let Some(quarantine_name) = identity.quarantine_name.as_deref() else {
+			return NativeExactUnlinkResult::failure("quarantine_destination_required");
+		};
+		if quarantine_name.is_empty()
+			|| quarantine_name == "."
+			|| quarantine_name == ".."
+			|| quarantine_name.contains('/')
+			|| quarantine_name.contains('\\')
+		{
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		let desired_access = FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | 0x0001_0000;
+		let handle = match open_symlink_exact(
+			path,
+			desired_access,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		) {
+			Ok(handle) => handle,
+			Err(result) => return result,
+		};
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(handle.target, &mut information) } == 0 {
+			return NativeExactUnlinkResult::failure(last_error_code());
+		}
+		if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+			|| !handle_identity_matches(&information, identity)
+			|| identity
+				.nlink
+				.is_some_and(|nlink| nlink != u64::from(information.nNumberOfLinks))
+		{
+			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		let Some(parent_handle) = handle.parent() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		if let Some((expected_parent_dev, expected_parent_ino)) =
+			identity.parent_dev.zip(identity.parent_ino)
+		{
+			let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(parent_handle, &mut parent_information) } == 0
+				|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+				|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+					| u64::from(parent_information.nFileIndexLow))
+					!= expected_parent_ino
+			{
+				return NativeExactUnlinkResult::failure("parent_mismatch");
+			}
+		}
+		let Some(original_name) = path.file_name() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let Some(parent_path) = path.parent() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let detached_path = parent_path
+			.join(quarantine_name)
+			.to_string_lossy()
+			.into_owned();
+		let quarantine_wide: Vec<u16> = quarantine_name.encode_utf16().collect();
+		if let Err(code) = rename_handle(handle.target, parent_handle, &quarantine_wide, false) {
+			return NativeExactUnlinkResult::failure(code);
+		}
+		let mut detached_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		let detached_matches =
+			unsafe { GetFileInformationByHandle(handle.target, &mut detached_information) } != 0
+				&& detached_information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+				&& handle_identity_matches(&detached_information, identity)
+				&& identity
+					.nlink
+					.is_none_or(|nlink| nlink == u64::from(detached_information.nNumberOfLinks));
+		if !detached_matches {
+			let original_name_wide: Vec<u16> = original_name.encode_wide().collect();
+			return match rename_handle(handle.target, parent_handle, &original_name_wide, false) {
+				Ok(()) => NativeExactUnlinkResult::failure("identity_mismatch"),
+				Err("quarantine_collision") => {
+					let mut result =
+						NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path);
+					result.retained_successor_path = Some(path.to_string_lossy().into_owned());
+					result
+				},
+				Err(_) => NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_path),
+			};
+		}
+		// The retained handle is the final identity proof. Disposition is therefore
+		// descriptor-bound and cannot consume a successor at either pathname.
+		match delete_handle(handle.target) {
+			Ok(()) => NativeExactUnlinkResult::success(),
+			Err(code) => NativeExactUnlinkResult::detached_failure(code, detached_path),
+		}
 	}
 
 	pub(super) fn exact_restore(
@@ -8467,6 +8867,9 @@ mod platform {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_unlink_direct(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("identity_unavailable")
+	}
+	pub(super) fn exact_unlink_symlink(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_restore(

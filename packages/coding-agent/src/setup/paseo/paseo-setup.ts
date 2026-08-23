@@ -412,6 +412,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				...bridgeLedger,
 				bridgePath: undefined,
 				bridgeEntries: [],
+				bridgeEntryIdentities: {},
 				bridgeDirCreated: false,
 				bridgeSourceDir: undefined,
 			});
@@ -459,6 +460,13 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			const afterCreate = await readProvenance(deps.paths.provenanceLedger);
 			await writeProvenance(deps.paths.provenanceLedger, { ...afterCreate, bridgeDirCreated: true });
 		}
+		if (Object.keys(bridge.entryIdentities).length > 0) {
+			const afterBridge = await readProvenance(deps.paths.provenanceLedger);
+			await writeProvenance(deps.paths.provenanceLedger, {
+				...afterBridge,
+				bridgeEntryIdentities: { ...afterBridge.bridgeEntryIdentities, ...bridge.entryIdentities },
+			});
+		}
 		// Prunes have completed: drop them from the ownership record so a later
 		// `--remove` does not treat the removed names as still owned.
 		if (bridgePreflight.prunes.length > 0) {
@@ -466,6 +474,11 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			await writeProvenance(deps.paths.provenanceLedger, {
 				...afterPrunes,
 				bridgeEntries: (afterPrunes.bridgeEntries ?? []).filter(name => !bridge.prunedEntries.includes(name)),
+				bridgeEntryIdentities: Object.fromEntries(
+					Object.entries(afterPrunes.bridgeEntryIdentities ?? {}).filter(
+						([name]) => !bridge.prunedEntries.includes(name),
+					),
+				),
 			});
 		}
 		if (
@@ -528,6 +541,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						createdEntries: [...migratedOldEntries],
 						prunedEntries: [],
 						adoptedEntries: [],
+						entryIdentities: bridgeLedger.bridgeEntryIdentities ?? {},
 						bridgeDirCreated: bridgeLedger.bridgeDirCreated ?? false,
 						sourceDir: oldSourceDir,
 					},
@@ -601,6 +615,12 @@ export async function correctBridgeOwnershipAfterFailure(
 	await writeProvenance(deps.paths.provenanceLedger, {
 		...corrected,
 		bridgeEntries: actual,
+		bridgeEntryIdentities: {
+			...Object.fromEntries(
+				Object.entries(bridgeLedger.bridgeEntryIdentities ?? {}).filter(([name]) => actual.includes(name)),
+			),
+			...partial.entryIdentities,
+		},
 		bridgeDirCreated: corrected.bridgeDirCreated === true || partial.bridgeDirCreated,
 	});
 }

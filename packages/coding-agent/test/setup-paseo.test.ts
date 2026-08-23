@@ -626,13 +626,14 @@ describe("skills bridge", () => {
 	/** Install without the full saga but with a realistic ledger, so preflight's provenance gate can run. */
 	async function installWithLedger(deps: PaseoSetupDependencies): Promise<void> {
 		const preflight = await preflightSkillsBridge(deps);
-		await installSkillsBridge(preflight);
+		const result = await installSkillsBridge(preflight);
 		await writeProvenance(deps.paths.provenanceLedger, {
 			version: 1,
 			providerKeys: {},
 			seededOrchestrationKeys: {},
 			bridgePath: deps.paths.bridgeDir,
 			bridgeEntries: [...Object.keys(preflight.entries), ...preflight.adopts.map(adopt => adopt.name)],
+			bridgeEntryIdentities: result.entryIdentities,
 			bridgeDirCreated: false,
 			...(preflight.sourceDir ? { bridgeSourceDir: preflight.sourceDir } : {}),
 		});
@@ -878,7 +879,7 @@ describe("skills bridge", () => {
 		const legacyTarget = path.join(fixture.paths.agentsSkillsDir as string, name);
 		const bridgeName = path.join(fixture.paths.bridgeDir, name);
 		await fs.symlink(legacyTarget, bridgeName);
-		const legacyStat = await fs.lstat(bridgeName);
+		const legacyStat = await fs.lstat(bridgeName, { bigint: true });
 		const plan = {
 			name,
 			linkPath: bridgeName,
@@ -889,7 +890,7 @@ describe("skills bridge", () => {
 				dev: legacyStat.dev,
 				ino: legacyStat.ino,
 				size: legacyStat.size,
-				mtimeMs: legacyStat.mtimeMs,
+				mtimeNs: legacyStat.mtimeNs,
 			},
 		};
 		// Occupy the bridge name so the replacement publish hits EEXIST.
@@ -913,7 +914,7 @@ describe("skills bridge", () => {
 		const name = "paseo-loop";
 		const bridgeName = path.join(fixture.paths.bridgeDir, name);
 		await fs.symlink(path.join(fixture.paths.agentsSkillsDir as string, "paseo"), bridgeName);
-		const foreignStat = await fs.lstat(bridgeName);
+		const foreignStat = await fs.lstat(bridgeName, { bigint: true });
 
 		await expect(
 			installSkillsBridge({
@@ -929,7 +930,7 @@ describe("skills bridge", () => {
 							dev: foreignStat.dev,
 							ino: foreignStat.ino,
 							size: foreignStat.size,
-							mtimeMs: foreignStat.mtimeMs,
+							mtimeNs: foreignStat.mtimeNs,
 						},
 					},
 				],
@@ -956,7 +957,7 @@ describe("skills bridge", () => {
 			path.join(fixture.paths.agentsSkillsDir as string, "paseo"),
 			path.join(fixture.paths.bridgeDir, "paseo-loop"),
 		);
-		const foreignStat = await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo-loop"));
+		const foreignStat = await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo-loop"), { bigint: true });
 		const before = await snapshotTree(fixture.paths.bridgeDir);
 
 		await expect(
@@ -973,7 +974,7 @@ describe("skills bridge", () => {
 							dev: foreignStat.dev,
 							ino: foreignStat.ino,
 							size: foreignStat.size,
-							mtimeMs: foreignStat.mtimeMs,
+							mtimeNs: foreignStat.mtimeNs,
 						},
 					},
 				],
@@ -996,7 +997,7 @@ describe("skills bridge", () => {
 		const bridgeName = path.join(fixture.paths.bridgeDir, name);
 		const target = path.join(fixture.paths.agentsSkillsDir as string, name);
 		await fs.symlink(target, bridgeName);
-		const original = await fs.lstat(bridgeName);
+		const original = await fs.lstat(bridgeName, { bigint: true });
 		const plan = {
 			name,
 			linkPath: bridgeName,
@@ -1005,7 +1006,7 @@ describe("skills bridge", () => {
 				dev: original.dev,
 				ino: original.ino,
 				size: original.size,
-				mtimeMs: original.mtimeMs,
+				mtimeNs: original.mtimeNs,
 			},
 		};
 		// The replacement has the exact expected link text, so content-only
@@ -1022,6 +1023,23 @@ describe("skills bridge", () => {
 				adopts: [],
 			}),
 		).rejects.toBeInstanceOf(SkillsBridgeError);
+		expect((await fs.lstat(bridgeName)).isSymbolicLink()).toBe(true);
+		expect(await fs.readlink(bridgeName)).toBe(target);
+	});
+
+	test("remove refuses a same-target successor after installation (#4644 review r21)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await installWithLedger(fixture.deps);
+		const name = "paseo-loop";
+		const bridgeName = path.join(fixture.paths.bridgeDir, name);
+		const target = path.join(fixture.paths.agentsSkillsDir as string, name);
+		const successor = path.join(fixture.paths.bridgeDir, "successor");
+		await fs.symlink(target, successor);
+		await fs.rename(successor, bridgeName);
+
+		const remove = await removePaseoSetup(fixture.deps, { now: new Date() });
+		expect(remove.outcome).toBe("partial-removal");
 		expect((await fs.lstat(bridgeName)).isSymbolicLink()).toBe(true);
 		expect(await fs.readlink(bridgeName)).toBe(target);
 	});
@@ -1542,6 +1560,7 @@ describe("skills bridge", () => {
 			createdEntries: ["paseo"],
 			prunedEntries: [],
 			adoptedEntries: [],
+			entryIdentities: {},
 			bridgeDirCreated: false,
 			sourceDir: fixture.paths.agentsSkillsDir,
 		});
@@ -1556,6 +1575,7 @@ describe("skills bridge", () => {
 				createdEntries: ["paseo-advisor"],
 				prunedEntries: ["paseo-loop"],
 				adoptedEntries: [],
+				entryIdentities: {},
 				bridgeDirCreated: false,
 			},
 		);
@@ -2460,17 +2480,17 @@ describe("skills bridge", () => {
 			bridgeEntries: [...SKILL_NAMES],
 			bridgeDirCreated: true,
 		});
-		// No source can be discovered anymore (the app is gone), and the legacy
-		// ledger has no bridgeSourceDir: removal must still prove ownership.
+		// No source can be discovered anymore (the app is gone). A legacy ledger
+		// also lacks install-time link identities, so removal must fail closed
+		// rather than treat a same-target successor as GJC-owned.
 		const deps: PaseoSetupDependencies = {
 			...fixture.deps,
 			skillsSource: async () => undefined,
 		};
 
 		const result = await removePaseoSetup(deps, { now: new Date() });
-		expect(result.outcome).toBe("removed");
-		// Every legacy link is gone and the bridge directory was removed.
-		await expect(fs.stat(deps.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(result.outcome).toBe("partial-removal");
+		expect((await fs.lstat(path.join(deps.paths.bridgeDir, SKILL_NAMES[0]))).isSymbolicLink()).toBe(true);
 	});
 
 	test("a non-ENOENT filesystem failure fails removal closed instead of reporting success (#4644 review)", async () => {

@@ -30,6 +30,17 @@ export interface ProviderReplacedRef {
 	readonly valueSha256: string;
 }
 
+/**
+ * Durable no-follow identity for one GJC-created Paseo bridge symlink.
+ * Strings preserve platform-sized inode fields in JSON without precision loss.
+ */
+export interface BridgeEntryIdentity {
+	readonly dev: string;
+	readonly ino: string;
+	readonly size: string;
+	readonly mtimeNs: string;
+}
+
 export interface ProvenanceLedger {
 	readonly version: number;
 	/** `agents.providers` keys GJC created, mapped to the value hash it wrote. */
@@ -60,6 +71,8 @@ export interface ProvenanceLedger {
 	readonly bridgeSourceDir?: string;
 	/** Bridge entries GJC created, so the inverse removes exactly those. */
 	readonly bridgeEntries?: readonly string[];
+	/** Install-time identities for bridge entries GJC may later remove. */
+	readonly bridgeEntryIdentities?: Record<string, BridgeEntryIdentity>;
 	/** True when GJC created the bridge directory itself (as opposed to populating an existing one). */
 	readonly bridgeDirCreated?: boolean;
 }
@@ -129,6 +142,9 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 				throw new Error("bridgeEntries contains a non-string entry");
 			}
 		}
+		if (parsed.bridgeEntryIdentities !== undefined && !isBridgeEntryIdentityRecord(parsed.bridgeEntryIdentities)) {
+			throw new Error("bridgeEntryIdentities is present but not an identity record");
+		}
 		return {
 			version: typeof parsed.version === "number" ? parsed.version : PROVENANCE_VERSION,
 			providerKeys: strictStringRecord(parsed.providerKeys, "providerKeys"),
@@ -140,6 +156,9 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 			...(typeof parsed.bridgePath === "string" ? { bridgePath: parsed.bridgePath } : {}),
 			...(typeof parsed.bridgeSourceDir === "string" ? { bridgeSourceDir: parsed.bridgeSourceDir } : {}),
 			...(Array.isArray(parsed.bridgeEntries) ? { bridgeEntries: parsed.bridgeEntries } : {}),
+			...(isBridgeEntryIdentityRecord(parsed.bridgeEntryIdentities)
+				? { bridgeEntryIdentities: parsed.bridgeEntryIdentities }
+				: {}),
 			...(typeof parsed.bridgeDirCreated === "boolean" ? { bridgeDirCreated: parsed.bridgeDirCreated } : {}),
 		};
 	} catch (error) {
@@ -164,6 +183,22 @@ function isProviderReplacedRefRecord(value: unknown): value is Record<string, Pr
 		}
 	}
 	return true;
+}
+
+function isBridgeEntryIdentityRecord(value: unknown): value is Record<string, BridgeEntryIdentity> {
+	if (!isRecord(value)) return false;
+	return Object.values(value).every(
+		identity =>
+			isRecord(identity) &&
+			typeof identity.dev === "string" &&
+			typeof identity.ino === "string" &&
+			typeof identity.size === "string" &&
+			typeof identity.mtimeNs === "string" &&
+			/^\d+$/u.test(identity.dev) &&
+			/^\d+$/u.test(identity.ino) &&
+			/^\d+$/u.test(identity.size) &&
+			/^-?\d+$/u.test(identity.mtimeNs),
+	);
 }
 function isStringRecord(value: unknown): value is Record<string, string> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
