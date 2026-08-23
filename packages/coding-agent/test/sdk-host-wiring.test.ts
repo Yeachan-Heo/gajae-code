@@ -6147,7 +6147,6 @@ test("PresentationArbiter drops a retired presentation before terminal persisten
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	emitter.registerGateTerminalController!({
 		completeGateInteractions: gateId => arbiter.complete(gateId),
@@ -6262,7 +6261,7 @@ test("PresentationArbiter serializes ordinary and workflow asks, fences queued c
 			return { status: "retired" as const };
 		},
 	} as never;
-	const arbiter = new PresentationArbiter(server, () => false, "test");
+	const arbiter = new PresentationArbiter(server, () => false);
 	const gate = (gateId: string, multi = false, recommendedIndex?: number) => ({
 		gateId,
 		...(gateId.startsWith("workflow") ? { workflowGateId: gateId } : {}),
@@ -6332,7 +6331,6 @@ test("PresentationArbiter retires and republishes an active replay whose option 
 			},
 		} as never,
 		() => false,
-		"test",
 	);
 	const presentation = (options: string[]) => ({
 		gateId: "workflow",
@@ -6372,7 +6370,6 @@ test("PresentationArbiter publishes the ask tool's selection state and keeps its
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	// The ask tool owns its multi-select loop: one presentation per toggle, with
 	// its own Next/Done control rather than the workflow gate's synthesized one.
@@ -6417,7 +6414,6 @@ test("PresentationArbiter keeps the routed option snapshot when replay retiremen
 			retireIfUnclaimed: () => ({ status: "claimed" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	const presentation = (options: string[]) => ({
 		gateId: "workflow",
@@ -6451,7 +6447,6 @@ test("PresentationArbiter terminalizes a queued direct control with explicit non
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	for (const gateId of ["published", "queued"]) {
 		arbiter.retain({
@@ -6485,7 +6480,6 @@ test("PresentationArbiter defers suspended gates, direct controls, and stale sou
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	const presentation = (gateId: string) => ({
 		gateId,
@@ -6552,7 +6546,6 @@ test("PresentationArbiter releases unscoped asks with the current workflow sourc
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	const presentation = (gateId: string, workflowGateId?: string) => ({
 		gateId,
@@ -6610,7 +6603,6 @@ test("PresentationArbiter fences deferred direct-control completions across same
 				retireIfUnclaimed: () => ({ status: "retired" as const }),
 			} as never,
 			() => false,
-			"test",
 		);
 		const presentation = (question: string) => ({
 			gateId: "same-gate",
@@ -6678,7 +6670,6 @@ test("PresentationArbiter preserves exact retired proof after route removal and 
 				},
 			} as never,
 			() => false,
-			"test",
 		);
 		arbiter.retain({
 			gateId: "proof",
@@ -6720,7 +6711,6 @@ test("PresentationArbiter carries retained route proofs into direct terminalizat
 				retireIfUnclaimed: () => ({ status: terminalStatus }),
 			} as never,
 			() => false,
-			"test",
 		);
 		emitter.registerGateTerminalController!({
 			completeGateInteractions: gateId => arbiter.complete(gateId),
@@ -6793,7 +6783,6 @@ test("PresentationArbiter preserves the already-terminal proof across multi-sele
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	emitter.registerGateTerminalController!({
 		completeGateInteractions: gateId => arbiter.complete(gateId),
@@ -6854,7 +6843,6 @@ test("PresentationArbiter fails closed when a published route loses its proof du
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	arbiter.retain({
 		gateId: "unknown-proof",
@@ -6889,7 +6877,6 @@ test("PresentationArbiter preserves replay retirement proof when replacement pub
 				retireIfUnclaimed: () => ({ status: terminalStatus }),
 			} as never,
 			() => false,
-			"test",
 		);
 		arbiter.retain({
 			gateId: "replay-proof",
@@ -6934,7 +6921,6 @@ test("PresentationArbiter preserves exact proof while completing an active route
 				retireIfUnclaimed: () => ({ status: terminalStatus }),
 			} as never,
 			() => false,
-			"test",
 		);
 		arbiter.retain({
 			gateId: "active-proof",
@@ -6971,7 +6957,6 @@ test("PresentationArbiter persists an already-terminal active proof", async () =
 			retireIfUnclaimed: () => ({ status: "already_terminal" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	emitter.registerGateTerminalController!({
 		completeGateInteractions: gateId => arbiter.complete(gateId),
@@ -7023,7 +7008,6 @@ test("PresentationArbiter clears only the exact interactive route across settlem
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	const retainInteractive = (gateId: string, onClosed: () => void) => {
 		let actionId: string | undefined;
@@ -7088,7 +7072,6 @@ test("PresentationArbiter rejects claimed or stale retirement as terminal proof 
 			retireIfUnclaimed: () => ({ status: "claimed" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	let closed = 0;
 	arbiter.retain({
@@ -7126,7 +7109,6 @@ test("PresentationArbiter fences an exhausted ordinary interactive head until ex
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	const answer = Promise.withResolvers<string | undefined>();
 	const pendingInteractive = new Map<string, { actionId?: string; resolve: (result: string | undefined) => void }>();
@@ -7202,7 +7184,6 @@ test("PresentationArbiter terminally cancels an exhausted ordinary head exactly 
 			retireIfUnclaimed: () => ({ status: "retired" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	const settled = Promise.withResolvers<string | undefined>();
 	let closes = 0;
@@ -7257,7 +7238,6 @@ test("PresentationArbiter fences already-terminal direct controls and resets exh
 			retireIfUnclaimed: () => ({ status: "already_terminal" as const }),
 		} as never,
 		() => false,
-		"test",
 	);
 	arbiter.retain({
 		gateId: "head",

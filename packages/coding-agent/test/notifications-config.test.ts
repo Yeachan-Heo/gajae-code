@@ -2403,7 +2403,7 @@ describe("notifications config", () => {
 		};
 
 		// Asks are exempt from redaction: question and options are preserved.
-		expect(buildRedactedAction(action, { redact: true, sessionTag: "abcdef" })).toEqual(action);
+		expect(buildRedactedAction(action, { redact: true })).toEqual(action);
 	});
 
 	test("buildRedactedAction returns unchanged action when redact is false", () => {
@@ -2417,7 +2417,7 @@ describe("notifications config", () => {
 			summary: "Sensitive summary",
 		};
 
-		expect(buildRedactedAction(action, { redact: false, sessionTag: "abcdef" })).toBe(action);
+		expect(buildRedactedAction(action, { redact: false })).toBe(action);
 	});
 
 	test("buildRedactedAction strips question and options for non-ask actions", () => {
@@ -2431,7 +2431,7 @@ describe("notifications config", () => {
 			summary: "Sensitive summary",
 		};
 
-		expect(buildRedactedAction(action, { redact: true, sessionTag: "abcdef" })).toEqual({
+		expect(buildRedactedAction(action, { redact: true })).toEqual({
 			id: "custom-1",
 			kind: "custom",
 			sessionId: "session-abcdef",
@@ -2446,7 +2446,7 @@ describe("notifications config", () => {
 			summary: "Sensitive idle summary",
 		};
 
-		expect(buildRedactedAction(action, { redact: true, sessionTag: "abcdef" })).toEqual({
+		expect(buildRedactedAction(action, { redact: true })).toEqual({
 			id: "i1",
 			kind: "idle",
 			sessionId: "session-abcdef",

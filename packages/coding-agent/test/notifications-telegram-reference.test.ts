@@ -193,6 +193,17 @@ describe("Telegram presentation helpers", () => {
 		expect(idle.text).toContain("done");
 	});
 
+	test("buildActionMessage idle sessionTag renders the escaped short tag", () => {
+		const tagged = buildActionMessage({ kind: "idle", id: "i1", sessionTag: "a1b2c3" });
+		expect(tagged.text).toBe("🟢 Agent idle · a1b2c3");
+		// The tag is HTML-escaped like any other rendered fragment.
+		const hostile = buildActionMessage({ kind: "idle", id: "i2", sessionTag: "<b>x</b>" });
+		expect(hostile.text).toBe("🟢 Agent idle · &lt;b&gt;x&lt;/b&gt;");
+		// Asks ignore the tag entirely.
+		const ask = buildActionMessage({ kind: "ask", id: "a1", question: "Q?", sessionTag: "a1b2c3" });
+		expect(ask.text).not.toContain("a1b2c3");
+	});
+
 	test("sendTelegramHtmlChunks awaits chunks sequentially and attaches keyboard to final chunk", async () => {
 		const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
 		const releases: Array<() => void> = [];
@@ -276,5 +287,14 @@ describe("buildActionMarkdown", () => {
 	test("idle with and without summary", () => {
 		expect(buildActionMarkdown({ kind: "idle", summary: "done" })).toBe("🟢 Agent idle\ndone");
 		expect(buildActionMarkdown({ kind: "idle" })).toBe("🟢 Agent idle");
+	});
+
+	test("idle sessionTag marks flat fallback identity without leaking full session ids", () => {
+		expect(buildActionMarkdown({ kind: "idle", sessionTag: "a1b2c3" })).toBe("🟢 Agent idle · a1b2c3");
+		expect(buildActionMarkdown({ kind: "idle", summary: "done", sessionTag: "a1b2c3" })).toBe(
+			"🟢 Agent idle · a1b2c3\ndone",
+		);
+		// Asks never carry a session tag: identity stays container-owned.
+		expect(buildActionMarkdown({ kind: "ask", question: "Q?", sessionTag: "a1b2c3" })).not.toContain("a1b2c3");
 	});
 });

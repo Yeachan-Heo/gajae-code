@@ -122,7 +122,7 @@ describe("notifications helpers", () => {
 				question: "Deploy prod with secret TOKEN?",
 				options: ["Deploy prod", "Cancel"],
 			},
-			{ redact: true, sessionTag: "secret" },
+			{ redact: true },
 		);
 
 		// Asks must stay readable/answerable on the remote surface even under redaction.
@@ -131,8 +131,19 @@ describe("notifications helpers", () => {
 
 		const idle = notificationActionPayload(
 			{ id: "idle-1", kind: "idle", sessionId: "session-secret", summary: "sensitive summary" },
-			{ redact: true, sessionTag: "secret" },
+			{ redact: true },
 		);
 		expect(idle.summary).toBeUndefined();
+		// The payload never carries a display tag: per-message identity is a
+		// renderer decision at the delivery boundary (#4855).
+		expect(JSON.stringify(idle)).not.toContain("sessionTag");
+	});
+
+	test("notificationActionPayload passes idle through unchanged when redaction is off", () => {
+		const idle = notificationActionPayload(
+			{ id: "idle-2", kind: "idle", sessionId: "session-abcdef", summary: "kept" },
+			{ redact: false },
+		);
+		expect(idle).toEqual({ id: "idle-2", kind: "idle", sessionId: "session-abcdef", summary: "kept" });
 	});
 });

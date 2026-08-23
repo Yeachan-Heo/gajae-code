@@ -12,7 +12,13 @@ import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { resizeImageBuffer } from "../../utils/image-resize";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
-import { getNotificationConfig, isProviderEffectivelyEnabled, isTelegramComplete, tokenFingerprint } from "./config";
+import {
+	getNotificationConfig,
+	isProviderEffectivelyEnabled,
+	isTelegramComplete,
+	sessionTag,
+	tokenFingerprint,
+} from "./config";
 import {
 	parseInThreadConfigCommand,
 	parseRichToggleCommand,
@@ -10823,6 +10829,10 @@ export class TelegramNotificationDaemon {
 				recommendedIndex: msg.recommendedIndex,
 				controls,
 				summary: msg.summary,
+				// Flat private-chat fallback has no topic carrying the session
+				// identity, so the idle marker needs the short tag (#4855). Topic
+				// delivery keeps the bare marker per #981's identity-once contract.
+				sessionTag: topicId ? undefined : sessionTag(logicalSessionId),
 			});
 			const kind = msg.kind === "idle" ? "idle" : "ask";
 			const callbackDispatchAuthorityIsCurrent = (): boolean =>
@@ -10931,6 +10941,7 @@ export class TelegramNotificationDaemon {
 								options: displayOptions,
 								recommendedIndex: msg.recommendedIndex,
 								summary: msg.summary,
+								sessionTag: topicId ? undefined : sessionTag(logicalSessionId),
 							}),
 							replyMarkup: kind === "ask" && inline_keyboard.length ? { inline_keyboard } : undefined,
 						},

@@ -17,7 +17,6 @@ describe("Discord and Slack notification adapters", () => {
 		const slack = createSlackAdapter({ channelId: "slack-channel" });
 		const engine = new NotificationPresentationEngine([discord, slack], {
 			redact: true,
-			sessionTag: sessionId => sessionId.slice(-6),
 		});
 		const replies: NotificationReplyRoute[] = [];
 		engine.connectSession("session-abcdef", { sendReply: route => replies.push(route) });
@@ -48,7 +47,6 @@ describe("Discord and Slack notification adapters", () => {
 	test("redacts public payload boundaries for non-ask events", () => {
 		const engine = new NotificationPresentationEngine([createDiscordAdapter(), createSlackAdapter()], {
 			redact: true,
-			sessionTag: () => "abcdef",
 		});
 		const payloads = engine.fanout({
 			type: "action_needed",
@@ -60,12 +58,20 @@ describe("Discord and Slack notification adapters", () => {
 		const serialized = JSON.stringify(payloads);
 		expect(serialized).toContain("Agent idle");
 		for (const secret of secretCorpus) expect(serialized).not.toContain(secret);
+		// Discord/Slack deliver inside per-session threads whose first message is
+		// the identity header, so the RENDERED idle text stays bare there
+		// (#981, #4855). The route keeps the full routing sessionId; it is
+		// transport metadata and never user-visible.
+		for (const payload of payloads) {
+			const body = payload.body as Record<string, unknown>;
+			const rendered = `${body.content ?? ""}${body.text ?? ""}`;
+			expect(rendered).toBe("Agent idle");
+		}
 	});
 
 	test("ignore unknown or stale inbound replies", () => {
 		const engine = new NotificationPresentationEngine([createDiscordAdapter()], {
 			redact: false,
-			sessionTag: () => "abcdef",
 		});
 		engine.connectSession("session-abcdef", { sendReply: () => expect.unreachable("stale reply routed") });
 		expect(engine.routeInbound("discord", { sessionId: "session-abcdef", actionId: "missing", answer: 0 })).toBe(

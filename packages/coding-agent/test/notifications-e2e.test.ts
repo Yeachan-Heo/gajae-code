@@ -116,7 +116,7 @@ test("ask frames are exempt from redaction so they stay readable and answerable"
 					question: "Deploy secret project Alpha?",
 					options,
 				},
-				{ redact: true, sessionTag: "abcdef" },
+				{ redact: true },
 			),
 		),
 		true,

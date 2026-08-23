@@ -182,7 +182,14 @@ function withRecommendedOptionLabel(options: readonly string[], recommendedIndex
 	return options.map((label, index) => (index === recommendedIndex ? `${label} (Recommended)` : label));
 }
 
-/** Render an `action_needed` payload into a Telegram message. */
+/**
+ * Render an `action_needed` payload into a Telegram message.
+ *
+ * `sessionTag` is the short per-session display tag appended to idle markers.
+ * It identifies the session only where the delivery container carries no
+ * identity of its own (the flat private-chat fallback); thread/topic delivery
+ * passes undefined so #981's identity-once contract stays intact.
+ */
 export function buildActionMessage(action: {
 	kind: "ask" | "idle";
 	id: string;
@@ -191,9 +198,11 @@ export function buildActionMessage(action: {
 	recommendedIndex?: unknown;
 	controls?: readonly TelegramActionControl[];
 	summary?: string;
+	sessionTag?: string;
 }): RenderedMessage {
 	if (action.kind === "idle") {
-		const text = action.summary ? `🟢 Agent idle\n${escapeHtml(action.summary)}` : "🟢 Agent idle";
+		const heading = action.sessionTag ? `🟢 Agent idle · ${escapeHtml(action.sessionTag)}` : "🟢 Agent idle";
+		const text = action.summary ? `${heading}\n${escapeHtml(action.summary)}` : heading;
 		return { text };
 	}
 	const text = `❓ ${bold(action.question ?? "Question")}`;
@@ -218,9 +227,11 @@ export function buildActionMarkdown(action: {
 	options?: string[];
 	recommendedIndex?: unknown;
 	summary?: string;
+	sessionTag?: string;
 }): string {
 	if (action.kind === "idle") {
-		return action.summary ? `🟢 Agent idle\n${action.summary}` : "🟢 Agent idle";
+		const heading = action.sessionTag ? `🟢 Agent idle · ${action.sessionTag}` : "🟢 Agent idle";
+		return action.summary ? `${heading}\n${action.summary}` : heading;
 	}
 	const question = (action.question ?? "Question")
 		.split(/\r\n|\r|\n/)

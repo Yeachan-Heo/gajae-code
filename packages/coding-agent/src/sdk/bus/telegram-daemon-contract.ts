@@ -281,7 +281,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * lock contention, so an already-running owner must be replaced rather than
  * retained across this upgrade.
  */
-export const DAEMON_GENERATION = 172;
+export const DAEMON_GENERATION = 173;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
