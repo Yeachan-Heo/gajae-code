@@ -5,6 +5,7 @@
 ### Fixed
 
 - Python kernel reuse is once again keyed on the settings values that shape a kernel, not on `Settings` object identity. Binding built-in executors to session settings (#4826) made `scopedSessionId` suffix each kernel key with a per-instance counter, so two logical sessions in one process — which resolve the same shell configuration and therefore spawn byte-identical kernels — each started their own kernel, and disposing one shut down a kernel the other still owned. The scope is now a fingerprint of the resolved shell config (shell, args, environment), so equivalent settings share one retained kernel while genuinely different shell environments stay isolated.
+- Flat Telegram private-chat idle markers now carry a short per-session tag (`🟢 Agent idle · <tag>`), because the flat fallback has no topic to identify which session went idle (#4855). Asks and threaded/topic delivery are unchanged, preserving the identity-once contract from #981; the tag is the last six characters of the session id and no full session id is ever rendered. The discarded `sessionTag` parameter threaded through `buildRedactedAction`, `notificationActionPayload`, and `NotificationPresentationEngine` — computed but never consumed anywhere — was removed.
 
 ## [0.15.0] - 2026-08-22
 

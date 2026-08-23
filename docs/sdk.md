@@ -676,6 +676,10 @@ Do not pair a group, supergroup, or channel to work around a missing BotFather
 menu; the bundled setup flow is
 private-chat only, and non-private chat ids remain fail-closed to avoid session
 data leaks.
+Because the flat private chat has no per-session topic, flat idle markers carry
+a short session tag (`🟢 Agent idle · <tag>`, last six characters of the session
+id) so concurrent sessions stay distinguishable. The tag never appears on asks
+or in threaded/topic delivery, where the topic itself identifies the session.
 
 Unknown, expired, or restart-unvalidated callback aliases fail closed: the daemon
 sends guidance and does not guess a target session or action.
