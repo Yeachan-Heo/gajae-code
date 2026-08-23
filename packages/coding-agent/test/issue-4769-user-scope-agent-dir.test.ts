@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
+import { getCapability, loadCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
 import { type ContextFile, contextFileCapability } from "@gajae-code/coding-agent/capability/context-file";
 import { clearCache } from "@gajae-code/coding-agent/capability/fs";
 import { type Rule, ruleCapability } from "@gajae-code/coding-agent/capability/rule";
@@ -124,6 +124,21 @@ describe("issue #4769: user scope follows the agent directory", () => {
 
 		expect(system.items.map(item => item.content)).toEqual(["# explicit system"]);
 		expect(skills.items.map(item => item.name)).toEqual(["explicit-skill"]);
+	});
+
+	test("capability loading derives an omitted agent directory from the owning settings", async () => {
+		const decoyAgentDir = path.join(tempDir, "process-global-decoy");
+		await writeFile(path.join(profile, "SYSTEM.md"), "# settings-owned system");
+		await writeFile(path.join(decoyAgentDir, "SYSTEM.md"), "# global decoy system");
+		setAgentDir(decoyAgentDir);
+
+		const result = await loadCapability<SystemPrompt>(systemPromptCapability.id, {
+			cwd: project,
+			settings: Settings.isolated({}, { agentDir: profile }),
+			providers: ["native"],
+		});
+
+		expect(result.items.map(item => item.content)).toEqual(["# settings-owned system"]);
 	});
 
 	test("public SDK context and prompt wrappers keep agent location and settings authority together", async () => {

@@ -78,7 +78,7 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 			const source = input.source ?? "all";
 			const result = await discoverRuntimeSkills({
 				cwd: this.#session.cwd,
-				home: this.#session.getSessionHome?.() ?? this.#session.home,
+				home: this.#session.getSessionHome?.(),
 				agentDir: this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
 				query: input.query,
 				source,

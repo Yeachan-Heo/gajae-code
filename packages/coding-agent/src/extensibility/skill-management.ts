@@ -111,20 +111,18 @@ type SecureWriteSkillFile = (
 	skillName: string,
 	content: string,
 ) => { ok: boolean; path?: string; code?: string };
-let secureWriteSkillFileNative: SecureWriteSkillFile | null | undefined;
+let secureWriteSkillFileNative: SecureWriteSkillFile | undefined;
 
-function getSecureWriteSkillFileNative(): SecureWriteSkillFile | undefined {
-	if (secureWriteSkillFileNative !== undefined) return secureWriteSkillFileNative ?? undefined;
-	try {
-		const natives = require("@gajae-code/natives") as {
-			secureWriteSkillFile?: SecureWriteSkillFile;
-		};
-		secureWriteSkillFileNative =
-			typeof natives.secureWriteSkillFile === "function" ? natives.secureWriteSkillFile : null;
-	} catch {
-		secureWriteSkillFileNative = null;
+function getSecureWriteSkillFileNative(): SecureWriteSkillFile {
+	if (secureWriteSkillFileNative !== undefined) return secureWriteSkillFileNative;
+	const natives = require("@gajae-code/natives") as {
+		secureWriteSkillFile?: SecureWriteSkillFile;
+	};
+	if (typeof natives.secureWriteSkillFile !== "function") {
+		throw new SkillNativeWriteUnavailableError("native bindings do not export secureWriteSkillFile");
 	}
-	return secureWriteSkillFileNative ?? undefined;
+	secureWriteSkillFileNative = natives.secureWriteSkillFile;
+	return secureWriteSkillFileNative;
 }
 
 function getRuntimeHome(): string {
@@ -313,7 +311,6 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 
 	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
 	const secureWriteSkillFile = getSecureWriteSkillFileNative();
-	if (!secureWriteSkillFile) throw new SkillNativeWriteUnavailableError();
 	const result = secureWriteSkillFile(directory, effectiveName, `${input.content.trimEnd()}\n`);
 	if (!result.ok) {
 		if (result.code === "unsupported_platform" || result.code === "native_unavailable")

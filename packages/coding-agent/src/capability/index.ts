@@ -258,7 +258,7 @@ async function loadCapabilityWithContext<T>(
 export async function loadCapability<T>(capabilityId: string, options: LoadOptions = {}): Promise<CapabilityResult<T>> {
 	return await loadCapabilityWithContext(
 		capabilityId,
-		{ ...options, agentDir: options.agentDir || getAgentDir() },
+		{ ...options, agentDir: options.agentDir || options.settings?.getAgentDir() || getAgentDir() },
 		getTrustedHomeDir(),
 	);
 }

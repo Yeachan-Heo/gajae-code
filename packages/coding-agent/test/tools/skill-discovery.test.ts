@@ -98,6 +98,27 @@ describe("SkillDiscoveryTool", () => {
 		}
 	});
 
+	it("does not treat the deprecated home field as discovery authority without an accessor", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skills-"));
+		const staleHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-stale-skill-home-"));
+		try {
+			await makeSkill(path.join(staleHome, ".custom-skills"), "stale-home", "Stale skill");
+			const result = await new SkillDiscoveryTool(
+				createSession(cwd, {
+					home: staleHome,
+					getSessionHome: undefined,
+					getSessionAgentDir: () => path.join(staleHome, ".gjc", "agent"),
+					settings: runtimeSkillSettings({ "skills.customDirectories": ["~/.custom-skills"] }),
+				}),
+			).execute("call", {});
+
+			expect(result.details?.candidates.map(candidate => candidate.name)).not.toContain("stale-home");
+		} finally {
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(staleHome, { recursive: true, force: true });
+		}
+	});
+
 	it("discovers project runtime skills from .gjc/skills", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-project-skills-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill");
