@@ -9,6 +9,7 @@ import {
 	HeartbeatUpdateSchema,
 	InteractionUpdateSchema,
 	PiReadExecArgsSchema,
+	PiWriteExecArgsSchema,
 	TextDeltaUpdateSchema,
 	TokenDeltaUpdateSchema,
 	TurnEndedUpdateSchema,
@@ -459,6 +460,113 @@ describe("Cursor raw transport watchdog", () => {
 		expect(signal?.aborted).toBe(true);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
+	});
+
+	it("waits for a started non-abortable write before publishing a deadline terminal", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piWriteArgs",
+								value: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+							},
+						}),
+					}),
+				10,
+			);
+		});
+		const started = Promise.withResolvers<void>();
+		const settleWrite = Promise.withResolvers<void>();
+		let terminalPublished = false;
+		const pending = collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					call.markNonAbortable?.();
+					started.resolve();
+					await settleWrite.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		}).then(value => {
+			terminalPublished = true;
+			return value;
+		});
+		await started.promise;
+		await Bun.sleep(220);
+		expect(terminalPublished).toBe(false);
+		settleWrite.resolve();
+		const { events, result } = await pending;
+		expect(result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("waits for a started non-abortable write before publishing a caller-abort terminal", async () => {
+		const controller = new AbortController();
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piWriteArgs",
+								value: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+							},
+						}),
+					}),
+				10,
+			);
+		});
+		const started = Promise.withResolvers<void>();
+		const settleWrite = Promise.withResolvers<void>();
+		let terminalPublished = false;
+		const pending = collectTerminal(baseUrl, {
+			signal: controller.signal,
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					call.markNonAbortable?.();
+					started.resolve();
+					await settleWrite.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		}).then(value => {
+			terminalPublished = true;
+			return value;
+		});
+		await started.promise;
+		controller.abort(new Error("caller cancelled archive write"));
+		await Bun.sleep(20);
+		expect(terminalPublished).toBe(false);
+		settleWrite.resolve();
+		const { events, result } = await pending;
+		expect(result.errorMessage).toBe("caller cancelled archive write");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
 	it("aborts the per-exec signal when the caller aborts mid-exec", async () => {

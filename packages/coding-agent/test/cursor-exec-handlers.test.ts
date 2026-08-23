@@ -79,6 +79,20 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		expect(signals).toEqual([controller.signal]);
 	});
 
+	it("marks a production non-abortable Pi write before dispatch", async () => {
+		const writeTool = { ...makeTool("write"), nonAbortable: true };
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		let marked = false;
+		await handlers.piWrite({
+			args: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+			toolCallId: "archive-write",
+			markNonAbortable: () => {
+				marked = true;
+			},
+		});
+		expect(marked).toBe(true);
+	});
+
 	it("a representative set of handlers all work detached", async () => {
 		const handlers = makeHandlers();
 		const { read, ls, grep, shell, write, diagnostics } = handlers;

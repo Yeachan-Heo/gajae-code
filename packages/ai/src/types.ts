@@ -854,6 +854,8 @@ export interface CursorPiCall<TArgs> {
 	toolCallId: string;
 	/** Per-exec cancellation signal; aborted when the caller aborts or the local exec deadline fires. */
 	signal?: AbortSignal;
+	/** Marks a started mutation that must settle before Cursor can terminalize the exec. */
+	markNonAbortable?: () => void;
 }
 
 export interface CursorExecHandlers {

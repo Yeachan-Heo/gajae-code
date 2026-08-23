@@ -24,12 +24,12 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
-	Usage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { kCursorExecResolved } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { getStreamIdleTimeoutMs } from "../utils/idle-iterator";
+import { transportFailureFacts } from "../utils/fallback-transport";
+import { FirstEventTimeoutError, getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs } from "../utils/idle-iterator";
 import { captureUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
 import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
@@ -77,7 +77,6 @@ import {
 	type ConversationStateStructure,
 	ConversationStateStructureSchema,
 	ConversationStepSchema,
-	ConversationTokenDetailsSchema,
 	ConversationTurnStructureSchema,
 	CursorRuleSchema,
 	CursorRuleSource,
@@ -177,7 +176,6 @@ export { CURSOR_CLIENT_VERSION };
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
-const conversationUsageContextCache = new Map<string, CursorUsageContext>();
 
 // F15: bound the module-global conversation caches so long-lived / many-session use cannot
 // grow them without limit. LRU by conversation count + TTL on idle conversations.
@@ -189,7 +187,6 @@ const conversationLastAccess = new Map<string, number>();
 export function disposeCursorConversation(conversationId: string): void {
 	conversationStateCache.delete(conversationId);
 	conversationBlobStores.delete(conversationId);
-	conversationUsageContextCache.delete(conversationId);
 	conversationLastAccess.delete(conversationId);
 }
 
@@ -220,6 +217,79 @@ export interface CursorOptions extends StreamOptions {
 }
 
 const CONNECT_END_STREAM_FLAG = 0b00000010;
+const CURSOR_MAX_PENDING_SERVER_MESSAGES = 256;
+const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
+const CURSOR_MIN_EXEC_DEADLINE_MS = 100;
+
+function cursorAbortError(signal: AbortSignal): Error {
+	const reason = signal.reason;
+	return reason instanceof Error ? reason : new Error("Request was aborted");
+}
+
+function cursorExecDeadlineMs(idleTimeoutMs: number | undefined): number {
+	if (idleTimeoutMs === undefined) return 120_000;
+	return Math.max(CURSOR_MIN_EXEC_DEADLINE_MS, idleTimeoutMs * CURSOR_EXEC_DEADLINE_MULTIPLIER);
+}
+
+function runWithCursorExecDeadline<T>(
+	operation: (signal: AbortSignal, markNonAbortable: () => void) => Promise<T>,
+	signal: AbortSignal | undefined,
+	deadlineMs: number,
+	onNonAbortableStarted?: (settled: Promise<void>) => void,
+): Promise<T> {
+	const result = Promise.withResolvers<T>();
+	const controller = new AbortController();
+	let settled = false;
+	let nonAbortableStarted = false;
+	let abortError: Error | undefined;
+	let timer: NodeJS.Timeout | undefined;
+
+	const cleanup = () => {
+		if (timer) clearTimeout(timer);
+		if (signal) signal.removeEventListener("abort", onAbort);
+	};
+	const settle = (settlement: () => void) => {
+		if (settled) return;
+		settled = true;
+		cleanup();
+		settlement();
+	};
+	const onAbort = () => {
+		if (signal) {
+			abortError = cursorAbortError(signal);
+			controller.abort(abortError);
+			if (!nonAbortableStarted) settle(() => result.reject(abortError!));
+		}
+	};
+
+	if (signal?.aborted) {
+		controller.abort(cursorAbortError(signal));
+		settle(() => result.reject(cursorAbortError(signal)));
+		return result.promise;
+	}
+	if (signal) signal.addEventListener("abort", onAbort, { once: true });
+	timer = setTimeout(() => {
+		// The deadline cannot forcibly cancel the handler's local work; it aborts
+		// the per-exec signal so cooperative tools stop, and the rejection below
+		// still bounds how long this turn waits for the handler promise.
+		abortError = new Error(`Cursor local exec exceeded its ${deadlineMs}ms deadline`);
+		controller.abort(abortError);
+		if (!nonAbortableStarted) settle(() => result.reject(abortError!));
+	}, deadlineMs);
+	void operation(controller.signal, () => {
+		nonAbortableStarted = true;
+		onNonAbortableStarted?.(
+			result.promise.then(
+				() => undefined,
+				() => undefined,
+			),
+		);
+	}).then(
+		value => settle(() => (abortError ? result.reject(abortError) : result.resolve(value))),
+		error => settle(() => result.reject(abortError ?? error)),
+	);
+	return result.promise;
+}
 
 interface CursorLogEntry {
 	ts: number;
@@ -341,18 +411,9 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 
 	admit(taskFactory: () => Promise<void>): void {
 		if (!this.canAdmitTask()) return;
-		this.#admitOrdered(taskFactory, false);
-	}
-
-	admitCheckpoint(taskFactory: () => Promise<void>): Promise<void> {
-		if (this.#state === "failed") return Promise.reject(this.#failure ?? new Error("Cursor request failed"));
-		return this.#admitOrdered(taskFactory, true);
-	}
-
-	#admitOrdered(taskFactory: () => Promise<void>, allowAfterSuccess: boolean): Promise<void> {
 		const orderedTask = this.#hasAdmittedTask
 			? this.#taskChain.then(() => {
-					if (this.#state === "failed" || (!allowAfterSuccess && this.#state === "succeeded")) return;
+					if (this.#state === "failed" || this.#state === "succeeded") return;
 					return taskFactory();
 				})
 			: taskFactory();
@@ -368,7 +429,6 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 			() => this.#tasks.delete(orderedTask),
 			() => this.#tasks.delete(orderedTask),
 		);
-		return orderedTask;
 	}
 
 	turnEnded(): void {
@@ -662,26 +722,78 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let h2Request: http2.ClientHttp2Stream | null = null;
 		let proxiedSocket: Awaited<ReturnType<typeof connectProxiedSocket>> | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
-		let onAbort: (() => void) | undefined;
-		let coordinator: CursorRequestCoordinator = undefined!;
+		let h2ClientErrorHandler: ((error: Error) => void) | undefined;
+		let h2RequestErrorHandler: ((error: Error) => void) | undefined;
 		const baseUrl = model.baseUrl || CURSOR_API_URL;
-		let activeConversationId: string | undefined;
-		let previousConversationState: ConversationStateStructure | undefined;
-		let previousUsageContext: CursorUsageContext | undefined;
+		const h2Completion = Promise.withResolvers<void>();
+		h2Completion.promise.catch(() => {});
+		let h2Settled = false;
+		let h2Failure: unknown;
+		let sawTurnEnded = false;
+		let responseEnded = false;
+		let queueDrained = false;
+		let endStreamError: Error | null = null;
+		const settleH2 = (error?: unknown): void => {
+			if (h2Settled) return;
+			h2Settled = true;
+			if (error !== undefined) {
+				h2Failure = mapH2TransportError(error, baseUrl);
+				h2Completion.reject(h2Failure);
+			} else {
+				h2Completion.resolve();
+			}
+		};
+		const settleH2WhenReady = (): void => {
+			if (!queueDrained) return;
+			if (endStreamError) {
+				settleH2(endStreamError);
+			} else if (sawTurnEnded) {
+				// A drained turnEnded is the successful terminal condition; Cursor
+				// may leave the HTTP/2 response open after sending it.
+				settleH2();
+			} else if (responseEnded) {
+				settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded"));
+			}
+		};
+		let transportWatchdog: NodeJS.Timeout | null = null;
+		let transportWatchdogClosed = false;
+		let callerAbortError: Error | undefined;
+		let pendingNonAbortableExec: Promise<void> | undefined;
+		const closeForCallerAbort = () => {
+			h2Request?.close();
+			h2Client?.close();
+			proxiedSocket?.destroy();
+			settleH2(callerAbortError!);
+		};
+		const onCallerAbort = () => {
+			const signal = options?.signal;
+			if (!signal) return;
+			if (callerAbortError) return;
+			callerAbortError = cursorAbortError(signal);
+			if (pendingNonAbortableExec) {
+				void pendingNonAbortableExec.finally(closeForCallerAbort);
+				return;
+			}
+			closeForCallerAbort();
+		};
+		// Abort fence: install the listener before any setup work so a caller that
+		// aborts during payload construction or a proxy handshake can never lose the
+		// race against request creation and credential transmission.
+		if (options?.signal) {
+			options.signal.addEventListener("abort", onCallerAbort, { once: true });
+		}
 
 		try {
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
 				throw new Error("Cursor API key (access token) is required");
 			}
-			if (options?.signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
-			activeConversationId = conversationId;
-			const cachedBlobStore = conversationBlobStores.get(conversationId);
-			const blobStore = new Map(cachedBlobStore);
+			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
+			conversationBlobStores.set(conversationId, blobStore);
 			const cachedState = conversationStateCache.get(conversationId);
 			previousConversationState = cachedState;
 			const usageContext = buildCursorUsageContext(context, model, options);
@@ -692,15 +804,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const { requestBytes, conversationState } = await buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
-				conversationState: reusableCachedState,
+				conversationState: cachedState,
 			});
 			conversationStateCache.set(conversationId, conversationState);
+			touchCursorConversation(conversationId);
+			// Recheck immediately before any network work: the caller may have
+			// aborted while the payload was being constructed.
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 			const targetUrl = new URL(baseUrl);
 			const proxyUrl = getProxyForUrl(model.provider, targetUrl);
-			if (options?.signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
 			if (proxyUrl) {
 				proxiedSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
 					signal: options?.signal,
@@ -710,6 +823,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			} else {
 				h2Client = http2.connect(baseUrl);
 			}
+			// Recheck after the (possibly async) proxy handshake, immediately before
+			// the bearer-authenticated request is created.
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
+			h2ClientErrorHandler = error => settleH2(error);
+			h2Client.on("error", h2ClientErrorHandler);
 
 			options?.onStreamCreated?.();
 			h2Request = h2Client.request({
@@ -724,77 +842,51 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
 			});
-			const stopHeartbeat = () => {
-				if (heartbeatTimer) {
-					clearInterval(heartbeatTimer);
-					heartbeatTimer = null;
-				}
-			};
-			let resolveH2: (() => void) | undefined;
-			let rejectH2: ((error: Error) => void) | undefined;
-			const inboundEnd = Promise.withResolvers<void>();
-			let inboundSettled = false;
-			let inboundTimeout: NodeJS.Timeout | undefined;
-			const settleInbound = (error?: Error) => {
-				if (inboundSettled) return;
-				inboundSettled = true;
-				if (inboundTimeout) {
-					clearTimeout(inboundTimeout);
-					inboundTimeout = undefined;
-				}
-				if (error) inboundEnd.reject(error);
-				else inboundEnd.resolve();
-			};
-			void inboundEnd.promise.catch(() => {});
-			const armInboundTimeout = () => {
-				const timeoutMs = options?.streamIdleTimeoutMs ?? 0;
-				if (timeoutMs <= 0 || inboundSettled) return;
-				inboundTimeout = setTimeout(
-					() => settleInbound(new Error("Cursor stream did not reach its inbound terminal frame")),
-					timeoutMs,
-				);
-			};
-			coordinator = new CursorRequestCoordinator(
-				h2Request,
-				stopHeartbeat,
-				() => {
-					const resolve = resolveH2;
-					resolveH2 = undefined;
-					resolve?.();
-				},
-				error => {
-					const reject = rejectH2;
-					rejectH2 = undefined;
-					reject?.(error);
-				},
-				options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(),
-			);
-			h2Client.on("error", error => {
-				settleInbound(error);
-				coordinator.fail(error);
-			});
-			h2Request.on("error", error => {
-				settleInbound(error);
-				coordinator.fail(error);
-			});
+			h2RequestErrorHandler = error => settleH2(error);
+			h2Request.on("error", h2RequestErrorHandler);
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 
 			stream.push({ type: "start", partial: output });
+			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
+			const firstEventStartedAt = Date.now();
+			const endpointClass = model.baseUrl ? "custom" : "canonical";
+			const createFirstEventTimeoutError = (): FirstEventTimeoutError =>
+				new FirstEventTimeoutError("Cursor stream timed out while waiting for the first transport event", {
+					requestBytes: requestBytes.length,
+					firstEventElapsedMs: Date.now() - firstEventStartedAt,
+					firstEventTimeoutMs,
+					endpointClass,
+				});
+			const clearTransportWatchdog = () => {
+				if (transportWatchdog) {
+					clearTimeout(transportWatchdog);
+					transportWatchdog = null;
+				}
+			};
+			const armTransportWatchdog = (timeoutMs: number | undefined, errorFactory: () => Error) => {
+				if (transportWatchdogClosed) return;
+				clearTransportWatchdog();
+				if (timeoutMs === undefined || timeoutMs <= 0) return;
+				transportWatchdog = setTimeout(() => {
+					if (transportWatchdogClosed) return;
+					const error = errorFactory();
+					h2Request?.close();
+					settleH2(error);
+				}, timeoutMs);
+			};
+			const refreshTransportWatchdog = () => {
+				armTransportWatchdog(
+					idleTimeoutMs,
+					() => new Error("Cursor stream stalled while waiting for transport progress"),
+				);
+			};
 
 			let pendingBuffer = Buffer.alloc(0);
-			const checkpointTasks: Promise<void>[] = [];
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
-			const cachedConversationUsedTokens =
-				conversationState.tokenDetails && canReuseCursorUsageContext(previousUsageContext, usageContext)
-					? conversationState.tokenDetails.usedTokens
-					: 0;
-			const usageState: UsageState = {
-				sawTokenDelta: false,
-				conversationUsedTokens: cachedConversationUsedTokens,
-				checkpointOutputTokens: 0,
-				hasConversationCheckpoint: false,
-			};
+			const usageState: UsageState = { sawTokenDelta: false };
 
 			const state: BlockState = {
 				get currentTextBlock() {
@@ -824,9 +916,27 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
-				usageState.pendingCheckpoint = checkpoint;
+				conversationStateCache.set(conversationId, checkpoint);
+				touchCursorConversation(conversationId);
 			};
 
+			const messageQueue = createCursorMessageQueueForTest(error => {
+				log("error", "handleServerMessage", { error: String(error) });
+				h2Request?.close();
+				settleH2(error);
+			});
+			const drainMessageQueue = (): void => {
+				void messageQueue.drain().then(
+					() => {
+						queueDrained = true;
+						settleH2WhenReady();
+					},
+					error => {
+						queueDrained = true;
+						settleH2(error);
+					},
+				);
+			};
 			h2Request.on("trailers", trailers => {
 				const status = trailers["grpc-status"];
 				const msg = trailers["grpc-message"];
@@ -835,28 +945,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			});
 			h2Request.on("end", () => {
-				settleInbound();
 				if (!coordinator.hasTurnEnded()) {
 					coordinator.fail(new Error("Cursor stream ended before turnEnded"));
 				}
 			});
-			h2Request.on("close", () => {
-				const error = new Error("Cursor stream closed before inbound completion");
-				if (!inboundSettled) settleInbound(error);
-				coordinator.fail(error);
-			});
-			onAbort = () => {
-				settleInbound(new Error("Request was aborted"));
-				coordinator.fail(new Error("Request was aborted"));
-			};
-			if (options?.signal) {
-				options.signal.addEventListener("abort", onAbort, { once: true });
-				if (options.signal.aborted) onAbort();
-			}
 
-			h2Request.on("data", (chunk: Buffer) => {
-				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
 
+			let processingPausedForExec = false;
+			let processPendingBuffer: (() => void) | undefined;
+			processPendingBuffer = () => {
+				if (processingPausedForExec) return;
 				while (pendingBuffer.length >= 5) {
 					const flags = pendingBuffer[0];
 					const msgLen = pendingBuffer.readUInt32BE(1);
@@ -877,54 +975,95 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 					try {
 						const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+						// Cursor can make meaningful progress (heartbeats, usage deltas,
+						// checkpoints, and server-side exec) without emitting a normalized
+						// assistant event. Watch the validated Connect/protobuf boundary rather
+						// than the normalized stream so those turns do not false-stall.
+						refreshTransportWatchdog();
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
-						const isConversationCheckpoint = serverMessage.message.case === "conversationCheckpointUpdate";
-						if (isConversationCheckpoint) {
-							checkpointTasks.push(
-								coordinator.admitCheckpoint(() => {
-									handleConversationCheckpointUpdate(
-										serverMessage.message.value as ConversationStateStructure,
-										output,
-										usageState,
-										onConversationCheckpoint,
-									);
-									return Promise.resolve();
-								}),
-							);
-							continue;
-						}
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
-						if (!coordinator.canAdmitTask()) continue;
-						coordinator.admit(() =>
-							handleServerMessage(
-								serverMessage,
-								output,
-								stream,
-								state,
-								blobStore,
-								coordinator,
-								options?.execHandlers,
-								options?.onToolResult,
-								usageState,
-								requestContextTools,
-								onConversationCheckpoint,
-								requestContextRules,
-							),
-						);
+						const isExecServerMessage = serverMessage.message.case === "execServerMessage";
+						if (isExecServerMessage) {
+							processingPausedForExec = true;
+							h2Request!.pause();
+							clearTransportWatchdog();
+						}
+						const queued = messageQueue.enqueue(async () => {
+							// An exec frame asks this process to perform work before Cursor can
+							// send another frame. Its deadline is independent from raw transport
+							// progress, and pausing the request supplies bounded backpressure.
+							if (isExecServerMessage) clearTransportWatchdog();
+							let execSucceeded = false;
+							try {
+								const run = (execSignal?: AbortSignal, markNonAbortable?: () => void) =>
+									handleServerMessage(
+										serverMessage,
+										output,
+										stream,
+										state,
+										blobStore,
+										h2Request!,
+										options?.execHandlers,
+										options?.onToolResult,
+										usageState,
+										requestContextTools,
+										onConversationCheckpoint,
+										requestContextRules,
+										execSignal,
+										markNonAbortable,
+									);
+								if (isExecServerMessage) {
+									// The deadline races the handler promise but the per-exec
+									// AbortSignal it owns reaches cooperative handlers so caller
+									// cancellation and the local deadline can actually stop work.
+									await runWithCursorExecDeadline(
+										run,
+										options?.signal,
+										cursorExecDeadlineMs(idleTimeoutMs),
+										settled => {
+											pendingNonAbortableExec = settled;
+										},
+									);
+								} else {
+									await run();
+								}
+								execSucceeded = true;
+							} finally {
+								if (isExecServerMessage) {
+									if (execSucceeded && !transportWatchdogClosed && !callerAbortError) {
+										processingPausedForExec = false;
+										h2Request!.resume();
+										refreshTransportWatchdog();
+										processPendingBuffer?.();
+									}
+								}
+							}
+						});
+						void queued.catch(() => {});
 
 						if (isTurnEnded) {
 							coordinator.turnEnded();
 						}
+						if (isExecServerMessage) break;
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
 					}
 				}
+			};
+
+			h2Request.on("data", (chunk: Buffer) => {
+				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
+				processPendingBuffer?.();
 			});
 
-			coordinator.enqueue(frameConnectMessage(requestBytes));
+			if (callerAbortError) throw callerAbortError;
+			if (h2Settled) {
+				await h2Completion.promise;
+			}
+			h2Request.write(frameConnectMessage(requestBytes));
 
 			const sendHeartbeat = () => {
 				if (!coordinator.isActive()) return;
@@ -936,21 +1075,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
-			await new Promise<void>((resolve, reject) => {
-				resolveH2 = resolve;
-				rejectH2 = reject;
-				const initialFailure = coordinator.failureError();
-				if (initialFailure) {
-					rejectH2 = undefined;
-					reject(initialFailure);
-				} else if (coordinator.hasTurnEnded() && !coordinator.isActive()) {
-					resolveH2 = undefined;
-					resolve();
-				}
-			});
-			armInboundTimeout();
-			await inboundEnd.promise;
-			await Promise.all(checkpointTasks);
+			armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
+			await h2Completion.promise;
 
 			if (state.currentTextBlock) {
 				const idx = output.content.indexOf(state.currentTextBlock);
@@ -984,36 +1110,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				});
 			}
 
-			finalizeCursorUsage(output, usageState);
-			const stateToCommit =
-				usageState.pendingCheckpoint ?? conversationStateCache.get(conversationId) ?? conversationState;
-			if (
-				usageState.pendingCheckpoint ||
-				usageState.hasConversationCheckpoint ||
-				usageState.conversationUsedTokens > 0
-			) {
-				conversationStateCache.set(
-					conversationId,
-					create(ConversationStateStructureSchema, {
-						...stateToCommit,
-						...(usageState.hasConversationCheckpoint || usageState.conversationUsedTokens > 0
-							? {
-									tokenDetails: create(ConversationTokenDetailsSchema, {
-										usedTokens: output.usage.totalTokens,
-										maxTokens: stateToCommit.tokenDetails?.maxTokens ?? 0,
-									}),
-								}
-							: {}),
-					}),
-				);
-				touchCursorConversation(conversationId);
-			}
-			conversationUsageContextCache.set(conversationId, {
-				...usageContext,
-				messageKeys: [...usageContext.messageKeys, hashCursorUsageMessage(output)],
-			});
-			conversationBlobStores.set(conversationId, blobStore);
-			touchCursorConversation(conversationId);
 			calculateCost(model, output.usage);
 
 			output.duration = Date.now() - startTime;
@@ -1025,33 +1121,39 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
-			if (activeConversationId) {
-				if (previousConversationState) conversationStateCache.set(activeConversationId, previousConversationState);
-				else conversationStateCache.delete(activeConversationId);
-				if (previousUsageContext) conversationUsageContextCache.set(activeConversationId, previousUsageContext);
-				else conversationUsageContextCache.delete(activeConversationId);
-			}
 			// Keep the completion promise terminal even for synchronous setup/write
 			// failures that may not emit a separate HTTP/2 error event.
 			const mappedError = mapH2TransportError(coordinator?.failureError() ?? error, baseUrl);
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(mappedError);
+			output.transportFailure = transportFailureFacts(error);
 			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		} finally {
+			options?.signal?.removeEventListener("abort", onCallerAbort);
+			transportWatchdogClosed = true;
+			if (transportWatchdog) {
+				clearTimeout(transportWatchdog);
+				transportWatchdog = null;
+			}
 			if (heartbeatTimer) {
 				clearInterval(heartbeatTimer);
 				heartbeatTimer = null;
 			}
-			if (options?.signal && onAbort) {
-				options.signal.removeEventListener("abort", onAbort);
+			if (h2Request && h2RequestErrorHandler) {
+				h2Request.removeListener("error", h2RequestErrorHandler);
 			}
-			if (h2Request && !h2Request.closed && !h2Request.destroyed) {
-				h2Request.end();
+			if (h2Client && h2ClientErrorHandler) {
+				h2Client.removeListener("error", h2ClientErrorHandler);
 			}
+			// A queued exec handler can still be draining when the caller aborts; its
+			// late writes must fail quietly on the closed stream instead of crashing
+			// the process with ERR_STREAM_WRITE_AFTER_END.
+			h2Request?.on("error", () => {});
+			h2Request?.close();
 			h2Client?.close();
 			proxiedSocket?.destroy();
 		}
@@ -1080,24 +1182,6 @@ interface BlockState {
 
 interface UsageState {
 	sawTokenDelta: boolean;
-	/**
-	 * Latest `ConversationTokenDetails.used_tokens`: the whole conversation's
-	 * token consumption as counted by Cursor, not this turn's output.
-	 */
-	conversationUsedTokens: number;
-	/** Output tokens already included in the latest checkpoint snapshot. */
-	checkpointOutputTokens: number;
-	/** Whether the current stream received a checkpoint, including an explicit zero. */
-	hasConversationCheckpoint: boolean;
-	pendingCheckpoint?: ConversationStateStructure;
-}
-
-interface CursorUsageContext {
-	modelKey: string;
-	systemPromptKey: string;
-	customSystemPromptKey: string;
-	toolsKey: string;
-	messageKeys: string[];
 }
 
 async function handleServerMessage(
@@ -1113,6 +1197,8 @@ async function handleServerMessage(
 	requestContextTools: McpToolDefinition[],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 	requestContextRules: CursorRule[] = [],
+	execSignal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<void> {
 	const msgCase = msg.message.case;
 
@@ -1132,6 +1218,8 @@ async function handleServerMessage(
 			output,
 			stream,
 			requestContextRules,
+			execSignal,
+			markNonAbortable,
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
@@ -1230,6 +1318,7 @@ async function handleShellStreamArgs(
 	h2Request: CursorRequestWriter,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
+	execSignal?: AbortSignal,
 ): Promise<void> {
 	const normalizedWorkingDirectory = args.workingDirectory || process.cwd();
 	const normalizedArgs: ShellArgs = { ...args, workingDirectory: normalizedWorkingDirectory };
@@ -1349,11 +1438,15 @@ async function handleShellStreamArgs(
 	// Falls back to the batch shell handler otherwise.
 	const streamHandler = execHandlers?.shellStream?.bind(execHandlers);
 	const batchHandler = execHandlers?.shell?.bind(execHandlers);
-	const handler = streamHandler ? (shellArgs: ShellArgs) => streamHandler(shellArgs, streamCallbacks) : batchHandler;
+	const handler = streamHandler
+		? (shellArgs: ShellArgs) => streamHandler(shellArgs, streamCallbacks, execSignal)
+		: batchHandler
+			? (shellArgs: ShellArgs) => batchHandler(shellArgs, execSignal)
+			: undefined;
 
 	const { execResult } = await resolveExecHandler(
 		args as any,
-		handler as typeof batchHandler,
+		handler,
 		onToolResult,
 		toolResult => buildShellResultFromToolResult(normalizedArgs as any, toolResult),
 		reason =>
@@ -1501,6 +1594,8 @@ async function handleExecServerMessage(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	requestContextRules: CursorRule[] = [],
+	execSignal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
@@ -1542,6 +1637,7 @@ async function handleExecServerMessage(
 				toolResult => buildReadResultFromToolResult(args.path, toolResult),
 				reason => buildReadRejectedResult(args.path, reason),
 				error => buildReadErrorResult(args.path, error),
+				execSignal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "readResult", execResult);
 			return;
@@ -1555,6 +1651,7 @@ async function handleExecServerMessage(
 				toolResult => buildLsResultFromToolResult(args.path, toolResult),
 				reason => buildLsRejectedResult(args.path, reason),
 				error => buildLsErrorResult(args.path, error),
+				execSignal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "lsResult", execResult);
 			return;
@@ -1568,6 +1665,7 @@ async function handleExecServerMessage(
 				toolResult => buildGrepResultFromToolResult(args, toolResult),
 				reason => buildGrepErrorResult(reason),
 				error => buildGrepErrorResult(error),
+				execSignal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "grepResult", execResult);
 			return;
@@ -1590,6 +1688,7 @@ async function handleExecServerMessage(
 					),
 				reason => buildWriteRejectedResult(args.path, reason),
 				error => buildWriteErrorResult(args.path, error),
+				execSignal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "writeResult", execResult);
 			return;
@@ -1603,6 +1702,7 @@ async function handleExecServerMessage(
 				toolResult => buildDeleteResultFromToolResult(args.path, toolResult),
 				reason => buildDeleteRejectedResult(args.path, reason),
 				error => buildDeleteErrorResult(args.path, error),
+				execSignal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "deleteResult", execResult);
 			return;
@@ -1617,6 +1717,7 @@ async function handleExecServerMessage(
 				toolResult => buildShellResultFromToolResult(normalizedArgs, toolResult),
 				reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
 				error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
+				execSignal,
 			);
 			const sanitizedExecResult = sanitizeShellExecResult(execResult);
 			sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
@@ -1624,7 +1725,7 @@ async function handleExecServerMessage(
 		}
 		case "shellStreamArgs": {
 			const args = execMsg.message.value;
-			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult);
+			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult, execSignal);
 			return;
 		}
 		case "backgroundShellSpawnArgs": {
@@ -1678,6 +1779,7 @@ async function handleExecServerMessage(
 				toolResult => buildDiagnosticsResultFromToolResult(args.path, toolResult),
 				reason => buildDiagnosticsRejectedResult(args.path, reason),
 				error => buildDiagnosticsErrorResult(args.path, error),
+				execSignal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "diagnosticsResult", execResult);
 			return;
@@ -1692,6 +1794,7 @@ async function handleExecServerMessage(
 				toolResult => buildMcpResultFromToolResult(mcpCall, toolResult),
 				_reason => buildMcpToolNotFoundResult(mcpCall),
 				error => buildMcpErrorResult(error),
+				execSignal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "mcpResult", execResult);
 			return;
@@ -1722,7 +1825,7 @@ async function handleExecServerMessage(
 			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", {
 				path: piReadDisplayPath(args.path, args.offset, args.limit),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piRead?.bind(execHandlers),
@@ -1741,7 +1844,7 @@ async function handleExecServerMessage(
 				command: args.command,
 				timeout: piTimeout(args.timeout),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piBash?.bind(execHandlers),
@@ -1760,7 +1863,7 @@ async function handleExecServerMessage(
 				path: args.path,
 				edits: args.edits.map(edit => ({ old_text: edit.oldText, new_text: edit.newText })),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piEdit?.bind(execHandlers),
@@ -1779,7 +1882,7 @@ async function handleExecServerMessage(
 				path: args.path,
 				content: args.content,
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piWrite?.bind(execHandlers),
@@ -1803,7 +1906,7 @@ async function handleExecServerMessage(
 				context: args.context,
 				limit: piLimit(args.limit),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piGrep?.bind(execHandlers),
@@ -1822,7 +1925,7 @@ async function handleExecServerMessage(
 				paths: [piJoinPath(args.path, args.pattern)],
 				limit: piLimit(args.limit),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piFind?.bind(execHandlers),
@@ -1838,7 +1941,7 @@ async function handleExecServerMessage(
 			const args = execMsg.message.value;
 			const toolCallId = crypto.randomUUID();
 			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", { path: piLsPath(args.path) });
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piLs?.bind(execHandlers),
@@ -1973,18 +2076,19 @@ function sendExecClientStreamClose(h2Request: CursorRequestWriter, execMsg: Exec
 /** Exported for tests: verifies handler is invoked with correct `this` when passed as bound. */
 export async function resolveExecHandler<TArgs, TResult>(
 	args: TArgs,
-	handler: ((args: TArgs) => Promise<CursorExecHandlerResult<TResult>>) | undefined,
+	handler: ((args: TArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<TResult>>) | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	buildFromToolResult: (toolResult: ToolResultMessage) => TResult,
 	buildRejected: (reason: string) => TResult,
 	buildError: (error: string) => TResult,
+	signal?: AbortSignal,
 ): Promise<{ execResult: TResult; toolResult?: ToolResultMessage }> {
 	if (!handler) {
 		return { execResult: buildRejected("Tool not available") };
 	}
 
 	try {
-		const handlerResult = await handler(args);
+		const handlerResult = await handler(args, signal);
 		const { execResult, toolResult } = splitExecHandlerResult(handlerResult);
 		const finalToolResult = await applyToolResultHandler(toolResult, onToolResult);
 
@@ -2007,12 +2111,26 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 	drain(): Promise<void>;
 } {
 	let chain = Promise.resolve();
+	let pending = 0;
+	let closed = false;
 	return {
 		enqueue(handler) {
-			const result = chain.then(handler);
-			chain = result.catch(error => {
+			if (closed) return Promise.reject(new Error("Cursor server-message queue is closed"));
+			if (pending >= CURSOR_MAX_PENDING_SERVER_MESSAGES) {
+				const error = new Error("Cursor server-message queue exceeded its bounded capacity");
+				closed = true;
 				onError?.(error);
-			});
+				return Promise.reject(error);
+			}
+			pending += 1;
+			const result = chain.then(handler);
+			chain = result
+				.catch(error => {
+					onError?.(error);
+				})
+				.finally(() => {
+					pending -= 1;
+				});
 			return result;
 		},
 		drain() {
@@ -2994,58 +3112,17 @@ function handleConversationCheckpointUpdate(
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 ): void {
 	onConversationCheckpoint?.(checkpoint);
+	if (usageState.sawTokenDelta) {
+		return;
+	}
 	const usedTokens = checkpoint.tokenDetails?.usedTokens ?? 0;
-	if (!checkpoint.tokenDetails) {
+	if (usedTokens <= 0) {
 		return;
 	}
-	const previousUsedTokens = usageState.conversationUsedTokens;
-	// `used_tokens` counts the whole conversation, so it is prompt-side usage and
-	// must not be attributed to this turn's output. Checkpoints can arrive while
-	// output is still streaming; the split is applied once the stream finalizes.
-	usageState.conversationUsedTokens = usedTokens;
-	usageState.checkpointOutputTokens =
-		usageState.hasConversationCheckpoint && usedTokens < previousUsedTokens ? 0 : output.usage.output;
-	usageState.hasConversationCheckpoint = true;
-}
-
-/**
- * Cursor streams output tokens as deltas and reports whole-conversation
- * consumption separately as `ConversationTokenDetails.used_tokens`. Derive
- * prompt tokens from the difference so context accounting and compaction see a
- * real prompt size instead of zero.
- */
-export function finalizeCursorUsage(output: AssistantMessage, usageState: UsageState): void {
-	const used = usageState.conversationUsedTokens;
-	if (!usageState.hasConversationCheckpoint && used <= 0) {
-		return;
+	if (output.usage.output !== usedTokens) {
+		output.usage.output = usedTokens;
+		output.usage.totalTokens = output.usage.input + output.usage.output;
 	}
-	const outputIncludedInSnapshot = usageState.hasConversationCheckpoint ? usageState.checkpointOutputTokens : 0;
-	output.usage.input = Math.max(0, used - outputIncludedInSnapshot);
-	output.usage.totalTokens = output.usage.input + output.usage.output;
-}
-
-/** Exposes {@link finalizeCursorUsage} for tests without a live HTTP/2 stream. */
-export function finalizeCursorUsageForTest(
-	usedTokens: number,
-	outputTokens: number,
-	options: { checkpointOutputTokens?: number; hasConversationCheckpoint?: boolean } = {},
-): Usage {
-	const usage: Usage = {
-		input: 0,
-		output: outputTokens,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: outputTokens,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-	finalizeCursorUsage({ usage } as AssistantMessage, {
-		sawTokenDelta: true,
-		conversationUsedTokens: usedTokens,
-		checkpointOutputTokens:
-			options.checkpointOutputTokens ?? ((options.hasConversationCheckpoint ?? usedTokens > 0) ? outputTokens : 0),
-		hasConversationCheckpoint: options.hasConversationCheckpoint ?? usedTokens > 0,
-	});
-	return usage;
 }
 
 function createBlobId(data: Uint8Array): Uint8Array {
@@ -3366,43 +3443,6 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	}
 
 	return turns;
-}
-
-function buildCursorUsageContext(
-	context: Context,
-	model: Model<"cursor-agent">,
-	options: CursorOptions | undefined,
-): CursorUsageContext {
-	return {
-		modelKey: hashCursorUsageValue({ provider: model.provider, id: model.id, wireModelId: model.wireModelId }),
-		systemPromptKey: hashCursorUsageValue(context.systemPrompt ?? []),
-		customSystemPromptKey: hashCursorUsageValue(options?.customSystemPrompt ?? ""),
-		toolsKey: hashCursorUsageValue(context.tools ?? []),
-		messageKeys: context.messages.map(message => hashCursorUsageMessage(message)),
-	};
-}
-
-function hashCursorUsageMessage(message: { role: string; content: unknown }): string {
-	return hashCursorUsageValue({ role: message.role, content: message.content });
-}
-
-function hashCursorUsageValue(value: unknown): string {
-	return createHash("sha256")
-		.update(JSON.stringify(value) ?? "")
-		.digest("hex");
-}
-
-function canReuseCursorUsageContext(previous: CursorUsageContext | undefined, current: CursorUsageContext): boolean {
-	if (
-		!previous ||
-		previous.modelKey !== current.modelKey ||
-		previous.systemPromptKey !== current.systemPromptKey ||
-		previous.customSystemPromptKey !== current.customSystemPromptKey ||
-		previous.toolsKey !== current.toolsKey
-	)
-		return false;
-	if (previous.messageKeys.length > current.messageKeys.length) return false;
-	return previous.messageKeys.every((key, index) => key === current.messageKeys[index]);
 }
 
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */

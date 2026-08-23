@@ -78,6 +78,7 @@ async function executeTool(
 	args: Record<string, unknown>,
 	overrideTool?: AgentTool,
 	execSignal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<ToolResultMessage> {
 	if (execSignal?.aborted) throw cursorAbortError(execSignal);
 	const tool = overrideTool ?? options.tools.get(toolName);
@@ -85,6 +86,7 @@ async function executeTool(
 		const result = buildToolErrorResult(`Tool "${toolName}" not available`);
 		return createToolResultMessage(toolCallId, toolName, result, true);
 	}
+	if (tool.nonAbortable) markNonAbortable?.();
 
 	// `tool` is the object this call will run; pass it so the start event carries proven
 	// provenance instead of a name a consumer would have to re-resolve later.
@@ -502,6 +504,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			},
 			undefined,
 			call.signal,
+			call.markNonAbortable,
 		);
 	}
 
