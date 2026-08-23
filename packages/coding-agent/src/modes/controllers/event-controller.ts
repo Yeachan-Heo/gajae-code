@@ -941,7 +941,7 @@ export class EventController {
 		this.ctx.editor.onEscape = () => {
 			this.ctx.session.abortCompaction();
 		};
-		stopInteractiveActivityIndicator(this.ctx, { restoreBackground: false });
+		stopInteractiveActivityIndicator(this.ctx, { restoreBackground: false, foregroundSettled: true });
 		const reasonText =
 			event.reason === "overflow" ? "Context overflow detected, " : event.reason === "idle" ? "Idle " : "";
 		const actionLabel = event.action === "handoff" ? "Auto-handoff" : "Auto context-full maintenance";
@@ -1042,7 +1042,7 @@ export class EventController {
 				this.ctx.session.abortRetry();
 			}
 		};
-		stopInteractiveActivityIndicator(this.ctx, { restoreBackground: false });
+		stopInteractiveActivityIndicator(this.ctx, { restoreBackground: false, foregroundSettled: true });
 		// Stop any prior retry loader/timer before installing a new one.
 		this.ctx.retryLoader?.stop();
 		this.#clearRetryCountdown();

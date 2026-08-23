@@ -94,6 +94,21 @@ describe("interactive background activity indicator", () => {
 		expect(renderStatus(mode)).toBe("");
 	});
 
+	it("retires stale foreground activity across maintenance stop boundaries", async () => {
+		mode.ensureLoadingAnimation();
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const controller = new EventController(mode);
+
+		await controller.handleEvent({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+		mode.autoCompactionLoader?.stop();
+		mode.autoCompactionLoader = undefined;
+		mode.statusContainer.clear();
+		mode.syncActivityIndicator();
+
+		expect(mode.loadingAnimation).toBeUndefined();
+		expect(renderStatus(mode)).toBe("");
+	});
+
 	it("schedules the startup crash relay hook from trusted global settings", async () => {
 		const debug = vi.spyOn(logger, "debug");
 		Settings.instance.set("crashReport.upstream", "sentry");

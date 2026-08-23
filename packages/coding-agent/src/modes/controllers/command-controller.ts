@@ -1031,7 +1031,7 @@ export class CommandController {
 		if (this.ctx.isStopped?.()) return false;
 		clearInteractiveActivityLoaders(this.ctx);
 
-		stopInteractiveActivityIndicator(this.ctx);
+		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
 		this.ctx.resetIrcSidebarSession();
 		this.ctx.resetObserverRegistry();
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
@@ -1064,7 +1064,7 @@ export class CommandController {
 	async handleContextClearCommand(): Promise<void> {
 		if (this.ctx.isStopped?.()) return;
 		clearInteractiveActivityLoaders(this.ctx);
-		stopInteractiveActivityIndicator(this.ctx);
+		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
 		if (this.ctx.session.isCompacting) {
 			this.ctx.session.abortCompaction();
 			while (this.ctx.session.isCompacting) {
@@ -1119,7 +1119,7 @@ export class CommandController {
 			return;
 		}
 		clearInteractiveActivityLoaders(this.ctx);
-		stopInteractiveActivityIndicator(this.ctx);
+		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
 		this.ctx.resetIrcSidebarSession();
 
 		this.ctx.statusLine.invalidate();

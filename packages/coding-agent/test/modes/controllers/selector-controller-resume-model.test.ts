@@ -105,7 +105,10 @@ describe("SelectorController resume model choice", () => {
 		// Only the (no-op) editor restore path runs — no confirm dialog mounted.
 		expect(ctx.editorContainer.children).toHaveLength(0);
 		expect(setModel).not.toHaveBeenCalled();
-		expect(ctx.stopLoadingAnimation).toHaveBeenCalledWith({ restoreBackground: false });
+		expect(ctx.stopLoadingAnimation).toHaveBeenCalledWith({
+			foregroundSettled: true,
+			restoreBackground: false,
+		});
 		expect(ctx.syncActivityIndicator).toHaveBeenCalledTimes(1);
 	});
 

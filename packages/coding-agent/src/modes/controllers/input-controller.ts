@@ -383,7 +383,7 @@ export class InputController {
 			// Stop the stale indicator so completed work clears the busy state and
 			// keep evaluating the remaining states; when none match, the key falls
 			// through to idle semantics instead of a no-op abort that swallows it.
-			stopInteractiveActivityIndicator(this.ctx);
+			stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
 		}
 		if (options.processes && this.ctx.session.isBashRunning) {
 			this.ctx.session.abortBash();

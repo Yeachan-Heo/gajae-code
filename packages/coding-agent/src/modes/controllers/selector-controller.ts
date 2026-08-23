@@ -3097,7 +3097,10 @@ export class SelectorController {
 
 	#clearTransientSessionUi(options?: { restoreBackground?: boolean; clearSpecializedLoaders?: boolean }): void {
 		if (options?.clearSpecializedLoaders) clearInteractiveActivityLoaders(this.ctx);
-		stopInteractiveActivityIndicator(this.ctx, { restoreBackground: options?.restoreBackground });
+		stopInteractiveActivityIndicator(this.ctx, {
+			restoreBackground: options?.restoreBackground,
+			foregroundSettled: true,
+		});
 		this.ctx.pendingMessagesContainer.clear();
 		this.ctx.compactionQueuedMessages = [];
 		this.ctx.streamingComponent = undefined;
