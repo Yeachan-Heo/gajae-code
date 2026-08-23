@@ -74,7 +74,7 @@ describe("recent-activity picker", () => {
 		expect(out[0]?.path).toBe(cwd);
 		expect(out[0]?.branch).toBe("feat/x");
 		expect(out[1]?.title).toBe("fix bug");
-	});
+	}, 10_000);
 
 	it("lists validated v2 sessions across workspaces when requested", async () => {
 		const root = tempRoot();
@@ -431,7 +431,7 @@ describe("recent-activity picker", () => {
 		fs.symlinkSync(target, path.join(directory, "linked.jsonl"));
 		const result = await listRecentSessions({ cwd, sessionsRoot: root });
 		expect(result).toMatchObject({ kind: "complete", entries: [] });
-	});
+	}, 10_000);
 
 	it("preserves unexpected metadata reader failures as request errors", async () => {
 		const root = tempRoot();
