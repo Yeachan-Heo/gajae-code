@@ -114,11 +114,11 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "omlx/Qwen3.6-35B-A3B-8bit:medium",
 	}),
 	profile("macos-omlx-quality", ["omlx"], {
-		default: "omlx/Qwen3.6-35B-A3B-bf16:high",
-		executor: "omlx/Qwen3.6-35B-A3B-bf16:medium",
-		architect: "omlx/Qwen3.6-35B-A3B-bf16:high",
-		planner: "omlx/Qwen3.6-35B-A3B-bf16:high",
-		critic: "omlx/Qwen3.6-35B-A3B-bf16:high",
+		default: "omlx/Qwen3.6-35B-A3B-8bit:high",
+		executor: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+		architect: "omlx/Qwen3.6-35B-A3B-8bit:high",
+		planner: "omlx/Qwen3.6-35B-A3B-8bit:high",
+		critic: "omlx/Qwen3.6-35B-A3B-8bit:high",
 	}),
 	profile("macos-omlx-abliterated-fast", ["omlx"], {
 		default: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:medium",
@@ -599,7 +599,7 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 		providerGroup: "MACOS LOCAL (OMLX)",
 	},
 	"macos-omlx-quality": {
-		displayName: "BF16 Max Quality (M5 Max 128GB / Default Ctx)",
+		displayName: "8-bit Max Quality (M5 Max 128GB / Default Ctx)",
 		providerGroup: "MACOS LOCAL (OMLX)",
 	},
 	"macos-omlx-abliterated-fast": {
