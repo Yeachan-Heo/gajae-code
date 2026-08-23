@@ -1930,6 +1930,7 @@ pub(crate) mod platform {
 			unix::ffi::OsStrExt,
 		},
 		path::{Component, Path, PathBuf},
+		sync::atomic::{AtomicU64, Ordering},
 	};
 
 	use super::{
@@ -2081,6 +2082,12 @@ pub(crate) mod platform {
 	static AFTER_TREE_FILE_LINK_CHECK_HOOK: OnceLock<
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
+	#[cfg(test)]
+	static SECURE_SKILL_WRITE_BEFORE_RENAME_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+
+	static NEXT_SECURE_SKILL_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 	#[cfg(test)]
 	pub(super) fn set_exact_replace_after_exchange_hook(
@@ -2171,6 +2178,16 @@ pub(crate) mod platform {
 		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
 	) {
 		*AFTER_TREE_FILE_LINK_CHECK_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn set_secure_skill_write_before_rename_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*SECURE_SKILL_WRITE_BEFORE_RENAME_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
@@ -2309,6 +2326,19 @@ pub(crate) mod platform {
 		{
 			entered.send(()).expect("tree file mutation hook receiver");
 			resume.recv().expect("tree file mutation hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_secure_skill_write_before_rename_for_test() {
+		if let Some((entered, resume)) = SECURE_SKILL_WRITE_BEFORE_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("secure skill write hook receiver");
+			resume.recv().expect("secure skill write hook resume");
 		}
 	}
 
@@ -4569,94 +4599,145 @@ pub(crate) mod platform {
 
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the opened descriptor and retained parent descriptor remain live through identity \
-		          checks"
+		reason = "the retained parent descriptor and no-follow final name remain live through \
+		          inspection"
 	)]
-	fn skill_file_matches_name(
+	fn inspect_existing_skill_file(
 		parent_fd: libc::c_int,
 		name: &CString,
-		file_fd: libc::c_int,
-	) -> Result<(), &'static str> {
-		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
-		if unsafe { libc::fstat(file_fd, &mut opened) } != 0 {
-			return Err(skill_write_error(&std::io::Error::last_os_error()));
+	) -> Result<bool, &'static str> {
+		let fd = unsafe {
+			libc::openat(
+				parent_fd,
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			)
+		};
+		if fd < 0 {
+			let error = std::io::Error::last_os_error();
+			return if error.raw_os_error() == Some(libc::ENOENT) {
+				Ok(false)
+			} else {
+				Err(skill_write_error(&error))
+			};
 		}
-		if opened.st_mode & libc::S_IFMT != libc::S_IFREG {
-			return Err("not_regular_file");
-		}
-		let mut named: libc::stat = unsafe { std::mem::zeroed() };
-		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW) }
-			!= 0
-		{
-			return Err(skill_write_error(&std::io::Error::last_os_error()));
-		}
-		if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
-			return Err("reparse_point");
-		}
-		if named.st_mode & libc::S_IFMT != libc::S_IFREG {
-			return Err("not_regular_file");
-		}
-		if opened.st_nlink != 1 || named.st_nlink != 1 {
-			return Err("hard_link");
-		}
-		if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
-			return Err("identity_mismatch");
-		}
-		Ok(())
+		let result = (|| {
+			let mut information: libc::stat = unsafe { std::mem::zeroed() };
+			if unsafe { libc::fstat(fd, &mut information) } != 0 {
+				return Err(skill_write_error(&std::io::Error::last_os_error()));
+			}
+			if information.st_mode & libc::S_IFMT != libc::S_IFREG {
+				return Err("not_regular_file");
+			}
+			if information.st_nlink > 1 {
+				return Err("hard_link");
+			}
+			Ok(information.st_nlink == 1)
+		})();
+		unsafe { libc::close(fd) };
+		result
 	}
 
-	/// Open the fixed `SKILL.md` leaf without following or truncating an
-	/// untrusted non-regular entry. Creation races are retried a bounded number
-	/// of times; every successful descriptor is checked against its live name
-	/// before any truncation or write occurs.
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the retained parent descriptor and final component remain live through open, \
-		          validation, and truncation"
+		reason = "the retained skill-directory descriptor owns the unique private file name"
 	)]
-	fn open_skill_file(parent_fd: libc::c_int, name: &CString) -> Result<File, &'static str> {
-		const OPEN_RETRY_LIMIT: usize = 4;
-		let base_flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-		for _ in 0..OPEN_RETRY_LIMIT {
-			let existing = unsafe { libc::openat(parent_fd, name.as_ptr(), base_flags) };
-			if existing >= 0 {
-				if let Err(code) = skill_file_matches_name(parent_fd, name, existing) {
-					unsafe { libc::close(existing) };
-					return Err(code);
-				}
-				if unsafe { libc::ftruncate(existing, 0) } != 0 {
-					let code = skill_write_error(&std::io::Error::last_os_error());
-					unsafe { libc::close(existing) };
-					return Err(code);
-				}
-				return Ok(unsafe { File::from_raw_fd(existing) });
-			}
-			let open_error = std::io::Error::last_os_error();
-			if open_error.raw_os_error() != Some(libc::ENOENT) {
-				return Err(skill_write_error(&open_error));
-			}
-			let created = unsafe {
-				libc::openat(parent_fd, name.as_ptr(), base_flags | libc::O_CREAT | libc::O_EXCL, 0o666)
+	fn create_private_skill_file(parent_fd: libc::c_int) -> Result<(File, CString), &'static str> {
+		for _ in 0..16 {
+			let sequence = NEXT_SECURE_SKILL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+			let name = CString::new(format!(".gjc-skill-write-{}-{}", std::process::id(), sequence))
+				.expect("private skill name contains no NUL");
+			let fd = unsafe {
+				libc::openat(
+					parent_fd,
+					name.as_ptr(),
+					libc::O_WRONLY
+						| libc::O_CREAT
+						| libc::O_EXCL
+						| libc::O_CLOEXEC
+						| libc::O_NOFOLLOW
+						| libc::O_NONBLOCK,
+					0o666,
+				)
 			};
-			if created >= 0 {
-				if let Err(code) = skill_file_matches_name(parent_fd, name, created) {
-					unsafe { libc::close(created) };
-					return Err(code);
+			if fd < 0 {
+				let error = std::io::Error::last_os_error();
+				if error.raw_os_error() == Some(libc::EEXIST) {
+					continue;
 				}
-				return Ok(unsafe { File::from_raw_fd(created) });
+				return Err(skill_write_error(&error));
 			}
-			let create_error = std::io::Error::last_os_error();
-			if create_error.raw_os_error() == Some(libc::EEXIST) {
-				continue;
+			let mut information: libc::stat = unsafe { std::mem::zeroed() };
+			let valid = unsafe { libc::fstat(fd, &mut information) } == 0
+				&& information.st_mode & libc::S_IFMT == libc::S_IFREG
+				&& information.st_nlink == 1;
+			if !valid {
+				unsafe { libc::close(fd) };
+				return Err("identity_mismatch");
 			}
-			return Err(skill_write_error(&create_error));
+			return Ok((unsafe { File::from_raw_fd(fd) }, name));
 		}
 		Err("race_limit")
 	}
 
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the retained directory and file descriptors are owned through the complete write"
+		reason = "the retained parent descriptor binds the only namespace mutation"
+	)]
+	fn replace_skill_file_name(
+		parent_fd: libc::c_int,
+		private_name: &CString,
+		final_name: &CString,
+		private_fd: libc::c_int,
+	) -> Result<(), &'static str> {
+		#[cfg(test)]
+		pause_secure_skill_write_before_rename_for_test();
+		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(private_fd, &mut opened) } != 0
+			|| unsafe {
+				libc::fstatat(parent_fd, private_name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+			} != 0 || opened.st_mode & libc::S_IFMT != libc::S_IFREG
+			|| opened.st_nlink != 1
+			|| named.st_mode & libc::S_IFMT != libc::S_IFREG
+			|| named.st_nlink != 1
+			|| opened.st_dev != named.st_dev
+			|| opened.st_ino != named.st_ino
+		{
+			return Err("identity_mismatch");
+		}
+		if unsafe { libc::renameat(parent_fd, private_name.as_ptr(), parent_fd, final_name.as_ptr()) }
+			== 0
+		{
+			Ok(())
+		} else {
+			Err(skill_write_error(&std::io::Error::last_os_error()))
+		}
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained directory descriptor owns private cleanup after failed publication"
+	)]
+	fn unlink_private_skill_file(parent_fd: libc::c_int, name: &CString, private_fd: libc::c_int) {
+		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		let same = unsafe { libc::fstat(private_fd, &mut opened) } == 0
+			&& unsafe {
+				libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+			} == 0 && opened.st_dev == named.st_dev
+			&& opened.st_ino == named.st_ino;
+		if same {
+			unsafe {
+				libc::unlinkat(parent_fd, name.as_ptr(), 0);
+			}
+		}
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained directory and private file handles remain live through complete \
+		          publication"
 	)]
 	pub(super) fn secure_write_skill_file(
 		root_path: &Path,
@@ -4678,15 +4759,22 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure(code);
 			},
 		};
-		let Ok(file_component) = CString::new("SKILL.md") else {
+		let Ok(final_name) = CString::new("SKILL.md") else {
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);
 			}
 			return NativeSecureSkillWriteResult::failure("invalid_request");
 		};
-		let mut file = match open_skill_file(skill_fd, &file_component) {
-			Ok(file) => file,
+		if let Err(code) = inspect_existing_skill_file(skill_fd, &final_name) {
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure(code);
+		}
+		let (mut file, private_name) = match create_private_skill_file(skill_fd) {
+			Ok(value) => value,
 			Err(code) => {
 				unsafe {
 					libc::close(skill_fd);
@@ -4695,23 +4783,38 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure(code);
 			},
 		};
-		let result = if file.write_all(content.as_bytes()).is_ok() {
-			NativeSecureSkillWriteResult::success(
-				canonical_root
-					.join(skill_name)
-					.join("SKILL.md")
-					.to_string_lossy()
-					.into_owned(),
-			)
-		} else {
-			NativeSecureSkillWriteResult::failure("write_failed")
-		};
+		if file.write_all(content.as_bytes()).is_err() {
+			let private_fd = file.as_raw_fd();
+			unlink_private_skill_file(skill_fd, &private_name, private_fd);
+			drop(file);
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure("write_failed");
+		}
+		let private_fd = file.as_raw_fd();
+		if let Err(code) = replace_skill_file_name(skill_fd, &private_name, &final_name, private_fd) {
+			unlink_private_skill_file(skill_fd, &private_name, private_fd);
+			drop(file);
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure(code);
+		}
 		drop(file);
 		unsafe {
 			libc::close(skill_fd);
 			libc::close(skills_fd);
 		}
-		result
+		NativeSecureSkillWriteResult::success(
+			canonical_root
+				.join(skill_name)
+				.join("SKILL.md")
+				.to_string_lossy()
+				.into_owned(),
+		)
 	}
 
 	#[expect(
@@ -6478,12 +6581,15 @@ pub(crate) mod platform {
 
 #[cfg(windows)]
 mod platform {
+	#[cfg(test)]
+	use std::sync::{Mutex, OnceLock, mpsc};
 	use std::{
 		ffi::{OsString, c_void},
 		mem::{align_of, size_of},
 		os::windows::ffi::{OsStrExt, OsStringExt},
 		path::{Component, Path, PathBuf},
 		ptr::{null, null_mut},
+		sync::atomic::{AtomicU64, Ordering},
 	};
 
 	use sha2::{Digest, Sha256};
@@ -6543,6 +6649,12 @@ mod platform {
 	}
 
 	#[cfg(test)]
+	static SECURE_SKILL_WRITE_BEFORE_RENAME_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+	static NEXT_SECURE_SKILL_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	#[cfg(test)]
 	pub(super) fn inject_exact_replace_destination_open_sharing_violations(count: u32) {
 		EXACT_REPLACE_DESTINATION_OPEN_SHARING_VIOLATION_INJECT.with(|target| target.set(count));
 	}
@@ -6562,6 +6674,29 @@ mod platform {
 	#[cfg(not(test))]
 	const fn take_injected_exact_replace_destination_open_sharing_violation() -> bool {
 		false
+	}
+
+	#[cfg(test)]
+	pub(super) fn set_secure_skill_write_before_rename_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*SECURE_SKILL_WRITE_BEFORE_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	fn pause_secure_skill_write_before_rename_for_test() {
+		if let Some((entered, resume)) = SECURE_SKILL_WRITE_BEFORE_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("secure skill write hook receiver");
+			resume.recv().expect("secure skill write hook resume");
+		}
 	}
 
 	const SECURITY_OWNER_DACL: u32 = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
@@ -9072,6 +9207,7 @@ mod platform {
 		}
 	}
 
+	const FILE_CREATE: u32 = 2;
 	const FILE_OPEN_IF: u32 = 3;
 
 	fn skill_write_error() -> &'static str {
@@ -9210,53 +9346,57 @@ mod platform {
 
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the retained skill-directory handle and final file handle remain live through \
-		          validation"
+		reason = "the retained skill-directory handle remains live through final no-follow \
+		          inspection"
 	)]
-	fn revalidate_skill_file_name(
+	fn inspect_existing_skill_file(
 		parent: HANDLE,
 		name: &std::ffi::OsStr,
-		file: HANDLE,
-	) -> Result<(), &'static str> {
-		validate_skill_file_handle(file)?;
-		let rebound = match open_relative(parent, name, FILE_READ_ATTRIBUTES | FILE_READ_DATA, false)
-		{
-			Ok(rebound) => rebound,
-			Err(_) => return Err("identity_mismatch"),
+	) -> Result<bool, &'static str> {
+		let file = match open_relative_with_disposition_status(
+			parent,
+			name,
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+			false,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			FILE_OPEN,
+		) {
+			Ok(file) => file,
+			Err(status) if ntstatus_code(status) == "not_found" => return Ok(false),
+			Err(status) => return Err(ntstatus_code(status)),
 		};
-		let result = validate_skill_file_handle(rebound)
-			.and_then(|()| handles_same_object_checked(file, rebound).map_err(|_| "identity_mismatch"))
-			.and_then(|same| {
-				if same {
-					Ok(())
-				} else {
-					Err("identity_mismatch")
-				}
-			});
-		unsafe { CloseHandle(rebound) };
+		let result = validate_skill_file_handle(file).map(|()| true);
+		unsafe { CloseHandle(file) };
 		result
 	}
 
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the retained skill-directory handle and returned file handle remain live through \
-		          creation races"
+		reason = "the retained skill-directory handle owns each unique private file name"
 	)]
-	fn open_skill_file(parent: HANDLE, name: &std::ffi::OsStr) -> Result<HANDLE, &'static str> {
-		let file = open_relative_with_disposition_status(
-			parent,
-			name,
-			FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA,
-			false,
-			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-			FILE_OPEN_IF,
-		)
-		.map_err(ntstatus_code)?;
-		if let Err(code) = revalidate_skill_file_name(parent, name, file) {
-			unsafe { CloseHandle(file) };
-			return Err(code);
+	fn create_private_skill_file(parent: HANDLE) -> Result<(HANDLE, Vec<u16>), &'static str> {
+		for _ in 0..16 {
+			let sequence = NEXT_SECURE_SKILL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+			let name = OsString::from(format!(".gjc-skill-write-{}-{}", std::process::id(), sequence));
+			let file = match open_relative_with_disposition_status(
+				parent,
+				&name,
+				FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | 0x0001_0000,
+				false,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				FILE_CREATE,
+			) {
+				Ok(file) => file,
+				Err(status) if status as u32 == 0xc000_0035 => continue,
+				Err(status) => return Err(ntstatus_code(status)),
+			};
+			if let Err(code) = validate_skill_file_handle(file) {
+				unsafe { CloseHandle(file) };
+				return Err(code);
+			}
+			return Ok((file, name.encode_wide().collect()));
 		}
-		Ok(file)
+		Err("race_limit")
 	}
 
 	#[expect(
@@ -9294,6 +9434,16 @@ mod platform {
 		Ok(())
 	}
 
+	fn replace_skill_file_name(
+		handle: HANDLE,
+		parent: HANDLE,
+		final_name: &[u16],
+	) -> Result<(), &'static str> {
+		#[cfg(test)]
+		pause_secure_skill_write_before_rename_for_test();
+		rename_handle(handle, parent, final_name, true)
+	}
+
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
 		reason = "all writes use the retained no-follow authority and are preceded by identity \
@@ -9319,33 +9469,32 @@ mod platform {
 		}
 		skills.retain_child(skill_handle);
 		let file_name = std::ffi::OsStr::new("SKILL.md");
-		let file = match open_skill_file(skills.target, file_name) {
+		if let Err(code) = inspect_existing_skill_file(skills.target, file_name) {
+			return NativeSecureSkillWriteResult::failure(code);
+		}
+		let (file, _private_name) = match create_private_skill_file(skills.target) {
 			Ok(file) => file,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
-		if let Err(code) = revalidate_skill_file_name(skills.target, file_name, file) {
+		if let Err(code) = truncate_and_write_skill_file(file, content.as_bytes()) {
+			let _ = delete_handle(file);
 			unsafe { CloseHandle(file) };
 			return NativeSecureSkillWriteResult::failure(code);
 		}
-		let canonical_path = match final_path(file) {
-			Ok(path) if path.starts_with(&canonical_volume) => path,
-			Ok(_) => {
-				unsafe { CloseHandle(file) };
-				return NativeSecureSkillWriteResult::failure("identity_unavailable");
-			},
-			Err(code) => {
-				unsafe { CloseHandle(file) };
-				return NativeSecureSkillWriteResult::failure(code);
-			},
-		};
-		let result = match truncate_and_write_skill_file(file, content.as_bytes()) {
-			Ok(()) => NativeSecureSkillWriteResult::success(canonical_path),
-			Err(code) => NativeSecureSkillWriteResult::failure(code),
-		};
-		unsafe {
-			CloseHandle(file);
+		let final_name: Vec<u16> = file_name.encode_wide().collect();
+		if let Err(code) = replace_skill_file_name(file, skills.target, &final_name) {
+			let _ = delete_handle(file);
+			unsafe { CloseHandle(file) };
+			return NativeSecureSkillWriteResult::failure(code);
 		}
-		result
+		unsafe { CloseHandle(file) };
+		NativeSecureSkillWriteResult::success(
+			root_path
+				.join(skill_name)
+				.join(file_name)
+				.to_string_lossy()
+				.into_owned(),
+		)
 	}
 }
 
@@ -9595,6 +9744,116 @@ mod owner_only_security_tests {
 		assert_eq!(result.phase, "preflight");
 	}
 }
+
+#[cfg(all(test, windows))]
+mod secure_skill_write_windows_tests {
+	use std::{
+		fs,
+		path::PathBuf,
+		sync::{
+			Mutex,
+			atomic::{AtomicU64, Ordering},
+			mpsc,
+		},
+		thread,
+	};
+
+	use super::{platform, secure_write_skill_file};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+	static HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"gjc-secure-skill-write-win-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+			));
+			fs::create_dir(&path).expect("create secure skill-write Windows temp directory");
+			Self(path)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[test]
+	fn late_hard_link_swap_replaces_only_the_final_name() {
+		let _guard = HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.0.join(".gjc").join("skills");
+		let skill = root.join("managed");
+		fs::create_dir_all(&skill).expect("create skill directory");
+		let final_path = skill.join("SKILL.md");
+		let outside = temporary.0.join("outside.md");
+		fs::write(&final_path, "before").expect("seed final file");
+		fs::write(&outside, "outside").expect("seed external file");
+
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_secure_skill_write_before_rename_hook(Some((entered_tx, resume_rx)));
+		let root_for_write = root.clone();
+		let writer = thread::spawn(move || {
+			secure_write_skill_file(
+				root_for_write.to_string_lossy().into_owned(),
+				"managed".to_owned(),
+				"after".to_owned(),
+			)
+		});
+		entered_rx.recv().expect("wait for private-file write");
+		fs::remove_file(&final_path).expect("remove final name");
+		fs::hard_link(&outside, &final_path).expect("install late hard-link alias");
+		resume_tx.send(()).expect("release private-file write");
+		let result = writer.join().expect("secure skill writer thread");
+		platform::set_secure_skill_write_before_rename_hook(None);
+
+		assert!(result.ok, "{:?}", result.code);
+		assert_eq!(fs::read_to_string(&outside).expect("read external file"), "outside");
+		assert_eq!(fs::read_to_string(&final_path).expect("read published file"), "after");
+	}
+
+	#[test]
+	fn concurrent_writers_publish_complete_payloads() {
+		let _guard = HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.0.join(".gjc").join("skills");
+		let payloads: Vec<String> = (0..8)
+			.map(|index| format!("payload-{index}-{}", "x".repeat(32 * 1024)))
+			.collect();
+		let workers: Vec<_> = payloads
+			.iter()
+			.cloned()
+			.map(|content| {
+				let root = root.clone();
+				thread::spawn(move || {
+					secure_write_skill_file(
+						root.to_string_lossy().into_owned(),
+						"managed".to_owned(),
+						content,
+					)
+				})
+			})
+			.collect();
+		for worker in workers {
+			let result = worker.join().expect("secure skill writer worker");
+			assert!(result.ok, "{:?}", result.code);
+		}
+		let final_contents = fs::read_to_string(root.join("managed").join("SKILL.md"))
+			.expect("read concurrent final file");
+		assert!(payloads.iter().any(|payload| payload == &final_contents));
+	}
+}
+
 #[cfg(all(test, unix))]
 mod retained_broker_publication_tests {
 	use std::{
@@ -11628,10 +11887,14 @@ mod secure_skill_write_tests {
 	use std::{
 		fs,
 		path::PathBuf,
-		sync::atomic::{AtomicU64, Ordering},
+		sync::{
+			atomic::{AtomicU64, Ordering},
+			mpsc,
+		},
+		thread,
 	};
 
-	use super::secure_write_skill_file;
+	use super::{PATH_IDENTITY_HOOK_TEST_LOCK, platform, secure_write_skill_file};
 
 	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -11657,6 +11920,9 @@ mod secure_skill_write_tests {
 
 	#[test]
 	fn creates_missing_skill_tree_and_overwrites_regular_file() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		let temporary = TempDir::new();
 		let root = temporary.0.join(".gjc").join("skills");
 		let first = secure_write_skill_file(
@@ -11680,6 +11946,9 @@ mod secure_skill_write_tests {
 
 	#[test]
 	fn rejects_symlinked_skill_root_skill_directory_and_file() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		let assert_rejected_link = |code: Option<&str>| {
 			assert!(
 				matches!(code, Some("reparse_point" | "not_directory")),
@@ -11746,6 +12015,76 @@ mod secure_skill_write_tests {
 			fs::read_to_string(outside_file).expect("read hard-linked outside file"),
 			"outside"
 		);
+	}
+
+	#[test]
+	fn late_hard_link_swap_replaces_only_the_final_name() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.0.join(".gjc").join("skills");
+		let skill = root.join("managed");
+		fs::create_dir_all(&skill).expect("create skill directory");
+		let final_path = skill.join("SKILL.md");
+		let outside = temporary.0.join("outside.md");
+		fs::write(&final_path, "before").expect("seed final file");
+		fs::write(&outside, "outside").expect("seed external file");
+
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_secure_skill_write_before_rename_hook(Some((entered_tx, resume_rx)));
+		let root_for_write = root.clone();
+		let writer = thread::spawn(move || {
+			secure_write_skill_file(
+				root_for_write.to_string_lossy().into_owned(),
+				"managed".to_owned(),
+				"after".to_owned(),
+			)
+		});
+		entered_rx.recv().expect("wait for private-file write");
+		fs::remove_file(&final_path).expect("remove final name");
+		fs::hard_link(&outside, &final_path).expect("install late hard-link alias");
+		resume_tx.send(()).expect("release private-file write");
+		let result = writer.join().expect("secure skill writer thread");
+		platform::set_secure_skill_write_before_rename_hook(None);
+
+		assert!(result.ok, "{:?}", result.code);
+		assert_eq!(fs::read_to_string(&outside).expect("read external file"), "outside");
+		assert_eq!(fs::read_to_string(&final_path).expect("read published file"), "after");
+	}
+
+	#[test]
+	fn concurrent_writers_publish_complete_payloads() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.0.join(".gjc").join("skills");
+		let payloads: Vec<String> = (0..8)
+			.map(|index| format!("payload-{index}-{}", "x".repeat(32 * 1024)))
+			.collect();
+		let workers: Vec<_> = payloads
+			.iter()
+			.cloned()
+			.map(|content| {
+				let root = root.clone();
+				thread::spawn(move || {
+					secure_write_skill_file(
+						root.to_string_lossy().into_owned(),
+						"managed".to_owned(),
+						content,
+					)
+				})
+			})
+			.collect();
+		for worker in workers {
+			let result = worker.join().expect("secure skill writer worker");
+			assert!(result.ok, "{:?}", result.code);
+		}
+		let final_contents = fs::read_to_string(root.join("managed").join("SKILL.md"))
+			.expect("read concurrent final file");
+		assert!(payloads.iter().any(|payload| payload == &final_contents));
 	}
 }
 

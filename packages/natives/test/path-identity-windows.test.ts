@@ -91,7 +91,7 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		const first = secureWriteSkillFile(skillsRoot, "managed", "first");
 		expect(first).toMatchObject({ ok: true });
 		if (!first.ok || !first.path) throw new Error(`secure skill create failed: ${first.code}`);
-		expect(first.path).toStartWith("\\\\?\\Volume{");
+		expect(first.path).toBe(path.join(skillsRoot, "managed", "SKILL.md"));
 		expect(await fs.readFile(path.join(skillsRoot, "managed", "SKILL.md"), "utf8")).toBe("first");
 
 		const second = secureWriteSkillFile(skillsRoot, "managed", "second");

@@ -11,6 +11,7 @@ import {
 	exactRestore,
 	exactUnlink,
 	exactUnlinkDirect,
+	secureWriteSkillFile,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
 } from "../native/index.js";
@@ -159,6 +160,45 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		expect(created.exitCode, created.stderr.toString()).toBe(0);
 
 		expect(verifyOwnerOnlyPathSecurity(fifo, "file")).toEqual({ ok: false, code: "not_directory" });
+	});
+
+	it("creates and atomically overwrites one skill file", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const skillsRoot = path.join(root, ".gjc", "skills");
+		const first = secureWriteSkillFile(skillsRoot, "managed", "first");
+		expect(first).toEqual({
+			ok: true,
+			path: path.join(skillsRoot, "managed", "SKILL.md"),
+		});
+		const second = secureWriteSkillFile(skillsRoot, "managed", "second");
+		expect(second).toEqual({
+			ok: true,
+			path: path.join(skillsRoot, "managed", "SKILL.md"),
+		});
+		expect(await fs.readFile(path.join(skillsRoot, "managed", "SKILL.md"), "utf8")).toBe("second");
+	});
+
+	it("rejects existing final symlinks and hard links without mutating external bytes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const skillsRoot = path.join(root, "skills");
+		const skillDirectory = path.join(skillsRoot, "managed");
+		const external = path.join(root, "external.md");
+		await fs.mkdir(skillDirectory, { recursive: true });
+		await fs.writeFile(external, "external");
+		await fs.symlink(external, path.join(skillDirectory, "SKILL.md"));
+		expect(secureWriteSkillFile(skillsRoot, "managed", "blocked")).toEqual({
+			ok: false,
+			code: "reparse_point",
+		});
+		await fs.unlink(path.join(skillDirectory, "SKILL.md"));
+		await fs.link(external, path.join(skillDirectory, "SKILL.md"));
+		expect(secureWriteSkillFile(skillsRoot, "managed", "blocked")).toEqual({
+			ok: false,
+			code: "hard_link",
+		});
+		expect(await fs.readFile(external, "utf8")).toBe("external");
 	});
 	it("rejects an unauthorized exact-unlink identity without deleting a replacement", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
