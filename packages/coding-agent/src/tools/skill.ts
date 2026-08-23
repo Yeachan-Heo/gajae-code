@@ -151,7 +151,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					this.#session.cwd,
 					requestedName,
 					this.#getRuntimeSkillPolicy(),
-					this.#session.home ?? this.#session.getSessionHome?.(),
+					this.#session.getSessionHome?.() ?? this.#session.home,
 					this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
 				));
 			if (!skill) {

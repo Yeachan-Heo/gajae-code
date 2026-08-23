@@ -21,7 +21,11 @@ import {
 } from "@gajae-code/coding-agent/extensibility/skill-management";
 import { loadSkills } from "@gajae-code/coding-agent/extensibility/skills";
 import { loadSlashCommands } from "@gajae-code/coding-agent/extensibility/slash-commands";
-import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import {
+	buildSystemPrompt as buildSdkSystemPrompt,
+	createAgentSession,
+	discoverContextFiles as discoverSdkContextFiles,
+} from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
@@ -120,6 +124,23 @@ describe("issue #4769: user scope follows the agent directory", () => {
 
 		expect(system.items.map(item => item.content)).toEqual(["# explicit system"]);
 		expect(skills.items.map(item => item.name)).toEqual(["explicit-skill"]);
+	});
+
+	test("public SDK context and prompt wrappers keep agent location and settings authority together", async () => {
+		await writeFile(path.join(profile, "AGENTS.md"), "profile agents authority marker");
+		await writeFile(path.join(profile, "SYSTEM.md"), "profile system authority marker");
+		const enabled = Settings.isolated({ disabledProviders: [] });
+		const disabled = Settings.isolated({ disabledProviders: ["native"] });
+
+		const enabledContext = await discoverSdkContextFiles(project, profile, enabled);
+		const disabledContext = await discoverSdkContextFiles(project, profile, disabled);
+		const enabledPrompt = await buildSdkSystemPrompt({ cwd: project, agentDir: profile, settings: enabled });
+		const disabledPrompt = await buildSdkSystemPrompt({ cwd: project, agentDir: profile, settings: disabled });
+
+		expect(enabledContext.map(item => item.content)).toContain("profile agents authority marker");
+		expect(disabledContext.map(item => item.content)).not.toContain("profile agents authority marker");
+		expect(enabledPrompt.systemPrompt.join("\n")).toContain("profile system authority marker");
+		expect(disabledPrompt.systemPrompt.join("\n")).not.toContain("profile system authority marker");
 	});
 
 	test("user SYSTEM.md is read from the agent directory, not the home-relative default", async () => {
