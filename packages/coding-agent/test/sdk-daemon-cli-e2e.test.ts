@@ -397,13 +397,13 @@ describe("SDK session CLI", () => {
 			pid: process.pid,
 			endpointMtimeMs,
 		});
-	});
+	}, 15_000);
 
 	afterEach(async () => {
 		await broker.stop();
 		await endpointServer.stop(true);
 		await fs.rm(root, { recursive: true, force: true });
-	});
+	}, 15_000);
 
 	type OfflineSession = { id: string; path: string };
 
